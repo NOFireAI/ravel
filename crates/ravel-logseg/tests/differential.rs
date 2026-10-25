@@ -8,8 +8,8 @@
 use proptest::prelude::*;
 use ravel_logseg::tokenizer::tokens;
 use ravel_logseg::{
-    AttrValue, FieldSel, LogRecord, LogStreamId, ObjectIdentity, Predicate, RlogConfig, RlogReader,
-    RlogWriter, stream_attrs_bytes,
+    AttrValue, ColumnSelection, ColumnarLogBatch, FieldSel, LogRecord, LogStreamId, ObjectIdentity,
+    Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
 };
 
 const STREAMS: u8 = 6;
@@ -285,10 +285,33 @@ fn normalize(v: Vec<LogRecord>) -> Vec<Vec<u8>> {
 }
 
 fn write_object(corpus: &[LogRecord]) -> Vec<u8> {
+    write_with(
+        RlogConfig {
+            block_target_records: 32,
+            ..RlogConfig::default()
+        },
+        corpus,
+        false,
+    )
+}
+
+/// `corpus` written with `chunk_order` (ADR-3217 decision 8) into row groups
+/// of two blocks, through the columnar path when `columnar` is set.
+fn write_object_ordered(
+    corpus: &[LogRecord],
+    chunk_order: &'static [&'static str],
+    columnar: bool,
+) -> Vec<u8> {
     let cfg = RlogConfig {
         block_target_records: 32,
+        group_target_blocks: 2,
+        chunk_order,
         ..RlogConfig::default()
     };
+    write_with(cfg, corpus, columnar)
+}
+
+fn write_with(cfg: RlogConfig, corpus: &[LogRecord], columnar: bool) -> Vec<u8> {
     let identity = ObjectIdentity {
         tenant_hash: [0u8; 16],
         shard: 0,
@@ -297,10 +320,33 @@ fn write_object(corpus: &[LogRecord]) -> Vec<u8> {
         writer_seq: 0,
     };
     let mut w = RlogWriter::new(cfg, identity);
-    for r in corpus {
-        w.push(r.clone()).expect("push");
+    if columnar {
+        w.push_columnar(ColumnarLogBatch::from_records(corpus))
+            .expect("push_columnar");
+    } else {
+        for r in corpus {
+            w.push(r.clone()).expect("push");
+        }
     }
     w.finish().expect("finish")
+}
+
+/// A chunk order drawn from the corpus's attribute names, in any order; a
+/// name no record of a given corpus carries is part of the case.
+fn arb_chunk_order() -> impl Strategy<Value = Vec<&'static str>> {
+    proptest::sample::subsequence(NAMES.to_vec(), 1..=NAMES.len()).prop_shuffle()
+}
+
+/// Every record the block scan returns under `columns`, block by block.
+fn scan_projected(object: &[u8], pred: &Predicate, columns: &ColumnSelection) -> Vec<LogRecord> {
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(object, &cfg).expect("open");
+    let mut cursor = reader.scan_blocks(pred, &[], columns).expect("scan_blocks");
+    let mut out = Vec::new();
+    while let Some(rows) = cursor.next_block(object).expect("next_block") {
+        out.extend(rows);
+    }
+    out
 }
 
 proptest! {
@@ -314,5 +360,41 @@ proptest! {
         let (got, _stats) = reader.scan(&pred).expect("scan");
         let want = naive_eval(&corpus, &pred);
         prop_assert_eq!(normalize(got), normalize(want));
+    }
+
+    /// A declared chunk order changes which name gets which column id and
+    /// nothing a read returns: the pruned scan, and the block scan projected
+    /// onto the declared names, agree with the default-order object on both
+    /// writer paths.
+    #[test]
+    fn chunk_order_reads_equal_the_default_order(
+        corpus in arb_corpus(),
+        pred in arb_predicate(),
+        order in arb_chunk_order(),
+        columnar in any::<bool>(),
+    ) {
+        let order: &'static [&'static str] = order.leak();
+        let default_object = write_object_ordered(&corpus, &[], columnar);
+        let ordered_object = write_object_ordered(&corpus, order, columnar);
+        let cfg = RlogConfig::default();
+        let scan = |object: &[u8]| {
+            RlogReader::new(object, &cfg)
+                .expect("open")
+                .scan(&pred)
+                .expect("scan")
+                .0
+        };
+        let got = scan(&ordered_object);
+        prop_assert_eq!(normalize(got.clone()), normalize(scan(&default_object)));
+        prop_assert_eq!(normalize(got), normalize(naive_eval(&corpus, &pred)));
+
+        let mut columns = ColumnSelection::fixed_only().with_body().with_severity_text();
+        for name in order.iter().take(2) {
+            columns = columns.with_attr(*name);
+        }
+        prop_assert_eq!(
+            normalize(scan_projected(&ordered_object, &pred, &columns)),
+            normalize(scan_projected(&default_object, &pred, &columns))
+        );
     }
 }

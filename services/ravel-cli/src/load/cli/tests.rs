@@ -620,6 +620,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
         None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         LoadMemoryRequest::Derived {
             host_total_bytes: Some(64 << 30),
         },
@@ -713,6 +714,7 @@ async fn a_failed_default_load_flushes_before_it_reports() {
         None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         LoadMemoryRequest::Derived {
             host_total_bytes: Some(64 << 30),
         },

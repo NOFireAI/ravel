@@ -888,6 +888,7 @@ impl LogFlushCtx {
         let rlog_config = RlogConfig {
             zstd_level: self.config.rlog_zstd_level.get(),
             group_target_blocks: self.config.rlog_group_target_blocks.get(),
+            chunk_order: self.config.rlog_chunk_order.get(),
             ..RlogConfig::default()
         };
         // The encode runs on the write gate when one is attached (ADR-1702).
@@ -3308,6 +3309,101 @@ mod tests {
             flushed_row_groups(100, crate::RlogGroupTargetBlocks::DEFAULT.get()).await,
             vec![(0, 32), (32, 32), (64, 32), (96, 4)],
             "the default writes 32-block groups"
+        );
+    }
+
+    /// `(name, column_id)` of every FIELD_DIR entry in the RLOG object one
+    /// flush writes under `chunk_order`, for records carrying `Age`,
+    /// `SearchPhrase` and `UserID` attributes.
+    async fn flushed_column_ids(chunk_order: crate::RlogChunkOrder) -> Vec<(String, u32)> {
+        let h = Harness::spawn(IngestConfig {
+            rlog_chunk_order: chunk_order,
+            ..flush_on_first()
+        });
+        let tenant = TenantId::new("acme");
+        let records: Vec<NormalizedLogRecord> = (0..8)
+            .map(|i| {
+                let mut rec = norm_record(&[("service.name", "api")], "scope", 1_000 + i, "");
+                rec.attrs = vec![
+                    ("Age".to_string(), AttrValue::I64(i)),
+                    (
+                        "SearchPhrase".to_string(),
+                        AttrValue::Str(format!("phrase {i}")),
+                    ),
+                    ("UserID".to_string(), AttrValue::I64(1_000 + i)),
+                ];
+                rec
+            })
+            .collect();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            arrival: false,
+            tenant: tenant.clone(),
+            records,
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        let token = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect("strict write commits");
+
+        let commit_key =
+            keys::commit_key_for_token(&tenant.hash(), Signal::Logs, &token).expect("commit key");
+        let commit_bytes = h
+            .store
+            .get(&commit_key, GetRange::Full)
+            .await
+            .expect("get commit record")
+            .data;
+        let rec = record::decode(&commit_bytes).expect("decode commit record");
+        let data_bytes = h
+            .store
+            .get(&rec.object_key, GetRange::Full)
+            .await
+            .expect("get data object")
+            .data;
+        let footer = ravel_logseg::footer::open(&data_bytes).expect("footer");
+        let field_dir = footer
+            .section(ravel_logseg::footer::kind::FIELD_DIR)
+            .expect("FIELD_DIR present");
+        let field_dir = ravel_logseg::read_section(&data_bytes, field_dir, &RlogConfig::default())
+            .expect("FIELD_DIR decompresses");
+        let ids = ravel_logseg::field_dir::FieldDir::decode(&field_dir, 1 << 16)
+            .expect("FIELD_DIR decodes")
+            .entries()
+            .iter()
+            .map(|e| (e.name.clone(), e.column_id))
+            .collect();
+        h.shutdown().await;
+        ids
+    }
+
+    /// ADR-3217 decision 8: `rlog_chunk_order` reaches the flush's writer.
+    /// Declaring `UserID,SearchPhrase` gives them the first two dynamic ids,
+    /// 10 and 11, in that order; the default is the alphabetical assignment.
+    ///
+    /// Non-vacuity: dropping `chunk_order` from the `RlogConfig` the flush
+    /// builds leaves the declared flush alphabetical.
+    #[tokio::test]
+    async fn rlog_chunk_order_sets_the_flushed_objects_column_ids() {
+        let named = |pairs: &[(&str, u32)]| -> Vec<(String, u32)> {
+            pairs.iter().map(|(n, id)| (n.to_string(), *id)).collect()
+        };
+        let order = crate::RlogChunkOrder::new(vec!["UserID".into(), "SearchPhrase".into()])
+            .expect("valid order");
+        assert_eq!(
+            flushed_column_ids(order).await,
+            named(&[("Age", 12), ("SearchPhrase", 11), ("UserID", 10)]),
+            "declared names first, in the declared order"
+        );
+        assert_eq!(
+            flushed_column_ids(crate::RlogChunkOrder::DEFAULT).await,
+            named(&[("Age", 10), ("SearchPhrase", 11), ("UserID", 12)]),
+            "the default is alphabetical"
         );
     }
 

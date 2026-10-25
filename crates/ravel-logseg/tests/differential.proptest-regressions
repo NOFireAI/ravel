@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b662e1fd53234cbd73f210fab3adf0082c4008b5888b68ee47d75958ee79aaf2 # shrinks to corpus = [LogRecord { stream_id: LogStreamId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), stream_attrs: [1, 12, 115, 101, 114, 118, 105, 99, 101, 46, 110, 97, 109, 101, 1, 2, 115, 48, 5, 115, 99, 111, 112, 101, 1, 49, 0], ts_ns: 0, observed_ts_ns: 0, severity_num: 0, severity_text: "INFO", body: "", trace_id: None, span_id: None, flags: 0, attrs: [("svc", Str("timeout")), ("code", Str("timeout"))] }], pred = And([]), order = ["svc"], columnar = false

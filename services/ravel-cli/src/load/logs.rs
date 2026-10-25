@@ -125,6 +125,7 @@ pub async fn load_with_fold_after_load(
         None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         None,
         true,
         Arc::new(TenantRules::none()),
@@ -176,6 +177,7 @@ pub async fn load_with_memory(
         None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         Some(load_memory),
         false,
         Arc::new(TenantRules::none()),
@@ -262,6 +264,7 @@ pub(super) async fn load_instrumented(
         on_batch_queued,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         None,
         false,
         Arc::new(TenantRules::none()),
@@ -273,7 +276,9 @@ pub(super) async fn load_instrumented(
 /// the router's [`IngestConfig::rlog_zstd_level`], the level every page and
 /// section of each object the load writes compresses at. `group_target_blocks`
 /// is `--group-target-blocks`, the router's
-/// [`IngestConfig::rlog_group_target_blocks`]. `load_memory` is the
+/// [`IngestConfig::rlog_group_target_blocks`], and `chunk_order` is
+/// `--chunk-order`, the router's [`IngestConfig::rlog_chunk_order`].
+/// `load_memory` is the
 /// memory budget's inputs, resolved once the read-cursor count is known;
 /// `None` derives the budget from this host's memory. `fold_after_load` is
 /// the `--fold-after-load` flag ([`load_with_fold_after_load`]).
@@ -303,6 +308,7 @@ pub(super) async fn load_instrumented_at(
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
     rules: Arc<TenantRules>,
@@ -328,6 +334,7 @@ pub(super) async fn load_instrumented_at(
         on_batch_queued,
         zstd_level,
         group_target_blocks,
+        chunk_order,
         DRAIN_REFLUSH_PERIOD,
         load_memory,
         fold_after_load,
@@ -365,6 +372,7 @@ pub(super) async fn load_with_drain_reflush_period(
     on_batch_queued: Option<BuildStartHook>,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
     drain_reflush_period: Duration,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
@@ -486,6 +494,7 @@ pub(super) async fn load_with_drain_reflush_period(
             IngestConfig {
                 rlog_zstd_level: zstd_level,
                 rlog_group_target_blocks: group_target_blocks,
+                rlog_chunk_order: chunk_order,
                 ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
             },
             Arc::clone(&store),
