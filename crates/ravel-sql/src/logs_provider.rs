@@ -2096,9 +2096,9 @@ mod tests {
     /// the scan's counters show the arm ran only when pushed (ADR-2773,
     /// contains-arm amendment). Each block is one plain-page cell, so the
     /// reader validates nothing and `str_cells_validated` is the cells the
-    /// declared build read for the rows the arm kept. Over this full window
-    /// only the pushed arm keeps the scan off the whole-segment fast path as a
-    /// block predicate.
+    /// declared build read for the rows the arm kept. A `Contains`-only
+    /// content list is not a block predicate for the route, so neither the
+    /// pushed nor the unpushed run records `fast_path_rejected_block_predicate`.
     ///
     /// Flipped assertion, seen failing: `contains_predicate` returning `None`
     /// makes the pushed `LIKE` run report 0 where 3 is expected for
@@ -2118,7 +2118,7 @@ mod tests {
                 rows: want.clone(),
                 contains_cells_tested: 3,
                 str_cells_validated: 2,
-                block_predicate_rejected: true,
+                block_predicate_rejected: false,
             }
         );
         // Unpushed, every row reaches the build and its three `Str` cells
@@ -2144,7 +2144,7 @@ mod tests {
                 rows: want.clone(),
                 contains_cells_tested: 3,
                 str_cells_validated: 1,
-                block_predicate_rejected: true,
+                block_predicate_rejected: false,
             }
         );
         assert_eq!(
