@@ -174,19 +174,89 @@ criterion confidence interval lies wholly above A's.
 
 ## Environment and versions
 
-(filled in after the runs)
+- `uname -m`: aarch64 (Raspberry Pi 5, kernel 6.12.25+rpt-rpi-2712);
+  `nproc`: 4; MemTotal 8,257,232 kB; cpufreq governor `ondemand`, max
+  2.4 GHz.
+- rustc 1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6, host
+  aarch64-unknown-linux-gnu. bbtree 0.1.5 built on this stable toolchain
+  with no feature flags or toolchain change.
+- criterion 0.8.2, stats_alloc 0.1.10, rand 0.10.2 (Cargo.lock).
+- `CARGO_BUILD_JOBS=2` on every cargo command.
+- Run 1 started at load average 0.12. Run 2 started at load average 3.04:
+  another session on the host was compiling (two `rustc` processes) during
+  it. Run 2's absolute figures are therefore noisier; its A-to-B and A-to-C
+  ordering is the same as run 1's on every geometry.
+- Benches use the system allocator. The shipped `ravel-server` and
+  `ravel-cli` binaries use jemalloc, so allocation-heavy arms may rank
+  differently there (see Not tested).
 
 ## Results
 
-(filled in after the runs)
+Medians and criterion 95% confidence intervals of the median, in ms, from
+`target/criterion/grouping_<geometry>/<arm>/new/estimates.json`.
+
+Run 1, `GROUPING_ARM_ORDER=ABC`:
+
+| geometry | A std BTreeMap | B bbtree | C HashMap + sort | B vs A | C vs A |
+|---|---|---|---|---|---|
+| small | 0.362 (0.360 to 0.363) | 0.520 (0.517 to 0.522) | 0.363 (0.357 to 0.364) | +44% | +0% |
+| medium | 72.7 (71.4 to 73.7) | 84.2 (83.6 to 84.5) | 100.7 (97.8 to 101.7) | +16% | +38% |
+| large | 570.9 (561.2 to 580.7) | 630.2 (620.2 to 633.2) | 892.2 (890.3 to 902.6) | +10% | +56% |
+| distinct | 198.0 (193.1 to 221.0) | 174.5 (172.1 to 177.4) | 259.1 (242.5 to 259.4) | -12% | +31% |
+| mixed | 107.7 (107.1 to 107.9) | 127.6 (127.4 to 128.5) | 172.6 (172.4 to 172.7) | +19% | +60% |
+
+Run 2, `GROUPING_ARM_ORDER=CBA`:
+
+| geometry | A std BTreeMap | B bbtree | C HashMap + sort | B vs A | C vs A |
+|---|---|---|---|---|---|
+| small | 0.353 (0.352 to 0.353) | 0.507 (0.507 to 0.507) | 0.337 (0.337 to 0.337) | +44% | -5% |
+| medium | 66.9 (66.2 to 67.4) | 77.4 (76.8 to 77.9) | 105.7 (105.2 to 107.9) | +16% | +58% |
+| large | 589.2 (583.9 to 598.0) | 639.4 (631.8 to 642.9) | 954.5 (877.0 to 976.3) | +9% | +62% |
+| distinct | 224.4 (210.5 to 253.5) | 199.2 (198.0 to 200.7) | 323.1 (318.7 to 329.5) | -11% | +44% |
+| mixed | 119.7 (118.2 to 120.6) | 141.2 (140.2 to 143.7) | 215.1 (213.8 to 219.2) | +18% | +80% |
+
+Every arm's checksum matched A's on every geometry before timing (the bench
+asserts it). Every A median fell inside its pre-registered band. Two
+pre-registered expectations missed:
+
+- C was expected 20 to 40% faster than A on medium and large; it was 38 to
+  62% slower. Hypothesis, not tested: each input's series arrive sorted by
+  id, so A's successive inserts land in the same or the adjacent leaf and
+  its descent stays in cache, while C's hashed probes scatter across a
+  table far larger than the cache. Shuffling each input's order would test
+  it (see Not tested).
+- B was expected within 20% of A everywhere; on small it was 44% slower in
+  both runs. On the other geometries it was within 20% (9 to 19% slower on
+  the 100%- and 50%-repeated ones, 11 to 12% faster on distinct).
 
 ## Memory
 
-(filled in after the runs)
+`CARGO_BUILD_JOBS=2 cargo bench -p ravel-maintain --bench
+compaction_grouping_alloc -- large` (exit 0; 3,200,000 contributions,
+200,000 groups, 3,400,000 samples for A and B and 3,400,001 for C, as the
+binary checks; every arm left 0 bytes live and produced checksum
+0x699fda67775cc32f):
+
+| arm | peak live, sampled (bytes) | peak live, bound (bytes) | allocations | reallocations |
+|---|---|---|---|---|
+| A std BTreeMap | 66,855,896 | 66,856,024 | 233,331 | 400,000 |
+| B bbtree | 64,174,145 (-4.0%) | 64,174,273 | 212,839 | 400,000 |
+| C HashMap + sort | 65,147,912 (-2.6%) | 65,147,912 | 200,018 | 400,000 |
+
+A's peak sits inside its pre-registered 40 to 100 MB band, and its 400,000
+reallocations match the predicted two per group. The 33,331 allocations
+above one per group are A's tree nodes; B allocates 12,839 nodes and C
+18 (table growth plus the key `Vec`).
 
 ## Decision
 
-(filled in after the runs)
+No change to `build.rs`. Neither alternative is at least 10% faster than A
+on medium and large in either run; both are slower on both (B +9 to +16%,
+C +38 to +62%). B passes the memory clause (-4.0%) and fails the speed
+clause; C fails the speed clause. Because no arm passed the stage-level
+rule, the 2% whole-build clause was not reached and the stage was not
+profiled against a whole build. The benchmark stays in the tree as the
+record of the measurement.
 
 ## Not tested
 
