@@ -82,6 +82,8 @@ mod logs_fast_path_projection_routing;
 mod logs_key_idx_reader_rule;
 #[path = "logs_metadata_agg.rs"]
 mod logs_metadata_agg;
+#[path = "logs_not_equal_route.rs"]
+mod logs_not_equal_route;
 #[path = "logs_plan_concurrency.rs"]
 mod logs_plan_concurrency;
 #[path = "logs_provider.rs"]

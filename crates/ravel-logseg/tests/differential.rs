@@ -187,7 +187,7 @@ fn eval(rec: &LogRecord, pred: &Predicate) -> bool {
         // Prune-only (ADR-0095 decision 6): never an exact per-row filter, and
         // `arb_predicate` never generates it. Mirror the reader's exact channel
         // (match every row) so the differential stays correct if one appears.
-        Predicate::NumRange { .. } => true,
+        Predicate::NumRange { .. } | Predicate::NumNotEq { .. } => true,
         // Keeps rows a later exact filter decides, so it has no record-level
         // mirror; the reader's own row-by-row oracle covers it.
         Predicate::Contains { .. } => unreachable!("arb_predicate never generates Contains"),

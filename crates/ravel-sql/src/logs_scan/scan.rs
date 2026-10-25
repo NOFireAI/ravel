@@ -203,11 +203,15 @@ fn open_segment_subset(
 /// Fetch one whole segment's object in a single GET and open its pruned,
 /// column-projected scan over all of its blocks (#693 part 3, deliverable 1).
 /// Used on the predicate-free full-window whole-segment path, where the
-/// segment is assigned to exactly one partition and every block survives, so a
-/// whole-object read is optimal for a projection wide enough to want most of
-/// the object's bytes ([`PartitionCtx::open_by_column_chunk`]) and no plan phase
-/// or suffix probe is needed. Also used for a segment at or under the plan
-/// bound (ADR-2677 decision 2), which has one owner and no plan: the open
+/// segment is assigned to exactly one partition and the plan phase prunes no
+/// block, so a whole-object read is optimal for a projection wide enough to
+/// want most of the object's bytes ([`PartitionCtx::open_by_column_chunk`]) and
+/// no plan phase or suffix probe is needed. A prune list holding only
+/// `NumNotEq` arms also takes this path; the open then drops the blocks whose
+/// skip-index stats rule the arm out, and the caller takes the survivor list
+/// from [`LogSegmentScan::survivor_block_indices`]. Also used for a segment at
+/// or under the plan bound (ADR-2677 decision 2), which has one owner and no
+/// plan: the open
 /// prunes blocks from the directory the whole read holds, and the caller takes
 /// the survivor list from [`LogSegmentScan::survivor_block_indices`].
 fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
@@ -236,10 +240,11 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
 /// Taken when [`PartitionCtx::open_by_column_chunk`] judges the skipped bytes
 /// worth the extra round trips. It passes the SAME [`ColumnSelection`] the
 /// decode uses, which is what ADR-0699 decision 5 requires of a version-4 fetch,
-/// and no block-index subset: the fast path's conjuncts already proved every
-/// block of this segment survives, so the ranged read's candidate set is the
-/// whole segment and the rows it yields are the rows
-/// [`open_segment_whole`] would have yielded.
+/// and no block-index subset: the plan phase pruned no block of this segment,
+/// so the ranged read's candidate set is the whole segment and the rows it
+/// yields are the rows [`open_segment_whole`] would have yielded. Under a
+/// `NumNotEq`-only prune list the open itself drops the blocks the arm rules
+/// out, in both entry points alike, and records the survivor list.
 fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
@@ -802,14 +807,17 @@ pub(super) struct RowRefRange {
 /// An unplanned segment ([`PlanCounts::unplanned`]) passes the survivor list
 /// its own open pruned to, so it resolves like a planned one.
 ///
-/// The whole-segment fast path passes `None`: it has no plan-phase survivor
-/// list, and late materialization resolves the row-ref as a position among the
-/// blocks its own reopen keeps. The two agree only while the open has pruned
-/// no block before this one, so the decoded block must equal `cursor`, the
-/// block's position in this scan's drain. A block that follows one the open
-/// pruned (its skip index disagreeing with the catalog's bounds) fails with a
-/// typed `Corrupted` error naming `key` rather than stamping a row-ref that
-/// would resolve to another block.
+/// The whole-segment fast path has no plan-phase survivor list. When its query
+/// carries a prune list (only `NumNotEq` arms reach it,
+/// `route_predicate_free`), the open's own survivor list is passed, so it
+/// resolves like an unplanned segment. Otherwise it passes `None`, and late
+/// materialization resolves the row-ref as a position among the blocks its
+/// own reopen keeps. The two agree only while the open has pruned no block
+/// before this one, so the decoded block must equal `cursor`, the block's
+/// position in this scan's drain. A block that follows one the open pruned
+/// (its skip index disagreeing with the catalog's bounds) fails with a typed
+/// `Corrupted` error naming `key` rather than stamping a row-ref that would
+/// resolve to another block.
 ///
 /// A free function rather than a method because the columnar drain calls it
 /// while the block cursor holds a mutable borrow of the stream's state field.
@@ -1067,6 +1075,15 @@ impl LogScanStream {
                 self.current_dirs.as_ref().map(|c| Arc::clone(&c.dirs)),
             )
         }
+    }
+
+    /// Whether this whole-segment fast-path open prunes blocks, so the open's
+    /// survivor list, not the whole segment, is what a row ref indexes. It
+    /// tests only that the prune list is non-empty: `route_predicate_free` is
+    /// the one way onto the fast path with a prune list, and it admits only
+    /// `NumNotEq` arms.
+    fn fast_path_prunes(&self) -> bool {
+        self.fast_whole_segment && !self.ctx.query.prune.is_empty()
     }
 
     /// The surviving-block index of the block just decoded, or `None` when
@@ -1541,6 +1558,10 @@ impl LogScanStream {
                                     .add_duration(at.saturating_duration_since(issued));
                                 match *opened {
                                     Ok(Some(scan)) => {
+                                        if this.fast_path_prunes() {
+                                            this.current_survivors =
+                                                Some(Arc::new(scan.survivor_block_indices()));
+                                        }
                                         this.state = if this.columnar_eligible {
                                             LogScanState::Columnar(Box::new(scan))
                                         } else {
@@ -1683,8 +1704,9 @@ impl LogScanStream {
                         // An unplanned segment's survivor list is the one its
                         // open just pruned to, which is also the list a
                         // late-materialization reopen prunes to, so a row-ref's
-                        // block position resolves the same way on both.
-                        if this.current_unplanned {
+                        // block position resolves the same way on both. A
+                        // fast-path open that prunes is the same case.
+                        if this.current_unplanned || this.fast_path_prunes() {
                             this.current_survivors = Some(Arc::new(scan.survivor_block_indices()));
                         }
                         this.state = if this.columnar_eligible {
