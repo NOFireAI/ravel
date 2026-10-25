@@ -736,3 +736,172 @@ pub(crate) async fn fetch_stats_object(
         reservation,
     ))
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+    use ravel_proto::catalog::v1::{ColumnStat, ColumnValue, DictEntry, column_value::Kind};
+
+    use super::*;
+    use crate::snapshot_format::encode_column_stats_v3;
+
+    const NAMES: [&str; 4] = ["a", "b", "c", "d"];
+
+    fn i64_value(v: i64) -> ColumnValue {
+        ColumnValue {
+            kind: Some(Kind::I64(v)),
+        }
+    }
+
+    /// A valid I64 column over `values`: exact counts, extrema and sum, and a
+    /// dictionary when `present`.
+    fn column(name: &str, values: &[i64], nulls: u64, present: bool) -> ColumnStat {
+        let mut counts = BTreeMap::new();
+        for v in values {
+            *counts.entry(*v).or_insert(0u64) += 1;
+        }
+        ColumnStat {
+            name: name.to_string(),
+            declared_type: 2,
+            non_null_count: values.len() as u64,
+            null_count: nulls,
+            min: values.iter().min().map(|v| i64_value(*v)),
+            max: values.iter().max().map(|v| i64_value(*v)),
+            dictionary_present: present,
+            dictionary: if present {
+                counts
+                    .into_iter()
+                    .map(|(v, count)| DictEntry {
+                        value: Some(i64_value(v)),
+                        count,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            sum: Some(values.iter().sum()),
+        }
+    }
+
+    fn arb_column(name: &'static str) -> impl Strategy<Value = ColumnStat> {
+        (
+            proptest::collection::vec(-3i64..4, 0..6),
+            0u64..3,
+            any::<bool>(),
+        )
+            .prop_map(move |(values, nulls, present)| column(name, &values, nulls, present))
+    }
+
+    /// One to four segments, each keyed by a distinct ascending 32-byte content
+    /// hash, each carrying every column of [`NAMES`].
+    fn arb_segments() -> impl Strategy<Value = Vec<ColumnStatsSegment>> {
+        proptest::collection::vec(
+            (
+                arb_column(NAMES[0]),
+                arb_column(NAMES[1]),
+                arb_column(NAMES[2]),
+                arb_column(NAMES[3]),
+            ),
+            1..5,
+        )
+        .prop_map(|rows| {
+            rows.into_iter()
+                .enumerate()
+                .map(|(i, (a, b, c, d))| ColumnStatsSegment {
+                    ingest_hour_bucket: 1,
+                    shard: 0,
+                    writer_id: vec![i as u8; 32],
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    columns: vec![a, b, c, d],
+                })
+                .collect()
+        })
+    }
+
+    fn arb_request() -> impl Strategy<Value = ColumnStatsRequest> {
+        proptest::sample::subsequence(NAMES.to_vec(), 0..=NAMES.len()).prop_map(|names| {
+            names
+                .into_iter()
+                .fold(ColumnStatsRequest::summary_only(), |request, name| {
+                    request.with_dictionary(name)
+                })
+        })
+    }
+
+    /// `bytes` decoded and keyed the way [`fetch_stats_object`] keys them.
+    fn decode(bytes: &[u8]) -> DecodedStats {
+        let decoded =
+            decode_column_stats(bytes, &ColumnStatsLimits::default()).expect("a fresh encode");
+        DecodedStats {
+            segments: HashMap::new(),
+            by_content_hash: decoded
+                .segments
+                .into_iter()
+                .map(|segment| {
+                    let hash = <[u8; 32]>::try_from(segment.writer_id.as_slice())
+                        .expect("a 32-byte content hash");
+                    (hash, segment)
+                })
+                .collect(),
+            body_uncompressed_len: decoded.header.body_uncompressed_len,
+        }
+    }
+
+    proptest! {
+        /// Issue #3244: stripping clears dictionaries and nothing else. An
+        /// entry built from one decode for `first`, then rebuilt from a second
+        /// decode for `second` with the first as `previous`, holds exactly
+        /// the union; with every cleared dictionary copied back from a third
+        /// decode it equals the encoded segments, so no summary field, and no
+        /// `dictionary_present`, was touched. Its `heap_bytes` is the stripped
+        /// segments' encoded length.
+        ///
+        /// FLIP: make `strip_dictionaries` also clear `dictionary_present`;
+        /// the restored segments differ (the checked-in seed is that case).
+        #[test]
+        fn strip_then_reattach_restores_the_decoded_segments(
+            segments in arb_segments(),
+            first in arb_request(),
+            second in arb_request(),
+        ) {
+            let bytes = encode_column_stats_v3([7; 16], 1, [9; 32], &segments, u64::MAX)
+                .expect("distinct ascending segments encode");
+            let earlier = PartColumnStats::from_decoded(decode(&bytes), &first, None);
+            let entry = PartColumnStats::from_decoded(decode(&bytes), &second, Some(&earlier));
+            let full = decode(&bytes).by_content_hash;
+
+            let mut union = first.clone();
+            union.extend(&second);
+            for name in NAMES {
+                prop_assert_eq!(entry.holds_dictionary(name), union.wants_dictionary(name));
+            }
+            prop_assert!(entry.covers(&union));
+
+            let held_len: u64 = entry
+                .by_content_hash
+                .values()
+                .map(|segment| segment.encoded_len() as u64)
+                .sum();
+            prop_assert_eq!(entry.heap_bytes(), held_len);
+
+            let mut restored = entry.by_content_hash.clone();
+            for (hash, segment) in &mut restored {
+                for (held, original) in segment.columns.iter_mut().zip(&full[hash].columns) {
+                    if union.wants_dictionary(&held.name) {
+                        prop_assert_eq!(&held.dictionary, &original.dictionary);
+                    } else {
+                        prop_assert!(held.dictionary.is_empty());
+                        held.dictionary = original.dictionary.clone();
+                    }
+                }
+            }
+            let mut restored: Vec<_> = restored.into_values().collect();
+            restored.sort_by(|x, y| x.writer_id.cmp(&y.writer_id));
+            prop_assert_eq!(restored, segments);
+        }
+    }
+}
