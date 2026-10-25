@@ -676,9 +676,19 @@ fn wide_record(i: usize) -> LogRecord {
 
 /// The wide rows written at `group_target_blocks` blocks per row group.
 fn wide_object(recs: &[LogRecord], group_target_blocks: usize) -> Vec<u8> {
+    wide_object_ordered(recs, group_target_blocks, &[])
+}
+
+/// [`wide_object`] with `chunk_order` (ADR-3217 decision 8).
+fn wide_object_ordered(
+    recs: &[LogRecord],
+    group_target_blocks: usize,
+    chunk_order: &'static [&'static str],
+) -> Vec<u8> {
     let cfg = RlogConfig {
         block_target_records: BLOCK_RECORDS,
         group_target_blocks,
+        chunk_order,
         ..RlogConfig::default()
     };
     let mut w = RlogWriter::new(cfg, identity());
@@ -810,6 +820,126 @@ async fn one_row_group_of_120_blocks_reads_three_far_apart_columns_in_three_gets
          whole {}, fetched {} against chunk bytes {grouped_chunk_bytes}",
         stats.whole_object,
         stats.block_bytes_fetched
+    );
+}
+
+/// ADR-3217 decision 8: on the one-row-group 104-column object above, at the
+/// same pinned gap of 0, three far-apart attribute columns (`a00`, `a46`,
+/// `a93`: ids 10, 56 and 103 alphabetically) named in `chunk_order` take ids
+/// 10 to 12 and read as exactly 1 chunk-run GET, beside the 1 GET for the
+/// adjacent fixed `ts`/`observed_ts`/`stream_ref` chunks. At the default
+/// order the same projection is 4 runs and 4 GETs.
+///
+/// `observed_ts` is selected so the fixed columns every projection carries
+/// are one run and the attribute run is the only thing the order changes.
+/// The chunk order moves attribute columns only: the fixed body chunk always
+/// separates `stream_ref` (id 2) from the first attribute id, so the
+/// `ts`/`stream_ref`/`a93` projection of the test above stays 3 runs whatever
+/// the order, which this test also pins.
+///
+/// Non-vacuity: with `chunk_order` dropped from `wide_object_ordered`'s
+/// config, the declared object is the default one: its ids stay 103, 56 and
+/// 10 and the declared-order assertion fails, and past it the read is the
+/// default's 4 runs and 4 GETs.
+#[tokio::test]
+async fn chunk_order_reads_three_far_apart_attribute_columns_in_one_chunk_run() {
+    const ORDER: &[&str] = &["a93", "a46", "a00"];
+    let recs: Vec<LogRecord> = (0..WIDE_BLOCKS * BLOCK_RECORDS).map(wide_record).collect();
+    let gap = 0;
+    let sel = ORDER.iter().fold(
+        ColumnSelection::fixed_only().with_observed_ts(),
+        |sel, name| sel.with_attr(*name),
+    );
+    let all_blocks: Vec<usize> = (0..WIDE_BLOCKS).collect();
+
+    let read = |bytes: Vec<u8>| {
+        let recs = recs.clone();
+        let sel = sel.clone();
+        async move {
+            let recording = RecordingStore::new(store_with(&bytes).await);
+            let store: Arc<dyn ObjectStoreBackend> =
+                Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+            let seg = seg_ref(bytes.len() as u64, &recs);
+            let acc = QueryAccounting::new();
+            let (_got, stats) = BlockRangeFetcher::new(store)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(tail_len(&bytes))
+                .with_coalesce_gap(gap)
+                .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+                .await
+                .expect("projected fetch");
+            (stats, recording.full_gets())
+        }
+    };
+    let attr_ids = |bytes: &[u8]| -> Vec<u32> {
+        ORDER
+            .iter()
+            .map(|name| {
+                field_dir_of(bytes)
+                    .entries()
+                    .iter()
+                    .find(|e| e.name == *name)
+                    .map(|e| e.column_id)
+                    .expect("attribute column")
+            })
+            .collect()
+    };
+
+    let default = wide_object(&recs, 512);
+    assert_eq!(page_dir_of(&default).groups.len(), 1, "one row group");
+    assert_eq!(
+        attr_ids(&default),
+        vec![103, 56, 10],
+        "far apart by default"
+    );
+    let ids = resolved(&default, &sel).expect("a projection, not all columns");
+    let runs = expected_runs(&default, &all_blocks, Some(&ids), gap);
+    assert_eq!(
+        runs.len(),
+        4,
+        "the fixed run and one per attribute: {runs:?}"
+    );
+    let (stats, full_gets) = read(default.clone()).await;
+    assert!(
+        !stats.whole_object && full_gets == 0,
+        "no whole-object read"
+    );
+    assert_eq!(stats.block_range_gets, 4, "4 chunk-run GETs by default");
+
+    let ordered = wide_object_ordered(&recs, 512, ORDER);
+    assert_eq!(page_dir_of(&ordered).groups.len(), 1, "one row group");
+    assert_eq!(attr_ids(&ordered), vec![10, 11, 12], "declared order");
+    let ids = resolved(&ordered, &sel).expect("a projection, not all columns");
+    let runs = expected_runs(&ordered, &all_blocks, Some(&ids), gap);
+    assert_eq!(
+        runs.len(),
+        2,
+        "the fixed run and one attribute run: {runs:?}"
+    );
+    let (stats, full_gets) = read(ordered.clone()).await;
+    assert!(
+        !stats.whole_object && full_gets == 0,
+        "no whole-object read"
+    );
+    assert_eq!(stats.probe_gets, 1, "one suffix probe");
+    assert_eq!(
+        stats.block_range_gets, 2,
+        "1 GET for the fixed chunks and exactly 1 for the three attribute chunks"
+    );
+    assert_eq!(
+        stats.block_bytes_fetched,
+        expected_stored_page_bytes(&ordered, &all_blocks, Some(&ids)),
+        "the projected chunks' bytes and nothing between them"
+    );
+
+    // The test above's projection: naming `a93` gives it id 10, and the body
+    // chunk still sits between it and `stream_ref`.
+    let narrow = ColumnSelection::fixed_only().with_attr("a93");
+    let ids = resolved(&ordered, &narrow).expect("a projection, not all columns");
+    assert_eq!(
+        expected_runs(&ordered, &all_blocks, Some(&ids), gap).len(),
+        3,
+        "ts, stream_ref and a93 stay 3 runs: the order moves attribute ids only"
     );
 }
 

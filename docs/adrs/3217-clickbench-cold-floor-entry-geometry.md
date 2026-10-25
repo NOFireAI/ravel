@@ -818,7 +818,8 @@ Follow-ups the design leaves to the builder or to a later pass:
   tuned entry, its own separately labelled result; the stock result is
   what this ADR moves.
 - Also out of this round, each a format change: chunk order inside a row
-  group (the format doc states ascending column id,
+  group (no longer out, and not a format change: see the decision 8 chunk
+  order amendment below; the format doc states ascending column id,
   `docs/log-segment-format.md:470-476`; byte order puts URL at slot 87 and
   UserID at 99 of 104, so the change would help); larger blocks (coarsens
   every block-level index 1:1, ADR-0699 rejected alternative 1); an
@@ -970,3 +971,42 @@ alone. The rules allow the rest: a single clustering key is the
 change storage layout and compression, and decision 1 narrows an index the
 database builds by itself. The cold-sum table's decision 2 row predicted 0
 to 2 s and was not counted in the stated estimate, so the estimate stands.
+
+## Amendment (2026-10-25): decision 8, a declared chunk order is a writer convention
+
+<!-- amendment-applies: sections="Rejected alternatives" pointer="decision 8 chunk order amendment" -->
+
+The rejected-alternatives bullet that begins "Also out of this round"
+called chunk order inside a row group a format change. The design note on
+#3251 found that it is not. Column ids are per object: the writer assigns
+them over the object's distinct `(name, type)` pairs, and every reader
+resolves a name to its id through that object's FIELD_DIR. FIELD_DIR stays
+sorted by name and the chunks of a row group still ascend by column id;
+only which name gets which id changes. A declared order is therefore a
+writer convention of the same class as decision 4, and it needs no format
+version bump.
+
+### 8. A declared chunk order for the load's RLOG objects
+
+`RlogConfig::chunk_order` lists attribute names that take the lowest
+dynamic column ids, in the given order, ahead of the remaining columns in
+name order, so their chunks sit first and adjacent in every row group. It
+is threaded as `IngestConfig::rlog_chunk_order` and the loader flag
+`--chunk-order`, and it is empty by default, which writes every object
+byte for byte as before. The server's ingest path and the compactor keep
+the default.
+
+The ClickBench load passes the co-projected sets `CounterID`/`EventDate`/
+`IsRefresh`, `SearchPhrase`+`UserID` and `WatchID`/`ClientIP`/`IsRefresh`/
+`ResolutionWidth` as one list that keeps each set contiguous:
+`--chunk-order CounterID,EventDate,IsRefresh,ResolutionWidth,ClientIP,WatchID,SearchPhrase,UserID`.
+
+Expected effect, as the ticket pre-registers it:
+
+- Per-object disk bytes on q9 to q19 and q33 fall by one region's cost,
+  1.5 to 3 MB each (region cost from #3217 comment 6384802590).
+- The cold sum falls by 15 to 35 s (predicted).
+- 43 of 43 answers stay byte-equal (predicted).
+- The hot sum stays inside 54 to 64 s (predicted).
+- Miss condition: disk bytes per object unchanged on those statements
+  (predicted).

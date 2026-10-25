@@ -823,6 +823,20 @@ enum Command {
             value_parser = ravel_cli::parse_group_target_blocks
         )]
         group_target_blocks: ravel_ingest::RlogGroupTargetBlocks,
+        /// Attribute columns, comma-separated, whose chunks each RLOG object
+        /// a logs load writes places first and adjacent in every row group, in
+        /// this order, so a query projecting them together reads one chunk run;
+        /// default none. The other columns follow in name order.
+        ///
+        /// A name the data never carries is skipped. An empty, padded or
+        /// repeated name is refused before anything is read. A metrics or spans
+        /// load warns and ignores it.
+        #[arg(
+            long,
+            value_name = "NAME,NAME,...",
+            value_parser = ravel_cli::parse_chunk_order
+        )]
+        chunk_order: Option<ravel_ingest::RlogChunkOrder>,
         /// The bytes of built batches a logs load may hold at once (issue
         /// #2626). Every batch is charged before it is built, at an estimate
         /// from the previous batch's bytes per row (zero for the first batch),
@@ -3364,6 +3378,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             max_flush_delay,
             zstd_level,
             group_target_blocks,
+            chunk_order,
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
@@ -3391,6 +3406,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 max_flush_delay,
                 zstd_level,
                 group_target_blocks,
+                chunk_order.unwrap_or_default(),
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
@@ -5017,6 +5033,56 @@ mod tests {
         );
         let err = blocks_of(&["--group-target-blocks", "x"]).expect_err("not a number");
         assert!(err.contains("invalid --group-target-blocks 'x'"), "{err}");
+    }
+
+    /// `--chunk-order` defaults to no order, the writer's own default, keeps
+    /// the given order rather than sorting it, and refuses a repeated or empty
+    /// name at parse time with a message naming the flag and the name.
+    #[test]
+    fn chunk_order_flag_defaults_to_empty_and_refuses_a_repeated_name() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+        let order_of = |extra: &[&str]| match Cli::try_parse_from(
+            base.iter().copied().chain(extra.iter().copied()),
+        )
+        .map(|cli| cli.command)
+        {
+            Ok(Command::Load { chunk_order, .. }) => {
+                Ok(chunk_order.unwrap_or_default().get().to_vec())
+            }
+            Ok(_) => panic!("expected the load subcommand"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(order_of(&[]), Ok(Vec::new()));
+        assert_eq!(
+            order_of(&[]),
+            Ok(ravel_logseg::RlogConfig::default().chunk_order.to_vec()),
+            "the default is the writer's"
+        );
+        assert_eq!(
+            order_of(&["--chunk-order", "UserID,SearchPhrase"]),
+            Ok(vec!["UserID", "SearchPhrase"])
+        );
+        let err = order_of(&["--chunk-order", "UserID,SearchPhrase,UserID"])
+            .expect_err("a repeated name is refused");
+        assert!(
+            err.contains("invalid --chunk-order: RLOG chunk order names \"UserID\" more than once"),
+            "{err}"
+        );
+        let err = order_of(&["--chunk-order", "UserID,,SearchPhrase"])
+            .expect_err("an empty name is refused");
+        assert!(
+            err.contains("invalid --chunk-order: RLOG chunk order name 1 is empty"),
+            "{err}"
+        );
     }
 
     /// Issue #1184's classification: `load`, `typed-attr-column set`,

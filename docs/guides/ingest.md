@@ -1691,6 +1691,35 @@ section that the RLOG objects of a logs load compress with zstd.
 - `ravel-server` has no matching flag yet. Its log flush writes at the
   default level.
 
+### Chunk order with `--chunk-order`
+
+`--chunk-order <NAME,NAME,...>` (default none) names attribute columns whose
+chunks the RLOG objects of a logs load write first and adjacent in every row
+group, in the given order.
+
+- The named columns take the first dynamic column ids, 10 upward, in the
+  given order. The other attribute columns follow in name order. Chunks
+  inside a row group are stored by ascending column id, so the named
+  columns' chunks sit next to each other right after the fixed columns.
+- Why: a query that projects the named columns together reads them as one
+  chunk run, one region of the object, instead of one region per column.
+  On a single-drive RustFS or MinIO each region costs about 1.5 MB of disk
+  read whatever the range asks for (measured on c6a.4xlarge); a store that
+  serves a range with one file read pays only the bytes asked for.
+- The reader is unaffected. PAGE_DIR gives each chunk's offset, and a query
+  resolves a column name to its id through FIELD_DIR, which stays sorted by
+  name. Objects with and without an order read back the same records.
+- A name the data never carries is skipped. An empty name, a name with
+  leading or trailing spaces, or a name given twice is refused before
+  anything is read.
+- An object with more attribute names than the writer's dynamic column cap
+  gives columns to the first names in the new order. A named column takes a
+  column that a name earlier in the alphabet would otherwise have had, and
+  that name's values are stored in the overflow attributes instead.
+- The order applies only to the objects that the load writes. Compaction
+  writes its objects in name order, with PAGE_DIR still exact for them.
+- A metrics or spans load warns and ignores the flag.
+
 ### Clustering key and bloom scope
 
 A tenant's config record can carry a clustering key and a bloom scope

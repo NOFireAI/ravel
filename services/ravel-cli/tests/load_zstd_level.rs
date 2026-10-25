@@ -18,7 +18,7 @@ use parquet::arrow::ArrowWriter;
 
 use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, PER_BATCH_TARGET_BYTES};
 use ravel_cli::maintain::SignalArg;
-use ravel_ingest::{RlogGroupTargetBlocks, RlogZstdLevel};
+use ravel_ingest::{RlogChunkOrder, RlogGroupTargetBlocks, RlogZstdLevel};
 use ravel_logseg::footer::{self, COMP_ZSTD, kind};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{LogRecord, Predicate, RlogConfig, RlogReader, read_section};
@@ -118,6 +118,7 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         None,
         RlogZstdLevel::new(level).expect("in range"),
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
