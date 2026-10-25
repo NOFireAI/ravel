@@ -674,6 +674,15 @@ mod tests {
         ctx: &datafusion::prelude::SessionContext,
         sql: &str,
     ) -> (BTreeSet<(i64, String)>, ScanCounts) {
+        let (batches, counts) = run_batches_counted(ctx, sql).await;
+        (rows(&batches), counts)
+    }
+
+    /// [`run_counted`] for a query whose result is not `(ts, body)` rows.
+    async fn run_batches_counted(
+        ctx: &datafusion::prelude::SessionContext,
+        sql: &str,
+    ) -> (Vec<RecordBatch>, ScanCounts) {
         let plan = ctx
             .sql(sql)
             .await
@@ -695,7 +704,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("metric {name} missing"))
         };
         (
-            rows(&batches),
+            batches,
             ScanCounts {
                 total: count("blocks_total"),
                 scanned: count("blocks_scanned"),
@@ -1616,6 +1625,81 @@ mod tests {
         assert!(pruned.scanned < plain.scanned);
     }
 
+    /// `status_code <> 0` through SQL: twelve one-record blocks, seven with
+    /// `status_code = 0`, four nonzero and one with no `status_code`. The
+    /// `NumNotEq` prune arm drops the seven all-zero blocks before decode and
+    /// keeps the no-stat block; the plain query, OR-ed with a body equality no
+    /// record satisfies so it yields no prune arm, decodes all twelve. Both
+    /// count the same four rows.
+    #[tokio::test]
+    async fn declared_i64_not_equal_prunes_all_equal_blocks() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records: Vec<LogRecord> = (1..=12)
+            .map(|ts| {
+                let attrs = match ts {
+                    4 | 6 | 7 | 11 => vec![("status_code".to_string(), AttrValue::I64(ts * 100))],
+                    12 => Vec::new(),
+                    _ => vec![("status_code".to_string(), AttrValue::I64(0))],
+                };
+                record(&worker, &attrs, ts, &format!("body {ts}"))
+            })
+            .collect();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-ne.rlog",
+            &records,
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            PhaseAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+
+        let count_of = |batches: &[RecordBatch]| -> i64 {
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+            let b = batches.iter().find(|b| b.num_rows() == 1).expect("one row");
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("COUNT(*) is Int64")
+                .value(0)
+        };
+        let (pruned_batches, pruned) =
+            run_batches_counted(&ctx, "SELECT COUNT(*) FROM logs WHERE status_code <> 0").await;
+        let (plain_batches, plain) = run_batches_counted(
+            &ctx,
+            "SELECT COUNT(*) FROM logs WHERE status_code <> 0 OR body = 'zzz'",
+        )
+        .await;
+
+        assert_eq!(count_of(&pruned_batches), 4);
+        assert_eq!(count_of(&plain_batches), 4);
+        assert_eq!(
+            pruned,
+            ScanCounts {
+                total: 12,
+                scanned: 5,
+                pruned_by_postings: 0,
+            },
+            "the seven all-zero blocks are pruned before decode"
+        );
+        assert_eq!(plain.scanned, 12, "the OR shape decodes every block");
+    }
+
     /// TEST 4: a predicate on a declared column absent from some objects (a
     /// tenant that added the column later) still returns correct results. Object
     /// A carries `status_code`; object B does not. The absence rule (a block with
@@ -1770,8 +1854,8 @@ mod tests {
         );
     }
 
-    /// TEST 8 (CRITICAL): the decline of `!=` and of a type-mismatched literal
-    /// must hold against the filters DataFusion's optimizer actually hands to
+    /// TEST 8 (CRITICAL): the `NumNotEq` arm for `!=` and the decline of a
+    /// type-mismatched literal must hold against the filters DataFusion's optimizer actually hands to
     /// `TableProvider::scan`, not a hand-built `Expr`. A type-coercion pass can
     /// rewrite `status_code > 2.5` into a `Cast`-wrapped comparison before the
     /// extractor sees it; the extractor must still decline (a `Cast` is not a bare
@@ -1835,8 +1919,9 @@ mod tests {
         let ctx = logs_session(provider).expect("build session");
         let declared = i64_status_code();
 
-        // `!=` on a declared column: the optimizer keeps it a `NotEq`, not in the
-        // comparison allowlist, so no prune arm.
+        // `!=` on a declared I64 column: the optimizer keeps it a bare `NotEq`
+        // against an Int64 literal, so it yields exactly the prune-only
+        // `NumNotEq` arm (ADR-0095, prune-only not-equal amendment).
         let plan = ctx
             .sql("SELECT ts, body FROM logs WHERE status_code != 500")
             .await
@@ -1848,9 +1933,13 @@ mod tests {
             !ne_filters.is_empty(),
             "the != predicate must reach the scan"
         );
-        assert!(
-            extract_logs(&ne_filters, &declared).prune.is_empty(),
-            "!= must produce no prune arm on the real optimized filter"
+        assert_eq!(
+            extract_logs(&ne_filters, &declared).prune,
+            vec![ravel_logseg::Predicate::NumNotEq {
+                field: ravel_logseg::FieldSel::Attr("status_code".into()),
+                value: 500,
+            }],
+            "!= yields the NumNotEq arm on the real optimized filter"
         );
 
         // Type-mismatched literal: the optimizer coerces `status_code > 2.5` by

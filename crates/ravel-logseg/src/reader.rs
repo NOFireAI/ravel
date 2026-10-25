@@ -33,7 +33,7 @@ use crate::record::{
 };
 use crate::rlog_bloom::RlogBloomSection;
 use crate::rlog_codec::decode_dict_page;
-use crate::skip_index::{NumRangeArm, SkipIndex};
+use crate::skip_index::{NumArm, SkipIndex};
 use crate::source::ByteSource;
 use crate::stream_dir::StreamDir;
 use crate::tokenizer::tokens;
@@ -1020,7 +1020,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// fallthrough the unindexed POSTINGS field takes. The bounds pass straight
     /// through as bit patterns; the range is prune-only, so the exact residual
     /// stays the caller's (SQL layer's) job (ADR-0095 decision 6, ADR-0013).
-    fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumRangeArm> {
+    fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumArm> {
         self.field_dir.numeric_range_arms(arms)
     }
 
@@ -1849,7 +1849,7 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
     for &p in arms {
         let arm = match p {
             // `flatten` leaves no `And`; an empty one matches every row.
-            Predicate::And(_) | Predicate::NumRange { .. } => continue,
+            Predicate::And(_) | Predicate::NumRange { .. } | Predicate::NumNotEq { .. } => continue,
             Predicate::TsRange { min_ns, max_ns } => Arm::Ts {
                 min: *min_ns,
                 max: *max_ns,
@@ -2654,7 +2654,7 @@ fn eval(
         // into `content`; it matches every row (a no-op) rather than filtering,
         // and the caller re-evaluates the real, exactly-typed range above the
         // scan.
-        Predicate::NumRange { .. } => true,
+        Predicate::NumRange { .. } | Predicate::NumNotEq { .. } => true,
     })
 }
 
@@ -5624,6 +5624,134 @@ mod tests {
             "a NumRange over an unresolved (name, type) must not prune"
         );
         assert_eq!(rows.len(), 2);
+    }
+
+    /// A record at `ts` whose `code` is `code`, or that carries no `code`.
+    fn rec_opt_code(ts: i64, code: Option<i64>) -> LogRecord {
+        let mut r = rec(0, ts, "msg");
+        if let Some(c) = code {
+            r.attrs.push(("code".into(), AttrValue::I64(c)));
+        }
+        r
+    }
+
+    fn code_of(r: &LogRecord) -> Option<i64> {
+        r.attrs.iter().find_map(|(k, v)| match (k.as_str(), v) {
+            ("code", AttrValue::I64(c)) => Some(*c),
+            _ => None,
+        })
+    }
+
+    fn not_eq_arm(value: i64) -> Predicate {
+        Predicate::NumNotEq {
+            field: FieldSel::Attr("code".into()),
+            value,
+        }
+    }
+
+    /// Exact figures for the `NumNotEq` prune (ADR-0095, prune-only not-equal
+    /// amendment). Eight two-record blocks; the arm is `code <> 0`. Blocks 0, 2,
+    /// 5 and 7 resolve only `0` or NULL, so their stat is `[0, 0]` and they are
+    /// pruned. Block 1 straddles (`0, 5`), block 3 has no `code` stat at all,
+    /// block 4 is `[7, 7]` and block 6 is `[-1, 0]`: those four are decoded.
+    #[test]
+    fn num_not_eq_prunes_exactly_the_all_equal_blocks() {
+        let cfg = RlogConfig {
+            block_target_records: 2,
+            ..RlogConfig::default()
+        };
+        let codes = [
+            [Some(0), Some(0)],
+            [Some(0), Some(5)],
+            [Some(0), None],
+            [None, None],
+            [Some(7), Some(7)],
+            [Some(0), Some(0)],
+            [Some(-1), Some(0)],
+            [Some(0), Some(0)],
+        ];
+        let recs = codes
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, c)| rec_opt_code(i as i64, *c))
+            .collect();
+        let obj = build(cfg, recs);
+        let fd = field_dir_of(&obj);
+        let cid = fd.column("code", FieldType::I64).expect("code").column_id;
+        let skip = skip_of(&obj);
+        assert_eq!(skip.l0.len(), 8, "two records per block");
+        assert!(
+            !skip.l0[3].stats.iter().any(|s| s.column_id == cid),
+            "block 3 carries no code stat"
+        );
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &[not_eq_arm(0)])
+            .expect("scan");
+        assert_eq!(stats.blocks_total, 8);
+        assert_eq!(stats.blocks_after_skip, 4, "blocks 0, 2, 5 and 7 pruned");
+        assert_eq!(stats.blocks_scanned, 4, "blocks 1, 3, 4 and 6 decoded");
+        let kept: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
+        assert_eq!(kept, vec![2, 3, 6, 7, 8, 9, 12, 13]);
+        let matching: Vec<i64> = rows
+            .iter()
+            .filter_map(code_of)
+            .filter(|c| *c != 0)
+            .collect();
+        assert_eq!(matching, vec![5, 7, 7, -1]);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// A `NumNotEq` prune never changes the answer: over blocks whose
+        /// `code` bounds equal, exclude or straddle the value, with NULL cells,
+        /// and beside an exact `TsRange` arm, the rows a scan with the arm
+        /// keeps after filtering `code <> value` row by row are exactly the
+        /// rows a scan without it keeps after the same filter.
+        #[test]
+        fn num_not_eq_prune_matches_the_unpruned_residual(
+            value in -2i64..3,
+            blocks in proptest::collection::vec(
+                (
+                    proptest::prelude::any::<bool>(),
+                    proptest::collection::vec(proptest::option::weighted(0.75, -2i64..3), 3),
+                ),
+                1..12,
+            ),
+            ts_lo in -1i64..20,
+            ts_len in 0i64..40,
+        ) {
+            let cfg = RlogConfig {
+                block_target_records: 3,
+                ..RlogConfig::default()
+            };
+            let mut recs = Vec::new();
+            for (all_equal, cells) in &blocks {
+                for c in cells {
+                    let c = if *all_equal { c.map(|_| value) } else { *c };
+                    recs.push(rec_opt_code(recs.len() as i64, c));
+                }
+            }
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+            let content = Predicate::TsRange {
+                min_ns: ts_lo,
+                max_ns: ts_lo + ts_len,
+            };
+            let residual = |rows: Vec<LogRecord>| -> Vec<(i64, i64)> {
+                rows.iter()
+                    .filter_map(|r| code_of(r).filter(|c| *c != value).map(|c| (r.ts_ns, c)))
+                    .collect()
+            };
+            let (all, _) = reader.scan_pruned(&content, &[]).expect("scan");
+            let (pruned, _) = reader
+                .scan_pruned(&content, &[not_eq_arm(value)])
+                .expect("scan");
+            proptest::prop_assert_eq!(residual(pruned), residual(all));
+        }
     }
 
     // --- columnar block view (ADR-0099 decision 1) ---------------------------

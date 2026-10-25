@@ -101,7 +101,11 @@
 //!   [`Predicate::Equals`] on `FieldSel::Attr`, byte-identical to the
 //!   `attrs['k'] = 'v'` predicate, feeding POSTINGS. `Str`/`Bytes` `IN (...)` is
 //!   not extracted (a disjunction, as above).
-//! - Anything else -- `!=`, `NOT`, a negated `BETWEEN`, `IS [NOT] NULL`, a
+//! - `I64` + `<>` (either operand order), against an `Int64` literal ->
+//!   [`Predicate::NumNotEq`], prune-only like `NumRange`: a block whose stat
+//!   has `min == max == value` holds no row the comparison keeps (ADR-0095,
+//!   prune-only not-equal amendment). The filter stays `Inexact`.
+//! - Anything else -- `!=` on a non-`I64` column, `NOT`, a negated `BETWEEN`, `IS [NOT] NULL`, a
 //!   general `OR` (anything but the same-column I64 equality union above), a
 //!   range operator on a `Str`/`Bytes` column, or a literal whose type does not
 //!   match the declared type (including a `Cast`-wrapped operand DataFusion's own
@@ -206,6 +210,17 @@ impl LogsPushdown {
     pub fn ts_max(&self) -> i64 {
         self.ts_hi.unwrap_or(i64::MAX)
     }
+}
+
+/// Whether `prune` holds no arm but [`Predicate::NumNotEq`], so it counts as
+/// empty for the metadata-only aggregate rewrite and the `.cstat` load that
+/// feeds it. That rewrite replaces the whole scan, so what the arm prunes
+/// cannot change its answer. The scan's route choice reads it the same way
+/// (`logs_scan::route_predicate_free`). Any other arm answers `false`.
+pub(crate) fn prune_is_rewrite_neutral(prune: &[Predicate]) -> bool {
+    prune
+        .iter()
+        .all(|p| matches!(p, Predicate::NumNotEq { .. }))
 }
 
 /// Extract all sound pushdown from a `logs` filter set. Each element of
@@ -424,7 +439,9 @@ fn resolve_declared<'a>(e: &Expr, declared: &'a [DeclaredColumn]) -> Option<&'a 
 /// A comparison (`<`, `<=`, `>`, `>=`, `=`, either operand order) against a
 /// declared typed column, resolved to a prune-only [`Predicate`]. Range
 /// operators on `Str`/`Bytes`, any negation, and a type-mismatched literal all
-/// decline (return `None`), per ADR-0093's allowlist.
+/// decline (return `None`), per ADR-0093's allowlist. `<>` on a declared I64
+/// column is the one exception: it resolves to [`Predicate::NumNotEq`]
+/// (ADR-0095, prune-only not-equal amendment).
 fn declared_comparison_predicate(
     be: &BinaryExpr,
     declared: &[DeclaredColumn],
@@ -434,11 +451,21 @@ fn declared_comparison_predicate(
         (dc, be.op, be.right.as_ref())
     } else {
         let dc = resolve_declared(&be.right, declared)?;
-        (dc, flip_op(be.op)?, be.left.as_ref())
+        let op = match be.op {
+            Operator::NotEq => Operator::NotEq,
+            op => flip_op(op)?,
+        };
+        (dc, op, be.left.as_ref())
     };
     match dc.ty {
         DeclaredType::I64 => {
             let v = lit_i64(lit)?;
+            if op == Operator::NotEq {
+                return Some(Predicate::NumNotEq {
+                    field: FieldSel::Attr(dc.key.clone()),
+                    value: v,
+                });
+            }
             let (min, max) = int_range_bounds(op, v)?;
             Some(num_range(&dc.key, FieldType::I64, min, max))
         }
@@ -1203,15 +1230,38 @@ mod tests {
         assert!(p.prune.is_empty(), "a Str IN must not be extracted");
     }
 
-    /// TEST 6: `!=` and a `NOT`-wrapped equality on a declared column produce no
-    /// prune arm at all. `NumRange` is a single contiguous range and cannot
-    /// express the complement of a point (ADR-0093).
+    /// TEST 6: `<>` on a declared I64 column against an Int64 literal, in either
+    /// operand order, yields exactly one [`Predicate::NumNotEq`] arm and stays
+    /// `Inexact`. A `NOT`-wrapped equality, `<>` on a Bool, Str or Bytes column,
+    /// `<>` against a mismatched literal, and `<>` on an undeclared column
+    /// yield no prune arm (ADR-0095, prune-only not-equal amendment).
     #[test]
-    fn not_equal_and_negation_produce_no_prune_arm() {
+    fn not_equal_on_declared_i64_is_the_only_negation_prune_arm() {
         let d = i64_decl();
+        let want = vec![Predicate::NumNotEq {
+            field: FieldSel::Attr("status_code".into()),
+            value: 500,
+        }];
 
         let ne = extract_logs(&[col("status_code").not_eq(lit(500i64))], &d);
-        assert!(ne.prune.is_empty(), "!= must produce no prune arm");
+        assert_eq!(ne.prune, want, "col <> v yields the NumNotEq arm");
+        let flipped = extract_logs(&[lit(500i64).not_eq(col("status_code"))], &d);
+        assert_eq!(flipped.prune, want, "v <> col yields the same arm");
+        assert!(!filter_is_exact(
+            &col("status_code").not_eq(lit(500i64)),
+            &d
+        ));
+
+        let mismatched = extract_logs(&[col("status_code").not_eq(lit(2.5f64))], &d);
+        assert!(mismatched.prune.is_empty(), "a float literal declines");
+        let undeclared = extract_logs(&[col("other").not_eq(lit(500i64))], &d);
+        assert!(undeclared.prune.is_empty(), "an undeclared column declines");
+        let sd = vec![DeclaredColumn::new("svc", DeclaredType::Str)];
+        let sne = extract_logs(&[col("svc").not_eq(lit("api"))], &sd);
+        assert!(sne.prune.is_empty(), "str <> must produce no prune arm");
+        let yd = vec![DeclaredColumn::new("blob", DeclaredType::Bytes)];
+        let yne = extract_logs(&[col("blob").not_eq(lit(vec![1u8, 2]))], &yd);
+        assert!(yne.prune.is_empty(), "bytes <> must produce no prune arm");
 
         let negated = extract_logs(
             &[Expr::Not(Box::new(col("status_code").eq(lit(500i64))))],
