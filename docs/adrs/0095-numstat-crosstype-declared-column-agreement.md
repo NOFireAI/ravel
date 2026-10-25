@@ -386,3 +386,12 @@ WHERE col <> lit`) keeps answering from statistics. Any other prune arm
 beside it keeps both refusing. The whole-plan statistics the scan reports
 to DataFusion stay strict: a `NumNotEq` arm makes them inexact, because the
 scan really does emit fewer rows when the arm prunes.
+
+A prune list holding only `NumNotEq` arms does not change the route a scan
+takes. The whole-segment fast path, which declines any other prune arm,
+reads such a list as empty and still opens each segment without a plan
+pass; the open carries the arm, so the reader applies it at decode from the
+skip index it already reads, and a block whose stat has `min == max ==
+value` is skipped there. A plan pass would cost more wall time than the arm
+saves on that route. Beside any other arm, the list routes as it would
+without the `NumNotEq` arm.

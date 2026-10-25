@@ -1295,6 +1295,23 @@ pub struct LogsScanExec {
     reversed: Arc<std::sync::OnceLock<bool>>,
 }
 
+/// [`LogQuery::is_block_predicate_free`] for route selection, reading a prune
+/// list of only `NumNotEq` arms as empty ([`prune_is_rewrite_neutral`]).
+///
+/// Such a list must not move a scan onto the planned route: a plan pass costs
+/// more wall time than the arm saves in decode. The whole-segment open still
+/// carries the arm, so the reader skips every block whose stat proves
+/// min == max == the literal from the skip index the open reads anyway, and
+/// the scan records that open's survivor list for row refs.
+fn route_predicate_free(query: &LogQuery) -> bool {
+    if query.prune.is_empty() || !prune_is_rewrite_neutral(&query.prune) {
+        return query.is_block_predicate_free();
+    }
+    let mut without_prune = query.clone();
+    without_prune.prune.clear();
+    without_prune.is_block_predicate_free()
+}
+
 /// Which conjunct kept a statement off the predicate-free full-window
 /// whole-segment fast path (issue #739). Recorded as a DataFusion counter by
 /// [`BlockMetrics::record_fast_path_rejection`] so a report reading the scan's
@@ -2493,7 +2510,8 @@ impl LogsScanExec {
     /// - the snapshot carries no pending selective erasure, and the query
     ///   carries no block-level predicate
     ///   ([`LogQuery::is_block_predicate_free`]: no content, prune-only,
-    ///   stream-attribute, pending-erasure, or exact-key arm), and
+    ///   stream-attribute, pending-erasure, or exact-key arm), a prune list of
+    ///   only `NumNotEq` arms excepted ([`route_predicate_free`]), and
     /// - every relevant segment has a well-formed span (`min <= max`) and is
     ///   fully CONTAINED in the window
     ///   (`ts_min <= seg.min && seg.max <= ts_max`). Containment is
@@ -2548,7 +2566,7 @@ impl LogsScanExec {
         if !self.erasure.is_empty() {
             return Err(FastPathRejection::PendingErasure);
         }
-        if !query.is_block_predicate_free() {
+        if !route_predicate_free(query) {
             return Err(FastPathRejection::BlockPredicate);
         }
         let mut relevant = 0usize;

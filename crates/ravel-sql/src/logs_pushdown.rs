@@ -215,7 +215,8 @@ impl LogsPushdown {
 /// Whether `prune` holds no arm but [`Predicate::NumNotEq`], so it counts as
 /// empty for the metadata-only aggregate rewrite and the `.cstat` load that
 /// feeds it. That rewrite replaces the whole scan, so what the arm prunes
-/// cannot change its answer. Any other arm answers `false`.
+/// cannot change its answer. The scan's route choice reads it the same way
+/// (`logs_scan::route_predicate_free`). Any other arm answers `false`.
 pub(crate) fn prune_is_rewrite_neutral(prune: &[Predicate]) -> bool {
     prune
         .iter()
