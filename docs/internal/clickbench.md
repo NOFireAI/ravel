@@ -304,6 +304,11 @@ the numbers.
 
 ### Fold the catalog before measuring anything
 
+This runbook describes the internal measurement setup, not the competing
+ClickBench entry. The competing entry does not fold (ADR-3217, decision 2
+fairness amendment); drop `--fold-after-load` from the load command above to
+reproduce it.
+
 `--fold-after-load` on the load command above does this: once every write has
 been acknowledged and the load's writers have shut down, the loader folds the
 tenant's logs catalog through the latest ingest hour it wrote, including the
