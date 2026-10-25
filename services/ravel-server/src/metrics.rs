@@ -2900,7 +2900,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_column_stats_cache_refusals_total",
-        "Column-statistics loads whose object alone exceeds the column-statistics cache byte budget, served but not cached.",
+        "Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget, served but not cached.",
         "counter",
     );
     write_sample(
@@ -11723,7 +11723,7 @@ mod tests {
 
         let body = render_in(Mode::All);
         for expected in [
-            "# HELP ravel_catalog_column_stats_cache_refusals_total Column-statistics loads whose object alone exceeds the column-statistics cache byte budget, served but not cached.",
+            "# HELP ravel_catalog_column_stats_cache_refusals_total Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget, served but not cached.",
             "# TYPE ravel_catalog_column_stats_cache_refusals_total counter",
             "ravel_catalog_column_stats_cache_refusals_total{mode=\"all\"} 11",
             "# HELP ravel_catalog_column_stats_cache_evictions_total Column-statistics cache entries evicted to stay within the cache byte budget.",
@@ -12428,6 +12428,7 @@ mod tests {
                     signal,
                     range,
                     50 * NS_PER_HOUR,
+                    &ravel_catalog::ColumnStatsRequest::summary_only(),
                     &QueryAccounting::new(),
                 )
                 .await
@@ -12616,6 +12617,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -12635,6 +12637,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -12651,6 +12654,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await

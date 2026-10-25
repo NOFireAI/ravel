@@ -2857,11 +2857,10 @@ mod tests {
                 )
             })
             .collect();
-        Arc::new(LoadedColumnStats {
-            segments: std::collections::HashMap::new(),
+        Arc::new(LoadedColumnStats::from_maps(
+            std::collections::HashMap::new(),
             by_content_hash,
-            part_blake3: Vec::new(),
-        })
+        ))
     }
 
     /// Write `values` as one real RLOG object at `key` and return its unstamped
@@ -3314,15 +3313,15 @@ mod tests {
                     end_ns: NOW_NS,
                 },
                 NOW_NS,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
             .expect("load .cstat")
             .expect("a .cstat object is present");
         let entries: Vec<_> = loaded
-            .by_content_hash
-            .values()
-            .flat_map(|seg| seg.columns.iter().filter(|c| c.name == CODE))
+            .content_hash_segments()
+            .flat_map(|(_, seg)| seg.columns.iter().filter(|c| c.name == CODE))
             .collect();
         assert_eq!(entries.len(), 1, "one .cstat entry for code");
         let code_value = |v: i64| ravel_proto::catalog::v1::ColumnValue {

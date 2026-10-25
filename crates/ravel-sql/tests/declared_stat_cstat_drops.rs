@@ -122,11 +122,7 @@ fn loaded(seg: &SegmentRef, columns: Vec<ColumnStat>) -> Arc<LoadedColumnStats> 
             columns,
         },
     );
-    Arc::new(LoadedColumnStats {
-        segments,
-        by_content_hash: HashMap::new(),
-        part_blake3: Vec::new(),
-    })
+    Arc::new(LoadedColumnStats::from_maps(segments, HashMap::new()))
 }
 
 /// Every label's tally, in [`StatCarrier::ALL`] order.

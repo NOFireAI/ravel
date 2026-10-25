@@ -396,10 +396,10 @@ Labels: `mode`.
 | `ravel_catalog_isolation_breach_total` | Hard-failed queries from a HEAD or postings tenant_hash mismatch or an out-of-prefix listing result. |
 | `ravel_catalog_column_stats_decode_refusals_total` | Column-statistics objects the HEAD referenced that the reader refused to decode: an oversized declared body, corruption, or a checksum or header failure. Counted on every load, not once per object. |
 | `ravel_catalog_column_stats_decode_panics_total` | Column-statistics decode jobs that panicked on the read CPU gate. Counted on every load. A job the gate cancelled at shutdown is not counted. |
-| `ravel_catalog_column_stats_cache_refusals_total` | Column-statistics loads whose object alone is larger than the column-statistics cache byte budget. The object is served but not cached. |
-| `ravel_catalog_column_stats_cache_evictions_total` | Column-statistics cache entries evicted to stay within the cache byte budget. |
-| `ravel_catalog_column_stats_cache_held_bytes` | Gauge. Bytes the column-statistics cache holds now. |
-| `ravel_catalog_column_stats_decoded_bytes_total` | Decompressed body bytes, not wire bytes, of the column-statistics objects that query loads decoded. A load served from the cache adds nothing, and so does an object the reader refused to decode. |
+| `ravel_catalog_column_stats_cache_refusals_total` | Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget. The entry is served but not cached. Reads 0 both when the cache is disabled and when it is enabled and idle. |
+| `ravel_catalog_column_stats_cache_evictions_total` | Column-statistics cache part entries evicted, least recently used first, to stay within the cache byte budget. Reads 0 both when the cache is disabled and when it is enabled and idle. |
+| `ravel_catalog_column_stats_cache_held_bytes` | Gauge. Bytes the column-statistics cache holds now: the sum of its live part entries, each weighing its records' encoded length with only the requested dictionaries kept. Reads 0 both when the cache is disabled and when it is enabled and holds nothing. |
+| `ravel_catalog_column_stats_decoded_bytes_total` | Decompressed body bytes, not wire bytes, of the column-statistics objects that query loads decoded, counted once per decoded body. A part served from the cache adds nothing, and so does an object the reader refused to decode. |
 
 The first two counters count an anomaly that the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with
