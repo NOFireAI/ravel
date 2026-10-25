@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -569,6 +569,50 @@ fn live_heap() -> isize {
     s.bytes_allocated as isize - s.bytes_deallocated as isize + s.bytes_reallocated
 }
 
+/// One [`Probe`] sample, taken as input batch `k` passes to the filter.
+#[derive(Clone, Copy, Debug)]
+struct Sample {
+    reserved: usize,
+    live: isize,
+    /// How many of batches `0..k`'s `URL` values arrays are still alive: the
+    /// probe holds only a `Weak` to each, so a live one is that very `Arc`
+    /// held by someone else.
+    alive_before: usize,
+    /// Batch `k`'s `URL` values array, `get_array_memory_size`.
+    values_bytes: usize,
+}
+
+/// The `URL` values arrays the probe has seen, as `Weak`s, so the probe keeps
+/// none of them alive.
+#[derive(Debug, Default)]
+struct SeenValues(Vec<std::sync::Weak<dyn Array>>);
+
+impl SeenValues {
+    /// Record `batch`'s `URL` values array and return how many earlier ones
+    /// are still alive and this one's size.
+    fn record(&mut self, batch: &RecordBatch) -> (usize, usize) {
+        let alive = self.0.iter().filter(|w| w.strong_count() > 0).count();
+        let Ok(i) = batch.schema().index_of(KEY) else {
+            return (alive, 0);
+        };
+        let column = batch.column(i);
+        let Some(dict) = column.as_any_dictionary_opt() else {
+            return (alive, 0);
+        };
+        let values = dict.values();
+        self.0.push(Arc::downgrade(values));
+        (alive, values.get_array_memory_size())
+    }
+
+    /// Whether `values` is one of the arrays seen, by `Arc` identity. Each
+    /// `Weak` keeps its allocation's address from being reused.
+    fn contains(&self, values: &ArrayRef) -> bool {
+        self.0
+            .iter()
+            .any(|w| std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(values)))
+    }
+}
+
 /// Pass-through over the `FilterExec`'s input that samples the pool and the
 /// live heap each time it hands a batch to the filter. At sample `k` the
 /// coalescer holds what it kept of batches `0..k`.
@@ -576,7 +620,8 @@ fn live_heap() -> isize {
 struct Probe {
     input: Arc<dyn ExecutionPlan>,
     pool: Arc<UnboundedMemoryPool>,
-    samples: Arc<Mutex<Vec<(usize, isize)>>>,
+    samples: Arc<Mutex<Vec<Sample>>>,
+    seen: Arc<Mutex<SeenValues>>,
 }
 
 impl DisplayAs for Probe {
@@ -613,6 +658,7 @@ impl ExecutionPlan for Probe {
             input: children.swap_remove(0),
             pool: Arc::clone(&self.pool),
             samples: Arc::clone(&self.samples),
+            seen: Arc::clone(&self.seen),
         }))
     }
 
@@ -624,8 +670,19 @@ impl ExecutionPlan for Probe {
         let inner = self.input.execute(partition, context)?;
         let pool = Arc::clone(&self.pool);
         let samples = Arc::clone(&self.samples);
-        let stream = inner.inspect(move |_| {
-            samples.lock().unwrap().push((pool.reserved(), live_heap()));
+        let seen = Arc::clone(&self.seen);
+        let stream = inner.inspect(move |batch| {
+            let (reserved, live) = (pool.reserved(), live_heap());
+            let (alive_before, values_bytes) = match batch {
+                Ok(batch) => seen.lock().unwrap().record(batch),
+                Err(_) => (0, 0),
+            };
+            samples.lock().unwrap().push(Sample {
+                reserved,
+                live,
+                alive_before,
+                values_bytes,
+            });
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.input.schema(),
@@ -634,29 +691,46 @@ impl ExecutionPlan for Probe {
     }
 }
 
-/// Report only: the heap the `FilterExec` holds while its coalescer is still
-/// filling, which its emitted batches cannot show. Per input batch, the live
-/// heap less the pool's reading, relative to the first batch; its growth per
-/// block is what the coalescer keeps of each block and nothing charges.
+/// Issue #3241: the heap the `FilterExec` holds while its coalescer is still
+/// filling, which its emitted batches cannot show, is charged to the pool.
+///
+/// Per input batch, the live heap less the pool's reading, relative to the
+/// first batch. The scan alone grows that figure too (a fixed amount per block
+/// that no downstream operator holds), so the excess over the scan alone is
+/// what the filter keeps and nothing charges. At the last input batch, for
+/// every case:
+///
+/// - the coalescer holds the very `Arc` of each earlier block's values array
+///   that has a surviving row, and the scan alone holds none of them, so a
+///   `strong_count` test on the scan's array sees the coalescer;
+/// - the excess is at most one block's values array plus 10%;
+/// - the pool reads at least one values array per block the coalescer holds:
+///   the bytes moved into the pool, rather than out of the heap.
+///
+/// The flushed output references none of the scan's values arrays: the
+/// coalescer's finish rebuilds the dictionary.
 #[tokio::test]
-async fn p5_report_heap_held_before_the_coalescer_flushes() {
+async fn p5_heap_held_before_the_coalescer_flushes_is_charged() {
     let _serial = SERIAL.lock().await;
     let cases = [
         (SELECT_URL, "SELECT URL", 1, [8, 64, 256]),
         (COUNT_URL, "COUNT(*)", 1, [8, 64, 256]),
         (SELECT_URL, "SELECT URL, 64/block", 64, [64, 128, 256]),
     ];
+    let mut misses = Vec::new();
     for (sql, label, matches, ns) in cases {
         for n in ns {
             let fx = fixture(n, matches).await;
-            scan_alone_heap(&fx, sql, label).await;
+            let alone = scan_alone_heap(&fx, sql, label).await;
             let pool = Arc::new(UnboundedMemoryPool::default());
             let (ctx, _, filter) = plan(&fx, &pool, sql).await;
             let samples = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::new(Mutex::new(SeenValues::default()));
             let probe: Arc<dyn ExecutionPlan> = Arc::new(Probe {
                 input: Arc::clone(filter.children()[0]),
                 pool: Arc::clone(&pool),
                 samples: Arc::clone(&samples),
+                seen: Arc::clone(&seen),
             });
             let filter = Arc::clone(&filter)
                 .replace_children(
@@ -671,9 +745,22 @@ async fn p5_report_heap_held_before_the_coalescer_flushes() {
             }
             let at_end = live_heap();
             let samples = samples.lock().unwrap().clone();
+            let output_sharing = {
+                let seen = seen.lock().unwrap();
+                held.iter()
+                    .filter(|b| {
+                        let Ok(i) = b.schema().index_of(KEY) else {
+                            return false;
+                        };
+                        b.column(i)
+                            .as_any_dictionary_opt()
+                            .is_some_and(|d| seen.contains(d.values()))
+                    })
+                    .count()
+            };
             let unaccounted: Vec<isize> = samples
                 .iter()
-                .map(|(reserved, live)| live - *reserved as isize)
+                .map(|s| s.live - s.reserved as isize)
                 .collect();
             let first = unaccounted.first().copied().unwrap_or(0);
             let last = unaccounted.last().copied().unwrap_or(0);
@@ -682,8 +769,19 @@ async fn p5_report_heap_held_before_the_coalescer_flushes() {
             } else {
                 0
             };
-            let max_reserved = samples.iter().map(|(r, _)| *r).max().unwrap_or(0);
+            let max_reserved = samples.iter().map(|s| s.reserved).max().unwrap_or(0);
             let peak = unaccounted.iter().max().copied().unwrap_or(0) - first;
+            let end = *samples.last().expect("at least one input batch");
+            let excess = (last - first) - alone.growth;
+            let charge = end.values_bytes;
+            // The blocks before the last whose surviving rows the coalescer
+            // still holds: none under COUNT(*), whose filter output carries no
+            // column, else every block since its last flush.
+            let held_blocks = if sql == COUNT_URL {
+                0
+            } else {
+                (n - 1) % (COALESCE_ROWS / matches)
+            };
             println!(
                 "[p5 {label} N={n}] input batches {}, output batches {}, max pool reading {max_reserved}",
                 samples.len(),
@@ -693,27 +791,76 @@ async fn p5_report_heap_held_before_the_coalescer_flushes() {
                 "  live heap less pool at the last input batch, over the first: {} bytes, {per_block} per block (one block's values array {}); live heap after the output, over the last input batch: {}",
                 last - first,
                 block_values_bytes(),
-                at_end - samples.last().map_or(0, |(_, l)| *l)
+                at_end - end.live
             );
             println!(
                 "  peak live heap less pool over the first input batch: {peak} bytes, {:.2} blocks' values arrays",
                 peak as f64 / block_values_bytes() as f64
             );
+            println!(
+                "  at the last input batch: excess over the scan alone {excess} bytes (bound {}), pool {} (floor {held_blocks} x {charge} = {}), earlier values arrays alive {} (want {held_blocks}); output batches sharing a scan values array {output_sharing}",
+                charge + charge / 10,
+                end.reserved,
+                held_blocks * charge,
+                end.alive_before,
+            );
+            if alone.max_alive_before != 0 {
+                misses.push(format!(
+                    "{label} N={n}: the scan alone keeps {} earlier values arrays alive",
+                    alone.max_alive_before
+                ));
+            }
+            if end.alive_before != held_blocks {
+                misses.push(format!(
+                    "{label} N={n}: {} earlier values arrays alive, want {held_blocks}",
+                    end.alive_before
+                ));
+            }
+            if excess > (charge + charge / 10) as isize {
+                misses.push(format!(
+                    "{label} N={n}: {excess} bytes held outside the pool over the scan alone, above one values array {charge} + 10%"
+                ));
+            }
+            if end.reserved < held_blocks * charge {
+                misses.push(format!(
+                    "{label} N={n}: pool {} below {held_blocks} values arrays of {charge}",
+                    end.reserved
+                ));
+            }
+            if output_sharing != 0 {
+                misses.push(format!(
+                    "{label} N={n}: {output_sharing} output batches share a scan values array"
+                ));
+            }
             drop(held);
         }
     }
+    assert!(misses.is_empty(), "#3241 missed: {misses:#?}");
+}
+
+/// What [`scan_alone_heap`] measured.
+struct ScanAlone {
+    /// Live heap less the pool, last batch over first.
+    growth: isize,
+    /// The most earlier batches' `URL` values arrays alive as any batch
+    /// arrived.
+    max_alive_before: usize,
 }
 
 /// The live heap growth of the `FilterExec`'s input executed alone, each batch
 /// dropped on arrival: what the scan itself keeps per block.
-async fn scan_alone_heap(fx: &Fixture, sql: &str, label: &str) {
+async fn scan_alone_heap(fx: &Fixture, sql: &str, label: &str) -> ScanAlone {
     let pool = Arc::new(UnboundedMemoryPool::default());
     let (ctx, _, filter) = plan(fx, &pool, sql).await;
     let input = Arc::clone(filter.children()[0]);
     let mut stream = input.execute(0, ctx.task_ctx()).expect("execute input");
     let mut unaccounted = Vec::new();
+    let mut seen = SeenValues::default();
+    let mut max_alive_before = 0;
     while let Some(batch) = stream.next().await {
-        drop(batch.expect("input batch"));
+        let batch = batch.expect("input batch");
+        max_alive_before = max_alive_before.max(seen.record(&batch).0);
+        drop(batch);
         unaccounted.push(live_heap() - pool.reserved() as isize);
     }
     let first = unaccounted.first().copied().unwrap_or(0);
@@ -724,8 +871,12 @@ async fn scan_alone_heap(fx: &Fixture, sql: &str, label: &str) {
         0
     };
     println!(
-        "[p5 scan alone under {label} N={}] live heap less pool, last batch over first: {} bytes, {per_block} per block",
+        "[p5 scan alone under {label} N={}] live heap less pool, last batch over first: {} bytes, {per_block} per block; earlier values arrays alive at most {max_alive_before}",
         fx.blocks,
         last - first
     );
+    ScanAlone {
+        growth: last - first,
+        max_alive_before,
+    }
 }
