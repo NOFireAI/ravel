@@ -81,14 +81,15 @@ impl Mode {
         self.installs_query_audit_pipeline() && !self.runs_scheduled_fold()
     }
 
-    /// Whether [`crate::metrics`] renders `ravel_catalog_fold_cycles_total`
-    /// and `ravel_catalog_fold_failures_total` for this mode: every mode a
-    /// fold can run in by either route, so an on-demand fold's failures are
-    /// visible on `/metrics` where it runs. That is [`Mode::Query`] on top of
-    /// the two scheduled-fold modes; [`Mode::Gateway`] renders no fold family
-    /// at all.
+    /// Whether [`crate::metrics`] renders `ravel_catalog_fold_cycles_total`,
+    /// `ravel_catalog_fold_failures_total` and
+    /// `ravel_catalog_fold_column_stats_dictionaries_dropped_total` for this
+    /// mode: every mode a fold can run in by either route, so an on-demand
+    /// fold's failures are visible on `/metrics` where it runs. That is
+    /// [`Mode::Query`] on top of the two scheduled-fold modes;
+    /// [`Mode::Gateway`] renders no fold family at all.
     ///
-    /// Deliberately mode-only, ignoring `--disable-fold`: those two counters
+    /// Deliberately mode-only, ignoring `--disable-fold`: those counters
     /// render wherever the liveness gauge does, and that gauge is rendered by
     /// mode alone (ADR-1693 decision 5) so a maintain process started with
     /// `--disable-fold` still shows a `0` gauge and pages.
