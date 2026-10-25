@@ -639,6 +639,173 @@ async fn narrow_fast_path_reads_the_directories_from_the_probe() {
     }
 }
 
+// ---- 1a'. a raised group size keeps a 120-block object one row group -------
+
+/// Blocks in the wide object: more than three default 32-block groups.
+const WIDE_BLOCKS: usize = 120;
+/// Dynamic attribute columns per record. With the ten fixed column ids (0-9,
+/// `attrs_raw` included) the object has 104 column ids.
+const WIDE_ATTRS: usize = 94;
+/// Body filler per wide record: the bulk between the projected columns.
+const WIDE_BODY_BYTES: usize = 2 * 1024;
+
+fn wide_record(i: usize) -> LogRecord {
+    let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+    let ts = i as i64;
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts + 1,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: filler(i as u64, WIDE_BODY_BYTES),
+        trace_id: None,
+        span_id: None,
+        flags: 1,
+        attrs: (0..WIDE_ATTRS)
+            .map(|a| (format!("a{a:02}"), AttrValue::I64((i * WIDE_ATTRS + a) as i64)))
+            .collect(),
+    }
+}
+
+/// The wide rows written at `group_target_blocks` blocks per row group.
+fn wide_object(recs: &[LogRecord], group_target_blocks: usize) -> Vec<u8> {
+    let cfg = RlogConfig {
+        block_target_records: BLOCK_RECORDS,
+        group_target_blocks,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity());
+    for r in recs {
+        w.push(r.clone()).expect("push");
+    }
+    w.finish().expect("finish")
+}
+
+/// ADR-3217 decision 5: a 120-block, 104-column object written as one row
+/// group (`group_target_blocks` 512) serves a 3-column projection at
+/// far-apart column ids (`ts` 0, `stream_ref` 2 and the last attribute
+/// column, 103) on the fast path with exactly 3 chunk-run GETs and no
+/// whole-object read. The same rows at the default 32-block groups raise 9
+/// candidate runs, bridge to at most 4, and either read the object whole or
+/// move more than 3x the projected chunk bytes.
+///
+/// The coalescing gap is pinned to 0: at the unpinned default, one request
+/// cost (`DEFAULT_LOG_REQUEST_COST_BYTES`, about 1.8 MiB), this sub-megabyte
+/// object's chunks fuse into one run that crosses the coverage threshold, so
+/// the one-group read is a whole-object GET.
+///
+/// Non-vacuity: writing the first object at the default group size fails its
+/// one-group assertion, and past that the read is the second half's: 4
+/// bridged GETs moving 87,638 bytes for 1,004 bytes of chunks (measured), so
+/// the 3-GET and byte assertions fail.
+#[tokio::test]
+async fn one_row_group_of_120_blocks_reads_three_far_apart_columns_in_three_gets() {
+    let recs: Vec<LogRecord> = (0..WIDE_BLOCKS * BLOCK_RECORDS).map(wide_record).collect();
+    let gap = 0;
+    let sel = ColumnSelection::fixed_only().with_attr(format!("a{:02}", WIDE_ATTRS - 1));
+
+    let read = |bytes: Vec<u8>| {
+        let recs = recs.clone();
+        let sel = sel.clone();
+        async move {
+            let recording = RecordingStore::new(store_with(&bytes).await);
+            let store: Arc<dyn ObjectStoreBackend> =
+                Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+            let seg = seg_ref(bytes.len() as u64, &recs);
+            let acc = QueryAccounting::new();
+            let (_got, stats) = BlockRangeFetcher::new(store)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(tail_len(&bytes))
+                .with_coalesce_gap(gap)
+                .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+                .await
+                .expect("projected fetch");
+            (stats, recording.full_gets())
+        }
+    };
+
+    let one = wide_object(&recs, 512);
+    let dir = page_dir_of(&one);
+    assert_eq!(
+        dir.groups
+            .iter()
+            .map(|g| (g.first_block, g.block_count))
+            .collect::<Vec<_>>(),
+        vec![(0, WIDE_BLOCKS as u32)],
+        "every block in one row group"
+    );
+    let field_dir = field_dir_of(&one);
+    assert_eq!(field_dir.len(), WIDE_ATTRS, "one column per attribute");
+    let ids = resolved(&one, &sel).expect("a projection, not all columns");
+    let chunk_ids: Vec<u32> = dir.groups[0]
+        .chunks
+        .iter()
+        .map(|c| c.column_id)
+        .filter(|id| ids.contains(id))
+        .collect();
+    let last_id = field_dir
+        .entries()
+        .iter()
+        .map(|e| e.column_id)
+        .max()
+        .expect("attribute columns");
+    assert_eq!(last_id, 103, "104 column ids, 0 through 103");
+    assert_eq!(
+        chunk_ids,
+        vec![COL_TS, COL_STREAM_REF, last_id],
+        "three projected chunks at far-apart ids (`attrs_raw` has no pages)"
+    );
+    let all_blocks: Vec<usize> = (0..WIDE_BLOCKS).collect();
+    let runs = expected_runs(&one, &all_blocks, Some(&ids), gap);
+    assert_eq!(runs.len(), 3, "one run per projected chunk: {runs:?}");
+
+    let (stats, full_gets) = read(one.clone()).await;
+    assert!(!stats.whole_object, "the one-group object is not read whole");
+    assert_eq!(full_gets, 0, "no whole-object GET");
+    assert_eq!(stats.probe_gets, 1, "one suffix probe");
+    assert_eq!(stats.block_range_gets, 3, "exactly 3 chunk-run GETs");
+    let chunk_bytes = expected_stored_page_bytes(&one, &all_blocks, Some(&ids));
+    assert_eq!(
+        stats.block_bytes_fetched, chunk_bytes,
+        "the three chunks' bytes and nothing between them"
+    );
+
+    let grouped = wide_object(&recs, RlogConfig::default().group_target_blocks);
+    assert_eq!(
+        page_dir_of(&grouped)
+            .groups
+            .iter()
+            .map(|g| g.block_count)
+            .collect::<Vec<_>>(),
+        vec![32, 32, 32, 24],
+        "the default group size cuts the same rows into four groups"
+    );
+    // `attrs_raw` (id 9) has no pages in either object, so the selected bytes
+    // are the same three columns' pages.
+    let grouped_chunk_bytes = expected_stored_page_bytes(&grouped, &all_blocks, Some(&ids));
+    assert_eq!(
+        expected_runs(&grouped, &all_blocks, Some(&ids), gap).len(),
+        9,
+        "12 chunks, each group's last abutting the next group's first"
+    );
+    let (stats, full_gets) = read(grouped.clone()).await;
+    assert!(
+        stats.block_range_gets <= MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "9 candidate runs bridge to at most 4: {}",
+        stats.block_range_gets
+    );
+    assert!(
+        stats.whole_object && full_gets == 1
+            || stats.block_bytes_fetched > 3 * grouped_chunk_bytes,
+        "either a covering read or bridged bytes above 3x the chunk bytes: \
+         whole {}, fetched {} against chunk bytes {grouped_chunk_bytes}",
+        stats.whole_object,
+        stats.block_bytes_fetched
+    );
+}
+
 // ---- 1b. multiple row groups: chunk runs cap at 4, bridging smallest gaps --
 
 /// A projected read of `k` columns over `G` row groups raises `G * k`
