@@ -3142,19 +3142,16 @@ mod tests {
     /// One unstamped segment: five rows carry `code` 1..=5 on the record, three
     /// carry `code = 100` only in the resource attributes. A real fold builds
     /// its `.cstat` entry, asserted to claim `[1, 5]` with the three resource
-    /// rows counted NULL. `NOT (code <> 100)` declines a prune arm in the
-    /// analyzed plan, so `SqlExecutor` loads the `.cstat`; the optimizer then
-    /// simplifies it to `code = 100`, which reaches the scan as a `[100, 100]`
-    /// arm disjoint from the entry.
+    /// rows counted NULL. The loaded entry is handed to the provider directly,
+    /// beside the resolved segment, so it is there to skip on whatever
+    /// `SqlExecutor`'s load gate decides; `code = 100` reaches the scan as a
+    /// `[100, 100]` arm disjoint from the entry.
     ///
     /// Flipped assertions: letting `arm_excludes` fall back to the entry when
     /// there is no stamp (`stamp_coverage(..)` to
     /// `stamp_coverage(..).or_else(|| cstat_coverage(..))`) skips the segment
-    /// on its `.cstat` entry and fails the result assertion (a count of `0`
-    /// where `3` is expected). The last assertion pins that `execute` fetched
-    /// the `.cstat` object, so the test cannot pass because no entry was
-    /// loaded: forcing `SqlExecutor` to skip the load (`true ||` before
-    /// `!self.logs_column_stats_eligible(..)`) fails it.
+    /// on its `.cstat` entry and fails the result assertion (no rows where the
+    /// three `code = 100` rows are expected).
     #[tokio::test]
     async fn a_cstat_entry_alone_never_skips_a_segment_with_resource_level_matches() {
         const NOW_NS: i64 = 4 * 3_600_000_000_000;
@@ -3249,39 +3246,38 @@ mod tests {
             "the .cstat entry tallies the record cells only"
         );
 
-        let store = KeyCountingStore::new(Arc::clone(&memory));
-        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
-        let outcome = execute_code_sql(
-            &backend,
-            &tenant,
-            "SELECT COUNT(*) AS n, MIN(code) AS lo, MAX(code) AS hi \
-             FROM logs WHERE NOT (code <> 100)",
-            NOW_NS,
+        let snapshot = catalog
+            .resolve(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: NOW_NS,
+                },
+                &[],
+                NOW_NS,
+            )
+            .await
+            .expect("resolve");
+        let run = run_pruned(
+            &memory,
+            snapshot.segments,
+            Some(loaded),
+            true,
+            "SELECT ts, body FROM logs WHERE code = 100",
         )
         .await;
-        let batches = outcome.output.batches();
-        let text = datafusion::arrow::util::pretty::pretty_format_batches(batches)
-            .expect("format")
-            .to_string();
-        let want = "\
-+---+-----+-----+
-| n | lo  | hi  |
-+---+-----+-----+
-| 3 | 100 | 100 |
-+---+-----+-----+";
+        let want: BTreeSet<(i64, String)> = (5..8usize).map(|i| code_row(1, i)).collect();
         assert_eq!(
-            text, want,
+            run.rows, want,
             "the three resource-level code = 100 rows are returned"
         );
         assert_eq!(
-            outcome.stats.segments_pruned_by_stats, 0,
+            run.scan_pruned_by_stats,
+            Some(0),
             "the .cstat entry alone must not skip the segment"
         );
-        assert!(store.gets_of(&key) > 0, "the segment is read");
-        assert!(
-            store.gets_with_suffix(".cstat") > 0,
-            "execute loads the .cstat object, so the entry was there to skip on"
-        );
+        assert!(run.store.gets_of(&key) > 0, "the segment is read");
     }
 
     /// Publish and fold the resource-level fixture of
@@ -3421,6 +3417,11 @@ mod tests {
         ),
     ];
 
+    /// The index of `COUNT(code)` in [`RESOURCE_CODE_STATEMENTS`], the one
+    /// statement `SqlExecutor`'s load gate does not load the `.cstat` for: the
+    /// stamp answers it and no `.cstat` reader takes it.
+    const COUNT_CODE_STATEMENT: usize = 1;
+
     /// One statement of [`RESOURCE_CODE_STATEMENTS`] as `SqlExecutor::execute`
     /// ran it: the formatted result, whether the `.cstat` object was fetched,
     /// and whether the segment's data object was.
@@ -3463,7 +3464,8 @@ mod tests {
     /// statistic of a declared column from that entry: the entry tallies the
     /// record-level cells only, so it misses the three rows whose `code`
     /// comes from the resource. Every statement reads the segment and returns
-    /// the exact answer, with the `.cstat` object loaded each time.
+    /// the exact answer, with the `.cstat` object loaded for every statement
+    /// but `COUNT(code)`.
     ///
     /// Flipped assertions: with `.cstat` coverage in
     /// `segment_declared_coverage` (the code before this test) MIN/MAX reads
@@ -3481,10 +3483,11 @@ mod tests {
         let got = run_resource_code_statements(&memory, &tenant, &key, NOW_NS).await;
         let want: Vec<StatementRun> = RESOURCE_CODE_STATEMENTS
             .iter()
-            .map(|(sql, result)| StatementRun {
+            .enumerate()
+            .map(|(i, (sql, result))| StatementRun {
                 sql,
                 result: result.to_string(),
-                cstat_loaded: true,
+                cstat_loaded: i != COUNT_CODE_STATEMENT,
                 segment_read: true,
             })
             .collect();
@@ -3492,8 +3495,8 @@ mod tests {
     }
 
     /// The same segment with a stamp: the stamp answers MIN, MAX and
-    /// `COUNT(code)` with no data GET, although the `.cstat` entry differs
-    /// from it in all three figures, and the shapes only the entry's
+    /// `COUNT(code)` with no data GET, MIN and MAX although the loaded
+    /// `.cstat` entry differs from it in both figures, and the shapes only the entry's
     /// dictionary or sum can answer read the segment, since the stamp does not
     /// match the entry. The difference is the expected one between a
     /// record-level entry and the merged view, so it is not treated as a
@@ -3501,7 +3504,7 @@ mod tests {
     ///
     /// Flipped assertions: declining when the stamp and the entry differ (the
     /// conflict rule `segment_declared_coverage` applied before this test)
-    /// reads the segment for MIN/MAX and `COUNT(code)`; dropping the
+    /// reads the segment for MIN/MAX; dropping the
     /// `agrees_with` check from `merged_view_entry` makes the SUM `15`, the
     /// not-equal count `4`, and the GROUP BY a NULL group of 3.
     #[tokio::test]
@@ -3519,7 +3522,7 @@ mod tests {
             .map(|(i, (sql, result))| StatementRun {
                 sql,
                 result: result.to_string(),
-                cstat_loaded: true,
+                cstat_loaded: i != COUNT_CODE_STATEMENT,
                 segment_read: i >= 2,
             })
             .collect();

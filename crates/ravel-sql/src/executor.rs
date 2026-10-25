@@ -94,7 +94,7 @@
 //! never returned (docs/query-engine.md "Budgets").
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -4426,16 +4426,29 @@ impl SqlExecutor {
     /// the query then answers exactly as an absent stats object would (the
     /// pre-ADR-0850 provider).
     ///
-    /// Every branch fails OPEN (returns `true`, keeping the load) on any
-    /// uncertainty, because a false `false` would turn ADR-0850 off for a plan
-    /// that could have used it. The three metadata-only paths -- q07
-    /// `MIN`/`MAX(declared)`, q02 `COUNT(*)` with a residual `declared <> lit`
-    /// filter, q08 `COUNT(*) GROUP BY declared` -- all gate downstream on
-    /// [`crate::logs_scan`]'s `stats_are_exact` (no pending erasure, no content
-    /// or prune predicate, and a ts bound that clips no touched segment) and
-    /// all are aggregates referencing a declared column. This mirrors exactly
-    /// those necessary conditions; anything they cannot prove is left to
-    /// decline downstream and still loads here.
+    /// The load is kept only when some aggregate in the plan (subquery plans
+    /// included) has a shape a statistics consumer accepts
+    /// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244),
+    /// each over a `logs` scan with no residual filter except where named:
+    ///
+    /// - q02 `COUNT(*) WHERE declared <> lit`, q08 `declared, COUNT(*) GROUP
+    ///   BY declared`, and one `SUM(declared [+ int])` or `AVG(declared)`
+    ///   (q03/q04/q30 in the `metadata_agg` module doc), all feeding
+    ///   [`crate::MetadataOnlyAggregate`];
+    /// - q07, any number of `COUNT(*)`/`MIN(declared)`/`MAX(declared)` with at
+    ///   least one `MIN`/`MAX` and none on an undeclared column, feeding
+    ///   DataFusion's `AggregateStatistics` rule
+    ///   through `LogsScanExec`'s exact statistics.
+    ///
+    /// Anything else (several aggregates beside a `SUM` or `AVG`, a distinct
+    /// count, a `GROUP BY` with a filter or with two keys, a raw select)
+    /// skips the load. Inside an admitted shape the gate still fails OPEN:
+    /// all of these paths also gate downstream on [`crate::logs_scan`]'s
+    /// `stats_are_exact` (no pending erasure, no content or prune predicate,
+    /// and a ts bound that clips no touched segment), which the checks below
+    /// mirror, and a condition known only once the statistics are read (no
+    /// stored sum for the column, a dictionary over the cardinality ceiling)
+    /// is left to decline downstream, so such a plan loads and then scans.
     ///
     /// `several_tables` is whether the statement names more than one table,
     /// two signal tables or a signal table beside a Parquet table; the
@@ -4463,11 +4476,7 @@ impl SqlExecutor {
         let Some(plan) = analyzed else {
             return true;
         };
-        // Every path is an aggregate over a declared column. A non-aggregate
-        // (a raw select, a top-N) or an aggregate touching no declared column
-        // (a predicate-free `COUNT(*)`, answered from `sample_count` with no
-        // column stats) can never consume the loaded object.
-        if !plan_has_aggregate(plan) || !plan_references_declared(plan, declared) {
+        if !plan_has_stats_answerable_aggregate(plan, declared) {
             return false;
         }
         if several_tables {
@@ -6522,71 +6531,19 @@ fn is_exact_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
     )
 }
 
-/// Whether `plan` (analyzed) has any [`LogicalPlan::Aggregate`] node (issue
-/// #888). Every ADR-0850 metadata-only path replaces an `AggregateExec`, so a
-/// plan with no aggregate can never consume column statistics. Reuses
-/// [`collect_aggregate_exprs`]'s reach (inputs plus embedded subquery plans),
-/// so it fails open: an aggregate anywhere counts, even one the metadata rule
-/// would not ultimately match.
-fn plan_has_aggregate(plan: &LogicalPlan) -> bool {
+/// Whether any [`LogicalPlan::Aggregate`] in `plan` (analyzed) has a shape a
+/// column-statistics consumer accepts
+/// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244).
+/// Reuses [`collect_aggregate_exprs`]'s reach (inputs plus embedded subquery
+/// plans), so `SELECT (SELECT MIN(status) FROM logs)` is judged on the nested
+/// aggregate.
+fn plan_has_stats_answerable_aggregate(plan: &LogicalPlan, declared: &[DeclaredColumn]) -> bool {
     let mut aggregates = Vec::new();
     let mut distincts = Vec::new();
     collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
-    !aggregates.is_empty()
-}
-
-/// Whether `plan` references at least one of `declared`'s columns by name
-/// (issue #888). Every ADR-0850 metadata-only path names a declared column: a
-/// `MIN`/`MAX` argument (q07), a `GROUP BY` key (q08), or the `col <> lit`
-/// filter column (q02). A plan naming none can never consume column
-/// statistics -- a predicate-free `COUNT(*)`, for instance, is answered from
-/// `sample_count` with no column stats at all. Recurses inputs the same way
-/// [`collect_filter_predicates`] does; matching by unqualified column name is
-/// intentionally broad (fail open), since a false negative would turn ADR-0850
-/// off for a plan that could use it.
-fn plan_references_declared(plan: &LogicalPlan, declared: &[DeclaredColumn]) -> bool {
-    let names: HashSet<&str> = declared.iter().map(|d| d.key.as_str()).collect();
-    plan_references_names(plan, &names)
-}
-
-fn plan_references_names(plan: &LogicalPlan, names: &HashSet<&str>) -> bool {
-    for expr in plan.expressions() {
-        let mut found = false;
-        // Never errors: the closure only inspects and returns a recursion verb.
-        let _ = expr.apply(|node| {
-            if let Expr::Column(column) = node
-                && names.contains(column.name.as_str())
-            {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            // A subquery's plan hangs off the expression, not off
-            // `plan.inputs()`, so the input recursion below never reaches it.
-            // `collect_aggregate_exprs` descends these three for the same
-            // reason; without the matching descent here the two walks disagree,
-            // and `SELECT (SELECT MIN(status) FROM logs)` would be judged to
-            // name no declared column while being judged to hold an aggregate.
-            let nested = match node {
-                Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
-                Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery.subquery),
-                Expr::Exists(exists) => Some(&exists.subquery.subquery),
-                _ => None,
-            };
-            if let Some(plan) = nested
-                && plan_references_names(plan, names)
-            {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-        if found {
-            return true;
-        }
-    }
-    plan.inputs()
+    aggregates
         .iter()
-        .any(|input| plan_references_names(input, names))
+        .any(|aggregate| crate::metadata_agg::logical_aggregate_answerable(aggregate, declared))
 }
 
 /// Classify a DISTINCT node's implicit group keys (ADR-0094 decision 1): a

@@ -63,7 +63,10 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::utils::split_conjunction;
+use datafusion::logical_expr::{
+    Aggregate, BinaryExpr as LogicalBinaryExpr, Cast, Expr, LogicalPlan, Operator, TryCast,
+};
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -79,7 +82,10 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 
+use crate::declared::{DeclaredColumn, DeclaredType};
+use crate::logs_pushdown::filter_is_exact;
 use crate::logs_scan::{DeclaredColumnSum, DeclaredGroupCounts, LogsScanExec};
+use crate::session::LOGS_TABLE;
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
@@ -184,73 +190,111 @@ fn group_index(group_by: &physical_plan::aggregates::PhysicalGroupBy) -> Option<
     }
 }
 
-/// The single aggregate this rule knows how to answer from statistics, or
-/// `None` for anything else. Every variant carries a scan-output column index
-/// (resolved to a declared column later, once the scan is in hand).
-enum AggKind {
-    /// `COUNT(*)`: physically `count(<non-null literal>)`.
+/// One aggregate call's single argument, reduced to the forms a statistics
+/// answer can take. `C` is the column reference: a scan-output index on the
+/// physical side ([`physical_arg`]), a declared column on the logical side
+/// ([`logical_arg`]).
+enum StatsArg<C> {
+    /// A non-null literal. `COUNT(*)` is `count(<non-null literal>)`; a
+    /// literal NULL would make DataFusion evaluate `COUNT(NULL)` as 0, so
+    /// treating it as `COUNT(*)` and answering from `non_null_count` would
+    /// return a filtered or grouped count where the correct answer is 0.
+    NonNullLiteral,
+    /// A plain column reference.
+    Column(C),
+    /// `col + k` or `k + col` with an integer literal `k`. A float addend
+    /// would make the result a float the integer sum cannot answer exactly.
+    ColumnPlus(C, i128),
+}
+
+/// An aggregate call one of the two statistics consumers can answer: this
+/// module's [`MetadataOnlyAggregate`] (`COUNT(*)`, `SUM`, `AVG`), or
+/// DataFusion's built-in `AggregateStatistics` rule over
+/// [`LogsScanExec`]'s exact statistics (`COUNT(*)`, `MIN`, `MAX`).
+enum StatsAggregate<C> {
     CountStar,
-    /// `SUM(col + addend)` over an integer column; `addend == 0` is the plain
-    /// `SUM(col)`.
-    Sum { col_index: usize, addend: i128 },
-    /// `AVG(col)` over an integer column.
-    Avg { col_index: usize },
+    /// `SUM(col + addend)`; `addend == 0` is the plain `SUM(col)`.
+    Sum {
+        col: C,
+        addend: i128,
+    },
+    Avg {
+        col: C,
+    },
+    Min(C),
+    Max(C),
+}
+
+/// The one aggregate-call classification both sides share: the physical
+/// rewrite ([`classify_aggregate`]) and the logical load gate
+/// ([`logical_aggregate_answerable`]) each reduce their own expression form to
+/// `name`, `distinct`, `filtered` and a [`StatsArg`], and ask this.
+///
+/// A per-aggregate `FILTER (WHERE ...)` is refused for every function: both
+/// consumers refuse it (DataFusion's rule requires every `filter_expr` to be
+/// `None`). `DISTINCT` is refused for `count`, `sum` and `avg`: this module
+/// does not reason about it, and DataFusion's `count` answers a distinct
+/// count only from a `distinct_count` statistic [`LogsScanExec`] does not
+/// report. DataFusion's `min`/`max` ignore `DISTINCT`, so it is admitted
+/// there.
+fn stats_aggregate<C>(
+    name: &str,
+    distinct: bool,
+    filtered: bool,
+    arg: StatsArg<C>,
+) -> Option<StatsAggregate<C>> {
+    if filtered {
+        return None;
+    }
+    match (name, arg) {
+        ("count", StatsArg::NonNullLiteral) if !distinct => Some(StatsAggregate::CountStar),
+        ("sum", StatsArg::Column(col)) if !distinct => Some(StatsAggregate::Sum { col, addend: 0 }),
+        ("sum", StatsArg::ColumnPlus(col, addend)) if !distinct => {
+            Some(StatsAggregate::Sum { col, addend })
+        }
+        ("avg", StatsArg::Column(col)) if !distinct => Some(StatsAggregate::Avg { col }),
+        ("min", StatsArg::Column(col)) => Some(StatsAggregate::Min(col)),
+        ("max", StatsArg::Column(col)) => Some(StatsAggregate::Max(col)),
+        _ => None,
+    }
 }
 
 /// Classify `agg`'s single aggregate, or `None` when it is not exactly one
-/// non-distinct, unfiltered aggregate this rule handles. `is_distinct` and a
-/// per-aggregate `FILTER (WHERE ...)` clause are both refused: neither changes
-/// what the underlying statistics mean, but this rule does not attempt to
-/// reason about them.
-fn classify_aggregate(agg: &physical_plan::aggregates::AggregateExec) -> Option<AggKind> {
+/// aggregate this rule handles: more than one aggregate expression, and
+/// anything [`stats_aggregate`] refuses, are declined. `MIN`/`MAX` are
+/// classified but never rewritten here; DataFusion's own rule answers them.
+///
+/// The logical mirror of this rule's plan-shape conditions is
+/// [`logical_aggregate_answerable`]; a change to either belongs in both.
+fn classify_aggregate(
+    agg: &physical_plan::aggregates::AggregateExec,
+) -> Option<StatsAggregate<usize>> {
     let aggr_exprs = agg.aggr_expr();
     let filter_exprs = agg.filter_expr();
     if aggr_exprs.len() != 1 || filter_exprs.len() != 1 {
         return None;
     }
-    if filter_exprs[0].is_some() {
-        return None;
-    }
     let expr = &aggr_exprs[0];
-    if expr.is_distinct() {
-        return None;
-    }
     let args = expr.expressions();
-    if args.len() != 1 {
+    let [arg] = args.as_slice() else {
         return None;
-    }
-    match expr.fun().name() {
-        // `count_all()` is physically `count(<non-null literal>)`; a literal
-        // NULL would make DataFusion evaluate `COUNT(NULL)` as 0, so treating
-        // it as `COUNT(*)` and answering from `non_null_count` would return a
-        // filtered or grouped count where the correct answer is 0. Require the
-        // literal to be non-null.
-        "count" => match args[0].downcast_ref::<Literal>() {
-            Some(lit) if !lit.value().is_null() => Some(AggKind::CountStar),
-            _ => None,
-        },
-        "sum" => {
-            let (col_index, addend) = sum_arg(&args[0])?;
-            Some(AggKind::Sum { col_index, addend })
-        }
-        "avg" => {
-            let col = args[0].downcast_ref::<Column>()?;
-            Some(AggKind::Avg {
-                col_index: col.index(),
-            })
-        }
-        _ => None,
-    }
+    };
+    stats_aggregate(
+        expr.fun().name(),
+        expr.is_distinct(),
+        filter_exprs[0].is_some(),
+        physical_arg(arg)?,
+    )
 }
 
-/// The `(column index, integer addend)` of a `SUM` argument this rule can
-/// decompose: a plain `Column` (addend 0), or `Column + <int literal>` /
-/// `<int literal> + Column`. `None` for any other expression, and for a
-/// non-integer literal (a float addend would make the result a float the
-/// integer sum cannot answer exactly).
-fn sum_arg(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, i128)> {
+/// `expr` as a [`StatsArg`] over scan-output column indices, or `None` for
+/// any other expression.
+fn physical_arg(expr: &Arc<dyn PhysicalExpr>) -> Option<StatsArg<usize>> {
     if let Some(col) = expr.downcast_ref::<Column>() {
-        return Some((col.index(), 0));
+        return Some(StatsArg::Column(col.index()));
+    }
+    if let Some(lit) = expr.downcast_ref::<Literal>() {
+        return (!lit.value().is_null()).then_some(StatsArg::NonNullLiteral);
     }
     let binary = expr.downcast_ref::<BinaryExpr>()?;
     if *binary.op() != Operator::Plus {
@@ -262,13 +306,19 @@ fn sum_arg(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, i128)> {
         left.downcast_ref::<Column>(),
         right.downcast_ref::<Literal>(),
     ) {
-        return Some((col.index(), scalar_to_i128(lit.value())?));
+        return Some(StatsArg::ColumnPlus(
+            col.index(),
+            scalar_to_i128(lit.value())?,
+        ));
     }
     if let (Some(lit), Some(col)) = (
         left.downcast_ref::<Literal>(),
         right.downcast_ref::<Column>(),
     ) {
-        return Some((col.index(), scalar_to_i128(lit.value())?));
+        return Some(StatsArg::ColumnPlus(
+            col.index(),
+            scalar_to_i128(lit.value())?,
+        ));
     }
     None
 }
@@ -307,6 +357,208 @@ fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, Scalar
         return Some((col.index(), lit.value().clone()));
     }
     None
+}
+
+/// Whether the analyzed logical `aggregate` has a shape one of the two
+/// statistics consumers accepts, judged before the column statistics are
+/// loaded (issue #3244). This is the logical mirror of [`rewrite`] (with
+/// [`group_index`], [`classify_aggregate`] and [`not_equal_literal`]) and of
+/// DataFusion's `AggregateStatistics` rule; a change to the conditions on
+/// either side belongs on both. The admitted shapes, each over a `logs` scan
+/// reached through at most [`logs_scan_residual`]'s pass-through nodes:
+///
+/// - **q02**, for [`MetadataOnlyAggregate`]: one `COUNT(*)`, no group key, and
+///   exactly one residual conjunct, `<declared column> <> <non-null literal>`
+///   on a non-`Str` column.
+/// - **q03/q04/q30**, for [`MetadataOnlyAggregate`]: one `SUM(col)`,
+///   `SUM(col + <int>)` or `AVG(col)` on an `I64` declared column, no group
+///   key, no residual conjunct.
+/// - **q08**, for [`MetadataOnlyAggregate`]: one `COUNT(*)`, a single group
+///   key that is a non-`Str` declared column, no residual conjunct.
+/// - **q07**, for DataFusion's `AggregateStatistics` over
+///   [`LogsScanExec`]'s exact statistics: any number of `COUNT(*)`, `MIN(col)`
+///   and `MAX(col)`, at least one `MIN`/`MAX` and every one on an `I64` or
+///   `Bool` declared column (the types the `SegmentRef` stamp carries), no
+///   group key, no residual conjunct.
+///
+/// A residual conjunct is one [`filter_is_exact`] does not report, so a pure
+/// `ts` bound or a `has_word` call, which `LogsTableProvider` takes `Exact`
+/// and removes from the plan, does not count. Admission is by shape only: an
+/// admitted statement can still decline at execution (no stored sum, a
+/// dictionary over the cardinality ceiling, a clipped segment) and scans.
+pub(crate) fn logical_aggregate_answerable(
+    aggregate: &Aggregate,
+    declared: &[DeclaredColumn],
+) -> bool {
+    let Some(residual) = logs_scan_residual(&aggregate.input, declared) else {
+        return false;
+    };
+    let Some(calls) = aggregate
+        .aggr_expr
+        .iter()
+        .map(|expr| logical_call(expr, declared))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    match (aggregate.group_expr.as_slice(), calls.as_slice()) {
+        ([], [StatsAggregate::CountStar]) => match residual.as_slice() {
+            [conjunct] => logical_not_equal_literal(conjunct, declared)
+                .is_some_and(|col| !matches!(col.ty, DeclaredType::Str)),
+            _ => false,
+        },
+        ([], [StatsAggregate::Sum { col, .. } | StatsAggregate::Avg { col }]) => {
+            residual.is_empty() && matches!(col.ty, DeclaredType::I64)
+        }
+        ([Expr::Column(key)], [StatsAggregate::CountStar]) => {
+            residual.is_empty()
+                && declared_named(declared, &key.name)
+                    .is_some_and(|col| !matches!(col.ty, DeclaredType::Str))
+        }
+        ([], calls) => {
+            let min_max_ok =
+                |col: &DeclaredColumn| matches!(col.ty, DeclaredType::I64 | DeclaredType::Bool);
+            residual.is_empty()
+                && calls.iter().all(|call| match call {
+                    StatsAggregate::CountStar => true,
+                    StatsAggregate::Min(col) | StatsAggregate::Max(col) => min_max_ok(col),
+                    StatsAggregate::Sum { .. } | StatsAggregate::Avg { .. } => false,
+                })
+                && calls
+                    .iter()
+                    .any(|call| matches!(call, StatsAggregate::Min(_) | StatsAggregate::Max(_)))
+        }
+        _ => false,
+    }
+}
+
+/// The residual filter conjuncts between an aggregate's input and the `logs`
+/// scan under it, or `None` when the input is not a `logs` scan reached
+/// through `Filter`, `SubqueryAlias`, and `Projection`s of plain columns only.
+/// [`rewrite`]'s scan chain admits a filter and partition shuffles and nothing
+/// that computes (a computed projection survives as a `ProjectionExec`), and
+/// DataFusion's rule needs the scan's own exact statistics as its input.
+fn logs_scan_residual(mut plan: &LogicalPlan, declared: &[DeclaredColumn]) -> Option<Vec<Expr>> {
+    let mut residual = Vec::new();
+    let mut keep = |predicate: &Expr| {
+        residual.extend(
+            split_conjunction(predicate)
+                .into_iter()
+                .filter(|conjunct| !filter_is_exact(conjunct, declared))
+                .cloned(),
+        );
+    };
+    loop {
+        match plan {
+            LogicalPlan::TableScan(scan) => {
+                for filter in &scan.filters {
+                    keep(filter);
+                }
+                return (scan.table_name.table() == LOGS_TABLE).then_some(residual);
+            }
+            LogicalPlan::Filter(filter) => {
+                keep(&filter.predicate);
+                plan = &filter.input;
+            }
+            LogicalPlan::SubqueryAlias(alias) => plan = &alias.input,
+            LogicalPlan::Projection(projection)
+                if projection
+                    .expr
+                    .iter()
+                    .all(|expr| matches!(expr, Expr::Column(_))) =>
+            {
+                plan = &projection.input;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `expr`, one entry of an `Aggregate`'s `aggr_expr`, as a [`StatsAggregate`]
+/// over declared columns, through the same [`stats_aggregate`] the physical
+/// [`classify_aggregate`] uses.
+fn logical_call<'a>(
+    expr: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<StatsAggregate<&'a DeclaredColumn>> {
+    let expr = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(call) = expr else {
+        return None;
+    };
+    let [arg] = call.params.args.as_slice() else {
+        return None;
+    };
+    stats_aggregate(
+        &call.func.name().to_ascii_lowercase(),
+        call.params.distinct,
+        call.params.filter.is_some(),
+        logical_arg(arg, declared)?,
+    )
+}
+
+/// [`physical_arg`] for a logical expression, with each column resolved to
+/// the declared column it names. A column naming no declared column is
+/// `None`: no consumer answers from statistics for it.
+fn logical_arg<'a>(
+    expr: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<StatsArg<&'a DeclaredColumn>> {
+    match expr {
+        Expr::Column(col) => declared_named(declared, &col.name).map(StatsArg::Column),
+        Expr::Literal(value, _) => (!value.is_null()).then_some(StatsArg::NonNullLiteral),
+        Expr::BinaryExpr(LogicalBinaryExpr {
+            left,
+            op: Operator::Plus,
+            right,
+        }) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(col), Expr::Literal(value, _))
+            | (Expr::Literal(value, _), Expr::Column(col)) => Some(StatsArg::ColumnPlus(
+                declared_named(declared, &col.name)?,
+                scalar_to_i128(value)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`not_equal_literal`] for a logical conjunct: the declared column of a
+/// `<declared column> <> <non-null literal>` (or reversed) predicate. The
+/// literal may sit under a cast, which the analyzer adds for a literal of
+/// another type and the optimizer folds away before [`rewrite`] sees it; a
+/// cast on the column side survives as a `CastExpr` the rewrite refuses.
+fn logical_not_equal_literal<'a>(
+    conjunct: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Option<&'a DeclaredColumn> {
+    let Expr::BinaryExpr(LogicalBinaryExpr {
+        left,
+        op: Operator::NotEq,
+        right,
+    }) = conjunct
+    else {
+        return None;
+    };
+    let (col, literal) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(col), literal) | (literal, Expr::Column(col)) => (col, literal),
+        _ => return None,
+    };
+    let mut literal = literal;
+    while let Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) = literal {
+        literal = expr.as_ref();
+    }
+    match literal {
+        Expr::Literal(value, _) if !value.is_null() => declared_named(declared, &col.name),
+        _ => None,
+    }
+}
+
+/// The declared column whose key is `name`.
+fn declared_named<'a>(declared: &'a [DeclaredColumn], name: &str) -> Option<&'a DeclaredColumn> {
+    declared.iter().find(|d| d.key == name)
 }
 
 /// Try to rewrite one node. Returns it unchanged unless it is a Final-output
@@ -375,7 +627,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
         // free COUNT(*) here is already handled by DataFusion's own built-in
         // AggregateStatistics rule, so require the filter this rule exists
         // for rather than reproducing that case.
-        (None, AggKind::CountStar) => {
+        (None, StatsAggregate::CountStar) => {
             let Some(filter) = filter else {
                 return Ok(Transformed::no(node));
             };
@@ -404,7 +656,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
         }
         // q08: <declared column>, COUNT(*) GROUP BY <declared column>. A
         // filter combined with a GROUP BY is out of scope for this rule.
-        (Some(col_index), AggKind::CountStar) => {
+        (Some(col_index), StatsAggregate::CountStar) => {
             if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
@@ -420,7 +672,13 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
             }
         }
         // q03/q04: SUM(<declared integer column> + k), ungrouped, no filter.
-        (None, AggKind::Sum { col_index, addend }) => {
+        (
+            None,
+            StatsAggregate::Sum {
+                col: col_index,
+                addend,
+            },
+        ) => {
             if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
@@ -439,7 +697,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
             }
         }
         // q30: AVG(<declared integer column>), ungrouped, no filter.
-        (None, AggKind::Avg { col_index }) => {
+        (None, StatsAggregate::Avg { col: col_index }) => {
             if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
@@ -457,8 +715,12 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
                 None => return Ok(Transformed::no(node)),
             }
         }
-        // A grouped SUM/AVG is out of scope for this rule.
-        (Some(_), AggKind::Sum { .. }) | (Some(_), AggKind::Avg { .. }) => {
+        // A grouped SUM/AVG is out of scope for this rule, and MIN/MAX are
+        // DataFusion's `AggregateStatistics` rule's to answer.
+        (Some(_), StatsAggregate::Sum { .. })
+        | (Some(_), StatsAggregate::Avg { .. })
+        | (_, StatsAggregate::Min(_))
+        | (_, StatsAggregate::Max(_)) => {
             return Ok(Transformed::no(node));
         }
     };
