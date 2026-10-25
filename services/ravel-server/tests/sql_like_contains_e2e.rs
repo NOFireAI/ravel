@@ -1,8 +1,14 @@
 //! Reachability proof for the ADR-2773 contains-arm amendment: `POST
 //! /api/v1/sql` pushes `col LIKE '%literal%'` and `col NOT LIKE '%literal%'`
 //! on a declared `Str` column into the RLOG reader as `Predicate::Contains`,
-//! returns the rows the unpushed plan returns, and reports the arm's work
-//! under `stats.pruning`.
+//! returns the rows the unpushed plan returns, reports the arm's work under
+//! `stats.pruning`, and keeps the whole-segment fast path the unpushed plan
+//! takes (issue #3241).
+//!
+//! The server runs SQL scans on two partitions, one per object, so the fast
+//! path's partition conjunct holds and the predicate decides the route.
+//! `stats.timings.planningWaitMaxMs` is the route as the endpoint reports it:
+//! only a scan the fast path rejected waits on the plan barrier.
 //!
 //! The tenant's durable config declares `svc` as a `Str` column before the
 //! server starts. Two strict-mode OTLP exports through `POST /v1/logs` write
@@ -247,7 +253,10 @@ fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: Default::default(),
-        query_budgets: Default::default(),
+        query_budgets: ravel_server::QueryBudgets {
+            sql_partition_count: 2,
+            ..Default::default()
+        },
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
         max_queued_flushes: 8,
@@ -340,6 +349,20 @@ fn contains_counters(value: &serde_json::Value, raw: &str) -> (u64, u64) {
     (read("containsCellsTested"), read("strCellsValidated"))
 }
 
+/// `stats.timings.planningWaitMaxMs`, checked to appear exactly once. Only a
+/// scan that waits on the plan barrier records it, so it reads exactly 0 on
+/// the whole-segment fast path and above 0 on the planned route.
+fn planning_wait_ms(value: &serde_json::Value, raw: &str) -> f64 {
+    assert_eq!(
+        raw.matches("\"planningWaitMaxMs\":").count(),
+        1,
+        "planningWaitMaxMs appears exactly once: {raw}"
+    );
+    value["stats"]["timings"]["planningWaitMaxMs"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no stats.timings.planningWaitMaxMs in {value}"))
+}
+
 /// `LIKE '%checkout%'` and `NOT LIKE '%checkout%'` on the declared `svc`
 /// column return the same rows pushed and unpushed, and `stats.pruning`
 /// carries the exact counts of each plan.
@@ -350,7 +373,9 @@ fn contains_counters(value: &serde_json::Value, raw: &str) -> (u64, u64) {
 /// nothing and `strCellsValidated` is the `Str` cells the declared build reads
 /// for the rows the arm kept: `a0` and `b1` for `LIKE` (`b0` reads its
 /// stream), `a1` and `b2` for `NOT LIKE` (`a2` and `a3` have no `Str` cell).
-/// Unpushed, the arm never runs and the build reads all 4 `Str` cells.
+/// Unpushed, the arm never runs and the build reads all 4 `Str` cells. Both
+/// plans read `planningWaitMaxMs` 0: the pushed arm keeps the whole-segment
+/// fast path.
 ///
 /// Flipped assertion, seen failing: `contains_predicate` in ravel-sql's
 /// `logs_pushdown.rs` returning `None` makes the pushed `LIKE` report
@@ -400,6 +425,11 @@ async fn like_contains_pushdown_reaches_the_sql_stats_json() {
             pushed_counters,
             "{op} pushed: {value}"
         );
+        assert_eq!(
+            planning_wait_ms(&value, &raw),
+            0.0,
+            "{op} pushed stays on the whole-segment route: {value}"
+        );
 
         let (value, raw) = fx.sql(&unpushed).await;
         assert_eq!(bodies(&value), want, "{op} unpushed: {value}");
@@ -408,7 +438,26 @@ async fn like_contains_pushdown_reaches_the_sql_stats_json() {
             (0, 4),
             "{op} unpushed: {value}"
         );
+        assert_eq!(
+            planning_wait_ms(&value, &raw),
+            0.0,
+            "{op} unpushed is on the whole-segment route: {value}"
+        );
     }
+
+    // A `has_word` arm beside the `Contains` arm is a block predicate, so
+    // this statement waits on the plan barrier: the route pin above can read
+    // non-zero.
+    let (value, raw) = fx
+        .sql(&format!(
+            "SELECT body FROM logs WHERE {KEY} LIKE '%checkout%' AND has_word(body, 'a0')"
+        ))
+        .await;
+    assert_eq!(bodies(&value), vec!["a0"], "{value}");
+    assert!(
+        planning_wait_ms(&value, &raw) > 0.0,
+        "has_word plans: {value}"
+    );
 
     fx.running.shutdown().await.expect("graceful shutdown");
 }
