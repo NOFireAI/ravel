@@ -4755,9 +4755,9 @@ pub fn resolve_performance_defaults(
     // ADR-1170 decision 3, amended by issue #1255: one process-wide
     // memory_budget_bytes, cgroup-capped effective memory minus the overhead
     // reserve, or `u64::MAX` (source `fallback`) when memory is unknown -- a
-    // percentage of an unknown total is not a number, so the two caches below
-    // fall back to a flat compiled-in constant rather than carving a budget
-    // that isn't one. `u64::MAX`, not `0`: "we could not measure the host"
+    // percentage of an unknown total is not a number, so the three caches
+    // below fall back to a flat compiled-in constant rather than carving a
+    // budget that isn't one. `u64::MAX`, not `0`: "we could not measure the host"
     // means no trustworthy ceiling can be derived, which is unlimited, not
     // the tightest possible ceiling. A `0` budget here would starve the
     // shared SQL/fetch `MemoryBudget` accountant (`memory_remainder_bytes`)
@@ -5073,7 +5073,7 @@ pub fn resolve_performance_defaults(
 ///
 /// Only raised when the host's memory is known: with no host memory figure
 /// there is no derived budget to check hard caps against
-/// (`memory_budget_bytes` is `u64::MAX`, and the two caches already fell
+/// (`memory_budget_bytes` is `u64::MAX`, and the three caches already fell
 /// back to a flat compiled-in default for exactly that reason -- see
 /// [`ResolvedPerformanceDefaults::check_memory_budget`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13002,7 +13002,7 @@ mod tests {
         assert!(resolved.cache_disabled);
         assert_eq!(
             resolved.memory_hard_caps_bytes, 0,
-            "neither cache is built, so neither ceiling charges the budget"
+            "no cache is built, so no ceiling charges the budget"
         );
         assert_eq!(
             resolved.memory_remainder_bytes, resolved.memory_budget_bytes,
