@@ -3716,7 +3716,13 @@ mod tests {
         assert!(!summary.dictionary_loaded(CODE));
         assert!(with_code.dictionary_loaded(CODE));
         let snapshot = catalog
-            .resolve(&tenant.hash(), ravel_types::Signal::Logs, window, &[], NOW_NS)
+            .resolve(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                window,
+                &[],
+                NOW_NS,
+            )
             .await
             .expect("resolve");
         assert_eq!(snapshot.segments.len(), 1, "one resolved segment");
