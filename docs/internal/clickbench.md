@@ -306,8 +306,9 @@ the numbers.
 
 This runbook describes the internal measurement setup, not the competing
 ClickBench entry. The competing entry does not fold (ADR-3217, decision 2
-fairness amendment); drop `--fold-after-load` from the load command above to
-reproduce it.
+fairness amendment): to reproduce it, drop `--fold-after-load` from the load
+command above and skip this section, including the by-hand fold below. The
+rest of this section applies to the internal setup only.
 
 `--fold-after-load` on the load command above does this: once every write has
 been acknowledged and the load's writers have shut down, the loader folds the
@@ -334,9 +335,9 @@ commit is missing, or the check cannot read the snapshot, the line says the
 commits were not confirmed and the load exits non-zero naming the hours. Load
 into a fresh tenant instead.
 
-If the load ran without the flag, or its fold failed (the load then exits
-non-zero, but every loaded object is already durable), seal the loaded hours by
-hand once the load has exited:
+In the internal setup, if the load ran without the flag, or its fold failed
+(the load then exits non-zero, but every loaded object is already durable),
+seal the loaded hours by hand once the load has exited:
 
 ```sh
 ravel-cli --store <your-store-flags> catalog fold \
@@ -354,7 +355,8 @@ tenant seals nothing and publishes an empty metrics HEAD. The report's
 `seal_through_hour` names the hour it sealed through and `entry_count` must
 equal `objects written`.
 
-This is not optional tuning. Without a snapshot covering these hours, every
+For the internal setup this is not optional tuning. Without a snapshot
+covering these hours, every
 query resolves by listing and reading commit records directly: one
 commit-record GET per segment, per statement. On a 100M-row `hits` load that
 is 8,424 GETs for a single statement, and a 43-statement pass measured that
