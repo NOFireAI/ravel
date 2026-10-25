@@ -1401,8 +1401,9 @@ impl SlicePushdown {
 
 /// Whether the slice pushdown layout carries `p`: an equality on an
 /// attribute against a string or bytes value, or a numeric range on an
-/// attribute. These are the only shapes `extract_logs` puts in its prune
-/// channel.
+/// attribute. The prune-only `NumNotEq` arm `extract_logs` also builds is not
+/// carried, so the layout is unchanged (ADR-0095, prune-only not-equal
+/// amendment); dropping it only widens what the worker reads.
 fn prune_is_carried(p: &Predicate) -> bool {
     matches!(
         p,
@@ -3562,6 +3563,42 @@ mod tests {
         let (decoded, carried) = FlightTicket::decode_with_pushdown(&bytes, &key).expect("decode");
         assert_eq!(decoded, ticket);
         assert_eq!(carried, Some(pushdown));
+    }
+
+    /// A prune-only `NumNotEq` arm is not carried (ADR-0095, prune-only
+    /// not-equal amendment): the logs constructor drops it, the ticket encodes
+    /// at the same version and bytes as without it, and every other prune arm
+    /// survives the codec in order.
+    #[test]
+    fn not_equal_prune_arm_is_dropped_from_the_ticket() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let expected = sample_logs_pushdown();
+        let mut with_ne = expected.as_logs().expect("logs").clone();
+        let not_eq = Predicate::NumNotEq {
+            field: FieldSel::Attr("adv_engine_id".to_owned()),
+            value: 0,
+        };
+        with_ne.prune.insert(0, not_eq.clone());
+        with_ne.prune.insert(3, not_eq);
+        let pushdown = SlicePushdown::logs(&with_ne);
+        assert_eq!(pushdown, expected, "the NumNotEq arms are dropped");
+
+        let bytes = ticket
+            .encode_with_pushdown(&key, Some(&pushdown))
+            .expect("encode");
+        let plain = ticket
+            .encode_with_pushdown(&key, Some(&expected))
+            .expect("encode");
+        assert_eq!(bytes, plain, "the wire bytes are unchanged");
+        let (decoded, carried) = FlightTicket::decode_with_pushdown(&bytes, &key).expect("decode");
+        assert_eq!(decoded, ticket);
+        let carried = carried.expect("pushdown");
+        assert_eq!(
+            carried.as_logs().map(|p| p.prune.clone()),
+            expected.as_logs().map(|p| p.prune.clone())
+        );
+        assert_eq!(carried.as_logs().map(|p| p.prune.len()), Some(5));
     }
 
     /// The spans constructor keeps only the carried fields, and the logs

@@ -71,7 +71,7 @@ use ravel_logseg::key_index::{
     Key8, KeyProbe, KeyProbeStep, KeyType, key_probe_prefix_range, locate_key,
 };
 use ravel_logseg::page_dir::PageDir;
-use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats};
+use ravel_logseg::skip_index::{Level0Entry, NumArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError,
@@ -2646,7 +2646,7 @@ impl LogSegmentFetcher {
             && !prune.is_empty()
             && prune
                 .iter()
-                .all(|p| matches!(p, Predicate::NumRange { .. }))
+                .all(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }))
     }
 
     /// The predicate-free plan fast path (#693): read the footer via the
@@ -4525,7 +4525,7 @@ impl FilterSections {
             && stream_attrs.is_empty()
             && prune
                 .iter()
-                .all(|p| matches!(p, Predicate::NumRange { .. }));
+                .all(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }));
         if reads_none {
             FilterSections::Skip
         } else {
@@ -7072,9 +7072,9 @@ impl BlockRangeFetcher {
         // candidate set). Bloom/POSTINGS arms are not resolved
         // here: they narrow further at decode over the fetched buffer, which is
         // sound because that narrowing only ever skips a fetched block.
-        let numeric: Vec<NumRangeArm> = if prune
+        let numeric: Vec<NumArm> = if prune
             .iter()
-            .any(|p| matches!(p, Predicate::NumRange { .. }))
+            .any(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }))
         {
             let field_dir = self
                 .place_and_decode_field_dir(
@@ -7430,7 +7430,7 @@ impl BlockRangeFetcher {
         // it there is a real saved GET.
         let wants_numeric = prune
             .iter()
-            .any(|p| matches!(p, Predicate::NumRange { .. }));
+            .any(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }));
         let (numeric, selected) = if wants_numeric || !columns.is_all() {
             let field_dir: &FieldDir = if let Some(dirs) = dirs {
                 dirs.field_dir()
@@ -7917,7 +7917,7 @@ impl BlockRangeFetcher {
     /// full extent from its SKIP_IDX level-0 entry, never a sub-block slice
     /// (ADR-0107 decision 1).
     ///
-    /// `numeric` are the query's prune-only [`NumRangeArm`]s, already resolved to
+    /// `numeric` are the query's prune-only [`NumArm`]s, already resolved to
     /// this object's own column ids against its FIELD_DIR
     /// ([`FieldDir::numeric_range_arms`]). They narrow the candidate set to the
     /// blocks whose recorded numeric bounds can still hold a matching row, exactly
@@ -7938,7 +7938,7 @@ impl BlockRangeFetcher {
         blocks_offset: u64,
         ts_min_ns: i64,
         ts_max_ns: i64,
-        numeric: &[NumRangeArm],
+        numeric: &[NumArm],
     ) -> Result<Vec<BlockExtent>, LogFetchError> {
         let candidates = skip.candidate_blocks(ts_min_ns, ts_max_ns, None, numeric);
         let mut out = Vec::with_capacity(candidates.len());

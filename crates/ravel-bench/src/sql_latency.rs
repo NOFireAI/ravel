@@ -5544,9 +5544,11 @@ mod tests {
     /// pin, so the whole-segment fast path is taken.
     const WHOLE_OBJECTS: usize = 4;
 
-    /// The q02 shape from #2121 Stage 0: a count over a declared-column
-    /// predicate, which the whole-segment fast path serves.
-    const WHOLE_OBJECT_SQL: &str = "SELECT count(*) FROM logs WHERE duration_ms <> 0";
+    /// A count over a declared-column predicate that pushes no block
+    /// predicate, so the whole-segment fast path serves it. The bare q02 shape
+    /// `duration_ms <> 0` pushes a prune-only arm (#3240) and leaves the fast
+    /// path for the plan phase.
+    const WHOLE_OBJECT_SQL: &str = "SELECT count(*) FROM logs WHERE abs(duration_ms) <> 0";
 
     /// Measure [`WHOLE_OBJECT_SQL`] over [`WHOLE_OBJECTS`] one-record objects
     /// through [`measure_corpus`], the core both the tenant and the generated

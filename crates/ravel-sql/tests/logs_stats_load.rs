@@ -434,10 +434,10 @@ async fn eligible_min_max_inside_a_scalar_subquery_still_answers_from_metadata()
 
 /// Deliverable 1 regression, exact TWO. q02 (`COUNT(*) WHERE status <> 200`)
 /// over a segment whose stamp matches its entry
-/// keeps its `status <> 200` residual filter -- `<>` is NEVER pushed to the
-/// prune channel (`int_range_bounds` declines `NotEq`), so the hoist must not
-/// mistake it for a prune predicate and skip the load. The load fires (two
-/// GETs) and the answer comes from the dictionary with no scan.
+/// keeps its `status <> 200` residual filter and pushes only a prune-only
+/// `NumNotEq` arm, which the hoist counts as no prune predicate, so it must
+/// not skip the load. The load fires (two GETs) and the answer comes from the
+/// dictionary with no scan.
 ///
 /// Answer: `non_null_count(5) - count(200)(3) = 2`.
 ///
@@ -615,4 +615,205 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
         2,
         "exactly the HEAD GET and the one column-stats GET; no scan"
     );
+}
+
+/// `status` and `bytes`, both declared I64: the second column gives a
+/// `NumRange` arm a column of its own to sit on beside the `NumNotEq` arm.
+fn status_and_bytes_cols() -> Vec<DeclaredColumn> {
+    vec![
+        DeclaredColumn::new("status", DeclaredType::I64),
+        DeclaredColumn::new("bytes", DeclaredType::I64),
+    ]
+}
+
+/// Exact ZERO. Only a prune list holding nothing but `NumNotEq` arms counts
+/// as empty for the load decision. `status <> 404 AND bytes > 0` pushes a
+/// `NumNotEq` arm on `status` and a `NumRange` arm on `bytes`; the range arm
+/// keeps every metadata-only path declining (a range prune changes which rows
+/// the scan emits, and q02 admits only a bare `<>` filter), so the load stays
+/// skipped exactly as it was before the `NumNotEq` arm existed.
+///
+/// Pre-fix demonstration: making `prune_is_rewrite_neutral` answer `true` for
+/// every prune list (ignoring every arm, not only `NumNotEq`) fires the load
+/// and this becomes 1.
+#[tokio::test]
+async fn not_equal_beside_a_range_arm_still_skips_the_load() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let executor = executor(&store);
+
+    let (plan, batches) = run(
+        &executor,
+        snapshot_of(Vec::new()),
+        "SELECT COUNT(*) FROM logs WHERE status <> 404 AND bytes > 0",
+        &status_and_bytes_cols(),
+    )
+    .await;
+
+    assert!(
+        !plan.contains("MetadataOnlyExec"),
+        "a NumRange arm beside the NumNotEq arm refuses the rewrite; plan was:\n{plan}"
+    );
+    assert_eq!(scalar(&batches, 0), Some(0), "empty snapshot counts zero");
+    assert_eq!(
+        store.gets(),
+        0,
+        "a NumRange arm declines every stats path, so the load must not fire"
+    );
+}
+
+/// One per-record-`status` record at `ts`; `None` writes no `status` at all.
+fn status_record(ts: i64, status: Option<i64>) -> ravel_logseg::LogRecord {
+    use ravel_logseg::{AttrValue, stream_attrs_bytes};
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    ravel_logseg::LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: format!("row at {ts}"),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: status
+            .map(|v| vec![("status".to_string(), AttrValue::I64(v))])
+            .unwrap_or_default(),
+    }
+}
+
+/// Write `statuses` as one real RLOG object, one record per block, ts 1..=n.
+async fn write_one_record_blocks(
+    store: &Arc<CountingStore>,
+    key: &str,
+    statuses: &[Option<i64>],
+) -> SegmentRef {
+    let mut w = ravel_logseg::RlogWriter::new(
+        ravel_logseg::RlogConfig {
+            block_target_records: 1,
+            ..ravel_logseg::RlogConfig::default()
+        },
+        ravel_logseg::writer::ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    );
+    for (i, status) in statuses.iter().enumerate() {
+        w.push(status_record(i as i64 + 1, *status)).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let object_size = bytes.len() as u64;
+    store
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size,
+        min_event_ts_ns: 1,
+        max_event_ts_ns: statuses.len() as i64,
+        sample_count: statuses.len() as u64,
+        ..seg_ref(1, statuses.len() as u64)
+    }
+}
+
+/// The value of `name=N` on `line`, when the line carries one.
+fn metric(line: &str, name: &str) -> Option<usize> {
+    let at = line.find(&format!("{name}="))? + name.len() + 1;
+    let digits: String = line[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// `(blocks_total, blocks_scanned)` of the executed `LogsScanExec`, plus the
+/// statement's `COUNT(*)`, for `sql` over `snapshot`.
+async fn scanned_count(
+    executor: &SqlExecutor,
+    snapshot: Snapshot,
+    sql: &str,
+) -> (i64, usize, usize) {
+    let (plan, batches) = run(executor, snapshot.clone(), sql, &status_col()).await;
+    assert!(
+        plan.contains("LogsScanExec") && !plan.contains("MetadataOnlyExec"),
+        "with no .cstat object the statement must scan; plan was:\n{plan}"
+    );
+    let count = scalar(&batches, 0).expect("COUNT(*) is never NULL");
+    let analyzed = executor
+        .plan_pinned(
+            TENANT,
+            snapshot,
+            sql,
+            &QueryAccounting::new(),
+            &status_col(),
+        )
+        .await
+        .expect("plan")
+        .execute_analyzed()
+        .await
+        .expect("execute analyzed");
+    let shown = &analyzed.plan_with_metrics;
+    let scan = shown
+        .lines()
+        .find(|l| l.trim_start().starts_with("LogsScanExec"))
+        .unwrap_or_else(|| panic!("no LogsScanExec:\n{shown}"));
+    let total = metric(scan, "blocks_total").unwrap_or_else(|| panic!("{shown}"));
+    let scanned = metric(scan, "blocks_scanned").unwrap_or_else(|| panic!("{shown}"));
+    (count, total, scanned)
+}
+
+/// A tenant with no `.cstat` object: the load now fires for q02 (the HEAD GET
+/// finds nothing), the rewrite has no statistics to answer from, and the
+/// statement scans. The `NumNotEq` arm then does its own job: of eight
+/// one-record blocks, the four whose `status` is `0` are pruned before decode,
+/// the block with no `status` is kept, and the count is the three nonzero
+/// rows. The same statement OR-ed with a body equality no row satisfies
+/// pushes no arm, decodes all eight blocks, and counts the same three.
+///
+/// Pre-fix demonstration: dropping the `NumNotEq` arm in
+/// `declared_comparison_predicate` makes the pruned run scan all eight blocks.
+#[tokio::test]
+async fn not_equal_without_cstat_scans_and_prunes_the_all_equal_blocks() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let statuses = [
+        Some(0),
+        Some(0),
+        Some(200),
+        Some(0),
+        Some(404),
+        None,
+        Some(0),
+        Some(500),
+    ];
+    let seg = write_one_record_blocks(&store, "logs/ne-no-cstat.rlog", &statuses).await;
+    let executor = executor(&store);
+
+    let (count, total, scanned) = scanned_count(
+        &executor,
+        snapshot_of(vec![seg.clone()]),
+        "SELECT COUNT(*) FROM logs WHERE status <> 0",
+    )
+    .await;
+    let (plain_count, plain_total, plain_scanned) = scanned_count(
+        &executor,
+        snapshot_of(vec![seg]),
+        "SELECT COUNT(*) FROM logs WHERE status <> 0 OR body = 'zzz'",
+    )
+    .await;
+
+    assert_eq!(count, 3, "200, 404 and 500");
+    assert_eq!(plain_count, count, "pruning never changes the count");
+    assert_eq!(total, 8);
+    assert_eq!(
+        scanned, 4,
+        "the four all-zero blocks are pruned; the no-stat block is kept"
+    );
+    assert_eq!((plain_total, plain_scanned), (8, 8), "no arm, no pruning");
 }

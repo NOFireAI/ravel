@@ -412,6 +412,7 @@ use tokio::sync::OnceCell;
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::error::SqlError;
 use crate::late_materialization::{RowRef, row_ref_field};
+use crate::logs_pushdown::prune_is_rewrite_neutral;
 use crate::logs_schema::{
     FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
@@ -686,8 +687,12 @@ fn content_columns(pred: &Predicate, fixed: &mut BTreeSet<usize>, attrs: &mut BT
         }
         // `NumRange` is prune-only (ADR-0095 decision 6): it never reaches the
         // exact content channel, so it reads no columns, same as ts/stream. The
-        // planner-side pushdown that would emit it is #278's job.
-        Predicate::TsRange { .. } | Predicate::StreamIn(_) | Predicate::NumRange { .. } => {}
+        // planner-side pushdown that would emit it is #278's job. `NumNotEq` is
+        // prune-only on the same terms.
+        Predicate::TsRange { .. }
+        | Predicate::StreamIn(_)
+        | Predicate::NumRange { .. }
+        | Predicate::NumNotEq { .. } => {}
         Predicate::HasWord { field, .. } | Predicate::Equals { field, .. } => match field {
             FieldSel::Body => {
                 fixed.insert(LOG_COL_BODY);
@@ -2138,8 +2143,18 @@ impl LogsScanExec {
     /// `content`, `prune`, `key_equals`); each is covered here, and `erasure` comes from the
     /// resolved snapshot rather than the pushdown.
     fn stats_are_exact(&self) -> bool {
+        self.prune.is_empty() && self.metadata_rewrite_stats_are_exact()
+    }
+
+    /// [`Self::stats_are_exact`] for the metadata-only aggregate rewrite
+    /// ([`crate::metadata_agg`]), which replaces the whole scan: a prune list
+    /// of only `NumNotEq` arms counts as empty
+    /// ([`prune_is_rewrite_neutral`]), since what those arms prune cannot
+    /// change an answer read from the statistics. Every other caller keeps the
+    /// strict check, because the scan does emit fewer rows when the arm prunes.
+    fn metadata_rewrite_stats_are_exact(&self) -> bool {
         self.content.is_empty()
-            && self.prune.is_empty()
+            && prune_is_rewrite_neutral(&self.prune)
             && self.key_equals.is_empty()
             && self.erasure.is_empty()
             && self
@@ -2294,8 +2309,9 @@ impl LogsScanExec {
     /// which per SQL three-valued logic excludes NULL rows the same way the
     /// scan path's per-row `<>` evaluation would). `None` means fall back to
     /// scanning, for every reason [`Self::declared_min_max_all`] does at its call
-    /// site ([`Self::stats_are_exact`]: no pending erasure, no content or
-    /// prune predicate, and a ts bound that clips no touched segment) plus no
+    /// site ([`Self::metadata_rewrite_stats_are_exact`]: no pending erasure,
+    /// no content predicate, no prune arm other than `NumNotEq`, and a ts
+    /// bound that clips no touched segment) plus no
     /// `Str` support, a loaded column-stats object covering every touched
     /// segment whose entry [`merged_view_entry`] grants (an entry whose row
     /// accounting disagrees with the joined `SegmentRef::sample_count`
@@ -2308,7 +2324,7 @@ impl LogsScanExec {
     /// no exact per-value count to subtract, so a count derived from it could
     /// be wrong outright, not merely unavailable.
     ///
-    /// The [`Self::stats_are_exact`] gate is what makes a clipping ts bound
+    /// The [`Self::metadata_rewrite_stats_are_exact`] gate is what makes a clipping ts bound
     /// safe. Segments are resolved on OVERLAP, and a pure `ts` bound is
     /// reported `Exact` by `LogsTableProvider::supports_filters_pushdown`, so
     /// the `FilterExec` that carried it is deleted and the bound survives only
@@ -2317,7 +2333,7 @@ impl LogsScanExec {
     /// cannot be derived from it at all; summing its whole-segment counts
     /// would answer a different query than the one asked.
     pub(crate) fn declared_not_equal_count(&self, k: usize, literal: &ScalarValue) -> Option<u64> {
-        if !self.stats_are_exact() {
+        if !self.metadata_rewrite_stats_are_exact() {
             return None;
         }
         let declared = self.declared.get(k)?;
@@ -2374,7 +2390,7 @@ impl LogsScanExec {
     /// touched segment's exact dictionary. `None` means fall back to
     /// scanning, for the same reasons [`Self::declared_not_equal_count`]
     /// does, the [`merged_view_entry`] gate on every entry read and the
-    /// [`Self::stats_are_exact`] gate included: this shape carries
+    /// [`Self::metadata_rewrite_stats_are_exact`] gate included: this shape carries
     /// no `FilterExec` at all, so a `WHERE ts < ...` bound that clips a
     /// touched segment reaches here purely as `self.ts_min`/`self.ts_max` and
     /// nothing else in the plan would refuse for it.
@@ -2383,7 +2399,7 @@ impl LogsScanExec {
     /// that motivate this repo's bit-pattern float-comparison rule elsewhere
     /// never arise for a declared column's value domain.
     pub(crate) fn declared_group_counts(&self, k: usize) -> Option<DeclaredGroupCounts> {
-        if !self.stats_are_exact() {
+        if !self.metadata_rewrite_stats_are_exact() {
             return None;
         }
         let declared = self.declared.get(k)?;
@@ -2423,8 +2439,9 @@ impl LogsScanExec {
     /// `FIRST_DECLARED_COL + k` (ADR-0850's q03/q04/q30 shapes, #861), summed
     /// across every touched segment's exact per-object statistics. `None` means
     /// fall back to scanning, for the same reasons
-    /// [`Self::declared_not_equal_count`] does (the [`Self::stats_are_exact`]
-    /// gate: no pending erasure, no content or prune predicate, a ts bound that
+    /// [`Self::declared_not_equal_count`] does (the
+    /// [`Self::metadata_rewrite_stats_are_exact`] gate: no pending erasure, no
+    /// content predicate, no prune arm other than `NumNotEq`, a ts bound that
     /// clips no touched segment; and the [`merged_view_entry`] gate, which
     /// refuses a segment's whole entry, its stored sum included, when the
     /// entry's row accounting disagrees with the joined
@@ -2444,7 +2461,7 @@ impl LogsScanExec {
     /// the sum is exact independently of whether the value dictionary was kept,
     /// so a high-cardinality integer column still decomposes.
     pub(crate) fn declared_column_sum(&self, k: usize) -> Option<DeclaredColumnSum> {
-        if !self.stats_are_exact() {
+        if !self.metadata_rewrite_stats_are_exact() {
             return None;
         }
         let declared = self.declared.get(k)?;
@@ -3588,6 +3605,15 @@ mod cstat_reconcile_tests {
     /// as its `.cstat` entries. No predicate and unbounded ts, so
     /// `stats_are_exact` holds and the entry itself is what decides each read.
     fn scan_with(sample_count: u64, columns: Vec<ColumnStat>) -> LogsScanExec {
+        scan_with_prune(sample_count, columns, Vec::new())
+    }
+
+    /// [`scan_with`] carrying `prune` as the scan's prune arms.
+    fn scan_with_prune(
+        sample_count: u64,
+        columns: Vec<ColumnStat>,
+        prune: Vec<Predicate>,
+    ) -> LogsScanExec {
         let seg = seg_ref(sample_count);
         let declared = vec![DeclaredColumn::new(COL, DeclaredType::I64)];
         let mut segments = HashMap::new();
@@ -3617,7 +3643,7 @@ mod cstat_reconcile_tests {
             i64::MIN,
             i64::MAX,
             Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
+            Arc::new(prune),
             Arc::new(Vec::new()),
             None,
             PhaseAccounting::new(),
@@ -3675,6 +3701,39 @@ mod cstat_reconcile_tests {
         let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(1)], not_equal_404);
         assert_eq!(answered, Some(3), "4 non-null rows less the one 404");
         assert_eq!(delta, 0, "a reconciled entry is not a defect");
+    }
+
+    /// The metadata rewrite counts a prune list of only `NumNotEq` arms as
+    /// empty: the `status <> 404` arm its own q02 filter pushes leaves the
+    /// answer at 3. A `NumRange` arm beside it refuses the rewrite, and the
+    /// strict `stats_are_exact` the plan statistics read refuses for the
+    /// `NumNotEq` arm alone, since the scan emits fewer rows when it prunes.
+    ///
+    /// Pre-fix demonstration: making `prune_is_rewrite_neutral` answer `true`
+    /// for every prune list reads `Some(3)` for the two-arm scan.
+    #[test]
+    fn q02_ignores_only_not_equal_prune_arms() {
+        let not_eq = Predicate::NumNotEq {
+            field: FieldSel::Attr(COL.to_string()),
+            value: 404,
+        };
+        let range = Predicate::NumRange {
+            field: FieldSel::Attr("bytes".to_string()),
+            ty: FieldType::I64,
+            min: Some(0),
+            max: None,
+        };
+        let _guard = drops_lock();
+
+        let ne_only = scan_with_prune(SAMPLE_COUNT, vec![status_stat(1)], vec![not_eq.clone()]);
+        assert_eq!(not_equal_404(&ne_only), Some(3), "a NumNotEq arm alone");
+        assert!(
+            !ne_only.stats_are_exact(),
+            "plan statistics stay strict for a NumNotEq arm"
+        );
+
+        let both = scan_with_prune(SAMPLE_COUNT, vec![status_stat(1)], vec![not_eq, range]);
+        assert_eq!(not_equal_404(&both), None, "a NumRange arm refuses");
     }
 
     /// q08 (`declared_group_counts`): the same divergent entry is refused and
