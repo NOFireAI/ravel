@@ -364,6 +364,12 @@ path = "tests/group_by_string_keys.rs"
 name = "esql"
 path = "tests/esql.rs"
 
+# Issue #3237's measurement prints every figure before asserting it, so it is
+# run by name with `--nocapture`.
+[[test]]
+name = "logs_filter_coalescer_pin"
+path = "tests/logs_filter_coalescer_pin.rs"
+
 [[bench]]
 name = "samples_scan"
 harness = false
