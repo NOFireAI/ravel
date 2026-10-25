@@ -1168,11 +1168,17 @@ mod tests {
         };
         let limits = ColumnStatsLimits::default();
         assert_eq!(
-            both_decoders_refuse(&frame(&[keyed(0x10, 1), keyed(0x30, 2), keyed(0x20, 3)]), &limits),
+            both_decoders_refuse(
+                &frame(&[keyed(0x10, 1), keyed(0x30, 2), keyed(0x20, 3)]),
+                &limits
+            ),
             SnapshotFormatError::ColumnStatsSegmentsUnsorted
         );
         assert_eq!(
-            both_decoders_refuse(&frame(&[keyed(0x10, 1), keyed(0x20, 2), keyed(0x20, 3)]), &limits),
+            both_decoders_refuse(
+                &frame(&[keyed(0x10, 1), keyed(0x20, 2), keyed(0x20, 3)]),
+                &limits
+            ),
             SnapshotFormatError::ColumnStatsDuplicateSegment
         );
         let mut short = keyed(0x10, 1);
@@ -1196,8 +1202,7 @@ mod tests {
     fn empty_dictionary_with_nonzero_non_null_rejected() {
         let mut seg = segment(1, 0, 1);
         seg.columns[0].dictionary = vec![];
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1215,8 +1220,7 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         // Drop one entry so the counts total 9 but non_null_count stays 10.
         seg.columns[0].dictionary.pop();
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1235,8 +1239,7 @@ mod tests {
         seg.columns[0].dictionary[0].value = Some(ColumnValue {
             kind: Some(ravel_proto::catalog::v1::column_value::Kind::B(true)),
         });
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1263,8 +1266,7 @@ mod tests {
                 count: 5,
             },
         ];
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1280,8 +1282,7 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         let dup = seg.columns[0].clone();
         seg.columns.push(dup);
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1297,8 +1298,7 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         seg.columns[0].min = Some(i64_value(9));
         seg.columns[0].max = Some(i64_value(0));
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1315,8 +1315,7 @@ mod tests {
         seg.columns[0].non_null_count = 0;
         seg.columns[0].dictionary = vec![];
         // min/max still populated: inconsistent with an all-null column.
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1409,8 +1408,7 @@ mod tests {
     fn dictionary_entries_without_present_flag_rejected() {
         let mut seg = segment(1, 0, 1);
         seg.columns[0].dictionary_present = false;
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1433,8 +1431,7 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         // True dictionary sum is 45; claim 44.
         seg.columns[0].sum = Some(44);
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1477,8 +1474,7 @@ mod tests {
             },
         ];
         seg.columns[0].sum = Some(6);
-        let err =
-            encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
         let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
         assert_eq!(decoded_err, err);
         assert_eq!(
@@ -1710,8 +1706,8 @@ mod tests {
     fn crc_mismatches_refused_by_both_decoders() {
         let mut seg = segment(1, 0, 1);
         seg.writer_id = vec![0x77; 32];
-        let bytes = encode_column_stats_v3([0x11; 16], 3, [0x22; 32], &[seg], u64::MAX)
-            .expect("encodes");
+        let bytes =
+            encode_column_stats_v3([0x11; 16], 3, [0x22; 32], &[seg], u64::MAX).expect("encodes");
         let limits = ColumnStatsLimits::default();
         let end = bytes.len();
 
@@ -1744,15 +1740,9 @@ mod tests {
         let segments = arb_v3_segments(2);
         let raw = column_stats_segments_concat(&segments);
         for claimed in [0u64, 1, 3] {
-            let bytes = frame_column_stats_body(
-                3,
-                [0x11; 16],
-                3,
-                vec![vec![0x22; 32]],
-                claimed,
-                &raw,
-            )
-            .expect("frames");
+            let bytes =
+                frame_column_stats_body(3, [0x11; 16], 3, vec![vec![0x22; 32]], claimed, &raw)
+                    .expect("frames");
             assert_eq!(
                 both_decoders_refuse(&bytes, &ColumnStatsLimits::default()),
                 SnapshotFormatError::ColumnStatsSegmentCountMismatch {
@@ -1813,8 +1803,9 @@ mod tests {
                 Err(SnapshotFormatError::Decompress(_))
             ));
             let mut consumed = 0;
-            let err = decode_streamed_counting(&bytes, &limits, &|_| true, &mut Unmetered, &mut consumed)
-                .expect_err("an inflating body is refused");
+            let err =
+                decode_streamed_counting(&bytes, &limits, &|_| true, &mut Unmetered, &mut consumed)
+                    .expect_err("an inflating body is refused");
             assert!(
                 matches!(err, SnapshotFormatError::Decompress(_)),
                 "declared {declared}: {err:?}"
@@ -1853,7 +1844,11 @@ mod tests {
         // varint(1000) then ten bytes: the length runs past the body's end.
         let mut past_end = vec![0xE8, 0x07];
         past_end.extend_from_slice(&[0u8; 10]);
-        let bytes = frame_raw(3, &v3_header(1, past_end.len() as u64), &compress(&past_end));
+        let bytes = frame_raw(
+            3,
+            &v3_header(1, past_end.len() as u64),
+            &compress(&past_end),
+        );
         let err = both_decoders_refuse(&bytes, &limits);
         assert!(
             matches!(err, SnapshotFormatError::ColumnStatsSegmentDecode(_)),
@@ -1870,7 +1865,11 @@ mod tests {
         // An eleven-byte varint is longer than any u64 length.
         let mut overlong = vec![0xFF; 10];
         overlong.push(0x01);
-        let bytes = frame_raw(3, &v3_header(1, overlong.len() as u64), &compress(&overlong));
+        let bytes = frame_raw(
+            3,
+            &v3_header(1, overlong.len() as u64),
+            &compress(&overlong),
+        );
         let err = both_decoders_refuse(&bytes, &limits);
         assert!(
             matches!(err, SnapshotFormatError::ColumnStatsSegmentDecode(_)),

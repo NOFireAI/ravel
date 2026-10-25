@@ -5256,7 +5256,13 @@ impl crate::charged::DecodeReserver for CatalogDecodeReserver {
         declared: u64,
         ceiling: u64,
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
-        reserve_decoded_evicting(&self.budget, &self.decoded, &self.retries, declared, ceiling)
+        reserve_decoded_evicting(
+            &self.budget,
+            &self.decoded,
+            &self.retries,
+            declared,
+            ceiling,
+        )
     }
 
     fn owned(&self) -> Box<dyn crate::charged::DecodeReserver + Send> {

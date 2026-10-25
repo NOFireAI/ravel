@@ -1006,10 +1006,8 @@ mod tests {
             ceiling: u64,
         ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
             let reservation = crate::charged::reserve_decoded(&self.budget, declared, ceiling)?;
-            self.high_water.fetch_max(
-                self.budget.reserved(),
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            self.high_water
+                .fetch_max(self.budget.reserved(), std::sync::atomic::Ordering::SeqCst);
             Ok(reservation)
         }
 
