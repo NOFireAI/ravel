@@ -32,7 +32,9 @@
 //! The statement's `ts` bound sits inside every segment's last block, so it
 //! prunes no block, but no segment is contained in the window, which keeps
 //! the scan off the whole-segment fast path; a block-range threshold of 0 puts
-//! every segment on the planned route.
+//! every segment on the planned route. The pushed `url LIKE` contains arm
+//! keeps it off that path too, and is the rejection the scan records, since
+//! the content check runs before the containment check.
 //!
 //! The answer is the early rows at offsets 0..10, so `T*`, its tenth `ts`, is
 //! offset 9, and the blocks whose minimum is at or under it, which every plan
@@ -629,7 +631,7 @@ async fn drive(sql: &str, fixture: Fixture) -> Driven {
         directories: setup.directories,
     };
     assert!(
-        metric(&scan, "fast_path_rejected_segment_not_contained") > 0,
+        metric(&scan, "fast_path_rejected_block_predicate") > 0,
         "the planned path ran:\n{explain}"
     );
     assert_eq!(

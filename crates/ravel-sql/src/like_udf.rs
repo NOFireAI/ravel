@@ -46,14 +46,16 @@
 //!
 //! # Pushdown
 //!
-//! None. `LIKE` is a substring predicate and the RLOG reader offers only exact
-//! `HasWord` (token/phrase) and `Equals` predicates ([`ravel_logseg::Predicate`]),
-//! neither of which is a sound superset of SQL substring `LIKE`: `LIKE '%foo%'`
-//! matches `"foobar"`, whose only token is `"foobar"`, so a `HasWord{word:"foo"}`
-//! prune (even block-level, widen-only) would drop that block and lose the row.
-//! `LIKE` is therefore evaluated exactly by DataFusion's mandatory `Inexact`
-//! residual over the scanned rows and pushes nothing; [`crate::logs_pushdown`]
-//! recognizes neither `Expr::Like` nor this UDF.
+//! `col LIKE '%literal%'` and `col NOT LIKE '%literal%'` on a declared `Str`
+//! column, as a top-level conjunct, are pushed to the RLOG reader as a
+//! [`ravel_logseg::Predicate::Contains`] arm (ADR-2773, contains-arm
+//! amendment): [`pushable_contains`] reads the shape, from either a raw
+//! `Expr::Like` or this UDF's call, and [`crate::logs_pushdown`] checks the
+//! column. The arm is a byte-substring test on the cell, which for a UTF-8
+//! cell and a UTF-8 literal equals the character-wise substring match. It is
+//! not a token test: `HasWord{word:"foo"}` would drop `"foobar"`, which
+//! `LIKE '%foo%'` matches. The filter stays `Inexact`, so this UDF still
+//! evaluates every row the scan returns. Every other `LIKE` pushes nothing.
 
 use std::sync::Arc;
 
@@ -283,6 +285,78 @@ impl FunctionRewrite for LikeToUdf {
             return Ok(Transformed::yes(call));
         }
         Ok(Transformed::no(expr))
+    }
+}
+
+/// A `col LIKE '%literal%'` or `col NOT LIKE '%literal%'` predicate whose
+/// match is a plain byte-substring test for `needle`, the shape the logs scan
+/// pushes as a [`ravel_logseg::Predicate::Contains`] arm (ADR-2773,
+/// contains-arm amendment). Whether `column` is a declared `Str` column is the
+/// caller's question ([`crate::logs_pushdown`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushableContains<'a> {
+    /// The `LIKE`'s first operand, unresolved.
+    pub column: &'a Expr,
+    /// The literal between the two `%`s, never empty.
+    pub needle: String,
+    /// `true` for `NOT LIKE`.
+    pub negated: bool,
+}
+
+/// The [`PushableContains`] `expr` denotes, if any. Two shapes are read: a
+/// raw `Expr::Like`, and the [`LIKE_UDF`] call [`LikeToUdf`] rewrites one into
+/// (the shape a session registering `logs` hands the provider). Either must be
+/// case-sensitive, carry no `ESCAPE` clause, and take a string literal pattern.
+///
+/// The pattern must classify as `%literal%` with a non-empty literal. Every
+/// exclusion the amendment lists answers `None`: a `_` anywhere, an escape
+/// character anywhere (an escaped `%` or `_`, or any other escape sequence),
+/// an `ESCAPE` clause, a `%` anywhere but the two ends (`'a%b'`), an anchored
+/// pattern (`'abc%'`, `'%abc'`), `ILIKE`, and a pattern that is not a literal.
+/// `'%%'` and `''` answer `None` too: the first matches every non-NULL value
+/// and the second only the empty string, neither a substring test. A `LIKE`
+/// that is not a top-level conjunct never reaches here; the caller only
+/// passes conjuncts.
+pub(crate) fn pushable_contains(expr: &Expr) -> Option<PushableContains<'_>> {
+    let (column, pattern, negated) = match expr {
+        Expr::Like(Like {
+            negated,
+            expr: inner,
+            pattern,
+            escape_char: None,
+            case_insensitive: false,
+        }) => (&**inner, &**pattern, *negated),
+        Expr::ScalarFunction(sf) if sf.func.name() == LIKE_UDF => {
+            let udf = sf.func.inner().downcast_ref::<LikeUdf>()?;
+            if udf.escape_char.is_some() {
+                return None;
+            }
+            let [inner, pattern] = sf.args.as_slice() else {
+                return None;
+            };
+            (inner, pattern, udf.negated)
+        }
+        _ => return None,
+    };
+    let Expr::Literal(
+        ScalarValue::Utf8(Some(pattern))
+        | ScalarValue::LargeUtf8(Some(pattern))
+        | ScalarValue::Utf8View(Some(pattern)),
+        _,
+    ) = pattern
+    else {
+        return None;
+    };
+    if pattern.contains(['_', DEFAULT_ESCAPE]) {
+        return None;
+    }
+    match LikeMatcher::compile(pattern.as_str(), DEFAULT_ESCAPE).kind {
+        MatchKind::Substring(needle) if !needle.is_empty() => Some(PushableContains {
+            column,
+            needle,
+            negated,
+        }),
+        _ => None,
     }
 }
 
@@ -676,6 +750,42 @@ mod tests {
         // Empty pattern matches only the empty string.
         assert!(matches("", ""));
         assert!(!matches("", "x"));
+    }
+
+    /// The needle is the literal between the `%`s, character for character;
+    /// repeated end `%`s and every string literal type are accepted, and a
+    /// non-literal pattern is not.
+    #[test]
+    fn pushable_contains_reads_the_needle() {
+        use datafusion::prelude::{col, lit};
+
+        let raw = |pattern: Expr, negated| {
+            Expr::Like(Like {
+                negated,
+                expr: Box::new(col("region")),
+                pattern: Box::new(pattern),
+                escape_char: None,
+                case_insensitive: false,
+            })
+        };
+        let e = raw(lit("%%é-ü%%"), true);
+        let got = pushable_contains(&e).expect("pushable");
+        assert_eq!(
+            (got.column, got.needle.as_str(), got.negated),
+            (&col("region"), "é-ü", true)
+        );
+        for pattern in [
+            lit(ScalarValue::LargeUtf8(Some("%x%".into()))),
+            lit(ScalarValue::Utf8View(Some("%x%".into()))),
+        ] {
+            let e = raw(pattern, false);
+            assert_eq!(pushable_contains(&e).map(|p| p.needle), Some("x".into()));
+        }
+        assert_eq!(pushable_contains(&raw(col("other"), false)), None);
+        assert_eq!(
+            pushable_contains(&raw(lit(ScalarValue::Utf8(None)), false)),
+            None
+        );
     }
 
     /// The scoped rewrite resolves an unqualified column through the schema

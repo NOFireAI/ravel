@@ -626,6 +626,9 @@ struct ColumnarBlockJob {
     block: DFResult<Option<usize>>,
     /// The scan's shared-dictionary values ([`LogScanStream::str_values`]).
     str_values: SharedStrValuesCache,
+    /// [`BlockMetrics::str_cells_validated`], which the build adds its
+    /// plain-page validations to.
+    str_cells_validated: Count,
     /// Panic inside the gate job instead of running it.
     #[cfg(test)]
     panic_for_test: bool,
@@ -672,6 +675,7 @@ impl ColumnarBlockJob {
                             first_row: 0,
                         }),
                         &self.str_values,
+                        &self.str_cells_validated,
                     )
                 });
                 match built {
@@ -1811,6 +1815,7 @@ impl LogScanStream {
                                 segment: this.current_seg_ordinal,
                                 block,
                                 str_values: Arc::clone(&this.str_values),
+                                str_cells_validated: this.blocks.str_cells_validated.clone(),
                                 #[cfg(test)]
                                 panic_for_test: take_columnar_job_panic(
                                     this.current_seg

@@ -1394,6 +1394,13 @@ struct BlockMetrics {
     /// Rows of this partition's decoded blocks the pushed exact predicate was
     /// evaluated over ([`ScanStats::rows_predicate_evaluated`]).
     rows_predicate_evaluated: Count,
+    /// Cells this partition's pushed `Contains` arms tested for their needle
+    /// ([`ScanStats::contains_cells_tested`], ADR-2773 contains-arm amendment).
+    contains_cells_tested: Count,
+    /// String cells this partition UTF-8 validated: the reader's dictionary
+    /// entries ([`ScanStats::str_cells_validated`]) plus every plain-page
+    /// `Str` cell the columnar build validated ([`build_columnar_batches`]).
+    str_cells_validated: Count,
     /// String dictionary values arrays this partition's declared `Str` columns
     /// built: one per row group dictionary per scan opening, one per per-block
     /// dictionary page, one per plain-page block, and one per extended copy
@@ -1554,6 +1561,10 @@ impl BlockMetrics {
                 .counter("blocks_predicate_dropped", partition),
             rows_predicate_evaluated: MetricBuilder::new(metrics)
                 .counter("rows_predicate_evaluated", partition),
+            contains_cells_tested: MetricBuilder::new(metrics)
+                .counter("contains_cells_tested", partition),
+            str_cells_validated: MetricBuilder::new(metrics)
+                .counter("str_cells_validated", partition),
             str_dict_values_built: MetricBuilder::new(metrics)
                 .counter("str_dict_values_built", partition),
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
@@ -1649,6 +1660,10 @@ impl BlockMetrics {
             .add(stats.blocks_predicate_dropped as usize);
         self.rows_predicate_evaluated
             .add(stats.rows_predicate_evaluated as usize);
+        self.contains_cells_tested
+            .add(stats.contains_cells_tested as usize);
+        self.str_cells_validated
+            .add(stats.str_cells_validated as usize);
     }
 }
 
