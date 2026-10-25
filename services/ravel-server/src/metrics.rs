@@ -3435,7 +3435,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_budget_bytes",
-        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the two resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
+        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the three resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
         "gauge",
     );
     write_sample(
