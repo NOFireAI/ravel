@@ -124,15 +124,20 @@ impl fmt::Debug for ReadServices {
 /// the manifest recorded, charged to [`QueryPhase::Probe`]; every other read
 /// is charged to [`QueryPhase::Scan`].
 ///
-/// The reader does not use the file's page index. The footer it hands out
-/// carries no column index or offset index, whatever options the caller
-/// passes, so the scan decodes every column chunk it reads by page header.
-/// Once the reader has handed out the footer, every range the scan reads
-/// that holds a whole column chunk has its page headers walked with
-/// [`check_page_headers`] before the range is handed to the decoder. A chunk
-/// that passed is not walked again by the reader or its clones. The
-/// table provider turns DataFusion's page index off, so the scans it plans
-/// read each column chunk as one whole range.
+/// The reader serves whole column chunks only. Once it has handed out the
+/// footer, it refuses a range that does not start on a column chunk's first
+/// byte and end on a column chunk's last byte, with
+/// [`ParquetReadError::Corrupt`] and before any GET for it; a range covering
+/// several adjacent whole chunks is served. Every chunk a served range holds
+/// has its page headers walked with [`check_page_headers`] before the range
+/// is handed to the decoder, and a chunk that passed is not walked again by
+/// the reader or its clones.
+///
+/// The footer it hands out carries no column index or offset index. With
+/// DataFusion's `enable_page_index` on, a scan whose predicate can prune
+/// pages asks for the page index region after the footer, and the scan ends
+/// in that refusal. The table provider turns DataFusion's page index off, so
+/// the scans it plans read each column chunk as one whole range.
 #[derive(Debug, Clone)]
 pub struct PinnedParquetReader {
     tenant: TenantHash,
@@ -232,6 +237,30 @@ impl PinnedParquetReader {
             walked.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Refuse `range` once the footer is handed out unless it starts on a
+    /// column chunk's first byte and ends on a column chunk's last byte.
+    fn check_whole_chunks(&self, range: &Range<u64>) -> Result<(), ParquetReadError> {
+        let Some(chunks) = self.chunks.get() else {
+            return Ok(());
+        };
+        let starts = chunks
+            .ranges
+            .binary_search_by_key(&range.start, |chunk| chunk.start)
+            .is_ok();
+        let ends = chunks
+            .ranges
+            .binary_search_by_key(&range.end, |chunk| chunk.end)
+            .is_ok();
+        if starts && ends {
+            return Ok(());
+        }
+        Err(self.corrupt(format!(
+            "the scan asked for bytes {}..{}, which do not start and end on column chunk \
+             boundaries; this reader serves whole column chunks only",
+            range.start, range.end
+        )))
     }
 
     fn cache_key(&self, offset: u64, len: u64) -> CacheKey {
@@ -819,7 +848,10 @@ fn check_arrow_schema(metadata: &Arc<ParquetMetaData>) -> Result<(), String> {
 impl AsyncFileReader for PinnedParquetReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         async move {
-            let bytes = self.read_range(range.clone(), QueryPhase::Scan).await;
+            let bytes = match self.check_whole_chunks(&range) {
+                Ok(()) => self.read_range(range.clone(), QueryPhase::Scan).await,
+                Err(err) => Err(err),
+            };
             bytes
                 .and_then(|bytes| self.check_chunks_in(&range, &bytes).map(|()| bytes))
                 .map_err(ParquetReadError::into_parquet)
@@ -838,6 +870,8 @@ impl AsyncFileReader for PinnedParquetReader {
             for range in ranges {
                 let len = self
                     .checked_len(&range)
+                    .map_err(ParquetReadError::into_parquet)?;
+                self.check_whole_chunks(&range)
                     .map_err(ParquetReadError::into_parquet)?;
                 let reservation = self
                     .limits
@@ -2953,6 +2987,115 @@ mod tests {
             want.sort_by_key(|range| format!("{range:?}"));
             assert_eq!(read, want, "{filter:?}");
         }
+    }
+
+    /// With DataFusion's page index on, the scan asks for the page index
+    /// region once it has the footer. The reader refuses that range before
+    /// any GET for it, so the scan ends in the typed refusal and reads no
+    /// byte of the file below the footer.
+    #[tokio::test]
+    async fn a_scan_with_the_page_index_on_is_refused_before_its_get() {
+        let bytes = many_page_file();
+        let memory = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
+        let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(&memory, "lake/t/a.parquet", bytes, false)
+            .await;
+        let footer_start = file.size - u64::from(file.footer_len) - TRAILER_LEN;
+        let table = fixture
+            .provider("t", 1, vec![file], false)
+            .await
+            .with_page_index()
+            .expect("table");
+        let ctx = fixture.session(&[("t", Arc::new(table))]);
+        let err = read_where(&ctx, "t", &["a", "b"], Some(ident("a").gt(lit(150_i64))))
+            .await
+            .expect_err("the page index read is refused");
+        match read_error(&err) {
+            Some(ParquetReadError::Corrupt { key, message }) => {
+                assert_eq!(key, "lake/t/a.parquet");
+                assert!(
+                    message.contains("this reader serves whole column chunks only"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected the whole-chunk refusal, got {other:?} from {err}"),
+        }
+        let read: Vec<_> = recording
+            .ranges()
+            .into_iter()
+            .filter(|range| !matches!(range, GetRange::Range(start, _) if *start >= footer_start))
+            .collect();
+        assert_eq!(read, Vec::new());
+    }
+
+    /// Once the footer is handed out, a range is served only when it starts
+    /// on a column chunk's first byte and ends on a column chunk's last byte.
+    /// A refused range, alone or in a batch, is not requested.
+    #[tokio::test]
+    async fn the_scan_phase_serves_whole_column_chunks_only() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let bytes = many_page_file();
+        let mut chunks: Vec<Range<u64>> = chunk_ranges_of(&bytes)
+            .into_iter()
+            .flatten()
+            .map(|range| match range {
+                GetRange::Range(start, end) => start..end,
+                _ => unreachable!("chunk ranges are explicit"),
+            })
+            .collect();
+        chunks.sort_by_key(|chunk| chunk.start);
+        assert_eq!(chunks[0].end, chunks[1].start, "{chunks:?}");
+        let footer = SerializedFileReader::new(bytes.clone()).expect("footer");
+        let column = footer.metadata().row_group(0).column(0);
+        let index_start =
+            u64::try_from(column.column_index_offset().expect("a column index")).expect("offset");
+        let index_len =
+            u64::try_from(column.column_index_length().expect("a column index")).expect("length");
+        assert!(index_start >= chunks[chunks.len() - 1].end, "{index_start}");
+
+        let memory = Arc::new(MemoryStore::new());
+        let recording = Arc::new(RecordingStore::new(Arc::clone(&memory), false));
+        let fixture = Fixture::new(Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture.put_file(&memory, KEY, bytes, false).await;
+        let mut reader = fixture.reader(file);
+        reader.metadata().await.expect("footer");
+
+        let whole = chunks[0].clone();
+        let adjacent = chunks[0].start..chunks[1].end;
+        assert!(reader.check_whole_chunks(&whole).is_ok(), "{whole:?}");
+        assert!(reader.check_whole_chunks(&adjacent).is_ok(), "{adjacent:?}");
+        for refused in [
+            whole.start + 1..whole.end,
+            whole.start..whole.end - 1,
+            index_start..index_start + index_len,
+        ] {
+            assert_corrupt(
+                reader.check_whole_chunks(&refused),
+                &format!(
+                    "bytes {}..{}, which do not start and end on column chunk boundaries",
+                    refused.start, refused.end
+                ),
+            );
+        }
+
+        let before = recording.ranges().len();
+        reader
+            .get_bytes(whole.start..whole.end - 1)
+            .await
+            .expect_err("a range ending mid-chunk");
+        reader
+            .get_byte_ranges(vec![whole.clone(), index_start..index_start + index_len])
+            .await
+            .expect_err("a batch holding the page index region");
+        assert_eq!(recording.ranges().len(), before, "{:?}", recording.ranges());
+        reader
+            .get_byte_ranges(vec![whole, adjacent])
+            .await
+            .expect("whole chunks");
+        assert_eq!(recording.ranges().len(), before + 2);
     }
 
     /// One reader walks each column chunk's page headers once: an unfiltered
