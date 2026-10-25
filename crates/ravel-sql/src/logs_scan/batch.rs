@@ -353,10 +353,9 @@ impl<'a> StrCursor<'a> {
 /// and chunks read it, and every chunk's `DictionaryArray` shares that array;
 /// and the values of each plain-page block ([`Self::block_values`]).
 ///
-/// An array stays in the cache while anything outside the cache holds it: a
-/// batch the stream has not emitted yet, or an operator downstream that kept
-/// it, such as the filter's batch coalescer or a TopK or aggregate input. A
-/// dictionary's entry also stays while the reader still holds the dictionary,
+/// An array stays in the cache while anything outside the cache holds its
+/// `Arc`: a batch the stream has not emitted yet, or an operator downstream
+/// that kept it, such as the filter's batch coalescer. A dictionary's entry also stays while the reader still holds the dictionary,
 /// so the next block of its row group reads the same array. So after each
 /// [`Self::retain_live`] the cache holds, per dictionary still being read or
 /// still read downstream, its base values plus one extended array per distinct
@@ -513,10 +512,12 @@ impl StrValuesCache {
     /// entries of the dictionaries the reader has moved past once none of
     /// their arrays is held, and release their charge.
     ///
-    /// The charge of an array lasts as long as its bytes do for every holder
-    /// downstream of the scan. The one gap is the end of the stream, where
-    /// [`Self::clear`] releases the whole reservation while an operator
-    /// downstream may still hold an array until its own flush.
+    /// An array's charge lasts while anything downstream of the scan holds
+    /// the array's `Arc`. Two gaps remain: a holder that keeps only the
+    /// array's buffers, through a new array built over them, is not seen; and
+    /// at the end of the stream [`Self::clear`] releases the whole reservation
+    /// while an operator downstream may still hold an array until its own
+    /// flush.
     pub(super) fn retain_live(&mut self) {
         let mut freed = 0;
         self.entries.retain(|e| {
@@ -4373,10 +4374,12 @@ mod tests {
 
     /// Issue #3241: a dictionary's values stay cached and charged while an
     /// operator downstream holds a batch reading them, after the reader has
-    /// moved past the dictionary.
+    /// moved past the dictionary. The kept entry does not keep the decoded
+    /// dictionary resident.
     #[test]
     fn str_values_charged_while_a_batch_holds_them() {
         let dict = page_dict(&VALID_ENTRIES);
+        let resident = Arc::downgrade(&dict);
         let pool = unbounded_pool();
         let shared = test_str_values(&pool);
         let base = lock_str_values(&shared)
@@ -4388,6 +4391,7 @@ mod tests {
         let mut cache = lock_str_values(&shared);
         cache.retain_live();
         assert_eq!(cache.entries.len(), 1, "the entry stays");
+        assert_eq!(resident.strong_count(), 0, "the dictionary is freed");
         assert_eq!(pool.reserved(), bytes, "the held values stay charged");
 
         drop(base);
@@ -4444,6 +4448,38 @@ mod tests {
         cache.retain_live();
         assert!(cache.plain.is_empty(), "dropped once nothing holds it");
         assert_eq!(pool.reserved(), 0, "and released");
+    }
+
+    /// ADR-1170 decision 1 for a plain-page block: a pool that cannot hold
+    /// the block's values refuses with `ResourcesExhausted`, and nothing is
+    /// built or left reserved.
+    ///
+    /// Flipped: building the array first and calling `try_grow` after it
+    /// returns the same error with the built counter at 1.
+    #[test]
+    fn plain_block_values_reserved_before_build() {
+        let texts = ["a", "bc", ""];
+        let ext = extra(&["ra"]);
+        let bytes = ValuesLayout {
+            len: texts.len() + ext.len(),
+            data: 1 + 2 + 2,
+            nulls: false,
+        }
+        .bytes();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes - 1));
+        let shared = test_str_values(&pool);
+        let err = lock_str_values(&shared)
+            .block_values(&texts, &ext)
+            .expect_err("a pool below the block's values refuses them");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "resources exhausted, got {err}"
+        );
+        let cache = lock_str_values(&shared);
+        assert_eq!(cache.built.value(), 0, "nothing built");
+        assert!(cache.plain.is_empty(), "nothing cached");
+        assert_eq!(cache.reserved(), 0, "the cache reserved nothing");
+        assert_eq!(pool.reserved(), 0, "nothing left on the pool");
     }
 
     /// A values array the cache holds is charged once, by the cache, however
