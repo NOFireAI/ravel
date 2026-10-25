@@ -1373,7 +1373,12 @@ narrow projection reads one chunk per row group for each column it
 projects, so its candidate chunk reads multiply by the group count. A
 load that raises `--target-bytes` toward about 100 MB stored objects
 raises `--group-target-blocks` with it, to at least the object's block
-count, to keep one row group per object. A group larger than 32 blocks
+count, to keep one row group per object. The cost lands on the load
+first: the writer buffers a whole row group of encoded pages before it
+places any of it, so each in-flight flush holds about one object's
+compressed bytes, times `--shards` and `--max-inflight-flushes`, and none
+of that is charged to `--load-memory-bytes`, which covers the built batches
+only. A group larger than 32 blocks also
 raises the raw bytes a compaction merge holds per input object: a merge
 cursor holds up to two row groups of each input, the one it is decoding
 and one prefetched, and every stream the merge carries fetches its row
