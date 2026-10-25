@@ -1820,6 +1820,7 @@ async fn load_with_default_geometry_on(
         None,
         None,
         RlogZstdLevel::default(),
+        RlogGroupTargetBlocks::DEFAULT,
         Some(LoadMemoryOptions::new(load_memory)),
         false,
         Arc::new(TenantRules::none()),
@@ -2084,6 +2085,7 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
         None,
         Some(on_batch_queued),
         RlogZstdLevel::default(),
+        RlogGroupTargetBlocks::DEFAULT,
         Some(LoadMemoryOptions::new(LoadMemoryRequest::Derived {
             host_total_bytes: Some(GEOMETRY_HOST_BYTES),
         })),
@@ -3011,6 +3013,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         None,
         Some(on_batch_queued),
         RlogZstdLevel::DEFAULT,
+        RlogGroupTargetBlocks::DEFAULT,
         UNREACHED_REFLUSH_PERIOD,
         None,
         false,

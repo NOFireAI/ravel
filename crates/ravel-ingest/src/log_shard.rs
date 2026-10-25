@@ -887,6 +887,7 @@ impl LogFlushCtx {
             .collect();
         let rlog_config = RlogConfig {
             zstd_level: self.config.rlog_zstd_level.get(),
+            group_target_blocks: self.config.rlog_group_target_blocks.get(),
             ..RlogConfig::default()
         };
         // The encode runs on the write gate when one is attached (ADR-1702).
@@ -3222,6 +3223,92 @@ mod tests {
         assert_eq!(snap.acks_ok, 1);
         assert_eq!(snap.stream_id_collisions, 0);
         h.shutdown().await;
+    }
+
+    /// The `(first_block, block_count)` of every PAGE_DIR row group in the
+    /// RLOG object one flush of `blocks` full blocks writes under
+    /// `group_target_blocks`.
+    async fn flushed_row_groups(blocks: usize, group_target_blocks: usize) -> Vec<(u32, u32)> {
+        let h = Harness::spawn(IngestConfig {
+            rlog_group_target_blocks: crate::RlogGroupTargetBlocks::new(group_target_blocks)
+                .expect("nonzero group size"),
+            ..flush_on_first()
+        });
+        let tenant = TenantId::new("acme");
+        let block_records = RlogConfig::default().block_target_records;
+        let records: Vec<NormalizedLogRecord> = (0..blocks * block_records)
+            .map(|i| norm_record(&[("service.name", "api")], "scope", 1_000 + i as i64, ""))
+            .collect();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            arrival: false,
+            tenant: tenant.clone(),
+            records,
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        let token = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect("strict write commits");
+
+        let commit_key =
+            keys::commit_key_for_token(&tenant.hash(), Signal::Logs, &token).expect("commit key");
+        let commit_bytes = h
+            .store
+            .get(&commit_key, GetRange::Full)
+            .await
+            .expect("get commit record")
+            .data;
+        let rec = record::decode(&commit_bytes).expect("decode commit record");
+        assert_eq!(
+            rec.sample_count,
+            (blocks * block_records) as u64,
+            "the whole write is one RLOG object"
+        );
+        let data_bytes = h
+            .store
+            .get(&rec.object_key, GetRange::Full)
+            .await
+            .expect("get data object")
+            .data;
+        let footer = ravel_logseg::footer::open(&data_bytes).expect("footer");
+        let page_dir = footer
+            .section(ravel_logseg::footer::kind::PAGE_DIR)
+            .expect("PAGE_DIR present");
+        let page_dir = ravel_logseg::read_section(&data_bytes, page_dir, &RlogConfig::default())
+            .expect("PAGE_DIR decompresses");
+        let groups = ravel_logseg::page_dir::PageDir::decode(&page_dir)
+            .expect("PAGE_DIR decodes")
+            .groups
+            .iter()
+            .map(|g| (g.first_block, g.block_count))
+            .collect();
+        h.shutdown().await;
+        groups
+    }
+
+    /// ADR-3217 decision 5: `rlog_group_target_blocks` reaches the flush's
+    /// writer. A 100-block flush at 512 is one row group of all 100 blocks; the
+    /// same flush at the default is 32/32/32/4.
+    ///
+    /// Non-vacuity: dropping `group_target_blocks` from the `RlogConfig` the
+    /// flush builds leaves the 512 flush at 4 groups.
+    #[tokio::test]
+    async fn rlog_group_target_blocks_sets_the_flushed_objects_row_groups() {
+        assert_eq!(
+            flushed_row_groups(100, 512).await,
+            vec![(0, 100)],
+            "one row group of every block"
+        );
+        assert_eq!(
+            flushed_row_groups(100, crate::RlogGroupTargetBlocks::DEFAULT.get()).await,
+            vec![(0, 32), (32, 32), (64, 32), (96, 4)],
+            "the default writes 32-block groups"
+        );
     }
 
     #[tokio::test]

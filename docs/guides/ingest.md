@@ -1366,6 +1366,20 @@ each shard merges several batches' slices into one buffer and flushes it
 as one object once the buffer's estimate reaches the target, so objects
 grow without growing the batch.
 
+A logs object's row group is `--group-target-blocks` consecutive blocks
+(default 32, up to about 262,000 records at 8,192 records per block). An
+object of more than 32 blocks is several row groups at the default, and a
+narrow projection reads one chunk per row group for each column it
+projects, so its candidate chunk reads multiply by the group count. A
+load that raises `--target-bytes` toward about 100 MB stored objects
+raises `--group-target-blocks` with it, to at least the object's block
+count, to keep one row group per object. A group larger than 32 blocks
+raises the raw bytes a compaction merge holds per input object: a merge
+cursor holds up to two row groups of each input, the one it is decoding
+and one prefetched, and every stream the merge carries fetches its row
+group again, so compacting one-group 100 MB objects reads about 100 MB per
+stream from each input. The compactor's own output keeps 32-block groups.
+
 The target, derived or given, counts the buffer's estimated
 **uncompressed** content (on logs: body, severity text, stream attributes,
 attribute names and values, and fixed per-row fields), not the stored
