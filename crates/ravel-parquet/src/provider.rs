@@ -294,6 +294,14 @@ impl ParquetTableProvider {
         Self::over(raw, self.casts.clone())
     }
 
+    /// The same table with DataFusion's page index turned on.
+    #[cfg(test)]
+    pub(crate) fn with_page_index(&self) -> Result<Self, ParquetTableError> {
+        let mut raw = self.raw.as_ref().clone();
+        raw.options.global.enable_page_index = true;
+        Self::over(Arc::new(raw), self.casts.clone())
+    }
+
     /// Whether the scan is split into up to `target_partitions` file groups.
     pub fn parallel(&self) -> bool {
         self.raw.parallel
