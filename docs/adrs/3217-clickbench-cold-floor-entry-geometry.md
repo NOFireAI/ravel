@@ -116,7 +116,9 @@ ratio of 0.058 (ADR-2023 decision 4), and no change may alter an answer.
 
 ## Decision
 
-Seven decisions, in delivery order. Each names the design change it
+Seven decisions, in delivery order (decision 2 is withdrawn for the
+competing entry and kept only for a labelled variant, see the decision 2
+fairness amendment). Each names the design change it
 carries, its class, what it does not change, and its own pre-registered
 A/B band. Every A/B compares all 43 statements against its A box under the
 answer comparison rule in Measurement, and a difference stops the change.
@@ -173,7 +175,9 @@ class. Cold sum (model): minus 28 s at `O = 0.5` (277 to 249 s), 44 s at
 `O = 0.8`, 2 s at `O = 0`.
 
 Pre-registered A/B (run 2, shared with decision 2 because their stamps are
-disjoint and decision 2's cold effect is inside noise). Stamps:
+disjoint and decision 2's cold effect is inside noise). Run 2's load did
+not fold, and any later measurement of this decision runs unfolded (see
+the decision 2 fairness amendment). Stamps:
 `bloom-scope show` prints `text`; one object's `rlog inspect` shows a
 BLOOM section under 8 KB and one row group; the binary digest equals the A
 box's. Each figure present exactly once:
@@ -737,7 +741,9 @@ Follow-ups the design leaves to the builder or to a later pass:
   `rlog inspect` (`RlogCommand::Inspect`,
   `services/ravel-cli/src/main.rs:1793-1794`) prints section sizes and the
   row-group count; `rlog footprint` emits no row-group count.
-- Decision 2: the fold's load-time cost, and whether
+- Decision 2 (withdrawn for the competing entry, see the decision 2
+  fairness amendment; open only for a labelled variant): the fold's
+  load-time cost, and whether
   `load_fold_after_load_sql_e2e.rs` already pins the seal-through hour
   against the load's highest ingest hour.
 - Decision 4: the amendment text and marker, the golden regeneration
@@ -876,7 +882,8 @@ with its header amended, the reader comments, the test re-pins; gate
 `ravel-cli`, docs; gate `-p ravel-ingest -p ravel-cli`). Each carries a
 `changelog.d` fragment. Fork pull requests: four, one per run row above;
 decision 2 shares fork PR 1 with decision 1 as two independently
-revertible lines.
+revertible lines. The decision 2 fairness amendment withdraws that line
+from the competing entry, so fork PR 1 carries decision 1 alone.
 
 Cumulative cold-sum arithmetic, in delivery order. The anchor is run 1's
 367.2 s. The `O = 0.5 MB` column is the central estimate and is
@@ -921,7 +928,7 @@ request, in money or in disk bytes.
 
 ## Amendment (2026-10-25): decision 2 fairness amendment, the competing entry does not fold
 
-<!-- amendment-applies: sections="2. The entry's load folds the catalog before it exits (design change 2)" pointer="decision 2 fairness amendment" -->
+<!-- amendment-applies: sections="Decision|1. The entry's tenant sets bloom scope `text` (design change 1)|2. The entry's load folds the catalog before it exits (design change 2)|Consequences|Measurement" pointer="decision 2 fairness amendment" -->
 
 The owner decided on 2026-10-25 (issue #3244 comment 6397193245, also on
 #3217 and #3243) that the competing ClickBench entry stays stock and
@@ -949,10 +956,14 @@ The reasons are two rules in ClickBench's README (read on 2026-10-25):
 The decision 2 A/B that was run (#3243, with the folded catalog's column
 statistics) measured a hot loss, not a gain, because a folded catalog
 re-reads its column statistics on every statement (#3244). That defect is
-fixed under #3244 for every folded tenant; this amendment does not depend
-on it.
+being fixed under #3244 for every folded tenant; this amendment does not
+depend on it.
 
-Decisions 1 and 3 to 7 are not affected: a single clustering key is the
+Decisions 1 and 3 to 7 keep their mechanisms. Decision 1's measurement no
+longer pairs with a fold: run 2's load did not fold (its launcher carried
+no fold flag; the fold A/B ran on its own under #3243), and any later
+measurement of decision 1 runs unfolded. Fork PR 1 carries decision 1
+alone. The rules allow the rest: a single clustering key is the
 "clustered (table sorting)" primary key the rules allow, decisions 3 to 6
 change storage layout and compression, and decision 1 narrows an index the
 database builds by itself. The cold-sum table's decision 2 row predicted 0
