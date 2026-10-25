@@ -1035,10 +1035,16 @@ pub(crate) fn segment_column_stats<'a>(
 /// carrier wrong. The entry therefore never answers and is never compared with
 /// the stamp here: a segment the stamp does not cover declines the column even
 /// when a `.cstat` entry covers it, and where both exist the stamp's triple is
-/// returned as is. The entry is still read, so a defective one is counted on
-/// the [`StatCarrier::Cstat`] drop tally, but only on segments this is called
-/// for: [`LogsScanExec::declared_min_max_all`] stops calling it for a column at
-/// the first touched segment with no stamp for that column, so on a stamp-less
+/// returned as is. The entry is still read when one was loaded, so a defective
+/// one is counted on the [`StatCarrier::Cstat`] drop tally. The executor loads
+/// the column statistics only for a statement with an aggregate shape the
+/// metadata-only rewrite answers (`SqlExecutor::logs_column_stats_eligible`,
+/// issue #3244), so through it a statement with no such shape, a lone
+/// `MIN`/`MAX` among them, reaches this with `seg_stats` `None` and tallies
+/// nothing. The read is
+/// also limited to segments this is called for:
+/// [`LogsScanExec::declared_min_max_all`] stops calling it for a column at the
+/// first touched segment with no stamp for that column, so on a stamp-less
 /// tenant only the first touched segment's entry is read on that path.
 ///
 /// `None` declines the column for this segment: a `Str` column (no scalar form
