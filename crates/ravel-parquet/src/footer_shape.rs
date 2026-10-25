@@ -44,6 +44,13 @@
 //! The walk does work linear in the footer's length, and its recursion is
 //! bounded by the fixed nesting of the decoder's structs plus
 //! [`SKIP_DEPTH`].
+//!
+//! [`check_page_headers`] runs the same walk over the page headers of a
+//! column chunk, before the page reader decodes them. That reader skips an
+//! unknown field through a `Read` whose skip of bytes past the end succeeds
+//! without reading any, so a skipped list or map of doubles, UUIDs or
+//! booleans with declared count `n` costs `n` steps whatever the chunk
+//! holds, up to `i32::MAX`.
 
 use std::mem::size_of;
 use std::ops::Range;
@@ -152,6 +159,11 @@ enum Shape {
     SortingColumn,
     KeyValue,
     ColumnOrder,
+    PageHeader,
+    DataPageHeader,
+    IndexPageHeader,
+    DictionaryPageHeader,
+    DataPageHeaderV2,
 }
 
 impl Shape {
@@ -313,6 +325,24 @@ fn field(shape: Shape, id: i16) -> Field {
         (S::KeyValue, 1 | 2) => Read(Binary),
         (S::ColumnOrder, 1) => Read(Empty),
 
+        // parquet 59.3.0's `PageHeader::read_thrift` and
+        // `read_thrift_without_stats` and the page structs they read
+        // (src/file/metadata/thrift/mod.rs). A page's `PageStatistics` has
+        // the fields of `Statistics`; the reader reads it or skips it
+        // depending on its options, and the walk reads it either way.
+        (S::PageHeader, 1..=4) => Read(I32),
+        (S::PageHeader, 5) => Read(Struct(S::DataPageHeader)),
+        (S::PageHeader, 6) => Read(Struct(S::IndexPageHeader)),
+        (S::PageHeader, 7) => Read(Struct(S::DictionaryPageHeader)),
+        (S::PageHeader, 8) => Read(Struct(S::DataPageHeaderV2)),
+        (S::DataPageHeader, 1..=4) => Read(I32),
+        (S::DataPageHeader, 5) => Read(Struct(S::Statistics)),
+        (S::DictionaryPageHeader, 1 | 2) => Read(I32),
+        (S::DictionaryPageHeader, 3) => Read(Bool),
+        (S::DataPageHeaderV2, 1..=6) => Read(I32),
+        (S::DataPageHeaderV2, 7) => Read(Bool),
+        (S::DataPageHeaderV2, 8) => Read(Struct(S::Statistics)),
+
         _ => Skip,
     }
 }
@@ -344,6 +374,37 @@ pub(crate) fn check_footer_shape(footer: &[u8]) -> Result<u64, String> {
     Ok(walk.decoded)
 }
 
+/// Walk the pages of `chunk`, one column chunk's bytes, as the page reader
+/// does when it has no offset index: a `PageHeader`, then the
+/// `compressed_page_size` bytes it declares, until the chunk ends. Refuse
+/// the chunk if a header fails the walk [`check_footer_shape`] runs. A
+/// header with no `compressed_page_size`, or one that is negative or runs
+/// past the chunk, ends the walk without a verdict: the decoder refuses
+/// those itself, and the pages after it cannot be found. Returns the number
+/// of headers walked. Error positions count from the chunk's first byte.
+pub(crate) fn check_page_headers(chunk: &[u8]) -> Result<usize, String> {
+    let mut pos = 0;
+    let mut pages = 0;
+    while pos < chunk.len() {
+        let mut walk = Walk {
+            bytes: chunk,
+            pos,
+            leaves: None,
+            decoded: 0,
+        };
+        let header = walk.read_struct(Shape::PageHeader).map_err(|err| {
+            let err = err.strip_prefix("footer ").unwrap_or(&err);
+            format!("page header at byte {pos}: {err}")
+        })?;
+        pages += 1;
+        match header.page_size.map(usize::try_from) {
+            Some(Ok(size)) if size <= walk.remaining() => pos = walk.pos + size,
+            _ => break,
+        }
+    }
+    Ok(pages)
+}
+
 struct Walk<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -372,6 +433,8 @@ struct Element {
     name_len: u64,
     key: Option<Range<usize>>,
     value: Option<Range<usize>>,
+    /// A `PageHeader`'s `compressed_page_size`.
+    page_size: Option<i32>,
 }
 
 /// A group of the schema tree that the next element is inside.
@@ -648,6 +711,9 @@ impl Walk<'_> {
                         }
                         (Shape::KeyValue, 1, Value::Bytes(range)) => element.key = Some(range),
                         (Shape::KeyValue, 2, Value::Bytes(range)) => element.value = Some(range),
+                        (Shape::PageHeader, 3, Value::Int(n)) => {
+                            element.page_size = Some(n as i32);
+                        }
                         _ => {}
                     }
                 }
@@ -891,8 +957,10 @@ mod tests {
     use datafusion::arrow::ipc::root_as_message_with_opts;
     use flatbuffers::VerifierOptions;
     use parquet::arrow::{ArrowWriter, encode_arrow_schema};
+    use parquet::basic::PageType;
     use parquet::file::metadata::{KeyValue, ParquetMetaDataReader, SortingColumn};
-    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use proptest::prelude::*;
     use ravel_memory::MemoryBudget;
 
@@ -2128,6 +2196,109 @@ mod tests {
         value.extend([0x10 | T_LIST, 0x25, 1, 2]);
         value.push(T_STOP);
         assert_eq!(passes(&skipped_field(T_STRUCT, &value)), Ok(()));
+    }
+
+    /// Every column chunk of every writer file, and of one written with
+    /// version 2 data pages carrying page statistics, walks to as many
+    /// page headers as the parquet page reader reads from it.
+    #[test]
+    fn writer_page_headers_walk_page_for_page() {
+        let v2 = write(
+            Schema::new(vec![
+                ArrowField::new("a", DataType::Int64, false),
+                ArrowField::new("b", DataType::Utf8, true),
+            ]),
+            vec![ints(500), strings(500)],
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_2_0)
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .set_write_page_header_statistics(true)
+                .set_data_page_row_count_limit(50)
+                .set_write_batch_size(50)
+                .build(),
+        );
+        let files = writer_files().iter().map(|(name, bytes)| (*name, bytes));
+        let mut types = Vec::new();
+        for (name, bytes) in files.chain([("version 2 pages", &v2)]) {
+            let reader = SerializedFileReader::new(bytes.clone()).expect(name);
+            for (g, group) in reader.metadata().row_groups().iter().enumerate() {
+                for (c, chunk) in group.columns().iter().enumerate() {
+                    let start = chunk
+                        .dictionary_page_offset()
+                        .unwrap_or_else(|| chunk.data_page_offset());
+                    let start = usize::try_from(start).expect(name);
+                    let end = start + usize::try_from(chunk.compressed_size()).expect(name);
+                    let walked = check_page_headers(&bytes[start..end])
+                        .unwrap_or_else(|err| panic!("{name}: {err}"));
+                    let mut pages = reader
+                        .get_row_group(g)
+                        .and_then(|group| group.get_column_page_reader(c))
+                        .expect(name);
+                    let mut read = 0;
+                    while let Some(page) = pages.get_next_page().expect(name) {
+                        types.push(page.page_type());
+                        read += 1;
+                    }
+                    assert_eq!(walked, read, "{name}: row group {g}, column {c}");
+                }
+            }
+        }
+        for kind in [
+            PageType::DICTIONARY_PAGE,
+            PageType::DATA_PAGE,
+            PageType::DATA_PAGE_V2,
+        ] {
+            assert!(types.contains(&kind), "no {kind:?} page was walked");
+        }
+    }
+
+    /// A page header whose skipped field holds a list of doubles longer
+    /// than the bytes left is refused, at the top level and inside each
+    /// page type's own header. The page reader skips such a list one
+    /// element at a time past the end of its input.
+    #[test]
+    fn a_skipped_list_longer_than_the_chunk_is_refused_in_every_page_header() {
+        let list = |field_header: u8| {
+            let mut header = vec![0x15, 0x00, 0x15, 0x02, 0x15, 0x02, field_header];
+            header.push(0xf0 | T_DOUBLE);
+            header.extend(uvarint(1_000_000));
+            header
+        };
+        assert_eq!(
+            check_page_headers(&list(0xc0 | T_LIST)).expect_err("refused"),
+            "page header at byte 0: list at byte 11 declares 1000000 elements with 0 bytes left"
+        );
+        for nested in 5..=8_u8 {
+            let mut header = list(((nested - 3) << 4) | T_STRUCT);
+            header.insert(7, 0xf0 | T_LIST);
+            assert_eq!(
+                check_page_headers(&header).expect_err("refused"),
+                "page header at byte 0: list at byte 12 declares 1000000 elements with 0 bytes left",
+                "field {nested}"
+            );
+        }
+    }
+
+    /// A page header whose skipped field holds a list of doubles the bytes
+    /// left can hold walks, at the top level and inside each page type's
+    /// own header, and the walk finds the page after it.
+    #[test]
+    fn a_skipped_list_that_fits_walks_in_every_page_header() {
+        let page = |skipped: &[u8], stops: usize| {
+            let mut page = vec![0x15, 0x00, 0x15, 0x02, 0x15, 0x02];
+            page.extend(skipped);
+            page.push(0x20 | T_DOUBLE);
+            page.extend([0; 16]);
+            page.extend(vec![T_STOP; stops]);
+            page.push(0xaa);
+            page
+        };
+        let chunk = page(&[0xc0 | T_LIST], 1).repeat(2);
+        assert_eq!(check_page_headers(&chunk), Ok(2));
+        for nested in 5..=8_u8 {
+            let chunk = page(&[((nested - 3) << 4) | T_STRUCT, 0xf0 | T_LIST], 2).repeat(2);
+            assert_eq!(check_page_headers(&chunk), Ok(2), "field {nested}");
+        }
     }
 
     proptest! {
