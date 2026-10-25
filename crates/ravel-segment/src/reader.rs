@@ -2685,7 +2685,7 @@ mod zstd_section_tests {
         let truncated = Section {
             len: cut.len() as u64,
             crc32c: crc32c::crc32c(cut),
-            ..section.clone()
+            ..section
         };
         assert!(matches!(
             decode_section_bytes(&truncated, cut, limits),
@@ -2696,7 +2696,7 @@ mod zstd_section_tests {
         bad[0] ^= 0xff;
         let corrupt = Section {
             crc32c: crc32c::crc32c(&bad),
-            ..section.clone()
+            ..section
         };
         assert!(matches!(
             decode_section_bytes(&corrupt, &bad, limits),
