@@ -23,7 +23,10 @@ use grouping::{GEOMETRIES, arm_label, arm_order, fixture, run_arm};
 fn bench_grouping(c: &mut Criterion) {
     let order = std::env::var("GROUPING_ARM_ORDER").unwrap_or_else(|_| "ABC".to_string());
     let arms = arm_order(&order);
-    println!("compaction_grouping arm_order={order} seed={:#x}", grouping::SEED);
+    println!(
+        "compaction_grouping arm_order={order} seed={:#x}",
+        grouping::SEED
+    );
 
     for g in GEOMETRIES {
         let inputs = fixture(g);

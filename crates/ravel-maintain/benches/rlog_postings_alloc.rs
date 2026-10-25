@@ -115,11 +115,17 @@ fn main() -> ExitCode {
         // No geometry reaches the distinct cap, so every insert ticks.
         let expected_samples = inserts + 1;
         if m.samples != expected_samples {
-            eprintln!("FAIL arm={label}: {} samples, expected {expected_samples}", m.samples);
+            eprintln!(
+                "FAIL arm={label}: {} samples, expected {expected_samples}",
+                m.samples
+            );
             failed = true;
         }
         if m.live_after != 0 {
-            eprintln!("FAIL arm={label}: {} bytes still live after the arm returned", m.live_after);
+            eprintln!(
+                "FAIL arm={label}: {} bytes still live after the arm returned",
+                m.live_after
+            );
             failed = true;
         }
         match reference {

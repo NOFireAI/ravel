@@ -123,11 +123,17 @@ fn main() -> ExitCode {
         // One tick per insert and per group, plus arm C's tick after its sort.
         let expected_samples = contributions + groups + usize::from(arm == 'C');
         if m.samples != expected_samples {
-            eprintln!("FAIL arm={label}: {} samples, expected {expected_samples}", m.samples);
+            eprintln!(
+                "FAIL arm={label}: {} samples, expected {expected_samples}",
+                m.samples
+            );
             failed = true;
         }
         if m.live_after != 0 {
-            eprintln!("FAIL arm={label}: {} bytes still live after the arm returned", m.live_after);
+            eprintln!(
+                "FAIL arm={label}: {} bytes still live after the arm returned",
+                m.live_after
+            );
             failed = true;
         }
         match reference {

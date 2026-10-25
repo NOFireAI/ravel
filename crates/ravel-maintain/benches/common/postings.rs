@@ -125,7 +125,13 @@ pub fn fixture(g: &Geometry) -> Vec<Vec<(u32, Value)>> {
     let services = terms(
         &mut rng,
         g.service_terms,
-        &["payments-", "checkout-api-", "svc-", "frontend-web-", "inventory-worker-"],
+        &[
+            "payments-",
+            "checkout-api-",
+            "svc-",
+            "frontend-web-",
+            "inventory-worker-",
+        ],
     );
     let namespaces = terms(
         &mut rng,
@@ -133,8 +139,8 @@ pub fn fixture(g: &Geometry) -> Vec<Vec<(u32, Value)>> {
         &["prod-", "prod-eu-west-1-", "staging-", "team-"],
     );
     const STATUSES: [i64; 20] = [
-        200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 422, 429, 500, 502,
-        503, 504, 599,
+        200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 422, 429, 500, 502, 503,
+        504, 599,
     ];
     let mut s = StdRng::seed_from_u64(SEED ^ 1);
     (0..g.blocks * ROWS_PER_BLOCK)
@@ -148,13 +154,19 @@ pub fn fixture(g: &Geometry) -> Vec<Vec<(u32, Value)>> {
                     NAMESPACE,
                     Value::Str(namespaces[s.random_range(0..namespaces.len())].clone()),
                 ),
-                (STATUS, Value::I64(STATUSES[s.random_range(0..STATUSES.len())])),
+                (
+                    STATUS,
+                    Value::I64(STATUSES[s.random_range(0..STATUSES.len())]),
+                ),
             ]
         })
         .collect()
 }
 
-fn checksum(fields: &[(u32, BTreeMap<Vec<u8>, BTreeSet<u32>>)]) -> u64 {
+/// One field's term map in the type the encoder takes (`FieldTerms::Terms`).
+type FieldTermMap = BTreeMap<Vec<u8>, BTreeSet<u32>>;
+
+fn checksum(fields: &[(u32, FieldTermMap)]) -> u64 {
     let mut acc = 0u64;
     for (cid, map) in fields {
         acc = acc.rotate_left(9) ^ u64::from(*cid);
@@ -172,7 +184,7 @@ fn checksum(fields: &[(u32, BTreeMap<Vec<u8>, BTreeSet<u32>>)]) -> u64 {
 
 /// Arm A: std maps throughout, the writer as it is.
 pub fn arm_std(rows: &[Vec<(u32, Value)>], tick: &mut impl FnMut()) -> u64 {
-    let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
+    let mut postings_terms: BTreeMap<u32, FieldTermMap> = BTreeMap::new();
     let mut postings_capped: BTreeSet<u32> = BTreeSet::new();
     for (blk, block_rows) in rows.chunks(ROWS_PER_BLOCK).enumerate() {
         let blk = blk as u32;
@@ -205,8 +217,7 @@ pub fn arm_std(rows: &[Vec<(u32, Value)>], tick: &mut impl FnMut()) -> u64 {
 /// types at the encoding boundary.
 pub fn arm_bbtree(rows: &[Vec<(u32, Value)>], tick: &mut impl FnMut()) -> u64 {
     use bbtree::unsync::{BBTreeMap, BBTreeSet};
-    let mut postings_terms: BBTreeMap<u32, BBTreeMap<Vec<u8>, BBTreeSet<u32>>> =
-        BBTreeMap::new();
+    let mut postings_terms: BBTreeMap<u32, BBTreeMap<Vec<u8>, BBTreeSet<u32>>> = BBTreeMap::new();
     let mut postings_capped: BBTreeSet<u32> = BBTreeSet::new();
     for (blk, block_rows) in rows.chunks(ROWS_PER_BLOCK).enumerate() {
         let blk = blk as u32;
@@ -229,7 +240,7 @@ pub fn arm_bbtree(rows: &[Vec<(u32, Value)>], tick: &mut impl FnMut()) -> u64 {
     for cid in INDEXED {
         if !postings_capped.contains(&cid) {
             let map = postings_terms.remove(&cid).unwrap_or_default();
-            let map: BTreeMap<Vec<u8>, BTreeSet<u32>> = map
+            let map: FieldTermMap = map
                 .into_iter()
                 .map(|(term, blocks)| (term, blocks.into_iter().collect()))
                 .collect();
