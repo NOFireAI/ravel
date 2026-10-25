@@ -4371,6 +4371,81 @@ mod tests {
         assert_eq!(pool.reserved(), 0, "nothing left on the pool");
     }
 
+    /// Issue #3241: a dictionary's values stay cached and charged while an
+    /// operator downstream holds a batch reading them, after the reader has
+    /// moved past the dictionary.
+    #[test]
+    fn str_values_charged_while_a_batch_holds_them() {
+        let dict = page_dict(&VALID_ENTRIES);
+        let pool = unbounded_pool();
+        let shared = test_str_values(&pool);
+        let base = lock_str_values(&shared)
+            .values(&dict, Vec::new())
+            .expect("base");
+        let bytes = base.get_array_memory_size();
+
+        drop(dict);
+        let mut cache = lock_str_values(&shared);
+        cache.retain_live();
+        assert_eq!(cache.entries.len(), 1, "the entry stays");
+        assert_eq!(pool.reserved(), bytes, "the held values stay charged");
+
+        drop(base);
+        cache.retain_live();
+        assert!(cache.entries.is_empty(), "the entry is dropped");
+        assert_eq!(pool.reserved(), 0, "the charge leaves with the values");
+    }
+
+    /// A dictionary's entry stays cached and charged while the reader holds
+    /// the dictionary, before any batch reading it exists, so the next block
+    /// of its row group reads the same array instead of building another.
+    #[test]
+    fn str_values_kept_while_the_reader_holds_the_dictionary() {
+        let dict = page_dict(&VALID_ENTRIES);
+        let pool = unbounded_pool();
+        let shared = test_str_values(&pool);
+        let mut cache = lock_str_values(&shared);
+        let first = cache.values(&dict, Vec::new()).expect("base");
+        let first_ptr = Arc::as_ptr(&first);
+        let bytes = first.get_array_memory_size();
+        drop(first);
+
+        cache.retain_live();
+        assert_eq!(cache.entries.len(), 1, "the entry stays");
+        assert_eq!(pool.reserved(), bytes, "and stays charged");
+        let again = cache.values(&dict, Vec::new()).expect("base again");
+        assert!(
+            std::ptr::addr_eq(Arc::as_ptr(&again), first_ptr),
+            "the same array, not a rebuild"
+        );
+        assert_eq!(pool.reserved(), bytes, "charged once");
+    }
+
+    /// A plain-page block's values are charged before they are built, by
+    /// exactly the bytes the built array holds, and stay charged while a batch
+    /// holds them.
+    #[test]
+    fn plain_block_values_charged_while_held() {
+        let pool = unbounded_pool();
+        let shared = test_str_values(&pool);
+        let mut cache = lock_str_values(&shared);
+        let values = cache
+            .block_values(&["a", "bc", ""], &extra(&["ra"]))
+            .expect("plain values");
+        assert_eq!(values.len(), 4);
+        let bytes = values.get_array_memory_size();
+        assert_eq!(pool.reserved(), bytes, "charged its built size");
+
+        cache.retain_live();
+        assert_eq!(pool.reserved(), bytes, "held, so still charged");
+        assert!(cache.owns(&values), "the cache holds it");
+
+        drop(values);
+        cache.retain_live();
+        assert!(cache.plain.is_empty(), "dropped once nothing holds it");
+        assert_eq!(pool.reserved(), 0, "and released");
+    }
+
     /// A values array the cache holds is charged once, by the cache, however
     /// many batches read it: what `LogScanStream::hold_batches` grows the
     /// stream's reservation by ([`charge_columnar_batches`]) plus the cache's
