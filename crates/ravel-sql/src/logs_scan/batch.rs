@@ -355,12 +355,15 @@ impl<'a> StrCursor<'a> {
 ///
 /// An array stays in the cache while anything outside the cache holds its
 /// `Arc`: a batch the stream has not emitted yet, or an operator downstream
-/// that kept it, such as the filter's batch coalescer. A dictionary's entry also stays while the reader still holds the dictionary,
-/// so the next block of its row group reads the same array. So after each
+/// that kept it, such as the filter's batch coalescer. A dictionary's base
+/// values also stay while the reader still holds the dictionary, so the next
+/// block of its row group reads the same array. So after each
 /// [`Self::retain_live`] the cache holds, per dictionary still being read or
-/// still read downstream, its base values plus one extended array per distinct
-/// sorted fallback value list that something outside the cache still holds,
-/// and every plain-page array something outside the cache still holds.
+/// still read downstream, its base values while the reader holds the
+/// dictionary or something outside the cache holds them, plus one extended
+/// array per distinct sorted fallback value list that something outside the
+/// cache still holds, and every plain-page array something outside the cache
+/// still holds.
 ///
 /// The cache charges the pool for every array it holds, once, through its own
 /// `reservation` (ADR-1170 decision 1): each array's [`ValuesLayout::bytes`]
@@ -383,7 +386,10 @@ pub(super) struct SharedStrValues {
     /// decoded dictionary resident, and the `Weak` keeps the dictionary's
     /// address from being reused while the entry is found by it.
     dict: std::sync::Weak<DictValues>,
-    pub(super) values: ChargedValues,
+    /// The base values; `None` once the reader has dropped the dictionary and
+    /// nothing outside the cache holds them, while the entry stays for an
+    /// extended array still held.
+    pub(super) values: Option<ChargedValues>,
     /// The values with a block's resource/scope fallback values appended past
     /// them, keyed by those values sorted and deduplicated
     /// ([`canonical_fallbacks`]).
@@ -404,15 +410,18 @@ impl ChargedValues {
 }
 
 impl SharedStrValues {
+    /// The charge of the arrays the entry still holds: the base values, if
+    /// not yet released, and every extended array.
     fn charge(&self) -> usize {
-        self.values.charge + self.extended.iter().map(|(_, v)| v.charge).sum::<usize>()
+        self.values.as_ref().map_or(0, |v| v.charge)
+            + self.extended.iter().map(|(_, v)| v.charge).sum::<usize>()
     }
 
     /// Whether the reader still holds the dictionary or anything outside the
-    /// cache holds one of its arrays.
+    /// cache holds one of the arrays the entry still holds.
     fn live(&self) -> bool {
         self.dict.strong_count() > 0
-            || self.values.held()
+            || self.values.as_ref().is_some_and(ChargedValues::held)
             || self.extended.iter().any(|(_, v)| v.held())
     }
 }
@@ -447,14 +456,25 @@ impl StrValuesCache {
                 let values = self.build(dict, &[])?;
                 self.entries.push(SharedStrValues {
                     dict: Arc::downgrade(dict),
-                    values,
+                    values: Some(values),
                     extended: Vec::new(),
                 });
                 self.entries.len() - 1
             }
         };
         if extra.is_empty() {
-            return Ok(Arc::clone(&self.entries[at].values.array));
+            // `retain_live` releases the base only once the dictionary is
+            // dropped, and `dict` is held here, so it is present; rebuild it
+            // if not rather than assume so.
+            return match &self.entries[at].values {
+                Some(values) => Ok(Arc::clone(&values.array)),
+                None => {
+                    let values = self.build(dict, &[])?;
+                    let array = Arc::clone(&values.array);
+                    self.entries[at].values = Some(values);
+                    Ok(array)
+                }
+            };
         }
         if let Some((_, values)) = self.entries[at].extended.iter().find(|(e, _)| *e == extra) {
             return Ok(Arc::clone(&values.array));
@@ -485,6 +505,7 @@ impl StrValuesCache {
     ///
     /// A build is reserved first, as in [`Self::values`].
     fn block_values(&mut self, texts: &[&str], extra: &[String]) -> DFResult<ArrayRef> {
+        self.retain_live();
         let layout = ValuesLayout {
             len: texts.len() + extra.len(),
             data: texts.iter().map(|t| t.len()).sum::<usize>()
@@ -509,9 +530,11 @@ impl StrValuesCache {
         Ok(array)
     }
 
-    /// Drop the arrays nothing outside the cache holds any more, and the
-    /// entries of the dictionaries the reader has moved past once none of
-    /// their arrays is held, and release their charge.
+    /// Drop the arrays nothing outside the cache holds any more, and release
+    /// their charge: every unheld extended and plain-page array, the base
+    /// values of a dictionary the reader has moved past once nothing holds
+    /// them, and the entry of such a dictionary once none of its arrays is
+    /// held.
     ///
     /// An array's charge lasts while anything downstream of the scan holds
     /// the array's `Arc`. Two gaps remain: a holder that keeps only the
@@ -535,6 +558,12 @@ impl StrValuesCache {
             live
         });
         for entry in &mut self.entries {
+            if entry.dict.strong_count() == 0
+                && entry.values.as_ref().is_some_and(|v| !v.held())
+                && let Some(values) = entry.values.take()
+            {
+                freed += values.charge;
+            }
             entry.extended.retain(|(_, v)| {
                 let live = v.held();
                 if !live {
@@ -584,7 +613,10 @@ impl StrValuesCache {
         self.entries
             .iter()
             .flat_map(|e| {
-                std::iter::once(&e.values.array).chain(e.extended.iter().map(|(_, v)| &v.array))
+                e.values
+                    .iter()
+                    .map(|v| &v.array)
+                    .chain(e.extended.iter().map(|(_, v)| &v.array))
             })
             .chain(self.plain.iter().map(|v| &v.array))
     }
@@ -2852,7 +2884,12 @@ mod columnar_lookup_tests {
         let base = {
             let cache = lock_str_values(&shared);
             assert_eq!(cache.entries.len(), 1, "one dictionary");
-            cache.entries[0].values.array.get_array_memory_size()
+            cache.entries[0]
+                .values
+                .as_ref()
+                .expect("the reader holds the dictionary, so its base stays")
+                .array
+                .get_array_memory_size()
         };
         let built = lock_str_values(&shared).built.value();
         (held, released, base, extended_bytes, built)
@@ -4379,7 +4416,7 @@ mod tests {
         assert_eq!(pool.reserved(), 0, "nothing left on the pool");
     }
 
-    /// Issue #3241: a dictionary's values stay cached and charged while an
+    /// Issue #3241: a dictionary's values stay cached and charged while a
     /// holder outside the cache keeps the array's `Arc`, after the reader has
     /// moved past the dictionary. The kept entry does not keep the decoded
     /// dictionary resident.
@@ -4405,6 +4442,48 @@ mod tests {
         cache.retain_live();
         assert!(cache.entries.is_empty(), "the entry is dropped");
         assert_eq!(pool.reserved(), 0, "the charge leaves with the values");
+    }
+
+    /// Once the reader has dropped a dictionary, its base values are released
+    /// on their own when nothing holds them, while the entry stays for an
+    /// extended array a holder outside the cache still keeps.
+    ///
+    /// Flipped: keeping the base for as long as the entry stays leaves the
+    /// pool at the base's charge plus the extended array's.
+    #[test]
+    fn str_values_base_released_while_only_an_extended_array_is_held() {
+        let dict = page_dict(&VALID_ENTRIES);
+        let pool = unbounded_pool();
+        let shared = test_str_values(&pool);
+        let mut cache = lock_str_values(&shared);
+        let base = cache.values(&dict, Vec::new()).expect("base");
+        let ext = cache.values(&dict, extra(&["ra"])).expect("extended");
+        let ext_bytes = ext.get_array_memory_size();
+        assert_eq!(
+            pool.reserved(),
+            base.get_array_memory_size() + ext_bytes,
+            "both arrays charged"
+        );
+
+        drop((base, dict));
+        cache.retain_live();
+        assert_eq!(
+            cache.entries.len(),
+            1,
+            "the entry stays for the extended array"
+        );
+        assert_eq!(
+            pool.reserved(),
+            ext_bytes,
+            "only the extended array charged"
+        );
+        assert!(cache.entries[0].values.is_none(), "the base is released");
+        assert!(cache.owns(&ext), "the extended array stays cached");
+
+        drop(ext);
+        cache.retain_live();
+        assert!(cache.entries.is_empty(), "the entry is dropped");
+        assert_eq!(pool.reserved(), 0, "nothing left on the pool");
     }
 
     /// A dictionary's entry stays cached and charged while the reader holds
@@ -4467,9 +4546,11 @@ mod tests {
     fn plain_block_values_reserved_before_build() {
         let texts = ["a", "bc", ""];
         let ext = extra(&["ra"]);
+        // One term per value, "a", "bc", "" then "ra".
+        #[allow(clippy::identity_op)]
         let bytes = ValuesLayout {
             len: texts.len() + ext.len(),
-            data: 1 + 2 + 2,
+            data: 1 + 2 + 0 + 2,
             nulls: false,
         }
         .bytes();
