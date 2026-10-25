@@ -396,13 +396,17 @@ Labels: `mode`.
 | `ravel_catalog_isolation_breach_total` | Hard-failed queries from a HEAD or postings tenant_hash mismatch or an out-of-prefix listing result. |
 | `ravel_catalog_column_stats_decode_refusals_total` | Column-statistics objects the HEAD referenced that the reader refused to decode: an oversized declared body, corruption, or a checksum or header failure. Counted on every load, not once per object. |
 | `ravel_catalog_column_stats_decode_panics_total` | Column-statistics decode jobs that panicked on the read CPU gate. Counted on every load. A job the gate cancelled at shutdown is not counted. |
+| `ravel_catalog_column_stats_cache_refusals_total` | Column-statistics loads whose object alone is larger than the column-statistics cache byte budget. The object is served but not cached. |
+| `ravel_catalog_column_stats_cache_evictions_total` | Column-statistics cache entries evicted to stay within the cache byte budget. |
+| `ravel_catalog_column_stats_cache_held_bytes` | Gauge. Bytes the column-statistics cache holds now. |
+| `ravel_catalog_column_stats_decoded_bytes_total` | Decompressed body bytes, not wire bytes, of the column-statistics objects that query loads decoded. A load served from the cache adds nothing, and so does an object the reader refused to decode. |
 
 The first two counters count an anomaly that the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with
 an explicit isolation-fault error.
 [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
 
-The two column-statistics counters fail no query: a query whose statistics
+The two column-statistics decode counters fail no query: a query whose statistics
 object cannot be decoded reads the data instead, at the cost of scanning what
 the statistics would have pruned. A figure that keeps climbing means a folded
 HEAD keeps pointing at an object that cannot be decoded, so that tenant runs
@@ -412,16 +416,16 @@ key is logged once per object.
 ### Catalog fold liveness (`ravel_catalog_fold_*`)
 
 Labels: `mode`, `signal`. Each folded signal (`metrics`, `logs`, `spans`) has
-one series. The mode decides which of the four families a process renders:
+one series. The mode decides which of these families a process renders:
 
 | Mode | Renders | Reason |
 |---|---|---|
-| `maintain`, `all` | All four. | These modes run the scheduled fold. |
-| `query` | The two counters. No gauge and no restart counter. | It folds only on a call to the on-demand `POST /api/v1/admin/fold` route, so the failures of an on-demand fold are visible on `/metrics`. It has no scheduled loop to restart. Nothing makes an on-demand fold recur, so the mode has no liveness gauge. |
+| `maintain`, `all` | All of them. | These modes run the scheduled fold. |
+| `query` | The cycle, failure and dropped-dictionary counters. No gauge, no restart counter and no refold counter. | It folds only on a call to the on-demand `POST /api/v1/admin/fold` route, so the failures of an on-demand fold are visible on `/metrics`. It has no scheduled loop to restart. Nothing makes an on-demand fold recur, so the mode has no liveness gauge. |
 | `gateway` | None. | It mounts no fold route. |
 
 `--disable-fold` stops the loop inside a folding mode. Such a process still
-renders all four families and reports zeros permanently.
+renders every family and reports zeros permanently.
 
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and belongs to
 [Declared-column statistics](#declared-column-statistics), which states where
@@ -431,6 +435,7 @@ the pair renders.
 |---|---|
 | `ravel_catalog_fold_cycles_total` | Catalog folds of this signal that completed successfully, no-op folds included. |
 | `ravel_catalog_fold_failures_total` | Catalog folds of this signal that failed. The fold retries on the next tick and never fails a query directly. |
+| `ravel_catalog_fold_column_stats_dictionaries_dropped_total` | Column-statistics dictionaries that successful folds of this signal in this process dropped to fit a part's statistics under the reader ceiling, the sum of each fold report's dropped-dictionary figure. A failed fold adds nothing. Covers the scheduled fold and the on-demand fold route. |
 | `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold of this signal in this process, `0` if none has succeeded since it started. |
 | `ravel_catalog_fold_loop_restarts_total` | This signal's fold loop caught panicking and restarted by its supervisor in this process. Rendered under the same rule as the gauge above: only where the fold runs on a schedule. |
 | `ravel_catalog_fold_refold_requests_dropped_total` | Pending re-fold requests evicted from this process's in-memory queue because it already held 256 `(tenant, signal)` pairs, one per evicted pair. Labelled by `mode` only: one queue serves every signal. A maintain sweep that finds an hour held by a named snapshot queues it for the scheduled fold of that pair. An evicted request is sent again by a later sweep pass that finds the hold. A pair removed because the process no longer folds it, or because the fold no longer maintains the tenant, is not counted here. Rendered under the same rule as the gauge above, and moves only in a `maintain` process whose scheduled fold is enabled: `--disable-fold` there leaves the queue unfed, and in mode `all` no sweep runs. |
