@@ -59,7 +59,7 @@ for c in $(git rev-list "${base}..${ref}"); do
   fi
   ai_trailer=''
   ai_trailer=$(printf '%s\n' "$body" \
-    | grep -iE '^Co-Authored-By:.*(claude|anthropic)|Generated with|Claude-Session:') || ai_trailer=''
+    | grep -iE '^Co-Authored-By:.*(claude|anthropic)|^(Generated with|🤖 Generated with)|^Claude-Session:') || ai_trailer=''
   if [ -n "$ai_trailer" ]; then
     echo "guard: $c carries an AI attribution trailer:" >&2
     printf '%s\n' "$ai_trailer" >&2
