@@ -13,8 +13,10 @@ mod postings;
 
 pub use column_stats::{
     ColumnStatsHeaderPeek, DecodedColumnStats, column_stats_segments_concat, decode_column_stats,
-    decode_column_stats_header, encode_column_stats_v3, validate_min_max_presence,
+    decode_column_stats_filtered, decode_column_stats_header, encode_column_stats_v3,
+    validate_min_max_presence,
 };
+pub(crate) use column_stats::{SegmentMeter, decode_column_stats_streamed};
 #[cfg(test)]
 pub use column_stats::{encode_column_stats, encode_column_stats_v2};
 pub use error::SnapshotFormatError;

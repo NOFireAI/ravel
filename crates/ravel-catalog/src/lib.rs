@@ -108,7 +108,7 @@ pub use snapshot_format::{
     DEFAULT_MAX_COLUMN_STATS_BYTES, DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES,
     DecodedColumnStats, DecodedPart, DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings,
     PartLimits, PostingsLimits, SnapshotFormatError, VERSION, column_stats_segments_concat,
-    decode_column_stats, decode_column_stats_header, decode_head, decode_part, decode_postings,
+    decode_column_stats, decode_column_stats_filtered, decode_column_stats_header, decode_head, decode_part, decode_postings,
     encode_column_stats_v3, encode_head, encode_part, encode_postings, validate_min_max_presence,
 };
 pub use snapshot_format::{

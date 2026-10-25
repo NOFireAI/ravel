@@ -432,6 +432,253 @@ pub fn decode_column_stats(
     Ok(DecodedColumnStats { header, segments })
 }
 
+/// [`decode_column_stats`], decoding the body one segment at a time and
+/// keeping a column's dictionary only when `keep` returns true for its name
+/// (issue #3244). An unkept dictionary is cleared after its segment is
+/// validated, so every per-column rule still runs against the whole record;
+/// `dictionary_present` is left as decoded. The result equals the whole
+/// decode's with the unkept dictionaries cleared.
+///
+/// The envelope, both CRCs and the declared-size ceiling are checked first,
+/// exactly as [`decode_column_stats`] checks them. The body is then read
+/// through a streaming zstd decoder: a segment's length varint, then that
+/// segment's bytes, which are decoded and validated against the segment
+/// before them before the next one is read. No more than one segment's
+/// encoded bytes and the segments kept so far are held at once, and a body
+/// that inflates past its declared length is refused on the read that
+/// passes it, having consumed at most one byte more than declared.
+///
+/// Every refusal is the [`SnapshotFormatError`] variant
+/// [`decode_column_stats`] returns for the same single defect. An object with
+/// several defects can be refused for a different one: this decoder meets a
+/// segment's validation failure before it learns that the body's total length
+/// or the header's `segment_count` is also wrong, where the whole decode
+/// checks both before validating any segment.
+pub fn decode_column_stats_filtered(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+    keep: impl Fn(&str) -> bool,
+) -> Result<DecodedColumnStats, SnapshotFormatError> {
+    decode_column_stats_streamed(bytes, limits, &keep, &mut Unmetered)
+}
+
+/// Told about each segment's memory as [`decode_column_stats_streamed`] reads
+/// it, so a caller can charge it before it is materialised.
+pub(crate) trait SegmentMeter {
+    type Error: From<SnapshotFormatError>;
+
+    /// A segment's encoded length, before any of its bytes are read.
+    fn before_segment(&mut self, len: u64) -> Result<(), Self::Error>;
+
+    /// The segment as it will be kept: validated, unkept dictionaries
+    /// cleared. The bytes [`Self::before_segment`] announced are freed once
+    /// this returns.
+    fn after_segment(&mut self, kept: &ColumnStatsSegment) -> Result<(), Self::Error>;
+}
+
+struct Unmetered;
+
+impl SegmentMeter for Unmetered {
+    type Error = SnapshotFormatError;
+
+    fn before_segment(&mut self, _len: u64) -> Result<(), SnapshotFormatError> {
+        Ok(())
+    }
+
+    fn after_segment(&mut self, _kept: &ColumnStatsSegment) -> Result<(), SnapshotFormatError> {
+        Ok(())
+    }
+}
+
+/// [`decode_column_stats_filtered`] with a [`SegmentMeter`] told about every
+/// segment.
+pub(crate) fn decode_column_stats_streamed<M: SegmentMeter>(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+    keep: &dyn Fn(&str) -> bool,
+    meter: &mut M,
+) -> Result<DecodedColumnStats, M::Error> {
+    let mut consumed = 0;
+    decode_streamed_counting(bytes, limits, keep, meter, &mut consumed)
+}
+
+/// The streamed decode, reporting in `consumed` how many decompressed bytes
+/// it read, whatever the outcome.
+fn decode_streamed_counting<M: SegmentMeter>(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+    keep: &dyn Fn(&str) -> bool,
+    meter: &mut M,
+    consumed: &mut u64,
+) -> Result<DecodedColumnStats, M::Error> {
+    let (peek, body) = decode_column_stats_prefix(bytes)?;
+    let header = peek.header;
+    let declared = header.body_uncompressed_len;
+    if declared > limits.max_column_stats_bytes {
+        return Err(SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+            declared,
+            cap: limits.max_column_stats_bytes,
+        }
+        .into());
+    }
+    let decoder = zstd::stream::read::Decoder::with_buffer(body)
+        .map_err(|e| SnapshotFormatError::Decompress(e.to_string()))?;
+    let mut stream = BodyStream {
+        inner: decoder,
+        declared,
+        consumed: 0,
+    };
+    let segments = read_segments(&mut stream, peek.envelope_version, keep, meter);
+    *consumed = stream.consumed;
+    let segments = segments?;
+    if stream.consumed != declared {
+        return Err(SnapshotFormatError::ColumnStatsDecompressedLenMismatch {
+            expected: declared,
+            actual: stream.consumed,
+        }
+        .into());
+    }
+    if segments.len() as u64 != header.segment_count {
+        return Err(SnapshotFormatError::ColumnStatsSegmentCountMismatch {
+            expected: header.segment_count,
+            actual: segments.len() as u64,
+        }
+        .into());
+    }
+    Ok(DecodedColumnStats { header, segments })
+}
+
+/// Every segment of `stream`, each validated against the one before it and
+/// stripped of its unkept dictionaries before the next is read.
+fn read_segments<R: std::io::Read, M: SegmentMeter>(
+    stream: &mut BodyStream<R>,
+    version: u8,
+    keep: &dyn Fn(&str) -> bool,
+    meter: &mut M,
+) -> Result<Vec<ColumnStatsSegment>, M::Error> {
+    let mut segments: Vec<ColumnStatsSegment> = Vec::new();
+    while let Some(len) = stream.read_len()? {
+        if len > stream.remaining() {
+            stream.drain()?;
+            return Err(stream
+                .ended_early(format!("segment length {len} runs past the body's end"))
+                .into());
+        }
+        meter.before_segment(len)?;
+        let mut encoded = vec![0u8; to_usize(len)?];
+        if stream.fill(&mut encoded)? < encoded.len() {
+            return Err(stream
+                .ended_early(format!("body ends inside a {len}-byte segment"))
+                .into());
+        }
+        let mut segment = ColumnStatsSegment::decode(encoded.as_slice())
+            .map_err(|e| SnapshotFormatError::ColumnStatsSegmentDecode(e.to_string()))?;
+        drop(encoded);
+        validate_segment(segments.last(), &segment, version)?;
+        for column in &mut segment.columns {
+            if !keep(&column.name) {
+                column.dictionary = Vec::new();
+            }
+        }
+        meter.after_segment(&segment)?;
+        segments.push(segment);
+    }
+    Ok(segments)
+}
+
+/// The decompressed body as a bounded stream: it never hands out more than
+/// one byte past `declared`, and refuses on the read that crosses it.
+struct BodyStream<R> {
+    inner: R,
+    declared: u64,
+    consumed: u64,
+}
+
+impl<R: std::io::Read> BodyStream<R> {
+    /// Fill `buf`, stopping short only at the end of the body. Returns the
+    /// bytes filled.
+    fn fill(&mut self, buf: &mut [u8]) -> Result<usize, SnapshotFormatError> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            // One byte past `declared` is allowed through so an inflating body
+            // is caught by the read that crosses the line, and never later.
+            let allowed = self
+                .declared
+                .saturating_add(1)
+                .saturating_sub(self.consumed);
+            let want = (buf.len() - filled).min(usize::try_from(allowed).unwrap_or(usize::MAX));
+            let read = match self.inner.read(&mut buf[filled..filled + want]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SnapshotFormatError::Decompress(e.to_string())),
+            };
+            filled += read;
+            self.consumed += read as u64;
+            if self.consumed > self.declared {
+                return Err(SnapshotFormatError::Decompress(format!(
+                    "column-statistics body inflates past its declared {} bytes",
+                    self.declared
+                )));
+            }
+        }
+        Ok(filled)
+    }
+
+    /// The declared bytes not yet read.
+    fn remaining(&self) -> u64 {
+        self.declared.saturating_sub(self.consumed)
+    }
+
+    /// The next segment's length varint (prost's encoding: at most ten bytes,
+    /// the tenth at most 1), or `None` at a clean end of body.
+    fn read_len(&mut self) -> Result<Option<u64>, SnapshotFormatError> {
+        let mut value: u64 = 0;
+        for i in 0..10u32 {
+            let mut byte = [0u8; 1];
+            if self.fill(&mut byte)? == 0 {
+                if i == 0 {
+                    return Ok(None);
+                }
+                return Err(self.ended_early("body ends inside a segment length".to_string()));
+            }
+            let [byte] = byte;
+            if i == 9 && byte > 1 {
+                break;
+            }
+            value |= u64::from(byte & 0x7f) << (7 * i);
+            if byte < 0x80 {
+                return Ok(Some(value));
+            }
+        }
+        Err(SnapshotFormatError::ColumnStatsSegmentDecode(
+            "invalid segment length varint".to_string(),
+        ))
+    }
+
+    /// Read to the end of the body, refusing if it inflates past `declared`.
+    fn drain(&mut self) -> Result<(), SnapshotFormatError> {
+        let mut scratch = [0u8; 8192];
+        while self.fill(&mut scratch)? == scratch.len() {}
+        Ok(())
+    }
+
+    /// The refusal for a body that ended where `what` says, mirroring the
+    /// whole decode: a body shorter than declared is a length mismatch, and
+    /// one of exactly the declared length holds a segment that does not
+    /// decode.
+    fn ended_early(&self, what: String) -> SnapshotFormatError {
+        if self.consumed < self.declared {
+            SnapshotFormatError::ColumnStatsDecompressedLenMismatch {
+                expected: self.declared,
+                actual: self.consumed,
+            }
+        } else {
+            SnapshotFormatError::ColumnStatsSegmentDecode(what)
+        }
+    }
+}
+
 /// Sort/uniqueness/field validation shared by the encoders (defensive check of
 /// caller input) and `decode_column_stats` (untrusted-bytes check). Beyond
 /// segment identity this also validates every `ColumnStat`'s internal
@@ -456,39 +703,54 @@ fn validate_segments(
     segments: &[ColumnStatsSegment],
     version: u8,
 ) -> Result<(), SnapshotFormatError> {
-    let part_keyed = version >= 2;
-    let expected_writer_id_len = if part_keyed { 32 } else { 16 };
-    for (i, segment) in segments.iter().enumerate() {
-        if segment.writer_id.len() != expected_writer_id_len {
-            return Err(SnapshotFormatError::ColumnStatsBadFieldLen {
-                field: "writer_id",
-                expected: expected_writer_id_len,
-                actual: segment.writer_id.len(),
-            });
-        }
-        if i > 0 {
-            let ordering = if part_keyed {
-                // v2: the whole key is the content hash carried in writer_id.
-                segments[i - 1]
-                    .writer_id
-                    .as_slice()
-                    .cmp(segment.writer_id.as_slice())
-            } else {
-                segment_key(&segments[i - 1]).cmp(&segment_key(segment))
-            };
-            match ordering {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => {
-                    return Err(SnapshotFormatError::ColumnStatsDuplicateSegment);
-                }
-                std::cmp::Ordering::Greater => {
-                    return Err(SnapshotFormatError::ColumnStatsSegmentsUnsorted);
-                }
-            }
-        }
-        validate_columns(&segment.columns)?;
+    let mut previous = None;
+    for segment in segments {
+        validate_segment(previous, segment, version)?;
+        previous = Some(segment);
     }
     Ok(())
+}
+
+/// One step of [`validate_segments`]: `segment`'s writer_id width, its order
+/// against `previous` (the segment before it in the object, if any), and its
+/// columns. [`decode_column_stats_filtered`] runs it as each segment arrives;
+/// ordering reads only identity fields, so a `previous` whose dictionaries
+/// were already cleared orders exactly as the unstripped one would.
+fn validate_segment(
+    previous: Option<&ColumnStatsSegment>,
+    segment: &ColumnStatsSegment,
+    version: u8,
+) -> Result<(), SnapshotFormatError> {
+    let part_keyed = version >= 2;
+    let expected_writer_id_len = if part_keyed { 32 } else { 16 };
+    if segment.writer_id.len() != expected_writer_id_len {
+        return Err(SnapshotFormatError::ColumnStatsBadFieldLen {
+            field: "writer_id",
+            expected: expected_writer_id_len,
+            actual: segment.writer_id.len(),
+        });
+    }
+    if let Some(previous) = previous {
+        let ordering = if part_keyed {
+            // v2: the whole key is the content hash carried in writer_id.
+            previous
+                .writer_id
+                .as_slice()
+                .cmp(segment.writer_id.as_slice())
+        } else {
+            segment_key(previous).cmp(&segment_key(segment))
+        };
+        match ordering {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                return Err(SnapshotFormatError::ColumnStatsDuplicateSegment);
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(SnapshotFormatError::ColumnStatsSegmentsUnsorted);
+            }
+        }
+    }
+    validate_columns(&segment.columns)
 }
 
 /// Per-segment column-list validation: no duplicate column name, and every
