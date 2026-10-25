@@ -109,6 +109,16 @@ pub fn parse_zstd_level(s: &str) -> Result<ravel_ingest::RlogZstdLevel, String> 
     ravel_ingest::RlogZstdLevel::new(level).map_err(|e| format!("invalid --zstd-level: {e}"))
 }
 
+/// Parse a `load --group-target-blocks` value, refusing 0 with
+/// [`ravel_ingest::RlogGroupTargetBlocksError`]'s message.
+pub fn parse_group_target_blocks(s: &str) -> Result<ravel_ingest::RlogGroupTargetBlocks, String> {
+    let blocks: usize = s
+        .parse()
+        .map_err(|e| format!("invalid --group-target-blocks '{s}': {e}"))?;
+    ravel_ingest::RlogGroupTargetBlocks::new(blocks)
+        .map_err(|e| format!("invalid --group-target-blocks: {e}"))
+}
+
 /// Parse an `export --max-ingest-lag` value into nanoseconds.
 ///
 /// Same humantime grammar as [`parse_max_flush_lifetime_ns`], naming the flag

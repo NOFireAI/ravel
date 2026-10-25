@@ -32,7 +32,7 @@ use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, PER_BATCH_TARGET_BYTES
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::storage_layout::{self, BloomScopeArg, BucketWidthArg};
 use ravel_cli::typed_attr_column;
-use ravel_ingest::RlogZstdLevel;
+use ravel_ingest::{RlogGroupTargetBlocks, RlogZstdLevel};
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{
     self, LogFooter, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, kind,
@@ -290,6 +290,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         Some(PER_BATCH_TARGET_BYTES),
         None,
         RlogZstdLevel::new(3).expect("in range"),
+        RlogGroupTargetBlocks::DEFAULT,
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

@@ -800,6 +800,23 @@ enum Command {
             value_parser = ravel_cli::parse_zstd_level
         )]
         zstd_level: ravel_ingest::RlogZstdLevel,
+        /// Blocks per row group in each RLOG object a logs load writes, a row
+        /// group being that many consecutive blocks of up to 8,192 records
+        /// each; default 32. Raise it with a large `--target-bytes` to write
+        /// each object as one row group, so a narrow projection reads one
+        /// chunk per column instead of one per row group and column.
+        ///
+        /// 0 is refused. A metrics or spans load ignores this flag. A group
+        /// larger than 32 blocks raises the raw bytes a compaction merge holds
+        /// per input object, one row group each; the compactor itself writes
+        /// 32-block groups.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value = "32",
+            value_parser = ravel_cli::parse_group_target_blocks
+        )]
+        group_target_blocks: ravel_ingest::RlogGroupTargetBlocks,
         /// The bytes of built batches a logs load may hold at once (issue
         /// #2626). Every batch is charged before it is built, at an estimate
         /// from the previous batch's bytes per row (zero for the first batch),
@@ -3340,6 +3357,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             target_bytes,
             max_flush_delay,
             zstd_level,
+            group_target_blocks,
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
@@ -3366,6 +3384,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 target_bytes,
                 max_flush_delay,
                 zstd_level,
+                group_target_blocks,
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
@@ -4947,6 +4966,51 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// `--group-target-blocks` defaults to 32, the writer's own row-group
+    /// size, and 0 is refused at parse time with a message naming the flag.
+    #[test]
+    fn group_target_blocks_flag_defaults_to_32_and_refuses_zero() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+        let blocks_of = |extra: &[&str]| match Cli::try_parse_from(
+            base.iter().copied().chain(extra.iter().copied()),
+        )
+        .map(|cli| cli.command)
+        {
+            Ok(Command::Load {
+                group_target_blocks,
+                ..
+            }) => Ok(group_target_blocks.get()),
+            Ok(_) => panic!("expected the load subcommand"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(blocks_of(&[]), Ok(32));
+        assert_eq!(
+            blocks_of(&[]),
+            Ok(ravel_logseg::RlogConfig::default().group_target_blocks),
+            "the default is the writer's"
+        );
+        assert_eq!(blocks_of(&["--group-target-blocks", "1"]), Ok(1));
+        assert_eq!(blocks_of(&["--group-target-blocks", "512"]), Ok(512));
+        let err = blocks_of(&["--group-target-blocks", "0"]).expect_err("0 is refused");
+        assert!(
+            err.contains(
+                "invalid --group-target-blocks: RLOG row-group size must be at least 1 block"
+            ),
+            "{err}"
+        );
+        let err = blocks_of(&["--group-target-blocks", "x"]).expect_err("not a number");
+        assert!(err.contains("invalid --group-target-blocks 'x'"), "{err}");
     }
 
     /// Issue #1184's classification: `load`, `typed-attr-column set`,
