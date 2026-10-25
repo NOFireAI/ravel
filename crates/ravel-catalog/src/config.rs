@@ -333,9 +333,9 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRIES: usize = 512;
 /// [`DEFAULT_MAX_POSTINGS_BYTES`](snapshot_format::DEFAULT_MAX_POSTINGS_BYTES), both 256 MiB).
 pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
 /// Default total byte budget for the column-statistics reuse cache (issue
-/// #905): the decoded `.cstat` objects the resolve path caches per
-/// `(tenant, signal)` so a repeated eligible plan against an unchanged folded
-/// HEAD skips the stats-object GET (ADR-0850, issue #888). A `.cstat` payload
+/// #905): the decoded `.cstat` objects the resolve path caches per covered
+/// part (issue #3244) so a repeated eligible plan against an unchanged part
+/// skips its stats-object GET (ADR-0850, issue #888). A `.cstat` payload
 /// scales with a tenant's declared typed columns times its live segments, and
 /// before this budget the map grew one such entry per served tenant for the
 /// process lifetime, with nothing reclaiming an active tenant's entry and
@@ -557,20 +557,22 @@ pub struct CatalogConfig {
     /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
     pub byte_cache_max_entry_bytes: u64,
     /// Total byte budget for the column-statistics reuse cache (issue #905),
-    /// the decoded `.cstat` objects cached per `(tenant, signal, query
-    /// window)` on the [`crate::Catalog::load_column_stats`] path. The budget is over the bytes
-    /// actually held
-    /// ([`LoadedColumnStats::heap_bytes`](crate::column_stats_resolve::LoadedColumnStats::heap_bytes)),
-    /// not an entry count: a `.cstat` payload's size varies by orders of
-    /// magnitude across tenants, so an entry-count bound would not bound memory.
-    /// When admitting a freshly resolved object would exceed this, the
-    /// least-recently-used entries are evicted first, each counted by
+    /// the decoded `.cstat` objects cached on the
+    /// [`crate::Catalog::load_column_stats`] path, one entry per covered part's
+    /// object (issue #3244). Each entry holds its part's summaries and only the
+    /// dictionaries statements have asked for. The budget is over the bytes
+    /// actually held (each entry's encoded segment bytes, as held; their sum is
+    /// [`crate::Catalog::column_stats_cache_held_bytes`]), not an entry count:
+    /// a `.cstat` payload's size varies by orders of magnitude across parts and
+    /// tenants, so an entry-count bound would not bound memory. When admitting
+    /// a freshly decoded entry would exceed this, the least-recently-used
+    /// entries are evicted first, each counted by
     /// [`crate::Catalog::column_stats_cache_evictions`], so an undersized budget
-    /// is observable rather than silent; an object larger than the whole budget
-    /// is not cached at all and counted by
+    /// is observable rather than silent; one part's entry larger than the whole
+    /// budget is not cached at all and counted by
     /// [`crate::Catalog::column_stats_cache_refusals`]. Eviction only ever
-    /// forces a cache miss and a re-resolve, never a partial or stale statistic
-    /// reaching the exact MIN/MAX path.
+    /// forces a cache miss and a re-fetch of that part, never a partial or
+    /// stale statistic reaching the exact MIN/MAX path.
     ///
     /// `0` is the disabled sentinel, matching
     /// [`byte_cache_max_bytes`](Self::byte_cache_max_bytes): [`crate::Catalog::new`]

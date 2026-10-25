@@ -2857,11 +2857,10 @@ mod tests {
                 )
             })
             .collect();
-        Arc::new(LoadedColumnStats {
-            segments: std::collections::HashMap::new(),
+        Arc::new(LoadedColumnStats::from_maps(
+            std::collections::HashMap::new(),
             by_content_hash,
-            part_blake3: Vec::new(),
-        })
+        ))
     }
 
     /// Write `values` as one real RLOG object at `key` and return its unstamped
@@ -3314,15 +3313,15 @@ mod tests {
                     end_ns: NOW_NS,
                 },
                 NOW_NS,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
             .expect("load .cstat")
             .expect("a .cstat object is present");
         let entries: Vec<_> = loaded
-            .by_content_hash
-            .values()
-            .flat_map(|seg| seg.columns.iter().filter(|c| c.name == CODE))
+            .content_hash_segments()
+            .flat_map(|(_, seg)| seg.columns.iter().filter(|c| c.name == CODE))
             .collect();
         assert_eq!(entries.len(), 1, "one .cstat entry for code");
         let code_value = |v: i64| ravel_proto::catalog::v1::ColumnValue {
@@ -3632,6 +3631,155 @@ mod tests {
             })
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// Issue #3244: a load that did not request `code`'s dictionary carries
+    /// the column's summary with its dictionary cleared, and the not-equal
+    /// count declines on it rather than reading the empty dictionary: the
+    /// statement scans the segment and returns the exact count. The same
+    /// segment with the dictionary requested is answered from the statistics
+    /// with no data GET, which shows the decline is the dictionary's absence.
+    ///
+    /// FLIP: drop both the `dictionary_loaded` check and the `dict_total !=
+    /// non_null_count` check from `LogsScanExec::declared_not_equal_count`;
+    /// the summary-only run then answers 5 from an emptied dictionary instead
+    /// of 3 and fails the exact-count assertion. The
+    /// `dictionary_loaded` check alone is not enough to flip: with it removed
+    /// the existing `dict_total` check still declines, since an emptied
+    /// dictionary sums to 0 against a non-zero `non_null_count`.
+    #[tokio::test]
+    async fn a_not_equal_count_declines_without_its_dictionary_and_scans() {
+        const NOW_NS: i64 = 4 * 3_600_000_000_000;
+        const SQL: &str = "SELECT COUNT(*) AS n FROM logs WHERE code <> 3";
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("cstat-no-dictionary".to_string());
+        let config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(
+                code_declared()
+                    .iter()
+                    .map(|d| ravel_catalog::DeclaredTypedColumn {
+                        key: d.key.clone(),
+                        ty: ravel_catalog::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        ravel_catalog::set_tenant_config(memory.as_ref(), &tenant.hash(), &config, 1)
+            .await
+            .expect("tenant config");
+        let values = [Some(1), Some(2), Some(3), Some(3), Some(5)];
+        let key = publish_code_segment(memory.as_ref(), &tenant, 1, &values, true).await;
+
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&memory),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                Uuid::from_u128(0x3244),
+                NOW_NS,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(report.column_stats_part_objects_built, 1);
+        let window = ravel_types::TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let load = |request: ravel_catalog::ColumnStatsRequest| {
+            let catalog = &catalog;
+            let tenant = &tenant;
+            async move {
+                catalog
+                    .load_column_stats(
+                        &tenant.hash(),
+                        ravel_types::Signal::Logs,
+                        window,
+                        NOW_NS,
+                        &request,
+                        &QueryAccounting::new(),
+                    )
+                    .await
+                    .expect("load .cstat")
+                    .expect("a .cstat object is present")
+            }
+        };
+        let summary = load(ravel_catalog::ColumnStatsRequest::summary_only()).await;
+        let with_code =
+            load(ravel_catalog::ColumnStatsRequest::summary_only().with_dictionary(CODE)).await;
+        assert!(!summary.dictionary_loaded(CODE));
+        assert!(with_code.dictionary_loaded(CODE));
+        let snapshot = catalog
+            .resolve(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                window,
+                &[],
+                NOW_NS,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1, "one resolved segment");
+
+        let count = |stats: Arc<LoadedColumnStats>| {
+            let memory = &memory;
+            let segments = snapshot.segments.clone();
+            async move {
+                let store = KeyCountingStore::new(Arc::clone(memory));
+                let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
+                let provider = LogsTableProvider::new(
+                    Snapshot {
+                        segments,
+                        segments_pruned: 0,
+                        pending_erasure: Vec::new(),
+                    },
+                    TenantHash([7u8; 16]),
+                    LogSegmentFetcher::new(backend),
+                    PhaseAccounting::pooled_over(&QueryAccounting::new()),
+                )
+                .with_declared_columns(code_declared())
+                .with_column_stats(Some(stats));
+                let ctx = logs_session(provider).expect("session");
+                let batches = ctx
+                    .sql(SQL)
+                    .await
+                    .expect("plan")
+                    .collect()
+                    .await
+                    .expect("collect");
+                let result = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                    .expect("format")
+                    .to_string();
+                (result, store)
+            }
+        };
+        let want = "\
++---+
+| n |
++---+
+| 3 |
++---+";
+
+        let (answered, answered_store) = count(with_code).await;
+        assert_eq!(answered, want);
+        assert_eq!(
+            answered_store.gets_of(&key),
+            0,
+            "with the dictionary loaded the count is answered from statistics"
+        );
+
+        let (declined, declined_store) = count(summary).await;
+        assert_eq!(declined, want, "the scan returns the exact count");
+        assert!(
+            declined_store.gets_of(&key) > 0,
+            "without the dictionary the count declines and the segment is read"
+        );
     }
 
     /// Only a stamp that no `.cstat` entry contradicts skips a segment by

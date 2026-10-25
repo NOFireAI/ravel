@@ -225,11 +225,7 @@ fn loaded_stats(entries: Vec<(&SegmentRef, ColumnStatsSegment)>) -> Arc<LoadedCo
     for (seg, stat) in entries {
         segments.insert(identity_of(seg), stat);
     }
-    Arc::new(LoadedColumnStats {
-        segments,
-        by_content_hash: HashMap::new(),
-        part_blake3: Vec::new(),
-    })
+    Arc::new(LoadedColumnStats::from_maps(segments, HashMap::new()))
 }
 
 fn snapshot_of(

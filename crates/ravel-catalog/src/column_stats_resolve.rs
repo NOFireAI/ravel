@@ -16,12 +16,23 @@
 //!
 //! Records key by content hash (`SegmentRef::content_hash` /
 //! `SnapshotEntry::content_hash`, ADR-0942), carried in
-//! `ColumnStatsSegment.writer_id` at 32 bytes. [`LoadedColumnStats`] keeps a
-//! legacy `segments` map keyed by the five-field `EntryIdentity` tuple
+//! `ColumnStatsSegment.writer_id` at 32 bytes. Each part entry keeps a
+//! legacy map keyed by the five-field `EntryIdentity` tuple
 //! (`fold::entry_identity`) for the retired v1 keying scheme; nothing
-//! populates it anymore, so it is always empty, but its removal would ripple
-//! into `ravel-sql`'s consumption of this type and is out of this change's
-//! scope.
+//! populates it from a fetched object anymore, so it is empty there, but
+//! [`LoadedColumnStats::from_maps`] still accepts one and
+//! [`LoadedColumnStats::stat_for`] still consults it.
+//!
+//! # Summaries and dictionaries
+//!
+//! A `ColumnStat`'s per-value dictionary is most of its weight, and only the
+//! q02 and q08 shapes read one. A load therefore takes a
+//! [`ColumnStatsRequest`] naming the columns whose dictionaries the statement
+//! needs, and every other column's dictionary is cleared from what the load
+//! holds (issue #3244). A reader asks
+//! [`LoadedColumnStats::dictionary_loaded`] before it reads a dictionary: a
+//! cleared one is empty, and an empty dictionary is a wrong answer, not an
+//! absent one.
 //!
 //! # Degrade-to-`None`, loud exceptions
 //!
@@ -58,7 +69,8 @@ use ravel_cpu_gate::ReadSite;
 use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::{ColumnStatsSegment, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::EntryIdentity;
 use crate::charged::DecodeReserver;
@@ -69,28 +81,191 @@ use crate::snapshot_format::{
     decode_head,
 };
 
-/// The owned column-statistics inputs a query-time metadata-only plan needs:
-/// exact per-segment statistics, assembled from every covered part a query's
-/// window touches. v1 (whole-object, tuple-keyed) records live in `segments`;
-/// v2 (whole-object) and v3 (per-part) records, both content-hash-keyed, live
-/// in `by_content_hash`. A live segment absent from both has no exact
-/// statistics and the query scans it.
-#[derive(Clone, Debug, Default)]
-pub struct LoadedColumnStats {
+/// The per-value dictionaries a statement needs from the column statistics it
+/// loads, by declared column name (`ColumnStat.name`). Empty (the
+/// [`Default`]) is a summary-only load: counts, extrema and sums, no
+/// dictionary at all. Every column it does not name has its dictionary
+/// cleared from the load, and [`LoadedColumnStats::dictionary_loaded`] reports
+/// it absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColumnStatsRequest {
+    dictionaries: BTreeSet<String>,
+}
+
+impl ColumnStatsRequest {
+    /// A request for no dictionary, the shape SUM, AVG and an unfiltered
+    /// count need.
+    pub fn summary_only() -> Self {
+        Self::default()
+    }
+
+    /// This request plus `column`'s dictionary.
+    pub fn with_dictionary(mut self, column: impl Into<String>) -> Self {
+        self.add_dictionary(column);
+        self
+    }
+
+    /// Add `column`'s dictionary to this request.
+    pub fn add_dictionary(&mut self, column: impl Into<String>) {
+        self.dictionaries.insert(column.into());
+    }
+
+    /// Add every dictionary `other` names to this request.
+    pub fn extend(&mut self, other: &ColumnStatsRequest) {
+        self.dictionaries.extend(other.dictionaries.iter().cloned());
+    }
+
+    /// Whether this request names `column`'s dictionary.
+    pub fn wants_dictionary(&self, column: &str) -> bool {
+        self.dictionaries.contains(column)
+    }
+
+    /// The columns whose dictionaries this request names, in name order.
+    pub fn dictionary_columns(&self) -> impl Iterator<Item = &str> {
+        self.dictionaries.iter().map(String::as_str)
+    }
+
+    /// Whether this request names no dictionary at all.
+    pub fn is_summary_only(&self) -> bool {
+        self.dictionaries.is_empty()
+    }
+}
+
+/// Which columns' dictionaries a [`PartColumnStats`] holds. `All` is a
+/// hand-built carrier ([`LoadedColumnStats::from_maps`]), which strips
+/// nothing; a fetched part always holds an explicit set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HeldDictionaries {
+    All,
+    Columns(BTreeSet<String>),
+}
+
+impl HeldDictionaries {
+    fn holds(&self, column: &str) -> bool {
+        match self {
+            HeldDictionaries::All => true,
+            HeldDictionaries::Columns(columns) => columns.contains(column),
+        }
+    }
+
+    fn covers(&self, request: &ColumnStatsRequest) -> bool {
+        request
+            .dictionary_columns()
+            .all(|column| self.holds(column))
+    }
+}
+
+/// One covered part's decoded column statistics, the unit the catalog's
+/// column-statistics cache holds and evicts (ADR-1413 decision 5, issue
+/// #3244): every segment the part's `.cstat` object carries, with the
+/// dictionary of every column outside [`Self::dictionaries`] cleared.
+/// Immutable once built; a load that needs a dictionary an entry lacks
+/// builds a new entry from a fresh decode rather than editing a shared one.
+#[derive(Debug)]
+pub(crate) struct PartColumnStats {
     /// Retired v1 keying scheme
     /// (`(ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq)`,
-    /// `fold::entry_identity`). Nothing populates this map anymore (ADR-1413
-    /// decision 6): it is always empty. Kept rather than removed because
-    /// removing it ripples into `ravel-sql`'s consumption of this type,
-    /// outside this change's scope.
-    pub segments: HashMap<EntryIdentity, ColumnStatsSegment>,
+    /// `fold::entry_identity`). Empty for a fetched part (ADR-1413 decision
+    /// 6); only [`LoadedColumnStats::from_maps`] fills it.
+    segments: HashMap<EntryIdentity, ColumnStatsSegment>,
     /// v3 per-part records, keyed by content hash (`SegmentRef::content_hash`,
     /// ADR-0942).
-    pub by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
-    /// The covered parts' blake3 hashes this load was assembled for, in
-    /// `SnapshotHead.parts` order (the window a cache entry built from this
-    /// load remains valid against).
-    pub part_blake3: Vec<[u8; 32]>,
+    by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
+    dictionaries: HeldDictionaries,
+    heap_bytes: u64,
+}
+
+impl PartColumnStats {
+    /// Build an entry from one decoded object, keeping the dictionaries
+    /// `request` names plus those `previous` (the same object's earlier entry)
+    /// already held, so a new statement's request never drops a dictionary an
+    /// earlier one paid to fetch.
+    pub(crate) fn from_decoded(
+        decoded: DecodedStats,
+        request: &ColumnStatsRequest,
+        previous: Option<&PartColumnStats>,
+    ) -> Self {
+        let dictionaries = match previous.map(|entry| &entry.dictionaries) {
+            Some(HeldDictionaries::All) => HeldDictionaries::All,
+            Some(HeldDictionaries::Columns(held)) => {
+                let mut columns = held.clone();
+                columns.extend(request.dictionaries.iter().cloned());
+                HeldDictionaries::Columns(columns)
+            }
+            None => HeldDictionaries::Columns(request.dictionaries.clone()),
+        };
+        Self::new(decoded.segments, decoded.by_content_hash, dictionaries)
+    }
+
+    fn new(
+        mut segments: HashMap<EntryIdentity, ColumnStatsSegment>,
+        mut by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
+        dictionaries: HeldDictionaries,
+    ) -> Self {
+        if let HeldDictionaries::Columns(columns) = &dictionaries {
+            for segment in segments.values_mut().chain(by_content_hash.values_mut()) {
+                strip_dictionaries(segment, columns);
+            }
+        }
+        let heap_bytes = segments
+            .values()
+            .chain(by_content_hash.values())
+            .map(|segment| segment.encoded_len() as u64)
+            .sum();
+        PartColumnStats {
+            segments,
+            by_content_hash,
+            dictionaries,
+            heap_bytes,
+        }
+    }
+
+    /// The exact byte weight this entry charges against the column-statistics
+    /// cache budget: the summed encoded protobuf length of every segment it
+    /// holds, as held (cleared dictionaries cost nothing, held ones count in
+    /// full). Computed once at construction.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        self.heap_bytes
+    }
+
+    /// Whether this entry holds every dictionary `request` names.
+    pub(crate) fn covers(&self, request: &ColumnStatsRequest) -> bool {
+        self.dictionaries.covers(request)
+    }
+
+    /// Whether this entry holds `column`'s dictionary.
+    pub(crate) fn holds_dictionary(&self, column: &str) -> bool {
+        self.dictionaries.holds(column)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty() && self.by_content_hash.is_empty()
+    }
+}
+
+/// Clear the dictionary of every column of `segment` not named in `keep`.
+/// Every other field, `dictionary_present` included, is left as decoded:
+/// `dictionary_present` describes the object, and whether the load holds the
+/// dictionary is [`LoadedColumnStats::dictionary_loaded`]'s answer.
+pub(crate) fn strip_dictionaries(segment: &mut ColumnStatsSegment, keep: &BTreeSet<String>) {
+    for column in &mut segment.columns {
+        if !keep.contains(&column.name) {
+            column.dictionary = Vec::new();
+        }
+    }
+}
+
+/// The column-statistics inputs a query-time metadata-only plan needs: exact
+/// per-segment statistics, assembled from every covered part a query's
+/// window touches. Each part is a shared cache entry (issue #3244), so
+/// building this costs no copy of any part's records. A live segment no part
+/// carries has no exact statistics and the query scans it.
+///
+/// Every column's summary (counts, extrema, sum) is present; a column's
+/// dictionary is present only where [`Self::dictionary_loaded`] says so.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedColumnStats {
+    parts: Vec<Arc<PartColumnStats>>,
 }
 
 /// The entry for column `name` in `segment`, and only when the segment carries
@@ -123,48 +298,103 @@ pub fn unique_column_stat<'a>(
 }
 
 impl LoadedColumnStats {
-    /// The exact byte weight this object charges against the catalog's
-    /// column-statistics cache budget (issue #905): the sum of every held
-    /// segment's encoded protobuf length (both maps) plus 32 bytes per covered
-    /// part hash.
+    /// A carrier built from records already in hand rather than from a load:
+    /// content-hash-keyed records in `by_content_hash`, retired v1
+    /// tuple-keyed records in `segments`. It holds every dictionary its
+    /// records carry, so [`Self::dictionary_loaded`] is true for every column.
+    pub fn from_maps(
+        segments: HashMap<EntryIdentity, ColumnStatsSegment>,
+        by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
+    ) -> Self {
+        LoadedColumnStats {
+            parts: vec![Arc::new(PartColumnStats::new(
+                segments,
+                by_content_hash,
+                HeldDictionaries::All,
+            ))],
+        }
+    }
+
+    /// Assemble a load from its covered parts' entries, in `SnapshotHead.parts`
+    /// order. Parts carrying no segment are dropped.
+    pub(crate) fn from_parts(parts: Vec<Arc<PartColumnStats>>) -> Self {
+        LoadedColumnStats {
+            parts: parts.into_iter().filter(|part| !part.is_empty()).collect(),
+        }
+    }
+
+    /// Whether no part carries any segment: nothing to join against.
+    pub fn is_empty(&self) -> bool {
+        self.parts.iter().all(|part| part.is_empty())
+    }
+
+    /// The exact bytes the part entries this load shares hold: the sum of
+    /// each part's encoded segment bytes, as held (issue #905, #3244).
     ///
     /// It counts the decoded `.cstat` payload itself, the term that scales with
     /// a tenant's declared typed columns times its live segments and with the
-    /// number of tenants a process serves, and the term the budget exists to
-    /// bound. It deliberately does NOT count `HashMap` slot overhead or the
-    /// `Arc` control block, so the figure is an exact, reproducible function of
-    /// the cached data (identical contents in, identical bytes out) rather than
-    /// an estimate of the entry count; it is a lower bound on the process RSS
-    /// the entry costs. The bytes counted are decoded-payload bytes, not the
+    /// number of tenants a process serves, and the term the cache budget
+    /// exists to bound. It deliberately does NOT count `HashMap` slot overhead
+    /// or the `Arc` control blocks, so the figure is an exact, reproducible
+    /// function of the held data rather than an estimate; it is a lower bound
+    /// on the process RSS the load costs. The bytes counted are
+    /// decoded-payload bytes with unrequested dictionaries cleared, not the
     /// object's on-wire compressed size.
     pub fn heap_bytes(&self) -> u64 {
-        let segment_bytes: u64 = self
-            .segments
-            .values()
-            .map(|segment| segment.encoded_len() as u64)
-            .sum::<u64>()
-            + self
-                .by_content_hash
-                .values()
-                .map(|segment| segment.encoded_len() as u64)
-                .sum::<u64>();
-        let part_bytes = self.part_blake3.len() as u64 * 32;
-        segment_bytes + part_bytes
+        self.parts.iter().map(|part| part.heap_bytes()).sum()
+    }
+
+    /// Whether `column`'s dictionary was loaded for every part this load
+    /// holds. When it is not, every record's dictionary for `column` is empty
+    /// whatever `dictionary_present` says, and a reader must decline rather
+    /// than count from it.
+    pub fn dictionary_loaded(&self, column: &str) -> bool {
+        self.parts.iter().all(|part| part.holds_dictionary(column))
     }
 
     /// The exact statistics for a live segment: the content-hash keyed record
     /// (a per-part v3 object, ADR-0942), falling back to the retired
-    /// identity-keyed v1 map (always empty since ADR-1413 decision 6). Returns
-    /// `None` when neither map carries an entry: the segment has no exact
-    /// statistics and the caller must scan it.
+    /// identity-keyed v1 map. A later part wins over an earlier one for the
+    /// same key, as when one map was extended part by part. Returns `None`
+    /// when no part carries an entry: the segment has no exact statistics and
+    /// the caller must scan it.
     pub fn stat_for(
         &self,
         content_hash: &[u8; 32],
         identity: &EntryIdentity,
     ) -> Option<&ColumnStatsSegment> {
-        self.by_content_hash
-            .get(content_hash)
-            .or_else(|| self.segments.get(identity))
+        self.parts
+            .iter()
+            .rev()
+            .find_map(|part| part.by_content_hash.get(content_hash))
+            .or_else(|| {
+                self.parts
+                    .iter()
+                    .rev()
+                    .find_map(|part| part.segments.get(identity))
+            })
+    }
+
+    /// Every content-hash keyed record this load holds, with its key.
+    pub fn content_hash_segments(&self) -> impl Iterator<Item = (&[u8; 32], &ColumnStatsSegment)> {
+        self.parts
+            .iter()
+            .flat_map(|part| part.by_content_hash.iter())
+    }
+
+    /// The content-hash keyed records as one map, a later part winning a key
+    /// the way [`Self::stat_for`] does.
+    #[cfg(test)]
+    pub(crate) fn by_content_hash(&self) -> HashMap<[u8; 32], &ColumnStatsSegment> {
+        self.content_hash_segments()
+            .map(|(hash, segment)| (*hash, segment))
+            .collect()
+    }
+
+    /// The part entries this load shares, in covered-part order.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> &[Arc<PartColumnStats>] {
+        &self.parts
     }
 }
 
@@ -230,10 +460,9 @@ pub(crate) enum FetchOutcome {
     DecodeRefused(SnapshotFormatError),
 }
 
-/// One fetched-and-decoded object's records, split by keying scheme. Kept
-/// separate from the public [`LoadedColumnStats`] because a single query
-/// merges records from up to several such fetches (one per covered part, plus
-/// at most one whole-object fallback) before it has a final result.
+/// One fetched-and-decoded object's records, split by keying scheme, with
+/// every dictionary still in place. [`PartColumnStats::from_decoded`] turns it
+/// into the cached, dictionary-stripped entry.
 #[derive(Default)]
 pub(crate) struct DecodedStats {
     pub segments: HashMap<EntryIdentity, ColumnStatsSegment>,
@@ -506,4 +735,173 @@ pub(crate) async fn fetch_stats_object(
         },
         reservation,
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+    use ravel_proto::catalog::v1::{ColumnStat, ColumnValue, DictEntry, column_value::Kind};
+
+    use super::*;
+    use crate::snapshot_format::encode_column_stats_v3;
+
+    const NAMES: [&str; 4] = ["a", "b", "c", "d"];
+
+    fn i64_value(v: i64) -> ColumnValue {
+        ColumnValue {
+            kind: Some(Kind::I64(v)),
+        }
+    }
+
+    /// A valid I64 column over `values`: exact counts, extrema and sum, and a
+    /// dictionary when `present`.
+    fn column(name: &str, values: &[i64], nulls: u64, present: bool) -> ColumnStat {
+        let mut counts = BTreeMap::new();
+        for v in values {
+            *counts.entry(*v).or_insert(0u64) += 1;
+        }
+        ColumnStat {
+            name: name.to_string(),
+            declared_type: 2,
+            non_null_count: values.len() as u64,
+            null_count: nulls,
+            min: values.iter().min().map(|v| i64_value(*v)),
+            max: values.iter().max().map(|v| i64_value(*v)),
+            dictionary_present: present,
+            dictionary: if present {
+                counts
+                    .into_iter()
+                    .map(|(v, count)| DictEntry {
+                        value: Some(i64_value(v)),
+                        count,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            sum: Some(values.iter().sum()),
+        }
+    }
+
+    fn arb_column(name: &'static str) -> impl Strategy<Value = ColumnStat> {
+        (
+            proptest::collection::vec(-3i64..4, 0..6),
+            0u64..3,
+            any::<bool>(),
+        )
+            .prop_map(move |(values, nulls, present)| column(name, &values, nulls, present))
+    }
+
+    /// One to four segments, each keyed by a distinct ascending 32-byte content
+    /// hash, each carrying every column of [`NAMES`].
+    fn arb_segments() -> impl Strategy<Value = Vec<ColumnStatsSegment>> {
+        proptest::collection::vec(
+            (
+                arb_column(NAMES[0]),
+                arb_column(NAMES[1]),
+                arb_column(NAMES[2]),
+                arb_column(NAMES[3]),
+            ),
+            1..5,
+        )
+        .prop_map(|rows| {
+            rows.into_iter()
+                .enumerate()
+                .map(|(i, (a, b, c, d))| ColumnStatsSegment {
+                    ingest_hour_bucket: 1,
+                    shard: 0,
+                    writer_id: vec![i as u8; 32],
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    columns: vec![a, b, c, d],
+                })
+                .collect()
+        })
+    }
+
+    fn arb_request() -> impl Strategy<Value = ColumnStatsRequest> {
+        proptest::sample::subsequence(NAMES.to_vec(), 0..=NAMES.len()).prop_map(|names| {
+            names
+                .into_iter()
+                .fold(ColumnStatsRequest::summary_only(), |request, name| {
+                    request.with_dictionary(name)
+                })
+        })
+    }
+
+    /// `bytes` decoded and keyed the way [`fetch_stats_object`] keys them.
+    fn decode(bytes: &[u8]) -> DecodedStats {
+        let decoded =
+            decode_column_stats(bytes, &ColumnStatsLimits::default()).expect("a fresh encode");
+        DecodedStats {
+            segments: HashMap::new(),
+            by_content_hash: decoded
+                .segments
+                .into_iter()
+                .map(|segment| {
+                    let hash = <[u8; 32]>::try_from(segment.writer_id.as_slice())
+                        .expect("a 32-byte content hash");
+                    (hash, segment)
+                })
+                .collect(),
+            body_uncompressed_len: decoded.header.body_uncompressed_len,
+        }
+    }
+
+    proptest! {
+        /// Issue #3244: stripping clears dictionaries and nothing else. An
+        /// entry built from one decode for `first`, then rebuilt from a second
+        /// decode for `second` with the first as `previous`, holds exactly
+        /// the union; with every cleared dictionary copied back from a third
+        /// decode it equals the encoded segments, so no summary field, and no
+        /// `dictionary_present`, was touched. Its `heap_bytes` is the stripped
+        /// segments' encoded length.
+        ///
+        /// FLIP: make `strip_dictionaries` also clear `dictionary_present`;
+        /// the restored segments differ (the checked-in seed is that case).
+        #[test]
+        fn strip_then_reattach_restores_the_decoded_segments(
+            segments in arb_segments(),
+            first in arb_request(),
+            second in arb_request(),
+        ) {
+            let bytes = encode_column_stats_v3([7; 16], 1, [9; 32], &segments, u64::MAX)
+                .expect("distinct ascending segments encode");
+            let earlier = PartColumnStats::from_decoded(decode(&bytes), &first, None);
+            let entry = PartColumnStats::from_decoded(decode(&bytes), &second, Some(&earlier));
+            let full = decode(&bytes).by_content_hash;
+
+            let mut union = first.clone();
+            union.extend(&second);
+            for name in NAMES {
+                prop_assert_eq!(entry.holds_dictionary(name), union.wants_dictionary(name));
+            }
+            prop_assert!(entry.covers(&union));
+
+            let held_len: u64 = entry
+                .by_content_hash
+                .values()
+                .map(|segment| segment.encoded_len() as u64)
+                .sum();
+            prop_assert_eq!(entry.heap_bytes(), held_len);
+
+            let mut restored = entry.by_content_hash.clone();
+            for (hash, segment) in &mut restored {
+                for (held, original) in segment.columns.iter_mut().zip(&full[hash].columns) {
+                    if union.wants_dictionary(&held.name) {
+                        prop_assert_eq!(&held.dictionary, &original.dictionary);
+                    } else {
+                        prop_assert!(held.dictionary.is_empty());
+                        held.dictionary = original.dictionary.clone();
+                    }
+                }
+            }
+            let mut restored: Vec<_> = restored.into_values().collect();
+            restored.sort_by(|x, y| x.writer_id.cmp(&y.writer_id));
+            prop_assert_eq!(restored, segments);
+        }
+    }
 }

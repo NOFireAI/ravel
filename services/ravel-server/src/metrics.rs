@@ -2900,7 +2900,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_column_stats_cache_refusals_total",
-        "Column-statistics loads whose object alone exceeds the column-statistics cache byte budget, served but not cached.",
+        "Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget, served but not cached.",
         "counter",
     );
     write_sample(
@@ -11724,7 +11724,7 @@ mod tests {
 
         let body = render_in(Mode::All);
         for expected in [
-            "# HELP ravel_catalog_column_stats_cache_refusals_total Column-statistics loads whose object alone exceeds the column-statistics cache byte budget, served but not cached.",
+            "# HELP ravel_catalog_column_stats_cache_refusals_total Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget, served but not cached.",
             "# TYPE ravel_catalog_column_stats_cache_refusals_total counter",
             "ravel_catalog_column_stats_cache_refusals_total{mode=\"all\"} 11",
             "# HELP ravel_catalog_column_stats_cache_evictions_total Column-statistics cache entries evicted to stay within the cache byte budget.",
@@ -12429,6 +12429,7 @@ mod tests {
                     signal,
                     range,
                     50 * NS_PER_HOUR,
+                    &ravel_catalog::ColumnStatsRequest::summary_only(),
                     &QueryAccounting::new(),
                 )
                 .await
@@ -12617,6 +12618,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -12636,6 +12638,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -12652,13 +12655,26 @@ mod tests {
                 Signal::Logs,
                 range,
                 50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
             .expect("load")
             .expect("the cached object covers the window");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
+        // Each load assembles its own carrier over the cached part entries, so
+        // a cache hit shows as the second load's records being the first's.
+        let records = |loaded: &ravel_catalog::LoadedColumnStats| {
+            let mut records: Vec<_> = loaded
+                .content_hash_segments()
+                .map(|(hash, segment)| (*hash, std::ptr::from_ref(segment)))
+                .collect();
+            records.sort_unstable();
+            records
+        };
+        assert!(!records(&first).is_empty(), "the load holds records");
+        assert_eq!(
+            records(&first),
+            records(&second),
             "the second load is served from the cache"
         );
         let cached = CatalogCountersSnapshot::from_catalog(&admitting);

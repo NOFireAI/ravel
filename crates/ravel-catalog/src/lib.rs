@@ -47,7 +47,9 @@ pub use catalog::{
     AuthoritativeSelection, erasure_dominated_compaction_records,
     select_authoritative_compaction_records,
 };
-pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats, unique_column_stat};
+pub use column_stats_resolve::{
+    ColumnStatsRequest, LoadColumnStatsError, LoadedColumnStats, unique_column_stat,
+};
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
     DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,

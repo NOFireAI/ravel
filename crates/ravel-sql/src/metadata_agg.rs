@@ -81,6 +81,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
+use ravel_catalog::ColumnStatsRequest;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::logs_pushdown::filter_is_exact;
@@ -382,37 +383,46 @@ fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, Scalar
 /// by shape only: an admitted statement can still decline at execution (no
 /// stored sum, a dictionary over the cardinality ceiling, a clipped segment,
 /// a residual the optimizer leaves in place) and scans.
+///
+/// An admitted statement returns the [`ColumnStatsRequest`] its answer reads
+/// (issue #3244): the shape's dictionaries and nothing else, since a load
+/// pays for every dictionary it carries.
+///
+/// - **q08** requests the group key's dictionary.
+/// - **q02** requests the dictionary of every non-`Str` declared column a
+///   residual `<>` conjunct or unknown conjunct names: whichever of them the
+///   optimizer leaves as the scan's one `<>` conjunct is the one
+///   [`LogsScanExec::declared_not_equal_count`] reads.
+/// - **SUM/AVG** read the stored sum and counts, so they request no
+///   dictionary.
+///
+/// `None` refuses the statement: no statistics load at all.
 pub(crate) fn logical_aggregate_answerable(
     aggregate: &Aggregate,
     declared: &[DeclaredColumn],
-) -> bool {
-    let Some(residual) = logs_scan_residual(&aggregate.input, declared) else {
-        return false;
-    };
-    let Some(calls) = aggregate
+) -> Option<ColumnStatsRequest> {
+    let residual = logs_scan_residual(&aggregate.input, declared)?;
+    let calls = aggregate
         .aggr_expr
         .iter()
         .map(|expr| logical_call(expr, declared))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
+        .collect::<Option<Vec<_>>>()?;
     let not_str = |col: &DeclaredColumn| !matches!(col.ty, DeclaredType::Str);
-    // `true` for q02, which needs exactly one `<>` conjunct; `false` for the
-    // shapes that need none.
-    let filtered_count = match (aggregate.group_expr.as_slice(), calls.as_slice()) {
-        ([], [StatsAggregate::CountStar]) => true,
+    // `None` for q02, which needs exactly one `<>` conjunct and reads that
+    // conjunct's dictionary; the request itself for the shapes that need no
+    // conjunct.
+    let unfiltered_request = match (aggregate.group_expr.as_slice(), calls.as_slice()) {
+        ([], [StatsAggregate::CountStar]) => None,
         ([], [StatsAggregate::Sum { col, .. } | StatsAggregate::Avg { col }])
             if matches!(col.ty, DeclaredType::I64) =>
         {
-            false
+            Some(ColumnStatsRequest::summary_only())
         }
-        ([Expr::Column(key)], [StatsAggregate::CountStar])
-            if declared_named(declared, &key.name).is_some_and(not_str) =>
-        {
-            false
+        ([Expr::Column(key)], [StatsAggregate::CountStar]) => {
+            let key = declared_named(declared, &key.name).filter(|col| not_str(col))?;
+            Some(ColumnStatsRequest::summary_only().with_dictionary(key.key.as_str()))
         }
-        _ => return false,
+        _ => return None,
     };
     let mut not_equal = Vec::new();
     let mut unknown = Vec::new();
@@ -422,25 +432,37 @@ pub(crate) fn logical_aggregate_answerable(
             None => unknown.push(conjunct),
         }
     }
-    if !unknown.is_empty() {
-        return !filtered_count
-            || not_equal.iter().any(|col| not_str(col))
-            || unknown
-                .iter()
-                .any(|conjunct| names_non_str_declared(conjunct, declared));
-    }
-    match not_equal.as_slice() {
-        [] => !filtered_count,
-        [col] => filtered_count && not_str(col),
-        _ => false,
-    }
+    let Some(unfiltered_request) = unfiltered_request else {
+        let mut request = ColumnStatsRequest::summary_only();
+        if !unknown.is_empty() {
+            for col in not_equal.iter().filter(|col| not_str(col)) {
+                request.add_dictionary(col.key.as_str());
+            }
+            for conjunct in &unknown {
+                for col in non_str_declared_named(conjunct, declared) {
+                    request.add_dictionary(col.key.as_str());
+                }
+            }
+            return (!request.is_summary_only()).then_some(request);
+        }
+        return match not_equal.as_slice() {
+            [col] if not_str(col) => Some(request.with_dictionary(col.key.as_str())),
+            _ => None,
+        };
+    };
+    (!unknown.is_empty() || not_equal.is_empty()).then_some(unfiltered_request)
 }
 
-/// Whether `expr` references a non-`Str` declared column by name.
-fn names_non_str_declared(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
-    expr.column_refs().iter().any(|col| {
-        declared_named(declared, &col.name).is_some_and(|col| !matches!(col.ty, DeclaredType::Str))
-    })
+/// The non-`Str` declared columns `expr` references by name.
+fn non_str_declared_named<'a>(
+    expr: &Expr,
+    declared: &'a [DeclaredColumn],
+) -> Vec<&'a DeclaredColumn> {
+    expr.column_refs()
+        .iter()
+        .filter_map(|col| declared_named(declared, &col.name))
+        .filter(|col| !matches!(col.ty, DeclaredType::Str))
+        .collect()
 }
 
 /// The residual filter conjuncts between an aggregate's input and the `logs`

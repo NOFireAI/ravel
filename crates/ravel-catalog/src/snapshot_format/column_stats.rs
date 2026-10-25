@@ -636,7 +636,7 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
 ///   so an all-NULL column contributes a value to a MIN/MAX the scan would
 ///   answer NULL for.
 ///
-/// Public because [`crate::LoadedColumnStats`] has public fields, so a reader
+/// Public because [`crate::LoadedColumnStats`] has a public constructor, so a reader
 /// can receive `ColumnStat` records from a carrier that never passed through
 /// [`decode_column_stats`] (an in-process construction, a cache, a test
 /// fixture). Such a reader enforces this clause by calling this function
