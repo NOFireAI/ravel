@@ -7,7 +7,9 @@
 //! `filter_dict` keeps that values array, and the coalescer behind
 //! `FilterExec` keeps a slice of each filtered batch until it has 8,192 rows.
 //! Neither holds a reservation, so a selective `LIKE` could hold every
-//! block's values while the pool reads one block's charge.
+//! block's values while the pool reads one block's charge. Since issue #3241
+//! the scan keeps each values array charged while anything downstream holds
+//! it, which [`p5_heap_held_before_the_coalescer_flushes_is_charged`] asserts.
 //!
 //! The fixture is one RLOG object of `N` blocks of [`BLOCK_ROWS`] rows. Every
 //! `URL` value is [`L`] bytes and distinct across the whole object, so each
@@ -467,7 +469,12 @@ fn within_ten_percent(got: usize, want: usize) -> bool {
 /// Prediction 1: with one matching row per block, the `FilterExec` output
 /// holds `N x (8192 x L + 4 x 8193)` bytes within 10% while the pool reads at
 /// most one block's charge.
+///
+/// Missed as registered: the coalescer's finish rebuilds the dictionary over
+/// the surviving values, so the output holds a few bytes per row. Kept with
+/// its band, run by name with `--ignored`.
 #[tokio::test]
+#[ignore = "prediction 1 of #3237 missed as registered; run by name with --ignored"]
 async fn p1_one_match_per_block_pins_every_blocks_values_array() {
     let _serial = SERIAL.lock().await;
     let mut misses = Vec::new();
