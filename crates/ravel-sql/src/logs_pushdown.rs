@@ -236,11 +236,24 @@ impl LogsPushdown {
 /// empty for the metadata-only aggregate rewrite and the `.cstat` load that
 /// feeds it. That rewrite replaces the whole scan, so what the arm prunes
 /// cannot change its answer. The scan's route choice reads it the same way
-/// (`logs_scan::route_predicate_free`). Any other arm answers `false`.
+/// (`logs_scan::route_predicate_free`), beside
+/// [`content_is_route_neutral`]. Any other arm answers `false`.
 pub(crate) fn prune_is_rewrite_neutral(prune: &[Predicate]) -> bool {
     prune
         .iter()
         .all(|p| matches!(p, Predicate::NumNotEq { .. }))
+}
+
+/// Whether `content` holds no arm but [`Predicate::Contains`], so the scan's
+/// route choice (`logs_scan::route_predicate_free`) counts it as empty. No
+/// index covers a `Contains` arm, so it excludes no block from a plan phase
+/// or an open: the reader evaluates it per row of every block on every route
+/// (ADR-2773, contains-arm amendment). Any other arm answers `false`; a
+/// `HasWord` or `Equals` arm can exclude a block through bloom or POSTINGS.
+pub(crate) fn content_is_route_neutral(content: &[Predicate]) -> bool {
+    content
+        .iter()
+        .all(|p| matches!(p, Predicate::Contains { .. }))
 }
 
 /// Extract all sound pushdown from a `logs` filter set. Each element of

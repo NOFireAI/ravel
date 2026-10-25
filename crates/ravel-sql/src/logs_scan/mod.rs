@@ -412,7 +412,7 @@ use tokio::sync::OnceCell;
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::error::SqlError;
 use crate::late_materialization::{RowRef, row_ref_field};
-use crate::logs_pushdown::prune_is_rewrite_neutral;
+use crate::logs_pushdown::{content_is_route_neutral, prune_is_rewrite_neutral};
 use crate::logs_schema::{
     FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
@@ -1302,20 +1302,31 @@ pub struct LogsScanExec {
 }
 
 /// [`LogQuery::is_block_predicate_free`] for route selection, reading a prune
-/// list of only `NumNotEq` arms as empty ([`prune_is_rewrite_neutral`]).
+/// list of only `NumNotEq` arms as empty ([`prune_is_rewrite_neutral`]) and a
+/// content list of only `Contains` arms as empty ([`content_is_route_neutral`]).
 ///
-/// Such a list must not move a scan onto the planned route: a plan pass costs
-/// more wall time than the arm saves in decode. The whole-segment open still
-/// carries the arm, so the reader skips every block whose stat proves
-/// min == max == the literal from the skip index the open reads anyway, and
-/// the scan records that open's survivor list for row refs.
+/// Neither list may move a scan onto the planned route. A `NumNotEq` arm
+/// saves less decode than a plan pass costs in wall time, and a `Contains`
+/// arm excludes no block in a plan pass at all, since no index covers it. The
+/// whole-segment open still carries both: the reader skips every block whose
+/// stat proves min == max == the `NumNotEq` literal, from the skip index the
+/// open reads anyway, and evaluates the `Contains` arm per row of every block
+/// it decodes. The scan records that open's survivor list for row refs. A
+/// content list holding any other arm (`HasWord`, `Equals`) keeps rejecting.
 fn route_predicate_free(query: &LogQuery) -> bool {
-    if query.prune.is_empty() || !prune_is_rewrite_neutral(&query.prune) {
+    let clear_prune = !query.prune.is_empty() && prune_is_rewrite_neutral(&query.prune);
+    let clear_content = !query.content.is_empty() && content_is_route_neutral(&query.content);
+    if !clear_prune && !clear_content {
         return query.is_block_predicate_free();
     }
-    let mut without_prune = query.clone();
-    without_prune.prune.clear();
-    without_prune.is_block_predicate_free()
+    let mut neutral = query.clone();
+    if clear_prune {
+        neutral.prune.clear();
+    }
+    if clear_content {
+        neutral.content.clear();
+    }
+    neutral.is_block_predicate_free()
 }
 
 /// Which conjunct kept a statement off the predicate-free full-window
@@ -1325,17 +1336,19 @@ fn route_predicate_free(query: &LogQuery) -> bool {
 ///
 /// The variants are exactly the query-wide conjuncts
 /// [`LogsScanExec::whole_segment_fast_path`] tests, in the order it tests them,
-/// and the first failure wins: a query with both a content predicate and a
-/// partial window reports [`Self::BlockPredicate`].
+/// and the first failure wins: a query with both a `HasWord` content predicate
+/// and a partial window reports [`Self::BlockPredicate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FastPathRejection {
     /// The snapshot carries a pending selective erasure (ADR-0064 decision 2).
     PendingErasure,
-    /// The query carries a content or stream-attribute arm, or a prune-only arm
-    /// other than `NumNotEq`, so the plan phase can exclude a block and the
-    /// survivor count is not the block count. A `NumNotEq`-only prune list does
-    /// not reject (`route_predicate_free`): the fast path takes it and the open
-    /// itself drops the blocks the arm rules out.
+    /// The query carries a stream-attribute arm, a content arm other than
+    /// `Contains`, or a prune-only arm other than `NumNotEq`, so the plan phase
+    /// can exclude a block and the survivor count is not the block count. A
+    /// `NumNotEq`-only prune list and a `Contains`-only content list do not
+    /// reject (`route_predicate_free`): the fast path takes them, the open
+    /// itself drops the blocks the `NumNotEq` arm rules out, and the reader
+    /// evaluates the `Contains` arm per row of every block it decodes.
     BlockPredicate,
     /// Some relevant segment is not fully contained in the query window (a
     /// partial ts overlap), or its catalog span is ill-formed (`min > max`), so
@@ -2535,7 +2548,8 @@ impl LogsScanExec {
     ///   carries no block-level predicate
     ///   ([`LogQuery::is_block_predicate_free`]: no content, prune-only,
     ///   stream-attribute, pending-erasure, or exact-key arm), a prune list of
-    ///   only `NumNotEq` arms excepted ([`route_predicate_free`]), and
+    ///   only `NumNotEq` arms and a content list of only `Contains` arms
+    ///   excepted ([`route_predicate_free`]), and
     /// - every relevant segment has a well-formed span (`min <= max`) and is
     ///   fully CONTAINED in the window
     ///   (`ts_min <= seg.min && seg.max <= ts_max`). Containment is
