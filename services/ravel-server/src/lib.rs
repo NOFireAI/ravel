@@ -2921,8 +2921,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         }
     }
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
-    // The two cache flags reach the catalog byte cache here, not only the
-    // fetcher cache.
+    // The cache flags reach the catalog byte cache and the column-statistics
+    // cache here, not only the fetcher cache.
     let catalog =
         query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
     // ADR-1702 decision 3: the catalog's resolve-path snapshot part, postings

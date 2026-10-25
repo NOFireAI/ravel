@@ -1660,14 +1660,17 @@ budget. The column-statistics cache has no disk tier, so it does not enter
 the SQL spill path's read-cache figure, which bounds that tier.
 
 The share is 2 because it admits the largest single entry measured today.
-The cache holds one decoded entry per tenant until ADR-1413's per-part
-entries land, and an entry larger than the cap is served but not cached, so
-every query reads and decodes the whole `.cstat` object again. The
-whole-tenant entry on the reference host was 266,736,092 bytes (measured
-2026-10-25, issue #3244 comment 6397066052); 2% of the reference budget is
-601,295,421 bytes and admits it with room for growth, and 2% of the
+Until ADR-1413's per-part entries land, the cache holds one decoded entry
+per (tenant, signal, query window hour bounds), so one tenant queried over
+several distinct windows holds one whole-tenant-sized entry per window, and
+an entry larger than the cap is served but not cached, so every query
+reads and decodes the whole `.cstat` object again. The whole-tenant entry
+on the reference host was 266,736,092 bytes (measured 2026-10-25, issue
+#3244 comment 6397066052); 2% of the reference budget is 601,295,421 bytes
+and holds two such entries, so two concurrent windows over that tenant stay
+cached and a third evicts the least recently used. 2% of the
 available-memory budget on the same host, 27,775,004,672 bytes, is
-555,500,093 and admits it too. 1%, about 278 to 301 MB on those budgets,
+555,500,093 and also holds two. 1%, about 278 to 301 MB on those budgets,
 would leave the entry less than 13% of headroom to grow. Once per-part entries land (issue #3244 plan step 2), an
 entry is one part's statistics rather than a tenant's, and the share is
 expected to be slack rather than the bound that decides what is cached.

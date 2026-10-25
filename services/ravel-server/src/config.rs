@@ -2508,12 +2508,13 @@ pub struct Cli {
 
     /// Maximum resident bytes for the catalog's column-statistics cache
     /// (`query::build_catalog_for_server`), the decoded `.cstat` objects the
-    /// resolve path reuses per tenant and signal, a SEPARATE LRU ceiling from
-    /// `--cache-max-bytes` and `--catalog-cache-max-bytes` (ADR-1413 decision
-    /// 5). An entry larger than this is served but not cached. A value of `0`
-    /// builds no column-statistics cache. Read at startup only; there is no
-    /// live resize. Ignored when `--disable-cache` is set. Unset, it derives
-    /// at 2% of the memory budget, and 64 MiB when memory is unknown.
+    /// resolve path reuses per tenant, signal and query window, a SEPARATE
+    /// LRU ceiling from `--cache-max-bytes` and `--catalog-cache-max-bytes`
+    /// (ADR-1413 decision 5). An entry larger than this is served but not
+    /// cached. A value of `0` builds no column-statistics cache. Read at
+    /// startup only; there is no live resize. Ignored when `--disable-cache`
+    /// is set. Unset, it derives at 2% of the memory budget, and 64 MiB when
+    /// memory is unknown.
     ///
     /// Omitted, the value derives at [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of
     /// `memory_budget_bytes`, unaffected by whether the store is loopback;
@@ -3362,9 +3363,10 @@ pub struct QueryBudgets {
     /// (ADR-1413 decision 5). Reaches
     /// `CatalogConfig::column_stats_cache_max_bytes` through
     /// [`crate::query::build_catalog_for_server`], which turns it into the
-    /// `0` disabled sentinel under `--disable-cache`. Not a query budget; it
-    /// rides here because it comes from the resolved performance defaults,
-    /// which `start` does not otherwise see.
+    /// `0` disabled sentinel under `--disable-cache`. Not a query budget:
+    /// `main` fills it from the resolved performance defaults through
+    /// `query_budgets`, beside the query-path figures, while the two byte
+    /// cache caps ride on `ServerConfig` directly.
     pub column_stats_cache_max_bytes: u64,
     /// The MCP surface's settings (ADR-1374). Not a query budget; it rides
     /// here because this is the query-surface configuration `start` receives.

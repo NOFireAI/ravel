@@ -1419,9 +1419,10 @@ non-negative byte counts, so their sum can never go below `0`), and the fix
 is `--memory-budget-bytes` above `0`, or leaving it unset to derive the
 budget from the host's memory.
 
-`--disable-cache` is outside that check entirely. It builds neither cache, so
-neither resolved ceiling holds any memory: the hard-caps figure is `0`
-regardless of `--cache-max-bytes` and `--catalog-cache-max-bytes`, the
+`--disable-cache` is outside that check entirely. It builds none of the
+three caches, so no resolved ceiling holds any memory: the hard-caps figure
+is `0` regardless of `--cache-max-bytes`, `--catalog-cache-max-bytes` and
+`--column-stats-cache-max-bytes`, the
 remainder is the whole budget, and
 startup never refuses. That is what keeps the flag usable as the remedy the
 caching guide names it as, and it is the one path that can start with a
