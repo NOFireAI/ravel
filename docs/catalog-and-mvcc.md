@@ -794,7 +794,7 @@ per-part coverage is decided per part, from that part's own field-7 ref
 alone.
 
 Every load takes a `ColumnStatsRequest` naming the columns whose value
-dictionaries the statement reads (issue #3244): `summary_only()` names none,
+dictionaries the statement reads: `summary_only()` names none,
 `with_dictionary(column)` adds one. Each part's statistics are held in memory
 without the dictionaries the request did not name: a column's `dictionary` is
 emptied while its `dictionary_present` and every other summary field stay as
@@ -807,9 +807,9 @@ non-string typed column a `<>` conjunct or a conjunct the load decision cannot
 read names; `SUM` and `AVG` read the summary alone.
 
 The decoded parts are kept in a per-process cache with one entry per part,
-keyed by (tenant, signal, the part's declared `.cstat` blake3) and bound to the
-HEAD just read (#888), so a fold that changes a part's statistics changes its
-key and the old entry is never served. An entry holds the part's stripped
+keyed by (tenant, signal, the part's declared `.cstat` blake3) as HEAD's
+field-7 ref names it. Every load reads HEAD first, so a fold that changes a
+part's statistics changes its key and the old entry is never served. An entry holds the part's stripped
 segments, the set of dictionaries it holds, and its exact size in bytes (the
 summed encoded length of those segments). A covered part is fetched only when
 it has no entry or its entry lacks a dictionary the request names; the refetch
