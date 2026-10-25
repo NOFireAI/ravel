@@ -45,6 +45,9 @@ tracing-subscriber = { workspace = true }
 # Builds the points an ingest router flushes in the format-floor acceptance
 # test (ADR-1746), whose audit half runs this crate's census.
 ravel-otlp = { workspace = true }
+# Issue #3254: the single-owner ordered map measured against std's BTreeMap
+# in benches/compaction_grouping.rs. Not in [workspace.dependencies].
+bbtree = "=0.1.5"
 
 [lints]
 workspace = true
