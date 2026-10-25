@@ -365,6 +365,7 @@ fn field(shape: Shape, id: i16) -> Field {
 /// converted from every `ARROW:schema` value.
 pub(crate) fn check_footer_shape(footer: &[u8]) -> Result<u64, String> {
     let mut walk = Walk {
+        subject: "footer",
         bytes: footer,
         pos: 0,
         leaves: None,
@@ -387,15 +388,15 @@ pub(crate) fn check_page_headers(chunk: &[u8]) -> Result<usize, String> {
     let mut pages = 0;
     while pos < chunk.len() {
         let mut walk = Walk {
+            subject: "page header",
             bytes: chunk,
             pos,
             leaves: None,
             decoded: 0,
         };
-        let header = walk.read_struct(Shape::PageHeader).map_err(|err| {
-            let err = err.strip_prefix("footer ").unwrap_or(&err);
-            format!("page header at byte {pos}: {err}")
-        })?;
+        let header = walk
+            .read_struct(Shape::PageHeader)
+            .map_err(|err| format!("page at byte {pos}: {err}"))?;
         pages += 1;
         match header.page_size.map(usize::try_from) {
             Some(Ok(size)) if size <= walk.remaining() => pos = walk.pos + size,
@@ -406,6 +407,8 @@ pub(crate) fn check_page_headers(chunk: &[u8]) -> Result<usize, String> {
 }
 
 struct Walk<'a> {
+    /// What the walk reads, for its error messages.
+    subject: &'static str,
     bytes: &'a [u8],
     pos: usize,
     /// The leaf columns of the last schema read, which every row group
@@ -545,18 +548,20 @@ impl Walk<'_> {
     }
 
     fn byte(&mut self) -> Result<u8, String> {
+        let subject = self.subject;
         let b = *self
             .bytes
             .get(self.pos)
-            .ok_or_else(|| format!("footer ends at byte {} inside a value", self.pos))?;
+            .ok_or_else(|| format!("{subject} ends at byte {} inside a value", self.pos))?;
         self.pos += 1;
         Ok(b)
     }
 
     fn advance(&mut self, n: usize) -> Result<(), String> {
+        let subject = self.subject;
         if n > self.remaining() {
             return Err(format!(
-                "footer declares {n} bytes at byte {} with {} left",
+                "{subject} declares {n} bytes at byte {} with {} left",
                 self.pos,
                 self.remaining()
             ));
@@ -568,6 +573,7 @@ impl Walk<'_> {
     /// An unsigned varint, decoded as the decoder's `read_vlq` decodes it.
     /// The decoder reads a longer one too; no writer produces it.
     fn varint(&mut self) -> Result<u64, String> {
+        let subject = self.subject;
         let start = self.pos;
         let mut value: u64 = 0;
         for i in 0..MAX_VARINT_BYTES {
@@ -578,7 +584,7 @@ impl Walk<'_> {
             }
         }
         Err(format!(
-            "footer varint at byte {start} runs past {MAX_VARINT_BYTES} bytes"
+            "{subject} varint at byte {start} runs past {MAX_VARINT_BYTES} bytes"
         ))
     }
 
@@ -591,14 +597,15 @@ impl Walk<'_> {
     /// Refuse a declared count that the bytes left could not hold at
     /// `min_bytes` per element.
     fn count_fits(&self, count: u64, min_bytes: u64, what: &str) -> Result<usize, String> {
+        let subject = self.subject;
         let left = self.remaining() as u64;
         if count.saturating_mul(min_bytes) > left {
             return Err(format!(
-                "footer {what} at byte {} declares {count} elements with {left} bytes left",
+                "{subject} {what} at byte {} declares {count} elements with {left} bytes left",
                 self.pos
             ));
         }
-        usize::try_from(count).map_err(|_| format!("footer {what} count {count} does not fit"))
+        usize::try_from(count).map_err(|_| format!("{subject} {what} count {count} does not fit"))
     }
 
     /// A list or set header, as the decoder's `read_list_begin` reads it:
@@ -606,6 +613,7 @@ impl Walk<'_> {
     /// empty list (some writers put element type 0 on one), else the
     /// element type and the declared count.
     fn list_header(&mut self) -> Result<Option<(u8, u64)>, String> {
+        let subject = self.subject;
         let at = self.pos;
         let header = self.byte()?;
         if header == 0 {
@@ -614,14 +622,14 @@ impl Walk<'_> {
         let element = header & 0x0f;
         if element == T_STOP || element > T_STRUCT {
             return Err(format!(
-                "footer list at byte {at} has element type {element}"
+                "{subject} list at byte {at} has element type {element}"
             ));
         }
         let short = u64::from(header >> 4);
         let count = if short == 15 { self.varint()? } else { short };
         if count > i32::MAX as u64 {
             return Err(format!(
-                "footer list at byte {at} declares {count} elements, past i32"
+                "{subject} list at byte {at} declares {count} elements, past i32"
             ));
         }
         Ok(Some((element, count)))
@@ -631,6 +639,7 @@ impl Walk<'_> {
     /// type and the field id, computed as the decoder's `read_field_begin`
     /// computes it from `last`.
     fn field_header(&mut self, last: i16) -> Result<Option<(u8, i16)>, String> {
+        let subject = self.subject;
         let at = self.pos;
         let header = self.byte()?;
         let code = header & 0x0f;
@@ -639,7 +648,7 @@ impl Walk<'_> {
         }
         if code > T_STRUCT {
             return Err(format!(
-                "footer has unknown compact type {code} at byte {at}"
+                "{subject} has unknown compact type {code} at byte {at}"
             ));
         }
         let delta = header >> 4;
@@ -647,7 +656,7 @@ impl Walk<'_> {
             self.zigzag()? as i16
         } else {
             last.checked_add(i16::from(delta))
-                .ok_or_else(|| format!("footer field id at byte {at} overflows i16"))?
+                .ok_or_else(|| format!("{subject} field id at byte {at} overflows i16"))?
         };
         Ok(Some((code, id)))
     }
@@ -656,6 +665,7 @@ impl Walk<'_> {
     /// return what [`Element`] keeps of it. A `KeyValue` whose key is
     /// `ARROW:schema` has its value checked and its conversion charged.
     fn read_struct(&mut self, shape: Shape) -> Result<Element, String> {
+        let subject = self.subject;
         let start = self.pos;
         let mut last = 0i16;
         let mut fields = 0usize;
@@ -667,7 +677,7 @@ impl Walk<'_> {
             let at = self.pos;
             let Some((code, id)) = self.field_header(last)? else {
                 if shape.is_union() && fields == 0 {
-                    return Err(format!("footer {shape:?} at byte {start} has no field"));
+                    return Err(format!("{subject} {shape:?} at byte {start} has no field"));
                 }
                 if shape == Shape::KeyValue {
                     self.check_key_value(&element)?;
@@ -676,14 +686,14 @@ impl Walk<'_> {
             };
             if shape.is_union() && fields == 1 {
                 return Err(format!(
-                    "footer {shape:?} at byte {start} has more than one field"
+                    "{subject} {shape:?} at byte {start} has more than one field"
                 ));
             }
             match field(shape, id) {
                 Field::Read(kind) => {
                     if !kind.matches(code) {
                         return Err(format!(
-                            "footer field {id} of {shape:?} at byte {at} has compact type \
+                            "{subject} field {id} of {shape:?} at byte {at} has compact type \
                              {code}, where the decoder reads {kind:?}"
                         ));
                     }
@@ -694,7 +704,7 @@ impl Walk<'_> {
                     let bit = 1u64 << (id & 63);
                     if read & bit != 0 {
                         return Err(format!(
-                            "footer field {id} of {shape:?} at byte {at} repeats a field read \
+                            "{subject} field {id} of {shape:?} at byte {at} repeats a field read \
                              before"
                         ));
                     }
@@ -720,7 +730,7 @@ impl Walk<'_> {
                 Field::Skip => self.skip(code, SKIP_DEPTH)?,
                 Field::Refuse(what) => {
                     return Err(format!(
-                        "footer field {id} of {shape:?} at byte {at} carries {what}"
+                        "{subject} field {id} of {shape:?} at byte {at} carries {what}"
                     ));
                 }
             }
@@ -730,6 +740,7 @@ impl Walk<'_> {
     }
 
     fn read_value(&mut self, kind: Kind, shape: Shape, id: i16) -> Result<Value, String> {
+        let subject = self.subject;
         match kind {
             // The value is the header type.
             Kind::Bool => Ok(Value::Other),
@@ -751,7 +762,7 @@ impl Walk<'_> {
                 let at = self.pos;
                 if self.byte()? != T_STOP {
                     return Err(format!(
-                        "footer field {id} of {shape:?} at byte {at} is not an empty struct"
+                        "{subject} field {id} of {shape:?} at byte {at} is not an empty struct"
                     ));
                 }
                 Ok(Value::Other)
@@ -762,9 +773,10 @@ impl Walk<'_> {
 
     /// A binary's bytes, as their range in the footer.
     fn binary(&mut self) -> Result<Range<usize>, String> {
+        let subject = self.subject;
         let len = self.varint()?;
-        let n =
-            usize::try_from(len).map_err(|_| format!("footer binary length {len} does not fit"))?;
+        let n = usize::try_from(len)
+            .map_err(|_| format!("{subject} binary length {len} does not fit"))?;
         self.advance(n)?;
         Ok(self.pos - n..self.pos)
     }
@@ -789,17 +801,18 @@ impl Walk<'_> {
 
     /// A known list: the decoder reads `elem` for every declared element.
     fn read_list(&mut self, elem: Elem, shape: Shape, id: i16) -> Result<(), String> {
+        let subject = self.subject;
         let at = self.pos;
         let list = (shape, id);
         if list == (Shape::FileMetaData, 4) && self.leaves.is_none() {
             return Err(format!(
-                "footer row groups at byte {at} come before the schema"
+                "{subject} row groups at byte {at} come before the schema"
             ));
         }
         let (code, count) = self.list_header()?.unwrap_or((elem.code(), 0));
         if code != elem.code() {
             return Err(format!(
-                "footer list at byte {at} in field {id} of {shape:?} has element type {code}, \
+                "{subject} list at byte {at} in field {id} of {shape:?} has element type {code}, \
                  where the decoder reads {elem:?}"
             ));
         }
@@ -812,7 +825,7 @@ impl Walk<'_> {
             (Shape::FileMetaData, 4) => {
                 if declared > MAX_ROW_GROUPS {
                     return Err(format!(
-                        "footer list at byte {at} declares {declared} row groups, more than \
+                        "{subject} list at byte {at} declares {declared} row groups, more than \
                          the decoder's {MAX_ROW_GROUPS}"
                     ));
                 }
@@ -823,7 +836,7 @@ impl Walk<'_> {
             (Shape::RowGroup, 1) => {
                 if self.leaves != Some(declared) {
                     return Err(format!(
-                        "footer row group at byte {at} has {count} column chunks for {} columns",
+                        "{subject} row group at byte {at} has {count} column chunks for {} columns",
                         self.leaves.unwrap_or_default()
                     ));
                 }
@@ -875,10 +888,11 @@ impl Walk<'_> {
     /// Skip a value of header type `code` as the decoder's `skip_till_depth`
     /// does, with `depth` levels left.
     fn skip(&mut self, code: u8, depth: u8) -> Result<(), String> {
+        let subject = self.subject;
         let at = self.pos;
         if depth == 0 {
             return Err(format!(
-                "footer nests deeper than {SKIP_DEPTH} levels at byte {at}"
+                "{subject} nests deeper than {SKIP_DEPTH} levels at byte {at}"
             ));
         }
         match code {
@@ -905,12 +919,12 @@ impl Walk<'_> {
                 // byte. The walk does not skip a set or a map.
                 if element == T_BOOL_TRUE || element == T_BOOL_FALSE {
                     return Err(format!(
-                        "footer list at byte {at} holds booleans in a field the decoder skips"
+                        "{subject} list at byte {at} holds booleans in a field the decoder skips"
                     ));
                 }
                 if code == T_SET || element == T_SET || element == T_MAP {
                     return Err(format!(
-                        "footer set or map at byte {at} is in a field the decoder skips"
+                        "{subject} set or map at byte {at} is in a field the decoder skips"
                     ));
                 }
                 for _ in 0..count {
@@ -925,11 +939,11 @@ impl Walk<'_> {
                     self.count_fits(count, 2, "map")?;
                 }
                 Err(format!(
-                    "footer set or map at byte {at} is in a field the decoder skips"
+                    "{subject} set or map at byte {at} is in a field the decoder skips"
                 ))
             }
             other => Err(format!(
-                "footer has unknown compact type {other} at byte {at}"
+                "{subject} has unknown compact type {other} at byte {at}"
             )),
         }
     }
@@ -2266,14 +2280,14 @@ mod tests {
         };
         assert_eq!(
             check_page_headers(&list(0xc0 | T_LIST)).expect_err("refused"),
-            "page header at byte 0: list at byte 11 declares 1000000 elements with 0 bytes left"
+            "page at byte 0: page header list at byte 11 declares 1000000 elements with 0 bytes left"
         );
         for nested in 5..=8_u8 {
             let mut header = list(((nested - 3) << 4) | T_STRUCT);
             header.insert(7, 0xf0 | T_LIST);
             assert_eq!(
                 check_page_headers(&header).expect_err("refused"),
-                "page header at byte 0: list at byte 12 declares 1000000 elements with 0 bytes left",
+                "page at byte 0: page header list at byte 12 declares 1000000 elements with 0 bytes left",
                 "field {nested}"
             );
         }
