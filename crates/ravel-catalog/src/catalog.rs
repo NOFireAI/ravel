@@ -13745,12 +13745,16 @@ mod tests {
     /// figure for a fixed fixture.
     const COLUMN_STATS_DECLARED_BODY_LEN: u64 = 75;
 
-    /// A column-statistics object is charged its declared uncompressed body
-    /// before decoding: a budget with no room for it fails the load with the
-    /// typed budget error rather than decoding uncharged.
+    /// A column-statistics object's segment is charged before it is read: a
+    /// budget with no room for it fails the load with the typed budget error
+    /// rather than decoding uncharged. The decode streams (issue #3244), so
+    /// the refused charge is the one segment's encoded length, the declared
+    /// body less its one-byte length prefix.
     ///
-    /// FLIP: drop the `reserve_decoded` call in `fetch_stats_object` and the
-    /// load succeeds, failing `expect_err`.
+    /// FLIP: drop the `reserve_decoded` call in `WorkingReservation`'s
+    /// `before_segment` and the refusal moves to the kept bytes, failing the
+    /// `requested` assertion; drop both of its calls and the load succeeds,
+    /// failing `expect_err`.
     #[tokio::test]
     async fn column_stats_decode_reserves_its_output() {
         let store = Arc::new(MemoryStore::new());
@@ -13776,8 +13780,9 @@ mod tests {
         match err {
             column_stats_resolve::LoadColumnStatsError::MemoryExhausted(exhausted) => {
                 assert_eq!(
-                    exhausted.requested, declared,
-                    "exactly the object's declared uncompressed body"
+                    exhausted.requested,
+                    declared - 1,
+                    "exactly the object's one segment"
                 );
                 assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
                 assert_eq!(exhausted.limit, 0);

@@ -990,4 +990,187 @@ mod tests {
             prop_assert_eq!(restored, segments);
         }
     }
+
+    /// A reserver over a bare budget that records the most the budget held
+    /// after any of its reservations.
+    #[derive(Clone)]
+    struct HighWaterReserver {
+        budget: Arc<ravel_memory::MemoryBudget>,
+        high_water: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl DecodeReserver for HighWaterReserver {
+        fn reserve_decoded(
+            &self,
+            declared: u64,
+            ceiling: u64,
+        ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+            let reservation = crate::charged::reserve_decoded(&self.budget, declared, ceiling)?;
+            self.high_water.fetch_max(
+                self.budget.reserved(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(reservation)
+        }
+
+        fn owned(&self) -> Box<dyn DecodeReserver + Send> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// A store holding one object, whatever key is asked for.
+    struct OneObject(bytes::Bytes);
+
+    impl AccountedRecordGet for OneObject {
+        fn accounted_get_full(
+            &self,
+            _key: &str,
+        ) -> impl Future<Output = Result<ravel_object_store::GetOutcome, StoreError>> + Send
+        {
+            let data = self.0.clone();
+            async move {
+                Ok(ravel_object_store::GetOutcome {
+                    total_size: data.len() as u64,
+                    data,
+                    etag: ravel_object_store::Etag(String::new()),
+                    version: ravel_object_store::Version(String::new()),
+                })
+            }
+        }
+    }
+
+    const WIDE_SEGMENTS: usize = 64;
+    const WIDE_ENTRIES: usize = 512;
+    const WIDE_VALUE_LEN: usize = 1024;
+
+    /// A segment holding one bytes column whose dictionary is about half a
+    /// megabyte: `WIDE_ENTRIES` distinct `WIDE_VALUE_LEN`-byte values. Every
+    /// segment encodes to the same length.
+    fn wide_segment(index: usize) -> ColumnStatsSegment {
+        let value = |entry: usize| {
+            let mut bytes = Vec::with_capacity(WIDE_VALUE_LEN);
+            bytes.extend_from_slice(&(index as u32).to_be_bytes());
+            bytes.extend_from_slice(&(entry as u32).to_be_bytes());
+            bytes.resize(WIDE_VALUE_LEN, 0x5A);
+            ColumnValue {
+                kind: Some(Kind::BytesVal(bytes)),
+            }
+        };
+        let mut writer_id = vec![0u8; 32];
+        writer_id[..4].copy_from_slice(&(index as u32).to_be_bytes());
+        ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ColumnStat {
+                name: "wide".to_string(),
+                declared_type: 4,
+                non_null_count: WIDE_ENTRIES as u64,
+                null_count: 0,
+                min: Some(value(0)),
+                max: Some(value(WIDE_ENTRIES - 1)),
+                dictionary_present: true,
+                dictionary: (0..WIDE_ENTRIES)
+                    .map(|entry| DictEntry {
+                        value: Some(value(entry)),
+                        count: 1,
+                    })
+                    .collect(),
+                sum: None,
+            }],
+        }
+    }
+
+    /// Issue #3244: a summary-only fetch of an object whose body is over
+    /// 32 MiB never holds more than one segment's encoded bytes plus the
+    /// bytes it keeps. Its reservations peak at exactly the segment length
+    /// plus every kept byte (the last segment's working charge is still held
+    /// when its kept bytes are reserved), it fits a budget of exactly that
+    /// size, and what it hands back holds exactly the kept bytes.
+    ///
+    /// FLIP: reserve the declared body before decoding, as the bulk decode
+    /// did, or hold each segment's working charge until the decode ends;
+    /// either is refused by this budget, and on an unlimited one peaks at
+    /// the declared body.
+    #[tokio::test]
+    async fn a_summary_only_fetch_reserves_one_segment_plus_the_kept_bytes() {
+        let segments: Vec<ColumnStatsSegment> = (0..WIDE_SEGMENTS).map(wide_segment).collect();
+        let segment_len = segments[0].encoded_len() as u64;
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.encoded_len() as u64 == segment_len)
+        );
+        let kept: u64 = segments
+            .iter()
+            .map(|segment| {
+                let mut stripped = segment.clone();
+                stripped.columns[0].dictionary.clear();
+                stripped.encoded_len() as u64
+            })
+            .sum();
+        let part_blake3 = [0x22; 32];
+        let tenant = TenantHash([0x11; 16]);
+        let bytes = crate::snapshot_format::encode_column_stats_v3(
+            tenant.0,
+            1,
+            part_blake3,
+            &segments,
+            u64::MAX,
+        )
+        .expect("distinct ascending segments encode");
+        let declared = decode_column_stats_header(&bytes)
+            .expect("header")
+            .header
+            .body_uncompressed_len;
+        assert!(declared >= 32 << 20, "declared body {declared}");
+        // A stripped segment is 2116 bytes: 34 of writer_id, 6 of hour, epoch
+        // and seq, and a 2073-byte column (min and max at 1030 each) behind a
+        // 3-byte tag and length. The dictionary adds 512 entries of 1035.
+        assert_eq!(segment_len, 532_037);
+        assert_eq!(kept, 64 * 2116);
+
+        let peak = segment_len + kept;
+        let reserver = HighWaterReserver {
+            budget: Arc::new(ravel_memory::MemoryBudget::new(peak)),
+            high_water: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let resolved = ResolvedStatsRef {
+            key: "stats.cstat".to_string(),
+            blake3: *blake3::hash(&bytes).as_bytes(),
+            expected_part_blake3: vec![part_blake3],
+            expected_version: 3,
+        };
+        let outcome = fetch_stats_object(
+            &OneObject(bytes::Bytes::from(bytes)),
+            &tenant,
+            &resolved,
+            &HeldDictionaries::Columns(BTreeSet::new()),
+            &reserver,
+            None,
+        )
+        .await
+        .expect("fits a budget of one segment plus the kept bytes");
+        let FetchOutcome::Loaded(decoded, reservations) = outcome else {
+            panic!("the object loads");
+        };
+
+        let high_water = reserver
+            .high_water
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(high_water <= segment_len + kept);
+        assert_eq!(high_water, peak);
+        let held: u64 = reservations.iter().map(|r| r.size()).sum();
+        assert_eq!(held, kept);
+        assert_eq!(reserver.budget.reserved(), kept);
+        let decoded_len: u64 = decoded
+            .by_content_hash
+            .values()
+            .map(|segment| segment.encoded_len() as u64)
+            .sum();
+        assert_eq!(decoded_len, kept);
+        assert_eq!(decoded.by_content_hash.len(), WIDE_SEGMENTS);
+    }
 }
