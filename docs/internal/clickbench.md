@@ -308,7 +308,13 @@ This runbook describes the internal measurement setup, not the competing
 ClickBench entry. The competing entry does not fold (ADR-3217, decision 2
 fairness amendment): to reproduce it, drop `--fold-after-load` from the load
 command above and skip this section, including the by-hand fold below. The
-rest of this section applies to the internal setup only.
+rest of this section applies to the internal setup only. Skipping it is not
+the 8,424-GET case described below: the server's start-up warm-up (ADR-0046,
+`services/ravel-server/src/cache_warm.rs`) already holds the commit records,
+so an unfolded statement pays the per-shard listing payload and no
+per-statement commit-record GETs, which ADR-3217 decision 2 puts under 2 s on
+the cold sum. The stock entry is measured that way (v0.26.0, cold sum
+365.7 s, issue #3217 comment 6391497585).
 
 `--fold-after-load` on the load command above does this: once every write has
 been acknowledged and the load's writers have shut down, the loader folds the
