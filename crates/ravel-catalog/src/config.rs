@@ -557,8 +557,8 @@ pub struct CatalogConfig {
     /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
     pub byte_cache_max_entry_bytes: u64,
     /// Total byte budget for the column-statistics reuse cache (issue #905),
-    /// the decoded `.cstat` objects cached per `(tenant, signal)` on the
-    /// [`crate::Catalog::load_column_stats`] path. The budget is over the bytes
+    /// the decoded `.cstat` objects cached per `(tenant, signal, query
+    /// window)` on the [`crate::Catalog::load_column_stats`] path. The budget is over the bytes
     /// actually held
     /// ([`LoadedColumnStats::heap_bytes`](crate::column_stats_resolve::LoadedColumnStats::heap_bytes)),
     /// not an entry count: a `.cstat` payload's size varies by orders of

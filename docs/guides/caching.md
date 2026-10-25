@@ -175,7 +175,7 @@ long scan of data read once each passes through probation instead of
 evicting the main queue. The ceiling is an upper bound on resident cache
 bytes, not memory claimed at startup.
 
-The **sum of every ceiling can exceed physical RAM**. The two caches are
+The **sum of every ceiling can exceed physical RAM**. The three caches are
 independent, and the SQL memory pools (`--sql-max-query-bytes`,
 `--sql-tenant-max-bytes`) are bounded separately again. On the reference host,
 the following sum is more than 100% of raw host memory:
