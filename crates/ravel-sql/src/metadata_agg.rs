@@ -424,7 +424,7 @@ pub(crate) fn logical_aggregate_answerable(
     }
     if !unknown.is_empty() {
         return !filtered_count
-            || !not_equal.is_empty()
+            || not_equal.iter().any(|col| not_str(col))
             || unknown
                 .iter()
                 .any(|conjunct| names_non_str_declared(conjunct, declared));
