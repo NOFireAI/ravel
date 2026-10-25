@@ -4443,7 +4443,8 @@ impl SqlExecutor {
     /// skips the load. Inside an admitted shape, a residual conjunct the
     /// analyzed plan does not show as either a pure `ts` or `has_word`
     /// conjunct or a `declared <> literal` keeps the load, except on the q02
-    /// shape when no residual conjunct names a declared column: the analyzed
+    /// shape when no residual conjunct names a non-`Str` declared column (no
+    /// consumer answers a `<>` on a `Str` column): the analyzed
     /// plan still carries the casts and constant expressions the optimizer
     /// folds (`TIMESTAMP '...'` is a cast of a string there). Beyond the shape
     /// and residual rules, the load is skipped only for what the rewrite's own

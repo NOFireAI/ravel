@@ -1100,3 +1100,114 @@ async fn count_star_beside_only_a_timestamp_bound_issues_zero_gets() {
         "no declared column is filtered, so the load must not fire"
     );
 }
+
+/// `status` beside a `Str` typed attribute column `url`. `url` has no
+/// `.cstat` entry or stamp: no statistics consumer answers a `Str` column, so
+/// a statement filtered on it alone must never reach the load.
+fn status_and_url_cols() -> Vec<DeclaredColumn> {
+    vec![
+        DeclaredColumn::new("status", DeclaredType::I64),
+        DeclaredColumn::new("url", DeclaredType::Str),
+    ]
+}
+
+/// Plan `sql` over [`installed_status_segment`] with [`status_and_url_cols`]
+/// declared and return the GET count once planned. Not executed: the fixture's
+/// data object does not exist, and a statement the gate refuses scans.
+async fn gets_to_plan_with_url(sql: &str) -> u64 {
+    let (store, snapshot) = installed_status_segment().await;
+    let executor = executor(&store);
+    let accounting = QueryAccounting::new();
+    let pinned = executor
+        .plan_pinned(TENANT, snapshot, sql, &accounting, &status_and_url_cols())
+        .await
+        .expect("plan");
+    let plan = pinned.create_physical_plan().await.expect("physical plan");
+    let plan = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        !plan.contains("MetadataOnlyExec"),
+        "{sql} has no metadata answer; plan was:\n{plan}"
+    );
+    store.gets()
+}
+
+/// Issue #3244, exact ZERO. ClickBench Q21's shape: a `COUNT(*)` filtered by
+/// `LIKE` on a `Str` column. The conjunct is unknown to the gate, but it names
+/// only a `Str` column, which can never become a `<>` the rewrite answers, so
+/// the load must not fire.
+///
+/// Pre-fix demonstration: on a gate that counts any declared column in an
+/// unknown conjunct, the GET count reads 2.
+#[tokio::test]
+async fn like_on_a_string_column_count_issues_zero_gets() {
+    assert_eq!(
+        gets_to_plan_with_url("SELECT COUNT(*) FROM logs WHERE url LIKE '%google%'").await,
+        0,
+        "no statistics consumer answers a LIKE on a Str column"
+    );
+}
+
+/// Issue #3244, exact ZERO. A `<>` on a `Str` column is refused by the gate
+/// and by `declared_not_equal_count`, so the load must not fire. This pins
+/// the gate's `not_str` refusal of a classified `<>`; the dispatched gate
+/// already read 0 here.
+#[tokio::test]
+async fn not_equal_on_a_string_column_count_issues_zero_gets() {
+    assert_eq!(
+        gets_to_plan_with_url("SELECT COUNT(*) FROM logs WHERE url <> 'x'").await,
+        0,
+        "no statistics consumer answers a <> on a Str column"
+    );
+}
+
+/// Issue #3244, exact TWO. A `Str` column declared beside `status` does not
+/// change q02 beside a `TIMESTAMP` bound: the unknown `ts` conjunct sits
+/// beside a non-`Str` `<>`, so the load still fires.
+#[tokio::test]
+async fn not_equal_count_beside_a_timestamp_bound_loads_with_a_string_column_declared() {
+    let sql = format!("SELECT COUNT(*) FROM logs WHERE status <> 200 AND {CONTAINING_TS_BOUND}");
+    let (store, snapshot) = installed_status_segment().await;
+    let executor = executor(&store);
+    let accounting = QueryAccounting::new();
+    let pinned = executor
+        .plan_pinned(TENANT, snapshot, &sql, &accounting, &status_and_url_cols())
+        .await
+        .expect("plan");
+    let _plan = pinned.create_physical_plan().await.expect("physical plan");
+    assert_eq!(store.gets(), 2, "the HEAD GET and the column-stats GET");
+}
+
+/// Issue #3244, exact TWO. `SUM(status)` beside the `TIMESTAMP` bound loads
+/// and answers from the stored sum.
+///
+/// Pre-fix demonstration: on a gate whose non-q02 arms refuse an unknown
+/// conjunct, the GET count reads 0.
+#[tokio::test]
+async fn sum_declared_beside_a_timestamp_bound_loads_and_answers() {
+    let sql = format!("SELECT SUM(status) FROM logs WHERE {CONTAINING_TS_BOUND}");
+    let batches = assert_metadata_answer_with_two_gets(&sql).await;
+    assert_eq!(scalar(&batches, 0), Some(1408), "200*3 + 404*2");
+}
+
+/// Issue #3244, exact TWO. `AVG(status)` beside the `TIMESTAMP` bound loads
+/// and answers from the stored sum over the non-null count.
+///
+/// Pre-fix demonstration: on a gate whose non-q02 arms refuse an unknown
+/// conjunct, the GET count reads 0.
+#[tokio::test]
+async fn avg_declared_beside_a_timestamp_bound_loads_and_answers() {
+    let sql = format!("SELECT AVG(status) FROM logs WHERE {CONTAINING_TS_BOUND}");
+    let batches = assert_metadata_answer_with_two_gets(&sql).await;
+    let avg = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 avg")
+                .value(0)
+        })
+        .expect("one avg row");
+    assert_eq!(avg.to_bits(), (1408.0_f64 / 5.0).to_bits(), "1408 / 5");
+}

@@ -374,8 +374,11 @@ fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, Scalar
 /// that is neither `<declared column> <> <literal>` (casts on the literal
 /// stripped) nor exact is therefore unknown, and an unknown conjunct keeps
 /// the load whatever the residual rule above says, with one exception: on
-/// the q02 shape, when no residual conjunct names a declared column, none
-/// can become the `<>` conjunct, and the statement is refused. Admission is
+/// the q02 shape, when no residual conjunct names a non-`Str` declared
+/// column, none can become a `<>` conjunct the rewrite answers (a `<>` on a
+/// `Str` column is refused here and by
+/// [`LogsScanExec::declared_not_equal_count`]), and the statement is
+/// refused. Admission is
 /// by shape only: an admitted statement can still decline at execution (no
 /// stored sum, a dictionary over the cardinality ceiling, a clipped segment,
 /// a residual the optimizer leaves in place) and scans.
@@ -424,7 +427,7 @@ pub(crate) fn logical_aggregate_answerable(
             || !not_equal.is_empty()
             || unknown
                 .iter()
-                .any(|conjunct| names_declared(conjunct, declared));
+                .any(|conjunct| names_non_str_declared(conjunct, declared));
     }
     match not_equal.as_slice() {
         [] => !filtered_count,
@@ -433,11 +436,11 @@ pub(crate) fn logical_aggregate_answerable(
     }
 }
 
-/// Whether `expr` references a declared column by name.
-fn names_declared(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
-    expr.column_refs()
-        .iter()
-        .any(|col| declared_named(declared, &col.name).is_some())
+/// Whether `expr` references a non-`Str` declared column by name.
+fn names_non_str_declared(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
+    expr.column_refs().iter().any(|col| {
+        declared_named(declared, &col.name).is_some_and(|col| !matches!(col.ty, DeclaredType::Str))
+    })
 }
 
 /// The residual filter conjuncts between an aggregate's input and the `logs`
