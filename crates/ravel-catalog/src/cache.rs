@@ -49,9 +49,59 @@ use ravel_cpu_gate::MonotonicClock;
 use ravel_proto::catalog::v1::SnapshotHead;
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord};
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::declared_stats::DeclaredColumnStat;
 use ravel_types::{Signal, TenantHash};
 
 use crate::charged::{Charged, ChargedPart, ChargedPostings};
+use crate::declared_stats::DeclaredColumnStats;
+
+/// What an L0 commit record's successful derivation leaves behind: proof that
+/// its `object_key` matched the key reconstructed from its identity (so the
+/// record's own `object_key` is the segment's data key from then on), and the
+/// stamps the gated declared-stats read kept. Kept in the record's cache entry
+/// so a later resolve rebuilds the `SegmentRef` from the record without
+/// repeating either check. A pure function of the commit key and the
+/// immutable record, so it never goes stale while that record stays resident.
+#[derive(Debug, Clone)]
+pub(crate) struct L0Derived {
+    pub(crate) declared_column_stats: DeclaredColumnStats,
+    /// Declared-column stamps the gated read dropped while deriving. A hit
+    /// re-observes this count, since the drop metric counts reads, not records.
+    pub(crate) dropped_stats: usize,
+}
+
+/// A commit record as the record cache hands it out: the record, plus its
+/// entry's derivation when one has been stored. Only a successful derivation
+/// is ever stored; a failure leaves it absent, so every later resolve
+/// re-derives and fails again.
+#[derive(Clone)]
+pub(crate) struct CachedCommit {
+    pub(crate) record: Arc<CommitRecord>,
+    pub(crate) derived: Option<L0Derived>,
+}
+
+/// Charged cost of the derivation slot every commit entry carries inline,
+/// admitted with the entry whether or not it is ever filled. Together with an
+/// ordinary entry's 864 bytes this stays inside
+/// [`RECORD_CACHE_ENTRY_BYTES`](crate::config::RECORD_CACHE_ENTRY_BYTES).
+const L0_DERIVED_SLOT_BYTES: u64 = std::mem::size_of::<Option<L0Derived>>() as u64;
+
+/// What a stored derivation adds to its entry's charge beyond its inline slot:
+/// when any stamp survived the gated read, the shared `Arc<[DeclaredColumnStat]>`
+/// (two counters, the structs, and each column name), and nothing otherwise.
+/// Measured from the derivation itself rather than estimated from the record,
+/// so the charge is exactly what the slot holds.
+pub(crate) fn l0_derived_resident_bytes(derived: &L0Derived) -> u64 {
+    let stats = derived.declared_column_stats.as_slice();
+    if stats.is_empty() {
+        return 0;
+    }
+    2 * std::mem::size_of::<usize>() as u64
+        + stats
+            .iter()
+            .map(|stat| std::mem::size_of::<DeclaredColumnStat>() as u64 + stat.name().len() as u64)
+            .sum::<u64>()
+}
 
 /// Charged cost of one cached commit entry beyond its variable-length
 /// members: the `CommitRecord` struct (about 224 bytes of scalars and
@@ -94,11 +144,14 @@ fn commit_entry_resident_bytes(key: &str, record: &CommitRecord) -> u64 {
 /// [`TenantCache::by_use`].
 struct RecordEntry {
     record: Arc<CommitRecord>,
+    derived: Option<L0Derived>,
     /// Size of the raw object this was decoded from, captured at insert so a
     /// hit never re-derives it (see the module docs on accounting).
     bytes: u64,
     /// What this entry is charged against the tenant's byte budget
-    /// ([`commit_entry_resident_bytes`]); not what a hit reports.
+    /// ([`commit_entry_resident_bytes`] and [`L0_DERIVED_SLOT_BYTES`] at
+    /// admission, plus [`l0_derived_resident_bytes`] once `derived` is
+    /// filled); not what a hit reports.
     resident_bytes: u64,
     use_tick: u64,
 }
@@ -119,12 +172,18 @@ struct TenantCache {
 impl TenantCache {
     /// Return the entry for `key` and mark it most-recently-used, or `None`
     /// when absent (an absent key leaves the recency order untouched).
-    fn touch(&mut self, key: &str) -> Option<(Arc<CommitRecord>, u64)> {
+    fn touch(&mut self, key: &str) -> Option<(CachedCommit, u64)> {
         let tick = self.next_tick;
         let entry = self.entries.get_mut(key)?;
         let previous = entry.use_tick;
         entry.use_tick = tick;
-        let hit = (entry.record.clone(), entry.bytes);
+        let hit = (
+            CachedCommit {
+                record: entry.record.clone(),
+                derived: entry.derived.clone(),
+            },
+            entry.bytes,
+        );
         self.by_use.remove(&previous);
         self.by_use.insert(tick, key.to_string());
         self.next_tick += 1;
@@ -155,18 +214,48 @@ impl TenantCache {
         }
         let tick = self.next_tick;
         self.next_tick += 1;
-        let resident_bytes = commit_entry_resident_bytes(&key, &record);
+        let resident_bytes = commit_entry_admitted_bytes(&key, &record);
         self.charged_bytes = self.charged_bytes.saturating_add(resident_bytes);
         self.entries.insert(
             key.clone(),
             RecordEntry {
                 record,
+                derived: None,
                 bytes,
                 resident_bytes,
                 use_tick: tick,
             },
         );
         self.by_use.insert(tick, key);
+        self.evict_to(capacity, max_bytes);
+    }
+
+    /// Store `derived` in the entry holding `record` under `key`, charge what
+    /// it holds, and evict back inside both bounds. A no-op when `key` was
+    /// evicted, holds a different decode of the record, or already carries a
+    /// derivation, since then nothing new is held.
+    fn store_derivation(
+        &mut self,
+        key: &str,
+        record: &Arc<CommitRecord>,
+        derived: L0Derived,
+        capacity: usize,
+        max_bytes: u64,
+    ) {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.record, record) || entry.derived.is_some() {
+            return;
+        }
+        let derived_bytes = l0_derived_resident_bytes(&derived);
+        entry.derived = Some(derived);
+        entry.resident_bytes = entry.resident_bytes.saturating_add(derived_bytes);
+        self.charged_bytes = self.charged_bytes.saturating_add(derived_bytes);
+        self.evict_to(capacity, max_bytes);
+    }
+
+    fn evict_to(&mut self, capacity: usize, max_bytes: u64) {
         while self.entries.len() > capacity || self.charged_bytes > max_bytes {
             let Some((_, evicted)) = self.by_use.pop_first() else {
                 break;
@@ -176,6 +265,12 @@ impl TenantCache {
             }
         }
     }
+}
+
+/// What a commit entry is charged when it is admitted: the record
+/// ([`commit_entry_resident_bytes`]) and its still-empty derivation slot.
+fn commit_entry_admitted_bytes(key: &str, record: &CommitRecord) -> u64 {
+    commit_entry_resident_bytes(key, record) + L0_DERIVED_SLOT_BYTES
 }
 
 /// Decoded-record cache, partitioned by tenant. Process-wide: one `Catalog`
@@ -195,16 +290,27 @@ impl RecordCache {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Option<Arc<CommitRecord>> {
+        self.get_cached(tenant, key, accounting)
+            .map(|cached| cached.record)
+    }
+
+    /// [`Self::get`], also handing out the entry's derivation slot.
+    pub(crate) fn get_cached(
+        &self,
+        tenant: &TenantHash,
+        key: &str,
+        accounting: &QueryAccounting,
+    ) -> Option<CachedCommit> {
         let hit = self
             .tenants
             .lock()
             .get_mut(tenant)
             .and_then(|c| c.touch(key));
         match hit {
-            Some((record, bytes)) => {
+            Some((cached, bytes)) => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes);
-                Some(record)
+                Some(cached)
             }
             None => {
                 accounting.record_cache_miss();
@@ -234,6 +340,22 @@ impl RecordCache {
             .entry(tenant)
             .or_default()
             .insert(key, record, bytes, capacity, max_bytes);
+    }
+
+    /// Keep `derived` with the cached `record` it was derived from (see
+    /// [`TenantCache::store_derivation`]).
+    pub(crate) fn store_derivation(
+        &self,
+        tenant: &TenantHash,
+        key: &str,
+        record: &Arc<CommitRecord>,
+        derived: L0Derived,
+        capacity: usize,
+        max_bytes: u64,
+    ) {
+        if let Some(cache) = self.tenants.lock().get_mut(tenant) {
+            cache.store_derivation(key, record, derived, capacity, max_bytes);
+        }
     }
 
     /// Charged residency currently held for `tenant`, the figure eviction
@@ -1499,7 +1621,7 @@ mod tests {
         // Fixed-width keys: the charge counts the key itself, so `k9` and `k10`
         // would not cost the same and the total could not be pinned exactly.
         let record = Arc::new(record_with_declared_columns([27; 16], 0, 200));
-        let charge = commit_entry_resident_bytes("k00", &record);
+        let charge = commit_entry_admitted_bytes("k00", &record);
         assert!(
             charge > 19_000,
             "sanity: one such record is charged {charge} bytes, more than twenty times the 900 \
@@ -1611,7 +1733,7 @@ mod tests {
         let cache = RecordCache::default();
         let tenant = TenantHash([28; 16]);
         let record = Arc::new(record_with_declared_columns([28; 16], 0, 0));
-        let charge = commit_entry_resident_bytes("k0", &record);
+        let charge = commit_entry_admitted_bytes("k0", &record);
         let budget = 10_000 * charge;
 
         for i in 0..5 {
@@ -1658,10 +1780,206 @@ mod tests {
         assert_eq!(cache.entry_count(&tenant), 1);
         assert_eq!(
             cache.charged_bytes(&tenant),
-            commit_entry_resident_bytes("m/c/0/2/b.cmt", &record),
+            commit_entry_admitted_bytes("m/c/0/2/b.cmt", &record),
             "the dropped entry's charge is released, not left on the tenant's total"
         );
         assert!(cache.charged_bytes(&tenant) < both);
+    }
+
+    /// The derivation of `record`, as the resolve path stores it.
+    fn derived_of(record: &CommitRecord) -> L0Derived {
+        let stamps = ravel_commit::declared_stats::read_commit_record(record);
+        L0Derived {
+            declared_column_stats: DeclaredColumnStats::from_validated(&stamps),
+            dropped_stats: stamps.dropped().len(),
+        }
+    }
+
+    /// A commit record carrying `columns` declared column statistics that the
+    /// gated read keeps, each named `attr.column_NNNN` (16 bytes).
+    fn record_with_valid_stamps(tenant_hash: [u8; 16], columns: usize) -> CommitRecord {
+        let stats: Vec<DeclaredColumnStat> = (0..columns)
+            .map(|i| {
+                DeclaredColumnStat::new(
+                    format!("attr.column_{i:04}"),
+                    ravel_types::declared_stats::DeclaredStatType::I64,
+                    Some(ravel_types::declared_stats::DeclaredStatValue::I64(0)),
+                    Some(ravel_types::declared_stats::DeclaredStatValue::I64(9)),
+                    0,
+                )
+                .expect("valid stat")
+            })
+            .collect();
+        let mut record = CommitRecord {
+            sample_count: 10,
+            ..record(tenant_hash, 0)
+        };
+        ravel_commit::declared_stats::stamp_commit_record(&mut record, &stats);
+        record
+    }
+
+    /// The derivation slot every commit entry now carries keeps an ordinary
+    /// stats-free entry inside the planning rate, and an ordinary record's
+    /// derivation adds nothing to it: what the derivation keeps is the
+    /// stamp list, and an ordinary record has none.
+    #[test]
+    fn an_ordinary_entry_with_its_derivation_stays_inside_the_planning_rate() {
+        let tenant = TenantHash([27; 16]);
+        let writer_id = uuid::Uuid::from_u128(1);
+        let content_hash = [7u8; 32];
+        let key =
+            keys::commit_key(&tenant, Signal::Metrics, 0, 0, writer_id, 1, 0).expect("commit key");
+        let ordinary = CommitRecord {
+            writer_id: writer_id.to_string(),
+            object_key: keys::data_key(&tenant, Signal::Metrics, 0, writer_id, 1, 0, &content_hash)
+                .expect("data key"),
+            content_hash: content_hash.to_vec(),
+            ..record([27; 16], 0)
+        };
+        assert_eq!(L0_DERIVED_SLOT_BYTES, 32);
+        assert_eq!(l0_derived_resident_bytes(&derived_of(&ordinary)), 0);
+        let admitted = commit_entry_admitted_bytes(&key, &ordinary);
+        assert_eq!(admitted, 864 + 32);
+        assert!(
+            admitted <= crate::config::RECORD_CACHE_ENTRY_BYTES,
+            "an ordinary entry and its derivation ({admitted}) must fit the planning rate ({})",
+            crate::config::RECORD_CACHE_ENTRY_BYTES
+        );
+    }
+
+    /// An entry's derivation lives and dies with its record: evicting the
+    /// entry, by the entry cap or by prefix invalidation, drops both and
+    /// releases the derivation's charge with the record's, and the key comes
+    /// back without one.
+    #[test]
+    fn eviction_drops_the_derivation_with_the_record() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([30; 16]);
+        let accounting = QueryAccounting::new();
+        let record = Arc::new(record_with_valid_stamps([30; 16], 4));
+        let derived = derived_of(&record);
+        assert_eq!(derived.declared_column_stats.as_slice().len(), 4);
+        // Two counters, then four structs, each named `attr.column_NNNN`.
+        let derived_bytes = 16 + 4 * (std::mem::size_of::<DeclaredColumnStat>() as u64 + 16);
+        assert_eq!(l0_derived_resident_bytes(&derived), derived_bytes);
+        let admitted = commit_entry_admitted_bytes("m/c/0/1/a.cmt", &record);
+        cache.insert(
+            tenant,
+            "m/c/0/1/a.cmt".to_string(),
+            record.clone(),
+            1,
+            2,
+            UNBOUNDED_BYTES,
+        );
+        cache.store_derivation(
+            &tenant,
+            "m/c/0/1/a.cmt",
+            &record,
+            derived,
+            2,
+            UNBOUNDED_BYTES,
+        );
+        assert_eq!(cache.charged_bytes(&tenant), admitted + derived_bytes);
+        assert!(
+            cache
+                .get_cached(&tenant, "m/c/0/1/a.cmt", &accounting)
+                .expect("resident")
+                .derived
+                .is_some()
+        );
+        let held_record = Arc::downgrade(&record);
+        drop(record);
+        assert!(held_record.upgrade().is_some());
+
+        let other = Arc::new(record_with_valid_stamps([30; 16], 4));
+        for key in ["m/c/0/2/b.cmt", "m/c/0/2/c.cmt"] {
+            cache.insert(
+                tenant,
+                key.to_string(),
+                other.clone(),
+                1,
+                2,
+                UNBOUNDED_BYTES,
+            );
+        }
+        assert!(
+            held_record.upgrade().is_none(),
+            "the cap evicted the record"
+        );
+        assert_eq!(
+            cache.charged_bytes(&tenant),
+            2 * commit_entry_admitted_bytes("m/c/0/2/b.cmt", &other),
+            "and released its derivation's charge with it"
+        );
+        let readmitted = Arc::new(record_with_valid_stamps([30; 16], 4));
+        cache.insert(
+            tenant,
+            "m/c/0/1/a.cmt".to_string(),
+            readmitted,
+            1,
+            3,
+            UNBOUNDED_BYTES,
+        );
+        assert!(
+            cache
+                .get_cached(&tenant, "m/c/0/1/a.cmt", &accounting)
+                .expect("resident")
+                .derived
+                .is_none(),
+            "the derivation went with the evicted entry"
+        );
+
+        cache.store_derivation(
+            &tenant,
+            "m/c/0/2/c.cmt",
+            &other,
+            derived_of(&other),
+            3,
+            UNBOUNDED_BYTES,
+        );
+        let before = cache.charged_bytes(&tenant);
+        cache.invalidate_prefix(&tenant, "m/c/0/2/");
+        assert_eq!(
+            cache.charged_bytes(&tenant),
+            before - 2 * commit_entry_admitted_bytes("m/c/0/2/b.cmt", &other) - derived_bytes
+        );
+    }
+
+    /// A derivation is kept only by the entry holding the very decode it was
+    /// derived from, and only once: one derived from an evicted-and-refetched
+    /// decode, or a second store racing the first, charges nothing.
+    #[test]
+    fn a_derivation_is_kept_once_and_only_with_its_own_record() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([31; 16]);
+        let held = Arc::new(record_with_valid_stamps([31; 16], 4));
+        let other_decode = Arc::new(record_with_valid_stamps([31; 16], 4));
+        cache.insert(tenant, "k".to_string(), held.clone(), 1, 1, UNBOUNDED_BYTES);
+        let admitted = cache.charged_bytes(&tenant);
+        let derived_bytes = l0_derived_resident_bytes(&derived_of(&held));
+
+        cache.store_derivation(
+            &tenant,
+            "k",
+            &other_decode,
+            derived_of(&other_decode),
+            1,
+            UNBOUNDED_BYTES,
+        );
+        assert_eq!(cache.charged_bytes(&tenant), admitted);
+        cache.store_derivation(&tenant, "k", &held, derived_of(&held), 1, UNBOUNDED_BYTES);
+        assert_eq!(cache.charged_bytes(&tenant), admitted + derived_bytes);
+        cache.store_derivation(&tenant, "k", &held, derived_of(&held), 1, UNBOUNDED_BYTES);
+        assert_eq!(cache.charged_bytes(&tenant), admitted + derived_bytes);
+        cache.store_derivation(
+            &tenant,
+            "gone",
+            &held,
+            derived_of(&held),
+            1,
+            UNBOUNDED_BYTES,
+        );
+        assert_eq!(cache.charged_bytes(&tenant), admitted + derived_bytes);
     }
 
     /// A compaction record over `inputs` L0 segments, the shape whose size the
