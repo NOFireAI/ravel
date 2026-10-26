@@ -11,6 +11,11 @@
 #   d  docker reachable (stub)           -> image digest and platform recorded
 #   e  Mimir 3.x with no docker          -> engine default "mimir", image is
 #                                           the docker-not-reachable string
+#   f  daemon up, compose plugin broken  -> exit 0, image carries the compose
+#                                           error, never "no running container"
+#   g  buildinfo with data: null         -> exit 1, document written, version
+#                                           unavailable, no crash
+#   h  --out not writable                -> exit 70, no document
 #
 # Every field is asserted by parsing the JSON with python3 -I, not by grep.
 #
@@ -163,7 +168,7 @@ for line in open(sys.argv[2]).read().splitlines():
         continue
     expr, want = line.split(" == ", 1)
     try:
-        got = eval(expr, {"d": d, "re": re})
+        got = eval(expr, {"d": d, "re": re, "json": json})
     except Exception as e:
         got = f"<{type(e).__name__}: {e}>"
     if got != eval(want):
@@ -272,6 +277,61 @@ d["comparators"]["mimir"]["querier_query_engine"] == "mimir"
 d["comparators"]["mimir"]["query_engine_default_for_version"] == "mimir"
 d["comparators"]["victoriametrics"]["image"] == "unavailable: docker not reachable"
 EOF
+
+# --- f: docker daemon up, compose plugin broken ---------------------------------
+# The real cause must reach the document; "no running container" would be a
+# false statement about a stack that is up and answering.
+# shellcheck disable=SC2016 # the stub body expands when the stub runs
+write "${TMP}/bin/docker-compose-broken" '#!/usr/bin/env bash
+case "$1 $2" in
+  "info --format") echo 27.0.0 ;;
+  "compose -f") echo "permission denied while trying to connect to the compose plugin" >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+'
+chmod +x "${TMP}/bin/docker-compose-broken"
+out_f="${TMP}/f.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-compose-broken" "${SCRIPT}" --out "${out_f}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  2>"${TMP}/f.err" || code=$?
+expect_exit "f compose broken" 0 "${code}"
+check "f image reason" "${out_f}" <<EOF
+d["comparators"]["prometheus"]["image"].startswith("unavailable: docker compose exited 1: permission denied") == True
+d["comparators"]["mimir"]["image"] == d["comparators"]["prometheus"]["image"]
+("no running container" in json.dumps(d)) == False
+EOF
+
+# --- g: a comparator answers buildinfo with data: null ---------------------------
+# A malformed answer is a partial capture (exit 1, document written), not a
+# crash: nothing may abort before the document exists.
+prom_null="${TMP}/prom_null"
+write "${prom_null}/api/v1/status/buildinfo" '{"status":"success","data":null}'
+write "${prom_null}/api/v1/status/flags" '{"status":"success","data":{"x":"y"}}'
+stub_server "${prom_null}"
+prom_null_url="${stub_url}"
+out_g="${TMP}/g.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_g}" \
+  --prometheus "${prom_null_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  2>"${TMP}/g.err" || code=$?
+expect_exit "g data null" 1 "${code}"
+if [[ -s "${out_g}" ]]; then pass "g document written"; else fail "g document written"; fi
+check "g fields" "${out_g}" <<EOF
+sorted(d["comparators"]["prometheus"]["version"]) == ["unavailable"]
+("not buildinfo JSON" in d["comparators"]["prometheus"]["version"]["unavailable"]) == True
+d["comparators"]["mimir"]["version"] == "2.14.2"
+EOF
+
+# --- h: the document cannot be written -------------------------------------------
+# Exit 1 means "document written, partial"; an unwritable --out is a crash and
+# gets its own code, so a caller never cites a stale file as this run's capture.
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${TMP}/no-such-dir/h.json" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  2>"${TMP}/h.err" || code=$?
+expect_exit "h unwritable out" 70 "${code}"
+if [[ -e "${TMP}/no-such-dir/h.json" ]]; then fail "h no document"; else pass "h no document"; fi
 
 if [[ -n "${CAPTURE_TEST_KEEP_CASE_A:-}" ]]; then
   cp "${out_a}" "${CAPTURE_TEST_KEEP_CASE_A}"

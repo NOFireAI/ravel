@@ -44,6 +44,8 @@
 #   1   at least one comparator's version is unavailable; the document is
 #       still written, because a partial capture is evidence
 #   64  usage error
+#   70  the capture crashed or could not write the document; no document, or
+#       a stale one from an earlier run, is at --out
 #
 # METRICSBENCH_DOCKER names the docker binary (default: docker); the test
 # suite points it at a stub.
@@ -108,6 +110,20 @@ import urllib.error
 import urllib.request
 
 compose_file, script_revision, out, prom_url, vm_url, mimir_url, docker = sys.argv[1:8]
+
+
+def crash_hook(exc_type, exc, tb):
+    # A crash must not share exit 1 with a partial capture: 1 means "document
+    # written, a version is unavailable"; a crash wrote nothing. 70 is EX_SOFTWARE.
+    import traceback
+
+    traceback.print_exception(exc_type, exc, tb)
+    sys.stderr.write("capture-effective-config.sh: crashed before writing the document\n")
+    sys.stderr.flush()
+    os._exit(70)
+
+
+sys.excepthook = crash_hook
 TIMEOUT_S = 10
 
 
@@ -138,12 +154,13 @@ def buildinfo_json(url):
         return unavailable(err), unavailable(err)
     try:
         data = json.loads(body)["data"]
+        if not isinstance(data, dict):
+            raise TypeError(f"data is {type(data).__name__}, not an object")
+        version, revision = data.get("version"), data.get("revision")
     except Exception as e:
-        reason = f"GET {url}: response is not buildinfo JSON: {type(e).__name__}"
+        reason = f"GET {url}: response is not buildinfo JSON: {type(e).__name__}: {e}"
         return unavailable(reason), unavailable(reason)
-    return nonempty(data.get("version"), "data.version", url), nonempty(
-        data.get("revision"), "data.revision", url
-    )
+    return nonempty(version, "data.version", url), nonempty(revision, "data.revision", url)
 
 
 def flags_json(url):
@@ -246,22 +263,28 @@ def run_docker(*args):
 
 
 def compose_containers():
-    """Map compose service name to container ID, or return a reason string."""
+    """Map compose service name to container ID, or return a reason string.
+
+    Every failure is a plain "unavailable: ..." string, never a dict, so that
+    image_of can tell a failed listing from a listing that lacks a service and
+    the document records the real cause (a daemon that answers `info` but
+    whose compose plugin fails is the case that used to read as "no running
+    container")."""
     _, err = run_docker("info", "--format", "{{.ServerVersion}}")
     if err:
         return DOCKER_UNREACHABLE
     stdout, err = run_docker("compose", "-f", compose_file, "ps", "--format", "json")
     if err:
-        return unavailable(err)
+        return f"unavailable: {err}"
     stdout = stdout.strip()
     try:
         if stdout.startswith("["):
             rows = json.loads(stdout)
         else:
             rows = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        return {r.get("Service"): r.get("ID") or r.get("Name") for r in rows}
     except Exception as e:
-        return unavailable(f"docker compose ps: unparseable output: {type(e).__name__}")
-    return {r.get("Service"): r.get("ID") or r.get("Name") for r in rows}
+        return f"unavailable: docker compose ps: unparseable output: {type(e).__name__}: {e}"
 
 
 def image_of(containers, service):
@@ -358,11 +381,15 @@ doc["comparators"]["mimir"] = {
 
 text = json.dumps(doc, indent=2, sort_keys=False) + "\n"
 if out:
-    directory = os.path.dirname(os.path.abspath(out))
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".capture-", suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.replace(tmp, out)
+    try:
+        directory = os.path.dirname(os.path.abspath(out))
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".capture-", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, out)
+    except OSError as e:
+        sys.stderr.write(f"capture-effective-config.sh: cannot write {out}: {e}\n")
+        sys.exit(70)
 else:
     sys.stdout.write(text)
 
@@ -380,7 +407,7 @@ sys.exit(0)
 PY
 
 if [[ ${rc} -ne 0 && ${rc} -ne 1 ]]; then
-  echo "capture-effective-config.sh: capture failed (python exit ${rc})" >&2
-  exit 1
+  echo "capture-effective-config.sh: capture failed before writing a document (python exit ${rc})" >&2
+  exit 70
 fi
 exit "${rc}"
