@@ -8,12 +8,16 @@
 //! every such panic.
 //!
 //! The same boundary types the decoder's errors. An error the stream yields
-//! whose chain holds no [`ParquetReadError`] and holds a `ParquetError`, or
-//! ends at the `ArrowError::ParquetError` the parquet crate converts one into,
+//! whose chain holds no [`ParquetReadError`] and ends at a `ParquetError`, or
+//! at the `ArrowError::ParquetError` the parquet crate converts one into,
 //! becomes [`ParquetReadError::Corrupt`] naming the file the partition opened
 //! last. Every other error, a budget refusal, a store failure or a DataFusion
 //! error among them, passes through unchanged, and so does every error
-//! yielded before the partition opened a file. A SQL client therefore gets a
+//! yielded before the partition opened a file. Only the chain's end counts:
+//! the query's own predicate, pushed down as a row filter, can fail on an
+//! intact file's values, and its error reaches the boundary inside a
+//! `ParquetError` that does not end the chain, so it must not be typed as a
+//! corrupt file. A SQL client therefore gets a
 //! decoder error the same answer as a decoder panic, the integrity-validation
 //! error (HTTP 500) rather than an execution error (HTTP 422); the file and
 //! table are named only in the server-side error.
@@ -296,25 +300,27 @@ impl BoundaryStream {
 }
 
 /// Whether `err` is one the Parquet decoder raised and nothing typed: no link
-/// of its chain is a [`ParquetReadError`], and some link is a `ParquetError`
-/// or the chain ends at the `ArrowError::ParquetError` the parquet crate
-/// converts one into. The `ParquetError` need not be last: parquet's
-/// `From<ArrowError>` wraps an arrow error in `ParquetError::External`, and
-/// that arrow error ends the chain.
+/// of its chain is a [`ParquetReadError`], and the chain ends at a
+/// `ParquetError` or at the `ArrowError::ParquetError` the parquet crate
+/// converts one into.
+///
+/// Only the last link counts. An error the pushed-down row filter raises
+/// while evaluating the query's own predicate reaches here as a
+/// `ParquetError::External` wrapping an `ArrowError::ComputeError`, on an
+/// intact file, so a `ParquetError` earlier in the chain says nothing about
+/// the file.
 fn is_untyped_decoder_error(err: &DataFusionError) -> bool {
     let mut current: &(dyn std::error::Error + 'static) = err;
-    let mut parquet = false;
     loop {
         if current.is::<ParquetReadError>() {
             return false;
         }
-        parquet |= current.is::<ParquetError>();
         match current.source() {
             Some(source) => current = source,
             None => break,
         }
     }
-    parquet
+    current.is::<ParquetError>()
         || matches!(
             current.downcast_ref::<ArrowError>(),
             Some(ArrowError::ParquetError(_))
@@ -365,12 +371,15 @@ mod tests {
 
     use datafusion::arrow::error::ArrowError;
     use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::{ident, lit};
     use parquet::errors::ParquetError;
 
     use super::is_untyped_decoder_error;
     use crate::error::ParquetReadError;
     use crate::limits::ReadLimits;
-    use crate::test_support::{Fixture, footer_len_of, parquet_bytes, read_all, read_error};
+    use crate::test_support::{
+        Fixture, footer_len_of, parquet_bytes, read_all, read_error, read_where,
+    };
 
     const GOOD: &str = "lake/t/good.parquet";
     const BAD: &str = "lake/t/bad.parquet";
@@ -470,6 +479,35 @@ mod tests {
         );
     }
 
+    /// A pushed-down predicate that fails on an intact file's values fails the
+    /// scan with the predicate's own error, not as a corrupt file.
+    #[tokio::test]
+    async fn a_failing_pushed_down_predicate_on_an_intact_file_is_not_corrupt() {
+        let store = Arc::new(MemoryStore::new());
+        let fixture = Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+        let file = fixture
+            .put_file(
+                &store,
+                GOOD,
+                parquet_bytes(&[0, 1, 2], &["one", "two", "six"]),
+                false,
+            )
+            .await;
+        let table = fixture.provider("t", 1, vec![file], false).await;
+        let ctx = fixture.session(&[("t", table)]);
+        let filter = (lit(10_i64) / ident("a")).gt(lit(1_i64));
+        let err = read_where(&ctx, "t", &["a", "b"], Some(filter))
+            .await
+            .expect_err("a division by zero must fail the scan");
+        assert!(read_error(&err).is_none(), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("Error evaluating filter predicate"),
+            "{err:?}"
+        );
+        assert!(message.contains("DivideByZero"), "{err:?}");
+    }
+
     #[test]
     fn a_bare_parquet_error_is_an_untyped_decoder_error() {
         let err = DataFusionError::ParquetError(Box::new(ParquetError::General(
@@ -478,15 +516,16 @@ mod tests {
         assert!(is_untyped_decoder_error(&err), "{err:?}");
     }
 
-    /// parquet's `From<ArrowError>` wraps the arrow error in
-    /// `ParquetError::External`, and an `ArrowError` other than
-    /// `ArrowError::ParquetError` has no source, so the chain ends at it.
+    /// The row filter's evaluation error on an intact file: a `ParquetError`
+    /// link that does not end the chain.
     #[test]
-    fn an_arrow_error_inside_a_parquet_error_is_an_untyped_decoder_error() {
-        let err = DataFusionError::External(Box::new(ParquetError::External(Box::new(
-            ArrowError::InvalidArgumentError("offset overflow".to_string()),
+    fn a_predicate_error_inside_a_parquet_error_is_not_untyped() {
+        let err = DataFusionError::ParquetError(Box::new(ParquetError::External(Box::new(
+            ArrowError::ComputeError(
+                "Error evaluating filter predicate: ArrowError(DivideByZero, None)".to_string(),
+            ),
         ))));
-        assert!(is_untyped_decoder_error(&err), "{err:?}");
+        assert!(!is_untyped_decoder_error(&err), "{err:?}");
     }
 
     #[test]
