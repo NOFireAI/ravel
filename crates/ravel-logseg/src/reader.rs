@@ -2436,6 +2436,166 @@ impl ContainsNeedle {
     }
 }
 
+/// An object's first block, decoded whole, and one `Contains` arm compiled
+/// against the object, so the crate's bench times [`contains_kernel`] on a
+/// block the writer and the decoder built. Public only for that bench; not
+/// part of the supported API.
+#[doc(hidden)]
+pub struct ContainsKernelBench {
+    stream_dir: Arc<StreamDir>,
+    arm: Arm,
+    block: DecodedBlock,
+    /// The dictionary entries the block's rows reference, ascending.
+    dict_keys: Vec<usize>,
+}
+
+/// What a [`ContainsKernelBench`] block holds, for the bench to check its
+/// corpus before timing it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainsKernelShape {
+    pub rows: usize,
+    /// Distinct `stream_ref` values.
+    pub streams: usize,
+    /// Entries of the key's dictionary; `None` for a plain column.
+    pub dict_entries: Option<usize>,
+    /// Rows with a present `attrs_raw` cell.
+    pub attrs_raw_cells: usize,
+    /// Columns the arm reads as the key's other types.
+    pub others: usize,
+}
+
+impl ContainsKernelBench {
+    /// `key LIKE '%needle%'` over the first block of `object`.
+    pub fn new(
+        object: &[u8],
+        cfg: &RlogConfig,
+        key: &str,
+        needle: &str,
+    ) -> Result<Self, LogSegError> {
+        let reader = RlogReader::new(object, cfg)?;
+        let pred = Predicate::Contains {
+            key: key.into(),
+            needle: needle.into(),
+            negated: false,
+        };
+        let arm = compile_arms(&reader.stream_dir, &reader.field_dir, &[&pred])
+            .pop()
+            .ok_or_else(|| LogSegError::Corrupted("no contains arm".into()))?;
+        let mut scan =
+            reader.scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())?;
+        scan.next_block_columnar(object)?;
+        let block = scan
+            .current
+            .take()
+            .ok_or_else(|| LogSegError::Corrupted("object has no block".into()))?;
+        let mut dict_keys = Vec::new();
+        if let Arm::Contains { col: Some(c), .. } = &arm
+            && let Some(StrColumn::Dict(d)) = block.str_column(*c)
+        {
+            dict_keys = (0..block.record_count())
+                .filter_map(|r| usize::try_from(d.key(r)?).ok())
+                .collect();
+            dict_keys.sort_unstable();
+            dict_keys.dedup();
+        }
+        Ok(Self {
+            stream_dir: Arc::clone(&reader.stream_dir),
+            arm,
+            block,
+            dict_keys,
+        })
+    }
+
+    pub fn shape(&self) -> ContainsKernelShape {
+        let (col, others) = match &self.arm {
+            Arm::Contains { col, others, .. } => (*col, others.len()),
+            _ => (None, 0),
+        };
+        let dict_entries = match col.and_then(|c| self.block.str_column(c)) {
+            Some(StrColumn::Dict(d)) => Some(d.values().len()),
+            _ => None,
+        };
+        let rows = self.block.record_count();
+        let mut refs: Vec<i64> = (0..rows)
+            .filter_map(|r| self.block.i64_column(COL_STREAM_REF)?.get(r))
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        ContainsKernelShape {
+            rows,
+            streams: refs.len(),
+            dict_entries,
+            attrs_raw_cells: (0..rows)
+                .filter(|&r| self.block.str_at(COL_ATTRS_RAW, r).is_some())
+                .count(),
+            others,
+        }
+    }
+
+    /// The dictionary entries the block's rows reference; empty for a plain
+    /// column.
+    pub fn dict_keys(&self) -> &[usize] {
+        &self.dict_keys
+    }
+
+    /// Each row's cell in the arm's string column for the key, if any.
+    pub fn key_cells(&self) -> Vec<Option<Vec<u8>>> {
+        let col = match &self.arm {
+            Arm::Contains { col, .. } => *col,
+            _ => None,
+        };
+        (0..self.block.record_count())
+            .map(|r| col.and_then(|c| self.block.str_at(c, r)).map(<[u8]>::to_vec))
+            .collect()
+    }
+
+    /// One kernel call over every row of the block, with the memo a scan
+    /// starts from: the rows kept and the cells the needle was run on.
+    pub fn run(&self) -> Result<(usize, u64), LogSegError> {
+        let mut sel = RowSelection::all(self.block.record_count());
+        let mut stats = ScanStats::default();
+        apply_arm(
+            &self.arm,
+            0,
+            &self.stream_dir,
+            &self.block,
+            &mut DictArmMemo::default(),
+            &mut stats,
+            &mut sel,
+        )?;
+        let kept = sel.words.iter().map(|w| w.count_ones() as usize).sum();
+        Ok((kept, stats.contains_cells_tested))
+    }
+
+    /// The needle searches [`Self::run`] makes, alone: each present plain
+    /// cell, or each dictionary entry a row references, searched once. The
+    /// hits and the searches made.
+    pub fn search_only(&self) -> (usize, u64) {
+        let (col, needle) = match &self.arm {
+            Arm::Contains { col, needle, .. } => (*col, needle),
+            _ => return (0, 0),
+        };
+        let (mut hits, mut searched) = (0, 0);
+        let mut search = |cell: &[u8]| {
+            searched += 1;
+            hits += usize::from(needle.is_in(cell));
+        };
+        match col.and_then(|c| self.block.str_column(c)) {
+            Some(StrColumn::Plain(cells)) => cells.iter().flatten().for_each(|c| search(c)),
+            Some(StrColumn::Dict(d)) => {
+                let values = d.values();
+                self.dict_keys
+                    .iter()
+                    .filter_map(|&k| values.entry(k))
+                    .for_each(&mut search);
+            }
+            None => {}
+        }
+        (hits, searched)
+    }
+}
+
 /// Whether `needle` occurs in `hay` as a contiguous run of bytes, by a plain
 /// window scan: the row-by-row [`eval`] reference the contains kernel's
 /// [`ContainsNeedle`] is tested against. An empty needle occurs in every value.
