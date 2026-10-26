@@ -35,10 +35,12 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    AckSemantics, GeneratedStream, HttpReplayConfig, MetricsIngestReport, RavelReplayConfig,
-    RowAccountingViolation, RunProvenance, StreamBandViolation, StreamCounts, Substrate,
-    build_profile_record, check_anchor, check_row_accounting, check_stream_band,
-    query_after_replay, replay_into_ravel, replay_over_http, workload_digest,
+    AnchorError, Band6Violation, GeneratedStream, HttpReplayConfig, MetricsIngestReport,
+    PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver, RowAccountingViolation,
+    RunProvenance, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
+    build_profile_record, check_anchor, check_expected_digests_agree, check_row_accounting,
+    check_row_band6, check_stream_band, query_after_replay, readback_over_http,
+    replay_into_ravel, replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -46,6 +48,9 @@ use ravel_types::TenantId;
 /// The exit code for a usage error (BSD `EX_USAGE`): a missing or invalid run
 /// parameter, refused before anything is generated.
 const EXIT_USAGE: i32 = 64;
+/// The exit code for input data that cannot be used (BSD `EX_DATAERR`): the
+/// manifest's profile declares no scrape grid, which no flag can fix.
+const EXIT_DATAERR: i32 = 65;
 
 /// Where the checked-in workload manifest lives, relative to this crate's
 /// manifest dir. The same default `metricsbench_gen` uses.
@@ -91,7 +96,7 @@ struct Args {
     /// Per-batch strict-ack deadline for the Ravel path.
     #[arg(long, default_value_t = 30)]
     ack_timeout_secs: u64,
-    /// Tenant to write under.
+    /// Tenant the in-process row writes under, recorded as its `tenant`.
     #[arg(long, default_value = "metricsbench")]
     tenant: String,
     /// `ravel-server` `/api/v1/write` endpoint, the portable Ravel row
@@ -99,6 +104,28 @@ struct Args {
     /// row is written.
     #[arg(long)]
     ravel_endpoint: Option<String>,
+    /// The tenant `ravel-server` resolves the portable Ravel row's requests
+    /// to (from its bearer token, or its dev default), recorded as that row's
+    /// `tenant`. Required with `--ravel-endpoint`, and it must equal
+    /// `--tenant`, so the two Ravel rows describe one tenant's data.
+    #[arg(long)]
+    ravel_tenant: Option<String>,
+    /// Base URL of `ravel-server`'s Prometheus query API, for the portable
+    /// Ravel row's read-back. Required with `--ravel-endpoint`.
+    #[arg(long)]
+    ravel_query_url: Option<String>,
+    /// Base URL of Prometheus's query API. Required with
+    /// `--prometheus-endpoint`.
+    #[arg(long)]
+    prometheus_query_url: Option<String>,
+    /// Base URL of VictoriaMetrics's query API. Required with
+    /// `--victoriametrics-endpoint`.
+    #[arg(long)]
+    victoriametrics_query_url: Option<String>,
+    /// Base URL of Mimir's Prometheus query API (its `/prometheus` prefix
+    /// included). Required with `--mimir-endpoint`.
+    #[arg(long)]
+    mimir_query_url: Option<String>,
     /// Name of the environment variable holding the bearer token for
     /// `--ravel-endpoint`. The token is read from the environment, never
     /// from argv, and never written into the report. Omitted, no
@@ -136,9 +163,42 @@ enum RunError {
          anchor read from the clock would make each run replay a different stream, and two \
          runs could never be shown to have replayed the same one. Pass the first step's \
          timestamp in milliseconds since the epoch, a multiple of the profile's scrape \
-         interval ({interval_ms} ms for profile `{profile}`)"
+         interval{grid}"
     )]
-    MissingAnchor { profile: String, interval_ms: u64 },
+    MissingAnchor { grid: String },
+    #[error(
+        "--ravel-endpoint needs --ravel-tenant, the tenant ravel-server resolves its requests \
+         to, so the portable Ravel row records whose data it wrote"
+    )]
+    MissingRavelTenant,
+    #[error(
+        "--ravel-tenant `{ravel_tenant}` differs from --tenant `{tenant}`: the in-process and \
+         portable Ravel rows must write one tenant's data to be compared"
+    )]
+    TenantMismatch {
+        tenant: String,
+        ravel_tenant: String,
+    },
+    #[error("--{flag}-endpoint needs --{flag}-query-url: every HTTP row is read back")]
+    MissingQueryUrl { flag: &'static str },
+    #[error("{0}")]
+    Band6(#[from] Band6Violation),
+    #[error(
+        "{system}'s expected scalar set (digest {got}) differs from the in-process row's \
+         ({expected}), so the rows were not offered the same scalar points"
+    )]
+    ScalarExpectedDiverged {
+        system: String,
+        expected: String,
+        got: String,
+    },
+    #[error("reading {system} back failed: {source}")]
+    Readback {
+        system: String,
+        source: ravel_bench::metrics_ingest::LaneError,
+    },
+    #[error("{system}'s read-back does not match what it accepted: {mismatches}")]
+    ReadbackMismatch { system: String, mismatches: String },
     #[error(
         "--ravel-bearer-token-env names `{var}`, which is unset, empty or not UTF-8; export the \
          token under that name (the token is never taken from argv)"
@@ -149,7 +209,7 @@ enum RunError {
     )]
     BearerWithoutEndpoint,
     #[error(transparent)]
-    Anchor(#[from] ravel_bench::metrics_ingest::AnchorError),
+    Anchor(#[from] AnchorError),
     #[error("loading the workload manifest failed: {0}")]
     Workload(String),
     #[error("generating the stream failed: {0}")]
@@ -205,15 +265,79 @@ fn resolve_steps(args: &Args, workload: &WorkloadFile) -> Result<u64, RunError> 
 
 /// The first step's timestamp, from the required flag, checked against the
 /// profile's grid and the nanosecond range. No clock is read.
+/// A zero interval is refused first, so a missing anchor never names a
+/// "0 ms" grid (`tests::a_zero_interval_exits_65_before_a_missing_anchor`).
 fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Result<i64, RunError> {
     let Some(anchor_ms) = args.anchor_ms else {
+        if scrape_interval_secs == 0 {
+            return Err(RunError::Anchor(AnchorError::ZeroInterval));
+        }
         return Err(RunError::MissingAnchor {
-            profile: args.profile.clone(),
-            interval_ms: scrape_interval_secs.saturating_mul(1_000),
+            grid: format!(
+                " ({} ms for profile `{}`)",
+                scrape_interval_secs.saturating_mul(1_000),
+                args.profile
+            ),
         });
     };
     check_anchor(anchor_ms, scrape_interval_secs, steps)?;
     Ok(anchor_ms)
+}
+
+/// The portable Ravel row's tenant: required with `--ravel-endpoint` and
+/// equal to `--tenant`.
+fn resolve_ravel_tenant(args: &Args) -> Result<Option<String>, RunError> {
+    if args.ravel_endpoint.is_none() {
+        return Ok(None);
+    }
+    let Some(ravel_tenant) = &args.ravel_tenant else {
+        return Err(RunError::MissingRavelTenant);
+    };
+    if *ravel_tenant != args.tenant {
+        return Err(RunError::TenantMismatch {
+            tenant: args.tenant.clone(),
+            ravel_tenant: ravel_tenant.clone(),
+        });
+    }
+    Ok(Some(ravel_tenant.clone()))
+}
+
+/// Each supplied endpoint's query URL, refused when one is missing.
+fn resolve_query_urls(args: &Args) -> Result<(), RunError> {
+    for (flag, endpoint, query_url) in [
+        ("ravel", &args.ravel_endpoint, &args.ravel_query_url),
+        (
+            "prometheus",
+            &args.prometheus_endpoint,
+            &args.prometheus_query_url,
+        ),
+        (
+            "victoriametrics",
+            &args.victoriametrics_endpoint,
+            &args.victoriametrics_query_url,
+        ),
+        ("mimir", &args.mimir_endpoint, &args.mimir_query_url),
+    ] {
+        if endpoint.is_some() && query_url.is_none() {
+            return Err(RunError::MissingQueryUrl { flag });
+        }
+    }
+    Ok(())
+}
+
+/// The process exit code for a failed run.
+fn exit_code(err: &RunError) -> i32 {
+    match err {
+        RunError::Anchor(AnchorError::ZeroInterval) => EXIT_DATAERR,
+        RunError::MissingAnchor { .. }
+        | RunError::Anchor(_)
+        | RunError::MissingBearerToken { .. }
+        | RunError::BearerWithoutEndpoint
+        | RunError::MissingRavelTenant
+        | RunError::TenantMismatch { .. }
+        | RunError::MissingQueryUrl { .. } => EXIT_USAGE,
+        _ => 1,
+    }
 }
 
 /// The portable Ravel row's bearer token, read from the environment
@@ -235,23 +359,39 @@ fn resolve_bearer_token(args: &Args) -> Result<Option<String>, RunError> {
 
 /// Close a drained stream and check one row against it: the classification
 /// identity of band 4, then the row's offering identity and the split of its
-/// offered samples.
+/// offered points, then band 6 for each class the row stores. A portable row
+/// passes the in-process row's scalar expected digest as `in_process_scalar`
+/// and must carry the same one.
 fn close_row(
-    system: &str,
+    label: &str,
     stream: GeneratedStream<'_>,
-    ingest: &ravel_bench::metrics_ingest::IngestPhase,
+    row: &SystemIngestResult,
+    in_process_scalar: Option<&str>,
 ) -> Result<(GenerationReport, StreamCounts), RunError> {
     let (report, counts) = stream
         .finish()
         .map_err(|e| RunError::Generate(e.to_string()))?;
     check_stream_band(&counts, &report).map_err(|source| RunError::StreamBand {
-        system: system.to_string(),
+        system: label.to_string(),
         source,
     })?;
-    check_row_accounting(ingest, &counts).map_err(|source| RunError::AccountingMismatch {
-        system: system.to_string(),
-        source: Box::new(source),
+    check_row_accounting(&row.ingest, &counts).map_err(|source| {
+        RunError::AccountingMismatch {
+            system: label.to_string(),
+            source: Box::new(source),
+        }
     })?;
+    check_row_band6(row)?;
+    if let Some(expected) = in_process_scalar {
+        let got = row.ingest.expected_digests.get(PayloadClass::Scalar);
+        if got != expected {
+            return Err(RunError::ScalarExpectedDiverged {
+                system: label.to_string(),
+                expected: expected.to_string(),
+                got: got.to_string(),
+            });
+        }
+    }
     Ok((report, counts))
 }
 
@@ -263,6 +403,8 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     })?;
     let anchor_ms = resolve_anchor(args, profile.scrape_interval_secs, steps)?;
     let ravel_bearer_token = resolve_bearer_token(args)?;
+    let ravel_tenant = resolve_ravel_tenant(args)?;
+    resolve_query_urls(args)?;
     // `load_workload` read the same file; a second read for the digest keeps
     // the loader's signature unchanged.
     let manifest_bytes = std::fs::read(&args.workload).map_err(|e| {
@@ -305,7 +447,13 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
 
     // Band 4: the stream closes against the generator and the Ravel
     // accounting closes over every line.
-    let (gen_report, _) = close_row("ravel (in-process)", ravel_stream, &ravel.result.ingest)?;
+    let (gen_report, _) = close_row("ravel (in-process)", ravel_stream, &ravel.result, None)?;
+    let in_process_scalar = ravel
+        .result
+        .ingest
+        .expected_digests
+        .get(PayloadClass::Scalar)
+        .to_string();
     if ravel.result.ingest.accepted_samples == 0 {
         return Err(RunError::NothingIngested);
     }
@@ -342,50 +490,59 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
 
     // Portable rows, only those a caller supplied an endpoint for. Their
     // `system` values are the names the query runner joins on.
-    for (system, endpoint, ack_semantics, bearer_token) in [
+    let mut portable = Vec::new();
+    for (receiver, endpoint, query_url, bearer_token, tenant) in [
         (
-            "ravel",
-            args.ravel_endpoint.as_ref(),
-            AckSemantics::DurableOnAck,
+            Receiver::Ravel,
+            &args.ravel_endpoint,
+            &args.ravel_query_url,
             ravel_bearer_token.clone(),
+            ravel_tenant.clone(),
         ),
         (
-            "prometheus",
-            args.prometheus_endpoint.as_ref(),
-            AckSemantics::Buffered,
+            Receiver::Prometheus,
+            &args.prometheus_endpoint,
+            &args.prometheus_query_url,
+            None,
             None,
         ),
         (
-            "victoriametrics",
-            args.victoriametrics_endpoint.as_ref(),
-            AckSemantics::Buffered,
+            Receiver::VictoriaMetrics,
+            &args.victoriametrics_endpoint,
+            &args.victoriametrics_query_url,
+            None,
             None,
         ),
         (
-            "mimir",
-            args.mimir_endpoint.as_ref(),
-            AckSemantics::Buffered,
+            Receiver::Mimir,
+            &args.mimir_endpoint,
+            &args.mimir_query_url,
+            None,
             None,
         ),
     ] {
-        let Some(endpoint) = endpoint else { continue };
+        let (Some(endpoint), Some(query_url)) = (endpoint, query_url) else {
+            continue;
+        };
+        let system = receiver.system();
         let http_cfg = HttpReplayConfig {
-            system: system.to_string(),
+            receiver,
             endpoint: endpoint.clone(),
-            ack_semantics,
-            bearer_token,
+            bearer_token: bearer_token.clone(),
+            tenant,
             batch_size: args.http_batch_size,
             max_retries: args.http_max_retries,
             timeout_secs: args.http_timeout_secs,
         };
         let mut stream = stream_from_anchor()?;
-        let row = replay_over_http(&http_cfg, &mut stream)
+        let outcome = replay_over_http_with_plan(&http_cfg, &mut stream)
             .await
             .map_err(|source| RunError::Http {
                 system: system.to_string(),
                 source,
             })?;
-        let (report, _) = close_row(system, stream, &row.ingest)?;
+        let mut row = outcome.result;
+        let (report, _) = close_row(system, stream, &row, Some(&in_process_scalar))?;
         if report.digest != gen_report.digest {
             return Err(RunError::StreamDiverged {
                 system: system.to_string(),
@@ -393,8 +550,29 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
                 got: report.digest,
             });
         }
-        rows.push(row);
+        let readback_cfg = ReadbackConfig {
+            query_url: query_url.clone(),
+            bearer_token,
+            timeout_secs: args.http_timeout_secs,
+        };
+        let readback = readback_over_http(&readback_cfg, &row, &outcome.plan)
+            .await
+            .map_err(|source| RunError::Readback {
+                system: system.to_string(),
+                source,
+            })?;
+        if !readback.matches_expected {
+            return Err(RunError::ReadbackMismatch {
+                system: system.to_string(),
+                mismatches: readback.mismatches.join("; "),
+            });
+        }
+        row.readback = Some(readback);
+        portable.push(row);
     }
+    let portable_refs: Vec<&SystemIngestResult> = portable.iter().collect();
+    check_expected_digests_agree(&portable_refs, &PayloadClass::ALL)?;
+    rows.extend(portable);
 
     Ok(MetricsIngestReport::new(rows)
         .with_query(query)
@@ -438,14 +616,77 @@ async fn main() {
         }
         Err(err) => {
             eprintln!("metricsbench_ingest: {err}");
-            let code = match err {
-                RunError::MissingAnchor { .. }
-                | RunError::Anchor(_)
-                | RunError::MissingBearerToken { .. }
-                | RunError::BearerWithoutEndpoint => EXIT_USAGE,
-                _ => 1,
-            };
-            std::process::exit(code);
+            std::process::exit(exit_code(&err));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Args {
+        let mut argv = vec!["metricsbench_ingest", "--profile", "ci"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    #[test]
+    fn a_zero_interval_exits_65_before_a_missing_anchor() {
+        let err = resolve_anchor(&args(&[]), 0, 1).expect_err("zero interval");
+        assert!(matches!(err, RunError::Anchor(AnchorError::ZeroInterval)));
+        assert_eq!(exit_code(&err), EXIT_DATAERR);
+        assert_eq!(EXIT_DATAERR, 65);
+        let with_anchor = resolve_anchor(&args(&["--anchor-ms", "0"]), 0, 1).expect_err("zero");
+        assert_eq!(exit_code(&with_anchor), 65);
+        let missing = resolve_anchor(&args(&[]), 10, 1).expect_err("missing anchor");
+        assert_eq!(exit_code(&missing), 64);
+        let text = missing.to_string();
+        assert!(text.contains("(10000 ms for profile `ci`)"), "{text}");
+        assert!(!text.contains("(0 ms"), "{text}");
+    }
+
+    #[test]
+    fn the_ravel_tenant_must_be_given_and_equal_the_tenant() {
+        let none = resolve_ravel_tenant(&args(&["--ravel-endpoint", "http://x/api/v1/write"]))
+            .expect_err("missing");
+        assert!(matches!(none, RunError::MissingRavelTenant));
+        assert_eq!(exit_code(&none), 64);
+        let differs = resolve_ravel_tenant(&args(&[
+            "--ravel-endpoint",
+            "http://x/api/v1/write",
+            "--tenant",
+            "a",
+            "--ravel-tenant",
+            "b",
+        ]))
+        .expect_err("differs");
+        assert!(matches!(differs, RunError::TenantMismatch { .. }));
+        assert_eq!(exit_code(&differs), 64);
+        let same = resolve_ravel_tenant(&args(&[
+            "--ravel-endpoint",
+            "http://x/api/v1/write",
+            "--tenant",
+            "a",
+            "--ravel-tenant",
+            "a",
+        ]))
+        .expect("same tenant");
+        assert_eq!(same.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn every_endpoint_needs_its_query_url() {
+        let err = resolve_query_urls(&args(&["--mimir-endpoint", "http://m/api/v1/push"]))
+            .expect_err("missing query url");
+        assert!(matches!(err, RunError::MissingQueryUrl { flag: "mimir" }));
+        assert_eq!(exit_code(&err), 64);
+        resolve_query_urls(&args(&[
+            "--mimir-endpoint",
+            "http://m/api/v1/push",
+            "--mimir-query-url",
+            "http://m/prometheus",
+        ]))
+        .expect("query url given");
     }
 }
