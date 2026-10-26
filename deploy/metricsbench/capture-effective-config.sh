@@ -5,7 +5,7 @@
 #
 # Usage:
 #   capture-effective-config.sh [--out FILE] [--prometheus URL]
-#     [--victoriametrics URL] [--mimir URL] [--ravel URL]
+#     [--victoriametrics URL] [--mimir URL] [--ravel URL | --no-ravel]
 #
 # Defaults are the compose ports on loopback: http://127.0.0.1:9090 (Prometheus),
 # http://127.0.0.1:8428 (VictoriaMetrics), http://127.0.0.1:9009 (Mimir),
@@ -35,9 +35,12 @@
 #                    2.14-2.16, mimir from 2.17.
 #   ravel            GET /api/v1/status/buildinfo (version, revision). Every
 #                    published ravel-server image answers an empty revision
-#                    (RAVEL_GIT_SHA is unset at build), which is recorded as
-#                    unavailable and makes the capture exit 1; the image
-#                    digest is then the build's identity.
+#                    (RAVEL_GIT_SHA is unset at build, issue #3312). It is
+#                    recorded as unavailable but does not count toward exit 1,
+#                    since no image can supply it; the image digest is then
+#                    the build's identity. Ravel's version still counts.
+#                    --no-ravel skips Ravel for a comparators-only launch: its
+#                    entry is {"skipped": "--no-ravel"} and nothing is queried.
 #                    runtime_flags: the container's .Config.Cmd from
 #                    `docker inspect` (the arguments ravel.yml passes to the
 #                    ravel-server entrypoint), as {"source": ..., "cmd": [...]}.
@@ -60,9 +63,10 @@
 #
 # Exit codes:
 #   0   every comparator answered its version call; the document is complete
-#       for version and revision
-#   1   at least one comparator's version is unavailable; the document is
-#       still written, because a partial capture is evidence
+#       for version and revision, except Ravel's revision (see above)
+#   1   at least one comparator's version, or a revision other than Ravel's,
+#       is unavailable; the document is still written, because a partial
+#       capture is evidence
 #   64  usage error
 #   70  the capture crashed or could not write the document; no document, or
 #       a stale one from an earlier run, is at --out
@@ -81,9 +85,14 @@ prom_url="http://127.0.0.1:9090"
 vm_url="http://127.0.0.1:8428"
 mimir_url="http://127.0.0.1:9009"
 ravel_url="http://127.0.0.1:4318"
+no_ravel=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-ravel)
+      no_ravel=1
+      shift
+      ;;
     --out | --prometheus | --victoriametrics | --mimir | --ravel)
       if [[ $# -lt 2 || -z "$2" ]]; then
         echo "capture-effective-config.sh: $1 needs a value" >&2
@@ -121,7 +130,7 @@ script_revision="$(git -C "${here}" rev-parse HEAD 2>/dev/null)" || script_revis
 rc=0
 python3 -I - "${here}/docker-compose.yml" "${here}/ravel.yml" "${script_revision}" "${out}" \
   "${prom_url%/}" "${vm_url%/}" "${mimir_url%/}" "${ravel_url%/}" \
-  "${METRICSBENCH_DOCKER:-docker}" <<'PY' || rc=$?
+  "${METRICSBENCH_DOCKER:-docker}" "${no_ravel}" <<'PY' || rc=$?
 import datetime
 import json
 import os
@@ -142,7 +151,9 @@ import urllib.request
     mimir_url,
     ravel_url,
     docker,
-) = sys.argv[1:10]
+    no_ravel,
+) = sys.argv[1:11]
+skip_ravel = no_ravel == "1"
 
 
 def crash_hook(exc_type, exc, tb):
@@ -467,13 +478,16 @@ doc["comparators"]["mimir"] = {
     "image": image_of(containers, "mimir"),
 }
 
-version, revision = buildinfo_json(urls["ravel"]["buildinfo"])
-doc["comparators"]["ravel"] = {
-    "version": version,
-    "revision": revision,
-    "runtime_flags": ravel_runtime_flags(containers, "ravel-server"),
-    "image": image_of(containers, "ravel-server"),
-}
+if skip_ravel:
+    doc["comparators"]["ravel"] = {"skipped": "--no-ravel"}
+else:
+    version, revision = buildinfo_json(urls["ravel"]["buildinfo"])
+    doc["comparators"]["ravel"] = {
+        "version": version,
+        "revision": revision,
+        "runtime_flags": ravel_runtime_flags(containers, "ravel-server"),
+        "image": image_of(containers, "ravel-server"),
+    }
 
 text = json.dumps(doc, indent=2, sort_keys=False) + "\n"
 if out:
@@ -489,11 +503,17 @@ if out:
 else:
     sys.stdout.write(text)
 
-missing = [
-    name
-    for name, c in doc["comparators"].items()
-    if not (isinstance(c["version"], str) and isinstance(c["revision"], str))
-]
+def is_missing(name, c):
+    if "skipped" in c:
+        return False
+    if not isinstance(c["version"], str):
+        return True
+    # No published ravel-server image carries a revision (issue #3312), so its
+    # absence is recorded in the document but is not a partial capture.
+    return name != "ravel" and not isinstance(c["revision"], str)
+
+
+missing = [name for name, c in doc["comparators"].items() if is_missing(name, c)]
 if missing:
     sys.stderr.write(
         "capture-effective-config.sh: version or revision unavailable for: " + ", ".join(missing) + "\n"

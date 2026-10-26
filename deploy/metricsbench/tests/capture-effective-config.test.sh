@@ -22,8 +22,11 @@
 #   i  compose ps                        -> reads docker-compose.yml and
 #                                           ravel.yml; RAVEL_IMAGE placeholder
 #                                           when unset, passed on when set
-#   j  Ravel 0.26.0 empty revision       -> exit 1, version kept, revision
-#                                           unavailable
+#   j  Ravel empty revision (every image)-> exit 0, version kept, revision
+#                                           recorded unavailable
+#   k  Ravel down / --no-ravel           -> exit 1 when Ravel is queried and
+#                                           down; --no-ravel skips it, exit 0,
+#                                           and still exits 1 for Mimir down
 #
 # Every field is asserted by parsing the JSON with python3 -I, not by grep.
 #
@@ -329,26 +332,61 @@ else
   fail "i RAVEL_IMAGE passed on unchanged: $(cat "${compose_log}")"
 fi
 
-# --- j: Ravel 0.26.0 answers an empty revision -----------------------------------
-# The pinned image's buildinfo carries no revision: that is a partial capture
-# (exit 1) with the version kept, not a pass with an empty string recorded.
+# --- j: Ravel answers an empty revision, as every published image does ----------
+# No ravel-server image carries a revision (issue #3312). It is recorded as
+# unavailable, never as an empty string, and it does not make a healthy stack
+# exit 1, so exit 1 still means a comparator is missing.
 out_j="${TMP}/j.json"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_j}" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
   --ravel "${ravel026_url}" \
   2>"${TMP}/j.err" || code=$?
-expect_exit "j ravel empty revision" 1 "${code}"
-if grep -q "unavailable for: ravel$" "${TMP}/j.err"; then
-  pass "j names ravel"
+expect_exit "j ravel empty revision" 0 "${code}"
+if grep -q "unavailable for" "${TMP}/j.err"; then
+  fail "j names nothing missing: $(cat "${TMP}/j.err")"
 else
-  fail "j names ravel: $(cat "${TMP}/j.err")"
+  pass "j names nothing missing"
 fi
 check "j fields" "${out_j}" <<EOF
 d["comparators"]["ravel"]["version"] == "0.26.0"
 d["comparators"]["ravel"]["revision"] == {"unavailable": "data.revision missing or empty in response from ${ravel026_url}/api/v1/status/buildinfo"}
 d["comparators"]["mimir"]["revision"] == "mimirrev214"
 EOF
+
+# --- k: Ravel down without --no-ravel, and a comparators-only launch -------------
+# Ravel's version still counts: an unreachable Ravel is a partial capture. With
+# --no-ravel nothing is queried for it and a healthy comparator set exits 0.
+out_k="${TMP}/k.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_k}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "$(dead_url)" \
+  2>"${TMP}/k.err" || code=$?
+expect_exit "k ravel down" 1 "${code}"
+if grep -q "unavailable for: ravel$" "${TMP}/k.err"; then
+  pass "k names ravel"
+else
+  fail "k names ravel: $(cat "${TMP}/k.err")"
+fi
+out_k2="${TMP}/k2.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_k2}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --no-ravel \
+  2>"${TMP}/k2.err" || code=$?
+expect_exit "k --no-ravel" 0 "${code}"
+check "k --no-ravel fields" "${out_k2}" <<EOF
+d["comparators"]["ravel"] == {"skipped": "--no-ravel"}
+d["comparators"]["mimir"]["revision"] == "mimirrev214"
+EOF
+out_k3="${TMP}/k3.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_k3}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "$(dead_url)" \
+  --no-ravel \
+  2>"${TMP}/k3.err" || code=$?
+expect_exit "k --no-ravel with mimir down" 1 "${code}"
 
 # --- e: Mimir 3.x ---------------------------------------------------------------
 out_e="${TMP}/e.json"
