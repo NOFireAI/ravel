@@ -149,8 +149,6 @@ use datafusion::physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, Partitioning, ReplaceChildrenOptions,
 };
 
-use crate::compact_slices::CompactSlicesExec;
-
 /// The in-memory type a dictionary-encoded string group key is grouped as.
 /// The operators between the aggregate and the restore projection see it too,
 /// and are rebuilt so their schemas say so; nothing above that projection, and
@@ -351,36 +349,55 @@ fn carried_columns(original: &SchemaRef, rewritten: &SchemaRef) -> Vec<usize> {
 /// schema says so, without changing a row it produces. This is the allowlist
 /// the module docs describe; anything not named here gets the restore
 /// projection directly over its input.
+///
+/// An operator that evaluates expressions over its input (a projection, a
+/// sort or merge through its ordering, an exchange through its partitioning
+/// or the ordering it preserves) carries only when every one of them that
+/// reads a carried column, anywhere in its tree, is that bare column: a
+/// computed expression such as `k = 'a'` was planned against the declared
+/// type and fails or changes meaning over views.
 fn carries(node: &Arc<dyn ExecutionPlan>, carried: &[usize], parent_is_aggregate: bool) -> bool {
     let reads = |expr: &Arc<dyn PhysicalExpr>| {
         collect_columns(expr)
             .iter()
             .any(|column| carried.contains(&column.index()))
     };
+    let bare =
+        |expr: &Arc<dyn PhysicalExpr>| !reads(expr) || expr.downcast_ref::<Column>().is_some();
     if let Some(sort) = node.downcast_ref::<SortExec>() {
         // A TopK publishes a dynamic filter over every column it orders by. A
         // filter that also reads a value an aggregate computed cannot be
         // pushed below that aggregate, so its thresholds never meet the scan's
         // dictionary column; one that reads only group keys could be.
-        return sort.fetch().is_none()
-            || !sort.expr().iter().any(|e| reads(&e.expr))
-            || sort.expr().iter().any(|e| {
-                e.expr
-                    .downcast_ref::<Column>()
-                    .is_some_and(|column| is_aggregate_value(sort.input(), column.index()))
-            });
+        return sort.expr().iter().all(|e| bare(&e.expr))
+            && (sort.fetch().is_none()
+                || !sort.expr().iter().any(|e| reads(&e.expr))
+                || sort.expr().iter().any(|e| {
+                    e.expr
+                        .downcast_ref::<Column>()
+                        .is_some_and(|column| is_aggregate_value(sort.input(), column.index()))
+                }));
+    }
+    if let Some(merge) = node.downcast_ref::<SortPreservingMergeExec>() {
+        return merge.expr().iter().all(|e| bare(&e.expr));
     }
     if let Some(repartition) = node.downcast_ref::<RepartitionExec>() {
-        return match repartition.partitioning() {
-            Partitioning::Hash(exprs, _) => parent_is_aggregate || !exprs.iter().any(reads),
-            _ => true,
-        };
+        let ordering_bare = !repartition.preserve_order()
+            || repartition
+                .input()
+                .properties()
+                .output_ordering()
+                .is_none_or(|ordering| ordering.iter().all(|e| bare(&e.expr)));
+        return ordering_bare
+            && match repartition.partitioning() {
+                Partitioning::Hash(exprs, _) => {
+                    exprs.iter().all(bare) && (parent_is_aggregate || !exprs.iter().any(reads))
+                }
+                _ => true,
+            };
     }
     if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-        return projection
-            .expr()
-            .iter()
-            .all(|e| !reads(&e.expr) || e.expr.downcast_ref::<Column>().is_some());
+        return projection.expr().iter().all(|e| bare(&e.expr));
     }
     if let Some(agg) = node.downcast_ref::<AggregateExec>() {
         return aggregate_carries(agg, carried, &reads);
@@ -389,14 +406,12 @@ fn carries(node: &Arc<dyn ExecutionPlan>, carried: &[usize], parent_is_aggregate
 }
 
 /// True for an operator that evaluates no expression over its input's columns
-/// and outputs them as they are: it merges, moves, limits or copies rows.
+/// and outputs them as they are: it moves or limits rows.
 fn passes_columns_through(node: &Arc<dyn ExecutionPlan>) -> bool {
-    node.is::<SortPreservingMergeExec>()
-        || node.is::<CoalescePartitionsExec>()
+    node.is::<CoalescePartitionsExec>()
         || node.is::<GlobalLimitExec>()
         || node.is::<LocalLimitExec>()
         || node.is::<CooperativeExec>()
-        || node.is::<CompactSlicesExec>()
 }
 
 /// True when column `index` of `plan`'s output is, through renaming
@@ -421,6 +436,7 @@ fn is_aggregate_value(plan: &Arc<dyn ExecutionPlan>, index: usize) -> bool {
             index = column.index();
             Arc::clone(projection.input())
         } else if plan.is::<SortExec>()
+            || plan.is::<SortPreservingMergeExec>()
             || plan.is::<RepartitionExec>()
             || passes_columns_through(&plan)
         {
@@ -716,7 +732,7 @@ mod tests {
 
     /// The statements the differential below runs. Each has one correct row
     /// order over the `dict_context` fixture.
-    const DIFFERENTIAL: [&str; 8] = [
+    const DIFFERENTIAL: [&str; 11] = [
         "SELECT k, sum(v) AS total FROM t GROUP BY k ORDER BY k",
         // q34's shape: a TopK over the grouped counts, restored above it.
         "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY c DESC LIMIT 2",
@@ -738,6 +754,13 @@ mod tests {
          FROM (SELECT k, count(*) AS c FROM t GROUP BY k) a \
          JOIN (SELECT k, sum(v) AS total FROM t GROUP BY k) b ON a.k = b.k \
          ORDER BY a.c DESC",
+        // Sort keys that compute on the key: the comparison against a
+        // dictionary literal, and a CASE over it, are evaluated on the sort's
+        // input, so that input must hold the declared type.
+        "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY k = 'a', c",
+        "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY c DESC, k = 'x' LIMIT 10",
+        "SELECT k, count(*) AS c FROM t GROUP BY k \
+         ORDER BY CASE k WHEN 'a' THEN 0 ELSE 1 END, c",
     ];
 
     /// Run `sql` on a fresh fixture session, returning the schema the plan

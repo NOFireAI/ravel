@@ -520,6 +520,22 @@ async fn single_distinct_two_level_aggregate_keeps_views_between_levels() {
             node.name()
         );
     }
+    let mut all = Vec::new();
+    nodes(&plan, &mut all);
+    let to_views: Vec<_> = all
+        .iter()
+        .filter(|node| casts_to(node, &DataType::Utf8View) > 0)
+        .collect();
+    let [to_view] = to_views.as_slice() else {
+        panic!("expected one node casting to Utf8View, found {to_views:?}");
+    };
+    assert_eq!(casts_to(to_view, &DataType::Utf8View), 1);
+    let inner_final_stage = inner_final.last().expect("path is non-empty");
+    assert!(
+        !Arc::ptr_eq(to_view, inner_final_stage)
+            && path_to(inner_final_stage, &|node| Arc::ptr_eq(node, to_view)).is_some(),
+        "the cast to Utf8View is not below the inner level's final stage: {to_view:?}"
+    );
 
     let outcome = executor
         .execute(tenant().hash(), &request(&sql))
@@ -531,6 +547,73 @@ async fn single_distinct_two_level_aggregate_keeps_views_between_levels() {
         Some(&("https://example.test/a".to_string(), 3))
     );
     assert_eq!(rows.len(), 3);
+}
+
+/// A sort key that computes on the group key (`url = '..'`, a `CASE` over
+/// it) is evaluated on the sort's input, against a dictionary literal, so the
+/// restore projection sits below that sort and its input holds the declared
+/// type. A sort key that is the bare group column next to an aggregate value
+/// does not stop the carry: the restore still runs above the TopK.
+#[tokio::test]
+async fn sort_key_computing_on_the_group_key_restores_below_the_sort() {
+    let executor = declared_url_executor().await;
+    for (order_by, order) in [
+        ("url = 'https://example.test/a', hits, url", ["b", "c", "a"]),
+        (
+            "CASE url WHEN 'https://example.test/a' THEN 0 ELSE 1 END, hits, url",
+            ["a", "b", "c"],
+        ),
+        // The key two levels below the root of the sort expression.
+        (
+            "CASE WHEN url = 'https://example.test/a' THEN 0 ELSE 1 END, hits, url",
+            ["a", "b", "c"],
+        ),
+    ] {
+        let sql = format!(
+            "SELECT {URL_KEY}, count(*) AS hits FROM logs GROUP BY {URL_KEY} ORDER BY {order_by}"
+        );
+        let plan = executor_plan(&executor, &sql).await;
+        assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+        let mut all = Vec::new();
+        nodes(&plan, &mut all);
+        let sorts: Vec<_> = all.iter().filter(|node| node.is::<SortExec>()).collect();
+        let [sort] = sorts.as_slice() else {
+            panic!("{sql}: expected one SortExec, found {sorts:?}");
+        };
+        let [input] = sort.children()[..] else {
+            panic!("a SortExec has one input");
+        };
+        assert_eq!(
+            column_type(input, URL_KEY).as_ref(),
+            Some(&dict_type()),
+            "{sql}: the sort's input carries the key as a view"
+        );
+        assert!(input.is::<ProjectionExec>(), "{sql}: {input:?}");
+        assert_eq!(casts_to(input, &dict_type()), 1, "{sql}");
+
+        let outcome = executor
+            .execute(tenant().hash(), &request(&sql))
+            .await
+            .expect("query runs");
+        assert_eq!(
+            url_counts(outcome.output.batches()),
+            order
+                .iter()
+                .map(|path| {
+                    let hits = if *path == "a" { 3 } else { 1 };
+                    (format!("https://example.test/{path}"), hits)
+                })
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    let sql = format!(
+        "SELECT {URL_KEY}, count(*) AS hits FROM logs GROUP BY {URL_KEY} \
+         ORDER BY hits DESC, {URL_KEY} ASC LIMIT 10"
+    );
+    let plan = executor_plan(&executor, &sql).await;
+    assert_restore_above_the_fetch(&plan);
 }
 
 /// The `(url, count)` rows of a result whose first column is the declared
