@@ -144,7 +144,12 @@ fn series(value: &str, kind: &'static str, params: &HashMap<String, String>) -> 
     }
 }
 
-async fn answer(stub: Stub, path: &'static str, headers: HeaderMap, params: HashMap<String, String>) -> Response {
+async fn answer(
+    stub: Stub,
+    path: &'static str,
+    headers: HeaderMap,
+    params: HashMap<String, String>,
+) -> Response {
     let authorization = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -159,11 +164,17 @@ async fn answer(stub: Stub, path: &'static str, headers: HeaderMap, params: Hash
     {
         return (
             StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"status": "error", "errorType": "unauthorized", "error": "missing bearer"})),
+            axum::Json(
+                json!({"status": "error", "errorType": "unauthorized", "error": "missing bearer"}),
+            ),
         )
             .into_response();
     }
-    let kind = if path == "/api/v1/query" { "instant" } else { "range" };
+    let kind = if path == "/api/v1/query" {
+        "instant"
+    } else {
+        "range"
+    };
     let query = params.get("query").cloned().unwrap_or_default();
     match stub.script.get(&query).copied().unwrap_or(Answer::Correct) {
         Answer::Correct => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
@@ -197,11 +208,19 @@ async fn spawn_stub(script: &[(&str, Answer)], bearer: Option<&str>) -> (Stub, S
     let app = Router::new()
         .route(
             "/api/v1/query",
-            get(|State(s): State<Stub>, h: HeaderMap, Query(p): Query<HashMap<String, String>>| answer(s, "/api/v1/query", h, p)),
+            get(
+                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<HashMap<String, String>>| {
+                    answer(s, "/api/v1/query", h, p)
+                },
+            ),
         )
         .route(
             "/api/v1/query_range",
-            get(|State(s): State<Stub>, h: HeaderMap, Query(p): Query<HashMap<String, String>>| answer(s, "/api/v1/query_range", h, p)),
+            get(
+                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<HashMap<String, String>>| {
+                    answer(s, "/api/v1/query_range", h, p)
+                },
+            ),
         )
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -336,7 +355,10 @@ fn ingest_report(urls: &Urls) -> MetricsIngestReport {
             source: u.source.to_string(),
         })
         .collect();
-    assert_eq!(victoriametrics.unsupported_classes[0].class, PayloadClass::NativeHistogram);
+    assert_eq!(
+        victoriametrics.unsupported_classes[0].class,
+        PayloadClass::NativeHistogram
+    );
     let mimir = SystemIngestResult::buffered_http_row(
         "mimir",
         format!("{}/api/v1/push", urls.mimir),
@@ -433,7 +455,11 @@ async fn run_bin(ingest: MetricsIngestReport, urls: &Urls) -> Run {
     let corpus_path = dir.path().join("corpus.json");
     std::fs::write(&corpus_path, &corpus_bytes).expect("write corpus");
     let ingest_path = dir.path().join("ingest.json");
-    std::fs::write(&ingest_path, serde_json::to_vec_pretty(&ingest).expect("ingest")).expect("write ingest");
+    std::fs::write(
+        &ingest_path,
+        serde_json::to_vec_pretty(&ingest).expect("ingest"),
+    )
+    .expect("write ingest");
     let provenance_path = dir.path().join("provenance.json");
     std::fs::write(
         &provenance_path,
@@ -454,7 +480,10 @@ async fn run_bin(ingest: MetricsIngestReport, urls: &Urls) -> Run {
         // The prometheus row's readback URL wins over this unreachable one.
         .args(["--engine", "name=prometheus,url=http://127.0.0.1:9"])
         .arg("--engine")
-        .arg(format!("name=ravel,url={},bearer_env={RAVEL_TOKEN_ENV}", urls.ravel))
+        .arg(format!(
+            "name=ravel,url={},bearer_env={RAVEL_TOKEN_ENV}",
+            urls.ravel
+        ))
         .arg("--engine")
         .arg(format!("name=victoriametrics,url={}", urls.victoriametrics))
         .arg("--engine")
@@ -466,10 +495,15 @@ async fn run_bin(ingest: MetricsIngestReport, urls: &Urls) -> Run {
         .arg("--out")
         .arg(&out)
         .env(RAVEL_TOKEN_ENV, RAVEL_TOKEN);
-    let output = tokio::task::spawn_blocking(move || command.output().expect("run metricsbench_query"))
-        .await
-        .expect("join");
-    Run { output, out, _dir: dir }
+    let output =
+        tokio::task::spawn_blocking(move || command.output().expect("run metricsbench_query"))
+            .await
+            .expect("join");
+    Run {
+        output,
+        out,
+        _dir: dir,
+    }
 }
 
 struct Stubs {
@@ -483,10 +517,16 @@ struct Stubs {
 async fn stubs() -> Stubs {
     let (prometheus, p) = spawn_stub(&[], None).await;
     let (ravel, r) = spawn_stub(&[], Some(RAVEL_TOKEN)).await;
-    let (victoriametrics, v) =
-        spawn_stub(&[(NATIVE_P95, Answer::Empty), (GAUGE, Answer::Diverge)], None).await;
+    let (victoriametrics, v) = spawn_stub(
+        &[(NATIVE_P95, Answer::Empty), (GAUGE, Answer::Diverge)],
+        None,
+    )
+    .await;
     let (mimir, m) = spawn_stub(
-        &[(JOB_RATE_SUM, Answer::RefuseChunks), (COUNTER_RATE, Answer::Hang)],
+        &[
+            (JOB_RATE_SUM, Answer::RefuseChunks),
+            (COUNTER_RATE, Answer::Hang),
+        ],
         None,
     )
     .await;
@@ -520,7 +560,11 @@ fn stderr(output: &Output) -> String {
 async fn the_corpus_runs_against_every_engine_and_validates() {
     let s = stubs().await;
     let run = run_bin(ingest_report(&s.urls), &s.urls).await;
-    assert!(run.output.status.success(), "metricsbench_query failed: {}", stderr(&run.output));
+    assert!(
+        run.output.status.success(),
+        "metricsbench_query failed: {}",
+        stderr(&run.output)
+    );
     let text = std::fs::read_to_string(&run.out).expect("report written");
     let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
 
@@ -529,7 +573,11 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
         .arg(&run.out)
         .output()
         .expect("run metricsbench_report");
-    assert!(validated.status.success(), "validate refused the output: {}", stderr(&validated));
+    assert!(
+        validated.status.success(),
+        "validate refused the output: {}",
+        stderr(&validated)
+    );
 
     // Every (engine, entry) case is expected, written from the corpus.
     assert_eq!(report.cases_expected.len(), 16);
@@ -544,10 +592,18 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
         (Engine::Ravel, "mb_single_counter_rate", Ok),
         (Engine::Ravel, "mb_selective_job_rate_sum", Ok),
         (Engine::Ravel, "mb_histogram_native_p95", Ok),
-        (Engine::VictoriaMetrics, "mb_single_gauge_instant", Incorrect),
+        (
+            Engine::VictoriaMetrics,
+            "mb_single_gauge_instant",
+            Incorrect,
+        ),
         (Engine::VictoriaMetrics, "mb_single_counter_rate", Ok),
         (Engine::VictoriaMetrics, "mb_selective_job_rate_sum", Ok),
-        (Engine::VictoriaMetrics, "mb_histogram_native_p95", UnsupportedConstruct),
+        (
+            Engine::VictoriaMetrics,
+            "mb_histogram_native_p95",
+            UnsupportedConstruct,
+        ),
         (Engine::Mimir, "mb_single_gauge_instant", Ok),
         (Engine::Mimir, "mb_single_counter_rate", Timeout),
         (Engine::Mimir, "mb_selective_job_rate_sum", Refused),
@@ -557,7 +613,11 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
     for (engine, id, status) in expected {
         let m = row(&report, *engine, id);
         assert_eq!(m.status, *status, "{engine:?}/{id}");
-        assert_eq!(m.pass_statuses, vec![*status; PASSES as usize], "{engine:?}/{id}");
+        assert_eq!(
+            m.pass_statuses,
+            vec![*status; PASSES as usize],
+            "{engine:?}/{id}"
+        );
         assert_eq!(m.oracle, *engine == Engine::Prometheus, "{engine:?}/{id}");
     }
     assert_eq!(
@@ -572,7 +632,15 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
     let denominators: Vec<(Engine, usize, usize, usize, usize)> = report
         .denominators
         .iter()
-        .map(|d| (d.engine, d.corpus, d.correctness, d.timing, d.coverage_success))
+        .map(|d| {
+            (
+                d.engine,
+                d.corpus,
+                d.correctness,
+                d.timing,
+                d.coverage_success,
+            )
+        })
         .collect();
     assert_eq!(
         denominators,
@@ -589,12 +657,23 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
     let ravel_requests = s.ravel.requests();
     assert!(!ravel_requests.is_empty());
     for r in &ravel_requests {
-        assert_eq!(r.authorization.as_deref(), Some(format!("Bearer {RAVEL_TOKEN}").as_str()));
+        assert_eq!(
+            r.authorization.as_deref(),
+            Some(format!("Bearer {RAVEL_TOKEN}").as_str())
+        );
     }
-    assert!(!text.contains(RAVEL_TOKEN), "the bearer token leaked into the report");
+    assert!(
+        !text.contains(RAVEL_TOKEN),
+        "the bearer token leaked into the report"
+    );
     assert!(!stderr(&run.output).contains(RAVEL_TOKEN));
     assert!(!String::from_utf8_lossy(&run.output.stdout).contains(RAVEL_TOKEN));
-    assert!(s.prometheus.requests().iter().all(|r| r.authorization.is_none()));
+    assert!(
+        s.prometheus
+            .requests()
+            .iter()
+            .all(|r| r.authorization.is_none())
+    );
 }
 
 /// Only an `ok` row is timed. Fails against a runner that times every
@@ -615,7 +694,12 @@ async fn only_ok_rows_carry_latency() {
             assert_eq!(m.reps_per_pass, Some(REPS), "{}", m.id);
             assert!(m.rel_mad_pct.is_some(), "{}", m.id);
         } else {
-            assert!(names.is_empty(), "{:?}/{} carries {names:?}", m.engine, m.id);
+            assert!(
+                names.is_empty(),
+                "{:?}/{} carries {names:?}",
+                m.engine,
+                m.id
+            );
             assert!(m.pass_medians_ms.is_empty(), "{:?}/{}", m.engine, m.id);
             assert_eq!(m.reps_per_pass, None, "{:?}/{}", m.engine, m.id);
             assert_eq!(m.rel_mad_pct, None, "{:?}/{}", m.engine, m.id);
@@ -646,7 +730,10 @@ async fn a_range_entry_is_one_range_request_per_repetition() {
         }
         for r in stub.requests() {
             if r.path == "/api/v1/query_range" {
-                assert_eq!(r.params["start"].parse::<f64>().unwrap(), (newest_s - 1485) as f64);
+                assert_eq!(
+                    r.params["start"].parse::<f64>().unwrap(),
+                    (newest_s - 1485) as f64
+                );
                 assert_eq!(r.params["end"].parse::<f64>().unwrap(), newest_s as f64);
                 assert_eq!(r.params["step"], "15000ms");
             } else {
@@ -666,10 +753,18 @@ async fn ravel_receives_the_full_multi_shard_commit_token() {
     let requests = s.ravel.requests();
     assert!(!requests.is_empty());
     for r in &requests {
-        assert_eq!(r.params.get("min_commit_token").map(String::as_str), Some(RAVEL_COMMIT_TOKEN));
+        assert_eq!(
+            r.params.get("min_commit_token").map(String::as_str),
+            Some(RAVEL_COMMIT_TOKEN)
+        );
     }
     for other in [&s.prometheus, &s.victoriametrics, &s.mimir] {
-        assert!(other.requests().iter().all(|r| !r.params.contains_key("min_commit_token")));
+        assert!(
+            other
+                .requests()
+                .iter()
+                .all(|r| !r.params.contains_key("min_commit_token"))
+        );
     }
 }
 
@@ -694,9 +789,15 @@ async fn an_unsupported_class_entry_is_unsupported_not_incorrect() {
         .expect("vm denominators");
     assert_eq!(vm.corpus, 4);
     // Mimir lists no unsupported class and answers the same entry correctly.
-    assert_eq!(row(&report, Engine::Mimir, "mb_histogram_native_p95").status, ResultStatus::Ok);
+    assert_eq!(
+        row(&report, Engine::Mimir, "mb_histogram_native_p95").status,
+        ResultStatus::Ok
+    );
     let err = stderr(&run.output);
-    assert!(err.contains("victoriametrics/mb_histogram_native_p95"), "{err}");
+    assert!(
+        err.contains("victoriametrics/mb_histogram_native_p95"),
+        "{err}"
+    );
     assert!(err.contains("lib/prompb/prompb.go"), "{err}");
     assert!(err.contains("0 series"), "{err}");
 }
@@ -707,11 +808,24 @@ async fn an_unsupported_class_entry_is_unsupported_not_incorrect() {
 async fn a_band6_failure_refuses_the_run() {
     let s = stubs().await;
     let mut ingest = ingest_report(&s.urls);
-    let mimir = ingest.systems.iter_mut().find(|r| r.system == "mimir").expect("mimir row");
+    let mimir = ingest
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "mimir")
+        .expect("mimir row");
     mimir.ingest.accepted_digests.scalar = "not-the-offered-stream".to_string();
     let run = run_bin(ingest, &s.urls).await;
-    assert_eq!(run.output.status.code(), Some(65), "{}", stderr(&run.output));
-    assert!(stderr(&run.output).contains("`mimir` fails band 6"), "{}", stderr(&run.output));
+    assert_eq!(
+        run.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&run.output)
+    );
+    assert!(
+        stderr(&run.output).contains("`mimir` fails band 6"),
+        "{}",
+        stderr(&run.output)
+    );
     assert!(!run.out.exists());
     for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
         assert!(stub.requests().is_empty());
@@ -723,10 +837,24 @@ async fn a_band6_failure_refuses_the_run() {
 async fn a_workload_digest_mismatch_refuses_the_run() {
     let s = stubs().await;
     let mut ingest = ingest_report(&s.urls);
-    ingest.profile.as_mut().expect("profile").run.workload_digest = Some("0".repeat(64));
+    ingest
+        .profile
+        .as_mut()
+        .expect("profile")
+        .run
+        .workload_digest = Some("0".repeat(64));
     let run = run_bin(ingest, &s.urls).await;
-    assert_eq!(run.output.status.code(), Some(65), "{}", stderr(&run.output));
-    assert!(stderr(&run.output).contains("run.workload_digest"), "{}", stderr(&run.output));
+    assert_eq!(
+        run.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&run.output)
+    );
+    assert!(
+        stderr(&run.output).contains("run.workload_digest"),
+        "{}",
+        stderr(&run.output)
+    );
     assert!(!run.out.exists());
 }
 
@@ -739,7 +867,12 @@ async fn a_classify_error_voids_the_run() {
     s.prometheus = prometheus;
     s.urls.prometheus = url;
     let run = run_bin(ingest_report(&s.urls), &s.urls).await;
-    assert_eq!(run.output.status.code(), Some(65), "{}", stderr(&run.output));
+    assert_eq!(
+        run.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&run.output)
+    );
     let err = stderr(&run.output);
     assert!(err.contains("mb_single_gauge_instant"), "{err}");
     assert!(err.contains("the run is void"), "{err}");

@@ -120,7 +120,10 @@ async fn run_main(args: Args) -> Result<(), Failure> {
     let ingest: MetricsIngestReport = serde_json::from_slice(&ingest_bytes).map_err(|e| {
         (
             EX_NOINPUT,
-            format!("{}: not an ingest report: {e}", args.ingest_report.display()),
+            format!(
+                "{}: not an ingest report: {e}",
+                args.ingest_report.display()
+            ),
         )
     })?;
     let workload_bytes = read(&args.workload)?;
@@ -186,7 +189,11 @@ async fn run_main(args: Args) -> Result<(), Failure> {
     set_config(config, "warmup_passes", args.warmup_passes.to_string());
     set_config(config, "passes", args.passes.to_string());
     set_config(config, "reps_per_pass", args.reps_per_pass.to_string());
-    set_config(config, "query_timeout_ms", args.query_timeout_ms.to_string());
+    set_config(
+        config,
+        "query_timeout_ms",
+        args.query_timeout_ms.to_string(),
+    );
     for (system, url) in endpoints(&binding) {
         set_config(config, &format!("query_url.{system}"), url);
     }

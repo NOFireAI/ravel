@@ -22,8 +22,8 @@
 //!
 //! An entry that reads a native-histogram family, run on an engine whose
 //! ingest row lists `native_histogram` among its `unsupported_classes`, is
-//! `unsupported_construct` on that engine before any comparison (the
-//! unsupported-class rule of PR #3316). Its query is still sent, and its
+//! `unsupported_construct` on that engine before any comparison. Its query
+//! is still sent, and its
 //! answer is summarised on stderr beside the row's citation, because the
 //! report row has no message field.
 
@@ -43,7 +43,7 @@ use crate::metrics_ingest::{
 use crate::metrics_workload::{FamilyKind, Profile, WorkloadFile};
 use crate::promql_corpus::{CorpusEntry, EvalKind};
 use crate::report_schema::{
-    EngineDenominators, ExpectedCase, Figure, Measurement, MIN_VARIANCE_PASSES, ResultStatus,
+    EngineDenominators, ExpectedCase, Figure, MIN_VARIANCE_PASSES, Measurement, ResultStatus,
     rel_mad_pct, row_status,
 };
 
@@ -127,9 +127,13 @@ pub fn parse_engine_spec(spec: &str) -> Result<EngineSpec, String> {
 pub enum BindError {
     #[error("ingest report has no `profile.run.{0}`; it predates the field and cannot bind a run")]
     MissingRunField(&'static str),
-    #[error("workload digest {file} does not match the ingest report's `run.workload_digest` {report}")]
+    #[error(
+        "workload digest {file} does not match the ingest report's `run.workload_digest` {report}"
+    )]
     WorkloadDigest { file: String, report: String },
-    #[error("workload version {file} does not match the ingest report's `run.workload_version` {report}")]
+    #[error(
+        "workload version {file} does not match the ingest report's `run.workload_version` {report}"
+    )]
     WorkloadVersion { file: u32, report: u32 },
     #[error("workload seed {file} does not match the ingest report's `run.seed` {report}")]
     Seed { file: u64, report: u64 },
@@ -139,7 +143,9 @@ pub enum BindError {
     Band6 { system: String, detail: String },
     #[error("ingest row `{system}` fails its accounting: {detail}")]
     Accounting { system: String, detail: String },
-    #[error("Prometheus is the oracle and must be one of the engines (--engine name=prometheus,...)")]
+    #[error(
+        "Prometheus is the oracle and must be one of the engines (--engine name=prometheus,...)"
+    )]
     NoOracle,
     #[error("engine `{0}` is given twice")]
     DuplicateEngine(&'static str),
@@ -147,7 +153,9 @@ pub enum BindError {
     NoIngestRow(&'static str),
     #[error("engine `{0}` has no query URL: its ingest row records none and no url= was given")]
     NoUrl(&'static str),
-    #[error("engine `{system}`: environment variable `{var}` named by bearer_env is unset or empty")]
+    #[error(
+        "engine `{system}`: environment variable `{var}` named by bearer_env is unset or empty"
+    )]
     BearerUnset { system: &'static str, var: String },
     #[error("the Ravel ingest row has no `last_commit_token` to pass as min_commit_token")]
     NoCommitToken,
@@ -245,7 +253,10 @@ impl std::fmt::Debug for BoundEngine {
         f.debug_struct("BoundEngine")
             .field("engine", &self.engine)
             .field("query_url", &self.query_url)
-            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("extra_params", &self.extra_params)
             .field("unsupported", &self.unsupported)
             .finish()
@@ -337,7 +348,11 @@ pub fn bind(
         .profile(&run.profile)
         .ok_or_else(|| BindError::UnknownProfile(run.profile.clone()))?;
 
-    for row in ingest.systems.iter().filter(|r| r.system != IN_PROCESS_SYSTEM) {
+    for row in ingest
+        .systems
+        .iter()
+        .filter(|r| r.system != IN_PROCESS_SYSTEM)
+    {
         check_row_band6(row).map_err(|e| BindError::Band6 {
             system: row.system.clone(),
             detail: e.to_string(),
@@ -371,17 +386,16 @@ pub fn bind(
             .map(|rb| rb.query_url.clone())
             .or_else(|| spec.url.clone())
             .ok_or(BindError::NoUrl(system))?;
-        let bearer_token = match &spec.bearer_env {
-            None => None,
-            Some(var) => Some(
-                env(var)
-                    .filter(|t| !t.is_empty())
-                    .ok_or_else(|| BindError::BearerUnset {
+        let bearer_token =
+            match &spec.bearer_env {
+                None => None,
+                Some(var) => Some(env(var).filter(|t| !t.is_empty()).ok_or_else(|| {
+                    BindError::BearerUnset {
                         system,
                         var: var.clone(),
-                    })?,
-            ),
-        };
+                    }
+                })?),
+            };
         let extra_params = if spec.engine == Engine::Ravel {
             let token = row
                 .last_commit_token
@@ -563,8 +577,13 @@ pub async fn run(
                 let record = &mut records[engine_index][entry_index];
                 let mut reps: Vec<(Classified, f64)> = Vec::new();
                 for _ in 0..options.reps_per_pass {
-                    let outcome =
-                        send(&clients[engine_index], entry, &binding.grid, options.deadline).await;
+                    let outcome = send(
+                        &clients[engine_index],
+                        entry,
+                        &binding.grid,
+                        options.deadline,
+                    )
+                    .await;
                     let latency_ms = outcome.timing().elapsed.as_secs_f64() * 1000.0;
                     let void = |source| RunError::Classify {
                         entry: entry.id.clone(),
@@ -589,8 +608,9 @@ pub async fn run(
                         ));
                         continue;
                     }
-                    let classified = classify(engine.engine, &outcome, oracle.as_ref(), &expectation)
-                        .map_err(void)?;
+                    let classified =
+                        classify(engine.engine, &outcome, oracle.as_ref(), &expectation)
+                            .map_err(void)?;
                     reps.push((classified, latency_ms));
                 }
                 let latencies: Vec<f64> = reps.iter().map(|(_, ms)| *ms).collect();
@@ -676,7 +696,9 @@ fn row_of(
     let mut m = Measurement {
         id: entry.id.clone(),
         // `run` refused an unclassed entry before any query.
-        class: entry.class.unwrap_or(crate::promql_corpus::CostClass::HighFanOut),
+        class: entry
+            .class
+            .unwrap_or(crate::promql_corpus::CostClass::HighFanOut),
         status,
         figures: Vec::new(),
         engine: Some(engine.engine),
