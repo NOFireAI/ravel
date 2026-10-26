@@ -68,6 +68,8 @@ mod labels_dict_compaction;
 mod live_accounting;
 #[path = "logs_columnar.rs"]
 mod logs_columnar;
+#[path = "logs_contains_fetch_bytes.rs"]
+mod logs_contains_fetch_bytes;
 #[path = "logs_contains_route.rs"]
 mod logs_contains_route;
 #[path = "logs_count_from_stats.rs"]

@@ -1141,6 +1141,31 @@ fn bloom_shaped(arm: &Predicate) -> bool {
     }
 }
 
+/// Whether [`RlogReader::scan_blocks`] can drop a block on a `content` list of
+/// conjuncts: some And-flattened arm is a `TsRange`, a `StreamIn`, an arm
+/// [`bloom_shaped`] accepts, or an `Equals` on an attribute (the postings
+/// gate). When false, every content arm (`Contains`, for one) is evaluated
+/// per row only, so the scan keeps every block its ts bounds and prune channel
+/// keep and reads neither BLOOM nor POSTINGS for its content.
+pub fn content_prunes_blocks(content: &[Predicate]) -> bool {
+    let mut arms = Vec::new();
+    for p in content {
+        flatten(p, &mut arms);
+    }
+    arms.into_iter().any(|a| {
+        bloom_shaped(a)
+            || matches!(
+                a,
+                Predicate::TsRange { .. }
+                    | Predicate::StreamIn(_)
+                    | Predicate::Equals {
+                        field: FieldSel::Attr(_),
+                        ..
+                    }
+            )
+    })
+}
+
 /// Which surviving block to decode: its whole-object block index, resolved to
 /// the block's pages through the [`BlockScan`]'s shared PAGE_DIR at decode time
 /// rather than carried here (issue #760), plus what the skip index says about
@@ -8477,6 +8502,76 @@ mod tests {
                 assert_eq!(stats.contains_cells_tested, 0);
                 assert_eq!(stats.str_cells_validated, 4 + 4);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod content_prunes_blocks_tests {
+    use super::*;
+
+    fn contains(key: &str) -> Predicate {
+        Predicate::Contains {
+            key: key.into(),
+            needle: "google".into(),
+            negated: false,
+        }
+    }
+
+    /// Only the arms `scan_blocks` drops blocks on count: a `Contains` list,
+    /// however nested in `And`, a long-string `Equals` off an attribute, and a
+    /// content `NumRange` prune nothing; a short `Equals` or a `HasWord`
+    /// (BLOOM), an attribute `Equals` of any length (POSTINGS), a `TsRange`
+    /// and a `StreamIn` each do, beside a `Contains` arm too.
+    #[test]
+    fn only_block_dropping_arms_count() {
+        let long = "x".repeat(65);
+        let none = [
+            vec![],
+            vec![contains("URL")],
+            vec![contains("URL"), contains("Title")],
+            vec![Predicate::And(vec![contains("URL"), Predicate::And(vec![])])],
+            vec![Predicate::Equals {
+                field: FieldSel::Body,
+                value: AttrValue::Str(long.clone()),
+            }],
+            vec![Predicate::NumRange {
+                field: FieldSel::Attr("n".into()),
+                ty: FieldType::I64,
+                min: Some(0),
+                max: None,
+            }],
+        ];
+        for content in &none {
+            assert!(!content_prunes_blocks(content), "{content:?}");
+        }
+        let some = [
+            Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "w".into(),
+            },
+            Predicate::Equals {
+                field: FieldSel::Body,
+                value: AttrValue::Str("short".into()),
+            },
+            Predicate::Equals {
+                field: FieldSel::Attr("k".into()),
+                value: AttrValue::Str(long),
+            },
+            Predicate::Equals {
+                field: FieldSel::Attr("k".into()),
+                value: AttrValue::I64(3),
+            },
+            Predicate::TsRange {
+                min_ns: 0,
+                max_ns: 1,
+            },
+            Predicate::StreamIn(vec![]),
+        ];
+        for arm in some {
+            assert!(content_prunes_blocks(&[arm.clone()]), "{arm:?}");
+            let nested = [Predicate::And(vec![contains("URL"), arm])];
+            assert!(content_prunes_blocks(&nested), "{nested:?}");
         }
     }
 }

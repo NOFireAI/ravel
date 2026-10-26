@@ -76,7 +76,8 @@ use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError,
     LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
-    SuffixOutcome, decode_section_accounted, open_from_suffix, read_section_accounted_from,
+    SuffixOutcome, content_prunes_blocks, decode_section_accounted, open_from_suffix,
+    read_section_accounted_from,
 };
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
@@ -4505,9 +4506,11 @@ struct OwnedBlocks<'a> {
 enum FilterSections {
     /// The scan can read either section.
     Place,
-    /// The query carries no content arm, no stream-attribute arm and no
-    /// prune arm other than `NumRange` or `NumNotEq`, so
-    /// `RlogReader::scan_blocks` reads neither section.
+    /// The query carries no content arm that can drop a block
+    /// (`ravel_logseg::content_prunes_blocks`; a `Contains` arm is evaluated
+    /// per row only), no stream-attribute arm and no prune arm other than
+    /// `NumRange` or `NumNotEq`, so `RlogReader::scan_blocks` reads neither
+    /// section.
     Skip,
 }
 
@@ -4531,7 +4534,7 @@ impl FilterSections {
             // or POSTINGS.
             key_equals: _,
         } = query;
-        let reads_none = content.is_empty()
+        let reads_none = !content_prunes_blocks(content)
             && stream_attrs.is_empty()
             && prune
                 .iter()
@@ -6300,8 +6303,9 @@ impl BlockRangeFetcher {
         };
 
         // `plan_skip_decidable` without its at-least-one-arm rule, which is a
-        // cost choice: with no content, stream or POSTINGS arm the reader's
-        // prune is its skip step, an empty prune list included.
+        // cost choice: with no block-dropping content arm and no stream or
+        // POSTINGS arm the reader's prune is its skip step, an empty prune
+        // list included.
         let skip_decidable = FilterSections::for_query(query) == FilterSections::Skip;
         let extra_tail: &[u32] = if skip_decidable {
             &[]
@@ -13020,6 +13024,45 @@ mod tail_section_placement_tests {
         assert_eq!(out.stats.blocks_after_postings, 1);
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].ts_ns, 3);
+    }
+
+    /// A content list of one `Contains` arm, which the reader evaluates per
+    /// row and answers from neither section, fetches no BLOOM or POSTINGS
+    /// byte: the same GETs and bytes as the predicate-free open, and the
+    /// same one record the whole-object scan with the arm returns.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` testing
+    /// `content.is_empty()` again places both sections, and the
+    /// BLOOM-intersection assertion fails.
+    #[tokio::test]
+    async fn a_contains_ranged_scan_fetches_neither_filter_section() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let postings = section(&obj, kind::POSTINGS);
+        let free = LogQuery::new(i64::MIN, i64::MAX);
+        let query = free.clone().with_content(Predicate::Contains {
+            key: "request.id".into(),
+            needle: "r3".into(),
+            negated: false,
+        });
+
+        let whole = scan(&assembled_without(&obj, &[]), &query).expect("whole scan");
+        let out = ranged(&obj, &query).await;
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].ts_ns, 3);
+        assert_eq!(
+            format!("{:?}", out.records),
+            format!("{:?}", whole.records)
+        );
+        for r in &out.ranges {
+            assert!(!intersects(*r, &bloom), "GET {r:?} reads BLOOM {bloom:?}");
+            assert!(
+                !intersects(*r, &postings),
+                "GET {r:?} reads POSTINGS {postings:?}"
+            );
+        }
+        let skip = ranged(&obj, &free).await;
+        assert_eq!((out.gets, out.bytes), (skip.gets, skip.bytes));
     }
 }
 
