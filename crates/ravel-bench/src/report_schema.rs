@@ -41,7 +41,9 @@
 //!   rather than a silently unasserted figure.
 //! - **Per-query results are the source of truth.** A geometric mean may be
 //!   included but never replaces the per-query rows, and the renderer cannot
-//!   print a summary line without the rows behind it.
+//!   print a summary line without the rows behind it. A version-3 report
+//!   carries no geometric mean at all (decision 6 rules out one figure across
+//!   engines) and is summarized by per-engine denominators instead.
 //! - **Every cost estimate carries the retry caveat** ([`RETRY_CAVEAT`],
 //!   ADR-0927 decision 8, issue #928): request counts are logical-call counts,
 //!   not billed requests, and the caveat is in the rendered output rather than
@@ -56,7 +58,13 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::allocator::Allocator;
+use crate::metrics_correctness::{Annotations, Classified, Denominators, Engine, RefusalReason};
 use crate::promql_corpus::CostClass;
+
+/// Which Prometheus HTTP query endpoint a version-3 row ran against: `instant`
+/// or `range`. The corpus's own [`crate::promql_corpus::EvalKind`] under the
+/// report's field name, so the report and the corpus share one value domain.
+pub use crate::promql_corpus::EvalKind as QueryKind;
 
 /// The report schema version every writer stamps: the newest version this build
 /// emits. A report declaring a version outside [`SUPPORTED_VERSIONS`] is refused
@@ -68,20 +76,28 @@ use crate::promql_corpus::CostClass;
 /// under one version number would defeat the field: a reader built before the
 /// allocator existed would accept a version-1 document it cannot fully read, and
 /// nothing would tell a consumer which shape it holds.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 is the portable query runner's shape (epic #2821, ADR-0927
+/// decisions 4 and 6, the "Bands pre-registered" list, amendment sections A, E
+/// and F): a row is one (engine, id, query kind) case, carries every pass's
+/// status and per-pass medians, and the report carries the expected case set
+/// and per-engine denominators that [`validate`] recomputes.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The set of report schema versions this build reads. Writers always stamp
-/// [`SCHEMA_VERSION`]; readers accept that version and the immediately preceding
-/// one, so a report emitted before version 2 added the allocator field still
-/// parses (its absent `allocator` takes [`Allocator::Unknown`] from the serde
-/// default) instead of being refused for a field it could not have carried.
+/// [`SCHEMA_VERSION`]; readers accept versions 1 through 3, so a report emitted
+/// before version 2 added the allocator field still parses (its absent
+/// `allocator` takes [`Allocator::Unknown`] from the serde default), and a
+/// version-1 or version-2 report is validated under its own rules rather than
+/// refused for the version-3 fields it could not have carried.
 ///
 /// The shape follows the persistent-format crates' `SUPPORTED_VERSIONS`
 /// (`ravel_segment::format`, `ravel_logseg::footer`) so a reviewer reads one
-/// idiom everywhere: a window at most two versions wide, never accepting
-/// anything below its floor, and the single source both [`validate`] and the
-/// error message read.
-pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(SCHEMA_VERSION);
+/// idiom everywhere: a contiguous window, never accepting anything below its
+/// floor, and the single source both [`validate`] and the error message read.
+/// It is three versions wide because the version-1 and version-2 readers are
+/// the same legacy path ([`validate`] branches only on version 3).
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::spanning(1, SCHEMA_VERSION);
 
 /// A window of accepted schema versions, the report-schema counterpart of the
 /// persistent-format crates' type of the same name. `u32` here because
@@ -111,6 +127,12 @@ impl SupportedVersions {
             newest,
             oldest: newest - 1,
         }
+    }
+
+    /// A window accepting every version from `oldest` through `newest`.
+    /// `oldest` must not exceed `newest`.
+    pub const fn spanning(oldest: u32, newest: u32) -> Self {
+        Self { newest, oldest }
     }
 
     /// The newest (always-written) version.
@@ -189,6 +211,17 @@ pub enum ResultStatus {
 }
 
 impl ResultStatus {
+    /// Every status, in declaration order.
+    pub const ALL: &'static [ResultStatus] = &[
+        ResultStatus::Ok,
+        ResultStatus::Incorrect,
+        ResultStatus::Partial,
+        ResultStatus::Timeout,
+        ResultStatus::Error,
+        ResultStatus::UnsupportedConstruct,
+        ResultStatus::Refused,
+    ];
+
     /// Whether a latency from a measurement with this status is admissible in a
     /// performance table. Only `ok` is timed (ADR-0927 decision 6).
     pub fn is_timed(self) -> bool {
@@ -365,22 +398,178 @@ pub struct Figure {
 /// One measured corpus query: its id, cost class, per-engine status, and the
 /// figures behind it. Per-query results are the source of truth (ADR-0927): the
 /// report-level geometric mean is derived from these and never replaces them.
+///
+/// Every field after `figures` was added at schema version 3 and is
+/// `#[serde(default)]`, so a version-1 or version-2 row still reads; [`validate`]
+/// refuses any of them set on a version-1 or version-2 report
+/// ([`ValidationError::FieldNotInVersion`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Measurement {
-    /// The corpus entry id (`CorpusEntry::id`). Report rows are keyed by it, so
-    /// it must be unique within a report.
+    /// The corpus entry id (`CorpusEntry::id`). On versions 1 and 2 report rows
+    /// are keyed by it alone, so it must be unique within a report; on version
+    /// 3 the key is (engine, id, query kind).
     pub id: String,
     /// The cost class the entry falls into (ADR-0927 decision 5).
     pub class: CostClass,
     /// The outcome status (ADR-0927 decision 6). Only [`ResultStatus::Ok`] is
-    /// timed.
+    /// timed. On version 3 it is [`row_status`] of `pass_statuses`.
     pub status: ResultStatus,
     /// The figures this measurement reports. An `ok` measurement must carry the
     /// timing figures in [`REQUIRED_TIMED_FIGURES`]; a non-`ok` measurement is
     /// not timed and carries none of them.
     #[serde(default)]
     pub figures: Vec<Figure>,
+    /// The engine that answered. Required on version 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<Engine>,
+    /// Whether this row is the oracle's own (ADR-0927 decision 4): true on
+    /// exactly the Prometheus rows of a version-3 report.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oracle: bool,
+    /// The base URL the engine was queried at. Required on version 3, and never
+    /// `in-process` there (amendment section A: that value marks a
+    /// diagnostic-lane row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Instant or range. Required on version 3, where it is part of the row key.
+    /// A range entry is one case, not one per grid point (amendment section E).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_kind: Option<QueryKind>,
+    /// Why the engine declined. Present exactly when `status` is `refused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<RefusalReason>,
+    /// The failure class for `error` ([`Classified::error_class`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// The response carried the engine's partial signal ([`Classified::incomplete`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
+    /// Every pass's status, in pass order. Required non-empty on version 3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_statuses: Vec<ResultStatus>,
+    /// How many timed repetitions each pass median is taken over. Only on `ok`
+    /// rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reps_per_pass: Option<u32>,
+    /// One median per pass, each over `reps_per_pass` repetitions. Only on `ok`
+    /// rows, and one per entry of `pass_statuses`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_medians_ms: Vec<f64>,
+    /// [`rel_mad_pct`] of `pass_medians_ms`: present on `ok` rows with at least
+    /// [`MIN_VARIANCE_PASSES`] passes, absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_mad_pct: Option<f64>,
+}
+
+/// One case a version-3 report expects a row for: the producer writes these
+/// from the corpus, one per (engine, entry, query kind), so a range entry is
+/// one case whatever its grid (amendment section E).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedCase {
+    /// The engine the case runs on.
+    pub engine: Engine,
+    /// The corpus entry id.
+    pub id: String,
+    /// Instant or range.
+    pub query_kind: QueryKind,
+}
+
+/// One engine's denominators as the producer reported them (ADR-0927 decision
+/// 6), under [`Denominators`]' field names. [`validate`] recomputes them from
+/// the rows with [`Denominators::of`] and requires an exact match.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineDenominators {
+    /// The engine these count.
+    pub engine: Engine,
+    /// Every case of this engine.
+    pub corpus: usize,
+    /// Cases whose data came back and was compared: `ok`, `incorrect`, `partial`.
+    pub correctness: usize,
+    /// Cases admissible in a timing table: `ok`.
+    pub timing: usize,
+    /// Coverage successes: `ok`.
+    pub coverage_success: usize,
+}
+
+/// A pass excluded for a recorded external cause ("Bands pre-registered" item
+/// 3: a pass is never dropped for being slow, only for a named cause, and the
+/// exclusion is in the report).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PassExclusion {
+    /// The excluded pass's index in the runner's pass numbering.
+    pub pass: u32,
+    /// The recorded external cause.
+    pub cause: String,
+}
+
+/// The status a version-3 row reports across its passes: the first non-`ok`
+/// pass status in pass order, else `ok`. An empty slice yields `ok`;
+/// [`validate`] refuses a version-3 row with no pass statuses, so that value
+/// never stands on its own.
+pub fn row_status(pass_statuses: &[ResultStatus]) -> ResultStatus {
+    pass_statuses
+        .iter()
+        .copied()
+        .find(|s| *s != ResultStatus::Ok)
+        .unwrap_or(ResultStatus::Ok)
+}
+
+/// The fewest passes a per-query variance is computed over ("Bands
+/// pre-registered" item 3). Below this a row carries no `rel_mad_pct` and the
+/// provenance carries the config entry `variance=insufficient_passes`
+/// ([`VARIANCE_CONFIG_KEY`], [`INSUFFICIENT_PASSES`]).
+pub const MIN_VARIANCE_PASSES: usize = 5;
+
+/// The provenance config key that records a run with fewer than
+/// [`MIN_VARIANCE_PASSES`] passes.
+pub const VARIANCE_CONFIG_KEY: &str = "variance";
+
+/// The value [`VARIANCE_CONFIG_KEY`] takes on a run with too few passes.
+pub const INSUFFICIENT_PASSES: &str = "insufficient_passes";
+
+/// The endpoint value amendment section A reserves for a diagnostic-lane row.
+pub const IN_PROCESS_ENDPOINT: &str = "in-process";
+
+/// The relative tolerance a reported `rel_mad_pct` is checked against the value
+/// recomputed from `pass_medians_ms`, for the same reason as
+/// [`GEOMEAN_REL_TOLERANCE`]: the producer and the validator may sum in a
+/// different order.
+pub const REL_MAD_REL_TOLERANCE: f64 = 1e-9;
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
+}
+
+/// The per-query relative median absolute deviation over the pass medians, in
+/// percent: `median(|m_i - median(m)|) / median(m) * 100` ("Bands
+/// pre-registered" item 3). Every pass is used; none is dropped as an outlier.
+/// `None` with fewer than [`MIN_VARIANCE_PASSES`] medians, a non-finite one, or
+/// a median of zero (the ratio is undefined).
+pub fn rel_mad_pct(pass_medians_ms: &[f64]) -> Option<f64> {
+    if pass_medians_ms.len() < MIN_VARIANCE_PASSES || pass_medians_ms.iter().any(|m| !m.is_finite())
+    {
+        return None;
+    }
+    let center = median(pass_medians_ms)?;
+    if center <= 0.0 {
+        return None;
+    }
+    let deviations: Vec<f64> = pass_medians_ms.iter().map(|m| (m - center).abs()).collect();
+    Some(median(&deviations)? / center * 100.0)
 }
 
 impl Measurement {
@@ -435,6 +624,18 @@ pub struct MetricsBenchReport {
     /// [`render`] cannot print it without them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geomean_ms: Option<f64>,
+    /// Version 3: every (engine, id, query kind) case the corpus defines for
+    /// this run. The rows must cover exactly this set ("Bands pre-registered"
+    /// item 1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cases_expected: Vec<ExpectedCase>,
+    /// Version 3: one entry per engine in `cases_expected`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denominators: Vec<EngineDenominators>,
+    /// Version 3: passes excluded for a recorded external cause; empty unless
+    /// one was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusions: Vec<PassExclusion>,
 }
 
 /// Everything [`validate`] can reject, one variant per failure class the task
@@ -632,6 +833,160 @@ pub enum ValidationError {
         /// The value that was not a valid digest.
         value: String,
     },
+    /// A field that exists only from a later schema version is set on a report
+    /// declaring an earlier one, or a field version 3 dropped (`geomean_ms`) is
+    /// set on a version-3 report. One document shape per version number.
+    #[error("field `{field}` is set on a schema version {version} report, which does not carry it")]
+    FieldNotInVersion {
+        /// The field that should not be there.
+        field: &'static str,
+        /// The version the report declares.
+        version: u32,
+    },
+    /// A version-3 row is missing a field version 3 requires.
+    #[error("version-3 row `{id}` is missing required field `{field}`")]
+    MissingRowField {
+        /// The row's corpus id.
+        id: String,
+        /// The missing field.
+        field: &'static str,
+    },
+    /// Two version-3 rows, or two `cases_expected` entries, share an (engine,
+    /// id, query kind) key.
+    #[error("case `{case}` appears more than once in {list}")]
+    DuplicateCase {
+        /// The duplicated case, `engine/id/query_kind`.
+        case: String,
+        /// `measurements` or `cases_expected`.
+        list: &'static str,
+    },
+    /// Band 1: the set of rows is not the set of expected cases. Compared as
+    /// sets of (engine, id, query kind), so a duplicated row cannot stand in for
+    /// a missing one.
+    #[error(
+        "the rows do not cover exactly the expected cases (ADR-0927 band 1): missing {missing:?}, \
+         unexpected {unexpected:?}"
+    )]
+    CaseSetMismatch {
+        /// Expected cases with no row.
+        missing: Vec<String>,
+        /// Rows with no expected case.
+        unexpected: Vec<String>,
+    },
+    /// A version-3 row names the in-process endpoint, which marks a
+    /// diagnostic-lane row (amendment section A).
+    #[error(
+        "case `{case}` has endpoint `in-process`, a diagnostic-lane row, in a portable report \
+         (ADR-0927 amendment A)"
+    )]
+    InProcessEndpoint {
+        /// The offending case.
+        case: String,
+    },
+    /// `oracle` is not true on exactly the Prometheus rows (decision 4).
+    #[error(
+        "case `{case}` has oracle = {oracle}; oracle is true on exactly the Prometheus rows \
+         (ADR-0927 decision 4)"
+    )]
+    OracleFlag {
+        /// The offending case.
+        case: String,
+        /// The value it carried.
+        oracle: bool,
+    },
+    /// A `refused` row has no `refusal_reason`, or another status has one
+    /// (decision 6).
+    #[error(
+        "case `{case}` has status `{}` with refusal_reason {reason:?}; a reason is required on \
+         refused and absent on every other status (ADR-0927 decision 6)",
+        status.slug()
+    )]
+    RefusalReasonMismatch {
+        /// The offending case.
+        case: String,
+        /// Its status.
+        status: ResultStatus,
+        /// Its reason.
+        reason: Option<RefusalReason>,
+    },
+    /// A row's status is not [`row_status`] of its pass statuses.
+    #[error(
+        "case `{case}` reports status `{}` but its pass statuses give `{}` (the first non-ok \
+         pass, in pass order)",
+        reported.slug(),
+        expected.slug()
+    )]
+    StatusAcrossPasses {
+        /// The offending case.
+        case: String,
+        /// The status the row reports.
+        reported: ResultStatus,
+        /// [`row_status`] of its pass statuses.
+        expected: ResultStatus,
+    },
+    /// Rows disagree on how many passes the run made.
+    #[error("case `{case}` lists {passes} pass statuses but the first row lists {expected}")]
+    PassCountMismatch {
+        /// The offending case.
+        case: String,
+        /// Its pass count.
+        passes: usize,
+        /// The first row's pass count.
+        expected: usize,
+    },
+    /// A row's per-pass timing is malformed: an `ok` row without
+    /// `reps_per_pass` or with a pass median count other than its pass count, a
+    /// pass median that is not finite and non-negative, or an untimed row
+    /// carrying per-pass timing (only `ok` is timed, decision 6).
+    #[error("case `{case}` per-pass timing is malformed: {reason}")]
+    PassTiming {
+        /// The offending case.
+        case: String,
+        /// What is wrong.
+        reason: String,
+    },
+    /// A row's `rel_mad_pct` is not [`rel_mad_pct`] of its pass medians (band
+    /// 3): absent where five or more passes require it, present with fewer, or
+    /// a different value.
+    #[error(
+        "case `{case}` rel_mad_pct {supplied:?} disagrees with {computed:?} recomputed from its \
+         pass medians (ADR-0927 band 3)"
+    )]
+    RelMadMismatch {
+        /// The offending case.
+        case: String,
+        /// The reported value.
+        supplied: Option<f64>,
+        /// The recomputed value.
+        computed: Option<f64>,
+    },
+    /// The provenance `variance` config entry disagrees with the pass count:
+    /// below [`MIN_VARIANCE_PASSES`] passes it must read `insufficient_passes`,
+    /// at or above it the key must be absent.
+    #[error("{passes} passes, but {reason}")]
+    VarianceConfig {
+        /// The run's pass count.
+        passes: usize,
+        /// What is wrong.
+        reason: String,
+    },
+    /// An engine's reported denominators are missing, duplicated, unexpected,
+    /// or differ from the counts recomputed from its rows.
+    #[error("denominators for engine {engine:?}: {reason}")]
+    DenominatorsMismatch {
+        /// The engine.
+        engine: Engine,
+        /// What is wrong.
+        reason: String,
+    },
+    /// A pass exclusion has a blank cause or repeats a pass index.
+    #[error("exclusion at index {index} is invalid: {reason}")]
+    InvalidExclusion {
+        /// The exclusion's index in the list.
+        index: usize,
+        /// What is wrong.
+        reason: String,
+    },
 }
 
 /// Whether a *present* provenance value is an absent-value sentinel rather than
@@ -724,7 +1079,7 @@ fn is_content_digest(value: &str) -> bool {
 /// must name at least one logical core, every named comparator must be
 /// completely pinned by a real content digest, and the configuration must carry
 /// no blank or duplicate key.
-fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
+pub fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
     if !SUPPORTED_VERSIONS.contains(p.schema_version) {
         return Err(ValidationError::UnsupportedSchemaVersion {
             found: p.schema_version,
@@ -886,8 +1241,16 @@ fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
 /// (and the renderer) runs before trusting any figure: a missing, duplicate,
 /// non-finite, negative, or malformed measurement all fail here, and an
 /// absent-but-expected figure fails exactly like an out-of-band one.
+///
+/// Each version is checked under its own rules: version 3 by [`validate_v3`]'s
+/// rule set, versions 1 and 2 by the original one, which also refuses any
+/// version-3 field set on them.
 pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
     validate_provenance(&report.provenance)?;
+    if report.provenance.schema_version >= 3 {
+        return validate_v3(report);
+    }
+    refuse_v3_fields(report)?;
     if report.measurements.is_empty() {
         return Err(ValidationError::NoMeasurements);
     }
@@ -933,6 +1296,360 @@ pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Refuse a version-3 field on a version-1 or version-2 report, so one version
+/// number names one document shape.
+fn refuse_v3_fields(report: &MetricsBenchReport) -> Result<(), ValidationError> {
+    let version = report.provenance.schema_version;
+    let refuse = |field| Err(ValidationError::FieldNotInVersion { field, version });
+    if !report.cases_expected.is_empty() {
+        return refuse("cases_expected");
+    }
+    if !report.denominators.is_empty() {
+        return refuse("denominators");
+    }
+    if !report.exclusions.is_empty() {
+        return refuse("exclusions");
+    }
+    for m in &report.measurements {
+        let set: [(&'static str, bool); 11] = [
+            ("engine", m.engine.is_some()),
+            ("oracle", m.oracle),
+            ("endpoint", m.endpoint.is_some()),
+            ("query_kind", m.query_kind.is_some()),
+            ("refusal_reason", m.refusal_reason.is_some()),
+            ("error_class", m.error_class.is_some()),
+            ("incomplete", m.incomplete),
+            ("pass_statuses", !m.pass_statuses.is_empty()),
+            ("reps_per_pass", m.reps_per_pass.is_some()),
+            ("pass_medians_ms", !m.pass_medians_ms.is_empty()),
+            ("rel_mad_pct", m.rel_mad_pct.is_some()),
+        ];
+        if let Some((field, _)) = set.iter().find(|(_, present)| *present) {
+            return refuse(field);
+        }
+    }
+    Ok(())
+}
+
+fn engine_slug(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Ravel => "ravel",
+        Engine::Prometheus => "prometheus",
+        Engine::VictoriaMetrics => "victoria_metrics",
+        Engine::Mimir => "mimir",
+    }
+}
+
+fn query_kind_slug(kind: QueryKind) -> &'static str {
+    match kind {
+        QueryKind::Instant => "instant",
+        QueryKind::Range => "range",
+    }
+}
+
+/// A version-3 case key, `engine/id/query_kind`, ordered for set comparison.
+fn case_label(engine: Engine, id: &str, kind: QueryKind) -> String {
+    format!("{}/{id}/{}", engine_slug(engine), query_kind_slug(kind))
+}
+
+/// A version-3 row with its required key fields resolved.
+struct KeyedRow<'a> {
+    m: &'a Measurement,
+    engine: Engine,
+    case: String,
+}
+
+/// Validate a version-3 report, fail-closed. The checks run in this order, and
+/// each failure class is its own [`ValidationError`] variant:
+///
+/// 1. provenance (already checked by [`validate`]); `geomean_ms` refused, since
+///    decision 6 rules out one figure across engines;
+/// 2. at least one row; every row names its engine, query kind, endpoint, and
+///    at least one pass status;
+/// 3. band 1: the set of row keys equals the set of `cases_expected` keys,
+///    compared as sets before duplicates are looked at, so a duplicated row
+///    standing in for a missing one reports the missing case;
+/// 4. per row: band 2 and band 5 ([`validate_measurement`]: only `ok` carries
+///    the timed figures, each figure once), the endpoint, the oracle flag, the
+///    refusal reason, [`row_status`], and the per-pass timing;
+/// 5. the variance config entry against the pass count;
+/// 6. the denominators, recomputed with [`Denominators::of`] and compared
+///    exactly;
+/// 7. the pass exclusions.
+fn validate_v3(report: &MetricsBenchReport) -> Result<(), ValidationError> {
+    let version = report.provenance.schema_version;
+    if report.geomean_ms.is_some() {
+        return Err(ValidationError::FieldNotInVersion {
+            field: "geomean_ms",
+            version,
+        });
+    }
+    if report.measurements.is_empty() {
+        return Err(ValidationError::NoMeasurements);
+    }
+
+    let mut rows: Vec<KeyedRow<'_>> = Vec::with_capacity(report.measurements.len());
+    for m in &report.measurements {
+        let missing = |field| ValidationError::MissingRowField {
+            id: m.id.clone(),
+            field,
+        };
+        let engine = m.engine.ok_or_else(|| missing("engine"))?;
+        let kind = m.query_kind.ok_or_else(|| missing("query_kind"))?;
+        if m.endpoint.as_deref().is_none_or(|e| e.trim().is_empty()) {
+            return Err(missing("endpoint"));
+        }
+        if m.pass_statuses.is_empty() {
+            return Err(missing("pass_statuses"));
+        }
+        rows.push(KeyedRow {
+            m,
+            engine,
+            case: case_label(engine, &m.id, kind),
+        });
+    }
+
+    // Band 1. The expected list is a set: a repeated entry is a producer bug.
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    for c in &report.cases_expected {
+        let label = case_label(c.engine, &c.id, c.query_kind);
+        if !expected.insert(label.clone()) {
+            return Err(ValidationError::DuplicateCase {
+                case: label,
+                list: "cases_expected",
+            });
+        }
+    }
+    let present: BTreeSet<String> = rows.iter().map(|r| r.case.clone()).collect();
+    if present != expected {
+        return Err(ValidationError::CaseSetMismatch {
+            missing: expected.difference(&present).cloned().collect(),
+            unexpected: present.difference(&expected).cloned().collect(),
+        });
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for r in &rows {
+        if !seen.insert(r.case.as_str()) {
+            return Err(ValidationError::DuplicateCase {
+                case: r.case.clone(),
+                list: "measurements",
+            });
+        }
+    }
+
+    let passes = rows.first().map_or(0, |r| r.m.pass_statuses.len());
+    for r in &rows {
+        let m = r.m;
+        validate_measurement(m)?;
+        if m.endpoint
+            .as_deref()
+            .is_some_and(|e| e.trim().eq_ignore_ascii_case(IN_PROCESS_ENDPOINT))
+        {
+            return Err(ValidationError::InProcessEndpoint {
+                case: r.case.clone(),
+            });
+        }
+        if m.oracle != (r.engine == Engine::Prometheus) {
+            return Err(ValidationError::OracleFlag {
+                case: r.case.clone(),
+                oracle: m.oracle,
+            });
+        }
+        if (m.status == ResultStatus::Refused) != m.refusal_reason.is_some() {
+            return Err(ValidationError::RefusalReasonMismatch {
+                case: r.case.clone(),
+                status: m.status,
+                reason: m.refusal_reason,
+            });
+        }
+        let expected_status = row_status(&m.pass_statuses);
+        if m.status != expected_status {
+            return Err(ValidationError::StatusAcrossPasses {
+                case: r.case.clone(),
+                reported: m.status,
+                expected: expected_status,
+            });
+        }
+        if m.pass_statuses.len() != passes {
+            return Err(ValidationError::PassCountMismatch {
+                case: r.case.clone(),
+                passes: m.pass_statuses.len(),
+                expected: passes,
+            });
+        }
+        validate_pass_timing(r)?;
+    }
+
+    validate_variance_config(&report.provenance, passes)?;
+    validate_denominators(report, &rows)?;
+
+    let mut excluded: BTreeSet<u32> = BTreeSet::new();
+    for (index, e) in report.exclusions.iter().enumerate() {
+        if e.cause.trim().is_empty() {
+            return Err(ValidationError::InvalidExclusion {
+                index,
+                reason: format!("pass {} has a blank cause", e.pass),
+            });
+        }
+        if !excluded.insert(e.pass) {
+            return Err(ValidationError::InvalidExclusion {
+                index,
+                reason: format!("pass {} is excluded more than once", e.pass),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Only `ok` rows carry per-pass timing; an `ok` row carries one median per
+/// pass and the [`rel_mad_pct`] of them.
+fn validate_pass_timing(r: &KeyedRow<'_>) -> Result<(), ValidationError> {
+    let m = r.m;
+    let bad = |reason: String| {
+        Err(ValidationError::PassTiming {
+            case: r.case.clone(),
+            reason,
+        })
+    };
+    if !m.status.is_timed() {
+        if m.reps_per_pass.is_some() || !m.pass_medians_ms.is_empty() || m.rel_mad_pct.is_some() {
+            return bad(format!(
+                "status `{}` is not timed, but the row carries reps_per_pass, pass_medians_ms or \
+                 rel_mad_pct (only ok is timed, ADR-0927 decision 6)",
+                m.status.slug()
+            ));
+        }
+        return Ok(());
+    }
+    match m.reps_per_pass {
+        None => return bad("an ok row has no reps_per_pass".to_string()),
+        Some(0) => return bad("reps_per_pass is 0".to_string()),
+        Some(_) => {}
+    }
+    if m.pass_medians_ms.len() != m.pass_statuses.len() {
+        return bad(format!(
+            "{} pass medians for {} passes; an ok row carries one per pass",
+            m.pass_medians_ms.len(),
+            m.pass_statuses.len()
+        ));
+    }
+    if let Some(v) = m
+        .pass_medians_ms
+        .iter()
+        .find(|v| !(v.is_finite() && **v >= 0.0))
+    {
+        return bad(format!("pass median {v} is not finite and non-negative"));
+    }
+    let computed = rel_mad_pct(&m.pass_medians_ms);
+    let agrees = match (m.rel_mad_pct, computed) {
+        (None, None) => true,
+        (Some(s), Some(c)) => (s - c).abs() <= REL_MAD_REL_TOLERANCE * c.max(1.0),
+        _ => false,
+    };
+    if !agrees {
+        return Err(ValidationError::RelMadMismatch {
+            case: r.case.clone(),
+            supplied: m.rel_mad_pct,
+            computed,
+        });
+    }
+    Ok(())
+}
+
+fn validate_variance_config(p: &Provenance, passes: usize) -> Result<(), ValidationError> {
+    let entry = p.config.iter().find(|c| c.key == VARIANCE_CONFIG_KEY);
+    let fail = |reason: String| Err(ValidationError::VarianceConfig { passes, reason });
+    if passes < MIN_VARIANCE_PASSES {
+        match entry {
+            Some(c) if c.value == INSUFFICIENT_PASSES => Ok(()),
+            Some(c) => fail(format!(
+                "config `{VARIANCE_CONFIG_KEY}` is `{}`, not `{INSUFFICIENT_PASSES}`",
+                c.value
+            )),
+            None => fail(format!(
+                "fewer than {MIN_VARIANCE_PASSES} passes need config \
+                 `{VARIANCE_CONFIG_KEY}={INSUFFICIENT_PASSES}`"
+            )),
+        }
+    } else if let Some(c) = entry {
+        fail(format!(
+            "config `{VARIANCE_CONFIG_KEY}={}` is set on a run with enough passes",
+            c.value
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Recompute each engine's denominators from its rows, never from the reported
+/// figures, and require an exact match. Every engine with an expected case has
+/// exactly one entry, and no other engine has one.
+fn validate_denominators(
+    report: &MetricsBenchReport,
+    rows: &[KeyedRow<'_>],
+) -> Result<(), ValidationError> {
+    let mut engines: Vec<Engine> = Vec::new();
+    for c in &report.cases_expected {
+        if !engines.contains(&c.engine) {
+            engines.push(c.engine);
+        }
+    }
+    let mut reported: Vec<Engine> = Vec::new();
+    for d in &report.denominators {
+        if reported.contains(&d.engine) {
+            return Err(ValidationError::DenominatorsMismatch {
+                engine: d.engine,
+                reason: "more than one denominators entry".to_string(),
+            });
+        }
+        if !engines.contains(&d.engine) {
+            return Err(ValidationError::DenominatorsMismatch {
+                engine: d.engine,
+                reason: "an entry for an engine with no expected case".to_string(),
+            });
+        }
+        reported.push(d.engine);
+    }
+    for engine in engines {
+        let Some(d) = report.denominators.iter().find(|d| d.engine == engine) else {
+            return Err(ValidationError::DenominatorsMismatch {
+                engine,
+                reason: "no denominators entry".to_string(),
+            });
+        };
+        let classified: Vec<Classified> = rows
+            .iter()
+            .filter(|r| r.engine == engine)
+            .map(|r| Classified {
+                status: r.m.status,
+                refusal_reason: r.m.refusal_reason,
+                error_class: r.m.error_class.clone(),
+                incomplete: r.m.incomplete,
+                annotations: Annotations::default(),
+                message: None,
+            })
+            .collect();
+        let computed = Denominators::of(&classified);
+        let pairs = [
+            ("corpus", d.corpus, computed.corpus),
+            ("correctness", d.correctness, computed.correctness),
+            ("timing", d.timing, computed.timing),
+            (
+                "coverage_success",
+                d.coverage_success,
+                computed.coverage_success,
+            ),
+        ];
+        if let Some((name, got, want)) = pairs.iter().find(|(_, got, want)| got != want) {
+            return Err(ValidationError::DenominatorsMismatch {
+                engine,
+                reason: format!("{name} is reported as {got} but the rows give {want}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 // --- Renderer bands (ADR-0927 decision 5). Re-register a band by editing
 // exactly one line in this block, exactly as the ClickBench runbook script
 // does. Each band is `None` until a reference run pre-registers it, and a
@@ -971,11 +1688,22 @@ pub enum RenderError {
 /// rows, then the per-class distribution, then the pre-registered bands (each a
 /// loud SKIP when not registered), and only then the optional geometric mean,
 /// which cannot appear without the per-query rows above it.
+///
+/// A version-3 report renders by [`render_v3`] instead, which prints every
+/// engine's denominators and status counts before any latency.
 pub fn render(report: &MetricsBenchReport) -> Result<String, RenderError> {
     validate(report)?;
 
     let mut out = String::new();
-    let p = &report.provenance;
+    render_header(&mut out, &report.provenance);
+    if report.provenance.schema_version >= 3 {
+        render_v3(&mut out, report);
+        return Ok(out);
+    }
+    render_legacy(out, report)
+}
+
+fn render_header(out: &mut String, p: &Provenance) {
     out.push_str("metricsbench report (schema v");
     let _ = writeln!(out, "{})", p.schema_version);
     let _ = writeln!(out, "  commit    : {}", p.ravel_git_commit);
@@ -1019,7 +1747,94 @@ pub fn render(report: &MetricsBenchReport) -> Result<String, RenderError> {
     }
     // The retry caveat rides in the rendered output, not only in a doc.
     let _ = writeln!(out, "  NOTE: {RETRY_CAVEAT}");
+}
 
+/// The version-3 body. Per engine, in the order `cases_expected` first names
+/// it: the denominators, then a count per status. Only after every engine's
+/// counts, the latency table over `ok` rows, with the per-query `rel_mad_pct`
+/// where the run had enough passes for one, then the pass exclusions.
+fn render_v3(out: &mut String, report: &MetricsBenchReport) {
+    let mut engines: Vec<Engine> = Vec::new();
+    for c in &report.cases_expected {
+        if !engines.contains(&c.engine) {
+            engines.push(c.engine);
+        }
+    }
+    out.push('\n');
+    out.push_str("  denominators and statuses per engine (ADR-0927 decision 6):\n");
+    for engine in &engines {
+        if let Some(d) = report.denominators.iter().find(|d| d.engine == *engine) {
+            let _ = writeln!(
+                out,
+                "    {:<17} corpus {} | correctness {} | timing {} | coverage_success {}",
+                engine_slug(*engine),
+                d.corpus,
+                d.correctness,
+                d.timing,
+                d.coverage_success
+            );
+        }
+        let mut counts: Vec<String> = Vec::new();
+        for status in ResultStatus::ALL {
+            let n = report
+                .measurements
+                .iter()
+                .filter(|m| m.engine == Some(*engine) && m.status == *status)
+                .count();
+            counts.push(format!("{} {n}", status.slug()));
+        }
+        let _ = writeln!(out, "    {:<17} {}", "", counts.join(" | "));
+    }
+
+    out.push('\n');
+    out.push_str("  latency over ok rows only:\n");
+    let _ = writeln!(
+        out,
+        "  {:<17} | {:<32} | {:<7} | {:>10} | {:>10} | {:>10} | {:>6} | {:>11}",
+        "engine", "id", "kind", "min_ms", "median_ms", "max_ms", "passes", "rel_mad_pct"
+    );
+    let _ = writeln!(
+        out,
+        "  {:-<17}-+-{:-<32}-+-{:-<7}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<6}-+-{:-<11}",
+        "", "", "", "", "", "", "", ""
+    );
+    let fig = |m: &Measurement, name: &str| {
+        m.figure(name)
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.3}"))
+    };
+    for m in report.measurements.iter().filter(|m| m.status.is_timed()) {
+        let _ = writeln!(
+            out,
+            "  {:<17} | {:<32} | {:<7} | {:>10} | {:>10} | {:>10} | {:>6} | {:>11}",
+            m.engine.map_or("-", engine_slug),
+            m.id,
+            m.query_kind.map_or("-", query_kind_slug),
+            fig(m, "min_ms"),
+            fig(m, "median_ms"),
+            fig(m, "max_ms"),
+            m.pass_medians_ms.len(),
+            m.rel_mad_pct
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.3}")),
+        );
+    }
+    if let Some(c) = report
+        .provenance
+        .config
+        .iter()
+        .find(|c| c.key == VARIANCE_CONFIG_KEY)
+    {
+        let _ = writeln!(
+            out,
+            "  variance: {} (fewer than {MIN_VARIANCE_PASSES} passes; no rel_mad_pct)",
+            c.value
+        );
+    }
+    for e in &report.exclusions {
+        let _ = writeln!(out, "  excluded pass {}: {}", e.pass, e.cause);
+    }
+}
+
+fn render_legacy(mut out: String, report: &MetricsBenchReport) -> Result<String, RenderError> {
     // Per-query rows: the source of truth, always printed before any summary.
     out.push('\n');
     let _ = writeln!(
@@ -1139,11 +1954,12 @@ pub fn render(report: &MetricsBenchReport) -> Result<String, RenderError> {
 mod tests {
     use super::*;
 
-    /// A provenance block that validates clean, for a test to mutate one field
-    /// of.
+    /// A version-2 provenance block that validates clean, for a test to mutate
+    /// one field of. The version-1/2 rule set is what most tests below pin; the
+    /// version-3 fixture is `v3_report`.
     fn valid_provenance() -> Provenance {
         Provenance {
-            schema_version: SCHEMA_VERSION,
+            schema_version: 2,
             ravel_git_commit: "9fc85f421590d360e7979ee167eb38e166b45462".to_string(),
             toolchain: "rustc 1.90.0".to_string(),
             protocol: "remote_write_1.0".to_string(),
@@ -1180,9 +1996,6 @@ mod tests {
     /// set.
     fn timed_measurement(id: &str) -> Measurement {
         Measurement {
-            id: id.to_string(),
-            class: CostClass::HighFanOut,
-            status: ResultStatus::Ok,
             figures: vec![
                 Figure {
                     name: "min_ms".to_string(),
@@ -1197,6 +2010,7 @@ mod tests {
                     value: 20.0,
                 },
             ],
+            ..legacy_row(id, CostClass::HighFanOut, ResultStatus::Ok)
         }
     }
 
@@ -1205,6 +2019,30 @@ mod tests {
             provenance: valid_provenance(),
             measurements: vec![timed_measurement("mb_fanout_total_rate")],
             geomean_ms: Some(12.5),
+            cases_expected: vec![],
+            denominators: vec![],
+            exclusions: vec![],
+        }
+    }
+
+    /// A version-1/2 row: no figures and none of the version-3 fields.
+    fn legacy_row(id: &str, class: CostClass, status: ResultStatus) -> Measurement {
+        Measurement {
+            id: id.to_string(),
+            class,
+            status,
+            figures: vec![],
+            engine: None,
+            oracle: false,
+            endpoint: None,
+            query_kind: None,
+            refusal_reason: None,
+            error_class: None,
+            incomplete: false,
+            pass_statuses: vec![],
+            reps_per_pass: None,
+            pass_medians_ms: vec![],
+            rel_mad_pct: None,
         }
     }
 
@@ -1326,9 +2164,6 @@ mod tests {
     /// geomean recomputation.
     fn timed_with_median(id: &str, median: f64) -> Measurement {
         Measurement {
-            id: id.to_string(),
-            class: CostClass::HighFanOut,
-            status: ResultStatus::Ok,
             figures: vec![
                 Figure {
                     name: "min_ms".to_string(),
@@ -1343,6 +2178,7 @@ mod tests {
                     value: median,
                 },
             ],
+            ..legacy_row(id, CostClass::HighFanOut, ResultStatus::Ok)
         }
     }
 
@@ -1507,20 +2343,22 @@ mod tests {
     /// the writer stamps the newest version, the previous one is still read, and
     /// nothing below the floor or above the newest is accepted.
     #[test]
-    fn the_supported_version_window_accepts_exactly_1_and_2() {
-        assert_eq!(SCHEMA_VERSION, 2, "the writer stamps version 2");
+    fn the_supported_version_window_accepts_exactly_1_2_and_3() {
+        assert_eq!(SCHEMA_VERSION, 3, "the writer stamps version 3");
         assert_eq!(SUPPORTED_VERSIONS.newest(), SCHEMA_VERSION);
         assert_eq!(SUPPORTED_VERSIONS.oldest(), 1);
         assert!(SUPPORTED_VERSIONS.contains(1));
         assert!(SUPPORTED_VERSIONS.contains(2));
+        assert!(SUPPORTED_VERSIONS.contains(3));
         assert!(!SUPPORTED_VERSIONS.contains(0));
-        assert!(!SUPPORTED_VERSIONS.contains(3));
-        // The one-version shape this returns to once the version-1 reader is
+        assert!(!SUPPORTED_VERSIONS.contains(4));
+        assert_eq!(SUPPORTED_VERSIONS.to_string(), "{1, 2, 3}");
+        // The one-version shape this returns to once the older readers are
         // retired accepts only its own version.
         let single = SupportedVersions::single(SCHEMA_VERSION);
         assert!(single.contains(SCHEMA_VERSION));
         assert!(!single.contains(SCHEMA_VERSION - 1));
-        assert_eq!(single.to_string(), "{2}");
+        assert_eq!(single.to_string(), "{3}");
     }
 
     /// A version-1 document carries NO `allocator` key (the field did not exist
@@ -1591,7 +2429,7 @@ mod tests {
     /// `Ok(())`, and `expect_err` panics.
     #[test]
     fn a_report_with_an_unsupported_schema_version_is_refused_naming_the_set() {
-        for unsupported in [0, 3, 99] {
+        for unsupported in [0, 4, 99] {
             let mut report = valid_report();
             report.provenance.schema_version = unsupported;
             let err = validate(&report).expect_err("an unsupported version must be refused");
@@ -1605,7 +2443,7 @@ mod tests {
             );
             let message = err.to_string();
             assert!(
-                message.contains("versions {1, 2}"),
+                message.contains("versions {1, 2, 3}"),
                 "the message must name the supported set, got: {message}"
             );
         }
@@ -2075,12 +2913,11 @@ mod tests {
         // A timed row exists so the geomean still has a row behind it.
         report.measurements = vec![
             timed_measurement("mb_fanout_total_rate"),
-            Measurement {
-                id: "mb_refused_row".to_string(),
-                class: CostClass::HighFanOut,
-                status: ResultStatus::Refused,
-                figures: vec![],
-            },
+            legacy_row(
+                "mb_refused_row",
+                CostClass::HighFanOut,
+                ResultStatus::Refused,
+            ),
         ];
         validate(&report).expect("a non-timed row with no timings validates");
     }
@@ -2173,5 +3010,562 @@ mod tests {
         let err = serde_json::from_value::<MetricsBenchReport>(doc)
             .expect_err("an unknown key must fail to deserialize");
         assert!(err.to_string().contains("measrements"), "{err}");
+    }
+
+    // --- Schema version 3 (ADR-0927 decisions 4 and 6, bands, amendments A, E,
+    // F). ---------------------------------------------------------------------
+
+    const PASSES: usize = 5;
+    /// Five pass medians whose rel MAD is hand-computed: median 11, absolute
+    /// deviations [1, 1, 0, 4, 2], their median 1, so 1 / 11 * 100.
+    const FIVE_PASS_MEDIANS: [f64; PASSES] = [10.0, 12.0, 11.0, 15.0, 9.0];
+    const FIVE_PASS_REL_MAD: f64 = 100.0 / 11.0;
+
+    /// A version-3 `ok` row: every pass ok, one median per pass, the timed
+    /// figures, and the rel MAD of the medians.
+    fn v3_ok(engine: Engine, id: &str, kind: QueryKind) -> Measurement {
+        Measurement {
+            figures: vec![
+                Figure {
+                    name: "min_ms".to_string(),
+                    value: 9.0,
+                },
+                Figure {
+                    name: "median_ms".to_string(),
+                    value: 11.0,
+                },
+                Figure {
+                    name: "max_ms".to_string(),
+                    value: 15.0,
+                },
+            ],
+            pass_statuses: vec![ResultStatus::Ok; PASSES],
+            reps_per_pass: Some(3),
+            pass_medians_ms: FIVE_PASS_MEDIANS.to_vec(),
+            rel_mad_pct: Some(FIVE_PASS_REL_MAD),
+            ..v3_row(engine, id, kind, ResultStatus::Ok)
+        }
+    }
+
+    /// A version-3 untimed row whose status is `row_status(passes)`.
+    fn v3_untimed(
+        engine: Engine,
+        id: &str,
+        kind: QueryKind,
+        passes: Vec<ResultStatus>,
+    ) -> Measurement {
+        let status = row_status(&passes);
+        Measurement {
+            pass_statuses: passes,
+            refusal_reason: (status == ResultStatus::Refused).then_some(RefusalReason::Budget),
+            error_class: (status == ResultStatus::Error).then(|| "http_5xx".to_string()),
+            ..v3_row(engine, id, kind, status)
+        }
+    }
+
+    fn v3_row(engine: Engine, id: &str, kind: QueryKind, status: ResultStatus) -> Measurement {
+        Measurement {
+            engine: Some(engine),
+            oracle: engine == Engine::Prometheus,
+            endpoint: Some(format!("http://{}:9090", engine_slug(engine))),
+            query_kind: Some(kind),
+            ..legacy_row(id, CostClass::HighFanOut, status)
+        }
+    }
+
+    const ENGINES: [Engine; 4] = [
+        Engine::Ravel,
+        Engine::Prometheus,
+        Engine::VictoriaMetrics,
+        Engine::Mimir,
+    ];
+
+    /// A version-3 report over four engines and two cases each (`mb_a`
+    /// instant, `mb_b` range). Ravel and Prometheus answer both `ok`;
+    /// VictoriaMetrics refuses `mb_b` on its budget in pass 2; Mimir answers
+    /// `mb_a` incorrectly in pass 3 and errors on `mb_b` in every pass.
+    fn v3_report() -> MetricsBenchReport {
+        use ResultStatus::{Error, Incorrect, Ok, Refused};
+        let mut provenance = valid_provenance();
+        provenance.schema_version = 3;
+        let mut cases_expected = Vec::new();
+        for engine in ENGINES {
+            for (id, kind) in [("mb_a", QueryKind::Instant), ("mb_b", QueryKind::Range)] {
+                cases_expected.push(ExpectedCase {
+                    engine,
+                    id: id.to_string(),
+                    query_kind: kind,
+                });
+            }
+        }
+        let den = |engine, correctness, timed| EngineDenominators {
+            engine,
+            corpus: 2,
+            correctness,
+            timing: timed,
+            coverage_success: timed,
+        };
+        MetricsBenchReport {
+            provenance,
+            measurements: vec![
+                v3_ok(Engine::Ravel, "mb_a", QueryKind::Instant),
+                v3_ok(Engine::Ravel, "mb_b", QueryKind::Range),
+                v3_ok(Engine::Prometheus, "mb_a", QueryKind::Instant),
+                v3_ok(Engine::Prometheus, "mb_b", QueryKind::Range),
+                v3_ok(Engine::VictoriaMetrics, "mb_a", QueryKind::Instant),
+                v3_untimed(
+                    Engine::VictoriaMetrics,
+                    "mb_b",
+                    QueryKind::Range,
+                    vec![Ok, Refused, Ok, Ok, Ok],
+                ),
+                v3_untimed(
+                    Engine::Mimir,
+                    "mb_a",
+                    QueryKind::Instant,
+                    vec![Ok, Ok, Incorrect, Ok, Ok],
+                ),
+                v3_untimed(Engine::Mimir, "mb_b", QueryKind::Range, vec![Error; PASSES]),
+            ],
+            geomean_ms: None,
+            cases_expected,
+            denominators: vec![
+                den(Engine::Ravel, 2, 2),
+                den(Engine::Prometheus, 2, 2),
+                den(Engine::VictoriaMetrics, 1, 1),
+                den(Engine::Mimir, 1, 0),
+            ],
+            exclusions: vec![],
+        }
+    }
+
+    fn row_mut<'a>(
+        report: &'a mut MetricsBenchReport,
+        engine: Engine,
+        id: &str,
+    ) -> &'a mut Measurement {
+        report
+            .measurements
+            .iter_mut()
+            .find(|m| m.engine == Some(engine) && m.id == id)
+            .expect("fixture row")
+    }
+
+    #[test]
+    fn a_v3_report_over_four_engines_validates_and_round_trips() {
+        let report = v3_report();
+        validate(&report).expect("the version-3 fixture validates");
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: MetricsBenchReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, report);
+        assert!(json.contains("\"engine\":\"victoria_metrics\""), "{json}");
+        assert!(json.contains("\"refusal_reason\":\"budget\""), "{json}");
+        assert!(json.contains("\"query_kind\":\"range\""), "{json}");
+    }
+
+    /// Band 1, missing: a case with no row.
+    #[test]
+    fn band_1_a_missing_case_fails() {
+        let mut report = v3_report();
+        report
+            .measurements
+            .retain(|m| !(m.engine == Some(Engine::Mimir) && m.id == "mb_b"));
+        assert_eq!(
+            validate(&report).expect_err("a missing case must fail"),
+            ValidationError::CaseSetMismatch {
+                missing: vec!["mimir/mb_b/range".to_string()],
+                unexpected: vec![],
+            }
+        );
+    }
+
+    /// Band 1, unexpected: a row with no expected case. An instant row for the
+    /// range entry `mb_b` is a different case, so a grid point reported as its
+    /// own row is caught the same way (amendment section E).
+    #[test]
+    fn band_1_an_unexpected_case_fails() {
+        let mut report = v3_report();
+        report
+            .measurements
+            .push(v3_ok(Engine::Ravel, "mb_b", QueryKind::Instant));
+        assert_eq!(
+            validate(&report).expect_err("an unexpected case must fail"),
+            ValidationError::CaseSetMismatch {
+                missing: vec![],
+                unexpected: vec!["ravel/mb_b/instant".to_string()],
+            }
+        );
+    }
+
+    /// Distinguishing: a duplicated row hiding a missing one keeps the row count
+    /// equal to the expected count, so a validator that compares counts passes
+    /// it. The set comparison reports the missing case.
+    ///
+    /// To watch it fail: replace the band 1 comparison in `validate_v3` with
+    /// `if rows.len() != report.cases_expected.len()`; the counts match, the
+    /// duplicate check then returns `DuplicateCase`, and the `assert_eq!` fails.
+    #[test]
+    fn band_1_a_duplicated_row_cannot_hide_a_missing_case() {
+        let mut report = v3_report();
+        let duplicate = report.measurements[0].clone();
+        report
+            .measurements
+            .retain(|m| !(m.engine == Some(Engine::Mimir) && m.id == "mb_b"));
+        report.measurements.push(duplicate);
+        assert_eq!(report.measurements.len(), report.cases_expected.len());
+        assert_eq!(
+            validate(&report).expect_err("a duplicate hiding a missing case must fail"),
+            ValidationError::CaseSetMismatch {
+                missing: vec!["mimir/mb_b/range".to_string()],
+                unexpected: vec![],
+            }
+        );
+    }
+
+    /// With the expected set intact, a duplicate row is its own failure.
+    #[test]
+    fn a_duplicate_v3_row_on_a_complete_set_fails() {
+        let mut report = v3_report();
+        let duplicate = report.measurements[0].clone();
+        report.measurements.push(duplicate);
+        assert_eq!(
+            validate(&report).expect_err("a duplicate row must fail"),
+            ValidationError::DuplicateCase {
+                case: "ravel/mb_a/instant".to_string(),
+                list: "measurements",
+            }
+        );
+    }
+
+    /// Band 2: latency on an `incorrect` row.
+    #[test]
+    fn band_2_latency_on_an_incorrect_row_fails() {
+        let mut report = v3_report();
+        let figures = report.measurements[0].figures.clone();
+        row_mut(&mut report, Engine::Mimir, "mb_a").figures = figures;
+        match validate(&report).expect_err("latency on an incorrect row must fail") {
+            ValidationError::MalformedMeasurement { id, reason } => {
+                assert_eq!(id, "mb_a");
+                assert!(
+                    reason.contains("status `incorrect` is not timed"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected MalformedMeasurement, got {other:?}"),
+        }
+    }
+
+    /// Band 2, per-pass half: pass medians on an untimed row.
+    #[test]
+    fn band_2_pass_medians_on_an_untimed_row_fail() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Mimir, "mb_a").pass_medians_ms = FIVE_PASS_MEDIANS.to_vec();
+        assert!(matches!(
+            validate(&report).expect_err("pass medians on an incorrect row must fail"),
+            ValidationError::PassTiming { case, .. } if case == "mimir/mb_a/instant"
+        ));
+    }
+
+    #[test]
+    fn a_refused_row_without_a_reason_fails() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::VictoriaMetrics, "mb_b").refusal_reason = None;
+        assert_eq!(
+            validate(&report).expect_err("refused without a reason must fail"),
+            ValidationError::RefusalReasonMismatch {
+                case: "victoria_metrics/mb_b/range".to_string(),
+                status: ResultStatus::Refused,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_refusal_reason_on_an_error_row_fails() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Mimir, "mb_b").refusal_reason = Some(RefusalReason::Budget);
+        assert_eq!(
+            validate(&report).expect_err("a refusal reason on an error row must fail"),
+            ValidationError::RefusalReasonMismatch {
+                case: "mimir/mb_b/range".to_string(),
+                status: ResultStatus::Error,
+                reason: Some(RefusalReason::Budget),
+            }
+        );
+    }
+
+    /// Distinguishing: the first non-ok pass, not the best and not the last.
+    ///
+    /// To watch it fail: make `row_status` return the last element
+    /// (`pass_statuses.last().copied().unwrap_or(ResultStatus::Ok)`, gives
+    /// `error`) or the best (`.min()` under the derived order, gives `ok`).
+    #[test]
+    fn row_status_is_the_first_non_ok_pass() {
+        use ResultStatus::{Error, Ok, Timeout};
+        assert_eq!(row_status(&[Ok, Timeout, Error]), Timeout);
+        assert_eq!(row_status(&[Ok, Ok, Ok]), Ok);
+        assert_eq!(row_status(&[Error, Timeout]), Error);
+    }
+
+    /// A row whose status is not `row_status` of its passes. The passes give
+    /// `timeout` and the row says `error`, which a last-status rule would
+    /// accept.
+    #[test]
+    fn a_status_disagreeing_with_its_passes_fails() {
+        use ResultStatus::{Error, Ok, Timeout};
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Mimir, "mb_b").pass_statuses =
+            vec![Ok, Timeout, Error, Error, Error];
+        assert_eq!(
+            validate(&report).expect_err("a status disagreeing with its passes must fail"),
+            ValidationError::StatusAcrossPasses {
+                case: "mimir/mb_b/range".to_string(),
+                reported: ResultStatus::Error,
+                expected: ResultStatus::Timeout,
+            }
+        );
+    }
+
+    /// Distinguishing: the rows change and the reported counts do not, so a
+    /// validator that trusts the reported counts (or checks only their internal
+    /// consistency, which still holds) passes it.
+    ///
+    /// To watch it fail: in `validate_denominators`, replace `Denominators::of(
+    /// &classified)` with a `Denominators` built from `d`'s own fields; the
+    /// report validates and `expect_err` panics.
+    #[test]
+    fn denominators_are_recomputed_from_the_rows() {
+        use ResultStatus::{Incorrect, Ok};
+        let mut report = v3_report();
+        *row_mut(&mut report, Engine::Ravel, "mb_a") = v3_untimed(
+            Engine::Ravel,
+            "mb_a",
+            QueryKind::Instant,
+            vec![Ok, Incorrect, Ok, Ok, Ok],
+        );
+        assert_eq!(
+            validate(&report).expect_err("stale denominators must fail"),
+            ValidationError::DenominatorsMismatch {
+                engine: Engine::Ravel,
+                reason: "timing is reported as 2 but the rows give 1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_engine_without_a_denominators_entry_fails() {
+        let mut report = v3_report();
+        report.denominators.retain(|d| d.engine != Engine::Mimir);
+        assert_eq!(
+            validate(&report).expect_err("a missing denominators entry must fail"),
+            ValidationError::DenominatorsMismatch {
+                engine: Engine::Mimir,
+                reason: "no denominators entry".to_string(),
+            }
+        );
+    }
+
+    /// Band 5: a figure named twice on one row.
+    #[test]
+    fn band_5_a_duplicated_figure_fails() {
+        let mut report = v3_report();
+        let median = report.measurements[0].figures[1].clone();
+        report.measurements[0].figures.push(median);
+        match validate(&report).expect_err("a duplicated figure must fail") {
+            ValidationError::MalformedMeasurement { id, reason } => {
+                assert_eq!(id, "mb_a");
+                assert!(
+                    reason.contains("figure `median_ms` appears more than once"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected MalformedMeasurement, got {other:?}"),
+        }
+    }
+
+    /// Amendment section A: an in-process row is diagnostic, never portable.
+    #[test]
+    fn an_in_process_endpoint_fails() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Ravel, "mb_b").endpoint = Some("in-process".to_string());
+        assert_eq!(
+            validate(&report).expect_err("an in-process endpoint must fail"),
+            ValidationError::InProcessEndpoint {
+                case: "ravel/mb_b/range".to_string(),
+            }
+        );
+    }
+
+    /// Decision 4: the oracle flag on a non-Prometheus row, and missing on a
+    /// Prometheus row.
+    #[test]
+    fn the_oracle_flag_is_true_exactly_on_prometheus_rows() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Mimir, "mb_a").oracle = true;
+        assert_eq!(
+            validate(&report).expect_err("oracle on a Mimir row must fail"),
+            ValidationError::OracleFlag {
+                case: "mimir/mb_a/instant".to_string(),
+                oracle: true,
+            }
+        );
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Prometheus, "mb_a").oracle = false;
+        assert_eq!(
+            validate(&report).expect_err("a Prometheus row without the flag must fail"),
+            ValidationError::OracleFlag {
+                case: "prometheus/mb_a/instant".to_string(),
+                oracle: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_v3_row_without_its_engine_fails() {
+        let mut report = v3_report();
+        report.measurements[0].engine = None;
+        assert_eq!(
+            validate(&report).expect_err("a row without an engine must fail"),
+            ValidationError::MissingRowField {
+                id: "mb_a".to_string(),
+                field: "engine",
+            }
+        );
+    }
+
+    /// Band 3 against hand-computed values. The second fixture has an outlier
+    /// (50): kept, the rel MAD is 1 / 12 * 100; dropped, it would be
+    /// 1 / 11.5 * 100.
+    #[test]
+    fn rel_mad_pct_matches_hand_computed_five_pass_fixtures() {
+        let got = rel_mad_pct(&FIVE_PASS_MEDIANS).expect("five passes");
+        assert!((got - 100.0 / 11.0).abs() < 1e-12, "{got}");
+        let got = rel_mad_pct(&[10.0, 11.0, 12.0, 13.0, 50.0]).expect("five passes");
+        assert!((got - 100.0 / 12.0).abs() < 1e-12, "{got}");
+        assert!((got - 100.0 / 11.5).abs() > 0.1, "the outlier is kept");
+        assert_eq!(rel_mad_pct(&[10.0, 11.0, 12.0, 13.0]), None);
+    }
+
+    #[test]
+    fn a_rel_mad_disagreeing_with_the_pass_medians_fails() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Ravel, "mb_a").rel_mad_pct = Some(5.0);
+        assert_eq!(
+            validate(&report).expect_err("a wrong rel MAD must fail"),
+            ValidationError::RelMadMismatch {
+                case: "ravel/mb_a/instant".to_string(),
+                supplied: Some(5.0),
+                computed: Some(FIVE_PASS_REL_MAD),
+            }
+        );
+    }
+
+    /// Fewer than five passes: no `rel_mad_pct`, and the provenance says why.
+    fn four_pass_report() -> MetricsBenchReport {
+        let mut report = v3_report();
+        for m in &mut report.measurements {
+            m.pass_statuses.truncate(4);
+            m.status = row_status(&m.pass_statuses);
+            if m.status.is_timed() {
+                m.pass_medians_ms.truncate(4);
+                m.rel_mad_pct = None;
+            }
+        }
+        report
+    }
+
+    #[test]
+    fn fewer_than_five_passes_carry_no_rel_mad_and_record_insufficient_passes() {
+        let mut report = four_pass_report();
+        assert_eq!(
+            validate(&report).expect_err("the variance entry is required"),
+            ValidationError::VarianceConfig {
+                passes: 4,
+                reason: "fewer than 5 passes need config `variance=insufficient_passes`"
+                    .to_string(),
+            }
+        );
+        report.provenance.config.push(ConfigEntry {
+            key: VARIANCE_CONFIG_KEY.to_string(),
+            value: INSUFFICIENT_PASSES.to_string(),
+        });
+        validate(&report).expect("a four-pass report with the variance entry validates");
+        row_mut(&mut report, Engine::Ravel, "mb_a").rel_mad_pct = Some(1.0);
+        assert!(matches!(
+            validate(&report).expect_err("rel MAD over four passes must fail"),
+            ValidationError::RelMadMismatch { computed: None, .. }
+        ));
+    }
+
+    #[test]
+    fn a_geomean_on_a_v3_report_and_a_v3_field_on_a_v2_report_fail() {
+        let mut report = v3_report();
+        report.geomean_ms = Some(11.0);
+        assert_eq!(
+            validate(&report).expect_err("a geomean on version 3 must fail"),
+            ValidationError::FieldNotInVersion {
+                field: "geomean_ms",
+                version: 3,
+            }
+        );
+        let mut report = valid_report();
+        report.measurements[0].engine = Some(Engine::Ravel);
+        assert_eq!(
+            validate(&report).expect_err("a version-3 field on version 2 must fail"),
+            ValidationError::FieldNotInVersion {
+                field: "engine",
+                version: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn a_pass_exclusion_needs_a_cause() {
+        let mut report = v3_report();
+        report.exclusions.push(PassExclusion {
+            pass: 2,
+            cause: " ".to_string(),
+        });
+        assert!(matches!(
+            validate(&report).expect_err("a blank cause must fail"),
+            ValidationError::InvalidExclusion { index: 0, .. }
+        ));
+    }
+
+    /// The v3 render prints every engine's denominators and status counts
+    /// before the first latency, and the latency table holds `ok` rows only.
+    #[test]
+    fn the_v3_render_prints_denominators_before_latency_over_ok_rows() {
+        let mut report = v3_report();
+        report.exclusions.push(PassExclusion {
+            pass: 2,
+            cause: "host rebooted".to_string(),
+        });
+        let out = render(&report).expect("renders");
+        let latency = out
+            .find("latency over ok rows only")
+            .expect("latency table");
+        for engine in ENGINES {
+            let line = out
+                .find(&format!("    {:<17} corpus", engine_slug(engine)))
+                .expect("a denominators line per engine");
+            assert!(line < latency, "{out}");
+        }
+        assert!(
+            out.contains(&format!(
+                "{:<17} corpus 2 | correctness 1 | timing 0 | coverage_success 0",
+                "mimir"
+            )),
+            "{out}"
+        );
+        assert!(out.find("refused 1").expect("status counts") < latency);
+        let table = &out[latency..];
+        assert_eq!(table.matches(" | mb_").count(), 5, "{table}");
+        assert!(!table.contains("mimir"), "{table}");
+        assert!(
+            table.contains(&format!("{FIVE_PASS_REL_MAD:.3}")),
+            "{table}"
+        );
+        assert!(table.contains("excluded pass 2: host rebooted"), "{table}");
     }
 }
