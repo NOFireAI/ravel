@@ -617,8 +617,17 @@ Decision: each profile declares its range-evaluation grid
 to the stream's newest sample, and the corpus gate checks that every range
 entry's window plus lookback fits inside the profile's span. An entry whose
 oracle answer is empty is timed only when the entry is marked
-intended-empty (the `absent` entries); otherwise the case is an invalid
-fixture and the experiment, not the engine, is reported as failed. The two
+intended-empty; otherwise the case is an invalid fixture and the
+experiment, not the engine, is reported as failed. The three `absent`
+entries are not empty answers: `absent()` and `absent_over_time()` return
+a one-sample vector with value 1 when the argument is empty, and the
+manifest guarantees the absent metric is never emitted, so they are
+ordinary non-empty cases. The two native-histogram entries
+(`mb_histogram_native_p95`, `mb_histogram_native_fraction`) are the
+empty-answer cases today, because no receiver has yet received a native
+histogram; T5 marks them intended-empty with a reason naming T1c, and T1c
+removes the marker when native histograms reach the wire, at which point
+an empty answer on either is again an invalid fixture. The two
 join entries are repaired under a corpus version bump with their
 modification reasons recorded, and the corpus gate checks that every
 `group_left`/`group_right` key is unique on the right side under the
