@@ -230,18 +230,19 @@ together.
 
 #### Rows and receivers
 
-The in-process row is `system: ravel`, `endpoint: in-process`: the
-diagnostic lane's replay through `IngestRouter`, which skips the event-time
-admission `ravel-server` applies (ADR-0927, 2026-10-26 amendment, section
-A). It carries every commit token its strict writes minted under
-`commit_tokens`.
+The in-process row is `system: ravel-in-process`, `endpoint: in-process`:
+the diagnostic lane's replay through `IngestRouter`, which skips the
+event-time admission `ravel-server` applies (ADR-0927, 2026-10-26 amendment,
+section A). Its name differs from the portable row's `ravel`, so a lookup by
+`system` returns one row or the other, never the wrong one. It carries every
+commit token its strict writes minted under `commit_tokens`.
 
 Each HTTP receiver gets a row only when its endpoint is passed, and its
 `system` value is the name the query runner joins on:
 
 | Flag | `system` | Ack |
 |---|---|---|
-| `--ravel-endpoint <url>` | `ravel` | `durable_on_ack` |
+| `--ravel-endpoint <url>` | `ravel` | `durable_on_ack`, refused when no response carries `x-ravel-commit-token` |
 | `--prometheus-endpoint <url>` | `prometheus` | `buffered` |
 | `--victoriametrics-endpoint <url>` | `victoriametrics` | `buffered` |
 | `--mimir-endpoint <url>` | `mimir` | `buffered` |
