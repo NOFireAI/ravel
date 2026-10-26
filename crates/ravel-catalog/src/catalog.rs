@@ -962,6 +962,21 @@ impl Catalog {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }
 
+    /// Bytes the reservations of the decoded snapshot parts the part cache
+    /// holds carry, across every tenant: the part cache's share of
+    /// [`DecodedCaches::reserved_bytes`]. An entry leaves this figure when the
+    /// cache drops it, even while a live resolve still holds it and its
+    /// reservation.
+    pub fn decoded_part_cache_reserved_bytes(&self) -> u64 {
+        self.decoded.parts().reserved_bytes()
+    }
+
+    /// [`Catalog::decoded_part_cache_reserved_bytes`] for the decoded
+    /// name-postings cache.
+    pub fn decoded_postings_cache_reserved_bytes(&self) -> u64 {
+        self.decoded.postings().reserved_bytes()
+    }
+
     /// Run this catalog's snapshot part, postings and column-statistics
     /// decodes on `gate` (ADR-1702 decision 4) instead of on the resolving
     /// task. Each decode is submitted with its declared uncompressed length,
@@ -13054,6 +13069,74 @@ mod tests {
             }
             other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
         }
+    }
+
+    /// Issue #3244: on the default (unlimited) budget, a pruned resolve leaves
+    /// the part cache holding exactly the part's declared length and the
+    /// postings cache exactly the postings object's, each read on its own.
+    /// Evicting the idle tenant returns both to 0 while a reader still holds
+    /// the decoded part: the figures count what the caches hold, not what is
+    /// still charged.
+    ///
+    /// FLIP: read `self.decoded.parts()` in
+    /// `decoded_postings_cache_reserved_bytes` and the postings figure reads
+    /// the part's declared length instead of the postings object's.
+    #[tokio::test]
+    async fn decoded_cache_reserved_bytes_read_each_cache_on_the_default_budget() {
+        let (store, range, now_ns, part_len) = folded_one_part_fixture().await;
+        let postings_len = install_fixture_postings(&store).await;
+        assert_ne!(
+            part_len, postings_len,
+            "the fixture tells the two caches apart"
+        );
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        assert_eq!(
+            (
+                catalog.decoded_part_cache_reserved_bytes(),
+                catalog.decoded_postings_cache_reserved_bytes()
+            ),
+            (0, 0)
+        );
+
+        let snapshot = catalog
+            .resolve_pruned(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now_ns,
+                Some("any_metric"),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(
+            (
+                catalog.decoded_part_cache_reserved_bytes(),
+                catalog.decoded_postings_cache_reserved_bytes()
+            ),
+            (part_len, postings_len),
+            "each cache holds exactly the declared length its one entry reserved"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        assert_eq!(catalog.decode_reserve_retries(), 0);
+
+        let part_key = fixture_part_key(&store, tenant()).await;
+        let live = catalog
+            .part_cache()
+            .get(&tenant(), &part_key, &QueryAccounting::new())
+            .expect("the part is cached");
+        assert_eq!(live.reserved_bytes(), part_len);
+        assert_eq!(catalog.evict_idle_tenants(now_ns + 1, 0), 1);
+        assert_eq!(
+            (
+                catalog.decoded_part_cache_reserved_bytes(),
+                catalog.decoded_postings_cache_reserved_bytes()
+            ),
+            (0, 0),
+            "an evicted entry leaves the figure although a reader still holds it"
+        );
+        drop(live);
     }
 
     /// The `now_ns` at which `sealed_hour` is foldable and resolvable.
