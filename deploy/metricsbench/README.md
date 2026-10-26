@@ -104,6 +104,7 @@ omitted or left empty. When docker is not reachable, `image` is the string
 | 0 | Every comparator answered its version call. |
 | 1 | At least one comparator's version or revision is unavailable. The document is still written, since a partial capture is evidence, but it is not a successful capture. |
 | 64 | Usage error. |
+| 70 | The capture crashed or could not write the document. Nothing at `--out` belongs to this run; a file there is from an earlier one. |
 
 The document's shape, abbreviated:
 
