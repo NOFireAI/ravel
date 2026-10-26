@@ -33,10 +33,11 @@
 #                    query_engine_default_for_version records the documented
 #                    default for the reported version: prometheus for
 #                    2.14-2.16, mimir from 2.17.
-#   ravel            GET /api/v1/status/buildinfo (version, revision). The
-#                    ravel-server 0.26.0 image answers an empty revision, which
-#                    is recorded as unavailable and makes the capture exit 1;
-#                    its image digest is then the build's identity.
+#   ravel            GET /api/v1/status/buildinfo (version, revision). Every
+#                    published ravel-server image answers an empty revision
+#                    (RAVEL_GIT_SHA is unset at build), which is recorded as
+#                    unavailable and makes the capture exit 1; the image
+#                    digest is then the build's identity.
 #                    runtime_flags: the container's .Config.Cmd from
 #                    `docker inspect` (the arguments ravel.yml passes to the
 #                    ravel-server entrypoint), as {"source": ..., "cmd": [...]}.
