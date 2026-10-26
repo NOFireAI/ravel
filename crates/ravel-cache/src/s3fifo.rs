@@ -116,6 +116,14 @@ const BOOKKEEPING_BUDGET_DIVISOR: u64 = 100;
 /// statement from 2.5 tenths on, and change no scan-resistance figure at 3.
 const GHOST_WINDOW_BYTES_TENTHS: u64 = 3;
 
+/// The ghost is held outside `max_bytes`, so its key count is capped to keep
+/// its queue slots and map entries within `max_bytes / GHOST_MEMORY_DIVISOR`.
+const GHOST_MEMORY_DIVISOR: u64 = 1_000;
+
+/// One ghost key's queue slot and map entry, before table and queue slack.
+const GHOST_KEY_BYTES: u64 =
+    (std::mem::size_of::<(CacheKey, u64)>() + std::mem::size_of::<(CacheKey, Ghost)>()) as u64;
+
 /// A tenant's pass window closes after at least this many times `max_bytes`
 /// of its traffic, and after at most [`WINDOW_CEILING_MULTIPLE`] times.
 const WINDOW_FLOOR_MULTIPLE: u64 = 2;
@@ -344,14 +352,21 @@ impl<V: Clone> S3Fifo<V> {
         // `GHOST_WINDOW_BYTES_TENTHS` of `max_bytes` (ADR-0046 decision 6,
         // amendment 2026-10-26). The window is the wider of the two, so it
         // never shrinks below the key window, and never spans more than the
-        // cache. `max_entries` caps the ghost's key count, as it caps the
-        // resident index.
+        // cache. The ghost is not charged to `max_bytes`, so its key count is
+        // capped at one per mille of `max_bytes` in ghost bookkeeping, never
+        // below the key window and never above `max_entries`.
         let capacity_from_bytes = limits
             .max_bytes
             .checked_div(limits.max_entry_bytes.max(1))
             .unwrap_or(0) as usize;
         let ghost_window_keys = capacity_from_bytes.min(limits.max_entries).max(1);
         let ghost_window_bytes = limits.max_bytes / 10 * GHOST_WINDOW_BYTES_TENTHS;
+        let ghost_max_keys = (limits.max_bytes / GHOST_MEMORY_DIVISOR / GHOST_KEY_BYTES)
+            .try_into()
+            .unwrap_or(usize::MAX)
+            .max(ghost_window_keys)
+            .min(limits.max_entries)
+            .max(1);
         let region_share_bytes = (limits.max_bytes as f64 * limits.effective_bulk_share()) as u64;
         S3Fifo {
             entries: HashMap::new(),
@@ -364,7 +379,7 @@ impl<V: Clone> S3Fifo<V> {
             small_bytes: 0,
             main_bytes: 0,
             small_quota_bytes,
-            ghost_max_keys: limits.max_entries.max(1),
+            ghost_max_keys,
             ghost_window_keys,
             ghost_window_bytes,
             region: BulkRegion::default(),
@@ -1959,6 +1974,39 @@ mod tests {
                 "a ghost hit inside the window promotes to main"
             );
         }
+    }
+
+    /// The ghost's byte window is wide in keys when entries are small, and the
+    /// ghost lives outside `max_bytes`: its key count stops at one per mille
+    /// of `max_bytes` in ghost bookkeeping, and its queue at twice that.
+    ///
+    /// FLIP: `ghost_max_keys` at `limits.max_entries` in `S3Fifo::new` reads
+    /// 1,000,000 against the cap of 657; with the two count assertions
+    /// dropped, the ghost grows on into its 30 MB window and the queue passes
+    /// `2 * cap + 64` slots.
+    #[test]
+    fn the_ghost_key_count_is_capped_by_its_memory() {
+        const ENTRY: u64 = 1024;
+        let limits = CacheLimits::new(100_000_000, 1_000_000, 64 * 1024 * 1024);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<()>::new(limits);
+        let cap = (limits.max_bytes / GHOST_MEMORY_DIVISOR / GHOST_KEY_BYTES) as usize;
+        assert_eq!(GHOST_KEY_BYTES, 152);
+        assert_eq!(cap, 657);
+        assert_eq!(fifo.ghost_max_keys, cap);
+        assert!(fifo.ghost_window_bytes / ENTRY > 20 * cap as u64);
+
+        for n in 0..200_000 {
+            fifo.insert(key(1, n, ENTRY), (), ENTRY, &metrics);
+            assert!(fifo.ghosts.len() <= cap);
+            assert!(fifo.ghost.len() <= 2 * cap + 64);
+        }
+        assert_eq!(fifo.ghosts.len(), cap);
+        assert_eq!(
+            fifo.ghost_bytes,
+            fifo.ghosts.values().map(|ghost| ghost.size).sum::<u64>()
+        );
+        assert_within_bounds(&fifo);
     }
 
     /// A region entry no read touches lives one to two pass windows of its

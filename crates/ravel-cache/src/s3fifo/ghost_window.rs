@@ -10,8 +10,11 @@
 //!   deferral cites: an 11.5 GB cache, a 33 MB hot set of 16 KiB ranges each
 //!   read once per thousand reads of 25 MB objects that an interactive scan
 //!   reads continuously.
-//! - W3, ADR-2677's loop case: a loop larger than the cache read over and
-//!   over, then a second one.
+//! - W3, ADR-2677's loop case at W1's cache: a loop of 0.5 to 3 times the
+//!   cache, of 1.3 MB or 25 MB entries, read five times, then a second one.
+//!
+//! The `w1_`, `w2_` and `w3_` tests pin the shipped sizing against the key
+//! window it replaced; `ghost_window_report` prints every candidate.
 
 use super::*;
 
@@ -21,6 +24,8 @@ const MIB: u64 = 1024 * 1024;
 /// A ghost sizing under test.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Window {
+    /// The sizing [`S3Fifo::new`] ships.
+    Shipped,
     /// `max_bytes / max_entry_bytes` keys, the sizing before issue #3270.
     LargestEntryKeys,
     /// Ghost keys summing to at most this many bytes, and `max_entries`.
@@ -34,10 +39,13 @@ pub(super) enum Window {
 
 pub(super) fn fifo_with(limits: CacheLimits, window: Window) -> S3Fifo<()> {
     let mut fifo = S3Fifo::new(limits);
+    if let Window::Shipped = window {
+        return fifo;
+    }
     let largest_entry_keys =
         (limits.max_bytes / limits.max_entry_bytes).min(limits.max_entries as u64) as usize;
     let (keys, window_keys, bytes) = match window {
-        Window::LargestEntryKeys => (largest_entry_keys, 0, u64::MAX),
+        Window::Shipped | Window::LargestEntryKeys => (largest_entry_keys, 0, u64::MAX),
         Window::Bytes(bytes) => (limits.max_entries, 0, bytes),
         Window::Either(bytes) => (limits.max_entries, largest_entry_keys, bytes),
         Window::Unbounded => (usize::MAX, 0, u64::MAX),
@@ -188,6 +196,7 @@ pub(super) struct W2 {
     pub(super) hot: f64,
     pub(super) hot_rereads: u64,
     pub(super) scan: f64,
+    pub(super) scan_hits: u64,
 }
 
 /// W2 for `scan_reads` scan reads, with the hot set read twice back to back
@@ -245,6 +254,7 @@ pub(super) fn run_w2(window: Window, scan: Scan, established: bool, scan_reads: 
         } else {
             scan_hits as f64 / scan_rereads as f64
         },
+        scan_hits,
     }
 }
 
@@ -269,6 +279,105 @@ pub(super) fn run_w3(window: Window, multiple: f64, entry: u64, passes: usize) -
     rates
 }
 
+/// W1: every statement's calls 2 and 3 are served from the cache in full,
+/// q29 and q31 to q33 included, where the key window before #3270 served
+/// q31, q32 and q33 nothing.
+///
+/// FLIP: `GHOST_WINDOW_BYTES_TENTHS = 0` (the key window alone, the sizing
+/// before #3270) serves q31 0.000 on calls 2 and 3.
+#[test]
+fn w1_every_statement_is_served_on_its_second_and_third_timed_call() {
+    let shipped = run_w1(Window::Shipped);
+    assert_eq!(shipped.len(), 43);
+    for (q, (_, calls)) in shipped.iter().enumerate() {
+        assert!(
+            calls[2] >= 1.0 && calls[3] >= 1.0,
+            "q{:02} served {:.3} and {:.3} on calls 2 and 3",
+            q + 1,
+            calls[2],
+            calls[3]
+        );
+    }
+
+    let before = run_w1(Window::LargestEntryKeys);
+    for (q, _, _) in LARGE {
+        let calls = before[q - 1].1;
+        let served = calls[2] + calls[3];
+        if q == 29 {
+            assert!(served >= 2.0, "q29 before #3270: {calls:?}");
+        } else {
+            assert!(served <= 0.0, "q{q} before #3270: {calls:?}");
+        }
+    }
+}
+
+/// W2: the hot set's hit rate is no lower than under the key window before
+/// #3270 for any scan, and a ghost wider than the cache lowers it. The scan's
+/// own rate moves by at most one object: against the 600-object loop with no
+/// hot set yet, the byte window keeps more 16 KiB hot ghosts, and promoting
+/// one costs one 25 MB re-read of 14,400.
+///
+/// FLIP: an unbounded ghost (`ghost_max_keys` and `ghost_window_keys` at
+/// `usize::MAX` in `S3Fifo::new`) serves the hot set 0.1210 against the
+/// 600-object loop, under the 0.1413 the key window serves. A byte window
+/// alone (`ghost_window_keys: 0`) serves that loop's scan 0.000 against
+/// 0.645.
+#[test]
+fn w2_the_hot_set_is_served_as_well_as_before_under_every_scan() {
+    for scan in [Scan::Loop(600), Scan::Loop(440), Scan::Loop(300), Scan::Unique] {
+        for established in [true, false] {
+            let reads = if established { 12_000 } else { 15_000 };
+            let shipped = run_w2(Window::Shipped, scan, established, reads);
+            let before = run_w2(Window::LargestEntryKeys, scan, established, reads);
+            assert!(
+                shipped.hot >= before.hot && shipped.scan_hits + 1 >= before.scan_hits,
+                "{scan:?} established={established}: hot {:.6} scan {:.6}, before #3270 hot {:.6} scan {:.6}",
+                shipped.hot,
+                shipped.scan,
+                before.hot,
+                before.scan
+            );
+        }
+    }
+
+    let shipped = run_w2(Window::Shipped, Scan::Loop(600), true, 12_000);
+    assert_eq!(shipped.hot_rereads, 24_168);
+    assert!((shipped.hot - 0.1413).abs() < 1e-4, "hot {:.4}", shipped.hot);
+    let over_wide = run_w2(Window::Unbounded, Scan::Loop(600), true, 12_000);
+    assert!(
+        over_wide.hot < shipped.hot,
+        "an unbounded ghost served the hot set {:.4}, the shipped one {:.4}",
+        over_wide.hot,
+        shipped.hot
+    );
+}
+
+/// W3: every pass of every loop, at both entry sizes and from half the cache
+/// to three times it, is served at least as well as under the key window
+/// before #3270, and a loop just over the cache of ClickBench-sized entries
+/// is served from its third pass where it was served nothing.
+///
+/// FLIP: a byte window alone of a quarter of `max_bytes`
+/// (`ghost_window_keys: 0` and `ghost_window_bytes = max_bytes / 4` in
+/// `S3Fifo::new`) serves the 1.3-times loop of 25 MB entries nothing, where
+/// the key window serves 0.695 of its third pass. `GHOST_WINDOW_BYTES_TENTHS
+/// = 0` fails the 1.05-times loop's floor.
+#[test]
+fn w3_no_loop_is_served_less_than_before() {
+    for entry in LOOP_ENTRIES {
+        for multiple in [0.5, 0.95, 1.05, 1.3, 1.5, 3.0] {
+            let shipped = run_w3(Window::Shipped, multiple, entry, 5);
+            let before = run_w3(Window::LargestEntryKeys, multiple, entry, 5);
+            assert!(
+                shipped.iter().zip(&before).all(|(now, then)| now >= then),
+                "{entry} B entries, loop {multiple} C: {shipped:?}, before #3270 {before:?}"
+            );
+        }
+    }
+    let shipped = run_w3(Window::Shipped, 1.05, LOOP_ENTRIES[0], 5);
+    assert!(shipped[2] > 0.85, "1.05 C loop, third pass: {shipped:?}");
+}
+
 /// The candidates the report compares.
 fn candidates(max_bytes: u64) -> Vec<(&'static str, Window)> {
     let small = max_bytes / 10;
@@ -279,7 +388,7 @@ fn candidates(max_bytes: u64) -> Vec<(&'static str, Window)> {
         ("bytes = 0.25 C", Window::Bytes(max_bytes / 4)),
         ("bytes = 0.3 C", Window::Bytes(max_bytes * 3 / 10)),
         ("either keys or 0.25 C", Window::Either(max_bytes / 4)),
-        ("either keys or 0.3 C", Window::Either(max_bytes * 3 / 10)),
+        ("shipped (either keys or 0.3 C)", Window::Shipped),
         ("bytes = 0.5 C", Window::Bytes(max_bytes / 2)),
         ("bytes = main quota (0.9 C)", Window::Bytes(max_bytes - small)),
         ("bytes = C", Window::Bytes(max_bytes)),
