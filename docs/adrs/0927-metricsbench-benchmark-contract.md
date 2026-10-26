@@ -236,7 +236,8 @@ counterpart in Ravel to measure:
 
 A corpus entry that needs any of those is not written, rather than written and
 reported `unsupported_construct`: the category means the engine cannot evaluate
-a query it was given, and these are not queries. The gap is recorded here so it
+a query it was given (the 2026-10-27 amendment, section D, widens it to a
+payload class the engine cannot store), and these are not queries. The gap is recorded here so it
 is visible without a corpus entry standing in for it.
 
 ### 7. The diagnostic lane exposes what is already measured
@@ -701,6 +702,7 @@ storage contracts.
 <!-- amendment-supersedes: phrase="leave the second half an interval ahead of the first" pointer="2026-10-27 amendment" -->
 <!-- amendment-supersedes: phrase="a lane that excludes a type another portable row carries is a diagnostic row" pointer="2026-10-27 amendment" -->
 <!-- amendment-supersedes: phrase="`offered == accepted + rejected + dropped`" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="the category means the engine cannot evaluate a query it was given" pointer="2026-10-27 amendment" -->
 
 Context. Implementing the status mapper (T3), the comparator limits (T4c)
 and the payload types on the wire (T1c) under epic #2821 found five places
@@ -783,8 +785,19 @@ native histogram (the classes of section D of the 2026-10-26 amendment).
   citation is recorded in that receiver's report row; an exclusion with no
   citation is not an exclusion.
 - Corpus entries that need an excluded class are classified
-  `unsupported_construct` on that engine (decision 6), and stay in its
-  corpus denominator.
+  `unsupported_construct` on that engine, and stay in its corpus
+  denominator. This widens decision 6's definition of that status from
+  "cannot evaluate a query it was given" to also cover "cannot store a
+  payload class the query needs". Such an engine evaluates the query and
+  answers an empty result, which the data comparison would otherwise call
+  `incorrect`. The status comes from a declaration, not from the response:
+  the query runner reads the receiver's ingest row, finds the class in its
+  cited unsupported classes, and sets `unsupported_construct` before any
+  data comparison, with the citation as the row's message. The query is
+  still sent and its answer recorded, so an engine version that starts
+  storing the class shows up as a changed answer. The status mapper's
+  response-driven path never produces this status for a 2xx answer, and
+  does not need to.
 - Every other row is still compared on that class, and every row is still
   compared on every class it does not exclude.
 - A receiver that drops part of a class it does support still fails band 6.
