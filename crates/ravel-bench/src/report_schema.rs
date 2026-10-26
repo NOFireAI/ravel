@@ -1662,7 +1662,10 @@ fn validate_pass_timing(r: &KeyedRow<'_>) -> Result<(), ValidationError> {
     for (figure, computed) in [("min_ms", min), ("median_ms", center), ("max_ms", max)] {
         // `validate_measurement` already required every timed figure.
         let supplied = m.figure(figure).unwrap_or(f64::NAN);
-        if !((supplied - computed).abs() <= PASS_SUMMARY_REL_TOLERANCE * computed.abs().max(1.0)) {
+        // A NaN on either side is not within tolerance, so it mismatches.
+        let within =
+            (supplied - computed).abs() <= PASS_SUMMARY_REL_TOLERANCE * computed.abs().max(1.0);
+        if !within {
             return Err(ValidationError::PassSummaryMismatch {
                 case: r.case.clone(),
                 figure,
