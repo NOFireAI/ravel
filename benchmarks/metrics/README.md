@@ -80,7 +80,39 @@ never mistakes a non-comparable or unbilled run for a publishable result.
   `steps`, `total_series_created`, `logical_input_bytes`,
   `total_samples_generated`, `scaling_label_cardinality` (distinct
   scaling-label values this run actually emitted), all the generator's exact
-  counts for this run.
+  counts for this run; plus `anchor_ms`, the first step's timestamp, and
+  `anchor_source`, `explicit` or `clock` (see below).
+
+### Anchor (`--anchor-ms`)
+
+`--anchor-ms <i64>` sets the timestamp, in milliseconds since the epoch, of
+the first generated step, for example `--anchor-ms 1700000000000`. Given, no
+clock is read to generate the stream, the report says
+`anchor_source: "explicit"`, and two runs with the same anchor replay the same
+bytes. Omitted, the anchor is `now - steps * scrape interval` so the newest
+sample lands near now, and the report says `anchor_source: "clock"`. A run
+meant to be compared with another passes `--anchor-ms` explicitly, with the
+same value on both, so the two replay the same stream. The nightly lane passes
+no anchor and keeps the clock default.
+
+### Stream accounting
+
+The bin streams the generator: it generates one scrape step at a time and
+replays it in `--batch-size` batches, so memory is bounded by the batch size
+and one step's width, not by the number of steps. Each comparator gets the
+same stream regenerated from the same anchor, and the bin fails if its digest
+differs from the Ravel row's.
+
+Every line of the stream is classified as a scalar (float) sample, a native
+histogram, a staleness marker, or malformed, and every row's `ingest` block
+carries `stream_counts` with `generated_lines`, `scalar`, `native_histogram`,
+`stale_marker` and `malformed`. The Remote Write 1.0 replay sends only the
+scalar samples: `offered_samples` equals `stream_counts.scalar`, and
+`excluded_native_histogram` and `excluded_stale_marker` name the two kinds it
+does not send. The bin fails, naming the figures, unless the four counts sum
+to `generated_lines`, `generated_lines` equals the generator's
+`emitted_samples`, `malformed` is zero, and the offered samples split exactly
+into accepted, rejected and dropped.
 
 `substrate`:
 - `store_backend`: the `--store` kind (`memory` or `s3`).

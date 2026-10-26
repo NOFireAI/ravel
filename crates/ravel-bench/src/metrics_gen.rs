@@ -201,6 +201,40 @@ pub struct GenerationReport {
     pub digest: String,
 }
 
+/// The running figures of a generation emitted in step windows
+/// ([`Generator::generate_steps_into`]), closed into a [`GenerationReport`] by
+/// [`Generator::finish_report`].
+#[derive(Debug, Default)]
+pub struct GenerationTally {
+    next_step: u64,
+    hasher: blake3::Hasher,
+    emitted: u64,
+    floats: u64,
+    stale: u64,
+    native: u64,
+    omitted: u64,
+    resets: u64,
+    out_of_order: u64,
+    bytes: u64,
+}
+
+impl GenerationTally {
+    /// A tally for a run that has generated nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Steps generated so far: the next window must start here.
+    pub fn steps_generated(&self) -> u64 {
+        self.next_step
+    }
+
+    /// Lines (samples) written so far.
+    pub fn emitted_samples(&self) -> u64 {
+        self.emitted
+    }
+}
+
 /// Everything that can go wrong generating a workload.
 #[derive(Debug, thiserror::Error)]
 pub enum GeneratorError {
@@ -218,6 +252,21 @@ pub enum GeneratorError {
         /// The underlying I/O failure.
         #[source]
         source: std::io::Error,
+    },
+    /// A step window did not start where the previous one stopped. Counter and
+    /// histogram state accumulates across steps, so a skipped or repeated
+    /// window would write a stream no one-shot run produces.
+    #[error(
+        "step window {start}..{end} does not continue the run, which stopped at step \
+         {expected_start}"
+    )]
+    NonContiguousWindow {
+        /// The step the previous window stopped at.
+        expected_start: u64,
+        /// The requested window's first step.
+        start: u64,
+        /// The requested window's end (exclusive).
+        end: u64,
     },
     /// The run's own accounting does not close. A silent drop is exactly what
     /// ADR-0927's band 4 fails a run for, so it is a hard error here rather
@@ -447,134 +496,57 @@ impl<'a> Generator<'a> {
         steps: u64,
         sink: &mut W,
     ) -> Result<GenerationReport, GeneratorError> {
-        let interval_ms = (self.profile.scrape_interval_secs * 1_000) as i64;
-        let seed = self.workload.seed;
-        let anomalies = self.workload.generator.anomalies;
-        let mut hasher = blake3::Hasher::new();
+        let mut tally = GenerationTally::new();
+        self.generate_steps_into(0, steps, sink, &mut tally)?;
+        self.finish_report(tally)
+    }
+
+    /// Generate the steps `start_step..end_step` into `sink`, adding their
+    /// figures to `tally`. Windows must be contiguous from step 0 on one
+    /// generator, because counter and histogram state accumulates across
+    /// steps: `start_step` must equal the step `tally` stopped at, or this is
+    /// a [`GeneratorError::NonContiguousWindow`]. Consecutive windows covering
+    /// `0..steps` write the same bytes as one [`Self::generate_into`] call
+    /// over `steps`, and [`Self::finish_report`] then returns the same report
+    /// (`tests::step_windows_are_byte_identical_to_one_shot_generation`).
+    pub fn generate_steps_into<W: Write>(
+        &mut self,
+        start_step: u64,
+        end_step: u64,
+        sink: &mut W,
+        tally: &mut GenerationTally,
+    ) -> Result<(), GeneratorError> {
+        if start_step != tally.next_step || end_step < start_step {
+            return Err(GeneratorError::NonContiguousWindow {
+                expected_start: tally.next_step,
+                start: start_step,
+                end: end_step,
+            });
+        }
         let mut line = Vec::with_capacity(256);
         let mut samples: Vec<GeneratedSample> = Vec::new();
-
-        let mut emitted = 0u64;
-        let mut floats = 0u64;
-        let mut stale = 0u64;
-        let mut native = 0u64;
-        let mut omitted = 0u64;
-        let mut resets = 0u64;
-        let mut out_of_order = 0u64;
-        let mut bytes = 0u64;
-
-        for step in 0..steps {
-            let step_secs = step * self.profile.scrape_interval_secs;
-            let epoch = step_secs / CHURN_EPOCH_SECS;
-            let step_ts = self.base_ts_ms + (step as i64) * interval_ms;
-
-            for plan_idx in 0..self.plans.len() {
-                let family = self.workload.families[self.plans[plan_idx].index].clone();
-                let base = self.plans[plan_idx].churned_per_epoch * epoch;
-                if base > 0 {
-                    self.plans[plan_idx].state.retain(|k, _| *k >= base);
-                }
-                let instances = self.plans[plan_idx].instances;
-                for local in 0..instances {
-                    let global = base + local;
-                    let fam_id = self.plans[plan_idx].index as u64;
-                    let per_instance = self.plans[plan_idx].series_per_instance;
-
-                    if fires(
-                        anomalies.missing_sample_one_in,
-                        seed,
-                        TAG_MISSING,
-                        fam_id,
-                        global,
-                        step,
-                    ) {
-                        omitted += per_instance;
-                        continue;
-                    }
-
-                    let mut ts = step_ts;
-                    let shifted = step >= 2
-                        && fires(
-                            anomalies.out_of_order_one_in,
-                            seed,
-                            TAG_OUT_OF_ORDER,
-                            fam_id,
-                            global,
-                            step,
-                        );
-                    if shifted {
-                        ts -= 2 * interval_ms;
-                    }
-
-                    let reset = matches!(
-                        family.kind,
-                        FamilyKind::Counter
-                            | FamilyKind::ClassicHistogram
-                            | FamilyKind::NativeHistogram
-                    ) && fires(
-                        anomalies.counter_reset_one_in,
-                        seed,
-                        TAG_RESET,
-                        fam_id,
-                        global,
-                        step,
-                    );
-                    if reset {
-                        self.plans[plan_idx].state.remove(&global);
-                        resets += 1;
-                    }
-
-                    let stale_now = family.kind == FamilyKind::Gauge
-                        && fires(
-                            anomalies.stale_marker_one_in,
-                            seed,
-                            TAG_STALE,
-                            fam_id,
-                            global,
-                            step,
-                        );
-
-                    samples.clear();
-                    let labels = self.labels_for(plan_idx, &family, global);
-                    let emit = EmitContext {
-                        plan_idx,
-                        global,
-                        step,
-                        ts_ms: ts,
-                        labels: &labels,
-                        stale_now,
-                    };
-                    self.emit_instance(&emit, &family, &mut samples);
-
-                    if shifted {
-                        out_of_order += samples.len() as u64;
-                    }
-                    for sample in &samples {
-                        match &sample.value {
-                            SampleValue::Float(_) => floats += 1,
-                            SampleValue::StaleMarker => stale += 1,
-                            SampleValue::NativeHistogram(_) => native += 1,
-                        }
-                        sample.encode(&mut line);
-                        hasher.update(&line);
-                        sink.write_all(&line)
-                            .map_err(|source| GeneratorError::Write { source })?;
-                        bytes += line.len() as u64;
-                        emitted += 1;
-                    }
-                }
-            }
+        for step in start_step..end_step {
+            self.generate_step(step, sink, tally, &mut line, &mut samples)?;
+            tally.next_step = step + 1;
         }
         sink.flush()
-            .map_err(|source| GeneratorError::Write { source })?;
+            .map_err(|source| GeneratorError::Write { source })
+    }
 
+    /// Close a windowed run: check its accounting and build the report over
+    /// every step `tally` covered.
+    pub fn finish_report(
+        &self,
+        tally: GenerationTally,
+    ) -> Result<GenerationReport, GeneratorError> {
+        let steps = tally.next_step;
         let nominal = steps * self.profile.active_series;
-        if emitted + omitted != nominal {
+        if tally.emitted + tally.omitted != nominal {
             return Err(GeneratorError::AccountingMismatch {
                 profile: self.profile.name.clone(),
-                emitted,
-                omitted,
-                sum: emitted + omitted,
+                emitted: tally.emitted,
+                omitted: tally.omitted,
+                sum: tally.emitted + tally.omitted,
                 steps,
                 active_series: self.profile.active_series,
                 nominal,
@@ -583,23 +555,138 @@ impl<'a> Generator<'a> {
 
         Ok(GenerationReport {
             profile: self.profile.name.clone(),
-            seed,
+            seed: self.workload.seed,
             publishable: self.profile.is_publishable(),
             non_comparable_reason: self.profile.comparability.reason().map(|r| r.to_string()),
             steps,
             active_series: self.profile.active_series,
             total_series_created: self.total_series_created(steps),
             nominal_samples: nominal,
-            emitted_samples: emitted,
-            float_samples: floats,
-            stale_markers: stale,
-            native_histogram_samples: native,
-            omitted_missing_samples: omitted,
-            counter_reset_events: resets,
-            out_of_order_samples: out_of_order,
-            bytes,
-            digest: hasher.finalize().to_hex().to_string(),
+            emitted_samples: tally.emitted,
+            float_samples: tally.floats,
+            stale_markers: tally.stale,
+            native_histogram_samples: tally.native,
+            omitted_missing_samples: tally.omitted,
+            counter_reset_events: tally.resets,
+            out_of_order_samples: tally.out_of_order,
+            bytes: tally.bytes,
+            digest: tally.hasher.finalize().to_hex().to_string(),
         })
+    }
+
+    /// Emit one scrape step into `sink`, counting it into `tally`.
+    fn generate_step<W: Write>(
+        &mut self,
+        step: u64,
+        sink: &mut W,
+        tally: &mut GenerationTally,
+        line: &mut Vec<u8>,
+        samples: &mut Vec<GeneratedSample>,
+    ) -> Result<(), GeneratorError> {
+        let interval_ms = (self.profile.scrape_interval_secs * 1_000) as i64;
+        let seed = self.workload.seed;
+        let anomalies = self.workload.generator.anomalies;
+        let step_secs = step * self.profile.scrape_interval_secs;
+        let epoch = step_secs / CHURN_EPOCH_SECS;
+        let step_ts = self.base_ts_ms + (step as i64) * interval_ms;
+
+        for plan_idx in 0..self.plans.len() {
+            let family = self.workload.families[self.plans[plan_idx].index].clone();
+            let base = self.plans[plan_idx].churned_per_epoch * epoch;
+            if base > 0 {
+                self.plans[plan_idx].state.retain(|k, _| *k >= base);
+            }
+            let instances = self.plans[plan_idx].instances;
+            for local in 0..instances {
+                let global = base + local;
+                let fam_id = self.plans[plan_idx].index as u64;
+                let per_instance = self.plans[plan_idx].series_per_instance;
+
+                if fires(
+                    anomalies.missing_sample_one_in,
+                    seed,
+                    TAG_MISSING,
+                    fam_id,
+                    global,
+                    step,
+                ) {
+                    tally.omitted += per_instance;
+                    continue;
+                }
+
+                let mut ts = step_ts;
+                let shifted = step >= 2
+                    && fires(
+                        anomalies.out_of_order_one_in,
+                        seed,
+                        TAG_OUT_OF_ORDER,
+                        fam_id,
+                        global,
+                        step,
+                    );
+                if shifted {
+                    ts -= 2 * interval_ms;
+                }
+
+                let reset = matches!(
+                    family.kind,
+                    FamilyKind::Counter
+                        | FamilyKind::ClassicHistogram
+                        | FamilyKind::NativeHistogram
+                ) && fires(
+                    anomalies.counter_reset_one_in,
+                    seed,
+                    TAG_RESET,
+                    fam_id,
+                    global,
+                    step,
+                );
+                if reset {
+                    self.plans[plan_idx].state.remove(&global);
+                    tally.resets += 1;
+                }
+
+                let stale_now = family.kind == FamilyKind::Gauge
+                    && fires(
+                        anomalies.stale_marker_one_in,
+                        seed,
+                        TAG_STALE,
+                        fam_id,
+                        global,
+                        step,
+                    );
+
+                samples.clear();
+                let labels = self.labels_for(plan_idx, &family, global);
+                let emit = EmitContext {
+                    plan_idx,
+                    global,
+                    step,
+                    ts_ms: ts,
+                    labels: &labels,
+                    stale_now,
+                };
+                self.emit_instance(&emit, &family, samples);
+
+                if shifted {
+                    tally.out_of_order += samples.len() as u64;
+                }
+                for sample in samples.iter() {
+                    match &sample.value {
+                        SampleValue::Float(_) => tally.floats += 1,
+                        SampleValue::StaleMarker => tally.stale += 1,
+                        SampleValue::NativeHistogram(_) => tally.native += 1,
+                    }
+                    sample.encode(line);
+                    tally.hasher.update(line);
+                    sink.write_all(line)
+                        .map_err(|source| GeneratorError::Write { source })?;
+                    tally.bytes += line.len() as u64;
+                    tally.emitted += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Generate `steps` scrapes into memory. Convenience over
@@ -1026,6 +1113,81 @@ mod tests {
         assert_ne!(other_report.digest, first.digest);
         // The accounting is seed-independent even though the bytes are not.
         assert_eq!(other_report.nominal_samples, first.nominal_samples);
+    }
+
+    /// Step windows are a streaming view of the same run: windows covering
+    /// `0..steps` on one generator write the one-shot bytes and close into the
+    /// one-shot report, digest included, over a churning anomalous stream whose
+    /// state carries across window edges.
+    #[test]
+    fn step_windows_are_byte_identical_to_one_shot_generation() {
+        let noisy = AnomalyRates {
+            missing_sample_one_in: 7,
+            stale_marker_one_in: 5,
+            counter_reset_one_in: 6,
+            out_of_order_one_in: 4,
+        };
+        let w = workload(0xABCD_1234, noisy);
+        let (one_shot_bytes, one_shot) = Generator::new(&w, "churn", 1_700_000_000_000)
+            .expect("generator builds")
+            .generate_bytes(200)
+            .expect("one-shot run generates");
+
+        let mut windowed =
+            Generator::new(&w, "churn", 1_700_000_000_000).expect("generator builds");
+        let mut tally = GenerationTally::new();
+        let mut bytes = Vec::new();
+        // Uneven window widths, including an empty one.
+        for (start, end) in [(0, 1), (1, 1), (1, 38), (38, 120), (120, 200)] {
+            windowed
+                .generate_steps_into(start, end, &mut bytes, &mut tally)
+                .expect("window generates");
+        }
+        assert_eq!(tally.steps_generated(), 200);
+        let report = windowed.finish_report(tally).expect("windowed run closes");
+
+        assert_eq!(
+            bytes, one_shot_bytes,
+            "windows must write the one-shot bytes"
+        );
+        assert_eq!(
+            report, one_shot,
+            "windows must close into the one-shot report"
+        );
+        assert!(one_shot.stale_markers > 0 && one_shot.counter_reset_events > 0);
+    }
+
+    /// A window that skips or repeats steps is refused rather than writing a
+    /// stream no one-shot run produces.
+    #[test]
+    fn a_non_contiguous_step_window_is_refused() {
+        let w = workload(3, clean());
+        let mut generator = Generator::new(&w, "cardinality", 0).expect("generator builds");
+        let mut tally = GenerationTally::new();
+        let mut sink = Vec::new();
+        generator
+            .generate_steps_into(0, 5, &mut sink, &mut tally)
+            .expect("first window");
+        for (start, end) in [(6, 8), (4, 8), (5, 4)] {
+            let err = generator
+                .generate_steps_into(start, end, &mut sink, &mut tally)
+                .expect_err("a non-contiguous window is refused");
+            assert!(
+                matches!(
+                    err,
+                    GeneratorError::NonContiguousWindow {
+                        expected_start: 5,
+                        ..
+                    }
+                ),
+                "{start}..{end}: {err}"
+            );
+        }
+        assert_eq!(
+            tally.steps_generated(),
+            5,
+            "a refused window generates nothing"
+        );
     }
 
     #[test]
