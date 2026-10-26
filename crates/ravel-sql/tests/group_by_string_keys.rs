@@ -700,7 +700,10 @@ fn join_context(with_rule: bool) -> SessionContext {
     let mut config = SessionConfig::new()
         .with_target_partitions(JOIN_PARTITIONS)
         .with_repartition_joins(true);
-    config.options_mut().optimizer.hash_join_single_partition_threshold = 0;
+    config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold = 0;
     config
         .options_mut()
         .optimizer
@@ -762,10 +765,7 @@ fn assert_invariants(plan: &Arc<dyn ExecutionPlan>) {
 /// Run `sql` on a fresh `join_context`, returning the schema the plan
 /// promised and the rows as a table.
 async fn run_join(with_rule: bool, sql: &str) -> (Schema, String) {
-    let df = join_context(with_rule)
-        .sql(sql)
-        .await
-        .expect("query plans");
+    let df = join_context(with_rule).sql(sql).await.expect("query plans");
     let logical = df.schema().as_arrow().clone();
     let batches = df
         .collect()

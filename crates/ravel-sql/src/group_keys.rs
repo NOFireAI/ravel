@@ -475,11 +475,14 @@ fn join_carries(
             || (carried_column(l, left) && carried_column(r, right))
     });
     let filter = join.filter().is_none_or(|filter| {
-        !filter.column_indices().iter().any(|column| match column.side {
-            JoinSide::Left => left.contains(&column.index),
-            JoinSide::Right => right.contains(&column.index),
-            JoinSide::None => false,
-        })
+        !filter
+            .column_indices()
+            .iter()
+            .any(|column| match column.side {
+                JoinSide::Left => left.contains(&column.index),
+                JoinSide::Right => right.contains(&column.index),
+                JoinSide::None => false,
+            })
     });
     keys && filter && !dynamic_filter_consumed(node)
 }
@@ -496,7 +499,11 @@ fn dynamic_filter_consumed(node: &Arc<dyn ExecutionPlan>) -> bool {
     if ids.len() != produced.len() {
         return true;
     }
-    !ids.is_empty() && node.children().iter().any(|child| holds_filter(child, &ids))
+    !ids.is_empty()
+        && node
+            .children()
+            .iter()
+            .any(|child| holds_filter(child, &ids))
 }
 
 /// True when `plan` or a node below it holds, in its own expressions, a
