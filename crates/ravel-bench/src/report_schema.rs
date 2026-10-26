@@ -1648,7 +1648,11 @@ fn validate_pass_timing(r: &KeyedRow<'_>) -> Result<(), ValidationError> {
             computed,
         });
     }
-    let min = m.pass_medians_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let min = m
+        .pass_medians_ms
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
     let max = m
         .pass_medians_ms
         .iter()
@@ -3389,7 +3393,7 @@ mod tests {
         row_mut(&mut report, Engine::Mimir, "mb_a").figures = figures;
         match validate(&report).expect_err("latency on an incorrect row must fail") {
             ValidationError::MalformedMeasurement { id, reason } => {
-                assert_eq!(id, "mb_a");
+                assert_eq!(id, "mimir/mb_a/instant");
                 assert!(
                     reason.contains("status `incorrect` is not timed"),
                     "{reason}"
@@ -3600,7 +3604,7 @@ mod tests {
         report.measurements[0].figures.push(median);
         match validate(&report).expect_err("a duplicated figure must fail") {
             ValidationError::MalformedMeasurement { id, reason } => {
-                assert_eq!(id, "mb_a");
+                assert_eq!(id, "ravel/mb_a/instant");
                 assert!(
                     reason.contains("figure `median_ms` appears more than once"),
                     "{reason}"
@@ -3687,6 +3691,33 @@ mod tests {
         );
     }
 
+    /// The row's min, median and max figures are those of its pass medians,
+    /// named by the full case label.
+    #[test]
+    fn a_summary_figure_disagreeing_with_the_pass_medians_fails() {
+        for (figure, wrong, computed) in [
+            ("min_ms", 8.0, 9.0),
+            ("median_ms", 12.0, 11.0),
+            ("max_ms", 16.0, 15.0),
+        ] {
+            let mut report = v3_report();
+            let row = row_mut(&mut report, Engine::VictoriaMetrics, "mb_a");
+            row.figures
+                .iter_mut()
+                .filter(|f| f.name == figure)
+                .for_each(|f| f.value = wrong);
+            assert_eq!(
+                validate(&report).expect_err("a wrong summary figure must fail"),
+                ValidationError::PassSummaryMismatch {
+                    case: "victoria_metrics/mb_a/instant".to_string(),
+                    figure,
+                    supplied: wrong,
+                    computed,
+                }
+            );
+        }
+    }
+
     /// Fewer than five passes: no `rel_mad_pct`, and the provenance says why.
     fn four_pass_report() -> MetricsBenchReport {
         let mut report = v3_report();
@@ -3694,8 +3725,16 @@ mod tests {
             m.pass_statuses.truncate(4);
             m.status = row_status(&m.pass_statuses);
             if m.status.is_timed() {
+                // [10, 12, 11, 15]: min 10, median 11.5, max 15.
                 m.pass_medians_ms.truncate(4);
                 m.rel_mad_pct = None;
+                for figure in &mut m.figures {
+                    match figure.name.as_str() {
+                        "min_ms" => figure.value = 10.0,
+                        "median_ms" => figure.value = 11.5,
+                        _ => {}
+                    }
+                }
             }
         }
         report
