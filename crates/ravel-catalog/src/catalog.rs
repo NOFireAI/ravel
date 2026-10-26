@@ -14241,7 +14241,8 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let part = *blake3::hash(b"cached-fallback").as_bytes();
         let installed = install_parts(&store, tenant(), Signal::Logs, &[(part, 7, 9)]).await;
-        let budget = budget(&installed[0]).map(|limit| Arc::new(ravel_memory::MemoryBudget::new(limit)));
+        let budget =
+            budget(&installed[0]).map(|limit| Arc::new(ravel_memory::MemoryBudget::new(limit)));
         let mut catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
         if let Some(budget) = &budget {
             catalog = catalog.with_memory_budget(Arc::clone(budget));
@@ -14258,7 +14259,10 @@ mod tests {
             &ColumnStatsRequest::summary_only().with_dictionary("a"),
         )
         .await;
-        assert_eq!(gets, 2, "the entry lacks a's dictionary, so the object is fetched");
+        assert_eq!(
+            gets, 2,
+            "the entry lacks a's dictionary, so the object is fetched"
+        );
         assert_eq!(refetched.parts().len(), 1);
         assert!(
             Arc::ptr_eq(&refetched.parts()[0], &cached),
