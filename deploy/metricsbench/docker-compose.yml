@@ -229,13 +229,17 @@ services:
     # buckets exist, which mimir depends_on below. Each bucket is created only
     # if head-bucket does not find it, so a rerun on the kept rustfs-data
     # volume still exits 0 whatever RustFS answers to a repeated CreateBucket.
-    # Stays plain: these are Mimir's buckets, which no Ravel server checks.
+    # ravel-metricsbench is Ravel's bucket, used only when ravel.yml is layered
+    # on this file; it is created here so one one-shot owns the RustFS
+    # buckets. All four stay plain (no Object Lock): Ravel's store qualify
+    # reports Object Lock but does not require it unless asked to, and bucket
+    # immutability is not what this lane measures.
     entrypoint: >
       /bin/sh -c "
       until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
         echo 'waiting for rustfs'; sleep 1;
       done &&
-      for b in mimir-blocks mimir-ruler mimir-alertmanager; do
+      for b in mimir-blocks mimir-ruler mimir-alertmanager ravel-metricsbench; do
         aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket $$b ||
         aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket $$b || exit 1;
       done"
