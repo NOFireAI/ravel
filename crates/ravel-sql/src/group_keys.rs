@@ -64,8 +64,9 @@
 //! the allowlist below is rebuilt over the carried input so that its own
 //! schema says `Utf8View` too, and the decision moves up to its parent; any
 //! other operator gets one projection restoring the declared types placed
-//! directly over that input, so a `HAVING` filter, a join, a window or a union
-//! reads the declared type. Above the plan root the same projection goes in,
+//! directly over that input, so a `HAVING` filter, a window, a union or a join
+//! that does not carry (see "Joins" below) reads the declared type. Above the
+//! plan root the same projection goes in,
 //! so the plan still produces the schema DataFusion promised at plan time,
 //! which the rule's `schema_check` asserts.
 //!
@@ -110,10 +111,51 @@
 //!   group keys, as the outer level of a `COUNT(DISTINCT ..)` planned as two
 //!   aggregates does. It is rebuilt like any other aggregate and groups on the
 //!   views directly, with no second cast.
+//! - `HashJoinExec` in `PartitionMode::Partitioned`, under the conditions in
+//!   "Joins" below, which it checks for both inputs at once.
 //!
-//! Any rebuilt operator other than a projection or an aggregate must report
-//! its input's schema as its own; one that does not gets the restore below it
-//! instead.
+//! Any rebuilt operator other than a projection, an aggregate or a hash join
+//! must report its input's schema as its own; a rebuilt hash join must report
+//! the join schema of its new inputs. One that does not gets the restore below
+//! it instead.
+//!
+//! # Joins
+//!
+//! A hash join in `Partitioned` mode requires both inputs hash-partitioned on
+//! its keys into the same partitions. The exchange below a grouped input
+//! hashes the views it carries, and this rule does not show that a view and a
+//! dictionary of the same string hash alike, so the two inputs must hash the
+//! same type on every key that reads a carried column. A cast in a projection
+//! also drops its input's hash partitioning when it casts a partitioning
+//! column, so a restore directly under the join would leave that input with
+//! unknown partitioning, which the join's executable-plan invariant refuses.
+//! A plan takes one of two paths.
+//!
+//! - The join carries the views when, for every key that reads a carried
+//!   column, both inputs carry views and the key is that bare column on both
+//!   sides; its join filter reads no carried column; and no node below it
+//!   holds a dynamic filter the join publishes, which would compare the views'
+//!   bounds and hashes with a column that may be a dictionary below an
+//!   aggregate. Both inputs then hash and match views, through exchanges that
+//!   carry them, and the one restore runs above the join.
+//! - Otherwise the join does not carry, even when one input carries views.
+//!   Each carrying input is restored at the first operator above its aggregate
+//!   that does not carry, as anywhere else, and when that leaves the join's
+//!   input with a partitioning other than the hash partitioning it had, the
+//!   restored input is exchanged again with the same hash expressions and
+//!   partition count. That exchange hashes the declared type, as the other
+//!   input does, so both inputs hash alike. The exchange preserves order when
+//!   its input is ordered, since the join reports its probe input's ordering
+//!   as its own. The exchange between a partial and a final aggregate carries
+//!   the views, its parent being an aggregate, so outside strict mode the
+//!   restore lands above the final aggregate, not between it and that
+//!   exchange.
+//!
+//! A hash join in `CollectLeft` mode, the mode `SqlExecutor`'s session plans
+//! its hash joins in (it turns `repartition_joins` off), and
+//! `SortMergeJoinExec`, `NestedLoopJoinExec` and `CrossJoinExec` are not in
+//! the allowlist: each carrying input is restored at or below the join's
+//! input, as before, and no exchange is added.
 //!
 //! # What the rule leaves alone
 //!
