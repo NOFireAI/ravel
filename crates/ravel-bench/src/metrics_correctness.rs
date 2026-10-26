@@ -39,18 +39,25 @@
 //! `warnings` and `infos` are recorded on [`Classified::annotations`] and
 //! never change the status: the data comparison runs on `status` and `data`
 //! only, so a warning or info on a complete, matching result stays `ok`.
+//! This departs from ADR-0927 decision 6, whose `partial` row also admits "a
+//! warning signal". Prometheus and Mimir warnings report things like mixed
+//! float and histogram inputs, not incompleteness, so reading them as
+//! `partial` would mark complete answers incomplete. Neither engine has a
+//! completeness signal, so `partial` is unreachable on Prometheus and Mimir by
+//! construction. Issue #3304 carries the ADR amendment.
 //!
 //! Two outcomes are failures of the experiment, not statuses of the engine:
 //! an oracle that did not answer ([`ClassifyError::OracleUnavailable`]), and
 //! an oracle answer that is empty on an entry not marked intended-empty, or
 //! non-empty on one that is ([`ClassifyError::InvalidFixture`]).
 //!
-//! [`Denominators`] keeps the three denominators apart: `applicable` counts
-//! every classified case; `correctness` counts the cases whose data came back
-//! and was compared (`ok`, `incorrect`, `partial`); `competitive` counts the
-//! cases admissible in a timing table (`ok` only); `coverage_success` counts
-//! the coverage numerator (`ok`). `refused`, `timeout`, `error` and
-//! `unsupported_construct` are in `applicable` and outside `correctness`.
+//! [`Denominators`] keeps decision 6's three denominators apart, under the
+//! decision's own names: `corpus` counts every classified case; `correctness`
+//! counts the cases whose data came back and was compared (`ok`, `incorrect`,
+//! `partial`); `timing` counts the cases admissible in a timing table (`ok`
+//! only); `coverage_success` is the coverage numerator (`ok`), divided by
+//! `corpus`. `refused`, `timeout`, `error` and `unsupported_construct` are in
+//! `corpus` and outside `correctness`.
 //!
 //! Lane or profile inapplicability is outside the seven statuses: an entry
 //! that does not apply to a lane or profile is never classified, and so never
@@ -625,12 +632,12 @@ impl Classified {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Denominators {
     /// Every classified case.
-    pub applicable: usize,
+    pub corpus: usize,
     /// Cases whose data came back and was compared: `ok`, `incorrect`,
     /// `partial`.
     pub correctness: usize,
     /// Cases admissible in a timing table: `ok`.
-    pub competitive: usize,
+    pub timing: usize,
     /// Cases counted as a coverage success: `ok`.
     pub coverage_success: usize,
 }
@@ -638,14 +645,14 @@ pub struct Denominators {
 impl Denominators {
     pub fn of(cases: &[Classified]) -> Self {
         let mut d = Denominators {
-            applicable: cases.len(),
+            corpus: cases.len(),
             ..Denominators::default()
         };
         for case in cases {
             match case.status {
                 ResultStatus::Ok => {
                     d.correctness += 1;
-                    d.competitive += 1;
+                    d.timing += 1;
                     d.coverage_success += 1;
                 }
                 ResultStatus::Incorrect | ResultStatus::Partial => d.correctness += 1,
@@ -826,9 +833,9 @@ mod tests {
         assert_eq!(
             d,
             Denominators {
-                applicable: 2,
+                corpus: 2,
                 correctness: 1,
-                competitive: 1,
+                timing: 1,
                 coverage_success: 1,
             }
         );
@@ -851,9 +858,9 @@ mod tests {
         assert_eq!(
             Denominators::of(&cases),
             Denominators {
-                applicable: 7,
+                corpus: 7,
                 correctness: 3,
-                competitive: 1,
+                timing: 1,
                 coverage_success: 1,
             }
         );
@@ -1490,11 +1497,60 @@ mod tests {
         }
     }
 
+    /// A row's citation is checked against the thing it cites: a source
+    /// file must exist, and a row citing the observed-refusal table must
+    /// find its match text inside that table.
+    #[test]
+    fn every_cited_source_resolves() {
+        const README_CITATION: &str = "deploy/metricsbench/README.md, Budget-refusal signatures";
+        const HEADING: &str = "### Budget-refusal signatures";
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let readme = std::fs::read_to_string(root.join("deploy/metricsbench/README.md"))
+            .expect("read deploy/metricsbench/README.md");
+        let start = readme
+            .find(HEADING)
+            .unwrap_or_else(|| panic!("README has no {HEADING:?} section"));
+        let body = &readme[start + HEADING.len()..];
+        let section = body.find("\n#").map_or(body, |end| &body[..end]);
+        let mut readme_rows = 0;
+        let mut file_rows = 0;
+        for engine in [
+            Engine::Ravel,
+            Engine::Prometheus,
+            Engine::VictoriaMetrics,
+            Engine::Mimir,
+        ] {
+            let rows = budget_signatures(engine)
+                .iter()
+                .chain(unsupported_signatures(engine));
+            for row in rows {
+                if row.source.contains(README_CITATION) {
+                    readme_rows += 1;
+                    assert!(
+                        section.contains(row.message_contains),
+                        "{engine:?}: {:?} is not in the README's observed table",
+                        row.message_contains
+                    );
+                } else if row.source.starts_with("crates/") {
+                    file_rows += 1;
+                    let path = row.source.split(':').next().unwrap_or_default();
+                    assert!(
+                        root.join(path).is_file(),
+                        "{engine:?}: {path} does not exist"
+                    );
+                }
+            }
+        }
+        assert_eq!(readme_rows, 13, "rows citing the README's observed table");
+        assert!(file_rows > 0, "no row cites a source file");
+    }
+
     #[test]
     fn long_messages_are_capped_on_a_char_boundary() {
-        let long = "é".repeat(MAX_MESSAGE_BYTES);
+        // A 3-byte character puts byte 1024 mid-character (1024 % 3 == 1), so
+        // the cap has to back up to 1023.
+        let long = "\u{20ac}".repeat(MAX_MESSAGE_BYTES);
         let capped = cap_message(&long);
-        assert!(capped.len() <= MAX_MESSAGE_BYTES);
-        assert_eq!(capped.len(), MAX_MESSAGE_BYTES);
+        assert_eq!(capped.len(), MAX_MESSAGE_BYTES - 1);
     }
 }
