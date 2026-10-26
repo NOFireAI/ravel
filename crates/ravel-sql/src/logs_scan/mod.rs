@@ -286,8 +286,10 @@
 //!
 //! This scan pushes three predicate kinds into [`LogSegmentFetcher::fetch`]:
 //! the ts range (a segment-level and reader-level prune, exact), content
-//! predicates (`has_word`, whose SQL semantics equal the reader's exact filter,
-//! [`crate::logs_pushdown`]), and the prune-only channel
+//! predicates ([`crate::logs_pushdown`]: `has_word`, whose SQL semantics equal
+//! the reader's exact filter, and `Contains` from a `LIKE '%literal%'` on a
+//! declared `Str` column, which may keep a row the `LIKE` rejects and never
+//! drops one it keeps, so its residual stays), and the prune-only channel
 //! ([`crate::logs_pushdown::LogsPushdown::prune`], attribute equalities that
 //! drive POSTINGS block pruning and are never evaluated per row). It does
 //! **not** push stream-attribute equalities, and it performs no per-record
@@ -1152,8 +1154,9 @@ pub struct LogsScanExec {
     /// Inclusive ts bounds for the fetch's [`LogQuery`].
     ts_min: i64,
     ts_max: i64,
-    /// Content predicates (`has_word`) handed to `RlogReader::scan_pruned` as
-    /// its exact per-row filter.
+    /// Content predicates handed to `RlogReader::scan_pruned` as its per-row
+    /// filter: `has_word` arms, exact, and `Contains` arms, which only drop
+    /// rows the residual `LIKE` would drop too.
     content: Arc<Vec<Predicate>>,
     /// Prune-only predicates (attribute equalities) handed to the fetch as
     /// `LogQuery::prune`. They drive POSTINGS block pruning inside the reader
@@ -2179,8 +2182,8 @@ impl LogsScanExec {
     ///   `[i64::MIN, i64::MAX]`. `self.segments` is already the ts-relevant
     ///   (overlapping) subset the provider resolved, so a fully-out-of-range
     ///   segment never reaches this check;
-    /// - no content predicate (`LogsPushdown::content`, the `has_word` arms
-    ///   evaluated exactly per row);
+    /// - no content predicate (`LogsPushdown::content`: `has_word` arms and
+    ///   `Contains` arms, each evaluated per row and able to drop rows);
     /// - no attribute-equality prune predicate (`LogsPushdown::prune`); a prune
     ///   is block-only and widen-safe, so it never changes the row count, but a
     ///   present prune means a predicate was pushed, so treat it as not-exact
@@ -3116,9 +3119,11 @@ impl ExecutionPlan for LogsScanExec {
             query = query.with_content(c.clone());
         }
         // The prune channel, kept out of `content` on purpose: the reader
-        // evaluates a content arm exactly per row against per-record attributes
-        // only, which would drop a resource/scope-only match the merged
-        // residual must keep.
+        // evaluates an `Equals` content arm per row against per-record
+        // attributes only, which would drop a resource/scope-only match the
+        // merged residual must keep. A `Contains` arm in `content` reads the
+        // stream's resource or scope value too, and is not exact: it keeps
+        // the rows it cannot decide for the residual `LIKE`.
         for p in self.prune.iter() {
             query = query.with_prune(p.clone());
         }

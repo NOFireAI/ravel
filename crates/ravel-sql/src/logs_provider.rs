@@ -1985,11 +1985,6 @@ mod tests {
         );
     }
 
-    // --- exact filter pushdown (issue #733) ----------------------------------
-
-    /// A provider over an empty snapshot: `supports_filters_pushdown` is a pure
-    /// function of the filter and the declared vocabulary, so it needs no data
-    /// and issues no I/O.
     /// What one `LIKE` query over [`contains_segments`] returned and counted.
     #[derive(Debug, PartialEq)]
     struct ContainsRun {
@@ -2188,7 +2183,6 @@ mod tests {
         let [filter] = filters.as_slice() else {
             panic!("one pushed filter, got {filters:?}");
         };
-        println!("delivered filter: {filter:?}");
         assert!(
             matches!(filter, Expr::ScalarFunction(sf) if sf.func.name() == crate::like_udf::LIKE_UDF),
             "{filter:?}"
@@ -2204,6 +2198,11 @@ mod tests {
         );
     }
 
+    // --- exact filter pushdown (issue #733) ----------------------------------
+
+    /// A provider over an empty snapshot: `supports_filters_pushdown` is a pure
+    /// function of the filter and the declared vocabulary, so it needs no data
+    /// and issues no I/O.
     fn pushdown_provider(declared: Vec<DeclaredColumn>) -> LogsTableProvider {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         LogsTableProvider::new(
@@ -2335,8 +2334,9 @@ mod tests {
                 .gt_eq(ts_lit(100))
                 .and(col("status_code").eq(lit(500i64))),
             // A ts bound AND a shape the extractor recognizes in NEITHER
-            // channel: `LIKE` is deliberately never pushed (soundness, see
-            // crate::logs_pushdown), so the residual must keep it.
+            // channel: `LIKE` on `body` is not pushed (only a declared `Str`
+            // column's is, see crate::logs_pushdown), so the residual must
+            // keep it.
             col("ts").gt_eq(ts_lit(100)).and(like),
         ];
         for filter in cases {

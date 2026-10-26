@@ -599,8 +599,9 @@ pub fn registry() -> Vec<Construct> {
     // (#479), evaluated by the Ravel `like` UDF (crate::like_udf) so a declared
     // `Str` column's dictionary is matched once per distinct value. Only `body`
     // is exercised here (a fixed `Utf8` column); the dictionary path is proven in
-    // `tests/logs_provider.rs`. Not pushed down: substring `LIKE` is not a sound
-    // superset of the reader's exact `HasWord`/`Equals` predicates.
+    // `tests/logs_provider.rs`. Not pushed down on `body` or an undeclared
+    // column; on a declared `Str` column a `'%literal%'` pattern is pushed as a
+    // `Contains` arm and the `LIKE` stays in the residual.
     out.push(Construct {
         category: Category::Clause,
         name: "LIKE".to_string(),
