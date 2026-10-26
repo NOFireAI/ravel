@@ -442,7 +442,10 @@ async fn late_materialized_topk_over_a_contains_scan_on_the_fast_path() {
 #[tokio::test]
 async fn an_invalid_utf8_cell_with_the_needle_bytes_reads_as_absent() {
     let resource = vec![
-        ("service.name".to_string(), AttrValue::Str("api".to_string())),
+        (
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        ),
         ("url".to_string(), AttrValue::Str("res-plain".to_string())),
     ];
     let records: Vec<LogRecord> = (1..=4)

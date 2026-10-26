@@ -2178,7 +2178,11 @@ mod tests {
 
     /// Run `sql` through the production session over `fixture`, with `svc`
     /// declared `Str` and `Contains` pushdown on or off.
-    async fn scan_contains(fixture: ContainsFixture, contains_pushdown: bool, sql: &str) -> ScanRun {
+    async fn scan_contains(
+        fixture: ContainsFixture,
+        contains_pushdown: bool,
+        sql: &str,
+    ) -> ScanRun {
         let store = MemoryStore::new();
         let segments = match fixture {
             ContainsFixture::Plain => contains_segments(&store).await,

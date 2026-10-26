@@ -565,7 +565,10 @@ async fn like_contains_over_a_dictionary_page_validates_only_kept_entries() {
 
     let cases = [
         ("LIKE", vec!["d0", "d11", "d8"]),
-        ("NOT LIKE", vec!["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d9"]),
+        (
+            "NOT LIKE",
+            vec!["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d9"],
+        ),
     ];
     for (op, want) in cases {
         let pushed = format!("SELECT body FROM logs WHERE {KEY} {op} '%checkout%'");
@@ -574,7 +577,10 @@ async fn like_contains_over_a_dictionary_page_validates_only_kept_entries() {
         let (value, raw) = fx.sql(&pushed).await;
         assert_eq!(bodies(&value), want, "{op} pushed: {value}");
         assert_eq!(
-            (contains_counters(&value, &raw), str_dict_values_built(&value)),
+            (
+                contains_counters(&value, &raw),
+                str_dict_values_built(&value)
+            ),
             ((4, 2), 1),
             "{op} pushed: {value}"
         );
@@ -582,7 +588,10 @@ async fn like_contains_over_a_dictionary_page_validates_only_kept_entries() {
         let (value, raw) = fx.sql(&unpushed).await;
         assert_eq!(bodies(&value), want, "{op} unpushed: {value}");
         assert_eq!(
-            (contains_counters(&value, &raw), str_dict_values_built(&value)),
+            (
+                contains_counters(&value, &raw),
+                str_dict_values_built(&value)
+            ),
             ((0, 4), 1),
             "{op} unpushed: {value}"
         );
