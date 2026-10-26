@@ -1182,4 +1182,81 @@ mod tests {
         assert_eq!(decoded_len, kept);
         assert_eq!(decoded.by_content_hash.len(), WIDE_SEGMENTS);
     }
+
+    /// Issue #3244: a budget that fits the first segment's working charge and
+    /// kept bytes but not the second segment's working charge refuses the
+    /// fetch mid-stream. The outcome is `BudgetRefused` carrying that second
+    /// charge, and the first segment's kept reservation is released with the
+    /// meter: the budget returns exactly to the foreign holder's figure.
+    ///
+    /// FLIP: `std::mem::forget(meter)` on the memory-refusal arm of the decode
+    /// closure in `fetch_stats_object` and the final `reserved` reads
+    /// `holder + kept` against `holder`; restore `return Err(refusal.into())`
+    /// for that arm and the `expect` panics on the propagated error.
+    #[tokio::test]
+    async fn a_refusal_mid_stream_releases_every_reservation_taken() {
+        let mut small = wide_segment(0);
+        small.columns[0].dictionary.truncate(4);
+        small.columns[0].non_null_count = 4;
+        small.columns[0].max = small.columns[0].dictionary[3].value.clone();
+        let big = wide_segment(1);
+        let small_len = small.encoded_len() as u64;
+        let big_len = big.encoded_len() as u64;
+        assert!(small_len < big_len, "{small_len} vs {big_len}");
+        let mut stripped = small.clone();
+        stripped.columns[0].dictionary.clear();
+        let small_kept = stripped.encoded_len() as u64;
+
+        let part_blake3 = [0x22; 32];
+        let tenant = TenantHash([0x11; 16]);
+        let bytes = crate::snapshot_format::encode_column_stats_v3(
+            tenant.0,
+            1,
+            part_blake3,
+            &[small, big],
+            u64::MAX,
+        )
+        .expect("distinct ascending segments encode");
+
+        let holder_bytes = 1000;
+        let limit = holder_bytes + small_len + small_kept;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let holder = budget.reserve(holder_bytes).expect("the holder fits");
+        let reserver = HighWaterReserver {
+            budget: Arc::clone(&budget),
+            high_water: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let resolved = ResolvedStatsRef {
+            key: "stats.cstat".to_string(),
+            blake3: *blake3::hash(&bytes).as_bytes(),
+            expected_part_blake3: vec![part_blake3],
+            expected_version: 3,
+        };
+        let outcome = fetch_stats_object(
+            &OneObject(bytes::Bytes::from(bytes)),
+            &tenant,
+            &resolved,
+            &HeldDictionaries::Columns(BTreeSet::new()),
+            &reserver,
+            None,
+        )
+        .await
+        .expect("a budget refusal is an outcome, not an error");
+        let FetchOutcome::BudgetRefused(refusal) = outcome else {
+            panic!("the second segment's working charge is refused");
+        };
+        assert_eq!(refusal.requested, big_len);
+        assert_eq!(refusal.reserved, holder_bytes + small_kept);
+        assert_eq!(refusal.limit, limit);
+        assert_eq!(
+            reserver
+                .high_water
+                .load(std::sync::atomic::Ordering::SeqCst),
+            limit,
+            "the first segment's working and kept charges were both held"
+        );
+        assert_eq!(budget.reserved(), holder_bytes);
+        drop(holder);
+        assert_eq!(budget.reserved(), 0);
+    }
 }

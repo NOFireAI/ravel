@@ -9736,9 +9736,6 @@ mod tests {
         part_hash: [u8; 32],
         value: i64,
     ) -> u64 {
-        let signal_num = signal::to_proto(signal) as u32;
-        let prefix = signal.key_prefix();
-
         let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
             ingest_hour_bucket: 1,
             shard: 0,
@@ -9766,11 +9763,26 @@ mod tests {
                 sum: Some(value),
             }],
         }];
+        install_stats_segments(store, tenant, signal, part_hash, &segments).await
+    }
+
+    /// [`install_stats`] with the object's segments given: one part bound to
+    /// `part_hash` whose `.cstat` carries `segments` in order. Returns the
+    /// object's declared `body_uncompressed_len`.
+    async fn install_stats_segments(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        segments: &[ColumnStatsSegment],
+    ) -> u64 {
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
         let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
             tenant.0,
             signal_num,
             part_hash,
-            &segments,
+            segments,
             crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
         )
         .expect("encode v3 column stats");
@@ -9802,7 +9814,7 @@ mod tests {
                     key: stats_key,
                     blake3: stats_hash.to_vec(),
                     size: stats_bytes.len() as u64,
-                    segment_count: 1,
+                    segment_count: u32::try_from(segments.len()).expect("a few segments"),
                     part_blake3: vec![part_hash.to_vec()],
                 }),
                 key_index: Vec::new(),
@@ -14078,6 +14090,246 @@ mod tests {
             "the binding check runs before any reservation"
         );
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #3244: an object whose first segment fits the budget and whose
+    /// second does not is refused mid-stream. The load leaves the part
+    /// uncovered, counts one budget skip and no decode refusal, and the
+    /// budget returns exactly to what a foreign holder reserved before the
+    /// load: the first segment's kept bytes go back with the refusal.
+    ///
+    /// FLIP: count the skip under `column_stats_decode_refusals` and the
+    /// counter assertions fail (0 != 1, then 1 != 0); `std::mem::forget(meter)`
+    /// on the memory-refusal arm of `fetch_stats_object`'s decode closure and
+    /// the final `reserved` reads the holder plus the first segment's kept
+    /// bytes.
+    #[tokio::test]
+    async fn a_column_stats_load_refused_mid_stream_releases_what_it_reserved() {
+        let store = Arc::new(MemoryStore::new());
+        let mut writers = [
+            *blake3::hash(b"mid-stream-1").as_bytes(),
+            *blake3::hash(b"mid-stream-2").as_bytes(),
+        ];
+        writers.sort_unstable();
+        let first = two_column_segment(writers[0], 1, 2);
+        let mut second = two_column_segment(writers[1], 3, 4);
+        second
+            .columns
+            .extend([i64_column("c", 5), i64_column("d", 6)]);
+        let first_len = first.encoded_len() as u64;
+        let second_len = second.encoded_len() as u64;
+        assert!(first_len < second_len, "{first_len} vs {second_len}");
+        let first_kept = stripped_len(&first, &[]);
+        install_stats_segments(
+            &store,
+            tenant(),
+            Signal::Logs,
+            *blake3::hash(b"mid-stream-part").as_bytes(),
+            &[first, second],
+        )
+        .await;
+
+        // Room for the holder, the first segment's working charge and its
+        // kept bytes; the second segment's working charge is larger than the
+        // first's, so it is refused with the first's kept bytes still held.
+        let holder_bytes = 1000;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(
+            holder_bytes + first_len + first_kept,
+        ));
+        let holder = budget.reserve(holder_bytes).expect("the holder fits");
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("a refusal mid-stream leaves the part uncovered");
+        assert!(loaded.is_none(), "the one part is uncovered: {loaded:?}");
+        assert_eq!(catalog.column_stats_budget_skips(), 1);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
+        assert_eq!(budget.reserved(), holder_bytes);
+        drop(holder);
+    }
+
+    /// Issue #3244: a budget refusal is per part. Of two parts, the one the
+    /// budget cannot hold is left uncovered and the other still loads: the
+    /// result covers exactly the fitting part, with its summaries as written,
+    /// and one skip is counted. Either order of the two fetches refuses the
+    /// larger part: first, its kept bytes do not fit beside its working
+    /// charge; second, its working charge does not fit beside the smaller
+    /// part's kept bytes.
+    ///
+    /// FLIP: restore `Ok(Err(refusal)) => return Err(refusal.into())` in
+    /// `fetch_stats_object` and the `expect` panics on the propagated budget
+    /// error, the fitting part lost with it.
+    #[tokio::test]
+    async fn a_budget_refusal_leaves_only_its_own_part_uncovered() {
+        let store = Arc::new(MemoryStore::new());
+        let refused = *blake3::hash(b"refused-part").as_bytes();
+        let fitting = *blake3::hash(b"fitting-part").as_bytes();
+        let installed = install_parts(
+            &store,
+            tenant(),
+            Signal::Logs,
+            &[(refused, 1 << 40, 1 << 41), (fitting, 1, 2)],
+        )
+        .await;
+        let refused_segment = &installed[0].segment;
+        let fitting_segment = &installed[1].segment;
+        let limit = fitting_segment.encoded_len() as u64 + stripped_len(fitting_segment, &[]);
+        assert!(
+            refused_segment.encoded_len() as u64 > fitting_segment.encoded_len() as u64
+                && stripped_len(refused_segment, &[]) > stripped_len(fitting_segment, &[]),
+            "the refused part is the larger on both charges"
+        );
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+
+        let (loaded, _) = load_counting(&catalog, &ColumnStatsRequest::summary_only()).await;
+        let by_part = loaded.by_content_hash();
+        assert_eq!(by_part.keys().collect::<Vec<_>>(), vec![&fitting]);
+        let mut expected = fitting_segment.clone();
+        for column in &mut expected.columns {
+            column.dictionary.clear();
+        }
+        assert_eq!(*by_part[&fitting], expected);
+        assert_eq!(catalog.column_stats_budget_skips(), 1);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
+        drop(by_part);
+        drop(loaded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The key and declared blake3 of the stats ref on the default tenant's
+    /// logs HEAD's first part.
+    async fn first_part_stats_ref(store: &MemoryStore) -> (String, [u8; 32]) {
+        let head_key = crate::fold::head_object_key(&tenant(), Signal::Logs);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("get head")
+            .data;
+        let head = crate::snapshot_format::decode_head(&head_bytes).expect("decode head");
+        let stats_ref = head.parts[0]
+            .column_stats
+            .as_ref()
+            .expect("the fixture's part carries a stats ref");
+        let blake3 = <[u8; 32]>::try_from(stats_ref.blake3.as_slice()).expect("32-byte blake3");
+        (stats_ref.key.clone(), blake3)
+    }
+
+    /// Issue #3244: load one part summary-only, let `break_refetch` arrange
+    /// that a refetch of its object does not load, then ask for dictionary
+    /// `a`. The cached summary-only entry must come back as the part's
+    /// statistics, field for field, still without `a`, and stay cached.
+    /// Returns the catalog for the caller's own counter checks.
+    async fn a_failed_dictionary_refetch_serves_the_cached_entry(
+        budget: impl FnOnce(&InstalledPart) -> Option<u64>,
+        break_refetch: impl AsyncFnOnce(&MemoryStore, &str),
+    ) -> (Catalog, Option<Arc<ravel_memory::MemoryBudget>>) {
+        let store = Arc::new(MemoryStore::new());
+        let part = *blake3::hash(b"cached-fallback").as_bytes();
+        let installed = install_parts(&store, tenant(), Signal::Logs, &[(part, 7, 9)]).await;
+        let budget = budget(&installed[0]).map(|limit| Arc::new(ravel_memory::MemoryBudget::new(limit)));
+        let mut catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        if let Some(budget) = &budget {
+            catalog = catalog.with_memory_budget(Arc::clone(budget));
+        }
+        let (stats_key, stats_blake3) = first_part_stats_ref(&store).await;
+
+        let (summary, _) = load_counting(&catalog, &ColumnStatsRequest::summary_only()).await;
+        assert!(!summary.dictionary_loaded("a"));
+        let cached = Arc::clone(&summary.parts()[0]);
+
+        break_refetch(&store, &stats_key).await;
+        let (refetched, gets) = load_counting(
+            &catalog,
+            &ColumnStatsRequest::summary_only().with_dictionary("a"),
+        )
+        .await;
+        assert_eq!(gets, 2, "the entry lacks a's dictionary, so the object is fetched");
+        assert_eq!(refetched.parts().len(), 1);
+        assert!(
+            Arc::ptr_eq(&refetched.parts()[0], &cached),
+            "the cached entry is returned"
+        );
+        let mut expected = installed[0].segment.clone();
+        for column in &mut expected.columns {
+            column.dictionary.clear();
+        }
+        assert_eq!(*refetched.by_content_hash()[&part], expected);
+        assert_eq!(
+            refetched.by_content_hash()[&part],
+            summary.by_content_hash()[&part]
+        );
+        assert!(!refetched.dictionary_loaded("a"));
+        let still_cached = catalog
+            .column_stats_cache
+            .as_ref()
+            .expect("the cache is enabled")
+            .get((tenant(), Signal::Logs, stats_blake3), &part)
+            .expect("the entry is still cached");
+        assert!(
+            Arc::ptr_eq(&still_cached, &cached),
+            "the cache still holds the original entry"
+        );
+        (catalog, budget)
+    }
+
+    /// Deliverable 3 of issue #3244, budget case: the refetch for `a` is
+    /// refused when its kept bytes do not fit beside the segment's working
+    /// charge. The budget fits exactly the summary load, one segment plus its
+    /// summary-only kept bytes, so the refusal lands with the working charge
+    /// held, and that charge must come back too.
+    ///
+    /// FLIP: drop the `parts.extend(cached)` after the outcome match in
+    /// `load_column_stats`, or push the cached entry only on `Absent`, and
+    /// the load returns `Ok(None)`, failing `load_counting`'s "stats
+    /// present"; `std::mem::forget(meter)` on the memory-refusal arm of
+    /// `fetch_stats_object` and `reserved` reads the working charge.
+    #[tokio::test]
+    async fn a_refetch_the_budget_refuses_serves_the_cached_entry() {
+        let (catalog, budget) = a_failed_dictionary_refetch_serves_the_cached_entry(
+            |installed| {
+                Some(installed.segment.encoded_len() as u64 + stripped_len(&installed.segment, &[]))
+            },
+            async |_, _| {},
+        )
+        .await;
+        assert_eq!(catalog.column_stats_budget_skips(), 1);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
+        assert_eq!(budget.expect("a budget was set").reserved(), 0);
+    }
+
+    /// Deliverable 3 of issue #3244, store case: the refetch for `a` finds
+    /// the object gone (a NotFound GET degrades to absent), and the cached
+    /// summary-only entry still answers for the part.
+    ///
+    /// FLIP: drop the `parts.extend(cached)` after the outcome match in
+    /// `load_column_stats` and the load returns `Ok(None)`, failing
+    /// `load_counting`'s "stats present".
+    #[tokio::test]
+    async fn a_refetch_that_finds_no_object_serves_the_cached_entry() {
+        let (catalog, _) = a_failed_dictionary_refetch_serves_the_cached_entry(
+            |_| None,
+            async |store, key| {
+                store.delete(key).await.expect("delete the stats object");
+            },
+        )
+        .await;
+        assert_eq!(catalog.column_stats_budget_skips(), 0);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
     }
 
     /// [`folded_one_part_fixture`] plus a postings object bound to its part
