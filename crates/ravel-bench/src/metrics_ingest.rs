@@ -153,8 +153,13 @@ use ravel_ingest::{
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetrics, list_all};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
+use ravel_promql_difftest::generator::STALE_MARKER_BITS;
 use ravel_remote_write::proto::prometheus::{
-    Label as PbLabel, Sample as PbSample, TimeSeries as PbTimeSeries, WriteRequest,
+    BucketSpan as PbBucketSpan, Histogram as PbHistogram, Label as PbLabel, Sample as PbSample,
+    TimeSeries as PbTimeSeries, WriteRequest, histogram as pb_histogram,
+};
+use ravel_segment::{
+    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint as SegResetHint,
 };
 use ravel_types::{CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
 use serde::{Deserialize, Serialize};
@@ -189,10 +194,10 @@ impl AckSemantics {
     }
 }
 
-/// One logical sample, the unit every system replays. Scalar float samples
-/// only: the portable cross-engine comparison is over the sample stream every
-/// candidate accepts without configuration, and a classic histogram already
-/// decomposes into its `_bucket`/`_sum`/`_count` float series upstream.
+/// One logical float sample: a scalar line, or a staleness marker carried as
+/// the Prometheus stale NaN ([`STALE_MARKER_BITS`]). A classic histogram
+/// already decomposes into its `_bucket`/`_sum`/`_count` float series
+/// upstream; a native histogram is a [`LogicalHistogram`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalSample {
     /// The metric name (the `__name__` label value), e.g. `mb_gauge`.
@@ -203,6 +208,66 @@ pub struct LogicalSample {
     pub ts_ms: i64,
     /// The scalar value.
     pub value: f64,
+}
+
+/// One logical native histogram, sent as a Remote Write 1.0 `Histogram`
+/// with integer counts, zero threshold 0, zero count 0, no negative buckets,
+/// and one positive span `{offset: 0, length: positive_deltas.len()}`
+/// ([`pb_histogram_from`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalHistogram {
+    /// The metric name (the `__name__` label value).
+    pub metric: String,
+    /// The other labels, name/value pairs, excluding `__name__`.
+    pub labels: Vec<(String, String)>,
+    /// Milliseconds since the epoch.
+    pub ts_ms: i64,
+    /// The bucket-layout schema.
+    pub schema: i32,
+    /// Total observations.
+    pub count: u64,
+    /// Sum of observations.
+    pub sum: f64,
+    /// Positive-bucket counts in the Remote Write delta encoding: each entry
+    /// is the difference against the previous bucket of this sample.
+    pub positive_deltas: Vec<i64>,
+    /// The Remote Write reset hint. The generator's line format
+    /// (`metrics_gen::GeneratedSample::encode`) carries no counter-reset
+    /// flag, so [`classify_line`] sets `Unknown`, which tells a receiver to
+    /// detect a reset from the counts itself.
+    pub reset_hint: pb_histogram::ResetHint,
+}
+
+/// A point a replay sends: a float sample or a native histogram.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LogicalPoint {
+    /// A scalar sample or a staleness marker.
+    Sample(LogicalSample),
+    /// A native histogram.
+    Histogram(LogicalHistogram),
+}
+
+impl LogicalPoint {
+    fn validate(&self) -> Result<(), RejectionReason> {
+        match self {
+            LogicalPoint::Sample(s) => s.validate(),
+            LogicalPoint::Histogram(h) => h.validate(),
+        }
+    }
+
+    fn ts_ms(&self) -> i64 {
+        match self {
+            LogicalPoint::Sample(s) => s.ts_ms,
+            LogicalPoint::Histogram(h) => h.ts_ms,
+        }
+    }
+
+    fn metric(&self) -> &str {
+        match self {
+            LogicalPoint::Sample(s) => &s.metric,
+            LogicalPoint::Histogram(h) => &h.metric,
+        }
+    }
 }
 
 /// Why a logical sample was refused before it reached a system. The lane owns
@@ -219,36 +284,96 @@ pub enum RejectionReason {
     /// A label carried an empty name. A label with no name has no identity and
     /// cannot participate in series identity.
     EmptyLabelName,
-    /// The value was not finite (NaN or +/-inf) on a plain sample. A Prometheus
-    /// staleness marker is a distinct concept the scalar replay does not model,
-    /// so a bare non-finite scalar is refused rather than silently ingested.
+    /// The value was not finite (NaN or +/-inf) on a plain sample, and was not
+    /// the staleness marker's exact bit pattern ([`STALE_MARKER_BITS`]), the
+    /// one non-finite value the lane sends.
     NonFiniteValue,
+    /// A native histogram whose delta-decoded bucket counts go negative or do
+    /// not sum to its `count` (its zero bucket is always empty here).
+    InvalidHistogram,
+}
+
+/// Shared admission rules on a series identity.
+fn validate_identity(metric: &str, labels: &[(String, String)]) -> Result<(), RejectionReason> {
+    if metric.is_empty() {
+        return Err(RejectionReason::EmptyMetricName);
+    }
+    if labels.iter().any(|(name, _)| name.is_empty()) {
+        return Err(RejectionReason::EmptyLabelName);
+    }
+    Ok(())
+}
+
+/// The canonical label set including `__name__`, sorted by name, so a series
+/// has exactly one spelling on the wire and in the id.
+fn canonical_labels(metric: &str, labels: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(labels.len() + 1);
+    out.push((METRIC_NAME_LABEL.to_string(), metric.to_string()));
+    out.extend(labels.iter().cloned());
+    out.sort();
+    out
 }
 
 impl LogicalSample {
     /// Validate a sample against the lane's client-side admission rules,
     /// naming the first reason it fails. `Ok` means every system receives it.
+    /// A non-finite value is refused unless its bits are exactly
+    /// [`STALE_MARKER_BITS`] (`tests::validate_exempts_exactly_the_stale_marker_bits`).
     pub fn validate(&self) -> Result<(), RejectionReason> {
-        if self.metric.is_empty() {
-            return Err(RejectionReason::EmptyMetricName);
-        }
-        if self.labels.iter().any(|(name, _)| name.is_empty()) {
-            return Err(RejectionReason::EmptyLabelName);
-        }
-        if !self.value.is_finite() {
+        validate_identity(&self.metric, &self.labels)?;
+        if !self.value.is_finite() && self.value.to_bits() != STALE_MARKER_BITS {
             return Err(RejectionReason::NonFiniteValue);
         }
         Ok(())
     }
 
-    /// The canonical label set including `__name__`, sorted by name, so a series
-    /// has exactly one spelling on the wire and in the id.
+    /// Whether this sample is a staleness marker.
+    pub fn is_stale_marker(&self) -> bool {
+        self.value.to_bits() == STALE_MARKER_BITS
+    }
+
     fn canonical_labels(&self) -> Vec<(String, String)> {
-        let mut labels: Vec<(String, String)> = Vec::with_capacity(self.labels.len() + 1);
-        labels.push((METRIC_NAME_LABEL.to_string(), self.metric.clone()));
-        labels.extend(self.labels.iter().cloned());
-        labels.sort();
-        labels
+        canonical_labels(&self.metric, &self.labels)
+    }
+}
+
+impl LogicalHistogram {
+    /// Validate a histogram against the lane's client-side admission rules.
+    pub fn validate(&self) -> Result<(), RejectionReason> {
+        validate_identity(&self.metric, &self.labels)?;
+        if !self.positive_deltas.is_empty() && self.positive_span_len().is_none() {
+            return Err(RejectionReason::InvalidHistogram);
+        }
+        self.absolute_buckets()
+            .ok_or(RejectionReason::InvalidHistogram)
+            .map(|_| ())
+    }
+
+    /// The absolute positive-bucket counts the deltas decode to, or `None`
+    /// when one goes negative, overflows, or they do not sum to `count`.
+    fn absolute_buckets(&self) -> Option<Vec<u64>> {
+        let mut out = Vec::with_capacity(self.positive_deltas.len());
+        let mut running: i64 = 0;
+        let mut total: u64 = 0;
+        for delta in &self.positive_deltas {
+            running = running.checked_add(*delta)?;
+            let bucket = u64::try_from(running).ok()?;
+            total = total.checked_add(bucket)?;
+            out.push(bucket);
+        }
+        (total == self.count).then_some(out)
+    }
+
+    fn canonical_labels(&self) -> Vec<(String, String)> {
+        canonical_labels(&self.metric, &self.labels)
+    }
+
+    /// The single positive span, or none for an empty bucket vector: a
+    /// zero-length span is not a valid layout.
+    fn positive_span_len(&self) -> Option<u32> {
+        u32::try_from(self.positive_deltas.len())
+            .ok()
+            .filter(|len| *len > 0)
     }
 }
 
@@ -299,31 +424,57 @@ pub const ELAPSED_BASIS_TIMED_SEGMENTS: &str = "timed_segments";
 /// written before it (`tests::a_pre_change_artifact_loads_with_defaults`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IngestPhase {
-    /// Every line of the stream this row replayed, counted by kind. The sample
-    /// accounting below is over the `scalar` lines only. All zero in an
-    /// artifact written before the stream was classified.
+    /// Every line of the stream this row replayed, counted by kind. All zero
+    /// in an artifact written before the stream was classified.
     #[serde(default)]
     pub stream_counts: StreamCounts,
-    /// Native-histogram lines the scalar replay excluded by name
-    /// (`stream_counts.native_histogram`): never offered, never dropped.
+    /// Native-histogram lines this row did not send, named rather than
+    /// skipped. Zero for every row this code writes, which sends every
+    /// native histogram; non-zero in artifacts written before it did.
     #[serde(default)]
     pub excluded_native_histogram: u64,
-    /// Staleness-marker lines the scalar replay excluded by name
-    /// (`stream_counts.stale_marker`).
+    /// Staleness-marker lines this row did not send. Zero for every row this
+    /// code writes, which sends every marker as an offered sample.
     #[serde(default)]
     pub excluded_stale_marker: u64,
-    /// Scalar logical samples offered to the system. `accepted + rejected +
-    /// dropped`.
+    /// Float samples offered to the system: the scalar lines plus the
+    /// staleness markers. `accepted + rejected + dropped`.
     pub offered_samples: u64,
-    /// BLAKE3 over the canonical `(series, ts_ms, value_bits)` tuple of every
-    /// sample this row offered, in offered order ([`OfferedDigest`]). Empty in
-    /// an artifact written before it existed.
+    /// BLAKE3 over every point this row offered, in offered order: each
+    /// sample's canonical `(series, ts_ms, value_bits)`, a staleness marker
+    /// by its bit pattern, and each native histogram by every field it is
+    /// encoded with ([`OfferedDigest`]). Empty in an artifact written before
+    /// it existed.
     #[serde(default)]
     pub offered_digest: String,
     /// Samples the system acknowledged.
     pub accepted_samples: u64,
     /// Samples the lane refused before sending (client-side admission).
     pub rejected_samples: u64,
+    /// Native histograms offered to the system, their own class, never
+    /// counted in `offered_samples`. `accepted_histograms +
+    /// rejected_histograms + dropped_histograms`.
+    #[serde(default)]
+    pub offered_histograms: u64,
+    /// Native histograms in batches the system acknowledged.
+    #[serde(default)]
+    pub accepted_histograms: u64,
+    /// Native histograms the lane refused before sending.
+    #[serde(default)]
+    pub rejected_histograms: u64,
+    /// Native histograms in batches sent and never acknowledged. On a
+    /// comparator row, `histograms_rejected_by_status` summed plus
+    /// `retry_exhausted_histograms`.
+    #[serde(default)]
+    pub dropped_histograms: u64,
+    /// Native histograms in batches that ended on a non-retryable non-2xx
+    /// response, keyed by that HTTP status. Part of `dropped_histograms`.
+    #[serde(default)]
+    pub histograms_rejected_by_status: BTreeMap<u16, u64>,
+    /// Native histograms in batches still failing once `max_retries` retries
+    /// were spent. Part of `dropped_histograms`.
+    #[serde(default)]
+    pub retry_exhausted_histograms: u64,
     /// Samples in a batch that was sent and never acknowledged: neither
     /// accepted nor rejected, so the accounting still closes. On a comparator
     /// row this is exactly `rejected_by_status` summed plus
@@ -419,11 +570,14 @@ pub struct StorageAccounting {
 /// One system's ingest result row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemIngestResult {
-    /// The system: `ravel`, `prometheus`, `victoriametrics`, `osn`.
+    /// The system: `ravel`, `prometheus`, `victoriametrics`, `mimir`. Two
+    /// rows can both say `ravel`: the in-process diagnostic row and the
+    /// portable row over HTTP, told apart by `endpoint`.
     pub system: String,
     /// What a 2xx from this system means (ADR-0927 decision 3).
     pub ack_semantics: AckSemantics,
-    /// The endpoint replayed against, or `in-process` for Ravel. Never a
+    /// The `/api/v1/write` URL replayed against, or `in-process` for the
+    /// in-process Ravel row (ADR-0927 2026-10-26 amendment A). Never a
     /// hardcoded host: an HTTP row's endpoint came from config.
     pub endpoint: String,
     /// Per-system client behaviour (batching, retries, backpressure), stated so
@@ -436,6 +590,12 @@ pub struct SystemIngestResult {
     /// buffered system, which is absence, not an empty vec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_tokens: Option<Vec<String>>,
+    /// The `x-ravel-commit-token` header value of the last acknowledged
+    /// request, verbatim (the server joins one token per shard the write
+    /// touched with commas). Set only on the portable Ravel row; the query
+    /// runner passes it as `min_commit_token` (ADR-0927 decision 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_token: Option<String>,
     /// Diagnostic object-store accounting; see [`StorageAccounting`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageAccounting>,
@@ -466,11 +626,12 @@ impl SystemIngestResult {
                 .to_string(),
             ingest,
             commit_tokens: Some(commit_tokens),
+            last_commit_token: None,
             storage: Some(storage),
         }
     }
 
-    /// Build a buffered comparator row (Prometheus/VictoriaMetrics/OSN over
+    /// Build a buffered comparator row (Prometheus/VictoriaMetrics/Mimir over
     /// portable RW1.0). No commit tokens and no object-store accounting: a
     /// buffered 2xx mints no token the client sees, and the comparator's store
     /// is not the bench's.
@@ -487,6 +648,31 @@ impl SystemIngestResult {
             client_behavior: client_behavior.into(),
             ingest,
             commit_tokens: None,
+            last_commit_token: None,
+            storage: None,
+        }
+    }
+
+    /// Build a durable-on-ack HTTP row, the portable Ravel row over
+    /// `ravel-server`'s `/api/v1/write`, carrying the last commit token it
+    /// returned. Only the last header value is kept: a long replay sends one
+    /// request per batch, so `commit_tokens` stays absent and the row stays
+    /// bounded.
+    pub fn durable_http_row(
+        system: impl Into<String>,
+        endpoint: impl Into<String>,
+        client_behavior: impl Into<String>,
+        ingest: IngestPhase,
+        last_commit_token: Option<String>,
+    ) -> Self {
+        SystemIngestResult {
+            system: system.into(),
+            ack_semantics: AckSemantics::DurableOnAck,
+            endpoint: endpoint.into(),
+            client_behavior: client_behavior.into(),
+            ingest,
+            commit_tokens: None,
+            last_commit_token,
             storage: None,
         }
     }
@@ -1031,11 +1217,42 @@ fn transport_setup_error(detail: String) -> LaneError {
     LaneError::Transport(detail)
 }
 
-/// Group logical samples into `prometheus.TimeSeries` by canonical identity.
-fn write_request_from(samples: &[LogicalSample]) -> WriteRequest {
+/// The Remote Write 1.0 `Histogram` a logical histogram is sent as: integer
+/// counts, zero threshold 0, zero count 0, no negative buckets, and one
+/// positive span covering every delta (none for an empty bucket vector).
+fn pb_histogram_from(h: &LogicalHistogram) -> PbHistogram {
+    PbHistogram {
+        count: Some(pb_histogram::Count::CountInt(h.count)),
+        sum: h.sum,
+        schema: h.schema,
+        zero_threshold: 0.0,
+        zero_count: Some(pb_histogram::ZeroCount::ZeroCountInt(0)),
+        negative_spans: Vec::new(),
+        negative_deltas: Vec::new(),
+        negative_counts: Vec::new(),
+        positive_spans: h
+            .positive_span_len()
+            .map(|length| PbBucketSpan { offset: 0, length })
+            .into_iter()
+            .collect(),
+        positive_deltas: h.positive_deltas.clone(),
+        positive_counts: Vec::new(),
+        reset_hint: h.reset_hint as i32,
+        timestamp: h.ts_ms,
+        custom_values: Vec::new(),
+    }
+}
+
+/// Group logical points into `prometheus.TimeSeries` by canonical identity:
+/// float samples (staleness markers included) under `samples`, native
+/// histograms under `histograms`.
+fn write_request_from_points(points: &[LogicalPoint]) -> WriteRequest {
     let mut by_series: BTreeMap<Vec<(String, String)>, PbTimeSeries> = BTreeMap::new();
-    for s in samples {
-        let labels = s.canonical_labels();
+    for point in points {
+        let labels = match point {
+            LogicalPoint::Sample(s) => s.canonical_labels(),
+            LogicalPoint::Histogram(h) => h.canonical_labels(),
+        };
         let entry = by_series
             .entry(labels.clone())
             .or_insert_with(|| PbTimeSeries {
@@ -1050,10 +1267,13 @@ fn write_request_from(samples: &[LogicalSample]) -> WriteRequest {
                 exemplars: Vec::new(),
                 histograms: Vec::new(),
             });
-        entry.samples.push(PbSample {
-            value: s.value,
-            timestamp: s.ts_ms,
-        });
+        match point {
+            LogicalPoint::Sample(s) => entry.samples.push(PbSample {
+                value: s.value,
+                timestamp: s.ts_ms,
+            }),
+            LogicalPoint::Histogram(h) => entry.histograms.push(pb_histogram_from(h)),
+        }
     }
     WriteRequest {
         timeseries: by_series.into_values().collect(),
@@ -1061,43 +1281,102 @@ fn write_request_from(samples: &[LogicalSample]) -> WriteRequest {
     }
 }
 
-/// Encode a batch of logical samples as a Remote Write 1.0 body: a
-/// `prometheus.WriteRequest` protobuf, snappy block-compressed. This is the
-/// exact wire shape every comparator receives, and its length is the batch's
-/// wire-byte figure for the in-process Ravel path too.
-pub fn encode_rw1_body(samples: &[LogicalSample]) -> Result<Vec<u8>, LaneError> {
-    let req = write_request_from(samples);
-    let raw = req.encode_to_vec();
+/// Group logical samples into `prometheus.TimeSeries` by canonical identity.
+#[cfg(test)]
+fn write_request_from(samples: &[LogicalSample]) -> WriteRequest {
+    let points: Vec<LogicalPoint> = samples.iter().cloned().map(LogicalPoint::Sample).collect();
+    write_request_from_points(&points)
+}
+
+fn snappy(req: &WriteRequest) -> Result<Vec<u8>, LaneError> {
     snap::raw::Encoder::new()
-        .compress_vec(&raw)
+        .compress_vec(&req.encode_to_vec())
         .map_err(|e| LaneError::Snappy(e.to_string()))
+}
+
+/// Encode a batch of logical samples as a Remote Write 1.0 body: a
+/// `prometheus.WriteRequest` protobuf, snappy block-compressed.
+pub fn encode_rw1_body(samples: &[LogicalSample]) -> Result<Vec<u8>, LaneError> {
+    let points: Vec<LogicalPoint> = samples.iter().cloned().map(LogicalPoint::Sample).collect();
+    encode_rw1_points(&points)
+}
+
+/// Encode a batch of logical points as a Remote Write 1.0 body. This is the
+/// exact wire shape every HTTP row receives, and its length is the batch's
+/// wire-byte figure for the in-process Ravel path too.
+pub fn encode_rw1_points(points: &[LogicalPoint]) -> Result<Vec<u8>, LaneError> {
+    snappy(&write_request_from_points(points))
 }
 
 /// Convert one accepted logical sample into an in-process ingest point. The
 /// stored label set carries `__name__` so a PromQL selector matches by name;
 /// `SeriesId::compute` hashes the name separately and skips the `__name__`
 /// label, so the id is unchanged by its presence (ADR-0005).
-fn ingest_point(tenant: &TenantId, sample: &LogicalSample) -> Result<IngestPoint, LaneError> {
-    let mut labels: Vec<Label> = Vec::with_capacity(sample.labels.len() + 1);
+fn ingest_point(tenant: &TenantId, point: &LogicalPoint) -> Result<IngestPoint, LaneError> {
+    let (metric, point_labels) = match point {
+        LogicalPoint::Sample(s) => (&s.metric, &s.labels),
+        LogicalPoint::Histogram(h) => (&h.metric, &h.labels),
+    };
+    let mut labels: Vec<Label> = Vec::with_capacity(point_labels.len() + 1);
     labels.push(Label {
         name: METRIC_NAME_LABEL.to_string(),
-        value: sample.metric.clone(),
+        value: metric.clone(),
     });
-    for (name, value) in &sample.labels {
+    for (name, value) in point_labels {
         labels.push(Label {
             name: name.clone(),
             value: value.clone(),
         });
     }
     let label_set = LabelSet::new(labels)?;
-    let series_id = SeriesId::compute(tenant, &sample.metric, &label_set)?;
+    let series_id = SeriesId::compute(tenant, metric, &label_set)?;
+    let ts_ns = point.ts_ms().saturating_mul(1_000_000);
+    let value = match point {
+        LogicalPoint::Sample(s) => IngestValue::Scalar(Sample {
+            ts_ns,
+            value: s.value,
+        }),
+        LogicalPoint::Histogram(h) => IngestValue::Histogram(HistogramSample {
+            ts_ns,
+            value: histogram_value(h)?,
+        }),
+    };
     Ok(IngestPoint {
         series_id,
         labels: Arc::new(label_set),
-        value: IngestValue::Scalar(Sample {
-            ts_ns: sample.ts_ms.saturating_mul(1_000_000),
-            value: sample.value,
-        }),
+        value,
+    })
+}
+
+/// The stored form of a validated logical histogram: the same layout
+/// [`pb_histogram_from`] puts on the wire, with absolute bucket counts.
+fn histogram_value(h: &LogicalHistogram) -> Result<HistogramValue, LaneError> {
+    let positive = h.absolute_buckets().ok_or_else(|| {
+        LaneError::Generate("a histogram reached ingest without passing validate".to_string())
+    })?;
+    Ok(HistogramValue {
+        scale: h.schema,
+        zero_threshold: 0.0,
+        sum: Some(h.sum),
+        custom_values: None,
+        positive_spans: h
+            .positive_span_len()
+            .map(|length| HistogramSpan { offset: 0, length })
+            .into_iter()
+            .collect(),
+        negative_spans: Vec::new(),
+        counts: HistogramCounts::Int {
+            zero_count: 0,
+            count: h.count,
+            positive,
+            negative: Vec::new(),
+        },
+        reset_hint: match h.reset_hint {
+            pb_histogram::ResetHint::Unknown => SegResetHint::Unknown,
+            pb_histogram::ResetHint::Yes => SegResetHint::Yes,
+            pb_histogram::ResetHint::No => SegResetHint::No,
+            pb_histogram::ResetHint::Gauge => SegResetHint::Gauge,
+        },
     })
 }
 
@@ -1123,24 +1402,16 @@ pub enum MalformedReason {
 
 /// One line of a generated stream (the canonical `metrics_gen` encoding,
 /// `<ts_ms>\t<metric>{<labels>}\t<payload>`), classified. Every line becomes
-/// exactly one record, so a line the scalar replay does not send is counted
-/// under its kind rather than skipped.
+/// exactly one record, counted under its kind.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamRecord {
-    /// A float payload: the unit the scalar replay sends.
+    /// A float payload.
     Scalar(LogicalSample),
-    /// A native-histogram payload. The portable RW1.0 scalar replay does not
-    /// model it, so it is excluded by name, never silently.
-    NativeHistogram {
-        ts_ms: i64,
-        series: String,
-        schema: i32,
-        count: u64,
-        sum_bits: u64,
-        deltas_len: usize,
-    },
-    /// A staleness marker. Excluded from the scalar replay by name.
-    StaleMarker { ts_ms: i64, series: String },
+    /// A native-histogram payload, sent as a Remote Write 1.0 `Histogram`.
+    NativeHistogram(LogicalHistogram),
+    /// A staleness marker: a sample whose value is the stale NaN
+    /// ([`STALE_MARKER_BITS`]).
+    StaleMarker(LogicalSample),
     /// A line that does not parse. `line_no` is 1-based over the whole stream.
     Malformed {
         line_no: u64,
@@ -1157,7 +1428,7 @@ fn parse_hex_bits(hex: &str) -> Option<u64> {
 }
 
 /// Parse a native-histogram payload body (after `h `).
-fn parse_native_histogram(body: &str) -> Result<(i32, u64, u64, usize), MalformedReason> {
+fn parse_native_histogram(body: &str) -> Result<(i32, u64, u64, Vec<i64>), MalformedReason> {
     let mut fields = body.split(' ');
     let (Some(schema), Some(count), Some(sum), Some(deltas), None) = (
         fields.next().and_then(|f| f.strip_prefix("schema=")),
@@ -1175,19 +1446,19 @@ fn parse_native_histogram(body: &str) -> Result<(i32, u64, u64, usize), Malforme
         .parse::<u64>()
         .map_err(|_| MalformedReason::UnknownPayload)?;
     let sum_bits = parse_hex_bits(sum).ok_or(MalformedReason::BadFloatBits)?;
-    let deltas_len = if deltas.is_empty() {
-        0
+    let deltas = if deltas.is_empty() {
+        Vec::new()
     } else {
-        let mut n = 0usize;
-        for delta in deltas.split(',') {
-            delta
-                .parse::<i64>()
-                .map_err(|_| MalformedReason::UnknownPayload)?;
-            n += 1;
-        }
-        n
+        deltas
+            .split(',')
+            .map(|delta| {
+                delta
+                    .parse::<i64>()
+                    .map_err(|_| MalformedReason::UnknownPayload)
+            })
+            .collect::<Result<Vec<i64>, _>>()?
     };
-    Ok((schema, count, sum_bits, deltas_len))
+    Ok((schema, count, sum_bits, deltas))
 }
 
 /// Classify one line (without its trailing newline) of a generated stream.
@@ -1220,21 +1491,27 @@ pub fn classify_line(line_no: u64, line: &str) -> StreamRecord {
         };
     }
     if payload == "stale" {
-        return StreamRecord::StaleMarker {
+        return StreamRecord::StaleMarker(LogicalSample {
+            metric,
+            labels,
             ts_ms,
-            series: series.to_string(),
-        };
+            value: f64::from_bits(STALE_MARKER_BITS),
+        });
     }
     if let Some(body) = payload.strip_prefix("h ") {
         return match parse_native_histogram(body) {
-            Ok((schema, count, sum_bits, deltas_len)) => StreamRecord::NativeHistogram {
-                ts_ms,
-                series: series.to_string(),
-                schema,
-                count,
-                sum_bits,
-                deltas_len,
-            },
+            Ok((schema, count, sum_bits, positive_deltas)) => {
+                StreamRecord::NativeHistogram(LogicalHistogram {
+                    metric,
+                    labels,
+                    ts_ms,
+                    schema,
+                    count,
+                    sum: f64::from_bits(sum_bits),
+                    positive_deltas,
+                    reset_hint: pb_histogram::ResetHint::Unknown,
+                })
+            }
             Err(reason) => malformed(reason),
         };
     }
@@ -1249,11 +1526,11 @@ pub fn classify_line(line_no: u64, line: &str) -> StreamRecord {
 pub struct StreamCounts {
     /// Lines read from the stream.
     pub generated_lines: u64,
-    /// Float lines: the samples the scalar replay offers.
+    /// Float lines, offered as samples.
     pub scalar: u64,
-    /// Native-histogram lines, excluded from the scalar replay.
+    /// Native-histogram lines, offered as histograms.
     pub native_histogram: u64,
-    /// Staleness-marker lines, excluded from the scalar replay.
+    /// Staleness-marker lines, offered as samples.
     pub stale_marker: u64,
     /// Lines that did not parse. Band 4 requires zero.
     pub malformed: u64,
@@ -1338,72 +1615,114 @@ pub fn check_stream_band(
     })
 }
 
-/// A row's sample accounting does not close (ADR-0927 band 4): the offering
-/// identity, `offered` against the stream's scalar lines, or the split of
-/// `offered` into accepted, rejected and dropped.
+/// A row's accounting does not close (ADR-0927 band 4): the offering
+/// identity, a class's offered count against the stream's lines of that
+/// class, or a class's split into accepted, rejected and dropped.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
     "the sample accounting does not close (ADR-0927 band 4): offering identity {offered} offered \
-     + {excluded_native_histogram} excluded_native_histogram + {excluded_stale_marker} \
-     excluded_stale_marker = {offering_total} against {generated_lines} generated lines; \
-     {offered} offered against {scalar} scalar lines; {offered} offered against {accepted} \
-     accepted + {rejected} rejected + {dropped} dropped. A silent drop fails the run."
+     samples + {offered_histograms} offered histograms + {excluded_native_histogram} \
+     excluded_native_histogram + {excluded_stale_marker} excluded_stale_marker = \
+     {offering_total} against {generated_lines} generated lines; {offered} offered samples + \
+     {excluded_stale_marker} excluded_stale_marker against {scalar} scalar + {stale_marker} \
+     stale marker lines; {offered_histograms} offered histograms + {excluded_native_histogram} \
+     excluded_native_histogram against {native_histogram} native histogram lines; {offered} \
+     offered against {accepted} accepted + {rejected} rejected + {dropped} dropped samples; \
+     {offered_histograms} offered against {accepted_histograms} accepted + \
+     {rejected_histograms} rejected + {dropped_histograms} dropped histograms. A silent drop \
+     fails the run."
 )]
 pub struct RowAccountingViolation {
     pub offered: u64,
+    pub offered_histograms: u64,
     pub excluded_native_histogram: u64,
     pub excluded_stale_marker: u64,
-    /// `offered + excluded_native_histogram + excluded_stale_marker`.
+    /// `offered + offered_histograms + excluded_native_histogram +
+    /// excluded_stale_marker`.
     pub offering_total: u64,
     pub generated_lines: u64,
     pub scalar: u64,
+    pub stale_marker: u64,
+    pub native_histogram: u64,
     pub accepted: u64,
     pub rejected: u64,
     pub dropped: u64,
+    pub accepted_histograms: u64,
+    pub rejected_histograms: u64,
+    pub dropped_histograms: u64,
 }
 
-/// Check one row against the stream it replayed: the offering identity
-/// `offered + excluded_native_histogram + excluded_stale_marker ==
-/// generated_lines`, read from the row's OWN fields, so a row that drops an
-/// exclusion fails even when `counts` still holds it; `offered ==
-/// counts.scalar`; and `offered == accepted + rejected + dropped`. `counts`
-/// is the stream's own classification ([`GeneratedStream::finish`]).
+/// Check one row against the stream it replayed, from the row's OWN fields
+/// (so a row that drops a count fails even when `counts` still holds it):
+/// the offering identity `offered_samples + offered_histograms +
+/// excluded_native_histogram + excluded_stale_marker == generated_lines`;
+/// `offered_samples + excluded_stale_marker == scalar + stale_marker`;
+/// `offered_histograms + excluded_native_histogram == native_histogram`; and
+/// each class's offered count equal to its accepted + rejected + dropped.
+/// `counts` is the stream's own classification ([`GeneratedStream::finish`]).
 pub fn check_row_accounting(
     ingest: &IngestPhase,
     counts: &StreamCounts,
 ) -> Result<(), RowAccountingViolation> {
     let offering_total = ingest
         .offered_samples
+        .saturating_add(ingest.offered_histograms)
         .saturating_add(ingest.excluded_native_histogram)
         .saturating_add(ingest.excluded_stale_marker);
     let split = ingest
         .accepted_samples
         .saturating_add(ingest.rejected_samples)
         .saturating_add(ingest.dropped_samples);
+    let histogram_split = ingest
+        .accepted_histograms
+        .saturating_add(ingest.rejected_histograms)
+        .saturating_add(ingest.dropped_histograms);
     if offering_total == counts.generated_lines
-        && ingest.offered_samples == counts.scalar
+        && ingest
+            .offered_samples
+            .saturating_add(ingest.excluded_stale_marker)
+            == counts.scalar.saturating_add(counts.stale_marker)
+        && ingest
+            .offered_histograms
+            .saturating_add(ingest.excluded_native_histogram)
+            == counts.native_histogram
         && split == ingest.offered_samples
+        && histogram_split == ingest.offered_histograms
     {
         return Ok(());
     }
     Err(RowAccountingViolation {
         offered: ingest.offered_samples,
+        offered_histograms: ingest.offered_histograms,
         excluded_native_histogram: ingest.excluded_native_histogram,
         excluded_stale_marker: ingest.excluded_stale_marker,
         offering_total,
         generated_lines: counts.generated_lines,
         scalar: counts.scalar,
+        stale_marker: counts.stale_marker,
+        native_histogram: counts.native_histogram,
         accepted: ingest.accepted_samples,
         rejected: ingest.rejected_samples,
         dropped: ingest.dropped_samples,
+        accepted_histograms: ingest.accepted_histograms,
+        rejected_histograms: ingest.rejected_histograms,
+        dropped_histograms: ingest.dropped_histograms,
     })
 }
 
-/// Hashes the canonical `(series, ts_ms, value_bits)` tuple of each offered
-/// sample, in offered order: the series as its sorted label pairs
-/// (`__name__` included), each string length-prefixed, then `ts_ms` and the
-/// value's `f64::to_bits`, all little-endian, so no two distinct tuple
-/// sequences share an encoding.
+/// Marks a histogram record in [`OfferedDigest`]. A sample record starts
+/// with its label count, which can never be `u64::MAX`, so the two record
+/// kinds never share an encoding.
+const DIGEST_HISTOGRAM_TAG: u64 = u64::MAX;
+
+/// Hashes every offered point, in offered order, all integers little-endian
+/// and every string length-prefixed, so no two distinct point sequences share
+/// an encoding. A sample (a staleness marker included) is its series as
+/// sorted label pairs (`__name__` included), `ts_ms`, and the value's
+/// `f64::to_bits`. A native histogram is [`DIGEST_HISTOGRAM_TAG`], its
+/// series, `ts_ms`, and every field [`pb_histogram_from`] encodes: schema,
+/// count, sum bits, zero threshold bits, zero count, reset hint, each
+/// positive span, and each positive delta.
 #[derive(Clone, Debug, Default)]
 pub struct OfferedDigest {
     hasher: blake3::Hasher,
@@ -1415,74 +1734,167 @@ impl OfferedDigest {
         Self::default()
     }
 
-    /// Add one offered sample.
-    pub fn update(&mut self, sample: &LogicalSample) {
-        let labels = sample.canonical_labels();
+    fn update_series(&mut self, labels: &[(String, String)]) {
         self.hasher.update(&(labels.len() as u64).to_le_bytes());
-        for (name, value) in &labels {
+        for (name, value) in labels {
             for part in [name, value] {
                 self.hasher.update(&(part.len() as u64).to_le_bytes());
                 self.hasher.update(part.as_bytes());
             }
         }
+    }
+
+    /// Add one offered sample.
+    pub fn update(&mut self, sample: &LogicalSample) {
+        self.update_series(&sample.canonical_labels());
         self.hasher.update(&sample.ts_ms.to_le_bytes());
         self.hasher.update(&sample.value.to_bits().to_le_bytes());
     }
 
-    /// The hex digest over every sample added so far.
+    /// Add one offered native histogram, by the fields of its wire form.
+    pub fn update_histogram(&mut self, histogram: &LogicalHistogram) {
+        let wire = pb_histogram_from(histogram);
+        self.hasher.update(&DIGEST_HISTOGRAM_TAG.to_le_bytes());
+        self.update_series(&histogram.canonical_labels());
+        self.hasher.update(&wire.timestamp.to_le_bytes());
+        self.hasher.update(&wire.schema.to_le_bytes());
+        self.hasher.update(&histogram.count.to_le_bytes());
+        self.hasher.update(&wire.sum.to_bits().to_le_bytes());
+        self.hasher.update(&wire.zero_threshold.to_bits().to_le_bytes());
+        let zero_count = match wire.zero_count {
+            Some(pb_histogram::ZeroCount::ZeroCountInt(n)) => n,
+            _ => 0,
+        };
+        self.hasher.update(&zero_count.to_le_bytes());
+        self.hasher.update(&wire.reset_hint.to_le_bytes());
+        self.hasher
+            .update(&(wire.positive_spans.len() as u64).to_le_bytes());
+        for span in &wire.positive_spans {
+            self.hasher.update(&span.offset.to_le_bytes());
+            self.hasher.update(&span.length.to_le_bytes());
+        }
+        self.hasher
+            .update(&(wire.positive_deltas.len() as u64).to_le_bytes());
+        for delta in &wire.positive_deltas {
+            self.hasher.update(&delta.to_le_bytes());
+        }
+    }
+
+    /// Add one offered point.
+    pub fn update_point(&mut self, point: &LogicalPoint) {
+        match point {
+            LogicalPoint::Sample(s) => self.update(s),
+            LogicalPoint::Histogram(h) => self.update_histogram(h),
+        }
+    }
+
+    /// The hex digest over every point added so far.
     pub fn finish(&self) -> String {
         self.hasher.finalize().to_hex().to_string()
     }
 }
 
-/// A source of scalar samples a replay pulls in batches, in stream order, so
-/// a replay holds one batch at a time rather than the whole history.
+/// A source of points a replay pulls in batches, in stream order, so a
+/// replay holds one batch at a time rather than the whole history.
 pub trait SampleBatches {
-    /// The next at most `max` scalar samples (`max` is raised to 1), or `None`
-    /// once the stream is exhausted. A returned batch is never empty.
-    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalSample>>, LaneError>;
+    /// The next at most `max` points (`max` is raised to 1), or `None` once
+    /// the stream is exhausted. A returned batch is never empty.
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalPoint>>, LaneError>;
     /// Per-kind counts of the lines read so far.
     fn stream_counts(&self) -> StreamCounts;
 }
 
+/// The stream line kind a point counts under.
+fn count_point(counts: &mut StreamCounts, point: &LogicalPoint) {
+    counts.generated_lines += 1;
+    match point {
+        LogicalPoint::Sample(s) if s.is_stale_marker() => counts.stale_marker += 1,
+        LogicalPoint::Sample(_) => counts.scalar += 1,
+        LogicalPoint::Histogram(_) => counts.native_histogram += 1,
+    }
+}
+
 /// A [`SampleBatches`] over samples already in memory, each counted as one
-/// scalar line.
+/// line: a staleness marker under `stale_marker`, any other under `scalar`.
 pub struct SliceSamples<'s> {
     samples: &'s [LogicalSample],
     pos: usize,
+    counts: StreamCounts,
 }
 
 impl<'s> SliceSamples<'s> {
     /// Serve `samples` in order.
     pub fn new(samples: &'s [LogicalSample]) -> Self {
-        SliceSamples { samples, pos: 0 }
+        SliceSamples {
+            samples,
+            pos: 0,
+            counts: StreamCounts::default(),
+        }
     }
 }
 
 impl SampleBatches for SliceSamples<'_> {
-    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalSample>>, LaneError> {
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalPoint>>, LaneError> {
         let rest = &self.samples[self.pos..];
         if rest.is_empty() {
             return Ok(None);
         }
         let n = max.max(1).min(rest.len());
         self.pos += n;
-        Ok(Some(rest[..n].to_vec()))
+        let batch: Vec<LogicalPoint> = rest[..n].iter().cloned().map(LogicalPoint::Sample).collect();
+        for point in &batch {
+            count_point(&mut self.counts, point);
+        }
+        Ok(Some(batch))
     }
 
     fn stream_counts(&self) -> StreamCounts {
-        let pulled = self.pos as u64;
-        StreamCounts {
-            generated_lines: pulled,
-            scalar: pulled,
-            ..StreamCounts::default()
+        self.counts
+    }
+}
+
+/// A [`SampleBatches`] over points already in memory, each counted as one
+/// line of its kind.
+pub struct SlicePoints<'s> {
+    points: &'s [LogicalPoint],
+    pos: usize,
+    counts: StreamCounts,
+}
+
+impl<'s> SlicePoints<'s> {
+    /// Serve `points` in order.
+    pub fn new(points: &'s [LogicalPoint]) -> Self {
+        SlicePoints {
+            points,
+            pos: 0,
+            counts: StreamCounts::default(),
         }
     }
 }
 
+impl SampleBatches for SlicePoints<'_> {
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalPoint>>, LaneError> {
+        let rest = &self.points[self.pos..];
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let n = max.max(1).min(rest.len());
+        self.pos += n;
+        for point in &rest[..n] {
+            count_point(&mut self.counts, point);
+        }
+        Ok(Some(rest[..n].to_vec()))
+    }
+
+    fn stream_counts(&self) -> StreamCounts {
+        self.counts
+    }
+}
+
 /// The MetricsBench generator as a [`SampleBatches`]: it generates one scrape
-/// step at a time into a reused buffer, classifies each line, and queues only
-/// that step's scalar samples. What it holds is bounded by one step's lines
+/// step at a time into a reused buffer, classifies each line, and queues that
+/// step's points: scalars, staleness markers and native histograms, every
+/// line but a malformed one. What it holds is bounded by one step's lines
 /// plus one batch, whatever the number of steps. Reusing the shipping encoder
 /// as the single source keeps this lane from growing a second workload
 /// generator (an ADR-0927 rejected alternative).
@@ -1491,7 +1903,7 @@ pub struct GeneratedStream<'a> {
     steps: u64,
     tally: crate::metrics_gen::GenerationTally,
     step_bytes: Vec<u8>,
-    pending: std::collections::VecDeque<LogicalSample>,
+    pending: std::collections::VecDeque<LogicalPoint>,
     counts: StreamCounts,
 }
 
@@ -1530,8 +1942,14 @@ impl<'a> GeneratedStream<'a> {
                 },
             };
             self.counts.record(&record);
-            if let StreamRecord::Scalar(sample) = record {
-                self.pending.push_back(sample);
+            match record {
+                StreamRecord::Scalar(sample) | StreamRecord::StaleMarker(sample) => {
+                    self.pending.push_back(LogicalPoint::Sample(sample));
+                }
+                StreamRecord::NativeHistogram(histogram) => {
+                    self.pending.push_back(LogicalPoint::Histogram(histogram));
+                }
+                StreamRecord::Malformed { .. } => {}
             }
         }
         Ok(true)
@@ -1558,7 +1976,7 @@ impl<'a> GeneratedStream<'a> {
 }
 
 impl SampleBatches for GeneratedStream<'_> {
-    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalSample>>, LaneError> {
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalPoint>>, LaneError> {
         let max = max.max(1);
         while self.pending.len() < max {
             if !self.advance_step()? {
@@ -1651,14 +2069,12 @@ fn fill_valid<S, T, F>(
     source: &mut S,
     batch_size: usize,
     pending: &mut Vec<T>,
-    offered: &mut u64,
-    offered_digest: &mut OfferedDigest,
-    rejected: &mut u64,
+    offer: &mut OfferTally,
     mut on_valid: F,
 ) -> Result<(), LaneError>
 where
     S: SampleBatches + ?Sized,
-    F: FnMut(LogicalSample) -> Result<T, LaneError>,
+    F: FnMut(LogicalPoint) -> Result<T, LaneError>,
 {
     while pending.len() < batch_size {
         let Some(batch) = source.next_batch(batch_size - pending.len())? else {
@@ -1667,16 +2083,42 @@ where
         if batch.is_empty() {
             break;
         }
-        for sample in batch {
-            *offered += 1;
-            offered_digest.update(&sample);
-            match sample.validate() {
-                Ok(()) => pending.push(on_valid(sample)?),
-                Err(_) => *rejected += 1,
+        for point in batch {
+            let is_histogram = matches!(point, LogicalPoint::Histogram(_));
+            if is_histogram {
+                offer.histograms += 1;
+            } else {
+                offer.samples += 1;
+            }
+            offer.digest.update_point(&point);
+            match point.validate() {
+                Ok(()) => pending.push(on_valid(point)?),
+                Err(_) if is_histogram => offer.rejected_histograms += 1,
+                Err(_) => offer.rejected_samples += 1,
             }
         }
     }
     Ok(())
+}
+
+/// What a replay offered, per class, and the digest over it.
+#[derive(Default)]
+struct OfferTally {
+    samples: u64,
+    histograms: u64,
+    rejected_samples: u64,
+    rejected_histograms: u64,
+    digest: OfferedDigest,
+}
+
+/// `(samples, histograms)` in a batch: the two classes are counted apart.
+fn class_counts<'p>(points: impl IntoIterator<Item = &'p LogicalPoint>) -> (u64, u64) {
+    points
+        .into_iter()
+        .fold((0, 0), |(samples, histograms), point| match point {
+            LogicalPoint::Sample(_) => (samples + 1, histograms),
+            LogicalPoint::Histogram(_) => (samples, histograms + 1),
+        })
 }
 
 /// Replay `source` into the in-process Ravel path, pulling one batch at a
@@ -1717,10 +2159,8 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     let cpu_before = process_cpu_secs();
     let mut timed = Duration::ZERO;
 
-    let mut pending: Vec<(IngestPoint, LogicalSample)> = Vec::with_capacity(batch_size);
-    let mut offered_samples: u64 = 0;
-    let mut offered_digest = OfferedDigest::new();
-    let mut rejected_samples: u64 = 0;
+    let mut pending: Vec<(IngestPoint, LogicalPoint)> = Vec::with_capacity(batch_size);
+    let mut offer = OfferTally::default();
     let mut max_ts_ms: Option<i64> = None;
     let mut first_metric: Option<String> = None;
     let mut wire_bytes: u64 = 0;
@@ -1728,38 +2168,33 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     let mut tokens: Vec<CommitToken> = Vec::new();
     let mut accepted_samples: u64 = 0;
     let mut dropped_samples: u64 = 0;
+    let mut accepted_histograms: u64 = 0;
+    let mut dropped_histograms: u64 = 0;
     let mut dropped_batches: u64 = 0;
     let mut batches: u64 = 0;
 
     loop {
-        // Client-side admission: valid points (carrying their logical sample
+        // Client-side admission: valid points (carrying their logical point
         // for the wire encoding) and exact rejections.
-        fill_valid(
-            source,
-            batch_size,
-            &mut pending,
-            &mut offered_samples,
-            &mut offered_digest,
-            &mut rejected_samples,
-            |sample| {
-                let point = ingest_point(&config.tenant, &sample)?;
-                max_ts_ms = Some(max_ts_ms.map_or(sample.ts_ms, |m| m.max(sample.ts_ms)));
-                first_metric.get_or_insert_with(|| sample.metric.clone());
-                Ok((point, sample))
-            },
-        )?;
+        fill_valid(source, batch_size, &mut pending, &mut offer, |logical| {
+            let point = ingest_point(&config.tenant, &logical)?;
+            let ts_ms = logical.ts_ms();
+            max_ts_ms = Some(max_ts_ms.map_or(ts_ms, |m| m.max(ts_ms)));
+            first_metric.get_or_insert_with(|| logical.metric().to_string());
+            Ok((point, logical))
+        })?;
         if pending.is_empty() {
             break;
         }
-        let (points, logical): (Vec<IngestPoint>, Vec<LogicalSample>) = pending.drain(..).unzip();
+        let (points, logical): (Vec<IngestPoint>, Vec<LogicalPoint>) = pending.drain(..).unzip();
         // The RW1.0 wire size is encoded OUTSIDE the timed segment (issue #937
         // review finding 5): the in-process path never serializes an RW1.0
         // body to ingest, while the HTTP comparators' encode IS client work
         // inside their own segments.
-        wire_bytes += encode_rw1_body(&logical)?.len() as u64;
+        wire_bytes += encode_rw1_points(&logical)?.len() as u64;
+        let (batch_samples, batch_histograms) = class_counts(&logical);
         drop(logical);
         batches += 1;
-        let batch_len = points.len() as u64;
 
         let start = std::time::Instant::now();
         let result = router
@@ -1775,16 +2210,18 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         match result {
             Ok(receipt) => {
                 ack_latencies_ns.push(took.as_nanos() as u64);
-                accepted_samples += batch_len;
+                accepted_samples += batch_samples;
+                accepted_histograms += batch_histograms;
                 tokens.extend(receipt.tokens);
             }
             Err(_) => {
                 // The strict write did not durably ack: the batch is dropped,
-                // its samples neither accepted nor rejected, so the accounting
+                // its points neither accepted nor rejected, so the accounting
                 // still closes. In process this is rare (a dead shard); over
                 // HTTP it is the exhausted-retry case.
                 dropped_batches += 1;
-                dropped_samples += batch_len;
+                dropped_samples += batch_samples;
+                dropped_histograms += batch_histograms;
             }
         }
     }
@@ -1817,15 +2254,21 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     let stream_counts = source.stream_counts();
     let ingest = IngestPhase {
         stream_counts,
-        excluded_native_histogram: stream_counts.native_histogram,
-        excluded_stale_marker: stream_counts.stale_marker,
-        offered_samples,
-        offered_digest: offered_digest.finish(),
+        excluded_native_histogram: 0,
+        excluded_stale_marker: 0,
+        offered_samples: offer.samples,
+        offered_digest: offer.digest.finish(),
         accepted_samples,
-        rejected_samples,
+        rejected_samples: offer.rejected_samples,
+        offered_histograms: offer.histograms,
+        accepted_histograms,
+        rejected_histograms: offer.rejected_histograms,
+        dropped_histograms,
+        // No HTTP status and no retry loop on the in-process path.
+        histograms_rejected_by_status: BTreeMap::new(),
+        retry_exhausted_histograms: 0,
         dropped_samples,
         dropped_batches,
-        // No HTTP status and no retry loop on the in-process path.
         rejected_by_status: BTreeMap::new(),
         retry_exhausted_samples: 0,
         batches,
@@ -1937,14 +2380,22 @@ pub async fn query_after_replay(
     })
 }
 
-/// Inputs for a comparator replay over portable Remote Write 1.0. The endpoint
-/// comes from config: there is no hardcoded host.
+/// Inputs for a replay over portable Remote Write 1.0. The endpoint comes
+/// from config: there is no hardcoded host.
 pub struct HttpReplayConfig {
-    /// The system name for the row: `prometheus`, `victoriametrics`, `osn`.
+    /// The system name for the row: `ravel`, `prometheus`, `victoriametrics`,
+    /// `mimir`.
     pub system: String,
     /// The full `/api/v1/write` URL supplied by the caller.
     pub endpoint: String,
-    /// Logical samples per RW1.0 request.
+    /// What a 2xx from this receiver means. [`AckSemantics::DurableOnAck`]
+    /// for `ravel-server`, whose row then records `last_commit_token`.
+    pub ack_semantics: AckSemantics,
+    /// Sent as `Authorization: Bearer <token>` when set. Never written into
+    /// the row: neither `endpoint` nor `client_behavior` carries it
+    /// (`tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_last_commit_token`).
+    pub bearer_token: Option<String>,
+    /// Logical points (samples and native histograms) per RW1.0 request.
     pub batch_size: usize,
     /// Retries on a retryable response (429 or 5xx) before the batch is
     /// dropped.
@@ -1960,18 +2411,26 @@ pub struct HttpReplayConfig {
 /// same choice `remote_write.rs` makes with its fixed `RETRY_AFTER_SECONDS`.
 const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
-/// Replay `source` into a comparator over Remote Write 1.0, pulling one batch
-/// at a time as [`replay_into_ravel`] does. Valid samples are batched in
+/// The response header `ravel-server` puts the strict write's commit tokens
+/// in (`services/ravel-server/src/remote_write.rs`).
+pub const COMMIT_TOKEN_HEADER: &str = "x-ravel-commit-token";
+
+/// Replay `source` into a receiver over Remote Write 1.0, pulling one batch
+/// at a time as [`replay_into_ravel`] does. Valid points are batched in
 /// stream order, encoded as snappy protobuf, and POSTed to the configured
-/// endpoint; each batch is retried on a 429/5xx or a transport error up to
-/// `max_retries`, then dropped under `retry_exhausted_samples`, and a batch
-/// answered with any other non-2xx is dropped at once under
-/// `rejected_by_status`, keyed by that status. Every
-/// row this produces is [`AckSemantics::Buffered`]: a Remote Write 2xx from a
-/// comparator means accepted-into-a-buffer, a durability the client cannot
-/// observe, so it is never placed in a pooled column with Ravel's durable ack.
+/// endpoint (with `Authorization: Bearer` when `bearer_token` is set); each
+/// batch is retried on a 429/5xx or a transport error up to `max_retries`,
+/// then dropped under `retry_exhausted_samples` and
+/// `retry_exhausted_histograms`, and a batch answered with any other non-2xx
+/// is dropped at once under `rejected_by_status` and
+/// `histograms_rejected_by_status`, keyed by that status. A comparator row is
+/// [`AckSemantics::Buffered`]: a Remote Write 2xx from a comparator means
+/// accepted-into-a-buffer, a durability the client cannot observe, so it is
+/// never placed in a pooled column with Ravel's durable ack. A
+/// [`AckSemantics::DurableOnAck`] config (the portable Ravel row) records the
+/// `x-ravel-commit-token` of the last acknowledged request that carried one.
 ///
-/// The comparator's object store is not the bench's, so this row carries no
+/// The receiver's object store is not the bench's, so this row carries no
 /// [`StorageAccounting`], and its CPU/RSS are the remote process's, so they are
 /// `None`: absent, never a zero.
 pub async fn replay_over_http<S: SampleBatches + ?Sized>(
@@ -1983,56 +2442,58 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         .build()
         .map_err(|e| transport_setup_error(format!("building the HTTP client failed: {e}")))?;
 
-    let mut pending: Vec<LogicalSample> = Vec::new();
-    let mut offered_samples: u64 = 0;
-    let mut offered_digest = OfferedDigest::new();
-    let mut rejected_samples: u64 = 0;
+    let mut pending: Vec<LogicalPoint> = Vec::new();
+    let mut offer = OfferTally::default();
     let mut timed = Duration::ZERO;
 
     let batch_size = config.batch_size.max(1);
     let mut ack_latencies_ns: Vec<u64> = Vec::new();
     let mut accepted_samples: u64 = 0;
     let mut dropped_samples: u64 = 0;
+    let mut accepted_histograms: u64 = 0;
+    let mut dropped_histograms: u64 = 0;
     let mut dropped_batches: u64 = 0;
     let mut batches: u64 = 0;
     let mut retries: u64 = 0;
     let mut wire_bytes: u64 = 0;
     let mut rejected_by_status: BTreeMap<u16, u64> = BTreeMap::new();
+    let mut histograms_rejected_by_status: BTreeMap<u16, u64> = BTreeMap::new();
     let mut retry_exhausted_samples: u64 = 0;
+    let mut retry_exhausted_histograms: u64 = 0;
+    let mut last_commit_token: Option<String> = None;
 
     loop {
-        fill_valid(
-            source,
-            batch_size,
-            &mut pending,
-            &mut offered_samples,
-            &mut offered_digest,
-            &mut rejected_samples,
-            Ok,
-        )?;
+        fill_valid(source, batch_size, &mut pending, &mut offer, Ok)?;
         if pending.is_empty() {
             break;
         }
         let chunk = std::mem::take(&mut pending);
         let segment_start = std::time::Instant::now();
         batches += 1;
-        let body = encode_rw1_body(&chunk)?;
+        let body = encode_rw1_points(&chunk)?;
         wire_bytes += body.len() as u64;
-        let batch_len = chunk.len() as u64;
+        let (batch_samples, batch_histograms) = class_counts(&chunk);
 
         let start = std::time::Instant::now();
         let mut attempt = 0u32;
         let outcome = loop {
-            let sent = client
+            let mut request = client
                 .post(&config.endpoint)
                 .header("Content-Type", "application/x-protobuf")
                 .header("Content-Encoding", "snappy")
-                .header("X-Prometheus-Remote-Write-Version", "0.1.0")
-                .body(body.clone())
-                .send()
-                .await;
+                .header("X-Prometheus-Remote-Write-Version", "0.1.0");
+            if let Some(token) = &config.bearer_token {
+                request = request.bearer_auth(token);
+            }
+            let sent = request.body(body.clone()).send().await;
             match sent {
-                Ok(resp) if resp.status().is_success() => break Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    break Ok(resp
+                        .headers()
+                        .get(COMMIT_TOKEN_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string));
+                }
                 Ok(resp) if is_retryable(resp.status()) && attempt < config.max_retries => {
                     attempt += 1;
                     retries += 1;
@@ -2051,18 +2512,32 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
             }
         };
         match outcome {
-            Ok(()) => {
+            Ok(token) => {
                 ack_latencies_ns.push(start.elapsed().as_nanos() as u64);
-                accepted_samples += batch_len;
+                accepted_samples += batch_samples;
+                accepted_histograms += batch_histograms;
+                if token.is_some() {
+                    last_commit_token = token;
+                }
             }
             Err(failure) => {
                 dropped_batches += 1;
-                dropped_samples += batch_len;
+                dropped_samples += batch_samples;
+                dropped_histograms += batch_histograms;
                 match failure {
                     BatchFailure::Status(code) => {
-                        *rejected_by_status.entry(code).or_insert(0) += batch_len;
+                        if batch_samples > 0 {
+                            *rejected_by_status.entry(code).or_insert(0) += batch_samples;
+                        }
+                        if batch_histograms > 0 {
+                            *histograms_rejected_by_status.entry(code).or_insert(0) +=
+                                batch_histograms;
+                        }
                     }
-                    BatchFailure::RetriesExhausted => retry_exhausted_samples += batch_len,
+                    BatchFailure::RetriesExhausted => {
+                        retry_exhausted_samples += batch_samples;
+                        retry_exhausted_histograms += batch_histograms;
+                    }
                 }
             }
         }
@@ -2073,12 +2548,18 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
     let stream_counts = source.stream_counts();
     let ingest = IngestPhase {
         stream_counts,
-        excluded_native_histogram: stream_counts.native_histogram,
-        excluded_stale_marker: stream_counts.stale_marker,
-        offered_samples,
-        offered_digest: offered_digest.finish(),
+        excluded_native_histogram: 0,
+        excluded_stale_marker: 0,
+        offered_samples: offer.samples,
+        offered_digest: offer.digest.finish(),
         accepted_samples,
-        rejected_samples,
+        rejected_samples: offer.rejected_samples,
+        offered_histograms: offer.histograms,
+        accepted_histograms,
+        rejected_histograms: offer.rejected_histograms,
+        dropped_histograms,
+        histograms_rejected_by_status,
+        retry_exhausted_histograms,
         dropped_samples,
         dropped_batches,
         rejected_by_status,
@@ -2091,27 +2572,42 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
         ack_latency_ms: LatencyReport::from_nanos(ack_latencies_ns),
-        // The comparator runs in another process: its CPU and RSS are not the
+        // The receiver runs in another process: its CPU and RSS are not the
         // bench's to report. Absent, never a zero.
         peak_rss_bytes: None,
         cpu_secs: None,
     };
     let client_behavior = format!(
-        "reqwest RW1.0 sender: snappy protobuf, {batch} logical samples/request sent sequentially \
-         (backpressure by awaiting each POST), retry on 429/5xx up to {retries} times with a fixed \
-         {backoff_ms} ms backoff then drop the batch; {timeout} s per-request timeout bounds the \
-         complete operation including the body read",
+        "reqwest RW1.0 sender: snappy protobuf, {batch} logical points (samples and native \
+         histograms)/request sent sequentially (backpressure by awaiting each POST), {auth}, \
+         retry on 429/5xx up to {retries} times with a fixed {backoff_ms} ms backoff then drop the \
+         batch; {timeout} s per-request timeout bounds the complete operation including the body \
+         read",
         batch = batch_size,
+        auth = if config.bearer_token.is_some() {
+            "bearer auth"
+        } else {
+            "no auth header"
+        },
         retries = config.max_retries,
         backoff_ms = HTTP_RETRY_BACKOFF.as_millis(),
         timeout = config.timeout_secs.max(1),
     );
-    Ok(SystemIngestResult::buffered_http_row(
-        config.system.clone(),
-        config.endpoint.clone(),
-        client_behavior,
-        ingest,
-    ))
+    Ok(match config.ack_semantics {
+        AckSemantics::DurableOnAck => SystemIngestResult::durable_http_row(
+            config.system.clone(),
+            config.endpoint.clone(),
+            client_behavior,
+            ingest,
+            last_commit_token,
+        ),
+        AckSemantics::Buffered => SystemIngestResult::buffered_http_row(
+            config.system.clone(),
+            config.endpoint.clone(),
+            client_behavior,
+            ingest,
+        ),
+    })
 }
 
 /// Why a comparator batch was dropped.
