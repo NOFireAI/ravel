@@ -13063,7 +13063,7 @@ mod tail_section_placement_tests {
     ///
     /// Prove-the-test: `FilterSections::for_query` returning
     /// `FilterSections::ALL` for a non-empty `content` (the placement before
-    /// #3295 item 7) fails the BLOOM-intersection assertion.
+    /// #3295 item 7) fails the intersection assertions on the POSTINGS GET.
     #[tokio::test]
     async fn a_contains_ranged_scan_fetches_neither_filter_section() {
         let obj = object();
@@ -14248,6 +14248,13 @@ mod read_gate_tests {
             .survivor_block_indices()
     }
 
+    /// [`keyed_fixture`] with a 64-byte footer probe, so no filter section
+    /// is resident from the probe and each is placed only if fetched.
+    async fn small_probe_keyed_fixture() -> (LogSegmentFetcher, SegmentRef) {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        (fetcher.with_suffix_len(64), seg_ref)
+    }
+
     /// A `HasWord` content arm is decided with BLOOM, so the keyed plan
     /// places it and prunes to the reader's survivors over the whole object:
     /// block 2 alone.
@@ -14256,7 +14263,7 @@ mod read_gate_tests {
     /// `expect("keyed plan")` with an Unplaced read over BLOOM.
     #[tokio::test]
     async fn the_keyed_plan_places_bloom_for_a_has_word_arm() {
-        let (fetcher, seg_ref) = keyed_fixture().await;
+        let (fetcher, seg_ref) = small_probe_keyed_fixture().await;
         let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_content(
             Predicate::HasWord {
                 field: FieldSel::Body,
@@ -14282,7 +14289,7 @@ mod read_gate_tests {
     /// fails `expect("keyed plan")` with an Unplaced read over BLOOM.
     #[tokio::test]
     async fn the_keyed_plan_of_a_contains_arm_reads_no_filter_section() {
-        let (fetcher, seg_ref) = keyed_fixture().await;
+        let (fetcher, seg_ref) = small_probe_keyed_fixture().await;
         let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_content(
             Predicate::Contains {
                 key: "request.id".to_string(),
