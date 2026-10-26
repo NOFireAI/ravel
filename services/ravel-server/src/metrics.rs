@@ -13081,7 +13081,9 @@ mod tests {
         assert_eq!(
             samples_of(&lines, "ravel_catalog_decoded_cache_reserved_bytes"),
             vec![
-                format!("ravel_catalog_decoded_cache_reserved_bytes{{mode=\"query\",cache=\"part\"}} {c_len}"),
+                format!(
+                    "ravel_catalog_decoded_cache_reserved_bytes{{mode=\"query\",cache=\"part\"}} {c_len}"
+                ),
                 "ravel_catalog_decoded_cache_reserved_bytes{mode=\"query\",cache=\"postings\"} 0"
                     .to_string(),
             ]
