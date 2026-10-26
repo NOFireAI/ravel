@@ -886,9 +886,13 @@ async fn partitioned_join_with_one_grouped_input_keeps_both_inputs_co_partitione
     assert_eq!(rows, 4 + 3 + 2 + 1);
 }
 
-/// (d): a join filter reading the key keeps the join from carrying, and both
-/// restores land under operators between the join and its inputs' exchanges
-/// (a filter on one side, a filter and a sort on the other). Each input is
+/// (d): the join keeps a filter reading the key, but the planner also puts a
+/// filter on each input below the join, so both restores land under operators
+/// between the join and its inputs' exchanges (a filter on one side, a filter
+/// and a sort on the other) and no input reaches the join carrying views. This
+/// shape does not exercise the join-filter condition of `join_carries`;
+/// `partitioned_join_filter_on_a_carried_key_restores_below_the_join` in
+/// `src/group_keys.rs` does, over a hand-built join. Each input is
 /// hash-partitioned again on the restored dictionary, and the sorted probe
 /// input keeps its order, which the join reports as its own.
 #[tokio::test]
