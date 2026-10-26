@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Cases for capture-effective-config.sh, run against stub HTTP servers that
+# serve canned engine responses, and a stub docker binary.
+#
+#   a  all three comparators answer      -> exit 0, every version and the
+#                                           Mimir engine fields present
+#   b  Mimir down                        -> exit 1, document still written,
+#                                           mimir.version unavailable, the
+#                                           other two complete
+#   c  usage error                       -> exit 64
+#   d  docker reachable (stub)           -> image digest and platform recorded
+#   e  Mimir 3.x with no docker          -> engine default "mimir", image is
+#                                           the docker-not-reachable string
+#
+# Every field is asserted by parsing the JSON with python3 -I, not by grep.
+#
+# Run: bash deploy/metricsbench/tests/capture-effective-config.test.sh
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="${HERE}/../capture-effective-config.sh"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/capture-config-test.XXXXXX")"
+server_pids=()
+cleanup() {
+  for pid in "${server_pids[@]}"; do
+    kill "${pid}" 2>/dev/null
+  done
+  rm -rf "${TMP}"
+}
+trap cleanup EXIT
+
+fails=0
+passes=0
+
+pass() {
+  passes=$((passes + 1))
+  echo "PASS: $1"
+}
+fail() {
+  fails=$((fails + 1))
+  echo "FAIL: $1"
+}
+
+# stub_server <docroot>: serve <docroot> on a free loopback port and set
+# stub_url to its base URL. Not called in a command substitution: the server
+# would hold the substitution's pipe open, and its pid would be lost. The server writes its port to a file once bound, so no fixed port
+# can collide with a running comparator.
+cat >"${TMP}/stub_server.py" <<'PY'
+import functools, http.server, sys
+root, port_file = sys.argv[1], sys.argv[2]
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=root)
+handler.func.log_message = lambda *a, **k: None
+srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+with open(port_file + ".tmp", "w") as f:
+    f.write(str(srv.server_address[1]))
+import os
+os.replace(port_file + ".tmp", port_file)
+srv.serve_forever()
+PY
+
+stub_server() {
+  local root="$1" port_file="$1.port" _
+  python3 -I "${TMP}/stub_server.py" "${root}" "${port_file}" >/dev/null 2>&1 &
+  server_pids+=("$!")
+  for _ in $(seq 1 100); do
+    [[ -s "${port_file}" ]] && break
+    sleep 0.05
+  done
+  stub_url="http://127.0.0.1:$(cat "${port_file}")"
+}
+
+# A loopback port with nothing listening: bind, read the port, release.
+dead_url() {
+  echo "http://127.0.0.1:$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+}
+
+write() {
+  mkdir -p "$(dirname "$1")"
+  printf '%s' "$2" >"$1"
+}
+
+# --- canned responses -------------------------------------------------------
+prom="${TMP}/prom"
+write "${prom}/api/v1/status/buildinfo" '{"status":"success","data":{"version":"3.13.1","revision":"promrev123","branch":"HEAD","goVersion":"go1.25.1"}}'
+write "${prom}/api/v1/status/flags" '{"status":"success","data":{"web.enable-remote-write-receiver":"true","storage.tsdb.retention.time":"45d"}}'
+
+vm="${TMP}/vm"
+write "${vm}/metrics" '# HELP x
+vm_cache_size_bytes 12
+vm_app_version{version="victoria-metrics-20250331-131035-tags-v1.115.0-0-gabcdef1", short_version="v1.115.0"} 1
+'
+write "${vm}/flags" '-dedup.minScrapeInterval="0s"
+-retentionPeriod="45d"
+-storageDataPath="/victoria-metrics-data"
+'
+# What VictoriaMetrics really answers here; the script must not use it.
+write "${vm}/api/v1/status/buildinfo" '{"status":"success","data":{"version":"2.24.0"}}'
+
+mimir_config() {
+  printf '%s' "target: all
+querier:
+  max_concurrent: 20
+  query_engine: $1
+  enable_query_engine_fallback: true
+query_frontend:
+  query_engine: other
+"
+}
+
+mimir2="${TMP}/mimir2"
+write "${mimir2}/prometheus/api/v1/status/buildinfo" '{"status":"success","data":{"application":"Grafana Mimir","version":"2.14.2","revision":"mimirrev214","branch":"release-2.14","goVersion":"go1.22.7","features":{}}}'
+write "${mimir2}/config" "$(mimir_config prometheus)"
+
+mimir3="${TMP}/mimir3"
+write "${mimir3}/prometheus/api/v1/status/buildinfo" '{"status":"success","data":{"application":"Grafana Mimir","version":"3.2.0","revision":"mimirrev320","branch":"release-3.2","goVersion":"go1.25.1","features":{}}}'
+write "${mimir3}/config" "$(mimir_config mimir)"
+
+stub_server "${prom}"
+prom_url="${stub_url}"
+stub_server "${vm}"
+vm_url="${stub_url}"
+stub_server "${mimir2}"
+mimir2_url="${stub_url}"
+stub_server "${mimir3}"
+mimir3_url="${stub_url}"
+
+# Docker stubs: one unreachable, one answering for the compose services.
+mkdir -p "${TMP}/bin"
+write "${TMP}/bin/docker-down" '#!/usr/bin/env bash
+echo "Cannot connect to the Docker daemon" >&2
+exit 1
+'
+# shellcheck disable=SC2016 # the stub body expands when the stub runs
+write "${TMP}/bin/docker-up" '#!/usr/bin/env bash
+case "$1 $2" in
+  "info --format") echo 27.0.0 ;;
+  "compose -f")
+    echo "{\"ID\":\"c-prom\",\"Service\":\"prometheus\"}"
+    echo "{\"ID\":\"c-vm\",\"Service\":\"victoriametrics\"}"
+    echo "{\"ID\":\"c-mimir\",\"Service\":\"mimir\"}" ;;
+  "inspect c-mimir")
+    echo "[{\"Image\":\"sha256:img-mimir\",\"Config\":{\"Image\":\"grafana/mimir:2.14.2@sha256:2d39\"}}]" ;;
+  "inspect "*)
+    echo "[{\"Image\":\"sha256:img-$2\",\"Config\":{\"Image\":\"ref-$2\"}}]" ;;
+  "image inspect")
+    echo "[{\"RepoDigests\":[\"repo@sha256:digest-$3\"],\"Architecture\":\"arm64\",\"Os\":\"linux\"}]" ;;
+  *) exit 1 ;;
+esac
+'
+chmod +x "${TMP}/bin/docker-down" "${TMP}/bin/docker-up"
+
+# check <case> <json-file>: each line of stdin is
+# "<python expression over d> == <python literal>"; reports every mismatch.
+check() {
+  local name="$1" file="$2" rc=0
+  cat >"${TMP}/expect.txt"
+  python3 -I - "${file}" "${TMP}/expect.txt" <<'PY' || rc=$?
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+bad = 0
+for line in open(sys.argv[2]).read().splitlines():
+    if not line.strip():
+        continue
+    expr, want = line.split(" == ", 1)
+    try:
+        got = eval(expr, {"d": d, "re": re})
+    except Exception as e:
+        got = f"<{type(e).__name__}: {e}>"
+    if got != eval(want):
+        print(f"  {expr}: got {got!r}, want {want}")
+        bad = 1
+sys.exit(bad)
+PY
+  if [[ ${rc} -eq 0 ]]; then pass "${name}"; else fail "${name}"; fi
+}
+
+expect_exit() {
+  local name="$1" want="$2" got="$3"
+  if [[ "${got}" == "${want}" ]]; then
+    pass "${name}: exit ${got}"
+  else
+    fail "${name}: exit ${got}, want ${want}"
+  fi
+}
+
+# --- a: every comparator answers ---------------------------------------------
+out_a="${TMP}/a.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_a}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  2>"${TMP}/a.err" || code=$?
+expect_exit "a all answer" 0 "${code}"
+check "a fields" "${out_a}" <<EOF
+d["comparators"]["prometheus"]["version"] == "3.13.1"
+d["comparators"]["prometheus"]["revision"] == "promrev123"
+d["comparators"]["prometheus"]["runtime_flags"]["storage.tsdb.retention.time"] == "45d"
+d["comparators"]["victoriametrics"]["version"] == "v1.115.0"
+d["comparators"]["victoriametrics"]["revision"] == "victoria-metrics-20250331-131035-tags-v1.115.0-0-gabcdef1"
+d["comparators"]["victoriametrics"]["runtime_flags"]["retentionPeriod"] == "45d"
+d["comparators"]["mimir"]["version"] == "2.14.2"
+d["comparators"]["mimir"]["revision"] == "mimirrev214"
+d["comparators"]["mimir"]["querier_query_engine"] == "prometheus"
+d["comparators"]["mimir"]["query_engine_default_for_version"] == "prometheus"
+d["comparators"]["mimir"]["runtime_flags"]["format"] == "yaml"
+("query_engine: prometheus" in d["comparators"]["mimir"]["runtime_flags"]["effective_config"]) == True
+d["comparators"]["mimir"]["image"] == "unavailable: docker not reachable"
+d["urls_queried"]["mimir"]["buildinfo"] == "${mimir2_url}/prometheus/api/v1/status/buildinfo"
+d["urls_queried"]["mimir"]["runtime_flags"] == "${mimir2_url}/config"
+d["urls_queried"]["victoriametrics"]["buildinfo"] == "${vm_url}/metrics"
+d["urls_queried"]["prometheus"]["runtime_flags"] == "${prom_url}/api/v1/status/flags"
+len(d["script_revision"]) == 40
+bool(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", d["captured_at"])) == True
+EOF
+
+# --- b: Mimir down ------------------------------------------------------------
+out_b="${TMP}/b.json"
+mimir_dead="$(dead_url)"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_b}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir_dead}" \
+  2>"${TMP}/b.err" || code=$?
+expect_exit "b mimir down" 1 "${code}"
+if [[ -s "${out_b}" ]]; then pass "b document written"; else fail "b document written"; fi
+check "b fields" "${out_b}" <<EOF
+sorted(d["comparators"]["mimir"]["version"]) == ["unavailable"]
+d["comparators"]["mimir"]["version"]["unavailable"].startswith("GET ${mimir_dead}/prometheus/api/v1/status/buildinfo: ") == True
+sorted(d["comparators"]["mimir"]["revision"]) == ["unavailable"]
+sorted(d["comparators"]["mimir"]["runtime_flags"]) == ["unavailable"]
+sorted(d["comparators"]["mimir"]["querier_query_engine"]) == ["unavailable"]
+d["comparators"]["mimir"]["query_engine_default_for_version"] == {"unavailable": "mimir version unavailable"}
+d["comparators"]["prometheus"]["version"] == "3.13.1"
+d["comparators"]["prometheus"]["revision"] == "promrev123"
+d["comparators"]["victoriametrics"]["version"] == "v1.115.0"
+d["comparators"]["victoriametrics"]["runtime_flags"]["storageDataPath"] == "/victoria-metrics-data"
+EOF
+
+# --- c: usage -----------------------------------------------------------------
+code=0
+"${SCRIPT}" --no-such-flag >/dev/null 2>&1 || code=$?
+expect_exit "c unknown flag" 64 "${code}"
+code=0
+"${SCRIPT}" --mimir >/dev/null 2>&1 || code=$?
+expect_exit "c flag without value" 64 "${code}"
+
+# --- d: docker reachable --------------------------------------------------------
+out_d="${TMP}/d.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-up" "${SCRIPT}" --out "${out_d}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  2>"${TMP}/d.err" || code=$?
+expect_exit "d docker up" 0 "${code}"
+check "d image fields" "${out_d}" <<EOF
+d["comparators"]["mimir"]["image"]["container"] == "c-mimir"
+d["comparators"]["mimir"]["image"]["image_id"] == "sha256:img-mimir"
+d["comparators"]["mimir"]["image"]["config_image"] == "grafana/mimir:2.14.2@sha256:2d39"
+d["comparators"]["mimir"]["image"]["repo_digests"] == ["repo@sha256:digest-sha256:img-mimir"]
+d["comparators"]["mimir"]["image"]["architecture"] == "arm64"
+d["comparators"]["mimir"]["image"]["os"] == "linux"
+d["comparators"]["prometheus"]["image"]["config_image"] == "ref-c-prom"
+EOF
+
+# --- e: Mimir 3.x ---------------------------------------------------------------
+out_e="${TMP}/e.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_e}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir3_url}" \
+  2>"${TMP}/e.err" || code=$?
+expect_exit "e mimir 3.x" 0 "${code}"
+check "e engine fields" "${out_e}" <<EOF
+d["comparators"]["mimir"]["version"] == "3.2.0"
+d["comparators"]["mimir"]["querier_query_engine"] == "mimir"
+d["comparators"]["mimir"]["query_engine_default_for_version"] == "mimir"
+d["comparators"]["victoriametrics"]["image"] == "unavailable: docker not reachable"
+EOF
+
+if [[ -n "${CAPTURE_TEST_KEEP_CASE_A:-}" ]]; then
+  cp "${out_a}" "${CAPTURE_TEST_KEEP_CASE_A}"
+fi
+
+echo
+echo "${passes} passed, ${fails} failed"
+[[ ${fails} -eq 0 ]]
