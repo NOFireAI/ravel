@@ -40,6 +40,7 @@ pub mod ingest_query_trial;
 pub mod logbody_report;
 #[cfg(feature = "sql-latency")]
 pub mod logs_scan_scaling;
+pub mod metrics_correctness;
 pub mod metrics_gen;
 pub mod metrics_ingest;
 pub mod metrics_workload;
