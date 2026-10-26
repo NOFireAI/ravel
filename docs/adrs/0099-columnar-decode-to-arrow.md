@@ -640,3 +640,34 @@ string bytes live in the aggregate's 2 MiB blocks. `CompactSlicesExec` (issue
 plan this rule produced and inserts the exec later, directly above the final
 aggregate, between that aggregate and the TopK, where it copies a batch whose charge is more than twice the bytes
 its rows reference before the TopK keeps it.
+
+## Amendment (2026-10-26, #3280): joins over carried group keys
+
+<!-- amendment-applies: none reason="adds the Partitioned hash join to the carried set the #3271 amendment describes and retires no earlier wording" -->
+
+`SqlExecutor` sessions set `repartition_joins` off
+(`crates/ravel-sql/src/session.rs`) and a client cannot turn it on, since
+`SET` is refused (`crates/ravel-sql/src/validate.rs`), so every hash join they
+plan is `CollectLeft`. The shape below is reachable only from a session that
+turns `repartition_joins` on.
+
+A hash join in `Partitioned` mode needs both inputs hash-partitioned on its
+keys, and a restore cast on a partitioning column leaves its input's
+partitioning unknown, so a restore directly under such a join made the plan
+fail DataFusion's executable-plan invariant (issue #3280). Such a join is in
+the carried set when, for every key that reads a carried column, both inputs
+carry the views and the key is the bare column on both sides, its join filter
+reads no carried column, and no node below it holds the dynamic filter it
+publishes: both inputs then hash views and the one restore runs above the join
+(`partitioned_join_of_two_grouped_inputs_restores_above_the_join`). Otherwise,
+including when only one input carries the views, the join does not carry: each
+carrying input is restored below it, above its final aggregate, and exchanged
+again on its original hash expressions, so both inputs hash the declared type
+(`partitioned_join_with_one_grouped_input_keeps_both_inputs_co_partitioned`).
+The join-filter and dynamic-filter conditions are pinned on a hand-built join
+whose inputs are both final aggregates carrying the views
+(`partitioned_join_filter_on_a_carried_key_restores_below_the_join` in
+`crates/ravel-sql/src/group_keys.rs`): without either filter the join carries,
+and with either one each input is restored below it. A `CollectLeft` hash
+join and the sort-merge, nested-loop and cross joins keep the restore under
+the join as before.
