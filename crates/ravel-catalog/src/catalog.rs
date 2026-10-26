@@ -31,7 +31,8 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::cache::{
-    CompactionRecordCache, DecodedCaches, HeadCache, PartCache, PostingsCache, RecordCache,
+    CachedCommit, CompactionRecordCache, DecodedCaches, HeadCache, L0Derived, PartCache,
+    PostingsCache, RecordCache,
 };
 use crate::column_stats_resolve::{
     self, ColumnStatsRequest, LoadColumnStatsError, LoadedColumnStats, PartColumnStats,
@@ -46,7 +47,41 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// One shard's listed commit-bucket entries, keyed by `(shard, ingest_hour)`,
 /// as produced by [`Catalog::list_shard_hours`] and merged in
 /// [`Catalog::list_window_bounded`].
-type ShardBuckets = HashMap<(u32, u32), Vec<ObjectMeta>>;
+type ShardBuckets = HashMap<(u32, u32), Vec<ListedKey>>;
+
+/// One listed commit-bucket key, carrying the shape its listing parse already
+/// established so no later pass of the same resolve parses it again, and, for
+/// an L0 key, the record cache hit
+/// [`Catalog::cached_commit_records`] found for it.
+struct ListedKey {
+    key: String,
+    kind: BucketKind,
+    cached: Option<CachedCommit>,
+}
+
+impl ListedKey {
+    fn new(key: String, entry: &BucketEntry) -> Self {
+        let kind = match entry {
+            BucketEntry::CommitRecord(_) => BucketKind::Commit,
+            BucketEntry::CompactionRecord(_) => BucketKind::Compaction,
+            BucketEntry::RewriteRecord(_) => BucketKind::Rewrite,
+            BucketEntry::Tombstone(_) => BucketKind::Tombstone,
+        };
+        ListedKey {
+            key,
+            kind,
+            cached: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BucketKind {
+    Commit,
+    Compaction,
+    Rewrite,
+    Tombstone,
+}
 /// Delay before the single retry on an exact `min_token` GET
 /// (docs/catalog-and-mvcc.md step 4: "GET it directly ... with one retry").
 /// `MemoryStore` is strongly consistent so tests never observe this delay;
@@ -428,6 +463,10 @@ pub struct Catalog {
     /// segment is still included for correctness (overlap harmlessness); the
     /// counter surfaces the anomaly to metrics.
     interlock_violations: AtomicU64,
+    /// Count of L0 `SegmentRef` derivations actually run (not served from a
+    /// cached record's stored derivation), for the tests that pin
+    /// memoisation.
+    l0_derivations: AtomicU64,
     /// Count of buckets observed holding two compaction records with
     /// different `input_set_hash` (docs/catalog-and-mvcc.md step 3, §3.6 row
     /// 11: a sealed bucket must yield exactly one input set). Both parts
@@ -793,6 +832,7 @@ impl Catalog {
             decoded: Arc::new(DecodedCaches::default()),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
+            l0_derivations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
             rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
@@ -1419,6 +1459,11 @@ impl Catalog {
     /// docs/catalog-and-mvcc.md step 3.
     pub fn interlock_violations(&self) -> u64 {
         self.interlock_violations.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn l0_derivations(&self) -> u64 {
+        self.l0_derivations.load(Ordering::Relaxed)
     }
 
     /// Number of buckets observed with two compaction records carrying
@@ -3220,16 +3265,13 @@ impl Catalog {
         // Resolve each surviving bucket through the shared per-bucket path,
         // concurrently. resolve_fanout's final deterministic sort makes the
         // result independent of merge order.
-        let coords: Vec<((u32, u32), Vec<ObjectMeta>)> = grouped.into_iter().collect();
-        let cached = self.cached_commit_records(tenant, signal, &coords, accounting)?;
-        let cached = &cached;
+        let mut coords: Vec<((u32, u32), Vec<ListedKey>)> = grouped.into_iter().collect();
+        self.cached_commit_records(tenant, signal, &mut coords, accounting)?;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
                 .map(|((shard, hour), objs)| async move {
-                    self.process_bucket(
-                        tenant, signal, shard, hour, objs, range, cached, accounting,
-                    )
-                    .await
+                    self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
+                        .await
                 })
                 .buffered(self.config.resolve_get_concurrency)
                 .collect()
@@ -3298,7 +3340,8 @@ impl Catalog {
                         actual: meta.key,
                     });
                 }
-                let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
+                let entry = keys::partition_bucket_entry(&meta.key)?;
+                let (bshard, bhour) = match &entry {
                     BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
                     BucketEntry::CompactionRecord(k) => (k.shard, k.ingest_hour_bucket),
                     BucketEntry::RewriteRecord(k) => (k.shard, k.ingest_hour_bucket),
@@ -3315,7 +3358,10 @@ impl Catalog {
                 if bhour < listing_start_hour {
                     return Ok(DrainStep::Continue);
                 }
-                grouped.entry((bshard, bhour)).or_default().push(meta);
+                grouped
+                    .entry((bshard, bhour))
+                    .or_default()
+                    .push(ListedKey::new(meta.key, &entry));
                 Ok(DrainStep::Continue)
             },
         )
@@ -3332,8 +3378,8 @@ impl Catalog {
     /// the set of keys in one bucket, so grouping a wider listing by bucket and
     /// running this per group yields the identical snapshot the per-bucket loop
     /// yields -- the property the differential test
-    /// pins. `cached` is the resolve's
-    /// [`cached_commit_records`](Self::cached_commit_records).
+    /// pins. An L0 key's `cached` hit is the one the resolve's
+    /// [`cached_commit_records`](Self::cached_commit_records) found.
     #[allow(clippy::too_many_arguments)]
     async fn process_bucket(
         &self,
@@ -3341,27 +3387,27 @@ impl Catalog {
         signal: Signal,
         shard: u32,
         hour: u32,
-        objects: Vec<ObjectMeta>,
+        objects: Vec<ListedKey>,
         range: TimeRange,
-        cached: &HashMap<String, Arc<CommitRecord>>,
         accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
 
         // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
-        // 2). An unrecognized shape is a fail-loud error, never a silent
-        // skip (fail-loud on layout drift).
-        let mut l0_keys: Vec<String> = Vec::new();
+        // 2), as the listing parse classified them. An unrecognized shape
+        // already failed that parse loudly, never a silent skip (fail-loud on
+        // layout drift).
+        let mut l0_keys: Vec<(String, Option<CachedCommit>)> = Vec::new();
         let mut compaction_keys: Vec<String> = Vec::new();
         let mut rewrite_keys: Vec<String> = Vec::new();
         let mut has_tombstone = false;
-        for meta in objects {
-            match keys::partition_bucket_entry(&meta.key)? {
-                BucketEntry::CommitRecord(_) => l0_keys.push(meta.key),
-                BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
-                BucketEntry::RewriteRecord(_) => rewrite_keys.push(meta.key),
-                BucketEntry::Tombstone(_) => has_tombstone = true,
+        for listed in objects {
+            match listed.kind {
+                BucketKind::Commit => l0_keys.push((listed.key, listed.cached)),
+                BucketKind::Compaction => compaction_keys.push(listed.key),
+                BucketKind::Rewrite => rewrite_keys.push(listed.key),
+                BucketKind::Tombstone => has_tombstone = true,
             }
         }
 
@@ -3382,7 +3428,7 @@ impl Catalog {
         // few per bucket and are re-read from their cache. A GET failure
         // surfaces here, before any include runs.
         let l0_records = self
-            .prewarm_commit_records(tenant, signal, shard, &l0_keys, cached, accounting)
+            .prewarm_commit_records(tenant, signal, shard, l0_keys, accounting)
             .await?;
         self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys, accounting)
             .await?;
@@ -3392,8 +3438,8 @@ impl Catalog {
         // compaction record does, so its presence alone (even with no
         // compaction record) rules out this fast path.
         if compaction_keys.is_empty() && rewrite_keys.is_empty() {
-            for (key, record) in l0_keys.iter().zip(&l0_records) {
-                Self::include_l0_if_overlaps(key, record, &range, &mut out)?;
+            for (key, entry) in &l0_records {
+                self.include_l0_if_overlaps(tenant, key, entry, &range, &mut out)?;
             }
             return Ok(out);
         }
@@ -3570,7 +3616,8 @@ impl Catalog {
         // any unlisted one normally, raising the interlock metric if it
         // postdates the newest compaction/rewrite record (docs/catalog-and-mvcc.md
         // step 3).
-        for (key, record) in l0_keys.iter().zip(&l0_records) {
+        for (key, entry) in &l0_records {
+            let record = &entry.record;
             let identity = (
                 record.writer_id.clone(),
                 record.writer_epoch,
@@ -3593,7 +3640,7 @@ impl Catalog {
                 end_ns: record.max_event_ts_ns,
             };
             if event_range.overlaps(&range) {
-                let segment_ref = build_segment_ref(key, record)?;
+                let segment_ref = self.l0_segment_ref(tenant, key, entry)?;
                 out.entry(segment_ref.data_object_key.clone())
                     .or_insert(segment_ref);
             }
@@ -3727,16 +3774,13 @@ impl Catalog {
         // concurrently under the resolve-wide semaphore. Bucket keys never
         // collide across buckets, and resolve_impl's final deterministic sort
         // makes the result independent of merge order.
-        let coords: Vec<((u32, u32), Vec<ObjectMeta>)> = grouped.into_iter().collect();
-        let cached = self.cached_commit_records(tenant, signal, &coords, accounting)?;
-        let cached = &cached;
+        let mut coords: Vec<((u32, u32), Vec<ListedKey>)> = grouped.into_iter().collect();
+        self.cached_commit_records(tenant, signal, &mut coords, accounting)?;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
                 .map(|((shard, hour), objs)| async move {
-                    self.process_bucket(
-                        tenant, signal, shard, hour, objs, range, cached, accounting,
-                    )
-                    .await
+                    self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
+                        .await
                 })
                 .buffered(self.config.resolve_get_concurrency)
                 .collect()
@@ -3817,7 +3861,8 @@ impl Catalog {
                         actual: meta.key,
                     });
                 }
-                let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
+                let entry = keys::partition_bucket_entry(&meta.key)?;
+                let (bshard, bhour) = match &entry {
                     BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
                     BucketEntry::CompactionRecord(k) => (k.shard, k.ingest_hour_bucket),
                     BucketEntry::RewriteRecord(k) => (k.shard, k.ingest_hour_bucket),
@@ -3826,7 +3871,10 @@ impl Catalog {
                 if bhour < listing_start_hour || bhour > window_end_hour {
                     return Ok(DrainStep::Continue);
                 }
-                grouped.entry((bshard, bhour)).or_default().push(meta);
+                grouped
+                    .entry((bshard, bhour))
+                    .or_default()
+                    .push(ListedKey::new(meta.key, &entry));
                 Ok(DrainStep::Continue)
             },
         )
@@ -3852,78 +3900,78 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         signal: Signal,
-        buckets: &[((u32, u32), Vec<ObjectMeta>)],
+        buckets: &mut [((u32, u32), Vec<ListedKey>)],
         accounting: &QueryAccounting,
-    ) -> Result<HashMap<String, Arc<CommitRecord>>, CatalogError> {
-        let mut cached: HashMap<String, Arc<CommitRecord>> = HashMap::new();
+    ) -> Result<(), CatalogError> {
         for ((shard, _hour), objects) in buckets {
             // A tombstoned bucket contributes nothing and drops its cached
             // records in `process_bucket`, so it is not looked up here.
-            let mut l0_keys: Vec<&str> = Vec::new();
-            let mut has_tombstone = false;
-            for meta in objects {
-                match keys::partition_bucket_entry(&meta.key)? {
-                    BucketEntry::CommitRecord(_) => l0_keys.push(&meta.key),
-                    BucketEntry::Tombstone(_) => has_tombstone = true,
-                    BucketEntry::CompactionRecord(_) | BucketEntry::RewriteRecord(_) => {}
-                }
-            }
-            if has_tombstone {
+            if objects
+                .iter()
+                .any(|listed| listed.kind == BucketKind::Tombstone)
+            {
                 continue;
             }
-            for key in l0_keys {
-                if let Some(record) = self.cache.get(tenant, key, accounting) {
-                    validate_expected_fields(self, &record, tenant, signal, *shard, key)?;
+            for listed in objects.iter_mut() {
+                if listed.kind != BucketKind::Commit {
+                    continue;
+                }
+                let key = listed.key.as_str();
+                if let Some(entry) = self.cache.get_cached(tenant, key, accounting) {
+                    validate_expected_fields(self, &entry.record, tenant, signal, *shard, key)?;
                     accounting.record_commit_record_cache_hit();
-                    cached.insert(key.to_string(), record);
+                    listed.cached = Some(entry);
                 }
             }
         }
-        Ok(cached)
+        Ok(())
     }
 
     /// Load every commit record in `keys`, returned in `keys` order, for the
-    /// include logic to read in place of the cache. A record in `cached` (the
-    /// resolve's [`cached_commit_records`](Self::cached_commit_records)) is
-    /// taken from there; the rest are fetched concurrently under the
-    /// resolve-wide semaphore. Each record therefore costs at most one GET per
-    /// resolve whatever the cache capacity. Returns the first load error.
+    /// include logic to read in place of the cache. A key that carries its
+    /// [`cached_commit_records`](Self::cached_commit_records) hit is taken
+    /// from there; the rest are fetched concurrently under the resolve-wide
+    /// semaphore. Each record therefore costs at most one GET per resolve
+    /// whatever the cache capacity. Returns the first load error.
     async fn prewarm_commit_records(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         shard: u32,
-        keys: &[String],
-        cached: &HashMap<String, Arc<CommitRecord>>,
+        keys: Vec<(String, Option<CachedCommit>)>,
         accounting: &QueryAccounting,
-    ) -> Result<Vec<Arc<CommitRecord>>, CatalogError> {
-        let mut loaded: Vec<(usize, Arc<CommitRecord>)> = Vec::with_capacity(keys.len());
+    ) -> Result<Vec<(String, CachedCommit)>, CatalogError> {
+        let mut loaded: Vec<(usize, String, CachedCommit)> = Vec::with_capacity(keys.len());
         let mut misses: Vec<(usize, String)> = Vec::new();
-        for (index, key) in keys.iter().enumerate() {
-            match cached.get(key) {
-                Some(record) => loaded.push((index, record.clone())),
-                None => misses.push((index, key.clone())),
+        for (index, (key, cached)) in keys.into_iter().enumerate() {
+            match cached {
+                Some(entry) => loaded.push((index, key, entry)),
+                None => misses.push((index, key)),
             }
         }
-        // Owned key clones, not borrowed slice items: a stream closure that
+        // Owned keys, not borrowed slice items: a stream closure that
         // borrows each `&String` makes rustc infer a non-higher-ranked
         // lifetime for the future, which then fails to unify with axum's
         // `Handler` blanket impl at the HTTP router (the same "FnOnce is not
         // general enough" wall the prefetch closure in `ravel-query` hit).
-        let fetches: Vec<Result<(usize, Arc<CommitRecord>), CatalogError>> = stream::iter(misses)
-            .map(|(index, key)| async move {
-                self.fetch_commit_record(tenant, signal, shard, &key, accounting)
-                    .await
-                    .map(|record| (index, record))
-            })
-            .buffer_unordered(self.config.resolve_get_concurrency)
-            .collect()
-            .await;
+        let fetches: Vec<Result<(usize, String, CachedCommit), CatalogError>> =
+            stream::iter(misses)
+                .map(|(index, key)| async move {
+                    self.fetch_commit_record(tenant, signal, shard, &key, accounting)
+                        .await
+                        .map(|entry| (index, key, entry))
+                })
+                .buffer_unordered(self.config.resolve_get_concurrency)
+                .collect()
+                .await;
         for fetch in fetches {
             loaded.push(fetch?);
         }
-        loaded.sort_unstable_by_key(|(index, _)| *index);
-        Ok(loaded.into_iter().map(|(_, record)| record).collect())
+        loaded.sort_unstable_by_key(|(index, _, _)| *index);
+        Ok(loaded
+            .into_iter()
+            .map(|(_, key, entry)| (key, entry))
+            .collect())
     }
 
     /// Compaction-record counterpart to
@@ -3956,21 +4004,54 @@ impl Catalog {
     /// no-compaction fast path; `record` is the one
     /// [`prewarm_commit_records`](Self::prewarm_commit_records) loaded.
     fn include_l0_if_overlaps(
+        &self,
+        tenant: &TenantHash,
         key: &str,
-        record: &CommitRecord,
+        entry: &CachedCommit,
         range: &TimeRange,
         out: &mut HashMap<String, SegmentRef>,
     ) -> Result<(), CatalogError> {
         let event_range = TimeRange {
-            start_ns: record.min_event_ts_ns,
-            end_ns: record.max_event_ts_ns,
+            start_ns: entry.record.min_event_ts_ns,
+            end_ns: entry.record.max_event_ts_ns,
         };
         if event_range.overlaps(range) {
-            let segment_ref = build_segment_ref(key, record)?;
+            let segment_ref = self.l0_segment_ref(tenant, key, entry)?;
             out.entry(segment_ref.data_object_key.clone())
                 .or_insert(segment_ref);
         }
         Ok(())
+    }
+
+    /// The `SegmentRef` an L0 record resolves to, from its cached derivation
+    /// when one is stored, else derived now and stored for the next resolve.
+    /// The caller has validated the record's fields against the listing on
+    /// this resolve. A failed derivation is returned and never stored, so it
+    /// fails every resolve that reaches the record, not only the first.
+    fn l0_segment_ref(
+        &self,
+        tenant: &TenantHash,
+        key: &str,
+        entry: &CachedCommit,
+    ) -> Result<SegmentRef, CatalogError> {
+        if let Some(derived) = &entry.derived {
+            ravel_commit::declared_stats::observe_declared_stat_drops(
+                ravel_commit::declared_stats::StatCarrier::CommitRecord,
+                derived.dropped_stats,
+            );
+            return rederive_l0(key, &entry.record, derived);
+        }
+        let (segment_ref, derived) = derive_l0(key, &entry.record)?;
+        self.l0_derivations.fetch_add(1, Ordering::Relaxed);
+        self.cache.store_derivation(
+            tenant,
+            key,
+            &entry.record,
+            derived,
+            self.config.cache_capacity_per_tenant,
+            self.config.commit_cache_max_bytes_per_tenant(),
+        );
+        Ok(segment_ref)
     }
 
     /// Load, decode, validate, and cache a compaction record, keyed by full
@@ -4116,10 +4197,11 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
-        if let Some(cached) = self.cache.get(tenant, &key, accounting)
-            && validate_expected_fields(self, &cached, tenant, signal, token.shard, &key).is_ok()
+        if let Some(cached) = self.cache.get_cached(tenant, &key, accounting)
+            && validate_expected_fields(self, &cached.record, tenant, signal, token.shard, &key)
+                .is_ok()
         {
-            let segment_ref = build_segment_ref(&key, &cached)?;
+            let segment_ref = self.l0_segment_ref(tenant, &key, &cached)?;
             if !out.contains_key(&segment_ref.data_object_key) {
                 origin_by_key.insert(
                     segment_ref.data_object_key.clone(),
@@ -4158,7 +4240,11 @@ impl Catalog {
                         self.config.cache_capacity_per_tenant,
                         self.config.commit_cache_max_bytes_per_tenant(),
                     );
-                    let segment_ref = build_segment_ref(&key, &record)?;
+                    let entry = CachedCommit {
+                        record,
+                        derived: None,
+                    };
+                    let segment_ref = self.l0_segment_ref(tenant, &key, &entry)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
                         origin_by_key.insert(
                             segment_ref.data_object_key.clone(),
@@ -4403,10 +4489,12 @@ impl Catalog {
         }
         self.fetch_commit_record(tenant, signal, shard, key, accounting)
             .await
+            .map(|entry| entry.record)
     }
 
     /// GET, decode, and validate one commit record and admit it to the
-    /// record cache, without consulting the cache first.
+    /// record cache, without consulting the cache first. Returns the record
+    /// with the derivation slot its cache entry holds.
     async fn fetch_commit_record(
         &self,
         tenant: &TenantHash,
@@ -4414,7 +4502,7 @@ impl Catalog {
         shard: u32,
         key: &str,
         accounting: &QueryAccounting,
-    ) -> Result<Arc<CommitRecord>, CatalogError> {
+    ) -> Result<CachedCommit, CatalogError> {
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
         let record = record::decode(&got.data)?;
@@ -4428,7 +4516,10 @@ impl Catalog {
             self.config.cache_capacity_per_tenant,
             self.config.commit_cache_max_bytes_per_tenant(),
         );
-        Ok(record)
+        Ok(CachedCommit {
+            record,
+            derived: None,
+        })
     }
 }
 
@@ -5377,16 +5468,57 @@ fn reserve_decoded_evicting(
     crate::charged::reserve_decoded(budget, declared, ceiling)
 }
 
-fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, CatalogError> {
+/// Derive the `SegmentRef` an L0 commit record resolves to, together with what
+/// a later resolve needs to rebuild it without repeating the object-key check
+/// or the gated declared-stats read.
+fn derive_l0(key: &str, record: &CommitRecord) -> Result<(SegmentRef, L0Derived), CatalogError> {
     let data_object_key =
         keys::verify_object_key(record).map_err(|source| CatalogError::Reconstruction {
             key: key.to_string(),
             source,
         })?;
+    let identity = l0_identity(key, record)?;
+    // ADR-0873 decision 4: a listed or token-resolved L0 segment carries the
+    // stamps of the very record this resolve already read, which is what
+    // covers the live tail no fold-built object can reach. The gated read
+    // binds the row-count clauses against the record's sample_count.
+    let stamps = ravel_commit::declared_stats::read_commit_record(record);
+    let derived = L0Derived {
+        declared_column_stats: DeclaredColumnStats::from_validated(&stamps),
+        dropped_stats: stamps.dropped().len(),
+    };
+    let segment_ref = l0_ref(
+        record,
+        data_object_key,
+        identity,
+        derived.declared_column_stats.clone(),
+    );
+    Ok((segment_ref, derived))
+}
+
+/// Rebuild an L0 record's `SegmentRef` from its stored derivation: the
+/// derivation proved the record's `object_key` is its data key, and holds the
+/// stamps the gated read kept.
+fn rederive_l0(
+    key: &str,
+    record: &CommitRecord,
+    derived: &L0Derived,
+) -> Result<SegmentRef, CatalogError> {
+    let identity = l0_identity(key, record)?;
+    Ok(l0_ref(
+        record,
+        record.object_key.clone(),
+        identity,
+        derived.declared_column_stats.clone(),
+    ))
+}
+
+/// The record's content hash and writer id in their typed forms.
+fn l0_identity(key: &str, record: &CommitRecord) -> Result<([u8; 32], Uuid), CatalogError> {
     let content_hash: [u8; 32] =
         record
             .content_hash
-            .clone()
+            .as_slice()
             .try_into()
             .map_err(|_| CatalogError::FieldMismatch {
                 key: key.to_string(),
@@ -5401,7 +5533,16 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
             expected: "uuid".to_string(),
             actual: record.writer_id.clone(),
         })?;
-    Ok(SegmentRef {
+    Ok((content_hash, writer_id))
+}
+
+fn l0_ref(
+    record: &CommitRecord,
+    data_object_key: String,
+    (content_hash, writer_id): ([u8; 32], Uuid),
+    declared_column_stats: DeclaredColumnStats,
+) -> SegmentRef {
+    SegmentRef {
         data_object_key,
         object_size: record.object_size,
         min_event_ts_ns: record.min_event_ts_ns,
@@ -5417,14 +5558,8 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
         created_unix_ns: record.created_unix_ns,
         level: SegmentLevel::L0,
         segment_format_version: record.segment_format_version,
-        // ADR-0873 decision 4: a listed or token-resolved L0 segment carries
-        // the stamps of the very record this resolve already read, which is
-        // what covers the live tail no fold-built object can reach. The gated
-        // read binds the row-count clauses against the record's sample_count.
-        declared_column_stats: DeclaredColumnStats::from_validated(
-            &ravel_commit::declared_stats::read_commit_record(record),
-        ),
-    })
+        declared_column_stats,
+    }
 }
 
 #[cfg(test)]
@@ -14753,5 +14888,600 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Warm-resolve tests and the timing harness for the memoised L0 derivation
+/// (issue #3231): a fixture of a few hundred stamped L0 commit records, the
+/// shape of the ClickBench tenant's unfolded tail.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod resolve_memo_tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use ravel_commit::declared_stats::{read_commit_record, stamp_commit_record};
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
+
+    use super::*;
+
+    const HOUR: u32 = 500_000;
+    const SHARDS: u32 = 4;
+    const RECORDS: u64 = 408;
+    const SIGNAL: Signal = Signal::Logs;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0xcb; 16])
+    }
+
+    fn config() -> CatalogConfig {
+        CatalogConfig {
+            shard_count: SHARDS,
+            ..Default::default()
+        }
+    }
+
+    /// Four declared columns, all valid against the record's row count: the
+    /// stamp a ClickBench flush carries.
+    fn stamps(seq: u64) -> Vec<DeclaredColumnStat> {
+        let seq = i64::try_from(seq).expect("seq fits i64");
+        let i64_stat = |name: &str, min: i64, max: i64| {
+            DeclaredColumnStat::new(
+                name,
+                DeclaredStatType::I64,
+                Some(DeclaredStatValue::I64(min)),
+                Some(DeclaredStatValue::I64(max)),
+                0,
+            )
+            .expect("valid stat")
+        };
+        vec![
+            i64_stat("EventDate", 15_887 + seq, 15_900 + seq),
+            i64_stat("CounterID", 1, 230_000),
+            i64_stat("RegionID", 0, 13_000),
+            DeclaredColumnStat::new(
+                "IsRefresh",
+                DeclaredStatType::Bool,
+                Some(DeclaredStatValue::Bool(false)),
+                Some(DeclaredStatValue::Bool(true)),
+                0,
+            )
+            .expect("valid stat"),
+        ]
+    }
+
+    /// Record `seq` of the fixture: shards round-robin, two ingest hours.
+    fn fixture_record(tenant_hash: TenantHash, seq: u64) -> CommitRecord {
+        let shard = u32::try_from(seq % u64::from(SHARDS)).expect("shard fits u32");
+        let hour = HOUR + u32::from(seq % 8 >= 4);
+        let start = i64::from(hour) * NS_PER_HOUR;
+        let offset = i64::try_from(seq).expect("seq fits i64") * 1_000;
+        let writer_id = Uuid::from_u128(0x1000 + u128::from(seq));
+        let content_hash = *blake3::hash(format!("segment-{seq}").as_bytes()).as_bytes();
+        let mut record = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: SIGNAL,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: 1_000_000 + seq,
+            content_hash,
+            sample_count: 100_000,
+            series_count: 1,
+            min_event_ts_ns: start + offset,
+            max_event_ts_ns: start + offset + 500,
+            min_ingest_ts_ns: start + offset,
+            max_ingest_ts_ns: start + offset + 500,
+            segment_format_version: 4,
+            created_unix_ns: start + offset,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid record");
+        stamp_commit_record(&mut record, &stamps(seq));
+        record
+    }
+
+    async fn publish_records(store: &MemoryStore, records: &[CommitRecord]) {
+        for record in records {
+            publish::publish(store, record, &RetryPolicy::default())
+                .await
+                .expect("publish");
+        }
+    }
+
+    fn commit_key_of(record: &CommitRecord) -> String {
+        keys::commit_key(
+            &tenant(),
+            SIGNAL,
+            record.shard,
+            record.ingest_hour_bucket,
+            Uuid::parse_str(&record.writer_id).expect("uuid"),
+            record.writer_epoch,
+            record.writer_seq,
+        )
+        .expect("commit key")
+    }
+
+    fn window() -> (TimeRange, i64) {
+        (
+            TimeRange {
+                start_ns: i64::from(HOUR) * NS_PER_HOUR,
+                end_ns: i64::from(HOUR + 2) * NS_PER_HOUR,
+            },
+            i64::from(HOUR + 2) * NS_PER_HOUR,
+        )
+    }
+
+    async fn fixture(records: u64) -> (Arc<MemoryStore>, Vec<CommitRecord>) {
+        let store = Arc::new(MemoryStore::new());
+        let built: Vec<CommitRecord> = (1..=records)
+            .map(|seq| fixture_record(tenant(), seq))
+            .collect();
+        publish_records(&store, &built).await;
+        (store, built)
+    }
+
+    fn per_resolve_us(elapsed: std::time::Duration, iters: u32) -> f64 {
+        elapsed.as_secs_f64() * 1e6 / f64::from(iters)
+    }
+
+    /// Timing harness for one warm resolve's derived work over 408 cached L0
+    /// records, split by phase. Not a gate: run it on purpose with
+    /// `cargo test -p ravel-catalog --release --lib -- --ignored --nocapture
+    /// warm_resolve_derived_work_split`.
+    #[tokio::test]
+    #[ignore = "timing harness, run by hand in release"]
+    async fn warm_resolve_derived_work_split() {
+        const ITERS: u32 = 300;
+        let (store, records) = fixture(RECORDS).await;
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        let (range, now) = window();
+        let cold = catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("cold resolve");
+        assert_eq!(cold.segments.len(), RECORDS as usize);
+
+        let keyed: Vec<(String, &CommitRecord)> =
+            records.iter().map(|r| (commit_key_of(r), r)).collect();
+        let acc = QueryAccounting::new();
+        let entries: Vec<CachedCommit> = keyed
+            .iter()
+            .map(|(key, _)| {
+                catalog
+                    .cache
+                    .get_cached(&tenant(), key, &acc)
+                    .expect("warm entry")
+            })
+            .collect();
+        let cached: Vec<Arc<CommitRecord>> = entries.iter().map(|e| e.record.clone()).collect();
+        let refs: Vec<SegmentRef> = keyed
+            .iter()
+            .zip(&cached)
+            .map(|((key, _), record)| derive_l0(key, record).expect("ref").0)
+            .collect();
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            black_box(
+                catalog
+                    .resolve(&tenant(), SIGNAL, range, &[], now)
+                    .await
+                    .expect("warm resolve"),
+            );
+        }
+        let full = per_resolve_us(started.elapsed(), ITERS);
+
+        // Once per key: the listing parse is the only one a resolve runs.
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for (key, _) in &keyed {
+                black_box(keys::partition_bucket_entry(black_box(key)).expect("parse"));
+            }
+        }
+        let key_parsing = per_resolve_us(started.elapsed(), ITERS);
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for (key, _) in &keyed {
+                black_box(catalog.cache.get_cached(&tenant(), black_box(key), &acc));
+            }
+        }
+        let cache_touch = per_resolve_us(started.elapsed(), ITERS);
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for ((key, _), entry) in keyed.iter().zip(&entries) {
+                black_box(
+                    catalog
+                        .l0_segment_ref(&tenant(), key, black_box(entry))
+                        .expect("ref"),
+                );
+            }
+        }
+        let memo_hit = per_resolve_us(started.elapsed(), ITERS);
+
+        let shard_of = |record: &CommitRecord| record.shard;
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for ((key, _), record) in keyed.iter().zip(&cached) {
+                validate_expected_fields(
+                    &catalog,
+                    black_box(record),
+                    &tenant(),
+                    SIGNAL,
+                    shard_of(record),
+                    key,
+                )
+                .expect("valid");
+            }
+        }
+        let validation = per_resolve_us(started.elapsed(), ITERS);
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for ((key, _), record) in keyed.iter().zip(&cached) {
+                black_box(derive_l0(key, black_box(record)).expect("ref"));
+            }
+        }
+        let build_ref = per_resolve_us(started.elapsed(), ITERS);
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for record in &cached {
+                black_box(keys::verify_object_key(black_box(record)).expect("verify"));
+            }
+        }
+        let verify_key = per_resolve_us(started.elapsed(), ITERS);
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for record in &cached {
+                let record = black_box(record);
+                let hash: Result<[u8; 32], _> = record.content_hash.clone().try_into();
+                black_box(hash.expect("32 bytes"));
+                black_box(Uuid::parse_str(&record.writer_id).expect("uuid"));
+            }
+        }
+        let id_parsing = per_resolve_us(started.elapsed(), ITERS);
+
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            for record in &cached {
+                black_box(DeclaredColumnStats::from_validated(&read_commit_record(
+                    black_box(record),
+                )));
+            }
+        }
+        let declared = per_resolve_us(started.elapsed(), ITERS);
+
+        // The String-keyed map traffic a warm resolve performs per L0 record:
+        // the bucket's and the window's `out` maps, and `resolve_impl`'s
+        // `segments`/`origin_by_key` pair (lookup, insert, insert, remove).
+        // The resolve-wide `cached` map is gone: a hit rides on its listed key.
+        let started = Instant::now();
+        for _ in 0..ITERS {
+            let mut bucket_out: HashMap<String, SegmentRef> = HashMap::new();
+            for segment_ref in &refs {
+                bucket_out
+                    .entry(segment_ref.data_object_key.clone())
+                    .or_insert_with(|| segment_ref.clone());
+            }
+            let mut window_out: HashMap<String, SegmentRef> = HashMap::new();
+            for (key, segment_ref) in bucket_out {
+                window_out.entry(key).or_insert(segment_ref);
+            }
+            let mut segments: HashMap<String, SegmentRef> = HashMap::new();
+            let mut origin_by_key: HashMap<String, SegmentOrigin> = HashMap::new();
+            for (key, segment_ref) in window_out {
+                if !segments.contains_key(&key) {
+                    origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
+                }
+                segments.entry(key).or_insert(segment_ref);
+            }
+            for segment in segments.values() {
+                black_box(origin_by_key.remove(&segment.data_object_key));
+            }
+        }
+        let hashing = per_resolve_us(started.elapsed(), ITERS);
+
+        // What a warm resolve now runs: one parse, the touch, validation, the
+        // memo hit, and the remaining map traffic. The derivation itself and
+        // its parts are listed for comparison; a warm resolve no longer runs
+        // them.
+        let derived = key_parsing + cache_touch + validation + memo_hit + hashing;
+        let rows = [
+            ("key parsing (1x partition_bucket_entry)", key_parsing),
+            ("cache touch (RecordCache::get_cached)", cache_touch),
+            ("validate_expected_fields", validation),
+            ("memoised ref (l0_segment_ref, hit)", memo_hit),
+            ("map hashing (6 String-keyed ops)", hashing),
+        ];
+        let reference = [
+            ("derive_l0 (once per record now)", build_ref),
+            ("  verify_object_key", verify_key),
+            ("  content_hash + writer_id parse", id_parsing),
+            ("  declared stats read", declared),
+        ];
+        println!("warm resolve over {RECORDS} cached L0 records, {ITERS} iterations");
+        println!("{:<44} {:>10} {:>9}", "phase", "us/resolve", "% derived");
+        for (name, us) in rows {
+            println!("{name:<44} {us:>10.1} {:>8.1}%", 100.0 * us / derived);
+        }
+        println!("{:<44} {derived:>10.1}", "derived total");
+        println!("{:<44} {full:>10.1}", "full warm resolve (MemoryStore)");
+        for (name, us) in reference {
+            println!("{name:<44} {us:>10.1}");
+        }
+        assert_eq!(
+            catalog.l0_derivations(),
+            RECORDS,
+            "the warm resolves above derived nothing"
+        );
+    }
+
+    fn assert_refs_equal(left: &Snapshot, right: &Snapshot, what: &str) {
+        assert_eq!(left.segments.len(), right.segments.len(), "{what}: count");
+        for (a, b) in left.segments.iter().zip(&right.segments) {
+            assert_eq!(a, b, "{what}: {}", a.data_object_key);
+        }
+    }
+
+    /// (a) A warm resolve served from memoised derivations returns the same
+    /// refs, field for field, as the cold resolve that derived them, and as a
+    /// resolve on a catalog that never cached anything. Every ref carries the
+    /// fixture's four declared-column stamps, so the shared stamp list is
+    /// compared too.
+    #[tokio::test]
+    async fn warm_and_cold_resolves_return_identical_refs() {
+        let (store, records) = fixture(RECORDS).await;
+        let (range, now) = window();
+        let catalog = Catalog::new(store.clone(), config()).expect("catalog");
+        let cold = catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("cold resolve");
+        assert_eq!(cold.segments.len(), RECORDS as usize);
+        for segment in &cold.segments {
+            assert_eq!(segment.declared_column_stats.as_slice().len(), 4);
+        }
+        for pass in 0..3 {
+            let warm = catalog
+                .resolve(&tenant(), SIGNAL, range, &[], now)
+                .await
+                .expect("warm resolve");
+            assert_refs_equal(&cold, &warm, &format!("warm pass {pass}"));
+        }
+
+        let uncached = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                cache_capacity_per_tenant: 0,
+                ..config()
+            },
+        )
+        .expect("uncached catalog");
+        let fresh = uncached
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("uncached resolve");
+        assert_refs_equal(&cold, &fresh, "uncached catalog");
+
+        // Token-resolved: the min-token path reads the same memo.
+        let tokens: Vec<CommitToken> = records
+            .iter()
+            .map(|record| CommitToken {
+                shard: record.shard,
+                writer_id: Uuid::parse_str(&record.writer_id).expect("uuid"),
+                epoch: record.writer_epoch,
+                seq: record.writer_seq,
+                ingest_hour_bucket: record.ingest_hour_bucket,
+            })
+            .collect();
+        let with_tokens = catalog
+            .resolve(&tenant(), SIGNAL, range, &tokens, now)
+            .await
+            .expect("token resolve");
+        assert_refs_equal(&cold, &with_tokens, "with tokens");
+    }
+
+    /// (b) Each record's ref is derived exactly once across one cold and N
+    /// warm resolves: the counter reads the record count after the cold pass
+    /// and never moves again.
+    #[tokio::test]
+    async fn derivation_runs_once_per_record_across_warm_resolves() {
+        const WARM: u64 = 5;
+        let (store, _) = fixture(RECORDS).await;
+        let (range, now) = window();
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("cold resolve");
+        assert_eq!(catalog.l0_derivations(), RECORDS);
+        for _ in 0..WARM {
+            catalog
+                .resolve(&tenant(), SIGNAL, range, &[], now)
+                .await
+                .expect("warm resolve");
+        }
+        assert_eq!(
+            catalog.l0_derivations(),
+            RECORDS,
+            "{WARM} warm resolves over {RECORDS} cached records derived again"
+        );
+    }
+
+    /// (c) A record whose derivation fails (its `object_key` does not match
+    /// the key reconstructed from its identity) fails every resolve that
+    /// reaches it, cached or not: neither the error nor its absence is
+    /// remembered as a success.
+    #[tokio::test]
+    async fn an_invalid_derivation_fails_every_resolve() {
+        let store = Arc::new(MemoryStore::new());
+        let mut bad = fixture_record(tenant(), 1);
+        bad.object_key = "t/deliberately/wrong/key".to_string();
+        publish_records(&store, &[bad.clone(), fixture_record(tenant(), 5)]).await;
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        let (range, now) = window();
+        for pass in 0..3 {
+            let err = catalog
+                .resolve(&tenant(), SIGNAL, range, &[], now)
+                .await
+                .expect_err("an object_key mismatch is fatal on every resolve");
+            assert!(
+                matches!(err, CatalogError::Reconstruction { .. }),
+                "pass {pass}: {err:?}"
+            );
+        }
+        let acc = QueryAccounting::new();
+        let entry = catalog
+            .cache
+            .get_cached(&tenant(), &commit_key_of(&bad), &acc)
+            .expect("the bad record is cached");
+        assert!(
+            entry.derived.is_none(),
+            "a failed derivation stores nothing"
+        );
+    }
+
+    /// The drop metric counts reads, not records: a memo hit re-observes the
+    /// stamps the derivation dropped. The counter is process-wide and only
+    /// grows, so the bound is a floor.
+    #[tokio::test]
+    async fn a_memo_hit_reobserves_dropped_stamps() {
+        use ravel_commit::declared_stats::{StatCarrier, declared_stat_drops_observed};
+        let store = Arc::new(MemoryStore::new());
+        let mut record = fixture_record(tenant(), 1);
+        // More nulls than the record has rows: dropped against the row count.
+        let mut ineligible = record.declared_column_stats[0].clone();
+        ineligible.name = "Ineligible".to_string();
+        ineligible.null_count = record.sample_count + 1;
+        record.declared_column_stats.push(ineligible);
+        publish_records(&store, &[record]).await;
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        let (range, now) = window();
+        let before = declared_stat_drops_observed(StatCarrier::CommitRecord);
+        for _ in 0..4 {
+            let snapshot = catalog
+                .resolve(&tenant(), SIGNAL, range, &[], now)
+                .await
+                .expect("resolve");
+            assert_eq!(
+                snapshot.segments[0].declared_column_stats.as_slice().len(),
+                4
+            );
+        }
+        assert_eq!(catalog.l0_derivations(), 1);
+        assert!(declared_stat_drops_observed(StatCarrier::CommitRecord) - before >= 4);
+    }
+
+    /// (e) A record's entry is charged its derivation once the derivation is
+    /// stored, by exactly what the derivation holds. Records are first loaded
+    /// through the fold's path, which admits them without deriving, so the
+    /// resolve that follows adds the derivation charge and nothing else.
+    #[tokio::test]
+    async fn a_stored_derivation_adds_exactly_its_bytes_to_the_entry_charge() {
+        let (store, records) = fixture(RECORDS).await;
+        let (range, now) = window();
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        let acc = QueryAccounting::new();
+        for record in &records {
+            catalog
+                .load_and_validate(
+                    &tenant(),
+                    SIGNAL,
+                    record.shard,
+                    &commit_key_of(record),
+                    &acc,
+                )
+                .await
+                .expect("load");
+        }
+        let admitted = catalog.cache.charged_bytes(&tenant());
+        catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("resolve");
+        let charged = catalog.cache.charged_bytes(&tenant());
+
+        let per_record: Vec<u64> = records
+            .iter()
+            .map(|record| {
+                let (_, derived) = derive_l0(&commit_key_of(record), record).expect("derive");
+                crate::cache::l0_derived_resident_bytes(&derived)
+            })
+            .collect();
+        assert_eq!(charged - admitted, per_record.iter().sum::<u64>());
+
+        // Per-record bound from the record alone: the stamp list's Arc with
+        // every raw entry kept (two counters, the structs, their names).
+        let stat = std::mem::size_of::<DeclaredColumnStat>() as u64;
+        for (record, bytes) in records.iter().zip(&per_record) {
+            let bound = 2 * std::mem::size_of::<usize>() as u64
+                + record
+                    .declared_column_stats
+                    .iter()
+                    .map(|s| stat + s.name.len() as u64)
+                    .sum::<u64>();
+            assert_eq!(*bytes, bound, "every stamp is valid, so the bound is exact");
+        }
+        // EventDate, CounterID, RegionID, IsRefresh: 35 bytes of names.
+        assert_eq!(per_record[0], 16 + 4 * stat + 35);
+        println!(
+            "derivation charge per record: {} bytes ({} stamp structs of {stat} + 16 + 35 of \
+             names), on top of the {}-byte inline slot admitted with every entry",
+            per_record[0],
+            4,
+            std::mem::size_of::<Option<L0Derived>>(),
+        );
+
+        // A second resolve charges nothing more.
+        catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("warm resolve");
+        assert_eq!(catalog.cache.charged_bytes(&tenant()), charged);
+    }
+
+    /// (f) Evicting a record re-derives it on the next resolve: the
+    /// derivation went with the record, and the eviction released its bytes.
+    #[tokio::test]
+    async fn eviction_drops_the_derivation_with_the_record() {
+        let (store, records) = fixture(8).await;
+        let (range, now) = window();
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("cold resolve");
+        assert_eq!(catalog.l0_derivations(), 8);
+        let charged = catalog.cache.charged_bytes(&tenant());
+
+        let bucket = keys::commit_shard_hour_prefix(
+            &tenant(),
+            SIGNAL,
+            records[0].shard,
+            records[0].ingest_hour_bucket,
+        )
+        .expect("prefix");
+        let in_bucket = records
+            .iter()
+            .filter(|r| commit_key_of(r).starts_with(&bucket))
+            .count() as u64;
+        assert!(in_bucket >= 1);
+        catalog.cache.invalidate_prefix(&tenant(), &bucket);
+        assert!(catalog.cache.charged_bytes(&tenant()) < charged);
+
+        catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("resolve after eviction");
+        assert_eq!(catalog.l0_derivations(), 8 + in_bucket);
+        assert_eq!(catalog.cache.charged_bytes(&tenant()), charged);
     }
 }
