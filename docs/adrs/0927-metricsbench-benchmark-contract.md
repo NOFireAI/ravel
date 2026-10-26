@@ -536,7 +536,11 @@ receivers that stored different sets.
 Decision: the shift lands strictly between scrape points (one and a half
 intervals back, computed as `3 * interval_ms / 2`, exact because every
 profile's scrape interval is a whole number of seconds), so the sample is
-out of order and never a duplicate.
+out of order and never a duplicate. This retires the generator's pinned
+invariant that every timestamp stays on the scrape grid: after the change
+only unshifted samples do, every shifted sample is out of order (the
+shifted-but-in-order case of the two-interval shift disappears), and the
+generator test's pinned shifted and regressed counts move with it.
 Every receiver runs a frozen, disclosed out-of-order window longer than
 the shift: Prometheus `storage.tsdb.out_of_order_time_window`, Mimir
 `limits.out_of_order_time_window`, VictoriaMetrics' default acceptance
@@ -544,8 +548,14 @@ stated as such, and Ravel's own rule stated next to its deployment. The
 lane reads each receiver's per-sample outcome (the Remote Write response
 body and the receiver's written-samples header or counter), never a
 per-batch status alone, and each row carries a digest of its accepted
-`(series, timestamp, value bits)` set. Band 6, new: the run fails when any
-two portable rows' accepted-set digests differ. The generator change moves
+`(series, timestamp, value bits)` set. Band 6, new: every portable row's
+accepted set must equal the set it was expected to accept, which is the
+offered stream minus that lane's named payload exclusions (section D), and
+the run fails when any two portable rows' expected-set digests differ or
+any row's accepted-set digest differs from its expected-set digest. The
+portable lane's drop budget is zero: a dropped or rejected sample on any
+receiver fails this band, and a row that needs a non-zero budget is a
+diagnostic row, not a portable one. The generator change moves
 the workload manifest to version 2 with its own digest; version 1 streams
 stay reproducible from the version-1 manifest.
 
@@ -573,9 +583,15 @@ Ravel row. The nightly artifact shows the gap (119,775 generated, 107,736
 offered, zero rejected, 2026-10-25 run).
 
 Decision: every line is classified as a scalar, a native histogram, a
-staleness marker, or a typed malformed line, and band 4 reads
+staleness marker, or a typed malformed line, and band 4 becomes two
+equations, both required: the classification identity
 `scalar + native_histogram + stale_marker + malformed == generated_lines`
-with `malformed == 0` for a generator stream. A lane that does not carry a
+with `malformed == 0` for a generator stream, and the offering identity
+`offered + excluded_native_histogram + excluded_stale_marker == generated_lines`
+per row, which keeps the original band's anchor on the generated count so
+a line that never reached a receiver still fails the run unless it is
+counted under a named exclusion. The 2026-10-25 nightly artifact fails the
+second equation as the lane stands today. A lane that does not carry a
 payload type reports it as a named exclusion, never as absent. Staleness
 markers travel as the Prometheus stale NaN bit pattern, reusing
 `ravel_promql_difftest::generator::STALE_MARKER_BITS` rather than adding
