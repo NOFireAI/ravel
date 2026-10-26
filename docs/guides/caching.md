@@ -667,8 +667,10 @@ exists because neither record type has a bounded size:
   `commit_cache_max_bytes_per_tenant`. `CommitRecord.declared_column_stats` is
   a repeated field with no cap in the proto, in validation, or in the
   tenant-config path for typed attribute columns. A record that declares 200
-  typed attribute columns charges about 20 KB where an ordinary one charges
-  896 bytes, more than twenty times the planning rate. The cache charges each
+  typed attribute columns charges about 20 KB when admitted and about 38 KB
+  once a resolve has kept its derivation (the kept stamp list adds about
+  18 KB), where an ordinary one charges 896 bytes: more than forty times the
+  planning rate. The cache charges each
   entry an estimate of the live heap that it holds. It evicts
   least-recently-used until the charged total is back inside the budget.
 - The **compaction-record cache** is bounded in bytes at the same share,
