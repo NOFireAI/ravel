@@ -1,6 +1,6 @@
 //! Default object geometry (issue #2753): the flush target and pipeline depth
 //! a load derives when `--target-bytes` and `--pipeline-depth` are unset, the
-//! depth-triggered flush that keeps a derived window moving, and the
+//! depth-triggered flush that keeps a load's window moving, and the
 //! serializable per-load flush report every signal prints.
 //!
 //! The router's size trigger compares a shard buffer's estimated uncompressed
@@ -57,10 +57,10 @@ pub fn rows_bound_depth(rows_depth: usize) -> usize {
     rows_depth.saturating_add(rows_depth.div_ceil(DEPTH_MARGIN_DIVISOR))
 }
 
-/// Whether a load with this target runs the depth flush: only a derived
-/// target above [`PER_BATCH_TARGET_BYTES`] does.
-fn depth_flush_runs(target_source: TargetSource, target_bytes: usize) -> bool {
-    target_source == TargetSource::Derived && target_bytes > PER_BATCH_TARGET_BYTES
+/// Whether a load with this target runs the depth flush: any target above
+/// [`PER_BATCH_TARGET_BYTES`] does, derived or given by `--target-bytes`.
+fn depth_flush_runs(target_bytes: usize) -> bool {
+    target_bytes > PER_BATCH_TARGET_BYTES
 }
 
 /// Called once a load's geometry is resolved, before its first write is
@@ -169,12 +169,11 @@ pub struct LoadGeometry {
 }
 
 impl LoadGeometry {
-    /// Whether the loader runs the depth flush (see [`DepthWindow`]). Only a
-    /// derived target turns it on: with an explicit `--target-bytes` the
-    /// buffers close on the size and age triggers and the loader's own
-    /// flushes alone, whatever `--pipeline-depth` says.
+    /// Whether the loader runs the depth flush (see [`DepthWindow`]): for
+    /// any target above [`PER_BATCH_TARGET_BYTES`], derived or explicit. At
+    /// or below it every write already flushes its own buffer.
     pub fn depth_flush_enabled(&self) -> bool {
-        depth_flush_runs(self.target_source, self.target_bytes)
+        depth_flush_runs(self.target_bytes)
     }
 
     /// The depth the rows bound derives for this load: [`Self::rows_depth`],
@@ -227,7 +226,7 @@ pub fn resolve_geometry(
             .unwrap_or(usize::MAX)
             .max(1)
     });
-    let rows_bound = if depth_flush_runs(target_source, target_bytes) {
+    let rows_bound = if depth_flush_runs(target_bytes) {
         rows_bound_depth(rows_depth)
     } else {
         rows_depth
@@ -419,11 +418,22 @@ pub(super) struct DepthWindow {
 /// The `oldest_pending` key for batches whose shards are unknown.
 const ANY_SHARD: u32 = u32::MAX;
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Turns the depth window off for a load whose geometry runs it, so a
+    /// test can reach the size, age and ack paths a depth flush would close
+    /// first.
+    pub(super) static DEPTH_FLUSH_OFF: ();
+}
+
 impl DepthWindow {
     pub(super) fn new(geometry: &LoadGeometry) -> Self {
+        let enabled = geometry.depth_flush_enabled();
+        #[cfg(test)]
+        let enabled = enabled && DEPTH_FLUSH_OFF.try_with(|()| ()).is_err();
         Self {
             depth: geometry.pipeline_depth.max(1) as u64,
-            enabled: geometry.depth_flush_enabled(),
+            enabled,
             submits: 0,
             oldest_pending: BTreeMap::new(),
             enqueued: BTreeMap::new(),
@@ -659,14 +669,17 @@ fn realign_text(gave_up: u64) -> String {
 pub const GEOMETRY_LINE_PREFIX: &str = "load geometry: ";
 
 /// The one-line geometry report printed as soon as the geometry is resolved:
-/// the target and the depth, with what decided each.
+/// the target and the depth, with what decided each, and whether the depth
+/// flush runs.
 pub fn render_geometry_line(signal: &str, g: &LoadGeometry) -> String {
     format!(
-        "{GEOMETRY_LINE_PREFIX}{signal}: flush target {} bytes ({}), pipeline depth {} ({})",
+        "{GEOMETRY_LINE_PREFIX}{signal}: flush target {} bytes ({}), pipeline depth {} ({}), \
+         depth flush {}",
         g.target_bytes,
         target_source_text(g),
         g.pipeline_depth,
         depth_bound_text(g),
+        if g.depth_flush_enabled() { "on" } else { "off" },
     )
 }
 
@@ -778,12 +791,16 @@ mod tests {
             render_geometry_line("spans", &g),
             "load geometry: spans: flush target 21750000 bytes (derived: 250000 rows x 87 \
              estimated bytes per row), pipeline depth 125 (rows bound decided it: rows bound \
-             100 + 25 = 125, memory bound 36245)"
+             100 + 25 = 125, memory bound 36245), depth flush on"
         );
     }
 
     /// `--target-bytes 1` turns the depth flush off, so the lane's inputs
     /// derive the plain rows bound with no margin.
+    ///
+    /// Prove-the-test: turn the depth flush on for every explicit target
+    /// (`depth_flush_runs` returning `true`) and the margin and the "on" fail
+    /// this test.
     #[test]
     fn a_per_batch_target_derives_the_plain_rows_bound() {
         let g = resolve_geometry(
@@ -803,7 +820,50 @@ mod tests {
         assert_eq!(
             render_geometry_line("spans", &g),
             "load geometry: spans: flush target 1 bytes (--target-bytes), pipeline depth 100 \
-             (rows bound decided it: rows bound 100, memory bound 36245)"
+             (rows bound decided it: rows bound 100, memory bound 36245), depth flush off"
+        );
+    }
+
+    /// Issue #3273: an explicit target above [`PER_BATCH_TARGET_BYTES`] runs
+    /// the depth flush as a derived one does, so the lane's inputs derive the
+    /// rows bound with its margin, the same depth the derived target gets.
+    ///
+    /// Prove-the-test: restore the `TargetSource::Derived` conjunct in
+    /// `depth_flush_runs` and every assertion on the flush and the margin
+    /// fails.
+    #[test]
+    fn an_explicit_target_runs_the_depth_flush_with_the_margin() {
+        let g = resolve_geometry(
+            Some(PER_BATCH_TARGET_BYTES + 1),
+            None,
+            4,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS * 87,
+            Some(36_245 * 870_000),
+        );
+        assert_eq!(g.target_source, TargetSource::Flag);
+        assert!(g.depth_flush_enabled());
+        assert_eq!(g.rows_depth, 100);
+        assert_eq!(g.rows_bound(), 125);
+        assert_eq!(g.pipeline_depth, 125);
+        assert_eq!(g.depth_bound, DepthBound::Rows);
+        let g = resolve_geometry(
+            Some(7_400_000_000),
+            Some(56),
+            4,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS * 7_970,
+            None,
+        );
+        assert!(g.depth_flush_enabled());
+        assert_eq!(g.rows_bound(), 125);
+        assert_eq!(g.pipeline_depth, 56);
+        assert_eq!(
+            render_geometry_line("logs", &g),
+            "load geometry: logs: flush target 7400000000 bytes (--target-bytes), pipeline \
+             depth 56 (--pipeline-depth), depth flush on"
         );
     }
 
@@ -866,15 +926,28 @@ mod tests {
         assert_eq!(fired, [false, false, true, false, false, true, false]);
     }
 
+    /// Issue #3273: the window runs for an explicit target above
+    /// [`PER_BATCH_TARGET_BYTES`] and is off at it.
+    ///
+    /// Prove-the-test: restore the `TargetSource::Derived` conjunct in
+    /// `depth_flush_runs` and the explicit targets above it fail; make it
+    /// `true` for every explicit target and the one at it fails.
     #[test]
-    fn depth_window_is_off_for_an_explicit_target() {
-        for target in [PER_BATCH_TARGET_BYTES, 1_000, 1_850_000_000] {
+    fn depth_window_runs_for_an_explicit_target_above_one_batch() {
+        for target in [PER_BATCH_TARGET_BYTES + 1, 1_000, 7_400_000_000] {
             let g = resolve_geometry(Some(target), Some(3), 1, 10, 10, 10, None);
-            assert!(!g.depth_flush_enabled());
+            assert_eq!(g.target_source, TargetSource::Flag);
+            assert!(g.depth_flush_enabled(), "target {target}");
             let mut w = DepthWindow::new(&g);
-            assert!(!w.enabled());
-            assert!((1..=7).all(|n| !w.submitted(one_shard(n, 0))));
+            assert!(w.enabled());
+            let fired: Vec<bool> = (1..=7).map(|n| w.submitted(one_shard(n, 0))).collect();
+            assert_eq!(fired, [false, false, true, false, false, true, false]);
         }
+        let g = resolve_geometry(Some(PER_BATCH_TARGET_BYTES), Some(3), 1, 10, 10, 10, None);
+        assert!(!g.depth_flush_enabled());
+        let mut w = DepthWindow::new(&g);
+        assert!(!w.enabled());
+        assert!((1..=7).all(|n| !w.submitted(one_shard(n, 0))));
     }
 
     #[test]

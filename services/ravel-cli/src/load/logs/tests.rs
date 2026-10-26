@@ -2002,11 +2002,10 @@ async fn a_small_memory_budget_decides_the_derived_depth() {
     );
 }
 
-/// Nanoseconds the issue #2753 explicit-target test advances the injected
-/// clock by to age a parked buffer out: past the 60 s `--max-flush-delay`
-/// default. The Strict ack deadline runs on wall time, which this never
-/// moves.
-const AGE_OUT_ADVANCE_NS: i64 = 61 * 1_000_000_000;
+/// Nanoseconds the issue #3273 uneven-share test advances the injected clock
+/// by to age a parked buffer out: past its 300 s `--max-flush-delay`. The
+/// Strict ack deadline runs on wall time, which this never moves.
+const AGE_OUT_ADVANCE_NS: i64 = 301 * 1_000_000_000;
 
 /// The geometry a default load of `pq` resolves, read off one run of it.
 async fn probe_default_geometry(pq: &Path, m: &Mapping, batch_rows: usize) -> LoadGeometry {
@@ -2029,28 +2028,29 @@ async fn probe_default_geometry(pq: &Path, m: &Mapping, batch_rows: usize) -> Lo
     .expect("a load that decoded rows resolves its geometry")
 }
 
-/// Issue #2753: an explicit `--target-bytes` turns the depth flush off
-/// (`LoadGeometry::depth_flush_enabled`), so the load keeps the layout it
-/// had before the depth flush existed, closed by the size and age triggers
-/// alone, whatever `--pipeline-depth` says.
+/// Wall time a load that should finish on a frozen clock gets before the
+/// test calls it parked. A deadlock guard, not a timing band: the loads it
+/// wraps finish in well under a second.
+const PARKED_LOAD_GUARD: Duration = Duration::from_secs(120);
+
+/// Issue #3273: an explicit `--target-bytes` above one batch runs the depth
+/// flush (`LoadGeometry::depth_flush_enabled`), as a derived target does.
 ///
 /// The target is the one the default geometry derives for this file (25
 /// batches' worth), passed as a flag, and the depth is 5, below the 25
-/// batches one object holds. No size flush comes within 5 batches, so at
-/// every 5th submit the loop waits on a write whose buffer nothing has
-/// flushed, and the driver ages that buffer out. It does so only once the
-/// loop is parked: the decode queue holds one batch, so the decoder has
-/// queued batch `5k + 1` only after the loader took batch `5k`, and the
-/// loader takes no further batch until the oldest write is answered. 51
-/// batches make 10 objects of 5 batches closed on age and a 1-batch tail
-/// the end-of-input flush publishes: 11 objects, depth 0.
+/// batches one object holds. No size flush comes within 5 batches, so the
+/// depth flush closes the buffer at every 5th submit, and the load finishes
+/// on an injected clock that never advances, so no age flush can fire: 51
+/// batches make 10 objects of 5 batches closed on depth and a 1-batch tail
+/// the end-of-input flush publishes, 11 objects.
 ///
-/// Prove-the-test: make `depth_flush_enabled` ignore `target_source` and the
-/// same objects close on depth instead, failing the mix assertion.
+/// Prove-the-test: restore the `TargetSource::Derived` conjunct in
+/// `depth_flush_runs` and the loop parks at the 5th submit on a buffer only
+/// the age trigger closes; the clock never moves, so the guard fails the
+/// test.
 #[tokio::test]
-async fn an_explicit_target_turns_the_depth_flush_off() {
+async fn an_explicit_target_runs_the_depth_flush() {
     use ravel_object_store::memory::MemoryStore;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const DEPTH: usize = 5;
     let (_dir, pq, m) = uniform_rows_fixture(GEOMETRY_BATCH_ROWS, GEOMETRY_BATCHES);
@@ -2061,11 +2061,6 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(NOW_NS);
-    let queued = Arc::new(AtomicUsize::new(0));
-    let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
-    let on_batch_queued: BuildStartHook = Arc::new(move || {
-        let _ = queued_tx.send(queued.fetch_add(1, Ordering::SeqCst) + 1);
-    });
     let load_fut = load_instrumented_at(
         Arc::clone(&store),
         &pq,
@@ -2084,7 +2079,7 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
         Arc::clone(&clock) as Arc<dyn Clock>,
         LoadPath::Columnar,
         None,
-        Some(on_batch_queued),
+        None,
         RlogZstdLevel::default(),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
@@ -2094,48 +2089,307 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
         false,
         Arc::new(TenantRules::none()),
     );
-
-    let parks = GEOMETRY_BATCHES / DEPTH;
-    let driver = async {
-        let mut seen = 0;
-        for k in 1..=parks {
-            let wanted = (k * DEPTH + 1).min(GEOMETRY_BATCHES);
-            while seen < wanted {
-                seen = queued_rx
-                    .recv()
-                    .await
-                    .expect("the decoder queues every batch");
-            }
-            yield_until_router_is_quiet(&clock).await;
-            clock.advance_ns(AGE_OUT_ADVANCE_NS);
-            yield_until_router_is_quiet(&clock).await;
-        }
-        std::future::pending::<()>().await
-    };
-    let report = tokio::select! {
-        report = load_fut => report.expect("load succeeds"),
-        () = driver => unreachable!("the driver parks after its last advance"),
-    };
+    let report = tokio::time::timeout(PARKED_LOAD_GUARD, load_fut) // allow-wall-clock: deadlock guard on a frozen clock; a regressed load would otherwise hang until the Strict ack deadline
+        .await
+        .expect("the depth flush closes every window, so the load never waits on age")
+        .expect("load succeeds");
 
     let layout = report.layout_report();
     let geometry = layout.geometry.expect("geometry resolved");
     assert_eq!(geometry.target_source, TargetSource::Flag);
     assert_eq!(geometry.pipeline_depth, DEPTH);
-    let expected = parks + usize::from(!GEOMETRY_BATCHES.is_multiple_of(DEPTH));
-    assert_eq!(expected, 11);
-    assert_eq!(list_data_objects(store.as_ref()).await.len(), expected);
+    assert!(geometry.depth_flush_enabled());
+    let windows = GEOMETRY_BATCHES / DEPTH;
+    assert_eq!(windows, 10);
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), windows + 1);
     assert_eq!(
         layout.flush_mix.totals,
         FlushMixCounts {
             size: 0,
-            age: parks as u64,
+            age: 0,
             arrival: 0,
-            depth: 0,
+            depth: windows as u64,
             manual: 1,
         },
-        "every 5-batch buffer closes on age, the tail on the end-of-input flush"
+        "every 5-batch buffer closes on depth, the tail on the end-of-input flush"
     );
-    assert!(!geometry.depth_flush_enabled());
+    assert_eq!(report.depth_flushes_by_shard, vec![(0, windows as u64)]);
+}
+
+/// Shards in the issue #3273 uneven-share test.
+const UNEVEN_SHARDS: u32 = 4;
+
+/// The shard that draws a tenth of every batch in that test.
+const SPARSE_SHARD: u32 = 0;
+
+/// Rows per batch routed to [`SPARSE_SHARD`].
+const UNEVEN_SPARSE_ROWS: usize = 20;
+
+/// Rows per batch routed to each of the other three shards.
+const UNEVEN_DENSE_ROWS: usize = 60;
+
+/// `--batch-rows` in that test: one row group of the fixture.
+const UNEVEN_BATCH_ROWS: usize = UNEVEN_SPARSE_ROWS + 3 * UNEVEN_DENSE_ROWS;
+
+/// Batches in that test.
+const UNEVEN_BATCHES: usize = 200;
+
+/// `--pipeline-depth` in that test.
+const UNEVEN_DEPTH: usize = 4;
+
+/// `UNEVEN_BATCHES` row groups of `UNEVEN_BATCH_ROWS` rows. Each holds
+/// `UNEVEN_SPARSE_ROWS` rows whose `host` routes to [`SPARSE_SHARD`] and
+/// `UNEVEN_DENSE_ROWS` rows for each other shard ([`host_for_shard`]), so
+/// with `--batch-rows UNEVEN_BATCH_ROWS` every batch gives the sparse shard a
+/// tenth of its rows and the others three tenths each. Returns the hosts by
+/// shard index.
+fn uneven_shares_fixture() -> (tempfile::TempDir, std::path::PathBuf, Mapping, Vec<String>) {
+    use parquet::arrow::ArrowWriter;
+
+    let hosts: Vec<String> = (0..UNEVEN_SHARDS)
+        .map(|s| host_for_shard(s, UNEVEN_SHARDS))
+        .collect();
+    let mut host_col: Vec<&str> = Vec::with_capacity(UNEVEN_BATCH_ROWS);
+    for (shard, host) in hosts.iter().enumerate() {
+        let rows = if shard as u32 == SPARSE_SHARD {
+            UNEVEN_SPARSE_ROWS
+        } else {
+            UNEVEN_DENSE_ROWS
+        };
+        host_col.extend(std::iter::repeat_n(host.as_str(), rows));
+    }
+    let group = batch(vec![
+        ("ts", i64_col(vec![NOW_NS; UNEVEN_BATCH_ROWS])),
+        ("svc", str_col(vec!["api"; UNEVEN_BATCH_ROWS])),
+        ("host", str_col(host_col)),
+    ]);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("uneven_shares.parquet");
+    let file = std::fs::File::create(&pq).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, group.schema(), None).expect("arrow writer");
+    for _ in 0..UNEVEN_BATCHES {
+        writer.write(&group).expect("write row group");
+        writer.flush().expect("flush row group");
+    }
+    writer.close().expect("close writer");
+
+    let m = parse_mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+    )
+    .expect("valid mapping");
+    (dir, pq, m, hosts)
+}
+
+/// The size trigger's estimate for one batch's slice on a shard: `rows` rows
+/// of `host`, as the shard actor sums it.
+fn slice_est_bytes(host: &str, rows: usize, m: &Mapping) -> usize {
+    let slice = batch(vec![
+        ("ts", i64_col(vec![NOW_NS; rows])),
+        ("svc", str_col(vec!["api"; rows])),
+        ("host", str_col(vec![host; rows])),
+    ]);
+    ravel_ingest::est_columnar_log_batch_object_bytes(&build_columnar_or_panic(&slice, m))
+}
+
+/// The row count of every `/l0/` object in `store`, grouped by the shard its
+/// rows route to. Every row of one object routes to the same shard.
+async fn object_rows_by_shard(
+    store: &dyn ObjectStoreBackend,
+    shards: u32,
+) -> std::collections::BTreeMap<u32, Vec<usize>> {
+    use ravel_logseg::{Predicate, RlogConfig, RlogReader};
+    use ravel_object_store::GetRange;
+    use ravel_types::shard_for_log;
+
+    let cfg = RlogConfig::default();
+    let mut out: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    for (key, _) in list_data_objects(store).await {
+        let got = store.get(&key, GetRange::Full).await.expect("get object");
+        let reader = RlogReader::new(got.data.as_ref(), &cfg).expect("open rlog");
+        let (rows, _stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan rlog");
+        let shard = shard_for_log(&rows.first().expect("a non-empty object").stream_id, shards);
+        assert!(
+            rows.iter()
+                .all(|r| shard_for_log(&r.stream_id, shards) == shard),
+            "object {key} mixes shards"
+        );
+        out.entry(shard).or_default().push(rows.len());
+    }
+    out
+}
+
+/// Issue #3273, end to end: on 4 shards with uneven shares, an explicit
+/// `--target-bytes` that one shard's window share never reaches no longer
+/// leaves that shard's buffer to the age trigger.
+///
+/// Every batch gives [`SPARSE_SHARD`] 20 rows and the other three 60 each.
+/// The target sits strictly between two dense slices' estimate and four
+/// sparse slices', so the size trigger closes every dense buffer at its
+/// second batch (120 rows) and, at `--pipeline-depth 4`, no window of the
+/// sparse shard reaches it. `--max-flush-delay` is 300 s on a clock the
+/// first load never advances, so no age flush can fire there: the depth
+/// flush closes the sparse shard at every 4th batch, 50 objects of
+/// `4 x 200 x 1/10 = 80` rows, and the load finishes with 100 objects of
+/// 120 rows on each dense shard.
+///
+/// The second load is the same with the depth window held off
+/// (`DEPTH_FLUSH_OFF`), which is what an explicit target got before this
+/// issue: the loop parks on the first batch's ack after the 4th submit,
+/// with the dense shards' two size-flushed objects each in the store and
+/// nothing on the sparse shard, and only advancing the clock past the age
+/// trigger publishes the sparse shard's first object.
+///
+/// Prove-the-test: restore the `TargetSource::Derived` conjunct in
+/// `depth_flush_runs` and the first load parks the same way, failing the
+/// guard; skip the `depth_flushes_by_shard` credit in the logs submit loop
+/// and the report assertion fails.
+#[tokio::test]
+async fn an_explicit_target_closes_a_sparse_shard_at_the_window() {
+    use ravel_object_store::memory::MemoryStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (_dir, pq, m, hosts) = uneven_shares_fixture();
+    let sparse = slice_est_bytes(&hosts[SPARSE_SHARD as usize], UNEVEN_SPARSE_ROWS, &m);
+    let dense: Vec<usize> = (0..UNEVEN_SHARDS)
+        .filter(|&s| s != SPARSE_SHARD)
+        .map(|s| slice_est_bytes(&hosts[s as usize], UNEVEN_DENSE_ROWS, &m))
+        .collect();
+    let dense_min = *dense.iter().min().expect("three dense shards");
+    let dense_max = *dense.iter().max().expect("three dense shards");
+    // One dense slice and a whole window of sparse slices stay under the
+    // target; two dense slices reach it.
+    let floor = dense_max.max(UNEVEN_DEPTH * sparse);
+    assert!(floor < 2 * dense_min, "sparse {sparse}, dense {dense:?}");
+    let target = (floor + 2 * dense_min).div_ceil(2);
+    assert!(target > floor && target <= 2 * dense_min);
+    let max_flush_delay = Duration::from_secs(300);
+
+    let run = |store: Arc<dyn ObjectStoreBackend>,
+               clock: Arc<TestClock>,
+               on_batch_queued: Option<BuildStartHook>| {
+        load_instrumented_at(
+            store,
+            &pq,
+            "acme",
+            &m,
+            UNEVEN_SHARDS,
+            UNEVEN_BATCH_ROWS,
+            0,
+            Some(1),
+            Some(UNEVEN_DEPTH),
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            1,
+            Some(target),
+            Some(max_flush_delay),
+            NOW_NS,
+            clock as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            on_batch_queued,
+            RlogZstdLevel::default(),
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            None,
+            false,
+            Arc::new(TenantRules::none()),
+        )
+    };
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let load_fut = run(Arc::clone(&store), TestClock::new(NOW_NS), None);
+    let report = tokio::time::timeout(PARKED_LOAD_GUARD, load_fut) // allow-wall-clock: deadlock guard on a frozen clock; a regressed load would otherwise hang until the Strict ack deadline
+        .await
+        .expect("the depth flush closes the sparse shard, so the load never waits on age")
+        .expect("load succeeds");
+
+    let geometry = report.geometry.expect("geometry resolved");
+    assert_eq!(geometry.target_source, TargetSource::Flag);
+    assert!(geometry.depth_flush_enabled());
+    let windows = (UNEVEN_BATCHES / UNEVEN_DEPTH) as u64;
+    assert_eq!(windows, 50);
+    assert_eq!(
+        report.depth_flushes_by_shard,
+        vec![(SPARSE_SHARD, windows)],
+        "only the sparse shard's buffer is open when the window comes due"
+    );
+    for (shard, mix) in &report.flush_trigger_mix {
+        assert_eq!(mix.age, 0, "shard {shard}: the clock never advanced");
+    }
+    let sparse_object_rows = UNEVEN_DEPTH * UNEVEN_BATCH_ROWS / 10;
+    assert_eq!(sparse_object_rows, UNEVEN_DEPTH * UNEVEN_SPARSE_ROWS);
+    let dense_object_rows = 2 * UNEVEN_DENSE_ROWS;
+    let mut expected = std::collections::BTreeMap::new();
+    for shard in 0..UNEVEN_SHARDS {
+        let objects = if shard == SPARSE_SHARD {
+            vec![sparse_object_rows; windows as usize]
+        } else {
+            vec![dense_object_rows; UNEVEN_BATCHES / 2]
+        };
+        expected.insert(shard, objects);
+    }
+    assert_eq!(
+        object_rows_by_shard(store.as_ref(), UNEVEN_SHARDS).await,
+        expected
+    );
+
+    // The same load with the depth window held off parks on the sparse
+    // shard's buffer until the age trigger closes it.
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(NOW_NS);
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let on_batch_queued: BuildStartHook = Arc::new(move || {
+        let _ = queued_tx.send(queued.fetch_add(1, Ordering::SeqCst) + 1);
+    });
+    let load_fut = crate::load::geometry::DEPTH_FLUSH_OFF.scope(
+        (),
+        run(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Some(on_batch_queued),
+        ),
+    );
+    tokio::pin!(load_fut);
+    tokio::select! {
+        biased;
+        result = &mut load_fut => panic!(
+            "with the depth window off nothing but the age trigger closes the sparse \
+             shard's buffer, and the clock has not moved: {result:?}"
+        ),
+        () = async {
+            // The decode queue holds one batch, so batch 5 is queued only
+            // once the loader took batch 4.
+            let mut seen = 0;
+            while seen < UNEVEN_DEPTH + 1 {
+                seen = queued_rx.recv().await.expect("the decoder queues every batch");
+            }
+            yield_until_router_is_quiet(&clock).await;
+        } => {}
+    }
+    let parked = object_rows_by_shard(store.as_ref(), UNEVEN_SHARDS).await;
+    assert_eq!(parked.get(&SPARSE_SHARD), None, "{parked:?}");
+    for shard in (0..UNEVEN_SHARDS).filter(|&s| s != SPARSE_SHARD) {
+        assert_eq!(
+            parked.get(&shard),
+            Some(&vec![dense_object_rows; 2]),
+            "shard {shard}: {parked:?}"
+        );
+    }
+    clock.advance_ns(AGE_OUT_ADVANCE_NS);
+    tokio::select! {
+        biased;
+        _ = &mut load_fut => {}
+        () = yield_until_router_is_quiet(&clock) => {}
+    }
+    let aged = object_rows_by_shard(store.as_ref(), UNEVEN_SHARDS).await;
+    assert_eq!(
+        aged.get(&SPARSE_SHARD),
+        Some(&vec![sparse_object_rows]),
+        "the age trigger publishes the sparse shard's first window: {aged:?}"
+    );
 }
 
 /// The batch numbers (1-based) at which a lone shard's buffer reaches
@@ -2552,8 +2806,9 @@ async fn an_empty_input_reports_no_geometry() {
 /// advances, the age trigger can never fire (the shard actor's flush tick
 /// waits on that clock's own `sleep`, which only returns on an advance),
 /// and at an 8 MiB target no write in this 16-row fixture can reach the
-/// size trigger either. The target is explicit, so the depth flush is off
-/// (issue #2753), and the pipeline depth is the batch count: after
+/// size trigger either. The depth flush is held off (`DEPTH_FLUSH_OFF`),
+/// since at this target it would close every buffer at the last submit, and
+/// the pipeline depth is the batch count: after
 /// submitting the last batch the loader waits on the first batch's ack
 /// before it reads the decoder's end of input, so the end-of-input flush
 /// never runs either. With no trigger reachable, the load cannot finish
@@ -2577,10 +2832,9 @@ async fn an_empty_input_reports_no_geometry() {
 /// triggers its own flush, so the
 /// acks are answered, the load runs to completion while the driver is
 /// still waiting for the router to go quiet, and the `biased` select hits
-/// the `panic!` arm ("the load must not complete..."). Making
-/// `LoadGeometry::depth_flush_enabled` ignore `target_source` trips the same
-/// arm: the 4th submit brings the depth window due and its flush answers
-/// every ack.
+/// the `panic!` arm ("the load must not complete..."). Dropping the
+/// `DEPTH_FLUSH_OFF` scope trips the same arm: the 4th submit brings the
+/// depth window due and its flush answers every ack.
 #[tokio::test]
 async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
     use ravel_object_store::memory::MemoryStore;
@@ -2604,25 +2858,28 @@ async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
         }
     });
 
-    let load_fut = load_instrumented(
-        Arc::clone(&store),
-        &pq,
-        "acme",
-        &m,
-        shards,
-        rows_per_group,
-        0,
-        Some(shards as usize),
-        batches,
-        DEFAULT_MAX_INFLIGHT_FLUSHES,
-        DEFAULT_DECODE_QUEUE_BATCHES,
-        8 * 1024 * 1024,
-        None,
-        NOW_NS,
-        Arc::clone(&clock) as Arc<dyn Clock>,
-        LoadPath::Columnar,
-        None,
-        Some(on_batch_queued),
+    let load_fut = crate::load::geometry::DEPTH_FLUSH_OFF.scope(
+        (),
+        load_instrumented(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &m,
+            shards,
+            rows_per_group,
+            0,
+            Some(shards as usize),
+            batches,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            8 * 1024 * 1024,
+            None,
+            NOW_NS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            Some(on_batch_queued),
+        ),
     );
     tokio::pin!(load_fut);
 

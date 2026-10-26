@@ -595,10 +595,10 @@ enum Command {
         /// it, rounded up, while the depth flush below runs (issue #3119),
         /// lowered to the memory bound
         /// `--load-memory-bytes` divided by the estimated object bytes of one
-        /// batch when that is smaller, never below 1, and capped at 1,024. With `--target-bytes` unset the loader also flushes every
+        /// batch when that is smaller, never below 1, and capped at 1,024. With a target above 1, derived or given, the loader also flushes every
         /// shard once the oldest batch pending on any shard is this many
         /// submitted batches old (a size flush restarts only its own shard's
-        /// window); an explicit `--target-bytes` turns that depth flush off,
+        /// window); `--target-bytes 1` turns that depth flush off,
         /// and with it the quarter, so the derived depth is the plain rows
         /// bound. The durable-token list a failed load reports
         /// is exactly what landed at any depth. `0` is rejected.
@@ -693,8 +693,8 @@ enum Command {
         /// about 250,000 rows on every signal, and the depth flush closes
         /// every shard once the oldest batch pending on any shard is
         /// `--pipeline-depth` batches old, which closes a shard whose rows
-        /// came out narrower than the first batch's. An explicit value is used as given and turns the depth
-        /// flush off. Stored objects come out much smaller than the target.
+        /// came out narrower than the first batch's. An explicit value is used as given; above 1 the depth
+        /// flush runs for it too. Stored objects come out much smaller than the target.
         /// `0` is rejected.
         ///
         /// On the ClickBench corpus the logs estimate counts about 7.4 KB per
@@ -746,8 +746,8 @@ enum Command {
         /// still sent only after its records' object and commit record are
         /// published, so an ack always means durable. But above `1` the flush
         /// that answers a batch's ack may be triggered by a LATER batch, so
-        /// that ack waits for one: the size trigger, the depth flush (derived
-        /// target only), the wall-clock age trigger
+        /// that ack waits for one: the size trigger, the depth flush, the
+        /// wall-clock age trigger
         /// (`--max-flush-delay`, 60s by default) or, at the end of the input,
         /// the loader's own force-flush. `0` is rejected.
         #[arg(long, value_name = "BYTES")]
@@ -763,9 +763,9 @@ enum Command {
         /// `--target-bytes` and one batch's per-shard slice footprint. A shard
         /// flushes on the first of: its buffer reaches `--target-bytes`, its
         /// oldest buffered point ages past this delay, the depth flush (with
-        /// `--target-bytes` unset), or the final drain at load close. A
-        /// buffer that fills slower than one target's worth per delay ages out
-        /// before it ever reaches the target, so the size trigger never fires
+        /// a target above 1), or the final drain at load close. A buffer that
+        /// fills slower than one target's worth per delay ages out (or closes
+        /// on the depth flush) before it reaches the target, so the size trigger never fires
         /// no matter how large the target is: at the router's own 2s delay the
         /// v4 load's ~11,871-row objects were about 2s of one shard's ingest
         /// rate.
@@ -775,8 +775,8 @@ enum Command {
         /// flush mix counts those under `manual`) before waiting on the last
         /// batches' acks, so a tail buffer left under `--target-bytes` is
         /// published there and never waits out this delay. Mid-load, a buffer
-        /// that misses `--target-bytes` waits for the depth flush (derived
-        /// target only), another batch's flush, or up to this delay for the
+        /// that misses `--target-bytes` waits for the depth flush, another
+        /// batch's flush, or up to this delay for the
         /// age trigger, and every write's ack deadline is
         /// raised to this delay plus one minute so that wait completes instead
         /// of failing the load. An ack still means durable whenever it arrives.
