@@ -445,15 +445,16 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     // phase read is reused by the Scan phase.
     //
     // Plan (2): the footer probe, then STREAM_DIR, which the 300-byte probe
-    // does not reach. Scan (5): its own footer probe; SKIP_IDX and PAGE_DIR in
+    // does not reach. Scan (4): its own footer probe; SKIP_IDX and PAGE_DIR in
     // one coalesced GET (the probe reaches neither); STREAM_DIR, which the
     // probe reaches only part of, while FIELD_DIR after it lies wholly inside
-    // the probe window and costs no GET; BLOOM, the tail section the probe
-    // also missed; and one chunk run, because the projection's
-    // pages across the 4 blocks `small_blocks()` cuts 11 records into (one
-    // row group) coalesce into a single run at the default gap. The cap
+    // the probe window and costs no GET; and one chunk run, because the
+    // projection's pages across the 4 blocks `small_blocks()` cuts 11 records
+    // into (one row group) coalesce into a single run at the default gap. No
+    // BLOOM: the stream matcher resolves to a `StreamIn` arm, which the
+    // reader never answers from BLOOM. The cap
     // (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`, 4) cannot bind on one run: the
-    // count is 5 because the probe carries FIELD_DIR, not because of
+    // count is 4 because the probe carries FIELD_DIR, not because of
     // bridging.
     let snap = accounting.snapshot();
     let plan_gets = snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get);
@@ -468,9 +469,8 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
         "Plan: one footer probe GET, one STREAM_DIR section GET"
     );
     assert_eq!(
-        scan_gets, 5,
-        "Scan: footer probe + SKIP_IDX/PAGE_DIR + STREAM_DIR + BLOOM + one \
-         chunk run"
+        scan_gets, 4,
+        "Scan: footer probe + SKIP_IDX/PAGE_DIR + STREAM_DIR + one chunk run"
     );
 
     let object_a = raw
@@ -482,7 +482,7 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     let section = |k: u32| *f.section(k).expect("section present");
     let (stream_dir, field_dir) = (section(kind::STREAM_DIR), section(kind::FIELD_DIR));
     let (skip_idx, page_dir) = (section(kind::SKIP_IDX), section(kind::PAGE_DIR));
-    let (bloom, blocks) = (section(kind::BLOOM), section(kind::BLOCKS));
+    let blocks = section(kind::BLOCKS);
     assert_eq!(
         field_dir.offset,
         stream_dir.offset + stream_dir.len,
@@ -510,16 +510,15 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     );
     let scan = &requests[2..];
     assert_eq!(
-        scan[..4],
+        scan[..3],
         [
             GetRange::Suffix(300),
             GetRange::Range(skip_idx.offset, page_dir.offset + page_dir.len),
             GetRange::Range(stream_dir.offset, stream_dir.offset + stream_dir.len),
-            GetRange::Range(bloom.offset, bloom.offset + bloom.len),
         ],
-        "Scan: probe, SKIP_IDX+PAGE_DIR, STREAM_DIR, BLOOM"
+        "Scan: probe, SKIP_IDX+PAGE_DIR, STREAM_DIR"
     );
-    let chunk_runs: Vec<&GetRange> = scan[4..]
+    let chunk_runs: Vec<&GetRange> = scan[3..]
         .iter()
         .filter(|r| {
             matches!(r, GetRange::Range(a, b)
@@ -528,7 +527,7 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
         .collect();
     assert_eq!(
         (chunk_runs.len(), scan.len()),
-        (1, 5),
+        (1, 4),
         "Scan: exactly one chunk run inside BLOCKS, and nothing after it"
     );
 
@@ -678,8 +677,8 @@ async fn log_series_samples_budget_trips_exactly() {
 }
 
 /// `max_s3_requests` trips at the exact request count `log_series_fetch_counts_lines_and_bytes_exactly`
-/// pins for this same fixture and window (2 Plan GETs + 5 Scan GETs = 7 for
-/// object A's one segment): `Bounded(6)` is one under that total, so the
+/// pins for this same fixture and window (2 Plan GETs + 4 Scan GETs = 6 for
+/// object A's one segment): `Bounded(5)` is one under that total, so the
 /// check after the segment completes must fail with the exact count, never
 /// silently truncate or round down to the budget.
 #[tokio::test]
@@ -700,24 +699,24 @@ async fn log_series_request_budget_trips_exactly() {
         end_ns: 120,
     };
     let req = LogSeriesRequest {
-        max_s3_requests: RequestLimit::Bounded(6),
+        max_s3_requests: RequestLimit::Bounded(5),
         ..lines_request(&matchers, window)
     };
     let accounting = PhaseAccounting::new();
 
     let err = fetch_log_series(&fetcher, TENANT, &[ref_a], &req, &accounting)
         .await
-        .expect_err("7 requests exceed max_s3_requests=6");
+        .expect_err("6 requests exceed max_s3_requests=5");
     match err {
         LogSeriesError::RequestsExceeded { requests, max } => {
-            assert_eq!(requests, 7);
-            assert_eq!(max, 6);
+            assert_eq!(requests, 6);
+            assert_eq!(max, 5);
         }
         other => panic!("expected RequestsExceeded, got {other:?}"),
     }
     assert_eq!(
         counting.get_count(),
-        7,
+        6,
         "accounted request count must equal the store's real GET count"
     );
 }
