@@ -1,6 +1,8 @@
 # ADR-0927: MetricsBench, a reproducible metrics and PromQL benchmark contract
 
-Status: Proposed. Issue #927, task T1 of the epic. Builds on ADR-0044
+Status: Accepted (implemented by PRs #932, #947, #948, #955, #1013, #1337 and
+#1510; amended 2026-10-26 under epic #2821, see the 2026-10-26 amendment at
+the end). Issue #927, task T1 of the epic. Builds on ADR-0044
 (per-query cost accounting), ADR-0070 (store request scheduling and the
 performance gate), ADR-0075 (published numbers are measured against real S3),
 ADR-0015 (Remote Write ingest), ADR-0025/ADR-0030 (accepted PromQL
@@ -63,6 +65,12 @@ against a 1.0 figure as though protocol overhead were identical.
 **Remote Read is not used.** `/api/v1/read` does not exist in Ravel, there is
 no handler and no ADR proposing one. Any comparison design that assumed a
 portable read-back path must not.
+
+The 2026-10-26 amendment adds to this decision: in the portable lane Ravel
+is driven through `ravel-server`'s own `/api/v1/write` like every
+comparator, the out-of-order anomaly is a genuine out-of-order sample under a
+frozen receiver window, and each receiver's accepted set is digested and
+compared across rows.
 
 ### 3. Acknowledgement semantics are reported, never normalised
 
@@ -132,7 +140,10 @@ cover every way a query ends, not only the interesting ones.
 
 Every outcome has exactly one status, and each status states its membership in
 three separate denominators. "The denominator" alone is ambiguous and must not
-appear in a report:
+appear in a report (the 2026-10-26 amendment adds two rules here: an
+empty oracle answer is timed only for an entry marked intended-empty, and
+each comparator's budget-error signatures are tabulated so a budget refusal
+lands in `refused` on every engine):
 
 - **corpus**: the query is in the corpus for this profile. Every status below
   is in it. This is the denominator a coverage claim divides by.
@@ -292,7 +303,10 @@ axis and pins the others.
 
 The `ci` profile exercises the same code paths and is **marked
 non-comparable** in the artifact itself. It cannot be presented as a
-performance result.
+performance result. The 2026-10-26 amendment corrects this table's `ci` churn
+figure (the manifest declares 0, not 5%/h), makes the stream's time anchor an
+explicit on-grid run parameter, and gives each profile a declared
+range-evaluation grid.
 
 Every profile records exact active-series count, total series created,
 samples per series, scrape interval, duration, total samples, label
@@ -455,3 +469,163 @@ statement's cost into the `/metrics` aggregator twice, pinned at
 Flight SQL and reading `ravel_query_*` sees 2x until it is fixed.
 
 Refs: #927, #51, #365, #573, #849, #913
+
+## Amendment (2026-10-26): the portable lane drives Ravel over HTTP, anomalies are the same logical data on every receiver, and the stream is a pure function of its run parameters
+
+<!-- amendment-applies: sections="2. Remote Write 1.0 is the cross-engine ingest baseline|6. Every outcome has a status, and refusals are not gaps|11. Three orthogonal profiles, pre-registered before the first run" pointer="2026-10-26 amendment" -->
+
+Context. Before the first portable query run (epic #2821, milestones #938
+and #940), an independent review of the contract against the code on
+`main` at cec01d088 found that the lane as built could hand four engines
+four different datasets while every per-row band passed. The findings and
+their evidence are on issue #2821 (comment 6407154211, 2026-10-26). This
+amendment records the decisions that close them. It changes no persistent
+format and no status in decision 6.
+
+### A. Ravel is driven through its own HTTP surface in the portable lane
+
+The replay lane writes to Ravel through an in-process `IngestRouter`
+(`crates/ravel-bench/src/metrics_ingest.rs`, `replay_into_ravel`) and
+queries through an in-process `QueryEngine` (`query_after_replay`). That
+path never runs `ravel_remote_write::normalize_resolved`, so it skips the
+event-time admission `ravel-server` applies on `/api/v1/write`
+(`crates/ravel-remote-write/src/normalize.rs`, `checked_event_ts`, bounded
+by `--max-ingest-lag`, default 2 h, ADR-0010 section 8). A 30-day history
+profile replayed in-process is accepted in full; the same stream sent to
+the shipped server is rejected almost entirely.
+
+Decision: in the portable lane, Ravel is one more comparator. It is
+deployed from `deploy/metricsbench/` at the same resource envelope as the
+others, written through `/api/v1/write` and queried through
+`/api/v1/query`, `/api/v1/query_range`, `/api/v1/labels`,
+`/api/v1/label/<name>/values` and `/api/v1/series`. The ingest limits a
+historical replay needs (`--max-ingest-lag` covering the profile's span,
+and the matching catalog setting) are set explicitly in that deployment and
+disclosed in the report's substrate block, exactly as every comparator's
+ingest window is. The in-process path stays as the diagnostic lane's
+replay (decision 1 and decision 7), and its report row says
+`endpoint: in-process` so it is never read as the portable row.
+
+### B. The out-of-order anomaly is an out-of-order sample, never a duplicate timestamp
+
+The generator shifts a selected instance-step by exactly two scrape
+intervals (`crates/ravel-bench/src/metrics_gen.rs`, the `out_of_order`
+branch of `emit_instance`), so the shifted sample carries a timestamp the
+series already emitted, with a different value. Receivers disagree on
+that. The review's reading of each receiver, which T1b verifies by
+reading back every receiver after the replay: Prometheus 3.13 rejects the
+Remote Write 1.0 request on the first duplicate-timestamp or out-of-order
+sample and rolls back its appender, Mimir rejects the sample and keeps the
+rest of the request, VictoriaMetrics accepts both samples, and Ravel keeps
+the later-written value at query time (docs/catalog-and-mvcc.md,
+cross-segment duplicate samples, the one receiver whose rule is pinned in
+this repository).
+The lane counts any non-retryable 4xx as the whole batch dropped
+(`replay_over_http`), so the report shows identical `dropped_samples` for
+receivers that stored different sets.
+
+Decision: the shift lands strictly between scrape points (one and a half
+intervals back), so the sample is out of order and never a duplicate.
+Every receiver runs a frozen, disclosed out-of-order window longer than
+the shift: Prometheus `storage.tsdb.out_of_order_time_window`, Mimir
+`limits.out_of_order_time_window`, VictoriaMetrics' default acceptance
+stated as such, and Ravel's own rule stated next to its deployment. The
+lane reads each receiver's per-sample outcome (the Remote Write response
+body and the receiver's written-samples header or counter), never a
+per-batch status alone, and each row carries a digest of its accepted
+`(series, timestamp, value bits)` set. A new band fails the run when any
+two portable rows' accepted-set digests differ. The generator change moves
+the workload manifest to version 2 with its own digest; version 1 streams
+stay reproducible from the version-1 manifest.
+
+### C. The stream is a pure function of its run parameters
+
+`metricsbench_ingest` anchors the first step at `now - steps * scrape`, an
+arbitrary millisecond, and the generator's BLAKE3 digest covers
+timestamps, so no two runs produce the same digest and the report records
+neither seed, manifest digest, anchor nor stream digest.
+
+Decision: `--anchor-ms` is an explicit run parameter with no default, like
+`--profile`, and must sit on the scrape grid (a multiple of the profile's
+scrape interval in milliseconds). The report records the manifest version
+and digest, the seed, the anchor, the generator's stream digest, and the
+parsed-stream digest per payload type. A chunked or streaming generation
+must produce the same bytes and digest as one-shot generation for the same
+parameters, pinned by test. Two runs with equal parameters produce equal
+digests, pinned by the smoke test.
+
+### D. Every generated line is counted by type, and a comparator row is banded
+
+`parse_logical_stream` skips native-histogram and staleness lines and
+malformed lines without a count, and `metricsbench_ingest` bands only the
+Ravel row. The nightly artifact shows the gap (119,775 generated, 107,736
+offered, zero rejected, 2026-10-25 run).
+
+Decision: every line is classified as a scalar, a native histogram, a
+staleness marker, or a typed malformed line, and band 4 reads
+`scalar + native_histogram + stale_marker + malformed == generated_lines`
+with `malformed == 0` for a generator stream. A lane that does not carry a
+payload type reports it as a named exclusion, never as absent. Staleness
+markers travel as the Prometheus stale NaN bit pattern, one shared
+constant, exempted from the non-finite rejection exactly for that pattern.
+Every row, comparator rows included, is banded on
+`offered == accepted + rejected + dropped` and on its declared drop budget,
+and the row records rejections by HTTP status.
+
+### E. Range evaluation grids and empty answers
+
+Nine corpus entries are `eval: range` and nothing declares their start,
+end or step, so band 1 (statement identity) is undefined for them. Two
+join entries can never produce a result on the generated data
+(`mb_join_cpu_on_build_version` has two `version` matches per
+`(job, instance)`; `mb_join_saturated_and_busy` thresholds a rate the
+generator cannot reach), and the two native-histogram entries compare an
+empty answer with an empty answer while no receiver has ever received a
+native histogram.
+
+Decision: each profile declares its range-evaluation grid
+(`range_eval: {start_offset_secs, end_offset_secs, step_secs}`) relative
+to the stream's newest sample, and the corpus gate checks that every range
+entry's window plus lookback fits inside the profile's span. An entry whose
+oracle answer is empty is timed only when the entry is marked
+intended-empty (the `absent` entries); otherwise the case is an invalid
+fixture and the experiment, not the engine, is reported as failed. The two
+join entries are repaired under a corpus version bump with their
+modification reasons recorded, and the corpus gate checks that every
+`group_left`/`group_right` key is unique on the right side under the
+manifest.
+
+### F. Comparator limits are frozen, and budget refusals land in `refused` on every engine
+
+Decision: every comparator's ingest window and query limits that the
+corpus can reach are set explicitly and disclosed in `deploy/metricsbench/`
+(Prometheus `--query.max-samples`, `--query.timeout`,
+`--query.lookback-delta`; VictoriaMetrics `-search.latencyOffset`,
+`-search.maxPointsPerTimeseries`, `-search.maxSamplesPerQuery`,
+`-search.maxQueryDuration`, `-search.maxUniqueTimeseries`; Mimir
+`querier.query_store_after`, `querier.query_ingesters_within`,
+`bucket_store.sync_interval`, `compactor.cleanup_interval`,
+`querier.max_samples`, `max_fetched_chunks_per_query`), and the status
+mapper carries a per-engine table of budget-error signatures so a limit
+that fires lands in `refused` with reason `budget` rather than in `error`.
+A historical replay into Mimir is followed by a readiness precondition
+(the bucket index lists blocks covering the replay's oldest sample) before
+the first statement, stamped into the report.
+
+### G. Correction to the profile table
+
+The `ci` row in decision 11 says churn 5%/h. The manifest
+(`benchmarks/metrics/workload.json`) declares
+`churn_basis_points_per_hour: 0` for `ci`, the generator tests pin it, and
+`benchmarks/metrics/README.md` is corrected in the same change. The table
+row is left as written and this paragraph is the correction.
+
+Consequences. Task routing under #2821: T1b (replay: generator shift,
+staleness markers, native-histogram wire shape, per-sample outcomes,
+accepted-set digest, per-row bands), T4c (comparator limits and Mimir
+read-path intervals), T4d (Ravel's own `deploy/metricsbench` deployment at
+the comparators' envelope), T5 (corpus and workload version 2: join
+repairs, range grids, corpus gates), T3 (status mapper and budget table).
+Nothing here changes a persistent format: the workload manifest and corpus
+are benchmark artifacts versioned by their own `version` field, not frozen
+storage contracts.

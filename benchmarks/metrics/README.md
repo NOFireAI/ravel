@@ -35,7 +35,7 @@ unattributable.
 | `cardinality` | 1,000,000 | 360 | 15 s | 90 m | none | 360,000,000 |
 | `history` | 10,000 | 172,800 | 15 s | 30 d | none | 1,728,000,000 |
 | `churn` | 50,000 concurrent | 8,640 | 15 s | 36 h | 20%/h | 432,000,000 |
-| `ci` | 1,000 | 120 | 15 s | 30 m | 5%/h | 120,000 |
+| `ci` | 1,000 | 120 | 15 s | 30 m | none | 120,000 |
 
 The `ci` profile is marked non-comparable **in the artifact**, as a typed
 `comparability` field carrying the reason:
