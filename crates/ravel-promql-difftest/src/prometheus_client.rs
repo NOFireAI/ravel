@@ -6,8 +6,9 @@
 //! (connect, request send, response headers, body transfer and JSON parse),
 //! and report a typed [`QueryOutcome`] so a query that exceeds its deadline
 //! is distinguishable from every other failure (ADR-0927 decision 6). The
-//! MetricsBench status mapper (`ravel-bench`'s `metrics_correctness`) is the
-//! consumer of that outcome; [`PrometheusClient::instant_query`] and
+//! MetricsBench status mapper (task T3 of #2821, a `metrics_correctness`
+//! module in `ravel-bench` that does not exist yet) is the intended consumer
+//! of that outcome; [`PrometheusClient::instant_query`] and
 //! [`PrometheusClient::range_query`] are thin wrappers that keep the
 //! differential runner on its parsed-envelope `Result`.
 //!
@@ -26,6 +27,11 @@ pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(120);
 /// Response body cap used unless [`PrometheusClient::with_max_body_bytes`]
 /// sets another.
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How many per-call-deadline query clients a [`PrometheusClient`] keeps
+/// before evicting the oldest. Each carries its own connection pool, so the
+/// set is bounded rather than grown per distinct deadline.
+pub const MAX_OVERRIDE_CLIENTS: usize = 8;
 
 /// How much earlier than the query deadline the transport's own connect
 /// timer fires. It exists so a connect stall reports [`TimeoutPhase::Connect`]
@@ -156,13 +162,17 @@ impl QueryOutcome {
 }
 
 pub struct PrometheusClient {
-    /// Readiness polling and remote write. No deadline: `wait_ready` keeps
-    /// its own timeout and is not a query.
+    /// Readiness polling and remote write. Not a query client: `wait_ready`
+    /// bounds each probe by its own remaining timeout, and `remote_write`
+    /// keeps the unbounded send it had before the query deadline existed.
     control: reqwest::Client,
     /// Query client whose connect timer matches `deadline`.
     query: reqwest::Client,
     /// Query clients for per-call deadlines other than `deadline`, keyed by
-    /// that deadline so each keeps its own connection pool.
+    /// that deadline so each keeps its own connection pool. Bounded to
+    /// [`MAX_OVERRIDE_CLIENTS`] entries, oldest evicted, so a caller that
+    /// passes a fresh remaining-budget deadline per query cannot grow one
+    /// client and pool per call.
     overrides: Mutex<Vec<(Duration, reqwest::Client)>>,
     base_url: String,
     deadline: Duration,
@@ -207,11 +217,16 @@ impl PrometheusClient {
     pub async fn wait_ready(&self, timeout: Duration) -> Result<(), PrometheusClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Ok(resp) = self
-                .control
-                .get(format!("{}/-/ready", self.base_url))
-                .send()
-                .await
+            // A probe the server accepts but never answers must not outlive
+            // the overall timeout: bound each send by what remains of it.
+            let probe = tokio::time::timeout_at(
+                deadline,
+                self.control
+                    .get(format!("{}/-/ready", self.base_url))
+                    .send(),
+            )
+            .await;
+            if let Ok(Ok(resp)) = probe
                 && resp.status().is_success()
             {
                 return Ok(());
@@ -317,6 +332,9 @@ impl PrometheusClient {
             return client.clone();
         }
         let client = query_client(deadline);
+        if overrides.len() >= MAX_OVERRIDE_CLIENTS {
+            overrides.remove(0);
+        }
         overrides.push((deadline, client.clone()));
         client
     }
