@@ -798,7 +798,14 @@ dictionaries the statement reads: `summary_only()` names none,
 `with_dictionary(column)` adds one. Each part's statistics are held in memory
 without the dictionaries the request did not name: a column's `dictionary` is
 emptied while its `dictionary_present` and every other summary field stay as
-decoded. `LoadedColumnStats::dictionary_loaded(column)` is true only when every
+decoded. The decode streams the body one segment at a time, validating each
+segment in full before clearing the dictionaries it does not keep (those the
+request names, plus those the part's cached entry already held). An object
+with one defect is refused with the same `SnapshotFormatError` variant the
+whole-object decode gives (one with several can be refused for a different
+one of them), and the load never reserves more than one segment plus the kept
+bytes (step 1 of "Snapshot resolution from a folded snapshot" below).
+`LoadedColumnStats::dictionary_loaded(column)` is true only when every
 covered part holds that column's dictionary, and a reader that needs one (the
 not-equal count and the per-value group counts) declines when it is false, so
 the statement scans rather than reading an emptied dictionary. SQL over logs
@@ -2205,16 +2212,24 @@ pinning are unchanged:
    reservation: an isolation breach must be reported as one even when the
    budget has no room for the object it is in, rather than being reported
    as a memory refusal with the breach and its counter lost. The
-   column-statistics load reserves each object's declared body the same
-   way and fails with `LoadColumnStatsError::MemoryExhausted`, which a SQL
+   column-statistics load reserves through the same evict-then-retry path,
+   but its decode streams: the body is decompressed one
+   length-delimited segment at a time, each segment's encoded length is
+   reserved before it is read, and once the segment is validated and its
+   unkept dictionaries are cleared that charge is replaced by one for the
+   bytes it keeps. A load therefore reserves at most its largest segment
+   plus the kept bytes, rather than the whole declared body up front; a
+   body declared over the
+   ceiling is charged 0 and refused before any segment is read. A refusal
+   fails the load with `LoadColumnStatsError::MemoryExhausted`, which a SQL
    client sees as 422 with the budget's own message (ADR-2633 section 5),
    never as corrupt data. Its header
    checks (tenant_hash, format version and part binding) also read the
    peeked header and run before that reservation, so under memory pressure
    a foreign-tenant object still fails with
    `LoadColumnStatsError::TenantHashMismatch` and a stale-bound one still
-   degrades to no statistics; that
-   reservation is released when `load_column_stats` returns, since
+   degrades to no statistics; the kept bytes' reservation is released
+   when `load_column_stats` returns, since
    `LoadedColumnStats` has no slot to carry it.
    The catalog's budget defaults to unlimited and the server does not yet
    pass it the process budget, so these reservations account without

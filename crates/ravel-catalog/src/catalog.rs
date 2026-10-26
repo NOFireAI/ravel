@@ -396,7 +396,7 @@ pub struct Catalog {
     /// bytes, so both give memory back together when
     /// [`Catalog::reserve_decoded`] is refused (see [`crate::cache::DecodedCache`]'s
     /// eviction rule).
-    decoded: DecodedCaches,
+    decoded: Arc<DecodedCaches>,
     /// The byte cache (ADR-0046 decisions 1-3): raw bytes of content-addressed
     /// objects (snapshot parts, postings), keyed by
     /// `(tenant_hash, content_hash, offset, len)`, consulted at
@@ -621,7 +621,7 @@ pub struct Catalog {
     /// caches gave memory back ([`Catalog::reserve_decoded`]). Counts the
     /// retry, not its outcome. Surfaced by
     /// [`Catalog::decode_reserve_retries`].
-    decode_reserve_retries: AtomicU64,
+    decode_reserve_retries: Arc<AtomicU64>,
     /// The read CPU gate the part, postings and column-stats decodes run on
     /// (ADR-1702 decision 4). `None` from [`Catalog::new`]: every decode runs
     /// inline on the calling task until a caller installs one with
@@ -787,7 +787,7 @@ impl Catalog {
             cache: RecordCache::default(),
             compaction_cache: CompactionRecordCache::default(),
             head_cache: HeadCache::default(),
-            decoded: DecodedCaches::default(),
+            decoded: Arc::new(DecodedCaches::default()),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
@@ -814,7 +814,7 @@ impl Catalog {
             column_stats_decode_job_fault: None,
             column_stats_part_ceiling_override: None,
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
-            decode_reserve_retries: AtomicU64::new(0),
+            decode_reserve_retries: Arc::new(AtomicU64::new(0)),
             read_gate: None,
             monotonic_clock: Arc::new(ravel_cpu_gate::InstantClock::new()),
         })
@@ -918,41 +918,24 @@ impl Catalog {
         declared: u64,
         ceiling: u64,
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
-        let refusal = match crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
-        {
-            Ok(reservation) => return Ok(reservation),
-            Err(refusal) => refusal,
-        };
-        // A closed host-memory gate (ADR-2633) refuses every reservation
-        // whatever the ledger holds, so giving cached bytes back cannot admit
-        // the retry: no pass, no retry, the gate's refusal is the answer.
-        if matches!(
-            refusal.cause,
-            ravel_memory::ExhaustionCause::HostMemory { .. }
-        ) {
-            return Err(refusal);
+        reserve_decoded_evicting(
+            &self.memory_budget,
+            &self.decoded,
+            &self.decode_reserve_retries,
+            declared,
+            ceiling,
+        )
+    }
+
+    /// An owned handle reserving exactly as [`Catalog::reserve_decoded`]
+    /// does, against this catalog's budget and caches, for a decode job that
+    /// reserves as it goes.
+    fn decode_reserve_handle(&self) -> CatalogDecodeReserver {
+        CatalogDecodeReserver {
+            budget: Arc::clone(&self.memory_budget),
+            decoded: Arc::clone(&self.decoded),
+            retries: Arc::clone(&self.decode_reserve_retries),
         }
-        let want = ravel_memory::decoded_charge(declared, ceiling);
-        let limit = self.memory_budget.limit();
-        // The test below also refuses this; checking it first skips the two
-        // cache locks `reserved_bytes` takes.
-        if want > limit {
-            return Err(refusal);
-        }
-        // `held` is read before `reserved`: an entry leaving the caches
-        // between the two reads then lowers `reserved` against a `held` that
-        // still counts it, which errs toward running the pass.
-        let held = self.decoded.reserved_bytes();
-        let held_outside_caches = self.memory_budget.reserved().saturating_sub(held);
-        if held_outside_caches
-            .checked_add(want)
-            .is_none_or(|total| total > limit)
-        {
-            return Err(refusal);
-        }
-        self.decoded.evict_until_fits(&self.memory_budget, want);
-        self.decode_reserve_retries.fetch_add(1, Ordering::Relaxed);
-        crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
     }
 
     /// Decoded-output cache entries dropped to make room for a refused decode
@@ -1689,17 +1672,21 @@ impl Catalog {
             // so a stale entry always misses (the issue #888 guarantee, per
             // part).
             let cache_key: ColumnStatsCacheKey = (*tenant, signal, resolved.blake3);
-            let part_blake3 = resolved.expected_part_blake3[0];
+            let &[part_blake3] = resolved.expected_part_blake3.as_slice() else {
+                continue;
+            };
             let cached = cache.and_then(|cache| cache.get(cache_key, &part_blake3));
             if let Some(entry) = cached.as_ref().filter(|entry| entry.covers(request)) {
                 parts.push(Arc::clone(entry));
                 continue;
             }
 
+            let keep = PartColumnStats::dictionaries_to_keep(request, cached.as_deref());
             let outcome = column_stats_resolve::fetch_stats_object(
                 &getter,
                 tenant,
                 &resolved,
+                &keep,
                 self,
                 self.read_gate(),
             )
@@ -1707,7 +1694,7 @@ impl Catalog {
             #[cfg(test)]
             let outcome = self.inject_column_stats_decode_job_fault(outcome).await;
             match outcome {
-                column_stats_resolve::FetchOutcome::Loaded(decoded, reservation) => {
+                column_stats_resolve::FetchOutcome::Loaded(decoded, kept) => {
                     self.column_stats_decoded_bytes
                         .fetch_add(decoded.body_uncompressed_len, Ordering::Relaxed);
                     let entry = Arc::new(PartColumnStats::from_decoded(
@@ -1719,7 +1706,7 @@ impl Catalog {
                         cache.insert(cache_key, part_blake3, Arc::clone(&entry));
                     }
                     parts.push(entry);
-                    reservations.push(reservation);
+                    reservations.extend(kept);
                 }
                 // Store read or stale binding: this part is simply
                 // left uncovered, silently.
@@ -5248,6 +5235,87 @@ impl crate::charged::DecodeReserver for Catalog {
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
         Catalog::reserve_decoded(self, declared, ceiling)
     }
+
+    fn owned(&self) -> Box<dyn crate::charged::DecodeReserver + Send> {
+        Box::new(self.decode_reserve_handle())
+    }
+}
+
+/// [`Catalog::reserve_decoded`] detached from the catalog: the same budget,
+/// caches and retry counter, held by `Arc` so a decode job running off the
+/// caller's task can reserve through it.
+struct CatalogDecodeReserver {
+    budget: Arc<ravel_memory::MemoryBudget>,
+    decoded: Arc<DecodedCaches>,
+    retries: Arc<AtomicU64>,
+}
+
+impl crate::charged::DecodeReserver for CatalogDecodeReserver {
+    fn reserve_decoded(
+        &self,
+        declared: u64,
+        ceiling: u64,
+    ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        reserve_decoded_evicting(
+            &self.budget,
+            &self.decoded,
+            &self.retries,
+            declared,
+            ceiling,
+        )
+    }
+
+    fn owned(&self) -> Box<dyn crate::charged::DecodeReserver + Send> {
+        Box::new(CatalogDecodeReserver {
+            budget: Arc::clone(&self.budget),
+            decoded: Arc::clone(&self.decoded),
+            retries: Arc::clone(&self.retries),
+        })
+    }
+}
+
+/// The body of [`Catalog::reserve_decoded`], whose doc is its contract.
+fn reserve_decoded_evicting(
+    budget: &Arc<ravel_memory::MemoryBudget>,
+    decoded: &DecodedCaches,
+    retries: &AtomicU64,
+    declared: u64,
+    ceiling: u64,
+) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+    let refusal = match crate::charged::reserve_decoded(budget, declared, ceiling) {
+        Ok(reservation) => return Ok(reservation),
+        Err(refusal) => refusal,
+    };
+    // A closed host-memory gate (ADR-2633) refuses every reservation
+    // whatever the ledger holds, so giving cached bytes back cannot admit
+    // the retry: no pass, no retry, the gate's refusal is the answer.
+    if matches!(
+        refusal.cause,
+        ravel_memory::ExhaustionCause::HostMemory { .. }
+    ) {
+        return Err(refusal);
+    }
+    let want = ravel_memory::decoded_charge(declared, ceiling);
+    let limit = budget.limit();
+    // The test below also refuses this; checking it first skips the two
+    // cache locks `reserved_bytes` takes.
+    if want > limit {
+        return Err(refusal);
+    }
+    // `held` is read before `reserved`: an entry leaving the caches
+    // between the two reads then lowers `reserved` against a `held` that
+    // still counts it, which errs toward running the pass.
+    let held = decoded.reserved_bytes();
+    let held_outside_caches = budget.reserved().saturating_sub(held);
+    if held_outside_caches
+        .checked_add(want)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(refusal);
+    }
+    decoded.evict_until_fits(budget, want);
+    retries.fetch_add(1, Ordering::Relaxed);
+    crate::charged::reserve_decoded(budget, declared, ceiling)
 }
 
 fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, CatalogError> {
@@ -13683,12 +13751,15 @@ mod tests {
     /// figure for a fixed fixture.
     const COLUMN_STATS_DECLARED_BODY_LEN: u64 = 75;
 
-    /// A column-statistics object is charged its declared uncompressed body
-    /// before decoding: a budget with no room for it fails the load with the
-    /// typed budget error rather than decoding uncharged.
+    /// A column-statistics object's segment is charged before it is read: a
+    /// budget with no room for it fails the load with the typed budget error
+    /// rather than decoding uncharged. The decode streams (issue #3244), so
+    /// the refused charge is the one segment's encoded length, the declared
+    /// body less its one-byte length prefix.
     ///
-    /// FLIP: drop the `reserve_decoded` call in `fetch_stats_object` and the
-    /// load succeeds, failing `expect_err`.
+    /// FLIP: drop the `reserve_decoded` call in `WorkingReservation`'s
+    /// `before_segment` and the refusal moves to the segment's kept bytes,
+    /// failing the `requested` assertion.
     #[tokio::test]
     async fn column_stats_decode_reserves_its_output() {
         let store = Arc::new(MemoryStore::new());
@@ -13714,8 +13785,9 @@ mod tests {
         match err {
             column_stats_resolve::LoadColumnStatsError::MemoryExhausted(exhausted) => {
                 assert_eq!(
-                    exhausted.requested, declared,
-                    "exactly the object's declared uncompressed body"
+                    exhausted.requested,
+                    declared - 1,
+                    "exactly the object's one segment"
                 );
                 assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
                 assert_eq!(exhausted.limit, 0);

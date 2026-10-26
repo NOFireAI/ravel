@@ -37,9 +37,10 @@ pub(crate) fn reserve_decoded(
 
 /// What a decode site reserves its declared output bytes through.
 ///
-/// The one implementation is [`Catalog::reserve_decoded`](crate::Catalog),
-/// which answers a refusal by evicting decoded-output cache entries and
-/// retrying once. A resolve helper takes this rather than the bare
+/// Every implementation is [`Catalog::reserve_decoded`](crate::Catalog)
+/// (on the catalog itself or the handle [`Self::owned`] returns), which
+/// answers a refusal by evicting decoded-output cache entries and retrying
+/// once. A resolve helper takes this rather than the bare
 /// `MemoryBudget` because the two are not interchangeable under memory
 /// pressure: a site holding the budget directly fails while cached decoded
 /// parts and postings still hold memory that would have let it through, which
@@ -51,6 +52,10 @@ pub(crate) trait DecodeReserver: Sync {
     /// [`reserve_decoded`]'s contract, with whatever the implementation does
     /// about a refusal.
     fn reserve_decoded(&self, declared: u64, ceiling: u64) -> Result<Reservation, MemoryExhausted>;
+
+    /// An owned reserver with the same refusal handling, for a decode job
+    /// that runs off the caller's task and reserves as it reads.
+    fn owned(&self) -> Box<dyn DecodeReserver + Send>;
 }
 
 /// A decoded value and the reservation that charges its bytes. Derefs to the
