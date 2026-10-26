@@ -395,11 +395,24 @@ fn sample(body: &str, series: &str) -> u64 {
     samples[0].parse().expect("gauge value")
 }
 
+/// The HELP text of `family`, asserting it renders exactly once.
+fn help<'a>(body: &'a str, family: &str) -> &'a str {
+    let prefix = format!("# HELP {family} ");
+    let helps: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .collect();
+    assert_eq!(helps.len(), 1, "{family:?} HELP must render once:\n{body}");
+    helps[0]
+}
+
 const FETCH_RESERVED: &str = r#"ravel_memory_reserved_bytes{mode="query",component="fetch"}"#;
 const PART_CACHE: &str =
     r#"ravel_catalog_decoded_cache_reserved_bytes{mode="query",cache="part"}"#;
 const POSTINGS_CACHE: &str =
     r#"ravel_catalog_decoded_cache_reserved_bytes{mode="query",cache="postings"}"#;
+const RETRIES: &str = "ravel_catalog_decode_reserve_retries_total";
+const EVICTIONS: &str = "ravel_catalog_decoded_cache_memory_evictions_total";
 
 /// A process budget one byte smaller than the part's entry body refuses the
 /// part decode: 422 `execution` with the budget's own figures. The part is
@@ -464,6 +477,11 @@ async fn the_catalog_charges_the_servers_own_budget() {
         "{body}"
     );
     assert_eq!(budget.reserved(), held_bytes, "the refusal charged nothing");
+    // The decoded caches were empty, so no eviction could admit the part and
+    // the catalog kept its first refusal without a pass or a retry.
+    let refused = scrape(&running).await;
+    assert_eq!(sample(&refused, &format!(r#"{RETRIES}{{mode="query"}}"#)), 0);
+    assert_eq!(sample(&refused, &format!(r#"{EVICTIONS}{{mode="query"}}"#)), 0);
 
     drop(held);
     let (status, body) = query_probe(&running, folded.query_time_s).await;
@@ -505,6 +523,20 @@ async fn the_fetch_gauge_counts_the_catalogs_held_decodes() {
         running.process_memory_budget().fetch_reserved(),
         folded.part_bytes + folded.postings_bytes
     );
+    assert!(
+        help(&after, "ravel_memory_reserved_bytes")
+            .contains("the catalog's snapshot-part and name-postings decodes"),
+        "{after}"
+    );
+    for counter in [RETRIES, EVICTIONS] {
+        assert!(
+            help(&after, counter).contains(
+                "moves only when the shared ADR-1170 process memory budget refuses a catalog \
+                 decode reservation that dropping cached entries could admit"
+            ),
+            "{after}"
+        );
+    }
     eprintln!(
         "pinned figures: part {} bytes, postings {} bytes, probe segment {} bytes",
         folded.part_bytes, folded.postings_bytes, folded.probe_segment_bytes
