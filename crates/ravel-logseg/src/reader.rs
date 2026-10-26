@@ -8548,7 +8548,9 @@ mod tests {
             /// next cell.
             #[test]
             fn contains_needle_is_in_each_handles_straddles() {
-                let cases: [(&str, &[&[u8]], &[bool]); 12] = [
+                /// A needle, the cells, and each cell's verdict.
+                type Case = (&'static str, &'static [&'static [u8]], &'static [bool]);
+                let cases: [Case; 12] = [
                     ("google", &[b"xgoo", b"gley"], &[false, false]),
                     ("google", &[b"google google", b"x"], &[true, false]),
                     (
