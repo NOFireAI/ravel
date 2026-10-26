@@ -149,6 +149,16 @@ impl Profile {
         self.comparability.is_comparable()
     }
 
+    /// Seconds from the profile's first sample to its newest one:
+    /// `(samples_per_series - 1) * scrape_interval_secs`, one scrape interval
+    /// less than `duration_secs`, because the generator stamps step `n` at
+    /// `base + n * interval` for `n` in `0..samples_per_series`. A range grid
+    /// and its lookback must fit inside this span, not inside `duration_secs`,
+    /// for every grid point's lookback to start at or after the first sample.
+    pub fn stream_span_secs(&self) -> u64 {
+        self.samples_per_series.saturating_sub(1) * self.scrape_interval_secs
+    }
+
     /// Churn epochs the profile spans, counting the first (partial) one.
     ///
     /// Measured from the last sample's offset rather than from `duration_secs`,
@@ -641,8 +651,9 @@ pub enum RangeEvalFault {
     /// between scrapes in a way that differs from point to point.
     #[error("the step is not a multiple of the scrape interval")]
     StepOffScrapeGrid,
-    /// The grid reaches back past the profile's first sample.
-    #[error("the start offset reaches past the profile's duration")]
+    /// The grid reaches back past the profile's first sample: its start offset
+    /// is larger than [`Profile::stream_span_secs`].
+    #[error("the start offset reaches past the profile's first sample")]
     StartPastDuration,
 }
 
@@ -821,7 +832,7 @@ fn gate_range_eval(profile: &Profile) -> Result<(), WorkloadError> {
         Some(RangeEvalFault::StepDoesNotDivideWindow)
     } else if !grid.step_secs.is_multiple_of(profile.scrape_interval_secs) {
         Some(RangeEvalFault::StepOffScrapeGrid)
-    } else if grid.start_offset_secs > profile.duration_secs {
+    } else if grid.start_offset_secs > profile.stream_span_secs() {
         Some(RangeEvalFault::StartPastDuration)
     } else {
         None
@@ -1297,6 +1308,9 @@ mod tests {
             (1_500, 0, 45, RangeEvalFault::StepDoesNotDivideWindow),
             (1_500, 0, 10, RangeEvalFault::StepOffScrapeGrid),
             (1_815, 0, 15, RangeEvalFault::StartPastDuration),
+            // One interval past the 1,785 s stream span: inside duration_secs
+            // (1,800) but before the first sample, so it must fail too.
+            (1_800, 0, 15, RangeEvalFault::StartPastDuration),
         ];
         for (start, end, step, expected) in cases {
             let mut w = fixture();
@@ -1313,14 +1327,16 @@ mod tests {
             );
         }
         // The boundary itself passes: a grid reaching back exactly to the
-        // duration fits, and a step equal to the window gives two points.
+        // first sample (the 1,785 s stream span) fits, and a step equal to the
+        // window gives two points.
         let mut w = fixture();
+        assert_eq!(w.profiles[2].stream_span_secs(), 1_785);
         w.profiles[2].range_eval = RangeEval {
-            start_offset_secs: 1_800,
+            start_offset_secs: 1_785,
             end_offset_secs: 0,
-            step_secs: 1_800,
+            step_secs: 1_785,
         };
-        gate_workload(&w).expect("a grid spanning exactly the duration gates clean");
+        gate_workload(&w).expect("a grid spanning exactly the stream gates clean");
         assert_eq!(w.profiles[2].range_eval.points(), 2);
     }
 
