@@ -17,6 +17,13 @@
 //!   scale that produced the original report, behind
 //!   `RAVEL_SQL_GROUP_BY_STRESS=1` because it moves gigabytes. See its own
 //!   doc comment.
+//!
+//! Issue #3271 adds where the cast back to the declared type runs:
+//! `group_by_str_limit_restores_above_the_topk` (above the TopK, once),
+//! `single_distinct_two_level_aggregate_keeps_views_between_levels` (no cast
+//! between the two levels of a `COUNT(DISTINCT ..)`) and
+//! `sort_key_computing_on_the_group_key_restores_below_the_sort` (below a sort
+//! whose key computes on the group key).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -29,14 +36,18 @@ use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DFResult;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::TableType;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_expr::expressions::CastExpr;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateOutputMode};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -287,6 +298,353 @@ async fn declared_str_group_by_groups_on_views_and_returns_its_declared_type() {
             ("https://example.test/c".to_string(), 1),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Where the cast back to the declared type runs (issue #3271)
+// ---------------------------------------------------------------------------
+
+/// The physical plan the real executor builds for `sql` over the declared-URL
+/// tenant, with every optimizer rule `build_session` installs.
+async fn executor_plan(executor: &SqlExecutor, sql: &str) -> Arc<dyn ExecutionPlan> {
+    let accounting = QueryAccounting::new();
+    let declared = executor
+        .resolve_declared_columns(tenant().hash(), request(sql).now_ns)
+        .await;
+    let (snapshot, _) = executor
+        .resolve_snapshot(tenant().hash(), &request(sql), &accounting)
+        .await
+        .expect("snapshot resolves");
+    executor
+        .plan_pinned(tenant().hash(), snapshot, sql, &accounting, &declared)
+        .await
+        .expect("query plans")
+        .create_physical_plan()
+        .await
+        .expect("physical plan builds")
+}
+
+/// The nodes from `plan` down to the first node, in pre-order, for which
+/// `pred` holds, both ends included.
+fn path_to(
+    plan: &Arc<dyn ExecutionPlan>,
+    pred: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
+) -> Option<Vec<Arc<dyn ExecutionPlan>>> {
+    if pred(plan) {
+        return Some(vec![Arc::clone(plan)]);
+    }
+    for child in plan.children() {
+        if let Some(mut path) = path_to(child, pred) {
+            path.insert(0, Arc::clone(plan));
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Every node of `plan`, in pre-order.
+fn nodes(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
+    out.push(Arc::clone(plan));
+    for child in plan.children() {
+        nodes(child, out);
+    }
+}
+
+/// How many `CastExpr`s to `ty` the node's own expressions hold, at any depth.
+fn casts_to(node: &Arc<dyn ExecutionPlan>, ty: &DataType) -> usize {
+    let mut count = 0;
+    node.apply_expressions(&mut |expr| {
+        expr.apply(|sub| {
+            if sub
+                .downcast_ref::<CastExpr>()
+                .is_some_and(|cast| cast.cast_type() == ty)
+            {
+                count += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+    })
+    .expect("expressions walk");
+    count
+}
+
+/// The type of the column named `name` in `node`'s output, if it has one.
+fn column_type(node: &Arc<dyn ExecutionPlan>, name: &str) -> Option<DataType> {
+    node.schema()
+        .field_with_name(name)
+        .ok()
+        .map(|field| field.data_type().clone())
+}
+
+/// Asserts that the plan holds exactly one `CastExpr` to the declared
+/// dictionary type, in a `ProjectionExec` that is an ancestor of the topmost
+/// node carrying a fetch, and returns the path from the root to that node.
+fn assert_restore_above_the_fetch(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
+    let mut all = Vec::new();
+    nodes(plan, &mut all);
+    let restores: Vec<_> = all
+        .iter()
+        .filter(|node| casts_to(node, &dict_type()) > 0)
+        .collect();
+    let [restore] = restores.as_slice() else {
+        panic!("expected exactly one cast to the declared type, found {restores:?}");
+    };
+    assert!(restore.is::<ProjectionExec>(), "{restore:?}");
+    assert_eq!(casts_to(restore, &dict_type()), 1);
+    let fetch = path_to(plan, &|node| node.fetch().is_some()).expect("the plan has a fetch node");
+    let at = fetch
+        .iter()
+        .position(|node| Arc::ptr_eq(node, restore))
+        .unwrap_or_else(|| {
+            panic!(
+                "the restore projection is not an ancestor of the topmost fetch node {:?}",
+                fetch.last()
+            )
+        });
+    assert!(
+        at + 1 < fetch.len(),
+        "the restore projection is the fetch node itself"
+    );
+    fetch
+}
+
+/// q34's shape, `GROUP BY <declared Str> ORDER BY count(*) DESC LIMIT k`:
+/// the cast back to the declared type runs once, above the TopK and the merge,
+/// on the rows the limit lets through, and nothing between it and the scan
+/// handles the key as a dictionary after the first aggregate.
+#[tokio::test]
+async fn group_by_str_limit_restores_above_the_topk() {
+    let executor = declared_url_executor().await;
+    let sql = format!(
+        "SELECT {URL_KEY}, count(*) AS hits FROM logs GROUP BY {URL_KEY} \
+         ORDER BY count(*) DESC LIMIT 10"
+    );
+    let plan = executor_plan(&executor, &sql).await;
+    assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+    assert_restore_above_the_fetch(&plan);
+
+    let mut all = Vec::new();
+    nodes(&plan, &mut all);
+    let mut checked = 0;
+    for node in &all {
+        if node.is::<AggregateExec>()
+            || node.is::<SortExec>()
+            || node.is::<SortPreservingMergeExec>()
+        {
+            assert_eq!(
+                column_type(node, URL_KEY).as_ref(),
+                Some(&DataType::Utf8View),
+                "{} still carries the key as a dictionary",
+                node.name()
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        all.iter().any(|node| node.is::<SortExec>()),
+        "the plan has a TopK sort to check"
+    );
+    assert!(
+        checked >= 3,
+        "only {checked} aggregate and sort nodes checked"
+    );
+
+    let outcome = executor
+        .execute(tenant().hash(), &request(&sql))
+        .await
+        .expect("query runs");
+    let rows = url_counts(outcome.output.batches());
+    assert_eq!(
+        rows.first(),
+        Some(&("https://example.test/a".to_string(), 3))
+    );
+    let mut sorted = rows.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec![
+            ("https://example.test/a".to_string(), 3),
+            ("https://example.test/b".to_string(), 1),
+            ("https://example.test/c".to_string(), 1),
+        ]
+    );
+}
+
+/// q14's shape, `GROUP BY <declared Str>` over one `COUNT(DISTINCT ..)`,
+/// which DataFusion plans as two aggregate levels: the key stays a view from
+/// the inner level to the outer one, so it is cast to `Utf8View` once, below
+/// the inner level's final stage, and back to the declared type once, above
+/// the TopK.
+#[tokio::test]
+async fn single_distinct_two_level_aggregate_keeps_views_between_levels() {
+    let executor = declared_url_executor().await;
+    let sql = format!(
+        "SELECT {URL_KEY}, COUNT(DISTINCT ts) AS u FROM logs GROUP BY {URL_KEY} \
+         ORDER BY 2 DESC LIMIT 10"
+    );
+    let plan = executor_plan(&executor, &sql).await;
+    assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+    assert_restore_above_the_fetch(&plan);
+
+    // The inner level groups on the key and the distinct argument; its final
+    // stage is the first aggregate producing final values with two keys.
+    let inner_final = path_to(&plan, &|node| {
+        node.downcast_ref::<AggregateExec>().is_some_and(|agg| {
+            agg.group_expr().expr().len() == 2
+                && agg.mode().output_mode() != AggregateOutputMode::Partial
+        })
+    })
+    .expect("the statement plans an inner aggregate level");
+    let outer_final = inner_final
+        .iter()
+        .position(|node| node.is::<AggregateExec>())
+        .expect("the outer level sits above the inner one");
+    assert!(
+        outer_final + 1 < inner_final.len(),
+        "the outer level is a different aggregate from the inner one"
+    );
+    for node in &inner_final[outer_final..] {
+        let schema = node.schema();
+        for field in schema.fields() {
+            assert!(
+                !matches!(field.data_type(), DataType::Dictionary(..)),
+                "{} carries {} as a dictionary between the two levels",
+                node.name(),
+                field.name()
+            );
+        }
+    }
+    for node in &inner_final[..inner_final.len() - 1] {
+        assert_eq!(
+            casts_to(node, &DataType::Utf8View),
+            0,
+            "{} casts the key to a view again above the inner final stage",
+            node.name()
+        );
+    }
+    let mut all = Vec::new();
+    nodes(&plan, &mut all);
+    let to_views: Vec<_> = all
+        .iter()
+        .filter(|node| casts_to(node, &DataType::Utf8View) > 0)
+        .collect();
+    let [to_view] = to_views.as_slice() else {
+        panic!("expected one node casting to Utf8View, found {to_views:?}");
+    };
+    assert_eq!(casts_to(to_view, &DataType::Utf8View), 1);
+    let inner_final_stage = inner_final.last().expect("path is non-empty");
+    assert!(
+        !Arc::ptr_eq(to_view, inner_final_stage)
+            && path_to(inner_final_stage, &|node| Arc::ptr_eq(node, to_view)).is_some(),
+        "the cast to Utf8View is not below the inner level's final stage: {to_view:?}"
+    );
+
+    let outcome = executor
+        .execute(tenant().hash(), &request(&sql))
+        .await
+        .expect("query runs");
+    let rows = url_counts(outcome.output.batches());
+    assert_eq!(
+        rows.first(),
+        Some(&("https://example.test/a".to_string(), 3))
+    );
+    assert_eq!(rows.len(), 3);
+}
+
+/// A sort key that computes on the group key (`url = '..'`, a `CASE` over
+/// it) is evaluated on the sort's input, against a dictionary literal, so the
+/// restore projection sits below that sort and its input holds the declared
+/// type. A sort key that is the bare group column next to an aggregate value
+/// does not stop the carry: the restore still runs above the TopK.
+#[tokio::test]
+async fn sort_key_computing_on_the_group_key_restores_below_the_sort() {
+    let executor = declared_url_executor().await;
+    for (order_by, order) in [
+        ("url = 'https://example.test/a', hits, url", ["b", "c", "a"]),
+        (
+            "CASE url WHEN 'https://example.test/a' THEN 0 ELSE 1 END, hits, url",
+            ["a", "b", "c"],
+        ),
+        // The key two levels below the root of the sort expression.
+        (
+            "CASE WHEN url = 'https://example.test/a' THEN 0 ELSE 1 END, hits, url",
+            ["a", "b", "c"],
+        ),
+    ] {
+        let sql = format!(
+            "SELECT {URL_KEY}, count(*) AS hits FROM logs GROUP BY {URL_KEY} ORDER BY {order_by}"
+        );
+        let plan = executor_plan(&executor, &sql).await;
+        assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+        let mut all = Vec::new();
+        nodes(&plan, &mut all);
+        let sorts: Vec<_> = all.iter().filter(|node| node.is::<SortExec>()).collect();
+        let [sort] = sorts.as_slice() else {
+            panic!("{sql}: expected one SortExec, found {sorts:?}");
+        };
+        let [input] = sort.children()[..] else {
+            panic!("a SortExec has one input");
+        };
+        assert_eq!(
+            column_type(input, URL_KEY).as_ref(),
+            Some(&dict_type()),
+            "{sql}: the sort's input carries the key as a view"
+        );
+        assert!(input.is::<ProjectionExec>(), "{sql}: {input:?}");
+        assert_eq!(casts_to(input, &dict_type()), 1, "{sql}");
+
+        let outcome = executor
+            .execute(tenant().hash(), &request(&sql))
+            .await
+            .expect("query runs");
+        assert_eq!(
+            url_counts(outcome.output.batches()),
+            order
+                .iter()
+                .map(|path| {
+                    let hits = if *path == "a" { 3 } else { 1 };
+                    (format!("https://example.test/{path}"), hits)
+                })
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    let sql = format!(
+        "SELECT {URL_KEY}, count(*) AS hits FROM logs GROUP BY {URL_KEY} \
+         ORDER BY hits DESC, {URL_KEY} ASC LIMIT 10"
+    );
+    let plan = executor_plan(&executor, &sql).await;
+    assert_restore_above_the_fetch(&plan);
+}
+
+/// The `(url, count)` rows of a result whose first column is the declared
+/// dictionary type and whose second is an `Int64` count, in result order.
+fn url_counts(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.column(0).data_type(), &dict_type());
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("group column is a dictionary");
+        let values = keys
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dictionary values are strings");
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is Int64");
+        for row in 0..batch.num_rows() {
+            let key = values.value(keys.keys().value(row) as usize).to_string();
+            rows.push((key, counts.value(row)));
+        }
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
