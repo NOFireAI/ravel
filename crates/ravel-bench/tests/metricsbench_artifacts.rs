@@ -603,7 +603,7 @@ fn a_version_1_corpus_is_refused_by_the_version_2_loader() {
 }
 
 #[test]
-fn the_two_repaired_joins_and_the_two_intended_empty_entries_say_why() {
+fn the_two_repaired_joins_say_why_and_no_entry_is_intended_empty() {
     let entries = load_corpus(corpus_path()).expect("corpus loads");
     let modified: Vec<&str> = entries
         .iter()
@@ -626,25 +626,16 @@ fn the_two_repaired_joins_and_the_two_intended_empty_entries_say_why() {
             .ends_with("rate(metricsbench_requests_total[5m]) > 0.5")
     );
 
-    // Only the two native-histogram entries are intended-empty. The three
-    // absent entries are not: absent() answers with a sample exactly when its
-    // argument is empty.
+    // No entry is intended-empty: the two native-histogram entries lost the
+    // marker once the ingest lane put native histograms on the wire (T1c of
+    // #2821). The three absent entries are not marked either: absent()
+    // answers with a sample exactly when its argument is empty.
     let intended_empty: Vec<&str> = entries
         .iter()
         .filter(|e| e.expected.intended_empty)
         .map(|e| e.id.as_str())
         .collect();
-    assert_eq!(
-        intended_empty,
-        vec!["mb_histogram_native_p95", "mb_histogram_native_fraction"]
-    );
-    for id in intended_empty {
-        let reason = by_id(id).expected.reason.as_deref().expect("a reason");
-        assert!(
-            reason.contains("T1c") && reason.contains("#2821"),
-            "{reason}"
-        );
-    }
+    assert_eq!(intended_empty, Vec::<&str>::new());
 
     // A blank reason on the marker is refused by the loader.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -653,7 +644,8 @@ fn the_two_repaired_joins_and_the_two_intended_empty_entries_say_why() {
         .position(|e| e.id == "mb_histogram_native_p95")
         .expect("entry present");
     let path = corrupt_corpus(&dir, "blank_reason.json", |doc| {
-        doc["entries"][index]["expected"]["reason"] = serde_json::json!("  ");
+        doc["entries"][index]["expected"] =
+            serde_json::json!({"intended_empty": true, "reason": "  "});
     });
     let err = load_corpus(&path).expect_err("a blank intended-empty reason must fail");
     assert!(

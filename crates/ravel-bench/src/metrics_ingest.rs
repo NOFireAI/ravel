@@ -1,13 +1,13 @@
 //! MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5).
 //!
-//! One logical sample stream is replayed into every participating system: the
-//! in-process Ravel path (`IngestRouter`, `WriteMode::Strict`), and, behind
-//! endpoints supplied by config with no hardcoded hosts, Prometheus,
-//! VictoriaMetrics, and the object-storage-native comparator over portable
-//! Remote Write 1.0. Every system is fed the same [`LogicalSample`]s and the
-//! same wire body shape (`prometheus.WriteRequest`, snappy-compressed
-//! protobuf), so a byte or a latency difference is a property of the engine,
-//! not of the protocol.
+//! One logical stream is replayed into every participating system: the
+//! in-process Ravel path (`IngestRouter`, `WriteMode::Strict`, row endpoint
+//! `in-process`), and, behind endpoints supplied by config with no hardcoded
+//! hosts, `ravel-server`, Prometheus, VictoriaMetrics and Mimir over portable
+//! Remote Write 1.0. Every system is fed the same [`LogicalPoint`]s (scalar
+//! samples, staleness markers and native histograms) and the same wire body
+//! shape (`prometheus.WriteRequest`, snappy-compressed protobuf), so a byte or
+//! a latency difference is a property of the engine, not of the protocol.
 //!
 //! ## Acknowledgement semantics are data, never normalised (ADR-0927 dec. 3)
 //!
@@ -15,8 +15,10 @@
 //! object AND its commit record are both durably stored, and the response
 //! carries `x-ravel-commit-token`
 //! (`services/ravel-server/src/remote_write.rs`). Its rows are tagged
-//! [`AckSemantics::DurableOnAck`] and carry the returned commit tokens. A
-//! Remote Write 2xx from Prometheus or VictoriaMetrics means the samples were
+//! [`AckSemantics::DurableOnAck`]: the in-process row carries every minted
+//! commit token, the portable row the last `x-ravel-commit-token` it received
+//! (`last_commit_token`). A Remote Write 2xx from a comparator means the
+//! samples were
 //! accepted into a buffer whose durability the harness cannot observe from the
 //! client, so those rows are tagged [`AckSemantics::Buffered`] and carry no
 //! tokens. A durable-on-ack latency is never placed in the same folded column
@@ -35,25 +37,29 @@
 //!
 //! ## Exact-count discipline (ADR-0927 bands 4/5)
 //!
-//! Every count the lane controls is exact and closes: `offered_samples ==
-//! accepted_samples + rejected_samples + dropped_samples`, over the stream's
-//! scalar (float) lines. Every line is classified ([`classify_line`]) as a
-//! scalar, a native histogram, a staleness marker or a malformed line, and
-//! each row's `stream_counts` counts all four, so nothing leaves the replay
-//! uncounted: the two non-scalar kinds are named exclusions
-//! (`excluded_native_histogram`, `excluded_stale_marker`) from the scalar
-//! replay. [`check_stream_band`] holds the stream to band 4's classification
-//! identity: the four counts sum to `generated_lines`, each count equals the
-//! generator's own per-type figure, and `malformed` is zero.
-//! [`check_row_accounting`] holds each row to the offering identity, read
-//! from the row's own fields: `offered + excluded_native_histogram +
-//! excluded_stale_marker == generated_lines`.
+//! Every line is classified ([`classify_line`]) as a scalar, a native
+//! histogram, a staleness marker or a malformed line, and each row's
+//! `stream_counts` counts all four. Every well-formed line is sent: a scalar
+//! or a staleness marker (the stale NaN, [`STALE_MARKER_BITS`]) as a sample
+//! under `offered_samples`, a native histogram under its own class,
+//! `offered_histograms`. Each class closes on its own: `offered_samples ==
+//! accepted_samples + rejected_samples + dropped_samples` and the same for
+//! histograms. [`check_stream_band`] holds the stream to band 4's
+//! classification identity: the four counts sum to `generated_lines`, each
+//! count equals the generator's own per-type figure, and `malformed` is
+//! zero. [`check_row_accounting`] holds each row to the offering identity,
+//! read from the row's own fields: `offered_samples + offered_histograms +
+//! excluded_native_histogram + excluded_stale_marker == generated_lines`.
+//! Both exclusions are zero on every row this code writes
+//! (`tests::the_ci_stream_replays_every_payload_type_with_zero_exclusions`);
+//! they stay in the identity so an artifact written before the lane sent
+//! every type still reads back closed.
 //!
 //! ## Bounded streaming replay
 //!
 //! A replay pulls batches from a [`SampleBatches`] source rather than holding
 //! the stream. [`GeneratedStream`] generates one scrape step at a time and
-//! queues only that step's scalar samples, so what a replay holds is bounded
+//! queues only that step's points, so what a replay holds is bounded
 //! by the batch size and one step's width, not by the run's length
 //! (`metricsbench_ingest_smoke::streaming_replay_memory_does_not_grow_with_
 //! history_length`). Its bytes, write order and digest are the one-shot
@@ -1961,7 +1967,7 @@ impl<'a> GeneratedStream<'a> {
     pub fn finish(self) -> Result<(crate::metrics_gen::GenerationReport, StreamCounts), LaneError> {
         if self.tally.steps_generated() != self.steps || !self.pending.is_empty() {
             return Err(LaneError::Generate(format!(
-                "the stream was closed after {} of {} steps with {} samples unread",
+                "the stream was closed after {} of {} steps with {} points unread",
                 self.tally.steps_generated(),
                 self.steps,
                 self.pending.len()
@@ -2060,11 +2066,11 @@ pub struct RavelReplayOutcome {
     pub first_metric: Option<String>,
 }
 
-/// Pull scalar samples from `source` until `pending` holds `batch_size` valid
-/// ones or the stream ends, counting each pulled sample as offered and each
-/// invalid one as rejected, and adding each pulled sample to
-/// `offered_digest`. `on_valid` sees each valid sample in stream order
-/// and returns what is queued for it.
+/// Pull points from `source` until `pending` holds `batch_size` valid ones or
+/// the stream ends, counting each pulled point as offered and each invalid
+/// one as rejected, under its own class (sample or histogram), and adding
+/// each pulled point to the offered digest. `on_valid` sees each valid point
+/// in stream order and returns what is queued for it.
 fn fill_valid<S, T, F>(
     source: &mut S,
     batch_size: usize,
@@ -2123,11 +2129,12 @@ fn class_counts<'p>(points: impl IntoIterator<Item = &'p LogicalPoint>) -> (u64,
 
 /// Replay `source` into the in-process Ravel path, pulling one batch at a
 /// time so memory is bounded by the batch, not the stream's history. Valid
-/// samples are batched in stream order and written with `WriteMode::Strict`,
-/// so each batch's ack means durable and mints commit tokens; invalid samples
-/// are refused with an exact count. The accounting closes: `offered ==
-/// accepted + rejected + dropped`, and the row carries the source's
-/// [`StreamCounts`].
+/// points (samples, staleness markers and native histograms, each through
+/// `IngestPoint`) are batched in stream order and written with
+/// `WriteMode::Strict`, so each batch's ack means durable and mints commit
+/// tokens; invalid points are refused with an exact count. Each class's
+/// accounting closes: `offered == accepted + rejected + dropped`, and the row
+/// carries the source's [`StreamCounts`].
 pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     config: &RavelReplayConfig,
     source: &mut S,
@@ -2701,6 +2708,12 @@ mod tests {
             offered_digest: String::new(),
             accepted_samples: 1,
             rejected_samples: 0,
+            offered_histograms: 0,
+            accepted_histograms: 0,
+            rejected_histograms: 0,
+            dropped_histograms: 0,
+            histograms_rejected_by_status: BTreeMap::new(),
+            retry_exhausted_histograms: 0,
             dropped_samples: 0,
             rejected_by_status: BTreeMap::new(),
             retry_exhausted_samples: 0,
@@ -2893,6 +2906,12 @@ mod tests {
         // 40 samples at batch 8 is exactly 5 batches.
         assert_eq!(ing.batches, 5, "exact batch count");
 
+        // The in-process row says so, so it is never read as the portable
+        // Ravel row (ADR-0927 2026-10-26 amendment A).
+        assert_eq!(outcome.result.system, "ravel");
+        assert_eq!(outcome.result.endpoint, "in-process");
+        assert_eq!(outcome.result.last_commit_token, None);
+
         // Durable-on-ack: one commit token per shard flushed, and the row is
         // tagged strict with tokens recorded.
         assert_eq!(outcome.result.ack_semantics, AckSemantics::DurableOnAck);
@@ -3006,6 +3025,222 @@ mod tests {
             .validate(),
             Ok(())
         );
+    }
+
+    /// The stale marker's exact bit pattern is the one non-finite value the
+    /// lane admits. The canonical quiet NaN and both infinities are still
+    /// refused.
+    ///
+    /// TO SEE THIS FAIL: drop the `&& self.value.to_bits() !=
+    /// STALE_MARKER_BITS` clause in `LogicalSample::validate` (exempt
+    /// nothing; the marker is refused), or replace the condition with
+    /// `!self.value.is_finite() && !self.value.is_nan()` (exempt every NaN;
+    /// 0x7ff8000000000000 is accepted).
+    #[test]
+    fn validate_exempts_exactly_the_stale_marker_bits() {
+        let with_bits = |bits: u64| LogicalSample {
+            metric: "m".to_string(),
+            labels: vec![],
+            ts_ms: 0,
+            value: f64::from_bits(bits),
+        };
+        assert_eq!(with_bits(STALE_MARKER_BITS).validate(), Ok(()));
+        assert!(with_bits(STALE_MARKER_BITS).is_stale_marker());
+        for refused in [
+            0x7ff8_0000_0000_0000,
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+        ] {
+            assert_eq!(
+                with_bits(refused).validate(),
+                Err(RejectionReason::NonFiniteValue),
+                "{refused:#018x}"
+            );
+        }
+    }
+
+    fn histogram(ts_ms: i64, deltas: Vec<i64>) -> LogicalHistogram {
+        // The absolute buckets' total; an invalid (negative) bucket vector
+        // gets count 0.
+        let mut running = 0i64;
+        let total: i64 = deltas
+            .iter()
+            .map(|d| {
+                running += d;
+                running
+            })
+            .sum();
+        let count = u64::try_from(total).unwrap_or(0);
+        LogicalHistogram {
+            metric: "mb_native".to_string(),
+            labels: vec![("instance".to_string(), "a".to_string())],
+            ts_ms,
+            schema: 2,
+            count,
+            sum: 12.5,
+            positive_deltas: deltas,
+            reset_hint: pb_histogram::ResetHint::Unknown,
+        }
+    }
+
+    /// A histogram whose deltas go negative, or whose buckets do not sum to
+    /// its count, is refused before sending.
+    #[test]
+    fn histogram_validation_refuses_inconsistent_buckets() {
+        assert_eq!(histogram(0, vec![1, 2, -1]).validate(), Ok(()));
+        assert_eq!(
+            histogram(0, vec![1, -2]).validate(),
+            Err(RejectionReason::InvalidHistogram)
+        );
+        let mut miscounted = histogram(0, vec![1, 2]);
+        miscounted.count += 1;
+        assert_eq!(
+            miscounted.validate(),
+            Err(RejectionReason::InvalidHistogram)
+        );
+        let mut unnamed = histogram(0, vec![1]);
+        unnamed.metric.clear();
+        assert_eq!(unnamed.validate(), Err(RejectionReason::EmptyMetricName));
+    }
+
+    /// The RW1.0 body carries a native histogram in `histograms` with the
+    /// shape the lane promises, decoded back with the same prost types: one
+    /// span `{0, deltas.len()}`, integer count, zero threshold 0, zero count
+    /// 0, the deltas verbatim, the reset hint, and no float samples. A stale
+    /// marker in the same body keeps its bit pattern.
+    #[test]
+    fn a_native_histogram_decodes_back_with_the_promised_wire_shape() {
+        let h = histogram(15_000, vec![3, 1, -2, 0]);
+        let stale = LogicalSample {
+            metric: "mb_gauge".to_string(),
+            labels: vec![],
+            ts_ms: 15_000,
+            value: f64::from_bits(STALE_MARKER_BITS),
+        };
+        let body = encode_rw1_points(&[
+            LogicalPoint::Histogram(h.clone()),
+            LogicalPoint::Sample(stale),
+        ])
+        .expect("encode");
+        let raw = snap::raw::Decoder::new()
+            .decompress_vec(&body)
+            .expect("snappy");
+        let req = WriteRequest::decode(raw.as_slice()).expect("prost decode");
+        assert_eq!(req.timeseries.len(), 2);
+        let hist_ts = req
+            .timeseries
+            .iter()
+            .find(|ts| ts.labels.iter().any(|l| l.value == "mb_native"))
+            .expect("histogram series");
+        assert!(hist_ts.samples.is_empty(), "never folded into samples");
+        assert_eq!(hist_ts.histograms.len(), 1);
+        let wire = &hist_ts.histograms[0];
+        assert_eq!(wire.count, Some(pb_histogram::Count::CountInt(h.count)));
+        assert_eq!(wire.sum.to_bits(), h.sum.to_bits());
+        assert_eq!(wire.schema, 2);
+        assert_eq!(wire.zero_threshold.to_bits(), 0.0f64.to_bits());
+        assert_eq!(
+            wire.zero_count,
+            Some(pb_histogram::ZeroCount::ZeroCountInt(0))
+        );
+        assert_eq!(
+            wire.positive_spans,
+            vec![PbBucketSpan {
+                offset: 0,
+                length: 4
+            }]
+        );
+        assert_eq!(wire.positive_deltas, vec![3, 1, -2, 0]);
+        assert!(wire.positive_counts.is_empty() && wire.negative_spans.is_empty());
+        assert!(wire.negative_deltas.is_empty() && wire.custom_values.is_empty());
+        assert_eq!(wire.reset_hint, pb_histogram::ResetHint::Unknown as i32);
+        assert_eq!(wire.timestamp, 15_000);
+
+        let stale_ts = req
+            .timeseries
+            .iter()
+            .find(|ts| ts.labels.iter().any(|l| l.value == "mb_gauge"))
+            .expect("stale series");
+        assert_eq!(stale_ts.samples.len(), 1);
+        assert_eq!(stale_ts.samples[0].value.to_bits(), STALE_MARKER_BITS);
+    }
+
+    /// Native histograms are their own offered class: a replay of samples
+    /// and histograms counts each under its own figures, and the scalar
+    /// `offered_samples` holds the samples alone. The in-process path
+    /// accepts both kinds through `IngestPoint`.
+    ///
+    /// TO SEE THIS FAIL: in `fill_valid`, count every point under
+    /// `offer.samples` (drop the `if is_histogram` branch); `offered_samples`
+    /// becomes 7 and the first assertion fails.
+    #[tokio::test]
+    async fn native_histograms_are_their_own_offered_class() {
+        let base = base_ts_ms();
+        let mut points: Vec<LogicalPoint> = valid_stream(4, 2)
+            .into_iter()
+            .map(LogicalPoint::Sample)
+            .collect();
+        points.push(LogicalPoint::Sample(LogicalSample {
+            metric: "mb_replay_gauge".to_string(),
+            labels: vec![("instance".to_string(), "mb-instance-0".to_string())],
+            ts_ms: base + 90_000,
+            value: f64::from_bits(STALE_MARKER_BITS),
+        }));
+        points.push(LogicalPoint::Histogram(histogram(base, vec![2, 1, 0])));
+        points.push(LogicalPoint::Histogram(histogram(base + 15_000, vec![3, 1, 0])));
+        let cfg = memory_config("mb-replay-classes", 3);
+        let outcome = replay_into_ravel(&cfg, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        let ing = &outcome.result.ingest;
+        assert_eq!(ing.offered_samples, 5, "four scalars and one stale marker");
+        assert_eq!(ing.accepted_samples, 5);
+        assert_eq!(ing.offered_histograms, 2);
+        assert_eq!(ing.accepted_histograms, 2);
+        assert_eq!(ing.rejected_histograms + ing.dropped_histograms, 0);
+        assert_eq!(
+            ing.stream_counts,
+            StreamCounts {
+                generated_lines: 7,
+                scalar: 4,
+                native_histogram: 2,
+                stale_marker: 1,
+                malformed: 0,
+            }
+        );
+        check_row_accounting(ing, &ing.stream_counts).expect("both classes close");
+    }
+
+    /// The ci profile replayed in process: every line is offered, the
+    /// per-type counts close against the generator, and both exclusions are
+    /// zero.
+    #[tokio::test]
+    async fn the_ci_stream_replays_every_payload_type_with_zero_exclusions() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let interval_ms = 1_000 * workload.profile("ci").expect("ci").scrape_interval_secs as i64;
+        let steps = 5;
+        let back = base_ts_ms() - steps as i64 * interval_ms;
+        let anchor = back - back.rem_euclid(interval_ms);
+        let mut stream = GeneratedStream::new(
+            Generator::new(&workload, "ci", anchor).expect("generator builds"),
+            steps,
+        );
+        let outcome = replay_into_ravel(&memory_config("mb-replay-ci-types", 4096), &mut stream)
+            .await
+            .expect("replay");
+        let (report, counts) = stream.finish().expect("drained stream closes");
+        check_stream_band(&counts, &report).expect("band 4 classification");
+        let ing = &outcome.result.ingest;
+        check_row_accounting(ing, &counts).expect("band 4 offering identity");
+        assert!(counts.stale_marker > 0 && counts.native_histogram > 0);
+        assert_eq!(ing.excluded_native_histogram, 0);
+        assert_eq!(ing.excluded_stale_marker, 0);
+        assert_eq!(ing.offered_samples, counts.scalar + counts.stale_marker);
+        assert_eq!(ing.offered_histograms, counts.native_histogram);
+        assert_eq!(ing.accepted_samples, ing.offered_samples);
+        assert_eq!(ing.accepted_histograms, ing.offered_histograms);
     }
 
     /// COMMIT-TOKEN READ-YOUR-WRITE (ADR-0927 decision 3): the tokens a strict
@@ -3296,23 +3531,28 @@ mod tests {
                 value: 3.5,
             })
         );
+        let StreamRecord::StaleMarker(stale) = &records[1] else {
+            panic!("a stale line is a stale marker: {:?}", records[1]);
+        };
+        assert_eq!(stale.metric, "mb_gauge");
         assert_eq!(
-            records[1],
-            StreamRecord::StaleMarker {
-                ts_ms: 15_000,
-                series: "mb_gauge{instance=\"mb-instance-1\"}".to_string(),
-            }
+            stale.labels,
+            vec![("instance".to_string(), "mb-instance-1".to_string())]
         );
+        assert_eq!(stale.ts_ms, 15_000);
+        assert_eq!(stale.value.to_bits(), STALE_MARKER_BITS);
         assert_eq!(
             records[2],
-            StreamRecord::NativeHistogram {
+            StreamRecord::NativeHistogram(LogicalHistogram {
+                metric: "mb_native".to_string(),
+                labels: vec![("job".to_string(), "api".to_string())],
                 ts_ms: 15_000,
-                series: "mb_native{job=\"api\"}".to_string(),
                 schema: 2,
                 count: 4,
-                sum_bits: 1.0f64.to_bits(),
-                deltas_len: 4,
-            }
+                sum: 1.0,
+                positive_deltas: vec![1, 1, 1, 1],
+                reset_hint: pb_histogram::ResetHint::Unknown,
+            })
         );
     }
 
@@ -3388,9 +3628,11 @@ mod tests {
             Generator::new(&workload, "ci", 1_700_000_000_000).expect("generator builds"),
             steps,
         );
-        let mut offered = 0u64;
+        let (mut offered_samples, mut offered_histograms) = (0u64, 0u64);
         while let Some(batch) = stream.next_batch(500).expect("generates") {
-            offered += batch.len() as u64;
+            let (samples, histograms) = class_counts(&batch);
+            offered_samples += samples;
+            offered_histograms += histograms;
         }
         let (report, counts) = stream.finish().expect("drained stream closes");
 
@@ -3400,7 +3642,15 @@ mod tests {
         assert_eq!(counts.stale_marker, report.stale_markers);
         assert_eq!(counts.malformed, 0);
         assert_eq!(counts.generated_lines, report.emitted_samples);
-        assert_eq!(offered, counts.scalar, "every scalar line is offered once");
+        assert_eq!(
+            offered_samples,
+            counts.scalar + counts.stale_marker,
+            "every scalar and stale-marker line is offered once"
+        );
+        assert_eq!(
+            offered_histograms, counts.native_histogram,
+            "every native-histogram line is offered once"
+        );
         check_stream_band(&counts, &report).expect("the ci stream closes band 4");
     }
 
@@ -3505,8 +3755,16 @@ mod tests {
         let (second, second_counts, second_samples) = drain();
         assert_eq!(first.digest, second.digest);
         assert_eq!(first_counts, second_counts);
+        // Compared through the offered digest, which is bit-exact: a stale
+        // marker is a NaN, so `PartialEq` on the points never holds.
+        let points_digest = |points: &[LogicalPoint]| {
+            let mut d = OfferedDigest::new();
+            points.iter().for_each(|p| d.update_point(p));
+            (points.len(), d.finish())
+        };
         assert_eq!(
-            first_samples, second_samples,
+            points_digest(&first_samples),
+            points_digest(&second_samples),
             "same anchor, same write order"
         );
 
@@ -3519,18 +3777,22 @@ mod tests {
             first, one_shot,
             "the streamed report is the one-shot report"
         );
-        let one_shot_scalars: Vec<LogicalSample> = std::str::from_utf8(&one_shot_bytes)
+        let one_shot_points: Vec<LogicalPoint> = std::str::from_utf8(&one_shot_bytes)
             .expect("utf8")
             .lines()
             .enumerate()
             .filter_map(|(i, line)| match classify_line(i as u64 + 1, line) {
-                StreamRecord::Scalar(sample) => Some(sample),
-                _ => None,
+                StreamRecord::Scalar(sample) | StreamRecord::StaleMarker(sample) => {
+                    Some(LogicalPoint::Sample(sample))
+                }
+                StreamRecord::NativeHistogram(h) => Some(LogicalPoint::Histogram(h)),
+                StreamRecord::Malformed { .. } => None,
             })
             .collect();
         assert_eq!(
-            first_samples, one_shot_scalars,
-            "streaming offers the one-shot stream's scalars in its order"
+            points_digest(&first_samples),
+            points_digest(&one_shot_points),
+            "streaming offers the one-shot stream's points in its order"
         );
 
         let (other, _, _) = {
@@ -3545,14 +3807,14 @@ mod tests {
         assert_ne!(other.digest, first.digest, "the anchor reaches the bytes");
     }
 
-    /// Scalar samples the first `steps` steps of the ci profile emit.
-    fn ci_scalars(workload: &WorkloadFile, steps: u64) -> u64 {
+    /// Points (every line) the first `steps` steps of the ci profile emit.
+    fn ci_points(workload: &WorkloadFile, steps: u64) -> u64 {
         crate::metrics_gen::Generator::new(workload, "ci", 0)
             .expect("builds")
             .generate_bytes(steps)
             .expect("generates")
             .1
-            .float_samples
+            .emitted_samples
     }
 
     /// Closing a stream with every step generated but samples still queued is
@@ -3562,8 +3824,8 @@ mod tests {
         use crate::metrics_gen::Generator;
 
         let workload = ci_workload();
-        let first_step = ci_scalars(&workload, 1);
-        let both_steps = ci_scalars(&workload, 2);
+        let first_step = ci_points(&workload, 1);
+        let both_steps = ci_points(&workload, 2);
         let mut stream =
             GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 2);
         // One more than the first step holds forces the second step out.
@@ -3578,7 +3840,7 @@ mod tests {
         let err = stream.finish().expect_err("unread samples are refused");
         assert!(
             err.to_string()
-                .contains(&format!("after 2 of 2 steps with {unread} samples unread")),
+                .contains(&format!("after 2 of 2 steps with {unread} points unread")),
             "{err}"
         );
     }
@@ -3590,7 +3852,7 @@ mod tests {
         use crate::metrics_gen::Generator;
 
         let workload = ci_workload();
-        let first_step = ci_scalars(&workload, 1) as usize;
+        let first_step = ci_points(&workload, 1) as usize;
         let mut stream =
             GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 2);
         // Exactly the first step's scalars: generated once, then drained.
@@ -3602,7 +3864,7 @@ mod tests {
         let err = stream.finish().expect_err("a short stream is refused");
         assert!(
             err.to_string()
-                .contains("after 1 of 2 steps with 0 samples unread"),
+                .contains("after 1 of 2 steps with 0 points unread"),
             "{err}"
         );
     }
@@ -3676,27 +3938,42 @@ mod tests {
             stale_marker: 1,
             malformed: 0,
         };
+        // A row that sends every type: 6 scalars + 1 stale marker offered
+        // as samples, 3 histograms offered as their own class.
         let mut ingest = ingest_phase(1.0);
         ingest.stream_counts = counts;
-        ingest.offered_samples = 6;
-        ingest.accepted_samples = 4;
+        ingest.offered_samples = 7;
+        ingest.accepted_samples = 5;
         ingest.rejected_samples = 1;
         ingest.dropped_samples = 1;
-        ingest.excluded_native_histogram = 3;
-        ingest.excluded_stale_marker = 1;
+        ingest.offered_histograms = 3;
+        ingest.accepted_histograms = 2;
+        ingest.dropped_histograms = 1;
         check_row_accounting(&ingest, &counts).expect("the row closes");
 
-        let mut zeroed = ingest.clone();
+        // A row carrying named exclusions (the pre-change lane) still closes.
+        let mut excluding = ingest.clone();
+        excluding.offered_samples = 6;
+        excluding.accepted_samples = 4;
+        excluding.excluded_stale_marker = 1;
+        excluding.offered_histograms = 0;
+        excluding.accepted_histograms = 0;
+        excluding.dropped_histograms = 0;
+        excluding.excluded_native_histogram = 3;
+        check_row_accounting(&excluding, &counts).expect("named exclusions close");
+
+        let mut zeroed = excluding.clone();
         zeroed.excluded_native_histogram = 0;
         zeroed.excluded_stale_marker = 0;
         let err = check_row_accounting(&zeroed, &counts).expect_err("zeroed exclusions");
         assert_eq!(err.offering_total, 6);
         let message = err.to_string();
         for figure in [
-            "6 offered + 0 excluded_native_histogram + 0 excluded_stale_marker = 6 against 10 \
-             generated lines",
-            "6 offered against 6 scalar lines",
-            "6 offered against 4 accepted + 1 rejected + 1 dropped",
+            "6 offered samples + 0 offered histograms + 0 excluded_native_histogram + 0 \
+             excluded_stale_marker = 6 against 10 generated lines",
+            "6 offered samples + 0 excluded_stale_marker against 6 scalar + 1 stale marker lines",
+            "0 offered histograms + 0 excluded_native_histogram against 3 native histogram lines",
+            "6 offered against 4 accepted + 1 rejected + 1 dropped samples",
         ] {
             assert!(message.contains(figure), "missing `{figure}` in: {message}");
         }
@@ -3706,7 +3983,43 @@ mod tests {
         let err = check_row_accounting(&unsplit, &counts).expect_err("an open split");
         assert!(
             err.to_string()
-                .contains("6 offered against 4 accepted + 1 rejected + 0 dropped"),
+                .contains("7 offered against 5 accepted + 1 rejected + 0 dropped samples"),
+            "{err}"
+        );
+
+        let mut unsplit_histograms = ingest.clone();
+        unsplit_histograms.dropped_histograms = 0;
+        let err = check_row_accounting(&unsplit_histograms, &counts)
+            .expect_err("an open histogram split");
+        assert!(
+            err.to_string()
+                .contains("3 offered against 2 accepted + 0 rejected + 0 dropped histograms"),
+            "{err}"
+        );
+    }
+
+    /// A row that folds its histograms into the scalar `offered_samples`
+    /// fails, even when its offering total and its split still close.
+    #[test]
+    fn a_row_that_folds_histograms_into_offered_samples_fails() {
+        let counts = StreamCounts {
+            generated_lines: 10,
+            scalar: 6,
+            native_histogram: 3,
+            stale_marker: 1,
+            malformed: 0,
+        };
+        let mut folded = ingest_phase(1.0);
+        folded.stream_counts = counts;
+        folded.offered_samples = 10;
+        folded.accepted_samples = 10;
+        folded.rejected_samples = 0;
+        folded.dropped_samples = 0;
+        let err = check_row_accounting(&folded, &counts).expect_err("folded histograms");
+        assert_eq!(err.offering_total, 10, "the total alone cannot see a fold");
+        assert!(
+            err.to_string()
+                .contains("10 offered samples + 0 excluded_stale_marker against 6 scalar"),
             "{err}"
         );
     }
@@ -3884,6 +4197,59 @@ mod tests {
         assert_ne!(base, digest(&reordered));
     }
 
+    /// The offered digest covers staleness markers by bit pattern and native
+    /// histograms by every encoded field: one stale marker turned into the
+    /// canonical NaN, one bucket delta, the sum, the schema, the count or the
+    /// reset hint each change it.
+    ///
+    /// TO SEE THIS FAIL: drop the `positive_deltas` loop from
+    /// `OfferedDigest::update_histogram`; the bucket-delta assertion fails.
+    #[test]
+    fn offered_digest_covers_stale_markers_and_every_histogram_field() {
+        let stale = LogicalSample {
+            metric: "mb_gauge".to_string(),
+            labels: vec![],
+            ts_ms: 15_000,
+            value: f64::from_bits(STALE_MARKER_BITS),
+        };
+        let points = vec![
+            LogicalPoint::Sample(stale.clone()),
+            LogicalPoint::Histogram(histogram(15_000, vec![3, 1, -2, 0])),
+        ];
+        let digest = |p: &[LogicalPoint]| {
+            let mut d = OfferedDigest::new();
+            p.iter().for_each(|x| d.update_point(x));
+            d.finish()
+        };
+        let base = digest(&points);
+        assert_eq!(base, digest(&points.clone()));
+
+        let mut quiet_nan = points.clone();
+        quiet_nan[0] = LogicalPoint::Sample(LogicalSample {
+            value: f64::from_bits(0x7ff8_0000_0000_0000),
+            ..stale
+        });
+        assert_ne!(base, digest(&quiet_nan), "a stale marker is its bit pattern");
+
+        let edit = |f: &dyn Fn(&mut LogicalHistogram)| {
+            let mut changed = points.clone();
+            if let LogicalPoint::Histogram(h) = &mut changed[1] {
+                f(h);
+            }
+            digest(&changed)
+        };
+        assert_ne!(base, edit(&|h| h.positive_deltas[2] = -1), "one bucket delta");
+        assert_ne!(base, edit(&|h| h.sum = 12.75), "sum");
+        assert_ne!(base, edit(&|h| h.schema = 3), "schema");
+        assert_ne!(base, edit(&|h| h.count += 1), "count");
+        assert_ne!(base, edit(&|h| h.ts_ms += 1), "timestamp");
+        assert_ne!(
+            base,
+            edit(&|h| h.reset_hint = pb_histogram::ResetHint::Yes),
+            "reset hint"
+        );
+    }
+
     /// A comparator batch answered with a non-retryable status lands under
     /// `rejected_by_status` keyed by that status; one still failing after the
     /// retry budget lands under `retry_exhausted_samples`; the two sum to
@@ -3921,6 +4287,8 @@ mod tests {
         let config = HttpReplayConfig {
             system: "stub".to_string(),
             endpoint: format!("http://{addr}/api/v1/write"),
+            ack_semantics: AckSemantics::Buffered,
+            bearer_token: None,
             batch_size: 1,
             max_retries: 2,
             timeout_secs: 5,
@@ -3948,6 +4316,96 @@ mod tests {
             ingest.rejected_by_status.values().sum::<u64>() + ingest.retry_exhausted_samples,
             ingest.dropped_samples
         );
+        assert_eq!(row.ack_semantics, AckSemantics::Buffered);
+        assert_eq!(row.last_commit_token, None, "a buffered row records no token");
+    }
+
+    /// The portable Ravel row against a stub `ravel-server`: every request
+    /// carries `Authorization: Bearer <token>`, `last_commit_token` is the
+    /// last `x-ravel-commit-token` the stub returned, histograms land in
+    /// their own class, and the token text appears nowhere in the serialized
+    /// report.
+    ///
+    /// TO SEE THIS FAIL: drop the `request.bearer_auth(token)` line in
+    /// `replay_over_http` (the header assertion fails), or keep the first
+    /// token instead of the last (the `tok-3` assertion fails).
+    #[tokio::test]
+    async fn the_portable_ravel_row_sends_the_bearer_and_keeps_the_last_commit_token() {
+        use std::sync::Mutex as StdMutex;
+
+        let seen: Arc<StdMutex<Vec<Option<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let n = {
+                        let mut seen = recorder.lock().expect("lock");
+                        seen.push(
+                            headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
+                        seen.len()
+                    };
+                    (
+                        axum::http::StatusCode::NO_CONTENT,
+                        [(COMMIT_TOKEN_HEADER, format!("tok-{n}"))],
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let secret = "metricsbench-secret-7f3a";
+        let base = base_ts_ms();
+        let mut points: Vec<LogicalPoint> = valid_stream(4, 2)
+            .into_iter()
+            .map(LogicalPoint::Sample)
+            .collect();
+        points.push(LogicalPoint::Histogram(histogram(base, vec![1, 1])));
+        points.push(LogicalPoint::Histogram(histogram(base + 15_000, vec![2, 1])));
+        let config = HttpReplayConfig {
+            system: "ravel".to_string(),
+            endpoint: format!("http://{addr}/api/v1/write"),
+            ack_semantics: AckSemantics::DurableOnAck,
+            bearer_token: Some(secret.to_string()),
+            batch_size: 2,
+            max_retries: 0,
+            timeout_secs: 5,
+        };
+        let row = replay_over_http(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        server.abort();
+
+        let seen = seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), 3, "six points at two per request");
+        for auth in &seen {
+            assert_eq!(auth.as_deref(), Some(format!("Bearer {secret}").as_str()));
+        }
+        assert_eq!(row.system, "ravel");
+        assert_eq!(row.endpoint, format!("http://{addr}/api/v1/write"));
+        assert_eq!(row.ack_semantics, AckSemantics::DurableOnAck);
+        assert_eq!(row.last_commit_token.as_deref(), Some("tok-3"));
+        assert_eq!(row.ingest.offered_samples, 4);
+        assert_eq!(row.ingest.accepted_samples, 4);
+        assert_eq!(row.ingest.offered_histograms, 2);
+        assert_eq!(row.ingest.accepted_histograms, 2);
+        check_row_accounting(&row.ingest, &row.ingest.stream_counts).expect("closes");
+
+        let report = serde_json::to_string(&MetricsIngestReport::new(vec![row]))
+            .expect("serialize report");
+        assert!(report.contains("\"last_commit_token\":\"tok-3\""), "{report}");
+        assert!(!report.contains(secret), "the bearer token leaked: {report}");
     }
 
     /// An `ingest` block written before the fields added since the nightly
@@ -3979,6 +4437,22 @@ mod tests {
         assert!(ingest.rejected_by_status.is_empty());
         assert_eq!(ingest.retry_exhausted_samples, 0);
         assert_eq!(ingest.peak_rss_bytes, None);
+        assert_eq!(ingest.offered_histograms, 0);
+        assert_eq!(ingest.accepted_histograms, 0);
+        assert_eq!(ingest.rejected_histograms, 0);
+        assert_eq!(ingest.dropped_histograms, 0);
+        assert!(ingest.histograms_rejected_by_status.is_empty());
+        assert_eq!(ingest.retry_exhausted_histograms, 0);
+
+        let row: SystemIngestResult = serde_json::from_value(serde_json::json!({
+            "system": "mimir",
+            "ack_semantics": "buffered",
+            "endpoint": "http://mimir.example/api/v1/push",
+            "client_behavior": "reqwest",
+            "ingest": serde_json::from_str::<serde_json::Value>(pre_change).expect("json"),
+        }))
+        .expect("a pre-change row loads");
+        assert_eq!(row.last_commit_token, None);
 
         let run: RunRecord = serde_json::from_str(
             r#"{"steps": 5, "total_series_created": 1000, "logical_input_bytes": 4096,
