@@ -2069,7 +2069,7 @@ pub struct RowAccountingViolation {
 pub fn check_row_accounting(
     ingest: &IngestPhase,
     counts: &StreamCounts,
-) -> Result<(), RowAccountingViolation> {
+) -> Result<(), Box<RowAccountingViolation>> {
     let offering_total = ingest
         .offered_samples
         .saturating_add(ingest.offered_histograms)
@@ -2106,7 +2106,7 @@ pub fn check_row_accounting(
     {
         return Ok(());
     }
-    Err(RowAccountingViolation {
+    Err(Box::new(RowAccountingViolation {
         unsupported: ingest.unsupported_samples,
         unsupported_histograms: ingest.unsupported_histograms,
         rejected_by_status,
@@ -2128,7 +2128,7 @@ pub fn check_row_accounting(
         accepted_histograms: ingest.accepted_histograms,
         rejected_histograms: ingest.rejected_histograms,
         dropped_histograms: ingest.dropped_histograms,
-    })
+    }))
 }
 
 /// A band 6 failure (ADR-0927 amendment B): a row's accepted set is not its
@@ -3062,14 +3062,11 @@ impl ReadbackPlan {
                 self.histogram_metrics.insert(metric.clone());
             }
         }
-        if !self.probes.contains_key(&class) {
-            self.probes.insert(
-                class,
-                Probe {
-                    key,
-                    selector: promql_selector(metric, labels),
-                },
-            );
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.probes.entry(class) {
+            entry.insert(Probe {
+                key,
+                selector: promql_selector(metric, labels),
+            });
             if class == PayloadClass::StaleMarker {
                 self.stale_probe = Some((ts_ms, prior_scalar));
             }

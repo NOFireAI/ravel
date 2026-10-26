@@ -377,7 +377,7 @@ fn close_row(
     })?;
     check_row_accounting(&row.ingest, &counts).map_err(|source| RunError::AccountingMismatch {
         system: label.to_string(),
-        source: Box::new(source),
+        source,
     })?;
     check_row_band6(row)?;
     check_scalar_expected(
@@ -395,16 +395,14 @@ fn check_scalar_expected(
     got: &str,
     in_process_scalar: Option<&str>,
 ) -> Result<(), RunError> {
-    if let Some(expected) = in_process_scalar {
-        if got != expected {
-            return Err(RunError::ScalarExpectedDiverged {
-                system: label.to_string(),
-                expected: expected.to_string(),
-                got: got.to_string(),
-            });
-        }
+    match in_process_scalar {
+        Some(expected) if got != expected => Err(RunError::ScalarExpectedDiverged {
+            system: label.to_string(),
+            expected: expected.to_string(),
+            got: got.to_string(),
+        }),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
