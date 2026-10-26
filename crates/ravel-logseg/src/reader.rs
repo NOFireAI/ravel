@@ -8353,6 +8353,50 @@ mod tests {
                 assert_eq!(s_cells(after, &obj, col), fresh);
             }
 
+            /// The kernel's searcher: a needle longer than the value is a
+            /// miss, and an empty needle a hit on every value, the empty one
+            /// included.
+            #[test]
+            fn contains_needle_long_needle_misses_and_empty_needle_hits() {
+                let long = ContainsNeedle::new(b"abcd");
+                assert!(!long.is_in(b"abc"));
+                assert!(!long.is_in(b""));
+                assert!(long.is_in(b"abcd"));
+                let empty = ContainsNeedle::new(b"");
+                assert!(empty.is_in(b""));
+                assert!(empty.is_in(b"abc"));
+                assert!(empty.is_in(&[0xff, 0xfe]));
+            }
+
+            /// Each `Contains` arm's searcher is built once, when the scan
+            /// compiles its arms, however many blocks and cells it tests.
+            #[test]
+            fn contains_needle_is_built_once_per_arm() {
+                let (obj, cfg) = group_dict_object();
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let built = || crate::reader::NEEDLES_BUILT.with(std::cell::Cell::get);
+                let before = built();
+                let mut scan = reader
+                    .scan_blocks(
+                        &Predicate::And(vec![
+                            contains("u", "u", false),
+                            contains("s", "ab", false),
+                        ]),
+                        &[],
+                        &ColumnSelection::all(),
+                    )
+                    .expect("scan");
+                assert_eq!(built() - before, 2, "one per arm, at compile");
+                let mut rows = 0;
+                while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                    rows += view.surviving_count();
+                }
+                assert_eq!(rows, 12);
+                assert_eq!(scan.stats().blocks_scanned, 4);
+                assert_eq!(scan.stats().contains_cells_tested, 6 + 24);
+                assert_eq!(built() - before, 2, "none in the kernel loop");
+            }
+
             /// The counters, exactly: a row group dictionary of six entries
             /// tested once each across its four blocks, 24 plain cells tested
             /// once each, and the three matching entries, the distinct ones
