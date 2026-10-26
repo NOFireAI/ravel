@@ -40,7 +40,9 @@ use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::kind;
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, read_section, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, LogRecord, RlogConfig, RlogWriter, read_section, stream_attrs_bytes,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -147,7 +149,10 @@ fn record(i: usize) -> LogRecord {
             AttrValue::Str(SEARCH_PHRASES[i % SEARCH_PHRASES.len()].to_string()),
         ),
         ("UserID".to_string(), AttrValue::I64((i % 97) as i64)),
-        ("IsRefresh".to_string(), AttrValue::Bool(i % 3 == 0)),
+        (
+            "IsRefresh".to_string(),
+            AttrValue::Bool(i.is_multiple_of(3)),
+        ),
     ];
     LogRecord {
         stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
@@ -472,11 +477,14 @@ fn regions(bytes: &[u8]) -> Vec<Region> {
     let cfg = config();
     let footer = ravel_logseg::footer::open(bytes).expect("footer");
     let desc = |k: u32| *footer.section(k).expect("section");
-    let field_dir =
-        FieldDir::decode(&read_section(bytes, &desc(kind::FIELD_DIR), &cfg).expect("read"), u64::MAX)
-            .expect("field dir");
-    let page_dir = PageDir::decode(&read_section(bytes, &desc(kind::PAGE_DIR), &cfg).expect("read"))
-        .expect("page dir");
+    let field_dir = FieldDir::decode(
+        &read_section(bytes, &desc(kind::FIELD_DIR), &cfg).expect("read"),
+        u64::MAX,
+    )
+    .expect("field dir");
+    let page_dir =
+        PageDir::decode(&read_section(bytes, &desc(kind::PAGE_DIR), &cfg).expect("read"))
+            .expect("page dir");
     let blocks = desc(kind::BLOCKS);
     let mut out = Vec::new();
     for s in &footer.sections {

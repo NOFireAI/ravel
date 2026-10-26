@@ -13050,10 +13050,7 @@ mod tail_section_placement_tests {
         let out = ranged(&obj, &query).await;
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].ts_ns, 3);
-        assert_eq!(
-            format!("{:?}", out.records),
-            format!("{:?}", whole.records)
-        );
+        assert_eq!(format!("{:?}", out.records), format!("{:?}", whole.records));
         for r in &out.ranges {
             assert!(!intersects(*r, &bloom), "GET {r:?} reads BLOOM {bloom:?}");
             assert!(

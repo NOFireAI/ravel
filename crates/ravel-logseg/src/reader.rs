@@ -8530,7 +8530,10 @@ mod content_prunes_blocks_tests {
             vec![],
             vec![contains("URL")],
             vec![contains("URL"), contains("Title")],
-            vec![Predicate::And(vec![contains("URL"), Predicate::And(vec![])])],
+            vec![Predicate::And(vec![
+                contains("URL"),
+                Predicate::And(vec![]),
+            ])],
             vec![Predicate::Equals {
                 field: FieldSel::Body,
                 value: AttrValue::Str(long.clone()),
@@ -8569,7 +8572,7 @@ mod content_prunes_blocks_tests {
             Predicate::StreamIn(vec![]),
         ];
         for arm in some {
-            assert!(content_prunes_blocks(&[arm.clone()]), "{arm:?}");
+            assert!(content_prunes_blocks(std::slice::from_ref(&arm)), "{arm:?}");
             let nested = [Predicate::And(vec![contains("URL"), arm])];
             assert!(content_prunes_blocks(&nested), "{nested:?}");
         }
