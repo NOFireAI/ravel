@@ -2417,8 +2417,8 @@ struct ContainsRows<'a> {
 
 impl ContainsRows<'_> {
     /// Keeps the selected rows the arm accepts, 64 rows to a word, visiting
-    /// them in row order so a row's error is the one the row-by-row kernel
-    /// raised first.
+    /// them in row order so the error returned is the first selected row's
+    /// error, in row order.
     ///
     /// Every selected row reads its `stream_ref`, absent being an error, and
     /// its stream's verdict through `fallback`; a run of rows on one stream
@@ -2512,7 +2512,7 @@ impl<'a> Elsewhere<'a> {
         if self.others.iter().any(|c| c.present(row)) {
             return Ok(true);
         }
-        match self.attrs_raw.and_then(|c| str_cell(c, row)) {
+        match self.attrs_raw.and_then(|c| c.cell(row)) {
             None => Ok(false),
             Some(raw) => Ok(decode_canonical_attrs(raw)?
                 .iter()
@@ -2524,7 +2524,10 @@ impl<'a> Elsewhere<'a> {
 /// A column holding a key's values of a type other than `Str`'s, for a
 /// presence test that equals `get_attr_value(..).is_some()` on its type.
 enum OtherCol<'a> {
-    /// A `Str` cell reads as present only when it is UTF-8.
+    /// A `Str` cell reads as present only when it is UTF-8. Unreachable from
+    /// [`compile_arms`], which leaves the key's `Str` column out of `others`;
+    /// kept so the match over [`FieldType`] is total and the presence test
+    /// covers every type.
     Str(&'a StrColumn),
     Bytes(&'a StrColumn),
     I64(&'a I64Column),
@@ -2547,21 +2550,12 @@ impl<'a> OtherCol<'a> {
 
     fn present(&self, row: usize) -> bool {
         match self {
-            OtherCol::Str(c) => str_cell(c, row).is_some_and(|b| std::str::from_utf8(b).is_ok()),
-            OtherCol::Bytes(c) => str_cell(c, row).is_some(),
+            OtherCol::Str(c) => c.cell(row).is_some_and(|b| std::str::from_utf8(b).is_ok()),
+            OtherCol::Bytes(c) => c.cell(row).is_some(),
             OtherCol::I64(c) => c.is_valid(row),
             OtherCol::F64(c) => matches!(c.get(row), Some(Some(_))),
             OtherCol::Bool(c) => matches!(c.get(row), Some(Some(_))),
         }
-    }
-}
-
-/// The bytes of a string column at `row`, as [`DecodedBlock::str_at`] reads
-/// them.
-fn str_cell(col: &StrColumn, row: usize) -> Option<&[u8]> {
-    match col {
-        StrColumn::Plain(cells) => cells.get(row)?.as_deref(),
-        StrColumn::Dict(d) => d.values().entry(usize::try_from(d.key(row)?).ok()?),
     }
 }
 
@@ -8188,11 +8182,6 @@ mod tests {
                 s: SVal,
                 unique: bool,
                 zz: Option<usize>,
-                /// On a row with no `s` of its own: 1 gives it an `s` of
-                /// type `Bytes`, which sorts after every column `c_corpus`
-                /// counts and so lands in `attrs_raw`; 2 a `Bool`, which takes
-                /// a column of its own.
-                extra: u8,
             }
 
             fn c_row() -> impl Strategy<Value = CRow> {
@@ -8206,16 +8195,25 @@ mod tests {
                     ],
                     any::<bool>(),
                     proptest::option::of(0usize..S.len()),
-                    0u8..3,
                 )
-                    .prop_map(|(stream, ts, s, unique, zz, extra)| CRow {
+                    .prop_map(|(stream, ts, s, unique, zz)| CRow {
                         stream,
                         ts,
                         s,
                         unique,
                         zz,
-                        extra,
                     })
+            }
+
+            /// The rows the property's `wide` parameter can append, so a
+            /// block can span every [`c_extras`] entry.
+            const WIDE_ROWS: usize = 200;
+
+            /// One entry per row of the property's corpus, drawn as its own
+            /// parameter after the others so the committed seeds still
+            /// generate the rows they were recorded with. See [`c_corpus`].
+            fn c_extras() -> impl Strategy<Value = Vec<u8>> {
+                proptest::collection::vec(0u8..3, 60 + WIDE_ROWS)
             }
 
             /// The records, and the dynamic column cap that gives `s` its
@@ -8224,8 +8222,12 @@ mod tests {
             /// small pool (dictionary pages), 1 makes every one unique (plain
             /// pages), 2 makes the rows whose `unique` is set unique. A unique
             /// value puts its row number before or after the pooled value, so
-            /// needles still land at the start, middle and end.
-            fn c_corpus(rows: &[CRow], mode: u8) -> (Vec<LogRecord>, usize) {
+            /// needles still land at the start, middle and end. On row `i`
+            /// with no `s` of its own, `extras[i]` 1 gives it an `s` of type
+            /// `Bytes`, which sorts after every column counted here and so
+            /// lands in `attrs_raw`, and 2 a `Bool`, which takes a column of
+            /// its own; a row past the end of `extras` gets neither.
+            fn c_corpus(rows: &[CRow], mode: u8, extras: &[u8]) -> (Vec<LogRecord>, usize) {
                 let mut pairs = std::collections::BTreeSet::new();
                 let recs = rows
                     .iter()
@@ -8233,7 +8235,7 @@ mod tests {
                     .map(|(i, r)| {
                         let mut attrs = Vec::new();
                         match r.s {
-                            SVal::None => match r.extra {
+                            SVal::None => match extras.get(i).copied().unwrap_or(0) {
                                 1 => attrs.push(attr("s", AttrValue::Bytes(b"ab".to_vec()))),
                                 2 => {
                                     attrs.push(attr("s", AttrValue::Bool(true)));
@@ -8282,6 +8284,70 @@ mod tests {
                 ]
             }
 
+            /// The property's check on one case: per block, the kernel keeps
+            /// exactly the rows [`eval`] keeps, and the scan's survivor-only
+            /// build keeps every surviving row's `s` bytes and reads each as
+            /// text exactly when it is UTF-8.
+            fn check_contains_case(
+                rows: &[CRow],
+                extras: &[u8],
+                mode: u8,
+                cfg: RlogConfig,
+                arms: Vec<Predicate>,
+            ) -> Result<(), TestCaseError> {
+                let (recs, columns) = c_corpus(rows, mode, extras);
+                let cfg = RlogConfig {
+                    max_dynamic_columns: columns,
+                    ..cfg
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                let col = fd.column("s", FieldType::Str).map(|e| e.column_id);
+                let pred = Predicate::And(arms);
+
+                let mut want = HashMap::new();
+                let mut all = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while all.next_block_columnar(&obj).expect("decode").is_some() {
+                    let loc = all.blocks[all.next - 1];
+                    let block = all.current.as_ref().expect("decoded");
+                    let w = oracle(sd, fd, &pred, block).expect("oracle");
+                    let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
+                    prop_assert_eq!(&got, &w, "block {}", loc.block_index);
+                    let cells: Vec<Option<Vec<u8>>> = (0..block.record_count())
+                        .map(|r| col.and_then(|c| block.str_at(c, r)).map(<[u8]>::to_vec))
+                        .collect();
+                    want.insert(loc.block_index, (w, cells));
+                }
+
+                let mut scan = reader
+                    .scan_blocks(&pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                    let loc = scan.blocks[scan.next - 1];
+                    let block = scan.current.as_ref().expect("decoded");
+                    let (w, cells) = want.remove(&loc.block_index).expect("block decoded once");
+                    prop_assert_eq!(&scan.surviving, &w, "block {}", loc.block_index);
+                    for &r in &w {
+                        let bytes = col.and_then(|c| block.str_at(c, r));
+                        prop_assert_eq!(bytes, cells[r].as_deref(), "row {}", r);
+                        if let Some(StrColumn::Dict(d)) = col.and_then(|c| block.str_column(c)) {
+                            let text = d.key(r).and_then(|k| d.values().text(k as usize));
+                            let utf8 = cells[r]
+                                .as_deref()
+                                .and_then(|b| std::str::from_utf8(b).ok());
+                            prop_assert_eq!(text, utf8, "row {}", r);
+                        }
+                    }
+                }
+                for (block, (w, _)) in want {
+                    prop_assert!(w.is_empty(), "block {block} pruned with survivors {w:?}");
+                }
+                Ok(())
+            }
+
             proptest! {
                 #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -8290,9 +8356,13 @@ mod tests {
                 /// pages holding invalid UTF-8 and empty values, absent cells,
                 /// cells of another type, an overflowing key, and streams with
                 /// and without a resource or scope value, alone and in
-                /// conjunction with `TsRange` and `Equals`. The scan's
+                /// conjunction with `TsRange` and `Equals`, on blocks of up to
+                /// 11 rows and, through `wide`, of more than 64. The scan's
                 /// survivor-only build keeps every surviving row's `s` bytes
                 /// and reads each as text exactly when it is UTF-8.
+                ///
+                /// `extras` and `wide` come after the other parameters so the
+                /// committed seeds draw the cases they were recorded with.
                 #[test]
                 fn contains_kernel_matches_row_by_row_eval(
                     rows in proptest::collection::vec(c_row(), 1..60),
@@ -8300,58 +8370,96 @@ mod tests {
                     block_target_records in 2usize..12,
                     group_target_blocks in 1usize..4,
                     arms in proptest::collection::vec(c_arm(), 1..=4),
+                    extras in c_extras(),
+                    wide in proptest::option::weighted(
+                        0.25,
+                        (proptest::collection::vec(c_row(), 64..=WIDE_ROWS), 65usize..300),
+                    ),
                 ) {
-                    let (recs, columns) = c_corpus(&rows, mode);
+                    let mut rows = rows;
+                    let mut block_target_records = block_target_records;
+                    if let Some((more, target)) = wide {
+                        rows.extend(more);
+                        block_target_records = target;
+                    }
                     let cfg = RlogConfig {
                         block_target_records,
                         group_target_blocks,
-                        max_dynamic_columns: columns,
                         ..RlogConfig::default()
                     };
-                    let obj = build_raw(cfg, recs);
-                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
-                    let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
-                    let col = fd.column("s", FieldType::Str).map(|e| e.column_id);
-                    let pred = Predicate::And(arms);
-
-                    let mut want = HashMap::new();
-                    let mut all = reader
-                        .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
-                        .expect("scan");
-                    while all.next_block_columnar(&obj).expect("decode").is_some() {
-                        let loc = all.blocks[all.next - 1];
-                        let block = all.current.as_ref().expect("decoded");
-                        let w = oracle(sd, fd, &pred, block).expect("oracle");
-                        let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
-                        prop_assert_eq!(&got, &w, "block {}", loc.block_index);
-                        let cells: Vec<Option<Vec<u8>>> = (0..block.record_count())
-                            .map(|r| col.and_then(|c| block.str_at(c, r)).map(<[u8]>::to_vec))
-                            .collect();
-                        want.insert(loc.block_index, (w, cells));
-                    }
-
-                    let mut scan = reader
-                        .scan_blocks(&pred, &[], &ColumnSelection::all())
-                        .expect("scan");
-                    while scan.next_block_columnar(&obj).expect("decode").is_some() {
-                        let loc = scan.blocks[scan.next - 1];
-                        let block = scan.current.as_ref().expect("decoded");
-                        let (w, cells) = want.remove(&loc.block_index).expect("block decoded once");
-                        prop_assert_eq!(&scan.surviving, &w, "block {}", loc.block_index);
-                        for &r in &w {
-                            let bytes = col.and_then(|c| block.str_at(c, r));
-                            prop_assert_eq!(bytes, cells[r].as_deref(), "row {}", r);
-                            if let Some(StrColumn::Dict(d)) = col.and_then(|c| block.str_column(c)) {
-                                let text = d.key(r).and_then(|k| d.values().text(k as usize));
-                                let utf8 = cells[r].as_deref().and_then(|b| std::str::from_utf8(b).ok());
-                                prop_assert_eq!(text, utf8, "row {}", r);
-                            }
-                        }
-                    }
-                    for (block, (w, _)) in want {
-                        prop_assert!(w.is_empty(), "block {block} pruned with survivors {w:?}");
-                    }
+                    check_contains_case(&rows, &extras, mode, cfg, arms)?;
                 }
+            }
+
+            /// The rows of the two committed seeds' shrunk cases.
+            fn seed_rows(rows: &[(u8, usize)]) -> Vec<CRow> {
+                rows.iter()
+                    .map(|&(stream, s)| CRow {
+                        stream,
+                        ts: 0,
+                        s: SVal::Str(s),
+                        unique: false,
+                        zz: None,
+                    })
+                    .collect()
+            }
+
+            /// The shrunk case of seed `afca21c6` in
+            /// `proptest-regressions/reader.txt`: an invalid UTF-8 cell
+            /// holding the needle reads its stream's value, `"xab"` on stream
+            /// 0 and `"zz"` on stream 1, and the valid empty cell rejects.
+            #[test]
+            fn contains_seed_invalid_cell_reads_stream_value() {
+                let rows = seed_rows(&[(0, 9), (1, 9), (0, 0)]);
+                let cfg = RlogConfig {
+                    block_target_records: 3,
+                    group_target_blocks: 1,
+                    ..RlogConfig::default()
+                };
+                let pred = contains("s", "a", false);
+                check_contains_case(&rows, &[], 0, cfg, vec![pred.clone()]).expect("case");
+                let (recs, columns) = c_corpus(&rows, 0, &[]);
+                let cfg = RlogConfig {
+                    max_dynamic_columns: columns,
+                    ..cfg
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let block = first_block(&obj, &cfg);
+                assert_eq!(block.record_count(), 3);
+                let s_of = |r: usize| block.str_at(s_col(&reader), r).map(<[u8]>::to_vec);
+                // Rows sort by stream: the two stream 0 rows, then stream 1's.
+                let kept = arm_on_rows(&reader, &reader.stream_dir, &pred, &block, &[0, 1, 2])
+                    .expect("kernel");
+                assert_eq!(kept.len(), 1, "{kept:?}");
+                assert_eq!(s_of(kept[0]), Some(b"a\xffb".to_vec()));
+                let refs = block.i64_column(COL_STREAM_REF).expect("stream_ref");
+                assert_eq!(refs.get(kept[0]), Some(0));
+            }
+
+            /// The shrunk case of seed `c30e35cb` in
+            /// `proptest-regressions/reader.txt`: `NOT LIKE` on an invalid
+            /// UTF-8 cell, on a stream whose `s` is not a string, reads NULL
+            /// and drops the row.
+            #[test]
+            fn contains_seed_not_like_on_invalid_cell_and_non_string_stream() {
+                let rows = seed_rows(&[(2, 9)]);
+                let cfg = RlogConfig {
+                    block_target_records: 2,
+                    group_target_blocks: 1,
+                    ..RlogConfig::default()
+                };
+                let pred = contains("s", "ab", true);
+                check_contains_case(&rows, &[], 0, cfg, vec![pred.clone()]).expect("case");
+                let (recs, columns) = c_corpus(&rows, 0, &[]);
+                let cfg = RlogConfig {
+                    max_dynamic_columns: columns,
+                    ..cfg
+                };
+                assert_eq!(
+                    kept_ts(&build_raw(cfg, recs), &cfg, &pred),
+                    Vec::<i64>::new()
+                );
             }
 
             /// The property's generator reaches every page shape it claims:
@@ -8366,17 +8474,16 @@ mod tests {
                         s: SVal::Str(i as usize % S.len()),
                         unique: false,
                         zz: Some(i as usize % 3),
-                        extra: 0,
                     })
                     .collect();
                 let mut seen_invalid = false;
                 for (mode, group_target_blocks, want) in
                     [(1, 1, Enc::Plain), (0, 1, Enc::Dict), (0, 3, Enc::DictPage)]
                 {
-                    let (mut recs, columns) = c_corpus(&rows, mode);
+                    let (mut recs, columns) = c_corpus(&rows, mode, &[]);
                     if mode == 0 {
                         // Repeat the pool so every block holds a dictionary.
-                        recs.extend(c_corpus(&rows, mode).0);
+                        recs.extend(c_corpus(&rows, mode, &[]).0);
                     }
                     let cfg = RlogConfig {
                         block_target_records: 11,
@@ -8430,10 +8537,10 @@ mod tests {
                         },
                         unique: false,
                         zz: None,
-                        extra: [1, 2][(i as usize / 4) % 2],
                     })
                     .collect();
-                let (recs, columns) = c_corpus(&rows, 0);
+                let extras: Vec<u8> = (0..24).map(|i| [1, 2][(i / 4) % 2]).collect();
+                let (recs, columns) = c_corpus(&rows, 0, &extras);
                 let cfg = RlogConfig {
                     block_target_records: 8,
                     max_dynamic_columns: columns,
@@ -9088,6 +9195,254 @@ mod tests {
                         accepted,
                         "{want:?}"
                     );
+                }
+            }
+
+            /// An absent `stream_ref` cell raises the missing-column error and
+            /// a negative one the range error, on a selected row whatever its
+            /// other readings say, and the first selected one in row order
+            /// wins; neither is read on an unselected row.
+            #[test]
+            fn absent_and_negative_stream_ref_error_on_selected_rows() {
+                // Streams 0 ("xab") and 1 ("zz") at refs 0 and 1, and `s`
+                // columns of type Str and I64.
+                let recs = vec![
+                    srec(0, 0, vec![s("ab")]),
+                    srec(1, 1, vec![attr("s", AttrValue::I64(1))]),
+                ];
+                let cfg = RlogConfig::default();
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let fd = &reader.field_dir;
+                assert_eq!(reader.stream_dir.len(), 2);
+                let i64_col = fd.column("s", FieldType::I64).expect("s i64").column_id;
+                assert!(fd.column("s", FieldType::Str).is_some());
+                let refs = [
+                    Some(0),
+                    None,
+                    Some(-1),
+                    Some(0),
+                    Some(1),
+                    Some(1),
+                    Some(0),
+                    Some(1),
+                ];
+                let mut s_i64 = [None; 8];
+                s_i64[1] = Some(1);
+                s_i64[5] = Some(1);
+                let block = DecodedBlock::with_i64_columns(
+                    refs.len(),
+                    vec![
+                        (COL_STREAM_REF, I64Column::from_options(&refs)),
+                        (i64_col, I64Column::from_options(&s_i64)),
+                    ],
+                );
+                let pred = contains("s", "ab", false);
+                let run =
+                    |rows: &[usize]| arm_on_rows(&reader, &reader.stream_dir, &pred, &block, rows);
+                let all: Vec<usize> = (0..refs.len()).collect();
+                let without = |skip: &[usize]| -> Vec<usize> {
+                    all.iter().copied().filter(|r| !skip.contains(r)).collect()
+                };
+
+                let err = run(&all).expect_err("row 1's ref is absent");
+                assert!(
+                    matches!(&err, LogSegError::Corrupted(m) if *m == format!("missing i64 col {COL_STREAM_REF}")),
+                    "{err:?}"
+                );
+                let err = run(&without(&[1])).expect_err("row 2's ref is negative");
+                assert!(
+                    matches!(&err, LogSegError::Corrupted(m) if m == "stream_ref range"),
+                    "{err:?}"
+                );
+                // Stream 0 accepts rows 0, 3 and 6; row 5 on stream 1 has an
+                // I64 `s`.
+                assert_eq!(
+                    run(&without(&[1, 2])).expect("valid refs"),
+                    vec![0, 3, 5, 6]
+                );
+                assert_eq!(run(&[0, 4, 7]).expect("valid refs"), vec![0]);
+            }
+
+            /// A block of 256 rows, four selection words, on streams 0
+            /// (rows 0-99), 1 (100-127), 4 (128-199) and 5 (200-255): the
+            /// stream changes inside word 1, at the boundary of words 1 and
+            /// 2, and inside word 3. Row `i % 6` holds a `"zz"` cell (0), an
+            /// `"ab"` cell (1), an `I64` `s` (3), an invalid UTF-8 `"~ab"`
+            /// cell (4) or none (2, 5); rows `i % 7 == 3` are unselected.
+            #[test]
+            fn contains_kernel_spans_selection_words() {
+                const N: usize = 256;
+                let stream_of = |i: usize| match i {
+                    0..100 => 0,
+                    100..128 => 1,
+                    128..200 => 4,
+                    _ => 5,
+                };
+                let accepts = |i: usize| matches!(stream_of(i), 0 | 4);
+                let selected: Vec<usize> = (0..N).filter(|i| i % 7 != 3).collect();
+                let expected: Vec<usize> = selected
+                    .iter()
+                    .copied()
+                    .filter(|&i| match i % 6 {
+                        0 => false,
+                        1 | 3 => true,
+                        _ => accepts(i),
+                    })
+                    .collect();
+                for w in 1..4 {
+                    let word: Vec<usize> = (w * 64..(w + 1) * 64).collect();
+                    let sel: Vec<usize> = word
+                        .iter()
+                        .copied()
+                        .filter(|r| selected.contains(r))
+                        .collect();
+                    assert!(sel.len() < 64, "word {w} has unselected rows");
+                    assert!(sel.iter().any(|r| expected.contains(r)), "word {w} keeps");
+                    assert!(
+                        sel.iter().any(|r| !expected.contains(r)),
+                        "word {w} rejects"
+                    );
+                    assert!(
+                        sel.iter().any(|r| matches!(r % 6, 2 | 5)),
+                        "word {w} absent"
+                    );
+                }
+                for (unique, want) in [(false, Enc::Dict), (true, Enc::Plain)] {
+                    let recs = (0..N)
+                        .map(|i| {
+                            let t = i as i64;
+                            let attrs = match i % 6 {
+                                0 => vec![s(&val("zz", unique, t))],
+                                1 => vec![s(&val("ab", unique, t))],
+                                3 => vec![attr("s", AttrValue::I64(t))],
+                                4 => vec![s(&val("~ab", unique, t))],
+                                _ => Vec::new(),
+                            };
+                            srec(stream_of(i), t, attrs)
+                        })
+                        .collect();
+                    let cfg = RlogConfig {
+                        block_target_records: N,
+                        group_target_blocks: 1,
+                        ..RlogConfig::default()
+                    };
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    assert!(encs(&reader, s_col(&reader)).contains(&want), "{want:?}");
+                    let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                    let block = first_block(&obj, &cfg);
+                    assert_eq!(block.record_count(), N);
+                    let all: Vec<usize> = (0..N).collect();
+                    assert_eq!(ts_of(&block, &all), (0..N as i64).collect::<Vec<_>>());
+                    let refs = block.i64_column(COL_STREAM_REF).expect("stream_ref");
+                    for (a, b) in [(99, 100), (127, 128), (199, 200)] {
+                        assert_ne!(refs.get(a), refs.get(b), "stream changes at {b}");
+                    }
+                    for negated in [false, true] {
+                        let pred = contains("s", "ab", negated);
+                        let got =
+                            arm_on_rows(&reader, sd, &pred, &block, &selected).expect("kernel");
+                        let oracle: Vec<usize> = oracle(sd, fd, &pred, &block)
+                            .expect("oracle")
+                            .into_iter()
+                            .filter(|r| selected.contains(r))
+                            .collect();
+                        assert_eq!(got, oracle, "{want:?} negated {negated}");
+                        if !negated {
+                            assert_eq!(got, expected, "{want:?}");
+                        }
+                    }
+                }
+            }
+
+            /// The property's `wide` parameter reaches blocks of more than
+            /// one selection word: its fewest rows, 65, at its smallest
+            /// target, 65, make one block of 65 rows.
+            #[test]
+            fn contains_corpus_reaches_multi_word_blocks() {
+                let rows: Vec<CRow> = (0..65)
+                    .map(|i| CRow {
+                        stream: (i % 6) as u8,
+                        ts: i,
+                        s: SVal::Str(i as usize % S.len()),
+                        unique: false,
+                        zz: None,
+                    })
+                    .collect();
+                let (recs, columns) = c_corpus(&rows, 0, &[]);
+                let cfg = RlogConfig {
+                    block_target_records: 65,
+                    group_target_blocks: 1,
+                    max_dynamic_columns: columns,
+                    ..RlogConfig::default()
+                };
+                let obj = build_raw(cfg, recs);
+                assert_eq!(first_block(&obj, &cfg).record_count(), 65);
+            }
+
+            /// Across two failing selected rows the first in row order wins:
+            /// row 1's corrupt `attrs_raw`, read because the needle rejects
+            /// the row, and not row 2's `stream_ref` past the STREAM_DIR.
+            #[test]
+            fn first_failing_row_in_row_order_wins() {
+                let garbage = vec![0xff; 3];
+                let decode_err = decode_canonical_attrs(&garbage)
+                    .expect_err("garbage")
+                    .to_string();
+                for unique in [false, true] {
+                    let cfg = RlogConfig {
+                        group_target_blocks: 1,
+                        max_dynamic_columns: 1,
+                        ..RlogConfig::default()
+                    };
+                    // Stream 3 (ref 0) then stream 5 (ref 1), neither with an
+                    // `s` of its own; `zz` overflows into `attrs_raw`.
+                    let recs = (0..8)
+                        .map(|i| {
+                            let v = if i == 1 { "zz" } else { "ab" };
+                            let zz = attr("zz", AttrValue::Str(format!("z{i}")));
+                            srec(
+                                if i < 2 { 3 } else { 5 },
+                                i,
+                                vec![s(&val(v, unique, i)), zz],
+                            )
+                        })
+                        .collect();
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let one = build_raw(cfg, vec![srec(3, 0, Vec::new())]);
+                    let short = RlogReader::new(&one, &cfg).expect("open object");
+                    assert_eq!((reader.stream_dir.len(), short.stream_dir.len()), (2, 1));
+                    assert!(reader.field_dir.column("zz", FieldType::Str).is_none());
+                    let mut block = first_block(&obj, &cfg);
+                    let n = block.record_count();
+                    assert_eq!(n, 8);
+                    let refs = block.i64_column(COL_STREAM_REF).expect("stream_ref");
+                    assert_eq!((refs.get(1), refs.get(2)), (Some(0), Some(1)));
+                    let cells = (0..n)
+                        .map(|r| {
+                            if r == 1 {
+                                Some(garbage.clone())
+                            } else {
+                                block.str_at(COL_ATTRS_RAW, r).map(<[u8]>::to_vec)
+                            }
+                        })
+                        .collect();
+                    *block.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") =
+                        StrColumn::Plain(cells);
+                    let pred = contains("s", "ab", false);
+                    let run = |rows: &[usize]| {
+                        arm_on_rows(&reader, &short.stream_dir, &pred, &block, rows)
+                    };
+                    let err = run(&[0, 1, 2]).expect_err("rows 1 and 2 fail");
+                    assert_eq!(err.to_string(), decode_err, "unique {unique}");
+                    let err = run(&[0, 2]).expect_err("row 2 fails");
+                    assert!(
+                        matches!(&err, LogSegError::Corrupted(m) if m == "stream_ref out of range"),
+                        "unique {unique}: {err:?}"
+                    );
+                    assert_eq!(run(&[0]).expect("row 0 alone"), vec![0]);
                 }
             }
         }

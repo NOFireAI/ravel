@@ -977,7 +977,7 @@ impl StrColumn {
     /// The bytes at block row `row`, or `None` when the row is absent (or out of
     /// range). Both shapes read identically here, which is what lets the storage
     /// shape stay invisible above [`DecodedBlock`].
-    fn cell(&self, row: usize) -> Option<&[u8]> {
+    pub(crate) fn cell(&self, row: usize) -> Option<&[u8]> {
         match self {
             StrColumn::Plain(v) => v.get(row)?.as_deref(),
             StrColumn::Dict(d) => d.cell(row),
