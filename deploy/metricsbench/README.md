@@ -67,6 +67,83 @@ Tear down (and drop the local volumes):
 docker compose -f deploy/metricsbench/docker-compose.yml down -v
 ```
 
+## Record what actually ran
+
+The compose file pins what should run; this captures what did. With the set
+up, run:
+
+```sh
+deploy/metricsbench/capture-effective-config.sh --out effective-config.json
+```
+
+`--prometheus URL`, `--victoriametrics URL` and `--mimir URL` override the
+loopback compose ports (9090, 8428, 9009); without `--out` the document goes to
+stdout. Per comparator it records the version and revision the engine itself
+reports, its runtime flags, and, when docker is reachable, the running
+container's image ID, `.Config.Image`, `RepoDigests`, `Architecture` and `Os`.
+The sources are:
+
+- Prometheus: `/api/v1/status/buildinfo` and `/api/v1/status/flags`.
+- VictoriaMetrics: the `vm_app_version` series on `/metrics` (`short_version`
+  is the version, the full `version` label the revision) and `/flags`. Its
+  `/api/v1/status/buildinfo` returns a fixed Prometheus-compatibility version
+  rather than its own, so the script does not read it.
+- Mimir: `/prometheus/api/v1/status/buildinfo`, and `/config`, the effective
+  YAML including defaults (its `/api/v1/status/flags` is an empty
+  compatibility stub). `querier_query_engine` is `querier.query_engine` read
+  out of `/config`; `query_engine_default_for_version` is the documented
+  default for the reported version: `prometheus` for 2.14 to 2.16, `mimir`
+  (the Mimir Query Engine) from 2.17.
+
+A field that could not be fetched is `{"unavailable": "<reason>"}`; none is
+omitted or left empty. When docker is not reachable, `image` is the string
+`"unavailable: docker not reachable"`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every comparator answered its version call. |
+| 1 | At least one comparator's version or revision is unavailable. The document is still written, since a partial capture is evidence, but it is not a successful capture. |
+| 64 | Usage error. |
+
+The document's shape, abbreviated:
+
+```json
+{
+  "captured_at": "2026-10-26T02:56:15Z",
+  "script_revision": "<git HEAD of the checkout, or \"unavailable\">",
+  "urls_queried": {
+    "mimir": {
+      "buildinfo": "http://127.0.0.1:9009/prometheus/api/v1/status/buildinfo",
+      "runtime_flags": "http://127.0.0.1:9009/config"
+    }
+  },
+  "comparators": {
+    "prometheus": {"version": "3.13.1", "revision": "...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
+    "victoriametrics": {"version": "v1.115.0", "revision": "victoria-metrics-...-tags-v1.115.0-0-g...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
+    "mimir": {
+      "version": "2.14.2",
+      "revision": "...",
+      "runtime_flags": {"format": "yaml", "effective_config": "..."},
+      "querier_query_engine": "prometheus",
+      "query_engine_default_for_version": "prometheus",
+      "image": {
+        "container": "...",
+        "image_id": "sha256:...",
+        "config_image": "grafana/mimir:2.14.2@sha256:...",
+        "repo_digests": ["grafana/mimir@sha256:..."],
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    }
+  }
+}
+```
+
+A run report cites this file by path and by its sha256 digest. Until the
+MetricsBench runner calls the script before each measurement pass, this
+section is its caller. Its cases run in CI's `doc-scripts` job:
+`deploy/metricsbench/tests/capture-effective-config.test.sh`.
+
 ## Verify the pins
 
 ```sh
