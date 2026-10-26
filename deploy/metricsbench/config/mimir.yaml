@@ -203,10 +203,11 @@ limits:
   native_histograms_ingestion_enabled: true
   # OUT-OF-ORDER WINDOW (disclosed, frozen; replaces the 3.2.3 default 0s,
   # under which -ingester.out-of-order-time-window's help gives no
-  # out-of-order support). The window exists so a sample the generator
-  # shifted back one and a half scrape intervals (22.5s at 15s) is stored by
-  # every receiver; 1h also covers a bulk historical replay arriving slightly
-  # out of time order, and matches the Prometheus comparator. Prometheus
+  # out-of-order support). The window exists so the out-of-order sample
+  # ADR-0927 amendment B specifies (shifted back one and a half scrape
+  # intervals, 22.5s at 15s, off the grid) is stored by every receiver; 1h
+  # also covers a bulk historical replay arriving slightly out of time
+  # order, and matches the Prometheus comparator. Prometheus
   # without its window rejects the whole Remote Write 1.0 request with HTTP
   # 400 on such a sample; Mimir rejects only the sample.
   out_of_order_time_window: 1h

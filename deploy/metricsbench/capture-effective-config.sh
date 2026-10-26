@@ -14,6 +14,9 @@
 # What is read, per comparator:
 #   prometheus       GET /api/v1/status/buildinfo (version, revision)
 #                    GET /api/v1/status/flags     (runtime_flags)
+#                    GET /api/v1/status/config    (config_settings: values set
+#                    in prometheus.yml that have no flag, today the TSDB
+#                    out_of_order_time_window)
 #   victoriametrics  GET /metrics, the vm_app_version series (version from its
 #                    short_version label, revision from its version label).
 #                    Its /api/v1/status/buildinfo answers a fixed
@@ -176,6 +179,29 @@ def flags_json(url):
     return data
 
 
+PROM_OOO_WINDOW = re.compile(r'^\s*out_of_order_time_window:\s*(\S+)\s*$', re.M)
+
+
+def prom_config_settings(url):
+    """Settings that live in prometheus.yml rather than on the command line,
+    so /api/v1/status/flags cannot show them, read from the loaded config."""
+    body, err = fetch(url)
+    if err:
+        return unavailable(err)
+    try:
+        yaml_text = json.loads(body)["data"]["yaml"]
+        if not isinstance(yaml_text, str):
+            raise TypeError(f"data.yaml is {type(yaml_text).__name__}, not a string")
+    except Exception as e:
+        return unavailable(f"GET {url}: response is not config JSON: {type(e).__name__}: {e}")
+    m = PROM_OOO_WINDOW.search(yaml_text)
+    return {
+        "storage.tsdb.out_of_order_time_window": m.group(1)
+        if m
+        else unavailable(f"GET {url}: out_of_order_time_window not in the loaded config"),
+    }
+
+
 VM_APP_VERSION = re.compile(r'^vm_app_version\{(?P<labels>[^}]*)\}', re.M)
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
@@ -325,6 +351,7 @@ urls = {
     "prometheus": {
         "buildinfo": f"{prom_url}/api/v1/status/buildinfo",
         "runtime_flags": f"{prom_url}/api/v1/status/flags",
+        "config_settings": f"{prom_url}/api/v1/status/config",
     },
     "victoriametrics": {
         "buildinfo": f"{vm_url}/metrics",
@@ -348,6 +375,7 @@ doc["comparators"]["prometheus"] = {
     "version": version,
     "revision": revision,
     "runtime_flags": flags_json(urls["prometheus"]["runtime_flags"]),
+    "config_settings": prom_config_settings(urls["prometheus"]["config_settings"]),
     "image": image_of(containers, "prometheus"),
 }
 
