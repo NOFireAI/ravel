@@ -84,8 +84,7 @@ async fn stalled_body_is_a_body_timeout_within_the_deadline() {
         .await;
     let wall = started.elapsed();
     eprintln!("stalled-body wall elapsed: {wall:?}, outcome: {outcome:?}");
-    // hygiene-allow: wall-clock -- the deadline under test bounds real socket I/O; 4x upper bound only
-    assert!(wall < DEADLINE_BOUND, "call took {wall:?}");
+    assert!(wall < DEADLINE_BOUND, "call took {wall:?}"); // allow-wall-clock: the deadline under test bounds real socket I/O; 4x upper bound only
     match outcome {
         QueryOutcome::Timeout {
             phase,
@@ -308,8 +307,7 @@ async fn stalled_connect_is_a_connect_timeout() {
         .instant_query_with_deadline("up", 0, DEADLINE)
         .await;
     let wall = started.elapsed();
-    // hygiene-allow: wall-clock -- the deadline under test bounds real socket I/O; 4x upper bound only
-    assert!(wall < DEADLINE_BOUND, "call took {wall:?}");
+    assert!(wall < DEADLINE_BOUND, "call took {wall:?}"); // allow-wall-clock: the deadline under test bounds real socket I/O; 4x upper bound only
     match outcome {
         QueryOutcome::Timeout { phase, timing, .. } => {
             assert_eq!(phase, TimeoutPhase::Connect);
