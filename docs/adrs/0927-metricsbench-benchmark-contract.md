@@ -1,8 +1,10 @@
 # ADR-0927: MetricsBench, a reproducible metrics and PromQL benchmark contract
 
-Status: Accepted (implemented by PRs #932, #947, #948, #955, #1013, #1337 and
-#1510; amended 2026-10-26 under epic #2821, see the 2026-10-26 amendment at
-the end). Issue #927, task T1 of the epic. Builds on ADR-0044
+Status: Accepted. The original decisions were implemented by PRs #932, #947,
+#948, #955, #1013, #1337 and #1510; the 2026-10-26 amendment at the end of
+this file records decisions under epic #2821 whose implementation is routed
+to tasks named there and not yet in the tree. Issue #927, task T1 of the
+epic. Builds on ADR-0044
 (per-query cost accounting), ADR-0070 (store request scheduling and the
 performance gate), ADR-0075 (published numbers are measured against real S3),
 ADR-0015 (Remote Write ingest), ADR-0025/ADR-0030 (accepted PromQL
@@ -303,8 +305,9 @@ axis and pins the others.
 
 The `ci` profile exercises the same code paths and is **marked
 non-comparable** in the artifact itself. It cannot be presented as a
-performance result. The 2026-10-26 amendment corrects this table's `ci` churn
-figure (the manifest declares 0, not 5%/h), makes the stream's time anchor an
+performance result. The 2026-10-26 amendment records the correction to this
+table's `ci` churn figure (the manifest declares 0, not 5%/h; the row above
+is left as written), makes the stream's time anchor an
 explicit on-grid run parameter, and gives each profile a declared
 range-evaluation grid.
 
@@ -363,6 +366,11 @@ whether Ravel is fast.
    reported rejections. A silent drop fails the run.
 5. Every figure the report claims is present exactly once and inside its
    band; absent-but-expected fails identically to out-of-band.
+
+The 2026-10-26 amendment changes this list: band 1 depends on each
+profile's declared range-evaluation grid (section E), band 4 becomes the
+per-type line accounting of section D, and section B adds band 6, the
+cross-row accepted-set digest.
 
 ## Lane boundary
 
@@ -472,7 +480,7 @@ Refs: #927, #51, #365, #573, #849, #913
 
 ## Amendment (2026-10-26): the portable lane drives Ravel over HTTP, anomalies are the same logical data on every receiver, and the stream is a pure function of its run parameters
 
-<!-- amendment-applies: sections="2. Remote Write 1.0 is the cross-engine ingest baseline|6. Every outcome has a status, and refusals are not gaps|11. Three orthogonal profiles, pre-registered before the first run" pointer="2026-10-26 amendment" -->
+<!-- amendment-applies: sections="2. Remote Write 1.0 is the cross-engine ingest baseline|6. Every outcome has a status, and refusals are not gaps|11. Three orthogonal profiles, pre-registered before the first run|Bands pre-registered for the first reference run" pointer="2026-10-26 amendment" -->
 
 Context. Before the first portable query run (epic #2821, milestones #938
 and #940), an independent review of the contract against the code on
@@ -509,8 +517,9 @@ replay (decision 1 and decision 7), and its report row says
 ### B. The out-of-order anomaly is an out-of-order sample, never a duplicate timestamp
 
 The generator shifts a selected instance-step by exactly two scrape
-intervals (`crates/ravel-bench/src/metrics_gen.rs`, the `out_of_order`
-branch of `emit_instance`), so the shifted sample carries a timestamp the
+intervals (`crates/ravel-bench/src/metrics_gen.rs`, the `shifted` branch
+in the step loop of `generate_into`, which hands the shifted timestamp to
+`emit_instance`), so the shifted sample carries a timestamp the
 series already emitted, with a different value. Receivers disagree on
 that. The review's reading of each receiver, which T1b verifies by
 reading back every receiver after the replay: Prometheus 3.13 rejects the
@@ -525,7 +534,9 @@ The lane counts any non-retryable 4xx as the whole batch dropped
 receivers that stored different sets.
 
 Decision: the shift lands strictly between scrape points (one and a half
-intervals back), so the sample is out of order and never a duplicate.
+intervals back, computed as `3 * interval_ms / 2`, exact because every
+profile's scrape interval is a whole number of seconds), so the sample is
+out of order and never a duplicate.
 Every receiver runs a frozen, disclosed out-of-order window longer than
 the shift: Prometheus `storage.tsdb.out_of_order_time_window`, Mimir
 `limits.out_of_order_time_window`, VictoriaMetrics' default acceptance
@@ -533,7 +544,7 @@ stated as such, and Ravel's own rule stated next to its deployment. The
 lane reads each receiver's per-sample outcome (the Remote Write response
 body and the receiver's written-samples header or counter), never a
 per-batch status alone, and each row carries a digest of its accepted
-`(series, timestamp, value bits)` set. A new band fails the run when any
+`(series, timestamp, value bits)` set. Band 6, new: the run fails when any
 two portable rows' accepted-set digests differ. The generator change moves
 the workload manifest to version 2 with its own digest; version 1 streams
 stay reproducible from the version-1 manifest.
@@ -566,15 +577,17 @@ staleness marker, or a typed malformed line, and band 4 reads
 `scalar + native_histogram + stale_marker + malformed == generated_lines`
 with `malformed == 0` for a generator stream. A lane that does not carry a
 payload type reports it as a named exclusion, never as absent. Staleness
-markers travel as the Prometheus stale NaN bit pattern, one shared
-constant, exempted from the non-finite rejection exactly for that pattern.
+markers travel as the Prometheus stale NaN bit pattern, reusing
+`ravel_promql_difftest::generator::STALE_MARKER_BITS` rather than adding
+another declaration, exempted from the non-finite rejection exactly for
+that pattern.
 Every row, comparator rows included, is banded on
 `offered == accepted + rejected + dropped` and on its declared drop budget,
 and the row records rejections by HTTP status.
 
 ### E. Range evaluation grids and empty answers
 
-Nine corpus entries are `eval: range` and nothing declares their start,
+Six corpus entries are `eval: range` and nothing declares their start,
 end or step, so band 1 (statement identity) is undefined for them. Two
 join entries can never produce a result on the generated data
 (`mb_join_cpu_on_build_version` has two `version` matches per
