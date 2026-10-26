@@ -1,6 +1,6 @@
 # Ravel in the MetricsBench portable lane (ADR-0927 amendment 2026-10-26 A).
 #
-# An overlay on docker-compose.yml, never run on its own: it reuses that
+# An overlay on docker-compose.yml, not run on its own: it reuses that
 # file's RustFS and createbuckets one-shot, and its network. Bring the whole
 # set up, comparators and Ravel together, with:
 #

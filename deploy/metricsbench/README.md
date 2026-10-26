@@ -8,9 +8,11 @@ query API for reads. Every system here receives the same logical samples and the
 same queries; no Ravel-only instrumentation is ever folded into a cross-engine
 score (ADR-0927 decision 1).
 
-Ravel itself is not in this file. It is the system under test and is launched
-separately (`deploy/docker-compose/ravel.yml`). This directory holds only the
-comparators.
+Ravel, the system under test, is not in `docker-compose.yml`. It runs from the
+overlay `ravel.yml` in this directory, on the same RustFS and at the same
+envelope as the comparators (see "Ravel in the portable lane" below).
+`deploy/docker-compose/ravel.yml` is the product quickstart, not a benchmark
+deployment, and MetricsBench does not use it.
 
 ## The comparators
 
@@ -20,8 +22,94 @@ comparators.
 | `victoriametrics` | Single-node VictoriaMetrics, accepts Prometheus remote write natively | **Local-disk storage.** Ack = local storage write. Not object storage. | `http://127.0.0.1:8428/api/v1/write` | `http://127.0.0.1:8428/prometheus/api/v1/query` |
 | `mimir` | Grafana Mimir 3.2.3 monolithic (`-target=all`); the ADR-0927 object-storage-native PromQL system | **Object storage (S3).** Ack = local WAL; blocks ship to S3 (RustFS here) later. See caveat below. | `http://127.0.0.1:9009/api/v1/push` | `http://127.0.0.1:9009/prometheus/api/v1/query` |
 
-Supporting services: `rustfs` (S3 backend for Mimir) and `createbuckets` (a
-one-shot AWS CLI container that creates Mimir's buckets and then exits).
+Supporting services: `rustfs` (S3 backend for Mimir and Ravel) and
+`createbuckets` (a one-shot AWS CLI container that creates Mimir's buckets and
+Ravel's `ravel-metricsbench` bucket, then exits).
+
+## Ravel in the portable lane
+
+Ravel runs as one more comparator, from the overlay `ravel.yml` (ADR-0927
+amendment 2026-10-26 A). The image under test is a required parameter with no
+default; compose refuses to start the set without it (`required variable
+RAVEL_IMAGE is missing a value`):
+
+```sh
+RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:<tag>@sha256:<digest> \
+  docker compose -f deploy/metricsbench/docker-compose.yml \
+    -f deploy/metricsbench/ravel.yml up -d
+```
+
+The overlay adds two services. `ravel-qualify` runs `ravel-cli --store s3
+store qualify` once, after `createbuckets`, because `ravel-server` refuses to
+start on an S3 store that has not been qualified. `ravel-server` then starts
+in `--mode all` (gateway, query and maintenance in one process, the
+counterpart of Mimir's `-target=all`).
+
+| Service | What it is | Durability / storage | Remote Write 1.0 endpoint | PromQL query endpoint |
+|---|---|---|---|---|
+| `ravel-server` | Ravel, `--mode all`, 4 ingest shards, one tenant `metricsbench` | **Object storage (S3), strict Remote Write.** A 2xx means the data object and the commit record are durable in object storage before the ack (ADR-0927 decision 3). No volume: no state lives on local disk. RustFS here, so the ADR-0927 decision 10 caveat above applies. | `http://127.0.0.1:4318/api/v1/write` | `http://127.0.0.1:4318/api/v1/query` |
+
+Every write and query carries `Authorization: Bearer metricsbench-token`
+(`--tenant-token metricsbench-token=metricsbench`). `/api/v1/status/buildinfo`
+answers without it.
+
+**Envelope.** The same `cpus: "2.0"` and `memory: 4g` limits as `prometheus`,
+`victoriametrics` and `mimir`. Ravel's memory split is written as flags, not
+left to the server's derivation from the container, and the server logs each
+value with `source="flag"` at startup:
+
+| Quantity | Bytes | How |
+|---|---|---|
+| Envelope | 4,294,967,296 | `memory: 4g` |
+| Reserve outside the budget | 1,073,741,824 | max(min(2 GiB, envelope / 4), 256 MiB baseline + 512 MiB ingest buffer) |
+| `--memory-budget-bytes` | 3,221,225,472 | envelope minus reserve |
+| `--cache-max-bytes` (fetcher cache) | 805,306,368 | 25% of the budget, the derived share for a non-loopback S3 endpoint |
+| `--catalog-cache-max-bytes` | 161,061,273 | 5% of the budget, the derived share |
+| Budget left for query working set | 2,254,857,831 | budget minus both caches (966,367,641) |
+| `--max-ingest-buffer-bytes` | 536,870,912 | the 512 MiB default, stated; held in the reserve |
+
+**Disclosed settings** (each commented next to its flag in `ravel.yml`):
+
+- `--max-ingest-lag 45d` replaces the 2h default, so the 30 d history profile
+  is admitted when replayed. The one flag sets both the admission bound and the
+  catalog listing window. A sample older than the window is dropped per sample
+  while the request still answers 2xx (Remote Write 1.0 has no partial-success
+  field); the local probe below shows the drop as an empty query result.
+- `--audit-mode off`, the default, stated: no query-audit record is written,
+  so no audit write sits on the query path.
+- `--tenant-hash-unkeyed`: a fresh bucket refuses to start without a
+  tenant-hash choice. It changes object key names only.
+- The query and admission limits listed under "Frozen limits" below. The
+  admission limits and the scanned-byte budget live in
+  `config/ravel-limits.toml`, passed with `--limits-file`.
+
+**The in-process lane is diagnostic, not portable.** The `metricsbench_ingest`
+binary in `crates/ravel-bench` replays through an in-process `IngestRouter`
+and queries an in-process `QueryEngine`, without HTTP, so it skips the
+event-time admission `ravel-server` applies on `/api/v1/write`. It is the
+diagnostic lane, and its report row says `endpoint: in-process` so it is not
+read as the portable row (ADR-0927 amendment 2026-10-26 A). Ravel's portable
+row is this service, driven through the same Remote Write and query endpoints
+as every other system here.
+
+**Local probe (2026-10-26, ravel-server 0.26.0, linux/arm64).** No docker
+daemon was available, so the compose stack itself has not been brought up.
+The 0.26.0 binary, extracted from the image, was run with every flag above and
+`--store memory` in place of `--store s3`; S3 and `ravel-qualify` were not
+exercised. Results:
+
+| Request | HTTP | Result |
+|---|---|---|
+| `GET /api/v1/status/buildinfo`, no bearer | 200 | `"version":"0.26.0","revision":""` |
+| Remote Write, one sample at now-60 s | 204 | queried back: `42` |
+| Remote Write, one sample at now-30 d | 204 | queried back: `7` |
+| Remote Write, one sample at now-50 d (outside 45d) | 204 | queried back: empty result (dropped per sample) |
+| `count()` over 1,000 series | 200 | `1000` |
+| `count()` over 10,001 series | 422 | max-series refusal (see "Budget-refusal signatures") |
+| `query_range`, 12,001 points | 422 | range-points refusal (see "Budget-refusal signatures") |
+
+`docker compose -f docker-compose.yml -f ravel.yml config` exits 0 with
+`RAVEL_IMAGE` set and 1 with it unset or empty.
 
 ### Storage architecture is not interchangeable
 
@@ -93,6 +181,20 @@ scrape grid.
 | Mimir | `limits.max_query_lookback` | `45d` | `0s` (disabled) | The 45 d retention; a silent clamp, not a refusal | `-querier.max-query-lookback duration ... the request will not fail but will be manipulated to only query data within the allowed time range. 0 to disable.` |
 | Mimir | `frontend.query_result_response_format` | `protobuf` | `protobuf` (unchanged) | Native histograms under the default query sharding | `-ingester.native-histograms-ingestion-enabled ... To query native histograms with query-sharding enabled make sure to set -query-frontend.query-result-response-format to 'protobuf'.` |
 | Mimir | `frontend.cache_results` | `false` | `false` (unchanged) | Parity with `-search.disableCache=true` | `-query-frontend.cache-results  Cache query results.` |
+| Ravel | `--max-ingest-lag` | `45d` | `2h` | Raised: history's 30 d span plus replay time, equal to the 45 d retention on Prometheus and VictoriaMetrics | `--max-ingest-lag <DURATION> ... One flag drives BOTH the OTLP admission bound ... AND the catalog listing window ... (default: 2h)` |
+| Ravel | future-skew bound | `10m` | `10m` (unchanged, no flag) | Kept: a replay of past event time does not reach it | `crates/ravel-otlp/src/limits.rs`, `max_future_skew_ns: 10 * MINUTE_NANOS` |
+| Ravel | `max_active_series` (config/ravel-limits.toml) | `"unlimited"` | `200000` | Raised: the cardinality profile writes 1,000,000 series; parity with Mimir's `max_global_series_per_user: 0` | `docs/guides/admission-limits.md`: `Active-series cap (metrics) \| 200,000 \| max_active_series` |
+| Ravel | `ingest_bytes_per_sec` (config/ravel-limits.toml) | `"unlimited"` | `33554432` (32 MiB/s, 64 MiB burst) | Raised: the replay sends as fast as the receiver acks, so a byte-rate cap measures the cap | `docs/guides/admission-limits.md`: `Ingest byte rate / burst \| 32 MiB/s / 64 MiB` |
+| Ravel | `series_creation_rate_per_sec` (config/ravel-limits.toml) | `"unlimited"` | `10000` (100,000 burst) | Raised: the cardinality profile's first timestamp creates 1,000,000 series, ten times the burst | `docs/guides/admission-limits.md`: `Series-creation rate / burst \| 10,000/s / 100,000` |
+| Ravel | `max_active_streams` (config/ravel-limits.toml) | `200000` | `200000` (unchanged) | Kept: the lane writes no logs | `docs/guides/admission-limits.md`: `Active-stream cap (logs) \| 200,000` |
+| Ravel | `max_bytes_scanned` (config/ravel-limits.toml) | `"unlimited"` | `"unlimited"` (unchanged) | Kept: no comparator has a scanned-byte budget | `docs/guides/admission-limits.md`: `Query bytes-scanned budget \| unlimited` |
+| Ravel | `--gc-max-query-duration` (query deadline) | `120s` | `11m` (derived) | Lowered to Prometheus' `--query.timeout`; a hit is refused(budget) | `--gc-max-query-duration <DURATION>  This process's query-engine deadline ... Default when unset: derived (host-independent): 11m` |
+| Ravel | `--max-segments` | `1000000` | `1000000` (derived, unchanged) | Kept: 4 shards at the 2 s flush age write 2 objects per second of ingest, so 1,000,000 needs 500,000 s (5.8 d) of replay before compaction; a hit is refused(budget) | `--max-segments <N> ... Default when unset: derived (host-independent): 1,000,000` |
+| Ravel | `--max-s3-requests` | `343400` | `343400` (derived, unchanged) | Kept: at one GET per object and 2 objects per second, a read over the whole uncompacted replay reaches it after 171,700 s (47.7 h) of ingest; a hit is refused(budget) | `--max-s3-requests <COUNT> ... That is 343,400 at the default 4 shards, the 2s flush cadence and the catalog's default 4,800s seal margin` |
+| Ravel | max series per query | `10000` | `10000` (unchanged, no flag) | Refused, not raised: no flag in the pinned image. Predicted to refuse 15 of the 21 cardinality entries (every one but the three `absent` and three `single` entries) | `crates/ravel-query/src/config.rs`, `DEFAULT_MAX_SERIES: usize = 10_000` |
+| Ravel | max samples per query | `10000000` | `10000000` (unchanged, no flag) | Refused, not raised: no flag in the pinned image. Predicted to refuse, on history: `mb_long_range_7d_avg` (about 40.3M), `mb_fanout_total_rate` and `mb_selective_error_ratio` (about 17.3M each), `mb_full_range_avg_over_time` (about 23.5M), `mb_long_range_subquery_max` (about 17.3M) | `crates/ravel-query/src/config.rs`, `DEFAULT_MAX_SAMPLES: usize = 10_000_000` |
+| Ravel | points per range series | `11000` | `11000` (unchanged, no flag) | Kept, same as Prometheus and Mimir: history's grid is 289 points | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_RANGE_POINTS: usize = 11_000` |
+| Ravel | total evaluation points per query | `1000000` | `1000000` (unchanged, no flag) | Kept: `mb_long_range_subquery_max` (`[1d:5m]`, 289 points) over the 289-point grid is 83,521 | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000` |
 
 Limits the corpus does not reach, left at their defaults: VictoriaMetrics
 `-search.maxSamplesPerSeries` (default 30000000; history holds 172,800 samples
@@ -100,6 +202,18 @@ per series) and `-search.maxPointsSubqueryPerTimeseries` (default 100000;
 `mb_long_range_subquery_max`'s `[1d:5m]` is 289 points), and the 11,000 points
 per series Prometheus and Mimir allow on `/api/v1/query_range`, which is not a
 flag.
+
+Ravel's flagged values are written in `ravel.yml` and its admission values in
+`config/ravel-limits.toml`, each with a comment naming the default it
+replaces. Four of its query caps (series, samples, points per range series,
+total evaluation points) and the future-skew bound are compiled into the
+pinned image with no flag or limits-file key; the source column cites the
+constant, and the capture cannot record them. The series and samples caps are
+the two that refuse corpus entries. They are kept, not raised, because the
+image offers no way to raise them, and every entry they refuse lands in
+`refused` as a budget refusal (ADR-0927 amendment 2026-10-26 F). The entries
+named in those two rows are predicted from `workload.json` series counts and
+sample spacing, not observed: no corpus pass has run against this deployment.
 
 Under Mimir 3.2.3's default query engine, `querier.max_samples` did not fire:
 with it set to 100, a query over 28,801 samples returned 200. That engine's
@@ -140,10 +254,23 @@ the query.
 | Mimir | 11,000 points per series (`query_range`) | 400 | `bad_data` | `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)` |
 | Mimir | `querier.max_samples` | not observed | | Did not fire under the default query engine (see above) |
 | Mimir | out-of-order window (Remote Write) | 400 | none (plain text) | `... this sample is beyond the out-of-order time window of 1h (err-mimir-sample-timestamp-too-old) ...`; only that sample is rejected, the rest of the request is stored |
+| Ravel | max series per query (10,000) | 422 | `execution` | `query matched 10001 series, exceeding the limit of 10000` |
+| Ravel | points per range series (11,000, `query_range`) | 422 | `execution` | `range query resolution of 12001 evaluation points exceeds the maximum of 11000; widen step_ms or narrow the range` |
+| Ravel | `--max-ingest-lag` (Remote Write) | 204 | none | Not a refusal: the too-old sample is dropped per sample and the request answers 2xx; it shows only as a missing sample |
+
+The Ravel rows were observed on 2026-10-26 against ravel-server 0.26.0
+(linux/arm64), run with every `ravel.yml` flag and `--store memory`, at the
+pinned values rather than tiny ones: 10,001 series and a 12,001-point range
+were written and queried. Not observed on the pinned image: max samples per
+query, total evaluation points, `--max-s3-requests`, `--max-segments`, the
+`--gc-max-query-duration` deadline, and `max_bytes_scanned` (unlimited here).
+Their signatures are not listed until observed.
 
 The match key for a status mapper is the stable token: Mimir's `err-mimir-*`
 identifier, VictoriaMetrics' flag name in the message, and Prometheus'
-`errorType` with its fixed message.
+`errorType` with its fixed message. Ravel's `errorType` is `execution` for
+both observed limits, so its key is the fixed message prefix: `query matched`
+for max series, `range query resolution of` for range points.
 
 ## Launch the set
 
@@ -151,9 +278,13 @@ identifier, VictoriaMetrics' flag name in the message, and Prometheus'
 docker compose -f deploy/metricsbench/docker-compose.yml up -d
 ```
 
-Every image is pinned to an immutable `@sha256:` digest (see below). Each
-comparator is given identical CPU (2.0) and memory (4g) limits so no engine
-wins on hardware.
+This starts the comparators alone; add `-f deploy/metricsbench/ravel.yml`
+with `RAVEL_IMAGE` set to include Ravel (see "Ravel in the portable lane").
+
+Every image in `docker-compose.yml` is pinned to an immutable `@sha256:`
+digest (see below); Ravel's image is the `RAVEL_IMAGE` the run passes. Each
+comparator, Ravel included, is given identical CPU (2.0) and memory (4g)
+limits so no engine wins on hardware.
 
 **The digest pins the manifest, not the platform.** These are multi-architecture
 manifest-list digests, so the same digest resolves to different image bytes on
@@ -170,6 +301,9 @@ Tear down (and drop the local volumes):
 docker compose -f deploy/metricsbench/docker-compose.yml down -v
 ```
 
+With Ravel up, name both files and keep `RAVEL_IMAGE` set, since compose
+interpolates the overlay on `down` too.
+
 ## Record what actually ran
 
 The compose file pins what should run; this captures what did. With the set
@@ -179,9 +313,9 @@ up, run:
 deploy/metricsbench/capture-effective-config.sh --out effective-config.json
 ```
 
-`--prometheus URL`, `--victoriametrics URL` and `--mimir URL` override the
-loopback compose ports (9090, 8428, 9009); without `--out` the document goes to
-stdout. Per comparator it records the version and revision the engine itself
+`--prometheus URL`, `--victoriametrics URL`, `--mimir URL` and `--ravel URL`
+override the loopback compose ports (9090, 8428, 9009, 4318); without `--out`
+the document goes to stdout. Per comparator it records the version and revision the engine itself
 reports, its runtime flags, and, when docker is reachable, the running
 container's image ID, `.Config.Image`, `RepoDigests`, `Architecture` and `Os`.
 The sources are:
@@ -199,6 +333,16 @@ The sources are:
   out of `/config`; `query_engine_default_for_version` is the documented
   default for the reported version: `prometheus` for 2.14 to 2.16, `mimir`
   (the Mimir Query Engine) from 2.17.
+- Ravel: `/api/v1/status/buildinfo` (no bearer needed) for version and
+  revision. Ravel serves no flags endpoint, so `runtime_flags` is the
+  `ravel-server` container's command line, `.Config.Cmd` from `docker
+  inspect`; it is unavailable when docker is not reachable. The limits file
+  and the compiled-in query caps are not read. ravel-server 0.26.0 reports an
+  empty `revision`, which the capture records as unavailable, so a capture
+  against 0.26.0 exits 1. The image ID and `RepoDigests` still identify the
+  build. `compose ps` reads both `docker-compose.yml` and `ravel.yml`; when
+  `RAVEL_IMAGE` is unset the script passes a placeholder so compose can
+  interpolate the overlay, which affects only the listing.
 
 A field that could not be fetched is `{"unavailable": "<reason>"}`; none is
 omitted or left empty. When docker is not reachable, `image` is the string
@@ -240,6 +384,12 @@ The document's shape, abbreviated:
         "architecture": "amd64",
         "os": "linux"
       }
+    },
+    "ravel": {
+      "version": "0.26.0",
+      "revision": {"unavailable": "..."},
+      "runtime_flags": {"source": "docker inspect .Config.Cmd of compose service ravel-server", "cmd": ["--mode", "all", "..."]},
+      "image": {"...": "..."}
     }
   }
 }
@@ -260,9 +410,13 @@ Besides this directory's compose file, the script checks image and action
 pins across the repository. All six categories run in one invocation and each
 is checked against its own expected count:
 
-- **Compose images** (this directory): every image reference carries an
-  `@sha256:` digest, every ADR-0927-required comparator is present, and the
-  number of image references equals the expected count.
+- **Compose images** (this directory, `docker-compose.yml` and the
+  `ravel.yml` overlay): every image reference except the two
+  `${RAVEL_IMAGE:?...}` references in `ravel.yml` (the image under test, a
+  required run parameter, excluded by exact match) carries an `@sha256:`
+  digest, every ADR-0927-required comparator and `ravel-server` are present,
+  and both the total image-reference count (7, across both files) and the
+  pin-required count (5) equal their expected totals.
 - **Dockerfile base images**: every `FROM`/`ARG` base image reference in the
   root `Dockerfile` and `Dockerfile.prebuilt` carries an `@sha256:` digest
   (`FROM scratch` is exempt: no registry manifest exists for it), and the

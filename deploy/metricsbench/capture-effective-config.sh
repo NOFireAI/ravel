@@ -329,7 +329,7 @@ def compose_containers():
     if err:
         return DOCKER_UNREACHABLE
     # ravel.yml refuses interpolation without RAVEL_IMAGE; ps only reads
-    # container labels, so a placeholder never names an image that is used.
+    # container labels, so the placeholder names no image that is used.
     env = dict(os.environ)
     if not env.get("RAVEL_IMAGE"):
         env["RAVEL_IMAGE"] = "unset-placeholder-for-compose-ps"
