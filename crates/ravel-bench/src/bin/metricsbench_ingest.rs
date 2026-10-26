@@ -178,7 +178,7 @@ enum RunError {
     #[error("{system}: {source}")]
     AccountingMismatch {
         system: String,
-        source: RowAccountingViolation,
+        source: Box<RowAccountingViolation>,
     },
     #[error(
         "the Ravel replay accepted zero samples, so it measured nothing; a stream that ingests \
@@ -250,7 +250,7 @@ fn close_row(
     })?;
     check_row_accounting(ingest, &counts).map_err(|source| RunError::AccountingMismatch {
         system: system.to_string(),
-        source,
+        source: Box::new(source),
     })?;
     Ok((report, counts))
 }
