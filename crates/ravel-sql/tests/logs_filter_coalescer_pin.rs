@@ -88,7 +88,15 @@ const OBJECT_KEY: &str = "t/coalescer-pin.rlog";
 const COALESCE_ROWS: usize = 8_192;
 
 // The `ESCAPE` clause keeps the `LIKE` out of the scan's contains arm, so the
-// scan builds every row's value and the coalescer holds whole-block arrays.
+// scan builds every row's value and the coalescer holds whole-block arrays:
+// the shape this pin measures. The bare `LIKE '%needle%'` now takes the
+// contains arm (#2865), on which the block's values array is built for the
+// surviving rows only, before `FilterExec` sees the batch; the array the
+// coalescer can pin is then a few hundred bytes per block rather than the
+// whole block (3,380 bytes held over 256 blocks against a 557,060-byte
+// whole-block array when this pin's bound was first run on that path), so
+// the retention this pin exists for cannot recur there. A pin of the pushed
+// path's own budget is a follow-up on #2865.
 const SELECT_URL: &str = r#"SELECT "URL" FROM logs WHERE "URL" LIKE '%needle%' ESCAPE '#'"#;
 const COUNT_URL: &str = r#"SELECT COUNT(*) FROM logs WHERE "URL" LIKE '%needle%' ESCAPE '#'"#;
 
