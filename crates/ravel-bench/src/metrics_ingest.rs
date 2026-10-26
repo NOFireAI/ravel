@@ -3716,10 +3716,7 @@ pub async fn readback_over_http(
             expected,
         });
     };
-    let window = [
-        ("start", seconds(min_ts)),
-        ("end", seconds(max_ts)),
-    ];
+    let window = [("start", seconds(min_ts)), ("end", seconds(max_ts))];
     let range_ms = max_ts - min_ts + 1;
 
     let series_count = reader
@@ -3839,7 +3836,11 @@ struct ApiReader<'a> {
 }
 
 impl ApiReader<'_> {
-    async fn get(&self, path: &str, params: &[(&str, String)]) -> Result<serde_json::Value, String> {
+    async fn get(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<serde_json::Value, String> {
         let mut url = reqwest::Url::parse(&format!("{}{path}", self.base))
             .map_err(|e| format!("query URL {}{path} does not parse: {e}", self.base))?;
         {
@@ -5389,9 +5390,8 @@ mod tests {
         assert_eq!(err.rejected_by_status, 2);
         assert_eq!(err.retry_exhausted, 0);
         assert!(
-            err.to_string().contains(
-                "2 rejected_by_status + 0 retry_exhausted against 3 dropped samples"
-            ),
+            err.to_string()
+                .contains("2 rejected_by_status + 0 retry_exhausted against 3 dropped samples"),
             "{err}"
         );
 
@@ -6089,7 +6089,10 @@ mod tests {
 
         let prometheus = replay_stub(Receiver::Prometheus, canned.clone(), &points, 9).await;
         let ingest = &prometheus.ingest;
-        assert_eq!(prometheus.acceptance_basis, Some(AcceptanceBasis::Acknowledged));
+        assert_eq!(
+            prometheus.acceptance_basis,
+            Some(AcceptanceBasis::Acknowledged)
+        );
         assert_eq!(ingest.offered_samples, 7);
         assert_eq!(ingest.accepted_samples, 0);
         assert_eq!(ingest.accepted_histograms, 0);
@@ -6221,11 +6224,13 @@ mod tests {
         check_row_accounting(&vm.ingest, &vm.ingest.stream_counts).expect("band 4 closes");
         check_row_band6(&vm).expect("band 6 passes over the stored classes");
         assert_ne!(
-            vm.ingest.accepted_digests.native_histogram, vm.ingest.expected_digests.native_histogram,
+            vm.ingest.accepted_digests.native_histogram,
+            vm.ingest.expected_digests.native_histogram,
             "the excluded class is not compared, not faked"
         );
 
-        let prometheus = replay_stub(Receiver::Prometheus, vec![Canned::ok(None)], &points, 4).await;
+        let prometheus =
+            replay_stub(Receiver::Prometheus, vec![Canned::ok(None)], &points, 4).await;
         assert_eq!(prometheus.ingest.accepted_histograms, 2);
         assert_eq!(prometheus.ingest.unsupported_histograms, 0);
         assert!(prometheus.unsupported_classes.is_empty());
@@ -6385,9 +6390,13 @@ mod tests {
             Receiver::Mimir,
         ] {
             for class in PayloadClass::ALL {
-                let unsupported = receiver == Receiver::VictoriaMetrics
-                    && class == PayloadClass::NativeHistogram;
-                assert_eq!(receiver.supports(class), !unsupported, "{receiver:?} {class:?}");
+                let unsupported =
+                    receiver == Receiver::VictoriaMetrics && class == PayloadClass::NativeHistogram;
+                assert_eq!(
+                    receiver.supports(class),
+                    !unsupported,
+                    "{receiver:?} {class:?}"
+                );
             }
             assert_eq!(
                 receiver.unsupported_classes().len(),
@@ -6472,50 +6481,62 @@ mod tests {
         axum::Router::new()
             .route(
                 "/api/v1/series",
-                axum::routing::get(move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
-                    let seen = Arc::clone(&seen_series);
-                    async move {
-                        seen.lock().expect("lock").push(raw.clone().unwrap_or_default());
-                        let matcher = pairs(&raw)
-                            .into_iter()
-                            .find(|(k, _)| k == "match[]")
-                            .map(|(_, v)| v)
-                            .unwrap_or_default();
-                        let n = if matcher.contains("mb_native") {
-                            1
-                        } else {
-                            3 + extra_series
-                        };
-                        axum::Json(serde_json::json!({
-                            "status": "success",
-                            "data": vec![serde_json::json!({}); n],
-                        }))
-                    }
-                }),
+                axum::routing::get(
+                    move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                        let seen = Arc::clone(&seen_series);
+                        async move {
+                            seen.lock()
+                                .expect("lock")
+                                .push(raw.clone().unwrap_or_default());
+                            let matcher = pairs(&raw)
+                                .into_iter()
+                                .find(|(k, _)| k == "match[]")
+                                .map(|(_, v)| v)
+                                .unwrap_or_default();
+                            let n = if matcher.contains("mb_native") {
+                                1
+                            } else {
+                                3 + extra_series
+                            };
+                            axum::Json(serde_json::json!({
+                                "status": "success",
+                                "data": vec![serde_json::json!({}); n],
+                            }))
+                        }
+                    },
+                ),
             )
             .route(
                 "/api/v1/query",
-                axum::routing::get(move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
-                    let seen = Arc::clone(&seen);
-                    async move {
-                        seen.lock().expect("lock").push(raw.clone().unwrap_or_default());
-                        let query = pairs(&raw)
-                            .into_iter()
-                            .find(|(k, _)| k == "query")
-                            .map(|(_, v)| v)
-                            .unwrap_or_default();
-                        let result = if !query.starts_with("count_over_time(") {
-                            serde_json::json!([])
-                        } else {
-                            let n = if query.contains("mb_native") { "2" } else { "3" };
-                            serde_json::json!([{"metric": {}, "value": [0, n]}])
-                        };
-                        axum::Json(serde_json::json!({
-                            "status": "success",
-                            "data": {"resultType": "vector", "result": result},
-                        }))
-                    }
-                }),
+                axum::routing::get(
+                    move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            seen.lock()
+                                .expect("lock")
+                                .push(raw.clone().unwrap_or_default());
+                            let query = pairs(&raw)
+                                .into_iter()
+                                .find(|(k, _)| k == "query")
+                                .map(|(_, v)| v)
+                                .unwrap_or_default();
+                            let result = if !query.starts_with("count_over_time(") {
+                                serde_json::json!([])
+                            } else {
+                                let n = if query.contains("mb_native") {
+                                    "2"
+                                } else {
+                                    "3"
+                                };
+                                serde_json::json!([{"metric": {}, "value": [0, n]}])
+                            };
+                            axum::Json(serde_json::json!({
+                                "status": "success",
+                                "data": {"resultType": "vector", "result": result},
+                            }))
+                        }
+                    },
+                ),
             )
     }
 
@@ -6550,7 +6571,11 @@ mod tests {
             .expect("replay");
         server.abort();
         assert_eq!(
-            outcome.result.commit_tokens_by_shard.as_ref().map(BTreeMap::len),
+            outcome
+                .result
+                .commit_tokens_by_shard
+                .as_ref()
+                .map(BTreeMap::len),
             Some(3)
         );
 

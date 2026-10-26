@@ -210,21 +210,32 @@ close:
   from the row's own fields, with `offered_samples + excluded_stale_marker ==
   scalar + stale_marker`, `offered_histograms + excluded_native_histogram ==
   native_histogram`, `offered_samples == accepted_samples + rejected_samples +
-  dropped_samples`, and the same split for histograms. A row that counts its
-  histograms under `offered_samples` fails the second equality even when the
-  total closes
+  dropped_samples + unsupported_samples`, and the same split for histograms
+  (`offered == accepted + rejected + dropped + unsupported` per class). A row
+  that counts its histograms under `offered_samples` fails the second
+  equality even when the total closes
   (`metrics_ingest::tests::a_row_that_folds_histograms_into_offered_samples_fails`).
+  Each class's drop must also be bucketed: `dropped_samples` equals
+  `rejected_by_status` summed plus `retry_exhausted_samples`, and
+  `dropped_histograms` equals `histograms_rejected_by_status` summed plus
+  `retry_exhausted_histograms`, on every row, the in-process one included
+  (`metrics_ingest::tests::dropped_points_must_be_bucketed_by_status_or_retry_exhaustion`).
 
-`dropped_samples` counts samples in batches that were sent and never
-acknowledged. An HTTP row splits them: `rejected_by_status` maps each
-non-retryable non-2xx HTTP status to the samples in batches answered with it
-(for example `{"400": 500}`), and `retry_exhausted_samples` counts samples in
-batches still failing with a 429, a 5xx or a transport error after
-`--http-max-retries` retries. The two sum to `dropped_samples`.
-`histograms_rejected_by_status` and `retry_exhausted_histograms` split
-`dropped_histograms` the same way. The in-process Ravel row has no HTTP
-status and no retry loop, so all four are empty there. `rejected_samples`
-and `rejected_histograms` are the points the lane refused before sending.
+`dropped_samples` counts samples sent and not accepted by the receiver. An
+HTTP row splits them: `rejected_by_status` maps each non-retryable non-2xx
+HTTP status to the samples it rejected (for example `{"400": 500}`), and
+`retry_exhausted_samples` counts samples in batches that ended on a
+retryable status after the retry budget, which may be zero
+(`--http-max-retries`), or on a transport error. `retry_exhausted_by_status`
+keys the first kind by that last status (for example `{"503": 500}`); a
+transport error has no status and is counted only in the total
+(`metrics_ingest::tests::comparator_drops_are_bucketed_by_status_and_by_retry_exhaustion`).
+`histograms_rejected_by_status`, `retry_exhausted_histograms` and
+`histograms_retry_exhausted_by_status` split `dropped_histograms` the same
+way. The in-process Ravel row has no HTTP status and no retry loop, so all
+six are empty there, and a strict write that did not ack fails the bucketing
+identity: the drop budget is zero. `rejected_samples` and
+`rejected_histograms` are the points the lane refused before sending.
 `--batch-size` and `--http-batch-size` count points: samples and histograms
 together.
 
@@ -238,14 +249,43 @@ section A). Its name differs from the portable row's `ravel`, so a lookup by
 commit token its strict writes minted under `commit_tokens`.
 
 Each HTTP receiver gets a row only when its endpoint is passed, and its
-`system` value is the name the query runner joins on:
+`system` value is the name the query runner joins on. Every HTTP endpoint
+needs its query URL, the base its `/api/v1/query` and `/api/v1/series` are
+appended to; the bin exits 64 without it
+(`metricsbench_ingest::tests::every_endpoint_needs_its_query_url`):
 
-| Flag | `system` | Ack |
-|---|---|---|
-| `--ravel-endpoint <url>` | `ravel` | `durable_on_ack`, refused when no response carries `x-ravel-commit-token` |
-| `--prometheus-endpoint <url>` | `prometheus` | `buffered` |
-| `--victoriametrics-endpoint <url>` | `victoriametrics` | `buffered` |
-| `--mimir-endpoint <url>` | `mimir` | `buffered` |
+| Flag | Query URL flag | `system` | Ack | `acceptance_basis` |
+|---|---|---|---|---|
+| `--ravel-endpoint <url>` | `--ravel-query-url` | `ravel` | `durable_on_ack`, refused when no response carries `x-ravel-commit-token` | `read_back` |
+| `--prometheus-endpoint <url>` | `--prometheus-query-url` | `prometheus` | `buffered` | `acknowledged` |
+| `--victoriametrics-endpoint <url>` | `--victoriametrics-query-url` | `victoriametrics` | `buffered` | `acknowledged` |
+| `--mimir-endpoint <url>` | `--mimir-query-url` | `mimir` | `buffered` | `acknowledged` |
+
+Every row sends Remote Write 1.0, the portable Ravel row included. Each
+receiver's response is read by its own rule, and every HTTP row records the
+rule's basis as `acceptance_basis`:
+
+- Prometheus: a 400 rejects the whole request, every point of it under
+  `rejected_by_status`.
+- Mimir: a 400 is a per-sample soft rejection. Only the points the body names
+  are rejected, matched on Mimir's rendering of a sample ("The affected sample
+  has timestamp `<RFC3339Nano UTC>` and is from series `<name{labels}>`",
+  taken from Mimir's main branch, not a pinned release); the rest of the
+  request is accepted. A 400 whose body names no point of the request
+  rejects it whole
+  (`metrics_ingest::tests::prometheus_rejects_a_400_request_whole_and_mimir_only_the_named_sample`,
+  `metrics_ingest::tests::a_mimir_400_naming_no_point_of_the_batch_rejects_it_whole`).
+- VictoriaMetrics: a 2xx accepts every point except native histograms, which
+  it acknowledges without storing (see the unsupported-class table below)
+  (`metrics_ingest::tests::victoriametrics_acknowledges_histograms_it_cannot_store`).
+- Ravel: a 2xx is a durable acknowledgement and a 400 rejects the request;
+  ravel-server answers 204 after admission or normalization drops too, so its
+  accepted set is confirmed by the read-back below.
+
+`accepted_samples` and `accepted_histograms` count the points a row's rule
+accepted. A Remote Write 1.0 response carries no written count, so on an
+`acknowledged` row they are what the receiver acknowledged; the read-back is
+what confirms them stored.
 
 `endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
 `ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it
@@ -255,20 +295,74 @@ variable is unset or empty, or when the flag is given without
 `--ravel-endpoint` (`metricsbench_ingest_smoke::a_bearer_token_env_that_cannot_be_read_exits_64`).
 The token is not written into the report: neither `endpoint` nor
 `client_behavior` carries it
-(`metrics_ingest::tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_last_commit_token`).
-The row records `last_commit_token`, the `x-ravel-commit-token` header of
-the last acknowledged request, verbatim (the server joins one token per
-shard that request touched with commas). It is a diagnostic sample, not a
-read-your-write fence: it names only the shards that one request touched.
-Only the last value is kept, so `commit_tokens` is absent on this row. A
-comparator row records neither.
+(`metrics_ingest::tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_latest_token_of_every_shard`).
 
-On every HTTP row, `accepted_samples` and `accepted_histograms` count points
-in requests the receiver answered 2xx. A Remote Write 1.0 response carries no
-written count, so a point dropped after the acknowledgement is counted as
-accepted; ravel-server, for one, answers 204 after admission or normalization
-drops. The figures are acknowledged, not confirmed stored, until a read-back
-confirms them.
+Every row records its `tenant`. The in-process row writes under `--tenant`
+(default `metricsbench`). The portable Ravel row records `--ravel-tenant`,
+the tenant ravel-server resolves its requests to, which `--ravel-endpoint`
+requires and which must equal `--tenant`, so both Ravel rows describe one
+tenant's data; the bin exits 64 otherwise
+(`metricsbench_ingest_smoke::a_missing_or_mismatched_ravel_tenant_exits_64`).
+A comparator is sent no tenant and records none.
+
+The portable Ravel row records `commit_tokens_by_shard`, the latest
+`x-ravel-commit-token` value per shard over every acknowledged request (the
+server joins one token per shard a request touched with commas), and
+`last_commit_token`, those tokens joined with commas in shard order: a
+read-your-write fence over every shard the replay wrote, not only the shards
+the last request touched. A header entry that does not decode as a commit
+token fails the replay
+(`metrics_ingest::tests::an_undecodable_commit_token_is_refused`). The row
+stays `durable_on_ack` only when some response carried a token; otherwise the
+bin refuses it as unbacked durability
+(`metrics_ingest::tests::a_durable_row_without_any_commit_token_is_refused`).
+`commit_tokens` is absent on this row. A comparator row records none of them.
+
+#### Read-back
+
+After each HTTP replay the bin reads the row back over the receiver's
+Prometheus query API and records `readback`: `series_count` (distinct series
+`/api/v1/series` returns over the replay window), `sample_count`
+(`count_over_time` over one probe series per float class, evaluated at the
+newest timestamp sent over the whole window), `histogram_series_count` (the
+native-histogram metrics' series, absent on a receiver that does not store
+them), `histogram_sample_count`, `stale_marker_honored` (an instant query at
+the marker's timestamp returns no sample for its series), `expected` (the
+same figures from what was sent, for the classes the receiver stores),
+`mismatches` naming each figure that differs, and `matches_expected`. The
+Ravel row passes every token in `commit_tokens_by_shard` as
+`min_commit_token` on every query. The bin fails when `matches_expected` is
+false
+(`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`,
+`metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`).
+
+#### Band 6: accepted digests per class
+
+Every row carries `expected_digests` and `accepted_digests`, one BLAKE3
+digest per class (`scalar`, `stale_marker`, `native_histogram`) over the
+points sent and the points accepted, in offered order. The bin fails a row
+whose accepted digest differs from its expected digest for any class it
+stores; digests are compared, not counts, so a row that accepted as many
+points as it was sent, but not the same ones, fails
+(`metrics_ingest::tests::band6_compares_digests_not_counts`,
+`metrics_ingest::tests::band6_fails_when_a_supporting_receiver_drops_one_point_of_any_class`).
+Across rows, every portable row must carry the same expected digest for every
+class, and each portable row's expected scalar digest must equal the
+in-process row's
+(`metrics_ingest::tests::portable_rows_with_different_expected_digests_fail`,
+`metricsbench_ingest::tests::a_portable_scalar_digest_must_equal_the_in_process_one`,
+`metrics_ingest::tests::the_in_process_and_portable_rows_carry_equal_expected_digests`).
+
+A class a receiver acknowledges without storing is excluded from its band 6
+comparison and its read-back, and counted under `unsupported_samples` or
+`unsupported_histograms` instead of accepted; it is not a drop, so the drop
+budget stays zero. Every row records the classes excluded for it, each with
+its citation, as `unsupported_classes`. The table has one entry
+(`metrics_ingest::tests::the_unsupported_class_table_names_only_victoriametrics_histograms`):
+
+| Receiver | Class | Source |
+|---|---|---|
+| VictoriaMetrics | native histogram | `lib/prompb/prompb.go` at v1.115.0: `TimeSeries.unmarshalProtobuf` reads only labels (field 1) and samples (field 2), so histograms (field 4) are skipped while the request is answered 2xx |
 
 Because generation runs inside the replay, `elapsed_secs` is the sum of the
 timed write segments (the `write_values` calls and the final flush for the

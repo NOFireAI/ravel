@@ -39,8 +39,8 @@ use ravel_bench::metrics_ingest::{
     PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver, RowAccountingViolation,
     RunProvenance, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
     build_profile_record, check_anchor, check_expected_digests_agree, check_row_accounting,
-    check_row_band6, check_stream_band, query_after_replay, readback_over_http,
-    replay_into_ravel, replay_over_http_with_plan, workload_digest,
+    check_row_band6, check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
+    replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -375,11 +375,9 @@ fn close_row(
         system: label.to_string(),
         source,
     })?;
-    check_row_accounting(&row.ingest, &counts).map_err(|source| {
-        RunError::AccountingMismatch {
-            system: label.to_string(),
-            source: Box::new(source),
-        }
+    check_row_accounting(&row.ingest, &counts).map_err(|source| RunError::AccountingMismatch {
+        system: label.to_string(),
+        source: Box::new(source),
     })?;
     check_row_band6(row)?;
     check_scalar_expected(
