@@ -539,7 +539,8 @@ pub struct IngestPhase {
     /// segments, which the sum excludes.
     #[serde(default)]
     pub elapsed_basis: String,
-    /// Accepted logical samples per second.
+    /// Accepted logical points (scalar samples plus native histograms) per
+    /// second.
     pub logical_points_per_sec: f64,
     /// Bytes of the snappy-compressed RW1.0 body offered (the wire shape every
     /// system receives), across accepted-or-dropped batches.
@@ -576,9 +577,13 @@ pub struct StorageAccounting {
     pub put_count: u64,
     /// PUT payload bytes offered to the backend (wire, stored form).
     pub put_bytes: u64,
-    /// Stored bytes divided by accepted samples.
-    pub stored_bytes_per_sample: f64,
-    /// Stored bytes over logical bytes ingested (`accepted * 16`).
+    /// Stored bytes divided by accepted logical points (scalar samples plus
+    /// native histograms), the same records `stored_bytes` holds.
+    #[serde(alias = "stored_bytes_per_sample")]
+    pub stored_bytes_per_point: f64,
+    /// Stored bytes over the logical bytes of the accepted points: 16 per
+    /// scalar sample (timestamp and value) and, per native histogram, 24
+    /// (timestamp, sum and count) plus 8 per bucket ([`logical_bytes_of`]).
     pub write_amplification: f64,
     /// Whether a request against this backend is billed: `false` on
     /// `MemoryStore` (real counts, but free), `true` on S3. The explicit
@@ -589,9 +594,9 @@ pub struct StorageAccounting {
 /// One system's ingest result row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemIngestResult {
-    /// The system: `ravel`, `prometheus`, `victoriametrics`, `mimir`. Two
-    /// rows can both say `ravel`: the in-process diagnostic row and the
-    /// portable row over HTTP, told apart by `endpoint`.
+    /// The system: `ravel` (the portable row over HTTP), `prometheus`,
+    /// `victoriametrics`, `mimir`, or [`IN_PROCESS_SYSTEM`] for the in-process
+    /// diagnostic row. Each name names one row.
     pub system: String,
     /// What a 2xx from this system means (ADR-0927 decision 3).
     pub ack_semantics: AckSemantics,
@@ -733,8 +738,8 @@ impl std::error::Error for AckConflation {}
 /// (ADR-0927 decision 3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemQueryResult {
-    /// The system queried: `ravel` (the only durable-on-ack, token-minting
-    /// path the bench can read deterministically).
+    /// The system queried: [`IN_PROCESS_SYSTEM`] (the in-process path, whose
+    /// commit tokens the bench holds in full and can read deterministically).
     pub system: String,
     /// The instant PromQL expression evaluated.
     pub query: String,
@@ -2163,6 +2168,29 @@ fn class_counts<'p>(points: impl IntoIterator<Item = &'p LogicalPoint>) -> (u64,
         })
 }
 
+/// Logical bytes of a native histogram before its buckets: timestamp, sum and
+/// count, 8 bytes each.
+const LOGICAL_BYTES_PER_HISTOGRAM_BASE: u64 = 24;
+/// Logical bytes per native-histogram bucket count.
+const LOGICAL_BYTES_PER_HISTOGRAM_BUCKET: u64 = 8;
+
+/// The logical bytes of `points`, the denominator of `write_amplification`:
+/// [`LOGICAL_BYTES_PER_SAMPLE`] per scalar sample (a staleness marker
+/// included), and per native histogram [`LOGICAL_BYTES_PER_HISTOGRAM_BASE`]
+/// plus [`LOGICAL_BYTES_PER_HISTOGRAM_BUCKET`] per bucket.
+fn logical_bytes_of<'p>(points: impl IntoIterator<Item = &'p LogicalPoint>) -> u64 {
+    points.into_iter().fold(0, |bytes, point| {
+        bytes
+            + match point {
+                LogicalPoint::Sample(_) => LOGICAL_BYTES_PER_SAMPLE,
+                LogicalPoint::Histogram(h) => {
+                    LOGICAL_BYTES_PER_HISTOGRAM_BASE
+                        + LOGICAL_BYTES_PER_HISTOGRAM_BUCKET * h.positive_deltas.len() as u64
+                }
+            }
+    })
+}
+
 /// Replay `source` into the in-process Ravel path, pulling one batch at a
 /// time so memory is bounded by the batch, not the stream's history. Valid
 /// points (samples, staleness markers and native histograms, each through
@@ -2213,6 +2241,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     let mut dropped_samples: u64 = 0;
     let mut accepted_histograms: u64 = 0;
     let mut dropped_histograms: u64 = 0;
+    let mut accepted_logical_bytes: u64 = 0;
     let mut dropped_batches: u64 = 0;
     let mut batches: u64 = 0;
 
@@ -2240,6 +2269,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         // inside their own segments.
         wire_bytes += encode_rw1_points(&logical)?.len() as u64;
         let (batch_samples, batch_histograms) = class_counts(&logical);
+        let batch_logical_bytes = logical_bytes_of(&logical);
         drop(logical);
         batches += 1;
 
@@ -2259,6 +2289,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
                 ack_latencies_ns.push(took.as_nanos() as u64);
                 accepted_samples += batch_samples;
                 accepted_histograms += batch_histograms;
+                accepted_logical_bytes += batch_logical_bytes;
                 tokens.extend(receipt.tokens);
             }
             Err(_) => {
@@ -2286,16 +2317,18 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     let objects = list_all(store.as_ref(), "").await.unwrap_or_default();
     let stored_bytes: u64 = objects.iter().map(|o| o.size).sum();
     let object_count = objects.len() as u64;
-    let logical_bytes = accepted_samples * LOGICAL_BYTES_PER_SAMPLE;
-    let write_amplification = if logical_bytes == 0 {
+    // Both ratios cover every record stored_bytes holds: scalar samples and
+    // native histograms alike.
+    let accepted_points = accepted_samples + accepted_histograms;
+    let write_amplification = if accepted_logical_bytes == 0 {
         0.0
     } else {
-        stored_bytes as f64 / logical_bytes as f64
+        stored_bytes as f64 / accepted_logical_bytes as f64
     };
-    let stored_bytes_per_sample = if accepted_samples == 0 {
+    let stored_bytes_per_point = if accepted_points == 0 {
         0.0
     } else {
-        stored_bytes as f64 / accepted_samples as f64
+        stored_bytes as f64 / accepted_points as f64
     };
 
     let stream_counts = source.stream_counts();
@@ -2322,7 +2355,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         retries: snapshot.put.attempts.saturating_sub(snapshot.put.calls),
         elapsed_secs,
         elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
-        logical_points_per_sec: accepted_samples as f64 / elapsed_secs,
+        logical_points_per_sec: (accepted_samples + accepted_histograms) as f64 / elapsed_secs,
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
         ack_latency_ms: LatencyReport::from_nanos(ack_latencies_ns),
@@ -2334,7 +2367,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         stored_bytes,
         put_count: snapshot.put.calls,
         put_bytes: snapshot.put.bytes,
-        stored_bytes_per_sample,
+        stored_bytes_per_point,
         write_amplification,
         backend_bills_requests: config.backend_bills_requests,
     };
@@ -2615,7 +2648,7 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         retries,
         elapsed_secs,
         elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
-        logical_points_per_sec: accepted_samples as f64 / elapsed_secs,
+        logical_points_per_sec: (accepted_samples + accepted_histograms) as f64 / elapsed_secs,
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
         ack_latency_ms: LatencyReport::from_nanos(ack_latencies_ns),
@@ -2789,7 +2822,7 @@ mod tests {
             stored_bytes: 100,
             put_count: 2,
             put_bytes: 100,
-            stored_bytes_per_sample: 100.0,
+            stored_bytes_per_point: 100.0,
             write_amplification: 6.25,
             backend_bills_requests: false,
         }
@@ -3270,6 +3303,28 @@ mod tests {
             }
         );
         check_row_accounting(ing, &ing.stream_counts).expect("both classes close");
+
+        // The storage ratios cover the same records stored_bytes holds: five
+        // samples at 16 logical bytes and two three-bucket histograms at
+        // 24 + 3 * 8, so 7 points and 176 logical bytes. A ratio over samples
+        // only (5 points, 80 bytes) fails both assertions.
+        assert_eq!(logical_bytes_of(&points), 5 * 16 + 2 * (24 + 3 * 8));
+        let storage = outcome.result.storage.as_ref().expect("storage present");
+        assert!(storage.stored_bytes > 0);
+        assert_eq!(
+            storage.stored_bytes_per_point.to_bits(),
+            (storage.stored_bytes as f64 / 7.0).to_bits(),
+            "{storage:?}"
+        );
+        assert_eq!(
+            storage.write_amplification.to_bits(),
+            (storage.stored_bytes as f64 / 176.0).to_bits(),
+            "{storage:?}"
+        );
+        assert!(
+            (ing.logical_points_per_sec * ing.elapsed_secs - 7.0).abs() < 1e-6,
+            "points per second counts histograms too: {ing:?}"
+        );
     }
 
     /// The ci profile replayed in process: every line is offered, the
