@@ -508,7 +508,8 @@ others, written through `/api/v1/write` and queried through
 `/api/v1/query`, `/api/v1/query_range`, `/api/v1/labels`,
 `/api/v1/label/<name>/values` and `/api/v1/series`. The ingest limits a
 historical replay needs (`--max-ingest-lag` covering the profile's span,
-and the matching catalog setting) are set explicitly in that deployment and
+which drives both the admission bound and the catalog listing window) are
+set explicitly in that deployment and
 disclosed in the report's substrate block, exactly as every comparator's
 ingest window is. The in-process path stays as the diagnostic lane's
 replay (decision 1 and decision 7), and its report row says
@@ -549,10 +550,14 @@ lane reads each receiver's per-sample outcome (the Remote Write response
 body and the receiver's written-samples header or counter), never a
 per-batch status alone, and each row carries a digest of its accepted
 `(series, timestamp, value bits)` set. Band 6, new: every portable row's
-accepted set must equal the set it was expected to accept, which is the
-offered stream minus that lane's named payload exclusions (section D), and
-the run fails when any two portable rows' expected-set digests differ or
-any row's accepted-set digest differs from its expected-set digest. The
+accepted set must equal its expected set, which is the generated stream
+minus that row's named payload exclusions (section D; a row's `offered`
+set is exactly this, so the expected-set digest is the digest of what the
+row offered). Every portable row carries the same exclusion set, because
+the portable lane sends every payload type it carries to every receiver;
+a lane that excludes a type another portable row carries is a diagnostic
+row. The run fails when any two portable rows' expected-set digests differ
+or any row's accepted-set digest differs from its expected-set digest. The
 portable lane's drop budget is zero: a dropped or rejected sample on any
 receiver fails this band, and a row that needs a non-zero budget is a
 diagnostic row, not a portable one. The generator change moves
@@ -658,12 +663,16 @@ The `ci` row in decision 11 says churn 5%/h. The manifest
 `benchmarks/metrics/README.md` is corrected in the same change. The table
 row is left as written and this paragraph is the correction.
 
-Consequences. Task routing under #2821: T1b (replay: generator shift,
-staleness markers, native-histogram wire shape, per-sample outcomes,
-accepted-set digest, per-row bands), T4c (comparator limits and Mimir
-read-path intervals), T4d (Ravel's own `deploy/metricsbench` deployment at
-the comparators' envelope), T5 (corpus and workload version 2: join
-repairs, range grids, corpus gates), T3 (status mapper and budget table).
+Consequences. Task routing under #2821: T1b (replay accounting: required
+on-grid anchor, comparability tied to it, provenance digests, the two
+band-4 equations, rejections by status), T1c (payload types on the wire:
+staleness markers, native-histogram wire shape, per-sample receiver
+outcomes, accepted-set digest and band 6; removes the intended-empty
+marker from the two native-histogram entries), T4c (comparator limits and
+Mimir read-path intervals), T4d (Ravel's own `deploy/metricsbench`
+deployment at the comparators' envelope), T5 (corpus and workload version
+2: generator shift, join repairs, range grids, corpus gates), T3 (status
+mapper and budget table).
 Nothing here changes a persistent format: the workload manifest and corpus
 are benchmark artifacts versioned by their own `version` field, not frozen
 storage contracts.
