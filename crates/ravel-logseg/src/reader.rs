@@ -11,6 +11,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use memchr::memmem;
+
 use ravel_types::logstream::AttrValue;
 
 use crate::block::{
@@ -1628,6 +1630,8 @@ impl DictCache {
 thread_local! {
     /// Dictionary pages `decode_v4_block_with` has decoded on this thread.
     static DICT_PAGE_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// [`ContainsNeedle`]s built on this thread.
+    static NEEDLES_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Dictionary pages decoded on this thread so far, for tests that pin one
@@ -1832,7 +1836,7 @@ enum Arm {
         col: Option<u32>,
         others: Vec<(u32, FieldType)>,
         key: String,
-        needle: Vec<u8>,
+        needle: ContainsNeedle,
         negated: bool,
     },
     /// An `Equals` that no row can satisfy (`body` against a non-string).
@@ -1916,7 +1920,7 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
                     .map(|e| (e.column_id, e.ty))
                     .collect(),
                 key: key.clone(),
-                needle: needle.as_bytes().to_vec(),
+                needle: ContainsNeedle::new(needle.as_bytes()),
                 negated: *negated,
             },
         };
@@ -2294,7 +2298,7 @@ struct ContainsArm<'a> {
     col: Option<u32>,
     others: &'a [(u32, FieldType)],
     key: &'a str,
-    needle: &'a [u8],
+    needle: &'a ContainsNeedle,
     negated: bool,
 }
 
@@ -2347,7 +2351,7 @@ fn contains_kernel(
         if let Some(Some(pass)) = streams.get(r as usize) {
             return Ok(*pass);
         }
-        let pass = stream_contains(stream_dir, r, arm.key, arm.needle, arm.negated)?;
+        let pass = stream_contains(stream_dir, r, arm.key, arm.negated, |v| arm.needle.is_in(v))?;
         if let Some(slot) = streams.get_mut(r as usize) {
             *slot = Some(pass);
         }
@@ -2362,7 +2366,7 @@ fn contains_kernel(
                 None => fb,
                 Some(cell) => {
                     *tested += 1;
-                    let t = contains_bytes(cell, arm.needle) != arm.negated;
+                    let t = arm.needle.is_in(cell) != arm.negated;
                     if t == fb || std::str::from_utf8(cell).is_ok() {
                         t
                     } else {
@@ -2386,9 +2390,7 @@ fn contains_kernel(
                             Some(t) => t,
                             None => {
                                 *tested += 1;
-                                let t = values
-                                    .entry(k)
-                                    .is_some_and(|e| contains_bytes(e, arm.needle))
+                                let t = values.entry(k).is_some_and(|e| arm.needle.is_in(e))
                                     != arm.negated;
                                 if let Some(slot) = verdicts.get_mut(k) {
                                     *slot = Some(t);
@@ -2409,23 +2411,49 @@ fn contains_kernel(
     }
 }
 
-/// Whether `needle` occurs in `hay` as a contiguous run of bytes. An empty
-/// needle occurs in every value.
+/// A `Contains` arm's needle with its substring searcher, built once per arm
+/// when the arms are compiled. Public only so the crate's bench measures the
+/// search the kernel runs; not part of the supported API.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ContainsNeedle {
+    finder: memmem::Finder<'static>,
+}
+
+impl ContainsNeedle {
+    pub fn new(needle: &[u8]) -> Self {
+        #[cfg(test)]
+        NEEDLES_BUILT.with(|n| n.set(n.get() + 1));
+        Self {
+            finder: memmem::Finder::new(needle).into_owned(),
+        }
+    }
+
+    /// Whether the needle occurs in `hay` as a contiguous run of bytes. An
+    /// empty needle occurs in every value.
+    pub fn is_in(&self, hay: &[u8]) -> bool {
+        self.finder.find(hay).is_some()
+    }
+}
+
+/// Whether `needle` occurs in `hay` as a contiguous run of bytes, by a plain
+/// window scan: the row-by-row [`eval`] reference the contains kernel's
+/// [`ContainsNeedle`] is tested against. An empty needle occurs in every value.
 fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// A `Contains` arm's verdict on stream `stream_ref`'s value for `key`: its
-/// resource or scope `Str` value contains `needle`, flipped when `negated`.
-/// `false` when the stream has no `Str` value for `key`, a NULL neither
-/// `LIKE` nor `NOT LIKE` keeps. A ref past the STREAM_DIR is the same
-/// `Corrupted` error [`rebuild_record`] gives.
+/// A `Contains` arm's verdict on stream `stream_ref`'s value for `key`: `test`
+/// on its resource or scope `Str` value, flipped when `negated`. `false` when
+/// the stream has no `Str` value for `key`, a NULL neither `LIKE` nor
+/// `NOT LIKE` keeps. A ref past the STREAM_DIR is the same `Corrupted` error
+/// [`rebuild_record`] gives.
 fn stream_contains(
     stream_dir: &StreamDir,
     stream_ref: u32,
     key: &str,
-    needle: &[u8],
     negated: bool,
+    test: impl FnOnce(&[u8]) -> bool,
 ) -> Result<bool, LogSegError> {
     let entry = stream_dir
         .entries()
@@ -2437,7 +2465,7 @@ fn stream_contains(
         .find(|(k, _)| k == key)
         .map(|(_, v)| v);
     Ok(match value {
-        Some(AttrValue::Str(s)) => contains_bytes(s.as_bytes(), needle) != negated,
+        Some(AttrValue::Str(s)) => test(s.as_bytes()) != negated,
         _ => false,
     })
 }
@@ -2633,7 +2661,8 @@ fn eval(
             let needle = needle.as_bytes();
             let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-            let stream = stream_contains(stream_dir, r, key, needle, *negated)?;
+            let stream =
+                stream_contains(stream_dir, r, key, *negated, |v| contains_bytes(v, needle))?;
             let cell = field_dir
                 .column(key, FieldType::Str)
                 .and_then(|e| block.str_at(e.column_id, row))
@@ -8317,6 +8346,50 @@ mod tests {
                 let mut after = reader.scan_blocks(&none, &[], &all).expect("scan");
                 after.dicts = std::mem::take(&mut with_arm.dicts);
                 assert_eq!(s_cells(after, &obj, col), fresh);
+            }
+
+            /// The kernel's searcher: a needle longer than the value is a
+            /// miss, and an empty needle a hit on every value, the empty one
+            /// included.
+            #[test]
+            fn contains_needle_long_needle_misses_and_empty_needle_hits() {
+                let long = ContainsNeedle::new(b"abcd");
+                assert!(!long.is_in(b"abc"));
+                assert!(!long.is_in(b""));
+                assert!(long.is_in(b"abcd"));
+                let empty = ContainsNeedle::new(b"");
+                assert!(empty.is_in(b""));
+                assert!(empty.is_in(b"abc"));
+                assert!(empty.is_in(&[0xff, 0xfe]));
+            }
+
+            /// Each `Contains` arm's searcher is built once, when the scan
+            /// compiles its arms, however many blocks and cells it tests.
+            #[test]
+            fn contains_needle_is_built_once_per_arm() {
+                let (obj, cfg) = group_dict_object();
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let built = || crate::reader::NEEDLES_BUILT.with(std::cell::Cell::get);
+                let before = built();
+                let mut scan = reader
+                    .scan_blocks(
+                        &Predicate::And(vec![
+                            contains("u", "u", false),
+                            contains("s", "ab", false),
+                        ]),
+                        &[],
+                        &ColumnSelection::all(),
+                    )
+                    .expect("scan");
+                assert_eq!(built() - before, 2, "one per arm, at compile");
+                let mut rows = 0;
+                while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                    rows += view.surviving_count();
+                }
+                assert_eq!(rows, 12);
+                assert_eq!(scan.stats().blocks_scanned, 4);
+                assert_eq!(scan.stats().contains_cells_tested, 6 + 24);
+                assert_eq!(built() - before, 2, "none in the kernel loop");
             }
 
             /// The counters, exactly: a row group dictionary of six entries

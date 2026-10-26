@@ -106,6 +106,11 @@ pub struct LogsTableProvider {
     /// statistics (ADR-2121 D1). Always `true` outside tests, which turn it
     /// off to compare against the unpruned scan.
     stats_pruning: bool,
+    /// Whether [`TableProvider::scan`] pushes `LIKE '%literal%'` into the
+    /// scan as `Predicate::Contains` (ADR-2773, contains-arm amendment).
+    /// Always `true` outside tests, which turn it off to compare against the
+    /// unpushed scan.
+    contains_pushdown: bool,
     /// The executor's record of scan executions (issue #3192), handed to
     /// every `LogsScanExec` this provider builds. `None` by default, installed
     /// with [`Self::with_scan_executions`].
@@ -138,6 +143,7 @@ impl LogsTableProvider {
             distributed: None,
             segment_timing: false,
             stats_pruning: true,
+            contains_pushdown: true,
             scan_executions: None,
         }
     }
@@ -278,6 +284,14 @@ impl LogsTableProvider {
     #[cfg(test)]
     pub(crate) fn with_stats_pruning(mut self, stats_pruning: bool) -> Self {
         self.stats_pruning = stats_pruning;
+        self
+    }
+
+    /// Turn `Predicate::Contains` pushdown off, so a test can compare the rows
+    /// and counters of the same `LIKE` query with and without it.
+    #[cfg(test)]
+    pub(crate) fn with_contains_pushdown(mut self, contains_pushdown: bool) -> Self {
+        self.contains_pushdown = contains_pushdown;
         self
     }
 
@@ -473,7 +487,12 @@ impl TableProvider for LogsTableProvider {
         }
 
         let target_partitions = state.config().target_partitions();
-        let pushdown = extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index);
+        let mut pushdown = extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index);
+        if !self.contains_pushdown {
+            pushdown
+                .content
+                .retain(|p| !matches!(p, ravel_logseg::Predicate::Contains { .. }));
+        }
         // Projection pushdown reaches the reader (ADR-0087 decision 3): the
         // scan's output schema *is* the projection, and the resolved column set
         // stops the RLOG reader decoding the pages of columns nothing reads.
@@ -1966,6 +1985,517 @@ mod tests {
         );
     }
 
+    /// What one `LIKE` query over a [`ContainsFixture`] returned and counted.
+    #[derive(Debug, PartialEq)]
+    struct ContainsRun {
+        /// `(ts, body)` rows, sorted, duplicates kept.
+        rows: Vec<(i64, String)>,
+        contains_cells_tested: usize,
+        str_cells_validated: usize,
+        /// Whether the scan recorded `fast_path_rejected_block_predicate`.
+        block_predicate_rejected: bool,
+    }
+
+    /// Two one-record-per-block objects with `svc` declared `Str`. Object A:
+    /// ts 1 `svc = "alice-checkout-1"`, ts 2 `svc = "bob"`, ts 3 no `svc`
+    /// anywhere, ts 4 `svc = 7` (an `I64` winner). Object B, whose resource
+    /// sets `svc = "checkout-svc"`: ts 5 with no record `svc` (read through
+    /// the stream fallback), ts 6 `svc = "xcheckoutx"`.
+    async fn contains_segments(store: &MemoryStore) -> Vec<SegmentRef> {
+        let plain = vec![("service.name".to_string(), s("a"))];
+        let with_svc = vec![
+            ("service.name".to_string(), s("b")),
+            ("svc".to_string(), s("checkout-svc")),
+        ];
+        let svc = |v: AttrValue| vec![("svc".to_string(), v)];
+        let a = [
+            record(&plain, &svc(s("alice-checkout-1")), 1, "a1"),
+            record(&plain, &svc(s("bob")), 2, "a2"),
+            record(&plain, &[], 3, "a3"),
+            record(&plain, &svc(AttrValue::I64(7)), 4, "a4"),
+        ];
+        let b = [
+            record(&with_svc, &[], 5, "b5"),
+            record(&with_svc, &svc(s("xcheckoutx")), 6, "b6"),
+        ];
+        vec![
+            write_object_with(
+                store,
+                "logs/contains-a.rlog",
+                &a,
+                one_record_per_block(),
+                &[],
+            )
+            .await,
+            write_object_with(
+                store,
+                "logs/contains-b.rlog",
+                &b,
+                one_record_per_block(),
+                &[],
+            )
+            .await,
+        ]
+    }
+
+    /// The four `svc` values of [`dict_records`]; the first and last contain
+    /// `checkout`.
+    const DICT_SVC: [&str; 4] = [
+        "alpha-checkout-1",
+        "beta-cart",
+        "delta-search",
+        "gamma-checkout-2",
+    ];
+
+    /// Four records per block, so [`dict_records`] is one row group of three
+    /// blocks.
+    fn four_records_per_block() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Twelve records, ts 1..=12, bodies `d<ts>`, on one stream with no `svc`
+    /// of its own, each `svc` drawn from [`DICT_SVC`] so the declared `Str`
+    /// column repeats (4 distinct over 11 present cells). By block: alpha,
+    /// beta, beta, delta | beta, delta, beta, delta | gamma, beta, absent,
+    /// alpha. Block 2 has no `checkout` value.
+    fn dict_records() -> Vec<LogRecord> {
+        let resource = vec![("service.name".to_string(), s("d"))];
+        let [alpha, beta, delta, gamma] = DICT_SVC.map(Some);
+        let layout = [
+            alpha, beta, beta, delta, beta, delta, beta, delta, gamma, beta, None, alpha,
+        ];
+        layout
+            .iter()
+            .zip(1i64..)
+            .map(|(v, ts)| {
+                let attrs: Vec<(String, AttrValue)> =
+                    v.iter().map(|v| ("svc".to_string(), s(v))).collect();
+                record(&resource, &attrs, ts, &format!("d{ts}"))
+            })
+            .collect()
+    }
+
+    /// The encodings PAGE_DIR records for the `svc` `Str` column's pages of
+    /// the object [`dict_records`] encodes to, in order.
+    fn dict_svc_page_encs() -> Vec<ravel_logseg::encoding::Enc> {
+        use ravel_logseg::field_dir::FieldDir;
+        use ravel_logseg::footer::{kind, open as open_footer};
+        use ravel_logseg::page_dir::PageDir;
+        use ravel_logseg::reader::read_section;
+
+        let cfg = four_records_per_block();
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in dict_records() {
+            w.push(r).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+        let footer = open_footer(&obj).expect("open footer");
+        let section = |k| {
+            let desc = *footer.section(k).expect("section");
+            read_section(&obj, &desc, &cfg).expect("read section")
+        };
+        let column_id = FieldDir::decode(&section(kind::FIELD_DIR), u64::MAX)
+            .expect("decode FIELD_DIR")
+            .column("svc", ravel_logseg::FieldType::Str)
+            .expect("a Str svc column")
+            .column_id;
+        PageDir::decode(&section(kind::PAGE_DIR))
+            .expect("decode PAGE_DIR")
+            .groups
+            .iter()
+            .flat_map(|g| &g.chunks)
+            .filter(|c| c.column_id == column_id)
+            .flat_map(|c| c.pages.iter().map(|p| p.enc))
+            .collect()
+    }
+
+    /// Which object set a contains run reads.
+    #[derive(Clone, Copy)]
+    enum ContainsFixture {
+        /// [`contains_segments`]: one plain-page cell per block.
+        Plain,
+        /// [`dict_records`]: a repeating `svc` the writer dictionary-encodes.
+        Dict,
+    }
+
+    /// The batches and `LogsScanExec` metrics of one executed query.
+    struct ScanRun {
+        batches: Vec<RecordBatch>,
+        metrics: datafusion::physical_plan::metrics::MetricsSet,
+    }
+
+    impl ScanRun {
+        fn count(&self, name: &str) -> usize {
+            self.metrics
+                .sum_by_name(name)
+                .map(|v| v.as_usize())
+                .unwrap_or_else(|| panic!("metric {name} missing"))
+        }
+
+        /// The `(ts, body)` rows, sorted, duplicates kept.
+        fn rows(&self) -> Vec<(i64, String)> {
+            let mut out: Vec<(i64, String)> = Vec::new();
+            for batch in &self.batches {
+                let ts = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("ts col");
+                let body = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("body col");
+                out.extend((0..batch.num_rows()).map(|i| (ts.value(i), body.value(i).to_string())));
+            }
+            out.sort();
+            out
+        }
+
+        fn contains_run(&self) -> ContainsRun {
+            ContainsRun {
+                rows: self.rows(),
+                contains_cells_tested: self.count("contains_cells_tested"),
+                str_cells_validated: self.count("str_cells_validated"),
+                block_predicate_rejected: self
+                    .metrics
+                    .sum_by_name("fast_path_rejected_block_predicate")
+                    .is_some_and(|v| v.as_usize() > 0),
+            }
+        }
+    }
+
+    /// Run `sql` through the production session over [`contains_segments`],
+    /// with `Contains` pushdown on or off.
+    async fn run_contains(contains_pushdown: bool, sql: &str) -> ContainsRun {
+        scan_contains(ContainsFixture::Plain, contains_pushdown, sql)
+            .await
+            .contains_run()
+    }
+
+    /// Run `sql` through the production session over `fixture`, with `svc`
+    /// declared `Str` and `Contains` pushdown on or off.
+    async fn scan_contains(
+        fixture: ContainsFixture,
+        contains_pushdown: bool,
+        sql: &str,
+    ) -> ScanRun {
+        let store = MemoryStore::new();
+        let segments = match fixture {
+            ContainsFixture::Plain => contains_segments(&store).await,
+            ContainsFixture::Dict => vec![
+                write_object_with(
+                    &store,
+                    "logs/contains-dict.rlog",
+                    &dict_records(),
+                    four_records_per_block(),
+                    &[],
+                )
+                .await,
+            ],
+        };
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let provider = LogsTableProvider::new(
+            Snapshot {
+                segments,
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(backend),
+            PhaseAccounting::new(),
+        )
+        .with_declared_columns(vec![DeclaredColumn::new("svc", DeclaredType::Str)])
+        .with_contains_pushdown(contains_pushdown);
+        let ctx = logs_session(provider).expect("session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        let metrics = find_logs_scan(&plan)
+            .expect("a LogsScanExec leaf")
+            .metrics()
+            .expect("the scan publishes metrics");
+        ScanRun { batches, metrics }
+    }
+
+    /// `LIKE '%literal%'` and `NOT LIKE '%literal%'` on a declared `Str`
+    /// column return the same rows with `Contains` pushdown on and off, and
+    /// the scan's counters show the arm ran only when pushed (ADR-2773,
+    /// contains-arm amendment). Each block is one plain-page cell, so the
+    /// reader validates nothing and `str_cells_validated` is the cells the
+    /// declared build read for the rows the arm kept. A `Contains`-only
+    /// content list is not a block predicate for the route, so neither the
+    /// pushed nor the unpushed run records `fast_path_rejected_block_predicate`.
+    ///
+    /// Flipped assertion, seen failing: `contains_predicate` returning `None`
+    /// makes the pushed `LIKE` run report 0 where 3 is expected for
+    /// `contains_cells_tested`.
+    #[tokio::test]
+    async fn pushed_like_matches_the_unpushed_scan_and_counts_its_cells() {
+        let row = |ts: i64, body: &str| (ts, body.to_string());
+
+        let like = "SELECT ts, body FROM logs WHERE svc LIKE '%checkout%'";
+        let want = vec![row(1, "a1"), row(5, "b5"), row(6, "b6")];
+        // Tested: the three present `Str` cells (ts 1, 2, 6); the `I64` cell
+        // and the absent ones are not tested. Validated: ts 1 and 6, the
+        // `Str` cells of the rows the arm kept (ts 5 reads its stream).
+        assert_eq!(
+            run_contains(true, like).await,
+            ContainsRun {
+                rows: want.clone(),
+                contains_cells_tested: 3,
+                str_cells_validated: 2,
+                block_predicate_rejected: false,
+            }
+        );
+        // Unpushed, every row reaches the build and its three `Str` cells
+        // are validated.
+        assert_eq!(
+            run_contains(false, like).await,
+            ContainsRun {
+                rows: want,
+                contains_cells_tested: 0,
+                str_cells_validated: 3,
+                block_predicate_rejected: false,
+            }
+        );
+
+        // ts 3 has no `svc` and no stream value: its `NOT LIKE` is NULL, so
+        // no row on either plan. ts 4's `I64` winner reads NULL in the `Str`
+        // column the same way, and ts 5's stream value matches.
+        let not_like = "SELECT ts, body FROM logs WHERE svc NOT LIKE '%checkout%'";
+        let want = vec![row(2, "a2")];
+        assert_eq!(
+            run_contains(true, not_like).await,
+            ContainsRun {
+                rows: want.clone(),
+                contains_cells_tested: 3,
+                str_cells_validated: 1,
+                block_predicate_rejected: false,
+            }
+        );
+        assert_eq!(
+            run_contains(false, not_like).await,
+            ContainsRun {
+                rows: want,
+                contains_cells_tested: 0,
+                str_cells_validated: 3,
+                block_predicate_rejected: false,
+            }
+        );
+    }
+
+    /// The same agreement over a dictionary-encoded `svc` ([`dict_records`]:
+    /// one row group dictionary of the four [`DICT_SVC`] values shared by the
+    /// group's three blocks). Pushed, the arm tests each dictionary entry
+    /// once per scan, and the reader's survivor-only build validates only the
+    /// entries a surviving row references, building one values array per
+    /// block that kept a row. Unpushed, the reader validates the whole
+    /// dictionary once and ravel-sql builds one values array for it.
+    #[tokio::test]
+    async fn pushed_like_over_a_dictionary_validates_only_surviving_entries() {
+        use ravel_logseg::encoding::Enc;
+
+        // One shared dictionary page, an ids page per block, and block 3's
+        // presence bitmap for its absent cell.
+        assert_eq!(
+            dict_svc_page_encs(),
+            vec![
+                Enc::DictPage,
+                Enc::DictIds,
+                Enc::DictIds,
+                Enc::Bitmap,
+                Enc::DictIds
+            ],
+            "the fixture must hold a row group dictionary"
+        );
+        let row = |ts: i64| (ts, format!("d{ts}"));
+        let run = |pushed: bool, sql: &'static str| async move {
+            let scan = scan_contains(ContainsFixture::Dict, pushed, sql).await;
+            (scan.contains_run(), scan.count("str_dict_values_built"))
+        };
+
+        let like = "SELECT ts, body FROM logs WHERE svc LIKE '%checkout%'";
+        let want = vec![row(1), row(9), row(12)];
+        // Tested: the 4 dictionary entries, once each. Validated: alpha and
+        // gamma, the entries the kept rows reference. Built: blocks 1 and 3;
+        // block 2 keeps no row.
+        assert_eq!(
+            run(true, like).await,
+            (
+                ContainsRun {
+                    rows: want.clone(),
+                    contains_cells_tested: 4,
+                    str_cells_validated: 2,
+                    block_predicate_rejected: false,
+                },
+                2
+            )
+        );
+        // Unpushed: all 4 entries validated once, one values array for the
+        // shared dictionary.
+        assert_eq!(
+            run(false, like).await,
+            (
+                ContainsRun {
+                    rows: want,
+                    contains_cells_tested: 0,
+                    str_cells_validated: 4,
+                    block_predicate_rejected: false,
+                },
+                1
+            )
+        );
+
+        // ts 11 has no `svc` anywhere, so its `NOT LIKE` is NULL.
+        let not_like = "SELECT ts, body FROM logs WHERE svc NOT LIKE '%checkout%'";
+        let want = vec![
+            row(2),
+            row(3),
+            row(4),
+            row(5),
+            row(6),
+            row(7),
+            row(8),
+            row(10),
+        ];
+        // Validated: beta and delta. Built: all three blocks keep a row.
+        assert_eq!(
+            run(true, not_like).await,
+            (
+                ContainsRun {
+                    rows: want.clone(),
+                    contains_cells_tested: 4,
+                    str_cells_validated: 2,
+                    block_predicate_rejected: false,
+                },
+                3
+            )
+        );
+        assert_eq!(
+            run(false, not_like).await,
+            (
+                ContainsRun {
+                    rows: want,
+                    contains_cells_tested: 0,
+                    str_cells_validated: 4,
+                    block_predicate_rejected: false,
+                },
+                1
+            )
+        );
+    }
+
+    /// ClickBench q21's shape, `COUNT(*)` with a pushed `LIKE` and no `attrs`
+    /// projection or pending erasure, takes the columnar path, the only path
+    /// whose plain-page validations `str_cells_validated` counts.
+    #[tokio::test]
+    async fn a_pushed_like_count_takes_the_columnar_path() {
+        let scan = scan_contains(
+            ContainsFixture::Dict,
+            true,
+            "SELECT COUNT(*) FROM logs WHERE svc LIKE '%checkout%'",
+        )
+        .await;
+        let counted: i64 = scan
+            .batches
+            .iter()
+            .filter_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            })
+            .flat_map(|a| a.iter().flatten())
+            .sum();
+        assert_eq!(counted, 3);
+        assert_eq!(scan.count("contains_cells_tested"), 4);
+        assert_eq!(scan.count("rowpath_batches"), 0);
+        assert!(scan.count("columnar_batches") > 0);
+    }
+
+    /// `pushable_contains` reads a `LIKE` on a bare column only: a declared
+    /// `Str` column named `body` resolves to the fixed column and a
+    /// `Cast`-wrapped declared column is not a bare column, so neither yields
+    /// a `Contains` arm. The bare `svc` control shows the shape itself
+    /// extracts.
+    #[test]
+    fn contains_extraction_declines_body_and_a_cast_column() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{Cast, col, lit};
+
+        let extract = |e: Expr, declared: &[DeclaredColumn]| {
+            extract_logs_keyed(&[e], declared, &KeyIndexDeclaration::default()).content
+        };
+        let svc = [DeclaredColumn::new("svc", DeclaredType::Str)];
+        assert_eq!(
+            extract(col("svc").like(lit("%checkout%")), &svc),
+            vec![ravel_logseg::Predicate::Contains {
+                key: "svc".into(),
+                needle: "checkout".into(),
+                negated: false,
+            }]
+        );
+        let body = [DeclaredColumn::new("body", DeclaredType::Str)];
+        assert_eq!(extract(col("body").like(lit("%checkout%")), &body), vec![]);
+        let cast = Expr::Cast(Cast::new(Box::new(col("svc")), DataType::Utf8));
+        assert_eq!(extract(cast.like(lit("%checkout%")), &svc), vec![]);
+    }
+
+    /// The filter a logs-only session hands to [`TableProvider::scan`] for a
+    /// `LIKE` on a declared column is the rewritten `like` UDF call, not
+    /// `Expr::Like`, and the extractor reads it into `Predicate::Contains`.
+    #[tokio::test]
+    async fn a_logs_session_delivers_like_as_the_udf_call() {
+        use datafusion::logical_expr::LogicalPlan;
+
+        fn table_scan_filters(plan: &LogicalPlan) -> Vec<Expr> {
+            if let LogicalPlan::TableScan(ts) = plan {
+                return ts.filters.clone();
+            }
+            plan.inputs()
+                .into_iter()
+                .map(table_scan_filters)
+                .find(|f| !f.is_empty())
+                .unwrap_or_default()
+        }
+
+        let provider = pushdown_provider(vec![DeclaredColumn::new("svc", DeclaredType::Str)]);
+        let ctx = logs_session(provider).expect("session");
+        let plan = ctx
+            .sql("SELECT ts FROM logs WHERE svc NOT LIKE '%checkout%'")
+            .await
+            .expect("plan")
+            .into_optimized_plan()
+            .expect("optimized plan");
+        let filters = table_scan_filters(&plan);
+        let [filter] = filters.as_slice() else {
+            panic!("one pushed filter, got {filters:?}");
+        };
+        assert!(
+            matches!(filter, Expr::ScalarFunction(sf) if sf.func.name() == crate::like_udf::LIKE_UDF),
+            "{filter:?}"
+        );
+        let declared = [DeclaredColumn::new("svc", DeclaredType::Str)];
+        assert_eq!(
+            extract_logs_keyed(&filters, &declared, &KeyIndexDeclaration::default()).content,
+            vec![ravel_logseg::Predicate::Contains {
+                key: "svc".into(),
+                needle: "checkout".into(),
+                negated: true,
+            }]
+        );
+    }
+
     // --- exact filter pushdown (issue #733) ----------------------------------
 
     /// A provider over an empty snapshot: `supports_filters_pushdown` is a pure
@@ -2102,8 +2632,9 @@ mod tests {
                 .gt_eq(ts_lit(100))
                 .and(col("status_code").eq(lit(500i64))),
             // A ts bound AND a shape the extractor recognizes in NEITHER
-            // channel: `LIKE` is deliberately never pushed (soundness, see
-            // crate::logs_pushdown), so the residual must keep it.
+            // channel: `LIKE` on `body` is not pushed (only a declared `Str`
+            // column's is, see crate::logs_pushdown), so the residual must
+            // keep it.
             col("ts").gt_eq(ts_lit(100)).and(like),
         ];
         for filter in cases {

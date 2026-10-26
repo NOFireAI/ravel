@@ -13,24 +13,42 @@
 //!   a literal timestamp (`>=`, `>`, `<`, `<=`, `=`), and `BETWEEN`. Feeds
 //!   segment-level pruning and the fetch's [`LogQuery`] ts bounds, identical to
 //!   the metrics `ts_lo`/`ts_hi` shape.
-//! - **word/phrase search** `has_word(col, 'literal')` and the plain
-//!   `col LIKE '%word%'` substring shape: see below. Only `has_word` is pushed;
-//!   `LIKE` is deliberately not, for soundness.
+//! - **word/phrase search** `has_word(col, 'literal')` on `body` or
+//!   `severity_text`, pushed as [`Predicate::HasWord`].
+//! - **substring search** `col LIKE '%literal%'` and `col NOT LIKE
+//!   '%literal%'` on a declared `Str` column, pushed as
+//!   [`Predicate::Contains`]: see below.
 //!
-//! # Why `LIKE '%word%'` is recognized but not pushed
+//! # How `LIKE '%literal%'` is pushed (ADR-2773, contains-arm amendment)
 //!
-//! ADR-0033 lists "literal extraction from plain `LIKE '%word%'` patterns...
-//! feeding `Predicate::HasWord`". Implementing that literally is **unsound**
-//! here, and soundness wins (the invariant is never a valid trade-off):
-//! `RlogReader::scan` applies a pushed `HasWord` as an *exact per-row filter*
-//! (reader.rs, `phrase_match`), not merely a bloom prune, and token/phrase
-//! matching is not a superset of SQL substring `LIKE`. The tokenizer lowercases
-//! and splits on non-alphanumerics, so `body LIKE '%time%'` matches `"timeout"`
-//! and `"TIME"` while `HasWord{word:"time"}` matches neither — pushing it would
-//! drop rows the query needs, which no residual can recover. So `LIKE` is
-//! recognized (for a future exact-substring predicate) but contributes no
-//! pushed predicate today; `has_word`, whose SQL semantics are defined to equal
-//! `HasWord` exactly (crate::logs_udf), is the sound text-pruning path.
+//! The pushed arm is a byte-substring test, not a token test. ADR-0033 lists
+//! "literal extraction from plain `LIKE '%word%'` patterns... feeding
+//! `Predicate::HasWord`", and that form is **unsound**: `RlogReader::scan`
+//! applies a pushed `HasWord` as an exact per-row filter (reader.rs,
+//! `phrase_match`), and token/phrase matching is not a superset of SQL
+//! substring `LIKE`. The tokenizer lowercases and splits on non-alphanumerics,
+//! so `body LIKE '%time%'` matches `"timeout"` and `"TIME"` while
+//! `HasWord{word:"time"}` matches neither. `has_word`, whose SQL semantics are
+//! defined to equal `HasWord` exactly (crate::logs_udf), stays the token path.
+//!
+//! [`Predicate::Contains`] instead tests a declared `Str` cell's raw bytes for
+//! the literal's bytes, which for a UTF-8 cell and a UTF-8 literal is the
+//! character-wise substring match. The reader drops a row only when every
+//! reading of its value fails the pattern (the cell as UTF-8 text, and the
+//! stream's resource or scope value for the key, else NULL), and keeps a row
+//! whose value resolves through anything else (a winning occurrence of the
+//! key with another type, an `attrs_raw` cell), so it never drops a row the
+//! SQL `LIKE` keeps.
+//! The filter stays `Inexact` ([`filter_is_exact`] does not recognize `LIKE`):
+//! DataFusion's residual re-evaluates every row the scan returns.
+//!
+//! [`crate::like_udf::pushable_contains`] decides the pattern shape and lists
+//! what declines (`_`, an escape, an `ESCAPE` clause, an inner `%`, an
+//! anchored pattern, `ILIKE`, a non-literal pattern, `'%%'`). This module
+//! adds the column check: only a bare declared `Str` column pushes. `body`,
+//! `attrs['k']`, an undeclared name, and a declared column of another type
+//! contribute nothing, and so does a `LIKE` under `OR` or `NOT`, which is not
+//! a top-level conjunct.
 //!
 //! # How attribute equalities are pushed (prune-only)
 //!
@@ -166,6 +184,7 @@ use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
 use ravel_query::KeyEquals;
 
 use crate::declared::{DeclaredColumn, DeclaredType, KeyIndexDeclaration};
+use crate::like_udf::pushable_contains;
 use crate::logs_udf::HAS_WORD_UDF;
 
 /// The scalar UDF name an `attrs['k']` subscript lowers to
@@ -179,9 +198,10 @@ pub struct LogsPushdown {
     pub ts_lo: Option<i64>,
     /// Inclusive upper bound on `ts` in nanoseconds, if provably required.
     pub ts_hi: Option<i64>,
-    /// Content predicates handed straight to `RlogReader::scan` as the exact
-    /// per-row filter. Only shapes whose SQL semantics equal the reader's exact
-    /// filter are pushed (today: `has_word`).
+    /// Content predicates handed straight to `RlogReader::scan` as the per-row
+    /// filter: `has_word` as [`Predicate::HasWord`], whose semantics equal the
+    /// SQL call, and `LIKE '%literal%'` on a declared `Str` column as
+    /// [`Predicate::Contains`], which never drops a row the SQL `LIKE` keeps.
     pub content: Vec<Predicate>,
     /// Prune-only attribute equalities (`attrs['k'] = 'v'`), each a
     /// `Predicate::Equals` on `FieldSel::Attr`. These drive POSTINGS block
@@ -216,11 +236,24 @@ impl LogsPushdown {
 /// empty for the metadata-only aggregate rewrite and the `.cstat` load that
 /// feeds it. That rewrite replaces the whole scan, so what the arm prunes
 /// cannot change its answer. The scan's route choice reads it the same way
-/// (`logs_scan::route_predicate_free`). Any other arm answers `false`.
+/// (`logs_scan::route_predicate_free`), beside
+/// [`content_is_route_neutral`]. Any other arm answers `false`.
 pub(crate) fn prune_is_rewrite_neutral(prune: &[Predicate]) -> bool {
     prune
         .iter()
         .all(|p| matches!(p, Predicate::NumNotEq { .. }))
+}
+
+/// Whether `content` holds no arm but [`Predicate::Contains`], so the scan's
+/// route choice (`logs_scan::route_predicate_free`) counts it as empty. No
+/// index covers a `Contains` arm, so it excludes no block from a plan phase
+/// or an open: the reader evaluates it per row of every block on every route
+/// (ADR-2773, contains-arm amendment). Any other arm answers `false`; a
+/// `HasWord` or `Equals` arm can exclude a block through bloom or POSTINGS.
+pub(crate) fn content_is_route_neutral(content: &[Predicate]) -> bool {
+    content
+        .iter()
+        .all(|p| matches!(p, Predicate::Contains { .. }))
 }
 
 /// Extract all sound pushdown from a `logs` filter set. Each element of
@@ -359,8 +392,26 @@ fn handle_leaf(expr: &Expr, out: &mut LogsPushdown, declared: &[DeclaredColumn])
                 out.content.push(p);
             }
         }
-        _ => {}
+        _ => {
+            if let Some(p) = contains_predicate(expr, declared) {
+                out.content.push(p);
+            }
+        }
     }
+}
+
+/// `col [NOT] LIKE '%literal%'` on a declared `Str` column, as the reader's
+/// byte-substring [`Predicate::Contains`] arm (ADR-2773, contains-arm
+/// amendment). Any other column, fixed or undeclared or of another declared
+/// type, yields nothing.
+fn contains_predicate(expr: &Expr, declared: &[DeclaredColumn]) -> Option<Predicate> {
+    let like = pushable_contains(expr)?;
+    let dc = resolve_declared(like.column, declared)?;
+    (dc.ty == DeclaredType::Str).then(|| Predicate::Contains {
+        key: dc.key.clone(),
+        needle: like.needle,
+        negated: like.negated,
+    })
 }
 
 fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredColumn]) {
@@ -963,19 +1014,137 @@ mod tests {
         assert!(extract_logs(&[e], &[]).content.is_empty());
     }
 
+    fn like(
+        column: Expr,
+        pattern: &str,
+        negated: bool,
+        escape_char: Option<char>,
+        case_insensitive: bool,
+    ) -> Expr {
+        Expr::Like(datafusion::logical_expr::Like {
+            negated,
+            expr: Box::new(column),
+            pattern: Box::new(lit(pattern)),
+            escape_char,
+            case_insensitive,
+        })
+    }
+
+    /// `like` as the raw `Expr::Like`, plus the `like` UDF call `LikeToUdf`
+    /// rewrites it into when it rewrites it at all (it leaves `ILIKE` alone).
+    fn like_shapes(like: Expr) -> Vec<Expr> {
+        use datafusion::common::DFSchema;
+        use datafusion::config::ConfigOptions;
+        use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
+
+        use crate::like_udf::{LikeScope, LikeToUdf};
+
+        let rewritten = LikeToUdf::new(LikeScope::Every)
+            .rewrite(like.clone(), &DFSchema::empty(), &ConfigOptions::default())
+            .expect("rewrite");
+        let mut shapes = vec![like];
+        if rewritten.transformed {
+            shapes.push(rewritten.data);
+        }
+        shapes
+    }
+
     #[test]
-    fn like_is_not_pushed() {
-        // `body LIKE '%time%'` is recognized syntactically but must contribute
-        // no pushed predicate (soundness; see module doc).
-        let like = Expr::Like(datafusion::logical_expr::Like {
-            negated: false,
-            expr: Box::new(col("body")),
-            pattern: Box::new(lit("%time%")),
-            escape_char: None,
-            case_insensitive: false,
-        });
-        let p = extract_logs(&[like], &[]);
-        assert!(p.content.is_empty());
+    fn like_substring_on_declared_str_pushes_contains() {
+        let d = vec![DeclaredColumn::new("region", DeclaredType::Str)];
+        for negated in [false, true] {
+            let shapes = like_shapes(like(col("region"), "%us-east%", negated, None, false));
+            assert_eq!(shapes.len(), 2, "the raw and the UDF shape");
+            assert!(
+                matches!(&shapes[1], Expr::ScalarFunction(sf) if sf.func.name() == crate::like_udf::LIKE_UDF)
+            );
+            for f in shapes {
+                let p = extract_logs(&[f.clone(), col("ts").gt_eq(ts_lit(100))], &d);
+                assert_eq!(
+                    p.content,
+                    vec![Predicate::Contains {
+                        key: "region".into(),
+                        needle: "us-east".into(),
+                        negated,
+                    }],
+                    "{f}"
+                );
+                assert_eq!((p.ts_lo, p.ts_hi), (Some(100), None), "{f}");
+                assert!(p.prune.is_empty() && p.key_equals.is_empty(), "{f}");
+            }
+        }
+    }
+
+    /// The pushed arm never makes the filter `Exact`: `FilterExec` stays the
+    /// exact evaluator (ADR-2773, contains-arm amendment).
+    #[test]
+    fn pushed_like_stays_inexact() {
+        let d = vec![DeclaredColumn::new("region", DeclaredType::Str)];
+        for negated in [false, true] {
+            for f in like_shapes(like(col("region"), "%us-east%", negated, None, false)) {
+                assert!(
+                    !extract_logs(std::slice::from_ref(&f), &d)
+                        .content
+                        .is_empty()
+                );
+                assert!(!filter_is_exact(&f, &d), "{f}");
+                let with_ts = and(col("ts").gt_eq(ts_lit(100)), f.clone());
+                assert!(!filter_is_exact(&with_ts, &d), "{with_ts}");
+            }
+        }
+    }
+
+    #[test]
+    fn like_shapes_outside_the_arm_push_nothing() {
+        let d = vec![
+            DeclaredColumn::new("region", DeclaredType::Str),
+            DeclaredColumn::new("code", DeclaredType::I64),
+        ];
+        let region = || col("region");
+        let plain = |pattern: &str| like(region(), pattern, false, None, false);
+        let cases = [
+            ("underscore", plain("%a_b%")),
+            ("escaped percent", plain("%a\\%b%")),
+            ("prefix", plain("abc%")),
+            ("suffix", plain("%abc")),
+            ("inner percent", plain("a%b")),
+            ("two needles", plain("%a%b%")),
+            ("only percents", plain("%%")),
+            ("empty", plain("")),
+            (
+                "ESCAPE clause",
+                like(region(), "%abc%", false, Some('#'), false),
+            ),
+            ("ILIKE", like(region(), "%abc%", false, None, true)),
+            (
+                "declared I64",
+                like(col("code"), "%abc%", false, None, false),
+            ),
+            ("body", like(col("body"), "%abc%", false, None, false)),
+            ("undeclared", like(col("zone"), "%abc%", false, None, false)),
+            (
+                "attrs subscript",
+                like(get_field(col("attrs"), "k"), "%abc%", false, None, false),
+            ),
+        ];
+        for (label, e) in cases {
+            for f in like_shapes(e) {
+                let p = extract_logs(&[f.clone(), col("ts").gt_eq(ts_lit(100))], &d);
+                assert!(p.content.is_empty(), "{label}: {f} pushed {:?}", p.content);
+                assert_eq!(p.ts_lo, Some(100), "{label}");
+            }
+        }
+
+        // Not a top-level conjunct.
+        for f in like_shapes(plain("%a%")) {
+            let under_or = or(f.clone(), col("ts").gt(ts_lit(100)));
+            assert!(extract_logs(&[under_or], &d).content.is_empty(), "OR: {f}");
+            let under_not = Expr::Not(Box::new(f.clone()));
+            assert!(
+                extract_logs(&[under_not], &d).content.is_empty(),
+                "NOT: {f}"
+            );
+        }
     }
 
     #[test]

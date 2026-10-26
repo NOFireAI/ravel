@@ -133,6 +133,8 @@ pub fn pruning_json(stats: &SqlStats) -> Json {
         "segmentsSkippedByThreshold": stats.segments_skipped_by_threshold,
         "blocksPredicateDropped": stats.blocks_predicate_dropped,
         "rowsPredicateEvaluated": stats.rows_predicate_evaluated,
+        "containsCellsTested": stats.contains_cells_tested,
+        "strCellsValidated": stats.str_cells_validated,
     })
 }
 
@@ -447,6 +449,8 @@ mod tests {
             segments_skipped_by_threshold: 2,
             blocks_predicate_dropped: 17,
             rows_predicate_evaluated: 19,
+            contains_cells_tested: 31,
+            str_cells_validated: 37,
             ..SqlStats::default()
         };
         stats.wall = crate::PhaseWallTiming {
@@ -531,7 +535,7 @@ mod tests {
         }
     }
 
-    /// `pruning_json`'s key set is exactly the eleven counters below, each
+    /// `pruning_json`'s key set is exactly the thirteen counters below, each
     /// carrying its own `SqlStats` field.
     #[test]
     fn pruning_json_names_every_field_exactly_once() {
@@ -548,6 +552,8 @@ mod tests {
             "segmentsSkippedByThreshold",
             "blocksPredicateDropped",
             "rowsPredicateEvaluated",
+            "containsCellsTested",
+            "strCellsValidated",
         ]
         .into_iter()
         .collect();
@@ -564,6 +570,8 @@ mod tests {
             ("segmentsSkippedByThreshold", 2),
             ("blocksPredicateDropped", 17),
             ("rowsPredicateEvaluated", 19),
+            ("containsCellsTested", 31),
+            ("strCellsValidated", 37),
         ] {
             assert_eq!(rendered[key].as_u64(), Some(value), "{key}: {rendered}");
         }

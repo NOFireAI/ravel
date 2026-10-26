@@ -788,12 +788,32 @@ pub struct SqlStats {
     /// `rows_predicate_evaluated` counter and summed over every logs scan in
     /// the plan. Zero for a metrics query.
     pub rows_predicate_evaluated: u64,
+    /// Cells the successful attempt's pushed `Contains` arms (`LIKE
+    /// '%literal%'` on a declared `Str` column) tested for their needle: a
+    /// dictionary entry once per test, a plain-page cell once (ADR-2773,
+    /// contains-arm amendment). Read off the scans' `contains_cells_tested`
+    /// counter and summed over every logs scan in the plan. Zero for a
+    /// metrics query and for a statement with no pushed `Contains` arm.
+    pub contains_cells_tested: u64,
+    /// String cells the successful attempt's logs scans UTF-8 validated, as
+    /// two halves. The reader's half is every string dictionary entry it
+    /// validated, once per validation, on either path: the dictionaries of
+    /// the columns the scan decodes, which include undeclared attribute
+    /// columns when `attrs` is projected. The columnar build's half is every
+    /// plain-page `Str` cell its declared and per-key `attrs['k']` cursors
+    /// validated. The row path, taken when `attrs` is projected or an erasure
+    /// is pending, validates plain-page cells too but does not count them.
+    /// Read off the scans' `str_cells_validated` counter and summed over every
+    /// logs scan in the plan. Zero for a metrics query.
+    pub str_cells_validated: u64,
     /// String dictionary values arrays the successful attempt's logs scans
     /// built for declared `Str` columns (ADR-2773 decision D3): one per row
     /// group dictionary per scan opening, one per per-block dictionary page,
-    /// one per plain-page block. Read off the scans'
-    /// `str_dict_values_built` counter and summed over every logs scan in the
-    /// plan. Zero for a metrics query.
+    /// one per plain-page block. With a pushed `Contains` arm the reader
+    /// hands each block a dictionary narrowed to its surviving rows, so a
+    /// dictionary column builds one per block that keeps a row instead. Read
+    /// off the scans' `str_dict_values_built` counter and summed over every
+    /// logs scan in the plan. Zero for a metrics query.
     pub str_dict_values_built: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
@@ -1030,6 +1050,8 @@ struct BlockCounts {
     int_values_buffers: u64,
     blocks_predicate_dropped: u64,
     rows_predicate_evaluated: u64,
+    contains_cells_tested: u64,
+    str_cells_validated: u64,
     str_dict_values_built: u64,
     timing: ScanTiming,
     /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
@@ -1045,9 +1067,10 @@ struct BlockCounts {
 /// `segments_pruned_by_stats` / `blocks_skipped_by_threshold` /
 /// `segments_skipped_by_threshold` / `int_values_buffers` /
 /// `blocks_predicate_dropped` / `rows_predicate_evaluated` /
+/// `contains_cells_tested` / `str_cells_validated` /
 /// `str_dict_values_built` DataFusion counters over `plan` and its
 /// descendants, plus the metrics scan's `histogram_series_skipped`. Only
-/// `LogsScanExec` publishes the first ten names (crate::logs_scan) and only `RsegScanExec` the last
+/// `LogsScanExec` publishes the first twelve names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. The
 /// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
@@ -1076,6 +1099,8 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.int_values_buffers += sum("int_values_buffers");
         counts.blocks_predicate_dropped += sum("blocks_predicate_dropped");
         counts.rows_predicate_evaluated += sum("rows_predicate_evaluated");
+        counts.contains_cells_tested += sum("contains_cells_tested");
+        counts.str_cells_validated += sum("str_cells_validated");
         counts.str_dict_values_built += sum("str_dict_values_built");
         counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
         accumulate_scan_timing(&metrics, &mut counts.timing);
@@ -2365,6 +2390,8 @@ impl SqlExecutor {
                     stats.int_values_buffers = blocks.int_values_buffers;
                     stats.blocks_predicate_dropped = blocks.blocks_predicate_dropped;
                     stats.rows_predicate_evaluated = blocks.rows_predicate_evaluated;
+                    stats.contains_cells_tested = blocks.contains_cells_tested;
+                    stats.str_cells_validated = blocks.str_cells_validated;
                     stats.str_dict_values_built = blocks.str_dict_values_built;
                     stats.scan_timing = blocks.timing;
                     stats.wall = PhaseWallTiming {
