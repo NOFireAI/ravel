@@ -382,8 +382,22 @@ fn close_row(
         }
     })?;
     check_row_band6(row)?;
+    check_scalar_expected(
+        label,
+        row.ingest.expected_digests.get(PayloadClass::Scalar),
+        in_process_scalar,
+    )?;
+    Ok((report, counts))
+}
+
+/// A portable row's expected scalar digest `got` equals the in-process
+/// row's (`tests::a_portable_scalar_digest_must_equal_the_in_process_one`).
+fn check_scalar_expected(
+    label: &str,
+    got: &str,
+    in_process_scalar: Option<&str>,
+) -> Result<(), RunError> {
     if let Some(expected) = in_process_scalar {
-        let got = row.ingest.expected_digests.get(PayloadClass::Scalar);
         if got != expected {
             return Err(RunError::ScalarExpectedDiverged {
                 system: label.to_string(),
@@ -392,7 +406,7 @@ fn close_row(
             });
         }
     }
-    Ok((report, counts))
+    Ok(())
 }
 
 async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
@@ -644,6 +658,21 @@ mod tests {
         let text = missing.to_string();
         assert!(text.contains("(10000 ms for profile `ci`)"), "{text}");
         assert!(!text.contains("(0 ms"), "{text}");
+    }
+
+    #[test]
+    fn a_portable_scalar_digest_must_equal_the_in_process_one() {
+        check_scalar_expected("prometheus", "aa", Some("aa")).expect("equal");
+        check_scalar_expected("prometheus", "aa", None).expect("no in-process row");
+        let err = check_scalar_expected("prometheus", "ab", Some("aa")).expect_err("differs");
+        assert!(
+            matches!(
+                &err,
+                RunError::ScalarExpectedDiverged { system, expected, got }
+                    if system == "prometheus" && expected == "aa" && got == "ab"
+            ),
+            "{err}"
+        );
     }
 
     #[test]

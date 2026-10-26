@@ -47,16 +47,14 @@ fn ci_interval_ms() -> i64 {
     secs as i64 * 1_000
 }
 
-/// A now-based anchor `steps` scrapes back, rounded down onto the scrape grid,
-/// so a strict write lands in a plausible ingest window and the bin accepts it.
-fn on_grid_anchor(steps: u64) -> i64 {
-    let interval_ms = ci_interval_ms();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after the epoch")
-        .as_millis() as i64;
-    let back = now_ms - steps as i64 * interval_ms;
-    back - back.rem_euclid(interval_ms)
+/// The fixed anchor every smoke run replays from (2025-10-09T08:53:30Z), so a
+/// run does not depend on the wall clock.
+const ANCHOR_MS: i64 = 1_760_000_010_000;
+
+/// [`ANCHOR_MS`], checked to sit on the `ci` profile's scrape grid.
+fn on_grid_anchor() -> i64 {
+    assert_eq!(ANCHOR_MS.rem_euclid(ci_interval_ms()), 0, "anchor off grid");
+    ANCHOR_MS
 }
 
 /// Run the bin over the `ci` profile against an in-process `MemoryStore`, a few
@@ -66,7 +64,7 @@ fn run_lane() -> serde_json::Value {
     // of strict writes: strict mode flushes durably per batch, so a small batch
     // over the `ci` profile's series count is many sequential flushes. This
     // keeps the reachability smoke fast.
-    run_lane_with_steps(1, on_grid_anchor(1))
+    run_lane_with_steps(1, on_grid_anchor())
 }
 
 /// Run the bin over the `ci` profile, one step, with `extra` arguments in
@@ -240,7 +238,7 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
 
     // A now-based on-grid anchor, so the strict write lands in a plausible
     // ingest window and the test can regenerate the same stream.
-    let anchor_ms = on_grid_anchor(STEPS);
+    let anchor_ms = on_grid_anchor();
     let (_, gen_report) = Generator::new(&workload, "ci", anchor_ms)
         .expect("generator builds")
         .generate_bytes(STEPS)
@@ -463,7 +461,7 @@ fn a_missing_or_off_grid_anchor_exits_64() {
         "{stderr}"
     );
 
-    let off_grid = (on_grid_anchor(1) + 1).to_string();
+    let off_grid = (on_grid_anchor() + 1).to_string();
     let (code, stderr) = run_refused(&["--anchor-ms", &off_grid]);
     assert_eq!(code, Some(64), "{stderr}");
     assert!(
@@ -482,7 +480,7 @@ fn a_missing_or_off_grid_anchor_exits_64() {
 #[test]
 fn a_bearer_token_env_that_cannot_be_read_exits_64() {
     let _serial = serial();
-    let anchor = on_grid_anchor(1).to_string();
+    let anchor = on_grid_anchor().to_string();
     let var = "METRICSBENCH_SMOKE_TOKEN_NEVER_SET";
     let (code, stderr) = run_refused(&[
         "--anchor-ms",
@@ -500,12 +498,39 @@ fn a_bearer_token_env_that_cannot_be_read_exits_64() {
     assert!(stderr.contains("needs --ravel-endpoint"), "{stderr}");
 }
 
+/// The portable Ravel row records its tenant: `--ravel-endpoint` without
+/// `--ravel-tenant`, or a `--ravel-tenant` other than `--tenant`, exits 64
+/// before anything is generated.
+#[test]
+fn a_missing_or_mismatched_ravel_tenant_exits_64() {
+    let _serial = serial();
+    let anchor = on_grid_anchor().to_string();
+    let endpoint = ["--ravel-endpoint", "http://127.0.0.1:9/api/v1/write"];
+    let query = ["--ravel-query-url", "http://127.0.0.1:9"];
+
+    let mut missing = vec!["--anchor-ms", anchor.as_str()];
+    missing.extend_from_slice(&endpoint);
+    missing.extend_from_slice(&query);
+    let (code, stderr) = run_refused(&missing);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("needs --ravel-tenant"), "{stderr}");
+
+    let mut differs = missing.clone();
+    differs.extend_from_slice(&["--tenant", "a", "--ravel-tenant", "b"]);
+    let (code, stderr) = run_refused(&differs);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains("--ravel-tenant `b` differs from --tenant `a`"),
+        "{stderr}"
+    );
+}
+
 /// The same anchor replays the same stream and offers the same tuples; a
 /// different anchor changes both digests.
 #[test]
 fn the_anchor_alone_determines_the_stream_and_offered_digests() {
     let _serial = serial();
-    let anchor = on_grid_anchor(1);
+    let anchor = on_grid_anchor();
     let digests = |report: &serde_json::Value| {
         (
             report["profile"]["run"]["stream_digest"]
