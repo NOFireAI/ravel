@@ -543,10 +543,10 @@ out of order and never a duplicate. This retires the generator's pinned
 invariant that every timestamp stays on the scrape grid: after the change
 only unshifted samples do. A shifted sample is not always a regression on
 its series (two consecutive shifted steps leave the second half an
-interval ahead of the first), so the generator test keeps counting
-shifted and regressed samples separately and its pinned counts move with
-the new offset. (The 2026-10-27 amendment, section B, adds that two
-consecutive shifted samples of one series stay one full interval apart.)
+interval ahead of the first; the 2026-10-27 amendment, section B, corrects
+this: two consecutive shifted samples of one series stay one full interval
+apart), so the generator test keeps counting shifted and regressed samples
+separately and its pinned counts move with the new offset.
 Every receiver runs a frozen, disclosed out-of-order window longer than
 the shift: Prometheus `storage.tsdb.out_of_order_time_window`, Mimir
 `limits.out_of_order_time_window`, VictoriaMetrics' default acceptance
@@ -563,8 +563,11 @@ row offered). Every portable row carries the same exclusion set (the
 a receiver exclude a class it cannot store), because
 the portable lane sends every payload type it carries to every receiver;
 a lane that excludes a type another portable row carries is a diagnostic
-row. The run fails when any two portable rows' expected-set digests differ
-or any row's accepted-set digest differs from its expected-set digest. The
+row (the 2026-10-27 amendment, section D, keeps such a receiver portable
+when the class is one it cannot store). The run fails when any two portable
+rows' expected-set digests differ or any row's accepted-set digest differs
+from its expected-set digest (the 2026-10-27 amendment, section D, applies
+both comparisons per payload class). The
 portable lane's drop budget is zero: a dropped or rejected sample on any
 receiver fails this band, and a row that needs a non-zero budget is a
 diagnostic row, not a portable one. The generator change moves
@@ -693,6 +696,8 @@ storage contracts.
 <!-- amendment-supersedes: phrase="the data object and its commit record are both durably stored" pointer="2026-10-27 amendment" -->
 <!-- amendment-supersedes: phrase="`querier.max_samples`, `max_fetched_chunks_per_query`" pointer="2026-10-27 amendment" -->
 <!-- amendment-supersedes: phrase="Every portable row carries the same exclusion set" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="leave the second half an interval ahead of the first" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="a lane that excludes a type another portable row carries is a diagnostic row" pointer="2026-10-27 amendment" -->
 
 Context. Implementing the status mapper (T3), the comparator limits (T4c)
 and the payload types on the wire (T1c) under epic #2821 found five places
@@ -781,6 +786,19 @@ native histogram (the classes of section D of the 2026-10-26 amendment).
   compared on every class it does not exclude.
 - A receiver that drops part of a class it does support still fails band 6.
   The drop budget of the 2026-10-26 amendment stays zero.
+- The exclusion applies on the receiving side only. The lane still sends
+  every payload class to every portable receiver, so every portable row's
+  offered set, and its expected-set digest, is the same whole stream, and
+  the cross-row equality of expected-set digests holds for every class. The
+  comparison of a row's accepted set against its expected set is made only
+  for the classes that row does not exclude.
+- The points of an excluded class that a receiver acknowledged but cannot
+  store are counted in that row's own per-class unsupported counter, not in
+  `excluded_native_histogram` or `excluded_stale_marker`. Those two count
+  what the lane never sent. Band 4's per-row identity gains the term:
+  offered equals accepted plus rejected plus dropped plus unsupported, per
+  class. A receiver with an excluded class stays a portable row; it is not
+  a diagnostic row.
 
 ### E. What a Ravel Remote Write 2xx acknowledges
 
