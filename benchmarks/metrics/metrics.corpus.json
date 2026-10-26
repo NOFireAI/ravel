@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "entries": [
     {
       "id": "mb_absent_instant",
@@ -158,6 +158,7 @@
       "class": "full_range",
       "promql": "avg_over_time(metricsbench_gauge_cpu_percent[30m])",
       "eval": "range",
+      "profiles": ["cardinality", "history", "churn"],
       "constructs": [
         "function call",
         "avg_over_time",
@@ -198,20 +199,26 @@
     {
       "id": "mb_join_cpu_on_build_version",
       "class": "join",
-      "promql": "metricsbench_gauge_cpu_percent * on (job, instance) group_left (version) metricsbench_build_info",
+      "promql": "metricsbench_gauge_cpu_percent * on (job, instance) group_left (version) metricsbench_build_info{version=\"1.25.0\"}",
       "eval": "instant",
       "constructs": [
         "binary expression",
         "*",
         "on",
         "group_left",
-        "vector selector"
-      ]
+        "vector selector",
+        "label matcher ="
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 2 selects version=\"1.25.0\" on the build_info side: the generator cycles both versions under one (job, instance), so the unqualified right side holds two series per key, the group_left match is many-to-many, and every engine answers with an error"
+        }
+      }
     },
     {
       "id": "mb_join_saturated_and_busy",
       "class": "join",
-      "promql": "metricsbench_gauge_cpu_percent{region=\"eu-west-1\"} > 80 and on (job, instance) rate(metricsbench_requests_total[5m]) > 10",
+      "promql": "metricsbench_gauge_cpu_percent{region=\"eu-west-1\"} > 80 and on (job, instance) rate(metricsbench_requests_total[5m]) > 0.5",
       "eval": "instant",
       "constructs": [
         "binary expression",
@@ -224,7 +231,12 @@
         "matrix selector",
         "vector selector",
         "label matcher ="
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 2 lowers the rate threshold from 10 to 0.5: the counter generator advances by 0 to 15 per 15 s scrape, so the per-second rate is bounded by 1.0, a threshold of 10 is never met, and the answer was empty on every engine"
+        }
+      }
     },
     {
       "id": "mb_join_unless_quiet_instances",
@@ -272,7 +284,11 @@
         "histogram_quantile",
         "number literal",
         "vector selector"
-      ]
+      ],
+      "expected": {
+        "intended_empty": true,
+        "reason": "no receiver has received a native histogram until task T1c of #2821 puts them on the wire; T1c removes this marker"
+      }
     },
     {
       "id": "mb_histogram_native_fraction",
@@ -286,7 +302,11 @@
         "rate",
         "matrix selector",
         "vector selector"
-      ]
+      ],
+      "expected": {
+        "intended_empty": true,
+        "reason": "no receiver has received a native histogram until task T1c of #2821 puts them on the wire; T1c removes this marker"
+      }
     },
     {
       "id": "mb_long_range_7d_avg",

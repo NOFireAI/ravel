@@ -28,9 +28,14 @@
 //!    every series it would have written counts as omitted.
 //! 2. **staleness** replaces a gauge's value with a marker. Counters and
 //!    histograms are left alone so a reset stays unambiguous.
-//! 3. **out-of-order** shifts the timestamp two scrape intervals earlier,
-//!    independently of what value was chosen, and only from step 2 on so the
-//!    shifted sample really does follow a newer one in the stream.
+//! 3. **out-of-order** shifts the timestamp one and a half scrape intervals
+//!    earlier (`3 * interval_ms / 2`), independently of what value was
+//!    chosen, and only from step 2 on so the shifted sample really does follow
+//!    a newer one in the stream. The shifted timestamp falls halfway between
+//!    two scrape points, so it never equals a timestamp its series already
+//!    carries: the sample is out of order, never a duplicate (ADR-0927,
+//!    2026-10-26 amendment, decision B). Only unshifted samples stay on the
+//!    scrape grid.
 //! 4. **counter reset** zeroes a counter or histogram instance before that
 //!    step's increment, independently of the three above.
 
@@ -40,6 +45,9 @@ use std::io::Write;
 use serde::Serialize;
 
 use crate::metrics_workload::{CHURN_EPOCH_SECS, FamilyKind, MetricFamily, Profile, WorkloadFile};
+
+/// One series' labels, sorted by name, as the stream spells them.
+pub type LabelSet = Vec<(String, String)>;
 
 /// Hash-domain tags, so two derivations from the same `(family, instance,
 /// step)` triple never collide.
@@ -625,7 +633,7 @@ impl<'a> Generator<'a> {
                         step,
                     );
                 if shifted {
-                    ts -= 2 * interval_ms;
+                    ts -= 3 * interval_ms / 2;
                 }
 
                 let reset = matches!(
@@ -687,6 +695,32 @@ impl<'a> Generator<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Every label set `family_name`'s instances carry over the first `steps`
+    /// steps, every churn cohort included, each sorted by name with the
+    /// scaling label, exactly as the stream spells them. `None` for a name the
+    /// manifest does not declare as a family. The label sets are those of the
+    /// family's instances, so a classic histogram's `le` and its
+    /// `_bucket`/`_sum`/`_count` suffixes are not part of them.
+    pub fn family_label_sets(&self, family_name: &str, steps: u64) -> Option<Vec<LabelSet>> {
+        let plan_idx = self
+            .plans
+            .iter()
+            .position(|p| self.workload.families[p.index].name == family_name)?;
+        let family = &self.workload.families[self.plans[plan_idx].index];
+        let plan = &self.plans[plan_idx];
+        let last_base = plan.churned_per_epoch * (self.epochs_spanned(steps) - 1);
+        let end = if plan.instances == 0 {
+            0
+        } else {
+            last_base + plan.instances
+        };
+        Some(
+            (0..end)
+                .map(|global| self.labels_for(plan_idx, family, global))
+                .collect(),
+        )
     }
 
     /// Generate `steps` scrapes into memory. Convenience over
@@ -979,6 +1013,11 @@ mod tests {
             churn_basis_points_per_hour: churn_bp,
             total_samples: 4_800,
             comparability,
+            range_eval: crate::metrics_workload::RangeEval {
+                start_offset_secs: 1_800,
+                end_offset_secs: 0,
+                step_secs: 15,
+            },
         };
         WorkloadFile {
             version: WORKLOAD_FORMAT_VERSION,
@@ -1677,66 +1716,157 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_shifted_sample_lands_at_or_before_a_timestamp_already_in_the_stream() {
-        let w = workload(
-            44,
-            AnomalyRates {
-                missing_sample_one_in: 0,
-                stale_marker_one_in: 0,
-                counter_reset_one_in: 0,
-                out_of_order_one_in: 4,
-            },
-        );
-        let (bytes, report) = Generator::new(&w, "cardinality", 0)
+    /// `(timestamp, series)` per stream line, in stream order.
+    type Lines = Vec<(i64, String)>;
+
+    fn ts_and_series(text: &str) -> Lines {
+        text.lines()
+            .map(|line| {
+                let mut parts = line.split('\t');
+                let ts: i64 = parts
+                    .next()
+                    .and_then(|t| t.parse().ok())
+                    .expect("line starts with a timestamp");
+                (ts, parts.next().unwrap_or_default().to_string())
+            })
+            .collect()
+    }
+
+    /// The out-of-order stream beside the same seed's stream with the shift
+    /// disabled. Values never depend on the timestamp, so the two streams
+    /// carry the same series in the same order and differ only in the
+    /// timestamps of the shifted lines: which lines were shifted is read off
+    /// the pair, not off the shift amount under test.
+    fn shifted_pair() -> (Lines, Lines, GenerationReport) {
+        let rates = |out_of_order_one_in| AnomalyRates {
+            missing_sample_one_in: 0,
+            stale_marker_one_in: 0,
+            counter_reset_one_in: 0,
+            out_of_order_one_in,
+        };
+        let shifted_w = workload(44, rates(4));
+        let (shifted, report) = Generator::new(&shifted_w, "cardinality", 0)
             .expect("generator builds")
             .generate_bytes(20)
             .expect("generates");
-        let text = String::from_utf8(bytes).expect("utf8");
-        assert_eq!(report.out_of_order_samples, 66);
+        let clean_w = workload(44, rates(0));
+        let (clean, _) = Generator::new(&clean_w, "cardinality", 0)
+            .expect("generator builds")
+            .generate_bytes(20)
+            .expect("generates");
+        let shifted = ts_and_series(&String::from_utf8(shifted).expect("utf8"));
+        let clean = ts_and_series(&String::from_utf8(clean).expect("utf8"));
+        assert_eq!(shifted.len(), clean.len(), "the shift drops no line");
+        (shifted, clean, report)
+    }
 
-        // Per series, count the samples whose timestamp is older than one
-        // already seen on that series: that is what "out of order in the
-        // stream" means to an ingester.
-        let mut newest: BTreeMap<String, i64> = BTreeMap::new();
-        let mut regressions = 0u64;
-        for line in text.lines() {
-            let mut parts = line.split('\t');
-            let ts: i64 = parts
-                .next()
-                .and_then(|t| t.parse().ok())
-                .expect("line starts with a timestamp");
-            let series = parts.next().unwrap_or_default().to_string();
-            match newest.get(&series) {
-                Some(previous) if ts <= *previous => regressions += 1,
-                _ => {
-                    newest.insert(series, ts);
-                }
+    #[test]
+    fn a_shifted_sample_lands_between_two_scrape_points_of_its_series() {
+        let (shifted, clean, report) = shifted_pair();
+        let interval_ms = 15_000i64;
+        let mut moved = 0u64;
+        for ((ts, series), (grid_ts, clean_series)) in shifted.iter().zip(&clean) {
+            assert_eq!(series, clean_series, "the two streams align line by line");
+            assert_eq!(grid_ts % interval_ms, 0, "the clean stream is on the grid");
+            if ts == grid_ts {
+                continue;
+            }
+            moved += 1;
+            assert_eq!(*ts, grid_ts - 3 * interval_ms / 2, "{series}");
+            // Strictly between two grid points, half an interval from each.
+            assert_eq!(ts.rem_euclid(interval_ms), interval_ms / 2, "{ts} {series}");
+            assert!(
+                *ts > grid_ts - 2 * interval_ms && *ts < grid_ts - interval_ms,
+                "{ts} is not between the two scrape points before {grid_ts}"
+            );
+            assert!(*ts >= 0, "no sample is stamped before the base timestamp");
+        }
+        assert_eq!(moved, report.out_of_order_samples);
+        assert_eq!(moved, 66);
+        // Steps 0 and 1 are never shifted, so the first two scrapes are clean.
+        let first_two_steps = 2 * 20;
+        assert!(
+            shifted
+                .iter()
+                .zip(&clean)
+                .take(first_two_steps)
+                .all(|(a, b)| a.0 == b.0)
+        );
+    }
+
+    /// The negative for any whole-interval shift: a shifted sample's
+    /// `(series, timestamp)` is disjoint from every pair the stream's
+    /// unshifted samples carry. A shift by `k * interval_ms` lands on a scrape
+    /// point the series already emitted (step `n - k` is unshifted unless it
+    /// was itself selected), so this fails for every whole multiple.
+    #[test]
+    fn no_shifted_sample_repeats_a_timestamp_its_series_carries() {
+        let (shifted, clean, _) = shifted_pair();
+        let mut on_grid: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+        let mut moved: Vec<(&str, i64)> = Vec::new();
+        for ((ts, series), (grid_ts, _)) in shifted.iter().zip(&clean) {
+            if ts == grid_ts {
+                on_grid.entry(series.as_str()).or_default().push(*ts);
+            } else {
+                moved.push((series.as_str(), *ts));
             }
         }
-        // 62 of the 66 shifted samples land at or before a timestamp already
-        // written for their series. The other 4 follow two consecutive shifted
-        // steps on the same series, where a two-interval shift still lands
-        // ahead of everything written so far, so they are shifted but not
-        // out-of-order to an ingester. Both figures are pinned: a generator
-        // that stopped shifting moves the first, and one that shifted by the
-        // wrong amount moves the second.
-        assert_eq!(regressions, 62);
-        assert!(
-            regressions < report.out_of_order_samples,
-            "a shift can only ever be at most as visible as the shifts applied"
-        );
-        // Steps 0 and 1 are never shifted, so the first two scrapes are clean.
-        let interval_ms = 15_000i64;
-        for line in text.lines() {
-            let ts: i64 = line
-                .split('\t')
-                .next()
-                .and_then(|t| t.parse().ok())
-                .expect("timestamp");
-            assert!(ts >= 0, "no sample is stamped before the base timestamp");
-            assert_eq!(ts % interval_ms, 0, "timestamps stay on the scrape grid");
+        assert_eq!(moved.len(), 66);
+        for (series, ts) in &moved {
+            let carried = on_grid.get(series).map(Vec::as_slice).unwrap_or_default();
+            assert!(
+                !carried.contains(ts),
+                "shifted sample {series} @ {ts} repeats a timestamp the series already carries"
+            );
         }
+        let distinct: std::collections::BTreeSet<&(&str, i64)> = moved.iter().collect();
+        assert_eq!(distinct.len(), moved.len(), "two shifted samples collide");
+    }
+
+    #[test]
+    fn shifted_and_regressed_samples_are_counted_separately() {
+        let (shifted, clean, report) = shifted_pair();
+        // Per series, count the samples whose timestamp is at or before one
+        // already seen on that series: that is what "out of order in the
+        // stream" means to an ingester.
+        let mut newest: BTreeMap<&str, i64> = BTreeMap::new();
+        let mut previous_was_shifted: BTreeMap<&str, bool> = BTreeMap::new();
+        let mut regressions = 0u64;
+        let mut shifted_ahead = 0u64;
+        for ((ts, series), (grid_ts, _)) in shifted.iter().zip(&clean) {
+            let is_shifted = ts != grid_ts;
+            match newest.get(series.as_str()) {
+                Some(previous) if ts <= previous => {
+                    assert!(is_shifted, "an unshifted sample regressed: {series} @ {ts}");
+                    regressions += 1;
+                }
+                _ => {
+                    if is_shifted {
+                        assert!(
+                            previous_was_shifted.get(series.as_str()) == Some(&true),
+                            "a shifted sample that does not regress must follow a shifted \
+                             one: {series} @ {ts}"
+                        );
+                        shifted_ahead += 1;
+                    }
+                    newest.insert(series.as_str(), *ts);
+                }
+            }
+            previous_was_shifted.insert(series.as_str(), is_shifted);
+        }
+        // 41 of the 66 shifted samples land before a timestamp already written
+        // for their series. The other 25 follow a shifted step on the same
+        // series: two consecutive shifted steps leave the second a full
+        // interval ahead of the first and half an interval ahead of the last
+        // unshifted sample, so it is shifted but not out of order to an
+        // ingester. Both figures are pinned, so a generator that stopped
+        // shifting, or shifted other steps, moves them. Any shift from one to
+        // two intervals splits the same way, so the shift amount itself is
+        // pinned by the two tests above, not by these counts.
+        assert_eq!(report.out_of_order_samples, 66);
+        assert_eq!(regressions, 41);
+        assert_eq!(shifted_ahead, 25);
+        assert_eq!(regressions + shifted_ahead, report.out_of_order_samples);
     }
 
     #[test]
