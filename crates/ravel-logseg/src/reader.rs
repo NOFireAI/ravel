@@ -2351,9 +2351,7 @@ fn contains_kernel(
         if let Some(Some(pass)) = streams.get(r as usize) {
             return Ok(*pass);
         }
-        let pass = stream_contains(stream_dir, r, arm.key, arm.negated, |v| {
-            arm.needle.is_in(v)
-        })?;
+        let pass = stream_contains(stream_dir, r, arm.key, arm.negated, |v| arm.needle.is_in(v))?;
         if let Some(slot) = streams.get_mut(r as usize) {
             *slot = Some(pass);
         }
@@ -2392,9 +2390,7 @@ fn contains_kernel(
                             Some(t) => t,
                             None => {
                                 *tested += 1;
-                                let t = values
-                                    .entry(k)
-                                    .is_some_and(|e| arm.needle.is_in(e))
+                                let t = values.entry(k).is_some_and(|e| arm.needle.is_in(e))
                                     != arm.negated;
                                 if let Some(slot) = verdicts.get_mut(k) {
                                     *slot = Some(t);
@@ -2665,9 +2661,8 @@ fn eval(
             let needle = needle.as_bytes();
             let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
                 .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-            let stream = stream_contains(stream_dir, r, key, *negated, |v| {
-                contains_bytes(v, needle)
-            })?;
+            let stream =
+                stream_contains(stream_dir, r, key, *negated, |v| contains_bytes(v, needle))?;
             let cell = field_dir
                 .column(key, FieldType::Str)
                 .and_then(|e| block.str_at(e.column_id, row))
