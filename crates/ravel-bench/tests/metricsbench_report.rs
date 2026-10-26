@@ -22,7 +22,7 @@ fn bin() -> PathBuf {
 fn valid_report() -> MetricsBenchReport {
     MetricsBenchReport {
         provenance: Provenance {
-            schema_version: SCHEMA_VERSION,
+            schema_version: 2,
             ravel_git_commit: "9fc85f421590d360e7979ee167eb38e166b45462".to_string(),
             toolchain: "rustc 1.90.0".to_string(),
             protocol: "remote_write_1.0".to_string(),
@@ -68,9 +68,122 @@ fn valid_report() -> MetricsBenchReport {
                     value: 20.0,
                 },
             ],
+            engine: None,
+            oracle: false,
+            endpoint: None,
+            query_kind: None,
+            refusal_reason: None,
+            error_class: None,
+            incomplete: false,
+            pass_statuses: vec![],
+            reps_per_pass: None,
+            pass_medians_ms: vec![],
+            rel_mad_pct: None,
         }],
         geomean_ms: Some(12.5),
+        cases_expected: vec![],
+        denominators: vec![],
+        exclusions: vec![],
     }
+}
+
+/// A version-3 report as a producer writes it: Ravel answers `mb_a` and
+/// Prometheus, the oracle, answers it too, five passes each.
+fn valid_v3_json() -> serde_json::Value {
+    let mut provenance = serde_json::to_value(valid_report().provenance).expect("serialize");
+    provenance["schema_version"] = serde_json::json!(3);
+    let row = |engine: &str, oracle: bool| {
+        serde_json::json!({
+            "id": "mb_a",
+            "class": "high_fan_out",
+            "status": "ok",
+            "figures": [
+                {"name": "min_ms", "value": 9.0},
+                {"name": "median_ms", "value": 11.0},
+                {"name": "max_ms", "value": 15.0}
+            ],
+            "engine": engine,
+            "oracle": oracle,
+            "endpoint": format!("http://{engine}:9090"),
+            "query_kind": "instant",
+            "pass_statuses": ["ok", "ok", "ok", "ok", "ok"],
+            "reps_per_pass": 3,
+            "pass_medians_ms": [10.0, 12.0, 11.0, 15.0, 9.0],
+            "rel_mad_pct": 100.0 / 11.0
+        })
+    };
+    let den = |engine: &str| {
+        serde_json::json!({
+            "engine": engine, "corpus": 1, "correctness": 1, "timing": 1, "coverage_success": 1
+        })
+    };
+    serde_json::json!({
+        "provenance": provenance,
+        "measurements": [row("ravel", false), row("prometheus", true)],
+        "cases_expected": [
+            {"engine": "ravel", "id": "mb_a", "query_kind": "instant"},
+            {"engine": "prometheus", "id": "mb_a", "query_kind": "instant"}
+        ],
+        "denominators": [den("ravel"), den("prometheus")]
+    })
+}
+
+fn run_validate(dir: &tempfile::TempDir, name: &str, doc: &serde_json::Value) -> Output {
+    let path = dir.path().join(name);
+    std::fs::write(&path, serde_json::to_string_pretty(doc).expect("serialize")).expect("write");
+    Command::new(bin())
+        .args(["validate", path.to_str().expect("utf8 path")])
+        .output()
+        .expect("spawn metricsbench_report")
+}
+
+#[test]
+fn the_validate_subcommand_exits_zero_on_a_report_that_stands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_validate(&dir, "good_v3.json", &valid_v3_json());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The version-2 shape still validates under its own rules.
+    let v2 = serde_json::to_value(valid_report()).expect("serialize");
+    let out = run_validate(&dir, "good_v2.json", &v2);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_validate_subcommand_exits_non_zero_naming_the_failing_rule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut doc = valid_v3_json();
+    doc["measurements"][0]["endpoint"] = serde_json::json!("in-process");
+    let out = run_validate(&dir, "in_process.json", &doc);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("endpoint `in-process`") && stderr.contains("amendment A"),
+        "the failing rule must be on stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout for a failing report"
+    );
+
+    let mut doc = valid_v3_json();
+    doc["denominators"][0]["timing"] = serde_json::json!(0);
+    let out = run_validate(&dir, "denominators.json", &doc);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("timing is reported as 0 but the rows give 1"),
+        "{stderr}"
+    );
 }
 
 /// Write a report artifact and run `metricsbench_report render` over it.

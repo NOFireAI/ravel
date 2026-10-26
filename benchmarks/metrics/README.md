@@ -481,3 +481,67 @@ Adding a query means adding an entry here; nothing about the corpus lives in
 code. `crates/ravel-bench/tests/metricsbench_artifacts.rs` pins the counts, so
 an addition that skews the class balance or names an unknown construct fails
 there.
+
+## Report schema version 3
+
+The run's result is a `MetricsBenchReport`
+(`crates/ravel-bench/src/report_schema.rs`). Version 3 is what the writer
+stamps; versions 1 and 2 still read and validate under their own rules, and a
+version-3 field set on one of them is refused
+(`a_geomean_on_a_v3_report_and_a_v3_field_on_a_v2_report_fail`). Check a file
+with:
+
+```sh
+cargo run -p ravel-bench --bin metricsbench_report -- validate report.json
+```
+
+It exits 0 only when the report stands, and otherwise exits non-zero with the
+failing rule on stderr (`tests/metricsbench_report.rs`,
+`the_validate_subcommand_exits_non_zero_naming_the_failing_rule`). `render
+--report` validates first and then prints, per engine, the denominators and
+the count of each status before any latency, then a latency table over `ok`
+rows only (`the_v3_render_prints_denominators_before_latency_over_ok_rows`).
+
+**Row identity.** A version-3 row is keyed by (engine, id, query kind), and
+the report lists every case the corpus defines in `cases_expected`. The rows
+must cover exactly that set, compared as sets, so a duplicated row cannot
+stand in for a missing one (ADR-0927 "Bands pre-registered" item 1;
+`band_1_a_duplicated_row_cannot_hide_a_missing_case`). A range entry is one
+case, not one per grid point (2026-10-26 amendment, section E). Every row
+names its endpoint, and `in-process` is refused: that value marks a
+diagnostic-lane row, never the portable one (amendment section A;
+`an_in_process_endpoint_fails`). `oracle` is true on exactly the Prometheus
+rows (decision 4; `the_oracle_flag_is_true_exactly_on_prometheus_rows`).
+
+**Status across passes.** Each row carries its status per pass in
+`pass_statuses`, and its `status` is `row_status` of them: the first non-`ok`
+pass in pass order, else `ok`, so passes `[ok, timeout, error]` give `timeout`
+(`row_status_is_the_first_non_ok_pass`). Only `ok` rows carry latency: the
+`min_ms`/`median_ms`/`max_ms` figures, `reps_per_pass`, and one
+`pass_medians_ms` entry per pass (decision 6; band 2,
+`band_2_latency_on_an_incorrect_row_fails`). Each figure appears once per row
+(band 5, `band_5_a_duplicated_figure_fails`). A `refused` row carries a
+`refusal_reason` and no other status does, including a budget refusal
+(decision 6 and amendment section F; `a_refused_row_without_a_reason_fails`,
+`a_refusal_reason_on_an_error_row_fails`).
+
+**Denominators.** `denominators` holds one entry per engine with the three
+decision-6 denominators: `corpus` counts every case, `correctness` counts
+`ok`, `incorrect` and `partial`, and `timing` and `coverage_success` count
+`ok`. The validator recomputes them from the rows with
+`metrics_correctness::Denominators::of` and requires an exact match; the
+reported numbers are never trusted
+(`denominators_are_recomputed_from_the_rows`).
+
+**Variance.** With five or more passes, every `ok` row carries `rel_mad_pct`,
+`median(|m_i - median(m)|) / median(m) * 100` over its pass medians, with no
+pass dropped as an outlier ("Bands pre-registered" item 3; `rel_mad_pct`,
+`rel_mad_pct_matches_hand_computed_five_pass_fixtures`). The validator
+recomputes it and refuses a value that disagrees
+(`a_rel_mad_disagreeing_with_the_pass_medians_fails`). With fewer than five
+passes no row carries one and the provenance config carries
+`variance=insufficient_passes`
+(`fewer_than_five_passes_carry_no_rel_mad_and_record_insufficient_passes`). A
+pass excluded for a recorded external cause is listed in `exclusions` with
+that cause (`a_pass_exclusion_needs_a_cause`). Version 3 drops the
+report-level `geomean_ms`: decision 6 rules out one figure across engines.

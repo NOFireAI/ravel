@@ -12,6 +12,9 @@
 //!   fail-closed contract is enforced where a consumer actually runs it. The
 //!   renderer derives its table entirely from the artifact; it is never
 //!   hand-maintained.
+//! - `validate <path>` runs only [`ravel_bench::report_schema::validate`]: exit
+//!   0 when the report stands under its schema version's rules, otherwise a
+//!   non-zero exit with the failing rule on stderr.
 //! - `provenance` gathers the reconciled provenance a producer stamps on a
 //!   report: the Ravel git commit, the toolchain, the hardware, the object-store
 //!   backend, and the content digests of the workload manifest and PromQL
@@ -31,7 +34,7 @@ use std::process::{Command, ExitCode};
 use clap::{Parser, Subcommand};
 use ravel_bench::report_schema::{
     Backend, Comparator, ConfigEntry, Hardware, MetricsBenchReport, Provenance, SCHEMA_VERSION,
-    render, validate,
+    render, validate, validate_provenance,
 };
 
 #[derive(Parser, Debug)]
@@ -50,6 +53,13 @@ enum CommandKind {
         /// The report artifact to validate and render.
         #[arg(long)]
         report: PathBuf,
+    },
+    /// Validate a report artifact under its own schema version's rules. Exits 0
+    /// only when the report stands; otherwise exits non-zero with the failing
+    /// rule on stderr. Prints no table.
+    Validate {
+        /// The report artifact to validate.
+        path: PathBuf,
     },
     /// Gather and print the reconciled provenance block a producer stamps on a
     /// report. The digests are the content digests of the two named artifacts.
@@ -185,22 +195,36 @@ fn parse_config(spec: &str) -> Result<ConfigEntry, String> {
     })
 }
 
+fn read_report(path: &std::path::Path) -> Result<MetricsBenchReport, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read report {}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "report {} is not a valid MetricsBench report: {e}",
+            path.display()
+        )
+    })
+}
+
 fn run() -> Result<(), String> {
     let args = Args::parse();
     match args.command {
         CommandKind::Render { report } => {
-            let text = std::fs::read_to_string(&report)
-                .map_err(|e| format!("read report {}: {e}", report.display()))?;
-            let doc: MetricsBenchReport = serde_json::from_str(&text).map_err(|e| {
-                format!(
-                    "report {} is not a valid MetricsBench report: {e}",
-                    report.display()
-                )
-            })?;
+            let doc = read_report(&report)?;
             // `render` runs `validate` first; a malformed artifact fails here,
             // through this binary, not only through a direct validator call.
             let rendered = render(&doc).map_err(|e| e.to_string())?;
             print!("{rendered}");
+            Ok(())
+        }
+        CommandKind::Validate { path } => {
+            let doc = read_report(&path)?;
+            validate(&doc).map_err(|e| format!("report {} does not stand: {e}", path.display()))?;
+            println!(
+                "report {} validates (schema version {})",
+                path.display(),
+                doc.provenance.schema_version
+            );
             Ok(())
         }
         CommandKind::Provenance {
@@ -256,7 +280,7 @@ fn run() -> Result<(), String> {
             // Prove the stamp we emit is one a report would accept: a producer
             // that pasted this block into a report and then failed validation on
             // it would be a silent contract break.
-            if let Err(err) = validate_provenance_only(&provenance) {
+            if let Err(err) = validate_provenance(&provenance) {
                 return Err(format!("gathered provenance does not validate: {err}"));
             }
             println!(
@@ -267,41 +291,6 @@ fn run() -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-/// Validate just the provenance, by validating a minimal report built around it.
-/// `report_schema::validate` is the whole-report entry point, so the provenance
-/// stamp is checked through the same code a consumer runs, with one dummy timed
-/// measurement standing in for the harness's rows.
-fn validate_provenance_only(
-    p: &Provenance,
-) -> Result<(), ravel_bench::report_schema::ValidationError> {
-    use ravel_bench::promql_corpus::CostClass;
-    use ravel_bench::report_schema::{Figure, Measurement, ResultStatus};
-    let probe = MetricsBenchReport {
-        provenance: p.clone(),
-        measurements: vec![Measurement {
-            id: "provenance_probe".to_string(),
-            class: CostClass::MetadataOnly,
-            status: ResultStatus::Ok,
-            figures: vec![
-                Figure {
-                    name: "min_ms".to_string(),
-                    value: 0.0,
-                },
-                Figure {
-                    name: "median_ms".to_string(),
-                    value: 0.0,
-                },
-                Figure {
-                    name: "max_ms".to_string(),
-                    value: 0.0,
-                },
-            ],
-        }],
-        geomean_ms: None,
-    };
-    validate(&probe)
 }
 
 fn main() -> ExitCode {
