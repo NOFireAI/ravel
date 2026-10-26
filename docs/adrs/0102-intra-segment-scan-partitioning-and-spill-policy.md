@@ -222,7 +222,9 @@ to 0.5 (give up when the probe found a new group for more than every other row,
 where the partial stage returns at most a factor of two and cannot pay for
 `partitions` copies of itself). Not lower on either: the ratio is judged from a
 sample of that many rows, and a smaller sample starts misjudging genuinely
-reducible mid-cardinality keys as unreducible.
+reducible mid-cardinality keys as unreducible. The ratio is now 0.1, on CPU
+grounds; see the probe ratio amendment (#3231) at the end of this ADR. The row
+threshold is unchanged.
 
 Neither option can change a result. Skipping decides only whether a partition
 pre-aggregates its rows or forwards them; the final stage sees the same rows and
@@ -1080,3 +1082,39 @@ it is `1.125 x (S + 192)`. `S` is the asked size, not the charged one. The
 `Vec` term holds while one batch adds fewer than `S x s / ((2W + s)(W + s))`
 groups. ADR-1170's capacity share amendment gives the derivation, what
 memory sits outside the bound, and the tests that pin it.
+
+## Amendment (2026-10-26, #3231): the skip-partial probe ratio is 0.1
+
+<!-- amendment-applies: sections="Amendment, 2026-08-26: aggregation state scales with partition count (issue #680)" pointer="probe ratio amendment" -->
+
+`datafusion.execution.skip_partial_aggregation_probe_ratio_threshold` moves
+from 0.5 to 0.1 (`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO` in
+`crates/ravel-sql/src/session.rs`); the 8,192-row probe threshold and
+`SqlConfig::skip_partial_aggregation` are unchanged. A partition now skips
+once its probe finds a new group for more than one row in ten. DataFusion
+compares strictly (`groups / rows > ratio`) and, until the partition skips,
+re-reads the ratio over all the rows it has seen after every batch past the
+probe threshold.
+
+The #680 amendment chose 0.5 on memory grounds. This change is on CPU grounds:
+above one new group in ten rows, hashing and inserting each row in both the
+partial and the final stage costs more CPU than the partial stage saves on
+string and high-cardinality keys. Measured on ClickBench with both binaries
+alternated on one box (#3231 comment 6428088457), the string and
+high-cardinality `GROUP BY` statements q13-q19, q34 and q35 spent 0.976 of the
+server CPU they spent at 0.5, and the whole sweep 0.985, with every answer
+unchanged.
+
+The cost falls on keys between 0.1 and 0.5 that still reduce, such as a
+phrase key with heavy repetition: they skip too, and the repartition and the
+final stage then receive every row instead of one per group. In the same
+measurement the `SearchPhrase`-keyed q13-q15 spent about 1.01 of their former
+CPU for that reason, and no statement spent more than 1.035.
+
+The memory argument of the #680 amendment still holds and is stronger: a
+skipped partition emits the groups its probe accumulated and then holds no
+partial state, and more partitions now skip. Skipping still cannot change a
+result. The #680 pin (`tests/skip_partial_aggregation.rs`) reads a ratio of
+1.0 on the tightened side and is unaffected; the same file's
+`probe_ratio_threshold_is_one_new_group_in_ten_rows` pins the new value from
+both sides, with 820 groups in the 8,192 probe rows skipping and 819 not.
