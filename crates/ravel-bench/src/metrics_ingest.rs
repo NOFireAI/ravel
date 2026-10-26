@@ -78,11 +78,14 @@
 //! - `comparable`: whether these figures may be published (decision 11).
 //!   Forced `false` when `steps_run != steps_declared`, regardless of the
 //!   profile's own verdict: a run that stopped short or ran long is not that
-//!   profile.
+//!   profile. Also forced `false` when the recorded `run.stream_digest`
+//!   differs from the digest [`build_profile_record`] recomputes from the
+//!   manifest, the anchor and `steps_run`.
 //! - `comparability_reason`: why not, present exactly when `comparable` is
 //!   `false`, absent when `true`. The workload's own `Comparability` reason,
-//!   never a second hand-written copy of it, unless the run's step count is
-//!   off the profile's, in which case this states that instead.
+//!   never a second hand-written copy of it, unless the stream digest does
+//!   not reproduce or the run's step count is off the profile's, in which
+//!   case this states that instead (the digest first).
 //! - `active_series`: series alive at any one instant, as declared.
 //! - `steps_run`: steps this run actually generated (the `--steps` flag, or
 //!   `steps_declared` when unset).
@@ -105,10 +108,11 @@
 //! - `run`: a [`RunRecord`], scoped to `steps_run`, never the declared full
 //!   profile:
 //!   - `steps`: equal to `steps_run`.
-//!   - `anchor_ms`: the first generated step's timestamp, in milliseconds.
-//!   - `anchor_source`: `explicit` when `--anchor-ms` set it (no clock was
-//!     read to generate the stream), `clock` when it was derived as
-//!     `now - steps * scrape interval`.
+//!   - `anchor_ms`: the first generated step's timestamp, in milliseconds,
+//!     as passed with the required `--anchor-ms` ([`check_anchor`]).
+//!   - `workload_version`, `workload_digest`, `seed`: the manifest's
+//!     `version`, BLAKE3 over its file bytes, and its seed.
+//!   - `stream_digest`: the generator's BLAKE3 over the encoded stream.
 //!   - `total_series_created`: distinct series the generator actually
 //!     created over these steps, the generator's exact count.
 //!   - `logical_input_bytes`: uncompressed input bytes the generator
@@ -285,28 +289,56 @@ pub const ELAPSED_BASIS_TIMED_SEGMENTS: &str = "timed_segments";
 /// recorded separately (ADR-0927 decision 9); this lane owns ingest, the query
 /// lane owns query.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Every field added after the nightly artifact began carries a serde default,
+/// so a reader built on this struct still loads a report written before it
+/// (`tests::a_pre_change_artifact_loads_with_defaults`).
 pub struct IngestPhase {
     /// Every line of the stream this row replayed, counted by kind. The sample
-    /// accounting below is over the `scalar` lines only.
+    /// accounting below is over the `scalar` lines only. All zero in a report
+    /// written before the field existed.
+    #[serde(default)]
     pub stream_counts: StreamCounts,
     /// Native-histogram lines the scalar replay excluded by name
     /// (`stream_counts.native_histogram`): never offered, never dropped.
+    #[serde(default)]
     pub excluded_native_histogram: u64,
     /// Staleness-marker lines the scalar replay excluded by name
     /// (`stream_counts.stale_marker`).
+    #[serde(default)]
     pub excluded_stale_marker: u64,
     /// Scalar logical samples offered to the system. `accepted + rejected +
-    /// dropped`.
+    /// dropped`, and `offered + excluded_native_histogram +
+    /// excluded_stale_marker == stream_counts.generated_lines`
+    /// ([`check_row_accounting`]).
     pub offered_samples: u64,
+    /// BLAKE3 over the canonical `(series, ts_ms, value bits)` tuple of every
+    /// sample this row offered, in offered order ([`OfferedDigest`]). Empty in
+    /// a report written before the field existed.
+    #[serde(default)]
+    pub offered_digest: String,
     /// Samples the system acknowledged.
     pub accepted_samples: u64,
     /// Samples the lane refused before sending (client-side admission).
     pub rejected_samples: u64,
-    /// Samples in a batch that was abandoned after exhausting retries: neither
-    /// accepted nor rejected, so the accounting still closes.
+    /// Samples in batches the system never acknowledged: neither accepted nor
+    /// rejected by the lane, so the accounting still closes. On a comparator
+    /// row this is exactly the sum of `rejected_by_status` plus
+    /// `retry_exhausted_samples`. On the Ravel row it counts batches whose
+    /// strict write returned an error; that path does not retry at this level
+    /// (object-store PUT retries run below it).
     pub dropped_samples: u64,
-    /// Batches abandoned after exhausting retries.
+    /// Batches counted under `dropped_samples`.
     pub dropped_batches: u64,
+    /// Samples in comparator batches that ended on a non-retryable non-2xx
+    /// response, keyed by that HTTP status. Part of `dropped_samples`. Empty
+    /// on the Ravel row, and in a report written before the field existed.
+    #[serde(default)]
+    pub rejected_by_status: BTreeMap<u16, u64>,
+    /// Samples in comparator batches dropped after every allowed retry ended
+    /// on a 429, a 5xx or a transport error. Part of `dropped_samples`.
+    #[serde(default)]
+    pub retry_exhausted_samples: u64,
     /// Batches offered (one write call each).
     pub batches: u64,
     /// Transport retries: object-store PUT retries below `InstrumentedStore`
@@ -331,7 +363,9 @@ pub struct IngestPhase {
     /// admission and the RW1.0 encode; for a comparator row the encode was
     /// inside it, as it is inside that row's timed segments now. In both
     /// lanes the only basis change is the generation now interleaved between
-    /// segments, which the sum excludes.
+    /// segments, which the sum excludes. Empty in such a report, which reads
+    /// as "wall time, unmarked".
+    #[serde(default)]
     pub elapsed_basis: String,
     /// Accepted logical samples per second.
     pub logical_points_per_sec: f64,
@@ -569,10 +603,23 @@ pub struct ProfileRecord {
 pub struct RunRecord {
     /// Steps this run generated. Equal to `ProfileRecord::steps_run`.
     pub steps: u64,
-    /// Timestamp of the first generated step, in milliseconds since the epoch.
+    /// Timestamp of the first generated step, in milliseconds since the epoch:
+    /// the required `--anchor-ms`, on the scrape grid ([`check_anchor`]).
     pub anchor_ms: i64,
-    /// Where `anchor_ms` came from: the `--anchor-ms` flag, or the clock.
-    pub anchor_source: AnchorSource,
+    /// The manifest's `version` field, as the loader accepted it.
+    #[serde(default)]
+    pub workload_version: u32,
+    /// BLAKE3 over the manifest file's bytes, hex.
+    #[serde(default)]
+    pub workload_digest: String,
+    /// The seed the manifest declared.
+    #[serde(default)]
+    pub seed: u64,
+    /// The generator's BLAKE3 over the encoded stream this run replayed, hex.
+    /// `comparable` requires it to equal a digest recomputed from the
+    /// manifest, `anchor_ms` and `steps`.
+    #[serde(default)]
+    pub stream_digest: String,
     /// Distinct series the generator actually created over these steps.
     pub total_series_created: u64,
     /// Logical (uncompressed, pre-wire) input bytes the generator produced
@@ -587,25 +634,112 @@ pub struct RunRecord {
     pub scaling_label_cardinality: u64,
 }
 
-/// Where a run's generation anchor (the first step's timestamp) came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AnchorSource {
-    /// Passed with `--anchor-ms`: no clock was read to generate the stream, so
-    /// two runs with the same anchor generate the same bytes.
-    Explicit,
-    /// Derived from the wall clock (`now - steps * scrape interval`), so the
-    /// stream's timestamps differ run to run.
-    Clock,
+/// The largest millisecond timestamp whose nanosecond form fits an `i64`:
+/// `i64::MAX / 1_000_000`. The newest generated step must not pass it, or the
+/// generator's `anchor + step * interval` or the lane's ms-to-ns conversion
+/// overflows.
+pub const ANCHOR_MAX_MS: i64 = i64::MAX / 1_000_000;
+
+/// A `--anchor-ms` the lane refuses (ADR-0927 2026-10-26 amendment, section C).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AnchorError {
+    /// No anchor was given.
+    #[error(
+        "--anchor-ms is required and has no default: the stream's timestamps and digest are a \
+         function of the anchor, so a clock-derived anchor would make every run a different \
+         stream and no two runs comparable; pass the first step's timestamp in milliseconds, \
+         on the profile's scrape grid"
+    )]
+    Missing,
+    /// The anchor is before the epoch.
+    #[error("--anchor-ms {anchor_ms} is negative; the anchor must be at or after the epoch")]
+    Negative {
+        /// The refused anchor.
+        anchor_ms: i64,
+    },
+    /// The newest step would pass [`ANCHOR_MAX_MS`].
+    #[error(
+        "--anchor-ms {anchor_ms} with {steps} steps of {interval_ms} ms puts the newest step \
+         past {max_ms} ms, the largest millisecond whose nanosecond form fits an i64"
+    )]
+    PastRange {
+        /// The refused anchor.
+        anchor_ms: i64,
+        /// Steps the run would generate.
+        steps: u64,
+        /// The profile's scrape interval in milliseconds.
+        interval_ms: u64,
+        /// [`ANCHOR_MAX_MS`].
+        max_ms: i64,
+    },
+    /// The anchor is not a multiple of the scrape interval.
+    #[error(
+        "--anchor-ms {anchor_ms} is off the scrape grid: {anchor_ms} mod {interval_ms} ms is \
+         {remainder}, and the anchor must be a multiple of the profile's scrape interval"
+    )]
+    OffGrid {
+        /// The refused anchor.
+        anchor_ms: i64,
+        /// The profile's scrape interval in milliseconds.
+        interval_ms: u64,
+        /// `anchor_ms % interval_ms`, non-zero.
+        remainder: i64,
+    },
 }
 
-/// A run's generation anchor and its source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Anchor {
-    /// Timestamp of the first generated step, in milliseconds.
-    pub ms: i64,
-    /// Where `ms` came from.
-    pub source: AnchorSource,
+/// Check a run's `--anchor-ms` against the profile: required, non-negative,
+/// its newest step (`anchor + (steps - 1) * interval`) at most
+/// [`ANCHOR_MAX_MS`], and a multiple of the scrape interval in milliseconds.
+pub fn check_anchor(
+    anchor_ms: Option<i64>,
+    scrape_interval_secs: u64,
+    steps: u64,
+) -> Result<i64, AnchorError> {
+    let anchor_ms = anchor_ms.ok_or(AnchorError::Missing)?;
+    if anchor_ms < 0 {
+        return Err(AnchorError::Negative { anchor_ms });
+    }
+    let interval_ms = scrape_interval_secs.saturating_mul(1_000);
+    let newest = (steps.saturating_sub(1) as u128) * u128::from(interval_ms)
+        + u128::from(anchor_ms.unsigned_abs());
+    if newest > ANCHOR_MAX_MS as u128 {
+        return Err(AnchorError::PastRange {
+            anchor_ms,
+            steps,
+            interval_ms,
+            max_ms: ANCHOR_MAX_MS,
+        });
+    }
+    if interval_ms > 0 {
+        let remainder = anchor_ms % interval_ms as i64;
+        if remainder != 0 {
+            return Err(AnchorError::OffGrid {
+                anchor_ms,
+                interval_ms,
+                remainder,
+            });
+        }
+    }
+    Ok(anchor_ms)
+}
+
+/// The generator's stream digest for `steps` scrapes of `profile` anchored at
+/// `anchor_ms`, regenerated into a sink that keeps no bytes.
+pub fn recompute_stream_digest(
+    workload: &WorkloadFile,
+    profile: &Profile,
+    anchor_ms: i64,
+    steps: u64,
+) -> Result<String, crate::metrics_gen::GeneratorError> {
+    crate::metrics_gen::Generator::for_profile(workload, profile, anchor_ms)
+        .generate_into(steps, &mut std::io::sink())
+        .map(|report| report.digest)
+}
+
+/// BLAKE3 over a manifest file's bytes, hex: the `workload_digest` a report
+/// records.
+pub fn workload_digest(manifest_bytes: &[u8]) -> String {
+    blake3::hash(manifest_bytes).to_hex().to_string()
 }
 
 /// The scaling label's identity and its cardinality over a profile's full
@@ -641,24 +775,26 @@ pub struct FamilyRecord {
 
 /// Builds the ADR-0927 decision-11 profile block for one run.
 ///
-/// `comparable` is forced `false` whenever `steps_run` differs from
-/// `profile`'s declared `samples_per_series`, regardless of the profile's
-/// own verdict: a run that stopped short or ran long is not that profile's
-/// figures either way. `comparability_reason` then states the step counts,
-/// not the profile's own (possibly `None`) reason. When the run matches the
-/// declared count, `comparable` and `comparability_reason` come straight
-/// from `profile.comparability`.
+/// `comparable` is true only when the profile is publishable, `steps_run`
+/// equals `profile`'s declared `samples_per_series`, and `gen_report.digest`
+/// (the stream digest this record carries) equals a digest this function
+/// recomputes from `workload`, `profile`, `anchor_ms` and `steps_run`
+/// ([`recompute_stream_digest`]). `comparability_reason` names the first
+/// failing condition: the digest, then the step counts, then the profile's
+/// own reason.
 ///
 /// `steps_run` is the `--steps` the run resolved to and `logical_input_bytes`
 /// the encoded stream's length (the generator's own `bytes` for a streamed
-/// run); `anchor` is the first step's timestamp and where it came from.
+/// run); `anchor_ms` is the first step's timestamp and `workload_digest` the
+/// manifest file's BLAKE3 ([`workload_digest`]).
 pub fn build_profile_record(
     workload: &WorkloadFile,
     profile: &Profile,
     steps_run: u64,
     logical_input_bytes: u64,
     gen_report: &crate::metrics_gen::GenerationReport,
-    anchor: Anchor,
+    anchor_ms: i64,
+    workload_digest: String,
 ) -> ProfileRecord {
     let families = workload
         .families
@@ -673,8 +809,23 @@ pub fn build_profile_record(
     // Any step count other than the profile's own: a short run is not that
     // profile's figures, and an over-long one is not either.
     let off_profile = steps_run != steps_declared;
-    let comparable = profile.is_publishable() && !off_profile;
-    let comparability_reason = if off_profile {
+    let digest_mismatch = match recompute_stream_digest(workload, profile, anchor_ms, steps_run) {
+        Ok(recomputed) if recomputed == gen_report.digest => None,
+        Ok(recomputed) => Some(format!(
+            "the recorded stream digest {} differs from {recomputed}, the digest of {steps_run} \
+             steps of profile `{}` regenerated from the manifest at anchor {anchor_ms} ms, so \
+             the replayed stream is not the one these parameters name",
+            gen_report.digest, profile.name
+        )),
+        Err(e) => Some(format!(
+            "the stream digest could not be recomputed from the manifest at anchor {anchor_ms} \
+             ms: {e}"
+        )),
+    };
+    let comparable = profile.is_publishable() && !off_profile && digest_mismatch.is_none();
+    let comparability_reason = if let Some(reason) = digest_mismatch {
+        Some(reason)
+    } else if off_profile {
         Some(format!(
             "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
              is not that profile and its figures cannot be published",
@@ -704,8 +855,11 @@ pub fn build_profile_record(
         families,
         run: RunRecord {
             steps: steps_run,
-            anchor_ms: anchor.ms,
-            anchor_source: anchor.source,
+            anchor_ms,
+            workload_version: workload.version,
+            workload_digest,
+            seed: workload.seed,
+            stream_digest: gen_report.digest.clone(),
             total_series_created: gen_report.total_series_created,
             logical_input_bytes,
             total_samples_generated: gen_report.emitted_samples,
@@ -1115,14 +1269,17 @@ impl StreamCounts {
 }
 
 /// The stream half of ADR-0927 band 4 failed: the lines the replay classified
-/// do not close against themselves or against what the generator emitted, or
-/// a line was malformed.
+/// do not close against themselves or against what the generator emitted, a
+/// per-type count differs from the generator's own, or a line was malformed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
     "the replayed stream does not close (ADR-0927 band 4): {scalar} scalar + {native_histogram} \
      native histogram + {stale_marker} stale marker + {malformed} malformed = {classified} \
      classified, against {generated_lines} lines read and {emitted_samples} samples the \
-     generator emitted; band 4 requires classified == lines read == emitted and zero malformed"
+     generator emitted, of which {float_samples} float, {generator_native_histogram} native \
+     histogram and {generator_stale_markers} stale marker; band 4 requires classified == lines \
+     read == emitted, each classified kind equal to the generator's count of it, and zero \
+     malformed"
 )]
 pub struct StreamBandViolation {
     pub generated_lines: u64,
@@ -1132,11 +1289,19 @@ pub struct StreamBandViolation {
     pub malformed: u64,
     pub classified: u64,
     pub emitted_samples: u64,
+    /// The generator's `float_samples`.
+    pub float_samples: u64,
+    /// The generator's `native_histogram_samples`.
+    pub generator_native_histogram: u64,
+    /// The generator's `stale_markers`.
+    pub generator_stale_markers: u64,
 }
 
 /// Check a replayed stream's counts against the generator's own report: the
 /// four kinds sum to the lines read, the lines read equal the samples the
-/// generator emitted, and no line was malformed.
+/// generator emitted, each of the three generated kinds equals the
+/// generator's own count of it (so a classifier that swaps two kinds with
+/// the totals intact fails), and no line was malformed.
 pub fn check_stream_band(
     counts: &StreamCounts,
     report: &crate::metrics_gen::GenerationReport,
@@ -1144,6 +1309,9 @@ pub fn check_stream_band(
     let classified = counts.classified();
     if classified == counts.generated_lines
         && counts.generated_lines == report.emitted_samples
+        && counts.scalar == report.float_samples
+        && counts.native_histogram == report.native_histogram_samples
+        && counts.stale_marker == report.stale_markers
         && counts.malformed == 0
     {
         return Ok(());
@@ -1156,7 +1324,106 @@ pub fn check_stream_band(
         malformed: counts.malformed,
         classified,
         emitted_samples: report.emitted_samples,
+        float_samples: report.float_samples,
+        generator_native_histogram: report.native_histogram_samples,
+        generator_stale_markers: report.stale_markers,
     })
+}
+
+/// One row's sample accounting failed (ADR-0927 band 4, the row half). Each
+/// variant names every figure of the equation that failed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RowAccountingViolation {
+    /// The row did not offer exactly the stream's scalar lines.
+    #[error(
+        "{offered} offered samples against {scalar} scalar lines in the stream; the replay \
+         offers exactly the scalar lines"
+    )]
+    OfferedNotScalar {
+        /// The row's `offered_samples`.
+        offered: u64,
+        /// The closed stream's `scalar` count.
+        scalar: u64,
+    },
+    /// The offering identity: offered plus the named exclusions is not every
+    /// generated line.
+    #[error(
+        "{offered} offered + {excluded_native_histogram} excluded native histogram + \
+         {excluded_stale_marker} excluded stale marker = {sum}, against {generated_lines} \
+         generated lines; a line that reached no receiver must be counted under a named \
+         exclusion"
+    )]
+    OfferingIdentity {
+        /// The row's `offered_samples`.
+        offered: u64,
+        /// The row's `excluded_native_histogram`.
+        excluded_native_histogram: u64,
+        /// The row's `excluded_stale_marker`.
+        excluded_stale_marker: u64,
+        /// The three summed.
+        sum: u64,
+        /// The closed stream's `generated_lines`.
+        generated_lines: u64,
+    },
+    /// The offered samples do not split into accepted, rejected and dropped.
+    #[error(
+        "{accepted} accepted + {rejected} rejected + {dropped} dropped = {sum}, against \
+         {offered} offered; a silent drop fails the run"
+    )]
+    OfferedSplit {
+        /// The row's `offered_samples`.
+        offered: u64,
+        /// The row's `accepted_samples`.
+        accepted: u64,
+        /// The row's `rejected_samples`.
+        rejected: u64,
+        /// The row's `dropped_samples`.
+        dropped: u64,
+        /// The three summed.
+        sum: u64,
+    },
+}
+
+/// Check one row against its closed stream: it offered exactly the scalar
+/// lines, the offering identity `offered + excluded_native_histogram +
+/// excluded_stale_marker == generated_lines` holds over the row's own fields,
+/// and the offered samples split exactly into accepted, rejected and dropped.
+/// `counts` is the stream's closed classification ([`GeneratedStream::finish`]
+/// after [`check_stream_band`]); the exclusions are read from `ingest`, never
+/// recomputed from `counts`.
+pub fn check_row_accounting(
+    ingest: &IngestPhase,
+    counts: &StreamCounts,
+) -> Result<(), RowAccountingViolation> {
+    if ingest.offered_samples != counts.scalar {
+        return Err(RowAccountingViolation::OfferedNotScalar {
+            offered: ingest.offered_samples,
+            scalar: counts.scalar,
+        });
+    }
+    let offering = ingest.offered_samples
+        + ingest.excluded_native_histogram
+        + ingest.excluded_stale_marker;
+    if offering != counts.generated_lines {
+        return Err(RowAccountingViolation::OfferingIdentity {
+            offered: ingest.offered_samples,
+            excluded_native_histogram: ingest.excluded_native_histogram,
+            excluded_stale_marker: ingest.excluded_stale_marker,
+            sum: offering,
+            generated_lines: counts.generated_lines,
+        });
+    }
+    let split = ingest.accepted_samples + ingest.rejected_samples + ingest.dropped_samples;
+    if split != ingest.offered_samples {
+        return Err(RowAccountingViolation::OfferedSplit {
+            offered: ingest.offered_samples,
+            accepted: ingest.accepted_samples,
+            rejected: ingest.rejected_samples,
+            dropped: ingest.dropped_samples,
+            sum: split,
+        });
+    }
+    Ok(())
 }
 
 /// A source of scalar samples a replay pulls in batches, in stream order, so
@@ -1265,12 +1532,24 @@ impl<'a> GeneratedStream<'a> {
     /// and the per-kind counts of every line. Refused before the stream is
     /// exhausted, since the report would then describe samples nobody offered.
     pub fn finish(self) -> Result<(crate::metrics_gen::GenerationReport, StreamCounts), LaneError> {
-        if self.tally.steps_generated() != self.steps || !self.pending.is_empty() {
-            return Err(LaneError::Generate(format!(
-                "the stream was closed after {} of {} steps with {} samples unread",
+        let mut reasons = Vec::new();
+        if self.tally.steps_generated() != self.steps {
+            reasons.push(format!(
+                "only {} of {} steps were generated",
                 self.tally.steps_generated(),
-                self.steps,
+                self.steps
+            ));
+        }
+        if !self.pending.is_empty() {
+            reasons.push(format!(
+                "{} generated samples were never read",
                 self.pending.len()
+            ));
+        }
+        if !reasons.is_empty() {
+            return Err(LaneError::Generate(format!(
+                "the stream was closed before it was drained: {}",
+                reasons.join(", and ")
             )));
         }
         let report = self
@@ -1366,16 +1645,54 @@ pub struct RavelReplayOutcome {
     pub first_metric: Option<String>,
 }
 
+/// BLAKE3 over the canonical `(series, ts_ms, value bits)` tuple of each
+/// sample fed to it, in the order fed: a row's `offered_digest`. A tuple is
+/// encoded as the label count, then each canonical label (`__name__`
+/// included, sorted by name) as its name and value, each a `u32` byte length
+/// and the bytes, then `ts_ms` as `i64` and the value's `f64::to_bits`, all
+/// integers little-endian. The length prefixes make the encoding injective.
+#[derive(Default)]
+pub struct OfferedDigest {
+    hasher: blake3::Hasher,
+}
+
+impl OfferedDigest {
+    /// An empty digest.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one sample's tuple.
+    pub fn update(&mut self, sample: &LogicalSample) {
+        let labels = sample.canonical_labels();
+        self.hasher.update(&(labels.len() as u32).to_le_bytes());
+        for (name, value) in &labels {
+            for part in [name, value] {
+                self.hasher.update(&(part.len() as u32).to_le_bytes());
+                self.hasher.update(part.as_bytes());
+            }
+        }
+        self.hasher.update(&sample.ts_ms.to_le_bytes());
+        self.hasher.update(&sample.value.to_bits().to_le_bytes());
+    }
+
+    /// The digest, hex.
+    pub fn finalize(&self) -> String {
+        self.hasher.finalize().to_hex().to_string()
+    }
+}
+
 /// Pull scalar samples from `source` until `pending` holds `batch_size` valid
-/// ones or the stream ends, counting each pulled sample as offered and each
-/// invalid one as rejected. `on_valid` sees each valid sample in stream order
-/// and returns what is queued for it.
+/// ones or the stream ends, counting each pulled sample as offered (and
+/// feeding it to `digest`) and each invalid one as rejected. `on_valid` sees
+/// each valid sample in stream order and returns what is queued for it.
 fn fill_valid<S, T, F>(
     source: &mut S,
     batch_size: usize,
     pending: &mut Vec<T>,
     offered: &mut u64,
     rejected: &mut u64,
+    digest: &mut OfferedDigest,
     mut on_valid: F,
 ) -> Result<(), LaneError>
 where
@@ -1391,6 +1708,7 @@ where
         }
         for sample in batch {
             *offered += 1;
+            digest.update(&sample);
             match sample.validate() {
                 Ok(()) => pending.push(on_valid(sample)?),
                 Err(_) => *rejected += 1,
@@ -1450,6 +1768,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     let mut dropped_samples: u64 = 0;
     let mut dropped_batches: u64 = 0;
     let mut batches: u64 = 0;
+    let mut offered_digest = OfferedDigest::new();
 
     loop {
         // Client-side admission: valid points (carrying their logical sample
@@ -1460,6 +1779,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
             &mut pending,
             &mut offered_samples,
             &mut rejected_samples,
+            &mut offered_digest,
             |sample| {
                 let point = ingest_point(&config.tenant, &sample)?;
                 max_ts_ms = Some(max_ts_ms.map_or(sample.ts_ms, |m| m.max(sample.ts_ms)));
@@ -1500,8 +1820,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
             Err(_) => {
                 // The strict write did not durably ack: the batch is dropped,
                 // its samples neither accepted nor rejected, so the accounting
-                // still closes. In process this is rare (a dead shard); over
-                // HTTP it is the exhausted-retry case.
+                // still closes. In process this is rare (a dead shard).
                 dropped_batches += 1;
                 dropped_samples += batch_len;
             }
@@ -1539,10 +1858,13 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         excluded_native_histogram: stream_counts.native_histogram,
         excluded_stale_marker: stream_counts.stale_marker,
         offered_samples,
+        offered_digest: offered_digest.finalize(),
         accepted_samples,
         rejected_samples,
         dropped_samples,
         dropped_batches,
+        rejected_by_status: BTreeMap::new(),
+        retry_exhausted_samples: 0,
         batches,
         retries: snapshot.put.attempts.saturating_sub(snapshot.put.calls),
         elapsed_secs,
@@ -1678,8 +2000,10 @@ const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// Replay `source` into a comparator over Remote Write 1.0, pulling one batch
 /// at a time as [`replay_into_ravel`] does. Valid samples are batched in
 /// stream order, encoded as snappy protobuf, and POSTed to the configured
-/// endpoint; each batch is retried on a 429/5xx up to `max_retries`, then
-/// dropped. Every
+/// endpoint; each batch is retried on a 429/5xx or a transport error up to
+/// `max_retries`, then dropped and counted under `retry_exhausted_samples`. A
+/// batch that ends on any other non-2xx is dropped without a retry and
+/// counted under `rejected_by_status` by that status. Every
 /// row this produces is [`AckSemantics::Buffered`]: a Remote Write 2xx from a
 /// comparator means accepted-into-a-buffer, a durability the client cannot
 /// observe, so it is never placed in a pooled column with Ravel's durable ack.
@@ -1709,6 +2033,9 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
     let mut batches: u64 = 0;
     let mut retries: u64 = 0;
     let mut wire_bytes: u64 = 0;
+    let mut offered_digest = OfferedDigest::new();
+    let mut rejected_by_status: BTreeMap<u16, u64> = BTreeMap::new();
+    let mut retry_exhausted_samples: u64 = 0;
 
     loop {
         fill_valid(
@@ -1717,6 +2044,7 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
             &mut pending,
             &mut offered_samples,
             &mut rejected_samples,
+            &mut offered_digest,
             Ok,
         )?;
         if pending.is_empty() {
@@ -1740,30 +2068,35 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
                 .body(body.clone())
                 .send()
                 .await;
-            match sent {
-                Ok(resp) if resp.status().is_success() => break Ok(()),
-                Ok(resp) if is_retryable(resp.status()) && attempt < config.max_retries => {
-                    attempt += 1;
-                    retries += 1;
-                    tokio::time::sleep(HTTP_RETRY_BACKOFF).await;
+            let retryable = match &sent {
+                Ok(resp) if resp.status().is_success() => break BatchOutcome::Accepted,
+                Ok(resp) if !is_retryable(resp.status()) => {
+                    break BatchOutcome::Rejected(resp.status().as_u16());
                 }
-                Ok(_) => break Err(()),
-                Err(_) if attempt < config.max_retries => {
-                    attempt += 1;
-                    retries += 1;
-                    tokio::time::sleep(HTTP_RETRY_BACKOFF).await;
-                }
-                Err(_) => break Err(()),
+                Ok(_) | Err(_) => true,
+            };
+            if retryable && attempt < config.max_retries {
+                attempt += 1;
+                retries += 1;
+                tokio::time::sleep(HTTP_RETRY_BACKOFF).await;
+            } else {
+                break BatchOutcome::RetriesExhausted;
             }
         };
         match outcome {
-            Ok(()) => {
+            BatchOutcome::Accepted => {
                 ack_latencies_ns.push(start.elapsed().as_nanos() as u64);
                 accepted_samples += batch_len;
             }
-            Err(()) => {
+            BatchOutcome::Rejected(status) => {
                 dropped_batches += 1;
                 dropped_samples += batch_len;
+                *rejected_by_status.entry(status).or_default() += batch_len;
+            }
+            BatchOutcome::RetriesExhausted => {
+                dropped_batches += 1;
+                dropped_samples += batch_len;
+                retry_exhausted_samples += batch_len;
             }
         }
         timed += segment_start.elapsed();
@@ -1776,10 +2109,13 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         excluded_native_histogram: stream_counts.native_histogram,
         excluded_stale_marker: stream_counts.stale_marker,
         offered_samples,
+        offered_digest: offered_digest.finalize(),
         accepted_samples,
         rejected_samples,
         dropped_samples,
         dropped_batches,
+        rejected_by_status,
+        retry_exhausted_samples,
         batches,
         retries,
         elapsed_secs,
@@ -1809,6 +2145,16 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         client_behavior,
         ingest,
     ))
+}
+
+/// How one comparator batch ended.
+enum BatchOutcome {
+    /// A 2xx.
+    Accepted,
+    /// A non-retryable non-2xx, with its status.
+    Rejected(u16),
+    /// Every allowed retry ended on a 429, a 5xx or a transport error.
+    RetriesExhausted,
 }
 
 /// Whether a response status warrants a Remote Write retry: 429 (too many
@@ -1890,10 +2236,13 @@ mod tests {
             excluded_native_histogram: 0,
             excluded_stale_marker: 0,
             offered_samples: 1,
+            offered_digest: String::new(),
             accepted_samples: 1,
             rejected_samples: 0,
             dropped_samples: 0,
             dropped_batches: 0,
+            rejected_by_status: BTreeMap::new(),
+            retry_exhausted_samples: 0,
             batches: 1,
             retries: 0,
             elapsed_secs: 1.0,
