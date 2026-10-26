@@ -81,27 +81,46 @@ fn record(ts: i64, url: Option<&str>) -> LogRecord {
     }
 }
 
-/// Write object `n`: [`ROWS_PER_BLOCK`] records per block, ts `n * 100 + 1..`.
-async fn write_object(store: &dyn ObjectStoreBackend, n: usize) -> SegmentRef {
+/// Encode `records` as one object written by this file's tenant, sequence `seq`.
+fn encode(records: &[LogRecord], cfg: RlogConfig, seq: u64) -> Vec<u8> {
     let mut w = RlogWriter::new(
-        RlogConfig {
-            block_target_records: ROWS_PER_BLOCK,
-            ..RlogConfig::default()
-        },
+        cfg,
         ObjectIdentity {
             tenant_hash: TENANT.0,
             shard: 0,
             writer_id: [5u8; 16],
             writer_epoch: 1,
-            writer_seq: n as u64 + 1,
+            writer_seq: seq,
         },
     );
-    let base = n as i64 * 100;
-    for i in 0..ROWS_PER_OBJECT {
-        w.push(record(base + i as i64 + 1, URLS[i % ROWS_PER_BLOCK]))
-            .expect("push");
+    for r in records {
+        w.push(r.clone()).expect("push");
     }
-    let bytes = w.finish().expect("finish");
+    w.finish().expect("finish")
+}
+
+/// Write object `n`: [`ROWS_PER_BLOCK`] records per block, ts `n * 100 + 1..`.
+async fn write_object(store: &dyn ObjectStoreBackend, n: usize) -> SegmentRef {
+    let base = n as i64 * 100;
+    let records: Vec<LogRecord> = (0..ROWS_PER_OBJECT)
+        .map(|i| record(base + i as i64 + 1, URLS[i % ROWS_PER_BLOCK]))
+        .collect();
+    let cfg = RlogConfig {
+        block_target_records: ROWS_PER_BLOCK,
+        ..RlogConfig::default()
+    };
+    let bytes = encode(&records, cfg, n as u64 + 1);
+    put_segment(store, n, bytes, &records).await
+}
+
+/// Put `bytes`, the object encoding `records` with sequence `n + 1`, and
+/// describe it as a `SegmentRef`.
+async fn put_segment(
+    store: &dyn ObjectStoreBackend,
+    n: usize,
+    bytes: Vec<u8>,
+    records: &[LogRecord],
+) -> SegmentRef {
     let key = format!("logs/contains-route-{n}.rlog");
     let content_hash = *blake3::hash(&bytes).as_bytes();
     let object_size = bytes.len() as u64;
@@ -112,10 +131,10 @@ async fn write_object(store: &dyn ObjectStoreBackend, n: usize) -> SegmentRef {
     SegmentRef {
         data_object_key: key,
         object_size,
-        min_event_ts_ns: base + 1,
-        max_event_ts_ns: base + ROWS_PER_OBJECT as i64,
+        min_event_ts_ns: records.iter().map(|r| r.ts_ns).min().expect("nonempty"),
+        max_event_ts_ns: records.iter().map(|r| r.ts_ns).max().expect("nonempty"),
         ingest_hour_bucket: 0,
-        sample_count: ROWS_PER_OBJECT as u64,
+        sample_count: records.len() as u64,
         series_count: 0,
         shard: 0,
         content_hash,
@@ -413,4 +432,76 @@ async fn late_materialized_topk_over_a_contains_scan_on_the_fast_path() {
     // Object 0 holds ts 1..=16; its needle rows are the even ts.
     assert_eq!(ts(&pushed.batches), vec![2, 4, 6, 8, 10]);
     assert_eq!(ts(&pushed.batches), ts(&plain.batches));
+}
+
+/// A declared `Str` cell holding the needle's bytes followed by invalid UTF-8
+/// reads as absent, so the row sees its resource's `url` ("res-plain"): `LIKE`
+/// rejects it and `NOT LIKE` keeps it, with the `Contains` arm pushed and on
+/// the arm-free `ESCAPE '#'` plan alike. One block, on a stream whose resource
+/// sets `url`: ts 1 `a-needle`, ts 2 `needle\xff`, ts 3 `plain`, ts 4 absent.
+#[tokio::test]
+async fn an_invalid_utf8_cell_with_the_needle_bytes_reads_as_absent() {
+    let resource = vec![
+        ("service.name".to_string(), AttrValue::Str("api".to_string())),
+        ("url".to_string(), AttrValue::Str("res-plain".to_string())),
+    ];
+    let records: Vec<LogRecord> = (1..=4)
+        .map(|ts| LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: format!("row at {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("url".to_string(), AttrValue::Str(format!("cell-{ts}")))],
+        })
+        .collect();
+    let cfg = RlogConfig::default();
+    let clean = encode(&records, cfg, 1);
+    let column_id = crate::logs_columnar::str_column_id(&clean, cfg, "url");
+    let patched = crate::logs_columnar::rewrite_str_column_cells(
+        &clean,
+        cfg,
+        &records,
+        column_id,
+        &[
+            Some(b"a-needle".to_vec()),
+            Some(b"needle\xff".to_vec()),
+            Some(b"plain".to_vec()),
+            None,
+        ],
+    );
+    let store = Arc::new(MemoryStore::new());
+    let segment = put_segment(store.as_ref(), 0, patched, &records).await;
+    let snapshot = Snapshot {
+        segments: vec![segment],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+
+    for (pattern, want) in [("LIKE", vec![1]), ("NOT LIKE", vec![2, 3, 4])] {
+        let pushed = execute(
+            &store,
+            snapshot.clone(),
+            &format!("SELECT ts FROM logs WHERE url {pattern} '%needle%' ORDER BY ts"),
+        )
+        .await;
+        let plain = execute(
+            &store,
+            snapshot.clone(),
+            &format!("SELECT ts FROM logs WHERE url {pattern} '%needle%' ESCAPE '#' ORDER BY ts"),
+        )
+        .await;
+        assert!(
+            pushed.contains_cells_tested > 0,
+            "{pattern}: the arm must have run"
+        );
+        assert_eq!(plain.contains_cells_tested, 0, "{pattern}: no arm pushed");
+        assert_eq!(ts(&pushed.batches), want, "{pattern}, pushed");
+        assert_eq!(ts(&plain.batches), want, "{pattern}, unpushed");
+    }
 }
