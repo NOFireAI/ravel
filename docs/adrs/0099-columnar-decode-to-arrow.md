@@ -419,11 +419,13 @@ reaches that in one query.
 
 The `logs` table therefore now groups such a column as `Utf8View` for the
 duration of the aggregation, and casts it back to `Dictionary(Int32, Utf8)` in
-a projection directly above the aggregate that produces final values. The rule
+a projection directly above the aggregate that produces final values (moved
+up the plan since: see the #3271 amendment below). The rule
 is `DictionaryGroupKeysAsViews` (`crates/ravel-sql/src/group_keys.rs`),
 installed by `build_session` on every session. The rewrite is schema-preserving
 by construction and DataFusion asserts it (the rule sets `schema_check`), so
-this amendment changes an in-memory representation inside one operator and
+this amendment changes an in-memory representation inside one operator (the
+operators up to the restore, under the #3271 amendment below) and
 nothing on the wire. `Utf8View`, not `Utf8`: the latter carries the same `i32`
 offsets in a single values buffer and would move the limit rather than remove
 it.
@@ -576,3 +578,53 @@ resolves to the same crate), and no arrow type crosses into `ravel-logseg`.
 That rule rests on decision 4's layering, not on the version split, and
 stands on its own. Buffer-level code in `ravel-sql` may use either path;
 there is no longer a second arrow to get wrong.
+
+## Amendment (2026-10-26, #3271): the cast back runs above the TopK
+
+<!-- amendment-applies: sections="Amendment: decision 5 is a wire type, not a grouping type (issue #737)" pointer="#3271 amendment" -->
+<!-- amendment-supersedes: phrase="directly above the aggregate that produces final values" pointer="#3271 amendment" -->
+<!-- amendment-supersedes: phrase="inside one operator" pointer="#3271 amendment" -->
+
+The grouping-type amendment placed the cast back to `Dictionary(Int32, Utf8)`
+directly above every aggregate that produces final values. Under
+`GROUP BY <declared Str> ORDER BY <aggregate> LIMIT k` that cast runs on every
+distinct group, and the TopK above it then keeps `k` of them. A
+`COUNT(DISTINCT ..)` planned as two aggregate levels paid it twice: back to
+the dictionary above the inner level, and to `Utf8View` again in the outer one.
+
+`DictionaryGroupKeysAsViews` now carries the `Utf8View` group column up
+through the operators above the aggregate that pass it along without
+computing on it, and places the one restore projection under the first
+ancestor outside that set, or above the plan root when there is none. The set
+is the sort, merge, coalesce, limit, cooperative-yield, repartition and
+slice-compaction operators, a projection that passes the column as a bare
+column, and an aggregate that reads it only as a bare group key. The module
+docs of `crates/ravel-sql/src/group_keys.rs` ("Where the cast back runs") list
+the exceptions and why each is one: a TopK that orders by group keys alone, a
+hash exchange on the key under a parent that is not an aggregate, and an input
+ordered on the key under a parent other than the plan root. Under
+`ORDER BY <aggregate> ... LIMIT k` the cast now runs above the TopK, on the `k`
+rows the statement returns (`group_by_str_limit_restores_above_the_topk`), and
+the outer level of a two-level `COUNT(DISTINCT ..)` groups on the inner
+level's views with no cast between the levels
+(`single_distinct_two_level_aggregate_keeps_views_between_levels`), both in
+`crates/ravel-sql/tests/group_by_string_keys.rs`.
+
+Unchanged: the plan's output schema is the declared one, the rule still sets
+`schema_check`, and a client sees the same column type and the same rows in
+the same order (`results_and_types_match_the_unrewritten_plan` in
+`crates/ravel-sql/src/group_keys.rs`, rule on against rule off). A parent
+outside the set, such as the filter of a `HAVING`, still reads the declared
+type from a projection directly above the aggregate
+(`having_on_an_aggregate_restores_below_the_filter`).
+
+What changes is that the `Utf8View` representation now spans every operator
+between the aggregate and the restore projection instead of one. The bound the
+cast back relied on holds with the new placement: the cast runs one batch at a
+time and packs a `Utf8` values buffer of that batch's rows only, and the batch
+is now one the topmost carried operator emits instead of one the aggregate
+emits. The TopK in between now holds views rather than dictionary arrays. Their
+string bytes live in the aggregate's 2 MiB blocks, and `CompactSlicesExec`
+(issue #2720) sits between the aggregate and the TopK, copying a batch whose
+charge is more than twice the bytes its rows reference before the TopK keeps
+it.
