@@ -201,10 +201,11 @@ services:
   # Prometheus engine for expressions MQE does not support
   # (-querier.enable-query-engine-fallback, also [experimental], default true;
   # both from 3.2.3's -help-all). Neither flag is set here: the benchmark
-  # measures the default. The CONFIGURED engine is recorded per run by the
-  # effective-config capture landed under epic #2821 (pull request #3286);
-  # which engine ANSWERED a given query (MQE, or the fallback) is not
-  # recorded by anything yet and is epic #2821 Wave 3 work.
+  # measures the default. The CONFIGURED engine is recorded per run by
+  # deploy/metricsbench/capture-effective-config.sh, which reads it from
+  # Mimir's /config (on main since pull request #3286, which this branch
+  # predates); which engine ANSWERED a given query (MQE, or the fallback)
+  # is not recorded by anything yet and is epic #2821 Wave 3 work.
   #
   # OTHER QUERY-PATH DEFAULTS 3.x FLIPPED (disclosed, left at default; from
   # 3.2.3's -help-all against 2.14.2's): query sharding is on
