@@ -1181,7 +1181,9 @@ mod tests {
         let [join] = joins.as_slice() else {
             panic!("expected one HashJoinExec: {joins:?}");
         };
-        let join = join.downcast_ref::<HashJoinExec>().expect("is a HashJoinExec");
+        let join = join
+            .downcast_ref::<HashJoinExec>()
+            .expect("is a HashJoinExec");
         assert_eq!(*join.partition_mode(), PartitionMode::Partitioned);
         // Each input is the subquery's renaming projection over its final
         // aggregate; the join is rebuilt directly on the aggregates, whose `k`
@@ -1268,13 +1270,14 @@ mod tests {
         assert_eq!(
             input_key_types(&join),
             [DataType::Utf8View, DataType::Utf8View],
-            "the join without a filter carries the views: {plan:?}"
+            "the join without a filter carries the views: {}",
+            show(&plan)
         );
         assert_eq!(join.schema().field(0).data_type(), &DataType::Utf8View);
         let restore = plan
             .downcast_ref::<ProjectionExec>()
             .expect("the restore projection is above the join");
-        assert!(Arc::ptr_eq(restore.input(), &join), "{plan:?}");
+        assert!(Arc::ptr_eq(restore.input(), &join), "{}", show(&plan));
         assert_eq!(plan.schema().field(0).data_type(), &dict_type());
 
         // `k = 'x'` on the left key, evaluated by the join itself.
@@ -1328,7 +1331,12 @@ mod tests {
             .data;
         let mut held = Vec::new();
         find(&probe, &|node| node.is::<FilterExec>(), &mut held);
-        assert_eq!(held.len(), 1, "the dynamic filter is held once: {probe:?}");
+        assert_eq!(
+            held.len(),
+            1,
+            "the dynamic filter is held once: {}",
+            show(&probe)
+        );
         let join = hash_join(&left, &probe, &on, None)
             .with_dynamic_filter_expr(dynamic)
             .expect("dynamic filter attaches");
@@ -1338,14 +1346,23 @@ mod tests {
 
     /// `join` does not carry: both its inputs hold the declared type, and it
     /// is the plan root, with no restore above it.
+    #[track_caller]
     fn assert_restored_below(plan: &Arc<dyn ExecutionPlan>, join: &Arc<dyn ExecutionPlan>) {
         assert_eq!(
             input_key_types(join),
             [dict_type(), dict_type()],
-            "the join carries the views: {plan:?}"
+            "the join carries the views: {}",
+            show(plan)
         );
-        assert!(Arc::ptr_eq(plan, join), "{plan:?}");
+        assert!(Arc::ptr_eq(plan, join), "{}", show(plan));
         assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+    }
+
+    /// `plan` as indented operator lines, for an assertion message.
+    fn show(plan: &Arc<dyn ExecutionPlan>) -> String {
+        datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string()
     }
 
     #[tokio::test]
