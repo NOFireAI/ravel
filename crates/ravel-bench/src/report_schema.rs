@@ -109,8 +109,8 @@ pub struct SupportedVersions {
 }
 
 impl SupportedVersions {
-    /// A window accepting exactly one version. The shape to return to once the
-    /// version-1 reader is retired.
+    /// A window accepting exactly one version. Unused while the legacy readers
+    /// remain; the shape once only the newest version is read.
     pub const fn single(version: u32) -> Self {
         Self {
             newest: version,
@@ -119,7 +119,8 @@ impl SupportedVersions {
     }
 
     /// The N/N-1 window: accept `newest` and the immediately preceding version.
-    /// The shape today, so a version-1 report (no `allocator` key) still parses.
+    /// Unused while [`SUPPORTED_VERSIONS`] spans versions 1 to 3; the shape
+    /// once the version-1 reader is retired.
     pub const fn n_and_prev(newest: u32) -> Self {
         // `newest` is always a real schema version (>= 1), so the predecessor
         // never underflows.
@@ -909,6 +910,36 @@ pub enum ValidationError {
         /// Its reason.
         reason: Option<RefusalReason>,
     },
+    /// An `error` row has no `error_class`, or another status has one.
+    #[error(
+        "case `{case}` has status `{}` with error_class {class:?}; a class is required on error \
+         and absent on every other status",
+        status.slug()
+    )]
+    ErrorClassMismatch {
+        /// The offending case.
+        case: String,
+        /// Its status.
+        status: ResultStatus,
+        /// Its class.
+        class: Option<String>,
+    },
+    /// `incomplete` is set on a status other than `partial` or `incorrect`, or
+    /// is clear on a `partial` row (decision 6's precedence rule).
+    #[error(
+        "case `{case}` has status `{}` with incomplete={incomplete}; incomplete is set on every \
+         partial row, may be set on incorrect, and is clear on every other status (ADR-0927 \
+         decision 6)",
+        status.slug()
+    )]
+    IncompleteMismatch {
+        /// The offending case.
+        case: String,
+        /// Its status.
+        status: ResultStatus,
+        /// Its flag.
+        incomplete: bool,
+    },
     /// A row's status is not [`row_status`] of its pass statuses.
     #[error(
         "case `{case}` reports status `{}` but its pass statuses give `{}` (the first non-ok \
@@ -1462,6 +1493,25 @@ fn validate_v3(report: &MetricsBenchReport) -> Result<(), ValidationError> {
                 reason: m.refusal_reason,
             });
         }
+        if (m.status == ResultStatus::Error) != m.error_class.is_some() {
+            return Err(ValidationError::ErrorClassMismatch {
+                case: r.case.clone(),
+                status: m.status,
+                class: m.error_class.clone(),
+            });
+        }
+        let incomplete_ok = match m.status {
+            ResultStatus::Partial => m.incomplete,
+            ResultStatus::Incorrect => true,
+            _ => !m.incomplete,
+        };
+        if !incomplete_ok {
+            return Err(ValidationError::IncompleteMismatch {
+                case: r.case.clone(),
+                status: m.status,
+                incomplete: m.incomplete,
+            });
+        }
         let expected_status = row_status(&m.pass_statuses);
         if m.status != expected_status {
             return Err(ValidationError::StatusAcrossPasses {
@@ -1697,7 +1747,7 @@ pub fn render(report: &MetricsBenchReport) -> Result<String, RenderError> {
     let mut out = String::new();
     render_header(&mut out, &report.provenance);
     if report.provenance.schema_version >= 3 {
-        render_v3(&mut out, report);
+        render_v3(&mut out, report, TIMED_FRACTION_BAND)?;
         return Ok(out);
     }
     render_legacy(out, report)
@@ -1752,8 +1802,14 @@ fn render_header(out: &mut String, p: &Provenance) {
 /// The version-3 body. Per engine, in the order `cases_expected` first names
 /// it: the denominators, then a count per status. Only after every engine's
 /// counts, the latency table over `ok` rows, with the per-query `rel_mad_pct`
-/// where the run had enough passes for one, then the pass exclusions.
-fn render_v3(out: &mut String, report: &MetricsBenchReport) {
+/// where the run had enough passes for one, then the pass exclusions, then
+/// each engine's per-class distribution and timed-fraction band (a band
+/// violation fails the render, as it does for older versions).
+fn render_v3(
+    out: &mut String,
+    report: &MetricsBenchReport,
+    band: Option<(f64, f64)>,
+) -> Result<(), RenderError> {
     let mut engines: Vec<Engine> = Vec::new();
     for c in &report.cases_expected {
         if !engines.contains(&c.engine) {
@@ -1832,6 +1888,77 @@ fn render_v3(out: &mut String, report: &MetricsBenchReport) {
     for e in &report.exclusions {
         let _ = writeln!(out, "  excluded pass {}: {}", e.pass, e.cause);
     }
+
+    for engine in &engines {
+        let rows: Vec<&Measurement> = report
+            .measurements
+            .iter()
+            .filter(|m| m.engine == Some(*engine))
+            .collect();
+        render_classes_and_band(out, engine_slug(*engine), &rows, band)?;
+    }
+    Ok(())
+}
+
+/// The per-class distribution and the pre-registered timed-fraction band over
+/// `rows`, which every report version prints after its per-query rows. Every
+/// class is listed, including the empty ones, so a class with no measurement
+/// is visible rather than dropped. A band that is not pre-registered is a loud
+/// SKIP, never a silent pass. `label` names the rows' scope ("" for the whole
+/// report, an engine for a version-3 report).
+fn render_classes_and_band(
+    out: &mut String,
+    label: &str,
+    rows: &[&Measurement],
+    band: Option<(f64, f64)>,
+) -> Result<(), RenderError> {
+    let scope = if label.is_empty() {
+        String::new()
+    } else {
+        format!(" [{label}]")
+    };
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "  measurements by cost class{scope} (timed = status ok):"
+    );
+    for class in CostClass::ALL {
+        let in_class = rows.iter().filter(|m| m.class == *class);
+        let measured = in_class.clone().count();
+        let timed = in_class.filter(|m| m.status.is_timed()).count();
+        let _ = writeln!(
+            out,
+            "    {:<22} {} measured, {} timed",
+            class.slug(),
+            measured,
+            timed
+        );
+    }
+
+    out.push('\n');
+    let total = rows.len();
+    let timed = rows.iter().filter(|m| m.status.is_timed()).count();
+    let timed_fraction = timed as f64 / total as f64;
+    match band {
+        None => {
+            let _ = writeln!(
+                out,
+                "  SKIP timed-fraction band{scope}: not pre-registered for this run (measured {timed}/{total} = {timed_fraction:.3})"
+            );
+        }
+        Some((lo, hi)) => {
+            let _ = writeln!(
+                out,
+                "  timed fraction{scope} {timed_fraction:.3} (band {lo:.3}..={hi:.3})"
+            );
+            if !(lo..=hi).contains(&timed_fraction) {
+                return Err(RenderError::BandViolation(format!(
+                    "timed fraction{scope} {timed_fraction:.3} outside band {lo:.3}..={hi:.3}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_legacy(mut out: String, report: &MetricsBenchReport) -> Result<String, RenderError> {
@@ -1864,57 +1991,10 @@ fn render_legacy(mut out: String, report: &MetricsBenchReport) -> Result<String,
         );
     }
 
-    // Per-class distribution, derived from the rows. Every class is listed,
-    // including the empty ones, so a class with no measurement is visible rather
-    // than dropped.
-    out.push('\n');
-    out.push_str("  measurements by cost class (timed = status ok):\n");
-    for class in CostClass::ALL {
-        let in_class: Vec<&Measurement> = report
-            .measurements
-            .iter()
-            .filter(|m| m.class == *class)
-            .collect();
-        let timed = in_class.iter().filter(|m| m.status.is_timed()).count();
-        let _ = writeln!(
-            out,
-            "    {:<22} {} measured, {} timed",
-            class.slug(),
-            in_class.len(),
-            timed
-        );
-    }
-
-    // Pre-registered bands. Integrity above already stood; a band is applied
-    // only now, and a band that is not pre-registered is a loud SKIP, never a
-    // silent pass.
-    out.push('\n');
-    let total = report.measurements.len();
-    let timed = report
-        .measurements
-        .iter()
-        .filter(|m| m.status.is_timed())
-        .count();
-    let timed_fraction = timed as f64 / total as f64;
-    match TIMED_FRACTION_BAND {
-        None => {
-            let _ = writeln!(
-                out,
-                "  SKIP timed-fraction band: not pre-registered for this run (measured {timed}/{total} = {timed_fraction:.3})"
-            );
-        }
-        Some((lo, hi)) => {
-            let _ = writeln!(
-                out,
-                "  timed fraction {timed_fraction:.3} (band {lo:.3}..={hi:.3})"
-            );
-            if !(lo..=hi).contains(&timed_fraction) {
-                return Err(RenderError::BandViolation(format!(
-                    "timed fraction {timed_fraction:.3} outside band {lo:.3}..={hi:.3}"
-                )));
-            }
-        }
-    }
+    let rows: Vec<&Measurement> = report.measurements.iter().collect();
+    render_classes_and_band(&mut out, "", &rows, TIMED_FRACTION_BAND)?;
+    let total = rows.len();
+    let timed = rows.iter().filter(|m| m.status.is_timed()).count();
 
     // The geometric mean is a summary and never a replacement: it is printed
     // last, after the per-query rows it derives from, and only when the producer
@@ -3294,6 +3374,89 @@ mod tests {
         );
     }
 
+    /// `error_class` is required on `error` and absent elsewhere.
+    #[test]
+    fn an_error_class_on_a_non_error_row_or_missing_on_an_error_row_fails() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Prometheus, "mb_a").error_class = Some("http_500".to_string());
+        assert!(
+            matches!(
+                validate(&report),
+                Err(ValidationError::ErrorClassMismatch {
+                    status: ResultStatus::Ok,
+                    ..
+                })
+            ),
+            "{:?}",
+            validate(&report)
+        );
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Mimir, "mb_b").error_class = None;
+        assert!(
+            matches!(
+                validate(&report),
+                Err(ValidationError::ErrorClassMismatch {
+                    status: ResultStatus::Error,
+                    class: None,
+                    ..
+                })
+            ),
+            "{:?}",
+            validate(&report)
+        );
+    }
+
+    /// `incomplete` is set on every `partial` row and clear on statuses other
+    /// than `partial` and `incorrect`.
+    #[test]
+    fn incomplete_must_agree_with_the_status() {
+        let mut report = v3_report();
+        row_mut(&mut report, Engine::Prometheus, "mb_a").incomplete = true;
+        assert!(
+            matches!(
+                validate(&report),
+                Err(ValidationError::IncompleteMismatch {
+                    status: ResultStatus::Ok,
+                    incomplete: true,
+                    ..
+                })
+            ),
+            "{:?}",
+            validate(&report)
+        );
+    }
+
+    /// The timed-fraction band applies to a version-3 report, per engine.
+    ///
+    /// To watch it fail: make `render_v3` skip the per-engine
+    /// `render_classes_and_band` loop, as it did before.
+    #[test]
+    fn a_v3_render_applies_the_timed_fraction_band_per_engine() {
+        let report = v3_report();
+        let mut out = String::new();
+        let err = render_v3(&mut out, &report, Some((0.99, 1.0)))
+            .expect_err("an engine below the band must fail the render");
+        assert!(matches!(err, RenderError::BandViolation(_)), "{err:?}");
+        let mut out = String::new();
+        render_v3(&mut out, &report, None).expect("no band registered");
+        for engine in ENGINES {
+            assert!(
+                out.contains(&format!(
+                    "SKIP timed-fraction band [{}]",
+                    engine_slug(engine)
+                )),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!(
+                    "measurements by cost class [{}]",
+                    engine_slug(engine)
+                )),
+                "{out}"
+            );
+        }
+    }
+
     /// Distinguishing: the first non-ok pass, not the best and not the last.
     ///
     /// To watch it fail: make `row_status` return the last element
@@ -3559,7 +3722,11 @@ mod tests {
             "{out}"
         );
         assert!(out.find("refused 1").expect("status counts") < latency);
-        let table = &out[latency..];
+        let classes = out
+            .find("measurements by cost class [")
+            .expect("per-engine class distribution after the latency table");
+        assert!(latency < classes, "{out}");
+        let table = &out[latency..classes];
         assert_eq!(table.matches(" | mb_").count(), 5, "{table}");
         assert!(!table.contains("mimir"), "{table}");
         assert!(
