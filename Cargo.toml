@@ -150,6 +150,8 @@ flate2 = "1"
 # query
 promql-parser = "0.10"
 regex = "1"
+# Substring search for the logs scan's contains arm (ravel-logseg).
+memchr = "2.8.3"
 
 # serde for control-plane/config docs only (never for on-object formats)
 serde = { version = "1", features = ["derive"] }

@@ -33,6 +33,7 @@ crc32c = { workspace = true }
 blake3 = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }
+memchr = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -64,6 +65,10 @@ harness = false
 
 [[bench]]
 name = "wide_gather"
+harness = false
+
+[[bench]]
+name = "contains_kernel"
 harness = false
 
 # Not a criterion target: it times the pre- and post-#1135 stamp itself so it
