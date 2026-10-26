@@ -112,8 +112,15 @@ jobs:
           # (ADR-0927 bands 4/5), so a malformed report can never be produced
           # by a green run -- success here is the exit code, never an
           # output keyword.
+          #
+          # The anchor is fixed and on the 15 s scrape grid: the nightly
+          # replays the same frozen window every night, so its stream digest
+          # is comparable night to night. A window this old is fine here
+          # because ravel-server's ingest-lag admission does not apply to the
+          # in-process diagnostic path this bin writes through.
           ./target/release/metricsbench_ingest \
             --profile ci \
+            --anchor-ms 1760000010000 \
             --store s3 \
             > metricsbench-rustfs-report.json
       - name: Report-schema gate rejects a malformed report (fail-closed)
