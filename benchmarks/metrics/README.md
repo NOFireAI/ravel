@@ -95,9 +95,10 @@ never mistakes a non-comparable or unbilled run for a publishable result.
 
 `profile`:
 - `name`: the `--profile` name.
-- `comparable`: whether these figures may be published. Forced `false` when
-  `steps_run` is less than `steps_declared`, regardless of the profile's own
-  verdict.
+- `comparable`: whether these figures may be published. True only when the
+  profile itself is publishable, `steps_run` equals `steps_declared`, and the
+  recorded `stream_digest` equals the digest the bin regenerates from the
+  manifest and the anchor; any one failing forces `false`.
 - `comparability_reason`: why not, present only when `comparable` is `false`.
 - `active_series`: series alive at any one instant, as declared.
 - `steps_run`: steps this run actually generated.
@@ -118,8 +119,9 @@ never mistakes a non-comparable or unbilled run for a publishable result.
   `steps`, `total_series_created`, `logical_input_bytes`,
   `total_samples_generated`, `scaling_label_cardinality` (distinct
   scaling-label values this run actually emitted), all the generator's exact
-  counts for this run; plus `anchor_ms`, the first step's timestamp, and
-  `anchor_source`, `explicit` or `clock` (see below).
+  counts for this run; plus `anchor_ms`, the first step's timestamp (see
+  below), and the provenance fields `workload_version`, `workload_digest`,
+  `seed` and `stream_digest` described under "Stream accounting".
 
 ### Anchor (`--anchor-ms`)
 
