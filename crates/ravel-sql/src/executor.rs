@@ -149,9 +149,7 @@ use crate::audit_provider::AuditTableProvider;
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
-use crate::declared::{
-    DeclaredColumn, DeclaredColumnSource, DeclaredType, default_declared_source,
-};
+use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
 use crate::error::SqlError;
 use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
@@ -4468,8 +4466,9 @@ impl SqlExecutor {
     /// A kept load returns the [`ColumnStatsRequest`] it carries: the union
     /// of every admitted aggregate's request, so a part's dictionaries are
     /// fetched only for the columns a q02 or q08 shape reads. With no plan
-    /// to judge, every non-`Str` declared column's dictionary is requested,
-    /// since either consumer may read any of them.
+    /// to judge, the request is summary-only: the q02 and q08 consumers check
+    /// `dictionary_loaded` and decline on a missing dictionary, so the
+    /// summaries alone can never answer them wrongly.
     fn logs_column_stats_eligible(
         &self,
         snapshot: &Snapshot,
@@ -4491,14 +4490,7 @@ impl SqlExecutor {
         // one analyzed plan with the exact-typed classification rather than
         // building a second throwaway session for the same SQL.
         let Some(plan) = analyzed else {
-            let mut request = ColumnStatsRequest::summary_only();
-            for column in declared
-                .iter()
-                .filter(|column| !matches!(column.ty, DeclaredType::Str))
-            {
-                request.add_dictionary(column.key.as_str());
-            }
-            return Some(request);
+            return Some(ColumnStatsRequest::summary_only());
         };
         let request = plan_stats_answerable_request(plan, declared)?;
         if several_tables {
@@ -7895,6 +7887,38 @@ pub(crate) mod tests {
             None,
             "a <> on a Str column is refused"
         );
+    }
+
+    /// Issue #3244: with no analyzed plan to judge, the load is kept but asks
+    /// for no dictionary. The q02 and q08 consumers in `logs_scan` check
+    /// `dictionary_loaded` and decline, so a summary-only load cannot answer
+    /// them wrongly, and nothing is fetched that no shape was shown to read.
+    ///
+    /// FLIP: restore the loop that added every non-`Str` declared column's
+    /// dictionary to the no-plan request; the request then names `code` and
+    /// `status` and the `dictionary_columns` assertion fails.
+    #[tokio::test]
+    async fn a_load_with_no_plan_requests_summaries_only() {
+        let exec = eviction_test_executor();
+        let declared = [
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("code", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        let request = exec
+            .logs_column_stats_eligible(&snapshot, None, &declared, false)
+            .expect("no plan keeps the load");
+        assert_eq!(
+            request.dictionary_columns().collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert!(request.is_summary_only());
     }
 
     /// ADR-0094 decision 1: the classifier admits exactly the exact-typed

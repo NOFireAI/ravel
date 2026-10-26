@@ -2733,6 +2733,10 @@ pub struct CatalogCountersSnapshot {
     /// Column-statistics objects HEAD referenced that the reader refused to
     /// decode ([`ravel_catalog::Catalog::column_stats_decode_refusals`]).
     pub column_stats_decode_refusals: u64,
+    /// Column-statistics part loads the memory budget refused, each part
+    /// left uncovered for its query
+    /// ([`ravel_catalog::Catalog::column_stats_budget_skips`]).
+    pub column_stats_budget_skips: u64,
     /// Column-statistics decode jobs that panicked on the read CPU gate
     /// ([`ravel_catalog::Catalog::column_stats_decode_panics`]).
     pub column_stats_decode_panics: u64,
@@ -2771,6 +2775,7 @@ impl Default for CatalogCountersSnapshot {
             compaction_input_set_conflicts: 0,
             isolation_breaches: 0,
             column_stats_decode_refusals: 0,
+            column_stats_budget_skips: 0,
             column_stats_decode_panics: 0,
             column_stats_cache_refusals: 0,
             column_stats_cache_evictions: 0,
@@ -2795,6 +2800,7 @@ impl CatalogCountersSnapshot {
             compaction_input_set_conflicts: catalog.compaction_input_set_conflicts(),
             isolation_breaches: catalog.isolation_breaches(),
             column_stats_decode_refusals: catalog.column_stats_decode_refusals(),
+            column_stats_budget_skips: catalog.column_stats_budget_skips(),
             column_stats_decode_panics: catalog.column_stats_decode_panics(),
             column_stats_cache_refusals: catalog.column_stats_cache_refusals(),
             column_stats_cache_evictions: catalog.column_stats_cache_evictions(),
@@ -2882,6 +2888,19 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_column_stats_decode_refusals_total",
         &[Label::Mode(mode)],
         snapshot.column_stats_decode_refusals,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_budget_skips_total",
+        "Column-statistics part loads the process memory budget refused; the part is left uncovered and the query falls back to reading the data.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_budget_skips_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_budget_skips,
     );
 
     write_header(
@@ -11602,12 +11621,14 @@ mod tests {
         );
     }
 
-    /// The two column-statistics decode counters render under their own
-    /// names, each with its own value, in a mode that runs no fold.
+    /// The column-statistics decode refusal, budget skip and panic counters
+    /// render under their own names, each with its own value, in a mode that
+    /// runs no fold.
     #[test]
     fn column_stats_decode_counters_render_at_metrics() {
         let catalog = CatalogCountersSnapshot {
             column_stats_decode_refusals: 6,
+            column_stats_budget_skips: 1,
             column_stats_decode_panics: 7,
             ..Default::default()
         };
@@ -11649,6 +11670,8 @@ mod tests {
         for expected in [
             "# TYPE ravel_catalog_column_stats_decode_refusals_total counter",
             "ravel_catalog_column_stats_decode_refusals_total{mode=\"gateway\"} 6",
+            "# TYPE ravel_catalog_column_stats_budget_skips_total counter",
+            "ravel_catalog_column_stats_budget_skips_total{mode=\"gateway\"} 1",
             "# TYPE ravel_catalog_column_stats_decode_panics_total counter",
             "ravel_catalog_column_stats_decode_panics_total{mode=\"gateway\"} 7",
         ] {
@@ -12458,6 +12481,57 @@ mod tests {
             after.column_stats_decoded_bytes, 0,
             "an object the reader refused to decode adds no decoded bytes"
         );
+    }
+
+    /// Issue #3244: a column-statistics load the memory budget refuses is
+    /// read off the live `Catalog` as a budget skip, not as a decode refusal.
+    /// Under a zero budget a real `.cstat` cannot reserve its one segment, so
+    /// the load leaves the part uncovered and the snapshot reads 1 and 0.
+    ///
+    /// Prove-the-test: read `column_stats_decode_refusals()` into
+    /// `column_stats_budget_skips` in `from_catalog` and the skip count reads
+    /// 0 against the expected 1.
+    #[tokio::test]
+    async fn column_stats_budget_skips_read_the_live_catalog() {
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::accounting::QueryAccounting;
+        use ravel_types::{TenantId, TimeRange};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let tenant = TenantId::new("column-stats-budget-skip").hash();
+        let store = std::sync::Arc::new(MemoryStore::new());
+        install_real_column_stats(&store, tenant).await;
+        let budget = std::sync::Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(std::sync::Arc::clone(&store) as _, CatalogConfig::default())
+            .expect("catalog")
+            .with_memory_budget(std::sync::Arc::clone(&budget));
+        assert_eq!(
+            CatalogCountersSnapshot::from_catalog(&catalog).column_stats_budget_skips,
+            0
+        );
+
+        let loaded = catalog
+            .load_column_stats(
+                &tenant,
+                Signal::Logs,
+                TimeRange {
+                    start_ns: 0,
+                    end_ns: 50 * NS_PER_HOUR,
+                },
+                50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("a refused reservation degrades rather than failing the load");
+        assert!(loaded.is_none(), "the refused part is left uncovered");
+
+        let after = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(after.column_stats_budget_skips, 1);
+        assert_eq!(after.column_stats_decode_refusals, 0);
+        assert_eq!(after.column_stats_decoded_bytes, 0);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// Write a folded `Signal::Logs` HEAD for `tenant` whose one part points

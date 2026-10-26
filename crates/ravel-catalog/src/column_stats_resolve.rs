@@ -46,7 +46,11 @@
 //! (rather than folding it into a bare miss) for the caller to log once and
 //! count (issue #1400). A read CPU gate job that failed takes the same
 //! variant but says nothing about the bytes; the caller accounts for it
-//! separately (`Catalog::note_column_stats_decode_failure`). A GET failure on either the HEAD or a resolved stats
+//! separately (`Catalog::note_column_stats_decode_failure`). A memory budget
+//! refusal of the decode's reservation is not a fault in the object either:
+//! it surfaces as [`FetchOutcome::BudgetRefused`], every reservation the
+//! decode took already released, and the caller leaves that part uncovered
+//! and counts it (issue #3244). A GET failure on either the HEAD or a resolved stats
 //! object degrades like a miss when [`StoreError::is_retryable`] reports it
 //! throttling, a timeout, or otherwise transient: the artifact is optional
 //! and the query is correct without it, so a blip is not worth failing a
@@ -443,13 +447,14 @@ pub(crate) struct ResolvedStatsHead {
 }
 
 /// Outcome of [`fetch_stats_object`]: an object the reader decoded, or one of
-/// the two degrade-to-miss kinds the caller must tell apart. A store read
+/// the three degrade-to-miss kinds the caller must tell apart. A store read
 /// that fails with `NotFound` or retryably, and a stale binding, are
 /// legitimately "no statistics" ([`Self::Absent`]); a DECODE failure on the
 /// object HEAD (or a covered part) points at is not ([`Self::DecodeRefused`])
 /// and the caller logs and counts it (issue #1400), apart from a failed gate
 /// job, which `Catalog::note_column_stats_decode_failure` keeps out of the
-/// refusal accounting.
+/// refusal accounting; and a memory budget refusal says nothing about the
+/// object ([`Self::BudgetRefused`]).
 pub(crate) enum FetchOutcome {
     /// Fetched, hash-verified, tenant-checked, part-bound, and decoded, with
     /// the reservations charging the kept segments (ADR-1702 decision 6), one
@@ -472,6 +477,11 @@ pub(crate) enum FetchOutcome {
     /// the cause and, for [`SnapshotFormatError::ColumnStatsDecompressedTooLarge`],
     /// the declared and cap bytes.
     DecodeRefused(SnapshotFormatError),
+    /// The memory budget refused a reservation the decode needed (ADR-1702
+    /// decision 6): the over-ceiling charge, a segment's working charge, or
+    /// its kept bytes. Every reservation the decode had taken is released
+    /// before this is returned. The object itself was not judged.
+    BudgetRefused(ravel_memory::MemoryExhausted),
 }
 
 /// One fetched-and-decoded object's records, split by keying scheme, holding
@@ -522,11 +532,6 @@ pub enum LoadColumnStatsError {
         #[source]
         source: StoreError,
     },
-    /// The process memory budget refused the reservation for a stats object's
-    /// declared uncompressed body (ADR-1702 decision 6). Carries only the
-    /// budget's figures and the class that refused.
-    #[error("column-stats decode refused: {0}")]
-    MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
 }
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
@@ -608,8 +613,10 @@ pub(crate) fn resolve_part_stats_ref(part: &SnapshotPartRef) -> Option<ResolvedS
 /// and part binding.
 ///
 /// The decode streams one segment at a time and keeps only the dictionaries
-/// `keep` holds, so the memory it reserves peaks at the largest segment's
-/// encoded length plus the bytes kept, rather than the declared body up front.
+/// `keep` holds, so the memory it reserves peaks at one segment's encoded
+/// length plus the bytes kept. When every dictionary is kept, that is up to
+/// one segment more than the declared body. A refused reservation returns
+/// [`FetchOutcome::BudgetRefused`] with nothing left reserved.
 ///
 /// A record's `writer_id` selects which map it lands in: 16 bytes is the
 /// retired v1 `EntryIdentity` tuple (never produced anymore), 32 bytes is a
@@ -708,7 +715,10 @@ pub(crate) async fn fetch_stats_object(
     let declared = header.body_uncompressed_len;
     let ceiling = limits.max_column_stats_bytes;
     let over_ceiling = if declared > ceiling {
-        Some(reserver.reserve_decoded(declared, ceiling)?)
+        match reserver.reserve_decoded(declared, ceiling) {
+            Ok(reservation) => Some(reservation),
+            Err(refusal) => return Ok(FetchOutcome::BudgetRefused(refusal)),
+        }
     } else {
         None
     };
@@ -719,6 +729,8 @@ pub(crate) async fn fetch_stats_object(
         kept: Vec::new(),
     };
     let keep = keep.clone();
+    // On any error the closure returns without handing `meter` back, so its
+    // working and kept reservations are released when the closure ends.
     let decoded = run_snapshot_decode(gate, ReadSite::CatalogColumnStats, declared, move || {
         let holds = |name: &str| keep.holds(name);
         match decode_column_stats_streamed(&data, &limits, &holds, &mut meter) {
@@ -731,7 +743,7 @@ pub(crate) async fn fetch_stats_object(
     drop(over_ceiling);
     let (decoded, reservations) = match decoded {
         Ok(Ok(decoded)) => decoded,
-        Ok(Err(refusal)) => return Err(refusal.into()),
+        Ok(Err(refusal)) => return Ok(FetchOutcome::BudgetRefused(refusal)),
         // Decode of an object the ref points at: the fold wrote it, so a
         // failure to open it is never the ordinary not-covered case. Surface
         // it for the caller to log once and count (issue #1400), or, for a
@@ -1169,5 +1181,82 @@ mod tests {
             .sum();
         assert_eq!(decoded_len, kept);
         assert_eq!(decoded.by_content_hash.len(), WIDE_SEGMENTS);
+    }
+
+    /// Issue #3244: a budget that fits the first segment's working charge and
+    /// kept bytes but not the second segment's working charge refuses the
+    /// fetch mid-stream. The outcome is `BudgetRefused` carrying that second
+    /// charge, and the first segment's kept reservation is released with the
+    /// meter: the budget returns exactly to the foreign holder's figure.
+    ///
+    /// FLIP: `std::mem::forget(meter)` on the memory-refusal arm of the decode
+    /// closure in `fetch_stats_object` and the final `reserved` reads
+    /// `holder + kept` against `holder`; restore `return Err(refusal.into())`
+    /// for that arm and the `expect` panics on the propagated error.
+    #[tokio::test]
+    async fn a_refusal_mid_stream_releases_every_reservation_taken() {
+        let mut small = wide_segment(0);
+        small.columns[0].dictionary.truncate(4);
+        small.columns[0].non_null_count = 4;
+        small.columns[0].max = small.columns[0].dictionary[3].value.clone();
+        let big = wide_segment(1);
+        let small_len = small.encoded_len() as u64;
+        let big_len = big.encoded_len() as u64;
+        assert!(small_len < big_len, "{small_len} vs {big_len}");
+        let mut stripped = small.clone();
+        stripped.columns[0].dictionary.clear();
+        let small_kept = stripped.encoded_len() as u64;
+
+        let part_blake3 = [0x22; 32];
+        let tenant = TenantHash([0x11; 16]);
+        let bytes = crate::snapshot_format::encode_column_stats_v3(
+            tenant.0,
+            1,
+            part_blake3,
+            &[small, big],
+            u64::MAX,
+        )
+        .expect("distinct ascending segments encode");
+
+        let holder_bytes = 1000;
+        let limit = holder_bytes + small_len + small_kept;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let holder = budget.reserve(holder_bytes).expect("the holder fits");
+        let reserver = HighWaterReserver {
+            budget: Arc::clone(&budget),
+            high_water: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let resolved = ResolvedStatsRef {
+            key: "stats.cstat".to_string(),
+            blake3: *blake3::hash(&bytes).as_bytes(),
+            expected_part_blake3: vec![part_blake3],
+            expected_version: 3,
+        };
+        let outcome = fetch_stats_object(
+            &OneObject(bytes::Bytes::from(bytes)),
+            &tenant,
+            &resolved,
+            &HeldDictionaries::Columns(BTreeSet::new()),
+            &reserver,
+            None,
+        )
+        .await
+        .expect("a budget refusal is an outcome, not an error");
+        let FetchOutcome::BudgetRefused(refusal) = outcome else {
+            panic!("the second segment's working charge is refused");
+        };
+        assert_eq!(refusal.requested, big_len);
+        assert_eq!(refusal.reserved, holder_bytes + small_kept);
+        assert_eq!(refusal.limit, limit);
+        assert_eq!(
+            reserver
+                .high_water
+                .load(std::sync::atomic::Ordering::SeqCst),
+            limit,
+            "the first segment's working and kept charges were both held"
+        );
+        assert_eq!(budget.reserved(), holder_bytes);
+        drop(holder);
+        assert_eq!(budget.reserved(), 0);
     }
 }

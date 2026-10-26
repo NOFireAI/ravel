@@ -606,19 +606,16 @@ impl SqlError {
             // ahead of the generic `Catalog(_)` arm so it does not collapse
             // into the transient-unavailable redaction.
             SqlError::Catalog(CatalogError::WindowTooWide { .. }) => ErrorClass::Unsupported,
-            // A memory-budget refusal on the fetch path or on a catalog or
-            // column-statistics decode is a budget refusal of a well-formed
-            // request, the same class as the SQL memory pool's own
-            // `ResourcesExhausted` (422), not a storage fault (503): ADR-2633
-            // decision 3, superseding ADR-1170's 503 for these. Handled ahead
-            // of the generic arms below for the same reason `WindowTooWide` is.
+            // A memory-budget refusal on the fetch path or on a catalog
+            // decode is a budget refusal of a well-formed request, the same
+            // class as the SQL memory pool's own `ResourcesExhausted` (422),
+            // not a storage fault (503): ADR-2633 decision 3, superseding
+            // ADR-1170's 503 for these. Handled ahead of the generic arms
+            // below for the same reason `WindowTooWide` is.
             SqlError::Fetch(FetchError::FetchMemoryExhausted { .. })
             | SqlError::LogFetch(LogFetchError::FetchMemoryExhausted { .. })
             | SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted { .. })
-            | SqlError::Catalog(CatalogError::MemoryExhausted(_))
-            | SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(_)) => {
-                ErrorClass::Unsupported
-            }
+            | SqlError::Catalog(CatalogError::MemoryExhausted(_)) => ErrorClass::Unsupported,
             // An object outside this build's reader window (ADR-2708 D5a): the
             // same 422 the PromQL surface answers, ahead of the generic fetch
             // arm so it does not collapse into the transient class.
@@ -690,10 +687,9 @@ impl SqlError {
             // gate), never an object key or tenant identity, and the class is
             // what the caller needs to see (ADR-2633 section 5). The same
             // treatment as the budget errors below, on every path a refusal
-            // reaches this surface by: a catalog or column-statistics decode
-            // charge, and a metrics, log or span fetch reservation.
+            // reaches this surface by: a catalog decode charge, and a
+            // metrics, log or span fetch reservation.
             SqlError::Catalog(CatalogError::MemoryExhausted(_))
-            | SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(_))
             | SqlError::Fetch(FetchError::FetchMemoryExhausted { .. })
             | SqlError::LogFetch(LogFetchError::FetchMemoryExhausted { .. })
             | SqlError::SpanFetch(SpanFetchError::FetchMemoryExhausted { .. }) => {
@@ -1084,7 +1080,7 @@ mod tests {
     }
 
     /// ADR-2633 section 5: every memory-budget refusal this surface answers
-    /// (a column-statistics or catalog decode charge, ADR-1702 decision 6; a
+    /// (a catalog decode charge, ADR-1702 decision 6; a
     /// metrics, log or span fetch reservation, ADR-1170 decision 2) is a
     /// budget refusal of a well-formed request, the 422 class the SQL memory
     /// pool's own refusal takes, with a message that is the budget's own
@@ -1128,10 +1124,6 @@ mod tests {
                 cause,
             } = refusal;
             let cases = [
-                (
-                    SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(refusal)),
-                    format!("column statistics load failed: column-stats decode refused: {text}"),
-                ),
                 (
                     SqlError::Catalog(CatalogError::MemoryExhausted(refusal)),
                     format!("snapshot resolution failed: catalog decode refused: {text}"),
