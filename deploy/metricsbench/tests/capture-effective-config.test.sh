@@ -378,6 +378,7 @@ METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_k2}" \
 expect_exit "k --no-ravel" 0 "${code}"
 check "k --no-ravel fields" "${out_k2}" <<EOF
 d["comparators"]["ravel"] == {"skipped": "--no-ravel"}
+("ravel" in d["urls_queried"]) == False
 d["comparators"]["mimir"]["revision"] == "mimirrev214"
 EOF
 out_k3="${TMP}/k3.json"

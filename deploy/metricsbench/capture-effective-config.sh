@@ -58,7 +58,8 @@
 #                    no image), so the ravel-server container is found.
 #
 # A field that could not be fetched is {"unavailable": "<reason>"}; no field is
-# omitted or left empty. The document also records captured_at (UTC ISO 8601),
+# omitted or left empty, except under --no-ravel, where Ravel's entry is
+# {"skipped": "--no-ravel"} alone. The document also records captured_at (UTC ISO 8601),
 # script_revision (git HEAD of this checkout) and every URL queried.
 #
 # Exit codes:
@@ -433,6 +434,8 @@ urls = {
         "buildinfo": f"{ravel_url}/api/v1/status/buildinfo",
     },
 }
+if skip_ravel:
+    del urls["ravel"]
 
 doc = {
     "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
