@@ -74,8 +74,8 @@ use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::skip_index::{Level0Entry, NumArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
-    AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError,
-    LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
+    AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, FilterSectionReads,
+    LogRecord, LogSegError, LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
     SuffixOutcome, decode_section_accounted, open_from_suffix, read_section_accounted_from,
 };
 use ravel_object_store::get_latency::InGetPhase;
@@ -2632,6 +2632,18 @@ impl LogSegmentFetcher {
     /// publish a survivor count the scan does not stripe, so a future field must
     /// be a build break rather than a silent gap.
     fn plan_skip_decidable(query: &LogQuery) -> bool {
+        !query.prune.is_empty() && Self::prune_is_skip_step(query)
+    }
+
+    /// Whether the reader's prune for `query` is its skip step alone: no
+    /// content arm, no stream-attribute arm, and no prune arm other than
+    /// `NumRange` or `NumNotEq`, so `candidate_blocks` over the decoded
+    /// directories names the reader's survivors.
+    ///
+    /// This is not "the scan reads no filter section"
+    /// ([`FilterSections::for_query`]): a stream-attribute arm reads neither
+    /// BLOOM nor POSTINGS and still narrows the survivors through STREAM_DIR.
+    fn prune_is_skip_step(query: &LogQuery) -> bool {
         let LogQuery {
             ts_min_ns: _,
             ts_max_ns: _,
@@ -2645,7 +2657,6 @@ impl LogSegmentFetcher {
         } = query;
         content.is_empty()
             && stream_attrs.is_empty()
-            && !prune.is_empty()
             && prune
                 .iter()
                 .all(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }))
@@ -4499,29 +4510,31 @@ struct OwnedBlocks<'a> {
     dirs: Option<&'a SegmentDirectories>,
 }
 
-/// Whether the scan over a ranged read can read BLOOM or POSTINGS, so the
-/// read has to place them.
+/// Which of BLOOM and POSTINGS the scan over a ranged read can read, so the
+/// read has to place them: the reader's own [`FilterSectionReads`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FilterSections {
-    /// The scan can read either section.
-    Place,
-    /// The query carries no content arm, no stream-attribute arm and no
-    /// prune arm other than `NumRange` or `NumNotEq`, so
-    /// `RlogReader::scan_blocks` reads neither section.
-    Skip,
-}
+struct FilterSections(FilterSectionReads);
 
 impl FilterSections {
-    /// The rule `fetch_keyed_plan`'s `skip_decidable` uses too.
+    /// Both sections, for a read whose predicate is not known here.
+    const ALL: Self = FilterSections(FilterSectionReads {
+        bloom: true,
+        postings: true,
+    });
+
+    /// The sections `RlogReader::scan_blocks` can read for `query`'s
+    /// `combined_predicate_with_streams` and prune channel.
     ///
     /// Destructures `LogQuery` by name for the reason
     /// [`LogQuery::is_block_predicate_free`] does: a field the reader could
-    /// answer from BLOOM or POSTINGS must be a build break here, not a `Skip`.
+    /// answer from BLOOM or POSTINGS must be a build break here, not a skip.
     fn for_query(query: &LogQuery) -> Self {
         let LogQuery {
             ts_min_ns: _,
             ts_max_ns: _,
-            stream_attrs,
+            // Resolved through STREAM_DIR into a `StreamIn` arm, which reads
+            // neither section.
+            stream_attrs: _,
             content,
             prune,
             // Erasure filters decoded rows; the reader never answers it from
@@ -4531,21 +4544,24 @@ impl FilterSections {
             // or POSTINGS.
             key_equals: _,
         } = query;
-        let reads_none = content.is_empty()
-            && stream_attrs.is_empty()
-            && prune
-                .iter()
-                .all(|p| matches!(p, Predicate::NumRange { .. } | Predicate::NumNotEq { .. }));
-        if reads_none {
-            FilterSections::Skip
-        } else {
-            FilterSections::Place
-        }
+        FilterSections(FilterSectionReads::for_scan(content, prune))
     }
 
     /// Whether a section of kind `k` is one this value leaves unplaced.
     fn skips(self, k: u32) -> bool {
-        self == FilterSections::Skip && matches!(k, kind::BLOOM | kind::POSTINGS)
+        match k {
+            kind::BLOOM => !self.0.bloom,
+            kind::POSTINGS => !self.0.postings,
+            _ => false,
+        }
+    }
+
+    /// The filter section kinds this value places.
+    fn placed(self) -> Vec<u32> {
+        [kind::BLOOM, kind::POSTINGS]
+            .into_iter()
+            .filter(|&k| !self.skips(k))
+            .collect()
     }
 }
 
@@ -6257,7 +6273,8 @@ impl BlockRangeFetcher {
     /// directories, so a subset open dealt any of them sees the same list:
     /// `candidate_blocks` for a skip-decidable shape, otherwise
     /// [`RlogReader::scan_blocks`] over a sparse object holding the tail
-    /// sections (BLOOM and POSTINGS included), with no BLOCKS byte read.
+    /// sections, of BLOOM and POSTINGS only those [`FilterSections::for_query`]
+    /// places, with no BLOCKS byte read.
     ///
     /// That `scan_blocks` prune runs on the read gate as one `log_postings`
     /// job (ADR-1702 decision 4), as the scan open of the unkeyed route does,
@@ -6301,20 +6318,18 @@ impl BlockRangeFetcher {
 
         // `plan_skip_decidable` without its at-least-one-arm rule, which is a
         // cost choice: with no content, stream or POSTINGS arm the reader's
-        // prune is its skip step, an empty prune list included.
-        let skip_decidable = FilterSections::for_query(query) == FilterSections::Skip;
-        let extra_tail: &[u32] = if skip_decidable {
-            &[]
-        } else {
-            &[kind::BLOOM, kind::POSTINGS]
-        };
+        // prune is its skip step, an empty prune list included. Otherwise the
+        // reader's prune runs over the filter sections it reads for `query`,
+        // which are the ones placed here; a skip-decidable query reads none.
+        let skip_decidable = LogSegmentFetcher::prune_is_skip_step(query);
+        let extra_tail = FilterSections::for_query(query).placed();
         let (dirs, sparse) = self
             .plan_directories_after_probe(
                 seg_ref,
                 tenant_hash,
                 &footer,
                 resident,
-                extra_tail,
+                &extra_tail,
                 &pin,
                 accounting,
                 &mut stats,
@@ -6749,7 +6764,7 @@ impl BlockRangeFetcher {
             phases,
             None,
             None,
-            FilterSections::Place,
+            FilterSections::ALL,
             accounting,
         )
         .await
@@ -15392,7 +15407,7 @@ mod owned_block_plan_tests {
                 ReadPhases::SCAN,
                 owned,
                 None,
-                FilterSections::Place,
+                FilterSections::ALL,
                 &QueryAccounting::new(),
             )
             .await
@@ -15701,7 +15716,7 @@ mod owned_block_plan_tests {
                 ReadPhases::SCAN,
                 owned,
                 None,
-                FilterSections::Place,
+                FilterSections::ALL,
                 &QueryAccounting::new(),
             )
             .await
@@ -15924,7 +15939,7 @@ mod owned_block_plan_tests {
                     dirs: None,
                 }),
                 None,
-                FilterSections::Place,
+                FilterSections::ALL,
                 &QueryAccounting::new(),
             )
             .await
