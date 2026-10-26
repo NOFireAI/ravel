@@ -793,7 +793,8 @@ counted in `Catalog::column_stats_budget_skips` and not as a refused decode.
 When the column-statistics cache holds an entry for the part but a refetch
 for a dictionary it lacks finds the object absent, fails to decode or is
 refused by the budget, the cached entry is served instead. The query scans a
-part left with no loaded statistics, exactly as if no statistics existed for that part. There
+part left with no loaded statistics, exactly as if no statistics existed for
+that part. There
 is no whole-tenant fallback and no declared-entry-count coverage comparison to decide whether one is needed --
 per-part coverage is decided per part, from that part's own field-7 ref
 alone.
