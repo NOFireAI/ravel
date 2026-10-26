@@ -577,6 +577,9 @@ pub struct Catalog {
     /// not it logged, so a metric can show the condition persisting after the
     /// single WARN. Surfaced by [`Catalog::column_stats_decode_refusals`].
     column_stats_decode_refusals: AtomicU64,
+    /// Cumulative count of column-stats part loads the memory budget refused
+    /// (issue #3244). Surfaced by [`Catalog::column_stats_budget_skips`].
+    column_stats_budget_skips: AtomicU64,
     /// `(tenant, signal, object key)` triples whose column-stats decode job
     /// has already panicked on the read CPU gate and been logged (issue
     /// #2402). The same bytes panic again on every eligible query, so the WARN
@@ -807,6 +810,7 @@ impl Catalog {
             column_stats_cache,
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
+            column_stats_budget_skips: AtomicU64::new(0),
             warned_decode_panics: Mutex::new(HashSet::new()),
             column_stats_decode_panics: AtomicU64::new(0),
             column_stats_decoded_bytes: AtomicU64::new(0),
@@ -834,8 +838,9 @@ impl Catalog {
     /// [`ravel_memory::MemoryBudget`] (ADR-1702 decision 6), the same `Arc` the
     /// query engine's fetchers reserve from. A decode whose declared
     /// uncompressed length does not fit fails its resolve with
-    /// [`CatalogError::MemoryExhausted`] (or
-    /// [`LoadColumnStatsError::MemoryExhausted`]). Call it before the catalog
+    /// [`CatalogError::MemoryExhausted`]; a column-statistics decode that does
+    /// not fit leaves its part uncovered instead
+    /// ([`Catalog::column_stats_budget_skips`]). Call it before the catalog
     /// serves a read: parts already cached stay charged to the budget they were
     /// decoded under.
     #[must_use]
@@ -1597,7 +1602,10 @@ impl Catalog {
     /// degrading (issue #1400), and a read CPU gate decode job that failed,
     /// which is not a refusal: a panicked job warns once per object key and
     /// increments [`Catalog::column_stats_decode_panics`], a cancelled one
-    /// warns every time (issue #2402).
+    /// warns every time (issue #2402). A memory budget refusal of a part's
+    /// decode reservation is not a refusal of the object either: it leaves
+    /// that part uncovered, increments [`Catalog::column_stats_budget_skips`]
+    /// and logs at debug (issue #3244).
     ///
     /// `request` names the columns whose dictionaries the statement reads
     /// (issue #3244); every other column's dictionary is cleared from the
@@ -1606,7 +1614,11 @@ impl Catalog {
     /// own entry (keyed by the part's declared `.cstat` blake3) when that entry
     /// holds every requested dictionary; otherwise that part's object alone is
     /// fetched and decoded again, and the entry is replaced by one holding the
-    /// old dictionaries and the newly requested ones. A window whose every
+    /// old dictionaries and the newly requested ones. When that refetch does
+    /// not load (an absent object, a decode failure, a budget refusal), the
+    /// part is served from the entry it already had, which is kept, and
+    /// [`LoadedColumnStats::dictionary_loaded`] reports the dictionary it
+    /// lacks. A window whose every
     /// covered part is served from the cache costs exactly the HEAD GET.
     pub async fn load_column_stats(
         &self,
@@ -1707,6 +1719,7 @@ impl Catalog {
                     }
                     parts.push(entry);
                     reservations.extend(kept);
+                    continue;
                 }
                 // Store read or stale binding: this part is simply
                 // left uncovered, silently.
@@ -1715,7 +1728,17 @@ impl Catalog {
                 column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
                     self.note_column_stats_decode_failure(tenant, signal, &resolved.key, &err);
                 }
+                // Memory was short, not the object at fault: leave the part
+                // uncovered and the query scans it.
+                column_stats_resolve::FetchOutcome::BudgetRefused(refusal) => {
+                    self.note_column_stats_budget_skip(tenant, signal, &resolved.key, &refusal);
+                }
             }
+            // A refetch for a dictionary the cached entry lacks that did not
+            // load: the entry is keyed by this object's declared blake3, so
+            // its summaries still describe it, and `dictionary_loaded`
+            // reports the missing dictionary.
+            parts.extend(cached);
         }
 
         let stats = LoadedColumnStats::from_parts(parts);
@@ -1757,6 +1780,31 @@ impl Catalog {
             other => crate::snapshot_format::SnapshotFormatError::DecodeJob(other),
         };
         column_stats_resolve::FetchOutcome::DecodeRefused(err)
+    }
+
+    /// Record a column-stats part load the memory budget refused for
+    /// `(tenant, signal)` at `key` (issue #3244): increment
+    /// [`Catalog::column_stats_budget_skips`] and log at debug. The object was
+    /// not judged, so neither the decode-refusal counter nor its warn-once
+    /// latch moves, and a later load with memory to spare decodes it.
+    fn note_column_stats_budget_skip(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        key: &str,
+        refusal: &ravel_memory::MemoryExhausted,
+    ) {
+        self.column_stats_budget_skips
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            key = %key,
+            requested = refusal.requested,
+            limit = refusal.limit,
+            "column-statistics load refused by the memory budget; the part is left uncovered \
+             and the query scans it"
+        );
     }
 
     /// Route a failed column-stats decode for `(tenant, signal)` at `key`
@@ -2046,6 +2094,17 @@ impl Catalog {
     /// `ravel_catalog_column_stats_decode_refusals_total`.
     pub fn column_stats_decode_refusals(&self) -> u64 {
         self.column_stats_decode_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative column-statistics part loads the process memory budget
+    /// refused (issue #3244), one per refused part load. The part is left
+    /// uncovered, or served from a cached entry that lacks a requested
+    /// dictionary, and the query scans what the statistics would have
+    /// answered. Not a decode refusal: never counted in
+    /// [`Catalog::column_stats_decode_refusals`]. `ravel-server` exports it on
+    /// `/metrics` as `ravel_catalog_column_stats_budget_skips_total`.
+    pub fn column_stats_budget_skips(&self) -> u64 {
+        self.column_stats_budget_skips.load(Ordering::Relaxed)
     }
 
     /// Cumulative column-statistics decode jobs that panicked on the read CPU
@@ -13752,26 +13811,28 @@ mod tests {
     const COLUMN_STATS_DECLARED_BODY_LEN: u64 = 75;
 
     /// A column-statistics object's segment is charged before it is read: a
-    /// budget with no room for it fails the load with the typed budget error
-    /// rather than decoding uncharged. The decode streams (issue #3244), so
-    /// the refused charge is the one segment's encoded length, the declared
-    /// body less its one-byte length prefix.
+    /// budget with no room for it leaves the part uncovered rather than
+    /// decoding uncharged, and the query scans it (issue #3244). The skip is
+    /// counted on its own counter, not as a decode refusal, since the object
+    /// itself was never judged.
     ///
-    /// FLIP: drop the `reserve_decoded` call in `WorkingReservation`'s
-    /// `before_segment` and the refusal moves to the segment's kept bytes,
-    /// failing the `requested` assertion.
+    /// FLIP: restore `Ok(Err(refusal)) => return Err(refusal.into())` in
+    /// `fetch_stats_object` and the `expect` below panics on the propagated
+    /// budget error; count the skip under `column_stats_decode_refusals` and
+    /// the refusal-count assertion fails.
     #[tokio::test]
     async fn column_stats_decode_reserves_its_output() {
         let store = Arc::new(MemoryStore::new());
         let declared =
             install_logs_stats(&store, *blake3::hash(b"part-reserve").as_bytes(), 1).await;
+        assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
         let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
         let catalog = Catalog::new(store.clone(), config(8))
             .expect("catalog")
             .with_memory_budget(budget.clone());
         let (range, now_ns) = full_window();
 
-        let err = catalog
+        let loaded = catalog
             .load_column_stats(
                 &tenant(),
                 Signal::Logs,
@@ -13781,28 +13842,19 @@ mod tests {
                 &QueryAccounting::new(),
             )
             .await
-            .expect_err("a stats object that does not fit the budget fails the load");
-        match err {
-            column_stats_resolve::LoadColumnStatsError::MemoryExhausted(exhausted) => {
-                assert_eq!(
-                    exhausted.requested,
-                    declared - 1,
-                    "exactly the object's one segment"
-                );
-                assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
-                assert_eq!(exhausted.limit, 0);
-            }
-            other => panic!("expected LoadColumnStatsError::MemoryExhausted, got {other:?}"),
-        }
+            .expect("a stats object that does not fit the budget leaves its part uncovered");
+        assert!(loaded.is_none(), "the one part is uncovered: {loaded:?}");
+        assert_eq!(catalog.column_stats_budget_skips(), 1);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
         assert_eq!(budget.reserved(), 0);
     }
 
     /// Issue #2107. A column-statistics decode is charged against the same
     /// process budget the decoded part and postings caches hold, so a refusal
     /// must take the same evict-then-retry pass the part and postings decodes
-    /// take. Reserved against the bare budget it did not: the load failed with
-    /// `LoadColumnStatsError::MemoryExhausted` while cached decoded parts held
-    /// memory an eviction would have handed straight back.
+    /// take. Reserved against the bare budget it did not: the load was refused
+    /// while cached decoded parts held memory an eviction would have handed
+    /// straight back.
     ///
     /// FLIP: make the `DecodeReserver` impl for `Catalog` (catalog.rs) call
     /// `crate::charged::reserve_decoded(&self.memory_budget, declared,
@@ -13951,7 +14003,8 @@ mod tests {
     /// tenant check runs on the peeked header, before the reservation.
     ///
     /// FLIP: move `reserve_decoded` above the header checks in
-    /// `fetch_stats_object` and the load fails with `MemoryExhausted` instead.
+    /// `fetch_stats_object` and the load returns `Ok(None)` as a budget skip
+    /// instead, failing the `expect_err`.
     #[tokio::test]
     async fn foreign_tenant_stats_under_memory_pressure_is_a_tenant_mismatch() {
         let store = Arc::new(MemoryStore::new());
@@ -13994,7 +14047,8 @@ mod tests {
     /// no room for its body, rather than failing the load.
     ///
     /// FLIP: move `reserve_decoded` above the header checks in
-    /// `fetch_stats_object` and the load fails with `MemoryExhausted` instead.
+    /// `fetch_stats_object` and the part is counted as a budget skip instead,
+    /// failing the skip-count assertion.
     #[tokio::test]
     async fn stale_binding_stats_under_memory_pressure_degrades_to_absent() {
         let store = Arc::new(MemoryStore::new());
@@ -14018,6 +14072,11 @@ mod tests {
             .expect("a stale binding degrades rather than failing the load");
         let covered = loaded.map_or(0, |l| l.content_hash_segments().count());
         assert_eq!(covered, 0, "the stale-bound object covers nothing");
+        assert_eq!(
+            catalog.column_stats_budget_skips(),
+            0,
+            "the binding check runs before any reservation"
+        );
         assert_eq!(budget.reserved(), 0);
     }
 
