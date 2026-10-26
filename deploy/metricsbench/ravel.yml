@@ -124,11 +124,16 @@ services:
       - "--cache-max-bytes"
       - "805306368"
       # Catalog cache: 5% of the budget, 161,061,273 bytes (about 154 MiB),
-      # the derived value. The two caches sum to 966,367,641 bytes, inside
-      # the 3 GiB budget as startup requires, which leaves 2,254,857,831
-      # bytes (2.1 GiB) of budget for query working set.
+      # the derived value.
       - "--catalog-cache-max-bytes"
       - "161061273"
+      # Column-statistics cache: 2% of the budget, 64,424,509 bytes (about
+      # 61 MiB), the derived value (ADR-1413 decision 5). The three caches
+      # sum to 1,030,792,150 bytes, inside the 3 GiB budget as startup
+      # requires, which leaves 2,190,433,322 bytes (about 2.0 GiB) of budget
+      # for query working set.
+      - "--column-stats-cache-max-bytes"
+      - "64424509"
       # Ingest buffer: the default 536870912 (512 MiB), stated. It is the
       # buffer the 1 GiB reserve above holds outside the budget.
       - "--max-ingest-buffer-bytes"

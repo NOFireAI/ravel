@@ -65,7 +65,8 @@ value with `source="flag"` at startup:
 | `--memory-budget-bytes` | 3,221,225,472 | envelope minus reserve |
 | `--cache-max-bytes` (fetcher cache) | 805,306,368 | 25% of the budget, the derived share for a non-loopback S3 endpoint |
 | `--catalog-cache-max-bytes` | 161,061,273 | 5% of the budget, the derived share |
-| Budget left for query working set | 2,254,857,831 | budget minus both caches (966,367,641) |
+| `--column-stats-cache-max-bytes` | 64,424,509 | 2% of the budget, the derived share (ADR-1413 decision 5) |
+| Budget left for query working set | 2,190,433,322 | budget minus the three caches (1,030,792,150) |
 | `--max-ingest-buffer-bytes` | 536,870,912 | the 512 MiB default, stated; held in the reserve |
 
 **Disclosed settings** (each commented next to its flag in `ravel.yml`):
@@ -342,10 +343,11 @@ The sources are:
   revision. Ravel serves no flags endpoint, so `runtime_flags` is the
   `ravel-server` container's command line, `.Config.Cmd` from `docker
   inspect`; it is unavailable when docker is not reachable. The limits file
-  and the compiled-in query caps are not read. ravel-server 0.26.0 reports an
-  empty `revision`, which the capture records as unavailable, so a capture
-  against 0.26.0 exits 1. The image ID and `RepoDigests` still identify the
-  build. `compose ps` reads both `docker-compose.yml` and `ravel.yml`; when
+  and the compiled-in query caps are not read. Every published ravel-server
+  image reports an empty `revision`: the server reads it from `RAVEL_GIT_SHA`
+  at compile time, and no image build sets it (issue #3312). The capture
+  records it as unavailable and exits 1 against any of them. The image ID and
+  `RepoDigests` still identify the build. `compose ps` reads both `docker-compose.yml` and `ravel.yml`; when
   `RAVEL_IMAGE` is unset the script passes a placeholder so compose can
   interpolate the overlay, which affects only the listing.
 
