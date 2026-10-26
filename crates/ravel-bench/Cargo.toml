@@ -356,6 +356,14 @@ name = "metricsbench_ingest"
 path = "src/bin/metricsbench_ingest.rs"
 bench = false
 
+# MetricsBench portable query run (ADR-0927, issue #938, epic #2821 W2b): the
+# PromQL corpus over HTTP against every engine an ingest run loaded, with
+# Prometheus as the oracle, written as a version-3 report.
+[[bin]]
+name = "metricsbench_query"
+path = "src/bin/metricsbench_query.rs"
+bench = false
+
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
@@ -593,6 +601,14 @@ bench = false
 [[test]]
 name = "metricsbench_ingest_smoke"
 path = "tests/metricsbench_ingest_smoke.rs"
+bench = false
+
+# Reachability for the portable query run (issue #938, W2b): the shipping
+# `metricsbench_query` binary runs against loopback stub engines and its output
+# passes `metricsbench_report validate`.
+[[test]]
+name = "metricsbench_query"
+path = "tests/metricsbench_query.rs"
 bench = false
 
 [[test]]
