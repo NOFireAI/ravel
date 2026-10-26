@@ -2031,7 +2031,7 @@ mod tests {
         };
 
         publish_metric_segment(store.as_ref(), &tenant_id, 1, 10).await;
-        let unlimited = Catalog::new(store.clone(), config.clone()).expect("catalog builds");
+        let unlimited = Catalog::new(store.clone(), config).expect("catalog builds");
         let first = unlimited
             .fold(
                 &tenant,
@@ -2086,13 +2086,14 @@ mod tests {
         };
         assert_eq!(refused.failed, vec![tenant], "{refused:?}");
         assert!(refused.folded.is_empty(), "{refused:?}");
-        let expected = ravel_catalog::CatalogError::MemoryExhausted(ravel_memory::MemoryExhausted {
-            requested: declared,
-            reserved: held_bytes,
-            limit: LIMIT,
-            cause: ravel_memory::ExhaustionCause::Accounted,
-        })
-        .to_string();
+        let expected =
+            ravel_catalog::CatalogError::MemoryExhausted(ravel_memory::MemoryExhausted {
+                requested: declared,
+                reserved: held_bytes,
+                limit: LIMIT,
+                cause: ravel_memory::ExhaustionCause::Accounted,
+            })
+            .to_string();
         assert_eq!(
             expected,
             format!(
@@ -2107,7 +2108,11 @@ mod tests {
             "a refused fold publishes no HEAD"
         );
         assert_eq!(budget.reserved(), held_bytes, "the refusal charged nothing");
-        assert_eq!(budgeted.decode_reserve_retries(), 0, "no eviction could help");
+        assert_eq!(
+            budgeted.decode_reserve_retries(),
+            0,
+            "no eviction could help"
+        );
 
         drop(held);
         let retried = tick_at(&budgeted, store.as_ref(), tenant, &refold, margin_seals(11)).await;

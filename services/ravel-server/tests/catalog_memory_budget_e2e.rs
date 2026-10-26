@@ -17,8 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ravel_catalog::{
-    Catalog, CatalogConfig, PartLimits, PostingsLimits, decode_head, decode_part,
-    decode_postings,
+    Catalog, CatalogConfig, PartLimits, PostingsLimits, decode_head, decode_part, decode_postings,
 };
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
@@ -27,7 +26,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreMetrics};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
-use ravel_types::{Label, LabelSet, Sample, Signal, SeriesId, TenantHash, TenantId};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
 const TOKEN: &str = "testtoken";
@@ -159,16 +158,7 @@ async fn fold_fixture(store: &Arc<MemoryStore>) -> Folded {
         .await;
     }
     let probe_first = hour_start + PROBE_MINUTE * 60 * NS_PER_SEC;
-    seed_segment(
-        store,
-        &tenant_id,
-        FILLERS + 1,
-        hour,
-        PROBE,
-        probe_first,
-        60,
-    )
-    .await;
+    seed_segment(store, &tenant_id, FILLERS + 1, hour, PROBE, probe_first, 60).await;
 
     let report = Catalog::new(
         store.clone(),
@@ -181,7 +171,11 @@ async fn fold_fixture(store: &Arc<MemoryStore>) -> Folded {
     .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[], None)
     .await
     .expect("fold");
-    assert_eq!(report.entry_count, FILLERS + 1, "every seeded segment folds");
+    assert_eq!(
+        report.entry_count,
+        FILLERS + 1,
+        "every seeded segment folds"
+    );
 
     let (part_bytes, postings_bytes) = decode_charges(store, &tenant).await;
     let probe_segment_bytes = probe_segment_size(store, &tenant).await;
@@ -407,8 +401,7 @@ fn help<'a>(body: &'a str, family: &str) -> &'a str {
 }
 
 const FETCH_RESERVED: &str = r#"ravel_memory_reserved_bytes{mode="query",component="fetch"}"#;
-const PART_CACHE: &str =
-    r#"ravel_catalog_decoded_cache_reserved_bytes{mode="query",cache="part"}"#;
+const PART_CACHE: &str = r#"ravel_catalog_decoded_cache_reserved_bytes{mode="query",cache="part"}"#;
 const POSTINGS_CACHE: &str =
     r#"ravel_catalog_decoded_cache_reserved_bytes{mode="query",cache="postings"}"#;
 const RETRIES: &str = "ravel_catalog_decode_reserve_retries_total";
@@ -480,8 +473,14 @@ async fn the_catalog_charges_the_servers_own_budget() {
     // The decoded caches were empty, so no eviction could admit the part and
     // the catalog kept its first refusal without a pass or a retry.
     let refused = scrape(&running).await;
-    assert_eq!(sample(&refused, &format!(r#"{RETRIES}{{mode="query"}}"#)), 0);
-    assert_eq!(sample(&refused, &format!(r#"{EVICTIONS}{{mode="query"}}"#)), 0);
+    assert_eq!(
+        sample(&refused, &format!(r#"{RETRIES}{{mode="query"}}"#)),
+        0
+    );
+    assert_eq!(
+        sample(&refused, &format!(r#"{EVICTIONS}{{mode="query"}}"#)),
+        0
+    );
 
     drop(held);
     let (status, body) = query_probe(&running, folded.query_time_s).await;
@@ -513,7 +512,11 @@ async fn the_fetch_gauge_counts_the_catalogs_held_decodes() {
 
     let after = scrape(&running).await;
     assert_eq!(sample(&after, PART_CACHE), folded.part_bytes, "{after}");
-    assert_eq!(sample(&after, POSTINGS_CACHE), folded.postings_bytes, "{after}");
+    assert_eq!(
+        sample(&after, POSTINGS_CACHE),
+        folded.postings_bytes,
+        "{after}"
+    );
     assert_eq!(
         sample(&after, FETCH_RESERVED),
         folded.part_bytes + folded.postings_bytes,
