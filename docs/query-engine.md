@@ -3499,10 +3499,17 @@ and block-level reported independently:
   `NOT LIKE '%literal%'` arm (`Predicate::Contains`, ADR-2773 contains-arm
   amendment) tested for its needle: a dictionary entry once per test, a
   plain-page cell once. 0 when no such arm was pushed.
-- `strCellsValidated`: declared `Str` cells the scan UTF-8 validated: the
-  dictionary entries the reader validated, plus the plain-page cells the
-  columnar build validated, once per validation. The build never validates
-  a row the arm dropped, so a pushed arm can lower this count.
+- `strCellsValidated`: string cells the scan UTF-8 validated, in two
+  halves. The reader's half is every string dictionary entry it validated,
+  once per validation, on either path; it covers the columns the scan
+  decodes, so undeclared attribute columns count when `attrs` is projected.
+  The columnar build's half is every plain-page `Str` cell its declared
+  and per-key `attrs['k']` cursors validated. The row path, taken when
+  `attrs` is projected or an erasure is pending, validates plain-page cells
+  too but does not count them. With a pushed `Contains` arm the reader
+  validates only the dictionary entries the arm read as text or a kept row
+  references, and the build never validates a row the arm dropped, so a
+  pushed arm can lower this count.
 
 The two key-index counts are 0 for a statement with no spans
 `trace_id =` lookup and are sums over every spans scan in the plan. The
@@ -3519,6 +3526,13 @@ both pruning levels through `POST /api/v1/sql`.
 two key-index counts the same way, and
 `services/ravel-server/tests/sql_like_contains_e2e.rs` the two `LIKE`
 counts.
+
+`stats.accounting.strDictValuesBuilt` counts the string dictionary values
+arrays the scans built for declared `Str` columns: one per row group
+dictionary per scan opening, one per per-block dictionary page, one per
+plain-page block. With a pushed `Contains` arm the reader hands each block
+a dictionary narrowed to its surviving rows, so a dictionary column builds
+one per block that keeps a row instead.
 
 Neither object reaches the Arrow-IPC encoding or Flight SQL, for the reasons
 given above. The MCP `sql_execute` tool's envelope renders neither, and it

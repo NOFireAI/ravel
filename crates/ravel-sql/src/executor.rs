@@ -793,18 +793,25 @@ pub struct SqlStats {
     /// counter and summed over every logs scan in the plan. Zero for a
     /// metrics query and for a statement with no pushed `Contains` arm.
     pub contains_cells_tested: u64,
-    /// String cells the successful attempt's logs scans UTF-8 validated: the
-    /// reader's string dictionary entries, once per validation, plus every
-    /// plain-page `Str` cell the columnar build validated. Read off the
-    /// scans' `str_cells_validated` counter and summed over every logs scan
-    /// in the plan. Zero for a metrics query.
+    /// String cells the successful attempt's logs scans UTF-8 validated, as
+    /// two halves. The reader's half is every string dictionary entry it
+    /// validated, once per validation, on either path: the dictionaries of
+    /// the columns the scan decodes, which include undeclared attribute
+    /// columns when `attrs` is projected. The columnar build's half is every
+    /// plain-page `Str` cell its declared and per-key `attrs['k']` cursors
+    /// validated. The row path, taken when `attrs` is projected or an erasure
+    /// is pending, validates plain-page cells too but does not count them.
+    /// Read off the scans' `str_cells_validated` counter and summed over every
+    /// logs scan in the plan. Zero for a metrics query.
     pub str_cells_validated: u64,
     /// String dictionary values arrays the successful attempt's logs scans
     /// built for declared `Str` columns (ADR-2773 decision D3): one per row
     /// group dictionary per scan opening, one per per-block dictionary page,
-    /// one per plain-page block. Read off the scans'
-    /// `str_dict_values_built` counter and summed over every logs scan in the
-    /// plan. Zero for a metrics query.
+    /// one per plain-page block. With a pushed `Contains` arm the reader
+    /// hands each block a dictionary narrowed to its surviving rows, so a
+    /// dictionary column builds one per block that keeps a row instead. Read
+    /// off the scans' `str_dict_values_built` counter and summed over every
+    /// logs scan in the plan. Zero for a metrics query.
     pub str_dict_values_built: u64,
     /// This query's spill totals (ADR-0954), read off the executed plan's own
     /// DataFusion counters after the stream stopped, the same way the block
