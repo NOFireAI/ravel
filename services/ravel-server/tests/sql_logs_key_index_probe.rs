@@ -616,10 +616,6 @@ struct Lookup<'a> {
     rows: &'a [&'a str],
     /// The blocks of object 0 holding the key; objects 1 and 2 hold none.
     blocks: &'a [u32],
-    /// Whether the scan places BLOOM: only when the pushdown also builds a
-    /// prune-channel `Equals`, which a declared Str equality does and a
-    /// declared I64 (a `NumRange`) or `trace_id` (KEY_IDX only) does not.
-    places_bloom: bool,
 }
 
 /// Asserts `lookup` returns its rows having read exactly the KEY_IDX bytes
@@ -673,9 +669,8 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
     assert_eq!(phase(&v, "keyIndex", "s3GetWireBytes"), key_bytes, "{sql}");
 
     // Object 0's plan: the tail probe, its KEY_IDX reads, then one GET for
-    // each of SKIP_IDX with PAGE_DIR, the STREAM_DIR and FIELD_DIR pair, and
-    // (when the query places it) BLOOM that does not lie wholly inside the
-    // probe window. Then the scan.
+    // each of SKIP_IDX with PAGE_DIR and the STREAM_DIR and FIELD_DIR pair
+    // that does not lie wholly inside the probe window. Then the scan.
     let holding = &fx.objects[0];
     let size = holding.bytes.len() as u64;
     let got = fx.gets(0);
@@ -698,10 +693,6 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
         dirs.iter().map(|r| r.end).max(),
     ) {
         plan.push(GetRange::Range(start, end));
-    }
-    let bloom = section(&holding.bytes, kind::BLOOM);
-    if lookup.places_bloom && bloom.start < probe_start {
-        plan.push(GetRange::Range(bloom.start, bloom.end));
     }
     assert_eq!(
         &got[..plan.len()],
@@ -732,28 +723,26 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
             .expect("sections"),
         size,
     );
+    // Every arm the pushdown builds beside the key is prune-channel (`Equals`
+    // for a declared Str, `NumRange` for a declared I64, none for
+    // `trace_id`), and the reader answers no prune arm from BLOOM: the plan
+    // reads above hold no BLOOM GET, and neither does the scan.
+    let bloom = section(&holding.bytes, kind::BLOOM);
     let bloom_gets: Vec<GetRange> = scan
         .iter()
         .copied()
         .filter(|g| touches(&[*g], size, &bloom))
         .collect();
-    let want_bloom = if lookup.places_bloom {
-        vec![GetRange::Range(bloom.start, bloom.end)]
-    } else {
-        Vec::new()
-    };
-    assert_eq!(bloom_gets, want_bloom, "{sql}: BLOOM reads in {scan:?}");
+    assert_eq!(bloom_gets, Vec::new(), "{sql}: BLOOM reads in {scan:?}");
     let blocks_section = section(&holding.bytes, kind::BLOCKS);
     let narrow: Vec<GetRange> = scan
         .iter()
         .copied()
-        .filter(|g| {
-            *g != tail && !bloom_gets.contains(g) && !pages.iter().any(|p| touches(&[*g], size, p))
-        })
+        .filter(|g| *g != tail && !pages.iter().any(|p| touches(&[*g], size, p)))
         .collect();
     // One GET per wanted body page; the footer and trailer past the last
-    // section, which the carried plan footer did not place; BLOOM only when
-    // the query places it; and two runs of narrow column pages inside BLOCKS.
+    // section, which the carried plan footer did not place; and two runs of
+    // narrow column pages inside BLOCKS.
     assert_eq!(scan[0], tail, "{sql}: {scan:?}");
     assert_eq!(narrow.len(), 2, "{sql}: narrow column runs in {scan:?}");
     for g in &narrow {
@@ -765,7 +754,7 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
     }
     assert_eq!(
         scan.len(),
-        3 + want_bloom.len() + lookup.blocks.len(),
+        3 + lookup.blocks.len(),
         "{sql}: {scan:?}"
     );
     assert_eq!(
@@ -815,7 +804,6 @@ async fn declared_i64_equality_reads_only_the_indexed_blocks() {
             key8: key8_i64(500),
             rows: &["o0r050", "o0r085"],
             blocks: &[3, 5],
-            places_bloom: false,
         };
         assert_reads_only_the_indexed_blocks(&fx, &lookup).await;
     }
@@ -836,7 +824,6 @@ async fn declared_str_equality_reads_only_the_indexed_blocks() {
             key8: key8_str(REGION),
             rows: &["o0r050", "o0r100"],
             blocks: &[3, 6],
-            places_bloom: true,
         };
         assert_reads_only_the_indexed_blocks(&fx, &lookup).await;
     }
@@ -862,7 +849,6 @@ async fn trace_id_equality_reads_only_the_indexed_blocks() {
             key8: key8_id16(&TARGET_TRACE),
             rows: &["o0r050"],
             blocks: &[3],
-            places_bloom: false,
         };
         assert_reads_only_the_indexed_blocks(&fx, &lookup).await;
     }
