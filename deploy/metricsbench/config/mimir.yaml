@@ -227,12 +227,17 @@ limits:
   # -blocks-storage.tsdb.out-of-order-capacity-max) add to it; 5000000
   # covers it with 49% headroom.
   max_fetched_chunks_per_query: 5000000
-  # Mimir query engine memory budget: the default 0 ("0 to disable"),
-  # written so the capture shows it. -help-all: "only enforced when Mimir's
-  # query engine is in use", which is the 3.2.3 default. Left off: no
-  # corpus statement is sized against it, so a query too large for the 4g
-  # envelope fails on container memory rather than as a budget refusal.
-  max_estimated_memory_consumption_per_query: 0
+  # Mimir query engine memory budget: replaces the default 0 ("0 to
+  # disable") with 2 GiB. -help-all marks it [experimental] and says it is
+  # "only enforced when Mimir's query engine is in use", which is the 3.2.3
+  # default. It is that engine's only per-query bound, since max_samples
+  # above does not fire under it. Sized to the 4g envelope, not to the
+  # corpus: this single process also holds the ingester and the
+  # store-gateway, so half the container is left to them, and a query whose
+  # estimate exceeds 2 GiB is refused with err-mimir-max-estimated-memory-
+  # consumption-per-query (refused(budget)) instead of killing the
+  # container mid-run.
+  max_estimated_memory_consumption_per_query: 2147483648
   # Query length: replaces the default 0s (no limit, -query-frontend.max-total-
   # query-length) with the history profile's 30d span plus 1d for range
   # windows, so the frozen value bounds every corpus statement and a longer
