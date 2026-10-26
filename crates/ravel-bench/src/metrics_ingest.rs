@@ -1401,9 +1401,8 @@ pub fn check_row_accounting(
             scalar: counts.scalar,
         });
     }
-    let offering = ingest.offered_samples
-        + ingest.excluded_native_histogram
-        + ingest.excluded_stale_marker;
+    let offering =
+        ingest.offered_samples + ingest.excluded_native_histogram + ingest.excluded_stale_marker;
     if offering != counts.generated_lines {
         return Err(RowAccountingViolation::OfferingIdentity {
             offered: ingest.offered_samples,
@@ -3556,8 +3555,10 @@ mod tests {
                 report.native_histogram_samples > 0 && report.stale_markers > 0
             })
             .expect("the ci profile emits both excluded kinds");
-        let mut stream =
-            GeneratedStream::new(Generator::new(&workload, "ci", anchor).expect("builds"), steps);
+        let mut stream = GeneratedStream::new(
+            Generator::new(&workload, "ci", anchor).expect("builds"),
+            steps,
+        );
         let outcome = replay_into_ravel(&memory_config("mb-offering-identity", 500), &mut stream)
             .await
             .expect("replay");

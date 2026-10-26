@@ -198,8 +198,8 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let profile = workload.profile(&args.profile).ok_or_else(|| {
         RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
     })?;
-    let anchor_ms =
-        check_anchor(args.anchor_ms, profile.scrape_interval_secs, steps).map_err(RunError::Anchor)?;
+    let anchor_ms = check_anchor(args.anchor_ms, profile.scrape_interval_secs, steps)
+        .map_err(RunError::Anchor)?;
     let manifest_bytes = std::fs::read(&args.workload)
         .map_err(|e| RunError::Workload(format!("{}: {e}", args.workload.display())))?;
     let stream_from_anchor = || -> Result<GeneratedStream<'_>, RunError> {

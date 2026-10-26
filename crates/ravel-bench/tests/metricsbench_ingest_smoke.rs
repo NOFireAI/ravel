@@ -535,7 +535,10 @@ fn an_out_of_contract_anchor_exits_64_with_its_reason() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(64), "{args:?}: {stderr}");
         assert!(stderr.contains(expected), "{args:?}: {stderr}");
-        assert!(output.stdout.is_empty(), "{args:?}: a refusal prints no report");
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?}: a refusal prints no report"
+        );
     }
 }
 
