@@ -1,6 +1,6 @@
 //! Issue #3295 item 7: a `LIKE '%lit%'` pushed into the logs scan as a
-//! `Contains` content arm fetches more object bytes than the same statement
-//! with the LIKE evaluated above the scan.
+//! `Contains` content arm fetches exactly the object bytes of the same
+//! statement with the LIKE evaluated above the scan.
 //!
 //! The fixture is the ClickBench q21 shape at small scale: four objects of
 //! sixteen blocks, a declared `Str` column `URL` (40-160 byte cells, the
@@ -18,13 +18,11 @@
 //! issues is recorded by `(key, range)` and mapped onto the object's
 //! sections and BLOCKS column chunks.
 //!
-//! What the extra is: one ranged GET per object for the BLOOM section, which
-//! the pushed run places because `FilterSections::for_query`
-//! (crates/ravel-query/src/log_fetcher.rs) reads any non-empty content list
-//! as one the reader may answer from BLOOM or POSTINGS. A `Contains` arm is
-//! neither `bloom_shaped` nor a postings arm in `RlogReader::scan_blocks`, so
-//! the reader never reads the section it paid for. Every other range is the
-//! same in both runs: same column chunks, same offsets.
+//! A `Contains` arm is neither `bloom_shaped` nor a postings arm in
+//! `RlogReader::scan_blocks`, so `FilterSectionReads::for_scan`
+//! (crates/ravel-logseg/src/reader.rs), which `FilterSections::for_query`
+//! (crates/ravel-query/src/log_fetcher.rs) calls, places neither BLOOM nor
+//! POSTINGS for it, and both runs issue the same ranges at the same offsets.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -568,22 +566,8 @@ fn describe(fx: &Fixture, label: &str, run: &Run) {
     }
 }
 
-/// `gets` less every element of `minus`, as multisets.
-fn difference(gets: &[Get], minus: &[Get]) -> Vec<Get> {
-    let mut left: BTreeMap<&Get, isize> = BTreeMap::new();
-    for g in gets {
-        *left.entry(g).or_default() += 1;
-    }
-    for g in minus {
-        *left.entry(g).or_default() -= 1;
-    }
-    left.into_iter()
-        .flat_map(|(g, n)| std::iter::repeat_n(g.clone(), n.max(0) as usize))
-        .collect()
-}
-
 #[tokio::test]
-async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
+async fn pushed_contains_fetches_no_bloom_section() {
     let fx = fixture().await;
 
     let pushed = run(
@@ -615,8 +599,8 @@ async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
     );
 
     // GETs and bytes per object: (plain GETs, plain bytes, pushed GETs,
-    // pushed bytes). Plain is a 4 KiB suffix probe plus four projection
-    // ranges; pushed is the same five plus one.
+    // pushed bytes). Both are a 4 KiB suffix probe plus four projection
+    // ranges.
     let per_key = |run: &Run, key: &str| {
         let gets: Vec<&Get> = run.gets.iter().filter(|g| g.key == key).collect();
         (
@@ -625,10 +609,10 @@ async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
         )
     };
     let expected_per_key: [(usize, u64, usize, u64); OBJECTS] = [
-        (5, 118_365, 6, 135_677),
-        (5, 118_353, 6, 135_793),
-        (5, 118_359, 6, 135_799),
-        (5, 118_379, 6, 135_627),
+        (5, 118_365, 5, 118_365),
+        (5, 118_353, 5, 118_353),
+        (5, 118_359, 5, 118_359),
+        (5, 118_379, 5, 118_379),
     ];
     for (n, want) in expected_per_key.iter().enumerate() {
         let (plain_gets, plain_bytes) = per_key(&plain, &key(n));
@@ -641,35 +625,29 @@ async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
         );
     }
     assert_eq!((plain.gets.len(), plain.bytes()), (20, 473_456));
-    assert_eq!((pushed.gets.len(), pushed.bytes()), (24, 542_896));
+    assert_eq!((pushed.gets.len(), pushed.bytes()), (20, 473_456));
 
-    // Every range plain reads, pushed reads too, at the same offsets: the
-    // projection is the same column chunks and nothing is read twice.
-    assert_eq!(difference(&plain.gets, &pushed.gets), Vec::<Get>::new());
-
-    // What pushed reads beyond that is one GET per object, exactly that
-    // object's BLOOM section, which the reader never parses for a `Contains`
-    // arm. Its last bytes sit inside the suffix probe already, so part of
-    // each extra GET is a second read of bytes the probe returned.
-    let extra = difference(&pushed.gets, &plain.gets);
-    let mut bloom_sections = Vec::new();
-    let mut reread = 0;
+    // The same ranges at the same offsets: the same column chunks, and no
+    // GET of the BLOOM section, which the reader never parses for a
+    // `Contains` arm. Placing it cost one GET per object, 69,440 bytes over
+    // the four.
+    assert_eq!(pushed.gets, plain.gets);
+    let mut bloom_bytes = 0;
     for (k, object) in &fx.objects {
         let bloom = regions(object)
             .into_iter()
             .find(|r| r.label == "BLOOM")
             .expect("BLOOM section");
+        bloom_bytes += bloom.end - bloom.start;
+        // The suffix probe may cover BLOOM's last bytes; nothing else may.
         let probe_start = object.len() as u64 - SUFFIX_LEN;
-        reread += bloom.end.saturating_sub(probe_start);
-        bloom_sections.push(Get {
-            key: k.clone(),
-            start: bloom.start,
-            end: bloom.end,
-        });
+        let into_bloom: Vec<&Get> = pushed
+            .gets
+            .iter()
+            .filter(|g| &g.key == k && g.start < bloom.end && bloom.start < g.end)
+            .filter(|g| g.start != probe_start)
+            .collect();
+        assert_eq!(into_bloom, Vec::<&Get>::new(), "{k}: BLOOM fetched");
     }
-    assert_eq!(extra, bloom_sections);
-    let extra_bytes: u64 = extra.iter().map(|g| g.end - g.start).sum();
-    assert_eq!(extra_bytes, pushed.bytes() - plain.bytes());
-    assert_eq!(extra_bytes, 69_440);
-    assert_eq!(reread, 9_750);
+    assert_eq!(bloom_bytes, 69_440);
 }

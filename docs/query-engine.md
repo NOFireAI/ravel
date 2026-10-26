@@ -4394,7 +4394,12 @@ never drop a true result):
     arms does not count as a block predicate for the route, so a
     full-window statement keeps the whole-segment fast path. A `has_word`
     arm beside it still makes the statement not block-predicate-free, and
-    the scan records `fast_path_rejected_block_predicate`.
+    the scan records `fast_path_rejected_block_predicate`. The fetcher
+    places BLOOM or POSTINGS only when the reader reads that section for the
+    predicate (`FilterSectionReads::for_scan` in ravel-logseg, which both
+    sides call), so a statement whose only content arms are `Contains`
+    fetches the same ranges as the same `LIKE` evaluated above the scan
+    (`crates/ravel-sql/tests/logs_contains_fetch_bytes.rs`).
   Everything else (`!=`, `NOT`, negated `BETWEEN`, `IS [NOT] NULL`, a general
   `OR`, a range operator on a `str`/`bytes` column, a `str`/`bytes` `IN`, or a
   type-mismatched literal, including one DataFusion coercion has already wrapped
