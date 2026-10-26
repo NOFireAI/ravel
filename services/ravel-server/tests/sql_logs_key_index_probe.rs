@@ -752,11 +752,7 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
             "{sql}: {g:?} outside BLOCKS {blocks_section:?}"
         );
     }
-    assert_eq!(
-        scan.len(),
-        3 + lookup.blocks.len(),
-        "{sql}: {scan:?}"
-    );
+    assert_eq!(scan.len(), 3 + lookup.blocks.len(), "{sql}: {scan:?}");
     assert_eq!(
         phase(&v, "scan", "s3GetRequests"),
         scan.len() as u64,

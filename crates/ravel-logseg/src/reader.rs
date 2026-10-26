@@ -3727,10 +3727,13 @@ mod tests {
         }
         // Arms from both channels union.
         assert_eq!(
-            FilterSectionReads::for_scan([&contains, &has_word], [&Predicate::Equals {
-                field: attr("k"),
-                value: AttrValue::Bool(true),
-            }]),
+            FilterSectionReads::for_scan(
+                [&contains, &has_word],
+                [&Predicate::Equals {
+                    field: attr("k"),
+                    value: AttrValue::Bool(true),
+                }]
+            ),
             both
         );
     }

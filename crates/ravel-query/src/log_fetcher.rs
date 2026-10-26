@@ -75,8 +75,9 @@ use ravel_logseg::skip_index::{Level0Entry, NumArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, FilterSectionReads,
-    LogRecord, LogSegError, LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
-    SuffixOutcome, decode_section_accounted, open_from_suffix, read_section_accounted_from,
+    LogRecord, LogSegError, LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats,
+    SegmentDirectories, SparseObject, SuffixOutcome, decode_section_accounted, open_from_suffix,
+    read_section_accounted_from,
 };
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
@@ -13080,14 +13081,8 @@ mod tail_section_placement_tests {
                 "GET {r:?} reads POSTINGS {postings:?}"
             );
         }
-        assert_eq!(
-            format!("{:?}", out.records),
-            format!("{:?}", whole.records)
-        );
-        assert_eq!(
-            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
-            [3]
-        );
+        assert_eq!(format!("{:?}", out.records), format!("{:?}", whole.records));
+        assert_eq!(out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(), [3]);
     }
 
     /// `Contains` beside a `HasWord` arm still places BLOOM, and the bloom
@@ -13109,14 +13104,8 @@ mod tail_section_placement_tests {
         let out = ranged(&obj, &query).await;
         assert!(covers(&out, &bloom), "no GET covers BLOOM {bloom:?}");
         assert_eq!(out.stats.blocks_after_bloom, (BLOCKS / 2) as u32);
-        assert_eq!(
-            format!("{:?}", out.records),
-            format!("{:?}", whole.records)
-        );
-        assert_eq!(
-            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
-            [3]
-        );
+        assert_eq!(format!("{:?}", out.records), format!("{:?}", whole.records));
+        assert_eq!(out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(), [3]);
     }
 
     /// `Contains` beside a short `Str` `Equals` content arm on the indexed
@@ -13138,13 +13127,13 @@ mod tail_section_placement_tests {
             });
         let out = ranged(&obj, &query).await;
         assert!(covers(&out, &bloom), "no GET covers BLOOM {bloom:?}");
-        assert!(covers(&out, &postings), "no GET covers POSTINGS {postings:?}");
+        assert!(
+            covers(&out, &postings),
+            "no GET covers POSTINGS {postings:?}"
+        );
         assert_eq!(out.stats.blocks_after_postings, 1);
         assert_eq!(out.stats.blocks_after_bloom, 1);
-        assert_eq!(
-            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
-            [3]
-        );
+        assert_eq!(out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(), [3]);
     }
 
     /// An `Equals` content arm on the indexed field places POSTINGS, as the
@@ -13161,12 +13150,12 @@ mod tail_section_placement_tests {
             value: AttrValue::Str("r3".into()),
         });
         let out = ranged(&obj, &query).await;
-        assert!(covers(&out, &postings), "no GET covers POSTINGS {postings:?}");
-        assert_eq!(out.stats.blocks_after_postings, 1);
-        assert_eq!(
-            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
-            [3]
+        assert!(
+            covers(&out, &postings),
+            "no GET covers POSTINGS {postings:?}"
         );
+        assert_eq!(out.stats.blocks_after_postings, 1);
+        assert_eq!(out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(), [3]);
     }
 }
 
@@ -14323,12 +14312,9 @@ mod read_gate_tests {
     #[tokio::test]
     async fn the_keyed_plan_of_a_stream_arm_is_not_skip_decidable() {
         let (fetcher, seg_ref) = keyed_fixture().await;
-        let query = keyed_on_r2(
-            LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
-                "service.name",
-                AttrValue::Str("other".to_string()),
-            )),
-        );
+        let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(
+            StreamAttrEquals::new("service.name", AttrValue::Str("other".to_string())),
+        ));
         let planned = keyed_plan(&fetcher, &seg_ref, &query).await;
         assert_eq!(planned.survivors, Vec::<usize>::new());
     }
