@@ -1532,10 +1532,12 @@ one line on stderr, so a long load shows what it resolved without waiting
 for the summary:
 
 ```text
-load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>), depth flush on
+load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>), depth flush on, ack deadline <SECONDS>s
 ```
 
-The stderr line ends with `depth flush on` or `depth flush off`.
+The stderr line names `depth flush on` or `depth flush off`, then the
+Strict ack deadline every write of the load waits under (`--max-flush-delay`
+plus its margin, see `--ack-margin`), in seconds.
 The flush target names `--target-bytes` when the flag set it. The depth
 line names which bound decided it (`memory bound decided it: ...`), or
 `--pipeline-depth` when the flag set it. The `depth realign` line appears
