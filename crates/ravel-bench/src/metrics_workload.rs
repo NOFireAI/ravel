@@ -14,6 +14,13 @@
 //! the artifact can only refuse to publish it if the refusal is in the data.
 //! [`Profile::is_publishable`] is that check, and [`gate_workload`] refuses a
 //! manifest that marks `ci` comparable at all.
+//!
+//! Format version 2 (ADR-0927, 2026-10-26 amendment, decision E) adds a
+//! per-profile [`RangeEval`] grid, so every `eval: range` corpus entry has a
+//! declared start, end and step. A version-1 manifest has no grid and is
+//! refused with [`WorkloadError::MissingRangeEval`]; version-1 streams stay
+//! reproducible from the version-1 manifest in git history, not through a
+//! compatibility path here.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +28,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// The manifest format version this module reads and writes.
-pub const WORKLOAD_FORMAT_VERSION: u32 = 1;
+pub const WORKLOAD_FORMAT_VERSION: u32 = 2;
 
 /// The profile names ADR-0927 decision 11 fixes. A manifest declaring a
 /// different set is refused: a run over a different profile set is not
@@ -72,6 +79,41 @@ impl Comparability {
     }
 }
 
+/// The evaluation grid every `eval: range` corpus entry runs on under one
+/// profile, as offsets back from the stream's newest sample.
+///
+/// `end_offset_secs: 0` is the newest sample itself; `start_offset_secs` counts
+/// backwards from it. Offsets rather than absolute timestamps, because the
+/// stream's anchor is a run parameter and the grid has to mean the same window
+/// whatever the anchor is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RangeEval {
+    /// Seconds before the newest sample at which the grid starts.
+    pub start_offset_secs: u64,
+    /// Seconds before the newest sample at which the grid ends.
+    pub end_offset_secs: u64,
+    /// Seconds between grid points.
+    pub step_secs: u64,
+}
+
+impl RangeEval {
+    /// Seconds the grid spans, start to end. Zero for a grid that does not
+    /// open, which [`gate_workload`] refuses.
+    pub fn window_secs(&self) -> u64 {
+        self.start_offset_secs.saturating_sub(self.end_offset_secs)
+    }
+
+    /// Evaluation points on the grid, both ends included. Exact only for a
+    /// gated grid, whose step divides the window.
+    pub fn points(&self) -> u64 {
+        if self.step_secs == 0 {
+            return 0;
+        }
+        self.window_secs() / self.step_secs + 1
+    }
+}
+
 /// One workload profile: one axis varied, the others pinned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +138,8 @@ pub struct Profile {
     pub total_samples: u64,
     /// Whether the profile's figures may be published.
     pub comparability: Comparability,
+    /// The grid `eval: range` corpus entries are evaluated on.
+    pub range_eval: RangeEval,
 }
 
 impl Profile {
@@ -192,8 +236,9 @@ pub struct AnomalyRates {
     pub stale_marker_one_in: u64,
     /// One series-step in N resets a counter or histogram instance to zero.
     pub counter_reset_one_in: u64,
-    /// One series-step in N is stamped two intervals early, so it reaches the
-    /// stream after a sample that is newer than it.
+    /// One series-step in N is stamped one and a half intervals early, between
+    /// two scrape points, so it reaches the stream after a sample that is
+    /// newer than it and never repeats a timestamp its series already carries.
     pub out_of_order_one_in: u64,
 }
 
@@ -370,6 +415,52 @@ pub enum WorkloadError {
         /// The version this build reads.
         expected: u32,
     },
+    /// A profile carries no `range_eval` block, which every version-2 profile
+    /// must. This is how a version-1 manifest is refused: by the block it
+    /// lacks, so the message says what to add rather than only that the
+    /// version number differs.
+    #[error(
+        "workload manifest {path} (format version {found_version}) declares profile `{profile}` \
+         with no `range_eval` block; format version {expected_version} requires \
+         `range_eval: {{start_offset_secs, end_offset_secs, step_secs}}` on every profile. A \
+         version-1 stream is reproduced from the version-1 manifest in git history, not by this \
+         build"
+    )]
+    MissingRangeEval {
+        /// The path that was parsed.
+        path: PathBuf,
+        /// The version the document declared, or 0 if it declared none.
+        found_version: u64,
+        /// The version this build reads.
+        expected_version: u32,
+        /// The first profile without the block.
+        profile: String,
+    },
+    /// A profile's scrape interval is zero. The out-of-order shift is
+    /// `3 * interval_ms / 2`, exact only for a whole number of seconds of at
+    /// least one.
+    #[error("profile `{profile}` declares a scrape interval of 0 s; it must be at least 1 s")]
+    ZeroScrapeInterval {
+        /// The offending profile.
+        profile: String,
+    },
+    /// A profile's range-evaluation grid does not close.
+    #[error(
+        "profile `{profile}` declares range_eval start {start_offset_secs}s, end \
+         {end_offset_secs}s, step {step_secs}s: {fault}"
+    )]
+    BadRangeEval {
+        /// The offending profile.
+        profile: String,
+        /// The declared start offset.
+        start_offset_secs: u64,
+        /// The declared end offset.
+        end_offset_secs: u64,
+        /// The declared step.
+        step_secs: u64,
+        /// Which rule the grid breaks.
+        fault: RangeEvalFault,
+    },
     /// The profile set is not the one ADR-0927 decision 11 fixes.
     #[error(
         "workload manifest declares profiles {found:?}, but ADR-0927 decision 11 fixes them at \
@@ -534,6 +625,27 @@ pub enum WorkloadError {
     },
 }
 
+/// Which rule a [`RangeEval`] grid breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RangeEvalFault {
+    /// The start is not strictly before the end, so the grid has no width.
+    #[error("the start offset must be greater than the end offset")]
+    EmptyWindow,
+    /// The step is zero.
+    #[error("the step must be at least 1 s")]
+    ZeroStep,
+    /// The step does not divide the window, so the last point misses the end.
+    #[error("the step does not divide the window")]
+    StepDoesNotDivideWindow,
+    /// The step is not a whole number of scrape intervals, so grid points fall
+    /// between scrapes in a way that differs from point to point.
+    #[error("the step is not a multiple of the scrape interval")]
+    StepOffScrapeGrid,
+    /// The grid reaches back past the profile's first sample.
+    #[error("the start offset reaches past the profile's duration")]
+    StartPastDuration,
+}
+
 /// Apply every structural check to a manifest, identically for the checked-in
 /// artifact and for an external file.
 pub fn gate_workload(workload: &WorkloadFile) -> Result<(), WorkloadError> {
@@ -634,6 +746,12 @@ pub fn gate_workload(workload: &WorkloadFile) -> Result<(), WorkloadError> {
         return Err(WorkloadError::ProfileSetMismatch { found, expected });
     }
     for profile in &workload.profiles {
+        if profile.scrape_interval_secs == 0 {
+            return Err(WorkloadError::ZeroScrapeInterval {
+                profile: profile.name.clone(),
+            });
+        }
+        gate_range_eval(profile)?;
         let computed = profile.samples_per_series * profile.scrape_interval_secs;
         if computed != profile.duration_secs {
             return Err(WorkloadError::SampleGridMismatch {
@@ -690,6 +808,50 @@ pub fn gate_workload(workload: &WorkloadFile) -> Result<(), WorkloadError> {
     Ok(())
 }
 
+/// The grid's own rules. The lookback the corpus adds on top of the window is
+/// checked by [`crate::promql_corpus::gate_corpus_against_workload`], which is
+/// the side that knows the lookbacks.
+fn gate_range_eval(profile: &Profile) -> Result<(), WorkloadError> {
+    let grid = profile.range_eval;
+    let fault = if grid.start_offset_secs <= grid.end_offset_secs {
+        Some(RangeEvalFault::EmptyWindow)
+    } else if grid.step_secs == 0 {
+        Some(RangeEvalFault::ZeroStep)
+    } else if !grid.window_secs().is_multiple_of(grid.step_secs) {
+        Some(RangeEvalFault::StepDoesNotDivideWindow)
+    } else if !grid.step_secs.is_multiple_of(profile.scrape_interval_secs) {
+        Some(RangeEvalFault::StepOffScrapeGrid)
+    } else if grid.start_offset_secs > profile.duration_secs {
+        Some(RangeEvalFault::StartPastDuration)
+    } else {
+        None
+    };
+    match fault {
+        Some(fault) => Err(WorkloadError::BadRangeEval {
+            profile: profile.name.clone(),
+            start_offset_secs: grid.start_offset_secs,
+            end_offset_secs: grid.end_offset_secs,
+            step_secs: grid.step_secs,
+            fault,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The first profile object in a raw manifest with no `range_eval` key.
+fn profile_missing_range_eval(doc: &serde_json::Value) -> Option<String> {
+    doc.get("profiles")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("range_eval").is_none())
+        .map(|p| {
+            p.get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string()
+        })
+}
+
 /// Read a manifest, parse it, and gate it.
 pub fn load_workload(path: impl AsRef<Path>) -> Result<WorkloadFile, WorkloadError> {
     let path = path.as_ref();
@@ -697,6 +859,22 @@ pub fn load_workload(path: impl AsRef<Path>) -> Result<WorkloadFile, WorkloadErr
         path: path.to_path_buf(),
         source,
     })?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&text).map_err(|source| WorkloadError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if let Some(profile) = profile_missing_range_eval(&raw) {
+        return Err(WorkloadError::MissingRangeEval {
+            path: path.to_path_buf(),
+            found_version: raw
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            expected_version: WORKLOAD_FORMAT_VERSION,
+            profile,
+        });
+    }
     let workload: WorkloadFile =
         serde_json::from_str(&text).map_err(|source| WorkloadError::Parse {
             path: path.to_path_buf(),
@@ -731,6 +909,11 @@ mod tests {
             churn_basis_points_per_hour: 0,
             total_samples: 120_000,
             comparability,
+            range_eval: RangeEval {
+                start_offset_secs: 1_500,
+                end_offset_secs: 0,
+                step_secs: 15,
+            },
         };
         WorkloadFile {
             version: WORKLOAD_FORMAT_VERSION,
@@ -1103,6 +1286,72 @@ mod tests {
             matches!(err, WorkloadError::UnsupportedVersion { found: 9, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn every_range_eval_rule_is_enforced_and_names_its_fault() {
+        let cases: &[(u64, u64, u64, RangeEvalFault)] = &[
+            (0, 0, 15, RangeEvalFault::EmptyWindow),
+            (300, 600, 15, RangeEvalFault::EmptyWindow),
+            (1_500, 0, 0, RangeEvalFault::ZeroStep),
+            (1_500, 0, 45, RangeEvalFault::StepDoesNotDivideWindow),
+            (1_500, 0, 10, RangeEvalFault::StepOffScrapeGrid),
+            (1_815, 0, 15, RangeEvalFault::StartPastDuration),
+        ];
+        for (start, end, step, expected) in cases {
+            let mut w = fixture();
+            w.profiles[2].range_eval = RangeEval {
+                start_offset_secs: *start,
+                end_offset_secs: *end,
+                step_secs: *step,
+            };
+            let err = gate_workload(&w).expect_err("a broken grid must fail");
+            assert!(
+                matches!(&err, WorkloadError::BadRangeEval { profile, fault, .. }
+                    if profile == "churn" && fault == expected),
+                "({start}, {end}, {step}): wrong error {err:?}"
+            );
+        }
+        // The boundary itself passes: a grid reaching back exactly to the
+        // duration fits, and a step equal to the window gives two points.
+        let mut w = fixture();
+        w.profiles[2].range_eval = RangeEval {
+            start_offset_secs: 1_800,
+            end_offset_secs: 0,
+            step_secs: 1_800,
+        };
+        gate_workload(&w).expect("a grid spanning exactly the duration gates clean");
+        assert_eq!(w.profiles[2].range_eval.points(), 2);
+    }
+
+    #[test]
+    fn a_zero_scrape_interval_is_refused() {
+        let mut w = fixture();
+        w.profiles[0].scrape_interval_secs = 0;
+        let err = gate_workload(&w).expect_err("a zero interval must fail");
+        assert!(
+            matches!(&err, WorkloadError::ZeroScrapeInterval { profile } if profile == "cardinality"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_without_range_eval_is_refused_naming_the_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workload.json");
+        let mut doc = serde_json::to_value(fixture()).expect("fixture serializes");
+        doc["profiles"][1]
+            .as_object_mut()
+            .expect("profile object")
+            .remove("range_eval");
+        std::fs::write(&path, doc.to_string()).expect("write fixture");
+        let err = load_workload(&path).expect_err("a profile without a grid must fail");
+        assert!(
+            matches!(&err, WorkloadError::MissingRangeEval { profile, found_version: 2, .. }
+                if profile == "history"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("range_eval"), "{err}");
     }
 
     #[test]

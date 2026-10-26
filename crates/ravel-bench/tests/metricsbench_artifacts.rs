@@ -14,10 +14,12 @@ use std::process::Command;
 
 use ravel_bench::metrics_gen::Generator;
 use ravel_bench::metrics_workload::{
-    Comparability, FamilyKind, NON_COMPARABLE_PROFILES, REQUIRED_PROFILES, load_workload,
+    Comparability, FamilyKind, NON_COMPARABLE_PROFILES, REQUIRED_PROFILES, WorkloadError,
+    load_workload,
 };
 use ravel_bench::promql_corpus::{
-    CostClass, EvalKind, class_counts, known_construct_names, load_corpus,
+    CorpusEntry, CorpusError, CostClass, EvalKind, class_counts, gate_corpus_against_workload,
+    known_construct_names, load_corpus,
 };
 
 /// The checked-in artifacts, relative to this crate's manifest dir.
@@ -44,7 +46,9 @@ const CORPUS_SIZE: usize = 24;
 fn the_checked_in_artifacts_load_and_pass_their_gates() {
     let workload = load_workload(workload_path()).expect("the workload manifest loads and gates");
     let entries = load_corpus(corpus_path()).expect("the query corpus loads and gates");
-    assert_eq!(workload.version, 1);
+    gate_corpus_against_workload(&entries, &workload)
+        .expect("the corpus gates clean against the manifest");
+    assert_eq!(workload.version, 2);
     assert_eq!(workload.seed, 927_000_933);
     assert_eq!(entries.len(), CORPUS_SIZE);
 }
@@ -75,6 +79,24 @@ fn the_manifest_declares_exactly_the_four_adr_0927_profiles_with_their_exact_fig
             "{name} churn rate"
         );
         assert_eq!(p.total_samples, *total, "{name} total_samples");
+    }
+
+    // The range-evaluation grids (workload version 2): (name, start offset,
+    // end offset, step, points). ci's window is 25 minutes, not 30: its whole
+    // span is 30 minutes and every range entry it runs reads a 5 m lookback
+    // before the window opens.
+    let grids: &[(&str, u64, u64, u64, u64)] = &[
+        ("cardinality", 1_800, 0, 15, 121),
+        ("history", 86_400, 0, 300, 289),
+        ("churn", 21_600, 0, 60, 361),
+        ("ci", 1_500, 0, 15, 101),
+    ];
+    for (name, start, end, step, points) in grids {
+        let grid = workload.profile(name).expect("profile present").range_eval;
+        assert_eq!(grid.start_offset_secs, *start, "{name} range start");
+        assert_eq!(grid.end_offset_secs, *end, "{name} range end");
+        assert_eq!(grid.step_secs, *step, "{name} range step");
+        assert_eq!(grid.points(), *points, "{name} range points");
     }
 }
 
@@ -329,27 +351,36 @@ fn the_corpus_splits_exactly_six_range_queries_from_eighteen_instant_ones() {
 }
 
 #[test]
-fn only_the_long_range_entries_restrict_themselves_to_a_profile() {
+fn only_entries_whose_window_a_profile_cannot_hold_restrict_themselves() {
     let entries = load_corpus(corpus_path()).expect("corpus loads");
     let restricted: Vec<&str> = entries
         .iter()
         .filter(|e| !e.profiles.is_empty())
         .map(|e| e.id.as_str())
         .collect();
-    // Exactly the three long-range entries: only `history` (30 days) and, for
-    // the 6-hour window, `churn` (36 hours) generate enough data for them.
+    // The three long-range entries: only `history` (30 days) and, for the
+    // 6-hour window, `churn` (36 hours) generate enough data for them. And the
+    // one range entry with a 30 m lookback, which the 30-minute ci profile
+    // cannot hold beside any evaluation window.
     assert_eq!(
         restricted,
         vec![
+            "mb_full_range_avg_over_time",
             "mb_long_range_7d_avg",
             "mb_long_range_subquery_max",
             "mb_long_range_predict_linear"
         ]
     );
     for entry in entries.iter().filter(|e| !e.profiles.is_empty()) {
-        assert_eq!(entry.class, Some(CostClass::LongRange), "{}", entry.id);
         assert!(entry.runs_under("history"), "{}", entry.id);
-        assert!(!entry.runs_under("cardinality"), "{}", entry.id);
+        assert!(!entry.runs_under("ci"), "{}", entry.id);
+        if entry.class == Some(CostClass::LongRange) {
+            assert!(!entry.runs_under("cardinality"), "{}", entry.id);
+        } else {
+            assert_eq!(entry.id, "mb_full_range_avg_over_time");
+            assert_eq!(entry.eval, EvalKind::Range);
+            assert!(entry.runs_under("cardinality") && entry.runs_under("churn"));
+        }
     }
 
     // Per profile, the exact number of entries that run.
@@ -357,7 +388,7 @@ fn only_the_long_range_entries_restrict_themselves_to_a_profile() {
     assert_eq!(counted("history"), 24);
     assert_eq!(counted("churn"), 22);
     assert_eq!(counted("cardinality"), 21);
-    assert_eq!(counted("ci"), 21);
+    assert_eq!(counted("ci"), 20);
 }
 
 #[test]
@@ -464,6 +495,316 @@ fn every_metric_and_label_literal_the_corpus_selects_exists_in_the_workload() {
         workload.generator.scaling_label_value_prefix, "metricsbench-instance-",
         "the single-series entries select an instance literal built from this prefix"
     );
+
+    // The literal check above only asks whether some dimension declares the
+    // value. The workload gate asks whether the selected family's generated
+    // series carry it, under every profile the entry runs under, so each of
+    // these fails even where the dimension check passes.
+    gate_corpus_against_workload(&entries, &workload).expect("the corpus selects real series");
+    for (promql, selector) in [
+        // A value no dimension declares.
+        (
+            r#"metricsbench_gauge_cpu_percent{job="metricsbench-ghost"}"#,
+            r#"metricsbench_gauge_cpu_percent{job="metricsbench-ghost"}"#,
+        ),
+        // A declared value on a dimension the gauge family does not carry.
+        (
+            r#"sum(metricsbench_gauge_cpu_percent{method="GET"})"#,
+            r#"metricsbench_gauge_cpu_percent{method="GET"}"#,
+        ),
+        // An instance ordinal no profile reaches.
+        (
+            r#"metricsbench_requests_total{instance="metricsbench-instance-999999"}"#,
+            r#"metricsbench_requests_total{instance="metricsbench-instance-999999"}"#,
+        ),
+        // A regex no value matches.
+        (
+            r#"avg(metricsbench_gauge_cpu_percent{region=~"sa-.*"})"#,
+            r#"metricsbench_gauge_cpu_percent{region=~"sa-.*"}"#,
+        ),
+        // The absent sentinel outside absent() is an ordinary empty selector.
+        (
+            "rate(metricsbench_absent_metric[5m])",
+            "metricsbench_absent_metric",
+        ),
+    ] {
+        let mutated = with_promql(&entries, "mb_single_gauge_instant", promql);
+        let err = gate_corpus_against_workload(&mutated, &workload)
+            .expect_err("a selector matching no generated series must fail");
+        assert!(
+            matches!(&err, CorpusError::SelectsNothing { entry_id, profile, selector: s }
+                if entry_id == "mb_single_gauge_instant" && profile == "cardinality"
+                    && s == selector),
+            "{promql}: {err:?}"
+        );
+    }
+}
+
+/// `entries` with entry `id`'s query replaced.
+fn with_promql(entries: &[CorpusEntry], id: &str, promql: &str) -> Vec<CorpusEntry> {
+    let mut out = entries.to_vec();
+    let entry = out.iter_mut().find(|e| e.id == id).expect("entry present");
+    entry.promql = promql.to_string();
+    out
+}
+
+/// `entries` with entry `id`'s profile list replaced.
+fn with_profiles(entries: &[CorpusEntry], id: &str, profiles: &[&str]) -> Vec<CorpusEntry> {
+    let mut out = entries.to_vec();
+    let entry = out.iter_mut().find(|e| e.id == id).expect("entry present");
+    entry.profiles = profiles.iter().map(|p| (*p).to_string()).collect();
+    out
+}
+
+#[test]
+fn a_version_1_manifest_is_refused_naming_the_missing_range_eval_block() {
+    // The version-1 manifest is the version-2 one without its grids and with
+    // the old version number; nothing else changed between the two.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let text = std::fs::read_to_string(workload_path()).expect("read the manifest");
+    let mut doc: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    doc["version"] = serde_json::json!(1);
+    for profile in doc["profiles"].as_array_mut().expect("profiles") {
+        profile
+            .as_object_mut()
+            .expect("profile object")
+            .remove("range_eval");
+    }
+    let path = dir.path().join("workload.v1.json");
+    std::fs::write(&path, doc.to_string()).expect("write");
+    let err = load_workload(&path).expect_err("a version-1 manifest must fail");
+    assert!(
+        matches!(&err, WorkloadError::MissingRangeEval { profile, found_version: 1, expected_version: 2, .. }
+            if profile == "cardinality"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("range_eval"), "{err}");
+}
+
+#[test]
+fn a_version_1_corpus_is_refused_by_the_version_2_loader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = corrupt_corpus(&dir, "corpus.v1.json", |doc| {
+        doc["version"] = serde_json::json!(1);
+    });
+    let err = load_corpus(&path).expect_err("a version-1 corpus must fail");
+    assert!(
+        matches!(
+            err,
+            CorpusError::UnsupportedVersion {
+                found: 1,
+                expected: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn the_two_repaired_joins_and_the_two_intended_empty_entries_say_why() {
+    let entries = load_corpus(corpus_path()).expect("corpus loads");
+    let modified: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.modified.is_modified())
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(
+        modified,
+        vec!["mb_join_cpu_on_build_version", "mb_join_saturated_and_busy"]
+    );
+    let by_id = |id: &str| entries.iter().find(|e| e.id == id).expect("entry present");
+    assert!(
+        by_id("mb_join_cpu_on_build_version")
+            .promql
+            .ends_with(r#"metricsbench_build_info{version="1.25.0"}"#)
+    );
+    assert!(
+        by_id("mb_join_saturated_and_busy")
+            .promql
+            .ends_with("rate(metricsbench_requests_total[5m]) > 0.5")
+    );
+
+    // Only the two native-histogram entries are intended-empty. The three
+    // absent entries are not: absent() answers with a sample exactly when its
+    // argument is empty.
+    let intended_empty: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.expected.intended_empty)
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(
+        intended_empty,
+        vec!["mb_histogram_native_p95", "mb_histogram_native_fraction"]
+    );
+    for id in intended_empty {
+        let reason = by_id(id).expected.reason.as_deref().expect("a reason");
+        assert!(
+            reason.contains("T1c") && reason.contains("#2821"),
+            "{reason}"
+        );
+    }
+
+    // A blank reason on the marker is refused by the loader.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index = entries
+        .iter()
+        .position(|e| e.id == "mb_histogram_native_p95")
+        .expect("entry present");
+    let path = corrupt_corpus(&dir, "blank_reason.json", |doc| {
+        doc["entries"][index]["expected"]["reason"] = serde_json::json!("  ");
+    });
+    let err = load_corpus(&path).expect_err("a blank intended-empty reason must fail");
+    assert!(
+        matches!(&err, CorpusError::EmptyIntendedEmptyReason { entry_id }
+            if entry_id == "mb_histogram_native_p95"),
+        "{err:?}"
+    );
+}
+
+/// The version-1 join: the build_info side unqualified. `job` and `instance`
+/// exist on both sides, so a gate that only checked the `on` labels exist
+/// would pass it; it is refused because the right side holds both versions
+/// under every `(job, instance)`.
+#[test]
+fn the_version_1_join_is_refused_because_its_right_side_repeats_every_key() {
+    let workload = load_workload(workload_path()).expect("manifest loads");
+    let entries = load_corpus(corpus_path()).expect("corpus loads");
+    let v1 = with_promql(
+        &entries,
+        "mb_join_cpu_on_build_version",
+        "metricsbench_gauge_cpu_percent * on (job, instance) group_left (version) \
+         metricsbench_build_info",
+    );
+    let err = gate_corpus_against_workload(&v1, &workload)
+        .expect_err("a right side holding two series per key must fail");
+    match &err {
+        CorpusError::JoinKeyNotUnique {
+            entry_id,
+            profile,
+            modifier,
+            selector,
+            series,
+            key,
+            ..
+        } => {
+            assert_eq!(entry_id, "mb_join_cpu_on_build_version");
+            assert_eq!(profile, "cardinality");
+            assert_eq!(*modifier, "group_left");
+            assert_eq!(selector, "metricsbench_build_info", "the right side");
+            assert_eq!(*series, 2, "one series per declared version");
+            assert!(key.contains("job=") && key.contains("instance="), "{key}");
+        }
+        other => panic!("wrong error variant: {other:?}"),
+    }
+    for family in ["metricsbench_gauge_cpu_percent", "metricsbench_build_info"] {
+        let f = workload
+            .families
+            .iter()
+            .find(|f| f.name == family)
+            .expect("family declared");
+        assert!(f.labels.iter().any(|l| l == "job"), "{family} carries job");
+    }
+    assert_eq!(workload.generator.scaling_label, "instance");
+}
+
+/// The repaired join passes although its LEFT side repeats every key: the
+/// gauge carries `region` beside `job`, so each `(job, instance)` holds up to
+/// three gauge series. That is the many side of a group_left match, and a gate
+/// checking the left side instead of the right would refuse the repaired
+/// corpus.
+#[test]
+fn the_repaired_join_passes_with_a_left_side_that_repeats_keys() {
+    let workload = load_workload(workload_path()).expect("manifest loads");
+    let entries = load_corpus(corpus_path()).expect("corpus loads");
+    gate_corpus_against_workload(&entries, &workload).expect("the repaired join gates clean");
+
+    let ci = workload.profile("ci").expect("ci profile");
+    let sets = Generator::new(&workload, "ci", 0)
+        .expect("generator builds")
+        .family_label_sets("metricsbench_gauge_cpu_percent", ci.samples_per_series)
+        .expect("family declared");
+    let mut per_key: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for labels in &sets {
+        let value = |name: &str| {
+            labels
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        *per_key
+            .entry((value("job"), value("instance")))
+            .or_default() += 1;
+    }
+    assert_eq!(per_key.values().max(), Some(&3), "three regions per key");
+}
+
+#[test]
+fn an_entry_naming_an_undeclared_profile_is_refused() {
+    let workload = load_workload(workload_path()).expect("manifest loads");
+    let entries = load_corpus(corpus_path()).expect("corpus loads");
+    let mutated = with_profiles(&entries, "mb_long_range_7d_avg", &["history", "smoke"]);
+    let err = gate_corpus_against_workload(&mutated, &workload)
+        .expect_err("an undeclared profile must fail");
+    assert!(
+        matches!(&err, CorpusError::UnknownProfile { entry_id, profile }
+            if entry_id == "mb_long_range_7d_avg" && profile == "smoke"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_entry_whose_window_and_lookback_outrun_a_profile_is_refused() {
+    let workload = load_workload(workload_path()).expect("manifest loads");
+    let entries = load_corpus(corpus_path()).expect("corpus loads");
+    // (entry, profiles to run under, expected profile, window, lookback,
+    // duration): the 30 m range entry under ci; the 1d:5m subquery (range plus
+    // the 5 m inside it) under cardinality; the 7d window under churn. The
+    // last two are instant entries in the corpus and are run as range entries
+    // here, since only a range entry has an evaluation window.
+    type Case<'a> = (&'a str, &'a [&'a str], &'a str, u64, u64, u64);
+    let cases: &[Case] = &[
+        (
+            "mb_full_range_avg_over_time",
+            &[],
+            "ci",
+            1_500,
+            1_800,
+            1_800,
+        ),
+        (
+            "mb_long_range_subquery_max",
+            &["cardinality"],
+            "cardinality",
+            1_800,
+            86_700,
+            5_400,
+        ),
+        (
+            "mb_long_range_7d_avg",
+            &["churn"],
+            "churn",
+            21_600,
+            604_800,
+            129_600,
+        ),
+    ];
+    for (id, profiles, expected_profile, window, lookback, duration) in cases {
+        let mut mutated = with_profiles(&entries, id, profiles);
+        for entry in mutated.iter_mut().filter(|e| e.id == *id) {
+            entry.eval = EvalKind::Range;
+        }
+        let err = gate_corpus_against_workload(&mutated, &workload)
+            .expect_err("an entry outrunning its profile must fail");
+        assert!(
+            matches!(&err, CorpusError::WindowExceedsProfile {
+                entry_id, profile, window_secs, lookback_secs, duration_secs }
+                if entry_id == id && profile == expected_profile && window_secs == window
+                    && lookback_secs == lookback && duration_secs == duration),
+            "{id}: {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -562,7 +903,13 @@ fn the_ci_profile_generates_its_exact_declared_sample_count() {
     assert_eq!(report.omitted_missing_samples, 225, "missing samples");
     assert_eq!(report.counter_reset_events, 43, "counter resets");
     assert_eq!(report.out_of_order_samples, 182, "out-of-order samples");
+    // Workload version 2 moved the out-of-order shift off the scrape grid, so
+    // the stream (and nothing else above) differs from version 1's.
+    assert_eq!(report.digest, CI_DIGEST_V2, "ci stream digest at anchor 0");
 }
+
+/// The full ci stream's BLAKE3 digest at anchor 0 under workload version 2.
+const CI_DIGEST_V2: &str = "f52ca005e0ddaa224e5d47cc2aba0f192be21a1e0d2ba36884ad665d55c2ea67";
 
 /// The `metricsbench_gen` binary, resolved the way an integration test can.
 fn bin() -> PathBuf {
@@ -587,7 +934,7 @@ fn the_shipping_binary_gates_the_checked_in_artifacts_and_reports_exact_figures(
     let document: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("the bin prints one JSON document");
     assert_eq!(document["corpus"]["entries"], 24);
-    assert_eq!(document["corpus"]["entries_in_profile"], 21);
+    assert_eq!(document["corpus"]["entries_in_profile"], 20);
     assert_eq!(document["workload"]["seed"], 927_000_933u64);
     assert_eq!(document["workload"]["families"], 5);
     assert_eq!(document["generation"]["profile"], "ci");
