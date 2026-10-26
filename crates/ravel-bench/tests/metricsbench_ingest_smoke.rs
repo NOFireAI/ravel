@@ -37,36 +37,51 @@ fn ci_workload() -> ravel_bench::metrics_workload::WorkloadFile {
     .expect("load the same workload manifest the binary loads")
 }
 
+/// The `ci` profile's scrape interval in milliseconds, the grid every anchor
+/// sits on.
+fn ci_interval_ms() -> i64 {
+    let secs = ci_workload()
+        .profile("ci")
+        .expect("manifest declares a `ci` profile")
+        .scrape_interval_secs;
+    secs as i64 * 1_000
+}
+
+/// A now-based anchor `steps` scrapes back, rounded down onto the scrape grid,
+/// so a strict write lands in a plausible ingest window and the bin accepts it.
+fn on_grid_anchor(steps: u64) -> i64 {
+    let interval_ms = ci_interval_ms();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_millis() as i64;
+    let back = now_ms - steps as i64 * interval_ms;
+    back - back.rem_euclid(interval_ms)
+}
+
 /// Run the bin over the `ci` profile against an in-process `MemoryStore`, a few
 /// steps, no comparator endpoints, and return the JSON report it prints.
 fn run_lane() -> serde_json::Value {
+    // One step, and a batch large enough to flush the whole step in a couple
+    // of strict writes: strict mode flushes durably per batch, so a small batch
+    // over the `ci` profile's series count is many sequential flushes. This
+    // keeps the reachability smoke fast.
+    run_lane_with_steps(1, on_grid_anchor(1))
+}
+
+/// Run the bin over the `ci` profile, one step, with `extra` arguments in
+/// place of the anchor, and return its exit code and stderr.
+fn run_refused(extra: &[&str]) -> (Option<i32>, String) {
     let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
     let output = Command::new(bin)
-        // One step, and a batch large enough to flush the whole step in a
-        // couple of strict writes: strict mode flushes durably per batch, so a
-        // small batch over the `ci` profile's series count is many sequential
-        // flushes. This keeps the reachability smoke fast.
-        .args([
-            "--profile",
-            "ci",
-            "--store",
-            "memory",
-            "--steps",
-            "1",
-            "--shards",
-            "2",
-            "--batch-size",
-            "4096",
-        ])
+        .args(["--profile", "ci", "--store", "memory", "--steps", "1"])
+        .args(extra)
         .output()
         .expect("spawn metricsbench_ingest");
-    assert!(
-        output.status.success(),
-        "metricsbench_ingest exited non-zero: status={:?} stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("stdout is a JSON report")
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 /// Run the bin over the `ci` profile for exactly `steps` scrapes (no
@@ -104,9 +119,9 @@ fn run_lane_with_steps(steps: u64, anchor_ms: i64) -> serde_json::Value {
 fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
     let _serial = serial();
     let report = run_lane();
-    assert_eq!(
-        report["profile"]["run"]["anchor_source"], "clock",
-        "without --anchor-ms the anchor is read from the clock, and the report says so"
+    assert!(
+        report["profile"]["run"].get("anchor_source").is_none(),
+        "the anchor is always the flag's, so there is no source to record"
     );
     let systems = report["systems"].as_array().expect("systems array");
 
@@ -215,13 +230,9 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         .expect("generator builds for the ci profile");
     let expected_total_series_created = generator.total_series_created(STEPS);
 
-    // A now-based anchor, so the strict write lands in a plausible ingest
-    // window, passed explicitly so the test can regenerate the same stream.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after the epoch")
-        .as_millis() as i64;
-    let anchor_ms = now_ms - STEPS as i64 * expected.scrape_interval_secs as i64 * 1_000;
+    // A now-based on-grid anchor, so the strict write lands in a plausible
+    // ingest window and the test can regenerate the same stream.
+    let anchor_ms = on_grid_anchor(STEPS);
     let (_, gen_report) = Generator::new(&workload, "ci", anchor_ms)
         .expect("generator builds")
         .generate_bytes(STEPS)
@@ -230,8 +241,27 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     let report = run_lane_with_steps(STEPS, anchor_ms);
     let profile = &report["profile"];
 
-    assert_eq!(profile["run"]["anchor_source"], "explicit");
     assert_eq!(profile["run"]["anchor_ms"].as_i64(), Some(anchor_ms));
+    assert_eq!(
+        profile["run"]["stream_digest"].as_str(),
+        Some(gen_report.digest.as_str()),
+        "the recorded stream digest is the regenerated stream's"
+    );
+    assert_eq!(
+        profile["run"]["workload_version"].as_u64(),
+        Some(u64::from(workload.version))
+    );
+    assert_eq!(profile["run"]["seed"].as_u64(), Some(workload.seed));
+    let manifest_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/metrics/workload.json"
+    ))
+    .expect("read the manifest");
+    assert_eq!(
+        profile["run"]["workload_digest"].as_str(),
+        Some(blake3::hash(&manifest_bytes).to_hex().as_str()),
+        "workload_digest is BLAKE3 over the manifest file's bytes"
+    );
     assert_eq!(
         report["systems"][0]["ingest"]["elapsed_basis"], "timed_segments",
         "the artifact says what elapsed_secs measures, so a reader can tell it from a \
@@ -397,6 +427,63 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     let substrate = &report["substrate"];
     assert_eq!(substrate["store_backend"].as_str(), Some("memory"));
     assert_eq!(substrate["backend_bills_requests"].as_bool(), Some(false));
+}
+
+/// The anchor is a run parameter: omitted, the bin exits 64 naming the flag
+/// and why no clock default exists; off the scrape grid, it exits 64 showing
+/// the remainder. Both refuse before anything is generated.
+#[test]
+fn a_missing_or_off_grid_anchor_exits_64() {
+    let _serial = serial();
+    let (code, stderr) = run_refused(&[]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("--anchor-ms is required"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "an anchor read from the clock would make each run replay a different stream"
+        ),
+        "{stderr}"
+    );
+
+    let off_grid = (on_grid_anchor(1) + 1).to_string();
+    let (code, stderr) = run_refused(&["--anchor-ms", &off_grid]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{off_grid} mod {} = 1", ci_interval_ms())),
+        "{stderr}"
+    );
+
+    let (code, stderr) = run_refused(&["--anchor-ms", &(i64::MAX - 1).to_string()]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("9223372036854 ms"), "{stderr}");
+}
+
+/// The same anchor replays the same stream and offers the same tuples; a
+/// different anchor changes both digests.
+#[test]
+fn the_anchor_alone_determines_the_stream_and_offered_digests() {
+    let _serial = serial();
+    let anchor = on_grid_anchor(1);
+    let digests = |report: &serde_json::Value| {
+        (
+            report["profile"]["run"]["stream_digest"]
+                .as_str()
+                .expect("stream_digest")
+                .to_string(),
+            report["systems"][0]["ingest"]["offered_digest"]
+                .as_str()
+                .expect("offered_digest")
+                .to_string(),
+        )
+    };
+    let first = digests(&run_lane_with_steps(1, anchor));
+    let second = digests(&run_lane_with_steps(1, anchor));
+    assert_eq!(first, second, "same anchor, same stream and offered tuples");
+    assert!(!first.1.is_empty());
+
+    let other = digests(&run_lane_with_steps(1, anchor - ci_interval_ms()));
+    assert_ne!(other.0, first.0, "a different anchor is a different stream");
+    assert_ne!(other.1, first.1, "and offers different tuples");
 }
 
 /// The replay batch size these tests pass explicitly (`run_lane` and

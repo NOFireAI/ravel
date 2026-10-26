@@ -17,9 +17,13 @@
 //! stream from the same anchor, and the run fails unless every regeneration's
 //! digest matches the Ravel replay's. `--profile` has no default: the profile
 //! selects which data the run touches (CLAUDE.md measurement discipline).
+//! `--anchor-ms` has none either (ADR-0927, 2026-10-26 amendment, section C):
+//! the stream is a pure function of the manifest, the profile, the step count
+//! and the anchor, so a clock-derived anchor would make every run a different
+//! stream. A missing or invalid anchor exits 64.
 //!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
-//! --profile ci --store memory --steps 10 --anchor-ms 1700000000000`.
+//! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
 #![allow(clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -30,13 +34,17 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    Anchor, AnchorSource, GeneratedStream, HttpReplayConfig, MetricsIngestReport,
-    RavelReplayConfig, StreamBandViolation, StreamCounts, Substrate, build_profile_record,
-    check_stream_band, query_after_replay, replay_into_ravel, replay_over_http,
+    GeneratedStream, HttpReplayConfig, MetricsIngestReport, RavelReplayConfig,
+    RowAccountingViolation, RunProvenance, StreamBandViolation, StreamCounts, Substrate,
+    build_profile_record, check_anchor, check_row_accounting, check_stream_band,
+    query_after_replay, replay_into_ravel, replay_over_http, workload_digest,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
-use ravel_ingest::{Clock, SystemClock};
 use ravel_types::TenantId;
+
+/// The exit code for a usage error (BSD `EX_USAGE`): a missing or invalid run
+/// parameter, refused before anything is generated.
+const EXIT_USAGE: i32 = 64;
 
 /// Where the checked-in workload manifest lives, relative to this crate's
 /// manifest dir. The same default `metricsbench_gen` uses.
@@ -63,9 +71,11 @@ struct Args {
     #[arg(long)]
     steps: Option<u64>,
     /// Timestamp of the first generated step, in milliseconds since the
-    /// epoch. Given, no clock is read to generate the stream and two runs with
-    /// the same anchor replay the same bytes. Omitted, the anchor is
-    /// `now - steps * scrape interval`, so the newest sample lands near now.
+    /// epoch. Required, with no default: the stream is a function of its run
+    /// parameters, and two runs with the same anchor replay the same bytes.
+    /// Must be non-negative, a multiple of the profile's scrape interval in
+    /// milliseconds, and put the last step at or before 9223372036854 ms.
+    /// Missing or invalid, the run exits 64.
     #[arg(long, allow_negative_numbers = true)]
     anchor_ms: Option<i64>,
     /// The object store backing the in-process Ravel path.
@@ -110,6 +120,16 @@ struct Args {
 /// (ADR-0927 band 4/5), separate from an artifact or replay error.
 #[derive(Debug, thiserror::Error)]
 enum RunError {
+    #[error(
+        "--anchor-ms is required: the stream digest covers every sample's timestamp, so an \
+         anchor read from the clock would make each run replay a different stream, and two \
+         runs could never be shown to have replayed the same one. Pass the first step's \
+         timestamp in milliseconds since the epoch, a multiple of the profile's scrape \
+         interval ({interval_ms} ms for profile `{profile}`)"
+    )]
+    MissingAnchor { profile: String, interval_ms: u64 },
+    #[error(transparent)]
+    Anchor(#[from] ravel_bench::metrics_ingest::AnchorError),
     #[error("loading the workload manifest failed: {0}")]
     Workload(String),
     #[error("generating the stream failed: {0}")]
@@ -135,18 +155,10 @@ enum RunError {
         expected: String,
         got: String,
     },
-    #[error(
-        "the {system} sample accounting does not close: {offered} offered against {scalar} \
-         scalar lines, {accepted} accepted + {rejected} rejected + {dropped} dropped. A silent \
-         drop fails the run (ADR-0927 band 4)."
-    )]
+    #[error("{system}: {source}")]
     AccountingMismatch {
         system: String,
-        scalar: u64,
-        offered: u64,
-        accepted: u64,
-        rejected: u64,
-        dropped: u64,
+        source: RowAccountingViolation,
     },
     #[error(
         "the Ravel replay accepted zero samples, so it measured nothing; a stream that ingests \
@@ -171,26 +183,22 @@ fn resolve_steps(args: &Args, workload: &WorkloadFile) -> Result<u64, RunError> 
         })
 }
 
-/// The first step's timestamp: the flag if set, read without touching the
-/// clock; else `now - steps * scrape interval`, so the newest generated sample
-/// lands near now and a strict write lands inside a plausible ingest window
-/// rather than in 1970.
-fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Anchor {
-    if let Some(ms) = args.anchor_ms {
-        return Anchor {
-            ms,
-            source: AnchorSource::Explicit,
-        };
-    }
-    let now_ms = SystemClock.now_ns() / 1_000_000;
-    Anchor {
-        ms: now_ms - steps as i64 * scrape_interval_secs as i64 * 1_000,
-        source: AnchorSource::Clock,
-    }
+/// The first step's timestamp, from the required flag, checked against the
+/// profile's grid and the nanosecond range. No clock is read.
+fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Result<i64, RunError> {
+    let Some(anchor_ms) = args.anchor_ms else {
+        return Err(RunError::MissingAnchor {
+            profile: args.profile.clone(),
+            interval_ms: scrape_interval_secs.saturating_mul(1_000),
+        });
+    };
+    check_anchor(anchor_ms, scrape_interval_secs, steps)?;
+    Ok(anchor_ms)
 }
 
-/// Close a drained stream and check one row against it: the stream half of
-/// band 4, then the sample accounting over the scalar lines.
+/// Close a drained stream and check one row against it: the classification
+/// identity of band 4, then the row's offering identity and the split of its
+/// offered samples.
 fn close_row(
     system: &str,
     stream: GeneratedStream<'_>,
@@ -203,19 +211,10 @@ fn close_row(
         system: system.to_string(),
         source,
     })?;
-    if ingest.offered_samples != counts.scalar
-        || ingest.accepted_samples + ingest.rejected_samples + ingest.dropped_samples
-            != ingest.offered_samples
-    {
-        return Err(RunError::AccountingMismatch {
-            system: system.to_string(),
-            scalar: counts.scalar,
-            offered: ingest.offered_samples,
-            accepted: ingest.accepted_samples,
-            rejected: ingest.rejected_samples,
-            dropped: ingest.dropped_samples,
-        });
-    }
+    check_row_accounting(ingest, &counts).map_err(|source| RunError::AccountingMismatch {
+        system: system.to_string(),
+        source,
+    })?;
     Ok((report, counts))
 }
 
@@ -225,9 +224,21 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let profile = workload.profile(&args.profile).ok_or_else(|| {
         RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
     })?;
-    let anchor = resolve_anchor(args, profile.scrape_interval_secs, steps);
+    let anchor_ms = resolve_anchor(args, profile.scrape_interval_secs, steps)?;
+    // `load_workload` read the same file; a second read for the digest keeps
+    // the loader's signature unchanged.
+    let manifest_bytes = std::fs::read(&args.workload).map_err(|e| {
+        RunError::Workload(format!(
+            "reading {} for its digest: {e}",
+            args.workload.display()
+        ))
+    })?;
+    let provenance = RunProvenance {
+        workload_digest: workload_digest(&manifest_bytes),
+        anchor_ms,
+    };
     let stream_from_anchor = || -> Result<GeneratedStream<'_>, RunError> {
-        let generator = Generator::new(&workload, &args.profile, anchor.ms)
+        let generator = Generator::new(&workload, &args.profile, anchor_ms)
             .map_err(|e| RunError::Generate(e.to_string()))?;
         Ok(GeneratedStream::new(generator, steps))
     };
@@ -271,8 +282,9 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         steps,
         gen_report.bytes,
         &gen_report,
-        anchor,
-    );
+        provenance,
+    )
+    .map_err(|e| RunError::Generate(e.to_string()))?;
 
     // Post-ingest read-your-write query phase (ADR-0927 decision 3): pass the
     // strict writes' commit tokens as `min_commit_token` and evaluate an instant
@@ -359,7 +371,11 @@ async fn main() {
         }
         Err(err) => {
             eprintln!("metricsbench_ingest: {err}");
-            std::process::exit(1);
+            let code = match err {
+                RunError::MissingAnchor { .. } | RunError::Anchor(_) => EXIT_USAGE,
+                _ => 1,
+            };
+            std::process::exit(code);
         }
     }
 }

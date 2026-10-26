@@ -85,15 +85,34 @@ never mistakes a non-comparable or unbilled run for a publishable result.
 
 ### Anchor (`--anchor-ms`)
 
-`--anchor-ms <i64>` sets the timestamp, in milliseconds since the epoch, of
-the first generated step, for example `--anchor-ms 1700000000000`. Given, no
-clock is read to generate the stream, the report says
-`anchor_source: "explicit"`, and two runs with the same anchor replay the same
-bytes. Omitted, the anchor is `now - steps * scrape interval` so the newest
-sample lands near now, and the report says `anchor_source: "clock"`. A run
-meant to be compared with another passes `--anchor-ms` explicitly, with the
-same value on both, so the two replay the same stream. The nightly lane passes
-no anchor and keeps the clock default.
+`--anchor-ms <i64>` is required. It sets the timestamp, in milliseconds since
+the epoch, of the first generated step, for example `--anchor-ms
+1700000010000`. There is no default: the stream digest covers every sample's
+timestamp, so an anchor read from the clock would make every run replay a
+different stream. No clock is read to generate the stream, and two runs with
+the same anchor replay the same bytes. The bin exits 64, naming the problem,
+when the flag is missing, when the anchor is negative, when it is not a
+multiple of the profile's scrape interval in milliseconds (the message shows
+the remainder), or when the last step, `anchor_ms + (steps - 1) * interval_ms`,
+lands past `9223372036854`, the largest millisecond whose nanosecond form fits
+an `i64`. The nightly lane passes a fixed on-grid anchor and replays the same
+frozen window every night.
+
+The report's `profile.run` block records the run's provenance, so a reader can
+regenerate the stream from it:
+- `workload_version`: the manifest's format version.
+- `workload_digest`: BLAKE3 (hex) over the manifest file's bytes.
+- `seed`: the manifest's generator seed.
+- `anchor_ms`: the `--anchor-ms` value.
+- `stream_digest`: the generator's digest over the stream the run replayed.
+
+Each row's `ingest` block adds `offered_digest`, BLAKE3 over the canonical
+`(series, ts_ms, value_bits)` tuple of every sample that row offered, in
+order. `comparable` is `true` only when the profile is publishable,
+`steps_run` equals `steps_declared`, and `stream_digest` equals the digest
+recomputed from the manifest and the anchor; `comparability_reason` names each
+cause that failed. All five provenance fields and `offered_digest` are absent
+from a report written before they existed and read back as unset.
 
 ### Stream accounting
 
@@ -109,10 +128,28 @@ carries `stream_counts` with `generated_lines`, `scalar`, `native_histogram`,
 `stale_marker` and `malformed`. The Remote Write 1.0 replay sends only the
 scalar samples: `offered_samples` equals `stream_counts.scalar`, and
 `excluded_native_histogram` and `excluded_stale_marker` name the two kinds it
-does not send. The bin fails, naming the figures, unless the four counts sum
-to `generated_lines`, `generated_lines` equals the generator's
-`emitted_samples`, `malformed` is zero, and the offered samples split exactly
-into accepted, rejected and dropped.
+does not send. Band 4 is two equations, and the bin fails, naming every
+figure, unless both close:
+
+- Classification identity: `scalar + native_histogram + stale_marker +
+  malformed == generated_lines == emitted_samples`, with `malformed` zero and
+  each of `scalar`, `native_histogram` and `stale_marker` equal to the
+  generator's own `float_samples`, `native_histogram_samples` and
+  `stale_markers`, so a classifier that swaps two kinds fails even though the
+  sum still closes.
+- Offering identity: `offered_samples + excluded_native_histogram +
+  excluded_stale_marker == generated_lines`, read from the row's own fields,
+  with `offered_samples == scalar` and `offered_samples == accepted_samples +
+  rejected_samples + dropped_samples`.
+
+`dropped_samples` counts samples in batches that were sent and never
+acknowledged. A comparator row splits them: `rejected_by_status` maps each
+non-retryable non-2xx HTTP status to the samples in batches answered with it
+(for example `{"400": 500}`), and `retry_exhausted_samples` counts samples in
+batches still failing with a 429, a 5xx or a transport error after
+`--http-max-retries` retries. The two sum to `dropped_samples`. The in-process
+Ravel row has no HTTP status and no retry loop, so both are empty there.
+`rejected_samples` is the samples the lane refused before sending.
 
 Because generation runs inside the replay, `elapsed_secs` is the sum of the
 timed write segments (the `write_values` calls and the final flush for the
