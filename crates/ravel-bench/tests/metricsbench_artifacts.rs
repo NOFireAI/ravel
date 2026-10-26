@@ -82,14 +82,15 @@ fn the_manifest_declares_exactly_the_four_adr_0927_profiles_with_their_exact_fig
     }
 
     // The range-evaluation grids (workload version 2): (name, start offset,
-    // end offset, step, points). ci's window is 25 minutes, not 30: its whole
-    // span is 30 minutes and every range entry it runs reads a 5 m lookback
-    // before the window opens.
+    // end offset, step, points). ci's window is 24 m 45 s, not 30 m: its
+    // stream spans 1,785 s from first sample to newest (120 steps at 15 s),
+    // and every range entry it runs reads a 5 m lookback before the window
+    // opens, so 1,785 - 300 = 1,485 is the most that fits.
     let grids: &[(&str, u64, u64, u64, u64)] = &[
         ("cardinality", 1_800, 0, 15, 121),
         ("history", 86_400, 0, 300, 289),
         ("churn", 21_600, 0, 60, 361),
-        ("ci", 1_500, 0, 15, 101),
+        ("ci", 1_485, 0, 15, 100),
     ];
     for (name, start, end, step, points) in grids {
         let grid = workload.profile(name).expect("profile present").range_eval;
@@ -759,7 +760,7 @@ fn an_entry_whose_window_and_lookback_outrun_a_profile_is_refused() {
     let workload = load_workload(workload_path()).expect("manifest loads");
     let entries = load_corpus(corpus_path()).expect("corpus loads");
     // (entry, profiles to run under, expected profile, window, lookback,
-    // duration): the 30 m range entry under ci; the 1d:5m subquery (range plus
+    // stream span): the 30 m range entry under ci; the 1d:5m subquery (range plus
     // the 5 m inside it) under cardinality; the 7d window under churn. The
     // last two are instant entries in the corpus and are run as range entries
     // here, since only a range entry has an evaluation window.
@@ -769,9 +770,9 @@ fn an_entry_whose_window_and_lookback_outrun_a_profile_is_refused() {
             "mb_full_range_avg_over_time",
             &[],
             "ci",
-            1_500,
+            1_485,
             1_800,
-            1_800,
+            1_785,
         ),
         (
             "mb_long_range_subquery_max",
@@ -779,7 +780,7 @@ fn an_entry_whose_window_and_lookback_outrun_a_profile_is_refused() {
             "cardinality",
             1_800,
             86_700,
-            5_400,
+            5_385,
         ),
         (
             "mb_long_range_7d_avg",
@@ -787,10 +788,10 @@ fn an_entry_whose_window_and_lookback_outrun_a_profile_is_refused() {
             "churn",
             21_600,
             604_800,
-            129_600,
+            129_585,
         ),
     ];
-    for (id, profiles, expected_profile, window, lookback, duration) in cases {
+    for (id, profiles, expected_profile, window, lookback, span) in cases {
         let mut mutated = with_profiles(&entries, id, profiles);
         for entry in mutated.iter_mut().filter(|e| e.id == *id) {
             entry.eval = EvalKind::Range;
@@ -799,9 +800,9 @@ fn an_entry_whose_window_and_lookback_outrun_a_profile_is_refused() {
             .expect_err("an entry outrunning its profile must fail");
         assert!(
             matches!(&err, CorpusError::WindowExceedsProfile {
-                entry_id, profile, window_secs, lookback_secs, duration_secs }
+                entry_id, profile, window_secs, lookback_secs, span_secs }
                 if entry_id == id && profile == expected_profile && window_secs == window
-                    && lookback_secs == lookback && duration_secs == duration),
+                    && lookback_secs == lookback && span_secs == span),
             "{id}: {err:?}"
         );
     }

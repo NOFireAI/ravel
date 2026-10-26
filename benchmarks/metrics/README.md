@@ -75,15 +75,18 @@ is the newest sample and `start_offset_secs` counts backwards from it.
 | `cardinality` | 1,800 s | 0 | 15 s | 30 m | 121 |
 | `history` | 86,400 s | 0 | 300 s | 24 h | 289 |
 | `churn` | 21,600 s | 0 | 60 s | 6 h | 361 |
-| `ci` | 1,500 s | 0 | 15 s | 25 m | 101 |
+| `ci` | 1,485 s | 0 | 15 s | 24 m 45 s | 100 |
 
 The manifest gate refuses a grid whose start is not after its end, whose step
 is zero, does not divide the window, or is not a multiple of the scrape
-interval, or whose start reaches past `duration_secs`. The corpus gate adds
-the lookback: every range entry's window plus its longest range-selector
-lookback must fit inside the duration of each profile it runs under. That is
-why `ci`'s window is 25 minutes, not 30: its whole span is 30 minutes and every
-range entry it runs reads 5 minutes before each grid point.
+interval, or whose start reaches past the profile's stream span, the time from
+its first sample to its newest: `(samples_per_series - 1) *
+scrape_interval_secs`, one scrape interval less than `duration_secs`. The
+corpus gate adds the lookback: every range entry's window plus its longest
+range-selector lookback must fit inside the stream span of each profile it
+runs under, so every grid point's lookback starts at or after the first
+sample. That is why `ci`'s window is 1,485 s: its stream spans 1,785 s and
+every range entry it runs reads 5 minutes before each grid point.
 
 ## Ingest artifact (`metricsbench_ingest`, ADR-0927 decision 11)
 

@@ -704,6 +704,17 @@ impl<'a> Generator<'a> {
     /// family's instances, so a classic histogram's `le` and its
     /// `_bucket`/`_sum`/`_count` suffixes are not part of them.
     pub fn family_label_sets(&self, family_name: &str, steps: u64) -> Option<Vec<LabelSet>> {
+        Some(self.family_label_iter(family_name, steps)?.collect())
+    }
+
+    /// The same label sets as [`Self::family_label_sets`], in the same order,
+    /// generated one at a time on demand, so a caller that stops early (a
+    /// check looking for the first match) never builds the whole family.
+    pub fn family_label_iter(
+        &self,
+        family_name: &str,
+        steps: u64,
+    ) -> Option<impl Iterator<Item = LabelSet> + '_> {
         let plan_idx = self
             .plans
             .iter()
@@ -716,11 +727,7 @@ impl<'a> Generator<'a> {
         } else {
             last_base + plan.instances
         };
-        Some(
-            (0..end)
-                .map(|global| self.labels_for(plan_idx, family, global))
-                .collect(),
-        )
+        Some((0..end).map(move |global| self.labels_for(plan_idx, family, global)))
     }
 
     /// Generate `steps` scrapes into memory. Convenience over

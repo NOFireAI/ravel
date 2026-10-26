@@ -405,15 +405,17 @@ pub enum CorpusError {
         selector: String,
         /// The repeated key, as `label="value"` pairs in `on (...)` order.
         key: String,
-        /// How many one-side series carry it.
+        /// How many one-side series carried it when the check stopped: the
+        /// check stops at the first key it sees twice, so this is 2 unless
+        /// that changes.
         series: usize,
     },
     /// A range entry's evaluation window plus its longest lookback reaches back
     /// past the first sample of a profile it runs under.
     #[error(
         "promql corpus entry `{entry_id}` needs a {window_secs}s range evaluation window plus a \
-         {lookback_secs}s lookback under profile `{profile}`, which generates only \
-         {duration_secs}s of data"
+         {lookback_secs}s lookback under profile `{profile}`, whose stream spans only \
+         {span_secs}s from its first sample to its newest"
     )]
     WindowExceedsProfile {
         /// The id of the offending entry.
@@ -424,8 +426,9 @@ pub enum CorpusError {
         window_secs: u64,
         /// The entry's longest lookback.
         lookback_secs: u64,
-        /// The profile's duration.
-        duration_secs: u64,
+        /// The profile's stream span, first sample to newest
+        /// ([`crate::metrics_workload::Profile::stream_span_secs`]).
+        span_secs: u64,
     },
     /// An entry restricts itself to a profile the manifest does not declare.
     #[error("promql corpus entry `{entry_id}` names profile `{profile}`, which is not declared")]
@@ -902,7 +905,10 @@ fn parse_duration_secs(text: &str) -> Result<u64, String> {
                 _ => return Err(format!("duration `{text}` has no unit")),
             }
         };
-        total += n * secs;
+        total = n
+            .checked_mul(secs)
+            .and_then(|part| total.checked_add(part))
+            .ok_or_else(|| format!("duration `{text}` overflows"))?;
         rest = &rest[width..];
     }
     Ok(total)
@@ -933,7 +939,9 @@ fn longest_lookback_secs(promql: &str) -> Result<u64, String> {
             Some((range, _step)) => {
                 let operand_start = subquery_operand_start(&chars, i)?;
                 let operand: String = chars[operand_start..i].iter().collect();
-                parse_duration_secs(range)? + longest_lookback_secs(&operand)?
+                parse_duration_secs(range)?
+                    .checked_add(longest_lookback_secs(&operand)?)
+                    .ok_or_else(|| format!("subquery `[{inner}]` lookback overflows"))?
             }
         };
         longest = longest.max(lookback);
@@ -1078,50 +1086,42 @@ fn read_join(promql: &str) -> Result<Option<Join>, String> {
     }))
 }
 
-/// Label sets per `(profile, family)`, generated once and reused.
-struct SeriesIndex<'a> {
-    workload: &'a WorkloadFile,
-    cache: BTreeMap<(String, String), Vec<LabelSet>>,
-}
-
-impl<'a> SeriesIndex<'a> {
-    fn new(workload: &'a WorkloadFile) -> Self {
-        Self {
-            workload,
-            cache: BTreeMap::new(),
+/// Visit the label sets of the instances that write `selector.metric` under
+/// `profile` over its whole declared run, one at a time, generated on demand
+/// and never collected, until `visit` returns `false`. `Ok(None)` when nothing
+/// writes the metric, else `Ok(Some(n))` with the number of label sets
+/// visited. A classic histogram's `_bucket`/`_sum`/`_count` resolve to its
+/// instances; a matcher on `le` is refused, since the sets do not carry it.
+fn visit_series(
+    workload: &WorkloadFile,
+    profile: &Profile,
+    selector: &Selector,
+    mut visit: impl FnMut(&LabelSet) -> bool,
+) -> Result<Option<u64>, String> {
+    let family = workload.families.iter().find(|f| match f.kind {
+        FamilyKind::ClassicHistogram => ["_bucket", "_sum", "_count"]
+            .iter()
+            .any(|suffix| selector.metric == format!("{}{suffix}", f.name)),
+        _ => selector.metric == f.name,
+    });
+    let Some(family) = family else {
+        return Ok(None);
+    };
+    if selector.matchers.iter().any(|m| m.label == "le") {
+        return Err(format!("`{}` matches on `le`", selector.text));
+    }
+    let generator = Generator::for_profile(workload, profile, 0);
+    let Some(sets) = generator.family_label_iter(&family.name, profile.samples_per_series) else {
+        return Ok(None);
+    };
+    let mut visited = 0u64;
+    for labels in sets {
+        visited += 1;
+        if !visit(&labels) {
+            break;
         }
     }
-
-    /// The label sets of the instances that write `metric` under `profile`
-    /// over its whole declared run, or `None` when nothing writes it. A
-    /// classic histogram's `_bucket`/`_sum`/`_count` resolve to its instances;
-    /// a matcher on `le` is refused, since the sets do not carry it.
-    fn series(
-        &mut self,
-        profile: &Profile,
-        selector: &Selector,
-    ) -> Result<Option<&[LabelSet]>, String> {
-        let family = self.workload.families.iter().find(|f| match f.kind {
-            FamilyKind::ClassicHistogram => ["_bucket", "_sum", "_count"]
-                .iter()
-                .any(|suffix| selector.metric == format!("{}{suffix}", f.name)),
-            _ => selector.metric == f.name,
-        });
-        let Some(family) = family else {
-            return Ok(None);
-        };
-        if selector.matchers.iter().any(|m| m.label == "le") {
-            return Err(format!("`{}` matches on `le`", selector.text));
-        }
-        let key = (profile.name.clone(), family.name.clone());
-        if !self.cache.contains_key(&key) {
-            let sets = Generator::for_profile(self.workload, profile, 0)
-                .family_label_sets(&family.name, profile.samples_per_series)
-                .unwrap_or_default();
-            self.cache.insert(key.clone(), sets);
-        }
-        Ok(self.cache.get(&key).map(Vec::as_slice))
-    }
+    Ok(Some(visited))
 }
 
 /// The checks that need the workload manifest, for every profile each entry
@@ -1129,9 +1129,10 @@ impl<'a> SeriesIndex<'a> {
 ///
 /// 1. every profile an entry names is declared;
 /// 2. an `eval: range` entry's evaluation window (the profile's `range_eval`
-///    start offset) plus its longest lookback fits inside the profile's
-///    `duration_secs`, so every grid point's lookback starts at or after the
-///    profile's first sample;
+///    start offset) plus its longest lookback fits inside the profile's stream
+///    span ([`crate::metrics_workload::Profile::stream_span_secs`], one scrape
+///    interval less than `duration_secs`), so every grid point's lookback
+///    starts at or after the profile's first sample;
 /// 3. unless the entry is marked intended-empty, every selector matches at
 ///    least one series the generator writes under the profile, except a
 ///    selector written directly as the argument of `absent(` or
@@ -1152,7 +1153,6 @@ pub fn gate_corpus_against_workload(
     entries: &[CorpusEntry],
     workload: &WorkloadFile,
 ) -> Result<(), CorpusError> {
-    let mut index = SeriesIndex::new(workload);
     for entry in entries {
         for name in &entry.profiles {
             if workload.profile(name).is_none() {
@@ -1176,14 +1176,16 @@ pub fn gate_corpus_against_workload(
             .filter(|p| entry.runs_under(&p.name))
         {
             let window_secs = profile.range_eval.start_offset_secs;
-            if entry.eval == EvalKind::Range && window_secs + lookback_secs > profile.duration_secs
+            let span_secs = profile.stream_span_secs();
+            if entry.eval == EvalKind::Range
+                && window_secs.saturating_add(lookback_secs) > span_secs
             {
                 return Err(CorpusError::WindowExceedsProfile {
                     entry_id: entry.id.clone(),
                     profile: profile.name.clone(),
                     window_secs,
                     lookback_secs,
-                    duration_secs: profile.duration_secs,
+                    span_secs,
                 });
             }
 
@@ -1195,13 +1197,12 @@ pub fn gate_corpus_against_workload(
                     ) {
                         continue;
                     }
-                    let hit = index
-                        .series(profile, selector)
-                        .map_err(unreadable)?
-                        .is_some_and(|sets| {
-                            sets.iter()
-                                .any(|labels| selector.matchers.iter().all(|m| m.matches(labels)))
-                        });
+                    let mut hit = false;
+                    visit_series(workload, profile, selector, |labels| {
+                        hit = selector.matchers.iter().all(|m| m.matches(labels));
+                        !hit
+                    })
+                    .map_err(unreadable)?;
                     if !hit {
                         return Err(CorpusError::SelectsNothing {
                             entry_id: entry.id.clone(),
@@ -1219,29 +1220,37 @@ pub fn gate_corpus_against_workload(
                         join.one_side.text
                     )));
                 }
-                let sets = index
-                    .series(profile, &join.one_side)
-                    .map_err(unreadable)?
-                    .unwrap_or_default();
-                let mut per_key: BTreeMap<Vec<&str>, usize> = BTreeMap::new();
-                for labels in sets
-                    .iter()
-                    .filter(|labels| join.one_side.matchers.iter().all(|m| m.matches(labels)))
-                {
-                    let key: Vec<&str> = join
+                // Bounded by the one side's matching series, not the family:
+                // only matching label sets are keyed, and the visit stops at
+                // the first key seen twice.
+                let mut per_key: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+                let mut repeated: Option<Vec<String>> = None;
+                visit_series(workload, profile, &join.one_side, |labels| {
+                    if !join.one_side.matchers.iter().all(|m| m.matches(labels)) {
+                        return true;
+                    }
+                    let key: Vec<String> = join
                         .keys
                         .iter()
                         .map(|k| {
                             labels
                                 .iter()
                                 .find(|(name, _)| name == k)
-                                .map(|(_, v)| v.as_str())
-                                .unwrap_or("")
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
                         })
                         .collect();
-                    *per_key.entry(key).or_default() += 1;
-                }
-                if let Some((key, series)) = per_key.iter().find(|(_, n)| **n > 1) {
+                    let n = per_key.entry(key.clone()).or_default();
+                    *n += 1;
+                    if *n > 1 {
+                        repeated = Some(key);
+                        return false;
+                    }
+                    true
+                })
+                .map_err(unreadable)?;
+                if let Some(key) = repeated {
+                    let series = per_key.get(&key).copied().unwrap_or(2);
                     return Err(CorpusError::JoinKeyNotUnique {
                         entry_id: entry.id.clone(),
                         profile: profile.name.clone(),
@@ -1254,7 +1263,7 @@ pub fn gate_corpus_against_workload(
                             .map(|(k, v)| format!("{k}=\"{v}\""))
                             .collect::<Vec<_>>()
                             .join(", "),
-                        series: *series,
+                        series,
                     });
                 }
             }
@@ -1777,6 +1786,93 @@ mod tests {
         );
         marked.expected.reason = Some("no native histogram on the wire yet".to_string());
         gate_corpus(&[marked]).expect("a stated reason gates clean");
+    }
+
+    fn checked_in_workload() -> crate::metrics_workload::WorkloadFile {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/metrics/workload.json");
+        crate::metrics_workload::load_workload(path).expect("the checked-in manifest loads")
+    }
+
+    #[test]
+    fn the_selector_check_stops_at_the_first_matching_series() {
+        // A selector that pins the first instance must be answered after one
+        // label set, not after the cardinality profile's 400,000 gauge
+        // instances: the check streams the family and stops on the first
+        // match rather than materializing it.
+        let workload = checked_in_workload();
+        let profile = workload
+            .profile("cardinality")
+            .expect("cardinality declared");
+        let selectors =
+            read_selectors(r#"metricsbench_gauge_cpu_percent{instance="metricsbench-instance-0"}"#)
+                .expect("selector parses");
+        let selector = &selectors[0];
+        let visited = visit_series(&workload, profile, selector, |labels| {
+            !selector.matchers.iter().all(|m| m.matches(labels))
+        })
+        .expect("visit runs")
+        .expect("the family exists");
+        assert_eq!(
+            visited, 1,
+            "the first instance matches, so one label set is enough"
+        );
+        // Visiting to the end reaches every instance, so the bound above is
+        // the early exit, not a small family.
+        let all = visit_series(&workload, profile, selector, |_| true)
+            .expect("visit runs")
+            .expect("the family exists");
+        assert_eq!(all, 400_000);
+    }
+
+    #[test]
+    fn a_range_window_fits_the_stream_span_not_the_duration() {
+        // ci: 120 steps at 15 s span 1,785 s from first sample to newest.
+        // A 5 m lookback plus a window ending exactly at the first sample
+        // passes; one scrape interval more reaches before the first sample
+        // and is refused, though it still fits inside duration_secs (1,800).
+        let mut workload = checked_in_workload();
+        let ci = workload
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == "ci")
+            .expect("ci declared");
+        assert_eq!(ci.stream_span_secs(), 1_785);
+        let mut range = entry("fits", Some(CostClass::SingleSeries));
+        range.eval = EvalKind::Range;
+        range.profiles = vec!["ci".to_string()];
+        ci.range_eval.start_offset_secs = 1_485;
+        gate_corpus_against_workload(&[range.clone()], &workload)
+            .expect("window plus lookback equal to the span fits");
+        let ci = workload
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == "ci")
+            .expect("ci declared");
+        ci.range_eval.start_offset_secs = 1_500;
+        let err = gate_corpus_against_workload(&[range], &workload)
+            .expect_err("one interval past the span must be refused");
+        assert!(
+            matches!(
+                &err,
+                CorpusError::WindowExceedsProfile {
+                    window_secs: 1_500,
+                    lookback_secs: 300,
+                    span_secs: 1_785,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_duration_too_large_for_seconds_is_a_typed_error() {
+        let err = parse_duration_secs("1000000000000y").expect_err("must overflow");
+        assert!(err.contains("overflows"), "{err}");
+        let err = longest_lookback_secs("max_over_time(x[1000000000000y:5m])")
+            .expect_err("a subquery range that overflows must be refused");
+        assert!(err.contains("overflows"), "{err}");
     }
 
     #[test]

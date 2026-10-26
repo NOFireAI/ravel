@@ -116,7 +116,7 @@
       "duration_secs": 1800,
       "churn_basis_points_per_hour": 0,
       "total_samples": 120000,
-      "range_eval": {"start_offset_secs": 1500, "end_offset_secs": 0, "step_secs": 15},
+      "range_eval": {"start_offset_secs": 1485, "end_offset_secs": 0, "step_secs": 15},
       "comparability": {
         "non_comparable": {
           "reason": "1,000 series over 30 minutes exercises the same code paths as the three measured profiles and measures none of them: it is sized to fit a CI job, not a workload. ADR-0927 decision 11 forbids presenting it as a performance result, and this field is why a reader that loads the artifact can refuse to publish it rather than having to know the rule."
