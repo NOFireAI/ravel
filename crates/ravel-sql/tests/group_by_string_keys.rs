@@ -44,7 +44,8 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::CastExpr;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateOutputMode};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, InvariantLevel};
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -616,6 +617,306 @@ async fn sort_key_computing_on_the_group_key_restores_below_the_sort() {
     );
     let plan = executor_plan(&executor, &sql).await;
     assert_restore_above_the_fetch(&plan);
+}
+
+// ---------------------------------------------------------------------------
+// A partitioned hash join over grouped inputs (issue #3280)
+// ---------------------------------------------------------------------------
+
+/// The join statements the differential below runs, each with one correct row
+/// order over the `join_context` fixture.
+const DIFFERENTIAL: [&str; 4] = [
+    // (a) Both inputs grouped on the key: the join carries the views.
+    "SELECT a.k, a.c, b.c \
+     FROM (SELECT k, count(*) AS c FROM logs GROUP BY k) a \
+     JOIN (SELECT k, count(*) AS c FROM logs GROUP BY k) b ON a.k = b.k \
+     ORDER BY a.k",
+    // (b) One input grouped, the other the scan's dictionary column.
+    "SELECT a.k, a.c, b.k \
+     FROM (SELECT k, count(*) AS c FROM logs GROUP BY k) a \
+     JOIN (SELECT k FROM logs) b ON a.k = b.k \
+     ORDER BY a.k",
+    // (c) A condition on the key next to the equality.
+    "SELECT a.k, a.c, b.c \
+     FROM (SELECT k, count(*) AS c FROM logs GROUP BY k) a \
+     JOIN (SELECT k, count(*) AS c FROM logs GROUP BY k) b ON a.k = b.k AND a.k <> 'x' \
+     ORDER BY a.k",
+    // (d) A join filter that computes on the key and reads both inputs, so it
+    // stays on the join.
+    "SELECT a.k, a.c, b.c \
+     FROM (SELECT k, count(*) AS c FROM logs GROUP BY k) a \
+     JOIN (SELECT k, count(*) AS c FROM logs GROUP BY k) b \
+     ON a.k = b.k AND (a.k <> 'x' OR b.c > 1) \
+     ORDER BY a.k",
+];
+
+/// Partitions of the `join_context` table, so every aggregate splits into a
+/// partial and a final stage with a hash exchange between them.
+const JOIN_PARTITIONS: usize = 4;
+
+/// A session over a `logs` table with one `Dictionary(Int32, Utf8)` column
+/// `k`, set up so a hash join plans in `Partitioned` mode, and with the rule
+/// installed after the default rules when `with_rule`, as `build_session`
+/// installs it.
+///
+/// `SqlExecutor` cannot reach that mode: its `session_config` turns
+/// `repartition_joins` off, which plans every hash join `CollectLeft`. Here it
+/// is on, and both `hash_join_single_partition_threshold` knobs are 0, so
+/// `JoinSelection` never finds an input small enough to collect.
+///
+/// The keys are `a` four times, `b` three, `c` twice, `x` once and NULL twice,
+/// spread over `JOIN_PARTITIONS` partitions.
+fn join_context(with_rule: bool) -> SessionContext {
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::session_state::SessionStateBuilder;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("k", dict_type(), true)]));
+    let keys: [Option<&str>; 12] = [
+        Some("a"),
+        Some("b"),
+        None,
+        Some("c"),
+        Some("a"),
+        Some("x"),
+        Some("b"),
+        Some("a"),
+        None,
+        Some("c"),
+        Some("b"),
+        Some("a"),
+    ];
+    let partitions: Vec<Vec<RecordBatch>> = keys
+        .chunks(keys.len() / JOIN_PARTITIONS)
+        .map(|chunk| {
+            let dict: DictionaryArray<Int32Type> = chunk.iter().copied().collect();
+            vec![
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+                    .expect("key batch builds"),
+            ]
+        })
+        .collect();
+    assert_eq!(partitions.len(), JOIN_PARTITIONS);
+
+    let mut config = SessionConfig::new()
+        .with_target_partitions(JOIN_PARTITIONS)
+        .with_repartition_joins(true);
+    config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold = 0;
+    config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold_rows = 0;
+    let mut builder = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features();
+    if with_rule {
+        builder = builder.with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews));
+    }
+    let ctx = SessionContext::new_with_state(builder.build());
+    let table = MemTable::try_new(schema, partitions).expect("mem table builds");
+    ctx.register_table("logs", Arc::new(table))
+        .expect("table registers");
+    ctx
+}
+
+/// The physical plan of `sql` over `join_context(true)`.
+async fn join_plan(sql: &str) -> Arc<dyn ExecutionPlan> {
+    join_context(true)
+        .sql(sql)
+        .await
+        .expect("query plans")
+        .create_physical_plan()
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: physical plan fails: {err}"))
+}
+
+/// The plan's one `HashJoinExec`, asserted to be in `Partitioned` mode.
+fn partitioned_join(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let mut all = Vec::new();
+    nodes(plan, &mut all);
+    let joins: Vec<_> = all
+        .into_iter()
+        .filter(|node| node.is::<HashJoinExec>())
+        .collect();
+    let [join] = joins.as_slice() else {
+        panic!("expected one HashJoinExec, found {joins:?}");
+    };
+    let mode = *join
+        .downcast_ref::<HashJoinExec>()
+        .expect("is a HashJoinExec")
+        .partition_mode();
+    assert_eq!(mode, PartitionMode::Partitioned, "{join:?}");
+    Arc::clone(join)
+}
+
+/// Every node of `plan` passes DataFusion's executable-plan invariants, the
+/// check whose failure issue #3280 reported for a partitioned join.
+fn assert_invariants(plan: &Arc<dyn ExecutionPlan>) {
+    let mut all = Vec::new();
+    nodes(plan, &mut all);
+    for node in &all {
+        node.check_invariants(InvariantLevel::Executable)
+            .unwrap_or_else(|err| panic!("{} fails its invariants: {err}", node.name()));
+    }
+}
+
+/// Run `sql` on a fresh `join_context`, returning the schema the plan
+/// promised and the rows as a table.
+async fn run_join(with_rule: bool, sql: &str) -> (Schema, String) {
+    let df = join_context(with_rule).sql(sql).await.expect("query plans");
+    let logical = df.schema().as_arrow().clone();
+    let batches = df
+        .collect()
+        .await
+        .unwrap_or_else(|err| panic!("{sql} (rule {with_rule}): {err}"));
+    for batch in &batches {
+        assert_eq!(batch.schema().fields(), logical.fields(), "{sql}");
+    }
+    let table = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .expect("batches format")
+        .to_string();
+    (logical, table)
+}
+
+/// Every join statement returns the same schema, rows and row order with the
+/// rule installed as without it, and plans a partitioned join either way.
+#[tokio::test]
+async fn partitioned_join_results_match_the_unrewritten_plan() {
+    for sql in DIFFERENTIAL {
+        for with_rule in [false, true] {
+            let plan = join_context(with_rule)
+                .sql(sql)
+                .await
+                .expect("query plans")
+                .create_physical_plan()
+                .await
+                .unwrap_or_else(|err| panic!("{sql} (rule {with_rule}): {err}"));
+            partitioned_join(&plan);
+        }
+        let (before_schema, before) = run_join(false, sql).await;
+        let (after_schema, after) = run_join(true, sql).await;
+        assert_eq!(before_schema, after_schema, "{sql}");
+        assert_eq!(before, after, "{sql}");
+        assert_eq!(before_schema.field(0).data_type(), &dict_type(), "{sql}");
+        assert!(before.lines().count() > 6, "{sql} returned too few rows");
+    }
+    let (_, both_grouped) = run_join(true, DIFFERENTIAL[0]).await;
+    let expected = [
+        "+---+---+---+",
+        "| k | c | c |",
+        "+---+---+---+",
+        "| a | 4 | 4 |",
+        "| b | 3 | 3 |",
+        "| c | 2 | 2 |",
+        "| x | 1 | 1 |",
+        "+---+---+---+",
+    ];
+    assert_eq!(both_grouped.lines().collect::<Vec<_>>(), expected);
+}
+
+/// (a): both inputs carry the views on the bare key, so the join hashes and
+/// matches views on both sides and the one restore projection is above it.
+#[tokio::test]
+async fn partitioned_join_of_two_grouped_inputs_restores_above_the_join() {
+    let plan = join_plan(DIFFERENTIAL[0]).await;
+    assert_invariants(&plan);
+    let join = partitioned_join(&plan);
+    let mut all = Vec::new();
+    nodes(&plan, &mut all);
+    let restores: Vec<_> = all
+        .iter()
+        .filter(|node| casts_to(node, &dict_type()) > 0)
+        .collect();
+    let [restore] = restores.as_slice() else {
+        panic!("expected exactly one cast to the declared type, found {restores:?}");
+    };
+    assert!(restore.is::<ProjectionExec>(), "{restore:?}");
+    assert!(
+        !Arc::ptr_eq(restore, &join)
+            && path_to(restore, &|node| Arc::ptr_eq(node, &join)).is_some(),
+        "the restore projection is not an ancestor of the join: {restore:?}"
+    );
+    for input in join.children() {
+        assert_eq!(
+            column_type(input, "k").as_ref(),
+            Some(&DataType::Utf8View),
+            "a join input does not carry the key as a view: {input:?}"
+        );
+    }
+}
+
+/// (b): one input carries views and the other reads the scan's dictionary
+/// column. The join does not carry; the grouped input is restored below it and
+/// hash-partitioned again on the restored dictionary, so both inputs hash the
+/// same type on the same key into the same number of partitions.
+#[tokio::test]
+async fn partitioned_join_with_one_grouped_input_keeps_both_inputs_co_partitioned() {
+    let plan = join_plan(DIFFERENTIAL[1]).await;
+    assert_invariants(&plan);
+    let join = partitioned_join(&plan);
+    let inputs = join.children();
+    let [left, right] = inputs.as_slice() else {
+        panic!("a HashJoinExec has two inputs");
+    };
+    for input in [left, right] {
+        let partitioning = input.properties().output_partitioning();
+        let Partitioning::Hash(exprs, count) = partitioning else {
+            panic!("a join input is not hash-partitioned: {partitioning:?}");
+        };
+        assert_eq!(*count, JOIN_PARTITIONS, "{input:?}");
+        assert_eq!(exprs.len(), 1, "{input:?}");
+    }
+    assert_eq!(
+        column_type(left, "k"),
+        column_type(right, "k"),
+        "the join's inputs hash different key types"
+    );
+    assert_eq!(column_type(left, "k").as_ref(), Some(&dict_type()));
+    let batches = join_context(true)
+        .sql(DIFFERENTIAL[1])
+        .await
+        .expect("query plans")
+        .collect()
+        .await
+        .expect("query runs");
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    // One row per scanned non-NULL key: each matches its own group once.
+    assert_eq!(rows, 4 + 3 + 2 + 1);
+}
+
+/// (d): a join filter reading the key keeps the join from carrying, and both
+/// restores land under operators between the join and its inputs' exchanges
+/// (a filter on one side, a filter and a sort on the other). Each input is
+/// hash-partitioned again on the restored dictionary, and the sorted probe
+/// input keeps its order, which the join reports as its own.
+#[tokio::test]
+async fn partitioned_join_with_a_key_filter_restores_both_inputs_below_it() {
+    let plan = join_plan(DIFFERENTIAL[3]).await;
+    assert_invariants(&plan);
+    let join = partitioned_join(&plan);
+    assert!(
+        join.downcast_ref::<HashJoinExec>()
+            .expect("is a HashJoinExec")
+            .filter()
+            .is_some(),
+        "the key condition no longer stays on the join: {join:?}"
+    );
+    let inputs = join.children();
+    let [left, right] = inputs.as_slice() else {
+        panic!("a HashJoinExec has two inputs");
+    };
+    for input in [left, right] {
+        let partitioning = input.properties().output_partitioning();
+        let Partitioning::Hash(_, count) = partitioning else {
+            panic!("a join input is not hash-partitioned: {partitioning:?}");
+        };
+        assert_eq!(*count, JOIN_PARTITIONS, "{input:?}");
+        assert_eq!(column_type(input, "k").as_ref(), Some(&dict_type()));
+    }
+    assert!(right.properties().output_ordering().is_some(), "{right:?}");
+    assert!(join.properties().output_ordering().is_some(), "{join:?}");
 }
 
 /// The `(url, count)` rows of a result whose first column is the declared

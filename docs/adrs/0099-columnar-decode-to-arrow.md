@@ -640,3 +640,21 @@ string bytes live in the aggregate's 2 MiB blocks. `CompactSlicesExec` (issue
 plan this rule produced and inserts the exec later, directly above the final
 aggregate, between that aggregate and the TopK, where it copies a batch whose charge is more than twice the bytes
 its rows reference before the TopK keeps it.
+
+A hash join in `Partitioned` mode needs both inputs hash-partitioned on its
+keys, and a restore cast on a partitioning column leaves its input's
+partitioning unknown, so a restore directly under such a join made the plan
+fail DataFusion's executable-plan invariant (issue #3280). Such a join is in
+the carried set when, for every key that reads a carried column, both inputs
+carry the views and the key is the bare column on both sides, its join filter
+reads no carried column, and no node below it holds the dynamic filter it
+publishes: both inputs then hash views and the one restore runs above the join
+(`partitioned_join_of_two_grouped_inputs_restores_above_the_join`). Otherwise,
+including when only one input carries the views, the join does not carry: each
+carrying input is restored below it, above its final aggregate, and exchanged
+again on its original hash expressions, so both inputs hash the declared type
+(`partitioned_join_with_one_grouped_input_keeps_both_inputs_co_partitioned`,
+`partitioned_join_with_a_key_filter_restores_both_inputs_below_it`). A
+`CollectLeft` hash join, the mode `SqlExecutor` plans with `repartition_joins`
+off, and the sort-merge, nested-loop and cross joins keep the restore under
+the join as before.
