@@ -81,8 +81,9 @@ pub(crate) struct CachedCommit {
 }
 
 /// Charged cost of the derivation slot every commit entry carries inline,
-/// admitted with the entry whether or not it is ever filled. Together with an
-/// ordinary entry's 864 bytes this stays inside
+/// admitted with the entry whether or not it is ever filled. Added to an
+/// ordinary record's 864 bytes ([`commit_entry_resident_bytes`]) it makes an
+/// 896-byte entry, inside
 /// [`RECORD_CACHE_ENTRY_BYTES`](crate::config::RECORD_CACHE_ENTRY_BYTES).
 const L0_DERIVED_SLOT_BYTES: u64 = std::mem::size_of::<Option<L0Derived>>() as u64;
 
@@ -106,9 +107,11 @@ pub(crate) fn l0_derived_resident_bytes(derived: &L0Derived) -> u64 {
 /// Charged cost of one cached commit entry beyond its variable-length
 /// members: the `CommitRecord` struct (about 224 bytes of scalars and
 /// `Vec`/`String` headers), its `Arc` allocation, the [`RecordEntry`] wrapper's
-/// own fields, the key `String` header held twice (the entry map and the
-/// recency index) and the two collections' slot overhead. The members that
-/// vary in length are charged separately by [`commit_entry_resident_bytes`].
+/// own fields other than its `derived` slot (charged by
+/// [`L0_DERIVED_SLOT_BYTES`]), the key `String` header held twice (the entry
+/// map and the recency index) and the two collections' slot overhead. The
+/// members that vary in length are charged separately by
+/// [`commit_entry_resident_bytes`].
 const COMMIT_ENTRY_FIXED_BYTES: u64 = 416;
 
 /// Estimated live heap one cached commit entry holds, the figure
@@ -1818,7 +1821,7 @@ mod tests {
         record
     }
 
-    /// The derivation slot every commit entry now carries keeps an ordinary
+    /// The derivation slot every commit entry carries keeps an ordinary
     /// stats-free entry inside the planning rate, and an ordinary record's
     /// derivation adds nothing to it: what the derivation keeps is the
     /// stamp list, and an ordinary record has none.
