@@ -64,6 +64,14 @@ blocks_storage:
     retention_period: 25h
   bucket_store:
     sync_dir: /data/tsdb-sync
+    # BLOCK DISCOVERY (disclosed, frozen at the 3.2.3 default 15m,
+    # -blocks-storage.bucket-store.sync-interval: "How frequently to scan the
+    # bucket, or to refresh the bucket index"). Written so the capture shows
+    # it. With compactor.cleanup_interval below, a shipped block can take up
+    # to about 30m to become queryable from the store-gateway; the READINESS
+    # comment after the `frontend` block waits that out before the first
+    # statement.
+    sync_interval: 15m
 
 compactor:
   data_dir: /data/compactor
@@ -72,6 +80,12 @@ compactor:
   # (-compactor.block-ranges). NO DOWNSAMPLING: the 3.2.3 binary exposes no
   # downsampling flag in -help-all (unlike Thanos' optional downsampling), so
   # stored resolution is not reduced. Left at defaults; no unpublished tuning.
+  # BUCKET INDEX REFRESH (disclosed, frozen at the 3.2.3 default 15m,
+  # -compactor.cleanup-interval: "How frequently the compactor should run
+  # blocks cleanup and maintenance, as well as update the bucket index").
+  # Written so the capture shows it; queriers find shipped blocks through
+  # this index.
+  cleanup_interval: 15m
   sharding_ring:
     kvstore:
       store: memberlist
@@ -91,6 +105,63 @@ store_gateway:
     replication_factor: 1
     kvstore:
       store: memberlist
+
+# READ PATH AND QUERY BUDGETS (disclosed, frozen per ADR-0927 amendment
+# 2026-10-26 F). Each budget that fires is a budget refusal, not an engine
+# error; deploy/metricsbench/README.md "Frozen limits" lists value, sizing and
+# error text. Defaults quoted are 3.2.3's -help-all.
+querier:
+  # WHERE A QUERY LOOKS (disclosed): replaces the defaults 12h
+  # (-querier.query-store-after) and 13h (limits.query_ingesters_within
+  # below). Both defaults split by distance from the WALL CLOCK, but a
+  # replayed stream's timestamps are set by its anchor, not by when it was
+  # written: a replay anchored more than 13h ago would leave its newest,
+  # not-yet-shipped head samples on the ingester while the querier asked only
+  # the store-gateway. 0 sends every query to the store-gateway ("0 means all
+  # queries are sent to store"), and query_ingesters_within 0 sends every
+  # query to the ingester too, so a sample is visible wherever it sits. This
+  # is consistent with the 25h local retention above, which -help-all requires
+  # to exceed query-store-after: the ingester keeps every block it shipped for
+  # 25h, and the querier merges the overlap.
+  query_store_after: 0s
+  # Sample budget: replaces the default 50000000 with the Prometheus
+  # comparator's 500000000, sized the same way: history's longest range
+  # window, 7d at 15s, is 40,320 samples per series; times 10,000 series is
+  # 403,200,000. -help-all says to set it on the query-frontend too under
+  # sharding; in -target=all both read this one value. Under the default
+  # Mimir query engine this budget did not fire (a 100-sample limit let a
+  # 28,801-sample query return 200 on the 3.2.3 binary); that engine's
+  # per-query bound is limits.max_estimated_memory_consumption_per_query.
+  max_samples: 500000000
+  # Query timeout: the default 2m (-querier.timeout), written to match the
+  # Prometheus comparator's --query.timeout=120s.
+  timeout: 2m
+
+frontend:
+  # The 3.2.3 default is already protobuf (-query-frontend.query-result-
+  # response-format, default "protobuf"), written because the
+  # -ingester.native-histograms-ingestion-enabled help line requires it:
+  # "To query native histograms with query-sharding enabled make sure to set
+  # -query-frontend.query-result-response-format to 'protobuf'", and sharding
+  # is on by default in this version.
+  query_result_response_format: protobuf
+  # Results cache: off, the default (-query-frontend.cache-results, no default
+  # printed, so false). Written for parity with VictoriaMetrics'
+  # -search.disableCache=true; a production_cache regime enables it per run.
+  cache_results: false
+
+# READINESS BEFORE THE FIRST STATEMENT (ADR-0927 amendment 2026-10-26 F): a
+# run proves historical blocks are visible before it issues a statement, and
+# stamps the figures into the report. With multitenancy off the tenant is
+# `anonymous`. (1) The bucket index, mimir-blocks/anonymous/bucket-index.json.gz
+# (written by the compactor every cleanup_interval), lists a block whose
+# min_time is at or before the replay's oldest sample in milliseconds; the
+# store-gateway page /store-gateway/tenant/anonymous/blocks shows the same
+# blocks with their Min Time. (2) On /metrics,
+# cortex_bucket_store_blocks_loaded{component="store-gateway"} equals
+# cortex_bucket_blocks_count{user="anonymous"}, so the store-gateway has
+# loaded every indexed block. Samples not yet shipped stay readable from the
+# ingester because query_ingesters_within is 0.
 
 ruler_storage:
   s3:
@@ -121,13 +192,57 @@ limits:
   # "ignored without an error"; 3.2.3 help: "[experimental] ... (default
   # true)", and the same help line says that querying native histograms with
   # query sharding on needs -query-frontend.query-result-response-format set
-  # to protobuf, which this config does not set). Pinned true explicitly so
-  # a future default flip cannot change what this comparator stores without
-  # a diff here. Today the portable Remote Write 1.0 replay sends no native
+  # to protobuf, which `frontend` above now sets explicitly; 3.2.3's own
+  # default for it is already protobuf). Pinned true explicitly so a future
+  # default flip cannot change what this comparator stores without a diff
+  # here. Today the portable Remote Write 1.0 replay sends no native
   # histograms (the ingest lane keeps only float payloads and the body
   # carries an empty histograms list), so this setting changes nothing
   # observable yet; once task T1c of #2821 puts native histograms on the
-  # wire, the comparator stores them but the query-side response format
-  # above must be set in the same change before they are queryable under
-  # sharding.
+  # wire, the comparator stores them and they are queryable under sharding.
   native_histograms_ingestion_enabled: true
+  # OUT-OF-ORDER WINDOW (disclosed, frozen; replaces the 3.2.3 default 0s,
+  # under which -ingester.out-of-order-time-window's help gives no
+  # out-of-order support). The window exists so a sample the generator
+  # shifted back one and a half scrape intervals (22.5s at 15s) is stored by
+  # every receiver; 1h also covers a bulk historical replay arriving slightly
+  # out of time order, and matches the Prometheus comparator. Prometheus
+  # without its window rejects the whole Remote Write 1.0 request with HTTP
+  # 400 on such a sample; Mimir rejects only the sample.
+  out_of_order_time_window: 1h
+  # PAST INGEST BOUND (disclosed): the default 0s, which disables
+  # -validation.past-grace-period ("0 to disable"). Written so the capture
+  # shows that a 30d historical replay is not refused for its age.
+  past_grace_period: 0s
+  # See `querier` above: with query_store_after 0s, 0 keeps the ingester in
+  # every query. Replaces the default 13h.
+  query_ingesters_within: 0s
+  # Chunk budget: replaces the default 2000000 (-querier.max-fetched-chunks-
+  # per-query). Sized at 120 samples per chunk, which the 3.2.3 binary
+  # produced for this stream shape (a shipped 2h block of 20 series at 15s
+  # held 9,600 samples in 80 chunks): 10,000 series over history's 7d window
+  # at 15s is 10,000 * 40,320 / 120 = 3,360,000 chunks, more where block
+  # boundaries cut chunks short or out-of-order chunks (at most 32 samples,
+  # -blocks-storage.tsdb.out-of-order-capacity-max) add to it; 5000000
+  # covers it with 49% headroom.
+  max_fetched_chunks_per_query: 5000000
+  # Mimir query engine memory budget: the default 0 ("0 to disable"),
+  # written so the capture shows it. -help-all: "only enforced when Mimir's
+  # query engine is in use", which is the 3.2.3 default. Left off: no
+  # corpus statement is sized against it, so a query too large for the 4g
+  # envelope fails on container memory rather than as a budget refusal.
+  max_estimated_memory_consumption_per_query: 0
+  # Query length: replaces the default 0s (no limit, -query-frontend.max-total-
+  # query-length) with the history profile's 30d span plus 1d for range
+  # windows, so the frozen value bounds every corpus statement and a longer
+  # one is a disclosed refusal. max_query_length does not exist in 3.2.3;
+  # this is its replacement.
+  max_total_query_length: 31d
+  # Partial query length: the default 0s (disabled), written so the capture
+  # shows that sharded and split sub-queries carry no separate bound.
+  max_partial_query_length: 0s
+  # Lookback: replaces the default 0s (disabled) with 45d, the retention
+  # above. -help-all: a request outside it "will not fail but will be
+  # manipulated to only query data within the allowed time range", so this
+  # is a silent clamp, not a refusal; 45d keeps every 30d profile inside it.
+  max_query_lookback: 45d
