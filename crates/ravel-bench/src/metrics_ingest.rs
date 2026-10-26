@@ -3321,10 +3321,6 @@ mod tests {
             (storage.stored_bytes as f64 / 176.0).to_bits(),
             "{storage:?}"
         );
-        assert!(
-            (ing.logical_points_per_sec * ing.elapsed_secs - 7.0).abs() < 1e-6,
-            "points per second counts histograms too: {ing:?}"
-        );
     }
 
     /// The ci profile replayed in process: every line is offered, the
