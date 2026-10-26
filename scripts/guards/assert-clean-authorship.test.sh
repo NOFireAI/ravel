@@ -63,12 +63,12 @@ check_contains "no ref passed: prints usage" "usage:" "${out}"
 
 d="$(new_repo no-email)"
 git -C "${d}" checkout -q -b feat
-git -C "${d}" config --unset user.email
 printf 'change\n' >>"${d}/README.md"
 git -C "${d}" add README.md
-git -C "${d}" commit -q -m "feat: change" -s --author="${TEST_NAME} <${TEST_EMAIL}>"
+git -C "${d}" commit -q -s -m "feat: change"
+git -C "${d}" config --unset user.email
 mkdir -p "${TMP}/emptyhome"
-out="$(cd "${d}" && HOME="${TMP}/emptyhome" GIT_CONFIG_GLOBAL=/dev/null "${GUARD}" feat 2>&1)"; rc=$?
+out="$(cd "${d}" && HOME="${TMP}/emptyhome" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null "${GUARD}" feat 2>&1)"; rc=$?
 check_eq "no expected email available: exits 1" "1" "${rc}"
 check_contains "no expected email available: error message" "no expected email" "${out}"
 
