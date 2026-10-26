@@ -886,6 +886,39 @@ async fn partitioned_join_with_one_grouped_input_keeps_both_inputs_co_partitione
     assert_eq!(rows, 4 + 3 + 2 + 1);
 }
 
+/// (d): a join filter reading the key keeps the join from carrying, and both
+/// restores land under operators between the join and its inputs' exchanges
+/// (a filter on one side, a filter and a sort on the other). Each input is
+/// hash-partitioned again on the restored dictionary, and the sorted probe
+/// input keeps its order, which the join reports as its own.
+#[tokio::test]
+async fn partitioned_join_with_a_key_filter_restores_both_inputs_below_it() {
+    let plan = join_plan(DIFFERENTIAL[3]).await;
+    assert_invariants(&plan);
+    let join = partitioned_join(&plan);
+    assert!(
+        join.downcast_ref::<HashJoinExec>()
+            .expect("is a HashJoinExec")
+            .filter()
+            .is_some(),
+        "the key condition no longer stays on the join: {join:?}"
+    );
+    let inputs = join.children();
+    let [left, right] = inputs.as_slice() else {
+        panic!("a HashJoinExec has two inputs");
+    };
+    for input in [left, right] {
+        let partitioning = input.properties().output_partitioning();
+        let Partitioning::Hash(_, count) = partitioning else {
+            panic!("a join input is not hash-partitioned: {partitioning:?}");
+        };
+        assert_eq!(*count, JOIN_PARTITIONS, "{input:?}");
+        assert_eq!(column_type(input, "k").as_ref(), Some(&dict_type()));
+    }
+    assert!(right.properties().output_ordering().is_some(), "{right:?}");
+    assert!(join.properties().output_ordering().is_some(), "{join:?}");
+}
+
 /// The `(url, count)` rows of a result whose first column is the declared
 /// dictionary type and whose second is an `Int64` count, in result order.
 fn url_counts(batches: &[RecordBatch]) -> Vec<(String, i64)> {
