@@ -5,10 +5,11 @@
 #
 # Usage:
 #   capture-effective-config.sh [--out FILE] [--prometheus URL]
-#                               [--victoriametrics URL] [--mimir URL]
+#     [--victoriametrics URL] [--mimir URL] [--ravel URL]
 #
 # Defaults are the compose ports on loopback: http://127.0.0.1:9090 (Prometheus),
-# http://127.0.0.1:8428 (VictoriaMetrics), http://127.0.0.1:9009 (Mimir).
+# http://127.0.0.1:8428 (VictoriaMetrics), http://127.0.0.1:9009 (Mimir),
+# http://127.0.0.1:4318 (Ravel, from ravel.yml).
 # Without --out the document goes to stdout.
 #
 # What is read, per comparator:
@@ -32,10 +33,25 @@
 #                    query_engine_default_for_version records the documented
 #                    default for the reported version: prometheus for
 #                    2.14-2.16, mimir from 2.17.
+#   ravel            GET /api/v1/status/buildinfo (version, revision). The
+#                    ravel-server 0.26.0 image answers an empty revision, which
+#                    is recorded as unavailable and makes the capture exit 1;
+#                    its image digest is then the build's identity.
+#                    runtime_flags: the container's .Config.Cmd from
+#                    `docker inspect` (the arguments ravel.yml passes to the
+#                    ravel-server entrypoint), as {"source": ..., "cmd": [...]}.
+#                    Ravel serves no flags or config endpoint, so the command
+#                    line is the only record of its flags, and it is
+#                    unavailable when docker is not reachable. Settings in the
+#                    mounted limits file are not read; ravel.yml names it.
 #   every one        the container's image ID, .Config.Image, RepoDigests,
 #                    Architecture and Os, via `docker compose ps` and
 #                    `docker inspect`, when docker is reachable; otherwise the
 #                    literal string "unavailable: docker not reachable".
+#                    `docker compose ps` reads docker-compose.yml and
+#                    ravel.yml together, with RAVEL_IMAGE set to a placeholder
+#                    when unset (ravel.yml requires it, and a listing pulls
+#                    no image), so the ravel-server container is found.
 #
 # A field that could not be fetched is {"unavailable": "<reason>"}; no field is
 # omitted or left empty. The document also records captured_at (UTC ISO 8601),
@@ -63,10 +79,11 @@ out=""
 prom_url="http://127.0.0.1:9090"
 vm_url="http://127.0.0.1:8428"
 mimir_url="http://127.0.0.1:9009"
+ravel_url="http://127.0.0.1:4318"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --out | --prometheus | --victoriametrics | --mimir)
+    --out | --prometheus | --victoriametrics | --mimir | --ravel)
       if [[ $# -lt 2 || -z "$2" ]]; then
         echo "capture-effective-config.sh: $1 needs a value" >&2
         usage
@@ -77,6 +94,7 @@ while [[ $# -gt 0 ]]; do
         --prometheus) prom_url="$2" ;;
         --victoriametrics) vm_url="$2" ;;
         --mimir) mimir_url="$2" ;;
+        --ravel) ravel_url="$2" ;;
       esac
       shift 2
       ;;
@@ -100,8 +118,9 @@ fi
 script_revision="$(git -C "${here}" rev-parse HEAD 2>/dev/null)" || script_revision="unavailable"
 
 rc=0
-python3 -I - "${here}/docker-compose.yml" "${script_revision}" "${out}" \
-  "${prom_url%/}" "${vm_url%/}" "${mimir_url%/}" "${METRICSBENCH_DOCKER:-docker}" <<'PY' || rc=$?
+python3 -I - "${here}/docker-compose.yml" "${here}/ravel.yml" "${script_revision}" "${out}" \
+  "${prom_url%/}" "${vm_url%/}" "${mimir_url%/}" "${ravel_url%/}" \
+  "${METRICSBENCH_DOCKER:-docker}" <<'PY' || rc=$?
 import datetime
 import json
 import os
@@ -112,7 +131,17 @@ import tempfile
 import urllib.error
 import urllib.request
 
-compose_file, script_revision, out, prom_url, vm_url, mimir_url, docker = sys.argv[1:8]
+(
+    compose_file,
+    ravel_compose_file,
+    script_revision,
+    out,
+    prom_url,
+    vm_url,
+    mimir_url,
+    ravel_url,
+    docker,
+) = sys.argv[1:10]
 
 
 def crash_hook(exc_type, exc, tb):
@@ -276,10 +305,10 @@ def mimir_default_engine(version):
 DOCKER_UNREACHABLE = "unavailable: docker not reachable"
 
 
-def run_docker(*args):
+def run_docker(*args, env=None):
     try:
         proc = subprocess.run(
-            [docker, *args], capture_output=True, text=True, timeout=30, check=False
+            [docker, *args], capture_output=True, text=True, timeout=30, check=False, env=env
         )
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
@@ -299,7 +328,14 @@ def compose_containers():
     _, err = run_docker("info", "--format", "{{.ServerVersion}}")
     if err:
         return DOCKER_UNREACHABLE
-    stdout, err = run_docker("compose", "-f", compose_file, "ps", "--format", "json")
+    # ravel.yml refuses interpolation without RAVEL_IMAGE; ps only reads
+    # container labels, so a placeholder never names an image that is used.
+    env = dict(os.environ)
+    if not env.get("RAVEL_IMAGE"):
+        env["RAVEL_IMAGE"] = "unset-placeholder-for-compose-ps"
+    stdout, err = run_docker(
+        "compose", "-f", compose_file, "-f", ravel_compose_file, "ps", "--format", "json", env=env
+    )
     if err:
         return f"unavailable: {err}"
     stdout = stdout.strip()
@@ -345,6 +381,26 @@ def image_of(containers, service):
     return record
 
 
+def ravel_runtime_flags(containers, service):
+    """The container's command line: Ravel serves no flags endpoint."""
+    source = f"docker inspect .Config.Cmd of compose service {service}"
+    if not isinstance(containers, dict):
+        return unavailable(f"{source}: {containers}")
+    cid = containers.get(service)
+    if not cid:
+        return unavailable(f"no running container for compose service {service}")
+    stdout, err = run_docker("inspect", cid)
+    if err:
+        return unavailable(err)
+    try:
+        cmd = json.loads(stdout)[0].get("Config", {}).get("Cmd")
+    except Exception as e:
+        return unavailable(f"docker inspect {cid}: {type(e).__name__}")
+    if not isinstance(cmd, list) or not cmd:
+        return unavailable(f"docker inspect {cid}: empty .Config.Cmd")
+    return {"source": source, "cmd": cmd}
+
+
 containers = compose_containers()
 
 urls = {
@@ -360,6 +416,9 @@ urls = {
     "mimir": {
         "buildinfo": f"{mimir_url}/prometheus/api/v1/status/buildinfo",
         "runtime_flags": f"{mimir_url}/config",
+    },
+    "ravel": {
+        "buildinfo": f"{ravel_url}/api/v1/status/buildinfo",
     },
 }
 
@@ -405,6 +464,14 @@ doc["comparators"]["mimir"] = {
     "querier_query_engine": engine,
     "query_engine_default_for_version": mimir_default_engine(version),
     "image": image_of(containers, "mimir"),
+}
+
+version, revision = buildinfo_json(urls["ravel"]["buildinfo"])
+doc["comparators"]["ravel"] = {
+    "version": version,
+    "revision": revision,
+    "runtime_flags": ravel_runtime_flags(containers, "ravel-server"),
+    "image": image_of(containers, "ravel-server"),
 }
 
 text = json.dumps(doc, indent=2, sort_keys=False) + "\n"
