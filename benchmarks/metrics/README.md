@@ -146,9 +146,10 @@ regenerate the stream from it:
 - `anchor_ms`: the `--anchor-ms` value.
 - `stream_digest`: the generator's digest over the stream the run replayed.
 
-Each row's `ingest` block adds `offered_digest`, BLAKE3 over the canonical
-`(series, ts_ms, value_bits)` tuple of every sample that row offered, in
-order. `comparable` is `true` only when the profile is publishable,
+Each row's `ingest` block adds `offered_digest`, BLAKE3 over every point that
+row offered, in order: a sample's canonical `(series, ts_ms, value_bits)`
+tuple (a staleness marker by its bit pattern), and a native histogram's
+series, timestamp and every field it is encoded with. `comparable` is `true` only when the profile is publishable,
 `steps_run` equals `steps_declared`, and `stream_digest` equals the digest
 recomputed from the manifest and the anchor; `comparability_reason` names each
 cause that failed. All five provenance fields and `offered_digest` are absent
@@ -165,11 +166,37 @@ differs from the Ravel row's.
 Every line of the stream is classified as a scalar (float) sample, a native
 histogram, a staleness marker, or malformed, and every row's `ingest` block
 carries `stream_counts` with `generated_lines`, `scalar`, `native_histogram`,
-`stale_marker` and `malformed`. The Remote Write 1.0 replay sends only the
-scalar samples: `offered_samples` equals `stream_counts.scalar`, and
-`excluded_native_histogram` and `excluded_stale_marker` name the two kinds it
-does not send. Band 4 is two equations, and the bin fails, naming every
-figure, unless both close:
+`stale_marker` and `malformed`. Every payload type is on the wire, to every
+row:
+
+- A scalar is a Remote Write 1.0 `Sample`.
+- A staleness marker is a `Sample` whose value is the Prometheus stale NaN,
+  bit pattern `0x7ff0000000000002`
+  (`ravel_promql_difftest::generator::STALE_MARKER_BITS`). It is the one
+  non-finite value the lane admits: any other NaN or infinity is refused
+  before sending as `non_finite_value`
+  (`metrics_ingest::tests::validate_exempts_exactly_the_stale_marker_bits`).
+- A native histogram is a `Histogram` with integer counts: the line's
+  schema, count, sum and positive deltas, one positive span `{offset: 0,
+  length: <number of deltas>}`, zero threshold 0, zero count 0, no negative
+  buckets, and reset hint `UNKNOWN`, because the generator's line carries no
+  counter-reset flag; a receiver detects the reset from the counts
+  (`metrics_ingest::tests::a_native_histogram_decodes_back_with_the_promised_wire_shape`).
+  A histogram whose deltas decode to a negative bucket, or whose buckets do
+  not sum to its count, is refused before sending as `invalid_histogram`.
+
+Each row reports two offered classes, never folded into one. Scalars and
+staleness markers are samples: `offered_samples`, `accepted_samples`,
+`rejected_samples`, `dropped_samples`. Native histograms are their own class:
+`offered_histograms`, `accepted_histograms`, `rejected_histograms`,
+`dropped_histograms`
+(`metrics_ingest::tests::native_histograms_are_their_own_offered_class`).
+`excluded_native_histogram` and `excluded_stale_marker` stay in the report
+and are zero on every row the bin writes
+(`metrics_ingest::tests::the_ci_stream_replays_every_payload_type_with_zero_exclusions`);
+a report written before the lane sent every type carries them non-zero.
+Band 4 is two equations, and the bin fails, naming every figure, unless both
+close:
 
 - Classification identity: `scalar + native_histogram + stale_marker +
   malformed == generated_lines == emitted_samples`, with `malformed` zero and
@@ -177,19 +204,61 @@ figure, unless both close:
   generator's own `float_samples`, `native_histogram_samples` and
   `stale_markers`, so a classifier that swaps two kinds fails even though the
   sum still closes.
-- Offering identity: `offered_samples + excluded_native_histogram +
-  excluded_stale_marker == generated_lines`, read from the row's own fields,
-  with `offered_samples == scalar` and `offered_samples == accepted_samples +
-  rejected_samples + dropped_samples`.
+- Offering identity: `offered_samples + offered_histograms +
+  excluded_native_histogram + excluded_stale_marker == generated_lines`, read
+  from the row's own fields, with `offered_samples + excluded_stale_marker ==
+  scalar + stale_marker`, `offered_histograms + excluded_native_histogram ==
+  native_histogram`, `offered_samples == accepted_samples + rejected_samples +
+  dropped_samples`, and the same split for histograms. A row that counts its
+  histograms under `offered_samples` fails the second equality even when the
+  total closes
+  (`metrics_ingest::tests::a_row_that_folds_histograms_into_offered_samples_fails`).
 
 `dropped_samples` counts samples in batches that were sent and never
-acknowledged. A comparator row splits them: `rejected_by_status` maps each
+acknowledged. An HTTP row splits them: `rejected_by_status` maps each
 non-retryable non-2xx HTTP status to the samples in batches answered with it
 (for example `{"400": 500}`), and `retry_exhausted_samples` counts samples in
 batches still failing with a 429, a 5xx or a transport error after
-`--http-max-retries` retries. The two sum to `dropped_samples`. The in-process
-Ravel row has no HTTP status and no retry loop, so both are empty there.
-`rejected_samples` is the samples the lane refused before sending.
+`--http-max-retries` retries. The two sum to `dropped_samples`.
+`histograms_rejected_by_status` and `retry_exhausted_histograms` split
+`dropped_histograms` the same way. The in-process Ravel row has no HTTP
+status and no retry loop, so all four are empty there. `rejected_samples`
+and `rejected_histograms` are the points the lane refused before sending.
+`--batch-size` and `--http-batch-size` count points: samples and histograms
+together.
+
+#### Rows and receivers
+
+The in-process row is `system: ravel`, `endpoint: in-process`: the
+diagnostic lane's replay through `IngestRouter`, which skips the event-time
+admission `ravel-server` applies (ADR-0927, 2026-10-26 amendment, section
+A). It carries every commit token its strict writes minted under
+`commit_tokens`.
+
+Each HTTP receiver gets a row only when its endpoint is passed, and its
+`system` value is the name the query runner joins on:
+
+| Flag | `system` | Ack |
+|---|---|---|
+| `--ravel-endpoint <url>` | `ravel` | `durable_on_ack` |
+| `--prometheus-endpoint <url>` | `prometheus` | `buffered` |
+| `--victoriametrics-endpoint <url>` | `victoriametrics` | `buffered` |
+| `--mimir-endpoint <url>` | `mimir` | `buffered` |
+
+`endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
+`ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it
+sends `Authorization: Bearer <token>`, the token read from the environment
+variable `VAR` names, never from the command line. The bin exits 64 when that
+variable is unset or empty, or when the flag is given without
+`--ravel-endpoint` (`metricsbench_ingest_smoke::a_bearer_token_env_that_cannot_be_read_exits_64`).
+The token is not written into the report: neither `endpoint` nor
+`client_behavior` carries it
+(`metrics_ingest::tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_last_commit_token`).
+The row records `last_commit_token`, the `x-ravel-commit-token` header of
+the last acknowledged request, verbatim (the server joins one token per
+shard that request touched with commas); the query runner passes it as
+`min_commit_token` (ADR-0927 decision 3). Only the last value is kept, so
+`commit_tokens` is absent on this row. A comparator row records neither.
 
 Because generation runs inside the replay, `elapsed_secs` is the sum of the
 timed write segments (the `write_values` calls and the final flush for the
@@ -274,10 +343,11 @@ Corpus version 2 repairs two join entries, each carrying its reason in
 An entry may carry `expected: {"intended_empty": true, "reason": "..."}`; the
 gate refuses the flag without a non-blank reason. An empty oracle answer on an
 entry without it is an invalid fixture, not an engine result (ADR-0927,
-2026-10-26 amendment, decision E). Exactly two entries carry it,
-`mb_histogram_native_p95` and `mb_histogram_native_fraction`, because no
-receiver has received a native histogram until task T1c of #2821 puts them on
-the wire; T1c removes the marker. The three `absent*` entries are not marked:
+2026-10-26 amendment, decision E). No entry carries it
+(`metricsbench_artifacts::the_two_repaired_joins_say_why_and_no_entry_is_intended_empty`):
+`mb_histogram_native_p95` and `mb_histogram_native_fraction` carried it until
+the ingest lane put native histograms on the wire (task T1c of #2821). The
+three `absent*` entries are not marked:
 `absent()` and `absent_over_time()` answer with one sample of value 1 when
 their argument is empty, and the manifest guarantees the absent metric is
 never emitted.
