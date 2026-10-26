@@ -291,7 +291,7 @@ object counts and still be correct. The comparison basis that *is* stable is the
 (a buffer reached `--target-bytes`), `age` (a buffer aged past
 `--max-flush-delay`), `arrival` (a strict write under the arrival policy;
 always 0 on a load, since the loader writes strict only), `depth` (the
-loader's flush every `--pipeline-depth` batches, derived target only) and
+loader's flush every `--pipeline-depth` batches, for any target above `1`) and
 `manual` (every other loader-requested flush: the drain at load close and a
 logs load's budget-stall flushes), per shard and as load totals. The five
 causes are disjoint and sum to the objects written, so a mix that shifts from
