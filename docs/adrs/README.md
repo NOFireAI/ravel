@@ -137,7 +137,7 @@ the reservation commit that used to work around it.
 | [0892](0892-drop-rlog-version-3-reader.md) | Drop the RLOG version-3 reader | Proposed |
 | [0904](0904-request-cost-latency-knob.md) | an operator knob for the request-cost vs latency trade | Accepted (2026-10-14; partly implemented) |
 | [0913](0913-declared-exact-materialisation.md) | Declared exact materialisations: tenant-declared aggregate shapes materialised as immutable, snapshot-bound per-part monoid states under a definition hash, selected only on provable answerability with fail-open fallback to scan, a 64 MiB materialised-plan byte budget, exact-until-budget `COUNT DISTINCT`, and float `SUM`/`AVG` deferred behind ADR-0024 | Proposed |
-| [0927](0927-metricsbench-benchmark-contract.md) | MetricsBench, a reproducible metrics and PromQL benchmark contract | Proposed. Issue #927, task T1 of the epic. Builds on ADR-0044 |
+| [0927](0927-metricsbench-benchmark-contract.md) | MetricsBench, a reproducible metrics and PromQL benchmark contract | Accepted (amended 2026-10-26) |
 | [0942](0942-cstat-snapshot-part-binding.md) | re-key `.cstat` column statistics to snapshot-part binding | Accepted (2026-08-30). Builds on ADR-0850 |
 | [0954](0954-bounded-ephemeral-spill.md) | Bounded ephemeral spill for eligible SQL operators | Accepted (2026-08-30) |
 | [0979](0979-bounded-memory-rlog-compaction-merge.md) | Bounded-memory RLOG compaction merge | Accepted (2026-10-14; partly implemented) |
