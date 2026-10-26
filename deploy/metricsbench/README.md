@@ -39,8 +39,108 @@ Every backend-specific behaviour that transforms, delays, or ages the stored dat
 — Prometheus' 2h head-block compaction and 45d retention, VictoriaMetrics'
 background merges and disabled deduplication, Mimir's delayed block upload to S3
 and its compactor — is disclosed in a comment next to the setting that causes it,
-in `docker-compose.yml` or `config/mimir.yaml`. No behaviour-changing tuning
-lives outside these files.
+in `docker-compose.yml`, `config/prometheus.yml` or `config/mimir.yaml`. No
+behaviour-changing tuning lives outside these files.
+
+## Frozen limits
+
+ADR-0927's 2026-10-26 amendment (decisions B and F) requires every ingest
+window and query limit the MetricsBench corpus can reach to be set explicitly
+and disclosed, so the comparators store the same logical samples and a limit
+that fires is a disclosed refusal with a known signature, not an undefault
+nobody chose. Each value below is written in the comparator's configuration,
+with a comment naming the default it replaces, even where it equals that
+default, so `capture-effective-config.sh` records it. Defaults are quoted from
+each pinned version's own help (`prometheus --help`, `victoria-metrics -help`,
+`mimir -help-all`) unless the source column says otherwise.
+
+The sizing figures come from `benchmarks/metrics/workload.json` and
+`benchmarks/metrics/metrics.corpus.json`: the history profile is 10,000 series
+at a 15 s scrape over 30 d, the cardinality profile 1,000,000 series, the
+longest range window in the corpus is `[7d]` (`mb_long_range_7d_avg`, history
+only), and the largest declared range grid is history's 24 h at a 5 m step.
+The generator shifts out-of-order samples back one and a half scrape intervals,
+22.5 s at 15 s.
+
+| Comparator | Setting | Value | Default replaced | Sized by | Source |
+|---|---|---|---|---|---|
+| Prometheus | `storage.tsdb.out_of_order_time_window` (config/prometheus.yml) | `1h` | `0` | Above the 22.5 s shift; covers a bulk replay arriving slightly out of order | No flag in `--help`; default read from the 3.13.1 binary's `/api/v1/status/config` (`outofordertimewindow: 0`) |
+| Prometheus | `--query.max-samples` | `500000000` | `50000000` | 10,000 series x 7 d / 15 s = 10,000 x 40,320 = 403,200,000, plus headroom | `--query.max-samples=50000000  Maximum number of samples a single query can load into memory` |
+| Prometheus | `--query.timeout` | `120s` | `2m` (unchanged) | Written so the capture shows it | `--query.timeout=2m  Maximum time a query may take before being aborted` |
+| Prometheus | `--query.lookback-delta` | `5m` | `5m` (unchanged) | Stated, not changed | `--query.lookback-delta=5m  The maximum lookback duration for retrieving metrics during expression evaluations` |
+| VictoriaMetrics | out-of-order window | none to set | not applicable | Accepts any order inside `-retentionPeriod` | v1.115.0 docs, `docs/victoriametrics/README.md`, "Backfilling": "VictoriaMetrics accepts historical data in arbitrary order of time via any supported ingestion method" |
+| VictoriaMetrics | `-search.latencyOffset` | `0` | `30s` | An instant query at the newest sample sees that sample | `-search.latencyOffset duration  The time when data points become visible in query results after the collection ... (default 30s)` |
+| VictoriaMetrics | `-search.maxPointsPerTimeseries` | `20000` | `30000` | History grid 24 h / 5 m + 1 = 289 points | `-search.maxPointsPerTimeseries int  The maximum points per a single timeseries returned from /api/v1/query_range ... (default 30000)` |
+| VictoriaMetrics | `-search.maxSamplesPerQuery` | `1000000000` | `1000000000` (unchanged) | 403,200,000, as for Prometheus | `-search.maxSamplesPerQuery int  The maximum number of raw samples a single query can process across all time series ... (default 1000000000)` |
+| VictoriaMetrics | `-search.maxQueryDuration` | `120s` | `30s` | Equal to Prometheus' `--query.timeout` | `-search.maxQueryDuration duration  The maximum duration for query execution ... (default 30s)` |
+| VictoriaMetrics | `-search.maxUniqueTimeseries` | `1000000` | derived from CPU and memory | Cardinality profile, 1,000,000 series | `When set to zero, the limit is automatically calculated based on -search.maxConcurrentRequests (inversely proportional) and memory available to the process (proportional).` |
+| VictoriaMetrics | `-search.disableCache` | `true` | `false` | Historical replay; a production_cache regime re-enables it per run | `-search.disableCache  Whether to disable response caching. This may be useful when ingesting historical data.` |
+| Mimir | `limits.out_of_order_time_window` | `1h` | `0s` | Same as Prometheus | `-ingester.out-of-order-time-window duration  Non-zero value enables out-of-order support`; `0s` read from the 3.2.3 binary's `/config` |
+| Mimir | `limits.past_grace_period` | `0s` | `0s` (unchanged) | A 30 d replay is not refused for its age | `-validation.past-grace-period duration ... 0 to disable.` |
+| Mimir | `querier.query_store_after` | `0s` | `12h` | Replayed timestamps follow the anchor, not the wall clock; every query reaches the store-gateway | `-querier.query-store-after duration ... 0 means all queries are sent to store. ... (default 12h0m0s)` |
+| Mimir | `limits.query_ingesters_within` | `0s` | `13h` | Every query reaches the ingester, so unshipped samples stay visible | `-querier.query-ingesters-within duration ... 0 means all queries are sent to ingester. (default 13h)` |
+| Mimir | `blocks_storage.bucket_store.sync_interval` | `15m` | `15m` (unchanged) | Readiness wait, not a query budget | `-blocks-storage.bucket-store.sync-interval duration  How frequently to scan the bucket, or to refresh the bucket index ... (default 15m0s)` |
+| Mimir | `compactor.cleanup_interval` | `15m` | `15m` (unchanged) | Readiness wait, not a query budget | `-compactor.cleanup-interval duration  How frequently the compactor should run blocks cleanup and maintenance, as well as update the bucket index. (default 15m0s)` |
+| Mimir | `limits.max_fetched_chunks_per_query` | `5000000` | `2000000` | 10,000 x 40,320 / 120 samples per chunk = 3,360,000 | `-querier.max-fetched-chunks-per-query int  Maximum number of chunks that can be fetched in a single query ... (default 2000000)`; 120 per chunk observed (9,600 samples in 80 chunks per 2 h block of 20 series) |
+| Mimir | `querier.max_samples` | `500000000` | `50000000` | As for Prometheus | `-querier.max-samples int  Maximum number of samples a single query can load into memory. ... (default 50000000)` |
+| Mimir | `limits.max_estimated_memory_consumption_per_query` | `0` | `0` (unchanged) | Not sized; see the note below | `-querier.max-estimated-memory-consumption-per-query uint  [experimental] ... only enforced when Mimir's query engine is in use. ... 0 to disable.` |
+| Mimir | `querier.timeout` | `2m` | `2m` (unchanged) | Equal to Prometheus' `--query.timeout` | `-querier.timeout duration  The timeout for a query. ... (default 2m0s)` |
+| Mimir | `limits.max_total_query_length` | `31d` | `0s` (no limit) | History's 30 d span plus 1 d; `max_query_length` does not exist in 3.2.3 | `-query-frontend.max-total-query-length duration  Limit the total query time range (end - start time).` |
+| Mimir | `limits.max_partial_query_length` | `0s` | `0s` (unchanged) | No separate bound on split sub-queries | `-querier.max-partial-query-length duration  Limit the time range for partial queries at the querier level.` |
+| Mimir | `limits.max_query_lookback` | `45d` | `0s` (disabled) | The 45 d retention; a silent clamp, not a refusal | `-querier.max-query-lookback duration ... the request will not fail but will be manipulated to only query data within the allowed time range. 0 to disable.` |
+| Mimir | `frontend.query_result_response_format` | `protobuf` | `protobuf` (unchanged) | Native histograms under the default query sharding | `-ingester.native-histograms-ingestion-enabled ... To query native histograms with query-sharding enabled make sure to set -query-frontend.query-result-response-format to 'protobuf'.` |
+| Mimir | `frontend.cache_results` | `false` | `false` (unchanged) | Parity with `-search.disableCache=true` | `-query-frontend.cache-results  Cache query results.` |
+
+Limits the corpus does not reach, left at their defaults: VictoriaMetrics
+`-search.maxSamplesPerSeries` (default 30000000; history holds 172,800 samples
+per series) and `-search.maxPointsSubqueryPerTimeseries` (default 100000;
+`mb_long_range_subquery_max`'s `[1d:5m]` is 289 points), and the 11,000 points
+per series Prometheus and Mimir allow on `/api/v1/query_range`, which is not a
+flag.
+
+Under Mimir 3.2.3's default query engine, `querier.max_samples` did not fire:
+with it set to 100, a query over 28,801 samples returned 200. That engine's
+per-query bound is `max_estimated_memory_consumption_per_query`, which is off,
+so on Mimir an oversized query fails on the 4g memory envelope rather than as
+a budget refusal. The value is still frozen for the Prometheus engine.
+
+Mimir readiness: a historical replay is not queried until the bucket index
+lists a block covering the replay's oldest sample and the store-gateway has
+loaded every indexed block. `config/mimir.yaml` names the file, page and
+metrics to read, beside the `frontend` block.
+
+### Budget-refusal signatures
+
+What each comparator returns when a limit fires. Observed on 2026-10-26 by
+running each limit at a deliberately tiny value against the pinned versions'
+upstream release binaries for linux/arm64 (Prometheus 3.13.1, VictoriaMetrics
+v1.115.0, Mimir 3.2.3 with this directory's `config/mimir.yaml` and a
+filesystem bucket in place of RustFS), then restoring the pinned value. The
+error text is the `error` field of the JSON body; numbers inside it vary with
+the query.
+
+| Comparator | Limit | HTTP | `errorType` | Error text |
+|---|---|---|---|---|
+| Prometheus | `--query.max-samples` | 422 | `execution` | `query processing would load too many samples into memory in query execution` |
+| Prometheus | `--query.timeout` | 503 | `timeout` | `query timed out in expression evaluation` |
+| Prometheus | 11,000 points per series (`query_range`) | 400 | `bad_data` | `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)` |
+| Prometheus | out-of-order window (Remote Write) | 400 | none (plain text) | `out of order sample`; the whole request is rejected, in-order samples beside it included |
+| VictoriaMetrics | `-search.maxPointsPerTimeseries` | 422 | `422` | `... too many points for the given start=..., end=... and step=...: 241; the maximum number of points is 10; (see -search.maxPointsPerTimeseries command-line flag)` |
+| VictoriaMetrics | `-search.maxSamplesPerQuery` | 422 | `422` | `cannot select more than -search.maxSamplesPerQuery=100 samples; possible solutions: ...` |
+| VictoriaMetrics | `-search.maxUniqueTimeseries` | 422 | `422` | `... the number of matching timeseries exceeds 5; either narrow down the search or increase -search.max* command-line flag values (the most likely limit is -search.maxUniqueTimeseries); ...` |
+| VictoriaMetrics | `-search.maxQueryDuration` | 422 | `422` | `timeout exceeded during query execution: 0.001 seconds (elapsed 1.143 seconds); the timeout can be adjusted with ` followed by the flag name; checked between evaluation phases, so a query can overrun before it fires |
+| VictoriaMetrics | `-search.maxPointsSubqueryPerTimeseries` | 422 | `422` | `too many points for the given start=..., end=... and step=...: ...; the maximum number of points is 100000; (see -search.maxPointsSubqueryPerTimeseries command-line flag)` |
+| Mimir | `limits.max_fetched_chunks_per_query` | 422 | `execution` | `the query exceeded the maximum number of chunks (limit: 1 chunks) (err-mimir-max-chunks-per-query). ...` |
+| Mimir | `limits.max_estimated_memory_consumption_per_query` | 422 | `execution` | `the query exceeded the maximum allowed estimated amount of memory consumed by a single query (limit: 1000 bytes) (err-mimir-max-estimated-memory-consumption-per-query). ...` |
+| Mimir | `limits.max_total_query_length` | 400 | `bad_data` | `the total query time range exceeds the limit (query length: 5h59m45s, limit: 1h0m0s) (err-mimir-max-total-query-length). ...` |
+| Mimir | `querier.timeout` | 503 | `timeout` | `context deadline exceeded: query timed out` |
+| Mimir | 11,000 points per series (`query_range`) | 400 | `bad_data` | `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)` |
+| Mimir | `querier.max_samples` | not observed | | Did not fire under the default query engine (see above) |
+| Mimir | out-of-order window (Remote Write) | 400 | none (plain text) | `... this sample is beyond the out-of-order time window of 1h (err-mimir-sample-timestamp-too-old) ...`; only that sample is rejected, the rest of the request is stored |
+
+The match key for a status mapper is the stable token: Mimir's `err-mimir-*`
+identifier, VictoriaMetrics' flag name in the message, and Prometheus'
+`errorType` with its fixed message.
 
 ## Launch the set
 
