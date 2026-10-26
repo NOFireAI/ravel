@@ -1549,7 +1549,7 @@ outcome:
 
 - `--target-bytes 1850000000` stored 25.1 MB mean objects on this
   corpus, 74 times below the target. The run predates the depth flush
-  for an explicit target (issue #3273), which these figures do not cover:
+  for an explicit target, which these figures do not cover:
   it wrote 408 objects (the mean
   is over the 407 above 100 KB), split size 390, age 14, final 4 (the final drain, which the trigger mix
   now counts under `manual`), so the
