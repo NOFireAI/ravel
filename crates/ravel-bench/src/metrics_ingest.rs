@@ -158,8 +158,8 @@ use ravel_ingest::{
 };
 use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetrics, list_all};
 use ravel_promql::Value;
-use ravel_query::{EngineConfig, QueryEngine};
 use ravel_promql_difftest::generator::STALE_MARKER_BITS;
+use ravel_query::{EngineConfig, QueryEngine};
 use ravel_remote_write::proto::prometheus::{
     BucketSpan as PbBucketSpan, Histogram as PbHistogram, Label as PbLabel, Sample as PbSample,
     TimeSeries as PbTimeSeries, WriteRequest, histogram as pb_histogram,
@@ -1766,7 +1766,8 @@ impl OfferedDigest {
         self.hasher.update(&wire.schema.to_le_bytes());
         self.hasher.update(&histogram.count.to_le_bytes());
         self.hasher.update(&wire.sum.to_bits().to_le_bytes());
-        self.hasher.update(&wire.zero_threshold.to_bits().to_le_bytes());
+        self.hasher
+            .update(&wire.zero_threshold.to_bits().to_le_bytes());
         let zero_count = match wire.zero_count {
             Some(pb_histogram::ZeroCount::ZeroCountInt(n)) => n,
             _ => 0,
@@ -1847,7 +1848,11 @@ impl SampleBatches for SliceSamples<'_> {
         }
         let n = max.max(1).min(rest.len());
         self.pos += n;
-        let batch: Vec<LogicalPoint> = rest[..n].iter().cloned().map(LogicalPoint::Sample).collect();
+        let batch: Vec<LogicalPoint> = rest[..n]
+            .iter()
+            .cloned()
+            .map(LogicalPoint::Sample)
+            .collect();
         for point in &batch {
             count_point(&mut self.counts, point);
         }
@@ -3187,7 +3192,10 @@ mod tests {
             value: f64::from_bits(STALE_MARKER_BITS),
         }));
         points.push(LogicalPoint::Histogram(histogram(base, vec![2, 1, 0])));
-        points.push(LogicalPoint::Histogram(histogram(base + 15_000, vec![3, 1, 0])));
+        points.push(LogicalPoint::Histogram(histogram(
+            base + 15_000,
+            vec![3, 1, 0],
+        )));
         let cfg = memory_config("mb-replay-classes", 3);
         let outcome = replay_into_ravel(&cfg, &mut SlicePoints::new(&points))
             .await
@@ -4229,7 +4237,11 @@ mod tests {
             value: f64::from_bits(0x7ff8_0000_0000_0000),
             ..stale
         });
-        assert_ne!(base, digest(&quiet_nan), "a stale marker is its bit pattern");
+        assert_ne!(
+            base,
+            digest(&quiet_nan),
+            "a stale marker is its bit pattern"
+        );
 
         let edit = |f: &dyn Fn(&mut LogicalHistogram)| {
             let mut changed = points.clone();
@@ -4238,7 +4250,11 @@ mod tests {
             }
             digest(&changed)
         };
-        assert_ne!(base, edit(&|h| h.positive_deltas[2] = -1), "one bucket delta");
+        assert_ne!(
+            base,
+            edit(&|h| h.positive_deltas[2] = -1),
+            "one bucket delta"
+        );
         assert_ne!(base, edit(&|h| h.sum = 12.75), "sum");
         assert_ne!(base, edit(&|h| h.schema = 3), "schema");
         assert_ne!(base, edit(&|h| h.count += 1), "count");
@@ -4317,7 +4333,10 @@ mod tests {
             ingest.dropped_samples
         );
         assert_eq!(row.ack_semantics, AckSemantics::Buffered);
-        assert_eq!(row.last_commit_token, None, "a buffered row records no token");
+        assert_eq!(
+            row.last_commit_token, None,
+            "a buffered row records no token"
+        );
     }
 
     /// The portable Ravel row against a stub `ravel-server`: every request
@@ -4372,7 +4391,10 @@ mod tests {
             .map(LogicalPoint::Sample)
             .collect();
         points.push(LogicalPoint::Histogram(histogram(base, vec![1, 1])));
-        points.push(LogicalPoint::Histogram(histogram(base + 15_000, vec![2, 1])));
+        points.push(LogicalPoint::Histogram(histogram(
+            base + 15_000,
+            vec![2, 1],
+        )));
         let config = HttpReplayConfig {
             system: "ravel".to_string(),
             endpoint: format!("http://{addr}/api/v1/write"),
@@ -4402,10 +4424,16 @@ mod tests {
         assert_eq!(row.ingest.accepted_histograms, 2);
         check_row_accounting(&row.ingest, &row.ingest.stream_counts).expect("closes");
 
-        let report = serde_json::to_string(&MetricsIngestReport::new(vec![row]))
-            .expect("serialize report");
-        assert!(report.contains("\"last_commit_token\":\"tok-3\""), "{report}");
-        assert!(!report.contains(secret), "the bearer token leaked: {report}");
+        let report =
+            serde_json::to_string(&MetricsIngestReport::new(vec![row])).expect("serialize report");
+        assert!(
+            report.contains("\"last_commit_token\":\"tok-3\""),
+            "{report}"
+        );
+        assert!(
+            !report.contains(secret),
+            "the bearer token leaked: {report}"
+        );
     }
 
     /// An `ingest` block written before the fields added since the nightly

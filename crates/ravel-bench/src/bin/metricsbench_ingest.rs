@@ -144,7 +144,9 @@ enum RunError {
          token under that name (the token is never taken from argv)"
     )]
     MissingBearerToken { var: String },
-    #[error("--ravel-bearer-token-env needs --ravel-endpoint: there is no portable Ravel row to authenticate")]
+    #[error(
+        "--ravel-bearer-token-env needs --ravel-endpoint: there is no portable Ravel row to authenticate"
+    )]
     BearerWithoutEndpoint,
     #[error(transparent)]
     Anchor(#[from] ravel_bench::metrics_ingest::AnchorError),
