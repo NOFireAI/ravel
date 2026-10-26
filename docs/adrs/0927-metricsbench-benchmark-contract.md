@@ -613,8 +613,10 @@ markers travel as the Prometheus stale NaN bit pattern, reusing
 another declaration, exempted from the non-finite rejection exactly for
 that pattern.
 Every row, comparator rows included, is banded on
-`offered == accepted + rejected + dropped` and on its declared drop budget,
-and the row records rejections by HTTP status.
+`offered == accepted + rejected + dropped` (the 2026-10-27 amendment,
+section D, adds a per-class unsupported term for a class the receiver
+cannot store) and on its declared drop budget, and the row records
+rejections by HTTP status.
 
 ### E. Range evaluation grids and empty answers
 
@@ -698,6 +700,7 @@ storage contracts.
 <!-- amendment-supersedes: phrase="Every portable row carries the same exclusion set" pointer="2026-10-27 amendment" -->
 <!-- amendment-supersedes: phrase="leave the second half an interval ahead of the first" pointer="2026-10-27 amendment" -->
 <!-- amendment-supersedes: phrase="a lane that excludes a type another portable row carries is a diagnostic row" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="`offered == accepted + rejected + dropped`" pointer="2026-10-27 amendment" -->
 
 Context. Implementing the status mapper (T3), the comparator limits (T4c)
 and the payload types on the wire (T1c) under epic #2821 found five places
