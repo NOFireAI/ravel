@@ -6,9 +6,11 @@
 //! sixteen blocks, a declared `Str` column `URL` (40-160 byte cells, the
 //! needle in one row of a hundred) beside three other declared columns of
 //! mixed types, written with the default writer configuration (BLOOM over
-//! every string column, no POSTINGS fields). The fetcher is set so every
-//! object above half its size takes the whole-segment fast path's ranged
-//! entry, which is the route the ClickBench objects take.
+//! every string column, no POSTINGS fields). The fetcher is set so both runs
+//! take the whole-segment fast path's ranged entry and the probe-and-range
+//! read, the route the ClickBench objects take: every object above the size
+//! crossover, a 4 KiB suffix probe and a 1 KiB coalesce gap scaled to these
+//! small objects.
 //!
 //! `SELECT COUNT(*) FROM logs WHERE "URL" LIKE '%google%'` runs twice: as main
 //! plans it (the arm pushed), and with `ESCAPE '#'`, which the extractor
@@ -21,8 +23,8 @@
 //! (crates/ravel-query/src/log_fetcher.rs) reads any non-empty content list
 //! as one the reader may answer from BLOOM or POSTINGS. A `Contains` arm is
 //! neither `bloom_shaped` nor a postings arm in `RlogReader::scan_blocks`, so
-//! the reader never reads the section it paid for. Both runs fetch the same
-//! column chunks through the same ranges; nothing is fetched twice.
+//! the reader never reads the section it paid for. Every other range is the
+//! same in both runs: same column chunks, same offsets.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -426,11 +428,10 @@ async fn fixture() -> Fixture {
     }
 }
 
-/// The executor over `fx`'s store. The block-range threshold, which
-/// `with_block_range_threshold` also makes the projection break-even, is half
-/// the smallest object: every object is above it, and a projection reading
-/// three of fourteen object columns saves more than it, so every open takes
-/// the ranged entry. No read cache, so every byte a run reads is a store GET.
+/// The executor over `fx`'s store. Half the smallest object is the
+/// block-range threshold and, through `with_block_range_threshold`, the ranged
+/// fetch's whole-object crossover and projection break-even; every object is
+/// above it. No read cache, so every byte a run reads is a store GET.
 fn executor(fx: &Fixture) -> SqlExecutor {
     let backend: Arc<dyn ObjectStoreBackend> =
         Arc::clone(&fx.store) as Arc<dyn ObjectStoreBackend>;
@@ -446,8 +447,7 @@ fn executor(fx: &Fixture) -> SqlExecutor {
         .with_block_range(
             BlockRangeFetcher::new(Arc::clone(&backend))
                 .with_suffix_len(SUFFIX_LEN)
-                .with_coalesce_gap(COALESCE_GAP)
-                .with_whole_object_threshold(0),
+                .with_coalesce_gap(COALESCE_GAP),
         )
         .with_block_range_threshold(threshold);
     let catalog =
