@@ -1966,8 +1966,10 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    what actually holds the memory figure, because a `CommitRecord` has no
    bounded size: its `declared_column_stats` list is capped neither by the
    format nor by validation, so a record declaring 200 columns charges about
-   20 KB where an ordinary one charges 896 bytes: 864 for the record and 32
-   for the inline slot that keeps its derivation. Each entry is charged an
+   20 KB when admitted and about 38 KB once a resolve has kept its derivation
+   (the kept stamp list adds about 18 KB), where an ordinary one charges 896
+   bytes: 864 for the record and 32 for the inline slot that keeps its
+   derivation. Each entry is charged an
    estimate of the live heap it holds and eviction runs until the tenant's
    summed charge is inside the budget. The derivation is what turns a cached
    L0 record into its segment reference: the check that the record's
@@ -1978,8 +1980,9 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    or token and rebuild the reference from the record and the slot, without
    repeating either step. A failed derivation is never stored, so it fails
    every resolve that reaches the record, and eviction or a tombstone's
-   invalidation drops the derivation with its record. At the shipped defaults the derivation
-   returns the 25,000-entry cap, so the budget is 22.5 MB per
+   invalidation drops the derivation with its record. At the shipped
+   defaults the capacity derivation returns the 25,000-entry cap, so the
+   budget is 22.5 MB per
    actively-queried tenant; at the 10,000-entry floor (which is also what
    `--disable-cache` holds) it is 9 MB. `0` disables the cache. On the
    listing path each L0 commit record is read at most once per resolve: the
