@@ -204,10 +204,7 @@ pub(super) struct W2 {
 /// on, while the scan already fills the cache.
 pub(super) fn run_w2(window: Window, scan: Scan, established: bool, scan_reads: u64) -> W2 {
     let metrics = CacheMetrics::default();
-    let mut fifo = fifo_with(
-        CacheLimits::new(W2_MAX_BYTES, 1_000_000, 64 * MIB),
-        window,
-    );
+    let mut fifo = fifo_with(CacheLimits::new(W2_MAX_BYTES, 1_000_000, 64 * MIB), window);
     let hot = |n: u64| key(1, 1_000_000 + n, HOT_RANGE);
     let hot_from = if established {
         for _ in 0..2 {
@@ -324,7 +321,12 @@ fn w1_every_statement_is_served_on_its_second_and_third_timed_call() {
 /// 0.645.
 #[test]
 fn w2_the_hot_set_is_served_as_well_as_before_under_every_scan() {
-    for scan in [Scan::Loop(600), Scan::Loop(440), Scan::Loop(300), Scan::Unique] {
+    for scan in [
+        Scan::Loop(600),
+        Scan::Loop(440),
+        Scan::Loop(300),
+        Scan::Unique,
+    ] {
         for established in [true, false] {
             let reads = if established { 12_000 } else { 15_000 };
             let shipped = run_w2(Window::Shipped, scan, established, reads);
@@ -342,7 +344,11 @@ fn w2_the_hot_set_is_served_as_well_as_before_under_every_scan() {
 
     let shipped = run_w2(Window::Shipped, Scan::Loop(600), true, 12_000);
     assert_eq!(shipped.hot_rereads, 24_168);
-    assert!((shipped.hot - 0.1413).abs() < 1e-4, "hot {:.4}", shipped.hot);
+    assert!(
+        (shipped.hot - 0.1413).abs() < 1e-4,
+        "hot {:.4}",
+        shipped.hot
+    );
     let over_wide = run_w2(Window::Unbounded, Scan::Loop(600), true, 12_000);
     assert!(
         over_wide.hot < shipped.hot,
@@ -382,7 +388,10 @@ fn w3_no_loop_is_served_less_than_before() {
 fn candidates(max_bytes: u64) -> Vec<(&'static str, Window)> {
     let small = max_bytes / 10;
     vec![
-        ("largest-entry keys (before #3270)", Window::LargestEntryKeys),
+        (
+            "largest-entry keys (before #3270)",
+            Window::LargestEntryKeys,
+        ),
         ("bytes = small quota (0.1 C)", Window::Bytes(small)),
         ("bytes = 0.2 C", Window::Bytes(max_bytes / 5)),
         ("bytes = 0.25 C", Window::Bytes(max_bytes / 4)),
@@ -390,7 +399,10 @@ fn candidates(max_bytes: u64) -> Vec<(&'static str, Window)> {
         ("either keys or 0.25 C", Window::Either(max_bytes / 4)),
         ("shipped (either keys or 0.3 C)", Window::Shipped),
         ("bytes = 0.5 C", Window::Bytes(max_bytes / 2)),
-        ("bytes = main quota (0.9 C)", Window::Bytes(max_bytes - small)),
+        (
+            "bytes = main quota (0.9 C)",
+            Window::Bytes(max_bytes - small),
+        ),
         ("bytes = C", Window::Bytes(max_bytes)),
         ("unbounded", Window::Unbounded),
     ]
@@ -422,7 +434,12 @@ fn ghost_window_report() {
         println!("W1 {name}: calls 2-3 under 0.95 on {low:?}");
     }
     for (name, window) in candidates(W2_MAX_BYTES) {
-        for scan in [Scan::Loop(600), Scan::Loop(440), Scan::Loop(300), Scan::Unique] {
+        for scan in [
+            Scan::Loop(600),
+            Scan::Loop(440),
+            Scan::Loop(300),
+            Scan::Unique,
+        ] {
             for established in [true, false] {
                 let reads = if established { 12_000 } else { 15_000 };
                 let r = run_w2(window, scan, established, reads);

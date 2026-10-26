@@ -629,12 +629,16 @@ impl<V: Clone> S3Fifo<V> {
         self.ghost_bytes += size;
         self.ghost.push_back((key, seq));
         while self.ghosts.len() > self.ghost_max_keys
-            || (self.ghosts.len() > self.ghost_window_keys && self.ghost_bytes > self.ghost_window_bytes)
+            || (self.ghosts.len() > self.ghost_window_keys
+                && self.ghost_bytes > self.ghost_window_bytes)
         {
             let Some((oldest, seq)) = self.ghost.pop_front() else {
                 break;
             };
-            if self.ghosts.get(&oldest).is_some_and(|ghost| ghost.seq == seq)
+            if self
+                .ghosts
+                .get(&oldest)
+                .is_some_and(|ghost| ghost.seq == seq)
                 && let Some(ghost) = self.ghosts.remove(&oldest)
             {
                 self.ghost_bytes -= ghost.size;
