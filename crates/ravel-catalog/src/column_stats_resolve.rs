@@ -76,9 +76,11 @@ use crate::EntryIdentity;
 use crate::charged::DecodeReserver;
 use crate::provisioning::AccountedRecordGet;
 use crate::read_gate::run_snapshot_decode;
+#[cfg(test)]
+use crate::snapshot_format::decode_column_stats;
 use crate::snapshot_format::{
-    ColumnStatsLimits, SnapshotFormatError, decode_column_stats, decode_column_stats_header,
-    decode_head,
+    ColumnStatsLimits, SegmentMeter, SnapshotFormatError, decode_column_stats_header,
+    decode_column_stats_streamed, decode_head,
 };
 
 /// The per-value dictionaries a statement needs from the column statistics it
@@ -185,7 +187,19 @@ impl PartColumnStats {
         request: &ColumnStatsRequest,
         previous: Option<&PartColumnStats>,
     ) -> Self {
-        let dictionaries = match previous.map(|entry| &entry.dictionaries) {
+        let dictionaries = Self::dictionaries_to_keep(request, previous);
+        Self::new(decoded.segments, decoded.by_content_hash, dictionaries)
+    }
+
+    /// The dictionaries an entry built for `request` holds: those `request`
+    /// names plus those `previous` already held. [`fetch_stats_object`] keeps
+    /// exactly these while decoding, and [`Self::from_decoded`] builds the
+    /// entry with them.
+    pub(crate) fn dictionaries_to_keep(
+        request: &ColumnStatsRequest,
+        previous: Option<&PartColumnStats>,
+    ) -> HeldDictionaries {
+        match previous.map(|entry| &entry.dictionaries) {
             Some(HeldDictionaries::All) => HeldDictionaries::All,
             Some(HeldDictionaries::Columns(held)) => {
                 let mut columns = held.clone();
@@ -193,8 +207,7 @@ impl PartColumnStats {
                 HeldDictionaries::Columns(columns)
             }
             None => HeldDictionaries::Columns(request.dictionaries.clone()),
-        };
-        Self::new(decoded.segments, decoded.by_content_hash, dictionaries)
+        }
     }
 
     fn new(
@@ -439,8 +452,9 @@ pub(crate) struct ResolvedStatsHead {
 /// refusal accounting.
 pub(crate) enum FetchOutcome {
     /// Fetched, hash-verified, tenant-checked, part-bound, and decoded, with
-    /// the reservation charging the decoded body (ADR-1702 decision 6).
-    Loaded(DecodedStats, ravel_memory::Reservation),
+    /// the reservations charging the kept segments (ADR-1702 decision 6), one
+    /// per segment.
+    Loaded(DecodedStats, Vec<ravel_memory::Reservation>),
     /// No usable object, silently: the store GET returned `NotFound` or a
     /// retryable failure (`StoreError::is_retryable`: throttling, a timeout,
     /// a transient blip), the content hash did not match, a part hash was
@@ -460,9 +474,9 @@ pub(crate) enum FetchOutcome {
     DecodeRefused(SnapshotFormatError),
 }
 
-/// One fetched-and-decoded object's records, split by keying scheme, with
-/// every dictionary still in place. [`PartColumnStats::from_decoded`] turns it
-/// into the cached, dictionary-stripped entry.
+/// One fetched-and-decoded object's records, split by keying scheme, holding
+/// only the dictionaries [`fetch_stats_object`] was asked to keep.
+/// [`PartColumnStats::from_decoded`] turns it into the cached entry.
 #[derive(Default)]
 pub(crate) struct DecodedStats {
     pub segments: HashMap<EntryIdentity, ColumnStatsSegment>,
@@ -593,6 +607,10 @@ pub(crate) fn resolve_part_stats_ref(part: &SnapshotPartRef) -> Option<ResolvedS
 /// the [module docs](self) is enforced here against `resolved`'s content hash
 /// and part binding.
 ///
+/// The decode streams one segment at a time and keeps only the dictionaries
+/// `keep` holds, so the memory it reserves peaks at the largest segment's
+/// encoded length plus the bytes kept, rather than the declared body up front.
+///
 /// A record's `writer_id` selects which map it lands in: 16 bytes is the
 /// retired v1 `EntryIdentity` tuple (never produced anymore), 32 bytes is a
 /// v3 content hash (ADR-0942's overloaded slot). Any other length is a
@@ -601,6 +619,7 @@ pub(crate) async fn fetch_stats_object(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     resolved: &ResolvedStatsRef,
+    keep: &HeldDictionaries,
     reserver: &impl DecodeReserver,
     gate: Option<&ravel_cpu_gate::ReadGate>,
 ) -> Result<FetchOutcome, LoadColumnStatsError> {
@@ -674,24 +693,45 @@ pub(crate) async fn fetch_stats_object(
         return Ok(FetchOutcome::Absent);
     }
 
-    // ADR-1702 decision 6: charge the declared body before decoding it.
-    // Through `reserver` rather than against the budget directly, so a refusal
-    // takes the decoded-output caches' evict-then-retry pass (issue #2107):
-    // those caches hold parts and postings together with their reservations,
-    // so under a finite budget they can hold the whole of it and a
-    // bare-budget reservation here fails with memory nothing else would have
-    // released.
-    let reservation =
-        reserver.reserve_decoded(header.body_uncompressed_len, limits.max_column_stats_bytes)?;
-    let (decoded, reservation) = match run_snapshot_decode(
-        gate,
-        ReadSite::CatalogColumnStats,
-        header.body_uncompressed_len,
-        move || decode_column_stats(&data, &limits).map(|decoded| (decoded, reservation)),
-    )
-    .await
-    {
-        Ok(decoded) => decoded,
+    // ADR-1702 decision 6: charge decoded bytes before decoding them. Through
+    // `reserver` rather than against the budget directly, so a refusal takes
+    // the decoded-output caches' evict-then-retry pass (issue #2107): those
+    // caches hold parts and postings together with their reservations, so
+    // under a finite budget they can hold the whole of it and a bare-budget
+    // reservation here fails with memory nothing else would have released.
+    //
+    // The decode streams (issue #3244), so the charge follows it: each
+    // segment's encoded length before it is read, shrunk to its kept bytes
+    // once its unkept dictionaries are cleared. A body declared over the
+    // ceiling is charged 0 here, as `decoded_charge` charges it, and the
+    // decoder then refuses it before reading any segment.
+    let declared = header.body_uncompressed_len;
+    let ceiling = limits.max_column_stats_bytes;
+    let over_ceiling = if declared > ceiling {
+        Some(reserver.reserve_decoded(declared, ceiling)?)
+    } else {
+        None
+    };
+    let mut meter = WorkingReservation {
+        reserver: reserver.owned(),
+        ceiling,
+        working: None,
+        kept: Vec::new(),
+    };
+    let keep = keep.clone();
+    let decoded = run_snapshot_decode(gate, ReadSite::CatalogColumnStats, declared, move || {
+        let holds = |name: &str| keep.holds(name);
+        match decode_column_stats_streamed(&data, &limits, &holds, &mut meter) {
+            Ok(decoded) => Ok(Ok((decoded, meter.kept))),
+            Err(MeteredDecodeError::Memory(refusal)) => Ok(Err(refusal)),
+            Err(MeteredDecodeError::Format(err)) => Err(err),
+        }
+    })
+    .await;
+    drop(over_ceiling);
+    let (decoded, reservations) = match decoded {
+        Ok(Ok(decoded)) => decoded,
+        Ok(Err(refusal)) => return Err(refusal.into()),
         // Decode of an object the ref points at: the fold wrote it, so a
         // failure to open it is never the ordinary not-covered case. Surface
         // it for the caller to log once and count (issue #1400), or, for a
@@ -733,8 +773,54 @@ pub(crate) async fn fetch_stats_object(
             by_content_hash,
             body_uncompressed_len: header.body_uncompressed_len,
         },
-        reservation,
+        reservations,
     ))
+}
+
+/// The [`SegmentMeter`] [`fetch_stats_object`] decodes under: a working
+/// reservation for the segment being read, and one kept reservation per
+/// segment already read. Reserving a segment's kept bytes before releasing
+/// its working charge keeps every decoded byte charged, so the most it holds
+/// is the largest segment's encoded length plus the kept bytes.
+struct WorkingReservation {
+    reserver: Box<dyn DecodeReserver + Send>,
+    ceiling: u64,
+    working: Option<ravel_memory::Reservation>,
+    kept: Vec<ravel_memory::Reservation>,
+}
+
+enum MeteredDecodeError {
+    Format(SnapshotFormatError),
+    Memory(ravel_memory::MemoryExhausted),
+}
+
+impl From<SnapshotFormatError> for MeteredDecodeError {
+    fn from(err: SnapshotFormatError) -> Self {
+        MeteredDecodeError::Format(err)
+    }
+}
+
+impl SegmentMeter for WorkingReservation {
+    type Error = MeteredDecodeError;
+
+    fn before_segment(&mut self, len: u64) -> Result<(), MeteredDecodeError> {
+        let working = self
+            .reserver
+            .reserve_decoded(len, self.ceiling)
+            .map_err(MeteredDecodeError::Memory)?;
+        self.working = Some(working);
+        Ok(())
+    }
+
+    fn after_segment(&mut self, kept: &ColumnStatsSegment) -> Result<(), MeteredDecodeError> {
+        let reservation = self
+            .reserver
+            .reserve_decoded(kept.encoded_len() as u64, self.ceiling)
+            .map_err(MeteredDecodeError::Memory)?;
+        self.kept.push(reservation);
+        self.working = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -903,5 +989,185 @@ mod tests {
             restored.sort_by(|x, y| x.writer_id.cmp(&y.writer_id));
             prop_assert_eq!(restored, segments);
         }
+    }
+
+    /// A reserver over a bare budget that records the most the budget held
+    /// after any of its reservations.
+    #[derive(Clone)]
+    struct HighWaterReserver {
+        budget: Arc<ravel_memory::MemoryBudget>,
+        high_water: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl DecodeReserver for HighWaterReserver {
+        fn reserve_decoded(
+            &self,
+            declared: u64,
+            ceiling: u64,
+        ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+            let reservation = crate::charged::reserve_decoded(&self.budget, declared, ceiling)?;
+            self.high_water
+                .fetch_max(self.budget.reserved(), std::sync::atomic::Ordering::SeqCst);
+            Ok(reservation)
+        }
+
+        fn owned(&self) -> Box<dyn DecodeReserver + Send> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// A store holding one object, whatever key is asked for.
+    struct OneObject(bytes::Bytes);
+
+    impl AccountedRecordGet for OneObject {
+        fn accounted_get_full(
+            &self,
+            _key: &str,
+        ) -> impl Future<Output = Result<ravel_object_store::GetOutcome, StoreError>> + Send
+        {
+            let data = self.0.clone();
+            async move {
+                Ok(ravel_object_store::GetOutcome {
+                    total_size: data.len() as u64,
+                    data,
+                    etag: ravel_object_store::Etag(String::new()),
+                    version: ravel_object_store::Version(String::new()),
+                })
+            }
+        }
+    }
+
+    const WIDE_SEGMENTS: usize = 64;
+    const WIDE_ENTRIES: usize = 512;
+    const WIDE_VALUE_LEN: usize = 1024;
+
+    /// A segment holding one bytes column whose dictionary is about half a
+    /// megabyte: `WIDE_ENTRIES` distinct `WIDE_VALUE_LEN`-byte values. Every
+    /// segment encodes to the same length.
+    fn wide_segment(index: usize) -> ColumnStatsSegment {
+        let value = |entry: usize| {
+            let mut bytes = Vec::with_capacity(WIDE_VALUE_LEN);
+            bytes.extend_from_slice(&(index as u32).to_be_bytes());
+            bytes.extend_from_slice(&(entry as u32).to_be_bytes());
+            bytes.resize(WIDE_VALUE_LEN, 0x5A);
+            ColumnValue {
+                kind: Some(Kind::BytesVal(bytes)),
+            }
+        };
+        let mut writer_id = vec![0u8; 32];
+        writer_id[..4].copy_from_slice(&(index as u32).to_be_bytes());
+        ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ColumnStat {
+                name: "wide".to_string(),
+                declared_type: 4,
+                non_null_count: WIDE_ENTRIES as u64,
+                null_count: 0,
+                min: Some(value(0)),
+                max: Some(value(WIDE_ENTRIES - 1)),
+                dictionary_present: true,
+                dictionary: (0..WIDE_ENTRIES)
+                    .map(|entry| DictEntry {
+                        value: Some(value(entry)),
+                        count: 1,
+                    })
+                    .collect(),
+                sum: None,
+            }],
+        }
+    }
+
+    /// Issue #3244: a summary-only fetch of an object whose body is over
+    /// 32 MiB never holds more than one segment's encoded bytes plus the
+    /// bytes it keeps. Its reservations peak at exactly the segment length
+    /// plus every kept byte (the last segment's working charge is still held
+    /// when its kept bytes are reserved), it fits a budget of exactly that
+    /// size, and what it hands back holds exactly the kept bytes.
+    ///
+    /// FLIP: reserve the declared body before decoding, as the bulk decode
+    /// did, or strip the dictionaries only after every segment is read;
+    /// either is refused by this budget, failing the `expect`.
+    #[tokio::test]
+    async fn a_summary_only_fetch_reserves_one_segment_plus_the_kept_bytes() {
+        let segments: Vec<ColumnStatsSegment> = (0..WIDE_SEGMENTS).map(wide_segment).collect();
+        let segment_len = segments[0].encoded_len() as u64;
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.encoded_len() as u64 == segment_len)
+        );
+        let kept: u64 = segments
+            .iter()
+            .map(|segment| {
+                let mut stripped = segment.clone();
+                stripped.columns[0].dictionary.clear();
+                stripped.encoded_len() as u64
+            })
+            .sum();
+        let part_blake3 = [0x22; 32];
+        let tenant = TenantHash([0x11; 16]);
+        let bytes = crate::snapshot_format::encode_column_stats_v3(
+            tenant.0,
+            1,
+            part_blake3,
+            &segments,
+            u64::MAX,
+        )
+        .expect("distinct ascending segments encode");
+        let declared = decode_column_stats_header(&bytes)
+            .expect("header")
+            .header
+            .body_uncompressed_len;
+        assert!(declared >= 32 << 20, "declared body {declared}");
+        // A stripped segment is 2116 bytes: 34 of writer_id, 6 of hour, epoch
+        // and seq, and a 2073-byte column (min and max at 1030 each) behind a
+        // 3-byte tag and length. The dictionary adds 512 entries of 1035.
+        assert_eq!(segment_len, 532_037);
+        assert_eq!(kept, 64 * 2116);
+
+        let peak = segment_len + kept;
+        let reserver = HighWaterReserver {
+            budget: Arc::new(ravel_memory::MemoryBudget::new(peak)),
+            high_water: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let resolved = ResolvedStatsRef {
+            key: "stats.cstat".to_string(),
+            blake3: *blake3::hash(&bytes).as_bytes(),
+            expected_part_blake3: vec![part_blake3],
+            expected_version: 3,
+        };
+        let outcome = fetch_stats_object(
+            &OneObject(bytes::Bytes::from(bytes)),
+            &tenant,
+            &resolved,
+            &HeldDictionaries::Columns(BTreeSet::new()),
+            &reserver,
+            None,
+        )
+        .await
+        .expect("fits a budget of one segment plus the kept bytes");
+        let FetchOutcome::Loaded(decoded, reservations) = outcome else {
+            panic!("the object loads");
+        };
+
+        let high_water = reserver
+            .high_water
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(high_water <= segment_len + kept);
+        assert_eq!(high_water, peak);
+        let held: u64 = reservations.iter().map(|r| r.size()).sum();
+        assert_eq!(held, kept);
+        assert_eq!(reserver.budget.reserved(), kept);
+        let decoded_len: u64 = decoded
+            .by_content_hash
+            .values()
+            .map(|segment| segment.encoded_len() as u64)
+            .sum();
+        assert_eq!(decoded_len, kept);
+        assert_eq!(decoded.by_content_hash.len(), WIDE_SEGMENTS);
     }
 }
