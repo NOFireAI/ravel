@@ -153,10 +153,12 @@ fn stream(n: usize) -> (LogStreamId, Vec<u8>) {
     )
 }
 
-/// `blocks` blocks of `CELLS` rows in one row group, row `i` on stream
-/// `i % (4 * blocks)` with `URL` `values[pick(i)]`, and with the attribute `zz`
-/// (overflowing into `attrs_raw`) on every row `i % every == 0` when
-/// `attrs_raw_every` is set.
+/// `blocks` blocks of `CELLS` rows in one row group, record `i` pushed on
+/// stream `i % (4 * blocks)` with `URL` `values[pick(i)]`, and with the
+/// attribute `zz` (overflowing into `attrs_raw`) on every record
+/// `i % every == 0` when `attrs_raw_every` is set. The writer sorts by
+/// `(stream_ref, ts)`, so each block holds 4 runs of 2,048 rows, one per
+/// stream: the best case for the stream-verdict cache.
 fn block_object(
     values: &[String],
     pick: impl Fn(usize) -> usize,
