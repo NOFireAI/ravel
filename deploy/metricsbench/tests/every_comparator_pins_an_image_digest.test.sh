@@ -5,7 +5,8 @@
 # standalone RustFS-and-bucket mirror and must stay pinned in lockstep).
 #
 # The script resolves every path it reads (Dockerfile, Dockerfile.prebuilt,
-# .github/workflows, .github/actions, deploy/metricsbench/docker-compose.yml,
+# .github/workflows, .github/actions, deploy/metricsbench/docker-compose.yml
+# and its ravel.yml overlay,
 # the two quickstart compose files, and deploy/k8s) from its own location, two
 # directories up. To exercise one category with a mutated file while the
 # other categories still see real, passing content, each case runs against a
@@ -58,6 +59,8 @@ new_tree() {
   cp -r "${REPO_ROOT}/.github/actions/." "${dir}/.github/actions/"
   cp "${REPO_ROOT}/deploy/metricsbench/docker-compose.yml" \
     "${dir}/deploy/metricsbench/docker-compose.yml"
+  cp "${REPO_ROOT}/deploy/metricsbench/ravel.yml" \
+    "${dir}/deploy/metricsbench/ravel.yml"
   cp "${REPO_ROOT}/deploy/docker-compose/ravel.yml" \
     "${dir}/deploy/docker-compose/ravel.yml"
   cp "${REPO_ROOT}/deploy/docker-compose/rustfs.yml" \
@@ -112,6 +115,34 @@ check() {
 d="$(new_tree committed)"
 check "the committed tree passes with all six categories pinned" \
   "${d}" 0 "RESULT: PASS"
+
+# --- the metricsbench Ravel overlay: exempt by exact match only -------------
+
+# The overlay's `${RAVEL_IMAGE:?...}` references are the only exemption; a
+# default tag in their place is a reference in the file and must be pinned.
+d="$(new_tree metricsbench-ravel-default-tag)"
+mutate "${d}/deploy/metricsbench/ravel.yml" \
+  '0,/image: \${RAVEL_IMAGE:?[^}]*}/s##image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.26.0}#'
+check "a defaulted RAVEL_IMAGE in the metricsbench overlay is not exempt" \
+  "${d}" 1 "[UNPINNED] \${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.26.0}"
+check "a defaulted RAVEL_IMAGE raises the pin-required count" "${d}" 1 \
+  "found 6 pin-required compose image references, expected exactly 5"
+
+d="$(new_tree metricsbench-ravel-literal-tag)"
+mutate "${d}/deploy/metricsbench/ravel.yml" \
+  's#image: \${RAVEL_IMAGE:?[^}]*}#image: ghcr.io/nofireai/ravel-server:0.26.0#'
+check "a bare-tag literal in the metricsbench overlay fails the digest check" \
+  "${d}" 1 "2 compose image reference(s) lack an @sha256: digest"
+
+d="$(new_tree metricsbench-ravel-missing)"
+rm "${d}/deploy/metricsbench/ravel.yml"
+check "a missing metricsbench overlay fails naming the missing path" "${d}" 1 \
+  "compose file not found at ${d}/deploy/metricsbench/ravel.yml"
+
+d="$(new_tree metricsbench-ravel-no-server)"
+mutate "${d}/deploy/metricsbench/ravel.yml" 's#^  ravel-server:#  ravel-renamed:#'
+check "a metricsbench overlay without ravel-server fails the comparator check" \
+  "${d}" 1 "required comparator 'ravel-server' is missing"
 
 # --- a bare tag in ravel.yml fails naming the line --------------------------
 

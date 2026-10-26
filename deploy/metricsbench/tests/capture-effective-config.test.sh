@@ -2,13 +2,16 @@
 # Cases for capture-effective-config.sh, run against stub HTTP servers that
 # serve canned engine responses, and a stub docker binary.
 #
-#   a  all three comparators answer      -> exit 0, every version and the
-#                                           Mimir engine fields present
+#   a  all four comparators answer       -> exit 0, every version and the
+#                                           Mimir engine fields present;
+#                                           Ravel's runtime_flags unavailable
+#                                           without docker
 #   b  Mimir down                        -> exit 1, document still written,
 #                                           mimir.version unavailable, the
 #                                           other two complete
 #   c  usage error                       -> exit 64
-#   d  docker reachable (stub)           -> image digest and platform recorded
+#   d  docker reachable (stub)           -> image digest and platform recorded,
+#                                           Ravel's runtime_flags from .Config.Cmd
 #   e  Mimir 3.x with no docker          -> engine default "mimir", image is
 #                                           the docker-not-reachable string
 #   f  daemon up, compose plugin broken  -> exit 0, image carries the compose
@@ -16,6 +19,11 @@
 #   g  buildinfo with data: null         -> exit 1, document written, version
 #                                           unavailable, no crash
 #   h  --out not writable                -> exit 70, no document
+#   i  compose ps                        -> reads docker-compose.yml and
+#                                           ravel.yml; RAVEL_IMAGE placeholder
+#                                           when unset, passed on when set
+#   j  Ravel 0.26.0 empty revision       -> exit 1, version kept, revision
+#                                           unavailable
 #
 # Every field is asserted by parsing the JSON with python3 -I, not by grep.
 #
@@ -121,8 +129,19 @@ mimir3="${TMP}/mimir3"
 write "${mimir3}/prometheus/api/v1/status/buildinfo" '{"status":"success","data":{"application":"Grafana Mimir","version":"3.2.0","revision":"mimirrev320","branch":"release-3.2","goVersion":"go1.25.1","features":{}}}'
 write "${mimir3}/config" "$(mimir_config mimir)"
 
+# Ravel's buildinfo, with a revision, and as the 0.26.0 image answers it:
+# every build field but version empty.
+ravel="${TMP}/ravel"
+write "${ravel}/api/v1/status/buildinfo" '{"status":"success","data":{"version":"0.27.0","revision":"ravelrev027","branch":"","buildUser":"","buildDate":"","goVersion":""}}'
+ravel026="${TMP}/ravel026"
+write "${ravel026}/api/v1/status/buildinfo" '{"status":"success","data":{"version":"0.26.0","revision":"","branch":"","buildUser":"","buildDate":"","goVersion":""}}'
+
 stub_server "${prom}"
 prom_url="${stub_url}"
+stub_server "${ravel}"
+ravel_url="${stub_url}"
+stub_server "${ravel026}"
+ravel026_url="${stub_url}"
 stub_server "${vm}"
 vm_url="${stub_url}"
 stub_server "${mimir2}"
@@ -141,11 +160,15 @@ write "${TMP}/bin/docker-up" '#!/usr/bin/env bash
 case "$1 $2" in
   "info --format") echo 27.0.0 ;;
   "compose -f")
+    printf "%s\n" "$*" "RAVEL_IMAGE=${RAVEL_IMAGE-<unset>}" >"$(dirname "$0")/compose-call.log"
     echo "{\"ID\":\"c-prom\",\"Service\":\"prometheus\"}"
     echo "{\"ID\":\"c-vm\",\"Service\":\"victoriametrics\"}"
-    echo "{\"ID\":\"c-mimir\",\"Service\":\"mimir\"}" ;;
+    echo "{\"ID\":\"c-mimir\",\"Service\":\"mimir\"}"
+    echo "{\"ID\":\"c-ravel\",\"Service\":\"ravel-server\"}" ;;
   "inspect c-mimir")
     echo "[{\"Image\":\"sha256:img-mimir\",\"Config\":{\"Image\":\"grafana/mimir:2.14.2@sha256:2d39\"}}]" ;;
+  "inspect c-ravel")
+    echo "[{\"Image\":\"sha256:img-ravel\",\"Config\":{\"Image\":\"ghcr.io/nofireai/ravel-server:0.26.0@sha256:b299\",\"Entrypoint\":[\"/usr/local/bin/ravel-server\"],\"Cmd\":[\"--mode\",\"all\",\"--max-ingest-lag\",\"45d\"]}}]" ;;
   "inspect "*)
     echo "[{\"Image\":\"sha256:img-$2\",\"Config\":{\"Image\":\"ref-$2\"}}]" ;;
   "image inspect")
@@ -194,6 +217,7 @@ out_a="${TMP}/a.json"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_a}" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/a.err" || code=$?
 expect_exit "a all answer" 0 "${code}"
 check "a fields" "${out_a}" <<EOF
@@ -216,6 +240,11 @@ d["urls_queried"]["mimir"]["buildinfo"] == "${mimir2_url}/prometheus/api/v1/stat
 d["urls_queried"]["mimir"]["runtime_flags"] == "${mimir2_url}/config"
 d["urls_queried"]["victoriametrics"]["buildinfo"] == "${vm_url}/metrics"
 d["urls_queried"]["prometheus"]["runtime_flags"] == "${prom_url}/api/v1/status/flags"
+d["comparators"]["ravel"]["version"] == "0.27.0"
+d["comparators"]["ravel"]["revision"] == "ravelrev027"
+d["urls_queried"]["ravel"]["buildinfo"] == "${ravel_url}/api/v1/status/buildinfo"
+("docker not reachable" in d["comparators"]["ravel"]["runtime_flags"]["unavailable"]) == True
+d["comparators"]["ravel"]["image"] == "unavailable: docker not reachable"
 len(d["script_revision"]) == 40
 bool(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", d["captured_at"])) == True
 EOF
@@ -226,6 +255,7 @@ mimir_dead="$(dead_url)"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_b}" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir_dead}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/b.err" || code=$?
 expect_exit "b mimir down" 1 "${code}"
 if [[ -s "${out_b}" ]]; then pass "b document written"; else fail "b document written"; fi
@@ -255,6 +285,7 @@ out_d="${TMP}/d.json"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-up" "${SCRIPT}" --out "${out_d}" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/d.err" || code=$?
 expect_exit "d docker up" 0 "${code}"
 check "d image fields" "${out_d}" <<EOF
@@ -265,6 +296,58 @@ d["comparators"]["mimir"]["image"]["repo_digests"] == ["repo@sha256:digest-sha25
 d["comparators"]["mimir"]["image"]["architecture"] == "arm64"
 d["comparators"]["mimir"]["image"]["os"] == "linux"
 d["comparators"]["prometheus"]["image"]["config_image"] == "ref-c-prom"
+d["comparators"]["ravel"]["image"]["container"] == "c-ravel"
+d["comparators"]["ravel"]["image"]["config_image"] == "ghcr.io/nofireai/ravel-server:0.26.0@sha256:b299"
+d["comparators"]["ravel"]["runtime_flags"]["cmd"] == ["--mode", "all", "--max-ingest-lag", "45d"]
+d["comparators"]["ravel"]["runtime_flags"]["source"] == "docker inspect .Config.Cmd of compose service ravel-server"
+EOF
+
+# --- i: compose ps reads ravel.yml, with RAVEL_IMAGE placeholder or passed on ---
+# ravel.yml refuses interpolation without RAVEL_IMAGE, so the listing would
+# fail for every service if the script left it unset.
+compose_log="${TMP}/bin/compose-call.log"
+if grep -q -- "-f .*/docker-compose.yml -f .*/ravel.yml ps --format json" "${compose_log}"; then
+  pass "i compose ps reads both files"
+else
+  fail "i compose ps reads both files: $(cat "${compose_log}")"
+fi
+if grep -qx "RAVEL_IMAGE=unset-placeholder-for-compose-ps" "${compose_log}"; then
+  pass "i placeholder RAVEL_IMAGE when unset"
+else
+  fail "i placeholder RAVEL_IMAGE when unset: $(cat "${compose_log}")"
+fi
+code=0
+RAVEL_IMAGE="ghcr.io/nofireai/ravel-server:0.26.0@sha256:given" \
+  METRICSBENCH_DOCKER="${TMP}/bin/docker-up" "${SCRIPT}" --out "${TMP}/i.json" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel_url}" \
+  2>"${TMP}/i.err" || code=$?
+expect_exit "i RAVEL_IMAGE set" 0 "${code}"
+if grep -qx "RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:0.26.0@sha256:given" "${compose_log}"; then
+  pass "i RAVEL_IMAGE passed on unchanged"
+else
+  fail "i RAVEL_IMAGE passed on unchanged: $(cat "${compose_log}")"
+fi
+
+# --- j: Ravel 0.26.0 answers an empty revision -----------------------------------
+# The pinned image's buildinfo carries no revision: that is a partial capture
+# (exit 1) with the version kept, not a pass with an empty string recorded.
+out_j="${TMP}/j.json"
+code=0
+METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_j}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel026_url}" \
+  2>"${TMP}/j.err" || code=$?
+expect_exit "j ravel empty revision" 1 "${code}"
+if grep -q "unavailable for: ravel$" "${TMP}/j.err"; then
+  pass "j names ravel"
+else
+  fail "j names ravel: $(cat "${TMP}/j.err")"
+fi
+check "j fields" "${out_j}" <<EOF
+d["comparators"]["ravel"]["version"] == "0.26.0"
+d["comparators"]["ravel"]["revision"] == {"unavailable": "data.revision missing or empty in response from ${ravel026_url}/api/v1/status/buildinfo"}
+d["comparators"]["mimir"]["revision"] == "mimirrev214"
 EOF
 
 # --- e: Mimir 3.x ---------------------------------------------------------------
@@ -272,6 +355,7 @@ out_e="${TMP}/e.json"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_e}" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir3_url}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/e.err" || code=$?
 expect_exit "e mimir 3.x" 0 "${code}"
 check "e engine fields" "${out_e}" <<EOF
@@ -297,11 +381,14 @@ out_f="${TMP}/f.json"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-compose-broken" "${SCRIPT}" --out "${out_f}" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/f.err" || code=$?
 expect_exit "f compose broken" 0 "${code}"
 check "f image reason" "${out_f}" <<EOF
 d["comparators"]["prometheus"]["image"].startswith("unavailable: docker compose exited 1: permission denied") == True
 d["comparators"]["mimir"]["image"] == d["comparators"]["prometheus"]["image"]
+d["comparators"]["ravel"]["image"] == d["comparators"]["prometheus"]["image"]
+("permission denied" in d["comparators"]["ravel"]["runtime_flags"]["unavailable"]) == True
 ("no running container" in json.dumps(d)) == False
 EOF
 
@@ -317,6 +404,7 @@ out_g="${TMP}/g.json"
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${out_g}" \
   --prometheus "${prom_null_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/g.err" || code=$?
 expect_exit "g data null" 1 "${code}"
 if [[ -s "${out_g}" ]]; then pass "g document written"; else fail "g document written"; fi
@@ -333,6 +421,7 @@ EOF
 code=0
 METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${TMP}/no-such-dir/h.json" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
+  --ravel "${ravel_url}" \
   2>"${TMP}/h.err" || code=$?
 expect_exit "h unwritable out" 70 "${code}"
 if [[ -e "${TMP}/no-such-dir/h.json" ]]; then fail "h no document"; else pass "h no document"; fi
