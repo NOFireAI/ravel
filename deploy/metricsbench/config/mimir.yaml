@@ -1,5 +1,8 @@
 # Grafana Mimir configuration for the MetricsBench object-storage-native
 # comparator (ADR-0927). Monolithic (-target=all) single-instance deployment.
+# Written for grafana/mimir:3.2.3. Every field below parses under 3.2.3 with no
+# removal or rename from the 2.14.2 config; defaults quoted in comments are the
+# 3.2.3 binary's own `mimir -help-all` output.
 #
 # Every setting that changes what data a query sees, when it becomes durable, or
 # how long it is kept is disclosed in a comment next to the setting (ADR-0927
@@ -13,10 +16,12 @@ multitenancy_enabled: false
 server:
   http_listen_port: 9009
   grpc_listen_port: 9095
-  # Raise gRPC message ceilings above the defaults: high-cardinality remote-write
-  # batches from the ADR-0927 cardinality profile (1,000,000 series) otherwise
-  # trip Mimir's default 4 MiB message limit. This is COMMITTED, EXPLAINED tuning
-  # to let the benchmark's own load through, not a performance optimisation.
+  # gRPC message ceilings sized for high-cardinality remote-write batches from
+  # the ADR-0927 cardinality profile (1,000,000 series). In 3.2.3 this equals
+  # the default (-server.grpc-max-recv-msg-size-bytes and
+  # -server.grpc-max-send-msg-size-bytes, default 104857600); it stays pinned
+  # so a future default change cannot shrink it. COMMITTED, EXPLAINED tuning to
+  # let the benchmark's own load through, not a performance optimisation.
   grpc_server_max_recv_msg_size: 104857600
   grpc_server_max_send_msg_size: 104857600
 
@@ -41,11 +46,21 @@ blocks_storage:
     dir: /data/tsdb
     # DELAYED OBJECT-STORAGE VISIBILITY / MATERIALISED STATE (disclosed): the
     # ingester keeps recent samples in a local head block plus WAL under this
-    # dir and only ships a compacted TSDB block to S3 after each 2h head range
-    # closes. So an ack is durable on the local WAL, and the S3 copy the
-    # store-gateway serves appears later. Left at the 2h default: shortening it
-    # would be undisclosed tuning that changes the ack-to-object-storage timing
-    # the benchmark is measuring.
+    # dir (-blocks-storage.tsdb.dir: "TSDBs (including WAL) in the ingesters")
+    # and only ships a TSDB block to S3 after each 2h head range closes (TSDB
+    # block range period, default 2h, per -blocks-storage.tsdb.retention-period
+    # help; shipping scans every 1m per -blocks-storage.tsdb.ship-interval).
+    # So an ack is durable on the local WAL, and the S3 copy the store-gateway
+    # serves appears later. Left at the 2h default: shortening it would be
+    # undisclosed tuning that changes the ack-to-object-storage timing the
+    # benchmark is measuring.
+    #
+    # LOCAL BLOCK RETENTION (disclosed): the ingester deletes its local copy of
+    # a block 25h after uploading it (-blocks-storage.tsdb.retention-period,
+    # 3.2.3 default 13h, must exceed the 2h block range and
+    # -querier.query-store-after, default 12h). This ages only the ingester's
+    # local copy; the S3 copy is governed by compactor_blocks_retention_period
+    # below.
     retention_period: 25h
   bucket_store:
     sync_dir: /data/tsdb-sync
@@ -53,9 +68,10 @@ blocks_storage:
 compactor:
   data_dir: /data/compactor
   # COMPACTION / MATERIALISED STATE (disclosed): the compactor merges shipped
-  # blocks in object storage. NO DOWNSAMPLING: Mimir does not downsample blocks
-  # (unlike Thanos' optional downsampling), so stored resolution is never
-  # silently reduced. Left at defaults; no unpublished tuning.
+  # blocks in object storage over the default ranges 2h, 12h, 24h
+  # (-compactor.block-ranges). NO DOWNSAMPLING: the 3.2.3 binary exposes no
+  # downsampling flag in -help-all (unlike Thanos' optional downsampling), so
+  # stored resolution is not reduced. Left at defaults; no unpublished tuning.
   sharding_ring:
     kvstore:
       store: memberlist
@@ -93,6 +109,10 @@ limits:
   max_global_series_per_user: 0        # 0 = unlimited active series
   ingestion_rate: 5000000              # samples/sec
   ingestion_burst_size: 20000000       # samples
-  # Query lookback must cover the history profile (30d); default is fine but
-  # pinned so a future default change cannot silently shorten the queryable range.
+  # RETENTION (disclosed): the compactor deletes blocks holding samples older
+  # than 45d, and the query-frontend does not query beyond it
+  # (-compactor.blocks-retention-period; 3.2.3 default is 0, deletion
+  # disabled). Set above the history profile's 30d, matching the Prometheus and
+  # VictoriaMetrics comparators' 45d, so retention cannot drop benchmark samples
+  # mid-run.
   compactor_blocks_retention_period: 45d
