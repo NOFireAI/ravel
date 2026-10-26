@@ -284,11 +284,7 @@
         "histogram_quantile",
         "number literal",
         "vector selector"
-      ],
-      "expected": {
-        "intended_empty": true,
-        "reason": "no receiver has received a native histogram until task T1c of #2821 puts them on the wire; T1c removes this marker"
-      }
+      ]
     },
     {
       "id": "mb_histogram_native_fraction",
@@ -302,11 +298,7 @@
         "rate",
         "matrix selector",
         "vector selector"
-      ],
-      "expected": {
-        "intended_empty": true,
-        "reason": "no receiver has received a native histogram until task T1c of #2821 puts them on the wire; T1c removes this marker"
-      }
+      ]
     },
     {
       "id": "mb_long_range_7d_avg",

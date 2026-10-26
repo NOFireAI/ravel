@@ -1,13 +1,14 @@
 //! MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5).
 //!
-//! Replays one logical sample stream into the in-process Ravel path
-//! (`WriteMode::Strict`, durable-on-ack, commit tokens) and, behind endpoints
-//! supplied on the command line with no hardcoded hosts, the
-//! Prometheus/VictoriaMetrics/object-storage-native comparators over portable
-//! Remote Write 1.0. It prints one JSON report whose every row states that
-//! system's acknowledgement meaning (ADR-0927 decision 3), and it fails the run
-//! if the sample accounting does not close (band 4) rather than reporting a
-//! silent drop.
+//! Replays one logical stream (scalar samples, staleness markers and native
+//! histograms) into the in-process Ravel path (`WriteMode::Strict`,
+//! durable-on-ack, commit tokens) and, behind endpoints supplied on the
+//! command line with no hardcoded hosts, over portable Remote Write 1.0 into
+//! `ravel-server` (`--ravel-endpoint`, ADR-0927 2026-10-26 amendment A),
+//! Prometheus, VictoriaMetrics and Mimir. It prints one JSON report whose
+//! every row states that system's acknowledgement meaning (ADR-0927 decision
+//! 3), and it fails the run if the accounting does not close (band 4) rather
+//! than reporting a silent drop.
 //!
 //! The stream is the deterministic MetricsBench workload
 //! (`metricsbench_gen`'s generator), streamed one scrape step at a time
@@ -34,7 +35,7 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    GeneratedStream, HttpReplayConfig, MetricsIngestReport, RavelReplayConfig,
+    AckSemantics, GeneratedStream, HttpReplayConfig, MetricsIngestReport, RavelReplayConfig,
     RowAccountingViolation, RunProvenance, StreamBandViolation, StreamCounts, Substrate,
     build_profile_record, check_anchor, check_row_accounting, check_stream_band,
     query_after_replay, replay_into_ravel, replay_over_http, workload_digest,
@@ -93,6 +94,17 @@ struct Args {
     /// Tenant to write under.
     #[arg(long, default_value = "metricsbench")]
     tenant: String,
+    /// `ravel-server` `/api/v1/write` endpoint, the portable Ravel row
+    /// (`system: ravel`, `endpoint: <url>`). Omitted, only the in-process
+    /// row is written.
+    #[arg(long)]
+    ravel_endpoint: Option<String>,
+    /// Name of the environment variable holding the bearer token for
+    /// `--ravel-endpoint`. The token is read from the environment, never
+    /// from argv, and never written into the report. Omitted, no
+    /// `Authorization` header is sent.
+    #[arg(long)]
+    ravel_bearer_token_env: Option<String>,
     /// Prometheus `/api/v1/write` endpoint. Omitted, Prometheus is not
     /// replayed. No hardcoded host: this is the only way to reach it.
     #[arg(long)]
@@ -100,11 +112,10 @@ struct Args {
     /// VictoriaMetrics `/api/v1/write` endpoint. Omitted, it is not replayed.
     #[arg(long)]
     victoriametrics_endpoint: Option<String>,
-    /// Object-storage-native comparator `/api/v1/write` endpoint. Omitted, it
-    /// is not replayed.
+    /// Mimir push endpoint (Remote Write 1.0). Omitted, it is not replayed.
     #[arg(long)]
-    osn_endpoint: Option<String>,
-    /// Logical samples per RW1.0 request to a comparator.
+    mimir_endpoint: Option<String>,
+    /// Logical points per RW1.0 request to an HTTP receiver.
     #[arg(long, default_value_t = 500)]
     http_batch_size: usize,
     /// Retries on a 429/5xx before a comparator batch is dropped.
@@ -128,6 +139,15 @@ enum RunError {
          interval ({interval_ms} ms for profile `{profile}`)"
     )]
     MissingAnchor { profile: String, interval_ms: u64 },
+    #[error(
+        "--ravel-bearer-token-env names `{var}`, which is unset, empty or not UTF-8; export the \
+         token under that name (the token is never taken from argv)"
+    )]
+    MissingBearerToken { var: String },
+    #[error(
+        "--ravel-bearer-token-env needs --ravel-endpoint: there is no portable Ravel row to authenticate"
+    )]
+    BearerWithoutEndpoint,
     #[error(transparent)]
     Anchor(#[from] ravel_bench::metrics_ingest::AnchorError),
     #[error("loading the workload manifest failed: {0}")]
@@ -158,7 +178,7 @@ enum RunError {
     #[error("{system}: {source}")]
     AccountingMismatch {
         system: String,
-        source: RowAccountingViolation,
+        source: Box<RowAccountingViolation>,
     },
     #[error(
         "the Ravel replay accepted zero samples, so it measured nothing; a stream that ingests \
@@ -196,6 +216,23 @@ fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Result<
     Ok(anchor_ms)
 }
 
+/// The portable Ravel row's bearer token, read from the environment
+/// variable `--ravel-bearer-token-env` names. Refused before anything is
+/// generated when the variable is unset or empty, or when the flag is given
+/// without `--ravel-endpoint`.
+fn resolve_bearer_token(args: &Args) -> Result<Option<String>, RunError> {
+    let Some(var) = &args.ravel_bearer_token_env else {
+        return Ok(None);
+    };
+    if args.ravel_endpoint.is_none() {
+        return Err(RunError::BearerWithoutEndpoint);
+    }
+    match std::env::var(var) {
+        Ok(token) if !token.is_empty() => Ok(Some(token)),
+        _ => Err(RunError::MissingBearerToken { var: var.clone() }),
+    }
+}
+
 /// Close a drained stream and check one row against it: the classification
 /// identity of band 4, then the row's offering identity and the split of its
 /// offered samples.
@@ -213,7 +250,7 @@ fn close_row(
     })?;
     check_row_accounting(ingest, &counts).map_err(|source| RunError::AccountingMismatch {
         system: system.to_string(),
-        source,
+        source: Box::new(source),
     })?;
     Ok((report, counts))
 }
@@ -225,6 +262,7 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
     })?;
     let anchor_ms = resolve_anchor(args, profile.scrape_interval_secs, steps)?;
+    let ravel_bearer_token = resolve_bearer_token(args)?;
     // `load_workload` read the same file; a second read for the digest keeps
     // the loader's signature unchanged.
     let manifest_bytes = std::fs::read(&args.workload).map_err(|e| {
@@ -266,8 +304,8 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         .map_err(|e| RunError::Replay(e.to_string()))?;
 
     // Band 4: the stream closes against the generator and the Ravel
-    // accounting closes over its scalar lines.
-    let (gen_report, _) = close_row("ravel", ravel_stream, &ravel.result.ingest)?;
+    // accounting closes over every line.
+    let (gen_report, _) = close_row("ravel (in-process)", ravel_stream, &ravel.result.ingest)?;
     if ravel.result.ingest.accepted_samples == 0 {
         return Err(RunError::NothingIngested);
     }
@@ -302,16 +340,40 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
 
     let mut rows = vec![ravel.result];
 
-    // Comparators, only those a caller supplied an endpoint for.
-    for (system, endpoint) in [
-        ("prometheus", args.prometheus_endpoint.as_ref()),
-        ("victoriametrics", args.victoriametrics_endpoint.as_ref()),
-        ("osn", args.osn_endpoint.as_ref()),
+    // Portable rows, only those a caller supplied an endpoint for. Their
+    // `system` values are the names the query runner joins on.
+    for (system, endpoint, ack_semantics, bearer_token) in [
+        (
+            "ravel",
+            args.ravel_endpoint.as_ref(),
+            AckSemantics::DurableOnAck,
+            ravel_bearer_token.clone(),
+        ),
+        (
+            "prometheus",
+            args.prometheus_endpoint.as_ref(),
+            AckSemantics::Buffered,
+            None,
+        ),
+        (
+            "victoriametrics",
+            args.victoriametrics_endpoint.as_ref(),
+            AckSemantics::Buffered,
+            None,
+        ),
+        (
+            "mimir",
+            args.mimir_endpoint.as_ref(),
+            AckSemantics::Buffered,
+            None,
+        ),
     ] {
         let Some(endpoint) = endpoint else { continue };
         let http_cfg = HttpReplayConfig {
             system: system.to_string(),
             endpoint: endpoint.clone(),
+            ack_semantics,
+            bearer_token,
             batch_size: args.http_batch_size,
             max_retries: args.http_max_retries,
             timeout_secs: args.http_timeout_secs,
@@ -349,12 +411,17 @@ async fn main() {
             println!("{json}");
             for row in &report.systems {
                 eprintln!(
-                    "{:>16}  ack={:<14}  accepted={} rejected={} dropped={} p99={:.3}ms",
+                    "{:>16}  endpoint={}  ack={:<14}  samples accepted={} rejected={} \
+                     dropped={}  histograms accepted={} rejected={} dropped={}  p99={:.3}ms",
                     row.system,
+                    row.endpoint,
                     row.ack_semantics.label(),
                     row.ingest.accepted_samples,
                     row.ingest.rejected_samples,
                     row.ingest.dropped_samples,
+                    row.ingest.accepted_histograms,
+                    row.ingest.rejected_histograms,
+                    row.ingest.dropped_histograms,
                     row.ingest.ack_latency_ms.p99,
                 );
             }
@@ -372,7 +439,10 @@ async fn main() {
         Err(err) => {
             eprintln!("metricsbench_ingest: {err}");
             let code = match err {
-                RunError::MissingAnchor { .. } | RunError::Anchor(_) => EXIT_USAGE,
+                RunError::MissingAnchor { .. }
+                | RunError::Anchor(_)
+                | RunError::MissingBearerToken { .. }
+                | RunError::BearerWithoutEndpoint => EXIT_USAGE,
                 _ => 1,
             };
             std::process::exit(code);
