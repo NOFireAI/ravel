@@ -522,7 +522,7 @@ intervals (`crates/ravel-bench/src/metrics_gen.rs`, the `shifted` branch
 in the step loop of `generate_into`, which hands the shifted timestamp to
 `emit_instance`), so the shifted sample carries a timestamp the
 series already emitted, with a different value. Receivers disagree on
-that. The review's reading of each receiver, which T1b verifies by
+that. The review's reading of each receiver, which T1c verifies by
 reading back every receiver after the replay: Prometheus 3.13 rejects the
 Remote Write 1.0 request on the first duplicate-timestamp or out-of-order
 sample and rolls back its appender, Mimir rejects the sample and keeps the
@@ -539,9 +539,11 @@ intervals back, computed as `3 * interval_ms / 2`, exact because every
 profile's scrape interval is a whole number of seconds), so the sample is
 out of order and never a duplicate. This retires the generator's pinned
 invariant that every timestamp stays on the scrape grid: after the change
-only unshifted samples do, every shifted sample is out of order (the
-shifted-but-in-order case of the two-interval shift disappears), and the
-generator test's pinned shifted and regressed counts move with it.
+only unshifted samples do. A shifted sample is not always a regression on
+its series (two consecutive shifted steps leave the second half an
+interval ahead of the first), so the generator test keeps counting
+shifted and regressed samples separately and its pinned counts move with
+the new offset.
 Every receiver runs a frozen, disclosed out-of-order window longer than
 the shift: Prometheus `storage.tsdb.out_of_order_time_window`, Mimir
 `limits.out_of_order_time_window`, VictoriaMetrics' default acceptance
