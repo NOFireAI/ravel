@@ -39,6 +39,11 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use ravel_catalog::{DeclaredColumnType, DeclaredTypedColumn, TenantConfig, TenantLifecycleState};
+use ravel_logseg::encoding::Enc;
+use ravel_logseg::field_dir::FieldDir;
+use ravel_logseg::footer::{kind, open as open_footer};
+use ravel_logseg::page_dir::PageDir;
+use ravel_logseg::reader::read_section;
 use ravel_logseg::{ColumnSelection, FieldType, Predicate, RlogConfig, RlogReader};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -222,6 +227,42 @@ impl Fixture {
                 }
             }
             out.push((blocks, dict));
+        }
+        out
+    }
+
+    /// The encodings PAGE_DIR records for the `svc` `Str` column's pages,
+    /// per data object, in order.
+    async fn svc_page_encs(&self) -> Vec<Vec<Enc>> {
+        let cfg = RlogConfig::default();
+        let mut out = Vec::new();
+        for key in self.data_keys().await {
+            let obj = self
+                .memory
+                .get(&key, GetRange::Full)
+                .await
+                .expect("get the data object")
+                .data;
+            let footer = open_footer(&obj).expect("open footer");
+            let section = |k| {
+                let desc = *footer.section(k).expect("section");
+                read_section(&obj, &desc, &cfg).expect("read section")
+            };
+            let column_id = FieldDir::decode(&section(kind::FIELD_DIR), u64::MAX)
+                .expect("decode FIELD_DIR")
+                .column(KEY, FieldType::Str)
+                .expect("a Str svc column")
+                .column_id;
+            out.push(
+                PageDir::decode(&section(kind::PAGE_DIR))
+                    .expect("decode PAGE_DIR")
+                    .groups
+                    .iter()
+                    .flat_map(|g| &g.chunks)
+                    .filter(|c| c.column_id == column_id)
+                    .flat_map(|c| c.pages.iter().map(|p| p.enc))
+                    .collect(),
+            );
         }
         out
     }
@@ -458,6 +499,94 @@ async fn like_contains_pushdown_reaches_the_sql_stats_json() {
         planning_wait_ms(&value, &raw) > 0.0,
         "has_word plans: {value}"
     );
+
+    fx.running.shutdown().await.expect("graceful shutdown");
+}
+
+/// `stats.accounting.strDictValuesBuilt`.
+fn str_dict_values_built(value: &serde_json::Value) -> u64 {
+    value["stats"]["accounting"]["strDictValuesBuilt"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("stats.accounting.strDictValuesBuilt: {value}"))
+}
+
+/// The same agreement over a dictionary-encoded `svc`. One export of twelve
+/// `web` rows `d0`..`d11` writes one block whose `svc` takes four values:
+/// `alpha-checkout-1` (`d0`, `d11`), `gamma-checkout-2` (`d8`), `beta-cart`
+/// (`d1`, `d2`, `d4`, `d6`, `d9`) and `delta-search` (`d3`, `d5`, `d7`), with
+/// `d10` setting no `svc`. Eleven cells over four distinct values put the
+/// column on a dictionary page.
+///
+/// Pushed, the arm tests each of the 4 dictionary entries once, and the
+/// reader validates only the entries a kept row references: alpha and gamma
+/// for `LIKE`, beta and delta for `NOT LIKE`, so `(4, 2)`. The block keeps
+/// rows either way, so ravel-sql builds 1 values array. Unpushed, the reader
+/// validates all 4 entries, `(0, 4)`, and builds 1.
+#[tokio::test]
+async fn like_contains_over_a_dictionary_page_validates_only_kept_entries() {
+    let fx = Fixture::start().await;
+    let [alpha, beta, delta, gamma] = [
+        "alpha-checkout-1",
+        "beta-cart",
+        "delta-search",
+        "gamma-checkout-2",
+    ]
+    .map(text);
+    let svc = [
+        alpha.clone(),
+        beta.clone(),
+        beta.clone(),
+        delta.clone(),
+        beta.clone(),
+        delta.clone(),
+        beta.clone(),
+        delta,
+        gamma,
+        beta,
+        None,
+        alpha,
+    ];
+    let bodies_in: Vec<String> = (0..svc.len()).map(|i| format!("d{i}")).collect();
+    fx.ingest(vec![resource_logs(
+        vec![str_kv("service.name", "web")],
+        bodies_in.iter().map(String::as_str).zip(svc).collect(),
+        fx.base_ts_ns,
+    )])
+    .await;
+    assert_eq!(
+        fx.svc_layout().await,
+        vec![(1, 1)],
+        "one object of one block, `svc` on a dictionary page"
+    );
+    // A per-block dictionary page behind `d10`'s presence bitmap: the writer
+    // takes a row group dictionary only when it is strictly smaller than the
+    // blocks' own pages, and for this lone block it is not.
+    assert_eq!(fx.svc_page_encs().await, vec![vec![Enc::Bitmap, Enc::Dict]]);
+
+    let cases = [
+        ("LIKE", vec!["d0", "d11", "d8"]),
+        ("NOT LIKE", vec!["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d9"]),
+    ];
+    for (op, want) in cases {
+        let pushed = format!("SELECT body FROM logs WHERE {KEY} {op} '%checkout%'");
+        let unpushed = format!("{pushed} ESCAPE '#'");
+
+        let (value, raw) = fx.sql(&pushed).await;
+        assert_eq!(bodies(&value), want, "{op} pushed: {value}");
+        assert_eq!(
+            (contains_counters(&value, &raw), str_dict_values_built(&value)),
+            ((4, 2), 1),
+            "{op} pushed: {value}"
+        );
+
+        let (value, raw) = fx.sql(&unpushed).await;
+        assert_eq!(bodies(&value), want, "{op} unpushed: {value}");
+        assert_eq!(
+            (contains_counters(&value, &raw), str_dict_values_built(&value)),
+            ((0, 4), 1),
+            "{op} unpushed: {value}"
+        );
+    }
 
     fx.running.shutdown().await.expect("graceful shutdown");
 }
