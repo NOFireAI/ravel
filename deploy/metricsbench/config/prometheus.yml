@@ -11,3 +11,16 @@ global:
   # rules are out of scope for MetricsBench v1 (ADR-0927 decision 6).
   scrape_interval: 15s
   evaluation_interval: 15s
+
+storage:
+  tsdb:
+    # OUT-OF-ORDER WINDOW (disclosed, frozen; replaces the 3.13.1 default of 0,
+    # which /api/v1/status/config shows as `outofordertimewindow: 0` and which
+    # rejects every out-of-order sample). The generator shifts selected samples
+    # back one and a half scrape intervals (22.5s at 15s), and the window exists
+    # so a sample shifted back 1.5 intervals is stored by every receiver; 1h
+    # also covers a bulk historical replay arriving slightly out of time order.
+    # Without it the Remote Write 1.0 receiver rejects the WHOLE request with
+    # HTTP 400 on the first out-of-window sample, in-order samples included.
+    # Matches Mimir's limits.out_of_order_time_window in config/mimir.yaml.
+    out_of_order_time_window: 1h
