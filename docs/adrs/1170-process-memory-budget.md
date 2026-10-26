@@ -468,7 +468,9 @@ cgroup-capped effective memory minus an overhead reserve. The caches keep
 hard eviction caps carved from it (they cannot shed, so they cannot share);
 the catalog's column-statistics cache is the third such carve, see the
 column-statistics carve amendment below;
-SQL and fetch draw from the remainder through the accountant, with the
+SQL and fetch draw from the remainder through the accountant (the catalog's
+decodes draw from it as fetch, see the catalog decode charge amendment
+below), with the
 per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
 the shared remainder equals the budget by construction, and startup refuses a
 flag combination whose hard caps alone exceed it (the 2026-09-07 amendment
@@ -1682,3 +1684,84 @@ expected to be slack rather than the bound that decides what is cached.
 `build_catalog_for_server_applies_the_column_stats_cache_cap` in
 `services/ravel-server/src/query.rs`, pin the derivation, the sum, the
 refusal, and the value reaching the catalog.
+
+## Amendment (2026-10-26, issue #3244): catalog decodes are charged to the shared budget
+
+<!-- amendment-applies: sections="3. A static carve under one number" pointer="catalog decode charge amendment" -->
+
+This is the catalog decode charge amendment. `crate::start` in
+`services/ravel-server/src/lib.rs` now builds the server's catalog with
+`Catalog::with_memory_budget` on the same `Arc<MemoryBudget>` the query
+engine, the SQL executor and the fetchers hold, rather than leaving the
+catalog on its default unlimited budget. The catalog's snapshot-part and
+name-postings decodes on the resolve path, its column-statistics loads, and
+the fold's decode of a tenant's previous postings object each reserve their
+declared uncompressed length against that one number before they decode.
+The fold's decode of the previous snapshot part is not charged
+(`load_previous_entries` in `crates/ravel-catalog/src/fold.rs`).
+
+The measurement it rests on: on the ClickBench hits tenant, folded, at 10
+concurrent connections (issue #3244 comment 6423368682), the decoded part
+and postings caches peaked at 924,705 bytes, while SQL and fetch reached 0.96
+of the shared budget with 9 budget refusals, all with the catalog unwired.
+About 1 MB of decoded catalog state joins a pool already that full, so a part
+or postings decode is refused only at the moments the pool is nearly
+exhausted by everything else.
+
+A separate carve for the catalog's decodes was considered and rejected. A
+carve must admit the largest object the decoders accept, 256 MiB for each
+of `DEFAULT_MAX_SNAPSHOT_PART_BYTES`, `DEFAULT_MAX_POSTINGS_BYTES` and
+`DEFAULT_MAX_COLUMN_STATS_BYTES`, or it refuses a legal object on every
+query that reads it. It would take at least 256 MiB from the remainder SQL
+draws on to hold about 1 MB.
+
+What a refusal does, by decode kind:
+
+- A snapshot part or name postings decode on a query's resolve fails the
+  query with `CatalogError::MemoryExhausted`, which answers 422 `execution`
+  over HTTP as the host-memory gate amendment states for every catalog
+  refusal. Before the refusal is final the catalog evicts its decoded part
+  and postings cache entries until the charge fits and retries once, and
+  skips that pass when no eviction could admit the charge (ADR-1702's
+  eviction-skip amendment).
+- A column-statistics load the budget refuses leaves its part uncovered and
+  the query scans it, counted on
+  `ravel_catalog_column_stats_budget_skips_total` (issue #3244 step 3b,
+  ADR-1702's column-statistics budget-skip amendment).
+- A fold tick whose previous-postings decode is refused fails for that
+  tenant with the typed error, logged at warn as "catalog fold failed", and
+  does not advance the HEAD; the next tick retries it. The scheduled fold
+  runs in `all` and `maintain` modes.
+
+The host-memory gate amendment's gate sits in front of the same budget, so
+the catalog inherits it. A catalog decode the gate refuses (the
+`HostMemory` cause) skips the eviction pass and fails at once as a budget
+refusal: dropping cached entries frees bytes the ledger counts, not the host
+memory the gate measured. Such a refusal moves neither
+`ravel_catalog_decode_reserve_retries_total` nor
+`ravel_catalog_decoded_cache_memory_evictions_total`.
+
+A catalog decode's charge is a `ravel_memory::Reservation`, so it reports
+under `ravel_memory_reserved_bytes{component="fetch"}`
+(`MemoryBudget::fetch_reserved`), not under a component of its own. The part
+and postings caches keep each entry's reservation for as long as they hold
+the entry, so the cached share stays in that figure, and
+`ravel_catalog_decoded_cache_reserved_bytes{cache="part"|"postings"}` splits
+it by cache.
+
+The budget the catalog charges is the shared remainder,
+`process_memory_budget_bytes`. It is finite in every mode except `gateway`
+whenever `--memory-budget-bytes` is set or the host's memory size can be
+read. It is unlimited in `gateway` mode (the gateway amendment) and on a
+host whose memory size cannot be read with no `--memory-budget-bytes`, where
+the remainder starts from `u64::MAX`; there the catalog's behaviour is
+unchanged and the two counters above read 0.
+
+`a_part_decode_over_the_process_budget_answers_422`,
+`the_catalog_charges_the_servers_own_budget` and
+`the_fetch_gauge_counts_the_catalogs_held_decodes` in
+`services/ravel-server/tests/catalog_memory_budget_e2e.rs` pin the 422 with
+the budget's own figures through `ravel_server::start`, the shared `Arc`
+against a copy of its size, and the fetch gauge against the decoded-cache
+gauge. `a_refused_postings_decode_fails_the_tick_and_the_next_tick_retries`
+in `services/ravel-server/src/fold.rs` pins the fold tick.

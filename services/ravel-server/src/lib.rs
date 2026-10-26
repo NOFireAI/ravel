@@ -2795,8 +2795,9 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // `metrics_state` and the `sql`-featured executor below so both install
     // the SAME instance rather than two independently drifting counters: the
     // SQL executor reserves against it via
-    // `SqlExecutor::with_process_memory_budget`, and the `/metrics` gauges
-    // read it back at scrape time.
+    // `SqlExecutor::with_process_memory_budget`, the catalog's decodes via
+    // `Catalog::with_memory_budget`, and the `/metrics` gauges read it back
+    // at scrape time.
     let process_memory_budget = Arc::new(ravel_memory::MemoryBudget::new(
         config.process_memory_budget_bytes,
     ));
@@ -2927,11 +2928,15 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
     // ADR-1702 decision 3: the catalog's resolve-path snapshot part, postings
     // and column-statistics decodes run on the read gate, not on the
-    // resolving task. The memory budget stays unlimited here.
+    // resolving task. ADR-1170 (issue #3244 amendment): those decodes and the
+    // fold's postings decode reserve against the same process budget the
+    // query engine and SQL executor hold, so a refusal there is a refusal of
+    // the one shared number rather than of a private copy.
     let catalog = Arc::new(
         Arc::into_inner(catalog)
             .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
-            .with_read_gate(cpu_gates.read.clone()),
+            .with_read_gate(cpu_gates.read.clone())
+            .with_memory_budget(process_memory_budget.clone()),
     );
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
