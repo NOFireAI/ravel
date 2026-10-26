@@ -196,12 +196,24 @@ services:
   # lists as a boolean with no default printed, so false.
   #
   # QUERY ENGINE (disclosed, left at default): in 3.2.3 queriers run the Mimir
-  # query engine (MQE) by default (-querier.query-engine, default "mimir") and
-  # fall back to the Prometheus engine for expressions MQE does not support
-  # (-querier.enable-query-engine-fallback, default true; both from 3.2.3's
-  # -help-all). Neither flag is set here: the benchmark measures the default.
-  # Which engine answered a given query is observed per query, not assumed from
-  # this default.
+  # query engine (MQE) by default (-querier.query-engine, marked
+  # [experimental] in -help-all, default "mimir") and fall back to the
+  # Prometheus engine for expressions MQE does not support
+  # (-querier.enable-query-engine-fallback, also [experimental], default true;
+  # both from 3.2.3's -help-all). Neither flag is set here: the benchmark
+  # measures the default. The configured engine is recorded per run by
+  # deploy/metricsbench/capture-effective-config.sh; attributing each query's
+  # answer to MQE or to the fallback engine is epic #2821 Wave 3 work and is
+  # not captured by anything in this directory today.
+  #
+  # OTHER QUERY-PATH DEFAULTS 3.x FLIPPED (disclosed, left at default; from
+  # 3.2.3's -help-all against 2.14.2's): query sharding is on
+  # (-query-frontend.parallelize-shardable-queries, default true, was false),
+  # the querier runs at most 8 concurrent queries (-querier.max-concurrent,
+  # default 8, was 20), and ingester request hedging starts immediately
+  # (-querier.minimize-ingester-requests-hedging-delay, default 0s, was 3s).
+  # Sharding changes how one query executes, so a 3.2.3 figure is not
+  # comparable with a 2.14.2 figure for the same statement.
   # Left on Docker Hub deliberately: same reasoning as the prometheus
   # comparator above.
   mimir:

@@ -116,3 +116,10 @@ limits:
   # VictoriaMetrics comparators' 45d, so retention cannot drop benchmark samples
   # mid-run.
   compactor_blocks_retention_period: 45d
+  # NATIVE HISTOGRAMS (disclosed): 3.x flipped this default from false to
+  # true (-ingester.native-histograms-ingestion-enabled, 2.14.2 help: samples
+  # "ignored without an error"; 3.2.3 help: "(default true)"). Pinned true
+  # explicitly: the MetricsBench generator emits native histogram samples and
+  # the contract wants every receiver to store them, so a run on 2.14.2 and a
+  # run on 3.2.3 must not differ silently on what this comparator holds.
+  native_histograms_ingestion_enabled: true
