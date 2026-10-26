@@ -29,8 +29,8 @@ use std::collections::HashSet;
 use std::hint::black_box;
 
 use ravel_logseg::reader::{ContainsKernelBench, ContainsKernelShape, ContainsNeedle};
-use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_logseg::stream_attrs_bytes;
+use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_types::logstream::log_stream_id;
 
 const CELLS: usize = 8192;
@@ -243,7 +243,10 @@ fn bench_block(c: &mut Criterion) {
             "{name}: corpus shape"
         );
         let cells = k.key_cells();
-        assert!(cells.iter().all(Option::is_some), "{name}: every row has a URL");
+        assert!(
+            cells.iter().all(Option::is_some),
+            "{name}: every row has a URL"
+        );
         let hits = cells
             .iter()
             .flatten()
@@ -272,7 +275,10 @@ fn bench_block(c: &mut Criterion) {
         let (searched_hits, searched) = k.search_only();
         assert_eq!(searched, tested, "{name}: search covers the kernel's tests");
         let searched_want = match dict_entries {
-            Some(_) => distinct.iter().filter(|c| windows_contains(c, NEEDLE)).count(),
+            Some(_) => distinct
+                .iter()
+                .filter(|c| windows_contains(c, NEEDLE))
+                .count(),
             None => hits,
         };
         assert_eq!(searched_hits, searched_want, "{name}: search hits");

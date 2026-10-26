@@ -2700,7 +2700,10 @@ impl ContainsKernelBench {
             _ => None,
         };
         (0..self.block.record_count())
-            .map(|r| col.and_then(|c| self.block.str_at(c, r)).map(<[u8]>::to_vec))
+            .map(|r| {
+                col.and_then(|c| self.block.str_at(c, r))
+                    .map(<[u8]>::to_vec)
+            })
             .collect()
     }
 
@@ -8442,7 +8445,10 @@ mod tests {
                 for ty in [FieldType::Str, FieldType::I64, FieldType::Bool] {
                     assert!(fd.column("s", ty).is_some(), "{ty:?} column");
                 }
-                assert!(fd.column("s", FieldType::Bytes).is_none(), "Bytes overflows");
+                assert!(
+                    fd.column("s", FieldType::Bytes).is_none(),
+                    "Bytes overflows"
+                );
                 let mut overflowing = 0;
                 let mut scan = reader
                     .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
@@ -9031,10 +9037,14 @@ mod tests {
                     let clean = first_block(&obj, &cfg);
                     let n = clean.record_count();
                     let all: Vec<usize> = (0..n).collect();
-                    assert!(all.iter().all(|&r| clean.str_at(COL_ATTRS_RAW, r).is_some()));
-                    let (accepted, rejected): (Vec<usize>, Vec<usize>) = all
-                        .iter()
-                        .partition(|&&r| clean.str_at(col, r).is_some_and(|b| b.starts_with(b"ab")));
+                    assert!(
+                        all.iter()
+                            .all(|&r| clean.str_at(COL_ATTRS_RAW, r).is_some())
+                    );
+                    let (accepted, rejected): (Vec<usize>, Vec<usize>) =
+                        all.iter().partition(|&&r| {
+                            clean.str_at(col, r).is_some_and(|b| b.starts_with(b"ab"))
+                        });
                     assert!(!accepted.is_empty() && !rejected.is_empty(), "{want:?}");
                     let pred = contains("s", "ab", false);
                     let sd = &reader.stream_dir;
@@ -9061,8 +9071,12 @@ mod tests {
                     let block = corrupt(rejected[0]);
                     let err = arm_on_rows(&reader, sd, &pred, &block, &all)
                         .expect_err("a selected rejected row reads attrs_raw");
-                    assert!(matches!(err, LogSegError::Corrupted(_)), "{want:?}: {err:?}");
-                    let rest: Vec<usize> = all.iter().copied().filter(|&r| r != rejected[0]).collect();
+                    assert!(
+                        matches!(err, LogSegError::Corrupted(_)),
+                        "{want:?}: {err:?}"
+                    );
+                    let rest: Vec<usize> =
+                        all.iter().copied().filter(|&r| r != rejected[0]).collect();
                     assert_eq!(
                         arm_on_rows(&reader, sd, &pred, &block, &rest).expect("unselected"),
                         accepted,
