@@ -67,6 +67,10 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, displayable, execute_stream,
@@ -656,6 +660,138 @@ async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables(
          partition that takes an object a full-sized hash table; both the \
          fixture and the bound need rewriting, not relaxing.",
         stock.partial.group_entries()
+    );
+}
+
+/// Input partitions of the threshold fixture. Two, so the plan has a partial
+/// stage at all: one partition plans a single-stage aggregate with no probe.
+const THRESHOLD_PARTITIONS: usize = 2;
+
+/// Distinct keys in a threshold partition's first batch for the side that must
+/// skip: 820 / 8192 is 0.1001, just above a 0.1 ratio.
+const GROUPS_JUST_ABOVE: i64 = 820;
+
+/// Distinct keys for the side that must not skip: 819 / 8192 is 0.09998, just
+/// below a 0.1 ratio.
+const GROUPS_JUST_BELOW: i64 = 819;
+
+/// The `skipped_aggregation_rows` total of `GROUP BY k` over
+/// [`THRESHOLD_PARTITIONS`] partitions of two batches each, every batch
+/// [`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`] rows of keys `0..groups` cycled.
+///
+/// The probe first reads the ratio once the first batch is aggregated, so the
+/// first batch alone decides it, at `groups / 8192`. A partition that skips
+/// forwards the whole second batch unaggregated; one that does not skip reads
+/// a lower ratio after the second batch (the same `groups` over twice the
+/// rows) and still does not skip, so its count stays zero.
+async fn skipped_rows_for(groups: i64) -> usize {
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let batch = || {
+        let keys: Int64Array = (0..SKIP_PARTIAL_AGGREGATION_PROBE_ROWS as i64)
+            .map(|i| i % groups)
+            .collect();
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(keys)]).expect("batch builds")
+    };
+    let parts: Vec<Vec<RecordBatch>> = (0..THRESHOLD_PARTITIONS)
+        .map(|_| vec![batch(), batch()])
+        .collect();
+
+    let mut config = SqlConfig::default();
+    config.engine.sql_partition_count = Some(THRESHOLD_PARTITIONS);
+    let accountant = TenantMemoryAccountant::new(1 << 30);
+    let (pool, _breach) = config.query_pool(accountant, QueryAccounting::new());
+    let logs = SessionTable::Logs(Arc::new(LogsTableProvider::new(
+        Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        },
+        TENANT,
+        LogSegmentFetcher::new(Arc::new(MemoryStore::new())),
+        PhaseAccounting::new(),
+    )));
+    let ctx = build_session(
+        &config,
+        pool,
+        logs,
+        true,
+        SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(TENANT),
+    )
+    .expect("session");
+    ctx.register_table(
+        "t",
+        Arc::new(MemTable::try_new(Arc::clone(&schema), parts).expect("mem table")),
+    )
+    .expect("table registers");
+
+    let plan = ctx
+        .sql("SELECT k, count(*) AS n FROM t GROUP BY k")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).expect("execute");
+    let mut result_groups = 0;
+    while let Some(next) = stream.next().await {
+        result_groups += next.expect("batch").num_rows();
+    }
+    drop(stream);
+    assert_eq!(
+        result_groups, groups as usize,
+        "GROUP BY k must return every key once, skipped or not"
+    );
+
+    let skipped = skipped_aggregation_rows(&plan);
+    assert_eq!(
+        skipped.len(),
+        1,
+        "expected exactly one node publishing skipped_aggregation_rows, the \
+         grouping Partial AggregateExec\n{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    skipped[0]
+}
+
+/// `skipped_aggregation_rows`, summed over partitions, for every node of `plan`
+/// that publishes it.
+fn skipped_aggregation_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
+    let mut found: Vec<usize> = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"))
+        .map(|value| value.as_usize())
+        .into_iter()
+        .collect();
+    for child in plan.children() {
+        found.extend(skipped_aggregation_rows(child));
+    }
+    found
+}
+
+/// Issue #3231: the session's probe ratio sits between 819 and 820 new groups
+/// per 8192 probe rows, which is 0.1. Each side has its own fixture, one key
+/// either way of the threshold, so a ratio moved in either direction fails one
+/// of the two assertions: at the former 0.5, the 820-key side does not skip
+/// and its count reads 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_ratio_threshold_is_one_new_group_in_ten_rows() {
+    let above = skipped_rows_for(GROUPS_JUST_ABOVE).await;
+    let below = skipped_rows_for(GROUPS_JUST_BELOW).await;
+
+    assert_eq!(
+        above,
+        THRESHOLD_PARTITIONS * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
+        "a partition whose probe read {GROUPS_JUST_ABOVE} groups in \
+         {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} rows must skip and forward its \
+         whole second batch: the session's \
+         SKIP_PARTIAL_AGGREGATION_PROBE_RATIO is no longer 0.1"
+    );
+    assert_eq!(
+        below, 0,
+        "a partition whose probe read {GROUPS_JUST_BELOW} groups in \
+         {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} rows must keep aggregating: the \
+         session's SKIP_PARTIAL_AGGREGATION_PROBE_RATIO is no longer 0.1"
     );
 }
 
