@@ -100,6 +100,38 @@ ignore = [
   # still wraps unsafe-libyaml. Revisit when a serde_yaml_ng release
   # drops unsafe-libyaml, or replace the test's parser.
   "RUSTSEC-2024-0449",
+  # RUSTSEC-2026-0391 (zstd 0.13.3), RUSTSEC-2026-0398 and RUSTSEC-2026-0403
+  # (zstd-safe 7.2.4): fixed only in zstd 0.14.3 and zstd-safe 8.2.0, which
+  # this lock file cannot take. arrow-ipc 59.3.0 and parquet 59.3.0 require
+  # zstd ^0.13, and zstd 0.13.3 requires zstd-safe ^7, so a workspace bump
+  # alone would leave the affected copies in place. Each advisory names the
+  # API it affects, and nothing in this workspace calls those APIs:
+  #
+  # - 0391: the stream `with_context` constructors (zstd src/stream/raw.rs,
+  #   and the read and write wrappers over them) reused a borrowed context
+  #   without resetting its session. No crate here calls `with_context` on a
+  #   zstd type. The per-thread context reuse in
+  #   crates/ravel-codec/src/zstd_frame.rs holds a `bulk::Decompressor`,
+  #   whose `decompress` is the one-shot `ZSTD_decompressDCtx`; that call
+  #   never uses the streaming session. arrow-ipc and parquet reuse
+  #   `bulk::Compressor` and `bulk::Decompressor` the same way.
+  # - 0398: `Seekable::decompress`, behind the `seekable` feature. zstd
+  #   0.13.3 has no `seekable` feature, and nothing here depends on
+  #   zstd-safe directly to turn it on.
+  # - 0403: `DCtx::decompress_stream` committing output positions on a
+  #   failed legacy frame, reached through `zstd::stream::write::Decoder`.
+  #   The advisory states `zstd::stream::read::Decoder`, `decode_all` and
+  #   the bulk API are not affected. Those are the only decompression
+  #   entry points used here, including the OTAP ingest path that
+  #   decompresses client-supplied payloads (crates/ravel-otap/src/stream.rs,
+  #   `zstd::Decoder`, the read decoder).
+  #
+  # Remove these when arrow and parquet accept zstd 0.14. RUSTSEC-2026-0410
+  # (zstd-sys, wasm32 only) is fixed in the lock file by zstd-sys 2.1.2 and
+  # is not ignored.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0403",
 ]
 
 [licenses]
