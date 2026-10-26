@@ -142,9 +142,9 @@ async fn each_engine_outcome_over_http_gets_one_status() {
     assert_eq!(
         Denominators::of(&classified),
         Denominators {
-            applicable: 7,
+            corpus: 7,
             correctness: 3,
-            competitive: 1,
+            timing: 1,
             coverage_success: 1,
         }
     );
