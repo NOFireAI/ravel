@@ -132,7 +132,7 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
         "only the in-process Ravel row without endpoints"
     );
     let ravel = &systems[0];
-    assert_eq!(ravel["system"], "ravel");
+    assert_eq!(ravel["system"], "ravel-in-process");
     assert_eq!(
         ravel["endpoint"], "in-process",
         "the in-process row is never read as the portable Ravel row"
@@ -184,7 +184,7 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
     let queries = report["queries"].as_array().expect("queries array present");
     let ravel_query = queries
         .iter()
-        .find(|q| q["system"] == "ravel")
+        .find(|q| q["system"] == "ravel-in-process")
         .expect("a ravel query-phase row exists");
     assert!(
         ravel_query["min_commit_tokens"]

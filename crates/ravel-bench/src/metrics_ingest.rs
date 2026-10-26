@@ -174,6 +174,12 @@ use serde::{Deserialize, Serialize};
 /// `ts_ns: i64` + `value: f64`. The same constant `ingest`/`report` use.
 const LOGICAL_BYTES_PER_SAMPLE: u64 = 16;
 
+/// The `system` of the in-process diagnostic Ravel row and its query row. The
+/// portable Ravel row over `/api/v1/write` is `ravel`, like every other engine
+/// named by its own name; the diagnostic row gets its own name so a lookup by
+/// `system` can never return one in place of the other (ADR-0927 amendment A).
+pub const IN_PROCESS_SYSTEM: &str = "ravel-in-process";
+
 /// What a 2xx from a system means about durability (ADR-0927 decision 3). Data
 /// on every result row: a durable-on-ack latency never sits in a pooled column
 /// with a buffered ack without the distinction on the same row.
@@ -347,6 +353,9 @@ impl LogicalHistogram {
     /// Validate a histogram against the lane's client-side admission rules.
     pub fn validate(&self) -> Result<(), RejectionReason> {
         validate_identity(&self.metric, &self.labels)?;
+        if !self.sum.is_finite() {
+            return Err(RejectionReason::InvalidHistogram);
+        }
         if !self.positive_deltas.is_empty() && self.positive_span_len().is_none() {
             return Err(RejectionReason::InvalidHistogram);
         }
@@ -628,7 +637,7 @@ impl SystemIngestResult {
         storage: StorageAccounting,
     ) -> Self {
         SystemIngestResult {
-            system: "ravel".to_string(),
+            system: IN_PROCESS_SYSTEM.to_string(),
             ack_semantics: AckSemantics::DurableOnAck,
             endpoint,
             client_behavior: "in-process IngestRouter, WriteMode::Strict: one write_values call \
@@ -1218,6 +1227,22 @@ pub enum LaneError {
     /// closed before it was drained.
     #[error("generating the replayed stream failed: {0}")]
     Generate(String),
+    /// A row configured as durable-on-ack acknowledged requests without ever
+    /// returning a commit token, so nothing the receiver did backs the
+    /// durability claim (an endpoint that is not ravel-server, or a proxy that
+    /// strips the header).
+    #[error(
+        "{system} at {endpoint} acknowledged {acknowledged} points but never returned \
+         x-ravel-commit-token, so its durable-on-ack claim is unbacked"
+    )]
+    UnbackedDurability {
+        /// The row's system.
+        system: String,
+        /// The row's endpoint.
+        endpoint: String,
+        /// Points in acknowledged requests.
+        acknowledged: u64,
+    },
 }
 
 /// Map a reqwest client-build failure to the transport-setup variant. The
@@ -2198,7 +2223,11 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
             let point = ingest_point(&config.tenant, &logical)?;
             let ts_ms = logical.ts_ms();
             max_ts_ms = Some(max_ts_ms.map_or(ts_ms, |m| m.max(ts_ms)));
-            first_metric.get_or_insert_with(|| logical.metric().to_string());
+            // The read-your-write probe is an instant query over a scalar
+            // series; a native-histogram metric would answer a different shape.
+            if matches!(logical, LogicalPoint::Sample(_)) {
+                first_metric.get_or_insert_with(|| logical.metric().to_string());
+            }
             Ok((point, logical))
         })?;
         if pending.is_empty() {
@@ -2389,7 +2418,7 @@ pub async fn query_after_replay(
     };
 
     Ok(SystemQueryResult {
-        system: "ravel".to_string(),
+        system: IN_PROCESS_SYSTEM.to_string(),
         query: query.to_string(),
         eval_ts_ms,
         min_commit_tokens: outcome.tokens.iter().map(CommitToken::encode).collect(),
@@ -2612,6 +2641,17 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         backoff_ms = HTTP_RETRY_BACKOFF.as_millis(),
         timeout = config.timeout_secs.max(1),
     );
+    let acknowledged = accepted_samples + accepted_histograms;
+    if config.ack_semantics == AckSemantics::DurableOnAck
+        && acknowledged > 0
+        && last_commit_token.is_none()
+    {
+        return Err(LaneError::UnbackedDurability {
+            system: config.system.clone(),
+            endpoint: config.endpoint.clone(),
+            acknowledged,
+        });
+    }
     Ok(match config.ack_semantics {
         AckSemantics::DurableOnAck => SystemIngestResult::durable_http_row(
             config.system.clone(),
@@ -2768,7 +2808,7 @@ mod tests {
     /// TO SEE THIS TEST FAIL by conflating the ack kinds, flip the
     /// `ack_semantics: AckSemantics::DurableOnAck` line in
     /// [`SystemIngestResult::ravel_row`] to `AckSemantics::Buffered`: both rows
-    /// then share `Buffered`, `max_ack_p99_ms(&["ravel", "prometheus"])`
+    /// then share `Buffered`, `max_ack_p99_ms(&[IN_PROCESS_SYSTEM, "prometheus"])`
     /// returns `Ok` instead of the `AckConflation` error, and the
     /// `expect_err` below panics.
     #[test]
@@ -2790,7 +2830,10 @@ mod tests {
         // Each row states its own ack meaning; it is not inferred from a zero
         // or a missing field.
         assert_eq!(
-            report.row("ravel").expect("ravel row").ack_semantics,
+            report
+                .row(IN_PROCESS_SYSTEM)
+                .expect("ravel row")
+                .ack_semantics,
             AckSemantics::DurableOnAck,
             "Ravel's strict Remote Write surface is durable-on-ack"
         );
@@ -2803,7 +2846,10 @@ mod tests {
         // Ravel records commit tokens; a buffered system has NONE -- absent,
         // never an empty vec standing in for "buffered mints no token".
         assert_eq!(
-            report.row("ravel").expect("ravel row").commit_tokens,
+            report
+                .row(IN_PROCESS_SYSTEM)
+                .expect("ravel row")
+                .commit_tokens,
             Some(vec!["tok-shard-0".to_string()]),
             "the durable-on-ack row carries its commit tokens"
         );
@@ -2817,7 +2863,7 @@ mod tests {
         // pool into one ack-latency figure. The pool is refused, naming both
         // ack meanings, so the two cannot be collapsed silently.
         let err = report
-            .max_ack_p99_ms(&["ravel", "prometheus"])
+            .max_ack_p99_ms(&[IN_PROCESS_SYSTEM, "prometheus"])
             .expect_err("a durable-on-ack and a buffered row must not pool into one ack figure");
         let kinds: BTreeSet<AckSemantics> = err.systems.iter().map(|(_, k)| *k).collect();
         assert_eq!(
@@ -2831,7 +2877,7 @@ mod tests {
         // that refused every pool unconditionally, which is not "kept separate".
         assert_eq!(
             report
-                .max_ack_p99_ms(&["ravel"])
+                .max_ack_p99_ms(&[IN_PROCESS_SYSTEM])
                 .expect("one durable-on-ack row pools fine"),
             Some(3.0)
         );
@@ -2920,7 +2966,7 @@ mod tests {
 
         // The in-process row says so, so it is never read as the portable
         // Ravel row (ADR-0927 2026-10-26 amendment A).
-        assert_eq!(outcome.result.system, "ravel");
+        assert_eq!(outcome.result.system, IN_PROCESS_SYSTEM);
         assert_eq!(outcome.result.endpoint, "in-process");
         assert_eq!(outcome.result.last_commit_token, None);
 
@@ -3287,7 +3333,7 @@ mod tests {
             .await
             .expect("read-your-write query phase");
 
-        assert_eq!(query.system, "ravel");
+        assert_eq!(query.system, IN_PROCESS_SYSTEM);
         assert_eq!(
             query.eval_ts_ms, newest,
             "the query evaluates at the replay's newest sample"
@@ -4441,6 +4487,70 @@ mod tests {
             !report.contains(secret),
             "the bearer token leaked: {report}"
         );
+    }
+
+    /// A durable-on-ack row whose receiver acknowledges every request without
+    /// ever returning a commit token (an endpoint that is not ravel-server) is
+    /// refused rather than published as durable.
+    ///
+    /// TO SEE THIS FAIL: delete the `UnbackedDurability` check before the
+    /// final `Ok` in `replay_over_http`; the replay then returns a row.
+    #[tokio::test]
+    async fn a_durable_row_without_any_commit_token_is_refused() {
+        let app = axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let points: Vec<LogicalPoint> = valid_stream(4, 2)
+            .into_iter()
+            .map(LogicalPoint::Sample)
+            .collect();
+        let config = HttpReplayConfig {
+            system: "ravel".to_string(),
+            endpoint: format!("http://{addr}/api/v1/write"),
+            ack_semantics: AckSemantics::DurableOnAck,
+            bearer_token: None,
+            batch_size: 2,
+            max_retries: 0,
+            timeout_secs: 5,
+        };
+        let err = replay_over_http(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect_err("an unbacked durable row must be refused");
+        server.abort();
+        assert!(
+            matches!(
+                err,
+                LaneError::UnbackedDurability {
+                    acknowledged: 4,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A native histogram with a non-finite `sum` is refused, as a sample with
+    /// a non-finite value is.
+    #[test]
+    fn a_histogram_with_a_non_finite_sum_is_refused() {
+        for sum in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut h = histogram(base_ts_ms(), vec![1, 1]);
+            h.sum = sum;
+            assert_eq!(
+                h.validate(),
+                Err(RejectionReason::InvalidHistogram),
+                "{sum}"
+            );
+        }
+        assert_eq!(histogram(base_ts_ms(), vec![1, 1]).validate(), Ok(()));
     }
 
     /// An `ingest` block written before the fields added since the nightly
