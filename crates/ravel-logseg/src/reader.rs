@@ -8562,6 +8562,128 @@ mod tests {
                 assert_eq!(stats.contains_cells_tested, 0);
                 assert_eq!(stats.str_cells_validated, 4 + 4);
             }
+
+            /// [`ContainsNeedle::is_in_each`] over `cells` laid end to end.
+            fn each(needle: &str, cells: &[&[u8]]) -> Vec<bool> {
+                let mut bytes = Vec::new();
+                let mut ends = Vec::new();
+                for c in cells {
+                    bytes.extend_from_slice(c);
+                    ends.push(bytes.len());
+                }
+                let mut verdicts = vec![true; 3];
+                ContainsNeedle::new(needle.as_bytes()).is_in_each(&bytes, &ends, &mut verdicts);
+                verdicts
+            }
+
+            /// The buffer search gives each cell the verdict [`ContainsNeedle::is_in`]
+            /// gives it alone, on the layouts where a hit can cross a cell
+            /// boundary: a needle spanning two or three cells is a miss for
+            /// each, a cell holding the needle after a straddling hit is a
+            /// hit, and a hit consumed by a straddle does not hide one in the
+            /// next cell.
+            #[test]
+            fn contains_needle_is_in_each_handles_straddles() {
+                let cases: [(&str, &[&[u8]], &[bool]); 12] = [
+                    ("google", &[b"xgoo", b"gley"], &[false, false]),
+                    ("google", &[b"google google", b"x"], &[true, false]),
+                    ("google", &[b"google", b"agoogle", b"googlea"], &[true, true, true]),
+                    ("google", &[b"zzgoog", b"legoogle"], &[false, true]),
+                    ("google", &[b"goo", b"gle", b"go", b"ogle"], &[false; 4]),
+                    ("google", &[b"", b"google", b""], &[false, true, false]),
+                    ("google", &[b"google\xff", b"x"], &[true, false]),
+                    ("aa", &[b"xa", b"aa"], &[false, true]),
+                    ("aa", &[b"a", b"a", b"aa"], &[false, false, true]),
+                    ("abc", &[b"xa", b"b", b"cx"], &[false; 3]),
+                    ("abc", &[b"xa", b"b", b"cabc"], &[false, false, true]),
+                    ("", &[b"", b"a", b""], &[true; 3]),
+                ];
+                for (needle, cells, want) in cases {
+                    let alone: Vec<bool> = cells
+                        .iter()
+                        .map(|c| ContainsNeedle::new(needle.as_bytes()).is_in(c))
+                        .collect();
+                    assert_eq!(alone, want, "{needle:?} in {cells:?}, cell by cell");
+                    assert_eq!(each(needle, cells), want, "{needle:?} in {cells:?}");
+                }
+                assert!(each("ab", &[]).is_empty());
+            }
+
+            proptest! {
+                #![proptest_config(ProptestConfig::with_cases(2048))]
+
+                /// Over a two-letter alphabet, where hits straddle cell
+                /// boundaries and overlap one another often, the buffer search
+                /// gives every cell, empty ones included, its own verdict.
+                #[test]
+                fn contains_needle_is_in_each_matches_is_in(
+                    cells in proptest::collection::vec(
+                        proptest::collection::vec(prop_oneof![Just(b'a'), Just(b'b')], 0..6),
+                        0..12,
+                    ),
+                    needle in "[ab]{0,4}",
+                ) {
+                    let refs: Vec<&[u8]> = cells.iter().map(Vec::as_slice).collect();
+                    let finder = ContainsNeedle::new(needle.as_bytes());
+                    let alone: Vec<bool> = refs.iter().map(|c| finder.is_in(c)).collect();
+                    prop_assert_eq!(each(&needle, &refs), alone);
+                }
+            }
+
+            /// Through the scan, over a plain page whose adjacent cells form
+            /// the needle across their boundary: the kept rows are the ones
+            /// [`eval`] keeps (a straddle keeps neither cell, a cell holding
+            /// the needle after a straddle is kept, an invalid UTF-8 cell
+            /// holding it is not), and every present cell counts once in
+            /// `contains_cells_tested`, as it did tested one by one.
+            #[test]
+            fn contains_kernel_plain_page_straddles() {
+                let cells = [
+                    Some("xgoo"),
+                    Some("gley"),
+                    Some("google"),
+                    Some("agoogleb google"),
+                    None,
+                    Some("zzgoog"),
+                    Some("legoogle"),
+                    Some("goo"),
+                    Some("gle"),
+                    Some("google~"),
+                ];
+                let recs = cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| srec(3, i as i64, c.map(s).into_iter().collect()))
+                    .collect();
+                let cfg = RlogConfig {
+                    block_target_records: cells.len(),
+                    group_target_blocks: 1,
+                    ..RlogConfig::default()
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                assert_eq!(
+                    encs(&reader, s_col(&reader)),
+                    vec![Enc::Bitmap, Enc::Plain],
+                    "a presence page and a plain value page"
+                );
+
+                assert_eq!(
+                    kept_ts(&obj, &cfg, &contains("s", "google", false)),
+                    vec![2, 3, 6]
+                );
+                assert_eq!(
+                    kept_ts(&obj, &cfg, &contains("s", "google", true)),
+                    vec![0, 1, 5, 7, 8]
+                );
+                let cols = ColumnSelection::fixed_only().with_attr("s");
+                let mut scan = reader
+                    .scan_blocks(&contains("s", "google", false), &[], &cols)
+                    .expect("scan");
+                while scan.next_block_columnar(&obj).expect("decode").is_some() {}
+                assert_eq!(scan.stats().blocks_scanned, 1);
+                assert_eq!(scan.stats().contains_cells_tested, 9, "the present cells");
+            }
         }
     }
 }
