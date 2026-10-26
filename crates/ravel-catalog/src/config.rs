@@ -62,16 +62,19 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// deployment with very few shards and a very long flush delay still gets the
 /// same protection the fixed constant used to give everyone.
 ///
-/// An ordinary commit-record entry costs about 864 bytes, which
-/// [`RECORD_CACHE_ENTRY_BYTES`] rounds up to 900: a 119-byte commit key held
-/// twice (the map key and the recency index), the 224-byte decoded
-/// `CommitRecord` plus 210 bytes of its own heap (16-byte tenant hash, 36-byte
-/// writer uuid, 126-byte data object key, 32-byte content hash), and the two
-/// maps' slot overhead. That is a PLANNING figure for a record carrying no
-/// declared column statistics; what each cache enforces is the byte budget
-/// below, charged per entry against what the entry actually holds
+/// An ordinary commit-record entry costs about 896 bytes, which
+/// [`RECORD_CACHE_ENTRY_BYTES`] rounds up to 900: 864 for the record and 32
+/// for the inline slot that keeps the record's L0 derivation. The record's 864
+/// is a 119-byte commit key held twice (the map key and the recency index),
+/// the 224-byte decoded `CommitRecord` plus 210 bytes of its own heap (16-byte
+/// tenant hash, 36-byte writer uuid, 126-byte data object key, 32-byte content
+/// hash), and the two maps' slot overhead. That is a PLANNING figure for a record
+/// carrying no declared column statistics; what each cache enforces is the
+/// byte budget below, charged per entry against what the entry actually holds
 /// (`the_per_entry_planning_figure_bounds_an_ordinary_records_charge` in
-/// `crate::cache` pins the 864 against the constant).
+/// `crate::cache` pins the 864 and
+/// `an_ordinary_entry_with_its_derivation_stays_inside_the_planning_rate` the
+/// 896 against the constant).
 ///
 /// The capacity sizes TWO per-tenant caches, not one
 /// (`RECORD_CACHES_PER_TENANT`), and each is held to an equal share of the
@@ -228,7 +231,7 @@ pub const HOT_REGION_HOURS: u64 = 3;
 ///
 /// It is a planning rate, not a per-entry cap: a cache charges each entry what
 /// that entry actually holds and evicts against the summed charge, so an
-/// ordinary 864-byte commit record leaves headroom under it and a record
+/// ordinary 896-byte commit entry leaves headroom under it and a record
 /// carrying declared column statistics costs more than one of these and takes
 /// more than one entry's worth of the budget.
 pub const RECORD_CACHE_ENTRY_BYTES: u64 = 900;

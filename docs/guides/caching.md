@@ -668,7 +668,7 @@ exists because neither record type has a bounded size:
   a repeated field with no cap in the proto, in validation, or in the
   tenant-config path for typed attribute columns. A record that declares 200
   typed attribute columns charges about 20 KB where an ordinary one charges
-  864 bytes, more than twenty times the planning rate. The cache charges each
+  896 bytes, more than twenty times the planning rate. The cache charges each
   entry an estimate of the live heap that it holds. It evicts
   least-recently-used until the charged total is back inside the budget.
 - The **compaction-record cache** is bounded in bytes at the same share,
@@ -680,8 +680,9 @@ exists because neither record type has a bounded size:
   evicts oldest-first until its charged bytes are back inside the budget.
 
 The 900 bytes is a PLANNING rate the capacity is derived against, not a
-per-entry cap: an ordinary stats-free commit entry charges 864 bytes (a
-119-byte commit key held twice, the decoded struct, and the record's own heap),
+per-entry cap: an ordinary stats-free commit entry charges 896 bytes (a
+119-byte commit key held twice, the decoded struct, the record's own heap, and
+a 32-byte slot for the derivation a resolve keeps with the record),
 and what each cache enforces is the summed charge against its budget. So the
 capacity is an entry cap rather than a guaranteed residency: a tenant whose
 records carry typed attribute column statistics holds proportionally fewer than
