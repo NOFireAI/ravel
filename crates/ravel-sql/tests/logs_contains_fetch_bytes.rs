@@ -10,7 +10,7 @@
 //! object above half its size takes the whole-segment fast path's ranged
 //! entry, which is the route the ClickBench objects take.
 //!
-//! `SELECT COUNT(*) FROM logs WHERE URL LIKE '%google%'` runs twice: as main
+//! `SELECT COUNT(*) FROM logs WHERE "URL" LIKE '%google%'` runs twice: as main
 //! plans it (the arm pushed), and with `ESCAPE '#'`, which the extractor
 //! declines, so the LIKE is evaluated above the scan. Every GET either run
 //! issues is recorded by `(key, range)` and mapped onto the object's
@@ -63,6 +63,8 @@ const OBJECTS: usize = 4;
 const PARTITIONS: usize = 2;
 const ROWS_PER_BLOCK: usize = 100;
 const BLOCKS_PER_OBJECT: usize = 16;
+/// Four row groups per object, so the projection is several ranges apart.
+const BLOCKS_PER_GROUP: usize = 4;
 const ROWS_PER_OBJECT: usize = ROWS_PER_BLOCK * BLOCKS_PER_OBJECT;
 /// One row in this many carries the needle in its `URL`.
 const NEEDLE_EVERY: usize = 100;
@@ -71,6 +73,10 @@ const NEEDLE_EVERY: usize = 100;
 /// production 256 KiB one probe would hold every tail section of these
 /// objects and the sections would cost no GET of their own.
 const SUFFIX_LEN: u64 = 4096;
+/// Coalesce gap, sized below one `Title` chunk so the `URL` chunks of
+/// consecutive row groups stay separate ranges, as the chunks of a wide
+/// ClickBench object do under the production 64 KiB gap.
+const COALESCE_GAP: u64 = 1024;
 
 fn declared() -> Vec<DeclaredColumn> {
     vec![
@@ -142,6 +148,7 @@ fn record(n: usize, i: usize) -> LogRecord {
 fn writer_config() -> RlogConfig {
     RlogConfig {
         block_target_records: ROWS_PER_BLOCK,
+        group_target_blocks: BLOCKS_PER_GROUP,
         ..RlogConfig::default()
     }
 }
@@ -437,7 +444,10 @@ fn executor(fx: &Fixture) -> SqlExecutor {
         / 2;
     let log_fetcher = LogSegmentFetcher::new(Arc::clone(&backend))
         .with_block_range(
-            BlockRangeFetcher::new(Arc::clone(&backend)).with_suffix_len(SUFFIX_LEN),
+            BlockRangeFetcher::new(Arc::clone(&backend))
+                .with_suffix_len(SUFFIX_LEN)
+                .with_coalesce_gap(COALESCE_GAP)
+                .with_whole_object_threshold(0),
         )
         .with_block_range_threshold(threshold);
     let catalog =
@@ -577,29 +587,15 @@ fn difference(gets: &[Get], minus: &[Get]) -> Vec<Get> {
 async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
     let fx = fixture().await;
 
-    let pushed = run(&fx, "SELECT COUNT(*) FROM logs WHERE URL LIKE '%google%'").await;
+    let pushed = run(&fx, "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%'").await;
     let plain = run(
         &fx,
-        "SELECT COUNT(*) FROM logs WHERE URL LIKE '%google%' ESCAPE '#'",
+        "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%' ESCAPE '#'",
     )
     .await;
 
     describe(&fx, "pushed", &pushed);
     describe(&fx, "plain", &plain);
-    let extra = difference(&pushed.gets, &plain.gets);
-    let missing = difference(&plain.gets, &pushed.gets);
-    eprintln!("extra: {extra:?}");
-    eprintln!("missing: {missing:?}");
-    for g in &extra {
-        let regions = regions(&fx.objects[&g.key]);
-        eprintln!(
-            "  extra {} [{}, {}): {:?}",
-            g.key,
-            g.start,
-            g.end,
-            covered(&regions, g.start, g.end)
-        );
-    }
 
     let expected = (OBJECTS * ROWS_PER_OBJECT / NEEDLE_EVERY) as i64;
     assert_eq!(pushed.count, expected);
@@ -614,4 +610,60 @@ async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
         (plain.ranged_segments, plain.whole_object_segments),
         (OBJECTS, 0)
     );
+
+    // GETs and bytes per object: (plain GETs, plain bytes, pushed GETs,
+    // pushed bytes). Plain is a 4 KiB suffix probe plus four projection
+    // ranges; pushed is the same five plus one.
+    let per_key = |run: &Run, key: &str| {
+        let gets: Vec<&Get> = run.gets.iter().filter(|g| g.key == key).collect();
+        (gets.len(), gets.iter().map(|g| g.end - g.start).sum::<u64>())
+    };
+    let expected_per_key: [(usize, u64, usize, u64); OBJECTS] = [
+        (5, 118_365, 6, 135_677),
+        (5, 118_353, 6, 135_793),
+        (5, 118_359, 6, 135_799),
+        (5, 118_379, 6, 135_627),
+    ];
+    for (n, want) in expected_per_key.iter().enumerate() {
+        let (plain_gets, plain_bytes) = per_key(&plain, &key(n));
+        let (pushed_gets, pushed_bytes) = per_key(&pushed, &key(n));
+        assert_eq!(
+            (plain_gets, plain_bytes, pushed_gets, pushed_bytes),
+            *want,
+            "{}",
+            key(n)
+        );
+    }
+    assert_eq!((plain.gets.len(), plain.bytes()), (20, 473_456));
+    assert_eq!((pushed.gets.len(), pushed.bytes()), (24, 542_896));
+
+    // Every range plain reads, pushed reads too, at the same offsets: the
+    // projection is the same column chunks and nothing is read twice.
+    assert_eq!(difference(&plain.gets, &pushed.gets), Vec::<Get>::new());
+
+    // What pushed reads beyond that is one GET per object, exactly that
+    // object's BLOOM section, which the reader never parses for a `Contains`
+    // arm. Its last bytes sit inside the suffix probe already, so part of
+    // each extra GET is a second read of bytes the probe returned.
+    let extra = difference(&pushed.gets, &plain.gets);
+    let mut bloom_sections = Vec::new();
+    let mut reread = 0;
+    for (k, object) in &fx.objects {
+        let bloom = regions(object)
+            .into_iter()
+            .find(|r| r.label == "BLOOM")
+            .expect("BLOOM section");
+        let probe_start = object.len() as u64 - SUFFIX_LEN;
+        reread += bloom.end.saturating_sub(probe_start);
+        bloom_sections.push(Get {
+            key: k.clone(),
+            start: bloom.start,
+            end: bloom.end,
+        });
+    }
+    assert_eq!(extra, bloom_sections);
+    let extra_bytes: u64 = extra.iter().map(|g| g.end - g.start).sum();
+    assert_eq!(extra_bytes, pushed.bytes() - plain.bytes());
+    assert_eq!(extra_bytes, 69_440);
+    assert_eq!(reread, 9_750);
 }
