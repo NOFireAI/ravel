@@ -584,8 +584,10 @@ impl ObjectStoreBackend for GeometryBeforePutStore {
 /// Issue #2753: with `--max-flush-delay` unset the CLI hands the router 60 s,
 /// not the library's 2 s default. One 2-row batch at a 1 GiB target and
 /// `--pipeline-depth 1` parks the loader on that batch's ack, which only the
-/// age trigger can answer. 59 s on the injected clock leaves the store empty;
-/// 2 s more ages the buffer out and the load finishes with one object.
+/// age trigger can answer once the depth flush, which would close that
+/// buffer at the first submit, is held off (`DEPTH_FLUSH_OFF`). 59 s on the
+/// injected clock leaves the store empty; 2 s more ages the buffer out and
+/// the load finishes with one object.
 ///
 /// Prove-the-test: delete the `max_flush_delay.unwrap_or(
 /// DEFAULT_MAX_FLUSH_DELAY)` line in `run_fold_warning_to` and the router
@@ -603,7 +605,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
     let sink = SharedSink::default();
     let mut warnings = sink.clone();
     let no_policy = IpcryptPolicy::empty();
-    let load = run_fold_warning_to(
+    let load = crate::load::geometry::DEPTH_FLUSH_OFF.scope((), run_fold_warning_to(
         Arc::clone(&store),
         &pq,
         "acme",
@@ -629,7 +631,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         &mut warnings,
-    );
+    ));
     tokio::pin!(load);
 
     tokio::select! {
@@ -653,7 +655,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
     assert!(
         emitted.contains(
             "load geometry: logs: flush target 1073741824 bytes (--target-bytes), pipeline \
-             depth 1 (--pipeline-depth)"
+             depth 1 (--pipeline-depth), depth flush on"
         ),
         "{emitted}"
     );
