@@ -605,33 +605,36 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
     let sink = SharedSink::default();
     let mut warnings = sink.clone();
     let no_policy = IpcryptPolicy::empty();
-    let load = crate::load::geometry::DEPTH_FLUSH_OFF.scope((), run_fold_warning_to(
-        Arc::clone(&store),
-        &pq,
-        "acme",
-        &mapping_path,
-        SignalArg::Logs,
-        1,
-        2,
-        0,
-        Some(1),
-        Some(1),
-        DEFAULT_MAX_INFLIGHT_FLUSHES,
-        DEFAULT_DECODE_QUEUE_BATCHES,
-        Some(1 << 30),
-        None,
-        RlogZstdLevel::DEFAULT,
-        RlogGroupTargetBlocks::DEFAULT,
-        RlogChunkOrder::DEFAULT,
-        LoadMemoryRequest::Derived {
-            host_total_bytes: Some(64 << 30),
-        },
-        false,
-        &no_policy,
-        NOW_NS,
-        Arc::clone(&clock) as Arc<dyn Clock>,
-        &mut warnings,
-    ));
+    let load = crate::load::geometry::DEPTH_FLUSH_OFF.scope(
+        (),
+        run_fold_warning_to(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping_path,
+            SignalArg::Logs,
+            1,
+            2,
+            0,
+            Some(1),
+            Some(1),
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            Some(1 << 30),
+            None,
+            RlogZstdLevel::DEFAULT,
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            LoadMemoryRequest::Derived {
+                host_total_bytes: Some(64 << 30),
+            },
+            false,
+            &no_policy,
+            NOW_NS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            &mut warnings,
+        ),
+    );
     tokio::pin!(load);
 
     tokio::select! {

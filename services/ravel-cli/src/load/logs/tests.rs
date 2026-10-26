@@ -2348,7 +2348,11 @@ async fn an_explicit_target_closes_a_sparse_shard_at_the_window() {
     });
     let load_fut = crate::load::geometry::DEPTH_FLUSH_OFF.scope(
         (),
-        run(Arc::clone(&store), Arc::clone(&clock), Some(on_batch_queued)),
+        run(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Some(on_batch_queued),
+        ),
     );
     tokio::pin!(load_fut);
     tokio::select! {
