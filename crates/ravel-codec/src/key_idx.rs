@@ -909,7 +909,7 @@ fn decode_frame(
         )));
     }
     let expected = count as usize * KEY_IDX_ENTRY_LEN;
-    let raw = zstd::bulk::decompress(payload, expected).map_err(|e| {
+    let raw = crate::zstd_frame::decompress(payload, expected).map_err(|e| {
         corrupted(format_args!(
             "bucket {bucket} frame does not decompress within entry_count x 12 = {expected} bytes: {e}"
         ))
