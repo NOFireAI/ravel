@@ -6,6 +6,231 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-26
+
+### Fixed
+
+- **`ravel-cli load` closes default-geometry objects by size.** The derived
+  `--pipeline-depth` now runs a quarter past the rows bound
+  (`ceil(250,000 x --shards / --batch-rows)` plus a quarter of it, rounded
+  up; 125 instead of 100 on four shards at the defaults), so a
+  shard that drew up to a fifth less than its share of a window's rows reaches the
+  250,000-row target before the depth flush closes it. On rows of one width
+  spread by hash across the shards, when the rows bound decides the depth,
+  the size trigger now closes every object but
+  the tails published at the end of the input, where before the depth flush
+  closed about half of them short of the target. The load summary's
+  pipeline-depth line reads `rows bound <N> + <K> = <M>`, `<K>` the quarter as a count. The quarter
+  applies only while the depth flush runs: with `--target-bytes 1` the
+  derived depth stays the plain rows
+  bound. Rows narrower than the first batch's close on size while they
+  reach the target inside one window (on four shards at the defaults, rows
+  at least about 80% as wide), between 250,000 and 312,500 rows; narrower
+  rows close on depth at the window's 312,500 rows on four shards, or
+  320,000 on one. The quarter rounds up, so a rows bound of 1 gives a depth
+  of 2: on four shards, 1,000,000-row batches make objects of up to two
+  slices.
+- **A Parquet page header that skips a list longer than its column chunk fails the scan as corrupt.** Previously the page decoder skipped the list one element at a time past the end of the chunk before ending the scan in an untyped error: at the largest count a header can declare, 2,147,483,647, that held one core for about three minutes in a release build. The reader walks every page header of a column chunk it reads whole, not only the pages a scan decodes, so a scan that stops early, such as one under `LIMIT`, can now fail as corrupt on a chunk with a corrupt page past the rows it would have returned. A footer that places two column chunks on overlapping bytes, or at the same offset, is refused as corrupt.
+- **A logs scan's string values stay charged to the SQL memory pool while a
+  filter downstream still holds them.** Previously a filter still collecting
+  rows for its next output batch kept one values array per input block alive
+  with no charge, so a selective filter over many blocks could hold gigabytes
+  the memory limit never saw (2.3 to 2.7 GB on the ClickBench `LIKE`
+  statements). A query that held that memory can now fail with a
+  resources-exhausted error under a memory limit instead. A sort or join
+  over a plain string column that charges its own buffered batches now
+  counts those values arrays a second time until the scan ends, so it can
+  spill or refuse earlier than before. The scan's charge is still released
+  when the scan ends, before an operator downstream has flushed what it
+  holds.
+- **`PinnedParquetReader` serves whole column chunks only.** Once it has
+  handed out the footer, it refuses a range that does not start and end on
+  column chunk boundaries, before any GET for it, so a caller that turns the
+  page index on gets a typed error instead of page reads whose headers were
+  never checked. SQL queries see no change: their table provider keeps the
+  page index off.
+- **A Parquet decoder error while scanning a corrupt file now answers HTTP 500, like a decoder panic does, instead of 422.** Some corrupt page headers and page bodies end the scan in a decoder error, such as `EOF: eof decoding byte array` or `Required field type_ is missing`, rather than a panic. A SQL query that hit one used to fail as an execution error (HTTP 422) carrying that bare message, which named neither the file nor the table. It now fails as the integrity-validation error, `stored data failed integrity validation` (HTTP 500), the same answer a decoder panic on a corrupt file already gave. The file and the table are named in the server-side error; the client sees only the integrity-validation message. A decoder error that arrives wrapped in a non-Parquet error still answers 422.
+- **`ravel-cli load` runs the depth flush with an explicit `--target-bytes`.**
+  Any target above `1`, given or derived, now closes every shard's buffer
+  once the oldest batch pending on any shard is `--pipeline-depth` batches
+  old, so a load whose shard shares are uneven no longer waits out
+  `--max-flush-delay` on every window for a shard whose share never reaches
+  the target; that shard writes smaller objects at the window instead. Such
+  a load also waits after each submit for the shards to take the batch, as
+  a load with a derived target already did. The derived depth gets the rows
+  bound's quarter for such a target too, and the stderr geometry line
+  reports `depth flush on` or `depth flush off`. `--target-bytes 1` keeps
+  the depth flush off.
+- **`ravel-cli load`'s ack deadline covers a target-sized flush.** The
+  deadline is now the larger of 60 s and `--max-flush-delay` plus a margin
+  of 60 s and the target divided by 100,000,000 bytes per second, the time
+  a flush the age trigger released may spend encoding its object before
+  the PUT starts. A 1,850,000,000-byte target adds 18.5 s: 138.5 s at the
+  60 s default delay and 108.5 s at `--max-flush-delay 30s`, where the
+  deadline was 120 s and 90 s. `--target-bytes 1`, or any target within one
+  batch's per-shard slice, keeps the old deadline. The new
+  `--ack-margin <SECONDS>` flag replaces the whole margin, the stderr
+  geometry line ends with `ack deadline <N>s`, and the load report JSON's
+  geometry object gains `ack_deadline` and `slice_est_bytes`.
+- **Hardening for sessions with `repartition_joins` on:** a `Partitioned` hash
+  join over a grouped declared `Str` key now keeps both inputs co-partitioned
+  when the key's dictionary type is restored, instead of failing planning with
+  `HashJoinExec requires children [0, 1] to be co-partitioned`. `SqlExecutor`
+  sessions turn `repartition_joins` off and plan `CollectLeft` joins, which
+  this does not change.
+
+### Added
+
+- **The differential harness's Prometheus client reports query timeouts as
+  timeouts.** `PrometheusClient` queries now run under a deadline that
+  encloses the complete operation (connect, headers, body transfer and JSON
+  parse; `PrometheusClient::with_deadline`, 120 s for `new`) and a 256 MiB
+  body cap, and `instant_query_with_deadline`/`range_query_with_deadline`
+  return a typed `QueryOutcome` (`Envelope` for every HTTP status whose body
+  is JSON, `Timeout` with the phase it expired in, `Transport`,
+  `BodyTooLarge`) with dispatch-to-headers, headers-to-body and parse timings
+  reported separately. A stalled response body used to hang the run with no
+  bound; it is now `Timeout { phase: Body }` at the deadline.
+- **`ravel-bench`'s `metricsbench_ingest` takes `--anchor-ms` and streams its replay** (issue
+  #2821). `--anchor-ms <i64>` fixes the first generated step's timestamp so
+  two runs replay the same bytes; the report records `anchor_ms` and
+  `anchor_source` (`explicit` or `clock`) under `profile.run`, and the clock
+  default is unchanged. The replay now generates and sends one step at a
+  time, so memory no longer grows with the step count. Every stream line is
+  classified, and each row's `ingest` block carries `stream_counts` plus the
+  named exclusions `excluded_native_histogram` and `excluded_stale_marker`;
+  the run fails when those counts do not close against the generator's own
+  figures or a line is malformed. `elapsed_secs` now sums the timed write
+  segments instead of measuring wall time, and the report says so with
+  `elapsed_basis: "timed_segments"`, so rates from before and after this
+  change are not comparable.
+- **`LIKE '%literal%'` on a declared `str` column filters rows inside the logs
+  scan** (issues #2865, #3241). `col LIKE '%literal%'` and
+  `col NOT LIKE '%literal%'` now push down as a contains predicate, so rows the
+  pattern rejects are dropped before the scan builds them; the `FilterExec`
+  stays in the plan and the result is unchanged. Each value is searched with
+  a substring finder built once per predicate. A pattern with `_`, a
+  backslash, an inner `%`, an `ESCAPE` clause, `ILIKE`, or a column that is
+  `body`, `attrs['k']`, undeclared or of another declared type is not pushed.
+  The pushed arm prunes no block, so a full-window statement whose only
+  content arms are such contains predicates keeps the whole-segment fast path.
+  The SQL response's `stats.pruning` gains `containsCellsTested` and
+  `strCellsValidated`. The sql-latency bench lane's per-statement scan
+  diagnostics carry both counters as `contains_cells_tested` and
+  `str_cells_validated`, and the ClickBench kit reads them from
+  `stats.pruning` in the HTTP response, which it records per run.
+- **`/metrics` shows the column-statistics cache and fold dictionary drops**
+  (issue #3244). New series: `ravel_catalog_column_stats_cache_refusals_total`,
+  `ravel_catalog_column_stats_cache_evictions_total`, the gauge
+  `ravel_catalog_column_stats_cache_held_bytes`,
+  `ravel_catalog_column_stats_decoded_bytes_total` (decompressed body bytes
+  of the objects query loads decoded; a cache hit adds nothing), and
+  `ravel_catalog_fold_column_stats_dictionaries_dropped_total{signal}`, the
+  sum of the dictionaries successful folds dropped to fit the reader
+  ceiling, which only `ravel-cli catalog fold` printed before. No read,
+  cache or fold behaviour changes.
+- **`ravel-cli load --group-target-blocks` sets the RLOG row-group size.**
+  A logs load whose objects hold at most that many blocks writes each as
+  one row group; a larger object is several groups of that size. The
+  default, 32, is the writer's existing size, so a load that leaves the
+  flag unset writes the same objects as before. Compaction rewrites the
+  objects it merges at 32-block groups, and a metrics or spans load warns
+  and ignores the flag.
+- **`ravel-cli load --chunk-order` places named columns' chunks first.**
+  A logs load given `--chunk-order NAME,NAME,...` writes those attribute
+  columns' chunks first and adjacent in every row group of each RLOG
+  object, in the given order, so a query projecting them together reads
+  one chunk run. Readers need no change. The default is no order, so a
+  load that leaves the flag unset writes the same objects as before.
+  Compaction rewrites the objects it merges in the default order, and a
+  metrics or spans load warns and ignores the flag. On an object with more
+  attribute names than the writer's dynamic column cap, a named column takes
+  a column an earlier name in the alphabet would have had, and that name's
+  values move to the overflow attributes.
+
+### Changed
+
+- **RLOG objects carry STREAM_DIR and FIELD_DIR after PAGE_DIR.** A narrow scan reads them from the tail probe instead of a second GET per object; readers open objects of either order by footer offset.
+- **Integer column pages decode in bulk** (issue #3235). Plain, delta,
+  double-delta and frame-of-reference pages decode straight into the output
+  slice, constant and RLE pages fill each run once, and pages with a
+  presence bitmap decode their present values densely and then scatter them.
+  Decoded values and the errors returned for malformed pages are unchanged.
+- **The logs scan prunes blocks for an integer `<>` predicate** (ADR-0095,
+  prune-only not-equal amendment). `col <> lit` or `lit <> col` on a
+  declared `I64` column with an integer literal now pushes a prune-only arm
+  that skips a block, or a whole skip-index group, whose stat for the column
+  has `min == max == lit`; a block with no stat for the column is kept. The
+  filter is still evaluated above the scan, so a statement returns the same
+  rows. `COUNT(*) WHERE col <> lit` still answers from column statistics
+  when they are loaded; the arm only applies when the statement scans, and
+  it does not change the route the scan takes: a scan the whole-segment
+  fast path served still takes it and skips the blocks at decode. The
+  arm is not carried in Flight SQL tickets, whose wire format is
+  unchanged. `NOT (col = lit)`, and `<>` on string, bytes, float and bool
+  columns, still push no arm.
+- **SQL over logs loads column statistics only for statements a metadata
+  path can answer, or whose filter the load decision cannot read** (issue
+  #3244). The two-GET column-statistics load now runs for one unfiltered
+  `SUM(col)`, `SUM(col + n)` or `AVG(col)` on an integer column, a
+  `COUNT(*)` filtered by a single `col <> literal` on a non-string column,
+  and a `COUNT(*)` grouped by one non-string typed attribute column. Inside those shapes a filter the load decision
+  cannot read, such as a `ts` bound written with `TIMESTAMP` literals or
+  `NOT (col = n)`, keeps the load; on a filtered `COUNT(*)` it keeps the load
+  only when it names a non-string typed attribute column, so
+  `COUNT(*) WHERE url LIKE '%google%'` on a string column no longer loads.
+  `MIN` and `MAX` are answered from the segment stamps and load nothing.
+  Other statements that name a typed attribute column, such as several
+  `SUM`s, `COUNT(DISTINCT col)`, a `GROUP BY` filtered by `<>` or a two-key
+  `GROUP BY`, no longer pay for a load nothing reads. Results are unchanged.
+- **ravel-server sizes the column-statistics cache from the memory budget**
+  (ADR-1170, column-statistics carve amendment). The catalog's decoded
+  `.cstat` cache was capped at a fixed 64 MiB; its cap now derives as 2% of
+  `memory_budget_bytes` (601,295,421 bytes on a 30,064,771,072-byte budget),
+  counts as a third hard cap in `memory_hard_caps_bytes` and the startup
+  refusal, and falls back to 64 MiB only when host memory cannot be read.
+  Because it is a hard cap, the remainder after the hard caps shrinks by
+  that amount, and the SQL per-query and per-tenant ceilings, a share of
+  that remainder, shrink with it: from 16,454,475,776 to 16,003,048,146
+  bytes on a 25,769,803,776-byte budget. The new `--column-stats-cache-max-bytes`
+  flag overrides it, a gateway resolves it to 0,
+  and `--disable-cache` now turns this cache off as well. On a budget under
+  3.125 GiB the derived cap is below the old 64 MiB (21,474,836 bytes
+  on 1 GiB), so a small host may refuse to cache an entry it used to hold;
+  `ravel_catalog_column_stats_cache_refusals_total` shows it. An explicit
+  `--cache-max-bytes` and `--catalog-cache-max-bytes` pair that leaves 2% or less
+  of the budget free now refuses startup with `MemoryBudgetExceeded`,
+  since the derived column-statistics cap joins the sum; lower one of them
+  or set `--column-stats-cache-max-bytes`.
+- **The column-statistics cache holds one entry per part, with only the
+  value dictionaries statements ask for** (issue #3244). A load now names the
+  dictionaries it reads: a non-string `GROUP BY` key's column, or a
+  non-string column a `<>` filter names; `SUM` and `AVG` read none. A part already cached with
+  those dictionaries costs no GET, so a load over a warm cache costs the one
+  HEAD GET, and a fold that adds a part costs the next load one GET for that
+  part instead of a reload of every part in the window. Byte-budget eviction
+  and refusal now apply to a single part's entry. Results are unchanged: a
+  count that needs a dictionary the load did not hold scans instead.
+- **A column-statistics load decodes one segment at a time, which lowers its peak memory** (issue #3244). The decode streams each part's statistics one segment at a time, validates each segment in full, and drops the dictionaries the statement does not read before reading the next, so it holds at most one segment beyond the bytes it keeps (up to one segment over the body when every dictionary is kept). Under a catalog memory budget it reserves those bytes rather than the whole object; the server's query catalog sets no budget yet. Results are unchanged, and an object with a single defect is refused with the same error variant as before.
+- **A column-statistics load the catalog's memory budget refuses now falls back to a scan instead of failing the query** (issue #3244). The refused part is left without statistics and scanned, which gives the same rows, and every reservation the load took for that part is released. Before, the load failed with a 422 budget error. This applies to a catalog built with `Catalog::with_memory_budget`; the server's query catalog does not set one yet, so its column-statistics loads are never refused today. A refetch for a dictionary that a cached entry lacks now serves the cached entry when the refetch is refused or finds no object, and a statement with no plan to read loads summaries only.
+- **New metric `ravel_catalog_column_stats_budget_skips_total`** (issue #3244) counts column-statistics part loads the memory budget refused (`Catalog::column_stats_budget_skips`). A skip is not counted in `ravel_catalog_column_stats_decode_refusals_total` and does not log the decode-refusal warning. The server's query catalog sets no budget yet, so on a shipped server it reads 0.
+- **RLOG, KEY_IDX and RSEG read paths reuse one zstd decompression context per thread.** RLOG page,
+  section and postings-block decodes, KEY_IDX bucket frames, and RSEG section
+  and sparse chunk-frame decodes no longer create and free a `ZSTD_DCtx` per
+  call; decoded bytes and error types are unchanged.
+- **A `GROUP BY` on a declared `Str` column casts its key back to the
+  dictionary type on the rows it returns, not on every group** (ravel-sql,
+  ADR-0099 #3271 amendment). The `Utf8View` group key is now carried through
+  the sort, merge, limit, exchange and renaming-projection operators above the
+  aggregate whose expressions read it only as the bare column, so under
+  `ORDER BY <aggregate> LIMIT k` the cast runs above the TopK on `k` rows, and
+  a two-level `COUNT(DISTINCT ..)` no longer casts the key back and forth
+  between its levels. A sort key that computes on the group key
+  (`ORDER BY k = 'a'`, a `CASE` over it) reads the dictionary type from a
+  projection below its sort, as do a `HAVING` filter, a join, a window and a
+  union, so the result's column types, rows and order are those the plan
+  produces without the rewrite.
+
 ## [0.26.0] - 2026-10-25
 
 ### Fixed
