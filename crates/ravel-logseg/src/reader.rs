@@ -1836,7 +1836,7 @@ enum Arm {
         col: Option<u32>,
         others: Vec<(u32, FieldType)>,
         key: String,
-        needle: ContainsNeedle,
+        needle: Box<ContainsNeedle>,
         negated: bool,
     },
     /// An `Equals` that no row can satisfy (`body` against a non-string).
@@ -1920,7 +1920,7 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
                     .map(|e| (e.column_id, e.ty))
                     .collect(),
                 key: key.clone(),
-                needle: ContainsNeedle::new(needle.as_bytes()),
+                needle: Box::new(ContainsNeedle::new(needle.as_bytes())),
                 negated: *negated,
             },
         };
@@ -2170,7 +2170,7 @@ fn apply_arm(
                 col: *col,
                 others,
                 key,
-                needle,
+                needle: needle.as_ref(),
                 negated: *negated,
             },
             stream_dir,
