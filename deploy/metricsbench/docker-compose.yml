@@ -63,6 +63,28 @@ services:
       # than 30d. Set generously above every ADR-0927 profile duration (history
       # is 30d) so retention never silently drops benchmark samples mid-run.
       - "--storage.tsdb.retention.time=45d"
+      # OUT-OF-ORDER WINDOW (disclosed, frozen): 1h, set in config/prometheus.yml
+      # (storage.tsdb.out_of_order_time_window has no command-line flag). The
+      # comment there carries the default it replaces and why.
+      #
+      # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
+      # Each one that fires is a budget refusal, not an engine error; the
+      # README's "Frozen limits" table lists value, sizing and error text.
+      # Max samples: replaces the 3.13.1 default 50000000. Sized to the history
+      # profile's longest range window, 7d (mb_long_range_7d_avg), across all
+      # 10,000 series at 15s: 7 * 86400 / 15 = 40,320 samples per series, times
+      # 10,000 = 403,200,000; 500000000 leaves 24% headroom. The corpus entry
+      # itself selects one job's gauge, about a tenth of that. The bound is set
+      # so no corpus statement is refused, not as a memory guard: at an 8-byte
+      # timestamp plus an 8-byte value per sample, 403,200,000 samples exceed
+      # the 4g envelope, so such a selection would fail on memory first.
+      - "--query.max-samples=500000000"
+      # Query timeout: equals the 3.13.1 default 2m, written so the effective
+      # config capture shows it and a default change cannot move it silently.
+      - "--query.timeout=120s"
+      # Lookback delta: the 3.13.1 default 5m, stated, not changed. An instant
+      # or range step sees a series' newest sample at most 5m old.
+      - "--query.lookback-delta=5m"
       # DELAYED COMPACTION / MATERIALISED STATE (disclosed): Prometheus holds
       # incoming samples in an in-memory head block and only cuts a persistent,
       # compacted on-disk block every 2h (fixed head-chunk range, not tunable).
@@ -103,6 +125,47 @@ services:
       # (disabled). Set explicitly to 0 so no sample is silently coalesced; the
       # portable lane sends each logical sample once and expects each stored once.
       - "-dedup.minScrapeInterval=0"
+      # OUT-OF-ORDER WINDOW (disclosed, no flag): VictoriaMetrics has no
+      # out-of-order window to set; v1.115.0's docs (docs/victoriametrics/
+      # README.md, "Backfilling") say it "accepts historical data in arbitrary
+      # order of time via any supported ingestion method", bounded only by
+      # -retentionPeriod above. So a sample shifted back 1.5 scrape intervals
+      # (22.5s at 15s) is stored here as it is by the 1h windows on Prometheus
+      # and Mimir; Prometheus without its window rejects the whole Remote
+      # Write 1.0 request with HTTP 400 on such a sample.
+      #
+      # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
+      # Each one that fires is a budget refusal, not an engine error; the
+      # README's "Frozen limits" table lists value, sizing and error text.
+      # Latency offset: replaces the v1.115.0 default 30s, which hides points
+      # newer than now-30s, so an instant query at the newest sample would be
+      # evaluated 30s earlier than on the other engines without saying so.
+      - "-search.latencyOffset=0"
+      # Points per series on /api/v1/query_range: replaces the default 30000.
+      # Bounds the declared range grids; the largest, history's 24h at a 5m
+      # step, is 24 * 12 + 1 = 289 points, far inside 20000.
+      - "-search.maxPointsPerTimeseries=20000"
+      # Raw samples per query: equals the default 1000000000, written so the
+      # capture shows it. Covers the history profile's bound of 10,000 series
+      # times the longest range window, 7d at 15s (40,320 samples per series):
+      # 403,200,000.
+      - "-search.maxSamplesPerQuery=1000000000"
+      # Query duration: replaces the default 30s with 120s, equal to the
+      # Prometheus comparator's --query.timeout, so a history statement the
+      # others finish is not refused here on time alone.
+      - "-search.maxQueryDuration=120s"
+      # Unique series per query: the default (unset) is derived from
+      # -search.maxConcurrentRequests and the memory available to the
+      # process, so it would move with the container's CPU and RAM. Pinned to
+      # the cardinality profile's 1,000,000 active series, the most any
+      # profile holds.
+      - "-search.maxUniqueTimeseries=1000000"
+      # Response cache: off (replaces the default false, cache on). The
+      # benchmark replays historical timestamps, and the same docs section
+      # recommends disabling the cache while "writing historical data with
+      # timestamps from the past". A production_cache regime re-enables it per
+      # run and discloses that it did.
+      - "-search.disableCache=true"
       # DOWNSAMPLING (disclosed, ABSENT): downsampling is a VictoriaMetrics
       # Enterprise feature and does not exist in this OSS single-node image, so
       # no automatic resolution reduction occurs. Stated here so its absence is
