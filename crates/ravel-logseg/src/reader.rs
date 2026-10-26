@@ -2026,8 +2026,7 @@ thread_local! {
 /// stream fallback verdict per `stream_ref` in `streams`, which holds for the
 /// whole scan. `texts` is per column, not per arm: the UTF-8 of an unvalidated
 /// dictionary's entries, decided once and shared by every arm on the column
-/// and by the survivor-only build ([`build_survivor_values`]). `cells` is
-/// the plain-page buffer a `Contains` arm searches, reused across blocks.
+/// and by the survivor-only build ([`build_survivor_values`]).
 #[derive(Default)]
 struct DictArmMemo {
     hits: Vec<DictSlot<Vec<i32>>>,
@@ -2035,16 +2034,6 @@ struct DictArmMemo {
     contains: Vec<DictSlot<Vec<Option<bool>>>>,
     streams: Vec<Vec<Option<bool>>>,
     texts: Vec<(u32, DictSlot<EntryTexts>)>,
-    cells: CellBuffer,
-}
-
-/// A plain page's selected present cells, copied end to end into `bytes` with
-/// each cell's end offset in `ends`, and the needle's verdict on each.
-#[derive(Default)]
-struct CellBuffer {
-    bytes: Vec<u8>,
-    ends: Vec<usize>,
-    verdicts: Vec<bool>,
 }
 
 /// Column `col`'s [`EntryTexts`] over `dict`, started afresh unless it
@@ -2319,12 +2308,11 @@ struct ContainsArm<'a> {
 /// A row reads its `Str` cell when that cell is present and UTF-8, else its
 /// stream's resource or scope `Str` value, decided once per stream for the
 /// scan. The needle test runs on the cell's raw bytes, once per dictionary
-/// entry through `memo`, or for a plain page once over its selected present
-/// cells copied into one buffer ([`ContainsNeedle::is_in_each`]); it counts
-/// one per entry or cell in [`ScanStats::contains_cells_tested`]. UTF-8 is
-/// decided only where it changes the answer, when the cell's verdict and the
-/// stream's differ: a dictionary entry through the column's [`EntryTexts`],
-/// counted in [`ScanStats::str_cells_validated`] when the dictionary was left
+/// entry through `memo` or once per present plain cell, and counts in
+/// [`ScanStats::contains_cells_tested`]. UTF-8 is decided only where it
+/// changes the answer, when the cell's verdict and the stream's differ: a
+/// dictionary entry through the column's [`EntryTexts`], counted in
+/// [`ScanStats::str_cells_validated`] when the dictionary was left
 /// unvalidated, and a plain cell in place, uncounted. A row with a present cell
 /// of another type for `key`, or an `attrs_raw` entry for it, is kept.
 fn contains_kernel(
@@ -2342,7 +2330,6 @@ fn contains_kernel(
         contains,
         streams,
         texts,
-        cells: cells_buf,
         ..
     } = memo;
     let ScanStats {
@@ -2373,44 +2360,22 @@ fn contains_kernel(
     let elsewhere = |row: usize| resolved_elsewhere(block, arm.others, arm.key, row);
     match arm.col.and_then(|c| Some((c, block.str_column(c)?))) {
         None => sel.retain(|row| Ok(fallback(row)? || elsewhere(row)?)),
-        Some((_, StrColumn::Plain(cells))) => {
-            let CellBuffer {
-                bytes,
-                ends,
-                verdicts,
-            } = cells_buf;
-            bytes.clear();
-            ends.clear();
-            sel.for_each(|row| {
-                if let Some(cell) = cells.get(row).and_then(Option::as_deref) {
-                    bytes.extend_from_slice(cell);
-                    ends.push(bytes.len());
-                }
-            });
-            *tested += ends.len() as u64;
-            arm.needle.is_in_each(bytes, ends, verdicts);
-            let mut next = 0;
-            sel.retain(|row| {
-                let fb = fallback(row)?;
-                let pass = match cells.get(row).and_then(Option::as_deref) {
-                    None => fb,
-                    Some(cell) => {
-                        let hit = verdicts
-                            .get(next)
-                            .copied()
-                            .unwrap_or_else(|| arm.needle.is_in(cell));
-                        next += 1;
-                        let t = hit != arm.negated;
-                        if t == fb || std::str::from_utf8(cell).is_ok() {
-                            t
-                        } else {
-                            fb
-                        }
+        Some((_, StrColumn::Plain(cells))) => sel.retain(|row| {
+            let fb = fallback(row)?;
+            let pass = match cells.get(row).and_then(Option::as_deref) {
+                None => fb,
+                Some(cell) => {
+                    *tested += 1;
+                    let t = arm.needle.is_in(cell) != arm.negated;
+                    if t == fb || std::str::from_utf8(cell).is_ok() {
+                        t
+                    } else {
+                        fb
                     }
-                };
-                Ok(pass || elsewhere(row)?)
-            })
-        }
+                }
+            };
+            Ok(pass || elsewhere(row)?)
+        }),
         Some((col, StrColumn::Dict(d))) => {
             let values = d.values();
             let verdicts = dict_slot(contains, arm.index, values, |v| vec![None; v.len()]);
@@ -2476,6 +2441,10 @@ impl ContainsNeedle {
     /// hit inside one cell decides that cell; a hit straddling cells decides
     /// none, and every cell it touches is searched on its own. Other cells are
     /// misses. `ends` must not decrease; a cell past `bytes` is a miss.
+    ///
+    /// Not called by [`contains_kernel`]: a plain page's cells are decoded to
+    /// one allocation each, and copying them into one buffer costs what the
+    /// single search saves (`benches/contains_kernel.rs`).
     pub fn is_in_each(&self, bytes: &[u8], ends: &[usize], verdicts: &mut Vec<bool>) {
         verdicts.clear();
         if self.finder.needle().is_empty() {
@@ -2675,19 +2644,14 @@ impl RowSelection {
         Ok(())
     }
 
-    /// Calls `f` on each selected row, in row order.
-    fn for_each(&self, mut f: impl FnMut(usize)) {
+    fn extend_rows(&self, out: &mut Vec<usize>) {
         for (wi, &word) in self.words.iter().enumerate() {
             let mut rest = word;
             while rest != 0 {
-                f(wi * 64 + rest.trailing_zeros() as usize);
+                out.push(wi * 64 + rest.trailing_zeros() as usize);
                 rest &= rest - 1;
             }
         }
-    }
-
-    fn extend_rows(&self, out: &mut Vec<usize>) {
-        self.for_each(|row| out.push(row));
     }
 }
 
@@ -8587,7 +8551,11 @@ mod tests {
                 let cases: [(&str, &[&[u8]], &[bool]); 12] = [
                     ("google", &[b"xgoo", b"gley"], &[false, false]),
                     ("google", &[b"google google", b"x"], &[true, false]),
-                    ("google", &[b"google", b"agoogle", b"googlea"], &[true, true, true]),
+                    (
+                        "google",
+                        &[b"google", b"agoogle", b"googlea"],
+                        &[true, true, true],
+                    ),
                     ("google", &[b"zzgoog", b"legoogle"], &[false, true]),
                     ("google", &[b"goo", b"gle", b"go", b"ogle"], &[false; 4]),
                     ("google", &[b"", b"google", b""], &[false, true, false]),
@@ -8635,7 +8603,7 @@ mod tests {
             /// [`eval`] keeps (a straddle keeps neither cell, a cell holding
             /// the needle after a straddle is kept, an invalid UTF-8 cell
             /// holding it is not), and every present cell counts once in
-            /// `contains_cells_tested`, as it did tested one by one.
+            /// `contains_cells_tested`.
             #[test]
             fn contains_kernel_plain_page_straddles() {
                 let cells = [
