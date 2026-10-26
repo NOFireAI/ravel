@@ -86,7 +86,7 @@ scrape grid.
 | Mimir | `compactor.cleanup_interval` | `15m` | `15m` (unchanged) | Readiness wait, not a query budget | `-compactor.cleanup-interval duration  How frequently the compactor should run blocks cleanup and maintenance, as well as update the bucket index. (default 15m0s)` |
 | Mimir | `limits.max_fetched_chunks_per_query` | `5000000` | `2000000` | 10,000 x 40,320 / 120 samples per chunk = 3,360,000 | `-querier.max-fetched-chunks-per-query int  Maximum number of chunks that can be fetched in a single query ... (default 2000000)`; 120 per chunk observed (9,600 samples in 80 chunks per 2 h block of 20 series) |
 | Mimir | `querier.max_samples` | `500000000` | `50000000` | As for Prometheus | `-querier.max-samples int  Maximum number of samples a single query can load into memory. ... (default 50000000)` |
-| Mimir | `limits.max_estimated_memory_consumption_per_query` | `0` | `0` (unchanged) | Not sized; see the note below | `-querier.max-estimated-memory-consumption-per-query uint  [experimental] ... only enforced when Mimir's query engine is in use. ... 0 to disable.` |
+| Mimir | `limits.max_estimated_memory_consumption_per_query` | `2147483648` (2 GiB) | `0` (disabled) | Half the 4g envelope, which this one process shares with the ingester and the store-gateway; sized to the envelope, not the corpus (see the note below) | `-querier.max-estimated-memory-consumption-per-query uint  [experimental] ... only enforced when Mimir's query engine is in use. ... 0 to disable.` |
 | Mimir | `querier.timeout` | `2m` | `2m` (unchanged) | Equal to Prometheus' `--query.timeout` | `-querier.timeout duration  The timeout for a query. ... (default 2m0s)` |
 | Mimir | `limits.max_total_query_length` | `31d` | `0s` (no limit) | History's 30 d span plus 1 d; `max_query_length` does not exist in 3.2.3 | `-query-frontend.max-total-query-length duration  Limit the total query time range (end - start time).` |
 | Mimir | `limits.max_partial_query_length` | `0s` | `0s` (unchanged) | No separate bound on split sub-queries | `-querier.max-partial-query-length duration  Limit the time range for partial queries at the querier level.` |
@@ -103,9 +103,14 @@ flag.
 
 Under Mimir 3.2.3's default query engine, `querier.max_samples` did not fire:
 with it set to 100, a query over 28,801 samples returned 200. That engine's
-per-query bound is `max_estimated_memory_consumption_per_query`, which is off,
-so on Mimir an oversized query fails on the 4g memory envelope rather than as
-a budget refusal. The value is still frozen for the Prometheus engine.
+per-query bound is `max_estimated_memory_consumption_per_query`, frozen at
+2 GiB so an oversized query is refused with
+`err-mimir-max-estimated-memory-consumption-per-query` (a `refused(budget)`
+outcome, matched by the signature table below) instead of exhausting the 4g
+envelope. Unlike the other Mimir limits it is sized to the envelope, not to
+the corpus, so a large history-profile statement may be refused on Mimir
+where Prometheus answers it. The flag is marked experimental in 3.2.3. The
+`max_samples` value is still frozen for the Prometheus engine.
 
 Mimir readiness: a historical replay is not queried until the bucket index
 lists a block covering the replay's oldest sample and the store-gateway has
