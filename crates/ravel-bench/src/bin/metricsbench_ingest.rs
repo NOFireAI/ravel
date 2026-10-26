@@ -10,13 +10,16 @@
 //! silent drop.
 //!
 //! The stream is the deterministic MetricsBench workload
-//! (`metricsbench_gen`'s generator), parsed back through the shipping encoder
-//! so this lane grows no second workload generator. `--profile` has no default:
-//! the profile selects which data the run touches (CLAUDE.md measurement
-//! discipline).
+//! (`metricsbench_gen`'s generator), streamed one scrape step at a time
+//! through the shipping encoder and classified line by line, so this lane
+//! grows no second workload generator and holds one batch rather than the
+//! whole history. Each comparator replays its own regeneration of the same
+//! stream from the same anchor, and the run fails unless every regeneration's
+//! digest matches the Ravel replay's. `--profile` has no default: the profile
+//! selects which data the run touches (CLAUDE.md measurement discipline).
 //!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
-//! --profile ci --store memory --steps 10`.
+//! --profile ci --store memory --steps 10 --anchor-ms 1700000000000`.
 #![allow(clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -25,11 +28,11 @@ use clap::Parser;
 use ravel_bench::harness::{
     StoreKind, backend_bills_requests, endpoint_host_from_env, store_and_metrics_from_env,
 };
-use ravel_bench::metrics_gen::Generator;
+use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    HttpReplayConfig, LogicalSample, MetricsIngestReport, RavelReplayConfig, Substrate,
-    build_profile_record, parse_logical_stream, query_after_replay, replay_into_ravel,
-    replay_over_http,
+    Anchor, AnchorSource, GeneratedStream, HttpReplayConfig, MetricsIngestReport,
+    RavelReplayConfig, StreamBandViolation, StreamCounts, Substrate, build_profile_record,
+    check_stream_band, query_after_replay, replay_into_ravel, replay_over_http,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_ingest::{Clock, SystemClock};
@@ -59,6 +62,12 @@ struct Args {
     /// `samples_per_series`.
     #[arg(long)]
     steps: Option<u64>,
+    /// Timestamp of the first generated step, in milliseconds since the
+    /// epoch. Given, no clock is read to generate the stream and two runs with
+    /// the same anchor replay the same bytes. Omitted, the anchor is
+    /// `now - steps * scrape interval`, so the newest sample lands near now.
+    #[arg(long, allow_negative_numbers = true)]
+    anchor_ms: Option<i64>,
     /// The object store backing the in-process Ravel path.
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,
@@ -112,11 +121,28 @@ enum RunError {
         system: String,
         source: ravel_bench::metrics_ingest::LaneError,
     },
+    #[error("{system}: {source}")]
+    StreamBand {
+        system: String,
+        source: StreamBandViolation,
+    },
     #[error(
-        "the Ravel sample accounting does not close: {offered} offered != {accepted} accepted + \
-         {rejected} rejected + {dropped} dropped. A silent drop fails the run (ADR-0927 band 4)."
+        "{system} replayed a regeneration whose digest {got} differs from the Ravel replay's \
+         {expected}, so the rows did not see the same stream"
+    )]
+    StreamDiverged {
+        system: String,
+        expected: String,
+        got: String,
+    },
+    #[error(
+        "the {system} sample accounting does not close: {offered} offered against {scalar} \
+         scalar lines, {accepted} accepted + {rejected} rejected + {dropped} dropped. A silent \
+         drop fails the run (ADR-0927 band 4)."
     )]
     AccountingMismatch {
+        system: String,
+        scalar: u64,
         offered: u64,
         accepted: u64,
         rejected: u64,
@@ -145,36 +171,66 @@ fn resolve_steps(args: &Args, workload: &WorkloadFile) -> Result<u64, RunError> 
         })
 }
 
+/// The first step's timestamp: the flag if set, read without touching the
+/// clock; else `now - steps * scrape interval`, so the newest generated sample
+/// lands near now and a strict write lands inside a plausible ingest window
+/// rather than in 1970.
+fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Anchor {
+    if let Some(ms) = args.anchor_ms {
+        return Anchor {
+            ms,
+            source: AnchorSource::Explicit,
+        };
+    }
+    let now_ms = SystemClock.now_ns() / 1_000_000;
+    Anchor {
+        ms: now_ms - steps as i64 * scrape_interval_secs as i64 * 1_000,
+        source: AnchorSource::Clock,
+    }
+}
+
+/// Close a drained stream and check one row against it: the stream half of
+/// band 4, then the sample accounting over the scalar lines.
+fn close_row(
+    system: &str,
+    stream: GeneratedStream<'_>,
+    ingest: &ravel_bench::metrics_ingest::IngestPhase,
+) -> Result<(GenerationReport, StreamCounts), RunError> {
+    let (report, counts) = stream
+        .finish()
+        .map_err(|e| RunError::Generate(e.to_string()))?;
+    check_stream_band(&counts, &report).map_err(|source| RunError::StreamBand {
+        system: system.to_string(),
+        source,
+    })?;
+    if ingest.offered_samples != counts.scalar
+        || ingest.accepted_samples + ingest.rejected_samples + ingest.dropped_samples
+            != ingest.offered_samples
+    {
+        return Err(RunError::AccountingMismatch {
+            system: system.to_string(),
+            scalar: counts.scalar,
+            offered: ingest.offered_samples,
+            accepted: ingest.accepted_samples,
+            rejected: ingest.rejected_samples,
+            dropped: ingest.dropped_samples,
+        });
+    }
+    Ok((report, counts))
+}
+
 async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let workload = load_workload(&args.workload).map_err(|e| RunError::Workload(e.to_string()))?;
     let steps = resolve_steps(args, &workload)?;
-
-    // Anchor the newest generated sample near now, so a strict write lands
-    // inside a plausible ingest window rather than in 1970.
-    let scrape_ms = workload
-        .profile(&args.profile)
-        .map(|p| p.scrape_interval_secs as i64 * 1_000)
-        .unwrap_or(15_000);
-    let now_ms = SystemClock.now_ns() / 1_000_000;
-    let base_ts_ms = now_ms - steps as i64 * scrape_ms;
-
-    let (bytes, gen_report) = Generator::new(&workload, &args.profile, base_ts_ms)
-        .map_err(|e| RunError::Generate(e.to_string()))?
-        .generate_bytes(steps)
-        .map_err(|e| RunError::Generate(e.to_string()))?;
-    let logical_input_bytes = bytes.len() as u64;
-    let text = String::from_utf8(bytes).map_err(|e| RunError::Generate(e.to_string()))?;
-    let stream: Vec<LogicalSample> = parse_logical_stream(&text);
-
-    // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
-    // generator's exact counts for the two figures that are not directly
-    // declared (total series created, logical input bytes) -- never derived
-    // from the offered sample count.
     let profile = workload.profile(&args.profile).ok_or_else(|| {
         RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
     })?;
-    let profile_record =
-        build_profile_record(&workload, profile, steps, logical_input_bytes, &gen_report);
+    let anchor = resolve_anchor(args, profile.scrape_interval_secs, steps);
+    let stream_from_anchor = || -> Result<GeneratedStream<'_>, RunError> {
+        let generator = Generator::new(&workload, &args.profile, anchor.ms)
+            .map_err(|e| RunError::Generate(e.to_string()))?;
+        Ok(GeneratedStream::new(generator, steps))
+    };
 
     // The in-process Ravel path: strict, durable-on-ack, commit tokens.
     let (store, store_metrics) = store_and_metrics_from_env(args.store);
@@ -193,23 +249,30 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         ack_timeout_secs: args.ack_timeout_secs,
         tenant: TenantId::new(args.tenant.clone()),
     };
-    let ravel = replay_into_ravel(&ravel_cfg, &stream)
+    let mut ravel_stream = stream_from_anchor()?;
+    let ravel = replay_into_ravel(&ravel_cfg, &mut ravel_stream)
         .await
         .map_err(|e| RunError::Replay(e.to_string()))?;
 
-    // Band 4: the Ravel accounting must close.
-    let ing = &ravel.result.ingest;
-    if ing.accepted_samples + ing.rejected_samples + ing.dropped_samples != ing.offered_samples {
-        return Err(RunError::AccountingMismatch {
-            offered: ing.offered_samples,
-            accepted: ing.accepted_samples,
-            rejected: ing.rejected_samples,
-            dropped: ing.dropped_samples,
-        });
-    }
-    if ing.accepted_samples == 0 {
+    // Band 4: the stream closes against the generator and the Ravel
+    // accounting closes over its scalar lines.
+    let (gen_report, _) = close_row("ravel", ravel_stream, &ravel.result.ingest)?;
+    if ravel.result.ingest.accepted_samples == 0 {
         return Err(RunError::NothingIngested);
     }
+
+    // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
+    // generator's exact counts for the figures that are not directly declared
+    // (total series created, logical input bytes) -- never derived from the
+    // offered sample count.
+    let profile_record = build_profile_record(
+        &workload,
+        profile,
+        steps,
+        gen_report.bytes,
+        &gen_report,
+        anchor,
+    );
 
     // Post-ingest read-your-write query phase (ADR-0927 decision 3): pass the
     // strict writes' commit tokens as `min_commit_token` and evaluate an instant
@@ -217,10 +280,9 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     // committed segments deterministically. Recorded as its own phase, separate
     // from ingest (decision 9). Runs while `ravel` is still whole, before its
     // result row is moved into `rows`.
-    let query_expr = stream
-        .iter()
-        .find(|s| s.validate().is_ok())
-        .map(|s| s.metric.clone())
+    let query_expr = ravel
+        .first_metric
+        .clone()
         .ok_or(RunError::NothingIngested)?;
     let query = query_after_replay(&ravel, &query_expr)
         .await
@@ -242,12 +304,21 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
             max_retries: args.http_max_retries,
             timeout_secs: args.http_timeout_secs,
         };
-        let row = replay_over_http(&http_cfg, &stream)
+        let mut stream = stream_from_anchor()?;
+        let row = replay_over_http(&http_cfg, &mut stream)
             .await
             .map_err(|source| RunError::Http {
                 system: system.to_string(),
                 source,
             })?;
+        let (report, _) = close_row(system, stream, &row.ingest)?;
+        if report.digest != gen_report.digest {
+            return Err(RunError::StreamDiverged {
+                system: system.to_string(),
+                expected: gen_report.digest.clone(),
+                got: report.digest,
+            });
+        }
         rows.push(row);
     }
 

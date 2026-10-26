@@ -6,7 +6,36 @@
 //! bin a caller runs, not only from the lib unit tests.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::alloc::System;
 use std::process::Command;
+use std::sync::Mutex;
+
+use ravel_bench::metrics_gen::Generator;
+use ravel_bench::metrics_ingest::{
+    GeneratedStream, LogicalSample, SampleBatches, StreamRecord, classify_line,
+};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+/// The allocator counts every thread, so each test holds this for its whole
+/// body and a measurement never sees another test's allocations.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn ci_workload() -> ravel_bench::metrics_workload::WorkloadFile {
+    ravel_bench::metrics_workload::load_workload(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/metrics/workload.json"
+    )))
+    .expect("load the same workload manifest the binary loads")
+}
 
 /// Run the bin over the `ci` profile against an in-process `MemoryStore`, a few
 /// steps, no comparator endpoints, and return the JSON report it prints.
@@ -41,8 +70,9 @@ fn run_lane() -> serde_json::Value {
 }
 
 /// Run the bin over the `ci` profile for exactly `steps` scrapes (no
-/// assumption that `steps` covers the profile's full declared step count).
-fn run_lane_with_steps(steps: u64) -> serde_json::Value {
+/// assumption that `steps` covers the profile's full declared step count),
+/// with the first step at `anchor_ms`.
+fn run_lane_with_steps(steps: u64, anchor_ms: i64) -> serde_json::Value {
     let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
     let output = Command::new(bin)
         .args([
@@ -52,6 +82,8 @@ fn run_lane_with_steps(steps: u64) -> serde_json::Value {
             "memory",
             "--steps",
             &steps.to_string(),
+            "--anchor-ms",
+            &anchor_ms.to_string(),
             "--shards",
             "2",
             "--batch-size",
@@ -70,7 +102,12 @@ fn run_lane_with_steps(steps: u64) -> serde_json::Value {
 
 #[test]
 fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
+    let _serial = serial();
     let report = run_lane();
+    assert_eq!(
+        report["profile"]["run"]["anchor_source"], "clock",
+        "without --anchor-ms the anchor is read from the clock, and the report says so"
+    );
     let systems = report["systems"].as_array().expect("systems array");
 
     // With no comparator endpoints supplied, exactly the Ravel row is present.
@@ -163,11 +200,8 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
 /// and the first assertion below fails.
 #[test]
 fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures() {
-    let workload = ravel_bench::metrics_workload::load_workload(std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../benchmarks/metrics/workload.json"
-    )))
-    .expect("load the same workload manifest the binary loads");
+    let _serial = serial();
+    let workload = ci_workload();
     let expected = workload
         .profile("ci")
         .expect("manifest declares a `ci` profile");
@@ -181,8 +215,64 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         .expect("generator builds for the ci profile");
     let expected_total_series_created = generator.total_series_created(STEPS);
 
-    let report = run_lane_with_steps(STEPS);
+    // A now-based anchor, so the strict write lands in a plausible ingest
+    // window, passed explicitly so the test can regenerate the same stream.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_millis() as i64;
+    let anchor_ms = now_ms - STEPS as i64 * expected.scrape_interval_secs as i64 * 1_000;
+    let (_, gen_report) = Generator::new(&workload, "ci", anchor_ms)
+        .expect("generator builds")
+        .generate_bytes(STEPS)
+        .expect("generates");
+
+    let report = run_lane_with_steps(STEPS, anchor_ms);
     let profile = &report["profile"];
+
+    assert_eq!(profile["run"]["anchor_source"], "explicit");
+    assert_eq!(profile["run"]["anchor_ms"].as_i64(), Some(anchor_ms));
+    assert_eq!(
+        profile["run"]["total_samples_generated"].as_u64(),
+        Some(gen_report.emitted_samples),
+        "the bin generated the stream this test regenerated from the same anchor"
+    );
+
+    // Every row's stream counts are the generator's per-type figures, and the
+    // scalar accounting names the two excluded kinds.
+    let ravel = &report["systems"][0];
+    let counts = &ravel["ingest"]["stream_counts"];
+    assert_eq!(
+        counts["generated_lines"].as_u64(),
+        Some(gen_report.emitted_samples)
+    );
+    assert_eq!(counts["scalar"].as_u64(), Some(gen_report.float_samples));
+    assert_eq!(
+        counts["native_histogram"].as_u64(),
+        Some(gen_report.native_histogram_samples)
+    );
+    assert_eq!(
+        counts["stale_marker"].as_u64(),
+        Some(gen_report.stale_markers)
+    );
+    assert_eq!(counts["malformed"].as_u64(), Some(0));
+    assert_eq!(
+        ravel["ingest"]["offered_samples"].as_u64(),
+        Some(gen_report.float_samples),
+        "the replay offers exactly the scalar lines"
+    );
+    let excluded_native = ravel["ingest"]["excluded_native_histogram"]
+        .as_u64()
+        .expect("excluded_native_histogram");
+    let excluded_stale = ravel["ingest"]["excluded_stale_marker"]
+        .as_u64()
+        .expect("excluded_stale_marker");
+    assert_eq!(excluded_native, gen_report.native_histogram_samples);
+    assert_eq!(excluded_stale, gen_report.stale_markers);
+    assert!(
+        excluded_native > 0 && excluded_stale > 0,
+        "the ci stream carries both excluded kinds at {STEPS} steps"
+    );
 
     // This run truncates the profile (STEPS < samples_per_series, asserted
     // below), so this only exercises the truncation branch of
@@ -302,4 +392,89 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     let substrate = &report["substrate"];
     assert_eq!(substrate["store_backend"].as_str(), Some("memory"));
     assert_eq!(substrate["backend_bills_requests"].as_bool(), Some(false));
+}
+
+/// The replay's batch size, the bin's own `--batch-size` default.
+const MEMORY_BATCH: usize = 4096;
+
+/// Bytes the global allocator holds now that it did not hold when `region`
+/// was opened. `stats_alloc` already books a realloc's growth or shrink under
+/// `bytes_allocated` or `bytes_deallocated`, so `bytes_reallocated` is not
+/// added again.
+fn live_bytes(region: &Region<'_, System>) -> i64 {
+    let change = region.change();
+    change.bytes_allocated as i64 - change.bytes_deallocated as i64
+}
+
+/// Peak live bytes while draining a `ci` stream of `steps` scrapes batch by
+/// batch, sampled with each batch held, the way a replay holds it.
+fn streaming_peak(steps: u64) -> i64 {
+    let workload = ci_workload();
+    let region = Region::new(GLOBAL);
+    let mut stream = GeneratedStream::new(
+        Generator::new(&workload, "ci", 1_700_000_000_000).expect("generator builds"),
+        steps,
+    );
+    let mut peak = live_bytes(&region);
+    let mut offered = 0u64;
+    while let Some(batch) = stream.next_batch(MEMORY_BATCH).expect("generates") {
+        peak = peak.max(live_bytes(&region));
+        offered += batch.len() as u64;
+    }
+    let (_, counts) = stream.finish().expect("drained stream closes");
+    assert_eq!(offered, counts.scalar);
+    peak
+}
+
+/// The negative control: the whole stream materialised, bytes then every
+/// scalar sample, as the pre-streaming lane held it.
+fn materialised_live(steps: u64) -> i64 {
+    let workload = ci_workload();
+    let region = Region::new(GLOBAL);
+    let (bytes, _) = Generator::new(&workload, "ci", 1_700_000_000_000)
+        .expect("generator builds")
+        .generate_bytes(steps)
+        .expect("generates");
+    let samples: Vec<LogicalSample> = std::str::from_utf8(&bytes)
+        .expect("utf8")
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| match classify_line(i as u64 + 1, line) {
+            StreamRecord::Scalar(sample) => Some(sample),
+            _ => None,
+        })
+        .collect();
+    let live = live_bytes(&region);
+    drop((bytes, samples));
+    live
+}
+
+/// Required test (iii): streaming replay memory is bounded by batch size and
+/// step width, not by history length. Four times the steps leaves the
+/// streaming peak within 1.5x, while the materialised stream grows past 3x,
+/// which shows the measurement can see history-proportional growth.
+#[test]
+fn streaming_replay_memory_does_not_grow_with_history_length() {
+    let _serial = serial();
+    let (short, long) = (120, 480);
+    let stream_short = streaming_peak(short);
+    let stream_long = streaming_peak(long);
+    let held_short = materialised_live(short);
+    let held_long = materialised_live(long);
+    let streaming_ratio = stream_long as f64 / stream_short as f64;
+    let materialised_ratio = held_long as f64 / held_short as f64;
+    eprintln!(
+        "streaming peak {stream_short} B at {short} steps, {stream_long} B at {long} \
+         (ratio {streaming_ratio:.3}); materialised {held_short} B, {held_long} B \
+         (ratio {materialised_ratio:.3})"
+    );
+    assert!(stream_short > 0 && held_short > 0);
+    assert!(
+        streaming_ratio <= 1.5,
+        "streaming peak grew {streaming_ratio:.3}x for 4x the steps"
+    );
+    assert!(
+        materialised_ratio > 3.0,
+        "the materialised control grew only {materialised_ratio:.3}x for 4x the steps"
+    );
 }

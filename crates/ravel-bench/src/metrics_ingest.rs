@@ -36,7 +36,28 @@
 //! ## Exact-count discipline (ADR-0927 bands 4/5)
 //!
 //! Every count the lane controls is exact and closes: `offered_samples ==
-//! accepted_samples + rejected_samples + dropped_samples`. A figure the lane
+//! accepted_samples + rejected_samples + dropped_samples`, over the stream's
+//! scalar (float) lines. Every line is classified ([`classify_line`]) as a
+//! scalar, a native histogram, a staleness marker or a malformed line, and
+//! each row's `stream_counts` counts all four, so nothing leaves the replay
+//! uncounted: the two non-scalar kinds are named exclusions
+//! (`excluded_native_histogram`, `excluded_stale_marker`) from the scalar
+//! replay. [`check_stream_band`] holds the stream to band 4: the four counts
+//! sum to `generated_lines`, `generated_lines` equals the generator's
+//! `emitted_samples`, and `malformed` is zero.
+//!
+//! ## Bounded streaming replay
+//!
+//! A replay pulls batches from a [`SampleBatches`] source rather than holding
+//! the stream. [`GeneratedStream`] generates one scrape step at a time and
+//! queues only that step's scalar samples, so what a replay holds is bounded
+//! by the batch size and one step's width, not by the run's length
+//! (`metricsbench_ingest_smoke::streaming_replay_memory_does_not_grow_with_
+//! history_length`). Its bytes, write order and digest are the one-shot
+//! generator's (`metrics_ingest::tests::streaming_is_deterministic_and_
+//! matches_one_shot_generation`).
+//!
+//! A figure the lane
 //! cannot measure on a system is ABSENT (an `Option`), never a zero standing in
 //! for unmeasured: a buffered system has no commit tokens (`None`, not an empty
 //! vec), an HTTP comparator has no object-store accounting the bench can see
@@ -84,6 +105,10 @@
 //! - `run`: a [`RunRecord`], scoped to `steps_run`, never the declared full
 //!   profile:
 //!   - `steps`: equal to `steps_run`.
+//!   - `anchor_ms`: the first generated step's timestamp, in milliseconds.
+//!   - `anchor_source`: `explicit` when `--anchor-ms` set it (no clock was
+//!     read to generate the stream), `clock` when it was derived as
+//!     `now - steps * scrape interval`.
 //!   - `total_series_created`: distinct series the generator actually
 //!     created over these steps, the generator's exact count.
 //!   - `logical_input_bytes`: uncompressed input bytes the generator
@@ -257,7 +282,17 @@ impl LatencyReport {
 /// lane owns query.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IngestPhase {
-    /// Logical samples offered to the system. `accepted + rejected + dropped`.
+    /// Every line of the stream this row replayed, counted by kind. The sample
+    /// accounting below is over the `scalar` lines only.
+    pub stream_counts: StreamCounts,
+    /// Native-histogram lines the scalar replay excluded by name
+    /// (`stream_counts.native_histogram`): never offered, never dropped.
+    pub excluded_native_histogram: u64,
+    /// Staleness-marker lines the scalar replay excluded by name
+    /// (`stream_counts.stale_marker`).
+    pub excluded_stale_marker: u64,
+    /// Scalar logical samples offered to the system. `accepted + rejected +
+    /// dropped`.
     pub offered_samples: u64,
     /// Samples the system acknowledged.
     pub accepted_samples: u64,
@@ -273,13 +308,15 @@ pub struct IngestPhase {
     /// Transport retries: object-store PUT retries below `InstrumentedStore`
     /// for Ravel, HTTP 429/5xx retries for a comparator.
     pub retries: u64,
-    /// Wall time of the ingest phase. The two lanes time DIFFERENT work, so a
-    /// throughput comparison must account for it: the Ravel window covers only
-    /// the in-process `write_values` calls (the RW1.0 encode that yields
-    /// `wire_bytes` is precomputed OUTSIDE this window, since the in-process
+    /// Time of the ingest phase, summed over the timed segments only: the
+    /// stream is generated batch by batch during the replay, and generating it
+    /// is never inside a segment. The two lanes time DIFFERENT work, so a
+    /// throughput comparison must account for it: the Ravel segments are the
+    /// in-process `write_values` calls and the final `flush_all` (the RW1.0
+    /// encode that yields `wire_bytes` runs OUTSIDE them, since the in-process
     /// path never serializes an RW1.0 body to ingest), while an HTTP
-    /// comparator's window includes its genuine per-batch encode and POST,
-    /// which is real client work for that lane.
+    /// comparator's segments are its genuine per-batch encode and POST, which
+    /// is real client work for that lane.
     pub elapsed_secs: f64,
     /// Accepted logical samples per second.
     pub logical_points_per_sec: f64,
@@ -298,7 +335,8 @@ pub struct IngestPhase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rss_bytes: Option<u64>,
     /// CPU seconds the bench process spent during the run, or `None` where
-    /// unmeasured (non-Linux, or a remote comparator).
+    /// unmeasured (non-Linux, or a remote comparator). It covers the whole
+    /// replay, so it includes generating and classifying the streamed input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_secs: Option<f64>,
 }
@@ -516,6 +554,10 @@ pub struct ProfileRecord {
 pub struct RunRecord {
     /// Steps this run generated. Equal to `ProfileRecord::steps_run`.
     pub steps: u64,
+    /// Timestamp of the first generated step, in milliseconds since the epoch.
+    pub anchor_ms: i64,
+    /// Where `anchor_ms` came from: the `--anchor-ms` flag, or the clock.
+    pub anchor_source: AnchorSource,
     /// Distinct series the generator actually created over these steps.
     pub total_series_created: u64,
     /// Logical (uncompressed, pre-wire) input bytes the generator produced
@@ -528,6 +570,27 @@ pub struct RunRecord {
     /// these steps (`Generator::scaling_label_cardinality`), across every
     /// family and every churn epoch these steps span.
     pub scaling_label_cardinality: u64,
+}
+
+/// Where a run's generation anchor (the first step's timestamp) came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorSource {
+    /// Passed with `--anchor-ms`: no clock was read to generate the stream, so
+    /// two runs with the same anchor generate the same bytes.
+    Explicit,
+    /// Derived from the wall clock (`now - steps * scrape interval`), so the
+    /// stream's timestamps differ run to run.
+    Clock,
+}
+
+/// A run's generation anchor and its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// Timestamp of the first generated step, in milliseconds.
+    pub ms: i64,
+    /// Where `ms` came from.
+    pub source: AnchorSource,
 }
 
 /// The scaling label's identity and its cardinality over a profile's full
@@ -571,16 +634,16 @@ pub struct FamilyRecord {
 /// declared count, `comparable` and `comparability_reason` come straight
 /// from `profile.comparability`.
 ///
-/// A caller passes `steps_run` and `logical_input_bytes` separately from
-/// `gen_report` because both are known before the report is built: the
-/// former is the `--steps` the run resolved to, the latter is the encoded
-/// stream's length before it is parsed back into [`LogicalSample`]s.
+/// `steps_run` is the `--steps` the run resolved to and `logical_input_bytes`
+/// the encoded stream's length (the generator's own `bytes` for a streamed
+/// run); `anchor` is the first step's timestamp and where it came from.
 pub fn build_profile_record(
     workload: &WorkloadFile,
     profile: &Profile,
     steps_run: u64,
     logical_input_bytes: u64,
     gen_report: &crate::metrics_gen::GenerationReport,
+    anchor: Anchor,
 ) -> ProfileRecord {
     let families = workload
         .families
@@ -626,6 +689,8 @@ pub fn build_profile_record(
         families,
         run: RunRecord {
             steps: steps_run,
+            anchor_ms: anchor.ms,
+            anchor_source: anchor.source,
             total_series_created: gen_report.total_series_created,
             logical_input_bytes,
             total_samples_generated: gen_report.emitted_samples,
@@ -773,6 +838,10 @@ pub enum LaneError {
     /// or query engine, or evaluating the instant query).
     #[error("the read-your-write query phase failed: {0}")]
     Query(String),
+    /// Generating the streamed workload failed, or a [`GeneratedStream`] was
+    /// closed before it was drained.
+    #[error("generating the replayed stream failed: {0}")]
+    Generate(String),
 }
 
 /// Map a reqwest client-build failure to the transport-setup variant. The
@@ -854,41 +923,367 @@ fn ingest_point(tenant: &TenantId, sample: &LogicalSample) -> Result<IngestPoint
     })
 }
 
-/// Parse a MetricsBench generated stream (the canonical `metrics_gen` encoding,
-/// `<ts_ms>\t<metric>{<labels>}\t<payload>`) into the scalar logical samples
-/// the ingest lane replays. Only float payloads (`f 0x<bits>`) become logical
-/// samples; native-histogram (`h ...`) and staleness (`stale`) lines are
-/// skipped, since the portable scalar replay does not model them. Reusing the
-/// shipping encoder as the single source keeps this lane from growing a second
-/// workload generator (an ADR-0927 rejected alternative).
-pub fn parse_logical_stream(text: &str) -> Vec<LogicalSample> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let mut parts = line.split('\t');
-        let (Some(ts), Some(series), Some(payload)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        let Some(hex) = payload.strip_prefix("f 0x") else {
-            continue; // native histogram or staleness marker: not a scalar
-        };
-        let Ok(ts_ms) = ts.parse::<i64>() else {
-            continue;
-        };
-        let Ok(bits) = u64::from_str_radix(hex, 16) else {
-            continue;
-        };
-        let Some((metric, labels)) = parse_series(series) else {
-            continue;
-        };
-        out.push(LogicalSample {
-            metric,
-            labels,
-            ts_ms,
-            value: f64::from_bits(bits),
-        });
+/// Why a line of a generated stream could not be classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MalformedReason {
+    /// The line does not carry three non-empty tab-separated fields
+    /// (timestamp, series, payload).
+    MissingField,
+    /// The timestamp field is not an `i64` of milliseconds.
+    BadTimestamp,
+    /// A float payload's (or a native histogram's `sum`) bits are not exactly
+    /// sixteen hex digits after `0x`.
+    BadFloatBits,
+    /// The series field is not `metric{k="v",...}`.
+    BadSeries,
+    /// The payload is none of the three shapes the encoder writes (`f 0x..`,
+    /// `stale`, `h schema=.. count=.. sum=0x.. deltas=..`), a native histogram
+    /// whose other fields do not parse, or the line is not UTF-8.
+    UnknownPayload,
+}
+
+/// One line of a generated stream (the canonical `metrics_gen` encoding,
+/// `<ts_ms>\t<metric>{<labels>}\t<payload>`), classified. Every line becomes
+/// exactly one record, so a line the scalar replay does not send is counted
+/// under its kind rather than skipped.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamRecord {
+    /// A float payload: the unit the scalar replay sends.
+    Scalar(LogicalSample),
+    /// A native-histogram payload. The portable RW1.0 scalar replay does not
+    /// model it, so it is excluded by name, never silently.
+    NativeHistogram {
+        ts_ms: i64,
+        series: String,
+        schema: i32,
+        count: u64,
+        sum_bits: u64,
+        deltas_len: usize,
+    },
+    /// A staleness marker. Excluded from the scalar replay by name.
+    StaleMarker { ts_ms: i64, series: String },
+    /// A line that does not parse. `line_no` is 1-based over the whole stream.
+    Malformed {
+        line_no: u64,
+        reason: MalformedReason,
+    },
+}
+
+/// Exactly sixteen hex digits, the encoder's `{:016x}` bit spelling.
+fn parse_hex_bits(hex: &str) -> Option<u64> {
+    if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
     }
-    out
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Parse a native-histogram payload body (after `h `).
+fn parse_native_histogram(body: &str) -> Result<(i32, u64, u64, usize), MalformedReason> {
+    let mut fields = body.split(' ');
+    let (Some(schema), Some(count), Some(sum), Some(deltas), None) = (
+        fields.next().and_then(|f| f.strip_prefix("schema=")),
+        fields.next().and_then(|f| f.strip_prefix("count=")),
+        fields.next().and_then(|f| f.strip_prefix("sum=0x")),
+        fields.next().and_then(|f| f.strip_prefix("deltas=")),
+        fields.next(),
+    ) else {
+        return Err(MalformedReason::UnknownPayload);
+    };
+    let schema = schema
+        .parse::<i32>()
+        .map_err(|_| MalformedReason::UnknownPayload)?;
+    let count = count
+        .parse::<u64>()
+        .map_err(|_| MalformedReason::UnknownPayload)?;
+    let sum_bits = parse_hex_bits(sum).ok_or(MalformedReason::BadFloatBits)?;
+    let deltas_len = if deltas.is_empty() {
+        0
+    } else {
+        let mut n = 0usize;
+        for delta in deltas.split(',') {
+            delta
+                .parse::<i64>()
+                .map_err(|_| MalformedReason::UnknownPayload)?;
+            n += 1;
+        }
+        n
+    };
+    Ok((schema, count, sum_bits, deltas_len))
+}
+
+/// Classify one line (without its trailing newline) of a generated stream.
+/// `line_no` is the line's 1-based position, carried on a
+/// [`StreamRecord::Malformed`] so a bad line can be found.
+pub fn classify_line(line_no: u64, line: &str) -> StreamRecord {
+    let malformed = |reason| StreamRecord::Malformed { line_no, reason };
+    let mut parts = line.splitn(3, '\t');
+    let (Some(ts), Some(series), Some(payload)) = (parts.next(), parts.next(), parts.next()) else {
+        return malformed(MalformedReason::MissingField);
+    };
+    if ts.is_empty() || series.is_empty() || payload.is_empty() {
+        return malformed(MalformedReason::MissingField);
+    }
+    let Ok(ts_ms) = ts.parse::<i64>() else {
+        return malformed(MalformedReason::BadTimestamp);
+    };
+    let Some((metric, labels)) = parse_series(series) else {
+        return malformed(MalformedReason::BadSeries);
+    };
+    if let Some(hex) = payload.strip_prefix("f 0x") {
+        return match parse_hex_bits(hex) {
+            Some(bits) => StreamRecord::Scalar(LogicalSample {
+                metric,
+                labels,
+                ts_ms,
+                value: f64::from_bits(bits),
+            }),
+            None => malformed(MalformedReason::BadFloatBits),
+        };
+    }
+    if payload == "stale" {
+        return StreamRecord::StaleMarker {
+            ts_ms,
+            series: series.to_string(),
+        };
+    }
+    if let Some(body) = payload.strip_prefix("h ") {
+        return match parse_native_histogram(body) {
+            Ok((schema, count, sum_bits, deltas_len)) => StreamRecord::NativeHistogram {
+                ts_ms,
+                series: series.to_string(),
+                schema,
+                count,
+                sum_bits,
+                deltas_len,
+            },
+            Err(reason) => malformed(reason),
+        };
+    }
+    malformed(MalformedReason::UnknownPayload)
+}
+
+/// Per-kind line counts of a replayed stream. Every line is counted under
+/// exactly one kind, so `scalar + native_histogram + stale_marker + malformed
+/// == generated_lines` holds by construction and [`check_stream_band`] checks
+/// it anyway.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCounts {
+    /// Lines read from the stream.
+    pub generated_lines: u64,
+    /// Float lines: the samples the scalar replay offers.
+    pub scalar: u64,
+    /// Native-histogram lines, excluded from the scalar replay.
+    pub native_histogram: u64,
+    /// Staleness-marker lines, excluded from the scalar replay.
+    pub stale_marker: u64,
+    /// Lines that did not parse. Band 4 requires zero.
+    pub malformed: u64,
+}
+
+impl StreamCounts {
+    /// Count one classified line.
+    pub fn record(&mut self, record: &StreamRecord) {
+        self.generated_lines += 1;
+        match record {
+            StreamRecord::Scalar(_) => self.scalar += 1,
+            StreamRecord::NativeHistogram { .. } => self.native_histogram += 1,
+            StreamRecord::StaleMarker { .. } => self.stale_marker += 1,
+            StreamRecord::Malformed { .. } => self.malformed += 1,
+        }
+    }
+
+    /// The four per-kind counts summed.
+    pub fn classified(&self) -> u64 {
+        self.scalar + self.native_histogram + self.stale_marker + self.malformed
+    }
+}
+
+/// The stream half of ADR-0927 band 4 failed: the lines the replay classified
+/// do not close against themselves or against what the generator emitted, or
+/// a line was malformed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the replayed stream does not close (ADR-0927 band 4): {scalar} scalar + {native_histogram} \
+     native histogram + {stale_marker} stale marker + {malformed} malformed = {classified} \
+     classified, against {generated_lines} lines read and {emitted_samples} samples the \
+     generator emitted; band 4 requires classified == lines read == emitted and zero malformed"
+)]
+pub struct StreamBandViolation {
+    pub generated_lines: u64,
+    pub scalar: u64,
+    pub native_histogram: u64,
+    pub stale_marker: u64,
+    pub malformed: u64,
+    pub classified: u64,
+    pub emitted_samples: u64,
+}
+
+/// Check a replayed stream's counts against the generator's own report: the
+/// four kinds sum to the lines read, the lines read equal the samples the
+/// generator emitted, and no line was malformed.
+pub fn check_stream_band(
+    counts: &StreamCounts,
+    report: &crate::metrics_gen::GenerationReport,
+) -> Result<(), StreamBandViolation> {
+    let classified = counts.classified();
+    if classified == counts.generated_lines
+        && counts.generated_lines == report.emitted_samples
+        && counts.malformed == 0
+    {
+        return Ok(());
+    }
+    Err(StreamBandViolation {
+        generated_lines: counts.generated_lines,
+        scalar: counts.scalar,
+        native_histogram: counts.native_histogram,
+        stale_marker: counts.stale_marker,
+        malformed: counts.malformed,
+        classified,
+        emitted_samples: report.emitted_samples,
+    })
+}
+
+/// A source of scalar samples a replay pulls in batches, in stream order, so
+/// a replay holds one batch at a time rather than the whole history.
+pub trait SampleBatches {
+    /// The next at most `max` scalar samples (`max` is raised to 1), or `None`
+    /// once the stream is exhausted. A returned batch is never empty.
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalSample>>, LaneError>;
+    /// Per-kind counts of the lines read so far.
+    fn stream_counts(&self) -> StreamCounts;
+}
+
+/// A [`SampleBatches`] over samples already in memory, each counted as one
+/// scalar line.
+pub struct SliceSamples<'s> {
+    samples: &'s [LogicalSample],
+    pos: usize,
+}
+
+impl<'s> SliceSamples<'s> {
+    /// Serve `samples` in order.
+    pub fn new(samples: &'s [LogicalSample]) -> Self {
+        SliceSamples { samples, pos: 0 }
+    }
+}
+
+impl SampleBatches for SliceSamples<'_> {
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalSample>>, LaneError> {
+        let rest = &self.samples[self.pos..];
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let n = max.max(1).min(rest.len());
+        self.pos += n;
+        Ok(Some(rest[..n].to_vec()))
+    }
+
+    fn stream_counts(&self) -> StreamCounts {
+        let pulled = self.pos as u64;
+        StreamCounts {
+            generated_lines: pulled,
+            scalar: pulled,
+            ..StreamCounts::default()
+        }
+    }
+}
+
+/// The MetricsBench generator as a [`SampleBatches`]: it generates one scrape
+/// step at a time into a reused buffer, classifies each line, and queues only
+/// that step's scalar samples. What it holds is bounded by one step's lines
+/// plus one batch, whatever the number of steps. Reusing the shipping encoder
+/// as the single source keeps this lane from growing a second workload
+/// generator (an ADR-0927 rejected alternative).
+pub struct GeneratedStream<'a> {
+    generator: crate::metrics_gen::Generator<'a>,
+    steps: u64,
+    tally: crate::metrics_gen::GenerationTally,
+    step_bytes: Vec<u8>,
+    pending: std::collections::VecDeque<LogicalSample>,
+    counts: StreamCounts,
+}
+
+impl<'a> GeneratedStream<'a> {
+    /// Stream `steps` scrapes from `generator`, which must not have generated
+    /// anything yet.
+    pub fn new(generator: crate::metrics_gen::Generator<'a>, steps: u64) -> Self {
+        GeneratedStream {
+            generator,
+            steps,
+            tally: crate::metrics_gen::GenerationTally::new(),
+            step_bytes: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            counts: StreamCounts::default(),
+        }
+    }
+
+    /// Generate and classify the next step. `false` once every step is done.
+    fn advance_step(&mut self) -> Result<bool, LaneError> {
+        let step = self.tally.steps_generated();
+        if step >= self.steps {
+            return Ok(false);
+        }
+        self.step_bytes.clear();
+        self.generator
+            .generate_steps_into(step, step + 1, &mut self.step_bytes, &mut self.tally)
+            .map_err(|e| LaneError::Generate(e.to_string()))?;
+        for raw in self.step_bytes.split_inclusive(|b| *b == b'\n') {
+            let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+            let line_no = self.counts.generated_lines + 1;
+            let record = match std::str::from_utf8(raw) {
+                Ok(line) => classify_line(line_no, line),
+                Err(_) => StreamRecord::Malformed {
+                    line_no,
+                    reason: MalformedReason::UnknownPayload,
+                },
+            };
+            self.counts.record(&record);
+            if let StreamRecord::Scalar(sample) = record {
+                self.pending.push_back(sample);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Close a drained stream: the generator's own report over every step,
+    /// and the per-kind counts of every line. Refused before the stream is
+    /// exhausted, since the report would then describe samples nobody offered.
+    pub fn finish(self) -> Result<(crate::metrics_gen::GenerationReport, StreamCounts), LaneError> {
+        if self.tally.steps_generated() != self.steps || !self.pending.is_empty() {
+            return Err(LaneError::Generate(format!(
+                "the stream was closed after {} of {} steps with {} samples unread",
+                self.tally.steps_generated(),
+                self.steps,
+                self.pending.len()
+            )));
+        }
+        let report = self
+            .generator
+            .finish_report(self.tally)
+            .map_err(|e| LaneError::Generate(e.to_string()))?;
+        Ok((report, self.counts))
+    }
+}
+
+impl SampleBatches for GeneratedStream<'_> {
+    fn next_batch(&mut self, max: usize) -> Result<Option<Vec<LogicalSample>>, LaneError> {
+        let max = max.max(1);
+        while self.pending.len() < max {
+            if !self.advance_step()? {
+                break;
+            }
+        }
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let n = max.min(self.pending.len());
+        Ok(Some(self.pending.drain(..n).collect()))
+    }
+
+    fn stream_counts(&self) -> StreamCounts {
+        self.counts
+    }
 }
 
 /// Split a rendered series identity `metric{k="v",k2="v2"}` into its metric
@@ -951,15 +1346,52 @@ pub struct RavelReplayOutcome {
     /// masquerading as a real timestamp -- a downstream ms-to-ns conversion of
     /// that sentinel overflows, so the absence must not escape as a number.
     pub max_ts_ms: Option<i64>,
+    /// The metric name of the first sample written, the selector a
+    /// read-your-write query reads back. `None` when nothing was written.
+    pub first_metric: Option<String>,
 }
 
-/// Replay `stream` into the in-process Ravel path. Valid samples are batched
-/// and written with `WriteMode::Strict`, so each batch's ack means durable and
-/// mints commit tokens; invalid samples are refused with an exact count. The
-/// accounting closes: `offered == accepted + rejected + dropped`.
-pub async fn replay_into_ravel(
+/// Pull scalar samples from `source` until `pending` holds `batch_size` valid
+/// ones or the stream ends, counting each pulled sample as offered and each
+/// invalid one as rejected. `on_valid` sees each valid sample in stream order
+/// and returns what is queued for it.
+fn fill_valid<S, T, F>(
+    source: &mut S,
+    batch_size: usize,
+    pending: &mut Vec<T>,
+    offered: &mut u64,
+    rejected: &mut u64,
+    mut on_valid: F,
+) -> Result<(), LaneError>
+where
+    S: SampleBatches + ?Sized,
+    F: FnMut(LogicalSample) -> Result<T, LaneError>,
+{
+    while pending.len() < batch_size {
+        let Some(batch) = source.next_batch(batch_size - pending.len())? else {
+            break;
+        };
+        for sample in batch {
+            *offered += 1;
+            match sample.validate() {
+                Ok(()) => pending.push(on_valid(sample)?),
+                Err(_) => *rejected += 1,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replay `source` into the in-process Ravel path, pulling one batch at a
+/// time so memory is bounded by the batch, not the stream's history. Valid
+/// samples are batched in stream order and written with `WriteMode::Strict`,
+/// so each batch's ack means durable and mints commit tokens; invalid samples
+/// are refused with an exact count. The accounting closes: `offered ==
+/// accepted + rejected + dropped`, and the row carries the source's
+/// [`StreamCounts`].
+pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     config: &RavelReplayConfig,
-    stream: &[LogicalSample],
+    source: &mut S,
 ) -> Result<RavelReplayOutcome, LaneError> {
     let instrumented = Arc::new(match &config.store_metrics {
         Some(handle) => {
@@ -982,45 +1414,18 @@ pub async fn replay_into_ravel(
         Arc::new(PendingAckBudget::new(0)),
     ));
 
-    // Client-side admission: partition into valid points (carrying their
-    // logical sample for the wire encoding) and exact rejections.
-    let mut valid: Vec<(IngestPoint, LogicalSample)> = Vec::new();
-    let mut rejected_samples: u64 = 0;
-    let mut max_ts_ms: Option<i64> = None;
-    for sample in stream {
-        match sample.validate() {
-            Ok(()) => {
-                let point = ingest_point(&config.tenant, sample)?;
-                max_ts_ms = Some(max_ts_ms.map_or(sample.ts_ms, |m| m.max(sample.ts_ms)));
-                valid.push((point, sample.clone()));
-            }
-            Err(_) => rejected_samples += 1,
-        }
-    }
-
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
     let batch_size = config.batch_size.max(1);
 
-    // Precompute the RW1.0 wire size OUTSIDE the timed window (issue #937 review
-    // finding 5). The in-process Ravel path never serializes an RW1.0 body to
-    // ingest; timing that encode would fold work the in-process path never
-    // performs into `elapsed_secs`, skewing Ravel's throughput against the HTTP
-    // comparators, whose encode IS genuine client work inside their own window.
-    // `wire_bytes` is finalized here and immutable through the timed loop.
-    // Window placement is enforced by this code structure alone: moving the
-    // accumulation into the timed loop leaves the value unchanged, so
-    // `tests::wire_bytes_equal_the_precomputed_rw1_body_sum` stays green (it
-    // pins only the value).
-    let mut precomputed_wire_bytes: u64 = 0;
-    for chunk in valid.chunks(batch_size) {
-        let logical: Vec<LogicalSample> = chunk.iter().map(|(_, s)| s.clone()).collect();
-        precomputed_wire_bytes += encode_rw1_body(&logical)?.len() as u64;
-    }
-    let wire_bytes = precomputed_wire_bytes;
-
     let cpu_before = process_cpu_secs();
-    let wall_start = std::time::Instant::now();
+    let mut timed = Duration::ZERO;
 
+    let mut pending: Vec<(IngestPoint, LogicalSample)> = Vec::with_capacity(batch_size);
+    let mut offered_samples: u64 = 0;
+    let mut rejected_samples: u64 = 0;
+    let mut max_ts_ms: Option<i64> = None;
+    let mut first_metric: Option<String> = None;
+    let mut wire_bytes: u64 = 0;
     let mut ack_latencies_ns: Vec<u64> = Vec::new();
     let mut tokens: Vec<CommitToken> = Vec::new();
     let mut accepted_samples: u64 = 0;
@@ -1028,9 +1433,33 @@ pub async fn replay_into_ravel(
     let mut dropped_batches: u64 = 0;
     let mut batches: u64 = 0;
 
-    for chunk in valid.chunks(batch_size) {
+    loop {
+        // Client-side admission: valid points (carrying their logical sample
+        // for the wire encoding) and exact rejections.
+        fill_valid(
+            source,
+            batch_size,
+            &mut pending,
+            &mut offered_samples,
+            &mut rejected_samples,
+            |sample| {
+                let point = ingest_point(&config.tenant, &sample)?;
+                max_ts_ms = Some(max_ts_ms.map_or(sample.ts_ms, |m| m.max(sample.ts_ms)));
+                first_metric.get_or_insert_with(|| sample.metric.clone());
+                Ok((point, sample))
+            },
+        )?;
+        if pending.is_empty() {
+            break;
+        }
+        let (points, logical): (Vec<IngestPoint>, Vec<LogicalSample>) = pending.drain(..).unzip();
+        // The RW1.0 wire size is encoded OUTSIDE the timed segment (issue #937
+        // review finding 5): the in-process path never serializes an RW1.0
+        // body to ingest, while the HTTP comparators' encode IS client work
+        // inside their own segments.
+        wire_bytes += encode_rw1_body(&logical)?.len() as u64;
+        drop(logical);
         batches += 1;
-        let points: Vec<IngestPoint> = chunk.iter().map(|(p, _)| p.clone()).collect();
         let batch_len = points.len() as u64;
 
         let start = std::time::Instant::now();
@@ -1042,9 +1471,11 @@ pub async fn replay_into_ravel(
                 ack_deadline,
             )
             .await;
+        let took = start.elapsed();
+        timed += took;
         match result {
             Ok(receipt) => {
-                ack_latencies_ns.push(start.elapsed().as_nanos() as u64);
+                ack_latencies_ns.push(took.as_nanos() as u64);
                 accepted_samples += batch_len;
                 tokens.extend(receipt.tokens);
             }
@@ -1059,8 +1490,10 @@ pub async fn replay_into_ravel(
         }
     }
 
+    let flush_start = std::time::Instant::now();
     router.flush_all().await;
-    let elapsed_secs = wall_start.elapsed().as_secs_f64().max(1e-9);
+    timed += flush_start.elapsed();
+    let elapsed_secs = timed.as_secs_f64().max(1e-9);
     let cpu_secs = match (cpu_before, process_cpu_secs()) {
         (Some(before), Some(after)) => Some((after - before).max(0.0)),
         _ => None,
@@ -1082,8 +1515,11 @@ pub async fn replay_into_ravel(
         stored_bytes as f64 / accepted_samples as f64
     };
 
-    let offered_samples = stream.len() as u64;
+    let stream_counts = source.stream_counts();
     let ingest = IngestPhase {
+        stream_counts,
+        excluded_native_histogram: stream_counts.native_histogram,
+        excluded_stale_marker: stream_counts.stale_marker,
         offered_samples,
         accepted_samples,
         rejected_samples,
@@ -1120,6 +1556,7 @@ pub async fn replay_into_ravel(
         shards: config.shards,
         tokens,
         max_ts_ms,
+        first_metric,
     })
 }
 
@@ -1219,9 +1656,11 @@ pub struct HttpReplayConfig {
 /// same choice `remote_write.rs` makes with its fixed `RETRY_AFTER_SECONDS`.
 const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
-/// Replay `stream` into a comparator over Remote Write 1.0. Valid samples are
-/// batched, encoded as snappy protobuf, and POSTed to the configured endpoint;
-/// each batch is retried on a 429/5xx up to `max_retries`, then dropped. Every
+/// Replay `source` into a comparator over Remote Write 1.0, pulling one batch
+/// at a time as [`replay_into_ravel`] does. Valid samples are batched in
+/// stream order, encoded as snappy protobuf, and POSTed to the configured
+/// endpoint; each batch is retried on a 429/5xx up to `max_retries`, then
+/// dropped. Every
 /// row this produces is [`AckSemantics::Buffered`]: a Remote Write 2xx from a
 /// comparator means accepted-into-a-buffer, a durability the client cannot
 /// observe, so it is never placed in a pooled column with Ravel's durable ack.
@@ -1229,26 +1668,21 @@ const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// The comparator's object store is not the bench's, so this row carries no
 /// [`StorageAccounting`], and its CPU/RSS are the remote process's, so they are
 /// `None`: absent, never a zero.
-pub async fn replay_over_http(
+pub async fn replay_over_http<S: SampleBatches + ?Sized>(
     config: &HttpReplayConfig,
-    stream: &[LogicalSample],
+    source: &mut S,
 ) -> Result<SystemIngestResult, LaneError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout_secs.max(1)))
         .build()
         .map_err(|e| transport_setup_error(format!("building the HTTP client failed: {e}")))?;
 
-    let mut valid: Vec<LogicalSample> = Vec::new();
+    let mut pending: Vec<LogicalSample> = Vec::new();
+    let mut offered_samples: u64 = 0;
     let mut rejected_samples: u64 = 0;
-    for sample in stream {
-        match sample.validate() {
-            Ok(()) => valid.push(sample.clone()),
-            Err(_) => rejected_samples += 1,
-        }
-    }
+    let mut timed = Duration::ZERO;
 
     let batch_size = config.batch_size.max(1);
-    let wall_start = std::time::Instant::now();
     let mut ack_latencies_ns: Vec<u64> = Vec::new();
     let mut accepted_samples: u64 = 0;
     let mut dropped_samples: u64 = 0;
@@ -1257,9 +1691,22 @@ pub async fn replay_over_http(
     let mut retries: u64 = 0;
     let mut wire_bytes: u64 = 0;
 
-    for chunk in valid.chunks(batch_size) {
+    loop {
+        fill_valid(
+            source,
+            batch_size,
+            &mut pending,
+            &mut offered_samples,
+            &mut rejected_samples,
+            Ok,
+        )?;
+        if pending.is_empty() {
+            break;
+        }
+        let chunk = std::mem::take(&mut pending);
+        let segment_start = std::time::Instant::now();
         batches += 1;
-        let body = encode_rw1_body(chunk)?;
+        let body = encode_rw1_body(&chunk)?;
         wire_bytes += body.len() as u64;
         let batch_len = chunk.len() as u64;
 
@@ -1300,11 +1747,16 @@ pub async fn replay_over_http(
                 dropped_samples += batch_len;
             }
         }
+        timed += segment_start.elapsed();
     }
 
-    let elapsed_secs = wall_start.elapsed().as_secs_f64().max(1e-9);
+    let elapsed_secs = timed.as_secs_f64().max(1e-9);
+    let stream_counts = source.stream_counts();
     let ingest = IngestPhase {
-        offered_samples: stream.len() as u64,
+        stream_counts,
+        excluded_native_histogram: stream_counts.native_histogram,
+        excluded_stale_marker: stream_counts.stale_marker,
+        offered_samples,
         accepted_samples,
         rejected_samples,
         dropped_samples,
@@ -1410,6 +1862,13 @@ mod tests {
 
     fn ingest_phase(p99: f64) -> IngestPhase {
         IngestPhase {
+            stream_counts: StreamCounts {
+                generated_lines: 1,
+                scalar: 1,
+                ..StreamCounts::default()
+            },
+            excluded_native_histogram: 0,
+            excluded_stale_marker: 0,
             offered_samples: 1,
             accepted_samples: 1,
             rejected_samples: 0,
@@ -1581,7 +2040,9 @@ mod tests {
         let n = 40usize;
         let stream = valid_stream(n, 8);
         let cfg = memory_config("mb-replay-accept", 8);
-        let outcome = replay_into_ravel(&cfg, &stream).await.expect("replay");
+        let outcome = replay_into_ravel(&cfg, &mut SliceSamples::new(&stream))
+            .await
+            .expect("replay");
         let ing = &outcome.result.ingest;
 
         assert_eq!(ing.offered_samples, n as u64, "exact offered count");
@@ -1653,7 +2114,9 @@ mod tests {
         });
 
         let cfg = memory_config("mb-replay-reject", 8);
-        let outcome = replay_into_ravel(&cfg, &stream).await.expect("replay");
+        let outcome = replay_into_ravel(&cfg, &mut SliceSamples::new(&stream))
+            .await
+            .expect("replay");
         let ing = &outcome.result.ingest;
 
         assert_eq!(ing.offered_samples, 13, "10 valid + 3 invalid");
@@ -1723,7 +2186,9 @@ mod tests {
         let n = 24usize;
         let stream = valid_stream(n, 6);
         let cfg = memory_config("mb-replay-ryw", 6);
-        let outcome = replay_into_ravel(&cfg, &stream).await.expect("replay");
+        let outcome = replay_into_ravel(&cfg, &mut SliceSamples::new(&stream))
+            .await
+            .expect("replay");
 
         assert!(
             !outcome.tokens.is_empty(),
@@ -1761,14 +2226,15 @@ mod tests {
     /// a sentinel cannot overflow, and the query phase refuses with a typed
     /// error rather than reading at a bogus instant.
     ///
-    /// TO SEE THIS FAIL against the pre-fix sentinel: change the `if
-    /// valid.is_empty()`/`map_or` absence in `replay_into_ravel` back to a bare
-    /// `i64::MIN` fold; `max_ts_ms` is then `Some(i64::MIN)` and the first
-    /// assertion below fails.
+    /// TO SEE THIS FAIL against the pre-fix sentinel: start `max_ts_ms` in
+    /// `replay_into_ravel` at `Some(i64::MIN)` instead of `None`; the first
+    /// assertion below then fails.
     #[tokio::test]
     async fn an_empty_stream_reports_absent_newest_ts_not_a_sentinel() {
         let cfg = memory_config("mb-replay-empty", 8);
-        let outcome = replay_into_ravel(&cfg, &[]).await.expect("replay");
+        let outcome = replay_into_ravel(&cfg, &mut SliceSamples::new(&[]))
+            .await
+            .expect("replay");
 
         assert_eq!(
             outcome.max_ts_ms, None,
@@ -1911,7 +2377,9 @@ mod tests {
         let batch_size = 8usize;
         let stream = valid_stream(n, 8);
         let cfg = memory_config("mb-replay-wire", batch_size);
-        let outcome = replay_into_ravel(&cfg, &stream).await.expect("replay");
+        let outcome = replay_into_ravel(&cfg, &mut SliceSamples::new(&stream))
+            .await
+            .expect("replay");
 
         // Every sample in `valid_stream` is valid, so the replay batches the
         // stream in its own order; recompute the wire size the same way, from
@@ -1932,12 +2400,14 @@ mod tests {
         );
     }
 
-    /// The lane parses the shipping `metrics_gen` encoding: float lines become
-    /// logical samples (with the exact bit-pattern value), native-histogram and
-    /// staleness lines are skipped. Uses the shipping `GeneratedSample::encode`
-    /// so the parser is pinned to the real format, not a hand-written stand-in.
+    /// The lane classifies the shipping `metrics_gen` encoding: a float line
+    /// becomes a scalar sample (with the exact bit-pattern value), and the
+    /// native-histogram and staleness lines become their own typed records
+    /// with their fields, not skipped. Uses the shipping
+    /// `GeneratedSample::encode` so the classifier is pinned to the real
+    /// format, not a hand-written stand-in.
     #[test]
-    fn parse_logical_stream_reads_float_lines_only() {
+    fn classify_line_types_every_shape_the_encoder_writes() {
         use crate::metrics_gen::{GeneratedSample, NativeHistogram, SampleValue};
 
         let mut text = Vec::new();
@@ -1975,22 +2445,268 @@ mod tests {
         .encode(&mut line);
         text.extend_from_slice(&line);
 
-        let parsed = parse_logical_stream(&String::from_utf8(text).expect("utf8"));
+        let text = String::from_utf8(text).expect("utf8");
+        let records: Vec<StreamRecord> = text
+            .lines()
+            .enumerate()
+            .map(|(i, line)| classify_line(i as u64 + 1, line))
+            .collect();
+        assert_eq!(records.len(), 3, "one record per line");
         assert_eq!(
-            parsed.len(),
-            1,
-            "only the one float line is a scalar sample"
+            records[0],
+            StreamRecord::Scalar(LogicalSample {
+                metric: "mb_gauge".to_string(),
+                labels: vec![
+                    ("instance".to_string(), "mb-instance-0".to_string()),
+                    ("job".to_string(), "api".to_string()),
+                ],
+                ts_ms: 15_000,
+                value: 3.5,
+            })
         );
-        assert_eq!(parsed[0].metric, "mb_gauge");
-        assert_eq!(parsed[0].value, 3.5);
         assert_eq!(
-            parsed[0].labels,
-            vec![
-                ("instance".to_string(), "mb-instance-0".to_string()),
-                ("job".to_string(), "api".to_string()),
-            ]
+            records[1],
+            StreamRecord::StaleMarker {
+                ts_ms: 15_000,
+                series: "mb_gauge{instance=\"mb-instance-1\"}".to_string(),
+            }
+        );
+        assert_eq!(
+            records[2],
+            StreamRecord::NativeHistogram {
+                ts_ms: 15_000,
+                series: "mb_native{job=\"api\"}".to_string(),
+                schema: 2,
+                count: 4,
+                sum_bits: 1.0f64.to_bits(),
+                deltas_len: 4,
+            }
         );
     }
+
+    /// Required test (i): one crafted malformed line of each shape gives
+    /// exactly one `Malformed` with that shape's reason at that line, and the
+    /// well-formed lines around them give none.
+    #[test]
+    fn each_malformed_shape_is_reported_once_with_its_reason_and_line() {
+        let good_f = "15000\tmb_gauge{job=\"api\"}\tf 0x400c000000000000";
+        let good_s = "15000\tmb_gauge{job=\"api\"}\tstale";
+        let good_h =
+            "15000\tmb_native{job=\"api\"}\th schema=2 count=4 sum=0x3ff0000000000000 deltas=";
+        let stream = [
+            good_f,
+            "15000\tmb_gauge{job=\"api\"}",
+            "15o00\tmb_gauge{job=\"api\"}\tf 0x400c000000000000",
+            "15000\tmb_gauge{job=\"api\"}\tf 0x400c00000000000z",
+            "15000\tmb_gauge job=api\tf 0x400c000000000000",
+            "15000\tmb_gauge{job=\"api\"}\tq 0x400c000000000000",
+            good_s,
+            good_h,
+        ];
+        let mut counts = StreamCounts::default();
+        let mut malformed = Vec::new();
+        for (i, line) in stream.iter().enumerate() {
+            let record = classify_line(i as u64 + 1, line);
+            counts.record(&record);
+            if let StreamRecord::Malformed { line_no, reason } = record {
+                malformed.push((line_no, reason));
+            }
+        }
+        assert_eq!(
+            malformed,
+            vec![
+                (2, MalformedReason::MissingField),
+                (3, MalformedReason::BadTimestamp),
+                (4, MalformedReason::BadFloatBits),
+                (5, MalformedReason::BadSeries),
+                (6, MalformedReason::UnknownPayload),
+            ]
+        );
+        assert_eq!(
+            counts,
+            StreamCounts {
+                generated_lines: 8,
+                scalar: 1,
+                native_histogram: 1,
+                stale_marker: 1,
+                malformed: 5,
+            }
+        );
+
+        let mut clean = StreamCounts::default();
+        for (i, line) in [good_f, good_s, good_h].iter().enumerate() {
+            clean.record(&classify_line(i as u64 + 1, line));
+        }
+        assert_eq!(clean.malformed, 0, "a correct stream has no malformed line");
+        assert_eq!(clean.classified(), 3);
+    }
+
+    /// Required test (ii): streaming the full `ci` profile through
+    /// [`GeneratedStream`] counts every line under its kind, and those counts
+    /// are the generator's own per-type figures. A line the classifier skipped
+    /// (a reintroduced `continue`) or counted under the wrong kind moves one
+    /// of the three equalities.
+    #[test]
+    fn streaming_the_ci_profile_reproduces_the_generators_per_type_counts() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let steps = workload.profile("ci").expect("ci").samples_per_series;
+        let mut stream = GeneratedStream::new(
+            Generator::new(&workload, "ci", 1_700_000_000_000).expect("generator builds"),
+            steps,
+        );
+        let mut offered = 0u64;
+        while let Some(batch) = stream.next_batch(500).expect("generates") {
+            offered += batch.len() as u64;
+        }
+        let (report, counts) = stream.finish().expect("drained stream closes");
+
+        assert!(report.native_histogram_samples > 0 && report.stale_markers > 0);
+        assert_eq!(counts.scalar, report.float_samples);
+        assert_eq!(counts.native_histogram, report.native_histogram_samples);
+        assert_eq!(counts.stale_marker, report.stale_markers);
+        assert_eq!(counts.malformed, 0);
+        assert_eq!(counts.generated_lines, report.emitted_samples);
+        assert_eq!(offered, counts.scalar, "every scalar line is offered once");
+        check_stream_band(&counts, &report).expect("the ci stream closes band 4");
+    }
+
+    /// Band 4's stream half names the figures of each failing condition: a
+    /// malformed line, a sum that does not close, and lines read that differ
+    /// from the samples the generator emitted.
+    #[test]
+    fn stream_band_violations_name_the_figures() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let (_, report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(1)
+            .expect("generates");
+        let closed = StreamCounts {
+            generated_lines: report.emitted_samples,
+            scalar: report.float_samples,
+            native_histogram: report.native_histogram_samples,
+            stale_marker: report.stale_markers,
+            malformed: 0,
+        };
+        check_stream_band(&closed, &report).expect("the generator's own figures close");
+
+        let one_malformed = StreamCounts {
+            scalar: closed.scalar - 1,
+            malformed: 1,
+            ..closed
+        };
+        let err = check_stream_band(&one_malformed, &report).expect_err("malformed is refused");
+        assert_eq!(err.malformed, 1);
+        assert!(err.to_string().contains("1 malformed"), "{err}");
+
+        let unsummed = StreamCounts {
+            generated_lines: closed.generated_lines + 1,
+            ..closed
+        };
+        let err = check_stream_band(&unsummed, &report).expect_err("an open sum is refused");
+        assert_eq!(err.classified + 1, err.generated_lines);
+
+        let short = StreamCounts {
+            generated_lines: closed.generated_lines - 1,
+            scalar: closed.scalar - 1,
+            ..closed
+        };
+        let err = check_stream_band(&short, &report).expect_err("a short stream is refused");
+        assert_eq!(err.emitted_samples, report.emitted_samples);
+        assert!(
+            err.to_string().contains(&format!(
+                "{} samples the generator emitted",
+                report.emitted_samples
+            )),
+            "{err}"
+        );
+    }
+
+    /// Required test (iv): the same anchor twice streams the same bytes, and
+    /// the streamed digest equals the one-shot `generate_into` digest.
+    #[test]
+    fn streaming_is_deterministic_and_matches_one_shot_generation() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let anchor = 1_700_000_000_000;
+        let steps = 12;
+        let drain = || {
+            let mut stream = GeneratedStream::new(
+                Generator::new(&workload, "ci", anchor).expect("generator builds"),
+                steps,
+            );
+            let mut samples = Vec::new();
+            while let Some(batch) = stream.next_batch(333).expect("generates") {
+                samples.extend(batch);
+            }
+            let (report, counts) = stream.finish().expect("closes");
+            (report, counts, samples)
+        };
+        let (first, first_counts, first_samples) = drain();
+        let (second, second_counts, second_samples) = drain();
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first_counts, second_counts);
+        assert_eq!(
+            first_samples, second_samples,
+            "same anchor, same write order"
+        );
+
+        let mut one_shot_bytes = Vec::new();
+        let one_shot = Generator::new(&workload, "ci", anchor)
+            .expect("generator builds")
+            .generate_into(steps, &mut one_shot_bytes)
+            .expect("generates");
+        assert_eq!(
+            first, one_shot,
+            "the streamed report is the one-shot report"
+        );
+        let one_shot_scalars: Vec<LogicalSample> = std::str::from_utf8(&one_shot_bytes)
+            .expect("utf8")
+            .lines()
+            .enumerate()
+            .filter_map(|(i, line)| match classify_line(i as u64 + 1, line) {
+                StreamRecord::Scalar(sample) => Some(sample),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            first_samples, one_shot_scalars,
+            "streaming offers the one-shot stream's scalars in its order"
+        );
+
+        let (other, _, _) = {
+            let mut stream = GeneratedStream::new(
+                Generator::new(&workload, "ci", anchor + 15_000).expect("generator builds"),
+                steps,
+            );
+            while stream.next_batch(333).expect("generates").is_some() {}
+            let (r, c) = stream.finish().expect("closes");
+            (r, c, ())
+        };
+        assert_ne!(other.digest, first.digest, "the anchor reaches the bytes");
+    }
+
+    /// Closing a stream before it is drained is refused rather than reporting
+    /// figures for samples nobody offered.
+    #[test]
+    fn an_undrained_stream_refuses_to_finish() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let mut stream =
+            GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 2);
+        stream.next_batch(10).expect("generates").expect("a batch");
+        assert!(stream.finish().is_err());
+    }
+
+    const CLOCK_ZERO: Anchor = Anchor {
+        ms: 0,
+        source: AnchorSource::Clock,
+    };
 
     fn ci_workload() -> WorkloadFile {
         crate::metrics_workload::load_workload(std::path::Path::new(concat!(
@@ -2027,8 +2743,14 @@ mod tests {
             .expect("generates steps");
         let logical_input_bytes = bytes.len() as u64;
 
-        let record =
-            build_profile_record(&workload, &profile, steps, logical_input_bytes, &gen_report);
+        let record = build_profile_record(
+            &workload,
+            &profile,
+            steps,
+            logical_input_bytes,
+            &gen_report,
+            CLOCK_ZERO,
+        );
 
         assert_eq!(
             record.steps_run, record.steps_declared,
@@ -2099,6 +2821,7 @@ mod tests {
             steps_run,
             bytes.len() as u64,
             &gen_report,
+            CLOCK_ZERO,
         );
 
         assert!(
@@ -2157,7 +2880,14 @@ mod tests {
             steps_run,
             logical_input_bytes,
             &gen_report,
+            Anchor {
+                ms: 1_700_000_000_000,
+                source: AnchorSource::Explicit,
+            },
         );
+
+        assert_eq!(record.run.anchor_ms, 1_700_000_000_000);
+        assert_eq!(record.run.anchor_source, AnchorSource::Explicit);
 
         assert!(
             steps_run < steps_declared,
