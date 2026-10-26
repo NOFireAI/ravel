@@ -112,8 +112,11 @@ is the one now pinned.
 
 **Local probe (2026-10-26, ravel-server 0.26.0, linux/arm64).** The source of
 the Ravel budget-refusal signatures below. The 0.26.0 binary, extracted from
-the image, was run with the flags above and `--store memory` in place of
-`--store s3`, on a host with no docker daemon. Results:
+the image, was run with the flags `ravel.yml` then carried, which did not yet
+include `--column-stats-cache-max-bytes` (0.26.0 has no such flag), and
+`--store memory` in place of `--store s3`, on a host with no docker daemon.
+Both observed refusals are compiled-in query caps, which no cache flag
+changes. Results:
 
 | Request | HTTP | Result |
 |---|---|---|
@@ -281,7 +284,8 @@ the query.
 | Ravel | `--max-ingest-lag` (Remote Write) | 204 | none | Not a refusal: the too-old sample is dropped per sample and the request answers 2xx; it shows only as a missing sample |
 
 The Ravel rows were observed on 2026-10-26 against ravel-server 0.26.0
-(linux/arm64), run with every `ravel.yml` flag and `--store memory`, at the
+(linux/arm64), run with the `ravel.yml` flags of that date (before the
+column-statistics cache pin, a flag 0.26.0 lacks) and `--store memory`, at the
 pinned values rather than tiny ones: 10,001 series and a 12,001-point range
 were written and queried. Not observed on the pinned image: max samples per
 query, total evaluation points, `--max-s3-requests`, `--max-segments`, the
@@ -372,7 +376,9 @@ The sources are:
   interpolate the overlay, which affects only the listing.
 
 A field that could not be fetched is `{"unavailable": "<reason>"}`; none is
-omitted or left empty. When docker is not reachable, `image` is the string
+omitted or left empty. The exception is a comparator skipped with
+`--no-ravel`, recorded as `{"skipped": "--no-ravel"}` with no other fields and
+no URL in `urls_queried`. When docker is not reachable, `image` is the string
 `"unavailable: docker not reachable"`.
 
 | Exit | Meaning |
