@@ -288,11 +288,11 @@ pub const ELAPSED_BASIS_TIMED_SEGMENTS: &str = "timed_segments";
 /// The ingest phase of one system's replay. Ingest and query phases are
 /// recorded separately (ADR-0927 decision 9); this lane owns ingest, the query
 /// lane owns query.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 ///
 /// Every field added after the nightly artifact began carries a serde default,
 /// so a reader built on this struct still loads a report written before it
 /// (`tests::a_pre_change_artifact_loads_with_defaults`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IngestPhase {
     /// Every line of the stream this row replayed, counted by kind. The sample
     /// accounting below is over the `scalar` lines only. All zero in a report
@@ -2993,6 +2993,50 @@ mod tests {
             )),
             "{err}"
         );
+
+        // Only the classification sum breaks: one scalar line lost from the
+        // kinds while the lines read and the generator's total are unchanged.
+        let scalar_short = StreamCounts {
+            scalar: closed.scalar - 1,
+            ..closed
+        };
+        let err =
+            check_stream_band(&scalar_short, &report).expect_err("an open classification sum");
+        assert_eq!(err.generated_lines, err.emitted_samples, "totals unchanged");
+        assert_eq!(err.classified + 1, err.generated_lines);
+        assert!(
+            err.to_string().contains(&format!(
+                "{} scalar + {} native histogram + {} stale marker + 0 malformed = {} classified, \
+                 against {} lines read",
+                closed.scalar - 1,
+                closed.native_histogram,
+                closed.stale_marker,
+                closed.generated_lines - 1,
+                closed.generated_lines,
+            )),
+            "{err}"
+        );
+
+        // A classifier that swaps native histograms and stale markers keeps
+        // every total intact; only the generator's per-type counts catch it.
+        assert_ne!(
+            closed.native_histogram, closed.stale_marker,
+            "the swap must move the counts for this case to mean anything"
+        );
+        let swapped = StreamCounts {
+            native_histogram: closed.stale_marker,
+            stale_marker: closed.native_histogram,
+            ..closed
+        };
+        assert_eq!(swapped.classified(), swapped.generated_lines);
+        let err = check_stream_band(&swapped, &report).expect_err("a type swap is refused");
+        assert!(
+            err.to_string().contains(&format!(
+                "{} native histogram and {} stale marker; band 4",
+                report.native_histogram_samples, report.stale_markers
+            )),
+            "{err}"
+        );
     }
 
     /// Required test (iv): the same anchor twice streams the same bytes, and
@@ -3060,23 +3104,61 @@ mod tests {
         assert_ne!(other.digest, first.digest, "the anchor reaches the bytes");
     }
 
-    /// Closing a stream before it is drained is refused rather than reporting
-    /// figures for samples nobody offered.
+    /// Closing a stream with every step generated but samples still queued is
+    /// refused rather than reporting figures for samples nobody offered.
     #[test]
-    fn an_undrained_stream_refuses_to_finish() {
+    fn a_stream_with_unread_samples_refuses_to_finish() {
         use crate::metrics_gen::Generator;
 
         let workload = ci_workload();
         let mut stream =
-            GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 2);
-        stream.next_batch(10).expect("generates").expect("a batch");
-        assert!(stream.finish().is_err());
+            GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 1);
+        let batch = stream.next_batch(10).expect("generates").expect("a batch");
+        assert_eq!(batch.len(), 10);
+        assert_eq!(stream.tally.steps_generated(), 1, "every step is generated");
+        let unread = stream.pending.len();
+        assert!(unread > 0);
+        let err = stream.finish().expect_err("unread samples are refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "generating the replayed stream failed: the stream was closed before it was \
+                 drained: {unread} generated samples were never read"
+            )
+        );
     }
 
-    const CLOCK_ZERO: Anchor = Anchor {
-        ms: 0,
-        source: AnchorSource::Clock,
-    };
+    /// Closing a stream whose queue is drained but whose steps are short is
+    /// refused too: the queue being empty says nothing about the steps.
+    #[test]
+    fn a_stream_with_steps_short_refuses_to_finish() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let step_scalars = {
+            let mut one =
+                GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 1);
+            let mut n = 0;
+            while let Some(batch) = one.next_batch(1 << 20).expect("generates") {
+                n += batch.len();
+            }
+            n
+        };
+        let mut stream =
+            GeneratedStream::new(Generator::new(&workload, "ci", 0).expect("builds"), 2);
+        let batch = stream
+            .next_batch(step_scalars)
+            .expect("generates")
+            .expect("a batch");
+        assert_eq!(batch.len(), step_scalars);
+        assert!(stream.pending.is_empty(), "the queue is drained");
+        let err = stream.finish().expect_err("short steps are refused");
+        assert_eq!(
+            err.to_string(),
+            "generating the replayed stream failed: the stream was closed before it was \
+             drained: only 1 of 2 steps were generated"
+        );
+    }
 
     fn ci_workload() -> WorkloadFile {
         crate::metrics_workload::load_workload(std::path::Path::new(concat!(
@@ -3107,8 +3189,7 @@ mod tests {
             ..ci.clone()
         };
 
-        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
-            .expect("generator builds")
+        let (bytes, gen_report) = Generator::for_profile(&workload, &profile, 0)
             .generate_bytes(steps)
             .expect("generates steps");
         let logical_input_bytes = bytes.len() as u64;
@@ -3119,7 +3200,8 @@ mod tests {
             steps,
             logical_input_bytes,
             &gen_report,
-            CLOCK_ZERO,
+            0,
+            String::new(),
         );
 
         assert_eq!(
@@ -3181,8 +3263,7 @@ mod tests {
             "this test's premise is a run PAST the declared step count"
         );
 
-        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
-            .expect("generator builds")
+        let (bytes, gen_report) = Generator::for_profile(&workload, &profile, 0)
             .generate_bytes(steps_run)
             .expect("generates steps");
         let record = build_profile_record(
@@ -3191,7 +3272,8 @@ mod tests {
             steps_run,
             bytes.len() as u64,
             &gen_report,
-            CLOCK_ZERO,
+            0,
+            String::new(),
         );
 
         assert!(
@@ -3238,8 +3320,7 @@ mod tests {
             "this test's premise is a profile that IS comparable"
         );
 
-        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
-            .expect("generator builds")
+        let (bytes, gen_report) = Generator::for_profile(&workload, &profile, 1_700_000_010_000)
             .generate_bytes(steps_run)
             .expect("generates steps");
         let logical_input_bytes = bytes.len() as u64;
@@ -3250,14 +3331,15 @@ mod tests {
             steps_run,
             logical_input_bytes,
             &gen_report,
-            Anchor {
-                ms: 1_700_000_000_000,
-                source: AnchorSource::Explicit,
-            },
+            1_700_000_010_000,
+            "manifest-digest".to_string(),
         );
 
-        assert_eq!(record.run.anchor_ms, 1_700_000_000_000);
-        assert_eq!(record.run.anchor_source, AnchorSource::Explicit);
+        assert_eq!(record.run.anchor_ms, 1_700_000_010_000);
+        assert_eq!(record.run.workload_digest, "manifest-digest");
+        assert_eq!(record.run.workload_version, workload.version);
+        assert_eq!(record.run.seed, workload.seed);
+        assert_eq!(record.run.stream_digest, gen_report.digest);
 
         assert!(
             steps_run < steps_declared,
@@ -3294,5 +3376,339 @@ mod tests {
             "run.scaling_label_cardinality must be the generator's own figure at steps_run, \
              not steps_declared"
         );
+    }
+
+    /// The anchor is required and bounded: missing, negative, past the
+    /// nanosecond range and off the scrape grid are each refused, with the
+    /// figures in the message, and the largest on-grid anchor whose newest
+    /// step fits is accepted.
+    ///
+    /// TO SEE THIS FAIL: drop the range check in [`check_anchor`] and
+    /// `i64::MAX - 1` reaches the grid check instead; drop the grid check and
+    /// the anchor 1 ms off the grid is accepted.
+    #[test]
+    fn check_anchor_refuses_each_out_of_contract_anchor() {
+        let interval_secs = 15;
+        let steps = 120;
+
+        let missing = check_anchor(None, interval_secs, steps).expect_err("no anchor");
+        assert_eq!(missing, AnchorError::Missing);
+        assert!(
+            missing
+                .to_string()
+                .starts_with("--anchor-ms is required and has no default: "),
+            "{missing}"
+        );
+
+        assert_eq!(
+            check_anchor(Some(1_700_000_010_000), interval_secs, steps),
+            Ok(1_700_000_010_000)
+        );
+
+        let off_grid = check_anchor(Some(1_700_000_010_001), interval_secs, steps)
+            .expect_err("1 ms off the grid");
+        assert_eq!(
+            off_grid,
+            AnchorError::OffGrid {
+                anchor_ms: 1_700_000_010_001,
+                interval_ms: 15_000,
+                remainder: 1,
+            }
+        );
+        assert_eq!(
+            off_grid.to_string(),
+            "--anchor-ms 1700000010001 is off the scrape grid: 1700000010001 mod 15000 ms is 1, \
+             and the anchor must be a multiple of the profile's scrape interval"
+        );
+
+        let negative =
+            check_anchor(Some(-15_000), interval_secs, steps).expect_err("before the epoch");
+        assert_eq!(negative, AnchorError::Negative { anchor_ms: -15_000 });
+        assert_eq!(
+            negative.to_string(),
+            "--anchor-ms -15000 is negative; the anchor must be at or after the epoch"
+        );
+
+        let near_max =
+            check_anchor(Some(i64::MAX - 1), interval_secs, steps).expect_err("past the range");
+        assert_eq!(
+            near_max,
+            AnchorError::PastRange {
+                anchor_ms: i64::MAX - 1,
+                steps,
+                interval_ms: 15_000,
+                max_ms: 9_223_372_036_854,
+            }
+        );
+        assert_eq!(
+            near_max.to_string(),
+            "--anchor-ms 9223372036854775806 with 120 steps of 15000 ms puts the newest step \
+             past 9223372036854 ms, the largest millisecond whose nanosecond form fits an i64"
+        );
+
+        let span = (steps as i64 - 1) * 15_000;
+        let top = (ANCHOR_MAX_MS - span) / 15_000 * 15_000;
+        assert_eq!(check_anchor(Some(top), interval_secs, steps), Ok(top));
+        assert!(
+            (top + span).checked_mul(1_000_000).is_some(),
+            "the newest step of the largest accepted anchor fits an i64 in nanoseconds"
+        );
+        assert!(matches!(
+            check_anchor(Some(top + 15_000), interval_secs, steps),
+            Err(AnchorError::PastRange { .. })
+        ));
+    }
+
+    /// `comparable` needs a publishable profile, the declared step count and
+    /// a stream digest that matches one regenerated from the manifest and the
+    /// anchor. A tampered digest, or a digest generated at another anchor,
+    /// forces it false with the digest reason.
+    ///
+    /// TO SEE THIS FAIL: make `build_profile_record` compare
+    /// `gen_report.digest` with itself (copy the generator's digest into the
+    /// comparison) and both tampered records come back comparable.
+    #[test]
+    fn profile_record_is_non_comparable_when_the_stream_digest_does_not_recompute() {
+        use crate::metrics_gen::Generator;
+        use crate::metrics_workload::Comparability;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        let steps = 3;
+        let anchor = 1_700_000_010_000;
+        let profile = Profile {
+            comparability: Comparability::Comparable,
+            samples_per_series: steps,
+            ..ci.clone()
+        };
+        let (bytes, gen_report) = Generator::for_profile(&workload, &profile, anchor)
+            .generate_bytes(steps)
+            .expect("generates steps");
+        let record = |report: &crate::metrics_gen::GenerationReport, anchor_ms: i64| {
+            build_profile_record(
+                &workload,
+                &profile,
+                steps,
+                bytes.len() as u64,
+                report,
+                anchor_ms,
+                String::new(),
+            )
+        };
+
+        let honest = record(&gen_report, anchor);
+        assert!(
+            honest.comparable,
+            "publishable profile, declared steps, recomputable digest: comparable"
+        );
+        assert_eq!(honest.comparability_reason, None);
+
+        let mut tampered = gen_report.clone();
+        tampered.digest = "0".repeat(64);
+        let forged = record(&tampered, anchor);
+        assert!(!forged.comparable, "a tampered digest is never comparable");
+        assert_eq!(
+            forged.comparability_reason,
+            Some(format!(
+                "the recorded stream digest {} differs from {}, the digest of {steps} steps of \
+                 profile `{}` regenerated from the manifest at anchor {anchor} ms, so the \
+                 replayed stream is not the one these parameters name",
+                tampered.digest, gen_report.digest, profile.name
+            ))
+        );
+
+        let elsewhere = record(&gen_report, anchor + 15_000);
+        assert!(
+            !elsewhere.comparable,
+            "a stream generated at another anchor is not the one this anchor names"
+        );
+        assert!(
+            elsewhere
+                .comparability_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("the recorded stream digest ")),
+            "{:?}",
+            elsewhere.comparability_reason
+        );
+    }
+
+    /// Band 4's row half reads the exclusions from the row's own fields. A
+    /// row from a real replay closes; the same row with either excluded
+    /// field zeroed after assignment fails the offering identity, and the
+    /// message names every figure.
+    ///
+    /// TO SEE THIS FAIL: compute the exclusions in [`check_row_accounting`]
+    /// from `counts` instead of `ingest`, and both zeroed rows pass.
+    #[tokio::test]
+    async fn a_row_with_a_zeroed_exclusion_fails_the_offering_identity() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let anchor = (base_ts_ms() / 15_000) * 15_000 - 60_000;
+        // The fewest steps whose stream holds both excluded kinds, so zeroing
+        // either field changes the row.
+        let steps = (1..=workload.profile("ci").expect("ci").samples_per_series)
+            .find(|&steps| {
+                let (_, report) = Generator::new(&workload, "ci", anchor)
+                    .expect("builds")
+                    .generate_bytes(steps)
+                    .expect("generates");
+                report.native_histogram_samples > 0 && report.stale_markers > 0
+            })
+            .expect("the ci profile emits both excluded kinds");
+        let mut stream =
+            GeneratedStream::new(Generator::new(&workload, "ci", anchor).expect("builds"), steps);
+        let outcome = replay_into_ravel(&memory_config("mb-offering-identity", 500), &mut stream)
+            .await
+            .expect("replay");
+        let (report, counts) = stream.finish().expect("drained stream closes");
+        check_stream_band(&counts, &report).expect("band 4 stream half");
+        let row = outcome.result.ingest;
+        assert!(row.excluded_native_histogram > 0 && row.excluded_stale_marker > 0);
+        check_row_accounting(&row, &counts).expect("an honest row closes");
+
+        let mut no_stale = row.clone();
+        no_stale.excluded_stale_marker = 0;
+        let err = check_row_accounting(&no_stale, &counts).expect_err("stale zeroed");
+        assert_eq!(
+            err,
+            RowAccountingViolation::OfferingIdentity {
+                offered: row.offered_samples,
+                excluded_native_histogram: row.excluded_native_histogram,
+                excluded_stale_marker: 0,
+                sum: row.offered_samples + row.excluded_native_histogram,
+                generated_lines: counts.generated_lines,
+            }
+        );
+        let message = err.to_string();
+        for figure in [
+            row.offered_samples,
+            row.excluded_native_histogram,
+            row.offered_samples + row.excluded_native_histogram,
+            counts.generated_lines,
+        ] {
+            assert!(message.contains(&figure.to_string()), "{figure}: {message}");
+        }
+
+        let mut no_native = row.clone();
+        no_native.excluded_native_histogram = 0;
+        assert!(matches!(
+            check_row_accounting(&no_native, &counts),
+            Err(RowAccountingViolation::OfferingIdentity {
+                excluded_native_histogram: 0,
+                ..
+            })
+        ));
+    }
+
+    /// A comparator's dropped samples split by cause: a 400 is a rejection
+    /// by status with no retry, and a 503 on every attempt is a retry
+    /// exhaustion. `dropped_samples` is their sum and the offered samples
+    /// still split exactly into accepted, rejected and dropped.
+    #[tokio::test]
+    async fn comparator_drops_are_split_by_status_and_retry_exhaustion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        axum::http::StatusCode::BAD_REQUEST
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stub");
+        let addr = listener.local_addr().expect("stub address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let stream = valid_stream(8, 2);
+        let config = HttpReplayConfig {
+            system: "prometheus".to_string(),
+            endpoint: format!("http://{addr}/api/v1/write"),
+            batch_size: 4,
+            max_retries: 2,
+            timeout_secs: 5,
+        };
+        let mut source = SliceSamples::new(&stream);
+        let row = replay_over_http(&config, &mut source)
+            .await
+            .expect("replay")
+            .ingest;
+        server.abort();
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            4,
+            "one POST for the 400 batch, three for the 503 batch"
+        );
+        assert_eq!(row.offered_samples, 8);
+        assert_eq!(row.accepted_samples, 0);
+        assert_eq!(row.rejected_samples, 0);
+        assert_eq!(row.rejected_by_status, BTreeMap::from([(400u16, 4u64)]));
+        assert_eq!(row.retry_exhausted_samples, 4);
+        assert_eq!(row.dropped_samples, 8);
+        assert_eq!(row.dropped_batches, 2);
+        assert_eq!(row.batches, 2);
+        assert_eq!(row.retries, 2);
+        check_row_accounting(&row, &source.stream_counts()).expect("the row's accounting closes");
+    }
+
+    /// An `ingest` block written before the stream accounting, the offered
+    /// digest and the status map existed still loads, each added field
+    /// taking its default; an empty `elapsed_basis` reads as wall time,
+    /// unmarked. The run block likewise loads without the provenance fields.
+    #[test]
+    fn a_pre_change_artifact_loads_with_defaults() {
+        let ingest: IngestPhase = serde_json::from_str(
+            r#"{
+                "offered_samples": 120,
+                "accepted_samples": 120,
+                "rejected_samples": 0,
+                "dropped_samples": 0,
+                "dropped_batches": 0,
+                "batches": 1,
+                "retries": 0,
+                "elapsed_secs": 0.5,
+                "logical_points_per_sec": 240.0,
+                "wire_bytes": 900,
+                "wire_bytes_per_sec": 1800.0,
+                "ack_latency_ms": {"p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0, "count": 1}
+            }"#,
+        )
+        .expect("a pre-change ingest block loads");
+        assert_eq!(ingest.stream_counts, StreamCounts::default());
+        assert_eq!(ingest.excluded_native_histogram, 0);
+        assert_eq!(ingest.excluded_stale_marker, 0);
+        assert_eq!(ingest.elapsed_basis, "");
+        assert_eq!(ingest.offered_digest, "");
+        assert!(ingest.rejected_by_status.is_empty());
+        assert_eq!(ingest.retry_exhausted_samples, 0);
+        assert_eq!(ingest.offered_samples, 120);
+
+        let run: RunRecord = serde_json::from_str(
+            r#"{
+                "steps": 5,
+                "anchor_ms": 1700000000000,
+                "anchor_source": "clock",
+                "total_series_created": 1000,
+                "logical_input_bytes": 1,
+                "total_samples_generated": 5000,
+                "scaling_label_cardinality": 1000
+            }"#,
+        )
+        .expect("a pre-change run block loads");
+        assert_eq!(run.workload_version, 0);
+        assert_eq!(run.workload_digest, "");
+        assert_eq!(run.seed, 0);
+        assert_eq!(run.stream_digest, "");
     }
 }
