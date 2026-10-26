@@ -877,10 +877,16 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Int32Type, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::common::tree_node::Transformed;
+    use datafusion::common::{JoinType, NullEquality, ScalarValue};
+    use datafusion::datasource::MemTable;
     use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
     use datafusion::physical_plan::aggregates::AggregateOutputMode;
     use datafusion::physical_plan::filter::FilterExec;
-    use datafusion::prelude::SessionContext;
+    use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinOn};
+    use datafusion::prelude::{SessionConfig, SessionContext};
 
     fn dict_type() -> DataType {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
@@ -1119,6 +1125,227 @@ mod tests {
     fn casts_to(expr: &Arc<dyn PhysicalExpr>, ty: &DataType) -> bool {
         expr.downcast_ref::<CastExpr>()
             .is_some_and(|cast| cast.cast_type() == ty)
+    }
+
+    /// The two inputs and the keys of a hash join planned, without the rule,
+    /// over two inputs grouped on the dictionary key `k`, in a session that
+    /// plans it `Partitioned`: `repartition_joins` on and no input small
+    /// enough to collect. Each input is the final stage of a two-stage
+    /// aggregate, hash-partitioned on `k` by the exchange below it.
+    async fn grouped_join_inputs() -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>, JoinOn) {
+        let partitions = 4;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", dict_type(), true)]));
+        let keys = ["a", "b", "c", "a", "x", "b", "a", "c"];
+        let batches: Vec<Vec<RecordBatch>> = keys
+            .chunks(keys.len() / partitions)
+            .map(|chunk| {
+                let dict: DictionaryArray<Int32Type> = chunk.iter().map(|k| Some(*k)).collect();
+                vec![
+                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+                        .expect("key batch builds"),
+                ]
+            })
+            .collect();
+        let mut config = SessionConfig::new()
+            .with_target_partitions(partitions)
+            .with_repartition_joins(true);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let table = MemTable::try_new(schema, batches).expect("mem table builds");
+        ctx.register_table("t", Arc::new(table))
+            .expect("table registers");
+        let plan = ctx
+            .sql(
+                "SELECT a.k, a.c, b.c \
+                 FROM (SELECT k, count(*) AS c FROM t GROUP BY k) a \
+                 JOIN (SELECT k, count(*) AS c FROM t GROUP BY k) b ON a.k = b.k",
+            )
+            .await
+            .expect("query plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let mut joins = Vec::new();
+        find(&plan, &|node| node.is::<HashJoinExec>(), &mut joins);
+        let [join] = joins.as_slice() else {
+            panic!("expected one HashJoinExec: {joins:?}");
+        };
+        let join = join.downcast_ref::<HashJoinExec>().expect("is a HashJoinExec");
+        assert_eq!(*join.partition_mode(), PartitionMode::Partitioned);
+        // Each input is the subquery's renaming projection over its final
+        // aggregate; the join is rebuilt directly on the aggregates, whose `k`
+        // is at the same index.
+        let aggregate = |input: &Arc<dyn ExecutionPlan>| {
+            let projection = input
+                .downcast_ref::<ProjectionExec>()
+                .expect("a join input is the subquery's projection");
+            let agg = Arc::clone(projection.input());
+            let mode = agg
+                .downcast_ref::<AggregateExec>()
+                .expect("the projection is over the grouped aggregate")
+                .mode()
+                .output_mode();
+            assert_eq!(mode, AggregateOutputMode::Final);
+            assert_eq!(agg.schema().field(0).data_type(), &dict_type());
+            assert!(matches!(
+                agg.properties().output_partitioning(),
+                Partitioning::Hash(..)
+            ));
+            agg
+        };
+        (
+            aggregate(join.left()),
+            aggregate(join.right()),
+            join.on().to_vec(),
+        )
+    }
+
+    /// A `Partitioned` inner hash join of `left` and `right` on `on`.
+    fn hash_join(
+        left: &Arc<dyn ExecutionPlan>,
+        right: &Arc<dyn ExecutionPlan>,
+        on: &JoinOn,
+        filter: Option<JoinFilter>,
+    ) -> HashJoinExec {
+        HashJoinExec::try_new(
+            Arc::clone(left),
+            Arc::clone(right),
+            on.clone(),
+            filter,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .expect("hash join builds")
+    }
+
+    /// The plan the rule makes of `join`, and the one `HashJoinExec` in it.
+    fn optimize_join(join: HashJoinExec) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
+        let plan = DictionaryGroupKeysAsViews
+            .optimize(Arc::new(join), &ConfigOptions::default())
+            .expect("rule runs");
+        let mut joins = Vec::new();
+        find(&plan, &|node| node.is::<HashJoinExec>(), &mut joins);
+        let [join] = joins.as_slice() else {
+            panic!("expected one HashJoinExec: {joins:?}");
+        };
+        let join = Arc::clone(join);
+        (plan, join)
+    }
+
+    /// The type of `k`, the first column, on each of `join`'s inputs.
+    fn input_key_types(join: &Arc<dyn ExecutionPlan>) -> Vec<DataType> {
+        join.children()
+            .iter()
+            .map(|input| input.schema().field(0).data_type().clone())
+            .collect()
+    }
+
+    /// The join-filter and dynamic-filter conditions of `join_carries`, on a
+    /// hand-built `Partitioned` join whose inputs both carry the views, so
+    /// neither condition is pre-empted by an operator between the join and
+    /// its aggregates. Without either filter the join carries; with a join
+    /// filter reading the key, or with a dynamic filter it publishes held
+    /// below its probe input's aggregate, each input is restored below it.
+    #[tokio::test]
+    async fn partitioned_join_filter_on_a_carried_key_restores_below_the_join() {
+        let (left, right, on) = grouped_join_inputs().await;
+
+        let (plan, join) = optimize_join(hash_join(&left, &right, &on, None));
+        assert_eq!(
+            input_key_types(&join),
+            [DataType::Utf8View, DataType::Utf8View],
+            "the join without a filter carries the views: {plan:?}"
+        );
+        assert_eq!(join.schema().field(0).data_type(), &DataType::Utf8View);
+        let restore = plan
+            .downcast_ref::<ProjectionExec>()
+            .expect("the restore projection is above the join");
+        assert!(Arc::ptr_eq(restore.input(), &join), "{plan:?}");
+        assert_eq!(plan.schema().field(0).data_type(), &dict_type());
+
+        // `k = 'x'` on the left key, evaluated by the join itself.
+        let filter_schema = Arc::new(Schema::new(vec![Field::new("k", dict_type(), true)]));
+        let x = ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some("x".to_owned()))),
+        );
+        let expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("k", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(x)),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(
+            expression,
+            vec![ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            }],
+            filter_schema,
+        );
+        let (plan, join) = optimize_join(hash_join(&left, &right, &on, Some(filter)));
+        assert_restored_below(&plan, &join);
+
+        // A dynamic filter the join publishes on the probe key, held by a
+        // filter under the probe input's partial aggregate, where `k` is still
+        // the scan's dictionary column.
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&on[0].1)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        let probe = Arc::clone(&right)
+            .transform_down(|node| {
+                let partial = node
+                    .downcast_ref::<AggregateExec>()
+                    .is_some_and(|agg| agg.mode().output_mode() == AggregateOutputMode::Partial);
+                let [scan] = node.children()[..] else {
+                    return Ok(Transformed::no(node));
+                };
+                if !partial {
+                    return Ok(Transformed::no(node));
+                }
+                let held = FilterExec::try_new(
+                    Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>,
+                    Arc::clone(scan),
+                )?;
+                let rebuilt = replace_children(&node, vec![Arc::new(held)])?;
+                Ok(Transformed::yes(rebuilt))
+            })
+            .expect("probe input rebuilds")
+            .data;
+        let mut held = Vec::new();
+        find(&probe, &|node| node.is::<FilterExec>(), &mut held);
+        assert_eq!(held.len(), 1, "the dynamic filter is held once: {probe:?}");
+        let join = hash_join(&left, &probe, &on, None)
+            .with_dynamic_filter_expr(dynamic)
+            .expect("dynamic filter attaches");
+        let (plan, join) = optimize_join(join);
+        assert_restored_below(&plan, &join);
+    }
+
+    /// `join` does not carry: both its inputs hold the declared type, and it
+    /// is the plan root, with no restore above it.
+    fn assert_restored_below(plan: &Arc<dyn ExecutionPlan>, join: &Arc<dyn ExecutionPlan>) {
+        assert_eq!(
+            input_key_types(join),
+            [dict_type(), dict_type()],
+            "the join carries the views: {plan:?}"
+        );
+        assert!(Arc::ptr_eq(plan, join), "{plan:?}");
+        assert_eq!(plan.schema().field(0).data_type(), &dict_type());
     }
 
     #[tokio::test]
