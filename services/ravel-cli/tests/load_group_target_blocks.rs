@@ -77,6 +77,7 @@ async fn row_groups_at(
         DEFAULT_DECODE_QUEUE_BATCHES,
         Some(PER_BATCH_TARGET_BYTES),
         None,
+        None,
         RlogZstdLevel::DEFAULT,
         group_target_blocks,
         RlogChunkOrder::DEFAULT,

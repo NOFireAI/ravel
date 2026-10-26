@@ -219,8 +219,10 @@ concurrently or one at a time.
 
 Setting `--max-inflight-flushes` *below* `--pipeline-depth` is the shape to
 avoid: each shard's excess batches queue on the flush semaphore, and they still
-have to clear it inside the 60s Strict ack deadline. A large depth against one
-permit is how a load fails with `timed out waiting for shard ack`.
+have to clear it inside the Strict ack deadline (60 s plus the margin the
+loader derives from the target, or `--ack-margin`; see the ingest guide). A
+large depth against one permit is how a load fails with `timed out waiting
+for shard ack`.
 
 The reported durable-token list is correct at any depth. On a partial-load
 failure the loader resolves every outstanding write before returning, rather

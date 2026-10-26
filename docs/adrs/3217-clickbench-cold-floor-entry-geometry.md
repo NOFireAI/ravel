@@ -267,7 +267,9 @@ What it does not change: no request, no answer; decode is
 level-independent, so the hot sum should not move. Load time at level 9
 is unknown; the 90 s ack deadline (`write_ack_deadline`,
 `services/ravel-cli/src/load/mod.rs:234-240`, `max(60 s, delay + 60 s)`)
-bounds a flush's encode.
+bounds a flush's encode. Since the decision 6 ack deadline amendment the
+deadline also carries the target's encode allowance, 108.5 s at this
+recipe.
 
 Effect: bytes only, 0.93 W on every scanning class. Cold sum (model): 7 s
 at the model's 25 GB of projected bytes, about 5 s at run 1's 19 GB
@@ -527,7 +529,9 @@ Rows per object are bounded by `--pipeline-depth x --batch-rows / --shards`
 explicit `--target-bytes` turns the depth flush off
 (`services/ravel-cli/src/load/geometry.rs:151-153`); the age trigger
 closes a buffer that has not reached the size; the ack deadline is
-`max(60 s, delay + 60 s)` (`load/mod.rs:234-240`); a memory budget below
+`max(60 s, delay + 60 s)` (`load/mod.rs:234-240`) (the depth-flush and
+deadline clauses are superseded: see the decision 6 ack deadline
+amendment); a memory budget below
 what the window needs makes the loader flush early and silently shrinks
 the objects (`load/memory.rs:1-12`, stall flusher at `:47-49`). Today's
 recipe at depth 32 measured 7.03 GB peak loader RSS for 25.1 MB objects on
@@ -542,7 +546,7 @@ Flags on the >= 30 GB tier:
 |---|---|---|---|
 | `--target-bytes` | 1,850,000,000 | 7,400,000,000 | 74x ratio, 100 MB stored |
 | `--pipeline-depth` | 32 | 56 | 1M rows needs 40 at even slices; 1.4x slack because the CounterID-sorted input hashes whole counters to one shard (`shard_for_log`, `crates/ravel-types/src/lib.rs:512`), so slices are uneven |
-| `--max-flush-delay` | 30s | 90s | about 27k rows/s per shard (931 s for 100M), so 1M rows fill in about 37 s; 30 s would close every object by age; the ack deadline follows to 150 s |
+| `--max-flush-delay` | 30s | 90s | about 27k rows/s per shard (931 s for 100M), so 1M rows fill in about 37 s; 30 s would close every object by age; the ack deadline follows to 150 s (224 s under the decision 6 ack deadline amendment) |
 | `--load-memory-bytes` | 6,500,000,000 | 14,000,000,000 | 56 x 100k x 2.2 KB = 12.3 GB for the in-flight window at the stamped per-row figure, with margin, since a budget below the window shrinks objects silently and only the object-count stamp catches it |
 | `--group-target-blocks` | (32) | 512 | decision 5; 512 covers a 2.5M-row object even if the 8 MiB block estimate cap closes hits blocks early |
 | `--batch-rows`, `--read-cursors`, `--shards` | 100000, 16, 4 | unchanged | batch rows set per-row decode memory; raise depth, not batches |
@@ -1010,3 +1014,55 @@ Expected effect, as the ticket pre-registers it:
 - The hot sum stays inside 54 to 64 s (predicted).
 - Miss condition: disk bytes per object unchanged on those statements
   (predicted).
+
+The measured effect is on the sweep sum, not one region per target
+statement: see the decision 6 ack deadline amendment below, part (d).
+
+## Amendment (2026-10-26): decision 6 mechanism, the depth flush and the ack deadline
+
+<!-- amendment-applies: sections="3. The entry's load compresses at zstd level 9 (design change 3)|6. The entry's load tiers move to 1M-row objects, about 100 MB, one row group (design change 7)|Amendment (2026-10-25): decision 8, a declared chunk order is a writer convention" pointer="decision 6 ack deadline amendment" -->
+
+(a) What failed. Run 4's decision 6 arms died at 47.3M rows (RB) and
+47.2M rows (SB) of 100M, each with `timed out waiting for shard ack`
+(#3273). Their objects closed on the memory backstop (`est_columnar_bytes`
+against `max(64 MiB, target)`) at about 7,970 estimate bytes per row, not
+on the size trigger's estimator (#3217 comment 6403991017). The
+CounterID-sorted input left shard 3 with about 12% of the rows instead of
+25%, and that shard flushed about every 94 s (#3273). A flush of about
+928k rows started its PUT 59 s after its age trigger fired (#3273): at the
+large tier's 90 s delay the old rule gave a 150 s deadline, 60 s past the
+delay, and encoding one target-sized object used all of it.
+
+(b) The mechanism as it now stands. The depth flush runs for any target
+above `PER_BATCH_TARGET_BYTES` (1), given or derived (PR #3282), so
+decision 6's "an explicit `--target-bytes` turns the depth flush off" no
+longer holds. The ack deadline is `max(60 s, delay + 60 s + target /
+100,000,000 bytes/s)` (`write_ack_deadline` and `ENCODE_BYTES_PER_SECOND`
+in `services/ravel-cli/src/load/mod.rs`, #3273). The divisor is a
+conservative single-core encode rate derived from #3273's 928k-row flush,
+which started its PUT 59 s after its age trigger at a 7.4e9 target: about
+1.25e8 estimate bytes per second. A target at or below
+one batch's per-shard slice adds nothing. `ravel-cli load --ack-margin
+<SECONDS>` replaces the whole margin, encode allowance included (#3273).
+At the large tier (7,400,000,000, 90 s) the deadline is 224 s instead of
+150 s; at the 15 GB tier (3,700,000,000, 60 s) 157 s instead of 120 s; at
+today's recipe (1,850,000,000, 30 s), which decision 3 cites as 90 s,
+108.5 s (all from the rule above). The rows-per-object bound
+`--pipeline-depth x --batch-rows / --shards` holds per shard as depth x
+batch rows x that shard's share of the rows, and the flag table's "1M rows
+fill in about 37 s" holds only at an even split: shard 3's 12% share
+(#3273) fills about half as fast.
+
+(c) What the half step measured. d6-half (target 3,700,000,000, delay
+60 s, 512-block groups) loaded 212 objects with no ack timeout, and its
+cold sum went from 341.7 s to 189.9 s on RustFS and from 157.5 s to
+112.0 s on s3s-fs (#3217 comment 6404601282). The 100 MB step is
+re-measured after this mechanism lands (#3217).
+
+(d) Correction to the decision 8 amendment's expected effect. The chunk
+order's effect is on the sweep sum, not per statement as the bullet
+"Per-object disk bytes on q9 to q19 and q33 fall by one region's cost"
+stated: the cold sum fell 34.5 s, arm B 308.4 s against arm A 342.9 s
+(#3217 comment 6407026515), while q02, q08 and q15 each gained one region
+per object (#3217 comment 6407026515). The `--chunk-order` list is tuned
+under #3283.

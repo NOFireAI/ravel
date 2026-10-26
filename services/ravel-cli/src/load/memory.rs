@@ -112,6 +112,9 @@ pub struct LoadMemoryOptions {
     /// submitted. It rides here because this is the logs load's one options
     /// carrier for hooks.
     pub on_geometry: Option<GeometryHook>,
+    /// `--ack-margin` ([`GeometryRequest::ack_margin`]), carried here for
+    /// the same reason as `on_geometry`.
+    pub ack_margin: Option<Duration>,
 }
 
 impl LoadMemoryOptions {
@@ -122,6 +125,7 @@ impl LoadMemoryOptions {
             on_budget: None,
             one_batch_warning: Arc::default(),
             on_geometry: None,
+            ack_margin: None,
         }
     }
 }

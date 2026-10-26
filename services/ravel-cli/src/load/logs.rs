@@ -221,7 +221,9 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 /// trigger, so a large `target_bytes` is only reachable once this is raised past
 /// the time one target's worth accumulates. See [`build_ingest_config`]. It also
 /// scales every write's ack deadline ([`write_ack_deadline`]), so a buffer the
-/// age trigger releases late is still awaited rather than timed out.
+/// age trigger releases late is still awaited rather than timed out; the
+/// deadline's margin grows with `target_bytes` as well, and `--ack-margin`
+/// ([`LoadMemoryOptions::ack_margin`]) replaces it.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_instrumented(
     store: Arc<dyn ObjectStoreBackend>,
@@ -436,6 +438,7 @@ pub(super) async fn load_with_drain_reflush_period(
                 .to_string(),
         ));
     }
+    validate_ack_margin(load_memory.as_ref().and_then(|o| o.ack_margin))?;
 
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
@@ -502,13 +505,6 @@ pub(super) async fn load_with_drain_reflush_period(
             Arc::new(PendingAckBudget::new(0)),
         ))
     };
-
-    // Every Strict write below waits this long for its ack, and the wait is
-    // whatever the age trigger the same flag configured takes to release the
-    // buffer (see `write_ack_deadline`): a buffer that misses `target_bytes`
-    // through slice variance mid-load is answered by the age trigger, so the
-    // deadline has to outlast it.
-    let ack_deadline = write_ack_deadline(max_flush_delay);
 
     // Parse the input's Parquet footer exactly once here (issue #773). The
     // shared metadata sizes the stride cursors, derives the reader schema, and
@@ -662,7 +658,14 @@ pub(super) async fn load_with_drain_reflush_period(
         first_rows,
         first_est_bytes,
         budget.is_some().then_some(load_memory.budget_bytes),
-    );
+    )
+    .with_ack_deadline(max_flush_delay, memory_options.ack_margin);
+    // Every Strict write below waits this long for its ack, and the wait is
+    // whatever the age trigger takes to release the buffer plus that flush's
+    // encode and PUT (see `write_ack_deadline`): a buffer that misses
+    // `target_bytes` through slice variance mid-load is answered by the age
+    // trigger, so the deadline has to outlast it.
+    let ack_deadline = geometry.ack_deadline;
     // Resolved over no rows, the geometry describes nothing the load did, so
     // it is neither announced nor reported, as on the metrics and spans paths.
     let geometry_resolved = first_rows > 0;
@@ -1625,11 +1628,12 @@ async fn drain_inflight(
 /// there is nothing left that can commit, so the reported list is exactly what
 /// landed, at any `--pipeline-depth`. The cost is on the failure path only, and
 /// it is bounded: the remaining writes were submitted before the failing one and
-/// run concurrently, so this waits at most one [`write_ack_deadline`], which at
-/// a raised `--max-flush-delay` is that delay plus its margin rather than a flat
-/// minute. Reached from the clean-exhaustion drain the wait is usually short,
-/// because the tail buffers were already published by the `flush_all` that
-/// precedes that drain -- with one exception either path shares: a write whose
+/// run concurrently, so this waits at most one [`write_ack_deadline`], which is
+/// `--max-flush-delay` plus its margin (the target's encode allowance
+/// included) rather than a flat minute. Reached from the clean-exhaustion
+/// drain the wait is usually short, because the tail buffers were already
+/// published by the `flush_all` that precedes that drain -- with one
+/// exception either path shares: a write whose
 /// task had not yet reached its channel send when the flush ran lands in a
 /// fresh buffer afterward and waits on the age trigger, which the scaled
 /// deadline outlasts by construction.

@@ -93,6 +93,7 @@ async fn field_dir_ids_at(
         DEFAULT_DECODE_QUEUE_BATCHES,
         Some(PER_BATCH_TARGET_BYTES),
         None,
+        None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         chunk_order,

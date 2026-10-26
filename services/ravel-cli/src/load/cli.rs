@@ -243,6 +243,7 @@ pub async fn run(
     decode_queue_batches: usize,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
+    ack_margin: Option<Duration>,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
@@ -266,6 +267,7 @@ pub async fn run(
         decode_queue_batches,
         target_bytes,
         max_flush_delay,
+        ack_margin,
         zstd_level,
         group_target_blocks,
         chunk_order,
@@ -370,6 +372,7 @@ pub(crate) async fn run_memory_warning_to(
         decode_queue_batches,
         target_bytes,
         max_flush_delay,
+        None,
         zstd_level,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
@@ -402,6 +405,7 @@ pub(crate) async fn run_fold_warning_to(
     decode_queue_batches: usize,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
+    ack_margin: Option<Duration>,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
@@ -475,6 +479,7 @@ pub(crate) async fn run_fold_warning_to(
                 decode_queue_batches,
                 target_bytes,
                 max_flush_delay,
+                ack_margin,
                 load_memory,
                 now_ns,
                 Arc::clone(&clock),
@@ -505,6 +510,7 @@ pub(crate) async fn run_fold_warning_to(
                 decode_queue_batches,
                 target_bytes,
                 max_flush_delay,
+                ack_margin,
                 load_memory,
                 now_ns,
                 Arc::clone(&clock),
@@ -527,6 +533,7 @@ pub(crate) async fn run_fold_warning_to(
     }
 
     let mut memory_options = LoadMemoryOptions::new(load_memory);
+    memory_options.ack_margin = ack_margin;
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
 
     // The production entry point drives the columnar fast path (ADR-0109) with
@@ -694,6 +701,7 @@ async fn run_metrics(
     decode_queue_batches: usize,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
+    ack_margin: Option<Duration>,
     load_memory: LoadMemoryRequest,
     now_ns: i64,
     clock: Arc<dyn Clock>,
@@ -720,6 +728,7 @@ async fn run_metrics(
                 target_bytes,
                 pipeline_depth,
                 load_memory,
+                ack_margin,
             },
             Some(on_geometry),
             max_inflight_flushes,
@@ -788,6 +797,7 @@ async fn run_spans(
     decode_queue_batches: usize,
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
+    ack_margin: Option<Duration>,
     load_memory: LoadMemoryRequest,
     now_ns: i64,
     clock: Arc<dyn Clock>,
@@ -820,6 +830,7 @@ async fn run_spans(
                 target_bytes,
                 pipeline_depth,
                 load_memory,
+                ack_margin,
             },
             Some(on_geometry),
             max_inflight_flushes,
