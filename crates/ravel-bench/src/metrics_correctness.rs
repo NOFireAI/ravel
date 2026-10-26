@@ -301,55 +301,93 @@ const PROMETHEUS_BUDGET: &[BudgetSignature] = &[
         http_status: Some(422),
         error_type: Some("execution"),
         message_contains: "query processing would load too many samples into memory in",
-        source: "Prometheus promql ErrTooManySamples (--query.max-samples), quoted in https://github.com/prometheus/prometheus/issues/7281; 422 execution per https://prometheus.io/docs/prometheus/latest/querying/api/#format-overview",
+        source: "Prometheus 3.13.1 --query.max-samples, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures; also quoted in https://github.com/prometheus/prometheus/issues/7281",
     },
     BudgetSignature {
         http_status: Some(503),
         error_type: Some("timeout"),
         message_contains: "query timed out in",
-        source: "unverified: Prometheus promql ErrQueryTimeout (--query.timeout); only the 503 for a timed-out query is documented, at https://prometheus.io/docs/prometheus/latest/querying/api/#format-overview",
+        source: "Prometheus 3.13.1 --query.timeout (\"query timed out in expression evaluation\"), observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
+    },
+    BudgetSignature {
+        http_status: Some(400),
+        error_type: Some("bad_data"),
+        message_contains: "exceeded maximum resolution of 11,000 points per timeseries",
+        source: "Prometheus 3.13.1 query_range resolution cap, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
     },
 ];
 
 const VICTORIAMETRICS_BUDGET: &[BudgetSignature] = &[
     BudgetSignature {
-        http_status: None,
+        http_status: Some(422),
         error_type: None,
         message_contains: "-search.maxSamplesPerQuery",
-        source: "error body quoted in https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6941 (\"cannot select more than -search.maxSamplesPerQuery=... samples\")",
+        source: "VictoriaMetrics v1.115.0, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures; also quoted in https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6941",
     },
     BudgetSignature {
-        http_status: None,
+        http_status: Some(422),
         error_type: None,
         message_contains: "-search.maxUniqueTimeseries",
-        source: "error body quoted in https://github.com/VictoriaMetrics/VictoriaMetrics/issues/7154 and pull 6893 (\"... the most likely limit is -search.maxUniqueTimeseries\")",
+        source: "VictoriaMetrics v1.115.0, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures; also quoted in https://github.com/VictoriaMetrics/VictoriaMetrics/issues/7154",
     },
     BudgetSignature {
-        http_status: None,
+        http_status: Some(422),
         error_type: None,
         message_contains: "-search.maxPointsPerTimeseries",
-        source: "unverified: flag named in ADR-0927 amendment F; the error text is assumed to name the flag as the two rows above do",
+        source: "VictoriaMetrics v1.115.0, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
     },
     BudgetSignature {
-        http_status: None,
+        http_status: Some(422),
+        error_type: None,
+        message_contains: "-search.maxPointsSubqueryPerTimeseries",
+        source: "VictoriaMetrics v1.115.0, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
+    },
+    BudgetSignature {
+        http_status: Some(422),
         error_type: None,
         message_contains: "-search.maxQueryDuration",
-        source: "unverified: flag named in ADR-0927 amendment F; the error text is assumed to name the flag as the two rows above do",
+        source: "VictoriaMetrics v1.115.0 (\"timeout exceeded during query execution ... the timeout can be adjusted with -search.maxQueryDuration\"), observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
     },
 ];
 
+// Mimir 3.2.3's default query engine (MQE) does not enforce querier.max_samples
+// (observed: a limit of 100 still answered 200), so no row matches that limit.
 const MIMIR_BUDGET: &[BudgetSignature] = &[
     BudgetSignature {
-        http_status: None,
-        error_type: None,
+        http_status: Some(422),
+        error_type: Some("execution"),
         message_contains: "err-mimir-max-chunks-per-query",
-        source: "https://grafana.com/docs/mimir/latest/manage/mimir-runbooks/#err-mimir-max-chunks-per-query (max_fetched_chunks_per_query; 422 since Mimir 2.7.1)",
+        source: "Mimir 3.2.3 limits.max_fetched_chunks_per_query, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures; runbook https://grafana.com/docs/mimir/latest/manage/mimir-runbooks/#err-mimir-max-chunks-per-query",
+    },
+    BudgetSignature {
+        http_status: Some(422),
+        error_type: Some("execution"),
+        message_contains: "err-mimir-max-estimated-memory-consumption-per-query",
+        source: "Mimir 3.2.3 limits.max_estimated_memory_consumption_per_query, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
+    },
+    BudgetSignature {
+        http_status: Some(400),
+        error_type: Some("bad_data"),
+        message_contains: "err-mimir-max-total-query-length",
+        source: "Mimir 3.2.3 limits.max_total_query_length, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
+    },
+    BudgetSignature {
+        http_status: Some(503),
+        error_type: Some("timeout"),
+        message_contains: "query timed out",
+        source: "Mimir 3.2.3 querier.timeout (\"context deadline exceeded: query timed out\"), observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
+    },
+    BudgetSignature {
+        http_status: Some(400),
+        error_type: Some("bad_data"),
+        message_contains: "exceeded maximum resolution of 11,000 points per timeseries",
+        source: "Mimir 3.2.3 query_range resolution cap, observed 2026-10-26 against the pinned release binary, deploy/metricsbench/README.md, Budget-refusal signatures",
     },
     BudgetSignature {
         http_status: None,
         error_type: None,
         message_contains: "err-mimir-max-estimated-chunks-per-query",
-        source: "https://grafana.com/docs/mimir/latest/manage/mimir-runbooks/#err-mimir-max-estimated-chunks-per-query",
+        source: "unverified: runbook https://grafana.com/docs/mimir/latest/manage/mimir-runbooks/#err-mimir-max-estimated-chunks-per-query; not triggered against 3.2.3",
     },
     BudgetSignature {
         http_status: None,
@@ -362,18 +400,6 @@ const MIMIR_BUDGET: &[BudgetSignature] = &[
         error_type: None,
         message_contains: "err-mimir-max-chunks-bytes-per-query",
         source: "unverified: error id from the Mimir runbook errors catalog, message text not read",
-    },
-    BudgetSignature {
-        http_status: None,
-        error_type: None,
-        message_contains: "query processing would load too many samples into memory in",
-        source: "unverified: querier.max_samples is enforced by the Prometheus engine Mimir embeds, so its ErrTooManySamples text is assumed",
-    },
-    BudgetSignature {
-        http_status: None,
-        error_type: Some("timeout"),
-        message_contains: "",
-        source: "unverified: a querier timeout is assumed to use the Prometheus API's timeout errorType",
     },
 ];
 
@@ -775,9 +801,8 @@ mod tests {
         )
     }
 
-    // Prometheus --query.timeout: 503 per
-    // https://prometheus.io/docs/prometheus/latest/querying/api/#format-overview;
-    // the message text is unverified.
+    // Prometheus --query.timeout: 503 `timeout`, text observed against the
+    // 3.13.1 release binary (deploy/metricsbench/README.md).
     fn prometheus_query_timeout() -> QueryOutcome {
         envelope(
             503,
@@ -1212,6 +1237,121 @@ mod tests {
             ),
         );
         assert_eq!(c.refusal_reason, Some(RefusalReason::Budget));
+    }
+
+    /// Every comparator refusal observed against the pinned release binaries
+    /// (deploy/metricsbench/README.md, "Budget-refusal signatures"), verbatim
+    /// apart from the numbers, lands in `refused(budget)`.
+    #[test]
+    fn every_observed_comparator_refusal_is_refused_budget() {
+        let observed: &[(Engine, u16, &str, &str)] = &[
+            (
+                Engine::Prometheus,
+                422,
+                "execution",
+                "query processing would load too many samples into memory in query execution",
+            ),
+            (
+                Engine::Prometheus,
+                503,
+                "timeout",
+                "query timed out in expression evaluation",
+            ),
+            (
+                Engine::Prometheus,
+                400,
+                "bad_data",
+                "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)",
+            ),
+            (
+                Engine::VictoriaMetrics,
+                422,
+                "422",
+                "too many points for the given start=1, end=2 and step=3: 241; the maximum number of points is 10; (see -search.maxPointsPerTimeseries command-line flag)",
+            ),
+            (
+                Engine::VictoriaMetrics,
+                422,
+                "422",
+                "cannot select more than -search.maxSamplesPerQuery=100 samples; possible solutions: increase -search.maxSamplesPerQuery",
+            ),
+            (
+                Engine::VictoriaMetrics,
+                422,
+                "422",
+                "the number of matching timeseries exceeds 5; either narrow down the search or increase -search.max* command-line flag values (the most likely limit is -search.maxUniqueTimeseries)",
+            ),
+            (
+                Engine::VictoriaMetrics,
+                422,
+                "422",
+                "timeout exceeded during query execution: 0.001 seconds (elapsed 1.143 seconds); the timeout can be adjusted with -search.maxQueryDuration command-line flag",
+            ),
+            (
+                Engine::VictoriaMetrics,
+                422,
+                "422",
+                "too many points for the given start=1, end=2 and step=3: 7; the maximum number of points is 100000; (see -search.maxPointsSubqueryPerTimeseries command-line flag)",
+            ),
+            (
+                Engine::Mimir,
+                422,
+                "execution",
+                "the query exceeded the maximum number of chunks (limit: 1 chunks) (err-mimir-max-chunks-per-query)",
+            ),
+            (
+                Engine::Mimir,
+                422,
+                "execution",
+                "the query exceeded the maximum allowed estimated amount of memory consumed by a single query (limit: 1000 bytes) (err-mimir-max-estimated-memory-consumption-per-query)",
+            ),
+            (
+                Engine::Mimir,
+                400,
+                "bad_data",
+                "the total query time range exceeds the limit (query length: 5h59m45s, limit: 1h0m0s) (err-mimir-max-total-query-length)",
+            ),
+            (
+                Engine::Mimir,
+                503,
+                "timeout",
+                "context deadline exceeded: query timed out",
+            ),
+            (
+                Engine::Mimir,
+                400,
+                "bad_data",
+                "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)",
+            ),
+        ];
+        for (engine, status, error_type, message) in observed {
+            let c = run(*engine, envelope(*status, error_body(error_type, message)));
+            assert_eq!(
+                c.status,
+                ResultStatus::Refused,
+                "{engine:?} {status} {message}"
+            );
+            assert_eq!(
+                c.refusal_reason,
+                Some(RefusalReason::Budget),
+                "{engine:?} {message}"
+            );
+        }
+        // Mimir's default engine never enforces querier.max_samples, so the
+        // Prometheus engine's max-samples text is not a Mimir budget row: an
+        // envelope carrying it from Mimir is an unexplained error, not a
+        // refusal the limit could have caused.
+        let c = run(
+            Engine::Mimir,
+            envelope(
+                422,
+                error_body(
+                    "execution",
+                    "query processing would load too many samples into memory in query execution",
+                ),
+            ),
+        );
+        assert_eq!(c.status, ResultStatus::Error);
     }
 
     #[test]
