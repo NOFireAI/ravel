@@ -22,7 +22,11 @@
 # scan that finds nothing in a category fails rather than passing silently:
 #
 #   1. every `image:` reference in deploy/metricsbench/docker-compose.yml
-#      (the original check, unchanged in behaviour);
+#      and its Ravel overlay deploy/metricsbench/ravel.yml -- excluding
+#      ravel.yml's two `${RAVEL_IMAGE:?...}` references by exact match, since
+#      the image under test is a required run parameter with no default in
+#      the file (the overlay was added for ADR-0927 amendment 2026-10-26 A;
+#      the docker-compose.yml check is unchanged in behaviour);
 #   2. every base image in Dockerfile and Dockerfile.prebuilt (`FROM ...` and
 #      the `ARG RUNTIME_BASE=...` default) -- excluding `scratch` (a
 #      zero-content pseudo-image with no registry manifest to pin) and a bare
@@ -92,6 +96,7 @@ DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # shellcheck disable=SC1007
 REPO_ROOT=$(CDPATH= cd -- "$DEPLOY_DIR/../.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
+METRICSBENCH_RAVEL_FILE="$DEPLOY_DIR/ravel.yml"
 RAVEL_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/ravel.yml"
 RUSTFS_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/rustfs.yml"
 K8S_DIR="$REPO_ROOT/deploy/k8s"
@@ -102,10 +107,28 @@ K8S_DIR="$REPO_ROOT/deploy/k8s"
 # permits Mimir or Thanos Receive) chosen for this deployment.
 REQUIRED_COMPARATORS="prometheus victoriametrics mimir"
 
-# Exact number of `image:` references the committed deployment must contain:
-# prometheus, victoriametrics, rustfs, createbuckets, mimir. If a service is added
-# or removed, update this number deliberately in the same change.
-COMPOSE_EXPECTED_IMAGE_COUNT=5
+# Exact number of `image:` references the committed deployment must contain,
+# across docker-compose.yml and its ravel.yml overlay: prometheus,
+# victoriametrics, rustfs, createbuckets, mimir, ravel-qualify, ravel-server.
+# Raised 5->7 when ravel.yml put Ravel in the portable lane (ADR-0927
+# amendment 2026-10-26 A): its two services both run the image under test. If
+# a service is added or removed, update this number deliberately in the same
+# change.
+COMPOSE_EXPECTED_IMAGE_COUNT=7
+
+# Of those seven, the number that must carry a digest pin: every image except
+# the two ravel.yml references matched by METRICSBENCH_RAVEL_IMAGE_REF below.
+# Unchanged at 5 by ravel.yml. Update deliberately alongside
+# COMPOSE_EXPECTED_IMAGE_COUNT.
+COMPOSE_EXPECTED_PINNED_COUNT=5
+
+# The exact stripped `image:` text of ravel.yml's two services. Ravel's image
+# is a required run parameter with no default (`${RAVEL_IMAGE:?...}`), so the
+# file holds no reference to pin; the run pins it by passing a digest and
+# capture-effective-config.sh records what ran. Excluded by exact string
+# match, so an unpinned literal or a `${RAVEL_IMAGE:-tag}` default in its
+# place is not exempt.
+METRICSBENCH_RAVEL_IMAGE_REF='${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}'
 
 # Exact number of base-image references across both Dockerfiles that must
 # carry a digest: Dockerfile's four `FROM` stages that pull a real image
@@ -272,18 +295,21 @@ echo "Repo-wide pin check (issue #1310)"
 
 # --- 1. MetricsBench compose file -------------------------------------------
 
-if [ ! -f "$COMPOSE_FILE" ]; then
-  echo "FAIL: compose file not found at $COMPOSE_FILE"
-  exit 1
-fi
+for f in "$COMPOSE_FILE" "$METRICSBENCH_RAVEL_FILE"; do
+  if [ ! -f "$f" ]; then
+    echo "FAIL: compose file not found at $f"
+    exit 1
+  fi
+done
 
 echo
 echo "== docker-compose image pins =="
 echo "  deployment file: $COMPOSE_FILE"
+echo "  deployment file: $METRICSBENCH_RAVEL_FILE"
 
 # Collect image references. Match indented `image:` keys only, strip the key and
 # surrounding whitespace to leave the bare reference.
-IMAGE_REFS=$(grep -E '^[[:space:]]*image:[[:space:]]*' "$COMPOSE_FILE" \
+IMAGE_REFS=$(grep -hE '^[[:space:]]*image:[[:space:]]*' "$COMPOSE_FILE" "$METRICSBENCH_RAVEL_FILE" \
   | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/[[:space:]]*$//')
 
 if [ -z "$IMAGE_REFS" ]; then
@@ -294,16 +320,31 @@ else
   echo "  image references found: $image_count (expected $COMPOSE_EXPECTED_IMAGE_COUNT)"
   echo "  references:"
   printf '%s\n' "$IMAGE_REFS" | while IFS= read -r ref; do
-    if printf '%s\n' "$ref" | grep -q "$IMAGE_DIGEST_RE"; then
+    if [ "$ref" = "$METRICSBENCH_RAVEL_IMAGE_REF" ]; then
+      echo "    [ravel image, exempt] $ref"
+    elif printf '%s\n' "$ref" | grep -q "$IMAGE_DIGEST_RE"; then
       echo "    [pinned]   $ref"
     else
       echo "    [UNPINNED] $ref"
     fi
   done
 
-  unpinned=$(printf '%s\n' "$IMAGE_REFS" | grep -vc "$IMAGE_DIGEST_RE")
+  # The Ravel-image references are excluded by exact match before the pin
+  # check; everything else must carry a digest.
+  REQUIRED_REFS=$(printf '%s\n' "$IMAGE_REFS" | while IFS= read -r ref; do
+    if [ "$ref" != "$METRICSBENCH_RAVEL_IMAGE_REF" ]; then
+      printf '%s\n' "$ref"
+    fi
+  done)
+  required_count=$(printf '%s\n' "$REQUIRED_REFS" | grep -c .)
+  unpinned=$(printf '%s\n' "$REQUIRED_REFS" | grep . | grep -vc "$IMAGE_DIGEST_RE")
   if [ "$unpinned" -ne 0 ]; then
     echo "FAIL: $unpinned compose image reference(s) lack an @sha256: digest"
+    fail=1
+  fi
+
+  if [ "$required_count" -ne "$COMPOSE_EXPECTED_PINNED_COUNT" ]; then
+    echo "FAIL: found $required_count pin-required compose image references, expected exactly $COMPOSE_EXPECTED_PINNED_COUNT"
     fail=1
   fi
 
@@ -324,6 +365,12 @@ for svc in $REQUIRED_COMPARATORS; do
     fail=1
   fi
 done
+if grep -Eq "^  ravel-server:[[:space:]]*\$" "$METRICSBENCH_RAVEL_FILE"; then
+  echo "  comparator present: ravel-server"
+else
+  echo "FAIL: required comparator 'ravel-server' is missing from $METRICSBENCH_RAVEL_FILE"
+  fail=1
+fi
 
 # --- 2. Dockerfile base images -----------------------------------------------
 
@@ -796,5 +843,5 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, $k8s_count k8s manifest images, all pinned; comparators: $REQUIRED_COMPARATORS)"
+echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, $k8s_count k8s manifest images, all pinned; comparators: $REQUIRED_COMPARATORS ravel-server)"
 exit 0
