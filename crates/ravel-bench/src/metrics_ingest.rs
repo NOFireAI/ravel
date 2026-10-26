@@ -325,8 +325,11 @@ pub struct IngestPhase {
     /// What `elapsed_secs` measures, so two artifacts can be told apart
     /// before their throughput figures are compared: always
     /// [`ELAPSED_BASIS_TIMED_SEGMENTS`] for a report this code writes.
-    /// Reports written before this field existed measured the replay's wall
-    /// time including admission and encoding, and carry no marker.
+    /// Reports written before this field existed carry no marker; their
+    /// `elapsed_secs` was one wall-clock span over the write loop of a
+    /// stream generated up front (admission and the RW1.0 encode were
+    /// already outside it), so the two bases differ only by the generation
+    /// now interleaved between segments, which the sum excludes.
     pub elapsed_basis: String,
     /// Accepted logical samples per second.
     pub logical_points_per_sec: f64,
