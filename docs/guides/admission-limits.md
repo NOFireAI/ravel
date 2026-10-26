@@ -67,7 +67,7 @@ bucket: a sustained `per_sec` plus an instantaneous `burst`.
 | Query bytes-scanned budget | unlimited | `max_bytes_scanned` |
 | Fleet-wide concurrent-query ceiling | unlimited | `--max-concurrent-queries` (CLI flag, not a `--limits-file` key) |
 | Event-time future skew | 10 m | not configurable (compiled-in default) |
-| Event-time ingest lag | 2 h | not configurable (compiled-in default) |
+| Event-time ingest lag | 2 h | `--max-ingest-lag` (CLI flag; sets both the admission bound and the catalog listing window, see [Replaying old telemetry](#replaying-old-telemetry)) |
 | Fast-tier flush delay | 2 s | `--max-flush-delay` (CLI flag) |
 | Idle-tier flush delay | 40 s | `--max-flush-delay-idle` (CLI flag) |
 | Min flush bytes | 256 KiB | `--min-flush-bytes` (CLI flag) |

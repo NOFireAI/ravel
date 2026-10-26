@@ -288,7 +288,8 @@ every profile each entry runs under:
 - every profile an entry names is declared;
 - every range entry's window plus its longest lookback (`[5m]`, `[6h]`,
   `[7d]`, and a subquery's `[1d:5m]` range plus the lookback inside it) fits
-  inside the profile's duration;
+  inside the profile's stream span, `(samples_per_series - 1) *
+  scrape_interval_secs`, not inside its `duration_secs`;
 - unless the entry is intended-empty, every selector matches at least one
   series the generator writes, so a label value no family emits fails (a
   selector written directly inside `absent(` or `absent_over_time(` is
