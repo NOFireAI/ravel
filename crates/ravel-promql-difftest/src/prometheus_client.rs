@@ -213,6 +213,15 @@ impl PrometheusClient {
         self.max_body_bytes
     }
 
+    /// How many per-call-deadline query clients are cached right now. Never
+    /// exceeds [`MAX_OVERRIDE_CLIENTS`]; exposed so a test can pin the bound.
+    pub fn cached_override_clients(&self) -> usize {
+        self.overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// Polls `/-/ready` until it returns 2xx or `timeout` elapses.
     pub async fn wait_ready(&self, timeout: Duration) -> Result<(), PrometheusClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -534,6 +543,18 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3600);
         let result = parse_within(b"<html>".to_vec(), deadline).await;
         assert!(matches!(result, ParseResult::Failed(_)), "{result:?}");
+    }
+
+    #[test]
+    fn per_call_deadline_clients_are_bounded() {
+        let client = PrometheusClient::new("http://127.0.0.1:9");
+        for extra_ms in 1..=(MAX_OVERRIDE_CLIENTS as u64 * 2) {
+            let _ = client.client_for(DEFAULT_QUERY_DEADLINE + Duration::from_millis(extra_ms));
+        }
+        assert_eq!(client.cached_override_clients(), MAX_OVERRIDE_CLIENTS);
+        // The default deadline never enters the cache.
+        let _ = client.client_for(DEFAULT_QUERY_DEADLINE);
+        assert_eq!(client.cached_override_clients(), MAX_OVERRIDE_CLIENTS);
     }
 
     #[test]

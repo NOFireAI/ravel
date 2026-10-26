@@ -75,6 +75,23 @@ fn client(addr: SocketAddr) -> PrometheusClient {
     PrometheusClient::with_deadline(format!("http://{addr}"), DEADLINE)
 }
 
+/// A server that accepts the readiness probe and never answers it must not
+/// hold `wait_ready` past its own timeout: the probe is bounded by what
+/// remains of that timeout, not by the connection staying open.
+#[tokio::test]
+async fn readiness_probe_that_never_answers_is_not_ready_within_the_timeout() {
+    let addr = serve_once(Vec::new(), true).await;
+    let started = Instant::now();
+    let result = client(addr).wait_ready(Duration::from_millis(500)).await;
+    let wall = started.elapsed();
+    // hygiene-allow: wall-clock -- the timeout under test bounds real socket I/O; 4x upper bound only
+    assert!(wall < DEADLINE_BOUND, "wait_ready took {wall:?}"); // allow-wall-clock: the timeout under test bounds real socket I/O; 4x upper bound only
+    match result {
+        Err(PrometheusClientError::NotReady(t)) => assert_eq!(t, Duration::from_millis(500)),
+        other => panic!("expected NotReady, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn stalled_body_is_a_body_timeout_within_the_deadline() {
     let addr = serve_once(vec![step(0, headers("200 OK", 100_000))], true).await;
