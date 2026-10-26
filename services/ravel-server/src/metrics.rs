@@ -2788,6 +2788,15 @@ pub struct CatalogCountersSnapshot {
     /// Decoded-output cache entries dropped by an eviction pass
     /// ([`ravel_catalog::Catalog::decoded_cache_memory_evictions`]).
     pub decoded_cache_memory_evictions: u64,
+    /// The catalog decode budget's limit, a gauge (ADR-1170, catalog decode
+    /// carve amendment). Not read off the catalog: the scrape handler reads
+    /// the `MemoryBudget` handle `crate::start` built the catalog with,
+    /// through [`CatalogCountersSnapshot::with_decode_budget`], and
+    /// [`CatalogCountersSnapshot::from_catalog`] leaves it zeroed.
+    pub decode_budget_bytes: u64,
+    /// Bytes reserved against the catalog decode budget now, a gauge, filled
+    /// in the same way as [`Self::decode_budget_bytes`].
+    pub decode_reserved_bytes: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
     /// Supervisor restarts of each signal's fold loop, in
@@ -2821,6 +2830,8 @@ impl Default for CatalogCountersSnapshot {
             decoded_postings_cache_reserved_bytes: 0,
             decode_reserve_retries: 0,
             decoded_cache_memory_evictions: 0,
+            decode_budget_bytes: 0,
+            decode_reserved_bytes: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
             fold_refold_requests_dropped: 0,
@@ -2850,6 +2861,8 @@ impl CatalogCountersSnapshot {
             decoded_postings_cache_reserved_bytes: catalog.decoded_postings_cache_reserved_bytes(),
             decode_reserve_retries: catalog.decode_reserve_retries(),
             decoded_cache_memory_evictions: catalog.decoded_cache_memory_evictions(),
+            decode_budget_bytes: 0,
+            decode_reserved_bytes: 0,
             fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
                 signal,
                 cycles: catalog.fold_cycles(signal),
@@ -2877,6 +2890,13 @@ impl CatalogCountersSnapshot {
     /// Attaches [`crate::fold::RefoldQueue::dropped_requests`].
     pub fn with_refold_requests_dropped(mut self, dropped: u64) -> Self {
         self.fold_refold_requests_dropped = dropped;
+        self
+    }
+
+    /// Attaches the catalog decode budget's limit and current reservation.
+    pub fn with_decode_budget(mut self, budget: &ravel_memory::MemoryBudget) -> Self {
+        self.decode_budget_bytes = budget.limit();
+        self.decode_reserved_bytes = budget.reserved();
         self
     }
 }
@@ -3038,8 +3058,34 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 
     write_header(
         out,
+        "ravel_catalog_decode_budget_bytes",
+        "Limit of the catalog decode budget, the fourth hard carve of the memory budget that the catalog's snapshot part, name postings and column-statistics decodes reserve against (--catalog-decode-budget-bytes).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decode_budget_bytes",
+        &[Label::Mode(mode)],
+        snapshot.decode_budget_bytes,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decode_reserved_bytes",
+        "Bytes reserved against the catalog decode budget now: the cached decoded parts and postings plus the decodes in flight and the decoded objects running queries still hold.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decode_reserved_bytes",
+        &[Label::Mode(mode)],
+        snapshot.decode_reserved_bytes,
+    );
+
+    write_header(
+        out,
         "ravel_catalog_decode_reserve_retries_total",
-        "Catalog decode reservations retried after the decoded-output caches dropped entries to make room; moves only when the catalog's memory budget refuses a reservation, and the server leaves that budget unlimited.",
+        "Catalog decode reservations retried after the decoded-output caches dropped entries to make room; moves only when the catalog decode budget refuses a reservation.",
         "counter",
     );
     write_sample(
@@ -3052,7 +3098,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_decoded_cache_memory_evictions_total",
-        "Decoded snapshot-part and name-postings cache entries the catalog dropped to make room for a refused decode reservation; moves only when the catalog's memory budget refuses a reservation, and the server leaves that budget unlimited.",
+        "Decoded snapshot-part and name-postings cache entries the catalog dropped to make room for a refused decode reservation; moves only when the catalog decode budget refuses a reservation.",
         "counter",
     );
     write_sample(
@@ -3486,9 +3532,10 @@ fn render_ingest_buffer_budget_family(
 /// `is_fallback` is set (the budget was sized on an unmeasured host,
 /// `config::PERF_SOURCE_FALLBACK`). On that path `raw_limit` is
 /// `ravel_memory::MemoryBudget::limit()`'s actual value: `u64::MAX` minus
-/// the three hard cache carves (`DEFAULT_CACHE_MAX_BYTES` for each byte cache
-/// and `DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` for the column-statistics
-/// cache), not `u64::MAX` itself, which would leave the "unlimited" doc
+/// the four hard carves (`DEFAULT_CACHE_MAX_BYTES` for each byte cache,
+/// `DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` for the column-statistics cache and
+/// `CATALOG_DECODE_BUDGET_FLOOR_BYTES` for the catalog decode budget), not
+/// `u64::MAX` itself, which would leave the "unlimited" doc
 /// claim on `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard
 /// check permanently unmatched.
 fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
@@ -3548,7 +3595,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_budget_bytes",
-        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the three resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
+        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the three resolved cache ceilings and the catalog decode budget), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
         "gauge",
     );
     write_sample(
@@ -8868,6 +8915,12 @@ pub struct MetricsState {
     /// rather than the raw near-miss remainder. See
     /// [`exposed_memory_budget_limit`].
     pub process_memory_budget_is_fallback: bool,
+    /// The catalog decode budget, the same `MemoryBudget` `crate::start`
+    /// installed on [`Self::catalog`] with `Catalog::with_memory_budget`
+    /// (ADR-1170, catalog decode carve amendment), read at scrape time for
+    /// `ravel_catalog_decode_budget_bytes` and
+    /// `ravel_catalog_decode_reserved_bytes`.
+    pub catalog_decode_budget: Arc<ravel_memory::MemoryBudget>,
     /// The ADR-1702 read and write CPU gates, the same handles every gated
     /// call site holds. Always present: `crate::start` builds both in every
     /// mode, so the `ravel_cpu_gate_*` families render in every mode.
@@ -8937,7 +8990,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
 
     let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref())
         .with_fold_loop_restarts(state.fold_loop.restarts())
-        .with_refold_requests_dropped(state.refold.dropped_requests());
+        .with_refold_requests_dropped(state.refold.dropped_requests())
+        .with_decode_budget(&state.catalog_decode_budget);
 
     let maintain_snapshot =
         state
@@ -16869,6 +16923,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             audit_pipeline: None,
             process_memory_budget: Arc::new(MemoryBudget::unlimited()),
             process_memory_budget_is_fallback: false,
+            catalog_decode_budget: Arc::new(MemoryBudget::unlimited()),
             cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
             can_fold: true,
             fold_loop: Default::default(),

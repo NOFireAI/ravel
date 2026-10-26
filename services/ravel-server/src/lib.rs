@@ -1212,6 +1212,10 @@ pub struct Running {
     /// The ADR-1170 process memory budget, whose host-memory gate the memory
     /// gate sampler (ADR-2633, as amended for issue #2806) writes.
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// The catalog decode budget the query catalog was built with (ADR-1170,
+    /// catalog decode carve amendment), onto which the memory gate sampler
+    /// mirrors the process budget's gate.
+    catalog_decode_budget: Arc<ravel_memory::MemoryBudget>,
     /// This process's hold on `<cache-dir>/sql-spill/<instance-id>` (ADR-0954
     /// requirement 7, amended by issue #2416), `Some` when SQL spill resolved
     /// under `--cache-dir`. Its lock tells every other process's startup sweep
@@ -1457,6 +1461,12 @@ impl Running {
     /// sampler on (ADR-2633 task 2).
     pub fn process_memory_budget(&self) -> Arc<ravel_memory::MemoryBudget> {
         self.process_memory_budget.clone()
+    }
+
+    /// The catalog decode budget, for `main` to mirror the memory gate onto
+    /// (ADR-1170, catalog decode carve amendment).
+    pub fn catalog_decode_budget(&self) -> Arc<ravel_memory::MemoryBudget> {
+        self.catalog_decode_budget.clone()
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
@@ -2927,11 +2937,19 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
     // ADR-1702 decision 3: the catalog's resolve-path snapshot part, postings
     // and column-statistics decodes run on the read gate, not on the
-    // resolving task. The memory budget stays unlimited here.
+    // resolving task. They reserve against the catalog decode budget, the
+    // fourth hard carve of the memory budget (ADR-1170, catalog decode carve
+    // amendment), separate from the shared SQL/fetch remainder; a mode
+    // outside the budget keeps the catalog's unlimited one.
+    let catalog_decode_budget = Arc::new(match config.query_budgets.catalog_decode_budget_bytes {
+        Some(bytes) => ravel_memory::MemoryBudget::new(bytes),
+        None => ravel_memory::MemoryBudget::unlimited(),
+    });
     let catalog = Arc::new(
         Arc::into_inner(catalog)
             .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
-            .with_read_gate(cpu_gates.read.clone()),
+            .with_read_gate(cpu_gates.read.clone())
+            .with_memory_budget(catalog_decode_budget.clone()),
     );
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
@@ -3185,6 +3203,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
         process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
+        catalog_decode_budget: catalog_decode_budget.clone(),
         cpu_gates: cpu_gates.clone(),
         // Both fold routes, not just the background task: the on-demand route
         // mounted below runs the same `Catalog::fold` into the same
@@ -4616,6 +4635,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         query_worker_heartbeat,
         runtime_heartbeat_task: None,
         process_memory_budget,
+        catalog_decode_budget,
         #[cfg(feature = "sql")]
         sql_spill_owner,
     })

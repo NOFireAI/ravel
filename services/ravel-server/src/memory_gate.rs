@@ -818,12 +818,26 @@ pub fn sample_once(
     }
 }
 
+/// Copy `from`'s host-memory gate (open, last available reading, floor) onto
+/// `to`, so a budget the sampler does not write itself refuses on the same
+/// host reading as the one it does.
+pub fn mirror_gate(from: &MemoryBudget, to: &MemoryBudget) {
+    to.set_host_memory_gate(from.gate_open(), from.gate_available(), from.gate_floor());
+}
+
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Starts the `ravel-memory-gate` thread for the process's life when `gate`
 /// is enabled, at most once per process. Returns whether this call started
-/// it: an off gate starts nothing, so the budget's setter is never called.
-pub fn start_sampler(gate: &MemoryGate, budget: Arc<MemoryBudget>) -> std::io::Result<bool> {
+/// it: an off gate starts nothing, so no budget's setter is ever called.
+/// Each pass writes the gate on `budget` and then mirrors it onto every
+/// budget in `mirrored` (the catalog decode budget, ADR-1170 catalog decode
+/// carve amendment).
+pub fn start_sampler(
+    gate: &MemoryGate,
+    budget: Arc<MemoryBudget>,
+    mirrored: Vec<Arc<MemoryBudget>>,
+) -> std::io::Result<bool> {
     if !gate.enabled {
         return Ok(false);
     }
@@ -841,7 +855,7 @@ pub fn start_sampler(gate: &MemoryGate, budget: Arc<MemoryBudget>) -> std::io::R
     let source = gate.available_source;
     let spawned = std::thread::Builder::new()
         .name("ravel-memory-gate".to_string())
-        .spawn(move || run_sampler(&budget, floors, interval, source));
+        .spawn(move || run_sampler(&budget, &mirrored, floors, interval, source));
     match spawned {
         Ok(_) => Ok(true),
         Err(err) => {
@@ -853,6 +867,7 @@ pub fn start_sampler(gate: &MemoryGate, budget: Arc<MemoryBudget>) -> std::io::R
 
 fn run_sampler(
     budget: &MemoryBudget,
+    mirrored: &[Arc<MemoryBudget>],
     floors: Floors,
     interval: Duration,
     resolved_source: HostMemorySource,
@@ -901,6 +916,9 @@ fn run_sampler(
             &mut read_resident,
             &mut purge,
         );
+        for other in mirrored {
+            mirror_gate(budget, other);
+        }
         match sample {
             Sample::Unread if !warned_unread => {
                 warned_unread = true;
@@ -2685,7 +2703,7 @@ mod tests {
             assert!(!gate.enabled);
             assert_eq!(gate.source, source);
             let budget = Arc::new(MemoryBudget::new(GIB));
-            assert!(!start_sampler(&gate, budget.clone()).expect("no spawn to fail"));
+            assert!(!start_sampler(&gate, budget.clone(), Vec::new()).expect("no spawn to fail"));
             std::thread::sleep(Duration::from_millis(3 * DEFAULT_INTERVAL_MS));
             assert!(budget.gate_open());
             assert_eq!(budget.gate_available(), 0);

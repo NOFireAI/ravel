@@ -271,7 +271,11 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         source: memory_gate::SOURCE_FLAG,
     };
     let budget = running.process_memory_budget();
-    assert!(memory_gate::start_sampler(&gate, budget.clone()).expect("sampler thread spawns"));
+    let catalog_budget = running.catalog_decode_budget();
+    assert!(
+        memory_gate::start_sampler(&gate, budget.clone(), vec![catalog_budget.clone()])
+            .expect("sampler thread spawns")
+    );
 
     let close_after = f64::from(memory_gate::DEFAULT_CLOSE_AFTER_SAMPLES);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -290,6 +294,7 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
             && value(&body, "ravel_memory_gate_available_floor_bytes") >= 1.0
             && value(&body, "ravel_memory_gate_samples_below_floor_total") >= close_after
             && !budget.gate_open()
+            && !catalog_budget.gate_open()
         {
             break body;
         }
@@ -300,6 +305,9 @@ async fn every_memory_gate_family_appears_on_the_scraped_metrics() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_every_family(&body);
+    // The catalog decode budget refuses on the same host reading: the
+    // sampler mirrors the process budget's gate onto it every pass.
+    assert_eq!(catalog_budget.gate_floor(), CLOSE_FLOOR);
     // Each family's value: the two floors as set (and distinct from each
     // other), the two readings real figures below both floors, the counters
     // moved, and the purge histogram's count equal to the purge counter.

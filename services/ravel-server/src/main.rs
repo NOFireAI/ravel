@@ -722,8 +722,12 @@ async fn main() -> anyhow::Result<()> {
         ipcrypt_policy,
     )
     .await?;
-    ravel_server::memory_gate::start_sampler(&memory_gate, running.process_memory_budget())
-        .context("failed to start the memory gate sampler thread")?;
+    ravel_server::memory_gate::start_sampler(
+        &memory_gate,
+        running.process_memory_budget(),
+        vec![running.catalog_decode_budget()],
+    )
+    .context("failed to start the memory gate sampler thread")?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
     if let Some(listener) = &health_listener {
         listener.attach_readiness(running.readiness());
@@ -1032,14 +1036,16 @@ mod tests {
     }
 
     /// `main` stamps the memory gate once before any listener binds, and
-    /// starts its sampler once, on the running server's own budget.
+    /// starts its sampler once, on the running server's own budget, mirrored
+    /// onto its catalog decode budget.
     #[test]
     fn main_stamps_the_memory_gate_before_start_and_samples_after() {
         const SRC: &str = include_str!("main.rs");
         let stamp = concat!("\n    memory_gate", ".emit();\n");
         let sampler = concat!(
             "ravel_server::memory_gate::start_",
-            "sampler(&memory_gate, running.process_memory_budget())"
+            "sampler(\n        &memory_gate,\n        running.process_memory_budget(),\n        ",
+            "vec![running.catalog_decode_budget()],\n    )"
         );
         assert_eq!(SRC.matches(stamp).count(), 1);
         assert_eq!(SRC.matches(sampler).count(), 1);

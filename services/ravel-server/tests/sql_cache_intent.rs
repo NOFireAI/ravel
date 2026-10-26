@@ -649,6 +649,7 @@ fn metrics_app(store: Arc<dyn ObjectStoreBackend>, cache: &ReadCache) -> Router 
         audit_pipeline: None,
         process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         process_memory_budget_is_fallback: false,
+        catalog_decode_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
