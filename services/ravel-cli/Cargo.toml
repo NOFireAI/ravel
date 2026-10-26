@@ -130,6 +130,9 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
 [dev-dependencies]
+# Paused tokio time, so a loader test can hold a PUT past the real-time
+# Strict ack deadline without waiting it out. A feature of the existing pin.
+tokio = { workspace = true, features = ["test-util"] }
 # `MemoryStore::insert_foreign`, to seed keys no store operation can write.
 ravel-object-store = { workspace = true, features = ["test-support"] }
 # `KeyType`, to build `.kidx` leaf fixtures for `inspect kidx`.

@@ -218,26 +218,136 @@ fn max_flush_delay_set_reaches_the_config_exactly() {
 /// `write_ack_deadline` and the 10m case fails at `left: 60s, right: 660s`.
 #[test]
 fn write_ack_deadline_scales_with_the_configured_flush_delay() {
+    let ack = |delay| write_ack_deadline(delay, None, PER_BATCH_TARGET_BYTES, 0);
     assert_eq!(
-        write_ack_deadline(None),
+        ack(None),
         Duration::from_secs(60),
         "an unset --max-flush-delay leaves the deadline at exactly 60s"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::from_secs(600))),
+        ack(Some(Duration::from_secs(600))),
         Duration::from_secs(660),
         "--max-flush-delay 10m gives an 11m deadline: the delay plus one minute of margin"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::ZERO)),
+        ack(Some(Duration::ZERO)),
         Duration::from_secs(60),
         "a delay under the floor cannot shorten the deadline"
     );
     let long = Duration::from_secs(3600);
     assert!(
-        write_ack_deadline(Some(long)) > long,
+        ack(Some(long)) > long,
         "the deadline always outlasts the age trigger it has to wait for"
     );
+}
+
+/// The ack deadline's margin carries the encode time of a target-sized flush
+/// (issue #3273): `max(60s, delay + 60s + target / 100,000,000 B/s)`. A flush
+/// released by the age trigger encodes up to `--target-bytes` of rows before
+/// its PUT starts, so the margin scales with the target, not with the delay.
+///
+/// Prove-the-test: drop the `encode_allowance` term from `write_ack_deadline`
+/// and the 7.4e9 case fails at `left: 150s, right: 224s`; scale the margin
+/// with the delay instead (`delay + delay`) and it fails at `180s`.
+#[test]
+fn write_ack_deadline_adds_the_encode_time_of_a_target_sized_flush() {
+    const SLICE: u64 = 4_000_000;
+    assert_eq!(ENCODE_BYTES_PER_SECOND, 100_000_000);
+    assert_eq!(
+        write_ack_deadline(None, None, 1_850_000_000, SLICE),
+        Duration::from_millis(78_500),
+        "an unset delay at the stock 1.85e9 target: the 60s margin plus 18.5s of encode"
+    );
+    assert_eq!(
+        write_ack_deadline(Some(Duration::from_secs(30)), None, 1_850_000_000, SLICE),
+        Duration::from_millis(108_500),
+        "a 30s delay at the stock target: 30 + 60 + 18.5"
+    );
+    assert_eq!(
+        write_ack_deadline(Some(Duration::from_secs(60)), None, 1_850_000_000, SLICE),
+        Duration::from_millis(138_500),
+        "the CLI's 60s default delay at the stock target: 60 + 60 + 18.5"
+    );
+    assert_eq!(
+        write_ack_deadline(Some(Duration::from_secs(90)), None, 7_400_000_000, SLICE),
+        Duration::from_secs(224),
+        "a 90s delay at a 7.4e9 target: 90 + 60 + 74, not the 150s a flat margin gives"
+    );
+    assert_eq!(
+        write_ack_deadline(Some(Duration::from_secs(90)), None, 1, SLICE),
+        Duration::from_secs(150),
+        "--target-bytes 1 flushes per batch and adds nothing"
+    );
+    assert_eq!(
+        write_ack_deadline(Some(Duration::from_secs(90)), None, 3_000_000, SLICE),
+        Duration::from_secs(150),
+        "a target below one batch's per-shard slice flushes per batch and adds nothing"
+    );
+    assert_eq!(
+        encode_allowance(PER_BATCH_TARGET_BYTES, 0),
+        Duration::ZERO,
+        "the per-batch target adds nothing even when the slice estimate is zero"
+    );
+}
+
+/// `--ack-margin` replaces the whole margin, the encode allowance included,
+/// and still never takes the deadline under the 60s floor.
+#[test]
+fn ack_margin_replaces_the_whole_margin() {
+    let margin = Some(Duration::from_secs(60));
+    assert_eq!(
+        write_ack_deadline(
+            Some(Duration::from_secs(90)),
+            margin,
+            7_400_000_000,
+            4_000_000
+        ),
+        Duration::from_secs(150),
+        "--ack-margin 60 drops the 74s encode allowance"
+    );
+    assert_eq!(
+        write_ack_deadline(
+            Some(Duration::from_secs(90)),
+            Some(Duration::from_secs(600)),
+            1,
+            4_000_000
+        ),
+        Duration::from_secs(690),
+        "--ack-margin 600 widens the margin at a per-batch target"
+    );
+    assert_eq!(
+        write_ack_deadline(None, Some(Duration::from_secs(1)), 7_400_000_000, 0),
+        Duration::from_secs(60),
+        "a 1s margin with no delay still meets the floor"
+    );
+    assert_eq!(
+        write_ack_deadline(
+            Some(Duration::from_secs(90)),
+            Some(Duration::from_secs(1)),
+            7_400_000_000,
+            0
+        ),
+        Duration::from_secs(91),
+        "the floor applies to the whole deadline, not to the margin: 90 + 1, not 90 + 60"
+    );
+}
+
+/// `--ack-margin 0` is refused at parse, with a message that names the flag,
+/// and so is a fractional or non-numeric value.
+#[test]
+fn parse_ack_margin_refuses_zero_and_names_the_flag() {
+    assert_eq!(parse_ack_margin("90"), Ok(Duration::from_secs(90)));
+    let zero = parse_ack_margin("0").expect_err("0 must be refused");
+    assert!(zero.contains("--ack-margin"), "{zero}");
+    assert!(zero.contains("at least 1 second"), "{zero}");
+    let fractional = parse_ack_margin("1.5").expect_err("whole seconds only");
+    assert!(fractional.contains("--ack-margin"), "{fractional}");
+    assert!(
+        validate_ack_margin(Some(Duration::ZERO)).is_err(),
+        "the loader refuses a zero margin a library caller hands it"
+    );
+    assert!(validate_ack_margin(None).is_ok());
+    assert!(validate_ack_margin(Some(Duration::from_secs(1))).is_ok());
 }
 
 /// `strict_visibility_budget_ns` follows the configured `max_flush_delay`

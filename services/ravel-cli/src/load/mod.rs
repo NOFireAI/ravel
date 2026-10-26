@@ -217,28 +217,87 @@ pub(crate) fn build_ingest_config(
 /// completing over racing a slow store.
 const WRITE_ACK_DEADLINE_FLOOR: Duration = Duration::from_secs(60);
 
-/// Headroom added over `--max-flush-delay` by [`write_ack_deadline`]: the
-/// window the released flush still needs to encode and PUT its object once the
-/// age trigger has opened it.
+/// Fixed headroom added over `--max-flush-delay` by [`write_ack_deadline`]:
+/// the window the released flush needs for its PUTs and commit once the age
+/// trigger has opened it. Encoding a target-sized object is added on top
+/// ([`encode_allowance`]).
 const WRITE_ACK_DEADLINE_MARGIN: Duration = Duration::from_secs(60);
 
-/// Ack deadline for each Strict write, scaled to the configured age trigger.
-///
-/// A write whose shard buffer never reaches `--target-bytes` is answered by the
-/// age trigger, so its ack can legitimately take `--max-flush-delay` plus the
-/// flush itself. A fixed 60s deadline therefore turns any raised delay into a
-/// `LogWriteError::AckTimeout` on the very batches the raised delay was meant
-/// to let accumulate, failing a whole load at its documented settings. Scaling
-/// keeps the deadline what it always was for an unset flag
-/// ([`WRITE_ACK_DEADLINE_FLOOR`] exactly) while leaving a raised delay one
-/// [`WRITE_ACK_DEADLINE_MARGIN`] of room past the trigger it configured.
-pub(crate) fn write_ack_deadline(max_flush_delay: Option<Duration>) -> Duration {
-    match max_flush_delay {
-        None => WRITE_ACK_DEADLINE_FLOOR,
-        Some(delay) => {
-            WRITE_ACK_DEADLINE_FLOOR.max(delay.saturating_add(WRITE_ACK_DEADLINE_MARGIN))
-        }
+/// Estimated object bytes a flush encodes per second, the rate
+/// [`encode_allowance`] turns a flush target into encode time with. A
+/// conservative single-core figure, derived from issue #3273: a flush of a
+/// 7.4e9-estimate object on c6a.4xlarge started its PUT 59 s after its age
+/// trigger, about 1.25e8 estimate bytes per second.
+pub const ENCODE_BYTES_PER_SECOND: u64 = 100_000_000;
+
+/// The encode time [`write_ack_deadline`] allows a flush of `target_bytes`:
+/// `target_bytes / ENCODE_BYTES_PER_SECOND`, exact to the nanosecond. Zero for
+/// a target at or below [`PER_BATCH_TARGET_BYTES`] or one batch's estimated
+/// per-shard slice (`slice_est_bytes`), since each write then flushes about
+/// one slice, which the fixed margin always covered.
+pub(crate) fn encode_allowance(target_bytes: usize, slice_est_bytes: u64) -> Duration {
+    let target = target_bytes as u64;
+    if target_bytes <= PER_BATCH_TARGET_BYTES || target <= slice_est_bytes {
+        return Duration::ZERO;
     }
+    let nanos = u128::from(target) * 1_000_000_000 / u128::from(ENCODE_BYTES_PER_SECOND);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// Ack deadline for each Strict write:
+/// `max(WRITE_ACK_DEADLINE_FLOOR, delay + margin)`, where the margin is
+/// `--ack-margin` when given and otherwise [`WRITE_ACK_DEADLINE_MARGIN`] plus
+/// the [`encode_allowance`] of the load's flush target. An unset delay counts
+/// as zero.
+///
+/// A write whose shard buffer never reaches `--target-bytes` is answered by
+/// the age trigger, so its ack can legitimately take `--max-flush-delay` plus
+/// the flush itself, and that flush encodes up to a target's worth of rows
+/// before its PUT starts. A deadline that ignores either turns a raised delay
+/// or a large target into a `LogWriteError::AckTimeout` on the very batches
+/// they were meant to let accumulate, failing a whole load at its documented
+/// settings.
+pub(crate) fn write_ack_deadline(
+    max_flush_delay: Option<Duration>,
+    ack_margin: Option<Duration>,
+    target_bytes: usize,
+    slice_est_bytes: u64,
+) -> Duration {
+    let margin = ack_margin.unwrap_or_else(|| {
+        WRITE_ACK_DEADLINE_MARGIN.saturating_add(encode_allowance(target_bytes, slice_est_bytes))
+    });
+    WRITE_ACK_DEADLINE_FLOOR.max(
+        max_flush_delay
+            .unwrap_or(Duration::ZERO)
+            .saturating_add(margin),
+    )
+}
+
+/// The message refusing `--ack-margin 0`: a zero margin leaves the released
+/// flush no time at all past the age trigger.
+const ACK_MARGIN_ZERO: &str = "--ack-margin must be at least 1 second (the time a flush \
+                               released by the age trigger has to encode, PUT and commit its \
+                               object); 0 was given";
+
+/// Reject an `--ack-margin` of zero where the deadline is built, so a library
+/// caller that bypasses the flag parser is refused too.
+pub(crate) fn validate_ack_margin(ack_margin: Option<Duration>) -> Result<(), LoadError> {
+    if ack_margin.is_some_and(|m| m.is_zero()) {
+        return Err(LoadError::Setup(ACK_MARGIN_ZERO.to_string()));
+    }
+    Ok(())
+}
+
+/// Parse `--ack-margin`: whole seconds, at least 1.
+pub fn parse_ack_margin(s: &str) -> Result<Duration, String> {
+    let secs: u64 = s
+        .trim()
+        .parse()
+        .map_err(|e| format!("--ack-margin takes whole seconds: {e}"))?;
+    if secs == 0 {
+        return Err(ACK_MARGIN_ZERO.to_string());
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 mod mapping;

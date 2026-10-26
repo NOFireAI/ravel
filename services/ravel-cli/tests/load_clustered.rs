@@ -289,6 +289,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         DEFAULT_DECODE_QUEUE_BATCHES,
         Some(PER_BATCH_TARGET_BYTES),
         None,
+        None,
         RlogZstdLevel::new(3).expect("in range"),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,

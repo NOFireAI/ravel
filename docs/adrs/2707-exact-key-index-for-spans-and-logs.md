@@ -1310,7 +1310,10 @@ bound of 1 gives a depth of 2 and a rows bound of 2 gives 3. The margin
 applies only while the depth flush runs (a derived target,
 `LoadGeometry::depth_flush_enabled`): with an explicit `--target-bytes`,
 `1` included, the depth flush is off, the margin would only add in-flight
-memory, and the derived depth stays the plain rows bound.
+memory, and the derived depth stays the plain rows bound. Since PR #3282
+only `--target-bytes 1` turns the depth flush off, and an explicit target
+above it gets the margin as a derived one does (ADR-3217's decision 6 ack
+deadline amendment).
 
 A shard of evenly spread rows reaches the target before its window comes
 due, so the size trigger closes every object but the end-of-input tails.

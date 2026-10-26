@@ -116,6 +116,7 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         DEFAULT_DECODE_QUEUE_BATCHES,
         Some(PER_BATCH_TARGET_BYTES),
         None,
+        None,
         RlogZstdLevel::new(level).expect("in range"),
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,

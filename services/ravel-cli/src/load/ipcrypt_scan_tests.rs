@@ -177,6 +177,7 @@ async fn cli_load_warning_to(
         DEFAULT_DECODE_QUEUE_BATCHES,
         None,
         None,
+        None,
         RlogZstdLevel::DEFAULT,
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,

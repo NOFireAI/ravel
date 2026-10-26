@@ -1198,7 +1198,6 @@ pub(super) async fn load_metrics_with(
     let mut lazy: Option<(Arc<IngestRouter>, LoadGeometry, DepthWindow)> = None;
     let mut enqueue = EnqueueTracker::new();
     let mut depth_flushes: u64 = 0;
-    let ack_deadline = write_ack_deadline(max_flush_delay);
 
     let input = FileInput { path: parquet_path };
     let metadata = read_input_metadata(&input)?;
@@ -1327,7 +1326,8 @@ pub(super) async fn load_metrics_with(
                 usize::try_from(batch_points).unwrap_or(usize::MAX),
                 ravel_ingest::est_points_object_bytes(&points),
                 memory_budget,
-            );
+            )
+            .with_ack_deadline(max_flush_delay, request.ack_margin);
             if let Some(on_geometry) = &on_geometry {
                 on_geometry(&resolved);
             }
@@ -1343,6 +1343,7 @@ pub(super) async fn load_metrics_with(
             tokio::task::yield_now().await;
         }
         let pipeline_depth = geometry.pipeline_depth;
+        let ack_deadline = geometry.ack_deadline;
 
         let handle = {
             let router = Arc::clone(router);

@@ -1086,7 +1086,6 @@ pub(super) async fn load_spans_into(
     let mut lazy: Option<(Arc<SpanIngestRouter>, LoadGeometry, DepthWindow)> = None;
     let mut enqueue = EnqueueTracker::new();
     let mut depth_flushes: u64 = 0;
-    let ack_deadline = write_ack_deadline(max_flush_delay);
 
     let input = FileInput { path: parquet_path };
     let metadata = read_input_metadata(&input)?;
@@ -1214,7 +1213,8 @@ pub(super) async fn load_spans_into(
                 spans.len(),
                 ravel_ingest::est_spans_object_bytes(&spans),
                 memory_budget,
-            );
+            )
+            .with_ack_deadline(max_flush_delay, request.ack_margin);
             if let Some(on_geometry) = &on_geometry {
                 on_geometry(&resolved);
             }
@@ -1230,6 +1230,7 @@ pub(super) async fn load_spans_into(
             tokio::task::yield_now().await;
         }
         let pipeline_depth = geometry.pipeline_depth;
+        let ack_deadline = geometry.ack_deadline;
 
         let handle = {
             let router = Arc::clone(router);
