@@ -1169,6 +1169,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
         )
         .await;
@@ -1207,6 +1208,29 @@ mod default_geometry {
     /// The clock is pinned, so the age trigger cannot fire. Per-batch
     /// flushing writes 51 objects; a target the size trigger never reaches
     /// leaves every object to the depth flush or the drain (size 0).
+    /// Issue #3273: a library caller's zero `--ack-margin` is refused by the
+    /// metrics loader, not only by clap.
+    ///
+    /// Prove-the-test: drop the `validate_ack_margin` call from
+    /// `GeometryRequest::validate` and the load succeeds at the floor.
+    #[tokio::test]
+    async fn a_zero_ack_margin_is_refused_by_the_metrics_loader() {
+        let (_dir, pq) = fixture(BATCH_ROWS, 1);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let request = GeometryRequest {
+            ack_margin: Some(Duration::ZERO),
+            ..GeometryRequest::explicit(PER_BATCH_TARGET_BYTES, 1)
+        };
+        let err = try_load_sharded(Arc::clone(&store), &pq, request, 1, BATCH_ROWS)
+            .await
+            .expect_err("a zero margin is refused");
+        match err {
+            LoadError::Setup(msg) => assert!(msg.contains("--ack-margin"), "{msg}"),
+            other => panic!("expected a setup error naming --ack-margin: {other:?}"),
+        }
+        assert_eq!(stored_objects(store.as_ref()).await, 0);
+    }
+
     #[tokio::test]
     async fn default_load_merges_batches_into_target_sized_objects() {
         let (_dir, pq) = fixture(BATCH_ROWS, BATCHES);
@@ -1218,6 +1242,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
         )
         .await;
@@ -1424,6 +1449,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
             None,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -1500,6 +1526,7 @@ mod default_geometry {
                 target_bytes: Some(PER_BATCH_TARGET_BYTES),
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
         )
         .await;
@@ -1528,6 +1555,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
         )
         .await;
@@ -1539,6 +1567,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: LoadMemoryRequest::Flag(3 * BATCH_ROWS as u64 * est_bytes_per_row),
+                ack_margin: None,
             },
         )
         .await;
@@ -1569,6 +1598,7 @@ mod default_geometry {
                 target_bytes: Some(2),
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
         )
         .await;
@@ -1641,6 +1671,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: Some(DEPTH),
                 load_memory: host_derived(),
+                ack_margin: None,
             },
             SHARDS,
             ROWS,
@@ -1721,6 +1752,7 @@ mod default_geometry {
                     target_bytes: None,
                     pipeline_depth: None,
                     load_memory: host_derived(),
+                    ack_margin: None,
                 },
                 1,
                 BATCH_ROWS,
@@ -1779,6 +1811,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
         )
         .await;
@@ -1831,6 +1864,7 @@ mod default_geometry {
                 target_bytes: None,
                 pipeline_depth: None,
                 load_memory: host_derived(),
+                ack_margin: None,
             },
             1,
             2,

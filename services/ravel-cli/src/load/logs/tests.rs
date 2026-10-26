@@ -2116,6 +2116,190 @@ async fn an_explicit_target_runs_the_depth_flush() {
     assert_eq!(report.depth_flushes_by_shard, vec![(0, windows as u64)]);
 }
 
+/// The scaled flush target of the issue #3273 ack-deadline tests: 4e9 bytes,
+/// a 40 s encode allowance at `ENCODE_BYTES_PER_SECOND`.
+const HELD_FLUSH_TARGET: usize = 4_000_000_000;
+
+/// `--max-flush-delay` in those tests, on the injected clock.
+const HELD_FLUSH_DELAY: Duration = Duration::from_secs(2);
+
+/// How long those tests hold the aged flush's data PUT, in paused tokio time:
+/// past the 62 s a flat 60 s margin gives, inside the 102 s
+/// (2 + 60 + 40) the scaled margin gives.
+const HELD_PUT: Duration = Duration::from_secs(80);
+
+/// One 10-row batch on one shard at [`HELD_FLUSH_TARGET`], with its write's
+/// age-released flush held at its data PUT for [`HELD_PUT`]. Returns the
+/// load's result and the `(op, key)` of every call the gate held.
+///
+/// Tokio time is paused, so the Strict ack deadline (real tokio time inside
+/// the router) and the hold both run on the auto-advancing test clock; the
+/// age trigger runs on the injected [`TestClock`]. `--pipeline-depth 1`
+/// parks the loader on the batch's ack, the depth window is held off
+/// (`DEPTH_FLUSH_OFF`) so only the age trigger can answer it, and the decode
+/// queue is wider than the input so no blocking decoder task is left to stop
+/// the runtime from advancing.
+async fn load_with_a_held_age_flush(
+    ack_margin: Option<Duration>,
+) -> (
+    Result<LoadReport, LoadError>,
+    Vec<(ravel_object_store::fault::Op, String)>,
+) {
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+
+    const BATCH_ROWS: usize = 10;
+    const GUARD: Duration = Duration::from_secs(3_600);
+    let (_dir, pq, m) = uniform_rows_fixture(BATCH_ROWS, 1);
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate = fault.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
+    let clock = TestClock::new(NOW_NS);
+    let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let on_batch_queued: BuildStartHook = Arc::new(move || {
+        let _ = queued_tx.send(());
+    });
+    let mut memory = LoadMemoryOptions::new(LoadMemoryRequest::Unbudgeted);
+    memory.ack_margin = ack_margin;
+
+    let load = crate::load::geometry::DEPTH_FLUSH_OFF.scope(
+        (),
+        load_instrumented_at(
+            Arc::clone(&fault) as Arc<dyn ObjectStoreBackend>,
+            &pq,
+            "acme",
+            &m,
+            1,
+            BATCH_ROWS,
+            0,
+            Some(1),
+            Some(1),
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            4,
+            Some(HELD_FLUSH_TARGET),
+            Some(HELD_FLUSH_DELAY),
+            NOW_NS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            Some(on_batch_queued),
+            RlogZstdLevel::default(),
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            Some(memory),
+            false,
+            Arc::new(TenantRules::none()),
+        ),
+    );
+    let driver = async {
+        queued_rx.recv().await.expect("the batch is queued");
+        yield_until_router_is_quiet(&clock).await;
+        assert_eq!(
+            gate.held_count(),
+            0,
+            "one batch under the target cannot flush before the age trigger"
+        );
+        clock.advance_ns(i64::try_from(HELD_FLUSH_DELAY.as_nanos()).unwrap() + 1_000_000_000);
+        tokio::time::timeout(GUARD, gate.wait_until_held(1)) // allow-wall-clock: paused tokio time; a deadlock guard on the aged flush reaching its PUT
+            .await
+            .expect("the age trigger releases the flush and its data PUT is held");
+        let held = gate.held_details();
+        tokio::time::sleep(HELD_PUT).await; // allow-wall-clock: paused tokio time; the PUT hold the ack deadline must outlast
+        for (id, _, _) in &held {
+            assert!(gate.release(*id), "call {id} was still held");
+        }
+        held.into_iter()
+            .map(|(_, op, key)| (op, key))
+            .collect::<Vec<_>>()
+    };
+    tokio::join!(load, driver)
+}
+
+/// Issue #3273: the Strict ack deadline covers a target-sized flush's encode
+/// as well as its delay. An age-released flush whose data PUT takes 80 s
+/// still completes the load at the default margin (2 + 60 + 40 = 102 s), and
+/// the same hold under `--ack-margin 60` (62 s) fails it with the router's
+/// ack timeout. Both sides assert the gate held exactly that one data PUT.
+///
+/// Prove-the-test: drop the `encode_allowance` term from
+/// `write_ack_deadline` and the default side times out at 62 s as well, its
+/// `expect` failing on "timed out waiting for shard ack".
+#[tokio::test(start_paused = true)]
+async fn the_ack_deadline_outlasts_a_held_put_by_the_targets_encode_allowance() {
+    let (result, held) = load_with_a_held_age_flush(None).await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].0, ravel_object_store::fault::Op::Put);
+    assert!(held[0].1.contains("/l0/"), "{held:?}");
+    let report = result.expect("the 102 s deadline outlasts the 80 s PUT");
+    assert_eq!(report.rows_processed, 10);
+    assert_eq!(
+        report.layout_report().flush_mix.totals.age,
+        1,
+        "the held flush was the age trigger's"
+    );
+    let geometry = report.layout_report().geometry.expect("geometry resolved");
+    assert_eq!(geometry.ack_deadline, Duration::from_secs(102));
+
+    let (result, held) = load_with_a_held_age_flush(Some(Duration::from_secs(60))).await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].0, ravel_object_store::fault::Op::Put);
+    assert!(held[0].1.contains("/l0/"), "{held:?}");
+    match result {
+        Err(LoadError::Flush { cause, .. }) => {
+            assert!(cause.contains("timed out waiting for shard ack"), "{cause}");
+        }
+        other => panic!("--ack-margin 60 gives 62 s, under the 80 s PUT: {other:?}"),
+    }
+}
+
+/// A library caller's zero `--ack-margin` is refused where the deadline is
+/// built, not only by clap: the logs loader through `LoadMemoryOptions`.
+///
+/// Prove-the-test: delete the `validate_ack_margin` call in
+/// `load_with_drain_reflush_period` and the load runs at the floor and
+/// succeeds.
+#[tokio::test]
+async fn a_zero_ack_margin_is_refused_by_the_logs_loader() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let (_dir, pq, m) = uniform_rows_fixture(10, 1);
+    let mut memory = LoadMemoryOptions::new(LoadMemoryRequest::Unbudgeted);
+    memory.ack_margin = Some(Duration::ZERO);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let err = load_instrumented_at(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &m,
+        1,
+        10,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(PER_BATCH_TARGET_BYTES),
+        None,
+        NOW_NS,
+        TestClock::new(NOW_NS) as Arc<dyn Clock>,
+        LoadPath::Columnar,
+        None,
+        None,
+        RlogZstdLevel::default(),
+        RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
+        Some(memory),
+        false,
+        Arc::new(TenantRules::none()),
+    )
+    .await
+    .expect_err("a zero margin is refused");
+    match err {
+        LoadError::Setup(msg) => assert!(msg.contains("--ack-margin"), "{msg}"),
+        other => panic!("expected a setup error naming --ack-margin: {other:?}"),
+    }
+    assert!(list_data_objects(store.as_ref()).await.is_empty());
+}
+
 /// Shards in the issue #3273 uneven-share test.
 const UNEVEN_SHARDS: u32 = 4;
 
@@ -3216,15 +3400,16 @@ const UNREACHED_REFLUSH_PERIOD: Duration = Duration::from_secs(3600);
 /// router is quiet: every write routed and the size flush finished.
 ///
 /// The drain-time re-flush ticker also publishes with the manual trigger, so
-/// its period is pushed to [`UNREACHED_REFLUSH_PERIOD`], past the 120 s ack
-/// deadline the 60 s delay scales to ([`write_ack_deadline`]). The tail can
-/// therefore be published only by the end-of-input `flush_all`.
+/// its period is pushed to [`UNREACHED_REFLUSH_PERIOD`], past the ack deadline
+/// the 60 s delay scales to, just over 120 s with this target's encode
+/// allowance ([`write_ack_deadline`]). The tail can therefore be published
+/// only by the end-of-input `flush_all`.
 ///
 /// Prove-the-test: move `router.flush_all()` after `drain_inflight`, or
 /// delete it, and the drain waits on an ack nothing will answer before the
-/// ticker's first tick. The router's ack deadline fires after 120 s, the load
-/// returns a flush failure (`LoadError::Flush`, an ack timeout), and the
-/// `expect` on the report fails.
+/// ticker's first tick. The router's ack deadline fires after about 120 s,
+/// the load returns a flush failure (`LoadError::Flush`, an ack timeout),
+/// and the `expect` on the report fails.
 #[tokio::test]
 async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
     use ravel_object_store::memory::MemoryStore;

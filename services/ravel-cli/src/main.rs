@@ -595,7 +595,8 @@ enum Command {
         /// it, rounded up, while the depth flush below runs (issue #3119),
         /// lowered to the memory bound
         /// `--load-memory-bytes` divided by the estimated object bytes of one
-        /// batch when that is smaller, never below 1, and capped at 1,024. With a target above 1, derived or given, the loader also flushes every
+        /// batch when that is smaller, never below 1, and capped at 1,024. With
+        /// a target above 1, derived or given, the loader also flushes every
         /// shard once the oldest batch pending on any shard is this many
         /// submitted batches old (a size flush restarts only its own shard's
         /// window); `--target-bytes 1` turns that depth flush off,
@@ -636,7 +637,8 @@ enum Command {
         ///
         /// With a flush target above `1` the depth also bounds object size:
         /// each Strict write waits for the flush of its own batch inside the
-        /// window, so one object merges at most this many batches' slices. An explicit depth
+        /// window, so one object merges at most this many batches' slices. An
+        /// explicit depth
         /// below the batches one object needs on a shard gives objects of
         /// about `depth x --batch-rows / --shards` rows. On ClickBench at
         /// `--batch-rows 100000 --target-bytes 1650000000 --max-flush-delay
@@ -661,11 +663,11 @@ enum Command {
         /// depth ADR-0807 measured at one object per batch. Setting it below
         /// the pipeline depth makes each shard's excess flushes queue on this
         /// semaphore, and they still have to clear it inside the Strict ack
-        /// deadline (`--max-flush-delay` plus one minute). On this bulk path it
-        /// costs no extra memory: the resident flush working set is whatever the
-        /// outstanding batches carry and `--pipeline-depth` already caps that,
-        /// so this knob only decides whether those objects are encoded and PUT
-        /// concurrently or one at a time. A Strict write's acknowledgement is
+        /// deadline (`--max-flush-delay` plus `--ack-margin`). On this bulk
+        /// path it costs no extra memory: the resident flush working set is
+        /// whatever the outstanding batches carry and `--pipeline-depth`
+        /// already caps that, so this knob only decides whether those objects
+        /// are encoded and PUT concurrently or one at a time. A Strict write's acknowledgement is
         /// unchanged by the setting: each flush answers its own waiters only
         /// after its own data object and its own commit record have landed. `1`
         /// restores one-flush-per-shard behavior. `0` is rejected: it is a
@@ -693,8 +695,9 @@ enum Command {
         /// about 250,000 rows on every signal, and the depth flush closes
         /// every shard once the oldest batch pending on any shard is
         /// `--pipeline-depth` batches old, which closes a shard whose rows
-        /// came out narrower than the first batch's. An explicit value is used as given; above 1 the depth
-        /// flush runs for it too. Stored objects come out much smaller than the target.
+        /// came out narrower than the first batch's. An explicit value is used
+        /// as given; above 1 the depth flush runs for it too. Stored objects
+        /// come out much smaller than the target.
         /// `0` is rejected.
         ///
         /// On the ClickBench corpus the logs estimate counts about 7.4 KB per
@@ -747,9 +750,9 @@ enum Command {
         /// published, so an ack always means durable. But above `1` the flush
         /// that answers a batch's ack may be triggered by a LATER batch, so
         /// that ack waits for one: the size trigger, the depth flush, the
-        /// wall-clock age trigger
-        /// (`--max-flush-delay`, 60s by default) or, at the end of the input,
-        /// the loader's own force-flush. `0` is rejected.
+        /// wall-clock age trigger (`--max-flush-delay`, 60s by default) or, at
+        /// the end of the input, the loader's own force-flush. `0` is
+        /// rejected.
         #[arg(long, value_name = "BYTES")]
         target_bytes: Option<usize>,
         /// How long a shard buffer may age before the router flushes it,
@@ -765,7 +768,8 @@ enum Command {
         /// oldest buffered point ages past this delay, the depth flush (with
         /// a target above 1), or the final drain at load close. A buffer that
         /// fills slower than one target's worth per delay ages out (or closes
-        /// on the depth flush) before it reaches the target, so the size trigger never fires
+        /// on the depth flush) before it reaches the target, so the size
+        /// trigger never fires
         /// no matter how large the target is: at the router's own 2s delay the
         /// v4 load's ~11,871-row objects were about 2s of one shard's ingest
         /// rate.
@@ -776,10 +780,10 @@ enum Command {
         /// batches' acks, so a tail buffer left under `--target-bytes` is
         /// published there and never waits out this delay. Mid-load, a buffer
         /// that misses `--target-bytes` waits for the depth flush, another
-        /// batch's flush, or up to this delay for the
-        /// age trigger, and every write's ack deadline is
-        /// raised to this delay plus one minute so that wait completes instead
-        /// of failing the load. An ack still means durable whenever it arrives.
+        /// batch's flush, or up to this delay for the age trigger, and every
+        /// write's ack deadline is raised to this delay plus `--ack-margin` so
+        /// that wait completes instead of failing the load. An ack still means durable whenever it
+        /// arrives.
         ///
         /// `0s` is accepted and means the age trigger fires on the next flush
         /// tick for any non-empty buffer on this path, where every write is
@@ -788,6 +792,20 @@ enum Command {
         /// slower idle timer instead).
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
         max_flush_delay: Option<Duration>,
+        /// Seconds a Strict write's ack may take past `--max-flush-delay`
+        /// before the load fails with `timed out waiting for shard ack`
+        /// (issue #3273). The ack deadline is the larger of 60 s and
+        /// `--max-flush-delay` plus this margin. Unset, the margin is 60 s
+        /// plus the flush target divided by 100,000,000 bytes per second
+        /// (`ENCODE_BYTES_PER_SECOND`), the time a flush released by the age
+        /// trigger may spend encoding a target-sized object before its PUT
+        /// starts. At the 60 s default delay the stock 1,850,000,000 target
+        /// adds 18.5 s, a 138.5 s deadline; a target at or below one batch's
+        /// per-shard slice, `--target-bytes 1` included, adds nothing. Given,
+        /// it replaces that whole margin. The stderr geometry line prints the
+        /// deadline the load runs with. `0` is rejected.
+        #[arg(long, value_name = "SECONDS", value_parser = ravel_cli::load::parse_ack_margin)]
+        ack_margin: Option<Duration>,
         /// The zstd level of every page and section the loader's RLOG objects
         /// compress with zstd. Compaction re-encodes the objects it merges at
         /// compaction's own level, so this sets only the load's own objects.
@@ -3376,6 +3394,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             decode_queue_batches,
             target_bytes,
             max_flush_delay,
+            ack_margin,
             zstd_level,
             group_target_blocks,
             chunk_order,
@@ -3404,6 +3423,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 decode_queue_batches,
                 target_bytes,
                 max_flush_delay,
+                ack_margin,
                 zstd_level,
                 group_target_blocks,
                 chunk_order.unwrap_or_default(),
@@ -4949,6 +4969,47 @@ mod tests {
             max_flush_delay,
             Some(std::time::Duration::from_secs(600)),
             "--max-flush-delay 10m reaches the field as 600s"
+        );
+    }
+
+    /// `--ack-margin` is absent by default, parses whole seconds, and is
+    /// refused at parse time at `0` with a message naming the flag.
+    #[test]
+    fn ack_margin_flag_parses_seconds_and_refuses_zero() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+
+        let Command::Load { ack_margin, .. } = Cli::try_parse_from(base)
+            .expect("a load with no --ack-margin parses")
+            .command
+        else {
+            panic!("expected the load subcommand");
+        };
+        assert_eq!(ack_margin, None);
+
+        let Command::Load { ack_margin, .. } =
+            Cli::try_parse_from(base.iter().copied().chain(["--ack-margin", "90"]))
+                .expect("a load with --ack-margin 90 parses")
+                .command
+        else {
+            panic!("expected the load subcommand");
+        };
+        assert_eq!(ack_margin, Some(std::time::Duration::from_secs(90)));
+
+        let err = Cli::try_parse_from(base.iter().copied().chain(["--ack-margin", "0"]))
+            .expect_err("--ack-margin 0 is refused at parse");
+        let text = err.to_string();
+        assert!(
+            text.contains("--ack-margin must be at least 1 second"),
+            "{text}"
         );
     }
 

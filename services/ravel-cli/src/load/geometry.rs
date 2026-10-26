@@ -59,6 +59,12 @@ pub fn rows_bound_depth(rows_depth: usize) -> usize {
 
 /// Whether a load with this target runs the depth flush: any target above
 /// [`PER_BATCH_TARGET_BYTES`] does, derived or given by `--target-bytes`.
+///
+/// That includes a target at or below one batch's per-shard slice, where
+/// every write already size-flushes on its own. The window is not gated on
+/// the slice estimate, so it never depends on the first batch being typical;
+/// the cost is one [`settle_shards`] wait per submit, which waits for one
+/// batch's merge on the shard actors, not for a flush.
 fn depth_flush_runs(target_bytes: usize) -> bool {
     target_bytes > PER_BATCH_TARGET_BYTES
 }
@@ -75,6 +81,10 @@ pub struct GeometryRequest {
     pub target_bytes: Option<usize>,
     pub pipeline_depth: Option<usize>,
     pub load_memory: LoadMemoryRequest,
+    /// `--ack-margin`: replaces the whole margin [`write_ack_deadline`] adds
+    /// over the flush delay. `None` keeps the fixed margin plus the target's
+    /// encode allowance.
+    pub ack_margin: Option<Duration>,
 }
 
 impl GeometryRequest {
@@ -85,6 +95,7 @@ impl GeometryRequest {
             target_bytes: Some(target_bytes),
             pipeline_depth: Some(pipeline_depth),
             load_memory: LoadMemoryRequest::Unbudgeted,
+            ack_margin: None,
         }
     }
 
@@ -104,7 +115,7 @@ impl GeometryRequest {
                     .to_string(),
             ));
         }
-        Ok(())
+        validate_ack_margin(self.ack_margin)
     }
 
     /// The memory budget a metrics or spans load bounds a derived depth by:
@@ -166,6 +177,16 @@ pub struct LoadGeometry {
     /// `budget / (batch_rows * est_bytes_per_row)`, at least 1. `None` when
     /// the load had no memory budget.
     pub memory_depth: Option<usize>,
+    /// One batch's estimated bytes on one shard at an even split:
+    /// `est_bytes_per_row * batch_rows / shards`.
+    #[serde(default)]
+    pub slice_est_bytes: u64,
+    /// The Strict ack deadline every write of the load waits under
+    /// ([`write_ack_deadline`]). [`resolve_geometry`] sets the one for an
+    /// unset delay and margin; a loader replaces it with
+    /// [`Self::with_ack_deadline`].
+    #[serde(default)]
+    pub ack_deadline: Duration,
 }
 
 impl LoadGeometry {
@@ -184,6 +205,23 @@ impl LoadGeometry {
         } else {
             self.rows_depth
         }
+    }
+
+    /// This geometry with the ack deadline for `--max-flush-delay` and
+    /// `--ack-margin` (`None` = unset), computed from the resolved target,
+    /// whether derived or given.
+    pub fn with_ack_deadline(
+        mut self,
+        max_flush_delay: Option<Duration>,
+        ack_margin: Option<Duration>,
+    ) -> Self {
+        self.ack_deadline = write_ack_deadline(
+            max_flush_delay,
+            ack_margin,
+            self.target_bytes,
+            self.slice_est_bytes,
+        );
+        self
     }
 }
 
@@ -226,6 +264,10 @@ pub fn resolve_geometry(
             .unwrap_or(usize::MAX)
             .max(1)
     });
+    let slice_est_bytes = u64::try_from(
+        (batch_rows_u as u128).saturating_mul(est_bytes_per_row as u128) / shards.max(1) as u128,
+    )
+    .unwrap_or(u64::MAX);
     let rows_bound = if depth_flush_runs(target_bytes) {
         rows_bound_depth(rows_depth)
     } else {
@@ -247,6 +289,8 @@ pub fn resolve_geometry(
         depth_bound,
         rows_depth,
         memory_depth,
+        slice_est_bytes,
+        ack_deadline: write_ack_deadline(None, None, target_bytes, slice_est_bytes),
     }
 }
 
@@ -422,7 +466,8 @@ const ANY_SHARD: u32 = u32::MAX;
 tokio::task_local! {
     /// Turns the depth window off for a load whose geometry runs it, so a
     /// test can reach the size, age and ack paths a depth flush would close
-    /// first.
+    /// first. It leaves [`LoadGeometry::depth_flush_enabled`] as resolved, so
+    /// the geometry line and the summary still report the depth flush on.
     pub(super) static DEPTH_FLUSH_OFF: ();
 }
 
@@ -668,18 +713,31 @@ fn realign_text(gave_up: u64) -> String {
 /// resolved, before its first write.
 pub const GEOMETRY_LINE_PREFIX: &str = "load geometry: ";
 
+/// A duration as exact decimal seconds, trailing zeros trimmed: `224`,
+/// `108.5`.
+fn seconds_text(d: Duration) -> String {
+    let nanos = d.subsec_nanos();
+    if nanos == 0 {
+        d.as_secs().to_string()
+    } else {
+        let frac = format!("{nanos:09}");
+        format!("{}.{}", d.as_secs(), frac.trim_end_matches('0'))
+    }
+}
+
 /// The one-line geometry report printed as soon as the geometry is resolved:
-/// the target and the depth, with what decided each, and whether the depth
-/// flush runs.
+/// the target and the depth, with what decided each, whether the depth flush
+/// runs, and the ack deadline every write waits under.
 pub fn render_geometry_line(signal: &str, g: &LoadGeometry) -> String {
     format!(
         "{GEOMETRY_LINE_PREFIX}{signal}: flush target {} bytes ({}), pipeline depth {} ({}), \
-         depth flush {}",
+         depth flush {}, ack deadline {}s",
         g.target_bytes,
         target_source_text(g),
         g.pipeline_depth,
         depth_bound_text(g),
         if g.depth_flush_enabled() { "on" } else { "off" },
+        seconds_text(g.ack_deadline),
     )
 }
 
@@ -791,7 +849,7 @@ mod tests {
             render_geometry_line("spans", &g),
             "load geometry: spans: flush target 21750000 bytes (derived: 250000 rows x 87 \
              estimated bytes per row), pipeline depth 125 (rows bound decided it: rows bound \
-             100 + 25 = 125, memory bound 36245), depth flush on"
+             100 + 25 = 125, memory bound 36245), depth flush on, ack deadline 60.2175s"
         );
     }
 
@@ -820,7 +878,8 @@ mod tests {
         assert_eq!(
             render_geometry_line("spans", &g),
             "load geometry: spans: flush target 1 bytes (--target-bytes), pipeline depth 100 \
-             (rows bound decided it: rows bound 100, memory bound 36245), depth flush off"
+             (rows bound decided it: rows bound 100, memory bound 36245), depth flush off, ack \
+             deadline 60s"
         );
     }
 
@@ -863,8 +922,102 @@ mod tests {
         assert_eq!(
             render_geometry_line("logs", &g),
             "load geometry: logs: flush target 7400000000 bytes (--target-bytes), pipeline \
-             depth 56 (--pipeline-depth), depth flush on"
+             depth 56 (--pipeline-depth), depth flush on, ack deadline 134s"
         );
+        assert_eq!(
+            render_geometry_line(
+                "logs",
+                &g.with_ack_deadline(Some(Duration::from_secs(90)), None)
+            ),
+            "load geometry: logs: flush target 7400000000 bytes (--target-bytes), pipeline \
+             depth 56 (--pipeline-depth), depth flush on, ack deadline 224s"
+        );
+    }
+
+    /// The ack deadline is computed from the resolved target whichever way it
+    /// was chosen (issue #3273): an explicit 7.4e9 target at a 90s delay gets
+    /// 90 + 60 + 74 = 224s, and a derived target its own allowance.
+    ///
+    /// Prove-the-test: apply the encode allowance only when `target_source`
+    /// is `TargetSource::Derived` and the explicit case fails at
+    /// `left: 150s, right: 224s`.
+    #[test]
+    fn the_ack_deadline_covers_an_explicit_target_as_well_as_a_derived_one() {
+        let explicit = resolve_geometry(
+            Some(7_400_000_000),
+            None,
+            4,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS * 7_970,
+            None,
+        )
+        .with_ack_deadline(Some(Duration::from_secs(90)), None);
+        assert_eq!(explicit.target_source, TargetSource::Flag);
+        assert_eq!(explicit.ack_deadline, Duration::from_secs(224));
+        // 250,000 rows x 7,400 bytes: the same 1.85e9 as the stock target.
+        let derived = resolve_geometry(
+            None,
+            None,
+            4,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS * 7_400,
+            None,
+        )
+        .with_ack_deadline(Some(Duration::from_secs(30)), None);
+        assert_eq!(derived.target_source, TargetSource::Derived);
+        assert_eq!(derived.target_bytes, 1_850_000_000);
+        assert_eq!(derived.ack_deadline, Duration::from_millis(108_500));
+        assert_eq!(
+            explicit
+                .with_ack_deadline(Some(Duration::from_secs(90)), Some(Duration::from_secs(60)))
+                .ack_deadline,
+            Duration::from_secs(150),
+            "--ack-margin replaces the margin the geometry would add"
+        );
+    }
+
+    /// Nit 1 of #3273's first part, pinned: a target above
+    /// [`PER_BATCH_TARGET_BYTES`] but at or below one batch's per-shard slice
+    /// still runs the depth window (it is not gated on the slice estimate),
+    /// and its writes, which each flush on their own, get no encode
+    /// allowance.
+    ///
+    /// Prove-the-test: gate `depth_flush_runs` on `target > slice_est_bytes`
+    /// and the window assertions fail.
+    #[test]
+    fn a_target_inside_one_slice_keeps_the_window_and_adds_no_encode_time() {
+        // One batch on one shard: 10,000 rows x 100 bytes = 1,000,000 bytes.
+        let g = resolve_geometry(Some(500_000), Some(3), 1, 10_000, 10_000, 1_000_000, None);
+        assert_eq!(g.slice_est_bytes, 1_000_000);
+        assert!(g.depth_flush_enabled());
+        assert!(DepthWindow::new(&g).enabled());
+        assert_eq!(g.ack_deadline, Duration::from_secs(60));
+        let g = g.with_ack_deadline(Some(Duration::from_secs(90)), None);
+        assert_eq!(g.ack_deadline, Duration::from_secs(150));
+        assert!(
+            render_geometry_line("logs", &g).ends_with("depth flush on, ack deadline 150s"),
+            "{}",
+            render_geometry_line("logs", &g)
+        );
+    }
+
+    /// Nit 3 of #3273's first part, pinned: `DEPTH_FLUSH_OFF` turns the
+    /// window off and leaves `depth_flush_enabled` as resolved, which is why
+    /// a test inside that scope still sees "depth flush on" in its geometry
+    /// line.
+    #[tokio::test]
+    async fn depth_flush_off_turns_the_window_off_but_not_the_reported_geometry() {
+        let g = resolve_geometry(Some(1 << 30), Some(3), 1, 10, 10, 10, None);
+        let (enabled, window) = DEPTH_FLUSH_OFF
+            .scope((), async {
+                (g.depth_flush_enabled(), DepthWindow::new(&g).enabled())
+            })
+            .await;
+        assert!(enabled, "the resolved geometry still runs the depth flush");
+        assert!(!window, "the window inside the scope is off");
+        assert!(render_geometry_line("logs", &g).contains("depth flush on"));
     }
 
     #[test]

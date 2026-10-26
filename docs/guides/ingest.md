@@ -1417,9 +1417,9 @@ is decoded, on every signal, as the lowest of three bounds:
 - the rows bound, ceil(250,000 x `--shards` / `--batch-rows`) batches,
   enough for every shard to fill one 250,000-row object, plus a quarter
   of it, rounded up, while the depth flush runs (with any target above
-  `1`, derived or given). 32 at the defaults on one shard, 125 on four; a rows bound of 1
-  gives 2 and a rows bound of 2 gives 3, which is why a slice just short
-  of the target waits for the next one. The rows of one window of exactly
+  `1`, derived or given). 32 at the defaults on one shard, 125 on four;
+  a rows bound of 1 gives 2 and a rows bound of 2 gives 3, which is why
+  a slice just short of the target waits for the next one. The rows of one window of exactly
   the rows bound add up to one target per shard, so every shard that drew
   less than its share would still be short when the depth flush closes
   it; the quarter lets the size trigger close it first. With
@@ -1444,9 +1444,9 @@ batches. A logs load also charges each built batch against the budget as
 it runs (see `--load-memory-bytes` below). A metrics or spans load applies
 the budget only through this bound and charges nothing at run time.
 
-With a target above `1`, derived or given, the loader also flushes every shard once the
-oldest batch pending on any shard is `--pipeline-depth` batches old, so a
-full window never waits out the age trigger. A shard's buffer is pending
+With a target above `1`, derived or given, the loader also flushes every
+shard once the oldest batch pending on any shard is `--pipeline-depth`
+batches old, so a full window never waits out the age trigger. A shard's buffer is pending
 from the first batch that reached it after its last size flush or depth
 flush. The trigger mix counts those flushes under `depth`. A size flush
 restarts only its own shard's window: on every signal the loader reads
@@ -1468,16 +1468,16 @@ shard's buffer, including the part that has not reached the target yet.
 On rows of one width spread evenly across the shards each shard reaches
 the target before its window comes due, so the size trigger closes
 every object but the tails published at the end of the input, and the
-depth flush is the backstop for rows narrower than the first batch's. An explicit `--pipeline-depth` below
-the rows bound caps objects at about depth x `--batch-rows` / `--shards`
-rows per shard.
+depth flush is the backstop for rows narrower than the first batch's.
+An explicit `--pipeline-depth` below the rows bound caps objects at
+about depth x `--batch-rows` / `--shards` rows per shard.
 
 An explicit `--target-bytes` above `1` runs the depth flush as a derived
 target does; `--target-bytes 1` turns it off, since every write then
 flushes its own buffer. The measured recipe below was run while an
-explicit target kept the depth flush off. Three things changed for every load, an
-explicit target included: `--max-flush-delay` defaults to 60 s instead of
-the router's 2 s, the end-of-input flush runs once every submitted batch
+explicit target kept the depth flush off. Three things changed for every
+load, an explicit target included: `--max-flush-delay` defaults to 60 s
+instead of the router's 2 s, the end-of-input flush runs once every submitted batch
 has reached its shard, and a failed load flushes its buffered writes
 before waiting on their acks. `--target-bytes 1` without
 `--pipeline-depth` still gets the derived depth, the plain rows bound
@@ -1492,6 +1492,23 @@ find a logs load's decoder waiting for room in `--load-memory-bytes` and
 the bytes charged not lower than at the first, the loader flushes every
 shard buffer early, so a target the budget cannot hold yields smaller
 objects rather than a stalled load.
+
+A Strict write whose ack does not arrive within the ack deadline fails
+the load with `timed out waiting for shard ack`. The deadline is the
+larger of 60 s and `--max-flush-delay` plus a margin. The margin is 60 s
+plus the target divided by 100,000,000 bytes per second, the time a
+flush the age trigger released may spend encoding a target-sized object
+before its PUT starts. At the 60 s default delay the stock
+1,850,000,000 target adds 18.5 s, a 138.5 s deadline; a 7,400,000,000
+target at `--max-flush-delay 90s` gets 224 s. `--target-bytes 1`, and a
+target at or below one batch's per-shard slice, add nothing, so their
+deadline stays the delay plus 60 s. The stderr geometry line prints the
+deadline as `ack deadline <N>s`.
+
+- `--ack-margin <SECONDS>` replaces the whole margin, encode allowance
+  included, so the deadline becomes the larger of 60 s and
+  `--max-flush-delay` plus the given seconds. Raise it when a slow store
+  or a wide row times out a load at the stock figure. `0` is rejected.
 
 ### The layout report
 
@@ -1563,6 +1580,10 @@ outcome:
   the earlier default, 798 of 916 objects closed on age and the median
   object was
   10.2 MB.
+- The ack deadline follows from the two flags above: 30 s of delay plus
+  60 s of margin plus 18.5 s to encode a 1,850,000,000-byte object,
+  108.5 s in all. The run predates that rule and had a 90 s deadline;
+  set `--ack-margin` to change the margin.
 - `--pipeline-depth` sets the load time once objects are large, because
   each Strict write waits for its batch's flush. At a 1,650,000,000
   target with the other flags above, depth 16 took 1,990 s, depth 24

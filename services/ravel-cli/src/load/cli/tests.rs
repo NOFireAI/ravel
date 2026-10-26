@@ -622,6 +622,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
             DEFAULT_DECODE_QUEUE_BATCHES,
             Some(1 << 30),
             None,
+            None,
             RlogZstdLevel::DEFAULT,
             RlogGroupTargetBlocks::DEFAULT,
             RlogChunkOrder::DEFAULT,
@@ -655,10 +656,13 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
         "a 59 s old buffer is inside the 60 s delay"
     );
     let emitted = sink.text();
+    // "depth flush on" although DEPTH_FLUSH_OFF holds the window off: the
+    // scope turns off only the window, never the resolved geometry the line
+    // reports (pinned in geometry.rs). 60 + 60 + 1073741824 / 1e8 s.
     assert!(
         emitted.contains(
             "load geometry: logs: flush target 1073741824 bytes (--target-bytes), pipeline \
-             depth 1 (--pipeline-depth), depth flush on"
+             depth 1 (--pipeline-depth), depth flush on, ack deadline 130.73741824s"
         ),
         "{emitted}"
     );
@@ -680,7 +684,8 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
 ///
 /// Prove-the-test: delete the `router.flush_all()` in `drain_inflight` and
 /// the buffered acks are answered by nothing, so the load fails only once
-/// the Strict ack deadline (120 s of wall time at the 60 s default delay)
+/// the Strict ack deadline (the 60 s default delay plus the 60 s margin and
+/// the small target's encode allowance, just over 120 s of wall time)
 /// expires, with a write error instead of the row rejection. Drop the
 /// `rx.recv()` arm in `printing_geometry` and the line is written only once
 /// the load returns, after that PUT.
@@ -715,6 +720,7 @@ async fn a_failed_default_load_flushes_before_it_reports() {
         None,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
+        None,
         None,
         None,
         RlogZstdLevel::DEFAULT,

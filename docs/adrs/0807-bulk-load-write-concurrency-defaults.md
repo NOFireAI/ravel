@@ -473,7 +473,10 @@ the derived depth is that rows bound plus a quarter of it, rounded up,
 still lowered to the memory bound and capped at 1,024
 (`services/ravel-cli/src/load/geometry.rs`, `resolve_geometry` and
 `rows_bound_depth`); with an explicit `--target-bytes` the depth flush is
-off and the derived depth stays the plain rows bound. A window of exactly
+off and the derived depth stays the plain rows bound. Since PR #3282 an
+explicit target above `1` runs the depth flush too and gets the quarter;
+ADR-3217's decision 6 ack deadline amendment records that and the ack
+deadline that now scales with the target. A window of exactly
 the rows bound left about half the shards short of the target when the
 depth flush closed them; the quarter lets the size trigger close them
 first. Decision 3's `--max-inflight-flushes` default of 4 and the
