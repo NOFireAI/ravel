@@ -432,6 +432,253 @@ pub fn decode_column_stats(
     Ok(DecodedColumnStats { header, segments })
 }
 
+/// [`decode_column_stats`], decoding the body one segment at a time and
+/// keeping a column's dictionary only when `keep` returns true for its name
+/// (issue #3244). An unkept dictionary is cleared after its segment is
+/// validated, so every per-column rule still runs against the whole record;
+/// `dictionary_present` is left as decoded. The result equals the whole
+/// decode's with the unkept dictionaries cleared.
+///
+/// The envelope, both CRCs and the declared-size ceiling are checked first,
+/// exactly as [`decode_column_stats`] checks them. The body is then read
+/// through a streaming zstd decoder: a segment's length varint, then that
+/// segment's bytes, which are decoded and validated against the segment
+/// before them before the next one is read. No more than one segment's
+/// encoded bytes and the segments kept so far are held at once, and a body
+/// that inflates past its declared length is refused on the read that
+/// passes it, having consumed at most one byte more than declared.
+///
+/// Every refusal is the [`SnapshotFormatError`] variant
+/// [`decode_column_stats`] returns for the same single defect. An object with
+/// several defects can be refused for a different one: this decoder meets a
+/// segment's validation failure before it learns that the body's total length
+/// or the header's `segment_count` is also wrong, where the whole decode
+/// checks both before validating any segment.
+pub fn decode_column_stats_filtered(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+    keep: impl Fn(&str) -> bool,
+) -> Result<DecodedColumnStats, SnapshotFormatError> {
+    decode_column_stats_streamed(bytes, limits, &keep, &mut Unmetered)
+}
+
+/// Told about each segment's memory as [`decode_column_stats_streamed`] reads
+/// it, so a caller can charge it before it is materialised.
+pub(crate) trait SegmentMeter {
+    type Error: From<SnapshotFormatError>;
+
+    /// A segment's encoded length, before any of its bytes are read.
+    fn before_segment(&mut self, len: u64) -> Result<(), Self::Error>;
+
+    /// The segment as it will be kept: validated, unkept dictionaries
+    /// cleared. The bytes [`Self::before_segment`] announced are freed once
+    /// this returns.
+    fn after_segment(&mut self, kept: &ColumnStatsSegment) -> Result<(), Self::Error>;
+}
+
+struct Unmetered;
+
+impl SegmentMeter for Unmetered {
+    type Error = SnapshotFormatError;
+
+    fn before_segment(&mut self, _len: u64) -> Result<(), SnapshotFormatError> {
+        Ok(())
+    }
+
+    fn after_segment(&mut self, _kept: &ColumnStatsSegment) -> Result<(), SnapshotFormatError> {
+        Ok(())
+    }
+}
+
+/// [`decode_column_stats_filtered`] with a [`SegmentMeter`] told about every
+/// segment.
+pub(crate) fn decode_column_stats_streamed<M: SegmentMeter>(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+    keep: &dyn Fn(&str) -> bool,
+    meter: &mut M,
+) -> Result<DecodedColumnStats, M::Error> {
+    let mut consumed = 0;
+    decode_streamed_counting(bytes, limits, keep, meter, &mut consumed)
+}
+
+/// The streamed decode, reporting in `consumed` how many decompressed bytes
+/// it read, whatever the outcome.
+fn decode_streamed_counting<M: SegmentMeter>(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+    keep: &dyn Fn(&str) -> bool,
+    meter: &mut M,
+    consumed: &mut u64,
+) -> Result<DecodedColumnStats, M::Error> {
+    let (peek, body) = decode_column_stats_prefix(bytes)?;
+    let header = peek.header;
+    let declared = header.body_uncompressed_len;
+    if declared > limits.max_column_stats_bytes {
+        return Err(SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+            declared,
+            cap: limits.max_column_stats_bytes,
+        }
+        .into());
+    }
+    let decoder = zstd::stream::read::Decoder::with_buffer(body)
+        .map_err(|e| SnapshotFormatError::Decompress(e.to_string()))?;
+    let mut stream = BodyStream {
+        inner: decoder,
+        declared,
+        consumed: 0,
+    };
+    let segments = read_segments(&mut stream, peek.envelope_version, keep, meter);
+    *consumed = stream.consumed;
+    let segments = segments?;
+    if stream.consumed != declared {
+        return Err(SnapshotFormatError::ColumnStatsDecompressedLenMismatch {
+            expected: declared,
+            actual: stream.consumed,
+        }
+        .into());
+    }
+    if segments.len() as u64 != header.segment_count {
+        return Err(SnapshotFormatError::ColumnStatsSegmentCountMismatch {
+            expected: header.segment_count,
+            actual: segments.len() as u64,
+        }
+        .into());
+    }
+    Ok(DecodedColumnStats { header, segments })
+}
+
+/// Every segment of `stream`, each validated against the one before it and
+/// stripped of its unkept dictionaries before the next is read.
+fn read_segments<R: std::io::Read, M: SegmentMeter>(
+    stream: &mut BodyStream<R>,
+    version: u8,
+    keep: &dyn Fn(&str) -> bool,
+    meter: &mut M,
+) -> Result<Vec<ColumnStatsSegment>, M::Error> {
+    let mut segments: Vec<ColumnStatsSegment> = Vec::new();
+    while let Some(len) = stream.read_len()? {
+        if len > stream.remaining() {
+            stream.drain()?;
+            return Err(stream
+                .ended_early(format!("segment length {len} runs past the body's end"))
+                .into());
+        }
+        meter.before_segment(len)?;
+        let mut encoded = vec![0u8; to_usize(len)?];
+        if stream.fill(&mut encoded)? < encoded.len() {
+            return Err(stream
+                .ended_early(format!("body ends inside a {len}-byte segment"))
+                .into());
+        }
+        let mut segment = ColumnStatsSegment::decode(encoded.as_slice())
+            .map_err(|e| SnapshotFormatError::ColumnStatsSegmentDecode(e.to_string()))?;
+        drop(encoded);
+        validate_segment(segments.last(), &segment, version)?;
+        for column in &mut segment.columns {
+            if !keep(&column.name) {
+                column.dictionary = Vec::new();
+            }
+        }
+        meter.after_segment(&segment)?;
+        segments.push(segment);
+    }
+    Ok(segments)
+}
+
+/// The decompressed body as a bounded stream: it never hands out more than
+/// one byte past `declared`, and refuses on the read that crosses it.
+struct BodyStream<R> {
+    inner: R,
+    declared: u64,
+    consumed: u64,
+}
+
+impl<R: std::io::Read> BodyStream<R> {
+    /// Fill `buf`, stopping short only at the end of the body. Returns the
+    /// bytes filled.
+    fn fill(&mut self, buf: &mut [u8]) -> Result<usize, SnapshotFormatError> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            // One byte past `declared` is allowed through so an inflating body
+            // is caught by the read that crosses the line, and never later.
+            let allowed = self
+                .declared
+                .saturating_add(1)
+                .saturating_sub(self.consumed);
+            let want = (buf.len() - filled).min(usize::try_from(allowed).unwrap_or(usize::MAX));
+            let read = match self.inner.read(&mut buf[filled..filled + want]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SnapshotFormatError::Decompress(e.to_string())),
+            };
+            filled += read;
+            self.consumed += read as u64;
+            if self.consumed > self.declared {
+                return Err(SnapshotFormatError::Decompress(format!(
+                    "column-statistics body inflates past its declared {} bytes",
+                    self.declared
+                )));
+            }
+        }
+        Ok(filled)
+    }
+
+    /// The declared bytes not yet read.
+    fn remaining(&self) -> u64 {
+        self.declared.saturating_sub(self.consumed)
+    }
+
+    /// The next segment's length varint (prost's encoding: at most ten bytes,
+    /// the tenth at most 1), or `None` at a clean end of body.
+    fn read_len(&mut self) -> Result<Option<u64>, SnapshotFormatError> {
+        let mut value: u64 = 0;
+        for i in 0..10u32 {
+            let mut byte = [0u8; 1];
+            if self.fill(&mut byte)? == 0 {
+                if i == 0 {
+                    return Ok(None);
+                }
+                return Err(self.ended_early("body ends inside a segment length".to_string()));
+            }
+            let [byte] = byte;
+            if i == 9 && byte > 1 {
+                break;
+            }
+            value |= u64::from(byte & 0x7f) << (7 * i);
+            if byte < 0x80 {
+                return Ok(Some(value));
+            }
+        }
+        Err(SnapshotFormatError::ColumnStatsSegmentDecode(
+            "invalid segment length varint".to_string(),
+        ))
+    }
+
+    /// Read to the end of the body, refusing if it inflates past `declared`.
+    fn drain(&mut self) -> Result<(), SnapshotFormatError> {
+        let mut scratch = [0u8; 8192];
+        while self.fill(&mut scratch)? == scratch.len() {}
+        Ok(())
+    }
+
+    /// The refusal for a body that ended where `what` says, mirroring the
+    /// whole decode: a body shorter than declared is a length mismatch, and
+    /// one of exactly the declared length holds a segment that does not
+    /// decode.
+    fn ended_early(&self, what: String) -> SnapshotFormatError {
+        if self.consumed < self.declared {
+            SnapshotFormatError::ColumnStatsDecompressedLenMismatch {
+                expected: self.declared,
+                actual: self.consumed,
+            }
+        } else {
+            SnapshotFormatError::ColumnStatsSegmentDecode(what)
+        }
+    }
+}
+
 /// Sort/uniqueness/field validation shared by the encoders (defensive check of
 /// caller input) and `decode_column_stats` (untrusted-bytes check). Beyond
 /// segment identity this also validates every `ColumnStat`'s internal
@@ -456,39 +703,54 @@ fn validate_segments(
     segments: &[ColumnStatsSegment],
     version: u8,
 ) -> Result<(), SnapshotFormatError> {
-    let part_keyed = version >= 2;
-    let expected_writer_id_len = if part_keyed { 32 } else { 16 };
-    for (i, segment) in segments.iter().enumerate() {
-        if segment.writer_id.len() != expected_writer_id_len {
-            return Err(SnapshotFormatError::ColumnStatsBadFieldLen {
-                field: "writer_id",
-                expected: expected_writer_id_len,
-                actual: segment.writer_id.len(),
-            });
-        }
-        if i > 0 {
-            let ordering = if part_keyed {
-                // v2: the whole key is the content hash carried in writer_id.
-                segments[i - 1]
-                    .writer_id
-                    .as_slice()
-                    .cmp(segment.writer_id.as_slice())
-            } else {
-                segment_key(&segments[i - 1]).cmp(&segment_key(segment))
-            };
-            match ordering {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => {
-                    return Err(SnapshotFormatError::ColumnStatsDuplicateSegment);
-                }
-                std::cmp::Ordering::Greater => {
-                    return Err(SnapshotFormatError::ColumnStatsSegmentsUnsorted);
-                }
-            }
-        }
-        validate_columns(&segment.columns)?;
+    let mut previous = None;
+    for segment in segments {
+        validate_segment(previous, segment, version)?;
+        previous = Some(segment);
     }
     Ok(())
+}
+
+/// One step of [`validate_segments`]: `segment`'s writer_id width, its order
+/// against `previous` (the segment before it in the object, if any), and its
+/// columns. [`decode_column_stats_filtered`] runs it as each segment arrives;
+/// ordering reads only identity fields, so a `previous` whose dictionaries
+/// were already cleared orders exactly as the unstripped one would.
+fn validate_segment(
+    previous: Option<&ColumnStatsSegment>,
+    segment: &ColumnStatsSegment,
+    version: u8,
+) -> Result<(), SnapshotFormatError> {
+    let part_keyed = version >= 2;
+    let expected_writer_id_len = if part_keyed { 32 } else { 16 };
+    if segment.writer_id.len() != expected_writer_id_len {
+        return Err(SnapshotFormatError::ColumnStatsBadFieldLen {
+            field: "writer_id",
+            expected: expected_writer_id_len,
+            actual: segment.writer_id.len(),
+        });
+    }
+    if let Some(previous) = previous {
+        let ordering = if part_keyed {
+            // v2: the whole key is the content hash carried in writer_id.
+            previous
+                .writer_id
+                .as_slice()
+                .cmp(segment.writer_id.as_slice())
+        } else {
+            segment_key(previous).cmp(&segment_key(segment))
+        };
+        match ordering {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                return Err(SnapshotFormatError::ColumnStatsDuplicateSegment);
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(SnapshotFormatError::ColumnStatsSegmentsUnsorted);
+            }
+        }
+    }
+    validate_columns(&segment.columns)
 }
 
 /// Per-segment column-list validation: no duplicate column name, and every
@@ -636,7 +898,7 @@ fn validate_column(column: &ColumnStat) -> Result<(), SnapshotFormatError> {
 ///   so an all-NULL column contributes a value to a MIN/MAX the scan would
 ///   answer NULL for.
 ///
-/// Public because [`crate::LoadedColumnStats`] has public fields, so a reader
+/// Public because [`crate::LoadedColumnStats`] has a public constructor, so a reader
 /// can receive `ColumnStat` records from a carrier that never passed through
 /// [`decode_column_stats`] (an in-process construction, a cache, a test
 /// fixture). Such a reader enforces this clause by calling this function
@@ -783,6 +1045,76 @@ mod tests {
         }
     }
 
+    /// Both decoders' refusals of `bytes`, the filtered one both keeping and
+    /// stripping every dictionary, asserted to be the same refusal; returns
+    /// the whole decode's. `Decompress` and `ColumnStatsSegmentDecode` carry
+    /// the underlying library's message, which differs between a bulk and a
+    /// streamed read, so those two compare by variant and every other refusal
+    /// compares in full.
+    fn both_decoders_refuse(bytes: &[u8], limits: &ColumnStatsLimits) -> SnapshotFormatError {
+        let whole = decode_column_stats(bytes, limits).expect_err("the whole decode refuses");
+        for keep_all in [true, false] {
+            let filtered = decode_column_stats_filtered(bytes, limits, |_| keep_all)
+                .expect_err("the filtered decode refuses");
+            assert_same_refusal(&filtered, &whole);
+        }
+        whole
+    }
+
+    fn assert_same_refusal(filtered: &SnapshotFormatError, whole: &SnapshotFormatError) {
+        match (filtered, whole) {
+            (SnapshotFormatError::Decompress(_), SnapshotFormatError::Decompress(_))
+            | (
+                SnapshotFormatError::ColumnStatsSegmentDecode(_),
+                SnapshotFormatError::ColumnStatsSegmentDecode(_),
+            ) => {}
+            _ => assert_eq!(filtered, whole),
+        }
+    }
+
+    /// `segment` re-keyed to v3's 32-byte writer_id and framed as a v3 object
+    /// without validation, so a record the encoders refuse reaches both
+    /// decoders.
+    fn unvalidated_v3(mut segment: ColumnStatsSegment) -> Vec<u8> {
+        segment.writer_id = vec![0xAA; 32];
+        frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[segment]).expect("frames")
+    }
+
+    /// A v3 header for `segment_count` segments whose body declares
+    /// `body_uncompressed_len` bytes.
+    fn v3_header(segment_count: u64, body_uncompressed_len: u64) -> ColumnStatsHeader {
+        ColumnStatsHeader {
+            format_version: 3,
+            tenant_hash: vec![0x11; 16],
+            signal: 3,
+            part_blake3: vec![vec![0x22; 32]],
+            segment_count,
+            body_uncompressed_len,
+        }
+    }
+
+    /// A v3 envelope around `header` and an already-compressed `body`, with
+    /// correct CRCs, so whatever `header` and `body` say is the only defect.
+    fn frame_raw(version: u8, header: &ColumnStatsHeader, body: &[u8]) -> Vec<u8> {
+        let header_bytes = header.encode_to_vec();
+        let mut out = Vec::new();
+        out.extend_from_slice(&COLUMN_STATS_MAGIC);
+        out.push(version);
+        out.extend_from_slice(&COLUMN_STATS_RESERVED);
+        out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        let header_crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(&crc32c::crc32c(body).to_le_bytes());
+        out.extend_from_slice(&header_crc.to_le_bytes());
+        out
+    }
+
+    fn compress(raw: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(raw, ZSTD_LEVEL).expect("compress")
+    }
+
     #[test]
     fn round_trips() {
         let mut a = segment(1, 0, 1);
@@ -821,6 +1153,46 @@ mod tests {
         assert_eq!(err, SnapshotFormatError::ColumnStatsDuplicateSegment);
     }
 
+    /// The v3 key is the writer_id alone, and both decoders enforce its order
+    /// and uniqueness on bytes no encoder validated; the filtered decoder does
+    /// so incrementally, against the segment before.
+    #[test]
+    fn both_decoders_refuse_unsorted_and_duplicate_v3_segments() {
+        let keyed = |hash: u8, seq: u64| {
+            let mut seg = segment(1, 0, seq);
+            seg.writer_id = vec![hash; 32];
+            seg
+        };
+        let frame = |segments: &[ColumnStatsSegment]| {
+            frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], segments).expect("frames")
+        };
+        let limits = ColumnStatsLimits::default();
+        assert_eq!(
+            both_decoders_refuse(
+                &frame(&[keyed(0x10, 1), keyed(0x30, 2), keyed(0x20, 3)]),
+                &limits
+            ),
+            SnapshotFormatError::ColumnStatsSegmentsUnsorted
+        );
+        assert_eq!(
+            both_decoders_refuse(
+                &frame(&[keyed(0x10, 1), keyed(0x20, 2), keyed(0x20, 3)]),
+                &limits
+            ),
+            SnapshotFormatError::ColumnStatsDuplicateSegment
+        );
+        let mut short = keyed(0x10, 1);
+        short.writer_id = vec![0x10; 16];
+        assert_eq!(
+            both_decoders_refuse(&frame(&[keyed(0x05, 1), short]), &limits),
+            SnapshotFormatError::ColumnStatsBadFieldLen {
+                field: "writer_id",
+                expected: 32,
+                actual: 16,
+            }
+        );
+    }
+
     /// Finding 4's exact example: a column claiming `non_null_count = 10`
     /// with `dictionary_present = true` but an empty dictionary is internally
     /// inconsistent (the metadata-only path would treat all 10 rows as
@@ -830,7 +1202,9 @@ mod tests {
     fn empty_dictionary_with_nonzero_non_null_rejected() {
         let mut seg = segment(1, 0, 1);
         seg.columns[0].dictionary = vec![];
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsDictCountMismatch {
@@ -846,7 +1220,9 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         // Drop one entry so the counts total 9 but non_null_count stays 10.
         seg.columns[0].dictionary.pop();
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsDictCountMismatch {
@@ -863,7 +1239,9 @@ mod tests {
         seg.columns[0].dictionary[0].value = Some(ColumnValue {
             kind: Some(ravel_proto::catalog::v1::column_value::Kind::B(true)),
         });
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsValueTypeMismatch {
@@ -888,7 +1266,9 @@ mod tests {
                 count: 5,
             },
         ];
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsDuplicateDictValue {
@@ -902,7 +1282,9 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         let dup = seg.columns[0].clone();
         seg.columns.push(dup);
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsDuplicateColumnName {
@@ -916,7 +1298,9 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         seg.columns[0].min = Some(i64_value(9));
         seg.columns[0].max = Some(i64_value(0));
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsMinMaxInverted {
@@ -931,7 +1315,9 @@ mod tests {
         seg.columns[0].non_null_count = 0;
         seg.columns[0].dictionary = vec![];
         // min/max still populated: inconsistent with an all-null column.
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsUnexpectedMinMax {
@@ -959,8 +1345,7 @@ mod tests {
         seg.columns.push(dup);
         let bytes =
             frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg]).expect("frames");
-        let err =
-            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
+        let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsDuplicateColumnName {
@@ -988,8 +1373,7 @@ mod tests {
         // min/max still populated: inconsistent with an all-null column.
         let bytes =
             frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg]).expect("frames");
-        let err =
-            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
+        let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsUnexpectedMinMax {
@@ -1011,8 +1395,7 @@ mod tests {
         seg.columns[0].max = None;
         let bytes =
             frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg]).expect("frames");
-        let err =
-            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
+        let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsMissingMinMax {
@@ -1025,7 +1408,9 @@ mod tests {
     fn dictionary_entries_without_present_flag_rejected() {
         let mut seg = segment(1, 0, 1);
         seg.columns[0].dictionary_present = false;
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsDictPresentMismatch {
@@ -1046,7 +1431,9 @@ mod tests {
         let mut seg = segment(1, 0, 1);
         // True dictionary sum is 45; claim 44.
         seg.columns[0].sum = Some(44);
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsSumMismatch {
@@ -1087,7 +1474,9 @@ mod tests {
             },
         ];
         seg.columns[0].sum = Some(6);
-        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg]).expect_err("rejected");
+        let err = encode_column_stats([0x11; 16], 3, vec![], &[seg.clone()]).expect_err("rejected");
+        let decoded_err = both_decoders_refuse(&unvalidated_v3(seg), &ColumnStatsLimits::default());
+        assert_eq!(decoded_err, err);
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsSumOnNonInteger {
@@ -1221,8 +1610,7 @@ mod tests {
             let bytes =
                 encode_column_stats_versioned(bad, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                     .expect("framing encodes any version byte");
-            let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
-                .expect_err("version outside the accepted set is rejected");
+            let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
             assert_eq!(
                 err,
                 SnapshotFormatError::ColumnStatsUnsupportedVersion(bad),
@@ -1251,6 +1639,11 @@ mod tests {
                 encode_column_stats_versioned(version, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                     .expect("framing encodes any version byte");
             let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default());
+            assert_eq!(
+                decode_column_stats_filtered(&bytes, &ColumnStatsLimits::default(), |_| true),
+                decoded,
+                "version {version}: the filtered decode agrees with the whole decode"
+            );
             let expected_accept = version == 3;
             assert_eq!(
                 decoded.is_ok(),
@@ -1274,33 +1667,14 @@ mod tests {
     #[test]
     fn header_envelope_version_disagreement_rejected() {
         let seg = segment(1, 0, 1);
-        // Hand-frame a v3 envelope, but with the header claiming v1 while the
-        // envelope byte stays v3.
+        let segments_raw = seg.encode_length_delimited_to_vec();
         let header = ColumnStatsHeader {
             format_version: 1, // disagrees with the v3 envelope byte below
-            tenant_hash: vec![0x11; 16],
-            signal: 3,
-            part_blake3: vec![vec![0x22; 32]],
-            segment_count: 1,
-            body_uncompressed_len: seg.encode_length_delimited_to_vec().len() as u64,
+            ..v3_header(1, segments_raw.len() as u64)
         };
-        let header_bytes = header.encode_to_vec();
-        let segments_raw = seg.encode_length_delimited_to_vec();
-        let body = zstd::bulk::compress(&segments_raw, ZSTD_LEVEL).expect("compress");
-        let mut out = Vec::new();
-        out.extend_from_slice(&COLUMN_STATS_MAGIC);
-        out.push(3); // v3 envelope
-        out.extend_from_slice(&COLUMN_STATS_RESERVED);
-        out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&header_bytes);
-        let header_crc = crc32c::crc32c(&out);
-        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
-        out.extend_from_slice(&header_crc.to_le_bytes());
+        let out = frame_raw(3, &header, &compress(&segments_raw));
 
-        let err = decode_column_stats(&out, &ColumnStatsLimits::default())
-            .expect_err("header/envelope version disagreement is rejected");
+        let err = both_decoders_refuse(&out, &ColumnStatsLimits::default());
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsHeaderVersionMismatch {
@@ -1322,10 +1696,185 @@ mod tests {
             // Must return a typed error rather than panic; the whole object at
             // full length is covered by `v2_stamped_object_decodes`.
             let _: SnapshotFormatError =
-                decode_column_stats(&bytes[..len], &ColumnStatsLimits::default()).expect_err(
-                    "a truncated envelope must be a typed error, not Ok and not a panic",
-                );
+                both_decoders_refuse(&bytes[..len], &ColumnStatsLimits::default());
         }
+    }
+
+    /// Both CRCs are checked by both decoders before anything else reads the
+    /// header or body.
+    #[test]
+    fn crc_mismatches_refused_by_both_decoders() {
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
+        let bytes =
+            encode_column_stats_v3([0x11; 16], 3, [0x22; 32], &[seg], u64::MAX).expect("encodes");
+        let limits = ColumnStatsLimits::default();
+        let end = bytes.len();
+
+        let mut body_crc = bytes.clone();
+        body_crc[end - 8] ^= 0x01;
+        assert_eq!(
+            both_decoders_refuse(&body_crc, &limits),
+            SnapshotFormatError::ColumnStatsBodyCrcMismatch
+        );
+
+        let mut header_crc = bytes.clone();
+        header_crc[end - 1] ^= 0x01;
+        assert_eq!(
+            both_decoders_refuse(&header_crc, &limits),
+            SnapshotFormatError::ColumnStatsHeaderCrcMismatch
+        );
+
+        let mut body_byte = bytes;
+        body_byte[end - 9] ^= 0x01;
+        assert_eq!(
+            both_decoders_refuse(&body_byte, &limits),
+            SnapshotFormatError::ColumnStatsBodyCrcMismatch
+        );
+    }
+
+    /// A header whose `segment_count` disagrees with the segments its body
+    /// holds is refused with both figures, by both decoders.
+    #[test]
+    fn segment_count_mismatch_refused_by_both_decoders() {
+        let segments = arb_v3_segments(2);
+        let raw = column_stats_segments_concat(&segments);
+        for claimed in [0u64, 1, 3] {
+            let bytes =
+                frame_column_stats_body(3, [0x11; 16], 3, vec![vec![0x22; 32]], claimed, &raw)
+                    .expect("frames");
+            assert_eq!(
+                both_decoders_refuse(&bytes, &ColumnStatsLimits::default()),
+                SnapshotFormatError::ColumnStatsSegmentCountMismatch {
+                    expected: claimed,
+                    actual: 2,
+                },
+                "segment_count {claimed}"
+            );
+        }
+    }
+
+    /// A body shorter than its header declares is refused with both lengths;
+    /// one longer is refused as a decompression failure, since neither
+    /// decoder reads past the declared length to measure it.
+    #[test]
+    fn declared_length_mismatch_refused_by_both_decoders() {
+        let segments = arb_v3_segments(3);
+        let raw = column_stats_segments_concat(&segments);
+        let actual = raw.len() as u64;
+        let body = compress(&raw);
+        let limits = ColumnStatsLimits::default();
+
+        let short = frame_raw(3, &v3_header(3, actual + 1), &body);
+        assert_eq!(
+            both_decoders_refuse(&short, &limits),
+            SnapshotFormatError::ColumnStatsDecompressedLenMismatch {
+                expected: actual + 1,
+                actual,
+            }
+        );
+
+        let long = frame_raw(3, &v3_header(3, actual - 1), &body);
+        assert!(matches!(
+            both_decoders_refuse(&long, &limits),
+            SnapshotFormatError::Decompress(_)
+        ));
+    }
+
+    /// A body that inflates past its declared length is refused by the read
+    /// that crosses it: the streamed decode consumes exactly one byte more
+    /// than declared, never the rest of the segment it was in or the
+    /// segments after it. Covers a declared end on a segment boundary (the
+    /// next length varint crosses it) and inside a segment (the oversized
+    /// length is drained to the declared end and one byte past).
+    #[test]
+    fn a_body_inflating_past_its_declared_length_is_refused_one_byte_past_it() {
+        let segments = arb_v3_segments(8);
+        let raw = column_stats_segments_concat(&segments);
+        let first = segments[0].encoded_len() as u64;
+        let first_framed = segments[0].encode_length_delimited_to_vec().len() as u64;
+        let second_framed = segments[1].encode_length_delimited_to_vec().len() as u64;
+        let body = compress(&raw);
+        let limits = ColumnStatsLimits::default();
+        for declared in [first_framed, first_framed + 3, first_framed + second_framed] {
+            let bytes = frame_raw(3, &v3_header(8, declared), &body);
+            assert!(matches!(
+                decode_column_stats(&bytes, &limits),
+                Err(SnapshotFormatError::Decompress(_))
+            ));
+            let mut consumed = 0;
+            let err =
+                decode_streamed_counting(&bytes, &limits, &|_| true, &mut Unmetered, &mut consumed)
+                    .expect_err("an inflating body is refused");
+            assert!(
+                matches!(err, SnapshotFormatError::Decompress(_)),
+                "declared {declared}: {err:?}"
+            );
+            assert_eq!(consumed, declared + 1, "declared {declared}");
+            assert!(consumed < declared + first, "declared {declared}");
+        }
+    }
+
+    /// A body that is not a whole zstd frame of length-delimited segments is
+    /// a typed refusal from both decoders, never a panic: a frame cut short,
+    /// bytes that are not zstd at all, a segment length running past the
+    /// body, and a body ending inside a length varint.
+    #[test]
+    fn corrupt_bodies_are_typed_refusals_from_both_decoders() {
+        let segments = arb_v3_segments(4);
+        let raw = column_stats_segments_concat(&segments);
+        let declared = raw.len() as u64;
+        let full = compress(&raw);
+        let limits = ColumnStatsLimits::default();
+
+        let truncated = frame_raw(3, &v3_header(4, declared), &full[..full.len() - 4]);
+        let err = both_decoders_refuse(&truncated, &limits);
+        assert!(
+            matches!(err, SnapshotFormatError::Decompress(_)),
+            "truncated frame: {err:?}"
+        );
+
+        let garbage = frame_raw(3, &v3_header(4, declared), &[0x55; 64]);
+        let err = both_decoders_refuse(&garbage, &limits);
+        assert!(
+            matches!(err, SnapshotFormatError::Decompress(_)),
+            "not zstd: {err:?}"
+        );
+
+        // varint(1000) then ten bytes: the length runs past the body's end.
+        let mut past_end = vec![0xE8, 0x07];
+        past_end.extend_from_slice(&[0u8; 10]);
+        let bytes = frame_raw(
+            3,
+            &v3_header(1, past_end.len() as u64),
+            &compress(&past_end),
+        );
+        let err = both_decoders_refuse(&bytes, &limits);
+        assert!(
+            matches!(err, SnapshotFormatError::ColumnStatsSegmentDecode(_)),
+            "length past the end: {err:?}"
+        );
+
+        let bytes = frame_raw(3, &v3_header(1, 1), &compress(&[0x80]));
+        let err = both_decoders_refuse(&bytes, &limits);
+        assert!(
+            matches!(err, SnapshotFormatError::ColumnStatsSegmentDecode(_)),
+            "body ends inside a varint: {err:?}"
+        );
+
+        // An eleven-byte varint is longer than any u64 length.
+        let mut overlong = vec![0xFF; 10];
+        overlong.push(0x01);
+        let bytes = frame_raw(
+            3,
+            &v3_header(1, overlong.len() as u64),
+            &compress(&overlong),
+        );
+        let err = both_decoders_refuse(&bytes, &limits);
+        assert!(
+            matches!(err, SnapshotFormatError::ColumnStatsSegmentDecode(_)),
+            "overlong varint: {err:?}"
+        );
     }
 
     /// A corrupted body under a v3 envelope is caught by the body CRC, a typed
@@ -1341,8 +1890,7 @@ mod tests {
         // before the trailing CRCs).
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
-        let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
-            .expect_err("a corrupted body is rejected");
+        let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
         assert!(
             matches!(
                 err,
@@ -1372,11 +1920,14 @@ mod tests {
         let tiny_limit = ColumnStatsLimits {
             max_column_stats_bytes: 1,
         };
-        let err = decode_column_stats(&bytes, &tiny_limit).expect_err("rejected");
-        assert!(matches!(
+        let err = both_decoders_refuse(&bytes, &tiny_limit);
+        assert_eq!(
             err,
-            SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
-        ));
+            SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+                declared: segments[0].encode_length_delimited_to_vec().len() as u64,
+                cap: 1,
+            }
+        );
     }
 
     /// ADR-1413: a v3 object round-trips like v2 (content-hash keying), and
@@ -1436,8 +1987,7 @@ mod tests {
             &[seg],
         )
         .expect("framing encodes any part_blake3 length");
-        let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
-            .expect_err("v3 with part_blake3 length != 1 is rejected");
+        let err = both_decoders_refuse(&bytes, &ColumnStatsLimits::default());
         assert_eq!(
             err,
             SnapshotFormatError::ColumnStatsV3PartBlake3CountMismatch(2)
@@ -1473,16 +2023,22 @@ mod tests {
             decode_column_stats(&bytes, &at_ceiling).expect("decodes at exactly the ceiling");
         assert_eq!(decoded.segments, vec![seg]);
         assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
+        assert_eq!(
+            decode_column_stats_filtered(&bytes, &at_ceiling, |_| true),
+            Ok(decoded)
+        );
 
         let one_under = ColumnStatsLimits {
             max_column_stats_bytes: declared - 1,
         };
-        let err = decode_column_stats(&bytes, &one_under)
-            .expect_err("one byte over a reader's ceiling is rejected");
-        assert!(matches!(
+        let err = both_decoders_refuse(&bytes, &one_under);
+        assert_eq!(
             err,
-            SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
-        ));
+            SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+                declared,
+                cap: declared - 1,
+            }
+        );
     }
 
     /// A v3 segment set of arbitrary size (0..6 distinct part-hash-keyed
@@ -1541,6 +2097,9 @@ mod tests {
                 result.is_err(),
                 "a strictly truncated v3 object must never decode successfully"
             );
+            let filtered =
+                decode_column_stats_filtered(truncated, &ColumnStatsLimits::default(), |_| false);
+            prop_assert!(filtered.is_err(), "nor through the filtered decode");
         }
 
         /// Every byte of a v3 object is protected against a single-bit flip
@@ -1573,6 +2132,142 @@ mod tests {
                 result.is_err(),
                 "a single-bit-flipped v3 object must never decode successfully"
             );
+            let filtered =
+                decode_column_stats_filtered(&bytes, &ColumnStatsLimits::default(), |_| false);
+            prop_assert!(filtered.is_err(), "nor through the filtered decode");
+        }
+
+        /// The filtered decode is the whole decode with the unkept
+        /// dictionaries cleared, refusals included: every column is validated
+        /// in full before its dictionary is dropped, so a defect only the
+        /// dictionary reveals (counts not summing to `non_null_count`, a sum
+        /// disagreeing with it, a repeated value) is refused with the same
+        /// error whether or not that column is kept.
+        #[test]
+        fn filtered_decode_is_the_whole_decode_stripped(
+            segments in arb_i64_segments(),
+            corruption in proptest::option::of((any::<usize>(), any::<usize>(), 0u8..4)),
+            keep in proptest::sample::subsequence(COLUMN_NAMES.to_vec(), 0..=COLUMN_NAMES.len()),
+        ) {
+            let mut segments = segments;
+            if let Some((segment_seed, column_seed, kind)) = corruption {
+                corrupt_one_column(&mut segments, segment_seed, column_seed, kind);
+            }
+            let bytes = frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &segments)
+                .expect("frames");
+            let limits = ColumnStatsLimits::default();
+            let kept = |name: &str| keep.contains(&name);
+            let whole = decode_column_stats(&bytes, &limits).map(|mut decoded| {
+                for column in decoded.segments.iter_mut().flat_map(|s| s.columns.iter_mut()) {
+                    if !kept(&column.name) {
+                        column.dictionary.clear();
+                    }
+                }
+                decoded
+            });
+            prop_assert_eq!(decode_column_stats_filtered(&bytes, &limits, kept), whole);
+        }
+    }
+
+    const COLUMN_NAMES: [&str; 4] = ["a", "b", "c", "d"];
+
+    /// A valid I64 column: distinct values with their counts, a null count,
+    /// and whether the dictionary is stored. `sum` is always the exact total,
+    /// which is valid with or without a dictionary.
+    fn i64_column(
+        name: &str,
+        entries: &std::collections::BTreeMap<i64, u64>,
+        null_count: u64,
+        dictionary_present: bool,
+    ) -> ColumnStat {
+        let non_null_count: u64 = entries.values().sum();
+        let sum: i64 = entries.iter().map(|(v, c)| v * *c as i64).sum();
+        ColumnStat {
+            name: name.to_string(),
+            declared_type: 2,
+            non_null_count,
+            null_count,
+            min: entries.keys().next().map(|v| i64_value(*v)),
+            max: entries.keys().next_back().map(|v| i64_value(*v)),
+            dictionary_present,
+            dictionary: if dictionary_present {
+                entries
+                    .iter()
+                    .map(|(v, c)| DictEntry {
+                        value: Some(i64_value(*v)),
+                        count: *c,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            sum: Some(sum),
+        }
+    }
+
+    /// Zero to four valid, sorted v3 segments, each holding any subset of
+    /// [`COLUMN_NAMES`] as I64 columns.
+    fn arb_i64_segments() -> impl Strategy<Value = Vec<ColumnStatsSegment>> {
+        let column = (
+            proptest::collection::btree_map(-1000i64..1000, 1u64..4, 0..6),
+            0u64..3,
+            any::<bool>(),
+        );
+        let segment = (
+            proptest::sample::subsequence(COLUMN_NAMES.to_vec(), 0..=COLUMN_NAMES.len()),
+            proptest::collection::vec(column, COLUMN_NAMES.len()),
+        );
+        proptest::collection::vec(segment, 0..5).prop_map(|segments| {
+            segments
+                .into_iter()
+                .enumerate()
+                .map(|(i, (names, columns))| ColumnStatsSegment {
+                    ingest_hour_bucket: 1,
+                    shard: 0,
+                    writer_id: vec![i as u8 + 1; 32],
+                    writer_epoch: 1,
+                    writer_seq: i as u64,
+                    columns: names
+                        .iter()
+                        .zip(&columns)
+                        .map(|(name, (entries, nulls, present))| {
+                            i64_column(name, entries, *nulls, *present)
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+    }
+
+    /// One defect in one column, of a kind only that column's own rules see:
+    /// `non_null_count` off by one, `sum` off by one, a repeated dictionary
+    /// value, or `min` dropped. Whether it is a defect depends on the column
+    /// (a stored dictionary is what reveals the first three).
+    fn corrupt_one_column(
+        segments: &mut [ColumnStatsSegment],
+        segment_seed: usize,
+        column_seed: usize,
+        kind: u8,
+    ) {
+        if segments.is_empty() {
+            return;
+        }
+        let at = segment_seed % segments.len();
+        let columns = &mut segments[at].columns;
+        if columns.is_empty() {
+            return;
+        }
+        let index = column_seed % columns.len();
+        let column = &mut columns[index];
+        match kind {
+            0 => column.non_null_count += 1,
+            1 => column.sum = column.sum.map(|s| s + 1),
+            2 => {
+                if let Some(first) = column.dictionary.first().cloned() {
+                    column.dictionary.push(first);
+                }
+            }
+            _ => column.min = None,
         }
     }
 }

@@ -992,9 +992,9 @@ pub(crate) fn cstat_coverage(
 
 /// [`cstat_coverage`] for an entry [`reconciled_column_stat`] already granted.
 fn entry_coverage(declared: &DeclaredColumn, stat: &ColumnStat) -> Option<SegmentCoverage> {
-    // The presence clause is called, not restated: `LoadedColumnStats` has
-    // public fields and can be populated by a carrier that never decoded an
-    // object, so the check has to bind here, where coverage is granted.
+    // The presence clause is called, not restated: `LoadedColumnStats` has a
+    // public constructor and can be populated by a carrier that never decoded
+    // an object, so the check has to bind here, where coverage is granted.
     if validate_min_max_presence(stat).is_err() {
         observe_declared_stat_drops(StatCarrier::Cstat, 1);
         return None;
@@ -1035,10 +1035,16 @@ pub(crate) fn segment_column_stats<'a>(
 /// carrier wrong. The entry therefore never answers and is never compared with
 /// the stamp here: a segment the stamp does not cover declines the column even
 /// when a `.cstat` entry covers it, and where both exist the stamp's triple is
-/// returned as is. The entry is still read, so a defective one is counted on
-/// the [`StatCarrier::Cstat`] drop tally, but only on segments this is called
-/// for: [`LogsScanExec::declared_min_max_all`] stops calling it for a column at
-/// the first touched segment with no stamp for that column, so on a stamp-less
+/// returned as is. The entry is still read when one was loaded, so a defective
+/// one is counted on the [`StatCarrier::Cstat`] drop tally. The executor loads
+/// the column statistics only for a statement with an aggregate shape the
+/// metadata-only rewrite answers (`SqlExecutor::logs_column_stats_eligible`,
+/// issue #3244), so through it a statement with no such shape, a lone
+/// `MIN`/`MAX` among them, reaches this with `seg_stats` `None` and tallies
+/// nothing. The read is
+/// also limited to segments this is called for:
+/// [`LogsScanExec::declared_min_max_all`] stops calling it for a column at the
+/// first touched segment with no stamp for that column, so on a stamp-less
 /// tenant only the first touched segment's entry is read on that path.
 ///
 /// `None` declines the column for this segment: a `Str` column (no scalar form
@@ -1200,9 +1206,11 @@ pub struct LogsScanExec {
     /// [`crate::executor::SqlExecutor`]. `None` when no usable column-stats
     /// object exists (nothing folded yet, no configured typed columns, or the
     /// last fold's build/PUT failed): every metadata-only path degrades to
-    /// scanning in that case. A live segment absent from
-    /// `LoadedColumnStats::segments` has no exact statistics either, checked
-    /// per column at the point of use rather than here.
+    /// scanning in that case. A live segment no loaded part carries has no
+    /// exact statistics either, and a column whose dictionary the load did
+    /// not request (`LoadedColumnStats::dictionary_loaded`) has no exact
+    /// per-value counts; both are checked at the point of use rather than
+    /// here.
     column_stats: Option<Arc<LoadedColumnStats>>,
     /// Whether this scan publishes its per-segment scan timeline
     /// (`SqlConfig::segment_timing`, issue #913). `false` by default,
@@ -2332,7 +2340,9 @@ impl LogsScanExec {
     /// site ([`Self::metadata_rewrite_stats_are_exact`]: no pending erasure,
     /// no content predicate, no prune arm other than `NumNotEq`, and a ts
     /// bound that clips no touched segment) plus no
-    /// `Str` support, a loaded column-stats object covering every touched
+    /// `Str` support, the column's dictionary loaded on every part
+    /// (`LoadedColumnStats::dictionary_loaded`: a load that did not request it
+    /// holds the summary only), a loaded column-stats object covering every touched
     /// segment whose entry [`merged_view_entry`] grants (an entry whose row
     /// accounting disagrees with the joined `SegmentRef::sample_count`
     /// describes rows this object does not have, and an entry the segment's
@@ -2361,6 +2371,9 @@ impl LogsScanExec {
             return None;
         }
         let stats = self.column_stats.as_ref()?;
+        if !stats.dictionary_loaded(&declared.key) {
+            return None;
+        }
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
             let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
@@ -2427,6 +2440,9 @@ impl LogsScanExec {
             return None;
         }
         let stats = self.column_stats.as_ref()?;
+        if !stats.dictionary_loaded(&declared.key) {
+            return None;
+        }
         let mut merged: HashMap<ScalarValue, u64> = HashMap::new();
         let mut null_count: u64 = 0;
         for seg in self.segments.iter() {
@@ -3649,11 +3665,7 @@ mod cstat_reconcile_tests {
                 columns,
             },
         );
-        let stats = Arc::new(LoadedColumnStats {
-            segments,
-            by_content_hash: HashMap::new(),
-            part_blake3: Vec::new(),
-        });
+        let stats = Arc::new(LoadedColumnStats::from_maps(segments, HashMap::new()));
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let schema = crate::logs_schema::logs_schema_with_declared(&declared);
         LogsScanExec::new(

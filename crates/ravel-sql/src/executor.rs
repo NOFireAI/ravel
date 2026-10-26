@@ -94,7 +94,7 @@
 //! never returned (docs/query-engine.md "Budgets").
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -122,7 +122,7 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
-use ravel_catalog::{Catalog, SegmentOrigins, Snapshot};
+use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -149,7 +149,9 @@ use crate::audit_provider::AuditTableProvider;
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
-use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
+use crate::declared::{
+    DeclaredColumn, DeclaredColumnSource, DeclaredType, default_declared_source,
+};
 use crate::error::SqlError;
 use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
@@ -3068,12 +3070,23 @@ impl SqlExecutor {
                             // tenant with no declared columns reading zero objects, and
                             // reproduces the pre-ADR-0850 provider exactly.
                             None
-                        } else if !self.logs_column_stats_eligible(
+                        } else if let Some(request) = self.logs_column_stats_eligible(
                             &snapshot,
                             analyzed.as_ref(),
                             &extras.declared,
                             several_tables,
                         ) {
+                            self.catalog
+                                .load_column_stats(
+                                    &tenant_hash,
+                                    Signal::Logs,
+                                    extras.column_stats_window,
+                                    extras.column_stats_now_ns,
+                                    &request,
+                                    phase_accounting.lane(signal).plan(),
+                                )
+                                .await?
+                        } else {
                             // Issue #888: no metadata-only column path can fire for this
                             // plan (decided from the plan and the resolved snapshot
                             // alone, ahead of the load), so skip the two GETs
@@ -3082,16 +3095,6 @@ impl SqlExecutor {
                             // stats object would, so every failing-open behavior is
                             // preserved.
                             None
-                        } else {
-                            self.catalog
-                                .load_column_stats(
-                                    &tenant_hash,
-                                    Signal::Logs,
-                                    extras.column_stats_window,
-                                    extras.column_stats_now_ns,
-                                    phase_accounting.lane(signal).plan(),
-                                )
-                                .await?
                         };
                         // Resolved per plan, not pinned: it only decides which
                         // equalities reach the KEY_IDX probe, which narrows the
@@ -4426,34 +4429,60 @@ impl SqlExecutor {
     /// the query then answers exactly as an absent stats object would (the
     /// pre-ADR-0850 provider).
     ///
-    /// Every branch fails OPEN (returns `true`, keeping the load) on any
-    /// uncertainty, because a false `false` would turn ADR-0850 off for a plan
-    /// that could have used it. The three metadata-only paths -- q07
-    /// `MIN`/`MAX(declared)`, q02 `COUNT(*)` with a residual `declared <> lit`
-    /// filter, q08 `COUNT(*) GROUP BY declared` -- all gate downstream on
-    /// [`crate::logs_scan`]'s `metadata_rewrite_stats_are_exact` (no pending
-    /// erasure, no content predicate, no prune arm other than `NumNotEq`, and
-    /// a ts bound that clips no touched segment) and
-    /// all are aggregates referencing a declared column. This mirrors exactly
-    /// those necessary conditions; anything they cannot prove is left to
-    /// decline downstream and still loads here.
+    /// The load is kept only when some aggregate in the plan (subquery plans
+    /// included) has a shape [`crate::MetadataOnlyAggregate`] answers
+    /// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244):
+    /// q02 `COUNT(*) WHERE declared <> lit`, q08 `declared, COUNT(*) GROUP BY
+    /// declared`, or one `SUM(declared [+ int])` or `AVG(declared)` (q03/q04/q30
+    /// in the `metadata_agg` module doc), each over a `logs` scan with no
+    /// classified residual filter other than q02's one `<>` conjunct (the
+    /// next paragraph covers unclassified ones). `MIN`/`MAX` are not among
+    /// them: DataFusion's `AggregateStatistics` answers them from the
+    /// `SegmentRef` stamps, which the snapshot already carries, so they load
+    /// nothing.
+    ///
+    /// Anything else (several aggregates beside a `SUM` or `AVG`, a distinct
+    /// count, a `GROUP BY` with a `<>` filter or with two keys, a raw select)
+    /// skips the load. Inside an admitted shape, a residual conjunct the
+    /// analyzed plan does not show as either a pure `ts` or `has_word`
+    /// conjunct or a `declared <> literal` keeps the load, except on the q02
+    /// shape when no residual conjunct names a non-`Str` declared column (no
+    /// consumer answers a `<>` on a `Str` column): the analyzed
+    /// plan still carries the casts and constant expressions the optimizer
+    /// folds (`TIMESTAMP '...'` is a cast of a string there). Beyond the shape
+    /// and residual rules, the load is skipped only for what the rewrite's own
+    /// gate, [`crate::logs_scan`]'s `metadata_rewrite_stats_are_exact`,
+    /// refuses and the checks below can read on the analyzed plan: a pending
+    /// erasure, a content predicate, a prune arm other than `NumNotEq`, and a
+    /// ts bound that clips a touched segment. A ts bound written with
+    /// `TIMESTAMP` literals is not read there, so its clip does not skip the
+    /// load; the rewrite then declines on the optimized plan and scans. A
+    /// condition known only once the statistics are read (no stored sum for
+    /// the column, a dictionary over the cardinality ceiling) is left to
+    /// decline downstream, so such a plan loads and then scans.
     ///
     /// `several_tables` is whether the statement names more than one table,
     /// two signal tables or a signal table beside a Parquet table; the
     /// pushdown checks then read only the `logs` scans' own conjuncts.
+    ///
+    /// A kept load returns the [`ColumnStatsRequest`] it carries: the union
+    /// of every admitted aggregate's request, so a part's dictionaries are
+    /// fetched only for the columns a q02 or q08 shape reads. With no plan
+    /// to judge, every non-`Str` declared column's dictionary is requested,
+    /// since either consumer may read any of them.
     fn logs_column_stats_eligible(
         &self,
         snapshot: &Snapshot,
         analyzed: Option<&LogicalPlan>,
         declared: &[DeclaredColumn],
         several_tables: bool,
-    ) -> bool {
+    ) -> Option<ColumnStatsRequest> {
         // Pending selective erasure (ADR-0064) rejects the ENTIRE query for
         // every metadata-only path (safety lemma): a pending erasure removes
         // rows the precomputed counts/extrema still include. Snapshot-only and
         // certain, so it is checked first and without building a plan.
         if !snapshot.pending_erasure.is_empty() {
-            return false;
+            return None;
         }
         // The analyzed logical plan carries both the aggregate shape and the
         // filter conjuncts this check needs. If it cannot be built, fall back
@@ -4462,17 +4491,19 @@ impl SqlExecutor {
         // one analyzed plan with the exact-typed classification rather than
         // building a second throwaway session for the same SQL.
         let Some(plan) = analyzed else {
-            return true;
+            let mut request = ColumnStatsRequest::summary_only();
+            for column in declared
+                .iter()
+                .filter(|column| !matches!(column.ty, DeclaredType::Str))
+            {
+                request.add_dictionary(column.key.as_str());
+            }
+            return Some(request);
         };
-        // Every path is an aggregate over a declared column. A non-aggregate
-        // (a raw select, a top-N) or an aggregate touching no declared column
-        // (a predicate-free `COUNT(*)`, answered from `sample_count` with no
-        // column stats) can never consume the loaded object.
-        if !plan_has_aggregate(plan) || !plan_references_declared(plan, declared) {
-            return false;
-        }
+        let request = plan_stats_answerable_request(plan, declared)?;
         if several_tables {
-            return Self::some_logs_scan_may_use_column_stats(snapshot, plan, declared);
+            return Self::some_logs_scan_may_use_column_stats(snapshot, plan, declared)
+                .then_some(request);
         }
         // Re-derive the reader pushdown from the plan's filter conjuncts with
         // the SAME extractor the scan uses, so the content/prune/ts decisions
@@ -4485,14 +4516,14 @@ impl SqlExecutor {
         collect_filter_predicates(plan, &mut filters);
         let pushdown = extract_logs(&filters, declared);
         if !pushdown.content.is_empty() || !prune_is_rewrite_neutral(&pushdown.prune) {
-            return false;
+            return None;
         }
         // A ts bound that clips even one touched segment makes `stats_are_exact`
         // fail closed. The touched set is the ts-overlapping subset the provider
         // resolves (`pruned_segments`); a segment fully outside the bound is
         // pruned away and never reaches the containment check, so it must not
         // count as a clip here either.
-        !Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())
+        (!Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())).then_some(request)
     }
 
     /// Whether `[ts_min, ts_max]` clips a segment of `snapshot` it touches.
@@ -6524,71 +6555,30 @@ fn is_exact_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
     )
 }
 
-/// Whether `plan` (analyzed) has any [`LogicalPlan::Aggregate`] node (issue
-/// #888). Every ADR-0850 metadata-only path replaces an `AggregateExec`, so a
-/// plan with no aggregate can never consume column statistics. Reuses
-/// [`collect_aggregate_exprs`]'s reach (inputs plus embedded subquery plans),
-/// so it fails open: an aggregate anywhere counts, even one the metadata rule
-/// would not ultimately match.
-fn plan_has_aggregate(plan: &LogicalPlan) -> bool {
+/// The union of the column-statistics requests of every
+/// [`LogicalPlan::Aggregate`] in `plan` (analyzed) whose shape a
+/// column-statistics consumer accepts
+/// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244), or
+/// `None` when no aggregate is accepted. Reuses [`collect_aggregate_exprs`]'s
+/// reach (inputs plus embedded subquery plans), so `SELECT (SELECT SUM(status)
+/// FROM logs)` is judged on the nested aggregate. The plan's `logs` scans share
+/// one load, so it carries every dictionary any accepted aggregate reads.
+fn plan_stats_answerable_request(
+    plan: &LogicalPlan,
+    declared: &[DeclaredColumn],
+) -> Option<ColumnStatsRequest> {
     let mut aggregates = Vec::new();
     let mut distincts = Vec::new();
     collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
-    !aggregates.is_empty()
-}
-
-/// Whether `plan` references at least one of `declared`'s columns by name
-/// (issue #888). Every ADR-0850 metadata-only path names a declared column: a
-/// `MIN`/`MAX` argument (q07), a `GROUP BY` key (q08), or the `col <> lit`
-/// filter column (q02). A plan naming none can never consume column
-/// statistics -- a predicate-free `COUNT(*)`, for instance, is answered from
-/// `sample_count` with no column stats at all. Recurses inputs the same way
-/// [`collect_filter_predicates`] does; matching by unqualified column name is
-/// intentionally broad (fail open), since a false negative would turn ADR-0850
-/// off for a plan that could use it.
-fn plan_references_declared(plan: &LogicalPlan, declared: &[DeclaredColumn]) -> bool {
-    let names: HashSet<&str> = declared.iter().map(|d| d.key.as_str()).collect();
-    plan_references_names(plan, &names)
-}
-
-fn plan_references_names(plan: &LogicalPlan, names: &HashSet<&str>) -> bool {
-    for expr in plan.expressions() {
-        let mut found = false;
-        // Never errors: the closure only inspects and returns a recursion verb.
-        let _ = expr.apply(|node| {
-            if let Expr::Column(column) = node
-                && names.contains(column.name.as_str())
-            {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            // A subquery's plan hangs off the expression, not off
-            // `plan.inputs()`, so the input recursion below never reaches it.
-            // `collect_aggregate_exprs` descends these three for the same
-            // reason; without the matching descent here the two walks disagree,
-            // and `SELECT (SELECT MIN(status) FROM logs)` would be judged to
-            // name no declared column while being judged to hold an aggregate.
-            let nested = match node {
-                Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
-                Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery.subquery),
-                Expr::Exists(exists) => Some(&exists.subquery.subquery),
-                _ => None,
-            };
-            if let Some(plan) = nested
-                && plan_references_names(plan, names)
-            {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-        if found {
-            return true;
-        }
-    }
-    plan.inputs()
+    aggregates
         .iter()
-        .any(|input| plan_references_names(input, names))
+        .filter_map(|aggregate| {
+            crate::metadata_agg::logical_aggregate_answerable(aggregate, declared)
+        })
+        .reduce(|mut union, request| {
+            union.extend(&request);
+            union
+        })
 }
 
 /// Classify a DISTINCT node's implicit group keys (ADR-0094 decision 1): a
@@ -7820,6 +7810,90 @@ pub(crate) mod tests {
         assert!(
             !aggregate_expr_is_exact(expr, schema),
             "avg over a Float64 input is never exact-eligible (ADR-0094 decision 1)"
+        );
+    }
+
+    /// Issue #3244: the column-statistics request each admitted shape derives,
+    /// read from the same analyzed plan the executor's gate judges. q02 names
+    /// its `<>` column, q08 its group key, SUM and AVG no dictionary, an
+    /// unknown conjunct every non-`Str` declared column it names, and two
+    /// `logs` aggregates in one statement the union of theirs.
+    ///
+    /// FLIP: make `plan_stats_answerable_request` return every non-`Str`
+    /// declared column's dictionary for an admitted plan (what the
+    /// pre-change load always carried); the q02 case fails first, naming
+    /// `code`, `level` and `status`. `level` is declared and named by no
+    /// statement here so the unknown-conjunct and union cases fail too.
+    #[tokio::test]
+    async fn column_stats_request_names_only_the_dictionaries_a_shape_reads() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+        let declared = [
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("code", DeclaredType::I64),
+            DeclaredColumn::new("level", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let request_for = |sql: &'static str| {
+            let exec = &exec;
+            let declared = &declared;
+            async move {
+                let plan = exec
+                    .sql_classification_plan(t, sql, declared, None)
+                    .await
+                    .expect("the statement plans");
+                plan_stats_answerable_request(&plan, declared)
+            }
+        };
+        let names = |request: Option<ColumnStatsRequest>| {
+            request.map(|request| {
+                request
+                    .dictionary_columns()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE status <> 500").await),
+            Some(vec!["status".to_string()]),
+            "q02 names exactly its <> column"
+        );
+        assert_eq!(
+            names(request_for("SELECT code, COUNT(*) FROM logs GROUP BY code").await),
+            Some(vec!["code".to_string()]),
+            "q08 names exactly its key"
+        );
+        assert_eq!(
+            names(request_for("SELECT SUM(status) FROM logs").await),
+            Some(Vec::new()),
+            "SUM is summary only"
+        );
+        assert_eq!(
+            names(request_for("SELECT AVG(status) FROM logs").await),
+            Some(Vec::new()),
+            "AVG is summary only"
+        );
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE status + code <> 7").await),
+            Some(vec!["code".to_string(), "status".to_string()]),
+            "an unknown conjunct names both non-Str columns it reads"
+        );
+        assert_eq!(
+            names(
+                request_for(
+                    "SELECT (SELECT COUNT(*) FROM logs WHERE status <> 1) AS a, \
+                     (SELECT COUNT(*) FROM logs WHERE code <> 2) AS b"
+                )
+                .await
+            ),
+            Some(vec!["code".to_string(), "status".to_string()]),
+            "two logs aggregates take the union"
+        );
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE region <> 'eu'").await),
+            None,
+            "a <> on a Str column is refused"
         );
     }
 

@@ -551,10 +551,10 @@ enum Command {
         /// batches (issue #2613). With `--target-bytes` unset it does not set
         /// the object size, which is `DEFAULT_OBJECT_ROWS` (250,000) rows per
         /// shard object, but it does set the derived `--pipeline-depth`
-        /// (`ceil(250,000 x --shards / --batch-rows)`). With `--target-bytes
-        /// 1` each batch flushes as its own object per involved shard, so
-        /// there this sets the object size. Must be at least 1; 0 is
-        /// rejected. Defaults to `DEFAULT_BATCH_ROWS` (10000).
+        /// (`ceil(250,000 x --shards / --batch-rows)` plus a quarter). With
+        /// `--target-bytes 1` each batch flushes as its own object per
+        /// involved shard, so there this sets the object size. Must be at
+        /// least 1; 0 is rejected. Defaults to `DEFAULT_BATCH_ROWS` (10000).
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
         batch_rows: usize,
         /// Number of leading rows, by file-absolute position, to drop before
@@ -591,22 +591,27 @@ enum Command {
         /// submitting the next, so that round-trip latency is serial. Raising
         /// the depth lets up to this many writes overlap. Unset, the depth is
         /// derived once the first batch is decoded (issue #2753): the rows
-        /// bound `ceil(250,000 x --shards / --batch-rows)`, lowered to the
-        /// memory bound `--load-memory-bytes` divided by the estimated object
-        /// bytes of one batch when that is smaller, never below 1, and capped
-        /// at 1,024. With `--target-bytes` unset the loader also flushes every
+        /// bound `ceil(250,000 x --shards / --batch-rows)`, plus a quarter of
+        /// it, rounded up, while the depth flush below runs (issue #3119),
+        /// lowered to the memory bound
+        /// `--load-memory-bytes` divided by the estimated object bytes of one
+        /// batch when that is smaller, never below 1, and capped at 1,024. With `--target-bytes` unset the loader also flushes every
         /// shard once the oldest batch pending on any shard is this many
         /// submitted batches old (a size flush restarts only its own shard's
-        /// window); an explicit `--target-bytes` turns that depth flush off.
-        /// The durable-token list a failed load reports
+        /// window); an explicit `--target-bytes` turns that depth flush off,
+        /// and with it the quarter, so the derived depth is the plain rows
+        /// bound. The durable-token list a failed load reports
         /// is exactly what landed at any depth. `0` is rejected.
         ///
         /// At the defaults (4 shards, 10,000-row batches) the rows bound is
         /// 100, enough batches in flight for every shard to fill one
-        /// 250,000-row object. The summary, the stderr geometry line printed
-        /// before the first write, and the JSON load report name the depth
-        /// and which bound decided it (`rows`, `memory`, `cap` or `flag`). The
-        /// load report counts the depth flush's flushes under `depth`.
+        /// 250,000-row object, and the derived depth is 125: the margin lets
+        /// a shard that drew fewer than its share of a window's rows reach the
+        /// target before the depth flush closes it. The summary, the stderr
+        /// geometry line printed before the first write, and the JSON load
+        /// report name the depth and which bound decided it (`rows`,
+        /// `memory`, `cap` or `flag`). The load report counts the depth
+        /// flush's flushes under `depth`.
         /// `4` (`MEASURED_PIPELINE_DEPTH`) is the depth measured at 2.94x on
         /// the 100M-row ClickBench corpus at one object per batch (ADR-0807),
         /// and `1` is one batch at a time.
@@ -685,9 +690,10 @@ enum Command {
         /// #801). Unset, the target is derived once the first batch is
         /// decoded (issue #2753): `DEFAULT_OBJECT_ROWS` (250,000) times that
         /// batch's estimated bytes per row, so the size trigger fires at
-        /// about 250,000 rows on every signal, and the depth flush closes a
-        /// shard whose rows came out narrower at the `--pipeline-depth` row
-        /// bound. An explicit value is used as given and turns the depth
+        /// about 250,000 rows on every signal, and the depth flush closes
+        /// every shard once the oldest batch pending on any shard is
+        /// `--pipeline-depth` batches old, which closes a shard whose rows
+        /// came out narrower than the first batch's. An explicit value is used as given and turns the depth
         /// flush off. Stored objects come out much smaller than the target.
         /// `0` is rejected.
         ///
@@ -800,6 +806,37 @@ enum Command {
             value_parser = ravel_cli::parse_zstd_level
         )]
         zstd_level: ravel_ingest::RlogZstdLevel,
+        /// Blocks per row group in each RLOG object a logs load writes, a row
+        /// group being that many consecutive blocks of up to 8,192 records
+        /// each; default 32. Raise it with a large `--target-bytes` to write
+        /// each object as one row group, so a narrow projection reads one
+        /// chunk per column instead of one per row group and column.
+        ///
+        /// 0 is refused. A metrics or spans load ignores this flag. A group
+        /// larger than 32 blocks raises the raw bytes a compaction merge holds
+        /// per input object, one row group each; the compactor itself writes
+        /// 32-block groups.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value = "32",
+            value_parser = ravel_cli::parse_group_target_blocks
+        )]
+        group_target_blocks: ravel_ingest::RlogGroupTargetBlocks,
+        /// Attribute columns, comma-separated, whose chunks each RLOG object
+        /// a logs load writes places first and adjacent in every row group, in
+        /// this order, so a query projecting them together reads one chunk run;
+        /// default none. The other columns follow in name order.
+        ///
+        /// A name the data never carries is skipped. An empty, padded or
+        /// repeated name is refused before anything is read. A metrics or spans
+        /// load warns and ignores it.
+        #[arg(
+            long,
+            value_name = "NAME,NAME,...",
+            value_parser = ravel_cli::parse_chunk_order
+        )]
+        chunk_order: Option<ravel_ingest::RlogChunkOrder>,
         /// The bytes of built batches a logs load may hold at once (issue
         /// #2626). Every batch is charged before it is built, at an estimate
         /// from the previous batch's bytes per row (zero for the first batch),
@@ -3340,6 +3377,8 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             target_bytes,
             max_flush_delay,
             zstd_level,
+            group_target_blocks,
+            chunk_order,
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
@@ -3366,6 +3405,8 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 target_bytes,
                 max_flush_delay,
                 zstd_level,
+                group_target_blocks,
+                chunk_order.unwrap_or_default(),
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
@@ -4947,6 +4988,101 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// `--group-target-blocks` defaults to 32, the writer's own row-group
+    /// size, and 0 is refused at parse time with a message naming the flag.
+    #[test]
+    fn group_target_blocks_flag_defaults_to_32_and_refuses_zero() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+        let blocks_of = |extra: &[&str]| match Cli::try_parse_from(
+            base.iter().copied().chain(extra.iter().copied()),
+        )
+        .map(|cli| cli.command)
+        {
+            Ok(Command::Load {
+                group_target_blocks,
+                ..
+            }) => Ok(group_target_blocks.get()),
+            Ok(_) => panic!("expected the load subcommand"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(blocks_of(&[]), Ok(32));
+        assert_eq!(
+            blocks_of(&[]),
+            Ok(ravel_logseg::RlogConfig::default().group_target_blocks),
+            "the default is the writer's"
+        );
+        assert_eq!(blocks_of(&["--group-target-blocks", "1"]), Ok(1));
+        assert_eq!(blocks_of(&["--group-target-blocks", "512"]), Ok(512));
+        let err = blocks_of(&["--group-target-blocks", "0"]).expect_err("0 is refused");
+        assert!(
+            err.contains(
+                "invalid --group-target-blocks: RLOG row-group size must be at least 1 block"
+            ),
+            "{err}"
+        );
+        let err = blocks_of(&["--group-target-blocks", "x"]).expect_err("not a number");
+        assert!(err.contains("invalid --group-target-blocks 'x'"), "{err}");
+    }
+
+    /// `--chunk-order` defaults to no order, the writer's own default, keeps
+    /// the given order rather than sorting it, and refuses a repeated or empty
+    /// name at parse time with a message naming the flag and the name.
+    #[test]
+    fn chunk_order_flag_defaults_to_empty_and_refuses_a_repeated_name() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+        let order_of = |extra: &[&str]| match Cli::try_parse_from(
+            base.iter().copied().chain(extra.iter().copied()),
+        )
+        .map(|cli| cli.command)
+        {
+            Ok(Command::Load { chunk_order, .. }) => {
+                Ok(chunk_order.unwrap_or_default().get().to_vec())
+            }
+            Ok(_) => panic!("expected the load subcommand"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(order_of(&[]), Ok(Vec::new()));
+        assert_eq!(
+            order_of(&[]),
+            Ok(ravel_logseg::RlogConfig::default().chunk_order.to_vec()),
+            "the default is the writer's"
+        );
+        assert_eq!(
+            order_of(&["--chunk-order", "UserID,SearchPhrase"]),
+            Ok(vec!["UserID", "SearchPhrase"])
+        );
+        let err = order_of(&["--chunk-order", "UserID,SearchPhrase,UserID"])
+            .expect_err("a repeated name is refused");
+        assert!(
+            err.contains("invalid --chunk-order: RLOG chunk order names \"UserID\" more than once"),
+            "{err}"
+        );
+        let err = order_of(&["--chunk-order", "UserID,,SearchPhrase"])
+            .expect_err("an empty name is refused");
+        assert!(
+            err.contains("invalid --chunk-order: RLOG chunk order name 1 is empty"),
+            "{err}"
+        );
     }
 
     /// Issue #1184's classification: `load`, `typed-attr-column set`,

@@ -41,8 +41,9 @@ use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, FlushTriggerMix, IngestByteBudget, IngestByteCharge, IngestConfig, IngestRouter,
     LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt, PendingAckBudget,
-    RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
-    SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
+    RlogChunkOrder, RlogGroupTargetBlocks, RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS,
+    SpanIngestRouter, SpanWriteError, SpanWriteReceipt, SystemClock, WriteError, WriteMode,
+    WriteReceipt,
 };
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};

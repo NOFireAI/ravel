@@ -2698,6 +2698,10 @@ pub struct CatalogFoldCounters {
     /// only at the render below, so this struct stays `Eq`-comparable in
     /// tests.
     pub last_success_unix_ns: i64,
+    /// Column-statistics dictionaries the successful folds of this signal
+    /// dropped to fit the reader ceiling
+    /// ([`ravel_catalog::Catalog::fold_column_stats_dictionaries_dropped`]).
+    pub column_stats_dictionaries_dropped: u64,
 }
 
 impl CatalogFoldCounters {
@@ -2710,6 +2714,7 @@ impl CatalogFoldCounters {
             cycles: 0,
             failures: 0,
             last_success_unix_ns: 0,
+            column_stats_dictionaries_dropped: 0,
         })
     }
 }
@@ -2731,6 +2736,18 @@ pub struct CatalogCountersSnapshot {
     /// Column-statistics decode jobs that panicked on the read CPU gate
     /// ([`ravel_catalog::Catalog::column_stats_decode_panics`]).
     pub column_stats_decode_panics: u64,
+    /// Column-statistics cache refusals
+    /// ([`ravel_catalog::Catalog::column_stats_cache_refusals`]).
+    pub column_stats_cache_refusals: u64,
+    /// Column-statistics cache evictions
+    /// ([`ravel_catalog::Catalog::column_stats_cache_evictions`]).
+    pub column_stats_cache_evictions: u64,
+    /// Bytes the column-statistics cache holds now, a gauge
+    /// ([`ravel_catalog::Catalog::column_stats_cache_held_bytes`]).
+    pub column_stats_cache_held_bytes: u64,
+    /// Decompressed body bytes of the column-statistics objects the catalog
+    /// decoded ([`ravel_catalog::Catalog::column_stats_decoded_bytes`]).
+    pub column_stats_decoded_bytes: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
     /// Supervisor restarts of each signal's fold loop, in
@@ -2755,6 +2772,10 @@ impl Default for CatalogCountersSnapshot {
             isolation_breaches: 0,
             column_stats_decode_refusals: 0,
             column_stats_decode_panics: 0,
+            column_stats_cache_refusals: 0,
+            column_stats_cache_evictions: 0,
+            column_stats_cache_held_bytes: 0,
+            column_stats_decoded_bytes: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
             fold_refold_requests_dropped: 0,
@@ -2775,11 +2796,17 @@ impl CatalogCountersSnapshot {
             isolation_breaches: catalog.isolation_breaches(),
             column_stats_decode_refusals: catalog.column_stats_decode_refusals(),
             column_stats_decode_panics: catalog.column_stats_decode_panics(),
+            column_stats_cache_refusals: catalog.column_stats_cache_refusals(),
+            column_stats_cache_evictions: catalog.column_stats_cache_evictions(),
+            column_stats_cache_held_bytes: catalog.column_stats_cache_held_bytes(),
+            column_stats_decoded_bytes: catalog.column_stats_decoded_bytes(),
             fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
                 signal,
                 cycles: catalog.fold_cycles(signal),
                 failures: catalog.fold_failures(signal),
                 last_success_unix_ns: catalog.fold_last_success_unix_ns(signal),
+                column_stats_dictionaries_dropped: catalog
+                    .fold_column_stats_dictionaries_dropped(signal),
             }),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
             fold_refold_requests_dropped: 0,
@@ -2870,15 +2897,67 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         snapshot.column_stats_decode_panics,
     );
 
-    // The three fold families carry a `signal` label because the fold is one
+    write_header(
+        out,
+        "ravel_catalog_column_stats_cache_refusals_total",
+        "Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget, served but not cached.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_cache_refusals_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_cache_refusals,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_cache_evictions_total",
+        "Column-statistics cache entries evicted to stay within the cache byte budget.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_cache_evictions_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_cache_evictions,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_cache_held_bytes",
+        "Bytes the column-statistics cache currently holds.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_cache_held_bytes",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_cache_held_bytes,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_decoded_bytes_total",
+        "Decompressed body bytes (not wire bytes) of column-statistics objects decoded by query loads; a cache hit adds nothing.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_decoded_bytes_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_decoded_bytes,
+    );
+
+    // The fold families carry a `signal` label because the fold is one
     // independent task per signal (`crate::fold::FOLD_SIGNALS`). Every folded
     // signal renders every cycle, whether or not its loop is still alive, so a
     // loop that has died leaves its own series standing and going stale
     // instead of vanishing into an aggregate its siblings keep fresh.
     //
-    // The two counters render wherever a fold can run by either route
-    // (`Mode::renders_fold_counters`), so an on-demand fold's cycles and
-    // failures are visible on `/metrics` in the process that served it: a
+    // The three counters render wherever a fold can run by either route
+    // (`Mode::renders_fold_counters`), so an on-demand fold's cycles,
+    // failures and dropped dictionaries are visible on `/metrics` in the process that served it: a
     // query process folds only through `POST /api/v1/admin/fold`, and
     // `Catalog::fold` moves these counters whichever route called it. A
     // gateway process folds by no route and renders no fold family at all.
@@ -2917,6 +2996,21 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
             "ravel_catalog_fold_failures_total",
             &labels(mode, fold.signal),
             fold.failures,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_catalog_fold_column_stats_dictionaries_dropped_total",
+        "Column-statistics dictionaries successful catalog folds dropped, by signal, to fit a part's statistics under the reader ceiling.",
+        "counter",
+    );
+    for fold in &snapshot.fold {
+        write_sample(
+            out,
+            "ravel_catalog_fold_column_stats_dictionaries_dropped_total",
+            &labels(mode, fold.signal),
+            fold.column_stats_dictionaries_dropped,
         );
     }
 
@@ -3279,10 +3373,11 @@ fn render_ingest_buffer_budget_family(
 /// `is_fallback` is set (the budget was sized on an unmeasured host,
 /// `config::PERF_SOURCE_FALLBACK`). On that path `raw_limit` is
 /// `ravel_memory::MemoryBudget::limit()`'s actual value: `u64::MAX` minus
-/// the two hard cache carves (`DEFAULT_CACHE_MAX_BYTES` each), not `u64::MAX`
-/// itself, which would leave the "unlimited" doc claim on
-/// `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard check
-/// permanently unmatched.
+/// the three hard cache carves (`DEFAULT_CACHE_MAX_BYTES` for each byte cache
+/// and `DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` for the column-statistics
+/// cache), not `u64::MAX` itself, which would leave the "unlimited" doc
+/// claim on `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard
+/// check permanently unmatched.
 fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
     if is_fallback { u64::MAX } else { raw_limit }
 }
@@ -3340,7 +3435,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_budget_bytes",
-        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the two resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
+        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the three resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
         "gauge",
     );
     write_sample(
@@ -11565,6 +11660,135 @@ mod tests {
         }
     }
 
+    /// Issue #3244: the column-statistics cache, decoded-bytes and
+    /// fold-dictionary-drop series render under their own names with the
+    /// HELP, TYPE and value each was driven with. Every field carries a
+    /// distinct value, and so does each signal's drop count, so a renderer
+    /// that read one field into another's series, or paired a drop count with
+    /// the wrong signal, fails here. The fold-drop family renders only where a
+    /// fold can run: a query process, which folds on demand, renders it, and a
+    /// gateway renders the four process-wide series and no fold-drop family.
+    #[test]
+    fn column_stats_cache_and_fold_drop_series_render_at_metrics() {
+        let mut catalog = CatalogCountersSnapshot {
+            column_stats_cache_refusals: 11,
+            column_stats_cache_evictions: 12,
+            column_stats_cache_held_bytes: 13,
+            column_stats_decoded_bytes: 14,
+            ..Default::default()
+        };
+        for (fold, dropped) in catalog.fold.iter_mut().zip([21, 22, 23]) {
+            fold.column_stats_dictionaries_dropped = dropped;
+        }
+        assert_eq!(
+            catalog.fold.map(|fold| fold.signal),
+            [Signal::Metrics, Signal::Logs, Signal::Spans],
+            "the drop counts above are assigned in this signal order"
+        );
+        let render_in = |mode| {
+            render(
+                mode,
+                &StoreMetricsSnapshot::default(),
+                &[],
+                &catalog,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &AdmissionCountersSnapshot::default(),
+                &[],
+                0,
+                IngestBufferBudgetSnapshot::default(),
+                PendingStrictAckSnapshot::default(),
+                None,
+                None,
+                &[],
+                None,
+                crate::mem_stats::AllocatorStats::Other { name: "test" },
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                MemoryBudgetSnapshot::default(),
+                true,
+            )
+        };
+
+        let body = render_in(Mode::All);
+        for expected in [
+            "# HELP ravel_catalog_column_stats_cache_refusals_total Column-statistics cache inserts refused because one part's entry is larger than the whole column-statistics cache byte budget, served but not cached.",
+            "# TYPE ravel_catalog_column_stats_cache_refusals_total counter",
+            "ravel_catalog_column_stats_cache_refusals_total{mode=\"all\"} 11",
+            "# HELP ravel_catalog_column_stats_cache_evictions_total Column-statistics cache entries evicted to stay within the cache byte budget.",
+            "# TYPE ravel_catalog_column_stats_cache_evictions_total counter",
+            "ravel_catalog_column_stats_cache_evictions_total{mode=\"all\"} 12",
+            "# HELP ravel_catalog_column_stats_cache_held_bytes Bytes the column-statistics cache currently holds.",
+            "# TYPE ravel_catalog_column_stats_cache_held_bytes gauge",
+            "ravel_catalog_column_stats_cache_held_bytes{mode=\"all\"} 13",
+            "# HELP ravel_catalog_column_stats_decoded_bytes_total Decompressed body bytes (not wire bytes) of column-statistics objects decoded by query loads; a cache hit adds nothing.",
+            "# TYPE ravel_catalog_column_stats_decoded_bytes_total counter",
+            "ravel_catalog_column_stats_decoded_bytes_total{mode=\"all\"} 14",
+            "# HELP ravel_catalog_fold_column_stats_dictionaries_dropped_total Column-statistics dictionaries successful catalog folds dropped, by signal, to fit a part's statistics under the reader ceiling.",
+            "# TYPE ravel_catalog_fold_column_stats_dictionaries_dropped_total counter",
+            "ravel_catalog_fold_column_stats_dictionaries_dropped_total{mode=\"all\",signal=\"metrics\"} 21",
+            "ravel_catalog_fold_column_stats_dictionaries_dropped_total{mode=\"all\",signal=\"logs\"} 22",
+            "ravel_catalog_fold_column_stats_dictionaries_dropped_total{mode=\"all\",signal=\"spans\"} 23",
+        ] {
+            assert_eq!(
+                body.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` line:\n{body}"
+            );
+        }
+        let drop_samples = body
+            .lines()
+            .filter(|line| {
+                line.starts_with("ravel_catalog_fold_column_stats_dictionaries_dropped_total")
+            })
+            .count();
+        assert_eq!(
+            drop_samples, 3,
+            "one drop series per folded signal:\n{body}"
+        );
+
+        let query = render_in(Mode::Query);
+        assert_eq!(
+            query
+                .lines()
+                .filter(|line| *line
+                    == "ravel_catalog_fold_column_stats_dictionaries_dropped_total{mode=\"query\",signal=\"logs\"} 22")
+                .count(),
+            1,
+            "a query process folds on demand and renders the drop counter:\n{query}"
+        );
+
+        let gateway = render_in(Mode::Gateway);
+        for expected in [
+            "ravel_catalog_column_stats_cache_refusals_total{mode=\"gateway\"} 11",
+            "ravel_catalog_column_stats_cache_evictions_total{mode=\"gateway\"} 12",
+            "ravel_catalog_column_stats_cache_held_bytes{mode=\"gateway\"} 13",
+            "ravel_catalog_column_stats_decoded_bytes_total{mode=\"gateway\"} 14",
+        ] {
+            assert_eq!(
+                gateway.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` line:\n{gateway}"
+            );
+        }
+        assert!(
+            !gateway.contains("ravel_catalog_fold_column_stats_dictionaries_dropped_total"),
+            "a gateway folds by no route and renders no fold family:\n{gateway}"
+        );
+    }
+
     /// The fold-liveness family reaches `/metrics` as one series per folded
     /// signal, each carrying the values it was driven with (issue #1306),
     /// following [`metadata_sink_counters_render_for_metrics_only`]: a family
@@ -11592,18 +11816,21 @@ mod tests {
                     cycles: 41,
                     failures: 3,
                     last_success_unix_ns: 1_758_000_123_500_000_000,
+                    column_stats_dictionaries_dropped: 0,
                 },
                 CatalogFoldCounters {
                     signal: Signal::Logs,
                     cycles: 17,
                     failures: 0,
                     last_success_unix_ns: 1_700_000_000_500_000_000,
+                    column_stats_dictionaries_dropped: 0,
                 },
                 CatalogFoldCounters {
                     signal: Signal::Spans,
                     cycles: 0,
                     failures: 9,
                     last_success_unix_ns: 0,
+                    column_stats_dictionaries_dropped: 0,
                 },
             ],
             ..Default::default()
@@ -11716,18 +11943,21 @@ mod tests {
                     cycles: 41,
                     failures: 3,
                     last_success_unix_ns: 1_758_000_123_500_000_000,
+                    column_stats_dictionaries_dropped: 0,
                 },
                 CatalogFoldCounters {
                     signal: Signal::Logs,
                     cycles: 17,
                     failures: 0,
                     last_success_unix_ns: 1_700_000_000_500_000_000,
+                    column_stats_dictionaries_dropped: 0,
                 },
                 CatalogFoldCounters {
                     signal: Signal::Spans,
                     cycles: 0,
                     failures: 9,
                     last_success_unix_ns: 0,
+                    column_stats_dictionaries_dropped: 0,
                 },
             ],
             ..Default::default()
@@ -12199,6 +12429,7 @@ mod tests {
                     signal,
                     range,
                     50 * NS_PER_HOUR,
+                    &ravel_catalog::ColumnStatsRequest::summary_only(),
                     &QueryAccounting::new(),
                 )
                 .await
@@ -12223,6 +12454,237 @@ mod tests {
             after.column_stats_decode_panics, 0,
             "panics read from the catalog's panic counter"
         );
+        assert_eq!(
+            after.column_stats_decoded_bytes, 0,
+            "an object the reader refused to decode adds no decoded bytes"
+        );
+    }
+
+    /// Write a folded `Signal::Logs` HEAD for `tenant` whose one part points
+    /// at a real per-part v3 `.cstat` object, built by the public encoder.
+    /// Returns the object's declared `body_uncompressed_len` and its wire
+    /// length, which differ, so a counter fed the wrong one is caught.
+    async fn install_real_column_stats(
+        store: &ravel_object_store::memory::MemoryStore,
+        tenant: ravel_types::TenantHash,
+    ) -> (u64, u64) {
+        use bytes::Bytes;
+        use ravel_object_store::{ObjectStoreBackend, PutOptions};
+        use ravel_proto::catalog::v1::{
+            ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry, SnapshotColumnStatsPartRef,
+            SnapshotHead, SnapshotPartRef, column_value::Kind,
+        };
+
+        let signal = Signal::Logs;
+        let signal_num = ravel_commit::signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+        let part_hash = *blake3::hash(b"decoded-bytes-part").as_bytes();
+        let i64_value = |value: i64| ColumnValue {
+            kind: Some(Kind::I64(value)),
+        };
+        let segments = vec![ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: part_hash.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 4,
+                null_count: 0,
+                min: Some(i64_value(200)),
+                max: Some(i64_value(503)),
+                dictionary_present: true,
+                dictionary: [200, 404, 500, 503]
+                    .into_iter()
+                    .map(|value| DictEntry {
+                        value: Some(i64_value(value)),
+                        count: 1,
+                    })
+                    .collect(),
+                sum: Some(1607),
+            }],
+        }];
+        let stats_bytes = ravel_catalog::encode_column_stats_v3(
+            tenant.0,
+            signal_num,
+            part_hash,
+            &segments,
+            ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encode v3 column stats");
+        let stats_key = format!("t/{}/catalog/{prefix}/cstat/real.cstat", tenant.to_hex());
+        store
+            .put(
+                &stats_key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put stats object");
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal_num,
+            shard_count: 1,
+            watermark_hour: 10,
+            parts: vec![SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/empty.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+                column_stats: Some(SnapshotColumnStatsPartRef {
+                    key: stats_key,
+                    blake3: blake3::hash(&stats_bytes).as_bytes().to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 1,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+                key_index: Vec::new(),
+            }],
+            folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
+            shard_generation_count: 1,
+            ..Default::default()
+        };
+        store
+            .put(
+                &format!("t/{}/catalog/{prefix}/HEAD", tenant.to_hex()),
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+        let body_uncompressed_len = ravel_catalog::decode_column_stats_header(&stats_bytes)
+            .expect("the object just written has a readable header")
+            .header
+            .body_uncompressed_len;
+        (body_uncompressed_len, stats_bytes.len() as u64)
+    }
+
+    /// Issue #3244: the column-statistics cache and decoded-bytes figures are
+    /// read off the live `Catalog`. Under a 1-byte cache budget a real `.cstat`
+    /// decodes and is refused admission, so refusals goes 0 to 1 and decoded
+    /// bytes rises by exactly the object's `body_uncompressed_len`. Under the
+    /// default budget the same object is admitted: the first load decodes it,
+    /// the second is a cache hit and leaves decoded bytes where the first put
+    /// it, and held bytes equals the cached entry's `heap_bytes`.
+    ///
+    /// Prove-the-test: adding the cached entry's `heap_bytes` on the cache-hit
+    /// return in `Catalog::load_column_stats` reads 243 against 106 after the
+    /// second load; feeding the object's wire length in place of
+    /// `body_uncompressed_len` reads 192 against 106 after the first.
+    #[tokio::test]
+    async fn column_stats_cache_and_decoded_bytes_read_the_live_catalog() {
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::accounting::QueryAccounting;
+        use ravel_types::{TenantId, TimeRange};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let range = TimeRange {
+            start_ns: 0,
+            end_ns: 50 * NS_PER_HOUR,
+        };
+        let tenant = TenantId::new("column-stats-cache-snapshot").hash();
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let (body_len, wire_len) = install_real_column_stats(&store, tenant).await;
+        assert_ne!(
+            body_len, wire_len,
+            "the fixture tells the two byte kinds apart"
+        );
+
+        let refusing = Catalog::new(
+            std::sync::Arc::clone(&store) as _,
+            CatalogConfig {
+                column_stats_cache_max_bytes: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let before = CatalogCountersSnapshot::from_catalog(&refusing);
+        assert_eq!(
+            (
+                before.column_stats_cache_refusals,
+                before.column_stats_decoded_bytes
+            ),
+            (0, 0)
+        );
+        refusing
+            .load_column_stats(
+                &tenant,
+                Signal::Logs,
+                range,
+                50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load")
+            .expect("the real object covers the window");
+        let after = CatalogCountersSnapshot::from_catalog(&refusing);
+        assert_eq!(after.column_stats_cache_refusals, 1);
+        assert_eq!(after.column_stats_cache_evictions, 0);
+        assert_eq!(after.column_stats_cache_held_bytes, 0);
+        assert_eq!(after.column_stats_decoded_bytes, body_len);
+
+        let admitting = Catalog::new(std::sync::Arc::clone(&store) as _, CatalogConfig::default())
+            .expect("catalog");
+        let first = admitting
+            .load_column_stats(
+                &tenant,
+                Signal::Logs,
+                range,
+                50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load")
+            .expect("the real object covers the window");
+        assert_eq!(
+            CatalogCountersSnapshot::from_catalog(&admitting).column_stats_decoded_bytes,
+            body_len,
+            "the first load decodes the object once"
+        );
+        let second = admitting
+            .load_column_stats(
+                &tenant,
+                Signal::Logs,
+                range,
+                50 * NS_PER_HOUR,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load")
+            .expect("the cached object covers the window");
+        // Each load assembles its own carrier over the cached part entries, so
+        // a cache hit shows as the second load's records being the first's.
+        let records = |loaded: &ravel_catalog::LoadedColumnStats| {
+            let mut records: Vec<_> = loaded
+                .content_hash_segments()
+                .map(|(hash, segment)| (*hash, std::ptr::from_ref(segment)))
+                .collect();
+            records.sort_unstable();
+            records
+        };
+        assert!(!records(&first).is_empty(), "the load holds records");
+        assert_eq!(
+            records(&first),
+            records(&second),
+            "the second load is served from the cache"
+        );
+        let cached = CatalogCountersSnapshot::from_catalog(&admitting);
+        assert_eq!(
+            cached.column_stats_decoded_bytes, body_len,
+            "a cache hit decodes nothing and adds nothing"
+        );
+        assert_eq!(cached.column_stats_cache_refusals, 0);
+        assert_eq!(cached.column_stats_cache_evictions, 0);
+        assert_eq!(cached.column_stats_cache_held_bytes, first.heap_bytes());
     }
 
     /// A process that has never folded successfully still renders the gauge,

@@ -1,5 +1,6 @@
 //! Sizing knobs for the ingest pipeline (docs/ingest.md "Sizing defaults").
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::budget::IngestByteBudgetLimit;
@@ -547,6 +548,93 @@ impl Default for RlogZstdLevel {
     }
 }
 
+/// Blocks per row group of each RLOG object a log flush writes
+/// (`RlogConfig::group_target_blocks`, ADR-0699 decision 4; ADR-3217 decision
+/// 5). Built only through [`RlogGroupTargetBlocks::new`], which refuses 0, so
+/// an [`IngestConfig`] cannot carry one: the writer reads 0 as one block per
+/// group, the opposite of what a caller raising the size wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlogGroupTargetBlocks(usize);
+
+impl RlogGroupTargetBlocks {
+    /// The ingest default, the writer's own `RlogConfig::default()` value.
+    pub const DEFAULT: RlogGroupTargetBlocks = RlogGroupTargetBlocks(32);
+
+    /// The group size, or [`RlogGroupTargetBlocksError::Zero`] for 0.
+    pub fn new(blocks: usize) -> Result<Self, RlogGroupTargetBlocksError> {
+        if blocks == 0 {
+            Err(RlogGroupTargetBlocksError::Zero)
+        } else {
+            Ok(RlogGroupTargetBlocks(blocks))
+        }
+    }
+
+    /// The group size as the writer takes it.
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for RlogGroupTargetBlocks {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Attribute names whose columns take the lowest dynamic column ids, in this
+/// order, in each RLOG object a log flush writes (`RlogConfig::chunk_order`,
+/// ADR-3217 decision 8). Built only through [`RlogChunkOrder::new`], which
+/// refuses an empty name, a name with leading or trailing whitespace, and a
+/// repeated name, so an [`IngestConfig`] cannot carry one. The names are held
+/// as a `'static` slice so the config stays `Copy`: `new` leaks the names it
+/// accepts, a few bytes per order, and a process builds its order once from
+/// operator input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlogChunkOrder(&'static [&'static str]);
+
+impl RlogChunkOrder {
+    /// The ingest default, the empty order: the writer's alphabetical
+    /// assignment.
+    pub const DEFAULT: RlogChunkOrder = RlogChunkOrder(&[]);
+
+    /// The order, or the [`RlogChunkOrderError`] for its first refused name.
+    pub fn new(names: Vec<String>) -> Result<Self, RlogChunkOrderError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (position, name) in names.iter().enumerate() {
+            if name.is_empty() {
+                return Err(RlogChunkOrderError::Empty { position });
+            }
+            if name.trim() != name {
+                return Err(RlogChunkOrderError::Whitespace { name: name.clone() });
+            }
+            if !seen.insert(name) {
+                return Err(RlogChunkOrderError::Duplicate { name: name.clone() });
+            }
+        }
+        if names.is_empty() {
+            return Ok(Self::DEFAULT);
+        }
+        let leaked: Vec<&'static str> = names.into_iter().map(|n| &*n.leak()).collect();
+        Ok(RlogChunkOrder(leaked.leak()))
+    }
+
+    /// The names as the writer takes them.
+    pub fn get(self) -> &'static [&'static str] {
+        self.0
+    }
+
+    /// The names, in order.
+    pub fn as_slice(&self) -> &[&'static str] {
+        self.0
+    }
+}
+
+impl Default for RlogChunkOrder {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -709,6 +797,17 @@ pub struct IngestConfig {
     /// POSTINGS term blocks of each RLOG object a log flush writes. Metrics and
     /// span flushes do not read it.
     pub rlog_zstd_level: RlogZstdLevel,
+    /// Consecutive blocks per row group of each RLOG object a log flush
+    /// writes. An object with more blocks than this is several row groups, and
+    /// a projected read wants one chunk extent per (group, column), which the
+    /// fetcher bridges into at most its run cap of GETs. Metrics and span
+    /// flushes do not read it.
+    pub rlog_group_target_blocks: RlogGroupTargetBlocks,
+    /// Attribute names whose chunks each RLOG object a log flush writes places
+    /// first and adjacent in every row group, in this order, ahead of the
+    /// remaining columns in alphabetical order. Empty by default. Metrics and
+    /// span flushes do not read it.
+    pub rlog_chunk_order: RlogChunkOrder,
     /// Ceiling on pending strict-mode acks a `submit` may hold outstanding at
     /// once (ADR-2793 decision 4; [`crate::PendingAckBudget`]). It is
     /// process-wide only when the metrics, log, and span routers share one
@@ -776,6 +875,8 @@ impl Default for IngestConfig {
             strict_visibility_budget_ns: max_flush_delay.as_nanos() as i64
                 + STRICT_VISIBILITY_RESERVE_NS,
             rlog_zstd_level: RlogZstdLevel::DEFAULT,
+            rlog_group_target_blocks: RlogGroupTargetBlocks::DEFAULT,
+            rlog_chunk_order: RlogChunkOrder::DEFAULT,
             max_pending_strict_acks: 8_192,
         }
     }
@@ -820,6 +921,28 @@ pub enum RlogZstdLevelError {
     /// The level is outside the range zstd accepts.
     #[error("RLOG zstd level {level} is outside zstd's accepted range {min}..={max}")]
     OutOfRange { level: i32, min: i32, max: i32 },
+}
+
+/// A group size [`RlogGroupTargetBlocks::new`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RlogGroupTargetBlocksError {
+    /// A group size of 0.
+    #[error("RLOG row-group size must be at least 1 block")]
+    Zero,
+}
+
+/// A chunk order [`RlogChunkOrder::new`] refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RlogChunkOrderError {
+    /// An empty name, at this position in the order.
+    #[error("RLOG chunk order name {position} is empty")]
+    Empty { position: usize },
+    /// A name with leading or trailing whitespace.
+    #[error("RLOG chunk order name {name:?} has leading or trailing whitespace")]
+    Whitespace { name: String },
+    /// A name listed twice.
+    #[error("RLOG chunk order names {name:?} more than once")]
+    Duplicate { name: String },
 }
 
 impl IngestConfig {
@@ -1433,5 +1556,63 @@ mod tests {
         }
         assert_eq!(IngestConfig::default().rlog_zstd_level.get(), 3);
         assert_eq!(RlogZstdLevel::default(), RlogZstdLevel::DEFAULT);
+    }
+
+    #[test]
+    fn rlog_group_target_blocks_refuses_zero_and_defaults_to_the_writers_32() {
+        assert_eq!(
+            RlogGroupTargetBlocks::new(0),
+            Err(RlogGroupTargetBlocksError::Zero)
+        );
+        for blocks in [1, 32, 512, usize::MAX] {
+            assert_eq!(
+                RlogGroupTargetBlocks::new(blocks).map(RlogGroupTargetBlocks::get),
+                Ok(blocks)
+            );
+        }
+        assert_eq!(IngestConfig::default().rlog_group_target_blocks.get(), 32);
+        assert_eq!(
+            RlogGroupTargetBlocks::DEFAULT.get(),
+            ravel_logseg::RlogConfig::default().group_target_blocks,
+            "inert at the default: the ingest default is the writer's"
+        );
+        assert_eq!(
+            RlogGroupTargetBlocks::default(),
+            RlogGroupTargetBlocks::DEFAULT
+        );
+    }
+
+    #[test]
+    fn rlog_chunk_order_refuses_empty_whitespace_and_duplicate_names() {
+        let order =
+            |names: &[&str]| RlogChunkOrder::new(names.iter().map(|n| n.to_string()).collect());
+        assert_eq!(
+            order(&["UserID", ""]),
+            Err(RlogChunkOrderError::Empty { position: 1 })
+        );
+        assert_eq!(
+            order(&[" UserID"]),
+            Err(RlogChunkOrderError::Whitespace {
+                name: " UserID".to_string()
+            })
+        );
+        assert_eq!(
+            order(&["UserID", "SearchPhrase", "UserID"]),
+            Err(RlogChunkOrderError::Duplicate {
+                name: "UserID".to_string()
+            })
+        );
+        assert_eq!(
+            order(&["UserID", "SearchPhrase"]).map(RlogChunkOrder::get),
+            Ok(&["UserID", "SearchPhrase"][..])
+        );
+        assert_eq!(order(&[]), Ok(RlogChunkOrder::DEFAULT));
+        assert!(IngestConfig::default().rlog_chunk_order.get().is_empty());
+        assert_eq!(
+            RlogChunkOrder::DEFAULT.get(),
+            ravel_logseg::RlogConfig::default().chunk_order,
+            "inert at the default: the ingest default is the writer's"
+        );
+        assert_eq!(RlogChunkOrder::default(), RlogChunkOrder::DEFAULT);
     }
 }

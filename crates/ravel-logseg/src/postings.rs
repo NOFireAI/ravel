@@ -592,7 +592,7 @@ impl<'a> PostingsSection<'a> {
         if crc32c::crc32c(stored) != block.crc32c {
             return Err(LogSegError::Corrupted("postings block crc mismatch".into()));
         }
-        let payload = zstd::bulk::decompress(stored, block.uncompressed_len)
+        let payload = ravel_codec::zstd_frame::decompress(stored, block.uncompressed_len)
             .map_err(|e| LogSegError::Corrupted(format!("postings block zstd: {e}")))?;
         if payload.len() != block.uncompressed_len {
             return Err(LogSegError::Corrupted(

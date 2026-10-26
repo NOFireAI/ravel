@@ -72,3 +72,7 @@ harness = false
 [[bench]]
 name = "stamp_declared"
 harness = false
+
+[[bench]]
+name = "page_decode"
+harness = false

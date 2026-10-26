@@ -33,7 +33,9 @@ use uuid::Uuid;
 use crate::cache::{
     CompactionRecordCache, DecodedCaches, HeadCache, PartCache, PostingsCache, RecordCache,
 };
-use crate::column_stats_resolve::{self, LoadColumnStatsError, LoadedColumnStats};
+use crate::column_stats_resolve::{
+    self, ColumnStatsRequest, LoadColumnStatsError, LoadedColumnStats, PartColumnStats,
+};
 use crate::config::CatalogConfig;
 use crate::declared_stats::DeclaredColumnStats;
 use crate::error::CatalogError;
@@ -164,52 +166,49 @@ fn clone_store_error(err: &StoreError) -> StoreError {
     }
 }
 
-/// One tenant/signal's last-resolved column-statistics object, cached so a
-/// repeated eligible plan reuses it instead of re-fetching the same object
-/// (ADR-0850, issue #888). Keyed for validity by the object's own content hash
-/// (`stats_blake3`) AND the folded HEAD's covered part set (`part_blake3`):
-/// the stats object is bound to the CURRENT folded HEAD, not the pinned query
-/// snapshot, so a fold that changes either value must re-resolve. Every load
-/// still reads HEAD (one GET) to learn the current `(blake3, parts)`, so a
-/// changed fold is always detected; the cache only ever avoids the SECOND GET,
-/// the stats-object fetch, and only when both keys still match. The covered
-/// part set is compared against the loaded object's own `part_blake3` (which
-/// `heap_bytes` charges), never a second copy: a duplicate buffer here would
-/// hold 32 uncharged bytes per covered part per entry, silently exceeding the
-/// budget.
+/// One covered part's decoded column statistics, cached so a repeated eligible
+/// plan reuses it instead of re-fetching the part's `.cstat` object (ADR-0850,
+/// issue #888; per part since issue #3244). Keyed by the part's declared
+/// `.cstat` ref blake3 and bound to the part's own blake3: statistics are
+/// bound to the CURRENT folded HEAD, not the pinned query snapshot, so a fold
+/// that rewrites the part's object or replaces the part must re-resolve.
+/// Every load still reads HEAD (one GET) to learn each covered part's current
+/// `(stats blake3, part blake3)`, so a changed fold is always detected; the
+/// cache only ever avoids a part's stats-object GET, and only when both still
+/// match and the entry holds every dictionary the statement asks for.
 struct CachedColumnStats {
-    stats_blake3: [u8; 32],
-    stats: Arc<LoadedColumnStats>,
+    part_blake3: [u8; 32],
+    entry: Arc<PartColumnStats>,
     /// The entry's charge against the budget, cached at insert time so the
-    /// running total and an eviction's refund never re-walk the object. Equal
-    /// to [`LoadedColumnStats::heap_bytes`] of `stats`.
+    /// running total and an eviction's refund never re-walk the entry. Equal
+    /// to [`PartColumnStats::heap_bytes`] of `entry`.
     bytes: u64,
     /// Recency tick for LRU eviction: the entry with the smallest value is the
     /// least recently used. Stamped on insert and refreshed on every cache hit.
     last_used: u64,
 }
 
-/// Byte-budgeted, process-wide reuse cache for resolved column-statistics
-/// objects (issue #905), one entry per `(tenant, signal)`. It fronts the
-/// stats-object GET on [`Catalog::load_column_stats`] the same way
-/// [`CachedColumnStats`] describes, but with a total byte budget so a
-/// multi-tenant process cannot accumulate one unbounded entry per served
-/// tenant for its lifetime.
+/// Byte-budgeted, process-wide reuse cache for decoded column statistics
+/// (issue #905), one entry per covered part's `.cstat` object (ADR-1413
+/// decision 5, issue #3244). It fronts each part's stats-object GET on
+/// [`Catalog::load_column_stats`] the way [`CachedColumnStats`] describes,
+/// with a total byte budget so a multi-tenant process cannot accumulate
+/// unbounded entries for its lifetime.
 ///
 /// The budget is over the bytes actually held
-/// ([`LoadedColumnStats::heap_bytes`]), not an entry count: a `.cstat`
-/// payload's size varies by orders of magnitude across tenants, so an
-/// entry-count bound would not bound memory. Admitting an object that would
+/// ([`PartColumnStats::heap_bytes`]), not an entry count: a `.cstat`
+/// payload's size varies by orders of magnitude across parts and tenants, so
+/// an entry-count bound would not bound memory. Admitting an entry that would
 /// push the total over `max_bytes` first evicts least-recently-used entries,
-/// each counted in `evictions`; an object larger than the whole budget is not
-/// cached at all and counted in `refusals`. Both counters make an undersized
-/// budget observable: they climb while the statistics plainly exist, which an
-/// operator reads apart from ABSENT statistics (a load returning `Ok(None)`,
-/// leaving both flat). Eviction only ever forces a later cache miss and a
-/// re-resolve; a returned entry is still gated on the exact
-/// `(stats_blake3, part_blake3)` binding, so no partial or stale statistic
-/// reaches the exact MIN/MAX path (issue #905 deliverable 4, guarding against a
-/// third route past #970/#973).
+/// each counted in `evictions`; one part's entry larger than the whole budget
+/// is not cached at all and counted in `refusals`. Both counters make an
+/// undersized budget observable: they climb while the statistics plainly
+/// exist, which an operator reads apart from ABSENT statistics (a load
+/// returning `Ok(None)`, leaving both flat). Eviction only ever forces a later
+/// cache miss and a re-fetch; a returned entry is still gated on the exact
+/// `(stats blake3, part blake3)` binding, so no partial or stale statistic
+/// reaches the exact MIN/MAX path (issue #905 deliverable 4, guarding against
+/// a third route past #970/#973).
 struct ColumnStatsCache {
     /// Total byte budget. Always positive for a live cache: a `0`
     /// `column_stats_cache_max_bytes` builds no cache at all (the catalog holds
@@ -218,17 +217,16 @@ struct ColumnStatsCache {
     state: Mutex<ColumnStatsCacheState>,
     /// Entries dropped to keep the held bytes within `max_bytes`, cumulative.
     evictions: AtomicU64,
-    /// Loads whose object alone exceeds `max_bytes`, so no eviction could ever
-    /// make room and the object is served but not cached, cumulative.
+    /// Part entries larger than `max_bytes` on their own, so no eviction could
+    /// ever make room and the entry is served but not cached, cumulative.
     refusals: AtomicU64,
 }
 
-/// `ColumnStatsCache` entry key: tenant, signal, and the query window's hour
-/// bounds (ADR-1413). A per-part-scoped load answers only for the parts its
-/// own window covers, so two queries over the same HEAD but different windows
-/// must never share an entry -- the window bounds are part of the key for
-/// exactly the same reason a resolved snapshot itself is window-scoped.
-type ColumnStatsCacheKey = (TenantHash, Signal, u32, u32);
+/// `ColumnStatsCache` entry key: tenant, signal, and the covered part's
+/// declared `.cstat` ref blake3 (`SnapshotPartRef.column_stats.blake3`). An
+/// entry answers for one part whatever window covers it, so windows that
+/// share parts share their entries.
+type ColumnStatsCacheKey = (TenantHash, Signal, [u8; 32]);
 
 struct ColumnStatsCacheState {
     entries: HashMap<ColumnStatsCacheKey, CachedColumnStats>,
@@ -253,56 +251,53 @@ impl ColumnStatsCache {
         }
     }
 
-    /// Return the cached object for `key` only when its content hash AND covered
-    /// part set both still match a freshly resolved HEAD (the issue #888
-    /// binding), refreshing the entry's recency. A mismatch or a miss returns
-    /// `None`, and the caller re-fetches; nothing stale is ever handed back.
+    /// Return the cached entry for `key` only when it is bound to `part_blake3`,
+    /// the covered part a freshly read HEAD names beside the ref (the issue
+    /// #888 binding, per part), refreshing the entry's recency. A mismatch or a
+    /// miss returns `None`, and the caller re-fetches; nothing stale is ever
+    /// handed back. The caller still checks the entry holds the dictionaries
+    /// it needs.
     fn get(
         &self,
         key: ColumnStatsCacheKey,
-        stats_blake3: &[u8; 32],
-        part_blake3: &[[u8; 32]],
-    ) -> Option<Arc<LoadedColumnStats>> {
+        part_blake3: &[u8; 32],
+    ) -> Option<Arc<PartColumnStats>> {
         let mut state = self.state.lock();
         state.tick += 1;
         let tick = state.tick;
-        let entry = state.entries.get_mut(&key)?;
-        if entry.stats_blake3 == *stats_blake3 && entry.stats.part_blake3 == part_blake3 {
-            entry.last_used = tick;
-            Some(Arc::clone(&entry.stats))
+        let cached = state.entries.get_mut(&key)?;
+        if cached.part_blake3 == *part_blake3 {
+            cached.last_used = tick;
+            Some(Arc::clone(&cached.entry))
         } else {
             None
         }
     }
 
-    /// Admit a freshly resolved object for `key`, evicting least-recently-used
-    /// entries as needed to keep the held bytes within `max_bytes`. Replaces any
-    /// existing entry for `key`. An object larger than the whole budget is not
-    /// cached (a `refusals` bump); it is still returned to the caller by
+    /// Admit a freshly decoded part entry for `key`, evicting
+    /// least-recently-used entries as needed to keep the held bytes within
+    /// `max_bytes`. Replaces any existing entry for `key`. An entry larger than
+    /// the whole budget is not cached (a `refusals` bump) and leaves any
+    /// existing entry for `key` in place; it is still returned to the caller by
     /// `load_column_stats`, so refusing to cache never changes an answer.
-    fn insert(
-        &self,
-        key: ColumnStatsCacheKey,
-        stats_blake3: [u8; 32],
-        stats: Arc<LoadedColumnStats>,
-    ) {
-        let bytes = stats.heap_bytes();
+    fn insert(&self, key: ColumnStatsCacheKey, part_blake3: [u8; 32], entry: Arc<PartColumnStats>) {
+        let bytes = entry.heap_bytes();
         let mut state = self.state.lock();
         state.tick += 1;
         let tick = state.tick;
 
-        // Replacing an existing entry: refund its bytes before accounting the
-        // new one, so a re-resolve of the same key never double-counts.
-        if let Some(old) = state.entries.remove(&key) {
-            state.held_bytes = state.held_bytes.saturating_sub(old.bytes);
-        }
-
-        // An object larger than the entire budget can never be made to fit by
+        // An entry larger than the entire budget can never be made to fit by
         // evicting others: refuse it loudly rather than evict everything for
-        // nothing. The caller still gets the object; it is just not cached.
+        // nothing. The caller still gets the entry; it is just not cached.
         if bytes > self.max_bytes {
             self.refusals.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+
+        // Replacing an existing entry: refund its bytes before accounting the
+        // new one, so a re-fetch of the same key never double-counts.
+        if let Some(old) = state.entries.remove(&key) {
+            state.held_bytes = state.held_bytes.saturating_sub(old.bytes);
         }
 
         // Evict the least-recently-used entry until the new one fits. `bytes <=
@@ -329,8 +324,8 @@ impl ColumnStatsCache {
         state.entries.insert(
             key,
             CachedColumnStats {
-                stats_blake3,
-                stats,
+                part_blake3,
+                entry,
                 bytes,
                 last_used: tick,
             },
@@ -343,7 +338,7 @@ impl ColumnStatsCache {
     fn evict_tenants(&self, idle: &[TenantHash]) {
         let mut state = self.state.lock();
         let mut freed = 0u64;
-        state.entries.retain(|(tenant, _, _, _), entry| {
+        state.entries.retain(|(tenant, _, _), entry| {
             if idle.contains(tenant) {
                 freed += entry.bytes;
                 false
@@ -401,7 +396,7 @@ pub struct Catalog {
     /// bytes, so both give memory back together when
     /// [`Catalog::reserve_decoded`] is refused (see [`crate::cache::DecodedCache`]'s
     /// eviction rule).
-    decoded: DecodedCaches,
+    decoded: Arc<DecodedCaches>,
     /// The byte cache (ADR-0046 decisions 1-3): raw bytes of content-addressed
     /// objects (snapshot parts, postings), keyed by
     /// `(tenant_hash, content_hash, offset, len)`, consulted at
@@ -503,6 +498,10 @@ pub struct Catalog {
     /// a liveness signal a bounded false positive is the safe side; an
     /// unbounded false negative is not.
     fold_last_success_unix_ns: [AtomicI64; SIGNAL_SLOTS],
+    /// Sum of [`crate::FoldReport::column_stats_dictionaries_dropped`] over
+    /// every [`Catalog::fold`] call for this signal that returned `Ok`
+    /// (issue #3244). Indexed by [`fold_slot`].
+    fold_column_stats_dictionaries_dropped: [AtomicU64; SIGNAL_SLOTS],
     /// Bounds the object-store requests this catalog keeps in flight across
     /// every tenant, shard and hour at once, sized from
     /// `CatalogConfig::resolve_get_concurrency` (ADR-1733 decision 1).
@@ -541,22 +540,21 @@ pub struct Catalog {
     /// backwards across callers with skewed clocks, which only ever delays an
     /// eviction, never causes a wrong one.
     tenant_activity: Mutex<HashMap<TenantHash, i64>>,
-    /// Last-resolved column-statistics object per `(tenant, signal)` (ADR-0850,
-    /// issue #888). Consulted in [`Catalog::load_column_stats`] after the HEAD
-    /// GET and before the stats-object GET, so a repeated eligible plan against
-    /// an unchanged folded HEAD reuses the decoded object instead of
-    /// re-fetching it.
+    /// Decoded column statistics per covered part's `.cstat` object (ADR-0850,
+    /// issue #888; per part since issue #3244). Consulted in
+    /// [`Catalog::load_column_stats`] after the HEAD GET and before each
+    /// part's stats-object GET, so a repeated eligible plan against an
+    /// unchanged part reuses the decoded entry instead of re-fetching it.
     ///
-    /// Reclamation runs on both dimensions, which differ. ENTRY COUNT is
-    /// bounded by (tenants x signals) and [`Catalog::evict_idle_tenants`]
-    /// removes a tenant's entries once it passes the idle TTL. ENTRY SIZE is
-    /// bounded by [`ColumnStatsCache`]'s byte budget
-    /// ([`CatalogConfig::column_stats_cache_max_bytes`], issue #905): a
-    /// `LoadedColumnStats` holds one `ColumnStatsSegment` per live segment, so
-    /// an ACTIVE tenant's entry grows with that tenant, and without a byte
-    /// budget an active tenant's entry was never reclaimed. The cache accounts
-    /// the bytes actually held and evicts the least-recently-used entry past the
-    /// budget, counting the eviction so an undersized budget is observable.
+    /// Reclamation runs on both dimensions. [`Catalog::evict_idle_tenants`]
+    /// removes a tenant's entries once it passes the idle TTL, and
+    /// [`ColumnStatsCache`]'s byte budget
+    /// ([`CatalogConfig::column_stats_cache_max_bytes`], issue #905) bounds
+    /// the bytes held across every tenant: each entry holds one
+    /// `ColumnStatsSegment` per segment of its part, so an ACTIVE tenant's
+    /// entries grow with that tenant. The cache accounts the bytes actually
+    /// held and evicts the least-recently-used entry past the budget, counting
+    /// the eviction so an undersized budget is observable.
     ///
     /// `None` when [`CatalogConfig::column_stats_cache_max_bytes`] is `0`: the
     /// cache is then absent entirely, so every eligible load re-fetches the
@@ -590,6 +588,10 @@ pub struct Catalog {
     /// CPU gate (issue #2402), incremented on every panic whether or not it
     /// logged. Surfaced by [`Catalog::column_stats_decode_panics`].
     column_stats_decode_panics: AtomicU64,
+    /// Cumulative declared `body_uncompressed_len` of every column-stats
+    /// object [`Catalog::load_column_stats`] decoded (issue #3244). Surfaced by
+    /// [`Catalog::column_stats_decoded_bytes`].
+    column_stats_decoded_bytes: AtomicU64,
     /// Test-only: when set, every column-stats object that would load fails
     /// its decode with this gate error instead (issue #2402).
     /// [`ravel_cpu_gate::CpuGateError::Panicked`] is produced by running a
@@ -619,7 +621,7 @@ pub struct Catalog {
     /// caches gave memory back ([`Catalog::reserve_decoded`]). Counts the
     /// retry, not its outcome. Surfaced by
     /// [`Catalog::decode_reserve_retries`].
-    decode_reserve_retries: AtomicU64,
+    decode_reserve_retries: Arc<AtomicU64>,
     /// The read CPU gate the part, postings and column-stats decodes run on
     /// (ADR-1702 decision 4). `None` from [`Catalog::new`]: every decode runs
     /// inline on the calling task until a caller installs one with
@@ -785,7 +787,7 @@ impl Catalog {
             cache: RecordCache::default(),
             compaction_cache: CompactionRecordCache::default(),
             head_cache: HeadCache::default(),
-            decoded: DecodedCaches::default(),
+            decoded: Arc::new(DecodedCaches::default()),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
@@ -794,6 +796,7 @@ impl Catalog {
             fold_cycles: std::array::from_fn(|_| AtomicU64::new(0)),
             fold_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             fold_last_success_unix_ns: std::array::from_fn(|_| AtomicI64::new(0)),
+            fold_column_stats_dictionaries_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.resolve_get_concurrency,
             )),
@@ -806,11 +809,12 @@ impl Catalog {
             column_stats_decode_refusals: AtomicU64::new(0),
             warned_decode_panics: Mutex::new(HashSet::new()),
             column_stats_decode_panics: AtomicU64::new(0),
+            column_stats_decoded_bytes: AtomicU64::new(0),
             #[cfg(test)]
             column_stats_decode_job_fault: None,
             column_stats_part_ceiling_override: None,
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
-            decode_reserve_retries: AtomicU64::new(0),
+            decode_reserve_retries: Arc::new(AtomicU64::new(0)),
             read_gate: None,
             monotonic_clock: Arc::new(ravel_cpu_gate::InstantClock::new()),
         })
@@ -914,41 +918,24 @@ impl Catalog {
         declared: u64,
         ceiling: u64,
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
-        let refusal = match crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
-        {
-            Ok(reservation) => return Ok(reservation),
-            Err(refusal) => refusal,
-        };
-        // A closed host-memory gate (ADR-2633) refuses every reservation
-        // whatever the ledger holds, so giving cached bytes back cannot admit
-        // the retry: no pass, no retry, the gate's refusal is the answer.
-        if matches!(
-            refusal.cause,
-            ravel_memory::ExhaustionCause::HostMemory { .. }
-        ) {
-            return Err(refusal);
+        reserve_decoded_evicting(
+            &self.memory_budget,
+            &self.decoded,
+            &self.decode_reserve_retries,
+            declared,
+            ceiling,
+        )
+    }
+
+    /// An owned handle reserving exactly as [`Catalog::reserve_decoded`]
+    /// does, against this catalog's budget and caches, for a decode job that
+    /// reserves as it goes.
+    fn decode_reserve_handle(&self) -> CatalogDecodeReserver {
+        CatalogDecodeReserver {
+            budget: Arc::clone(&self.memory_budget),
+            decoded: Arc::clone(&self.decoded),
+            retries: Arc::clone(&self.decode_reserve_retries),
         }
-        let want = ravel_memory::decoded_charge(declared, ceiling);
-        let limit = self.memory_budget.limit();
-        // The test below also refuses this; checking it first skips the two
-        // cache locks `reserved_bytes` takes.
-        if want > limit {
-            return Err(refusal);
-        }
-        // `held` is read before `reserved`: an entry leaving the caches
-        // between the two reads then lowers `reserved` against a `held` that
-        // still counts it, which errs toward running the pass.
-        let held = self.decoded.reserved_bytes();
-        let held_outside_caches = self.memory_budget.reserved().saturating_sub(held);
-        if held_outside_caches
-            .checked_add(want)
-            .is_none_or(|total| total > limit)
-        {
-            return Err(refusal);
-        }
-        self.decoded.evict_until_fits(&self.memory_budget, want);
-        self.decode_reserve_retries.fetch_add(1, Ordering::Relaxed);
-        crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
     }
 
     /// Decoded-output cache entries dropped to make room for a refused decode
@@ -1521,6 +1508,16 @@ impl Catalog {
         self.fold_last_success_unix_ns[fold_slot(signal)].load(Ordering::Relaxed)
     }
 
+    /// Column-statistics dictionaries the fold dropped for `signal` to bring
+    /// an over-ceiling part under the reader ceiling, summed over every
+    /// [`Catalog::fold`] call for that signal that returned `Ok` across this
+    /// catalog's lifetime: the sum of each report's
+    /// [`crate::FoldReport::column_stats_dictionaries_dropped`]. A failed fold
+    /// adds nothing, even if it dropped dictionaries before failing.
+    pub fn fold_column_stats_dictionaries_dropped(&self, signal: Signal) -> u64 {
+        self.fold_column_stats_dictionaries_dropped[fold_slot(signal)].load(Ordering::Relaxed)
+    }
+
     /// `pub(crate)`: the single accounting point every [`Catalog::fold`]
     /// outcome passes through, called from the wrapper in `fold.rs` rather
     /// than from each of the fold body's many exits. Keeping it in one place
@@ -1531,11 +1528,17 @@ impl Catalog {
     /// read as healthy while the other was dead. A `ravel-cli` fold and the
     /// catalog bench run in their own processes, each with its own `Catalog`
     /// and no `/metrics` route, so they account into counters nothing scrapes.
-    pub(crate) fn record_fold_outcome(&self, signal: Signal, now_ns: i64, succeeded: bool) {
+    ///
+    /// `succeeded` carries the successful fold's
+    /// [`crate::FoldReport::column_stats_dictionaries_dropped`]; `None` is a
+    /// failed fold.
+    pub(crate) fn record_fold_outcome(&self, signal: Signal, now_ns: i64, succeeded: Option<u64>) {
         let slot = fold_slot(signal);
-        if succeeded {
+        if let Some(dictionaries_dropped) = succeeded {
             self.fold_cycles[slot].fetch_add(1, Ordering::Relaxed);
             self.fold_last_success_unix_ns[slot].store(now_ns, Ordering::Relaxed);
+            self.fold_column_stats_dictionaries_dropped[slot]
+                .fetch_add(dictionaries_dropped, Ordering::Relaxed);
         } else {
             self.fold_failures[slot].fetch_add(1, Ordering::Relaxed);
         }
@@ -1595,12 +1598,23 @@ impl Catalog {
     /// which is not a refusal: a panicked job warns once per object key and
     /// increments [`Catalog::column_stats_decode_panics`], a cancelled one
     /// warns every time (issue #2402).
+    ///
+    /// `request` names the columns whose dictionaries the statement reads
+    /// (issue #3244); every other column's dictionary is cleared from the
+    /// result, and [`LoadedColumnStats::dictionary_loaded`] reports which
+    /// survived. With the cache enabled, each covered part is served from its
+    /// own entry (keyed by the part's declared `.cstat` blake3) when that entry
+    /// holds every requested dictionary; otherwise that part's object alone is
+    /// fetched and decoded again, and the entry is replaced by one holding the
+    /// old dictionaries and the newly requested ones. A window whose every
+    /// covered part is served from the cache costs exactly the HEAD GET.
     pub async fn load_column_stats(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         range: TimeRange,
         now_ns: i64,
+        request: &ColumnStatsRequest,
         accounting: &QueryAccounting,
     ) -> Result<Option<Arc<LoadedColumnStats>>, LoadColumnStatsError> {
         // Route every GET through the same semaphore-bounded, accounted funnel
@@ -1633,103 +1647,82 @@ impl Catalog {
         if covered.is_empty() {
             return Ok(None);
         }
-        let covered_part_blake3: Vec<[u8; 32]> = covered
+        if covered
             .iter()
-            .filter_map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).ok())
-            .collect();
-        if covered_part_blake3.len() != covered.len() {
+            .any(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).is_err())
+        {
             return Ok(None);
         }
 
-        // The composite identity a cache entry is valid against: every
-        // object a fully-resolved load for this exact covered-part set would
-        // consult, by its DECLARED blake3 (derivable from `head` alone, no
-        // extra GET). A re-fold that rewrites any one of those objects
-        // changes this fingerprint, so a stale entry always misses -- the
-        // same guarantee issue #888 gives the single-whole-object case,
-        // extended per part.
-        let fingerprint = Self::column_stats_fingerprint(&covered);
-        let cache_key: ColumnStatsCacheKey = (*tenant, signal, window_start_hour, window_end_hour);
-        let cache_hit = self
-            .column_stats_cache
-            .as_ref()
-            .and_then(|cache| cache.get(cache_key, &fingerprint, &covered_part_blake3));
-        if let Some(stats) = cache_hit {
-            return Ok(Some(stats));
-        }
-
-        let mut segments: HashMap<
-            crate::EntryIdentity,
-            ravel_proto::catalog::v1::ColumnStatsSegment,
-        > = HashMap::new();
-        let mut by_content_hash: HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> =
-            HashMap::new();
-
+        let cache = self.column_stats_cache.as_ref();
+        let mut parts: Vec<Arc<PartColumnStats>> = Vec::with_capacity(covered.len());
         // Each decoded object's reservation (ADR-1702 decision 6), held until
-        // the merged result is built. `LoadedColumnStats` has no slot to carry
-        // them past this call, so the merged value is uncharged once returned;
-        // when the column-stats cache is enabled, its own byte budget bounds
-        // the cached copy.
+        // the result is assembled. `LoadedColumnStats` has no slot to carry
+        // them past this call, so the result is uncharged once returned; when
+        // the column-stats cache is enabled, its own byte budget bounds the
+        // cached entries.
         let mut reservations = Vec::new();
         for part in &covered {
             // No field-7 ref at all: the part is simply left uncovered.
-            if let Some(resolved) = column_stats_resolve::resolve_part_stats_ref(part) {
-                let outcome = column_stats_resolve::fetch_stats_object(
-                    &getter,
-                    tenant,
-                    &resolved,
-                    self,
-                    self.read_gate(),
-                )
-                .await?;
-                #[cfg(test)]
-                let outcome = self.inject_column_stats_decode_job_fault(outcome).await;
-                match outcome {
-                    column_stats_resolve::FetchOutcome::Loaded(decoded, reservation) => {
-                        segments.extend(decoded.segments);
-                        by_content_hash.extend(decoded.by_content_hash);
-                        reservations.push(reservation);
+            let Some(resolved) = column_stats_resolve::resolve_part_stats_ref(part) else {
+                continue;
+            };
+            // The ref's DECLARED blake3, read from HEAD with no extra GET, keys
+            // the entry: a re-fold that rewrites this part's object changes it,
+            // so a stale entry always misses (the issue #888 guarantee, per
+            // part).
+            let cache_key: ColumnStatsCacheKey = (*tenant, signal, resolved.blake3);
+            let &[part_blake3] = resolved.expected_part_blake3.as_slice() else {
+                continue;
+            };
+            let cached = cache.and_then(|cache| cache.get(cache_key, &part_blake3));
+            if let Some(entry) = cached.as_ref().filter(|entry| entry.covers(request)) {
+                parts.push(Arc::clone(entry));
+                continue;
+            }
+
+            let keep = PartColumnStats::dictionaries_to_keep(request, cached.as_deref());
+            let outcome = column_stats_resolve::fetch_stats_object(
+                &getter,
+                tenant,
+                &resolved,
+                &keep,
+                self,
+                self.read_gate(),
+            )
+            .await?;
+            #[cfg(test)]
+            let outcome = self.inject_column_stats_decode_job_fault(outcome).await;
+            match outcome {
+                column_stats_resolve::FetchOutcome::Loaded(decoded, kept) => {
+                    self.column_stats_decoded_bytes
+                        .fetch_add(decoded.body_uncompressed_len, Ordering::Relaxed);
+                    let entry = Arc::new(PartColumnStats::from_decoded(
+                        decoded,
+                        request,
+                        cached.as_deref(),
+                    ));
+                    if let Some(cache) = cache {
+                        cache.insert(cache_key, part_blake3, Arc::clone(&entry));
                     }
-                    // Store read or stale binding: this part is simply
-                    // left uncovered, silently.
-                    column_stats_resolve::FetchOutcome::Absent => {}
-                    // The decode failed: leave the part uncovered.
-                    column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
-                        self.note_column_stats_decode_failure(tenant, signal, &resolved.key, &err);
-                    }
+                    parts.push(entry);
+                    reservations.extend(kept);
+                }
+                // Store read or stale binding: this part is simply
+                // left uncovered, silently.
+                column_stats_resolve::FetchOutcome::Absent => {}
+                // The decode failed: leave the part uncovered.
+                column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
+                    self.note_column_stats_decode_failure(tenant, signal, &resolved.key, &err);
                 }
             }
         }
 
-        if segments.is_empty() && by_content_hash.is_empty() {
+        let stats = LoadedColumnStats::from_parts(parts);
+        if stats.is_empty() {
             return Ok(None);
         }
-
-        let stats = Arc::new(LoadedColumnStats {
-            segments,
-            by_content_hash,
-            part_blake3: covered_part_blake3,
-        });
-        if let Some(cache) = self.column_stats_cache.as_ref() {
-            cache.insert(cache_key, fingerprint, Arc::clone(&stats));
-        }
-        Ok(Some(stats))
-    }
-
-    /// The declared-blake3 fingerprint [`Catalog::load_column_stats`] keys its
-    /// reuse cache on: each covered part's v3 ref blake3 (or a zero sentinel
-    /// when the part carries none), in `covered`'s order. Computed entirely
-    /// from HEAD-derived refs, with no object GET, so a cache check costs
-    /// nothing beyond the HEAD read already paid for.
-    fn column_stats_fingerprint(covered: &[ravel_proto::catalog::v1::SnapshotPartRef]) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(covered.len() * 32);
-        for part in covered {
-            match column_stats_resolve::resolve_part_stats_ref(part) {
-                Some(resolved) => buf.extend_from_slice(&resolved.blake3),
-                None => buf.extend_from_slice(&[0u8; 32]),
-            }
-        }
-        *blake3::hash(&buf).as_bytes()
+        Ok(Some(Arc::new(stats)))
     }
 
     /// Apply [`Catalog::column_stats_decode_job_fault`] to a fetch outcome: a
@@ -2027,11 +2020,11 @@ impl Catalog {
             .map_or(0, ColumnStatsCache::evictions)
     }
 
-    /// Cumulative column-statistics cache refusals (issue #905): loads whose
-    /// object alone exceeds the whole byte budget, so no eviction could make
-    /// room and the object was served but not cached. Distinct from an
-    /// eviction: it means the budget is below a SINGLE object's size, not merely
-    /// below the working set. `0` when the cache is disabled.
+    /// Cumulative column-statistics cache refusals (issue #905): one part's
+    /// entry larger than the whole byte budget, so no eviction could make room
+    /// and the entry was served but not cached. Distinct from an eviction: it
+    /// means the budget is below a SINGLE part's entry, not merely below the
+    /// working set. `0` when the cache is disabled.
     pub fn column_stats_cache_refusals(&self) -> u64 {
         self.column_stats_cache
             .as_ref()
@@ -2069,13 +2062,27 @@ impl Catalog {
     }
 
     /// Bytes currently held by the column-statistics cache (issue #905), the
-    /// sum of every cached object's [`LoadedColumnStats::heap_bytes`]. Bounded
-    /// by [`CatalogConfig::column_stats_cache_max_bytes`]. `0` when the cache is
-    /// disabled.
+    /// sum of every live part entry's encoded segment bytes as held (cleared
+    /// dictionaries cost nothing, issue #3244). Bounded by
+    /// [`CatalogConfig::column_stats_cache_max_bytes`]. `0` when the cache is
+    /// disabled, and when it is enabled but holds nothing.
     pub fn column_stats_cache_held_bytes(&self) -> u64 {
         self.column_stats_cache
             .as_ref()
             .map_or(0, ColumnStatsCache::held_bytes)
+    }
+
+    /// Cumulative decompressed body bytes of the column-statistics objects
+    /// [`Catalog::load_column_stats`] decoded (issue #3244): each object's
+    /// declared `body_uncompressed_len`, not its wire size, counted once per
+    /// decoded body. A part served from the column-statistics cache decodes
+    /// nothing and adds nothing, and so does an object the reader refused to
+    /// decode. Counted whether or not the cache then admits the entry. The
+    /// fold's own read of the previous fold's objects is not counted.
+    /// `ravel-server` exports it on `/metrics` as
+    /// `ravel_catalog_column_stats_decoded_bytes_total`.
+    pub fn column_stats_decoded_bytes(&self) -> u64 {
+        self.column_stats_decoded_bytes.load(Ordering::Relaxed)
     }
 
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the
@@ -5228,6 +5235,87 @@ impl crate::charged::DecodeReserver for Catalog {
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
         Catalog::reserve_decoded(self, declared, ceiling)
     }
+
+    fn owned(&self) -> Box<dyn crate::charged::DecodeReserver + Send> {
+        Box::new(self.decode_reserve_handle())
+    }
+}
+
+/// [`Catalog::reserve_decoded`] detached from the catalog: the same budget,
+/// caches and retry counter, held by `Arc` so a decode job running off the
+/// caller's task can reserve through it.
+struct CatalogDecodeReserver {
+    budget: Arc<ravel_memory::MemoryBudget>,
+    decoded: Arc<DecodedCaches>,
+    retries: Arc<AtomicU64>,
+}
+
+impl crate::charged::DecodeReserver for CatalogDecodeReserver {
+    fn reserve_decoded(
+        &self,
+        declared: u64,
+        ceiling: u64,
+    ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        reserve_decoded_evicting(
+            &self.budget,
+            &self.decoded,
+            &self.retries,
+            declared,
+            ceiling,
+        )
+    }
+
+    fn owned(&self) -> Box<dyn crate::charged::DecodeReserver + Send> {
+        Box::new(CatalogDecodeReserver {
+            budget: Arc::clone(&self.budget),
+            decoded: Arc::clone(&self.decoded),
+            retries: Arc::clone(&self.retries),
+        })
+    }
+}
+
+/// The body of [`Catalog::reserve_decoded`], whose doc is its contract.
+fn reserve_decoded_evicting(
+    budget: &Arc<ravel_memory::MemoryBudget>,
+    decoded: &DecodedCaches,
+    retries: &AtomicU64,
+    declared: u64,
+    ceiling: u64,
+) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+    let refusal = match crate::charged::reserve_decoded(budget, declared, ceiling) {
+        Ok(reservation) => return Ok(reservation),
+        Err(refusal) => refusal,
+    };
+    // A closed host-memory gate (ADR-2633) refuses every reservation
+    // whatever the ledger holds, so giving cached bytes back cannot admit
+    // the retry: no pass, no retry, the gate's refusal is the answer.
+    if matches!(
+        refusal.cause,
+        ravel_memory::ExhaustionCause::HostMemory { .. }
+    ) {
+        return Err(refusal);
+    }
+    let want = ravel_memory::decoded_charge(declared, ceiling);
+    let limit = budget.limit();
+    // The test below also refuses this; checking it first skips the two
+    // cache locks `reserved_bytes` takes.
+    if want > limit {
+        return Err(refusal);
+    }
+    // `held` is read before `reserved`: an entry leaving the caches
+    // between the two reads then lowers `reserved` against a `held` that
+    // still counts it, which errs toward running the pass.
+    let held = decoded.reserved_bytes();
+    let held_outside_caches = budget.reserved().saturating_sub(held);
+    if held_outside_caches
+        .checked_add(want)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(refusal);
+    }
+    decoded.evict_until_fits(budget, want);
+    retries.fetch_add(1, Ordering::Relaxed);
+    crate::charged::reserve_decoded(budget, declared, ceiling)
 }
 
 fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, CatalogError> {
@@ -5295,6 +5383,7 @@ mod tests {
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{Capabilities, DelimitedList, ListPage, PageToken, PutOutcome};
+    use ravel_proto::catalog::v1::ColumnStatsSegment;
 
     use super::*;
 
@@ -9227,12 +9316,19 @@ mod tests {
         let acc = QueryAccounting::new();
         let (range, now_ns) = full_window();
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
         assert_eq!(
-            loaded.by_content_hash.len(),
+            loaded.by_content_hash().len(),
             1,
             "the one segment's stats loaded"
         );
@@ -9285,7 +9381,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let err = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
         match err {
@@ -9321,7 +9424,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
         assert!(loaded.is_none());
@@ -9353,7 +9463,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("a retryable failure on the HEAD must degrade to Ok(None), never an error");
         assert!(loaded.is_none());
@@ -9404,7 +9521,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let err = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect_err("a non-NotFound GET failure on the stats object must surface as an error");
         match err {
@@ -9456,7 +9580,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("a retryable failure on the stats object must degrade quietly, never an error");
         assert!(
@@ -9507,7 +9638,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("a NotFound on the stats object must degrade quietly, never an error");
         assert!(
@@ -9641,11 +9779,348 @@ mod tests {
     /// The exact I64 `status` value carried by the one segment of a loaded
     /// column-stats object built by [`install_logs_stats`].
     fn loaded_value(loaded: &LoadedColumnStats) -> i64 {
-        let segment = loaded.by_content_hash.values().next().expect("one segment");
+        let (_, segment) = loaded.content_hash_segments().next().expect("one segment");
         match &segment.columns[0].min.as_ref().expect("min present").kind {
             Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)) => *v,
             other => panic!("expected an I64 min, got {other:?}"),
         }
+    }
+
+    /// One I64 column of [`two_column_segment`]: two non-null rows, both
+    /// `value`, with the dictionary present.
+    fn i64_column(name: &str, value: i64) -> ravel_proto::catalog::v1::ColumnStat {
+        ravel_proto::catalog::v1::ColumnStat {
+            name: name.to_string(),
+            declared_type: 2,
+            non_null_count: 2,
+            null_count: 0,
+            min: Some(i64_value(value)),
+            max: Some(i64_value(value)),
+            dictionary_present: true,
+            dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                value: Some(i64_value(value)),
+                count: 2,
+            }],
+            sum: Some(2 * value),
+        }
+    }
+
+    /// The one segment a part written by [`install_parts`] carries: I64
+    /// columns `a` and `b`, keyed by `part_hash` as its content hash.
+    fn two_column_segment(part_hash: [u8; 32], a: i64, b: i64) -> ColumnStatsSegment {
+        ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: part_hash.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![i64_column("a", a), i64_column("b", b)],
+        }
+    }
+
+    /// The encoded length of `segment` with the dictionary of every column not
+    /// in `keep` emptied: what a cache entry holding `keep` must charge.
+    fn stripped_len(segment: &ColumnStatsSegment, keep: &[&str]) -> u64 {
+        let mut segment = segment.clone();
+        for column in &mut segment.columns {
+            if !keep.contains(&column.name.as_str()) {
+                column.dictionary.clear();
+            }
+        }
+        segment.encoded_len() as u64
+    }
+
+    /// `name`'s statistics in the record `loaded` holds for `part`.
+    fn loaded_column<'a>(
+        loaded: &'a LoadedColumnStats,
+        part: &[u8; 32],
+        name: &str,
+    ) -> &'a ravel_proto::catalog::v1::ColumnStat {
+        loaded.by_content_hash()[part]
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .expect("column present")
+    }
+
+    /// One part written by [`install_parts`]: its segment as encoded, and the
+    /// object's declared `body_uncompressed_len`.
+    struct InstalledPart {
+        segment: ColumnStatsSegment,
+        body_len: u64,
+    }
+
+    /// Write one v3 `.cstat` object per `(part_hash, a, b)` (each at its own
+    /// key, one [`two_column_segment`] each) and a HEAD listing every part,
+    /// part `i` covering hours `[5i, 5i + 4]`, inside [`full_window`] for up
+    /// to ten parts. Calling it again with a longer list is the shape a fold
+    /// that adds a part leaves: the earlier parts' objects are rewritten byte
+    /// for byte, so their declared blake3s do not move.
+    async fn install_parts(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
+        parts: &[([u8; 32], i64, i64)],
+    ) -> Vec<InstalledPart> {
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+        let mut part_refs = Vec::new();
+        let mut segments = Vec::new();
+        let mut watermark_hour = 0;
+        for (i, &(part_hash, a, b)) in parts.iter().enumerate() {
+            let min_hour = 5 * i as u32;
+            watermark_hour = min_hour + 4;
+            let segment = two_column_segment(part_hash, a, b);
+            let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
+                tenant.0,
+                signal_num,
+                part_hash,
+                std::slice::from_ref(&segment),
+                crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+            )
+            .expect("encode v3 column stats");
+            let name: String = part_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let stats_key = format!("t/{}/catalog/{prefix}/cstat/{name}.cstat", tenant.to_hex());
+            store
+                .put(
+                    &stats_key,
+                    Bytes::from(stats_bytes.clone()),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put stats");
+            part_refs.push(ravel_proto::catalog::v1::SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/{name}.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour,
+                min_hour,
+                column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                    key: stats_key,
+                    blake3: blake3::hash(&stats_bytes).as_bytes().to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 1,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+                key_index: Vec::new(),
+            });
+            let body_len = crate::snapshot_format::decode_column_stats_header(&stats_bytes)
+                .expect("the object just written has a readable header")
+                .header
+                .body_uncompressed_len;
+            segments.push(InstalledPart { segment, body_len });
+        }
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour,
+            parts: part_refs,
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant, signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+        segments
+    }
+
+    /// One `load_column_stats` over [`full_window`] for the default tenant's
+    /// logs, returning the result and the GETs it was charged.
+    async fn load_counting(
+        catalog: &Catalog,
+        request: &ColumnStatsRequest,
+    ) -> (Arc<LoadedColumnStats>, u64) {
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, request, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        (loaded, acc.snapshot().s3_requests(AccountedOp::Get))
+    }
+
+    /// Issue #3244: an entry is one part's summary plus only the dictionaries
+    /// asked for so far. A request the entry covers costs the HEAD GET alone;
+    /// a dictionary it lacks re-fetches that part's object once, and the new
+    /// entry keeps the union, so asking for `b` never drops `a`. The held
+    /// bytes are the stripped segment's encoded length, summed here
+    /// independently of the cache.
+    ///
+    /// FLIP: make `PartColumnStats::from_decoded` ignore `previous` (an entry
+    /// holding only the latest request's dictionaries); "the union keeps a"
+    /// fails, then the held bytes (90 != 98), then the final q02 on `a`
+    /// (2 GETs != 1).
+    #[tokio::test]
+    async fn column_stats_cache_entry_fetches_only_missing_dictionaries() {
+        let store = Arc::new(MemoryStore::new());
+        let part = *blake3::hash(b"part-a").as_bytes();
+        let installed = install_parts(&store, tenant(), Signal::Logs, &[(part, 7, 9)]).await;
+        let segment = &installed[0].segment;
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let summary = ColumnStatsRequest::summary_only();
+        let q02_a = ColumnStatsRequest::summary_only().with_dictionary("a");
+        let q08_b = ColumnStatsRequest::summary_only().with_dictionary("b");
+
+        let (loaded, gets) = load_counting(&catalog, &summary).await;
+        assert_eq!(gets, 2, "cold summary: HEAD and the part's object");
+        assert!(!loaded.dictionary_loaded("a"));
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            stripped_len(segment, &[])
+        );
+        let summary_stat = loaded_column(&loaded, &part, "a");
+        assert!(summary_stat.dictionary.is_empty());
+        assert!(summary_stat.dictionary_present, "left as decoded");
+        assert_eq!(summary_stat.sum, Some(14), "the summary is kept whole");
+        assert_eq!(summary_stat.non_null_count, 2);
+
+        let (loaded, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 2, "the summary entry lacks a's dictionary");
+        assert!(loaded.dictionary_loaded("a"));
+        assert!(!loaded.dictionary_loaded("b"));
+        assert_eq!(
+            loaded_column(&loaded, &part, "a").dictionary,
+            segment.columns[0].dictionary
+        );
+        assert!(loaded_column(&loaded, &part, "b").dictionary.is_empty());
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            stripped_len(segment, &["a"])
+        );
+
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "a's dictionary is held: HEAD only");
+
+        let (_, gets) = load_counting(&catalog, &summary).await;
+        assert_eq!(gets, 1, "a summary is covered by any entry");
+
+        let (loaded, gets) = load_counting(&catalog, &q08_b).await;
+        assert_eq!(gets, 2, "b's dictionary is not held yet");
+        assert!(loaded.dictionary_loaded("a"), "the union keeps a");
+        assert!(loaded.dictionary_loaded("b"));
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            stripped_len(segment, &["a", "b"])
+        );
+
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "a survived the b fetch");
+
+        assert_eq!(catalog.column_stats_cache_evictions(), 0);
+        assert_eq!(catalog.column_stats_cache_refusals(), 0);
+        assert_eq!(
+            catalog.column_stats_decoded_bytes(),
+            3 * installed[0].body_len,
+            "three fetches, each decoded body counted once"
+        );
+    }
+
+    /// Issue #3244: entries are per part, keyed by the part's declared
+    /// `.cstat` blake3, so a HEAD that gains a third part (what a fold
+    /// publishes) costs the HEAD GET plus the new part's object only; the two
+    /// parts that did not change are still served from the cache.
+    ///
+    /// FLIP: in `load_column_stats`, key each entry by a hash of every covered
+    /// part's blake3 plus its own (a window-keyed cache); the post-fold load
+    /// charges 4 GETs, not 2.
+    #[tokio::test]
+    async fn column_stats_cache_fetches_only_the_part_a_fold_added() {
+        let store = Arc::new(MemoryStore::new());
+        let p1 = *blake3::hash(b"part-1").as_bytes();
+        let p2 = *blake3::hash(b"part-2").as_bytes();
+        let p3 = *blake3::hash(b"part-3").as_bytes();
+        install_parts(&store, tenant(), Signal::Logs, &[(p1, 1, 2), (p2, 3, 4)]).await;
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let q02_a = ColumnStatsRequest::summary_only().with_dictionary("a");
+
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 3, "cold: HEAD and both parts' objects");
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "warm: HEAD only");
+
+        let installed = install_parts(
+            &store,
+            tenant(),
+            Signal::Logs,
+            &[(p1, 1, 2), (p2, 3, 4), (p3, 5, 6)],
+        )
+        .await;
+        let (loaded, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 2, "after the fold: HEAD and the new part's object");
+        assert_eq!(loaded.content_hash_segments().count(), 3);
+        assert!(loaded.dictionary_loaded("a"));
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            installed
+                .iter()
+                .map(|part| stripped_len(&part.segment, &["a"]))
+                .sum::<u64>()
+        );
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "all three parts held");
+    }
+
+    /// Issue #3244: the byte budget is enforced per part entry. A budget
+    /// holding one summary entry but not two evicts once over a two-part
+    /// load; a budget below one entry refuses it (once per part) and the load
+    /// is still answered in full.
+    #[tokio::test]
+    async fn column_stats_cache_budget_evicts_and_refuses_per_part_entry() {
+        let p1 = *blake3::hash(b"budget-1").as_bytes();
+        let p2 = *blake3::hash(b"budget-2").as_bytes();
+        let entry_bytes = stripped_len(&two_column_segment(p1, 1, 2), &[]);
+        assert_eq!(
+            entry_bytes,
+            stripped_len(&two_column_segment(p2, 1, 2), &[]),
+            "both entries weigh the same"
+        );
+        let summary = ColumnStatsRequest::summary_only();
+
+        let store = Arc::new(MemoryStore::new());
+        install_parts(&store, tenant(), Signal::Logs, &[(p1, 1, 2), (p2, 1, 2)]).await;
+        let fits_one = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                column_stats_cache_max_bytes: entry_bytes + entry_bytes / 2,
+                ..config(8)
+            },
+        )
+        .expect("catalog");
+        let (loaded, gets) = load_counting(&fits_one, &summary).await;
+        assert_eq!(gets, 3);
+        assert_eq!(loaded.content_hash_segments().count(), 2);
+        assert_eq!(fits_one.column_stats_cache_evictions(), 1);
+        assert_eq!(fits_one.column_stats_cache_refusals(), 0);
+        assert_eq!(fits_one.column_stats_cache_held_bytes(), entry_bytes);
+
+        let too_small = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                column_stats_cache_max_bytes: entry_bytes - 1,
+                ..config(8)
+            },
+        )
+        .expect("catalog");
+        install_parts(&store, tenant(), Signal::Logs, &[(p1, 1, 2)]).await;
+        let (loaded, gets) = load_counting(&too_small, &summary).await;
+        assert_eq!(gets, 2);
+        assert_eq!(loaded.content_hash_segments().count(), 1, "served anyway");
+        assert_eq!(too_small.column_stats_cache_refusals(), 1);
+        assert_eq!(too_small.column_stats_cache_evictions(), 0);
+        assert_eq!(too_small.column_stats_cache_held_bytes(), 0);
     }
 
     /// Write a folded HEAD for `(tenant, signal)` whose one part's field-7
@@ -9870,6 +10345,7 @@ mod tests {
                     Signal::Logs,
                     range,
                     now_ns,
+                    &ColumnStatsRequest::summary_only(),
                     &QueryAccounting::new(),
                 )
                 .await
@@ -9934,6 +10410,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -9985,6 +10462,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -10026,6 +10504,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -10051,6 +10530,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -10082,6 +10562,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -10114,7 +10595,14 @@ mod tests {
         let (range, now_ns) = full_window();
         let acc1 = QueryAccounting::new();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc1)
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc1,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10126,7 +10614,14 @@ mod tests {
 
         let acc2 = QueryAccounting::new();
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc2)
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc2,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10163,7 +10658,14 @@ mod tests {
         let (range, now_ns) = full_window();
         let acc1 = QueryAccounting::new();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc1)
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc1,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10175,7 +10677,14 @@ mod tests {
 
         let acc2 = QueryAccounting::new();
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc2)
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc2,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10195,59 +10704,130 @@ mod tests {
         TenantHash([n; 16])
     }
 
-    /// A `LoadedColumnStats` carrying one segment and `parts` covered-part
-    /// hashes, for driving [`ColumnStatsCache`] directly with a known byte
-    /// weight. The segment's content is fixed, so every call produces an object
-    /// of identical [`LoadedColumnStats::heap_bytes`].
-    fn make_loaded(parts: usize) -> Arc<LoadedColumnStats> {
-        let segment = ravel_proto::catalog::v1::ColumnStatsSegment {
-            ingest_hour_bucket: 1,
-            shard: 0,
-            writer_id: vec![0xAA; 16],
-            writer_epoch: 1,
-            writer_seq: 1,
-            columns: Vec::new(),
-        };
-        let identity: crate::EntryIdentity = (1, 0, [0xAA; 16], 1, 1);
-        let mut segments = HashMap::new();
-        segments.insert(identity, segment);
-        let part_blake3 = (0..parts).map(|i| [i as u8; 32]).collect();
-        Arc::new(LoadedColumnStats {
-            segments,
-            by_content_hash: HashMap::new(),
-            part_blake3,
-        })
+    /// The records of one part entry for driving [`ColumnStatsCache`]
+    /// directly: `segments` content-hash keyed records, each with one I64
+    /// column carrying a two-entry dictionary. The content is fixed per count,
+    /// so equal counts give entries of identical [`PartColumnStats::heap_bytes`].
+    fn make_part_records(
+        segments: u8,
+    ) -> HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> {
+        (0..segments)
+            .map(|i| {
+                let segment = ravel_proto::catalog::v1::ColumnStatsSegment {
+                    ingest_hour_bucket: 1,
+                    shard: 0,
+                    writer_id: vec![i; 32],
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                        name: "status".into(),
+                        non_null_count: 3,
+                        dictionary_present: true,
+                        dictionary: vec![
+                            ravel_proto::catalog::v1::DictEntry {
+                                value: Some(i64_value(200)),
+                                count: 2,
+                            },
+                            ravel_proto::catalog::v1::DictEntry {
+                                value: Some(i64_value(500)),
+                                count: 1,
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                };
+                ([i; 32], segment)
+            })
+            .collect()
     }
 
-    /// Issue #905, exact byte accounting: the cache reports the bytes actually
-    /// held as the exact sum of each segment's encoded protobuf length plus 32
-    /// bytes per covered part hash, not `> 0` and not an entry count.
+    fn i64_value(v: i64) -> ravel_proto::catalog::v1::ColumnValue {
+        ravel_proto::catalog::v1::ColumnValue {
+            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)),
+        }
+    }
+
+    /// A summary-only part entry over [`make_part_records`]`(1)`.
+    fn make_entry() -> Arc<PartColumnStats> {
+        Arc::new(PartColumnStats::from_decoded(
+            column_stats_resolve::DecodedStats {
+                by_content_hash: make_part_records(1),
+                ..Default::default()
+            },
+            &ColumnStatsRequest::summary_only(),
+            None,
+        ))
+    }
+
+    /// Issue #3244, exact byte accounting: an entry's weight is the exact sum
+    /// of its records' encoded protobuf length as held (dictionaries outside
+    /// the request stripped), and the cache's held bytes is that sum over its
+    /// live entries, not `> 0` and not an entry count.
     ///
-    /// Flip to watch it fail: change `heap_bytes` to return the entry count
-    /// (`self.segments.len() as u64`) and the `held_bytes` assertion drops to
-    /// `1`.
+    /// Flip to watch it fail: compute `heap_bytes` before `strip_dictionaries`
+    /// runs in `PartColumnStats::new` and the summary entry's weight reads the
+    /// full records' length, not the stripped one.
     #[test]
     fn column_stats_cache_accounts_exact_held_bytes() {
-        let loaded = make_loaded(3);
+        let records = make_part_records(3);
+        let summary = PartColumnStats::from_decoded(
+            column_stats_resolve::DecodedStats {
+                by_content_hash: records.clone(),
+                ..Default::default()
+            },
+            &ColumnStatsRequest::summary_only(),
+            None,
+        );
+        let with_status = PartColumnStats::from_decoded(
+            column_stats_resolve::DecodedStats {
+                by_content_hash: records.clone(),
+                ..Default::default()
+            },
+            &ColumnStatsRequest::summary_only().with_dictionary("status"),
+            None,
+        );
         // Independently summed, not via heap_bytes: the payload the budget bounds.
-        let expected: u64 = loaded
-            .segments
+        let full: u64 = records
             .values()
             .map(|segment| segment.encoded_len() as u64)
-            .sum::<u64>()
-            + 3 * 32;
+            .sum();
+        let stripped: u64 = records
+            .values()
+            .map(|segment| {
+                let mut segment = segment.clone();
+                for column in &mut segment.columns {
+                    column.dictionary.clear();
+                }
+                segment.encoded_len() as u64
+            })
+            .sum();
+        assert!(
+            stripped < full,
+            "the fixture's dictionaries weigh something"
+        );
         assert_eq!(
-            loaded.heap_bytes(),
-            expected,
-            "heap_bytes is the summed segment encoded length plus 32 bytes per part"
+            summary.heap_bytes(),
+            stripped,
+            "a summary entry weighs its records with every dictionary cleared"
+        );
+        assert_eq!(
+            with_status.heap_bytes(),
+            full,
+            "an entry holding the status dictionary weighs the full records"
         );
 
         let cache = ColumnStatsCache::new(1 << 20);
         cache.insert(
-            (tenant(), Signal::Logs, 0, 50),
+            (tenant_n(1), Signal::Logs, [1u8; 32]),
             [1u8; 32],
-            Arc::clone(&loaded),
+            Arc::new(summary),
         );
+        cache.insert(
+            (tenant_n(1), Signal::Logs, [2u8; 32]),
+            [2u8; 32],
+            Arc::new(with_status),
+        );
+        let expected = stripped + full;
         assert_eq!(
             cache.held_bytes(),
             expected,
@@ -10264,16 +10844,13 @@ mod tests {
     /// `evictions()` reads `1` after the second insert.
     #[test]
     fn column_stats_cache_evicts_lru_at_byte_boundary() {
-        let entry = make_loaded(1);
+        let entry = make_entry();
         let b = entry.heap_bytes();
         let cache = ColumnStatsCache::new(2 * b);
 
-        let ka = (tenant_n(1), Signal::Logs, 0, 50);
-        let kb = (tenant_n(2), Signal::Logs, 0, 50);
-        let kc = (tenant_n(3), Signal::Logs, 0, 50);
-        // Lookups still verify the part binding against the loaded object's
-        // own copy; the cache stores no duplicate.
-        let parts = entry.part_blake3.clone();
+        let ka = (tenant_n(1), Signal::Logs, [0xA1; 32]);
+        let kb = (tenant_n(2), Signal::Logs, [0xA1; 32]);
+        let kc = (tenant_n(3), Signal::Logs, [0xA1; 32]);
 
         cache.insert(ka, [1u8; 32], Arc::clone(&entry));
         cache.insert(kb, [1u8; 32], Arc::clone(&entry));
@@ -10290,12 +10867,12 @@ mod tests {
         );
 
         assert!(
-            cache.get(ka, &[1u8; 32], &parts).is_none(),
+            cache.get(ka, &[1u8; 32]).is_none(),
             "the least-recently-used entry was evicted"
         );
-        assert!(cache.get(kb, &[1u8; 32], &parts).is_some(), "kb survives");
+        assert!(cache.get(kb, &[1u8; 32]).is_some(), "kb survives");
         assert!(
-            cache.get(kc, &[1u8; 32], &parts).is_some(),
+            cache.get(kc, &[1u8; 32]).is_some(),
             "the just-inserted kc survives"
         );
     }
@@ -10309,17 +10886,17 @@ mod tests {
     /// `insert` and the eviction assertion reads `0`.
     #[test]
     fn column_stats_cache_eviction_counter_increments_by_one() {
-        let entry = make_loaded(1);
+        let entry = make_entry();
         let b = entry.heap_bytes();
 
         let cache = ColumnStatsCache::new(b);
         cache.insert(
-            (tenant_n(1), Signal::Logs, 0, 50),
+            (tenant_n(1), Signal::Logs, [0xA1; 32]),
             [1u8; 32],
             Arc::clone(&entry),
         );
         cache.insert(
-            (tenant_n(2), Signal::Logs, 0, 50),
+            (tenant_n(2), Signal::Logs, [0xA1; 32]),
             [1u8; 32],
             Arc::clone(&entry),
         );
@@ -10329,7 +10906,7 @@ mod tests {
         // An object larger than the whole budget: refused, not evicted.
         let refuse_cache = ColumnStatsCache::new(b - 1);
         refuse_cache.insert(
-            (tenant_n(1), Signal::Logs, 0, 50),
+            (tenant_n(1), Signal::Logs, [0xA1; 32]),
             [1u8; 32],
             Arc::clone(&entry),
         );
@@ -10376,7 +10953,14 @@ mod tests {
         .expect("catalog");
         let (range, now_ns) = full_window();
         let fresh_a = disabled
-            .load_column_stats(&ta, Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &ta,
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10399,7 +10983,14 @@ mod tests {
         .expect("catalog");
 
         catalog
-            .load_column_stats(&ta, Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &ta,
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10410,7 +11001,14 @@ mod tests {
         );
 
         catalog
-            .load_column_stats(&tb, Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tb,
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10423,7 +11021,14 @@ mod tests {
         // Reload A: its entry was evicted, so this re-fetches (two GETs).
         let acc_reload = QueryAccounting::new();
         let reloaded_a = catalog
-            .load_column_stats(&ta, Signal::Logs, range, now_ns, &acc_reload)
+            .load_column_stats(
+                &ta,
+                Signal::Logs,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc_reload,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -10434,11 +11039,13 @@ mod tests {
         );
 
         assert_eq!(
-            reloaded_a.segments, fresh_a.segments,
+            reloaded_a.by_content_hash(),
+            fresh_a.by_content_hash(),
             "the evicted-then-reloaded stats equal the never-cached stats, row for row"
         );
         assert_eq!(
-            reloaded_a.part_blake3, fresh_a.part_blake3,
+            reloaded_a.parts().len(),
+            fresh_a.parts().len(),
             "the covered part set is unchanged by eviction"
         );
         assert_eq!(loaded_value(&reloaded_a), 42, "and carry tenant A's value");
@@ -11098,7 +11705,14 @@ mod tests {
         let now_ns = 29 * NS_PER_HOUR;
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -11135,12 +11749,12 @@ mod tests {
         );
 
         assert_eq!(
-            loaded.by_content_hash.len(),
+            loaded.by_content_hash().len(),
             2,
             "both covered parts' segments loaded, and only theirs"
         );
-        assert!(loaded.by_content_hash.contains_key(&content_b));
-        assert!(loaded.by_content_hash.contains_key(&content_c));
+        assert!(loaded.by_content_hash().contains_key(&content_b));
+        assert!(loaded.by_content_hash().contains_key(&content_c));
     }
 
     /// BLOCKING regression (issue #1483 review, ADR-1413 T2): `fetch_stats_object`
@@ -11269,7 +11883,14 @@ mod tests {
         let acc = QueryAccounting::new();
         let (range, now_ns) = full_window();
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("load ok");
 
@@ -11424,7 +12045,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
@@ -11441,16 +12069,16 @@ mod tests {
         );
 
         assert!(
-            loaded.by_content_hash.contains_key(&content_x),
+            loaded.by_content_hash().contains_key(&content_x),
             "part x's own v3 record loaded"
         );
         assert!(
-            !loaded.by_content_hash.contains_key(&content_y),
+            !loaded.by_content_hash().contains_key(&content_y),
             "part y has no field-7 ref, so it is uncovered rather than answered \
              from the stale field-13 fallback"
         );
         assert_eq!(
-            loaded.by_content_hash.len(),
+            loaded.by_content_hash().len(),
             1,
             "only part x's own object contributes statistics"
         );
@@ -11568,17 +12196,24 @@ mod tests {
 
         let (range, now_ns) = full_window();
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok")
             .expect("part q's statistics still load");
 
         assert_eq!(
-            loaded.by_content_hash.len(),
+            loaded.by_content_hash().len(),
             1,
             "only part q's segment loaded; part p's coverage was subtracted"
         );
-        assert!(loaded.by_content_hash.contains_key(&content_q));
+        assert!(loaded.by_content_hash().contains_key(&content_q));
 
         assert_eq!(
             catalog.column_stats_decode_refusals(),
@@ -11768,7 +12403,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("load ok");
 
@@ -11952,7 +12594,14 @@ mod tests {
         let (range, now_ns) = full_window();
 
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .load_column_stats(
+                &tenant(),
+                signal,
+                range,
+                now_ns,
+                &ColumnStatsRequest::summary_only(),
+                &acc,
+            )
             .await
             .expect("load ok");
 
@@ -13102,12 +13751,15 @@ mod tests {
     /// figure for a fixed fixture.
     const COLUMN_STATS_DECLARED_BODY_LEN: u64 = 75;
 
-    /// A column-statistics object is charged its declared uncompressed body
-    /// before decoding: a budget with no room for it fails the load with the
-    /// typed budget error rather than decoding uncharged.
+    /// A column-statistics object's segment is charged before it is read: a
+    /// budget with no room for it fails the load with the typed budget error
+    /// rather than decoding uncharged. The decode streams (issue #3244), so
+    /// the refused charge is the one segment's encoded length, the declared
+    /// body less its one-byte length prefix.
     ///
-    /// FLIP: drop the `reserve_decoded` call in `fetch_stats_object` and the
-    /// load succeeds, failing `expect_err`.
+    /// FLIP: drop the `reserve_decoded` call in `WorkingReservation`'s
+    /// `before_segment` and the refusal moves to the segment's kept bytes,
+    /// failing the `requested` assertion.
     #[tokio::test]
     async fn column_stats_decode_reserves_its_output() {
         let store = Arc::new(MemoryStore::new());
@@ -13125,6 +13777,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -13132,8 +13785,9 @@ mod tests {
         match err {
             column_stats_resolve::LoadColumnStatsError::MemoryExhausted(exhausted) => {
                 assert_eq!(
-                    exhausted.requested, declared,
-                    "exactly the object's declared uncompressed body"
+                    exhausted.requested,
+                    declared - 1,
+                    "exactly the object's one segment"
                 );
                 assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
                 assert_eq!(exhausted.limit, 0);
@@ -13199,6 +13853,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -13315,6 +13970,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -13355,11 +14011,12 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
             .expect("a stale binding degrades rather than failing the load");
-        let covered = loaded.map_or(0, |l| l.by_content_hash.len() + l.segments.len());
+        let covered = loaded.map_or(0, |l| l.content_hash_segments().count());
         assert_eq!(covered, 0, "the stale-bound object covers nothing");
         assert_eq!(budget.reserved(), 0);
     }
@@ -13450,6 +14107,7 @@ mod tests {
                 Signal::Logs,
                 stats_range,
                 stats_now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -13543,10 +14201,12 @@ mod tests {
 
         assert_eq!(inline_snapshot.segments.len(), 1);
         assert_eq!(gated_snapshot, inline_snapshot);
-        assert_eq!(gated_stats.segments, inline_stats.segments);
-        assert_eq!(gated_stats.by_content_hash, inline_stats.by_content_hash);
-        assert_eq!(gated_stats.part_blake3, inline_stats.part_blake3);
-        assert_eq!(gated_stats.by_content_hash.len(), 1);
+        assert_eq!(
+            gated_stats.by_content_hash(),
+            inline_stats.by_content_hash()
+        );
+        assert_eq!(gated_stats.heap_bytes(), inline_stats.heap_bytes());
+        assert_eq!(gated_stats.by_content_hash().len(), 1);
         assert_eq!(gated_meta, inline_meta);
         assert_eq!(gated_meta.len(), 1);
         let jobs: u64 = gate.snapshot().sites.iter().map(|s| s.jobs).sum();
@@ -13580,6 +14240,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -13702,6 +14363,7 @@ mod tests {
                 Signal::Logs,
                 range,
                 now_ns,
+                &ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
@@ -13729,6 +14391,7 @@ mod tests {
                         Signal::Logs,
                         range,
                         now_ns,
+                        &ColumnStatsRequest::summary_only(),
                         &QueryAccounting::new(),
                     )
                     .await

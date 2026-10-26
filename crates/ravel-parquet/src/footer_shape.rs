@@ -44,6 +44,13 @@
 //! The walk does work linear in the footer's length, and its recursion is
 //! bounded by the fixed nesting of the decoder's structs plus
 //! [`SKIP_DEPTH`].
+//!
+//! [`check_page_headers`] runs the same walk over the page headers of a
+//! column chunk, before the page reader decodes them. That reader skips an
+//! unknown field through a `Read` whose skip of bytes past the end succeeds
+//! without reading any, so a skipped list or map of doubles, UUIDs or
+//! booleans with declared count `n` costs `n` steps whatever the chunk
+//! holds, up to `i32::MAX`.
 
 use std::mem::size_of;
 use std::ops::Range;
@@ -152,6 +159,11 @@ enum Shape {
     SortingColumn,
     KeyValue,
     ColumnOrder,
+    PageHeader,
+    DataPageHeader,
+    IndexPageHeader,
+    DictionaryPageHeader,
+    DataPageHeaderV2,
 }
 
 impl Shape {
@@ -313,6 +325,24 @@ fn field(shape: Shape, id: i16) -> Field {
         (S::KeyValue, 1 | 2) => Read(Binary),
         (S::ColumnOrder, 1) => Read(Empty),
 
+        // parquet 59.3.0's `PageHeader::read_thrift` and
+        // `read_thrift_without_stats` and the page structs they read
+        // (src/file/metadata/thrift/mod.rs). A page's `PageStatistics` has
+        // the fields of `Statistics`; the reader reads it or skips it
+        // depending on its options, and the walk reads it either way.
+        (S::PageHeader, 1..=4) => Read(I32),
+        (S::PageHeader, 5) => Read(Struct(S::DataPageHeader)),
+        (S::PageHeader, 6) => Read(Struct(S::IndexPageHeader)),
+        (S::PageHeader, 7) => Read(Struct(S::DictionaryPageHeader)),
+        (S::PageHeader, 8) => Read(Struct(S::DataPageHeaderV2)),
+        (S::DataPageHeader, 1..=4) => Read(I32),
+        (S::DataPageHeader, 5) => Read(Struct(S::Statistics)),
+        (S::DictionaryPageHeader, 1 | 2) => Read(I32),
+        (S::DictionaryPageHeader, 3) => Read(Bool),
+        (S::DataPageHeaderV2, 1..=6) => Read(I32),
+        (S::DataPageHeaderV2, 7) => Read(Bool),
+        (S::DataPageHeaderV2, 8) => Read(Struct(S::Statistics)),
+
         _ => Skip,
     }
 }
@@ -335,6 +365,7 @@ fn field(shape: Shape, id: i16) -> Field {
 /// converted from every `ARROW:schema` value.
 pub(crate) fn check_footer_shape(footer: &[u8]) -> Result<u64, String> {
     let mut walk = Walk {
+        subject: "footer",
         bytes: footer,
         pos: 0,
         leaves: None,
@@ -344,7 +375,40 @@ pub(crate) fn check_footer_shape(footer: &[u8]) -> Result<u64, String> {
     Ok(walk.decoded)
 }
 
+/// Walk the pages of `chunk`, one column chunk's bytes, as the page reader
+/// does when it has no offset index: a `PageHeader`, then the
+/// `compressed_page_size` bytes it declares, until the chunk ends. Refuse
+/// the chunk if a header fails the walk [`check_footer_shape`] runs. A
+/// header with no `compressed_page_size`, or one that is negative or runs
+/// past the chunk, ends the walk without a verdict: the decoder refuses
+/// those itself, and the pages after it cannot be found. Returns the number
+/// of headers walked. Error positions count from the chunk's first byte.
+pub(crate) fn check_page_headers(chunk: &[u8]) -> Result<usize, String> {
+    let mut pos = 0;
+    let mut pages = 0;
+    while pos < chunk.len() {
+        let mut walk = Walk {
+            subject: "page header",
+            bytes: chunk,
+            pos,
+            leaves: None,
+            decoded: 0,
+        };
+        let header = walk
+            .read_struct(Shape::PageHeader)
+            .map_err(|err| format!("page at byte {pos}: {err}"))?;
+        pages += 1;
+        match header.page_size.map(usize::try_from) {
+            Some(Ok(size)) if size <= walk.remaining() => pos = walk.pos + size,
+            _ => break,
+        }
+    }
+    Ok(pages)
+}
+
 struct Walk<'a> {
+    /// What the walk reads, for its error messages.
+    subject: &'static str,
     bytes: &'a [u8],
     pos: usize,
     /// The leaf columns of the last schema read, which every row group
@@ -372,6 +436,8 @@ struct Element {
     name_len: u64,
     key: Option<Range<usize>>,
     value: Option<Range<usize>>,
+    /// A `PageHeader`'s `compressed_page_size`.
+    page_size: Option<i32>,
 }
 
 /// A group of the schema tree that the next element is inside.
@@ -482,18 +548,20 @@ impl Walk<'_> {
     }
 
     fn byte(&mut self) -> Result<u8, String> {
+        let subject = self.subject;
         let b = *self
             .bytes
             .get(self.pos)
-            .ok_or_else(|| format!("footer ends at byte {} inside a value", self.pos))?;
+            .ok_or_else(|| format!("{subject} ends at byte {} inside a value", self.pos))?;
         self.pos += 1;
         Ok(b)
     }
 
     fn advance(&mut self, n: usize) -> Result<(), String> {
+        let subject = self.subject;
         if n > self.remaining() {
             return Err(format!(
-                "footer declares {n} bytes at byte {} with {} left",
+                "{subject} declares {n} bytes at byte {} with {} left",
                 self.pos,
                 self.remaining()
             ));
@@ -505,6 +573,7 @@ impl Walk<'_> {
     /// An unsigned varint, decoded as the decoder's `read_vlq` decodes it.
     /// The decoder reads a longer one too; no writer produces it.
     fn varint(&mut self) -> Result<u64, String> {
+        let subject = self.subject;
         let start = self.pos;
         let mut value: u64 = 0;
         for i in 0..MAX_VARINT_BYTES {
@@ -515,7 +584,7 @@ impl Walk<'_> {
             }
         }
         Err(format!(
-            "footer varint at byte {start} runs past {MAX_VARINT_BYTES} bytes"
+            "{subject} varint at byte {start} runs past {MAX_VARINT_BYTES} bytes"
         ))
     }
 
@@ -528,14 +597,15 @@ impl Walk<'_> {
     /// Refuse a declared count that the bytes left could not hold at
     /// `min_bytes` per element.
     fn count_fits(&self, count: u64, min_bytes: u64, what: &str) -> Result<usize, String> {
+        let subject = self.subject;
         let left = self.remaining() as u64;
         if count.saturating_mul(min_bytes) > left {
             return Err(format!(
-                "footer {what} at byte {} declares {count} elements with {left} bytes left",
+                "{subject} {what} at byte {} declares {count} elements with {left} bytes left",
                 self.pos
             ));
         }
-        usize::try_from(count).map_err(|_| format!("footer {what} count {count} does not fit"))
+        usize::try_from(count).map_err(|_| format!("{subject} {what} count {count} does not fit"))
     }
 
     /// A list or set header, as the decoder's `read_list_begin` reads it:
@@ -543,6 +613,7 @@ impl Walk<'_> {
     /// empty list (some writers put element type 0 on one), else the
     /// element type and the declared count.
     fn list_header(&mut self) -> Result<Option<(u8, u64)>, String> {
+        let subject = self.subject;
         let at = self.pos;
         let header = self.byte()?;
         if header == 0 {
@@ -551,14 +622,14 @@ impl Walk<'_> {
         let element = header & 0x0f;
         if element == T_STOP || element > T_STRUCT {
             return Err(format!(
-                "footer list at byte {at} has element type {element}"
+                "{subject} list at byte {at} has element type {element}"
             ));
         }
         let short = u64::from(header >> 4);
         let count = if short == 15 { self.varint()? } else { short };
         if count > i32::MAX as u64 {
             return Err(format!(
-                "footer list at byte {at} declares {count} elements, past i32"
+                "{subject} list at byte {at} declares {count} elements, past i32"
             ));
         }
         Ok(Some((element, count)))
@@ -568,6 +639,7 @@ impl Walk<'_> {
     /// type and the field id, computed as the decoder's `read_field_begin`
     /// computes it from `last`.
     fn field_header(&mut self, last: i16) -> Result<Option<(u8, i16)>, String> {
+        let subject = self.subject;
         let at = self.pos;
         let header = self.byte()?;
         let code = header & 0x0f;
@@ -576,7 +648,7 @@ impl Walk<'_> {
         }
         if code > T_STRUCT {
             return Err(format!(
-                "footer has unknown compact type {code} at byte {at}"
+                "{subject} has unknown compact type {code} at byte {at}"
             ));
         }
         let delta = header >> 4;
@@ -584,7 +656,7 @@ impl Walk<'_> {
             self.zigzag()? as i16
         } else {
             last.checked_add(i16::from(delta))
-                .ok_or_else(|| format!("footer field id at byte {at} overflows i16"))?
+                .ok_or_else(|| format!("{subject} field id at byte {at} overflows i16"))?
         };
         Ok(Some((code, id)))
     }
@@ -593,6 +665,7 @@ impl Walk<'_> {
     /// return what [`Element`] keeps of it. A `KeyValue` whose key is
     /// `ARROW:schema` has its value checked and its conversion charged.
     fn read_struct(&mut self, shape: Shape) -> Result<Element, String> {
+        let subject = self.subject;
         let start = self.pos;
         let mut last = 0i16;
         let mut fields = 0usize;
@@ -604,7 +677,7 @@ impl Walk<'_> {
             let at = self.pos;
             let Some((code, id)) = self.field_header(last)? else {
                 if shape.is_union() && fields == 0 {
-                    return Err(format!("footer {shape:?} at byte {start} has no field"));
+                    return Err(format!("{subject} {shape:?} at byte {start} has no field"));
                 }
                 if shape == Shape::KeyValue {
                     self.check_key_value(&element)?;
@@ -613,14 +686,14 @@ impl Walk<'_> {
             };
             if shape.is_union() && fields == 1 {
                 return Err(format!(
-                    "footer {shape:?} at byte {start} has more than one field"
+                    "{subject} {shape:?} at byte {start} has more than one field"
                 ));
             }
             match field(shape, id) {
                 Field::Read(kind) => {
                     if !kind.matches(code) {
                         return Err(format!(
-                            "footer field {id} of {shape:?} at byte {at} has compact type \
+                            "{subject} field {id} of {shape:?} at byte {at} has compact type \
                              {code}, where the decoder reads {kind:?}"
                         ));
                     }
@@ -631,7 +704,7 @@ impl Walk<'_> {
                     let bit = 1u64 << (id & 63);
                     if read & bit != 0 {
                         return Err(format!(
-                            "footer field {id} of {shape:?} at byte {at} repeats a field read \
+                            "{subject} field {id} of {shape:?} at byte {at} repeats a field read \
                              before"
                         ));
                     }
@@ -648,13 +721,16 @@ impl Walk<'_> {
                         }
                         (Shape::KeyValue, 1, Value::Bytes(range)) => element.key = Some(range),
                         (Shape::KeyValue, 2, Value::Bytes(range)) => element.value = Some(range),
+                        (Shape::PageHeader, 3, Value::Int(n)) => {
+                            element.page_size = Some(n as i32);
+                        }
                         _ => {}
                     }
                 }
                 Field::Skip => self.skip(code, SKIP_DEPTH)?,
                 Field::Refuse(what) => {
                     return Err(format!(
-                        "footer field {id} of {shape:?} at byte {at} carries {what}"
+                        "{subject} field {id} of {shape:?} at byte {at} carries {what}"
                     ));
                 }
             }
@@ -664,6 +740,7 @@ impl Walk<'_> {
     }
 
     fn read_value(&mut self, kind: Kind, shape: Shape, id: i16) -> Result<Value, String> {
+        let subject = self.subject;
         match kind {
             // The value is the header type.
             Kind::Bool => Ok(Value::Other),
@@ -685,7 +762,7 @@ impl Walk<'_> {
                 let at = self.pos;
                 if self.byte()? != T_STOP {
                     return Err(format!(
-                        "footer field {id} of {shape:?} at byte {at} is not an empty struct"
+                        "{subject} field {id} of {shape:?} at byte {at} is not an empty struct"
                     ));
                 }
                 Ok(Value::Other)
@@ -696,9 +773,10 @@ impl Walk<'_> {
 
     /// A binary's bytes, as their range in the footer.
     fn binary(&mut self) -> Result<Range<usize>, String> {
+        let subject = self.subject;
         let len = self.varint()?;
-        let n =
-            usize::try_from(len).map_err(|_| format!("footer binary length {len} does not fit"))?;
+        let n = usize::try_from(len)
+            .map_err(|_| format!("{subject} binary length {len} does not fit"))?;
         self.advance(n)?;
         Ok(self.pos - n..self.pos)
     }
@@ -723,17 +801,18 @@ impl Walk<'_> {
 
     /// A known list: the decoder reads `elem` for every declared element.
     fn read_list(&mut self, elem: Elem, shape: Shape, id: i16) -> Result<(), String> {
+        let subject = self.subject;
         let at = self.pos;
         let list = (shape, id);
         if list == (Shape::FileMetaData, 4) && self.leaves.is_none() {
             return Err(format!(
-                "footer row groups at byte {at} come before the schema"
+                "{subject} row groups at byte {at} come before the schema"
             ));
         }
         let (code, count) = self.list_header()?.unwrap_or((elem.code(), 0));
         if code != elem.code() {
             return Err(format!(
-                "footer list at byte {at} in field {id} of {shape:?} has element type {code}, \
+                "{subject} list at byte {at} in field {id} of {shape:?} has element type {code}, \
                  where the decoder reads {elem:?}"
             ));
         }
@@ -746,7 +825,7 @@ impl Walk<'_> {
             (Shape::FileMetaData, 4) => {
                 if declared > MAX_ROW_GROUPS {
                     return Err(format!(
-                        "footer list at byte {at} declares {declared} row groups, more than \
+                        "{subject} list at byte {at} declares {declared} row groups, more than \
                          the decoder's {MAX_ROW_GROUPS}"
                     ));
                 }
@@ -757,7 +836,7 @@ impl Walk<'_> {
             (Shape::RowGroup, 1) => {
                 if self.leaves != Some(declared) {
                     return Err(format!(
-                        "footer row group at byte {at} has {count} column chunks for {} columns",
+                        "{subject} row group at byte {at} has {count} column chunks for {} columns",
                         self.leaves.unwrap_or_default()
                     ));
                 }
@@ -809,10 +888,11 @@ impl Walk<'_> {
     /// Skip a value of header type `code` as the decoder's `skip_till_depth`
     /// does, with `depth` levels left.
     fn skip(&mut self, code: u8, depth: u8) -> Result<(), String> {
+        let subject = self.subject;
         let at = self.pos;
         if depth == 0 {
             return Err(format!(
-                "footer nests deeper than {SKIP_DEPTH} levels at byte {at}"
+                "{subject} nests deeper than {SKIP_DEPTH} levels at byte {at}"
             ));
         }
         match code {
@@ -839,12 +919,12 @@ impl Walk<'_> {
                 // byte. The walk does not skip a set or a map.
                 if element == T_BOOL_TRUE || element == T_BOOL_FALSE {
                     return Err(format!(
-                        "footer list at byte {at} holds booleans in a field the decoder skips"
+                        "{subject} list at byte {at} holds booleans in a field the decoder skips"
                     ));
                 }
                 if code == T_SET || element == T_SET || element == T_MAP {
                     return Err(format!(
-                        "footer set or map at byte {at} is in a field the decoder skips"
+                        "{subject} set or map at byte {at} is in a field the decoder skips"
                     ));
                 }
                 for _ in 0..count {
@@ -859,11 +939,11 @@ impl Walk<'_> {
                     self.count_fits(count, 2, "map")?;
                 }
                 Err(format!(
-                    "footer set or map at byte {at} is in a field the decoder skips"
+                    "{subject} set or map at byte {at} is in a field the decoder skips"
                 ))
             }
             other => Err(format!(
-                "footer has unknown compact type {other} at byte {at}"
+                "{subject} has unknown compact type {other} at byte {at}"
             )),
         }
     }
@@ -891,8 +971,10 @@ mod tests {
     use datafusion::arrow::ipc::root_as_message_with_opts;
     use flatbuffers::VerifierOptions;
     use parquet::arrow::{ArrowWriter, encode_arrow_schema};
+    use parquet::basic::PageType;
     use parquet::file::metadata::{KeyValue, ParquetMetaDataReader, SortingColumn};
-    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use proptest::prelude::*;
     use ravel_memory::MemoryBudget;
 
@@ -2128,6 +2210,109 @@ mod tests {
         value.extend([0x10 | T_LIST, 0x25, 1, 2]);
         value.push(T_STOP);
         assert_eq!(passes(&skipped_field(T_STRUCT, &value)), Ok(()));
+    }
+
+    /// Every column chunk of every writer file, and of one written with
+    /// version 2 data pages carrying page statistics, walks to as many
+    /// page headers as the parquet page reader reads from it.
+    #[test]
+    fn writer_page_headers_walk_page_for_page() {
+        let v2 = write(
+            Schema::new(vec![
+                ArrowField::new("a", DataType::Int64, false),
+                ArrowField::new("b", DataType::Utf8, true),
+            ]),
+            vec![ints(500), strings(500)],
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_2_0)
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .set_write_page_header_statistics(true)
+                .set_data_page_row_count_limit(50)
+                .set_write_batch_size(50)
+                .build(),
+        );
+        let files = writer_files().iter().map(|(name, bytes)| (*name, bytes));
+        let mut types = Vec::new();
+        for (name, bytes) in files.chain([("version 2 pages", &v2)]) {
+            let reader = SerializedFileReader::new(bytes.clone()).expect(name);
+            for (g, group) in reader.metadata().row_groups().iter().enumerate() {
+                for (c, chunk) in group.columns().iter().enumerate() {
+                    let start = chunk
+                        .dictionary_page_offset()
+                        .unwrap_or_else(|| chunk.data_page_offset());
+                    let start = usize::try_from(start).expect(name);
+                    let end = start + usize::try_from(chunk.compressed_size()).expect(name);
+                    let walked = check_page_headers(&bytes[start..end])
+                        .unwrap_or_else(|err| panic!("{name}: {err}"));
+                    let mut pages = reader
+                        .get_row_group(g)
+                        .and_then(|group| group.get_column_page_reader(c))
+                        .expect(name);
+                    let mut read = 0;
+                    while let Some(page) = pages.get_next_page().expect(name) {
+                        types.push(page.page_type());
+                        read += 1;
+                    }
+                    assert_eq!(walked, read, "{name}: row group {g}, column {c}");
+                }
+            }
+        }
+        for kind in [
+            PageType::DICTIONARY_PAGE,
+            PageType::DATA_PAGE,
+            PageType::DATA_PAGE_V2,
+        ] {
+            assert!(types.contains(&kind), "no {kind:?} page was walked");
+        }
+    }
+
+    /// A page header whose skipped field holds a list of doubles longer
+    /// than the bytes left is refused, at the top level and inside each
+    /// page type's own header. The page reader skips such a list one
+    /// element at a time past the end of its input.
+    #[test]
+    fn a_skipped_list_longer_than_the_chunk_is_refused_in_every_page_header() {
+        let list = |field_header: u8| {
+            let mut header = vec![0x15, 0x00, 0x15, 0x02, 0x15, 0x02, field_header];
+            header.push(0xf0 | T_DOUBLE);
+            header.extend(uvarint(1_000_000));
+            header
+        };
+        assert_eq!(
+            check_page_headers(&list(0xc0 | T_LIST)).expect_err("refused"),
+            "page at byte 0: page header list at byte 11 declares 1000000 elements with 0 bytes left"
+        );
+        for nested in 5..=8_u8 {
+            let mut header = list(((nested - 3) << 4) | T_STRUCT);
+            header.insert(7, 0xf0 | T_LIST);
+            assert_eq!(
+                check_page_headers(&header).expect_err("refused"),
+                "page at byte 0: page header list at byte 12 declares 1000000 elements with 0 bytes left",
+                "field {nested}"
+            );
+        }
+    }
+
+    /// A page header whose skipped field holds a list of doubles the bytes
+    /// left can hold walks, at the top level and inside each page type's
+    /// own header, and the walk finds the page after it.
+    #[test]
+    fn a_skipped_list_that_fits_walks_in_every_page_header() {
+        let page = |skipped: &[u8], stops: usize| {
+            let mut page = vec![0x15, 0x00, 0x15, 0x02, 0x15, 0x02];
+            page.extend(skipped);
+            page.push(0x20 | T_DOUBLE);
+            page.extend([0; 16]);
+            page.extend(vec![T_STOP; stops]);
+            page.push(0xaa);
+            page
+        };
+        let chunk = page(&[0xc0 | T_LIST], 1).repeat(2);
+        assert_eq!(check_page_headers(&chunk), Ok(2));
+        for nested in 5..=8_u8 {
+            let chunk = page(&[((nested - 3) << 4) | T_STRUCT, 0xf0 | T_LIST], 2).repeat(2);
+            assert_eq!(check_page_headers(&chunk), Ok(2), "field {nested}");
+        }
     }
 
     proptest! {

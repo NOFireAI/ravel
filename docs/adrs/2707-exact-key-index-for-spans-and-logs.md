@@ -62,7 +62,8 @@ What it shows:
    target, so the estimate is under about 300 B/span against 21.5 B/span
    stored, a ratio under about 14x (derived). Every object waited out the
    60 s age trigger, projecting about 3.3 h. The derived target must make the
-   size trigger fire as the last in-flight batch lands (decision 9).
+   size trigger fire as the last in-flight batch lands (decision 9;
+   superseded: see the depth margin amendment below).
 4. **Once objects are large or folded, every lookup reads the window
    whole.** Folded: 4.35 GB per lookup for 10 spans, at 1 h and at 24 h,
    because compaction groups by ingest hour and this bulk load put 24 h of
@@ -639,7 +640,7 @@ Stage 0 figures are the band: 80,003 GETs at 80,000 records, 803 at 800.
   under about 14x, never fired.
 - **Pipeline depth from host memory.** `--pipeline-depth` defaults to
   `ceil(DEFAULT_OBJECT_ROWS x shards / batch_rows)`, so the size trigger
-  fires as the last in-flight batch lands, bounded above by
+  fires as the last in-flight batch lands (superseded: see the depth margin amendment below), bounded above by
   `--load-memory-bytes / (batch_rows x est_bytes_per_row)`. When the bound
   binds, objects close smaller and the report says which trigger closed
   them.
@@ -1258,3 +1259,90 @@ not probed. `services/ravel-server/tests/sql_logs_key_index_probe_bound.rs`
 pins both routes, the single whole read, and the threshold.
 
 Refs: #3117, #2961, #2762
+
+## Amendment (issue #3119): the derived depth runs a quarter past the rows bound
+
+<!-- amendment-applies: sections="9. `ravel-cli load` defaults for every signal (ADR-2614 decision 6's default is retired)" pointer="depth margin amendment" -->
+<!-- amendment-supersedes: phrase="as the last in-flight batch lands" pointer="depth margin amendment" -->
+
+T12 measured the default spans load at 828 objects with depth 438 and
+size 390 in the trigger mix (the T12 acceptance amendment above). The
+cause is the depth rule, not the target or the estimate. A window of
+exactly `ceil(DEFAULT_OBJECT_ROWS x shards / batch_rows)` batches holds
+`shards x DEFAULT_OBJECT_ROWS` rows, one target per shard on average, so
+every shard that drew less than its share of a window is still short of
+the target when the depth flush closes it: about half the shards on each
+window, and the size trigger cannot fire as the last in-flight batch
+lands on more than `shards - 1` of them. Each such depth flush also
+leaves a fragment on the shards that were just past a size flush, which
+is where the 28 objects above 800 come from.
+
+Reproduced in process on 4 shards (10 M spans, 1 M traces of 10 spans,
+random trace ids, uniform estimate; 40 objects of 250,000 spans is the
+ideal), varying one knob at a time from the default geometry:
+
+| arm | depth | objects | size | depth flushes | end of input |
+|---|---|---|---|---|---|
+| default (rows bound) | 100 | 41 | 21 | 20 | 0 |
+| rows bound + 1 | 101 | 45 | 34 | 7 | 4 |
+| rows bound x 1.25 | 125 | 40 | 36 | 0 | 4 |
+| rows bound x 2 | 200 | 40 | 36 | 0 | 4 |
+| `--batch-rows 100000` | 10 | 40 | 21 | 19 | 0 |
+| `--batch-rows 1000000` | 1 | 40 | 21 | 19 | 0 |
+| target x 0.95 | 100 | 44 | 40 | 0 | 4 |
+
+The depth margin moves the trigger mix and `--batch-rows` moves only the
+write count. A depth between the rows bound and the full quarter closes
+most objects on size but not all of them: at 101 the shards that drew
+less than their share of a window still close on depth, and that share
+falls as the depth approaches the quarter. Lowering the target also hands the mix to the size trigger,
+but it moves every object 5% below 250,000 rows and wrote 10% more
+objects. The load time did not follow the write count: on 20 M spans in
+an optimised build, 10,000-, 100,000- and 1,000,000-row batches took
+28.9, 28.9 and 32.0 s, so the default `--batch-rows` stays 10,000.
+
+The rows bound of decision 9 is now `ceil(DEFAULT_OBJECT_ROWS x shards /
+batch_rows)` plus a quarter of it, rounded up
+(`services/ravel-cli/src/load/geometry.rs`, `rows_bound_depth`), still
+lowered to the memory bound and capped at 1,024. At the defaults that is
+125 batches on 4 shards and 32 on one. The margin rounds up, so a rows
+bound of 1 gives a depth of 2 and a rows bound of 2 gives 3. The margin
+applies only while the depth flush runs (a derived target,
+`LoadGeometry::depth_flush_enabled`): with an explicit `--target-bytes`,
+`1` included, the depth flush is off, the margin would only add in-flight
+memory, and the derived depth stays the plain rows bound.
+
+A shard of evenly spread rows reaches the target before its window comes
+due, so the size trigger closes every object but the end-of-input tails.
+A window of the derived depth holds `depth x batch_rows / shards` rows
+per shard on an even spread: 312,500 at the defaults on 4 shards and
+320,000 on one. Rows narrower than the first batch's need more than
+250,000 rows to reach the target; while they reach it inside one window
+(on 4 shards at the defaults, rows whose estimate per row is at least
+about 80% of the first batch's) the size trigger still closes them,
+between 250,000 and 312,500 rows. Only rows narrower than that close on
+depth, at the window's 312,500 rows (4 shards) or 320,000 (one shard),
+where the old rule closed them at 250,000. In-process, the margin also took 16% off
+the load time (29.1 and 29.4 s against 24.4 and 24.9 s on 20 M spans),
+because a depth flush blocks the loader until every shard has published.
+`spans_default_geometry_closes_the_majority_by_size` pins the mix on a
+2.1 M-span corpus: 8 size and 4 end-of-input objects, against 5 size,
+4 depth and 4 end-of-input at the old rule.
+
+Above the default batch the margin costs object size: when one shard's
+slice is close to the target, a slice that falls just short now waits
+for the next one instead of being closed by the depth flush, so an
+object holds up to two slices. On 20 M spans in 1,000,000-row batches
+(4 shards, one slice about one target, a rows bound of 1 and so a depth
+of 2) the load wrote 54 objects
+against 80 at the old rule, 52 closed by size and 2 at the end of the
+input.
+
+For the 200 M-span lane at the defaults this predicts 20,000 writes of
+10,000 spans, a derived depth of 125 (rows bound 100), about 800 objects
+with the size trigger naming at least 80% of them, and a load time near
+240 s. That is still over the 165 s band: the remaining time is the
+loader's serial decode and its per-batch wait for the shards to merge,
+which this amendment does not change.
+
+Refs: #2961, #3072, #3119

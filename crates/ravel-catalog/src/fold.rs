@@ -1711,7 +1711,14 @@ impl Catalog {
                 seal_through_hour,
             )
             .await;
-        self.record_fold_outcome(signal, now_ns, result.is_ok());
+        self.record_fold_outcome(
+            signal,
+            now_ns,
+            result
+                .as_ref()
+                .ok()
+                .map(|report| report.column_stats_dictionaries_dropped),
+        );
         result
     }
 
@@ -4893,13 +4900,14 @@ pub(crate) mod tests {
                     end_ns: 50 * NS_PER_HOUR,
                 },
                 50 * NS_PER_HOUR,
+                &crate::ColumnStatsRequest::summary_only(),
                 &acc,
             )
             .await
             .expect("load ok")
             .expect("stats present");
         assert_eq!(
-            loaded.by_content_hash.len(),
+            loaded.content_hash_segments().count(),
             3,
             "the reused baseline plus the new segment cover all three"
         );
@@ -6450,6 +6458,115 @@ pub(crate) mod tests {
             assert_eq!(
                 columns[i].sum, reference_columns[i].sum,
                 "column {i} sum stays exact"
+            );
+        }
+    }
+
+    /// Issue #3244: [`Catalog::fold_column_stats_dictionaries_dropped`] is the
+    /// sum of the successful folds' reported
+    /// [`FoldReport::column_stats_dictionaries_dropped`], in the folded
+    /// signal's own slot. The fixture is the one above: one part whose two
+    /// largest dictionaries must drop to fit an injected ceiling, so a counter
+    /// that added one per part or one per degraded part reads 1, not 2. A
+    /// second, no-op fold reports 0 drops and must leave the counter at 2.
+    /// The other folded signals were never folded and read exactly 0.
+    #[tokio::test]
+    async fn fold_dictionary_drop_counter_sums_the_reported_drops_per_signal() {
+        let rows = 300;
+        let reference_store = Arc::new(MemoryStore::new());
+        set_three_column_config(reference_store.as_ref()).await;
+        publish_logs_segment_wide(reference_store.as_ref(), 0, 10, rows).await;
+        Catalog::new(reference_store.clone(), config(1))
+            .expect("catalog")
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold");
+        let reference_ref = read_logs_head(reference_store.as_ref()).await.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let mut post_drop_segments = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes")
+        .segments;
+        for column in &mut post_drop_segments[0].columns {
+            if column.name == "col_a" || column.name == "col_b" {
+                column.dictionary_present = false;
+                column.dictionary.clear();
+            }
+        }
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        let store = Arc::new(MemoryStore::new());
+        set_three_column_config(store.as_ref()).await;
+        publish_logs_segment_wide(store.as_ref(), 0, 10, rows).await;
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+        assert_eq!(
+            catalog.fold_column_stats_dictionaries_dropped(Signal::Logs),
+            0
+        );
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(report.column_stats_dictionaries_dropped, 2);
+        assert_eq!(report.parts_total, 1, "one part, so drops != parts");
+        assert_eq!(
+            catalog.fold_column_stats_dictionaries_dropped(Signal::Logs),
+            report.column_stats_dictionaries_dropped,
+            "the counter equals the report's figure exactly"
+        );
+
+        let no_op = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds");
+        assert!(
+            no_op.no_op,
+            "nothing new sealed, so the second fold is a no-op"
+        );
+        assert_eq!(no_op.column_stats_dictionaries_dropped, 0);
+        assert_eq!(catalog.fold_cycles(Signal::Logs), 2);
+        assert_eq!(
+            catalog.fold_column_stats_dictionaries_dropped(Signal::Logs),
+            2,
+            "a fold that dropped nothing adds nothing"
+        );
+        for untouched in [Signal::Metrics, Signal::Spans] {
+            assert_eq!(
+                catalog.fold_column_stats_dictionaries_dropped(untouched),
+                0,
+                "{untouched:?} was never folded"
             );
         }
     }

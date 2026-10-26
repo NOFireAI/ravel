@@ -116,7 +116,9 @@ ratio of 0.058 (ADR-2023 decision 4), and no change may alter an answer.
 
 ## Decision
 
-Seven decisions, in delivery order. Each names the design change it
+Seven decisions, in delivery order (decision 2 is withdrawn for the
+competing entry and kept only for a labelled variant, see the decision 2
+fairness amendment). Each names the design change it
 carries, its class, what it does not change, and its own pre-registered
 A/B band. Every A/B compares all 43 statements against its A box under the
 answer comparison rule in Measurement, and a difference stops the change.
@@ -173,7 +175,9 @@ class. Cold sum (model): minus 28 s at `O = 0.5` (277 to 249 s), 44 s at
 `O = 0.8`, 2 s at `O = 0`.
 
 Pre-registered A/B (run 2, shared with decision 2 because their stamps are
-disjoint and decision 2's cold effect is inside noise). Stamps:
+disjoint and decision 2's cold effect is inside noise). Run 2's load did
+not fold, and any later measurement of this decision runs unfolded (see
+the decision 2 fairness amendment). Stamps:
 `bloom-scope show` prints `text`; one object's `rlog inspect` shows a
 BLOOM section under 8 KB and one row group; the binary digest equals the A
 box's. Each figure present exactly once:
@@ -197,6 +201,9 @@ the first; the mutation "`probe_window_covers` returns true" fails the
 second.
 
 ### 2. The entry's load folds the catalog before it exits (design change 2)
+
+Withdrawn for the competing entry: see the decision 2 fairness amendment
+at the end of this ADR.
 
 Class: loader flag, shipped in 0.24.0 (`--fold-after-load`,
 `services/ravel-cli/src/main.rs:866-867`,
@@ -734,7 +741,9 @@ Follow-ups the design leaves to the builder or to a later pass:
   `rlog inspect` (`RlogCommand::Inspect`,
   `services/ravel-cli/src/main.rs:1793-1794`) prints section sizes and the
   row-group count; `rlog footprint` emits no row-group count.
-- Decision 2: the fold's load-time cost, and whether
+- Decision 2 (withdrawn for the competing entry, see the decision 2
+  fairness amendment; open only for a labelled variant): the fold's
+  load-time cost, and whether
   `load_fold_after_load_sql_e2e.rs` already pins the seal-through hour
   against the load's highest ingest hour.
 - Decision 4: the amendment text and marker, the golden regeneration
@@ -809,7 +818,8 @@ Follow-ups the design leaves to the builder or to a later pass:
   tuned entry, its own separately labelled result; the stock result is
   what this ADR moves.
 - Also out of this round, each a format change: chunk order inside a row
-  group (the format doc states ascending column id,
+  group (no longer out, and not a format change: see the decision 8 chunk
+  order amendment below; the format doc states ascending column id,
   `docs/log-segment-format.md:470-476`; byte order puts URL at slot 87 and
   UserID at 99 of 104, so the change would help); larger blocks (coarsens
   every block-level index 1:1, ADR-0699 rejected alternative 1); an
@@ -828,7 +838,7 @@ before it:
 
 | run | carries | A box | B box |
 |---|---|---|---|
-| 2 | decisions 1 and 2 (fork PR 1) | current `main` with #3221, stock `load` (band both rows of decision 1 if #3221 has not merged) | the same commit, fork PR 1 |
+| 2 | decision 1 (fork PR 1; decision 2 withdrawn, see the decision 2 fairness amendment) | current `main` with #3221, stock `load` (band both rows of decision 1 if #3221 has not merged) | the same commit, fork PR 1 |
 | 3 | decision 3 (fork PR 2) | one `main` commit, fork PR 1 | the same commit, fork PR 2 |
 | 4 | decision 4 (Ravel, one PR) | the parent of the first of decision 4's commits as they landed on `main`, fork PR 2 | the last of decision 4's commits as they landed on `main`, fork PR 2 |
 | 5 | decision 6 (fork PR 3), after the stage 1 load stamp | a `main` commit carrying decision 5, fork PR 2 | the same commit, fork PR 3 |
@@ -873,7 +883,8 @@ with its header amended, the reader comments, the test re-pins; gate
 `ravel-cli`, docs; gate `-p ravel-ingest -p ravel-cli`). Each carries a
 `changelog.d` fragment. Fork pull requests: four, one per run row above;
 decision 2 shares fork PR 1 with decision 1 as two independently
-revertible lines.
+revertible lines. The decision 2 fairness amendment withdraws that line
+from the competing entry, so fork PR 1 carries decision 1 alone.
 
 Cumulative cold-sum arithmetic, in delivery order. The anchor is run 1's
 367.2 s. The `O = 0.5 MB` column is the central estimate and is
@@ -888,7 +899,7 @@ show on its own A/B. Every figure below the anchor is predicted.
 | v0.25.1 stock (run 1) | 5.5 | 367.2 (anchor) | 367.2 (anchor) | | measured 2026-10-23, comment 6368995087 |
 | #3219, PR #3221 (landed) | 4.5 | 277 | 303 | 106 | predicted |
 | decision 1, bloom scope `text` | 3.5 | 249 | 301 | 44 | predicted |
-| decision 2, fold after load | 3.5 | 249 (0 to 2 s, not counted) | 301 | 0 to 2 | predicted |
+| decision 2, fold after load (withdrawn, see the decision 2 fairness amendment) | 3.5 | 249 (0 to 2 s, not counted) | 301 | 0 to 2 | predicted |
 | decision 3, zstd 9 | 3.5 | 242 | 294 | 7 (bytes only) | predicted |
 | decision 4, directories at the tail | 2.5 | 216 | 294 (under 0.1 s) | 42 | predicted |
 | decisions 5 and 6, 100 MB one-group objects | 2 over 103 objects | 148 | 286 | 104 | predicted |
@@ -915,3 +926,87 @@ to 4.2 s and 16 to 23 s. The design moves the per-statement floor 2.5x
 with no amplification and 5 to 6x under it, which is why the two sums
 differ so much: request count only matters if the store charges per
 request, in money or in disk bytes.
+
+## Amendment (2026-10-25): decision 2 fairness amendment, the competing entry does not fold
+
+<!-- amendment-applies: sections="Decision|1. The entry's tenant sets bloom scope `text` (design change 1)|2. The entry's load folds the catalog before it exits (design change 2)|Consequences|Measurement" pointer="decision 2 fairness amendment" -->
+
+The owner decided on 2026-10-25 (issue #3244 comment 6397193245, also on
+#3217 and #3243) that the competing ClickBench entry stays stock and
+unfolded. Decision 2 is withdrawn for that entry. A folded variant may be
+published only as a separately labelled result outside the competition,
+which ClickBench's README allows for tuned setups.
+
+The reasons are two rules in ClickBench's README (read on 2026-10-25):
+
+- "You should not wait for cool down after data loading or running
+  OPTIMIZE / VACUUM before the main benchmark queries unless the database
+  strictly requires this." A tenant is folded by the maintain tier only
+  after the seal margin, and #3243 is open because the load's last hour
+  never seals before the sweep. `--fold-after-load` in `./load` runs that
+  maintenance step early. Counting its time inside the load does not
+  change what the step is.
+- "The creation of pre-aggregated tables or indices, projections, or
+  materialized views is not recommended for the purpose of this
+  benchmark." A fold writes a `.cstat` object per part with a value to
+  count dictionary and a stored sum for each declared column, and the
+  metadata aggregate path answers `COUNT(*) WHERE col <> v` (q2) and a
+  `GROUP BY col` count (q8) from the dictionaries, and `SUM(col + k)` (q3,
+  q4) and `AVG(col)` (q30) from the stored sums
+  (`crates/ravel-sql/src/metadata_agg.rs:1-32`). That is a pre-aggregated index, even though the
+  fold builds it for every tenant and not for this benchmark.
+
+The decision 2 A/B that was run (#3243, with the folded catalog's column
+statistics) measured a hot loss, not a gain, because a folded catalog
+re-reads its column statistics on every statement (#3244). That defect is
+being fixed under #3244 for every folded tenant; this amendment does not
+depend on it.
+
+Decisions 1 and 3 to 7 keep their mechanisms. Decision 1's measurement no
+longer pairs with a fold: run 2's load did not fold (its launcher carried
+no fold flag; the fold A/B ran on its own under #3243), and any later
+measurement of decision 1 runs unfolded. Fork PR 1 carries decision 1
+alone. The rules allow the rest: a single clustering key is the
+"clustered (table sorting)" primary key the rules allow, decisions 3 to 6
+change storage layout and compression, and decision 1 narrows an index the
+database builds by itself. The cold-sum table's decision 2 row predicted 0
+to 2 s and was not counted in the stated estimate, so the estimate stands.
+
+## Amendment (2026-10-25): decision 8, a declared chunk order is a writer convention
+
+<!-- amendment-applies: sections="Rejected alternatives" pointer="decision 8 chunk order amendment" -->
+
+The rejected-alternatives bullet that begins "Also out of this round"
+called chunk order inside a row group a format change. The design note on
+#3251 found that it is not. Column ids are per object: the writer assigns
+them over the object's distinct `(name, type)` pairs, and every reader
+resolves a name to its id through that object's FIELD_DIR. FIELD_DIR stays
+sorted by name and the chunks of a row group still ascend by column id;
+only which name gets which id changes. A declared order is therefore a
+writer convention of the same class as decision 4, and it needs no format
+version bump.
+
+### 8. A declared chunk order for the load's RLOG objects
+
+`RlogConfig::chunk_order` lists attribute names that take the lowest
+dynamic column ids, in the given order, ahead of the remaining columns in
+name order, so their chunks sit first and adjacent in every row group. It
+is threaded as `IngestConfig::rlog_chunk_order` and the loader flag
+`--chunk-order`, and it is empty by default, which writes every object
+byte for byte as before. The server's ingest path and the compactor keep
+the default.
+
+The ClickBench load passes the co-projected sets `CounterID`/`EventDate`/
+`IsRefresh`, `SearchPhrase`+`UserID` and `WatchID`/`ClientIP`/`IsRefresh`/
+`ResolutionWidth` as one list that keeps each set contiguous:
+`--chunk-order CounterID,EventDate,IsRefresh,ResolutionWidth,ClientIP,WatchID,SearchPhrase,UserID`.
+
+Expected effect, as the ticket pre-registers it:
+
+- Per-object disk bytes on q9 to q19 and q33 fall by one region's cost,
+  1.5 to 3 MB each (region cost from #3217 comment 6384802590).
+- The cold sum falls by 15 to 35 s (predicted).
+- 43 of 43 answers stay byte-equal (predicted).
+- The hot sum stays inside 54 to 64 s (predicted).
+- Miss condition: disk bytes per object unchanged on those statements
+  (predicted).

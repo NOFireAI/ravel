@@ -244,6 +244,8 @@ pub async fn run(
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
+    group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
     load_memory_bytes: Option<u64>,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -265,6 +267,8 @@ pub async fn run(
         target_bytes,
         max_flush_delay,
         zstd_level,
+        group_target_blocks,
+        chunk_order,
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         ipcrypt,
@@ -367,6 +371,8 @@ pub(crate) async fn run_memory_warning_to(
         target_bytes,
         max_flush_delay,
         zstd_level,
+        RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         load_memory,
         false,
         &IpcryptPolicy::empty(),
@@ -397,6 +403,8 @@ pub(crate) async fn run_fold_warning_to(
     target_bytes: Option<usize>,
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
+    group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -426,6 +434,12 @@ pub(crate) async fn run_fold_warning_to(
     };
     let _ = writeln!(warnings, "{admission_warning}");
     if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_group_target_blocks_warning(group_target_blocks, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_chunk_order_warning(chunk_order, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
     // Every signal's loader resolves the budget once it knows the read-cursor
@@ -540,6 +554,8 @@ pub(crate) async fn run_fold_warning_to(
             None,
             None,
             zstd_level,
+            group_target_blocks,
+            chunk_order,
             Some(memory_options),
             fold_after_load,
             rules,
@@ -644,8 +660,8 @@ fn write_report_warnings(warnings: &mut dyn std::io::Write, report: &LoadReport)
         let _ = writeln!(warnings, "{warning}");
     }
     // The loader's writer uses `RlogConfig::default()` apart from its zstd
-    // level (log_shard.rs), so its per-object dynamic-column budget is
-    // that default.
+    // level and its row-group size (log_shard.rs), so its per-object
+    // dynamic-column budget is that default.
     let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
     for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
         let _ = writeln!(warnings, "{warning}");
@@ -943,6 +959,48 @@ pub(super) fn unused_zstd_level_warning(
             "warning: a {noun} load ignores --zstd-level {}. The level applies only to the \
              RLOG objects a logs load writes.",
             zstd_level.get()
+        )
+    })
+}
+
+/// The warning for a `--group-target-blocks` a metrics or spans load cannot
+/// use, or `None` when the value is the default or the load is a logs load.
+/// The row-group size reaches only the RLOG writer a logs flush runs.
+pub(super) fn unused_group_target_blocks_warning(
+    group_target_blocks: RlogGroupTargetBlocks,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (group_target_blocks != RlogGroupTargetBlocks::DEFAULT).then(|| {
+        format!(
+            "warning: a {noun} load ignores --group-target-blocks {}. The row-group size \
+             applies only to the RLOG objects a logs load writes.",
+            group_target_blocks.get()
+        )
+    })
+}
+
+/// The warning for a `--chunk-order` a metrics or spans load cannot use, or
+/// `None` when the order is empty or the load is a logs load. The order
+/// reaches only the RLOG writer a logs flush runs.
+pub(super) fn unused_chunk_order_warning(
+    chunk_order: RlogChunkOrder,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (chunk_order != RlogChunkOrder::DEFAULT).then(|| {
+        format!(
+            "warning: a {noun} load ignores --chunk-order {}. The chunk order applies only \
+             to the RLOG objects a logs load writes.",
+            chunk_order.get().join(",")
         )
     })
 }

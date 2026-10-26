@@ -2857,11 +2857,10 @@ mod tests {
                 )
             })
             .collect();
-        Arc::new(LoadedColumnStats {
-            segments: std::collections::HashMap::new(),
+        Arc::new(LoadedColumnStats::from_maps(
+            std::collections::HashMap::new(),
             by_content_hash,
-            part_blake3: Vec::new(),
-        })
+        ))
     }
 
     /// Write `values` as one real RLOG object at `key` and return its unstamped
@@ -3231,19 +3230,19 @@ mod tests {
     /// One unstamped segment: five rows carry `code` 1..=5 on the record, three
     /// carry `code = 100` only in the resource attributes. A real fold builds
     /// its `.cstat` entry, asserted to claim `[1, 5]` with the three resource
-    /// rows counted NULL. `NOT (code <> 100)` declines a prune arm in the
-    /// analyzed plan, so `SqlExecutor` loads the `.cstat`; the optimizer then
-    /// simplifies it to `code = 100`, which reaches the scan as a `[100, 100]`
-    /// arm disjoint from the entry.
+    /// rows counted NULL. The loaded entry is handed to the provider directly,
+    /// beside the resolved segment, so it is there to skip on whatever
+    /// `SqlExecutor`'s load gate decides; `code = 100` reaches the scan as a
+    /// `[100, 100]` arm disjoint from the entry.
     ///
     /// Flipped assertions: letting `arm_excludes` fall back to the entry when
     /// there is no stamp (`stamp_coverage(..)` to
     /// `stamp_coverage(..).or_else(|| cstat_coverage(..))`) skips the segment
-    /// on its `.cstat` entry and fails the result assertion (a count of `0`
-    /// where `3` is expected). The last assertion pins that `execute` fetched
-    /// the `.cstat` object, so the test cannot pass because no entry was
-    /// loaded: forcing `SqlExecutor` to skip the load (`true ||` before
-    /// `!self.logs_column_stats_eligible(..)`) fails it.
+    /// on its `.cstat` entry and fails the result assertion (no rows where the
+    /// three `code = 100` rows are expected). The assertion before the run pins
+    /// that the entry joins to the resolved segment through the same
+    /// `segment_column_stats` and `cstat_coverage` the prune reads, so the
+    /// flip has an entry to skip on.
     #[tokio::test]
     async fn a_cstat_entry_alone_never_skips_a_segment_with_resource_level_matches() {
         const NOW_NS: i64 = 4 * 3_600_000_000_000;
@@ -3314,15 +3313,15 @@ mod tests {
                     end_ns: NOW_NS,
                 },
                 NOW_NS,
+                &ravel_catalog::ColumnStatsRequest::summary_only(),
                 &QueryAccounting::new(),
             )
             .await
             .expect("load .cstat")
             .expect("a .cstat object is present");
         let entries: Vec<_> = loaded
-            .by_content_hash
-            .values()
-            .flat_map(|seg| seg.columns.iter().filter(|c| c.name == CODE))
+            .content_hash_segments()
+            .flat_map(|(_, seg)| seg.columns.iter().filter(|c| c.name == CODE))
             .collect();
         assert_eq!(entries.len(), 1, "one .cstat entry for code");
         let code_value = |v: i64| ravel_proto::catalog::v1::ColumnValue {
@@ -3338,39 +3337,53 @@ mod tests {
             "the .cstat entry tallies the record cells only"
         );
 
-        let store = KeyCountingStore::new(Arc::clone(&memory));
-        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
-        let outcome = execute_code_sql(
-            &backend,
-            &tenant,
-            "SELECT COUNT(*) AS n, MIN(code) AS lo, MAX(code) AS hi \
-             FROM logs WHERE NOT (code <> 100)",
-            NOW_NS,
+        let snapshot = catalog
+            .resolve(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: NOW_NS,
+                },
+                &[],
+                NOW_NS,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1, "one resolved segment");
+        let entry = crate::logs_scan::cstat_coverage(
+            &code_declared()[0],
+            &snapshot.segments[0],
+            crate::logs_scan::segment_column_stats(Some(&loaded), &snapshot.segments[0]),
+        )
+        .expect("the .cstat entry joins to the resolved segment");
+        assert_eq!(
+            (entry.min, entry.max),
+            (
+                Some(datafusion::scalar::ScalarValue::Int64(Some(1))),
+                Some(datafusion::scalar::ScalarValue::Int64(Some(5)))
+            ),
+            "the joined entry is the one whose [1, 5] excludes code = 100"
+        );
+        let run = run_pruned(
+            &memory,
+            snapshot.segments,
+            Some(loaded),
+            true,
+            "SELECT ts, body FROM logs WHERE code = 100",
         )
         .await;
-        let batches = outcome.output.batches();
-        let text = datafusion::arrow::util::pretty::pretty_format_batches(batches)
-            .expect("format")
-            .to_string();
-        let want = "\
-+---+-----+-----+
-| n | lo  | hi  |
-+---+-----+-----+
-| 3 | 100 | 100 |
-+---+-----+-----+";
+        let want: BTreeSet<(i64, String)> = (5..8usize).map(|i| code_row(1, i)).collect();
         assert_eq!(
-            text, want,
+            run.rows, want,
             "the three resource-level code = 100 rows are returned"
         );
         assert_eq!(
-            outcome.stats.segments_pruned_by_stats, 0,
+            run.scan_pruned_by_stats,
+            Some(0),
             "the .cstat entry alone must not skip the segment"
         );
-        assert!(store.gets_of(&key) > 0, "the segment is read");
-        assert!(
-            store.gets_with_suffix(".cstat") > 0,
-            "execute loads the .cstat object, so the entry was there to skip on"
-        );
+        assert!(run.store.gets_of(&key) > 0, "the segment is read");
     }
 
     /// Publish and fold the resource-level fixture of
@@ -3510,6 +3523,12 @@ mod tests {
         ),
     ];
 
+    /// How many leading statements of [`RESOURCE_CODE_STATEMENTS`]
+    /// (`MIN`/`MAX` and `COUNT(code)`) `SqlExecutor`'s load gate does not load
+    /// the `.cstat` for: the stamp answers them and no `.cstat` reader takes
+    /// them.
+    const STAMP_ANSWERED_STATEMENTS: usize = 2;
+
     /// One statement of [`RESOURCE_CODE_STATEMENTS`] as `SqlExecutor::execute`
     /// ran it: the formatted result, whether the `.cstat` object was fetched,
     /// and whether the segment's data object was.
@@ -3552,11 +3571,10 @@ mod tests {
     /// statistic of a declared column from that entry: the entry tallies the
     /// record-level cells only, so it misses the three rows whose `code`
     /// comes from the resource. Every statement reads the segment and returns
-    /// the exact answer, with the `.cstat` object loaded each time.
+    /// the exact answer, with the `.cstat` object loaded for every statement
+    /// but `MIN`/`MAX` and `COUNT(code)`.
     ///
-    /// Flipped assertions: with `.cstat` coverage in
-    /// `segment_declared_coverage` (the code before this test) MIN/MAX reads
-    /// `1 | 5` and the segment is not read; calling `reconciled_column_stat`
+    /// Flipped assertions: calling `reconciled_column_stat`
     /// in place of `merged_view_entry` makes the SUM `15`, the not-equal count
     /// `4`, and the GROUP BY a NULL group of 3 in place of the `100` group,
     /// each without reading the segment.
@@ -3570,10 +3588,11 @@ mod tests {
         let got = run_resource_code_statements(&memory, &tenant, &key, NOW_NS).await;
         let want: Vec<StatementRun> = RESOURCE_CODE_STATEMENTS
             .iter()
-            .map(|(sql, result)| StatementRun {
+            .enumerate()
+            .map(|(i, (sql, result))| StatementRun {
                 sql,
                 result: result.to_string(),
-                cstat_loaded: true,
+                cstat_loaded: i >= STAMP_ANSWERED_STATEMENTS,
                 segment_read: true,
             })
             .collect();
@@ -3581,16 +3600,15 @@ mod tests {
     }
 
     /// The same segment with a stamp: the stamp answers MIN, MAX and
-    /// `COUNT(code)` with no data GET, although the `.cstat` entry differs
-    /// from it in all three figures, and the shapes only the entry's
-    /// dictionary or sum can answer read the segment, since the stamp does not
-    /// match the entry. The difference is the expected one between a
-    /// record-level entry and the merged view, so it is not treated as a
-    /// carrier conflict and does not decline the stamp.
+    /// `COUNT(code)` with no data GET and no `.cstat` GET, and the shapes only
+    /// the entry's dictionary or sum can answer load the entry and read the
+    /// segment, since the stamp does not match the entry. The difference is
+    /// the expected one between a record-level entry and the merged view, so
+    /// it is not treated as a carrier conflict and does not decline the stamp.
     ///
-    /// Flipped assertions: declining when the stamp and the entry differ (the
-    /// conflict rule `segment_declared_coverage` applied before this test)
-    /// reads the segment for MIN/MAX and `COUNT(code)`; dropping the
+    /// Flipped assertions: loading the `.cstat` for MIN/MAX (the gate's
+    /// former MIN/MAX arm) fails `cstat_loaded` for the first statement;
+    /// dropping the
     /// `agrees_with` check from `merged_view_entry` makes the SUM `15`, the
     /// not-equal count `4`, and the GROUP BY a NULL group of 3.
     #[tokio::test]
@@ -3608,11 +3626,160 @@ mod tests {
             .map(|(i, (sql, result))| StatementRun {
                 sql,
                 result: result.to_string(),
-                cstat_loaded: true,
+                cstat_loaded: i >= STAMP_ANSWERED_STATEMENTS,
                 segment_read: i >= 2,
             })
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// Issue #3244: a load that did not request `code`'s dictionary carries
+    /// the column's summary with its dictionary cleared, and the not-equal
+    /// count declines on it rather than reading the empty dictionary: the
+    /// statement scans the segment and returns the exact count. The same
+    /// segment with the dictionary requested is answered from the statistics
+    /// with no data GET, which shows the decline is the dictionary's absence.
+    ///
+    /// FLIP: drop both the `dictionary_loaded` check and the `dict_total !=
+    /// non_null_count` check from `LogsScanExec::declared_not_equal_count`;
+    /// the summary-only run then answers 5 from an emptied dictionary instead
+    /// of 3 and fails the exact-count assertion. The
+    /// `dictionary_loaded` check alone is not enough to flip: with it removed
+    /// the existing `dict_total` check still declines, since an emptied
+    /// dictionary sums to 0 against a non-zero `non_null_count`.
+    #[tokio::test]
+    async fn a_not_equal_count_declines_without_its_dictionary_and_scans() {
+        const NOW_NS: i64 = 4 * 3_600_000_000_000;
+        const SQL: &str = "SELECT COUNT(*) AS n FROM logs WHERE code <> 3";
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("cstat-no-dictionary".to_string());
+        let config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(
+                code_declared()
+                    .iter()
+                    .map(|d| ravel_catalog::DeclaredTypedColumn {
+                        key: d.key.clone(),
+                        ty: ravel_catalog::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        ravel_catalog::set_tenant_config(memory.as_ref(), &tenant.hash(), &config, 1)
+            .await
+            .expect("tenant config");
+        let values = [Some(1), Some(2), Some(3), Some(3), Some(5)];
+        let key = publish_code_segment(memory.as_ref(), &tenant, 1, &values, true).await;
+
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&memory),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                Uuid::from_u128(0x3244),
+                NOW_NS,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(report.column_stats_part_objects_built, 1);
+        let window = ravel_types::TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let load = |request: ravel_catalog::ColumnStatsRequest| {
+            let catalog = &catalog;
+            let tenant = &tenant;
+            async move {
+                catalog
+                    .load_column_stats(
+                        &tenant.hash(),
+                        ravel_types::Signal::Logs,
+                        window,
+                        NOW_NS,
+                        &request,
+                        &QueryAccounting::new(),
+                    )
+                    .await
+                    .expect("load .cstat")
+                    .expect("a .cstat object is present")
+            }
+        };
+        let summary = load(ravel_catalog::ColumnStatsRequest::summary_only()).await;
+        let with_code =
+            load(ravel_catalog::ColumnStatsRequest::summary_only().with_dictionary(CODE)).await;
+        assert!(!summary.dictionary_loaded(CODE));
+        assert!(with_code.dictionary_loaded(CODE));
+        let snapshot = catalog
+            .resolve(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                window,
+                &[],
+                NOW_NS,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1, "one resolved segment");
+
+        let count = |stats: Arc<LoadedColumnStats>| {
+            let memory = &memory;
+            let segments = snapshot.segments.clone();
+            async move {
+                let store = KeyCountingStore::new(Arc::clone(memory));
+                let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
+                let provider = LogsTableProvider::new(
+                    Snapshot {
+                        segments,
+                        segments_pruned: 0,
+                        pending_erasure: Vec::new(),
+                    },
+                    TenantHash([7u8; 16]),
+                    LogSegmentFetcher::new(backend),
+                    PhaseAccounting::pooled_over(&QueryAccounting::new()),
+                )
+                .with_declared_columns(code_declared())
+                .with_column_stats(Some(stats));
+                let ctx = logs_session(provider).expect("session");
+                let batches = ctx
+                    .sql(SQL)
+                    .await
+                    .expect("plan")
+                    .collect()
+                    .await
+                    .expect("collect");
+                let result = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                    .expect("format")
+                    .to_string();
+                (result, store)
+            }
+        };
+        let want = "\
++---+
+| n |
++---+
+| 3 |
++---+";
+
+        let (answered, answered_store) = count(with_code).await;
+        assert_eq!(answered, want);
+        assert_eq!(
+            answered_store.gets_of(&key),
+            0,
+            "with the dictionary loaded the count is answered from statistics"
+        );
+
+        let (declined, declined_store) = count(summary).await;
+        assert_eq!(declined, want, "the scan returns the exact count");
+        assert!(
+            declined_store.gets_of(&key) > 0,
+            "without the dictionary the count declines and the segment is read"
+        );
     }
 
     /// Only a stamp that no `.cstat` entry contradicts skips a segment by

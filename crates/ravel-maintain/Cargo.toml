@@ -45,6 +45,40 @@ tracing-subscriber = { workspace = true }
 # Builds the points an ingest router flushes in the format-floor acceptance
 # test (ADR-1746), whose audit half runs this crate's census.
 ravel-otlp = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+# The workspace forbids `unsafe_code`, so the allocation bench counts through
+# this crate's instrumented global allocator instead of a hand-rolled one
+# (the same pin six other workspace crates use).
+stats_alloc = "0.1.10"
+# A high-water heap peak for the postings memory bench (issue #3263):
+# `HeapStats::max_bytes` is a running maximum kept inside the allocator,
+# which stats_alloc does not track, without `unsafe` in this crate.
+dhat = "0.3.3"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "compaction_grouping"
+harness = false
+
+[[bench]]
+name = "compaction_grouping_alloc"
+harness = false
+
+[[bench]]
+name = "rlog_postings"
+harness = false
+
+[[bench]]
+name = "rlog_postings_alloc"
+harness = false
+
+[[bench]]
+name = "rlog_postings_dhat"
+harness = false
+
+[[bench]]
+name = "rlog_postings_share"
+harness = false

@@ -1297,35 +1297,53 @@ slices of several batches into one object. With `--target-bytes` unset,
 the loader derives the flush target from the first decoded batch: 250,000
 rows times that batch's estimated bytes per row. While one shard's slice
 of a batch (`--batch-rows` / `--shards` rows) is at most 250,000 rows and
-the memory bound (below) does not lower the pipeline depth, each shard's
-objects hold about 250,000 rows on logs, metrics and spans alike.
-`--batch-rows` (default 10000) then sets the batch size, the memory held
-per batch and the derived pipeline depth, not the object size. A load of
+the memory bound (below) does not lower the pipeline depth below the rows
+bound plus its quarter, each shard's objects close on size, on logs, metrics
+and spans alike. The size trigger is checked once per batch, so an object holds
+250,000 rows plus up to one slice: about 250,000 rows while the slice is
+small against the target (below 252,500 at the defaults on four
+shards), and up to two slices, just under 500,000 rows, when a slice is
+just under 250,000. `--batch-rows` (default 10000) then sets the
+batch size, the memory held per batch and the derived pipeline depth,
+not the object size. A load of
 510,000 rows on one shard writes three objects: two of 250,000 rows closed
 by the size trigger, and the 10,000-row tail published at the end of the
 input.
 
-Three cases fall outside that. When `--batch-rows` / `--shards` is above
-250,000 the rows bound is 1 and every slice is over the target on its
-own, so each object holds one slice, `--batch-rows` / `--shards` rows.
-When the memory bound is lower than the rows bound, the depth flush
-closes each shard's buffer every `--pipeline-depth` batches, so objects
-hold about depth x `--batch-rows` / `--shards` rows, below 250,000.
-When `--batch-rows` / `--shards` is below about 244 the rows bound is
-above the 1,024 cap, so the cap decides the depth and the depth flush
+Three cases fall outside that. When `--batch-rows` / `--shards` is
+250,000 or more the rows bound is 1 and the depth is 2. A slice at or over
+the target closes its object on its own, but shards draw unequal shares of
+each batch, so a slice that falls short waits for the next one: an object
+holds one or two slices, `--batch-rows` / `--shards` rows to twice that.
+When the memory bound is lower than the rows bound plus its quarter, it
+decides the depth. If it is also lower than the rows bound itself, the
+depth flush closes each shard's buffer every `--pipeline-depth` batches,
+so objects hold about depth x `--batch-rows` / `--shards` rows, below
+250,000. A depth between the rows bound and the full quarter closes most
+objects on size, but a window of it leaves the shards that drew less than
+their share of its rows to the depth flush, short of the target; that
+share falls as the depth approaches the quarter.
+When `--batch-rows` / `--shards` is below about 305 the rows bound plus
+its quarter is above the 1,024 cap, so the cap decides the depth. Below
+245 the rows bound itself is above the cap, and the depth flush
 closes each buffer after 1,024 batches: objects hold about 1,024 x
 `--batch-rows` / `--shards` rows (`--batch-rows 500 --shards 4` gives
 about 128,000).
 
 The derived target is a per-row estimate read off one batch. Rows
-narrower than the first batch's never reach it in 250,000 rows; the depth
-flush closes them instead. When the rows bound decided the depth and the
-rows spread evenly across the shards, that object holds about 250,000
-rows anyway; with an uneven spread, the shards that received fewer rows
-close below that, and with a memory-bound or capped depth objects hold
-about depth x `--batch-rows` / `--shards` rows. Only rows wider than the
-first batch's move the size trigger, which then closes objects of fewer
-rows.
+narrower than the first batch's need more than 250,000 rows to reach it.
+When the rows bound decided the depth and the rows spread evenly across
+the shards, one window of the derived depth holds depth x `--batch-rows`
+/ `--shards` rows per shard: 312,500 at the defaults on four shards
+(depth 125) and 320,000 on one (depth 32). Rows that still reach the
+target inside that window close on size, between 250,000 and 312,500
+rows on four shards at the defaults; that is rows whose estimate per row
+is at least about 80% of the first batch's. Narrower rows close on depth,
+at the window's 312,500 rows on four shards (320,000 on one). With an
+uneven spread, the shards that received fewer rows close below that, and
+with a memory-bound or capped depth objects hold at most about depth x
+`--batch-rows` / `--shards` rows. Rows wider than the first batch's reach
+the target sooner and close on size with fewer rows.
 
 Object count is a first-order query-cost variable. Every later query over
 the affected range pays the per-object cost (LIST, footer read, per-object
@@ -1347,6 +1365,25 @@ and more memory held per batch.
 each shard merges several batches' slices into one buffer and flushes it
 as one object once the buffer's estimate reaches the target, so objects
 grow without growing the batch.
+
+A logs object's row group is `--group-target-blocks` consecutive blocks
+(default 32, up to about 262,000 records at 8,192 records per block). An
+object of more than 32 blocks is several row groups at the default, and a
+narrow projection reads one chunk per row group for each column it
+projects, so its candidate chunk reads multiply by the group count. A
+load that raises `--target-bytes` toward about 100 MB stored objects
+raises `--group-target-blocks` with it, to at least the object's block
+count, to keep one row group per object. The cost lands on the load
+first: the writer buffers a whole row group of encoded pages before it
+places any of it, so each in-flight flush holds about one object's
+compressed bytes, times `--shards` and `--max-inflight-flushes`, and none
+of that is charged to `--load-memory-bytes`, which covers the built batches
+only. A group larger than 32 blocks also
+raises the raw bytes a compaction merge holds per input object: a merge
+cursor holds up to two row groups of each input, the one it is decoding
+and one prefetched, and every stream the merge carries fetches its row
+group again, so compacting one-group 100 MB objects reads about 100 MB per
+stream from each input. The compactor's own output keeps 32-block groups.
 
 The target, derived or given, counts the buffer's estimated
 **uncompressed** content (on logs: body, severity text, stream attributes,
@@ -1370,9 +1407,17 @@ batch's ack can wait for later batches to fill the buffer.
 With `--pipeline-depth` unset the loader derives it once the first batch
 is decoded, on every signal, as the lowest of three bounds:
 
-- the rows bound, ceil(250,000 x `--shards` / `--batch-rows`): enough
-  batches for every shard to fill one 250,000-row object. 25 at the
-  defaults on one shard, 100 on four;
+- the rows bound, ceil(250,000 x `--shards` / `--batch-rows`) batches,
+  enough for every shard to fill one 250,000-row object, plus a quarter
+  of it, rounded up, while the depth flush runs (with `--target-bytes`
+  unset). 32 at the defaults on one shard, 125 on four; a rows bound of 1
+  gives 2 and a rows bound of 2 gives 3, which is why a slice just short
+  of the target waits for the next one. The rows of one window of exactly
+  the rows bound add up to one target per shard, so every shard that drew
+  less than its share would still be short when the depth flush closes
+  it; the quarter lets the size trigger close it first. With an explicit
+  `--target-bytes` the depth flush is off, the quarter would only add
+  in-flight memory, and the rows bound is used as it is;
 - the memory bound, `--load-memory-bytes` (or the budget derived from
   host memory when the flag is unset) divided by the estimated object
   bytes of one batch (`--batch-rows` times the first batch's estimated
@@ -1382,8 +1427,9 @@ is decoded, on every signal, as the lowest of three bounds:
   flight.
 
 The summary names the cap when it decided the depth (`cap decided it:
-cap 1024, rows bound <N>, memory bound <N>`), including when the memory
-bound is above the cap.
+cap 1024, rows bound <N> + <N> = <N>, memory bound <N>`), including when
+the memory bound is above the cap. With an explicit `--target-bytes` the
+rows bound prints without the quarter (`rows bound <N>`).
 
 The memory bound compares the budget with the estimate the size trigger
 uses, which is the content of the objects, not the in-memory size of the
@@ -1410,11 +1456,14 @@ task of its own. If the shards have not merged a batch within 30 s on the
 loader's clock, the loader stops reading the counts for the rest of the
 load: size flushes then restart no window, so a depth flush can come
 early but never late, and the summary's `depth realign` line and the
-JSON `realign_gave_up` field report it. With several
-shards, a depth flush also publishes the part of each buffer that has not
-reached the target yet, so a multi-shard load leaves some objects below
-250,000 rows. An explicit `--pipeline-depth` below the rows bound caps
-objects at about depth x `--batch-rows` / `--shards` rows per shard.
+JSON `realign_gave_up` field report it. A depth flush publishes every
+shard's buffer, including the part that has not reached the target yet.
+On rows of one width spread evenly across the shards each shard reaches
+the target before its window comes due, so the size trigger closes
+every object but the tails published at the end of the input, and the
+depth flush is the backstop for rows narrower than the first batch's. An explicit `--pipeline-depth` below
+the rows bound caps objects at about depth x `--batch-rows` / `--shards`
+rows per shard.
 
 An explicit `--target-bytes` turns the depth flush off: buffers close on
 the size trigger, the age trigger or the loader's own flushes, and the
@@ -1424,8 +1473,9 @@ explicit target included: `--max-flush-delay` defaults to 60 s instead of
 the router's 2 s, the end-of-input flush runs once every submitted batch
 has reached its shard, and a failed load flushes its buffered writes
 before waiting on their acks. `--target-bytes 1` without
-`--pipeline-depth` still gets the derived depth, not the earlier default
-of 4; add `--pipeline-depth 4` for that too.
+`--pipeline-depth` still gets the derived depth, the plain rows bound
+without the quarter, not the earlier default of 4; add `--pipeline-depth
+4` for that too.
 
 `--max-flush-delay` defaults to 60s on every signal, so at the defaults
 the size trigger and the depth flush, not the age trigger, close objects.
@@ -1443,7 +1493,7 @@ mix that produced its objects, on logs, metrics and spans alike:
 
 ```text
   flush target     : <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row)
-  pipeline depth   : <N> (rows bound decided it: rows bound <N>, memory bound <N>)
+  pipeline depth   : <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>)
   depth realign    : per shard on size flushes
   flush triggers   : size <N>, age <N>, arrival <N>, depth <N>, manual <N> (total <N>)
     shard   0      : size <N>, age <N>, arrival <N>, depth <N>, manual <N> (total <N>)
@@ -1456,7 +1506,7 @@ one line on stderr, so a long load shows what it resolved without waiting
 for the summary:
 
 ```text
-load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N>, memory bound <N>)
+load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>)
 ```
 
 The flush target names `--target-bytes` when the flag set it. The depth
@@ -1640,6 +1690,35 @@ section that the RLOG objects of a logs load compress with zstd.
   set to anything but 3.
 - `ravel-server` has no matching flag yet. Its log flush writes at the
   default level.
+
+### Chunk order with `--chunk-order`
+
+`--chunk-order <NAME,NAME,...>` (default none) names attribute columns whose
+chunks the RLOG objects of a logs load write first and adjacent in every row
+group, in the given order.
+
+- The named columns take the first dynamic column ids, 10 upward, in the
+  given order. The other attribute columns follow in name order. Chunks
+  inside a row group are stored by ascending column id, so the named
+  columns' chunks sit next to each other right after the fixed columns.
+- Why: a query that projects the named columns together reads them as one
+  chunk run, one region of the object, instead of one region per column.
+  On a single-drive RustFS or MinIO each region costs about 1.5 MB of disk
+  read whatever the range asks for (measured on c6a.4xlarge); a store that
+  serves a range with one file read pays only the bytes asked for.
+- The reader is unaffected. PAGE_DIR gives each chunk's offset, and a query
+  resolves a column name to its id through FIELD_DIR, which stays sorted by
+  name. Objects with and without an order read back the same records.
+- A name the data never carries is skipped. An empty name, a name with
+  leading or trailing spaces, or a name given twice is refused before
+  anything is read.
+- An object with more attribute names than the writer's dynamic column cap
+  gives columns to the first names in the new order. A named column takes a
+  column that a name earlier in the alphabet would otherwise have had, and
+  that name's values are stored in the overflow attributes instead.
+- The order applies only to the objects that the load writes. Compaction
+  writes its objects in name order, with PAGE_DIR still exact for them.
+- A metrics or spans load warns and ignores the flag.
 
 ### Clustering key and bloom scope
 
