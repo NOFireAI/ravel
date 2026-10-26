@@ -45,7 +45,9 @@ use ravel_logseg::record::{
     COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS,
 };
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, read_section, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, LogRecord, RlogConfig, RlogWriter, read_section, stream_attrs_bytes,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -76,8 +78,8 @@ const NEEDLE_EVERY: usize = 100;
 /// objects and the sections would cost no GET of their own.
 const SUFFIX_LEN: u64 = 4096;
 /// Coalesce gap, sized below one `Title` chunk so the `URL` chunks of
-/// consecutive row groups stay separate ranges, as the chunks of a wide
-/// ClickBench object do under the production 64 KiB gap.
+/// consecutive row groups stay separate ranges. At the production 64 KiB they
+/// coalesce across `Title` and the coverage crossover reads both runs whole.
 const COALESCE_GAP: u64 = 1024;
 
 fn declared() -> Vec<DeclaredColumn> {
@@ -130,7 +132,10 @@ fn record(n: usize, i: usize) -> LogRecord {
             AttrValue::Str(filler(seed ^ 0xA5A5, 20 + i % 40)),
         ),
         ("RegionID".to_string(), AttrValue::I64((i % 230) as i64)),
-        ("IsRefresh".to_string(), AttrValue::Bool(i % 3 == 0)),
+        (
+            "IsRefresh".to_string(),
+            AttrValue::Bool(i.is_multiple_of(3)),
+        ),
     ];
     LogRecord {
         stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
@@ -331,10 +336,9 @@ fn regions(object: &[u8]) -> Vec<Region> {
         u64::MAX,
     )
     .expect("decode FIELD_DIR");
-    let page_dir = PageDir::decode(
-        &read_section(object, &section(kind::PAGE_DIR), &cfg).expect("PAGE_DIR"),
-    )
-    .expect("decode PAGE_DIR");
+    let page_dir =
+        PageDir::decode(&read_section(object, &section(kind::PAGE_DIR), &cfg).expect("PAGE_DIR"))
+            .expect("decode PAGE_DIR");
     let blocks = section(kind::BLOCKS);
 
     let mut out = Vec::new();
@@ -433,8 +437,7 @@ async fn fixture() -> Fixture {
 /// fetch's whole-object crossover and projection break-even; every object is
 /// above it. No read cache, so every byte a run reads is a store GET.
 fn executor(fx: &Fixture) -> SqlExecutor {
-    let backend: Arc<dyn ObjectStoreBackend> =
-        Arc::clone(&fx.store) as Arc<dyn ObjectStoreBackend>;
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&fx.store) as Arc<dyn ObjectStoreBackend>;
     let threshold = fx
         .snapshot
         .segments
@@ -551,11 +554,7 @@ fn count(batches: &[RecordBatch]) -> i64 {
 
 /// Print every GET of `run` with the regions it covers.
 fn describe(fx: &Fixture, label: &str, run: &Run) {
-    eprintln!(
-        "== {label}: {} GETs, {} bytes",
-        run.gets.len(),
-        run.bytes()
-    );
+    eprintln!("== {label}: {} GETs, {} bytes", run.gets.len(), run.bytes());
     for g in &run.gets {
         let regions = regions(&fx.objects[&g.key]);
         eprintln!(
@@ -587,7 +586,11 @@ fn difference(gets: &[Get], minus: &[Get]) -> Vec<Get> {
 async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
     let fx = fixture().await;
 
-    let pushed = run(&fx, "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%'").await;
+    let pushed = run(
+        &fx,
+        "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%'",
+    )
+    .await;
     let plain = run(
         &fx,
         "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%' ESCAPE '#'",
@@ -616,7 +619,10 @@ async fn pushed_contains_fetches_the_bloom_section_the_reader_never_reads() {
     // ranges; pushed is the same five plus one.
     let per_key = |run: &Run, key: &str| {
         let gets: Vec<&Get> = run.gets.iter().filter(|g| g.key == key).collect();
-        (gets.len(), gets.iter().map(|g| g.end - g.start).sum::<u64>())
+        (
+            gets.len(),
+            gets.iter().map(|g| g.end - g.start).sum::<u64>(),
+        )
     };
     let expected_per_key: [(usize, u64, usize, u64); OBJECTS] = [
         (5, 118_365, 6, 135_677),
