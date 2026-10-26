@@ -41,7 +41,9 @@
 //!   rather than a silently unasserted figure.
 //! - **Per-query results are the source of truth.** A geometric mean may be
 //!   included but never replaces the per-query rows, and the renderer cannot
-//!   print a summary line without the rows behind it.
+//!   print a summary line without the rows behind it. A version-3 report
+//!   carries no geometric mean at all (decision 6 rules out one figure across
+//!   engines) and is summarized by per-engine denominators instead.
 //! - **Every cost estimate carries the retry caveat** ([`RETRY_CAVEAT`],
 //!   ADR-0927 decision 8, issue #928): request counts are logical-call counts,
 //!   not billed requests, and the caveat is in the rendered output rather than
@@ -545,7 +547,7 @@ fn median(values: &[f64]) -> Option<f64> {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let mid = sorted.len() / 2;
-    Some(if sorted.len() % 2 == 0 {
+    Some(if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
