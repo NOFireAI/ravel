@@ -857,7 +857,7 @@ pub struct SystemIngestResult {
     /// `x-ravel-commit-token` header the replay received (the server joins
     /// one token per shard a request touched with commas). Set only on the
     /// portable Ravel row
-    /// (`tests::the_portable_ravel_row_keeps_the_latest_token_of_every_shard`).
+    /// (`tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_latest_token_of_every_shard`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_tokens_by_shard: Option<BTreeMap<u32, String>>,
     /// `commit_tokens_by_shard`'s tokens joined with commas, in shard order:
@@ -3284,6 +3284,7 @@ fn mimir_sample_needle(point: &LogicalPoint) -> String {
 }
 
 /// An HTTP replay's row and the plan its read-back checks.
+#[derive(Debug)]
 pub struct HttpReplayOutcome {
     /// The report row.
     pub result: SystemIngestResult,
@@ -4013,9 +4014,15 @@ mod tests {
             dropped_histograms: 0,
             histograms_rejected_by_status: BTreeMap::new(),
             retry_exhausted_histograms: 0,
+            histograms_retry_exhausted_by_status: BTreeMap::new(),
             dropped_samples: 0,
             rejected_by_status: BTreeMap::new(),
             retry_exhausted_samples: 0,
+            retry_exhausted_by_status: BTreeMap::new(),
+            unsupported_samples: 0,
+            unsupported_histograms: 0,
+            expected_digests: ClassDigests::default(),
+            accepted_digests: ClassDigests::default(),
             dropped_batches: 0,
             batches: 1,
             retries: 0,
@@ -5272,9 +5279,11 @@ mod tests {
         ingest.accepted_samples = 5;
         ingest.rejected_samples = 1;
         ingest.dropped_samples = 1;
+        ingest.rejected_by_status = BTreeMap::from([(400, 1)]);
         ingest.offered_histograms = 3;
         ingest.accepted_histograms = 2;
         ingest.dropped_histograms = 1;
+        ingest.histograms_rejected_by_status = BTreeMap::from([(400, 1)]);
         check_row_accounting(&ingest, &counts).expect("the row closes");
 
         // A row carrying named exclusions (the pre-change lane) still closes.
@@ -5285,6 +5294,7 @@ mod tests {
         excluding.offered_histograms = 0;
         excluding.accepted_histograms = 0;
         excluding.dropped_histograms = 0;
+        excluding.histograms_rejected_by_status.clear();
         excluding.excluded_native_histogram = 3;
         check_row_accounting(&excluding, &counts).expect("named exclusions close");
 
@@ -5299,7 +5309,7 @@ mod tests {
              excluded_stale_marker = 6 against 10 generated lines",
             "6 offered samples + 0 excluded_stale_marker against 6 scalar + 1 stale marker lines",
             "0 offered histograms + 0 excluded_native_histogram against 3 native histogram lines",
-            "6 offered against 4 accepted + 1 rejected + 1 dropped samples",
+            "6 offered against 4 accepted + 1 rejected + 1 dropped + 0 unsupported samples",
         ] {
             assert!(message.contains(figure), "missing `{figure}` in: {message}");
         }
@@ -5308,8 +5318,9 @@ mod tests {
         unsplit.dropped_samples = 0;
         let err = check_row_accounting(&unsplit, &counts).expect_err("an open split");
         assert!(
-            err.to_string()
-                .contains("7 offered against 5 accepted + 1 rejected + 0 dropped samples"),
+            err.to_string().contains(
+                "7 offered against 5 accepted + 1 rejected + 0 dropped + 0 unsupported samples"
+            ),
             "{err}"
         );
 
@@ -5318,8 +5329,79 @@ mod tests {
         let err = check_row_accounting(&unsplit_histograms, &counts)
             .expect_err("an open histogram split");
         assert!(
-            err.to_string()
-                .contains("3 offered against 2 accepted + 0 rejected + 0 dropped histograms"),
+            err.to_string().contains(
+                "3 offered against 2 accepted + 0 rejected + 0 dropped + 0 unsupported histograms"
+            ),
+            "{err}"
+        );
+
+        // Unsupported points close the split: a row that moves an accepted
+        // histogram to `unsupported_histograms` still closes, and one that
+        // counts it in neither does not.
+        let mut unsupported = ingest.clone();
+        unsupported.accepted_histograms = 1;
+        unsupported.unsupported_histograms = 1;
+        check_row_accounting(&unsupported, &counts).expect("unsupported closes the split");
+        unsupported.unsupported_histograms = 0;
+        let err = check_row_accounting(&unsupported, &counts).expect_err("a silent drop");
+        assert!(
+            err.to_string().contains(
+                "3 offered against 1 accepted + 0 rejected + 1 dropped + 0 unsupported histograms"
+            ),
+            "{err}"
+        );
+    }
+
+    /// Every dropped point is bucketed: `rejected_by_status` summed plus
+    /// `retry_exhausted_*` equals `dropped_*`, for samples and for
+    /// histograms, on every row (the in-process row included, whose maps are
+    /// empty and whose drops are zero).
+    ///
+    /// TO SEE THIS FAIL: drop the status identity clauses from
+    /// `check_row_accounting`; both `expect_err` calls below then pass the row.
+    #[test]
+    fn dropped_points_must_be_bucketed_by_status_or_retry_exhaustion() {
+        let counts = StreamCounts {
+            generated_lines: 10,
+            scalar: 6,
+            native_histogram: 3,
+            stale_marker: 1,
+            malformed: 0,
+        };
+        let mut ingest = ingest_phase(1.0);
+        ingest.stream_counts = counts;
+        ingest.offered_samples = 7;
+        ingest.accepted_samples = 4;
+        ingest.dropped_samples = 3;
+        ingest.rejected_by_status = BTreeMap::from([(400, 1), (422, 1)]);
+        ingest.retry_exhausted_samples = 1;
+        ingest.retry_exhausted_by_status = BTreeMap::from([(503, 1)]);
+        ingest.offered_histograms = 3;
+        ingest.accepted_histograms = 1;
+        ingest.dropped_histograms = 2;
+        ingest.histograms_rejected_by_status = BTreeMap::from([(400, 1)]);
+        ingest.retry_exhausted_histograms = 1;
+        check_row_accounting(&ingest, &counts).expect("every drop is bucketed");
+
+        let mut unbucketed = ingest.clone();
+        unbucketed.retry_exhausted_samples = 0;
+        let err = check_row_accounting(&unbucketed, &counts).expect_err("an unbucketed sample");
+        assert_eq!(err.rejected_by_status, 2);
+        assert_eq!(err.retry_exhausted, 0);
+        assert!(
+            err.to_string().contains(
+                "2 rejected_by_status + 0 retry_exhausted against 3 dropped samples"
+            ),
+            "{err}"
+        );
+
+        let mut unbucketed = ingest.clone();
+        unbucketed.histograms_rejected_by_status.clear();
+        let err = check_row_accounting(&unbucketed, &counts).expect_err("an unbucketed histogram");
+        assert!(
+            err.to_string().contains(
+                "0 histograms_rejected_by_status + 1 retry_exhausted against 2 dropped histograms"
+            ),
             "{err}"
         );
     }
@@ -5619,10 +5701,10 @@ mod tests {
 
         let samples = valid_stream(3, 3);
         let config = HttpReplayConfig {
-            system: "stub".to_string(),
+            receiver: Receiver::Prometheus,
             endpoint: format!("http://{addr}/api/v1/write"),
-            ack_semantics: AckSemantics::Buffered,
             bearer_token: None,
+            tenant: None,
             batch_size: 1,
             max_retries: 2,
             timeout_secs: 5,
@@ -5640,6 +5722,11 @@ mod tests {
         assert_eq!(ingest.dropped_batches, 2);
         assert_eq!(ingest.rejected_by_status, BTreeMap::from([(400u16, 1u64)]));
         assert_eq!(ingest.retry_exhausted_samples, 1);
+        assert_eq!(
+            ingest.retry_exhausted_by_status,
+            BTreeMap::from([(503u16, 1u64)]),
+            "the exhausted batch is keyed by the status it ended on"
+        );
         assert_eq!(ingest.retries, 2, "the 503 batch spent the whole budget");
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -5657,17 +5744,42 @@ mod tests {
         );
     }
 
-    /// The portable Ravel row against a stub `ravel-server`: every request
-    /// carries `Authorization: Bearer <token>`, `last_commit_token` is the
-    /// last `x-ravel-commit-token` the stub returned, histograms land in
-    /// their own class, and the token text appears nowhere in the serialized
-    /// report.
+    /// An encoded commit token for `shard` at `seq`.
+    fn token(shard: u32, seq: u64) -> String {
+        CommitToken {
+            shard,
+            writer_id: uuid::Uuid::from_u128(0x5eed),
+            epoch: 1,
+            seq,
+            ingest_hour_bucket: 488_888,
+        }
+        .encode()
+    }
+
+    /// The `x-ravel-commit-token` header a Ravel-like stub answers request
+    /// `n` (1-based) with: the requests touch different shards, and shard 0
+    /// is written twice.
+    fn ravel_stub_header(n: usize) -> String {
+        match n {
+            1 => format!("{},{}", token(0, 1), token(1, 1)),
+            2 => token(0, 2),
+            _ => token(2, 1),
+        }
+    }
+
+    /// The portable Ravel row against a Ravel-like stub (a 2xx with
+    /// per-shard tokens): every request carries `Authorization: Bearer
+    /// <token>`, `commit_tokens_by_shard` keeps the latest token of every
+    /// shard written, `last_commit_token` is those tokens comma-joined,
+    /// histograms land in their own class, and the bearer text appears
+    /// nowhere in the serialized report.
     ///
     /// TO SEE THIS FAIL: drop the `request.bearer_auth(token)` line in
-    /// `replay_over_http` (the header assertion fails), or keep the first
-    /// token instead of the last (the `tok-3` assertion fails).
+    /// `replay_over_http_with_plan` (the header assertion fails), or keep
+    /// only the last header instead of folding every header by shard in
+    /// `record_commit_tokens` (the by-shard map then holds shard 2 alone).
     #[tokio::test]
-    async fn the_portable_ravel_row_sends_the_bearer_and_keeps_the_last_commit_token() {
+    async fn the_portable_ravel_row_sends_the_bearer_and_keeps_the_latest_token_of_every_shard() {
         use std::sync::Mutex as StdMutex;
 
         let seen: Arc<StdMutex<Vec<Option<String>>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -5689,7 +5801,7 @@ mod tests {
                     };
                     (
                         axum::http::StatusCode::NO_CONTENT,
-                        [(COMMIT_TOKEN_HEADER, format!("tok-{n}"))],
+                        [(COMMIT_TOKEN_HEADER, ravel_stub_header(n))],
                     )
                 }
             }),
@@ -5714,10 +5826,10 @@ mod tests {
             vec![2, 1],
         )));
         let config = HttpReplayConfig {
-            system: "ravel".to_string(),
+            receiver: Receiver::Ravel,
             endpoint: format!("http://{addr}/api/v1/write"),
-            ack_semantics: AckSemantics::DurableOnAck,
             bearer_token: Some(secret.to_string()),
+            tenant: Some("metricsbench".to_string()),
             batch_size: 2,
             max_retries: 0,
             timeout_secs: 5,
@@ -5735,17 +5847,23 @@ mod tests {
         assert_eq!(row.system, "ravel");
         assert_eq!(row.endpoint, format!("http://{addr}/api/v1/write"));
         assert_eq!(row.ack_semantics, AckSemantics::DurableOnAck);
-        assert_eq!(row.last_commit_token.as_deref(), Some("tok-3"));
+        assert_eq!(row.acceptance_basis, Some(AcceptanceBasis::ReadBack));
+        assert_eq!(row.tenant.as_deref(), Some("metricsbench"));
+        let by_shard = BTreeMap::from([(0u32, token(0, 2)), (1, token(1, 1)), (2, token(2, 1))]);
+        assert_eq!(row.commit_tokens_by_shard.as_ref(), Some(&by_shard));
+        let joined = format!("{},{},{}", token(0, 2), token(1, 1), token(2, 1));
+        assert_eq!(row.last_commit_token.as_deref(), Some(joined.as_str()));
         assert_eq!(row.ingest.offered_samples, 4);
         assert_eq!(row.ingest.accepted_samples, 4);
         assert_eq!(row.ingest.offered_histograms, 2);
         assert_eq!(row.ingest.accepted_histograms, 2);
         check_row_accounting(&row.ingest, &row.ingest.stream_counts).expect("closes");
+        check_row_band6(&row).expect("a Ravel-like stub that keeps everything passes band 6");
 
         let report =
             serde_json::to_string(&MetricsIngestReport::new(vec![row])).expect("serialize report");
         assert!(
-            report.contains("\"last_commit_token\":\"tok-3\""),
+            report.contains(&format!("\"last_commit_token\":\"{joined}\"")),
             "{report}"
         );
         assert!(
@@ -5778,10 +5896,10 @@ mod tests {
             .map(LogicalPoint::Sample)
             .collect();
         let config = HttpReplayConfig {
-            system: "ravel".to_string(),
+            receiver: Receiver::Ravel,
             endpoint: format!("http://{addr}/api/v1/write"),
-            ack_semantics: AckSemantics::DurableOnAck,
             bearer_token: None,
+            tenant: None,
             batch_size: 2,
             max_retries: 0,
             timeout_secs: 5,
@@ -5800,6 +5918,675 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A Ravel-like stub whose token header does not decode fails the replay
+    /// rather than publishing an unusable fence.
+    #[tokio::test]
+    async fn an_undecodable_commit_token_is_refused() {
+        let points = class_mix(base_ts_ms());
+        let err = try_replay_stub(
+            Receiver::Ravel,
+            vec![Canned::ok(Some("tok-1".to_string()))],
+            &points,
+            9,
+        )
+        .await
+        .expect_err("an undecodable token");
+        assert!(
+            matches!(&err, LaneError::InvalidCommitToken { value, .. } if value == "tok-1"),
+            "{err:?}"
+        );
+    }
+
+    fn scalar(instance: &str, ts_ms: i64, value: f64) -> LogicalPoint {
+        LogicalPoint::Sample(LogicalSample {
+            metric: "mb_gauge".to_string(),
+            labels: vec![("instance".to_string(), instance.to_string())],
+            ts_ms,
+            value,
+        })
+    }
+
+    /// Every class: series `a` with three scalars then a stale marker 15 s
+    /// after the last, series `b` with three scalars, and two native
+    /// histograms on `mb_native{instance="a"}`. Indexes 3, 5 and 8 are a
+    /// scalar, a histogram and the stale marker.
+    fn class_mix(base: i64) -> Vec<LogicalPoint> {
+        vec![
+            scalar("a", base, 1.0),
+            scalar("b", base, 2.0),
+            LogicalPoint::Histogram(histogram(base, vec![1, 1])),
+            scalar("a", base + 15_000, 1.5),
+            scalar("b", base + 15_000, 2.5),
+            LogicalPoint::Histogram(histogram(base + 15_000, vec![2, 1])),
+            scalar("a", base + 30_000, 1.75),
+            scalar("b", base + 30_000, 2.75),
+            scalar("a", base + 45_000, f64::from_bits(STALE_MARKER_BITS)),
+        ]
+    }
+
+    /// One canned answer of a write stub.
+    #[derive(Clone)]
+    struct Canned {
+        status: u16,
+        body: String,
+        token: Option<String>,
+    }
+
+    impl Canned {
+        fn ok(token: Option<String>) -> Self {
+            Canned {
+                status: 204,
+                body: String::new(),
+                token,
+            }
+        }
+
+        /// A Mimir 400 naming `point` as its rejected sample.
+        fn mimir_400(point: &LogicalPoint) -> Self {
+            Canned {
+                status: 400,
+                body: format!(
+                    "send data to ingesters: failed pushing to ingester ingester-0: \
+                     user=anonymous: the sample has been rejected because another sample with \
+                     the same timestamp, but a different value, has already been ingested \
+                     (err-mimir-sample-duplicate-timestamp). The affected sample has {}",
+                    mimir_sample_needle(point)
+                ),
+                token: None,
+            }
+        }
+    }
+
+    async fn serve(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, server)
+    }
+
+    /// A write stub answering request `n` with `canned[n]`, the last answer
+    /// repeating.
+    fn write_stub(canned: Vec<Canned>) -> axum::Router {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let canned = Arc::new(canned);
+        let requests = Arc::new(AtomicUsize::new(0));
+        axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(move || {
+                let canned = Arc::clone(&canned);
+                let requests = Arc::clone(&requests);
+                async move {
+                    let i = requests
+                        .fetch_add(1, Ordering::SeqCst)
+                        .min(canned.len() - 1);
+                    let answer = canned[i].clone();
+                    let mut response =
+                        axum::response::Response::new(axum::body::Body::from(answer.body));
+                    *response.status_mut() =
+                        axum::http::StatusCode::from_u16(answer.status).expect("status");
+                    if let Some(token) = answer.token {
+                        response.headers_mut().insert(
+                            axum::http::HeaderName::from_static(COMMIT_TOKEN_HEADER),
+                            axum::http::HeaderValue::from_str(&token).expect("header value"),
+                        );
+                    }
+                    response
+                }
+            }),
+        )
+    }
+
+    async fn try_replay_stub(
+        receiver: Receiver,
+        canned: Vec<Canned>,
+        points: &[LogicalPoint],
+        batch_size: usize,
+    ) -> Result<HttpReplayOutcome, LaneError> {
+        let (addr, server) = serve(write_stub(canned)).await;
+        let config = HttpReplayConfig {
+            receiver,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size,
+            max_retries: 0,
+            timeout_secs: 5,
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(points)).await;
+        server.abort();
+        outcome
+    }
+
+    async fn replay_stub(
+        receiver: Receiver,
+        canned: Vec<Canned>,
+        points: &[LogicalPoint],
+        batch_size: usize,
+    ) -> SystemIngestResult {
+        try_replay_stub(receiver, canned, points, batch_size)
+            .await
+            .expect("replay")
+            .result
+    }
+
+    /// One 400 for a whole request, read two ways: Prometheus rejects every
+    /// point of the request; Mimir rejects only the sample its body names
+    /// and accepts the rest.
+    ///
+    /// TO SEE THIS FAIL: make `Receiver::soft_rejects_samples` false for
+    /// Mimir (the Mimir row then drops all nine points), or true for
+    /// Prometheus (its row then accepts eight).
+    #[tokio::test]
+    async fn prometheus_rejects_a_400_request_whole_and_mimir_only_the_named_sample() {
+        let points = class_mix(base_ts_ms());
+        let canned = vec![Canned::mimir_400(&points[3]), Canned::ok(None)];
+
+        let prometheus = replay_stub(Receiver::Prometheus, canned.clone(), &points, 9).await;
+        let ingest = &prometheus.ingest;
+        assert_eq!(prometheus.acceptance_basis, Some(AcceptanceBasis::Acknowledged));
+        assert_eq!(ingest.offered_samples, 7);
+        assert_eq!(ingest.accepted_samples, 0);
+        assert_eq!(ingest.accepted_histograms, 0);
+        assert_eq!(ingest.dropped_samples, 7);
+        assert_eq!(ingest.dropped_histograms, 2);
+        assert_eq!(ingest.rejected_by_status, BTreeMap::from([(400u16, 7u64)]));
+        assert_eq!(
+            ingest.histograms_rejected_by_status,
+            BTreeMap::from([(400u16, 2u64)])
+        );
+        assert_eq!(ingest.dropped_batches, 1);
+        check_row_accounting(ingest, &ingest.stream_counts).expect("band 4 closes");
+
+        let mimir = replay_stub(Receiver::Mimir, canned, &points, 9).await;
+        let ingest = &mimir.ingest;
+        assert_eq!(mimir.acceptance_basis, Some(AcceptanceBasis::Acknowledged));
+        assert_eq!(ingest.accepted_samples, 6);
+        assert_eq!(ingest.accepted_histograms, 2);
+        assert_eq!(ingest.dropped_samples, 1);
+        assert_eq!(ingest.dropped_histograms, 0);
+        assert_eq!(ingest.rejected_by_status, BTreeMap::from([(400u16, 1u64)]));
+        assert!(ingest.histograms_rejected_by_status.is_empty());
+        assert_eq!(ingest.dropped_batches, 1);
+        check_row_accounting(ingest, &ingest.stream_counts).expect("band 4 closes");
+    }
+
+    /// A Mimir 400 whose body names no point of the batch rejects the batch
+    /// whole: an unparseable body is never read as an acceptance.
+    #[tokio::test]
+    async fn a_mimir_400_naming_no_point_of_the_batch_rejects_it_whole() {
+        let points = class_mix(base_ts_ms());
+        let canned = vec![Canned {
+            status: 400,
+            body: "bad request".to_string(),
+            token: None,
+        }];
+        let mimir = replay_stub(Receiver::Mimir, canned, &points, 9).await;
+        assert_eq!(mimir.ingest.accepted_samples, 0);
+        assert_eq!(mimir.ingest.dropped_samples, 7);
+        assert_eq!(mimir.ingest.dropped_histograms, 2);
+        assert_eq!(
+            mimir.ingest.rejected_by_status,
+            BTreeMap::from([(400u16, 7u64)])
+        );
+    }
+
+    /// Mimir's rendering of a rejected sample: Go RFC3339Nano UTC with the
+    /// fraction's trailing zeros trimmed, and the series as its name then
+    /// sorted labels with Go-quoted values.
+    #[test]
+    fn mimir_needles_match_mimirs_rendering() {
+        assert_eq!(go_rfc3339_nano_ms(0), "1970-01-01T00:00:00Z");
+        assert_eq!(go_rfc3339_nano_ms(951_782_400_000), "2000-02-29T00:00:00Z");
+        assert_eq!(
+            go_rfc3339_nano_ms(1_760_000_010_000),
+            "2025-10-09T08:53:30Z"
+        );
+        assert_eq!(
+            go_rfc3339_nano_ms(1_760_000_010_123),
+            "2025-10-09T08:53:30.123Z"
+        );
+        assert_eq!(
+            go_rfc3339_nano_ms(1_760_000_010_100),
+            "2025-10-09T08:53:30.1Z"
+        );
+        let point = LogicalPoint::Sample(LogicalSample {
+            metric: "m".to_string(),
+            labels: vec![
+                ("zone".to_string(), "eu\"1\n".to_string()),
+                ("instance".to_string(), "a".to_string()),
+            ],
+            ts_ms: 1_760_000_010_000,
+            value: 1.0,
+        });
+        assert_eq!(
+            mimir_sample_needle(&point),
+            "timestamp 2025-10-09T08:53:30Z and is from series \
+             m{instance=\"a\", zone=\"eu\\\"1\\n\"}"
+        );
+        let bare = LogicalPoint::Sample(LogicalSample {
+            metric: "m".to_string(),
+            labels: Vec::new(),
+            ts_ms: 1_760_000_025_000,
+            value: 1.0,
+        });
+        assert_eq!(
+            mimir_sample_needle(&bare),
+            "timestamp 2025-10-09T08:53:45Z and is from series m"
+        );
+    }
+
+    /// A VictoriaMetrics 2xx acknowledges native histograms it cannot store:
+    /// they land under `unsupported_histograms`, the row declares the class
+    /// with its citation, and band 6 passes over the classes it stores. The
+    /// same 2xx from Prometheus accepts the histograms.
+    ///
+    /// TO SEE THIS FAIL: make `Receiver::supports` return false for native
+    /// histograms on every receiver; the Prometheus assertions then fail.
+    #[tokio::test]
+    async fn victoriametrics_acknowledges_histograms_it_cannot_store() {
+        let points = class_mix(base_ts_ms());
+        let vm = replay_stub(
+            Receiver::VictoriaMetrics,
+            vec![Canned::ok(None)],
+            &points,
+            4,
+        )
+        .await;
+        assert_eq!(vm.ingest.offered_histograms, 2);
+        assert_eq!(vm.ingest.accepted_histograms, 0);
+        assert_eq!(vm.ingest.unsupported_histograms, 2, "every histogram sent");
+        assert_eq!(vm.ingest.dropped_histograms, 0);
+        assert_eq!(vm.ingest.excluded_native_histogram, 0);
+        assert_eq!(vm.ingest.accepted_samples, 7);
+        assert_eq!(vm.ingest.unsupported_samples, 0);
+        assert_eq!(vm.unsupported_classes.len(), 1);
+        assert_eq!(
+            vm.unsupported_classes[0].class,
+            PayloadClass::NativeHistogram
+        );
+        assert!(
+            vm.unsupported_classes[0]
+                .source
+                .contains("lib/prompb/prompb.go")
+                && vm.unsupported_classes[0].source.contains("v1.115.0"),
+            "{:?}",
+            vm.unsupported_classes
+        );
+        check_row_accounting(&vm.ingest, &vm.ingest.stream_counts).expect("band 4 closes");
+        check_row_band6(&vm).expect("band 6 passes over the stored classes");
+        assert_ne!(
+            vm.ingest.accepted_digests.native_histogram, vm.ingest.expected_digests.native_histogram,
+            "the excluded class is not compared, not faked"
+        );
+
+        let prometheus = replay_stub(Receiver::Prometheus, vec![Canned::ok(None)], &points, 4).await;
+        assert_eq!(prometheus.ingest.accepted_histograms, 2);
+        assert_eq!(prometheus.ingest.unsupported_histograms, 0);
+        assert!(prometheus.unsupported_classes.is_empty());
+        check_row_band6(&prometheus).expect("band 6 passes");
+
+        assert_eq!(
+            vm.ingest.expected_digests, prometheus.ingest.expected_digests,
+            "a row with an excluded class is still offered every class"
+        );
+        check_expected_digests_agree(&[&vm, &prometheus], &PayloadClass::ALL)
+            .expect("one expected set");
+    }
+
+    /// Band 6 fails when a receiver that stores every class drops one point
+    /// of any one class, even though band 4 closes (the drop is counted).
+    ///
+    /// TO SEE THIS FAIL: feed `accepted_digests` from the offered points
+    /// instead of the accepted ones (every case then passes band 6).
+    #[tokio::test]
+    async fn band6_fails_when_a_supporting_receiver_drops_one_point_of_any_class() {
+        let points = class_mix(base_ts_ms());
+        let clean = replay_stub(Receiver::Mimir, vec![Canned::ok(None)], &points, 9).await;
+        check_row_band6(&clean).expect("nothing dropped");
+        for (index, class) in [
+            (3, PayloadClass::Scalar),
+            (5, PayloadClass::NativeHistogram),
+            (8, PayloadClass::StaleMarker),
+        ] {
+            assert_eq!(PayloadClass::of(&points[index]), class);
+            let row = replay_stub(
+                Receiver::Mimir,
+                vec![Canned::mimir_400(&points[index]), Canned::ok(None)],
+                &points,
+                9,
+            )
+            .await;
+            check_row_accounting(&row.ingest, &row.ingest.stream_counts)
+                .expect("the drop is counted");
+            let err = check_row_band6(&row).expect_err("one point dropped");
+            assert!(
+                matches!(&err, Band6Violation::AcceptedDiffers { class: c, .. } if *c == class),
+                "{class:?}: {err}"
+            );
+            for other in PayloadClass::ALL.into_iter().filter(|c| *c != class) {
+                assert_eq!(
+                    row.ingest.accepted_digests.get(other),
+                    row.ingest.expected_digests.get(other),
+                    "{other:?} kept every point"
+                );
+            }
+        }
+    }
+
+    /// Band 6 compares digests, not counts: a row that accepted as many
+    /// scalars as it was sent, but not the same ones, fails.
+    ///
+    /// TO SEE THIS FAIL: compare `accepted_samples` with `offered_samples`
+    /// in `check_row_band6` instead of the digests; the swapped row passes.
+    #[test]
+    fn band6_compares_digests_not_counts() {
+        let base = 1_760_000_010_000;
+        let (a, b, c) = (
+            scalar("a", base, 1.0),
+            scalar("b", base, 2.0),
+            scalar("c", base, 3.0),
+        );
+        let digests = |points: &[&LogicalPoint]| {
+            let mut digester = ClassDigester::default();
+            for point in points {
+                digester.update(point);
+            }
+            digester.finish()
+        };
+        let mut ingest = ingest_phase(1.0);
+        ingest.offered_samples = 2;
+        ingest.accepted_samples = 2;
+        ingest.expected_digests = digests(&[&a, &b]);
+        ingest.accepted_digests = digests(&[&a, &c]);
+        let row = SystemIngestResult::buffered_http_row(
+            "mimir".to_string(),
+            "http://mimir.example/api/v1/push".to_string(),
+            "stub".to_string(),
+            ingest.clone(),
+        );
+        let err = check_row_band6(&row).expect_err("same count, different points");
+        assert!(
+            matches!(
+                err,
+                Band6Violation::AcceptedDiffers {
+                    class: PayloadClass::Scalar,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        let mut same = row.clone();
+        same.ingest.accepted_digests = digests(&[&a, &b]);
+        check_row_band6(&same).expect("the same points pass");
+    }
+
+    /// Two portable rows offered different expected sets for one class fail
+    /// the run, whichever class it is.
+    #[test]
+    fn portable_rows_with_different_expected_digests_fail() {
+        let base = 1_760_000_010_000;
+        let mut digester = ClassDigester::default();
+        for point in class_mix(base) {
+            digester.update(&point);
+        }
+        let expected = digester.finish();
+        let mut ingest = ingest_phase(1.0);
+        ingest.expected_digests = expected.clone();
+        let first = SystemIngestResult::buffered_http_row(
+            "prometheus".to_string(),
+            "http://p/api/v1/write".to_string(),
+            "stub".to_string(),
+            ingest.clone(),
+        );
+        let mut second = first.clone();
+        second.system = "victoriametrics".to_string();
+        check_expected_digests_agree(&[&first, &second], &PayloadClass::ALL).expect("agree");
+
+        let mut diverged = second.clone();
+        let mut other = ClassDigester::default();
+        other.update(&LogicalPoint::Histogram(histogram(base, vec![3])));
+        diverged.ingest.expected_digests.native_histogram = other.finish().native_histogram;
+        let err = check_expected_digests_agree(&[&first, &diverged], &PayloadClass::ALL)
+            .expect_err("histogram sets differ");
+        assert!(
+            matches!(
+                &err,
+                Band6Violation::ExpectedDiverged {
+                    class: PayloadClass::NativeHistogram,
+                    second_system,
+                    ..
+                } if second_system == "victoriametrics"
+            ),
+            "{err}"
+        );
+        check_expected_digests_agree(&[&first, &diverged], &[PayloadClass::Scalar])
+            .expect("only the named classes are compared");
+    }
+
+    /// The unsupported-class table has one entry, VictoriaMetrics plus
+    /// native histograms, and every other receiver stores every class.
+    ///
+    /// TO SEE THIS FAIL: add a second entry to `UNSUPPORTED_CLASSES`, or
+    /// remove the VictoriaMetrics one.
+    #[test]
+    fn the_unsupported_class_table_names_only_victoriametrics_histograms() {
+        assert_eq!(UNSUPPORTED_CLASSES.len(), 1);
+        for receiver in [
+            Receiver::Ravel,
+            Receiver::Prometheus,
+            Receiver::VictoriaMetrics,
+            Receiver::Mimir,
+        ] {
+            for class in PayloadClass::ALL {
+                let unsupported = receiver == Receiver::VictoriaMetrics
+                    && class == PayloadClass::NativeHistogram;
+                assert_eq!(receiver.supports(class), !unsupported, "{receiver:?} {class:?}");
+            }
+            assert_eq!(
+                receiver.unsupported_classes().len(),
+                usize::from(receiver == Receiver::VictoriaMetrics)
+            );
+        }
+    }
+
+    /// The in-process row and a portable row replaying the same points carry
+    /// equal expected digests for every class, the scalar one included.
+    #[tokio::test]
+    async fn the_in_process_and_portable_rows_carry_equal_expected_digests() {
+        let points = class_mix(base_ts_ms());
+        let in_process = replay_into_ravel(&memory_config("t", 4), &mut SlicePoints::new(&points))
+            .await
+            .expect("in-process replay");
+        let portable = replay_stub(
+            Receiver::Ravel,
+            vec![Canned::ok(Some(token(0, 1)))],
+            &points,
+            4,
+        )
+        .await;
+        assert_ne!(
+            in_process.result.ingest.expected_digests.scalar,
+            ClassDigests::default().scalar
+        );
+        assert_eq!(
+            in_process.result.ingest.expected_digests,
+            portable.ingest.expected_digests
+        );
+        assert_eq!(in_process.result.tenant.as_deref(), Some("t"));
+        check_row_band6(&in_process.result).expect("the in-process row keeps every point");
+    }
+
+    /// What a read-back expects follows what was sent and what the receiver
+    /// stores: VictoriaMetrics expects no histogram series and counts none.
+    #[test]
+    fn readback_expectations_follow_what_was_sent_and_what_the_receiver_stores() {
+        let points = class_mix(1_760_000_010_000);
+        let plan = |receiver| {
+            let mut plan = ReadbackPlan::new(receiver);
+            for point in &points {
+                plan.observe(point);
+            }
+            plan.expected()
+        };
+        assert_eq!(
+            plan(Receiver::Ravel),
+            ReadbackExpected {
+                series_count: 3,
+                sample_count: 3,
+                histogram_series_count: Some(1),
+                histogram_sample_count: Some(2),
+                stale_marker_honored: Some(true),
+            }
+        );
+        assert_eq!(
+            plan(Receiver::VictoriaMetrics),
+            ReadbackExpected {
+                series_count: 2,
+                sample_count: 3,
+                histogram_series_count: None,
+                histogram_sample_count: None,
+                stale_marker_honored: Some(true),
+            }
+        );
+    }
+
+    /// A query stub answering the series and query endpoints as a receiver
+    /// that stored `class_mix` would, with `extra_series` added to the
+    /// all-series cardinality; it records every query string it receives.
+    fn query_stub(extra_series: usize, seen: Arc<std::sync::Mutex<Vec<String>>>) -> axum::Router {
+        let pairs = |raw: &Option<String>| -> Vec<(String, String)> {
+            reqwest::Url::parse(&format!("http://stub/?{}", raw.clone().unwrap_or_default()))
+                .expect("query parses")
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        };
+        let seen_series = Arc::clone(&seen);
+        axum::Router::new()
+            .route(
+                "/api/v1/series",
+                axum::routing::get(move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                    let seen = Arc::clone(&seen_series);
+                    async move {
+                        seen.lock().expect("lock").push(raw.clone().unwrap_or_default());
+                        let matcher = pairs(&raw)
+                            .into_iter()
+                            .find(|(k, _)| k == "match[]")
+                            .map(|(_, v)| v)
+                            .unwrap_or_default();
+                        let n = if matcher.contains("mb_native") {
+                            1
+                        } else {
+                            3 + extra_series
+                        };
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": vec![serde_json::json!({}); n],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/query",
+                axum::routing::get(move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock().expect("lock").push(raw.clone().unwrap_or_default());
+                        let query = pairs(&raw)
+                            .into_iter()
+                            .find(|(k, _)| k == "query")
+                            .map(|(_, v)| v)
+                            .unwrap_or_default();
+                        let result = if !query.starts_with("count_over_time(") {
+                            serde_json::json!([])
+                        } else {
+                            let n = if query.contains("mb_native") { "2" } else { "3" };
+                            serde_json::json!([{"metric": {}, "value": [0, n]}])
+                        };
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": {"resultType": "vector", "result": result},
+                        }))
+                    }
+                }),
+            )
+    }
+
+    /// The read-back of the portable Ravel row matches a receiver that
+    /// stored what was sent, fences every query with every shard's token,
+    /// and fails when the series count is off by one.
+    ///
+    /// TO SEE THIS FAIL: drop the `min_commit_token` loop in
+    /// `ApiReader::get` (the fence assertion fails), or the
+    /// `series_count` comparison in `readback_over_http` (the off-by-one
+    /// read-back then matches).
+    #[tokio::test]
+    async fn readback_matches_what_was_stored_and_fails_one_series_off() {
+        let points = class_mix(base_ts_ms());
+        let (addr, server) = serve(write_stub(vec![
+            Canned::ok(Some(ravel_stub_header(1))),
+            Canned::ok(Some(ravel_stub_header(2))),
+            Canned::ok(Some(ravel_stub_header(3))),
+        ]))
+        .await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Ravel,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 3,
+            max_retries: 0,
+            timeout_secs: 5,
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        server.abort();
+        assert_eq!(
+            outcome.result.commit_tokens_by_shard.as_ref().map(BTreeMap::len),
+            Some(3)
+        );
+
+        for (extra, matches) in [(0usize, true), (1, false)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (addr, server) = serve(query_stub(extra, Arc::clone(&seen))).await;
+            let readback = readback_over_http(
+                &ReadbackConfig {
+                    query_url: format!("http://{addr}"),
+                    bearer_token: None,
+                    timeout_secs: 5,
+                },
+                &outcome.result,
+                &outcome.plan,
+            )
+            .await
+            .expect("read back");
+            server.abort();
+            assert_eq!(readback.matches_expected, matches, "{readback:?}");
+            assert_eq!(readback.series_count, 3 + extra as u64);
+            assert_eq!(readback.sample_count, 3);
+            assert_eq!(readback.histogram_series_count, Some(1));
+            assert_eq!(readback.histogram_sample_count, Some(2));
+            assert_eq!(readback.stale_marker_honored, Some(true));
+            if !matches {
+                assert_eq!(
+                    readback.mismatches,
+                    vec!["series_count: read 4, expected 3".to_string()]
+                );
+            }
+            let seen = seen.lock().expect("lock").clone();
+            assert_eq!(seen.len(), 5, "{seen:?}");
+            for query in &seen {
+                assert_eq!(query.matches("min_commit_token=").count(), 3, "{query}");
+            }
+        }
     }
 
     /// A native histogram with a non-finite `sum` is refused, as a sample with
@@ -5866,7 +6653,8 @@ mod tests {
 
         let run: RunRecord = serde_json::from_str(
             r#"{"steps": 5, "total_series_created": 1000, "logical_input_bytes": 4096,
-                "total_samples_generated": 5000, "scaling_label_cardinality": 1000}"#,
+                "total_samples_generated": 5000, "scaling_label_cardinality": 1000,
+                "anchor_source": "clock"}"#,
         )
         .expect("a pre-change run block loads");
         assert_eq!(run.anchor_ms, None);
