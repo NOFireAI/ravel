@@ -216,9 +216,8 @@ services:
   # 3s; the flag's help says 0 disables them). The hedging flip changes
   # nothing on this stack: with replication_factor 1 and one ingester there
   # is no further ingester to hedge to on either version. Sharding is the
-  # flip that changes how a query executes here.
-  # Sharding changes how one query executes, so a 3.2.3 figure is not
-  # comparable with a 2.14.2 figure for the same statement.
+  # one flip that changes how a query executes here, so a 3.2.3 figure is
+  # not comparable with a 2.14.2 figure for the same statement.
   # Left on Docker Hub deliberately: same reasoning as the prometheus
   # comparator above.
   mimir:
