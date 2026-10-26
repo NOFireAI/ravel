@@ -31,8 +31,9 @@
 //! [`DictionaryGroupKeysAsViews`] is a physical optimizer rule that casts
 //! every `Dictionary(_, Utf8 | LargeUtf8)` group key to `Utf8View` on the
 //! aggregate that first reads it, carries the emitted `Utf8View` column up
-//! through the operators above that aggregate that pass it along without
-//! computing on it, and casts it back to its declared type in one projection:
+//! through the operators above that aggregate whose every expression reading
+//! it is the bare column, and casts it back to its declared type in one
+//! projection:
 //! under the first ancestor outside that allowlist, or above the plan root
 //! when there is none (see "Where the cast back runs" below). `Utf8View` is in
 //! both dispatch tables, so the aggregate uses `GroupValuesBytesView`, whose
@@ -49,7 +50,8 @@
 //! dictionary's values buffer and building views over it, with no string data
 //! copied. The cast back runs on the batches the topmost carried operator
 //! emits, one batch at a time, so the `Utf8` values buffer it packs is bounded
-//! by the rows of one such batch. Under `ORDER BY <aggregate> ... LIMIT k` the
+//! by the rows of one such batch. Under `ORDER BY <aggregate> ... LIMIT k`,
+//! when every sort key that reads the group key is the bare column, the
 //! topmost carried operator is the TopK or the merge above it, so the cast
 //! runs on the `k` rows the statement returns, not on one row per distinct
 //! group.
@@ -67,12 +69,24 @@
 //! so the plan still produces the schema DataFusion promised at plan time,
 //! which the rule's `schema_check` asserts.
 //!
+//! An operator that evaluates expressions over its input carries the views
+//! only when every one of those expressions that reads a carried column,
+//! anywhere in its tree, is that bare column. A computed expression was
+//! planned against the declared type: `k = 'a'` on a dictionary column
+//! compares with a dictionary literal, and over views arrow refuses it at
+//! execution (`Invalid comparison operation: Utf8View == Utf8`). Under such an
+//! operator the restore goes directly over its input, as under any operator
+//! outside the allowlist.
+//!
 //! The allowlist:
 //!
-//! - `SortPreservingMergeExec`, `CoalescePartitionsExec`, `GlobalLimitExec`,
-//!   `LocalLimitExec`, `CooperativeExec` and [`crate::CompactSlicesExec`],
-//!   with or without a fetch: they output their input's columns as they are.
-//! - `SortExec`, except a TopK (a sort with a fetch) that orders by a carried
+//! - `CoalescePartitionsExec`, `GlobalLimitExec`, `LocalLimitExec` and
+//!   `CooperativeExec`, with or without a fetch: they evaluate no expression
+//!   and output their input's columns as they are.
+//! - `SortPreservingMergeExec`, when every expression it orders by that reads
+//!   a carried column is that bare column.
+//! - `SortExec`, with or without a fetch, under the same condition on its
+//!   ordering, and except a TopK (a sort with a fetch) that orders by a carried
 //!   column and by no value an aggregate computed. A TopK publishes a dynamic
 //!   filter over the columns it orders by; one that reads only group keys
 //!   could be pushed below the aggregate to the scan, and this rule does not
@@ -80,8 +94,11 @@
 //!   scan's dictionary column there. A filter that also reads a computed value
 //!   (`ORDER BY count(*) DESC`, with or without the key as a tie-breaker)
 //!   cannot be evaluated below the aggregate, so it stays above it.
-//! - `RepartitionExec`, except one that hash-partitions on a carried column
-//!   under a parent that is not an aggregate. This rule does not show that a
+//! - `RepartitionExec`, when every expression it hash-partitions by and, for
+//!   one that preserves order, every expression of its input's ordering that
+//!   reads a carried column is that bare column; and except one that
+//!   hash-partitions on a carried column under a parent that is not an
+//!   aggregate. This rule does not show that a
 //!   view and a dictionary of the same string hash alike, and a join needs
 //!   both of its inputs partitioned by the same hash; an aggregate above the
 //!   exchange sees every row through the same one.

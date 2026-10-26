@@ -19,9 +19,11 @@
 //!   doc comment.
 //!
 //! Issue #3271 adds where the cast back to the declared type runs:
-//! `group_by_str_limit_restores_above_the_topk` (above the TopK, once) and
+//! `group_by_str_limit_restores_above_the_topk` (above the TopK, once),
 //! `single_distinct_two_level_aggregate_keeps_views_between_levels` (no cast
-//! between the two levels of a `COUNT(DISTINCT ..)`).
+//! between the two levels of a `COUNT(DISTINCT ..)`) and
+//! `sort_key_computing_on_the_group_key_restores_below_the_sort` (below a sort
+//! whose key computes on the group key).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
