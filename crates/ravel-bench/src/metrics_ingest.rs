@@ -327,9 +327,11 @@ pub struct IngestPhase {
     /// [`ELAPSED_BASIS_TIMED_SEGMENTS`] for a report this code writes.
     /// Reports written before this field existed carry no marker; their
     /// `elapsed_secs` was one wall-clock span over the write loop of a
-    /// stream generated up front (admission and the RW1.0 encode were
-    /// already outside it), so the two bases differ only by the generation
-    /// now interleaved between segments, which the sum excludes.
+    /// stream generated up front. For the Ravel row that span started after
+    /// admission and the RW1.0 encode; for a comparator row the encode was
+    /// inside it, as it is inside that row's timed segments now. In both
+    /// lanes the only basis change is the generation now interleaved between
+    /// segments, which the sum excludes.
     pub elapsed_basis: String,
     /// Accepted logical samples per second.
     pub logical_points_per_sec: f64,

@@ -121,10 +121,12 @@ generating or classifying the stream, while `cpu_secs` covers the whole
 replay, generation included. Every `ingest` block carries
 `elapsed_basis: "timed_segments"` so a report written before this change can
 be told apart: its `elapsed_secs` was one wall-clock span over the write loop
-of a stream generated up front (admission and encoding were already outside
-it), so the two bases differ by the generation now interleaved between
-segments, which the sum excludes, and a throughput figure is compared across
-the change only with that in mind.
+of a stream generated up front. For the Ravel row that span started after
+admission and after the RW1.0 encode; for a comparator row the encode was
+inside it, as it still is inside that row's timed segments. In both lanes
+the only basis change is the generation now interleaved between segments,
+which the sum excludes, and a throughput figure is compared across the
+change only with that in mind.
 
 `substrate`:
 - `store_backend`: the `--store` kind (`memory` or `s3`).
