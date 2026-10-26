@@ -12933,9 +12933,10 @@ mod tail_section_placement_tests {
 
     /// A predicate-free ranged open fetches no BLOOM or POSTINGS byte and
     /// returns every row. Against the same open forced to place both
-    /// sections, by a prune arm on an attribute no record carries, it moves
-    /// exactly their stored sizes fewer bytes and two fewer GETs, since the
-    /// placement loop fetches each tail section with a GET of its own.
+    /// sections, by a content arm every record matches (BLOOM) and a prune
+    /// arm on an attribute no record carries (POSTINGS), it moves exactly
+    /// their stored sizes fewer bytes and two fewer GETs, since the placement
+    /// loop fetches each tail section with a GET of its own.
     ///
     /// Prove-the-test: in `fetch_object_v4`'s placement loop, dropping
     /// `|| filter_sections.skips(section.kind)` makes the BLOOM-intersection
@@ -12965,10 +12966,16 @@ mod tail_section_placement_tests {
 
         let place = ranged(
             &obj,
-            &query.clone().with_prune(Predicate::Equals {
-                field: FieldSel::Attr("absent.attr".into()),
-                value: AttrValue::Str("x".into()),
-            }),
+            &query
+                .clone()
+                .with_content(Predicate::Equals {
+                    field: FieldSel::SeverityText,
+                    value: AttrValue::Str("INFO".into()),
+                })
+                .with_prune(Predicate::Equals {
+                    field: FieldSel::Attr("absent.attr".into()),
+                    value: AttrValue::Str("x".into()),
+                }),
         )
         .await;
         assert_eq!(
@@ -13035,6 +13042,131 @@ mod tail_section_placement_tests {
         assert_eq!(out.stats.blocks_after_postings, 1);
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].ts_ns, 3);
+    }
+
+    fn contains_r3() -> Predicate {
+        Predicate::Contains {
+            key: "request.id".into(),
+            needle: "r3".into(),
+            negated: false,
+        }
+    }
+
+    fn covers(out: &Ranged, d: &SectionDesc) -> bool {
+        out.ranges
+            .iter()
+            .any(|&(s, e)| s <= d.offset && d.offset + d.len <= e)
+    }
+
+    /// A `Contains` content arm reads neither filter section, so the ranged
+    /// open fetches neither and returns the whole object's rows.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` returning
+    /// `FilterSections::ALL` for a non-empty `content` (the placement before
+    /// #3295 item 7) fails the BLOOM-intersection assertion.
+    #[tokio::test]
+    async fn a_contains_ranged_scan_fetches_neither_filter_section() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_content(contains_r3());
+
+        let whole = scan(&assembled_without(&obj, &[]), &query).expect("whole scan");
+        let out = ranged(&obj, &query).await;
+        for r in &out.ranges {
+            assert!(!intersects(*r, &bloom), "GET {r:?} reads BLOOM {bloom:?}");
+            assert!(
+                !intersects(*r, &postings),
+                "GET {r:?} reads POSTINGS {postings:?}"
+            );
+        }
+        assert_eq!(
+            format!("{:?}", out.records),
+            format!("{:?}", whole.records)
+        );
+        assert_eq!(
+            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
+    /// `Contains` beside a `HasWord` arm still places BLOOM, and the bloom
+    /// still rules out the four `beta` blocks.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` placing no filter section
+    /// fails `expect("scan")` with an Unplaced read over BLOOM.
+    #[tokio::test]
+    async fn a_contains_and_has_word_ranged_scan_prunes_with_bloom() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let query = LogQuery::new(i64::MIN, i64::MAX)
+            .with_content(contains_r3())
+            .with_content(Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "beta".into(),
+            });
+        let whole = scan(&assembled_without(&obj, &[]), &query).expect("whole scan");
+        let out = ranged(&obj, &query).await;
+        assert!(covers(&out, &bloom), "no GET covers BLOOM {bloom:?}");
+        assert_eq!(out.stats.blocks_after_bloom, (BLOCKS / 2) as u32);
+        assert_eq!(
+            format!("{:?}", out.records),
+            format!("{:?}", whole.records)
+        );
+        assert_eq!(
+            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
+    /// `Contains` beside a short `Str` `Equals` content arm on the indexed
+    /// field places both BLOOM and POSTINGS, and keeps only the one block
+    /// both rule in.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` placing no filter section
+    /// fails `expect("scan")` with an Unplaced read.
+    #[tokio::test]
+    async fn a_contains_and_equals_ranged_scan_places_both_sections() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX)
+            .with_content(contains_r3())
+            .with_content(Predicate::Equals {
+                field: FieldSel::Attr("request.id".into()),
+                value: AttrValue::Str("r3".into()),
+            });
+        let out = ranged(&obj, &query).await;
+        assert!(covers(&out, &bloom), "no GET covers BLOOM {bloom:?}");
+        assert!(covers(&out, &postings), "no GET covers POSTINGS {postings:?}");
+        assert_eq!(out.stats.blocks_after_postings, 1);
+        assert_eq!(out.stats.blocks_after_bloom, 1);
+        assert_eq!(
+            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
+    /// An `Equals` content arm on the indexed field places POSTINGS, as the
+    /// prune-channel arm in `an_equals_ranged_scan_fetches_postings` does.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` placing no filter section
+    /// fails `expect("scan")` with an Unplaced read over POSTINGS.
+    #[tokio::test]
+    async fn an_equals_content_ranged_scan_fetches_postings() {
+        let obj = object();
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_content(Predicate::Equals {
+            field: FieldSel::Attr("request.id".into()),
+            value: AttrValue::Str("r3".into()),
+        });
+        let out = ranged(&obj, &query).await;
+        assert!(covers(&out, &postings), "no GET covers POSTINGS {postings:?}");
+        assert_eq!(out.stats.blocks_after_postings, 1);
+        assert_eq!(
+            out.records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            [3]
+        );
     }
 }
 
@@ -13462,9 +13594,10 @@ mod projection_break_even_crossover_tests {
             "a one-column projection moves under a fifth of the object: {bytes} of {}",
             large.object_size
         );
-        // A prune arm on an attribute no record carries places BLOOM without
-        // changing what the scan decodes: one more GET, BLOOM's stored size.
-        let (place_gets, place_bytes) = ranged_open_query(
+        // The reader never reads BLOOM for a prune arm, and with no POSTINGS
+        // on the object an `Equals` prune arm places no filter section: the
+        // same GETs and bytes, none of them BLOOM's.
+        let (prune_gets, prune_bytes) = ranged_open_query(
             &f,
             &large,
             &LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::Equals {
@@ -13473,8 +13606,8 @@ mod projection_break_even_crossover_tests {
             }),
         )
         .await;
-        assert_eq!(place_gets, gets + 1);
-        assert_eq!(place_bytes, bytes + bloom.len);
+        assert_eq!((prune_gets, prune_bytes), (gets, bytes));
+        assert!(bloom.len > 0);
     }
 }
 
@@ -14088,6 +14221,109 @@ mod read_gate_tests {
             .expect("scan");
         assert_eq!(planned.survivors, whole.survivor_block_indices());
         assert_eq!(planned.survivors, vec![2]);
+    }
+
+    /// The survivors `RlogReader::scan_blocks` names over the whole object
+    /// for `query`, which carries no stream-attribute arm.
+    async fn whole_survivors(
+        fetcher: &LogSegmentFetcher,
+        seg_ref: &SegmentRef,
+        query: &LogQuery,
+    ) -> Vec<usize> {
+        assert!(query.stream_attrs.is_empty());
+        let object = fetcher
+            .store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get")
+            .data;
+        RlogReader::new(&object[..], &RlogConfig::default())
+            .expect("open")
+            .scan_blocks(
+                &combined_predicate_with_streams(query, None),
+                &query.prune,
+                &ColumnSelection::all(),
+            )
+            .expect("scan")
+            .survivor_block_indices()
+    }
+
+    /// A `HasWord` content arm is decided with BLOOM, so the keyed plan
+    /// places it and prunes to the reader's survivors over the whole object:
+    /// block 2 alone.
+    ///
+    /// Prove-the-test: an empty `extra_tail` in `fetch_keyed_plan` fails
+    /// `expect("keyed plan")` with an Unplaced read over BLOOM.
+    #[tokio::test]
+    async fn the_keyed_plan_places_bloom_for_a_has_word_arm() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_content(
+            Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "2".to_string(),
+            },
+        ));
+        let planned = keyed_plan(&fetcher, &seg_ref, &query).await;
+        assert_eq!(
+            planned.survivors,
+            whole_survivors(&fetcher, &seg_ref, &query).await
+        );
+        assert_eq!(planned.survivors, vec![2]);
+        assert_eq!(planned.stats.blocks_after_bloom, 1, "{:?}", planned.stats);
+    }
+
+    /// A `Contains` content arm is decided without BLOOM or POSTINGS, so the
+    /// keyed plan places neither and its prune, which still runs the reader
+    /// (one `LogPostings` job), reads no unplaced byte and names the reader's
+    /// survivors over the whole object.
+    ///
+    /// Prove-the-test: a reader that reads BLOOM whatever the arms (`if
+    /// reads.bloom` replaced with `if true` in `RlogReader::scan_blocks`)
+    /// fails `expect("keyed plan")` with an Unplaced read over BLOOM.
+    #[tokio::test]
+    async fn the_keyed_plan_of_a_contains_arm_reads_no_filter_section() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_content(
+            Predicate::Contains {
+                key: "request.id".to_string(),
+                needle: "r2".to_string(),
+                negated: false,
+            },
+        ));
+        let gate = floor_zero_gate();
+        let planned = keyed_plan(
+            &fetcher.clone().with_read_gate(gate.clone()),
+            &seg_ref,
+            &query,
+        )
+        .await;
+        assert_eq!(
+            planned.survivors,
+            whole_survivors(&fetcher, &seg_ref, &query).await
+        );
+        assert_eq!(planned.key_blocks, Some(vec![2]));
+        assert_eq!(site_counts(&gate, ReadSite::LogPostings), (1, 0));
+    }
+
+    /// A stream-attribute arm reads neither filter section, and the keyed
+    /// plan is still not skip-decidable: the reader's prune resolves the arm
+    /// through STREAM_DIR, and no stream in the object matches, so nothing
+    /// survives.
+    ///
+    /// Prove-the-test: deciding `skip_decidable` in `fetch_keyed_plan` as
+    /// "places no filter section" plans all four blocks and reads
+    /// `left: [0, 1, 2, 3], right: []`.
+    #[tokio::test]
+    async fn the_keyed_plan_of_a_stream_arm_is_not_skip_decidable() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = keyed_on_r2(
+            LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
+                "service.name",
+                AttrValue::Str("other".to_string()),
+            )),
+        );
+        let planned = keyed_plan(&fetcher, &seg_ref, &query).await;
+        assert_eq!(planned.survivors, Vec::<usize>::new());
     }
 
     /// A gated RLOG decode that panicked is the log fetcher's decode error, and
