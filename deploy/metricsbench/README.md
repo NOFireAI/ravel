@@ -93,11 +93,27 @@ read as the portable row (ADR-0927 amendment 2026-10-26 A). Ravel's portable
 row is this service, driven through the same Remote Write and query endpoints
 as every other system here.
 
-**Local probe (2026-10-26, ravel-server 0.26.0, linux/arm64).** No docker
-daemon was available, so the compose stack itself has not been brought up.
-The 0.26.0 binary, extracted from the image, was run with every flag above and
-`--store memory` in place of `--store s3`; S3 and `ravel-qualify` were not
-exercised. Results:
+**Compose stack (2026-10-26, ravel-server 0.27.0, darwin/arm64 Docker).**
+`RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:0.27.0 docker compose -f
+docker-compose.yml -f ravel.yml up -d rustfs createbuckets ravel-qualify
+ravel-server` brought the overlay up on the stack's RustFS. Results:
+
+| Step or request | Result |
+|---|---|
+| `createbuckets`, `ravel-qualify` | both exited 0 |
+| `ravel-server` limits (`docker inspect`) | 4,294,967,296 bytes memory, 2.0 CPUs |
+| `GET /api/v1/status/buildinfo` | 200, `"version":"0.27.0","revision":""` |
+| Remote Write 1.0, one sample at now-60 s, bearer token | 204 with `x-ravel-commit-token`; queried back with that token as `min_commit_token`: `42` |
+| Remote Write 1.0, one sample at now-30 d, bearer token | 204 with `x-ravel-commit-token`; queried back: `7` |
+| Remote Write 1.0 without the bearer token | 401 |
+
+That run predates the column-statistics cache pin; the cache's derived value
+is the one now pinned.
+
+**Local probe (2026-10-26, ravel-server 0.26.0, linux/arm64).** The source of
+the Ravel budget-refusal signatures below. The 0.26.0 binary, extracted from
+the image, was run with the flags above and `--store memory` in place of
+`--store s3`, on a host with no docker daemon. Results:
 
 | Request | HTTP | Result |
 |---|---|---|
@@ -286,6 +302,8 @@ docker compose -f deploy/metricsbench/docker-compose.yml up -d
 
 This starts the comparators alone; add `-f deploy/metricsbench/ravel.yml`
 with `RAVEL_IMAGE` set to include Ravel (see "Ravel in the portable lane").
+For a comparators-only launch, run `capture-effective-config.sh --no-ravel` so
+the capture does not query a Ravel that is not running.
 
 Every image in `docker-compose.yml` is pinned to an immutable `@sha256:`
 digest (see below); Ravel's image is the `RAVEL_IMAGE` the run passes. Each
@@ -346,7 +364,9 @@ The sources are:
   and the compiled-in query caps are not read. Every published ravel-server
   image reports an empty `revision`: the server reads it from `RAVEL_GIT_SHA`
   at compile time, and no image build sets it (issue #3312). The capture
-  records it as unavailable and exits 1 against any of them. The image ID and
+  records it as unavailable and does not count it toward exit 1, since no
+  image can supply it; Ravel's version still counts. `--no-ravel` skips Ravel
+  for a comparators-only launch. The image ID and
   `RepoDigests` still identify the build. `compose ps` reads both `docker-compose.yml` and `ravel.yml`; when
   `RAVEL_IMAGE` is unset the script passes a placeholder so compose can
   interpolate the overlay, which affects only the listing.
