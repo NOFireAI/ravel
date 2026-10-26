@@ -541,6 +541,11 @@ pub const IN_PROCESS_ENDPOINT: &str = "in-process";
 /// different order.
 pub const REL_MAD_REL_TOLERANCE: f64 = 1e-9;
 
+/// The relative tolerance a version-3 `ok` row's `min_ms`, `median_ms` and
+/// `max_ms` are checked against the min, median and max of its pass medians,
+/// for the same reason as [`REL_MAD_REL_TOLERANCE`].
+pub const PASS_SUMMARY_REL_TOLERANCE: f64 = 1e-9;
+
 fn median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -991,6 +996,22 @@ pub enum ValidationError {
         /// The recomputed value.
         computed: Option<f64>,
     },
+    /// An `ok` row's `min_ms`, `median_ms` or `max_ms` is not the min, median
+    /// or max of its pass medians, beyond [`PASS_SUMMARY_REL_TOLERANCE`].
+    #[error(
+        "case `{case}` reports {figure} {supplied} but its pass medians give {computed}; the \
+         timed figures summarize the pass medians"
+    )]
+    PassSummaryMismatch {
+        /// The offending case.
+        case: String,
+        /// `min_ms`, `median_ms` or `max_ms`.
+        figure: &'static str,
+        /// The reported value.
+        supplied: f64,
+        /// The value computed from the pass medians.
+        computed: f64,
+    },
     /// The provenance `variance` config entry disagrees with the pass count:
     /// below [`MIN_VARIANCE_PASSES`] passes it must read `insufficient_passes`,
     /// at or above it the key must be absent.
@@ -1180,25 +1201,27 @@ pub fn validate_provenance(p: &Provenance) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Validate one measurement's figures and status shape, fail-closed.
-fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
+/// Validate one measurement's figures and status shape, fail-closed. `label`
+/// names the row in every error: its id on versions 1 and 2, its full
+/// `engine/id/query_kind` case on version 3, where the id alone is ambiguous.
+fn validate_measurement(m: &Measurement, label: &str) -> Result<(), ValidationError> {
     for f in &m.figures {
         if f.name.trim().is_empty() {
             return Err(ValidationError::MalformedMeasurement {
-                id: m.id.clone(),
+                id: label.to_string(),
                 reason: "a figure has a blank name".to_string(),
             });
         }
         if !f.value.is_finite() {
             return Err(ValidationError::NonFiniteFigure {
-                id: m.id.clone(),
+                id: label.to_string(),
                 figure: f.name.clone(),
                 value: f.value,
             });
         }
         if f.value < 0.0 {
             return Err(ValidationError::NegativeFigure {
-                id: m.id.clone(),
+                id: label.to_string(),
                 figure: f.name.clone(),
                 value: f.value,
             });
@@ -1210,7 +1233,7 @@ fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
     for f in &m.figures {
         if !seen.insert(f.name.as_str()) {
             return Err(ValidationError::MalformedMeasurement {
-                id: m.id.clone(),
+                id: label.to_string(),
                 reason: format!("figure `{}` appears more than once", f.name),
             });
         }
@@ -1220,14 +1243,14 @@ fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
         // exactly like an out-of-band one.
         if m.figures.is_empty() {
             return Err(ValidationError::MalformedMeasurement {
-                id: m.id.clone(),
+                id: label.to_string(),
                 reason: "an ok (timed) measurement carries no figures".to_string(),
             });
         }
         for figure in REQUIRED_TIMED_FIGURES {
             if m.figure(figure).is_none() {
                 return Err(ValidationError::MissingExpectedFigure {
-                    id: m.id.clone(),
+                    id: label.to_string(),
                     figure,
                 });
             }
@@ -1242,7 +1265,7 @@ fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
         let max_ms = m.figure("max_ms").unwrap_or_default();
         if !(min_ms <= median_ms && median_ms <= max_ms) {
             return Err(ValidationError::TimingOutOfOrder {
-                id: m.id.clone(),
+                id: label.to_string(),
                 min_ms,
                 median_ms,
                 max_ms,
@@ -1255,7 +1278,7 @@ fn validate_measurement(m: &Measurement) -> Result<(), ValidationError> {
         for figure in REQUIRED_TIMED_FIGURES {
             if m.figure(figure).is_some() {
                 return Err(ValidationError::MalformedMeasurement {
-                    id: m.id.clone(),
+                    id: label.to_string(),
                     reason: format!(
                         "status `{}` is not timed, but the row carries timing figure `{figure}` \
                          (only ok is timed, ADR-0927 decision 6)",
@@ -1290,7 +1313,7 @@ pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
         if !seen.insert(m.id.as_str()) {
             return Err(ValidationError::DuplicateMeasurement { id: m.id.clone() });
         }
-        validate_measurement(m)?;
+        validate_measurement(m, &m.id)?;
     }
     if let Some(g) = report.geomean_ms {
         if !(g.is_finite() && g > 0.0) {
@@ -1393,20 +1416,42 @@ struct KeyedRow<'a> {
 /// Validate a version-3 report, fail-closed. The checks run in this order, and
 /// each failure class is its own [`ValidationError`] variant:
 ///
-/// 1. provenance (already checked by [`validate`]); `geomean_ms` refused, since
-///    decision 6 rules out one figure across engines;
-/// 2. at least one row; every row names its engine, query kind, endpoint, and
-///    at least one pass status;
-/// 3. band 1: the set of row keys equals the set of `cases_expected` keys,
-///    compared as sets before duplicates are looked at, so a duplicated row
-///    standing in for a missing one reports the missing case;
-/// 4. per row: band 2 and band 5 ([`validate_measurement`]: only `ok` carries
-///    the timed figures, each figure once), the endpoint, the oracle flag, the
-///    refusal reason, [`row_status`], and the per-pass timing;
-/// 5. the variance config entry against the pass count;
+/// 1. provenance (already checked by [`validate`]); `geomean_ms` refused
+///    ([`ValidationError::FieldNotInVersion`]), since decision 6 rules out one
+///    figure across engines;
+/// 2. at least one row ([`ValidationError::NoMeasurements`]); every row names
+///    its engine, query kind, endpoint, and at least one pass status
+///    ([`ValidationError::MissingRowField`]);
+/// 3. band 1: the set of row keys equals the set of `cases_expected` keys
+///    ([`ValidationError::CaseSetMismatch`]), compared as sets before
+///    duplicates are looked at ([`ValidationError::DuplicateCase`]), so a
+///    duplicated row standing in for a missing one reports the missing case;
+/// 4. per row, in this order:
+///    - band 2 and band 5 ([`validate_measurement`]: only `ok` carries the
+///      timed figures, each figure once, finite, non-negative and ordered);
+///    - the endpoint is not `in-process` ([`ValidationError::InProcessEndpoint`]);
+///    - the oracle flag is set on exactly the Prometheus rows
+///      ([`ValidationError::OracleFlag`]);
+///    - a refusal reason on exactly the `refused` rows
+///      ([`ValidationError::RefusalReasonMismatch`]);
+///    - an error class on exactly the `error` rows
+///      ([`ValidationError::ErrorClassMismatch`]);
+///    - `incomplete` set on every `partial` row, allowed on `incorrect`, clear
+///      on every other status ([`ValidationError::IncompleteMismatch`]);
+///    - the status is [`row_status`] of the pass statuses
+///      ([`ValidationError::StatusAcrossPasses`]);
+///    - the pass count equals the first row's
+///      ([`ValidationError::PassCountMismatch`]);
+///    - the per-pass timing ([`validate_pass_timing`]): only `ok` carries it
+///      ([`ValidationError::PassTiming`]), `rel_mad_pct` is [`rel_mad_pct`] of
+///      the pass medians ([`ValidationError::RelMadMismatch`]), and `min_ms`,
+///      `median_ms` and `max_ms` are the min, median and max of the pass
+///      medians ([`ValidationError::PassSummaryMismatch`]);
+/// 5. the variance config entry against the pass count
+///    ([`ValidationError::VarianceConfig`]);
 /// 6. the denominators, recomputed with [`Denominators::of`] and compared
-///    exactly;
-/// 7. the pass exclusions.
+///    exactly ([`ValidationError::DenominatorsMismatch`]);
+/// 7. the pass exclusions ([`ValidationError::InvalidExclusion`]).
 fn validate_v3(report: &MetricsBenchReport) -> Result<(), ValidationError> {
     let version = report.provenance.schema_version;
     if report.geomean_ms.is_some() {
@@ -1471,7 +1516,7 @@ fn validate_v3(report: &MetricsBenchReport) -> Result<(), ValidationError> {
     let passes = rows.first().map_or(0, |r| r.m.pass_statuses.len());
     for r in &rows {
         let m = r.m;
-        validate_measurement(m)?;
+        validate_measurement(m, &r.case)?;
         if m.endpoint
             .as_deref()
             .is_some_and(|e| e.trim().eq_ignore_ascii_case(IN_PROCESS_ENDPOINT))
@@ -1602,6 +1647,25 @@ fn validate_pass_timing(r: &KeyedRow<'_>) -> Result<(), ValidationError> {
             supplied: m.rel_mad_pct,
             computed,
         });
+    }
+    let min = m.pass_medians_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = m
+        .pass_medians_ms
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let center = median(&m.pass_medians_ms).unwrap_or(f64::NAN);
+    for (figure, computed) in [("min_ms", min), ("median_ms", center), ("max_ms", max)] {
+        // `validate_measurement` already required every timed figure.
+        let supplied = m.figure(figure).unwrap_or(f64::NAN);
+        if !((supplied - computed).abs() <= PASS_SUMMARY_REL_TOLERANCE * computed.abs().max(1.0)) {
+            return Err(ValidationError::PassSummaryMismatch {
+                case: r.case.clone(),
+                figure,
+                supplied,
+                computed,
+            });
+        }
     }
     Ok(())
 }
