@@ -2344,8 +2344,7 @@ fn contains_kernel(
     if streams.len() < stream_dir.len() {
         streams.resize(stream_dir.len(), None);
     }
-    let mut fallback = |row: usize| -> Result<bool, LogSegError> {
-        let raw = refs.get(row).ok_or_else(|| missing_i64(COL_STREAM_REF))?;
+    let fallback = |raw: i64| -> Result<bool, LogSegError> {
         let r =
             u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
         if let Some(Some(pass)) = streams.get(r as usize) {
@@ -2357,12 +2356,14 @@ fn contains_kernel(
         }
         Ok(pass)
     };
-    let elsewhere = |row: usize| resolved_elsewhere(block, arm.others, arm.key, row);
+    let rows = ContainsRows {
+        refs,
+        elsewhere: Elsewhere::resolve(block, arm.others, arm.key),
+    };
     match arm.col.and_then(|c| Some((c, block.str_column(c)?))) {
-        None => sel.retain(|row| Ok(fallback(row)? || elsewhere(row)?)),
-        Some((_, StrColumn::Plain(cells))) => sel.retain(|row| {
-            let fb = fallback(row)?;
-            let pass = match cells.get(row).and_then(Option::as_deref) {
+        None => rows.retain(sel, fallback, |_, fb| fb),
+        Some((_, StrColumn::Plain(cells))) => rows.retain(sel, fallback, |row, fb| {
+            match cells.get(row).and_then(Option::as_deref) {
                 None => fb,
                 Some(cell) => {
                     *tested += 1;
@@ -2373,41 +2374,194 @@ fn contains_kernel(
                         fb
                     }
                 }
-            };
-            Ok(pass || elsewhere(row)?)
+            }
         }),
         Some((col, StrColumn::Dict(d))) => {
             let values = d.values();
             let verdicts = dict_slot(contains, arm.index, values, |v| vec![None; v.len()]);
             let entry_texts = texts_slot(texts, col, values);
-            sel.retain(|row| {
-                let fb = fallback(row)?;
-                let pass = match d.key(row) {
-                    None => fb,
-                    Some(k) => {
-                        let k = k as usize;
-                        let t = match verdicts.get(k).copied().flatten() {
-                            Some(t) => t,
-                            None => {
-                                *tested += 1;
-                                let t = values.entry(k).is_some_and(|e| arm.needle.is_in(e))
-                                    != arm.negated;
-                                if let Some(slot) = verdicts.get_mut(k) {
-                                    *slot = Some(t);
-                                }
-                                t
+            rows.retain(sel, fallback, |row, fb| match d.key(row) {
+                None => fb,
+                Some(k) => {
+                    let k = k as usize;
+                    let t = match verdicts.get(k).copied().flatten() {
+                        Some(t) => t,
+                        None => {
+                            *tested += 1;
+                            let t =
+                                values.entry(k).is_some_and(|e| arm.needle.is_in(e)) != arm.negated;
+                            if let Some(slot) = verdicts.get_mut(k) {
+                                *slot = Some(t);
                             }
-                        };
-                        if t == fb || entry_texts.is_valid(values, k, validated) {
                             t
-                        } else {
-                            fb
                         }
+                    };
+                    if t == fb || entry_texts.is_valid(values, k, validated) {
+                        t
+                    } else {
+                        fb
                     }
-                };
-                Ok(pass || elsewhere(row)?)
+                }
             })
         }
+    }
+}
+
+/// The per-row reads every `Contains` arm makes besides its own `Str` cell,
+/// resolved once per block: the `stream_ref` column and the key's other
+/// readings.
+struct ContainsRows<'a> {
+    refs: &'a I64Column,
+    elsewhere: Elsewhere<'a>,
+}
+
+impl ContainsRows<'_> {
+    /// Keeps the selected rows the arm accepts, 64 rows to a word, visiting
+    /// them in row order so a row's error is the one the row-by-row kernel
+    /// raised first.
+    ///
+    /// Every selected row reads its `stream_ref`, absent being an error, and
+    /// its stream's verdict through `fallback`; a run of rows on one stream
+    /// reuses the verdict after one compare. `verdict` then decides the row
+    /// from its own cell and that verdict, and a row it rejects is kept when
+    /// [`Elsewhere::found`] finds another reading of the key.
+    fn retain(
+        &self,
+        sel: &mut RowSelection,
+        mut fallback: impl FnMut(i64) -> Result<bool, LogSegError>,
+        mut verdict: impl FnMut(usize, bool) -> bool,
+    ) -> Result<(), LogSegError> {
+        let values = self.refs.values();
+        let validity = self.refs.validity();
+        let elsewhere = (!self.elsewhere.is_empty()).then_some(&self.elsewhere);
+        let mut last: Option<(i64, bool)> = None;
+        for (wi, word) in sel.words.iter_mut().enumerate() {
+            if *word == 0 {
+                continue;
+            }
+            let start = wi * 64;
+            let chunk = values.get(start..).unwrap_or(&[]);
+            let chunk = &chunk[..chunk.len().min(64)];
+            let valid = validity_word(validity, wi) & low_bits(chunk.len());
+            let mut keep = 0u64;
+            let mut rest = *word;
+            while rest != 0 {
+                let j = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                let mut row_pass = || -> Result<bool, LogSegError> {
+                    let raw = chunk
+                        .get(j)
+                        .filter(|_| valid >> j & 1 == 1)
+                        .copied()
+                        .ok_or_else(|| missing_i64(COL_STREAM_REF))?;
+                    let fb = match last {
+                        Some((r, fb)) if r == raw => fb,
+                        _ => {
+                            let fb = fallback(raw)?;
+                            last = Some((raw, fb));
+                            fb
+                        }
+                    };
+                    let row = start + j;
+                    Ok(verdict(row, fb) || elsewhere.map_or(Ok(false), |e| e.found(row))?)
+                };
+                match row_pass() {
+                    Ok(pass) => keep |= u64::from(pass) << j,
+                    Err(e) => {
+                        *word &= keep | !low_bits(j);
+                        return Err(e);
+                    }
+                }
+            }
+            *word &= keep;
+        }
+        Ok(())
+    }
+}
+
+/// A `Contains` arm's readings of its key other than the `Str` cell and the
+/// stream value, resolved once per block: the key's columns of other types and
+/// the `attrs_raw` column, each present in the block.
+struct Elsewhere<'a> {
+    others: Vec<OtherCol<'a>>,
+    attrs_raw: Option<&'a StrColumn>,
+    key: &'a str,
+}
+
+impl<'a> Elsewhere<'a> {
+    fn resolve(block: &'a DecodedBlock, others: &[(u32, FieldType)], key: &'a str) -> Self {
+        Elsewhere {
+            others: others
+                .iter()
+                .filter_map(|&(col, ty)| OtherCol::resolve(block, col, ty))
+                .collect(),
+            attrs_raw: block.str_column(crate::record::COL_ATTRS_RAW),
+            key,
+        }
+    }
+
+    /// No column to read: [`Self::found`] is false on every row.
+    fn is_empty(&self) -> bool {
+        self.others.is_empty() && self.attrs_raw.is_none()
+    }
+
+    /// Whether `row` has a present cell for the key in one of the other
+    /// columns, or an `attrs_raw` entry for it. A present `attrs_raw` cell is
+    /// decoded whole, so a corrupt one is an error here.
+    fn found(&self, row: usize) -> Result<bool, LogSegError> {
+        if self.others.iter().any(|c| c.present(row)) {
+            return Ok(true);
+        }
+        match self.attrs_raw.and_then(|c| str_cell(c, row)) {
+            None => Ok(false),
+            Some(raw) => Ok(decode_canonical_attrs(raw)?
+                .iter()
+                .any(|(k, _)| k == self.key)),
+        }
+    }
+}
+
+/// A column holding a key's values of a type other than `Str`'s, for a
+/// presence test that equals `get_attr_value(..).is_some()` on its type.
+enum OtherCol<'a> {
+    /// A `Str` cell reads as present only when it is UTF-8.
+    Str(&'a StrColumn),
+    Bytes(&'a StrColumn),
+    I64(&'a I64Column),
+    F64(&'a [Option<u64>]),
+    Bool(&'a [Option<bool>]),
+}
+
+impl<'a> OtherCol<'a> {
+    /// The column `cid` of type `ty`, from the maps [`get_attr_value`] reads
+    /// it from; `None` when the block does not carry it.
+    fn resolve(block: &'a DecodedBlock, cid: u32, ty: FieldType) -> Option<Self> {
+        Some(match ty {
+            FieldType::Str => OtherCol::Str(block.str_column(cid)?),
+            FieldType::Bytes => OtherCol::Bytes(block.str_column(cid)?),
+            FieldType::I64 => OtherCol::I64(block.i64_column(cid)?),
+            FieldType::F64 => OtherCol::F64(block.f64_col(cid)?),
+            FieldType::Bool => OtherCol::Bool(block.bool_col(cid)?),
+        })
+    }
+
+    fn present(&self, row: usize) -> bool {
+        match self {
+            OtherCol::Str(c) => str_cell(c, row).is_some_and(|b| std::str::from_utf8(b).is_ok()),
+            OtherCol::Bytes(c) => str_cell(c, row).is_some(),
+            OtherCol::I64(c) => c.is_valid(row),
+            OtherCol::F64(c) => matches!(c.get(row), Some(Some(_))),
+            OtherCol::Bool(c) => matches!(c.get(row), Some(Some(_))),
+        }
+    }
+}
+
+/// The bytes of a string column at `row`, as [`DecodedBlock::str_at`] reads
+/// them.
+fn str_cell(col: &StrColumn, row: usize) -> Option<&[u8]> {
+    match col {
+        StrColumn::Plain(cells) => cells.get(row)?.as_deref(),
+        StrColumn::Dict(d) => d.values().entry(usize::try_from(d.key(row)?).ok()?),
     }
 }
 
@@ -2628,24 +2782,6 @@ fn stream_contains(
         Some(AttrValue::Str(s)) => test(s.as_bytes()) != negated,
         _ => false,
     })
-}
-
-/// Whether row `row` has a present cell for `key` in one of the columns
-/// `others`, or an `attrs_raw` entry for it: a reading other than the `Str`
-/// cell and the stream value, which a `Contains` arm never drops.
-fn resolved_elsewhere(
-    block: &DecodedBlock,
-    others: &[(u32, FieldType)],
-    key: &str,
-    row: usize,
-) -> Result<bool, LogSegError> {
-    if others
-        .iter()
-        .any(|&(col, ty)| get_attr_value(block, col, ty, row).is_some())
-    {
-        return Ok(true);
-    }
-    Ok(overflow_attr(block, row, key)?.is_some())
 }
 
 /// Clears from `sel` the rows of an integer column whose value fails `keep`,
@@ -8740,6 +8876,78 @@ mod tests {
                 let mut out = Vec::new();
                 sel.extend_rows(&mut out);
                 Ok(out)
+            }
+
+            /// The kernel's presence test on a column of each type is
+            /// `get_attr_value(..).is_some()` on every row: present, absent,
+            /// and, for `Str`, a present cell that is not UTF-8, which reads
+            /// as absent. Over plain and dictionary string pages.
+            #[test]
+            fn other_column_presence_equals_get_attr_value() {
+                let keys = [
+                    ("o_str", FieldType::Str),
+                    ("o_bytes", FieldType::Bytes),
+                    ("o_i64", FieldType::I64),
+                    ("o_f64", FieldType::F64),
+                    ("o_bool", FieldType::Bool),
+                ];
+                for (unique, want) in [(false, Enc::Dict), (true, Enc::Plain)] {
+                    let recs = (0..24i64)
+                        .map(|i| {
+                            let v = |p: &str| if unique { format!("{p}{i}") } else { p.into() };
+                            let mut attrs = Vec::new();
+                            if i % 3 != 0 {
+                                let text = if i % 2 == 0 { v("ab") } else { v("~ab") };
+                                attrs.push(attr("o_str", AttrValue::Str(text)));
+                            }
+                            if i % 4 != 1 {
+                                attrs.push(attr("o_bytes", AttrValue::Bytes(v("b").into_bytes())));
+                            }
+                            if i % 5 != 2 {
+                                attrs.push(attr("o_i64", AttrValue::I64(i)));
+                            }
+                            if i % 3 != 1 {
+                                attrs.push(attr("o_f64", AttrValue::F64(-0.0)));
+                            }
+                            if i % 2 == 0 {
+                                attrs.push(attr("o_bool", AttrValue::Bool(false)));
+                            }
+                            srec(3, i, attrs)
+                        })
+                        .collect();
+                    let cfg = RlogConfig {
+                        block_target_records: 24,
+                        group_target_blocks: 1,
+                        ..RlogConfig::default()
+                    };
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let str_col = reader
+                        .field_dir
+                        .column("o_str", FieldType::Str)
+                        .expect("o_str column")
+                        .column_id;
+                    assert!(encs(&reader, str_col).contains(&want), "{want:?}");
+                    let block = first_block(&obj, &cfg);
+                    let n = block.record_count();
+                    assert_eq!(n, 24);
+                    let mut invalid = 0;
+                    for (key, ty) in keys {
+                        let cid = reader.field_dir.column(key, ty).expect("column").column_id;
+                        let col = OtherCol::resolve(&block, cid, ty).expect("resolved");
+                        let mut present = 0;
+                        for r in 0..n {
+                            let got = get_attr_value(&block, cid, ty, r).is_some();
+                            assert_eq!(col.present(r), got, "{key} row {r} ({want:?} page)");
+                            present += usize::from(got);
+                            if ty == FieldType::Str && !got && block.str_at(cid, r).is_some() {
+                                invalid += 1;
+                            }
+                        }
+                        assert!(0 < present && present < n, "{key}: {present} of {n}");
+                    }
+                    assert_eq!(invalid, 8, "the odd o_str rows hold invalid UTF-8");
+                }
             }
 
             /// Every selected row reads its `stream_ref`, which is that row's
