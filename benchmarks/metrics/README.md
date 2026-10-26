@@ -149,8 +149,9 @@ regenerate the stream from it:
 Each row's `ingest` block adds `offered_digest`, BLAKE3 over every point that
 row offered, in order: a sample's canonical `(series, ts_ms, value_bits)`
 tuple (a staleness marker by its bit pattern), and a native histogram's
-series, timestamp and every field it is encoded with. `comparable` is `true` only when the profile is publishable,
-`steps_run` equals `steps_declared`, and `stream_digest` equals the digest
+series, timestamp and every field it is encoded with. `comparable` is `true`
+only when the profile is publishable, `steps_run` equals `steps_declared`,
+and `stream_digest` equals the digest
 recomputed from the manifest and the anchor; `comparability_reason` names each
 cause that failed. All five provenance fields and `offered_digest` are absent
 from a report written before they existed and read back as unset.
@@ -256,9 +257,17 @@ The token is not written into the report: neither `endpoint` nor
 (`metrics_ingest::tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_last_commit_token`).
 The row records `last_commit_token`, the `x-ravel-commit-token` header of
 the last acknowledged request, verbatim (the server joins one token per
-shard that request touched with commas); the query runner passes it as
-`min_commit_token` (ADR-0927 decision 3). Only the last value is kept, so
-`commit_tokens` is absent on this row. A comparator row records neither.
+shard that request touched with commas). It is a diagnostic sample, not a
+read-your-write fence: it names only the shards that one request touched.
+Only the last value is kept, so `commit_tokens` is absent on this row. A
+comparator row records neither.
+
+On every HTTP row, `accepted_samples` and `accepted_histograms` count points
+in requests the receiver answered 2xx. A Remote Write 1.0 response carries no
+written count, so a point dropped after the acknowledgement is counted as
+accepted; ravel-server, for one, answers 204 after admission or normalization
+drops. The figures are acknowledged, not confirmed stored, until a read-back
+confirms them.
 
 Because generation runs inside the replay, `elapsed_secs` is the sum of the
 timed write segments (the `write_values` calls and the final flush for the

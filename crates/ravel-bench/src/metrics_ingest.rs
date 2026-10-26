@@ -453,7 +453,11 @@ pub struct IngestPhase {
     /// it existed.
     #[serde(default)]
     pub offered_digest: String,
-    /// Samples the system acknowledged.
+    /// Samples the system acknowledged. On an HTTP row this is the samples in
+    /// requests answered 2xx: a Remote Write 1.0 response carries no written
+    /// count, so a point the receiver drops after acknowledging the request
+    /// (ravel-server answers 204 after admission or normalization drops) is
+    /// counted here. Acknowledged, not confirmed stored.
     pub accepted_samples: u64,
     /// Samples the lane refused before sending (client-side admission).
     pub rejected_samples: u64,
@@ -598,8 +602,10 @@ pub struct SystemIngestResult {
     pub commit_tokens: Option<Vec<String>>,
     /// The `x-ravel-commit-token` header value of the last acknowledged
     /// request, verbatim (the server joins one token per shard the write
-    /// touched with commas). Set only on the portable Ravel row; the query
-    /// runner passes it as `min_commit_token` (ADR-0927 decision 3).
+    /// touched with commas). Set only on the portable Ravel row. A diagnostic
+    /// sample of the last acknowledgement, not a read-your-write fence: it
+    /// names only the shards that one request touched, so a query gated on it
+    /// is not gated on shards earlier batches wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_commit_token: Option<String>,
     /// Diagnostic object-store accounting; see [`StorageAccounting`].
@@ -2594,7 +2600,8 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
          histograms)/request sent sequentially (backpressure by awaiting each POST), {auth}, \
          retry on 429/5xx up to {retries} times with a fixed {backoff_ms} ms backoff then drop the \
          batch; {timeout} s per-request timeout bounds the complete operation including the body \
-         read",
+         read; accepted_* counts points in 2xx-acknowledged requests, not points confirmed \
+         stored, since an RW1.0 response carries no written count",
         batch = batch_size,
         auth = if config.bearer_token.is_some() {
             "bearer auth"
