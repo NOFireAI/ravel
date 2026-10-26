@@ -330,6 +330,9 @@ pub enum Label {
     /// key with the other reason variants.
     HandBackReason(HandBackReason),
     Cache(CacheFamily),
+    /// Which catalog decoded-output cache: `part` or `postings`. Shares the
+    /// `cache` key with [`Label::Cache`].
+    DecodedCache(DecodedCacheKind),
     CacheTier(CacheTier),
     /// Which access intent a read-cache lookup carried: `interactive`,
     /// `bulk_scan` or `maintenance`. A closed enum owned by `ravel_cache`.
@@ -540,6 +543,25 @@ impl CacheFamily {
     }
 }
 
+/// Which of the catalog's decoded-output caches (ADR-1702 decision 6) a
+/// `ravel_catalog_decoded_cache_reserved_bytes` sample belongs to: `part` is
+/// the decoded snapshot-part cache, `postings` the decoded name-postings
+/// cache. Shares the `cache` key with [`CacheFamily`] on a different family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedCacheKind {
+    Part,
+    Postings,
+}
+
+impl DecodedCacheKind {
+    fn name(self) -> &'static str {
+        match self {
+            DecodedCacheKind::Part => "part",
+            DecodedCacheKind::Postings => "postings",
+        }
+    }
+}
+
 /// Which ADR-0046 cache tier a `ravel_cache_*` sample belongs to (#97), the
 /// second, orthogonal `tier=` label alongside `cache=`. Both caches (`fetch`,
 /// `catalog`) may carry a RAM tier and, when `--cache-dir` is set, a local-disk
@@ -636,6 +658,7 @@ impl Label {
             Label::CompactionInputSkipReason(_) => "reason",
             Label::HandBackReason(_) => "reason",
             Label::Cache(_) => "cache",
+            Label::DecodedCache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::CacheIntent(_) => "intent",
             Label::MergeMemoryKind(_) => "kind",
@@ -689,6 +712,7 @@ impl Label {
             Label::CompactionInputSkipReason(reason) => reason.name().to_string(),
             Label::HandBackReason(reason) => reason.label().to_string(),
             Label::Cache(family) => family.name().to_string(),
+            Label::DecodedCache(kind) => kind.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::CacheIntent(intent) => cache_intent_name(*intent).to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -2752,6 +2776,18 @@ pub struct CatalogCountersSnapshot {
     /// Decompressed body bytes of the column-statistics objects the catalog
     /// decoded ([`ravel_catalog::Catalog::column_stats_decoded_bytes`]).
     pub column_stats_decoded_bytes: u64,
+    /// Bytes the decoded snapshot-part cache's entries reserve, a gauge
+    /// ([`ravel_catalog::Catalog::decoded_part_cache_reserved_bytes`]).
+    pub decoded_part_cache_reserved_bytes: u64,
+    /// Bytes the decoded name-postings cache's entries reserve, a gauge
+    /// ([`ravel_catalog::Catalog::decoded_postings_cache_reserved_bytes`]).
+    pub decoded_postings_cache_reserved_bytes: u64,
+    /// Decode reservations retried after an eviction pass
+    /// ([`ravel_catalog::Catalog::decode_reserve_retries`]).
+    pub decode_reserve_retries: u64,
+    /// Decoded-output cache entries dropped by an eviction pass
+    /// ([`ravel_catalog::Catalog::decoded_cache_memory_evictions`]).
+    pub decoded_cache_memory_evictions: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
     /// Supervisor restarts of each signal's fold loop, in
@@ -2781,6 +2817,10 @@ impl Default for CatalogCountersSnapshot {
             column_stats_cache_evictions: 0,
             column_stats_cache_held_bytes: 0,
             column_stats_decoded_bytes: 0,
+            decoded_part_cache_reserved_bytes: 0,
+            decoded_postings_cache_reserved_bytes: 0,
+            decode_reserve_retries: 0,
+            decoded_cache_memory_evictions: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
             fold_refold_requests_dropped: 0,
@@ -2806,6 +2846,10 @@ impl CatalogCountersSnapshot {
             column_stats_cache_evictions: catalog.column_stats_cache_evictions(),
             column_stats_cache_held_bytes: catalog.column_stats_cache_held_bytes(),
             column_stats_decoded_bytes: catalog.column_stats_decoded_bytes(),
+            decoded_part_cache_reserved_bytes: catalog.decoded_part_cache_reserved_bytes(),
+            decoded_postings_cache_reserved_bytes: catalog.decoded_postings_cache_reserved_bytes(),
+            decode_reserve_retries: catalog.decode_reserve_retries(),
+            decoded_cache_memory_evictions: catalog.decoded_cache_memory_evictions(),
             fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
                 signal,
                 cycles: catalog.fold_cycles(signal),
@@ -2966,6 +3010,56 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_column_stats_decoded_bytes_total",
         &[Label::Mode(mode)],
         snapshot.column_stats_decoded_bytes,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decoded_cache_reserved_bytes",
+        "Bytes the memory reservations of the catalog's cached decoded snapshot parts (cache=\"part\") or name postings (cache=\"postings\") carry, across every tenant; an entry leaves this figure when the cache drops it, even while a running query still holds it.",
+        "gauge",
+    );
+    for (kind, bytes) in [
+        (
+            DecodedCacheKind::Part,
+            snapshot.decoded_part_cache_reserved_bytes,
+        ),
+        (
+            DecodedCacheKind::Postings,
+            snapshot.decoded_postings_cache_reserved_bytes,
+        ),
+    ] {
+        write_sample(
+            out,
+            "ravel_catalog_decoded_cache_reserved_bytes",
+            &[Label::Mode(mode), Label::DecodedCache(kind)],
+            bytes,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_catalog_decode_reserve_retries_total",
+        "Catalog decode reservations retried after the decoded-output caches dropped entries to make room; moves only when the catalog's memory budget refuses a reservation, and the server leaves that budget unlimited.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decode_reserve_retries_total",
+        &[Label::Mode(mode)],
+        snapshot.decode_reserve_retries,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decoded_cache_memory_evictions_total",
+        "Decoded snapshot-part and name-postings cache entries the catalog dropped to make room for a refused decode reservation; moves only when the catalog's memory budget refuses a reservation, and the server leaves that budget unlimited.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decoded_cache_memory_evictions_total",
+        &[Label::Mode(mode)],
+        snapshot.decoded_cache_memory_evictions,
     );
 
     // The fold families carry a `signal` label because the fold is one
@@ -9543,6 +9637,7 @@ mod tests {
             ),
             Label::HandBackReason(HandBackReason::RetiredIndex),
             Label::Cache(CacheFamily::Fetch),
+            Label::DecodedCache(DecodedCacheKind::Part),
             Label::CacheTier(CacheTier::Ram),
             Label::CacheIntent(ravel_cache::AccessIntent::BulkScan),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -9591,6 +9686,7 @@ mod tests {
                 Label::CompactionInputSkipReason(_) => "reason",
                 Label::HandBackReason(_) => "reason",
                 Label::Cache(_) => "cache",
+                Label::DecodedCache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::CacheIntent(_) => "intent",
                 Label::MergeMemoryKind(_) => "kind",
@@ -9664,6 +9760,8 @@ mod tests {
                 "reason",
                 // HandBackReason (issue #2600) reuses the `reason` key.
                 "reason",
+                "cache",
+                // DecodedCache (issue #3244) reuses the `cache` key.
                 "cache",
                 "tier",
                 // CacheIntent (ADR-3072 decision 3a) is a new key, for the
@@ -12636,6 +12734,358 @@ mod tests {
             .header
             .body_uncompressed_len;
         (body_uncompressed_len, stats_bytes.len() as u64)
+    }
+
+    const DECODED_CACHE_NS_PER_HOUR: i64 = 3_600_000_000_000;
+    const DECODED_CACHE_SEALED_HOUR: u32 = 500_000;
+
+    /// A `now_ns` at which [`DECODED_CACHE_SEALED_HOUR`] is sealed under the
+    /// default fold margins.
+    fn decoded_cache_now_ns() -> i64 {
+        (i64::from(DECODED_CACHE_SEALED_HOUR) + 1) * DECODED_CACHE_NS_PER_HOUR
+            + ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS
+    }
+
+    fn decoded_cache_range() -> ravel_types::TimeRange {
+        ravel_types::TimeRange {
+            start_ns: i64::from(DECODED_CACHE_SEALED_HOUR) * DECODED_CACHE_NS_PER_HOUR,
+            end_ns: (i64::from(DECODED_CACHE_SEALED_HOUR) + 1) * DECODED_CACHE_NS_PER_HOUR - 1,
+        }
+    }
+
+    /// Publish `segments` metrics flushes for `tenant` in
+    /// [`DECODED_CACHE_SEALED_HOUR`] and fold them into a one-part snapshot.
+    /// Returns the part's declared `entries_uncompressed_len`, the bytes a
+    /// resolve's decode reserves for it, read off the stored object.
+    async fn fold_decoded_cache_part(
+        store: &std::sync::Arc<ravel_object_store::memory::MemoryStore>,
+        tenant: ravel_types::TenantHash,
+        segments: u64,
+    ) -> u64 {
+        use bytes::Bytes;
+        use ravel_commit::publish::{self, RetryPolicy};
+        use ravel_commit::record::{self, NewCommitRecord};
+        use ravel_object_store::{GetRange, ObjectStoreBackend};
+
+        let created =
+            (i64::from(DECODED_CACHE_SEALED_HOUR) + 1) * DECODED_CACHE_NS_PER_HOUR - 1_000;
+        for seq in 1..=segments {
+            let writer_id = uuid::Uuid::new_v4();
+            let payload = format!("segment-{seq}-{writer_id}").into_bytes();
+            let commit = record::build(NewCommitRecord {
+                tenant_hash: tenant,
+                signal: Signal::Metrics,
+                shard: 0,
+                writer_id,
+                writer_epoch: 1,
+                writer_seq: seq,
+                object_size: payload.len() as u64,
+                content_hash: *blake3::hash(&payload).as_bytes(),
+                sample_count: 1,
+                series_count: 1,
+                min_event_ts_ns: created - 1_000,
+                max_event_ts_ns: created,
+                min_ingest_ts_ns: created - 1_000,
+                max_ingest_ts_ns: created,
+                segment_format_version: 1,
+                created_unix_ns: created,
+                ingest_hour_bucket: DECODED_CACHE_SEALED_HOUR,
+            })
+            .expect("valid commit record");
+            let data_key =
+                ravel_commit::keys::reconstruct_data_key(&commit).expect("data object key");
+            publish::put_data_object(store.as_ref(), &data_key, Bytes::from(payload))
+                .await
+                .expect("put data object");
+            publish::publish(store.as_ref(), &commit, &RetryPolicy::default())
+                .await
+                .expect("publish commit record");
+        }
+        ravel_catalog::Catalog::new(
+            std::sync::Arc::clone(store) as _,
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .expect("fold catalog")
+        .fold(
+            &tenant,
+            Signal::Metrics,
+            uuid::Uuid::new_v4(),
+            decoded_cache_now_ns(),
+            &[],
+            None,
+        )
+        .await
+        .expect("fold produces a snapshot HEAD");
+
+        let head_bytes = store
+            .get(
+                &crate::fold::head_key(&tenant, Signal::Metrics),
+                GetRange::Full,
+            )
+            .await
+            .expect("HEAD present")
+            .data;
+        let head = ravel_catalog::decode_head(&head_bytes).expect("HEAD decodes");
+        assert_eq!(head.parts.len(), 1, "the fixture folds exactly one part");
+        let part_bytes = store
+            .get(&head.parts[0].key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        ravel_catalog::decode_part(&part_bytes, &ravel_catalog::PartLimits::default())
+            .expect("part decodes")
+            .header
+            .entries_uncompressed_len
+    }
+
+    /// Bind a postings object (one name, `any_metric`, over the part's one
+    /// entry) to `tenant`'s one folded part and re-point its HEAD at it, so a
+    /// pruned resolve for `any_metric` decodes it. Returns its declared
+    /// `body_uncompressed_len`.
+    async fn install_decoded_cache_postings(
+        store: &ravel_object_store::memory::MemoryStore,
+        tenant: ravel_types::TenantHash,
+    ) -> u64 {
+        use bytes::Bytes;
+        use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+
+        let head_key = crate::fold::head_key(&tenant, Signal::Metrics);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let mut head = ravel_catalog::decode_head(&head_bytes).expect("HEAD decodes");
+        let part_blake3: [u8; 32] = head.parts[0]
+            .blake3
+            .clone()
+            .try_into()
+            .expect("32-byte part blake3");
+        let postings_bytes = ravel_catalog::encode_postings(
+            tenant.0,
+            ravel_commit::signal::to_proto(Signal::Metrics) as u32,
+            &[part_blake3],
+            1,
+            &[ravel_catalog::NamePostings {
+                name: "any_metric".to_string(),
+                ordinals: vec![0],
+            }],
+        )
+        .expect("encode postings");
+        let postings_len = ravel_catalog::decode_postings(
+            &postings_bytes,
+            &ravel_catalog::PostingsLimits::default(),
+            &[part_blake3],
+        )
+        .expect("postings decode")
+        .header
+        .body_uncompressed_len;
+        let postings_key = format!("postings-decoded-cache-{}", tenant.to_hex());
+        store
+            .put(
+                &postings_key,
+                Bytes::from(postings_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put postings");
+        head.postings = Some(ravel_proto::catalog::v1::SnapshotPostingsRef {
+            key: postings_key,
+            blake3: blake3::hash(&postings_bytes).as_bytes().to_vec(),
+            size: postings_bytes.len() as u64,
+            name_count: 1,
+            part_blake3: vec![part_blake3.to_vec()],
+        });
+        store
+            .put(
+                &head_key,
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+        postings_len
+    }
+
+    /// The `ravel_catalog_` lines `render_catalog_family` writes for
+    /// `catalog` in `Mode::Query`.
+    fn rendered_catalog_lines(catalog: &ravel_catalog::Catalog) -> Vec<String> {
+        let mut out = String::new();
+        render_catalog_family(
+            &mut out,
+            Mode::Query,
+            &CatalogCountersSnapshot::from_catalog(catalog),
+        );
+        out.lines().map(str::to_string).collect()
+    }
+
+    /// The lines of `lines` that are samples of `family`, header lines
+    /// excluded.
+    fn samples_of(lines: &[String], family: &str) -> Vec<String> {
+        let prefix = format!("{family}{{");
+        lines
+            .iter()
+            .filter(|line| line.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    /// Issue #3244: after one pruned resolve on the server's default
+    /// (unlimited) catalog budget, `/metrics` renders exactly one
+    /// `ravel_catalog_decoded_cache_reserved_bytes` sample per cache, each
+    /// the declared uncompressed length of the one object that cache holds,
+    /// and both reservation counters at 0.
+    ///
+    /// Prove-the-test: render `decoded_part_cache_reserved_bytes` under the
+    /// `cache="postings"` label too and the postings line reads the part's
+    /// 99 bytes against the postings object's 13.
+    #[tokio::test]
+    async fn decoded_cache_reserved_bytes_render_one_line_per_cache() {
+        let tenant = ravel_types::TenantHash([0x51; 16]);
+        let store = std::sync::Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let part_len = fold_decoded_cache_part(&store, tenant, 1).await;
+        let postings_len = install_decoded_cache_postings(&store, tenant).await;
+        assert_ne!(
+            part_len, postings_len,
+            "the fixture tells the two caches' figures apart"
+        );
+        let catalog = ravel_catalog::Catalog::new(
+            std::sync::Arc::clone(&store) as _,
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let family = "ravel_catalog_decoded_cache_reserved_bytes";
+        assert_eq!(
+            samples_of(&rendered_catalog_lines(&catalog), family),
+            vec![
+                format!("{family}{{mode=\"query\",cache=\"part\"}} 0"),
+                format!("{family}{{mode=\"query\",cache=\"postings\"}} 0"),
+            ]
+        );
+
+        let snapshot = catalog
+            .resolve_pruned(
+                &tenant,
+                Signal::Metrics,
+                decoded_cache_range(),
+                &[],
+                decoded_cache_now_ns(),
+                Some("any_metric"),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1);
+
+        let lines = rendered_catalog_lines(&catalog);
+        assert_eq!(
+            samples_of(&lines, family),
+            vec![
+                format!("{family}{{mode=\"query\",cache=\"part\"}} {part_len}"),
+                format!("{family}{{mode=\"query\",cache=\"postings\"}} {postings_len}"),
+            ]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| *line == &format!("# TYPE {family} gauge"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with(&format!("# HELP {family} ")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            samples_of(&lines, "ravel_catalog_decode_reserve_retries_total"),
+            vec!["ravel_catalog_decode_reserve_retries_total{mode=\"query\"} 0".to_string()]
+        );
+        assert_eq!(
+            samples_of(&lines, "ravel_catalog_decoded_cache_memory_evictions_total"),
+            vec![
+                "ravel_catalog_decoded_cache_memory_evictions_total{mode=\"query\"} 0".to_string()
+            ]
+        );
+    }
+
+    /// Issue #3244: one eviction pass on a finite catalog budget reaches the
+    /// rendered text. Tenants A and B each fold a one-segment part and C a
+    /// two-segment one, under a budget that holds A and B together, or C
+    /// alone, but not C beside either. C's resolve is refused, its one pass
+    /// drops both A's and B's parts, and the one retry admits it: evictions
+    /// 2, retries 1, and the part gauge holds C's part alone.
+    ///
+    /// Prove-the-test: render `decode_reserve_retries` for the evictions
+    /// counter as well and it reads 1 against 2.
+    #[tokio::test]
+    async fn decoded_cache_eviction_counters_render_one_pass() {
+        let store = std::sync::Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let a = ravel_types::TenantHash([0x61; 16]);
+        let b = ravel_types::TenantHash([0x62; 16]);
+        let c = ravel_types::TenantHash([0x63; 16]);
+        let a_len = fold_decoded_cache_part(&store, a, 1).await;
+        let b_len = fold_decoded_cache_part(&store, b, 1).await;
+        let c_len = fold_decoded_cache_part(&store, c, 2).await;
+        assert!(
+            c_len > a_len && c_len > b_len,
+            "the two-segment part is the larger: {a_len} {b_len} {c_len}"
+        );
+
+        let limit = (a_len + b_len).max(c_len);
+        let budget = std::sync::Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = ravel_catalog::Catalog::new(
+            std::sync::Arc::clone(&store) as _,
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_memory_budget(std::sync::Arc::clone(&budget));
+        for (tenant, segments) in [(a, 1), (b, 1), (c, 2)] {
+            let snapshot = catalog
+                .resolve(
+                    &tenant,
+                    Signal::Metrics,
+                    decoded_cache_range(),
+                    &[],
+                    decoded_cache_now_ns(),
+                )
+                .await
+                .expect("every tenant resolves within the budget");
+            assert_eq!(snapshot.segments.len(), segments);
+        }
+        assert_eq!(budget.reserved(), c_len);
+
+        let lines = rendered_catalog_lines(&catalog);
+        assert_eq!(
+            samples_of(&lines, "ravel_catalog_decoded_cache_memory_evictions_total"),
+            vec![
+                "ravel_catalog_decoded_cache_memory_evictions_total{mode=\"query\"} 2".to_string()
+            ]
+        );
+        assert_eq!(
+            samples_of(&lines, "ravel_catalog_decode_reserve_retries_total"),
+            vec!["ravel_catalog_decode_reserve_retries_total{mode=\"query\"} 1".to_string()]
+        );
+        assert_eq!(
+            samples_of(&lines, "ravel_catalog_decoded_cache_reserved_bytes"),
+            vec![
+                format!("ravel_catalog_decoded_cache_reserved_bytes{{mode=\"query\",cache=\"part\"}} {c_len}"),
+                "ravel_catalog_decoded_cache_reserved_bytes{mode=\"query\",cache=\"postings\"} 0"
+                    .to_string(),
+            ]
+        );
     }
 
     /// Issue #3244: the column-statistics cache and decoded-bytes figures are
