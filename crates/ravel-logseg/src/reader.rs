@@ -8049,6 +8049,11 @@ mod tests {
                 s: SVal,
                 unique: bool,
                 zz: Option<usize>,
+                /// On a row with no `s` of its own: 1 gives it an `s` of
+                /// type `Bytes`, which sorts after every column `c_corpus`
+                /// counts and so lands in `attrs_raw`; 2 a `Bool`, which takes
+                /// a column of its own.
+                extra: u8,
             }
 
             fn c_row() -> impl Strategy<Value = CRow> {
@@ -8062,19 +8067,21 @@ mod tests {
                     ],
                     any::<bool>(),
                     proptest::option::of(0usize..S.len()),
+                    0u8..3,
                 )
-                    .prop_map(|(stream, ts, s, unique, zz)| CRow {
+                    .prop_map(|(stream, ts, s, unique, zz, extra)| CRow {
                         stream,
                         ts,
                         s,
                         unique,
                         zz,
+                        extra,
                     })
             }
 
             /// The records, and the dynamic column cap that gives `s` its
             /// columns and leaves `zz` (last in the writer's `(name, type)`
-            /// order) in `attrs_raw`. `mode` 0 keeps every `s` value in the
+            /// order) and a `Bytes` `s` in `attrs_raw`. `mode` 0 keeps every `s` value in the
             /// small pool (dictionary pages), 1 makes every one unique (plain
             /// pages), 2 makes the rows whose `unique` is set unique. A unique
             /// value puts its row number before or after the pooled value, so
@@ -8087,7 +8094,14 @@ mod tests {
                     .map(|(i, r)| {
                         let mut attrs = Vec::new();
                         match r.s {
-                            SVal::None => {}
+                            SVal::None => match r.extra {
+                                1 => attrs.push(attr("s", AttrValue::Bytes(b"ab".to_vec()))),
+                                2 => {
+                                    attrs.push(attr("s", AttrValue::Bool(true)));
+                                    pairs.insert("s:bool");
+                                }
+                                _ => {}
+                            },
                             SVal::Str(v) => {
                                 let unique = mode == 1 || (mode == 2 && r.unique);
                                 let v = match (unique, i % 2) {
@@ -8213,6 +8227,7 @@ mod tests {
                         s: SVal::Str(i as usize % S.len()),
                         unique: false,
                         zz: Some(i as usize % 3),
+                        extra: 0,
                     })
                     .collect();
                 let mut seen_invalid = false;
@@ -8258,6 +8273,53 @@ mod tests {
                     }
                 }
                 assert!(seen_invalid, "the corpus stores invalid UTF-8 cells");
+            }
+
+            /// The property's generator reaches the arm's other readings of
+            /// `s`: an `I64` and a `Bool` column beside the `Str` one, and
+            /// `attrs_raw` cells holding `s` on rows with no `s` column cell.
+            #[test]
+            fn contains_corpus_reaches_other_type_columns_and_overflowing_key() {
+                let rows: Vec<CRow> = (0..24)
+                    .map(|i| CRow {
+                        stream: [0, 1, 3, 4, 5][i as usize % 5],
+                        ts: i,
+                        s: match i % 4 {
+                            0 | 1 => SVal::Str(i as usize % S.len()),
+                            2 => SVal::I64(1),
+                            _ => SVal::None,
+                        },
+                        unique: false,
+                        zz: None,
+                        extra: [1, 2][(i as usize / 4) % 2],
+                    })
+                    .collect();
+                let (recs, columns) = c_corpus(&rows, 0);
+                let cfg = RlogConfig {
+                    block_target_records: 8,
+                    max_dynamic_columns: columns,
+                    ..RlogConfig::default()
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let fd = &reader.field_dir;
+                for ty in [FieldType::Str, FieldType::I64, FieldType::Bool] {
+                    assert!(fd.column("s", ty).is_some(), "{ty:?} column");
+                }
+                assert!(fd.column("s", FieldType::Bytes).is_none(), "Bytes overflows");
+                let mut overflowing = 0;
+                let mut scan = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    for r in 0..block.record_count() {
+                        if overflow_attr(block, r, "s").expect("attrs_raw").is_some() {
+                            overflowing += 1;
+                        }
+                    }
+                }
+                assert_eq!(overflowing, 3, "rows 3, 11 and 19");
             }
 
             /// The records `recs(unique)` builds, as one block on a per-block
@@ -8636,6 +8698,175 @@ mod tests {
                 assert_eq!(rows, 16);
                 assert_eq!(stats.contains_cells_tested, 0);
                 assert_eq!(stats.str_cells_validated, 4 + 4);
+            }
+
+            /// Block 0 of `obj`, decoded whole.
+            fn first_block(obj: &[u8], cfg: &RlogConfig) -> DecodedBlock {
+                let reader = RlogReader::new(obj, cfg).expect("open object");
+                let mut scan = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                scan.next_block_columnar(obj).expect("decode");
+                scan.current.take().expect("decoded")
+            }
+
+            /// The rows of `rows` that `pred`, one `Contains` arm compiled
+            /// against `reader`, keeps when run with `sd` as the STREAM_DIR.
+            fn arm_on_rows(
+                reader: &RlogReader,
+                sd: &StreamDir,
+                pred: &Predicate,
+                block: &DecodedBlock,
+                rows: &[usize],
+            ) -> Result<Vec<usize>, LogSegError> {
+                let arm = compile_arms(&reader.stream_dir, &reader.field_dir, &[pred])
+                    .pop()
+                    .expect("one arm");
+                let mut sel = RowSelection {
+                    words: vec![0; block.record_count().div_ceil(64)],
+                };
+                for &r in rows {
+                    sel.words[r / 64] |= 1 << (r % 64);
+                }
+                apply_arm(
+                    &arm,
+                    0,
+                    sd,
+                    block,
+                    &mut DictArmMemo::default(),
+                    &mut ScanStats::default(),
+                    &mut sel,
+                )?;
+                let mut out = Vec::new();
+                sel.extend_rows(&mut out);
+                Ok(out)
+            }
+
+            /// Every selected row reads its `stream_ref`, which is that row's
+            /// corruption check: a ref past the STREAM_DIR errors on a selected
+            /// row even where the row's own cell decides it, and not on an
+            /// unselected row.
+            #[test]
+            fn corrupt_stream_ref_errors_on_selected_rows_only() {
+                // Four rows, so the plain object's first block holds both
+                // streams.
+                let objects = dict_and_plain(|unique| {
+                    (0..4)
+                        .map(|i| srec([3, 5][i as usize % 2], i, vec![s(&val("ab", unique, i))]))
+                        .collect()
+                });
+                let one = |cfg| build_raw(cfg, vec![srec(3, 0, Vec::new())]);
+                for (obj, cfg, enc) in objects {
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let one = one(cfg);
+                    let short = RlogReader::new(&one, &cfg).expect("open object");
+                    assert_eq!((reader.stream_dir.len(), short.stream_dir.len()), (2, 1));
+                    let block = first_block(&obj, &cfg);
+                    let n = block.record_count();
+                    let refs = block.i64_column(COL_STREAM_REF).expect("stream_ref");
+                    let (bad, good): (Vec<usize>, Vec<usize>) =
+                        (0..n).partition(|&r| refs.get(r) == Some(1));
+                    assert!(!bad.is_empty() && !good.is_empty(), "{enc:?}: {n} rows");
+                    let pred = contains("s", "ab", false);
+                    let all: Vec<usize> = (0..n).collect();
+                    assert_eq!(
+                        arm_on_rows(&reader, &reader.stream_dir, &pred, &block, &all)
+                            .expect("whole STREAM_DIR"),
+                        all,
+                        "{enc:?}: every cell holds the needle"
+                    );
+                    for rows in [all.clone(), vec![bad[0]], vec![good[0], bad[0]]] {
+                        let err = arm_on_rows(&reader, &short.stream_dir, &pred, &block, &rows)
+                            .expect_err("a selected row's ref is past the STREAM_DIR");
+                        assert!(
+                            matches!(&err, LogSegError::Corrupted(m) if m == "stream_ref out of range"),
+                            "{enc:?}: {err:?}"
+                        );
+                    }
+                    assert_eq!(
+                        arm_on_rows(&reader, &short.stream_dir, &pred, &block, &good)
+                            .expect("the bad refs are unselected"),
+                        good,
+                        "{enc:?}"
+                    );
+                }
+            }
+
+            /// `attrs_raw` is read only on a selected row the arm otherwise
+            /// rejects: a corrupt cell there errors, and one on a row the
+            /// needle accepts or on an unselected row does not.
+            #[test]
+            fn corrupt_attrs_raw_errors_only_where_the_kernel_reads_it() {
+                let garbage = vec![0xff; 3];
+                assert!(decode_canonical_attrs(&garbage).is_err());
+                for (unique, block_target_records, want) in
+                    [(false, 64, Enc::Dict), (true, 4, Enc::Plain)]
+                {
+                    let cfg = RlogConfig {
+                        block_target_records,
+                        group_target_blocks: 1,
+                        max_dynamic_columns: 1,
+                        ..RlogConfig::default()
+                    };
+                    let recs = (0..8)
+                        .map(|i| {
+                            let v = if i % 2 == 0 { "ab" } else { "zz" };
+                            let zz = attr("zz", AttrValue::Str(format!("z{i}")));
+                            srec(3, i, vec![s(&val(v, unique, i)), zz])
+                        })
+                        .collect();
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let col = s_col(&reader);
+                    assert!(encs(&reader, col).contains(&want), "{want:?}");
+                    assert!(reader.field_dir.column("zz", FieldType::Str).is_none());
+                    let clean = first_block(&obj, &cfg);
+                    let n = clean.record_count();
+                    let all: Vec<usize> = (0..n).collect();
+                    assert!(all.iter().all(|&r| clean.str_at(COL_ATTRS_RAW, r).is_some()));
+                    let (accepted, rejected): (Vec<usize>, Vec<usize>) = all
+                        .iter()
+                        .partition(|&&r| clean.str_at(col, r).is_some_and(|b| b.starts_with(b"ab")));
+                    assert!(!accepted.is_empty() && !rejected.is_empty(), "{want:?}");
+                    let pred = contains("s", "ab", false);
+                    let sd = &reader.stream_dir;
+                    assert_eq!(
+                        arm_on_rows(&reader, sd, &pred, &clean, &all).expect("clean"),
+                        accepted
+                    );
+                    let corrupt = |row: usize| {
+                        let mut b = first_block(&obj, &cfg);
+                        let cells = (0..n)
+                            .map(|r| {
+                                if r == row {
+                                    Some(garbage.clone())
+                                } else {
+                                    b.str_at(COL_ATTRS_RAW, r).map(<[u8]>::to_vec)
+                                }
+                            })
+                            .collect();
+                        *b.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") =
+                            StrColumn::Plain(cells);
+                        b
+                    };
+
+                    let block = corrupt(rejected[0]);
+                    let err = arm_on_rows(&reader, sd, &pred, &block, &all)
+                        .expect_err("a selected rejected row reads attrs_raw");
+                    assert!(matches!(err, LogSegError::Corrupted(_)), "{want:?}: {err:?}");
+                    let rest: Vec<usize> = all.iter().copied().filter(|&r| r != rejected[0]).collect();
+                    assert_eq!(
+                        arm_on_rows(&reader, sd, &pred, &block, &rest).expect("unselected"),
+                        accepted,
+                        "{want:?}"
+                    );
+                    let block = corrupt(accepted[0]);
+                    assert_eq!(
+                        arm_on_rows(&reader, sd, &pred, &block, &all).expect("accepted row"),
+                        accepted,
+                        "{want:?}"
+                    );
+                }
             }
         }
     }
