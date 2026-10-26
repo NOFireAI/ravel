@@ -1,6 +1,6 @@
 //! Default object geometry (issue #2753): the flush target and pipeline depth
 //! a load derives when `--target-bytes` and `--pipeline-depth` are unset, the
-//! depth-triggered flush that keeps a derived window moving, and the
+//! depth-triggered flush that keeps a load's window moving, and the
 //! serializable per-load flush report every signal prints.
 //!
 //! The router's size trigger compares a shard buffer's estimated uncompressed

@@ -1365,6 +1365,13 @@ and more memory held per batch.
 each shard merges several batches' slices into one buffer and flushes it
 as one object once the buffer's estimate reaches the target, so objects
 grow without growing the batch.
+The depth flush (below) runs for such a target too, so a shard's buffer
+also closes once its oldest pending batch is `--pipeline-depth` batches
+old: the target bounds an object's size from above, and an object holds
+about `--pipeline-depth` x `--batch-rows` times the shard's share of the
+rows at most. A shard whose share of a window never reaches the target
+writes smaller objects at the window instead of waiting out
+`--max-flush-delay`.
 
 A logs object's row group is `--group-target-blocks` consecutive blocks
 (default 32, up to about 262,000 records at 8,192 records per block). An
@@ -1409,14 +1416,14 @@ is decoded, on every signal, as the lowest of three bounds:
 
 - the rows bound, ceil(250,000 x `--shards` / `--batch-rows`) batches,
   enough for every shard to fill one 250,000-row object, plus a quarter
-  of it, rounded up, while the depth flush runs (with `--target-bytes`
-  unset). 32 at the defaults on one shard, 125 on four; a rows bound of 1
+  of it, rounded up, while the depth flush runs (with any target above
+  `1`, derived or given). 32 at the defaults on one shard, 125 on four; a rows bound of 1
   gives 2 and a rows bound of 2 gives 3, which is why a slice just short
   of the target waits for the next one. The rows of one window of exactly
   the rows bound add up to one target per shard, so every shard that drew
   less than its share would still be short when the depth flush closes
-  it; the quarter lets the size trigger close it first. With an explicit
-  `--target-bytes` the depth flush is off, the quarter would only add
+  it; the quarter lets the size trigger close it first. With
+  `--target-bytes 1` the depth flush is off, the quarter would only add
   in-flight memory, and the rows bound is used as it is;
 - the memory bound, `--load-memory-bytes` (or the budget derived from
   host memory when the flag is unset) divided by the estimated object
@@ -1428,7 +1435,7 @@ is decoded, on every signal, as the lowest of three bounds:
 
 The summary names the cap when it decided the depth (`cap decided it:
 cap 1024, rows bound <N> + <N> = <N>, memory bound <N>`), including when
-the memory bound is above the cap. With an explicit `--target-bytes` the
+the memory bound is above the cap. With `--target-bytes 1` the
 rows bound prints without the quarter (`rows bound <N>`).
 
 The memory bound compares the budget with the estimate the size trigger
@@ -1437,7 +1444,7 @@ batches. A logs load also charges each built batch against the budget as
 it runs (see `--load-memory-bytes` below). A metrics or spans load applies
 the budget only through this bound and charges nothing at run time.
 
-With `--target-bytes` unset, the loader also flushes every shard once the
+With a target above `1`, derived or given, the loader also flushes every shard once the
 oldest batch pending on any shard is `--pipeline-depth` batches old, so a
 full window never waits out the age trigger. A shard's buffer is pending
 from the first batch that reached it after its last size flush or depth
@@ -1465,10 +1472,10 @@ depth flush is the backstop for rows narrower than the first batch's. An explici
 the rows bound caps objects at about depth x `--batch-rows` / `--shards`
 rows per shard.
 
-An explicit `--target-bytes` turns the depth flush off: buffers close on
-the size trigger, the age trigger or the loader's own flushes, and the
-measured recipe below still holds because it also sets `--max-flush-delay`
-and `--pipeline-depth` by hand. Three things changed for every load, an
+An explicit `--target-bytes` above `1` runs the depth flush as a derived
+target does; `--target-bytes 1` turns it off, since every write then
+flushes its own buffer. The measured recipe below was run while an
+explicit target kept the depth flush off. Three things changed for every load, an
 explicit target included: `--max-flush-delay` defaults to 60 s instead of
 the router's 2 s, the end-of-input flush runs once every submitted batch
 has reached its shard, and a failed load flushes its buffered writes
@@ -1506,9 +1513,10 @@ one line on stderr, so a long load shows what it resolved without waiting
 for the summary:
 
 ```text
-load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>)
+load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>), depth flush on
 ```
 
+The stderr line ends with `depth flush on` or `depth flush off`.
 The flush target names `--target-bytes` when the flag set it. The depth
 line names which bound decided it (`memory bound decided it: ...`), or
 `--pipeline-depth` when the flag set it. The `depth realign` line appears
@@ -1540,9 +1548,9 @@ Each setting does a separate job, and dropping any one of them changes the
 outcome:
 
 - `--target-bytes 1850000000` stored 25.1 MB mean objects on this
-  corpus, 74 times below the target. The target is explicit, so the depth
-  flush stays off and these figures still describe the loader: the run
-  wrote 408 objects (the mean
+  corpus, 74 times below the target. The run predates the depth flush
+  for an explicit target (issue #3273), which these figures do not cover:
+  it wrote 408 objects (the mean
   is over the 407 above 100 KB), split size 390, age 14, final 4 (the final drain, which the trigger mix
   now counts under `manual`), so the
   target is what closed almost all of them,
