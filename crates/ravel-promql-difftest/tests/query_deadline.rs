@@ -171,8 +171,14 @@ async fn refused_connect_is_transport_not_timeout() {
         .instant_query_with_deadline("up", 0, DEADLINE)
         .await;
     match outcome {
-        QueryOutcome::Transport { kind, timing, .. } => {
+        QueryOutcome::Transport {
+            kind,
+            http_status,
+            timing,
+            ..
+        } => {
             assert_eq!(kind, TransportErrorKind::Connect);
+            assert_eq!(http_status, None);
             assert!(timing.dispatch_to_headers.is_none(), "{timing:?}");
         }
         other => panic!("expected Transport {{ kind: Connect }}, got {other:?}"),
@@ -258,22 +264,71 @@ async fn declared_body_over_the_cap_is_body_too_large() {
     );
 }
 
+/// The cap is checked as bytes arrive, not after the body completes: the
+/// server sends one byte over the cap in an unterminated chunked body and
+/// then holds the socket, so an implementation that buffers to the end
+/// before checking runs into the deadline instead.
 #[tokio::test]
 async fn received_body_over_the_cap_is_body_too_large() {
-    let body = "x".repeat(4096);
+    const CAP: u64 = 1024;
+    let body = "x".repeat(CAP as usize + 1);
     let mut response =
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
             .to_vec();
-    response.extend_from_slice(format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).as_bytes());
-    let addr = serve_once(vec![step(0, response)], false).await;
+    response.extend_from_slice(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes());
+    let addr = serve_once(vec![step(0, response)], true).await;
     let outcome = client(addr)
-        .with_max_body_bytes(1024)
+        .with_max_body_bytes(CAP)
         .instant_query_with_deadline("up", 0, DEADLINE)
         .await;
-    assert!(
-        matches!(outcome, QueryOutcome::BodyTooLarge { limit: 1024, .. }),
-        "{outcome:?}"
-    );
+    match outcome {
+        QueryOutcome::BodyTooLarge { limit, timing } => {
+            assert_eq!(limit, CAP);
+            assert!(
+                timing.elapsed < DEADLINE,
+                "the cap fired only at {:?}, not before the {DEADLINE:?} deadline",
+                timing.elapsed
+            );
+        }
+        other => panic!("expected BodyTooLarge, got {other:?}"),
+    }
+}
+
+/// Serves `/-/ready` on every connection: the first `failing` requests get a
+/// 503, every later one a 200. Each response closes its connection.
+async fn serve_ready_after(failing: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut served = 0usize;
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            read_request_head(&mut sock).await;
+            let status = if served < failing {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            served += 1;
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = sock.write_all(response.as_bytes()).await;
+            drop(sock);
+        }
+    });
+    addr
+}
+
+/// The lower bound on `wait_ready`: a server that answers the second probe,
+/// not the first, is ready. An implementation that gives up after one probe
+/// returns `NotReady` here.
+#[tokio::test]
+async fn readiness_probe_that_answers_the_second_probe_is_ready() {
+    let addr = serve_ready_after(1).await;
+    let result = client(addr).wait_ready(Duration::from_secs(2)).await;
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[tokio::test]
@@ -293,6 +348,7 @@ async fn non_json_body_is_a_decode_failure() {
             outcome,
             QueryOutcome::Transport {
                 kind: TransportErrorKind::Decode,
+                http_status: Some(502),
                 ..
             }
         ),

@@ -6,9 +6,8 @@
 //! (connect, request send, response headers, body transfer and JSON parse),
 //! and report a typed [`QueryOutcome`] so a query that exceeds its deadline
 //! is distinguishable from every other failure (ADR-0927 decision 6). The
-//! MetricsBench status mapper (task T3 of #2821, a `metrics_correctness`
-//! module in `ravel-bench` that does not exist yet) is the intended consumer
-//! of that outcome; [`PrometheusClient::instant_query`] and
+//! MetricsBench status mapper (`ravel_bench::metrics_correctness`, task T3
+//! of #2821) is the consumer of that outcome; [`PrometheusClient::instant_query`] and
 //! [`PrometheusClient::range_query`] are thin wrappers that keep the
 //! differential runner on its parsed-envelope `Result`.
 //!
@@ -52,9 +51,10 @@ pub enum PrometheusClientError {
         phase: TimeoutPhase,
         elapsed: Duration,
     },
-    #[error("query transport failure ({kind:?}): {message}")]
+    #[error("query transport failure ({kind:?}, http status {http_status:?}): {message}")]
     Transport {
         kind: TransportErrorKind,
+        http_status: Option<u16>,
         message: String,
     },
     #[error("query response body exceeds the {limit}-byte cap")]
@@ -122,9 +122,12 @@ pub enum QueryOutcome {
         timing: QueryTiming,
     },
     /// The operation failed within the deadline for a reason other than
-    /// time.
+    /// time. `http_status` is the response status when headers arrived
+    /// before the failure (always for `Body` and `Decode`, never for
+    /// `Connect` and `Request`), so a non-JSON 502 keeps its 502.
     Transport {
         kind: TransportErrorKind,
+        http_status: Option<u16>,
         message: String,
         timing: QueryTiming,
     },
@@ -151,9 +154,16 @@ impl QueryOutcome {
             QueryOutcome::Timeout { phase, elapsed, .. } => {
                 Err(PrometheusClientError::Timeout { phase, elapsed })
             }
-            QueryOutcome::Transport { kind, message, .. } => {
-                Err(PrometheusClientError::Transport { kind, message })
-            }
+            QueryOutcome::Transport {
+                kind,
+                http_status,
+                message,
+                ..
+            } => Err(PrometheusClientError::Transport {
+                kind,
+                http_status,
+                message,
+            }),
             QueryOutcome::BodyTooLarge { limit, .. } => {
                 Err(PrometheusClientError::BodyTooLarge { limit })
             }
@@ -378,7 +388,7 @@ impl PrometheusClient {
                 } else {
                     TransportErrorKind::Request
                 };
-                return transport(kind, e.to_string(), start, timing);
+                return transport(kind, None, e.to_string(), start, timing);
             }
             Ok(Ok(resp)) => resp,
         };
@@ -396,7 +406,13 @@ impl PrometheusClient {
             match tokio::time::timeout_at(deadline_at, resp.chunk()).await {
                 Err(_) => return timeout(TimeoutPhase::Body, start, timing),
                 Ok(Err(e)) => {
-                    return transport(TransportErrorKind::Body, e.to_string(), start, timing);
+                    return transport(
+                        TransportErrorKind::Body,
+                        Some(http_status),
+                        e.to_string(),
+                        start,
+                        timing,
+                    );
                 }
                 Ok(Ok(None)) => break,
                 Ok(Ok(Some(chunk))) => {
@@ -424,7 +440,13 @@ impl PrometheusClient {
             ParseResult::Timeout => timeout(TimeoutPhase::Parse, start, timing),
             ParseResult::Failed(message) => {
                 timing.parse = Some(body_at.elapsed());
-                transport(TransportErrorKind::Decode, message, start, timing)
+                transport(
+                    TransportErrorKind::Decode,
+                    Some(http_status),
+                    message,
+                    start,
+                    timing,
+                )
             }
         }
     }
@@ -455,6 +477,7 @@ fn timeout(phase: TimeoutPhase, start: Instant, mut timing: QueryTiming) -> Quer
 
 fn transport(
     kind: TransportErrorKind,
+    http_status: Option<u16>,
     message: String,
     start: Instant,
     mut timing: QueryTiming,
@@ -462,6 +485,7 @@ fn transport(
     timing.elapsed = start.elapsed();
     QueryOutcome::Transport {
         kind,
+        http_status,
         message,
         timing,
     }
