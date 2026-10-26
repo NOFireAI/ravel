@@ -71,7 +71,8 @@ use serde_json::Value as Json;
 use crate::report_schema::ResultStatus;
 
 /// The engines MetricsBench classifies outcomes for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Engine {
     Ravel,
     Prometheus,
@@ -81,7 +82,8 @@ pub enum Engine {
 
 /// Why an engine declined to answer (ADR-0927 decision 6). Required on every
 /// `refused` outcome and absent on every other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RefusalReason {
     /// A configured query limit fired.
     Budget,
@@ -111,12 +113,15 @@ pub struct Classified {
     /// and on `incorrect` when a partial response also diverged.
     pub incomplete: bool,
     pub annotations: Annotations,
-    /// The comparator's mismatch text, or the engine's error message, capped
-    /// at [`MAX_MESSAGE_BYTES`].
-    pub redacted_message: Option<String>,
+    /// The comparator's mismatch text, or the engine's error message, as the
+    /// engine wrote it and truncated to [`MAX_MESSAGE_BYTES`] (`cap_message`).
+    /// It is capped, not redacted: nothing is removed from the text other than
+    /// what lies past the cap, so whatever the engine put in its error body
+    /// reaches the report.
+    pub message: Option<String>,
 }
 
-/// Upper bound on [`Classified::redacted_message`], so one oversized error
+/// Upper bound on [`Classified::message`], so one oversized error
 /// body cannot bloat a report row.
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 
@@ -559,7 +564,7 @@ fn classify_success(
             };
             Classified {
                 incomplete,
-                redacted_message: Some(cap_message(&text)),
+                message: Some(cap_message(&text)),
                 ..Classified::bare(ResultStatus::Incorrect)
             }
         }
@@ -569,7 +574,7 @@ fn classify_success(
 fn classify_error(engine: Engine, http_status: u16, body: &Json) -> Classified {
     let error_type = body["errorType"].as_str();
     let message = body["error"].as_str().unwrap_or_default();
-    let redacted = (!message.is_empty()).then(|| cap_message(message));
+    let capped = (!message.is_empty()).then(|| cap_message(message));
 
     if engine == Engine::Ravel
         && http_status == 503
@@ -577,25 +582,25 @@ fn classify_error(engine: Engine, http_status: u16, body: &Json) -> Classified {
         && message.starts_with(RAVEL_PARTIAL_REFUSAL_PREFIX)
         && body.get("data").is_none_or(Json::is_null)
     {
-        return Classified::refused(RefusalReason::PartialCoverage, redacted);
+        return Classified::refused(RefusalReason::PartialCoverage, capped);
     }
     if budget_signatures(engine)
         .iter()
         .any(|s| s.matches(http_status, error_type, message))
     {
-        return Classified::refused(RefusalReason::Budget, redacted);
+        return Classified::refused(RefusalReason::Budget, capped);
     }
     if unsupported_signatures(engine)
         .iter()
         .any(|s| s.matches(http_status, error_type, message))
     {
         return Classified {
-            redacted_message: redacted,
+            message: capped,
             ..Classified::bare(ResultStatus::UnsupportedConstruct)
         };
     }
     let class = error_type.map_or_else(|| format!("http_{http_status}"), str::to_string);
-    Classified::error(class, redacted)
+    Classified::error(class, capped)
 }
 
 impl Classified {
@@ -606,22 +611,22 @@ impl Classified {
             error_class: None,
             incomplete: false,
             annotations: Annotations::default(),
-            redacted_message: None,
+            message: None,
         }
     }
 
-    fn error(class: String, redacted_message: Option<String>) -> Self {
+    fn error(class: String, message: Option<String>) -> Self {
         Classified {
             error_class: Some(class),
-            redacted_message,
+            message,
             ..Classified::bare(ResultStatus::Error)
         }
     }
 
-    fn refused(reason: RefusalReason, redacted_message: Option<String>) -> Self {
+    fn refused(reason: RefusalReason, message: Option<String>) -> Self {
         Classified {
             refusal_reason: Some(reason),
-            redacted_message,
+            message,
             ..Classified::bare(ResultStatus::Refused)
         }
     }
@@ -919,7 +924,7 @@ mod tests {
         let c = run(Engine::Ravel, envelope(200, ravel));
         assert_eq!(c.status, ResultStatus::Incorrect);
         assert!(c.incomplete);
-        assert!(c.redacted_message.is_some());
+        assert!(c.message.is_some());
     }
 
     #[test]
@@ -969,7 +974,7 @@ mod tests {
     fn mismatching_data_is_incorrect_with_the_comparator_text() {
         let c = run(Engine::Mimir, envelope(200, vector("2")));
         assert_eq!(c.status, ResultStatus::Incorrect);
-        let text = c.redacted_message.expect("mismatch text");
+        let text = c.message.expect("mismatch text");
         assert!(!text.starts_with("semantic_difference:"), "{text}");
     }
 
@@ -1408,7 +1413,7 @@ mod tests {
         .expect("classified");
         assert_eq!(c.status, ResultStatus::Incorrect);
         assert_eq!(c.refusal_reason, None);
-        let text = c.redacted_message.expect("message");
+        let text = c.message.expect("message");
         assert!(text.starts_with("semantic_difference: "), "{text}");
 
         // The prefix is VictoriaMetrics-only.
@@ -1419,7 +1424,7 @@ mod tests {
             &entry,
         )
         .expect("classified");
-        let text = c.redacted_message.expect("message");
+        let text = c.message.expect("message");
         assert!(!text.starts_with("semantic_difference:"), "{text}");
     }
 
@@ -1497,9 +1502,72 @@ mod tests {
         }
     }
 
+    /// The last cell (`Error text`) of every data row of the markdown tables
+    /// in `section`. The header row (the one followed by a `|---` separator)
+    /// and the separator itself are skipped, so a column heading never counts
+    /// as observed text.
+    fn error_text_cells(section: &str) -> Vec<&str> {
+        let lines: Vec<&str> = section.lines().map(str::trim).collect();
+        let mut cells = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.starts_with('|') || line.starts_with("|---") {
+                continue;
+            }
+            if lines
+                .get(i + 1)
+                .is_some_and(|next| next.starts_with("|---"))
+            {
+                continue;
+            }
+            if let Some(last) = line.trim_matches('|').split('|').next_back() {
+                cells.push(last.trim());
+            }
+        }
+        cells
+    }
+
+    /// Whether `needle` appears in the `Error text` column of a table row in
+    /// `section`, not merely somewhere in the section.
+    fn in_error_text(section: &str, needle: &str) -> bool {
+        error_text_cells(section)
+            .iter()
+            .any(|cell| cell.contains(needle))
+    }
+
+    /// The observed-text check reads only the `Error text` column: a flag name
+    /// that appears in the `Limit` cell and nowhere in the observed text does
+    /// not count as observed.
+    ///
+    /// To watch it fail against the whole-section search, change the body of
+    /// `in_error_text` to `section.contains(needle)`: the fixture's
+    /// `-search.fixtureOnlyInLimit` sits in the `Limit` cell, so the first
+    /// assertion then reads `true`.
+    #[test]
+    fn a_match_text_only_in_the_limit_cell_is_not_observed() {
+        let section = "\n\
+            | Comparator | Limit | HTTP | `errorType` | Error text |\n\
+            |---|---|---|---|---|\n\
+            | VictoriaMetrics | `-search.fixtureOnlyInLimit` | 422 | `422` | `timeout exceeded` followed by the flag name |\n\
+            | VictoriaMetrics | `-search.other` | 422 | `422` | `see -search.other command-line flag` |\n";
+        assert!(section.contains("-search.fixtureOnlyInLimit"));
+        assert!(!in_error_text(section, "-search.fixtureOnlyInLimit"));
+        assert!(in_error_text(section, "-search.other command-line flag"));
+        assert!(
+            !in_error_text(section, "Error text"),
+            "the header is skipped"
+        );
+    }
+
+    /// Rows whose match text is not quoted in the README table's `Error text`
+    /// column. The README paraphrases this one ("followed by the flag name")
+    /// and spells the flag only in the `Limit` cell; the README is outside this
+    /// crate, so the row is listed here until the table quotes the flag, and
+    /// the test fails once it does so the entry gets removed.
+    const NOT_QUOTED_IN_ERROR_TEXT: &[&str] = &["-search.maxQueryDuration"];
+
     /// A row's citation is checked against the thing it cites: a source
     /// file must exist, and a row citing the observed-refusal table must
-    /// find its match text inside that table.
+    /// find its match text inside that table's `Error text` column.
     #[test]
     fn every_cited_source_resolves() {
         const README_CITATION: &str = "deploy/metricsbench/README.md, Budget-refusal signatures";
@@ -1512,6 +1580,10 @@ mod tests {
             .unwrap_or_else(|| panic!("README has no {HEADING:?} section"));
         let body = &readme[start + HEADING.len()..];
         let section = body.find("\n#").map_or(body, |end| &body[..end]);
+        assert!(
+            error_text_cells(section).len() >= 13,
+            "the README's observed table parsed to too few rows"
+        );
         let mut readme_rows = 0;
         let mut file_rows = 0;
         for engine in [
@@ -1526,9 +1598,20 @@ mod tests {
             for row in rows {
                 if row.source.contains(README_CITATION) {
                     readme_rows += 1;
+                    if NOT_QUOTED_IN_ERROR_TEXT.contains(&row.message_contains) {
+                        assert!(
+                            !in_error_text(section, row.message_contains)
+                                && section.contains(row.message_contains),
+                            "{engine:?}: {:?} is now quoted in the Error text column (or gone \
+                             from the table); update NOT_QUOTED_IN_ERROR_TEXT",
+                            row.message_contains
+                        );
+                        continue;
+                    }
                     assert!(
-                        section.contains(row.message_contains),
-                        "{engine:?}: {:?} is not in the README's observed table",
+                        in_error_text(section, row.message_contains),
+                        "{engine:?}: {:?} is not in the Error text column of the README's \
+                         observed table",
                         row.message_contains
                     );
                 } else if row.source.starts_with("crates/") {
