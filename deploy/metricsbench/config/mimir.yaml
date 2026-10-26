@@ -118,11 +118,16 @@ limits:
   compactor_blocks_retention_period: 45d
   # NATIVE HISTOGRAMS (disclosed): 3.x flipped this default from false to
   # true (-ingester.native-histograms-ingestion-enabled, 2.14.2 help: samples
-  # "ignored without an error"; 3.2.3 help: "(default true)"). Pinned true
-  # explicitly so a future default flip cannot change what this comparator
-  # stores without a diff here. Today the portable Remote Write 1.0 replay
-  # sends no native histograms (the ingest lane keeps only float payloads
-  # and the body carries an empty histograms list), so this setting changes
-  # nothing observable yet; it matters once task T1c of #2821 puts native
-  # histograms on the wire.
+  # "ignored without an error"; 3.2.3 help: "[experimental] ... (default
+  # true)", and the same help line says that querying native histograms with
+  # query sharding on needs -query-frontend.query-result-response-format set
+  # to protobuf, which this config does not set). Pinned true explicitly so
+  # a future default flip cannot change what this comparator stores without
+  # a diff here. Today the portable Remote Write 1.0 replay sends no native
+  # histograms (the ingest lane keeps only float payloads and the body
+  # carries an empty histograms list), so this setting changes nothing
+  # observable yet; once task T1c of #2821 puts native histograms on the
+  # wire, the comparator stores them but the query-side response format
+  # above must be set in the same change before they are queryable under
+  # sharding.
   native_histograms_ingestion_enabled: true

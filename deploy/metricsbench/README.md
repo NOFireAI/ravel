@@ -122,15 +122,15 @@ The document's shape, abbreviated:
     "prometheus": {"version": "3.13.1", "revision": "...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
     "victoriametrics": {"version": "v1.115.0", "revision": "victoria-metrics-...-tags-v1.115.0-0-g...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
     "mimir": {
-      "version": "2.14.2",
+      "version": "3.2.3",
       "revision": "...",
       "runtime_flags": {"format": "yaml", "effective_config": "..."},
-      "querier_query_engine": "prometheus",
-      "query_engine_default_for_version": "prometheus",
+      "querier_query_engine": "mimir",
+      "query_engine_default_for_version": "mimir",
       "image": {
         "container": "...",
         "image_id": "sha256:...",
-        "config_image": "grafana/mimir:2.14.2@sha256:...",
+        "config_image": "grafana/mimir:3.2.3@sha256:...",
         "repo_digests": ["grafana/mimir@sha256:..."],
         "architecture": "amd64",
         "os": "linux"
