@@ -2089,7 +2089,7 @@ async fn an_explicit_target_runs_the_depth_flush() {
         false,
         Arc::new(TenantRules::none()),
     );
-    let report = tokio::time::timeout(PARKED_LOAD_GUARD, load_fut)
+    let report = tokio::time::timeout(PARKED_LOAD_GUARD, load_fut) // allow-wall-clock: deadlock guard, the load never waits on time
         .await
         .expect("the depth flush closes every window, so the load never waits on age")
         .expect("load succeeds");
@@ -2299,13 +2299,11 @@ async fn an_explicit_target_closes_a_sparse_shard_at_the_window() {
     };
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let report = tokio::time::timeout(
-        PARKED_LOAD_GUARD,
-        run(Arc::clone(&store), TestClock::new(NOW_NS), None),
-    )
-    .await
-    .expect("the depth flush closes the sparse shard, so the load never waits on age")
-    .expect("load succeeds");
+    let load_fut = run(Arc::clone(&store), TestClock::new(NOW_NS), None);
+    let report = tokio::time::timeout(PARKED_LOAD_GUARD, load_fut) // allow-wall-clock: deadlock guard, the load never waits on time
+        .await
+        .expect("the depth flush closes the sparse shard, so the load never waits on age")
+        .expect("load succeeds");
 
     let geometry = report.geometry.expect("geometry resolved");
     assert_eq!(geometry.target_source, TargetSource::Flag);
