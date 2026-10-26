@@ -185,7 +185,8 @@ rule on thread placement.
    That is task 5 in the list below. (What is reserved, and when it
    shrinks, is refined by the decoded-output charge amendment below; what a
    declared length over the decoder's own ceiling costs, and what a refused
-   reservation does, by the decode-refusal amendment.)
+   reservation does, by the decode-refusal amendment; for a
+   column-statistics load, by the column-statistics budget-skip amendment.)
 
 7. **The logs and spans scans get a decode state.** Their decode runs
    inside `poll_next`, so a wrap in place is not possible. Each scan's state
@@ -580,7 +581,9 @@ reservation sites. Both readings are settled here.
   directly with no eviction pass, so there a 0-byte charge on an over-limit
   budget is refused outright.
 - **A refused reservation fails the operation, on the resolve path and on the
-  fold path alike.** Both paths could instead degrade: the resolve by
+  fold path alike.** (A column-statistics load is the exception: see the
+  column-statistics budget-skip amendment below.) Both paths could instead
+  degrade: the resolve by
   disabling pruning, the fold by rebuilding its postings from scratch. Both
   fallbacks cost MORE memory than the decode that was just refused -- an
   unpruned scan holds more than the postings that would have pruned it, and a
@@ -991,3 +994,30 @@ arrow's reader rejects a buffer that does not decompress to exactly its
 declared length; its LZ4_FRAME reader does not, which is why that codec is
 refused rather than sized. So at most the cap, 16 MiB by default, of IPC body
 decompression per payload runs on the stream's task outside the gate.
+
+## Amendment (2026-10-26): the column-statistics budget-skip amendment (issue #3244)
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-09-28): the decode-refusal amendment" pointer="column-statistics budget-skip amendment" -->
+
+The decode-refusal amendment's "a refused reservation fails the operation"
+no longer covers a column-statistics load. When the budget refuses a
+column-statistics reservation, the load releases every reservation it took
+for that part, leaves the part uncovered, and the query scans it. The skip is
+counted in `Catalog::column_stats_budget_skips`
+(`ravel_catalog_column_stats_budget_skips_total`) and logged at debug level;
+it is not a refused decode, so it moves neither
+`column_stats_decode_refusals` nor that object's warn-once latch.
+
+The decode-refusal amendment's reason does not hold here. The statistics are
+an optional artifact: a part with none is answered by scanning its data,
+which is exact, so the skip changes cost and never a result. The fallback is
+also not the more expensive path in the sense that amendment rejects: the
+scan reads the data through the query fetcher, whose own decode reservations
+are charged to the process budget and refuse on their own terms, while the
+statistics charge the scan replaces is gone. A part or postings refusal, and
+a fold's, still fails the operation as that amendment states.
+
+Decision 6's rule is unchanged: the statistics decode still reserves before
+it decodes, its header checks still run before any reservation, and a body
+declared over the decoder's ceiling is still charged 0 and refused by the
+decoder.

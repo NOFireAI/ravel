@@ -787,8 +787,13 @@ refused decode and leaves the part uncovered the same way: a cancelled job,
 or a closed gate, never ran and a retry can succeed, so it is logged each
 time and not counted; a panicked job panics again on the same bytes, so it
 is logged once per object key and counted on every occurrence in
-`Catalog::column_stats_decode_panics`. The query scans a part left with no
-loaded statistics, exactly as if no statistics existed for that part. There
+`Catalog::column_stats_decode_panics`. A load whose memory reservation the
+budget refuses (`FetchOutcome::BudgetRefused`) leaves the part uncovered too,
+counted in `Catalog::column_stats_budget_skips` and not as a refused decode.
+When the column-statistics cache holds an entry for the part but a refetch
+for a dictionary it lacks finds the object absent, fails to decode or is
+refused by the budget, the cached entry is served instead. The query scans a
+part left with no loaded statistics, exactly as if no statistics existed for that part. There
 is no whole-tenant fallback and no declared-entry-count coverage comparison to decide whether one is needed --
 per-part coverage is decided per part, from that part's own field-7 ref
 alone.
@@ -2217,13 +2222,22 @@ pinning are unchanged:
    length-delimited segment at a time, each segment's encoded length is
    reserved before it is read, and once the segment is validated and its
    unkept dictionaries are cleared that charge is replaced by one for the
-   bytes it keeps. A load therefore reserves at most its largest segment
-   plus the kept bytes, rather than the whole declared body up front; a
-   body declared over the
-   ceiling is charged 0 and refused before any segment is read. A refusal
-   fails the load with `LoadColumnStatsError::MemoryExhausted`, which a SQL
-   client sees as 422 with the budget's own message (ADR-2633 section 5),
-   never as corrupt data. Its header
+   bytes it keeps. The keep charge is taken while the segment's charge is
+   still held, so a load's reservation peaks at one segment's encoded
+   length plus the bytes kept so far. When every dictionary is kept, the
+   kept bytes approach the declared body and the peak exceeds it by up to
+   one segment; streaming lowers the peak only when the request leaves
+   dictionaries out. A body declared over the ceiling is charged 0 and
+   refused before any segment is read. A refused reservation is a budget
+   skip, not an error: every reservation the load took for that part is
+   released, the part is left uncovered and the query scans it, and the
+   skip is logged at debug level (object key, requested bytes, limit) and
+   counted in `Catalog::column_stats_budget_skips`
+   (`ravel_catalog_column_stats_budget_skips_total`). It is not a refused
+   decode: it does not move `column_stats_decode_refusals` and does not
+   spend that object's warn-once latch, since the bytes were never judged.
+   ADR-1702's 2026-10-26 amendment records why the statistics load
+   degrades where the other decodes refuse. Its header
    checks (tenant_hash, format version and part binding) also read the
    peeked header and run before that reservation, so under memory pressure
    a foreign-tenant object still fails with
