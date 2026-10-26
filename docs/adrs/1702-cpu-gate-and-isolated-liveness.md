@@ -596,7 +596,8 @@ reservation sites. Both readings are settled here.
   refused on every tick and that tenant's fold stays failed where the old code
   rebuilt, and an operator sees the fold's typed budget error logged every
   tick. The shipped server cannot reach it today, since ravel-server never
-  calls `Catalog::with_memory_budget`.
+  calls `Catalog::with_memory_budget` (retired: catalog decode charge amendment
+  below; the server now calls it).
 
 ## Amendment (2026-09-28): where the heartbeat age comes from
 
@@ -635,6 +636,7 @@ fold path this is the same outcome the decode-refusal amendment describes for
 an oversized object: refused on every tick while it holds, with the fold's
 typed budget error logged. The shipped server still never calls
 `Catalog::with_memory_budget`, so no deployment reaches this path yet.
+(Retired by the catalog decode charge amendment below.)
 
 ## Amendment (2026-10-10): the inline open-decode amendment
 
@@ -1021,3 +1023,21 @@ Decision 6's rule is unchanged: the statistics decode still reserves before
 it decodes, its header checks still run before any reservation, and a body
 declared over the decoder's ceiling is still charged 0 and refused by the
 decoder.
+
+## Amendment (2026-10-26): the catalog decode charge amendment (issue #3244)
+
+<!-- amendment-supersedes: phrase="The shipped server cannot reach it today" pointer="catalog decode charge amendment" -->
+<!-- amendment-supersedes: phrase="no deployment reaches this path yet" pointer="catalog decode charge amendment" -->
+
+The decode-refusal and eviction-skip amendments each closed by saying the
+shipped server could not reach the path they describe, because ravel-server
+never called `Catalog::with_memory_budget`. It now does: `crate::start`
+builds the catalog with `.with_memory_budget(process_memory_budget.clone())`
+beside `.with_read_gate`, on the same budget the query engine and the SQL
+executor hold (ADR-1170, catalog decodes are charged to the shared budget).
+Where that budget is finite, a part or postings decode it refuses fails the
+resolve with the typed error after the eviction pass those amendments
+describe, and a fold tick whose previous-postings decode it refuses fails
+with the typed error logged and is retried by the next tick. Decision 6 and
+both amendments' rules are unchanged; only the two sentences saying no
+deployment reaches them are retired.

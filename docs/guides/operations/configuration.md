@@ -2112,7 +2112,7 @@ The current state is visible live at `/metrics`:
 | Metric | Meaning |
 |---|---|
 | `ravel_memory_budget_bytes` | The ceiling of the shared accountant. It is the `memory_remainder_bytes` of the startup log: the budget MINUS the three cache ceilings. It is not the pre-carve `memory_budget_bytes` figure logged beside it. `u64::MAX` means unlimited, which is what any host with unreadable memory reports regardless of the caps set on it. |
-| `ravel_memory_reserved_bytes` | The reserved total, split by a `component` label. `fetch` is the bytes held by fetch reservations on the PromQL and SQL paths, including distributed fragment slices and the startup cache warm pass. `sql` is the rest of the reserved total: what the per-tenant accountants of the SQL executor hold. |
+| `ravel_memory_reserved_bytes` | The reserved total, split by a `component` label. `fetch` is the bytes held by fetch reservations on the PromQL and SQL paths, including distributed fragment slices and the startup cache warm pass, and by the catalog's snapshot-part and name-postings decodes, both while they are decoded and for as long as the catalog's decoded-output caches keep them (`ravel_catalog_decoded_cache_reserved_bytes` is that cached share). `sql` is the rest of the reserved total: what the per-tenant accountants of the SQL executor hold. |
 | `ravel_memory_handoff_overlap_bytes` | The part of the `fetch` share whose bytes went through the read cache, hit or miss, whether or not the cache kept them. `0` when no read cache is configured. |
 
 `--cache-max-bytes` has a limited effect on how many times a logs statement
