@@ -20,8 +20,8 @@ server:
   # the ADR-0927 cardinality profile (1,000,000 series). In 3.2.3 this equals
   # the default (-server.grpc-max-recv-msg-size-bytes and
   # -server.grpc-max-send-msg-size-bytes, default 104857600); it stays pinned
-  # so a future default change cannot shrink it. COMMITTED, EXPLAINED tuning to
-  # let the benchmark's own load through, not a performance optimisation.
+  # so a future default change cannot shrink the ceiling below what the
+  # benchmark's own batches need. Not a performance optimisation.
   grpc_server_max_recv_msg_size: 104857600
   grpc_server_max_send_msg_size: 104857600
 
