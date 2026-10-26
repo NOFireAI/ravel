@@ -209,7 +209,10 @@ fn open_segment_subset(
 /// no plan phase or suffix probe is needed. A prune list holding only
 /// `NumNotEq` arms also takes this path; the open then drops the blocks whose
 /// skip-index stats rule the arm out, and the caller takes the survivor list
-/// from [`LogSegmentScan::survivor_block_indices`]. Also used for a segment at
+/// from [`LogSegmentScan::survivor_block_indices`]. So does a content list
+/// holding only `Contains` arms: `ctx.query` carries it into the open, the
+/// reader evaluates it per row of every block, and the caller takes the
+/// survivor list the same way. Also used for a segment at
 /// or under the plan bound (ADR-2677 decision 2), which has one owner and no
 /// plan: the open
 /// prunes blocks from the directory the whole read holds, and the caller takes
@@ -244,7 +247,9 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
 /// so the ranged read's candidate set is the whole segment and the rows it
 /// yields are the rows [`open_segment_whole`] would have yielded. Under a
 /// `NumNotEq`-only prune list the open itself drops the blocks the arm rules
-/// out, in both entry points alike, and records the survivor list.
+/// out, in both entry points alike, and records the survivor list; a
+/// `Contains`-only content list is evaluated per row by the reader in both
+/// alike.
 fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
@@ -626,6 +631,9 @@ struct ColumnarBlockJob {
     block: DFResult<Option<usize>>,
     /// The scan's shared-dictionary values ([`LogScanStream::str_values`]).
     str_values: SharedStrValuesCache,
+    /// [`BlockMetrics::str_cells_validated`], which the build adds its
+    /// plain-page validations to.
+    str_cells_validated: Count,
     /// Panic inside the gate job instead of running it.
     #[cfg(test)]
     panic_for_test: bool,
@@ -672,6 +680,7 @@ impl ColumnarBlockJob {
                             first_row: 0,
                         }),
                         &self.str_values,
+                        &self.str_cells_validated,
                     )
                 });
                 match built {
@@ -808,9 +817,10 @@ pub(super) struct RowRefRange {
 /// its own open pruned to, so it resolves like a planned one.
 ///
 /// The whole-segment fast path has no plan-phase survivor list. When its query
-/// carries a prune list (only `NumNotEq` arms reach it,
-/// `route_predicate_free`), the open's own survivor list is passed, so it
-/// resolves like an unplanned segment. Otherwise it passes `None`, and late
+/// carries a prune or content list (only `NumNotEq` prune arms and `Contains`
+/// content arms reach it, `route_predicate_free`), the open's own survivor
+/// list is passed, so it resolves like an unplanned segment. Otherwise it
+/// passes `None`, and late
 /// materialization resolves the row-ref as a position among the blocks its
 /// own reopen keeps. The two agree only while the open has pruned no block
 /// before this one, so the decoded block must equal `cursor`, the block's
@@ -1077,13 +1087,14 @@ impl LogScanStream {
         }
     }
 
-    /// Whether this whole-segment fast-path open prunes blocks, so the open's
-    /// survivor list, not the whole segment, is what a row ref indexes. It
-    /// tests only that the prune list is non-empty: `route_predicate_free` is
-    /// the one way onto the fast path with a prune list, and it admits only
-    /// `NumNotEq` arms.
-    fn fast_path_prunes(&self) -> bool {
-        self.fast_whole_segment && !self.ctx.query.prune.is_empty()
+    /// Whether this whole-segment fast-path open carries a block-level arm, so
+    /// the open's survivor list, not the whole segment, is what a row ref
+    /// indexes. It tests only that the prune or content list is non-empty:
+    /// `route_predicate_free` is the one way onto the fast path with either,
+    /// and it admits only `NumNotEq` prune arms and `Contains` content arms.
+    fn fast_path_records_survivors(&self) -> bool {
+        self.fast_whole_segment
+            && !(self.ctx.query.prune.is_empty() && self.ctx.query.content.is_empty())
     }
 
     /// The surviving-block index of the block just decoded, or `None` when
@@ -1560,7 +1571,7 @@ impl LogScanStream {
                                     .add_duration(at.saturating_duration_since(issued));
                                 match *opened {
                                     Ok(Some(scan)) => {
-                                        if this.fast_path_prunes() {
+                                        if this.fast_path_records_survivors() {
                                             this.current_survivors =
                                                 Some(Arc::new(scan.survivor_block_indices()));
                                         }
@@ -1707,8 +1718,8 @@ impl LogScanStream {
                         // open just pruned to, which is also the list a
                         // late-materialization reopen prunes to, so a row-ref's
                         // block position resolves the same way on both. A
-                        // fast-path open that prunes is the same case.
-                        if this.current_unplanned || this.fast_path_prunes() {
+                        // fast-path open carrying an arm is the same case.
+                        if this.current_unplanned || this.fast_path_records_survivors() {
                             this.current_survivors = Some(Arc::new(scan.survivor_block_indices()));
                         }
                         this.state = if this.columnar_eligible {
@@ -1811,6 +1822,7 @@ impl LogScanStream {
                                 segment: this.current_seg_ordinal,
                                 block,
                                 str_values: Arc::clone(&this.str_values),
+                                str_cells_validated: this.blocks.str_cells_validated.clone(),
                                 #[cfg(test)]
                                 panic_for_test: take_columnar_job_panic(
                                     this.current_seg

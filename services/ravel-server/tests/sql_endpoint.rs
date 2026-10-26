@@ -2473,6 +2473,8 @@ const PRUNING_KEYS: &[&str] = &[
     "segmentsSkippedByThreshold",
     "blocksPredicateDropped",
     "rowsPredicateEvaluated",
+    "containsCellsTested",
+    "strCellsValidated",
 ];
 
 /// ADR-2677 decision 4: the JSON response carries `stats.timings` and
@@ -2518,7 +2520,12 @@ async fn sql_response_carries_timings_and_pruning_stats() {
         pruning["blocksTotal"], 0,
         "a metrics scan has no logs blocks: {value}"
     );
-    for key in ["blocksPredicateDropped", "rowsPredicateEvaluated"] {
+    for key in [
+        "blocksPredicateDropped",
+        "rowsPredicateEvaluated",
+        "containsCellsTested",
+        "strCellsValidated",
+    ] {
         assert_eq!(pruning[key], 0, "{key} with no logs scan: {value}");
     }
     for key in ["segmentsPrunedByKeyIndex", "blocksPrunedByKeyIndex"] {

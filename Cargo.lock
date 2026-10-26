@@ -4822,6 +4822,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "criterion",
+ "memchr",
  "proptest",
  "prost",
  "ravel-codec",

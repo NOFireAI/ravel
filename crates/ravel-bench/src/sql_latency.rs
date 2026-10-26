@@ -598,6 +598,16 @@ pub struct ScanDiagnostics {
     /// field existed reads as `0`.
     #[serde(default)]
     pub segments_pruned_by_stats: u64,
+    /// Distinct cell values a pushed `Contains` arm tested on the cold run
+    /// (`SqlStats::contains_cells_tested`). A report written before the field
+    /// existed reads as `0`.
+    #[serde(default)]
+    pub contains_cells_tested: u64,
+    /// String cells checked as UTF-8 on the cold run
+    /// (`SqlStats::str_cells_validated`). A report written before the field
+    /// existed reads as `0`.
+    #[serde(default)]
+    pub str_cells_validated: u64,
     /// Object-store GET requests the cold run issued.
     pub object_store_get_requests: u64,
     /// Object-store LIST requests the cold run issued.
@@ -2040,6 +2050,8 @@ pub async fn measure_corpus(
             blocks_scanned: 0,
             blocks_pruned_by_postings: 0,
             segments_pruned_by_stats: 0,
+            contains_cells_tested: 0,
+            str_cells_validated: 0,
             object_store_get_requests: 0,
             object_store_list_requests: 0,
             object_store_bytes: 0,
@@ -2155,6 +2167,8 @@ pub async fn measure_corpus(
                     blocks_scanned: outcome.stats.blocks_scanned,
                     blocks_pruned_by_postings: outcome.stats.blocks_pruned_by_postings,
                     segments_pruned_by_stats: outcome.stats.segments_pruned_by_stats,
+                    contains_cells_tested: outcome.stats.contains_cells_tested,
+                    str_cells_validated: outcome.stats.str_cells_validated,
                     object_store_get_requests: acc.s3_requests(AccountedOp::Get),
                     object_store_list_requests: acc.s3_requests(AccountedOp::List),
                     object_store_bytes: acc.total_s3_bytes(),
@@ -5006,6 +5020,79 @@ mod tests {
             .remove("segments_pruned_by_stats");
         let old: ScanDiagnostics = serde_json::from_value(legacy).expect("legacy report parses");
         assert_eq!(old.segments_pruned_by_stats, 0);
+    }
+
+    /// The report carries the logs scan's `contains_cells_tested` and
+    /// `str_cells_validated` for each statement. Five one-record objects hold
+    /// a declared `Str` column `attr_0` with `v0` through `v4`, one plain cell
+    /// per block, so the pushed `Contains` arm tests five cells and keeps one
+    /// row, and the columnar build reads only that row's cell as text. A
+    /// predicate-free statement tests and validates none. A report written
+    /// before the fields existed still parses, with both figures `0`.
+    ///
+    /// Flipped assertion: filling the cold run's `contains_cells_tested` or
+    /// `str_cells_validated` with `0` fails the first entry's `5` or `1`.
+    #[tokio::test]
+    async fn scan_diagnostics_report_contains_counters() {
+        let store = empty_store();
+        let tenant = TenantId::new("contains-counter-tenant");
+        let records = build_records(5, 1);
+        write_records_as_objects_with(&store, &tenant, 0, &records, true).await;
+        let (measured, skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &[
+                entry("like", "SELECT body FROM logs WHERE attr_0 LIKE '%v3%'"),
+                entry("all", "SELECT body FROM logs"),
+            ],
+            &[DeclaredColumn::new("attr_0", DeclaredType::Str)],
+            1,
+            TimeRange {
+                start_ns: 0,
+                end_ns: NOW_NS,
+            },
+            NOW_NS,
+            0,
+            Duration::from_secs(30),
+            false,
+            None,
+            ExecutorSettings::default(),
+            false,
+            None,
+        )
+        .await
+        .expect("run");
+        assert!(skipped.is_empty() && failed.is_empty());
+        let scan = |i: usize| {
+            measured[i]
+                .scan
+                .as_ref()
+                .expect("in-process scan diagnostics")
+        };
+        assert_eq!(measured[0].rows_returned, 1, "only record 3 holds v3");
+        assert_eq!(
+            scan(0).contains_cells_tested,
+            5,
+            "one attr_0 cell per object, each tested once"
+        );
+        assert_eq!(
+            scan(0).str_cells_validated,
+            1,
+            "only the surviving row's attr_0 cell is read as text"
+        );
+        assert_eq!(measured[1].rows_returned, 5);
+        assert_eq!(scan(1).contains_cells_tested, 0);
+        assert_eq!(scan(1).str_cells_validated, 0);
+
+        let mut legacy = serde_json::to_value(scan(0)).expect("serialize");
+        assert_eq!(legacy["contains_cells_tested"], 5);
+        assert_eq!(legacy["str_cells_validated"], 1);
+        let fields = legacy.as_object_mut().expect("object");
+        fields.remove("contains_cells_tested");
+        fields.remove("str_cells_validated");
+        let old: ScanDiagnostics = serde_json::from_value(legacy).expect("legacy report parses");
+        assert_eq!(old.contains_cells_tested, 0);
+        assert_eq!(old.str_cells_validated, 0);
     }
 
     // ---- Probe misses in the per-run accounting (#883) ---------------------

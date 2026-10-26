@@ -1875,7 +1875,7 @@ async fn logs_scan_declares_no_output_ordering() {
 /// independent knowledge of any section's encoding. The stale BLOOM is harmless
 /// here: it is consulted only to prune on a content predicate, and this fixture
 /// pushes none.
-fn rewrite_str_column_cells(
+pub(crate) fn rewrite_str_column_cells(
     obj: &[u8],
     cfg: RlogConfig,
     records: &[LogRecord],
@@ -1959,7 +1959,7 @@ fn rewrite_str_column_cells(
 }
 
 /// The `Str`-typed FIELD_DIR column id for `key` in `obj`.
-fn str_column_id(obj: &[u8], cfg: RlogConfig, key: &str) -> u32 {
+pub(crate) fn str_column_id(obj: &[u8], cfg: RlogConfig, key: &str) -> u32 {
     let footer = open_footer(obj).expect("open footer");
     let desc = *footer
         .section(kind::FIELD_DIR)

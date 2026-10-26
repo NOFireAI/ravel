@@ -303,6 +303,8 @@ struct StrCursor<'a> {
     /// The page's keys and shared dictionary, `Some` only for a dictionary
     /// page.
     dict: Option<StrDictColumn<'a>>,
+    /// Plain-page cells [`cell_text`] validated through this cursor.
+    validated: std::cell::Cell<u64>,
 }
 
 impl<'a> StrCursor<'a> {
@@ -310,6 +312,7 @@ impl<'a> StrCursor<'a> {
         StrCursor {
             cells: view.bytes_cursor(column_id),
             dict: view.str_dict(column_id),
+            validated: std::cell::Cell::new(0),
         }
     }
 
@@ -328,7 +331,11 @@ impl<'a> StrCursor<'a> {
     fn text_at(&self, i: usize) -> Option<&'a str> {
         match &self.dict {
             Some(d) => d.values().text(usize::try_from(d.key_at(i)?).ok()?),
-            None => cell_text(self.cells.at(i)?),
+            None => {
+                let cell = self.cells.at(i)?;
+                self.validated.set(self.validated.get() + 1);
+                cell_text(cell)
+            }
         }
     }
 
@@ -785,6 +792,15 @@ impl<'a> DeclaredCursor<'a> {
             FieldType::I64 => DeclaredCursor::I64(view.i64_cursor(col.column_id)),
             FieldType::F64 => DeclaredCursor::F64(view.f64_bits_cursor(col.column_id)),
             FieldType::Bool => DeclaredCursor::Bool(view.bool_cursor(col.column_id)),
+        }
+    }
+
+    /// Plain-page `Str` cells validated through this cursor; zero for any
+    /// other cursor.
+    fn str_cells_validated(&self) -> u64 {
+        match self {
+            DeclaredCursor::Str(c) => c.validated.get(),
+            _ => 0,
         }
     }
 
@@ -1620,6 +1636,11 @@ fn view_str(bytes: &[u8]) -> DFResult<&str> {
 /// empty vec for a block with no surviving row. The view borrows the scan, so
 /// the whole block is built here and the batches handed back owned, letting the
 /// caller drop the view before decoding the next block.
+///
+/// Every plain-page `Str` cell [`cell_text`] validated for the block is added
+/// to `str_cells_validated`, the ravel-sql half of
+/// [`BlockMetrics::str_cells_validated`]; a dictionary page validates nothing
+/// here.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_columnar_batches(
     view: &ColumnarBlockView<'_>,
@@ -1630,6 +1651,7 @@ pub(super) fn build_columnar_batches(
     full_len: usize,
     row_refs: Option<RowRefRange>,
     str_values: &SharedStrValuesCache,
+    str_cells_validated: &Count,
 ) -> DFResult<Vec<RecordBatch>> {
     let n = view.surviving_count();
     // Resolve each projected declared column's FIELD_DIR columns to cursors once
@@ -1693,6 +1715,13 @@ pub(super) fn build_columnar_batches(
         )?);
         start = end;
     }
+    let validated: u64 = plans
+        .values()
+        .flat_map(|p| &p.cursors)
+        .chain(attr_plans.values().flat_map(|p| &p.cursors))
+        .map(DeclaredCursor::str_cells_validated)
+        .sum();
+    str_cells_validated.add(usize::try_from(validated).unwrap_or(usize::MAX));
     Ok(out)
 }
 
@@ -4214,6 +4243,108 @@ mod tests {
             "a per-key read of a dictionary page validates nothing"
         );
         assert_eq!(cells, want);
+    }
+
+    /// `build_columnar_batches` over `block`, projecting the declared `Str`
+    /// column `KEY` or (with `per_key`) the synthetic per-key column for it:
+    /// the value it added to its `str_cells_validated` counter and the
+    /// [`cell_text`] validations it ran.
+    fn count_batch_build(block: &Block, per_key: bool) -> (usize, u64) {
+        let cfg = cfg();
+        let obj = encode(block, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&window(block), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let declared = [DeclaredColumn::new(KEY, DeclaredType::Str)];
+        let full = crate::logs_schema::logs_schema_with_declared(&declared);
+        let full_len = full.fields().len();
+        let (schema, projection, attr_keys) = if per_key {
+            let mut fields = full.fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                attr_key_field_name(KEY),
+                DataType::Utf8,
+                true,
+            )));
+            (Schema::new(fields), vec![full_len], vec![KEY.to_string()])
+        } else {
+            (Schema::clone(&full), vec![FIRST_DECLARED_COL], Vec::new())
+        };
+        let schema: SchemaRef = Arc::new(schema.project(&projection).expect("project"));
+        let counter = Count::new();
+        let before = validations();
+        build_columnar_batches(
+            &view,
+            &schema,
+            &projection,
+            &declared,
+            &attr_keys,
+            full_len,
+            None,
+            &test_str_values(&unbounded_pool()),
+            &counter,
+        )
+        .expect("batches");
+        (counter.value(), validations() - before)
+    }
+
+    /// The ravel-sql half of `str_cells_validated` (ADR-2773, contains-arm
+    /// amendment): the scan's counter gains exactly the plain-page validations
+    /// [`cell_text`] ran, for the declared column and the per-key column
+    /// alike, and nothing for a dictionary page, whose entries
+    /// the reader counts in its own `ScanStats::str_cells_validated`.
+    ///
+    /// Flipped assertion, seen failing: counting a dictionary-arm read in
+    /// `StrCursor::text_at` as well makes the per-key dictionary build report
+    /// `(8, 0)` where `(0, 0)` is expected.
+    #[test]
+    fn the_scan_counter_adds_each_plain_page_validation_once() {
+        let plain = fixed_block(
+            &[FieldType::Str],
+            vec![
+                vec![str_value(b"r0")],
+                vec![str_value(b"r1")],
+                vec![None],
+                vec![str_value(&[b'r', 0xff])],
+                vec![str_value(b"r4")],
+                vec![None],
+                vec![str_value(b"r6")],
+                vec![str_value(b"r7")],
+            ],
+            1,
+            6,
+        );
+        assert_eq!(
+            count_batch_build(&plain, false),
+            (4, 4),
+            "one count per surviving present cell"
+        );
+        // The per-key column validates a UTF-8 winner twice, in its presence
+        // test and again in `value_at`, and the non-UTF-8 cell once: 3 * 2 + 1.
+        assert_eq!(
+            count_batch_build(&plain, true),
+            (7, 7),
+            "one count per validation the per-key build ran"
+        );
+
+        let entries: [&[u8]; 3] = [b"a", b"bc", &[b'b', 0xff]];
+        let dict = fixed_block(
+            &[FieldType::Str],
+            (0..12).map(|r| vec![str_value(entries[r % 3])]).collect(),
+            0,
+            11,
+        );
+        for per_key in [false, true] {
+            assert_eq!(
+                count_batch_build(&dict, per_key),
+                (0, 0),
+                "a dictionary page adds nothing (per_key: {per_key})"
+            );
+        }
     }
 
     // --- StrValuesCache pool charge (issue #3181) ---------------------------

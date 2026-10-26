@@ -232,7 +232,8 @@ cannot be proven. The full set of decline conditions:
 - A non-empty `content` predicate (e.g. `has_word`) or a non-empty `prune`
   channel is present: both also survive pushdown as `Exact` (deleted
   `FilterExec`, evaluated exactly inside the scan), and neither is reflected in
-  the whole-segment dictionary counts.
+  the whole-segment dictionary counts. A pushed `LIKE '%literal%'` contains arm
+  stays `Inexact` (its `FilterExec` remains) and declines all the same.
 - A `Str`-typed typed attribute column, a predicate or group key over a
   column that is not declared, or a segment with no loaded statistics.
 - A segment with no `SegmentRef` stamp for the column (see the next section),
@@ -751,7 +752,12 @@ partition:
 A statement with a block-level predicate (a declared-column or `attrs`
 numeric comparison, the ClickBench q20 and q37-q43 shapes; a text
 `has_word`; a stream filter) is not block-predicate-free, so it takes the
-plan-then-stripe path, never the whole-segment fast path above. Without the
+plan-then-stripe path, never the whole-segment fast path above. A pushed
+`LIKE '%literal%'` contains arm is not a block predicate for this choice: no
+index covers it, so it excludes no block, and a content list holding only
+such arms keeps the whole-segment fast path, whose open carries the arm and
+evaluates it per row (`route_predicate_free`,
+`crates/ravel-sql/tests/logs_contains_route.rs`). Without the
 numeric prune arms below, that path read every relevant object WHOLE twice
 over: the plan phase opened
 each segment to count survivors, and the scan's `fetch_object_with_footer`
@@ -2578,7 +2584,7 @@ alter it without the slice key (`crates/ravel-sql/src/flight_ticket.rs`,
 | Table | Carried | Not carried |
 |---|---|---|
 | `spans` | `ts_lo`, `ts_hi`, `trace_id` | `duration_ns` window, `status_code` mask, `service_name`, `name` |
-| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe | the content channel (`has_word`) |
+| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe | the content channel (`has_word`, a pushed `LIKE '%literal%'`) |
 
 The pushdown-aware fragment is built by the provider's
 `worker_fragment_with_pushdown`. No production `DoGet` calls it yet: the Flight
@@ -3489,10 +3495,25 @@ and block-level reported independently:
   was no arm (ADR-2773 decision D2).
 - `rowsPredicateEvaluated`: rows of the other scanned blocks, which the
   predicate's remaining arms evaluated a block at a time.
+- `containsCellsTested`: cells a pushed `LIKE '%literal%'` or
+  `NOT LIKE '%literal%'` arm (`Predicate::Contains`, ADR-2773 contains-arm
+  amendment) tested for its needle: a dictionary entry once per test, a
+  plain-page cell once. 0 when no such arm was pushed.
+- `strCellsValidated`: string cells the scan UTF-8 validated, in two
+  halves. The reader's half is every string dictionary entry it validated,
+  once per validation, on either path; it covers the columns the scan
+  decodes, so undeclared attribute columns count when `attrs` is projected.
+  The columnar build's half is every plain-page `Str` cell its declared
+  and per-key `attrs['k']` cursors validated. The row path, taken when
+  `attrs` is projected or an erasure is pending, validates plain-page cells
+  too but does not count them. With a pushed `Contains` arm the reader
+  validates only the dictionary entries the arm read as text or a kept row
+  references, and the build never validates a row the arm dropped, so a
+  pushed arm can lower this count.
 
 The two key-index counts are 0 for a statement with no spans
 `trace_id =` lookup and are sums over every spans scan in the plan. The
-other eight counts after `segments` are 0 for a statement with no logs scan.
+other ten counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
 while `segments` counts every segment of every resolved snapshot. With one
 scan, `segmentsPrunedByStats` is a subset of `segments`; with two, each scan
@@ -3502,7 +3523,16 @@ twice.
 `services/ravel-server/tests/sql_declared_prune_reachability_e2e.rs` drives
 both pruning levels through `POST /api/v1/sql`.
 `services/ravel-server/tests/spans_trace_key_index_routing.rs` drives the
-two key-index counts the same way.
+two key-index counts the same way, and
+`services/ravel-server/tests/sql_like_contains_e2e.rs` the two `LIKE`
+counts.
+
+`stats.accounting.strDictValuesBuilt` counts the string dictionary values
+arrays the scans built for declared `Str` columns: one per row group
+dictionary per scan opening, one per per-block dictionary page, one per
+plain-page block. With a pushed `Contains` arm the reader hands each block
+a dictionary narrowed to its surviving rows, so a dictionary column builds
+one per block that keeps a row instead.
 
 Neither object reaches the Arrow-IPC encoding or Flight SQL, for the reasons
 given above. The MCP `sql_execute` tool's envelope renders neither, and it
@@ -4322,8 +4352,9 @@ never drop a true result):
 - `has_word(body, 'literal')`: a word/phrase content search whose SQL
   semantics equal the RLOG reader's exact token filter, so it both pushes down
   (bloom-accelerated pruning inside the scan) and needs no residual correction.
-  A plain `LIKE '%word%'` pattern's literal is recognized but is **not** pushed
-  as a prune, because token matching is not a superset of SQL substring `LIKE`.
+  A `LIKE '%word%'` on `body` is **not** pushed, because token matching is not
+  a superset of SQL substring `LIKE`; only a declared `str` column's substring
+  `LIKE` is pushed, below.
 - `attrs['k'] = 'v'`: an attribute equality. `extract_logs` sends it to a
   prune-only channel that drives POSTINGS block pruning (ADR-0049). The channel
   never becomes the reader's per-row filter, so it cannot drop a resource-only
@@ -4347,6 +4378,23 @@ never drop a true result):
     the same envelope.
   - `str`/`bytes` `=` against a matching-type literal → the same
     `Predicate::Equals` the `attrs['k'] = 'v'` shape builds, driving POSTINGS.
+  - `str` `LIKE '%literal%'` or `NOT LIKE '%literal%'` as a top-level
+    conjunct → a content arm `Predicate::Contains` (ADR-2773, contains-arm
+    amendment), which the reader tests as a byte substring of each row's
+    merged value: the record cell, else the stream's resource or scope value.
+    A row whose value has another type, or whose key sits in an `attrs_raw`
+    entry, is kept. The filter stays `Inexact`, so DataFusion re-applies the
+    `LIKE` above the scan. Only a pattern of a leading `%`, a non-empty
+    literal and a trailing `%` is pushed: a `_`, a backslash, an inner `%`,
+    an `ESCAPE` clause or `ILIKE` keeps the whole `LIKE` in the residual, and
+    so does the same pattern on `body`, on `attrs['k']`, on an undeclared
+    name, on a column of another declared type, or under `OR` or `NOT`.
+    `stats.pruning.containsCellsTested` counts the cells the arm tested.
+    The arm prunes no block, and a content list holding only `Contains`
+    arms does not count as a block predicate for the route, so a
+    full-window statement keeps the whole-segment fast path. A `has_word`
+    arm beside it still makes the statement not block-predicate-free, and
+    the scan records `fast_path_rejected_block_predicate`.
   Everything else (`!=`, `NOT`, negated `BETWEEN`, `IS [NOT] NULL`, a general
   `OR`, a range operator on a `str`/`bytes` column, a `str`/`bytes` `IN`, or a
   type-mismatched literal, including one DataFusion coercion has already wrapped
@@ -4774,10 +4822,15 @@ difference between a query and a timeout:
 
 The first two bound the third: the count proves the scan and the substring
 `LIKE` cost about 23 s, and the two-column ordered variant proves the sort adds
-about 2 s. `prune=0`/`content=0` in that plan is correct and not a missed
-pushdown -- a substring `LIKE` is neither a block prune nor a bloom probe -- so
-every block is a candidate and the scan decodes all 105 columns of every one of
-them before the filter or the TopK sees a row. The whole difference is the 103
+about 2 s. `prune=0`/`content=0` in that plan was not a missed block prune --
+a substring `LIKE` is neither a block prune nor a bloom probe -- so every block
+is a candidate and the scan decodes all 105 columns of every one of them before
+the filter or the TopK sees a row. These figures predate the contains arm: a
+declared `str` column such as `URL` now pushes `LIKE '%google%'` as a content
+predicate (`content=1`), which drops rows inside each decoded block but still
+prunes no block, so every block remains a candidate, and a statement that
+takes the whole-segment fast path without the arm keeps it with the arm. The
+whole difference is the 103
 columns nobody looks at until ten rows have been chosen.
 
 `TopKLateMaterialization` is a physical optimizer rule (installed by

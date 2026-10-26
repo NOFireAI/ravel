@@ -87,8 +87,10 @@ const OBJECT_KEY: &str = "t/coalescer-pin.rlog";
 /// `FILTER_EXEC_DEFAULT_BATCH_SIZE`: the coalescer flushes at this many rows.
 const COALESCE_ROWS: usize = 8_192;
 
-const SELECT_URL: &str = r#"SELECT "URL" FROM logs WHERE "URL" LIKE '%needle%'"#;
-const COUNT_URL: &str = r#"SELECT COUNT(*) FROM logs WHERE "URL" LIKE '%needle%'"#;
+// The `ESCAPE` clause keeps the `LIKE` out of the scan's contains arm, so the
+// scan builds every row's value and the coalescer holds whole-block arrays.
+const SELECT_URL: &str = r#"SELECT "URL" FROM logs WHERE "URL" LIKE '%needle%' ESCAPE '#'"#;
+const COUNT_URL: &str = r#"SELECT COUNT(*) FROM logs WHERE "URL" LIKE '%needle%' ESCAPE '#'"#;
 
 fn tenant() -> TenantId {
     TenantId::new("filter-coalescer-pin-3237".to_string())
