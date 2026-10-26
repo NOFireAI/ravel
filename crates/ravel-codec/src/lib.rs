@@ -3,7 +3,9 @@
 //! tag registry, the blocked token bloom filter and its section framing, and
 //! the normative word tokenizer. `ravel-logseg` re-exports all four so its
 //! own callers see no change. It also holds the KEY_IDX exact-key section
-//! grammar (`key_idx`, ADR-2707 decision 1), shared by RLOG and RSPAN.
+//! grammar (`key_idx`, ADR-2707 decision 1), shared by RLOG and RSPAN, and
+//! the reused-context zstd frame decompression the read paths share
+//! (`zstd_frame`).
 //! `ravel-rspan` will depend on this crate directly rather than growing a
 //! second copy of the tokenizer, which is
 //! normative because it defines word semantics identically on the write and
@@ -22,3 +24,4 @@ pub mod encoding;
 pub mod error;
 pub mod key_idx;
 pub mod tokenizer;
+pub mod zstd_frame;

@@ -2947,7 +2947,7 @@ pub fn decode_section(
         return Err(LogSegError::Corrupted("section uncomp_len over cap".into()));
     }
     if desc.comp == COMP_ZSTD {
-        let raw = zstd::bulk::decompress(stored, desc.uncomp_len as usize)
+        let raw = ravel_codec::zstd_frame::decompress(stored, desc.uncomp_len as usize)
             .map_err(|e| LogSegError::Corrupted(format!("section zstd: {e}")))?;
         if raw.len() as u64 != desc.uncomp_len {
             return Err(LogSegError::Corrupted("section decompressed length".into()));
