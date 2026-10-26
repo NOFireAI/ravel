@@ -50,7 +50,9 @@ and disclosed, so the comparators store the same logical samples and a limit
 that fires is a disclosed refusal with a known signature, not an undefault
 nobody chose. Each value below is written in the comparator's configuration,
 with a comment naming the default it replaces, even where it equals that
-default, so `capture-effective-config.sh` records it. Defaults are quoted from
+default, so `capture-effective-config.sh` records it (the Prometheus
+out-of-order window has no flag, so the capture reads it from
+`/api/v1/status/config` into `config_settings`). Defaults are quoted from
 each pinned version's own help (`prometheus --help`, `victoria-metrics -help`,
 `mimir -help-all`) unless the source column says otherwise.
 
@@ -59,8 +61,9 @@ The sizing figures come from `benchmarks/metrics/workload.json` and
 at a 15 s scrape over 30 d, the cardinality profile 1,000,000 series, the
 longest range window in the corpus is `[7d]` (`mb_long_range_7d_avg`, history
 only), and the largest declared range grid is history's 24 h at a 5 m step.
-The generator shifts out-of-order samples back one and a half scrape intervals,
-22.5 s at 15 s.
+ADR-0927's 2026-10-26 amendment B specifies the generator's out-of-order
+anomaly as a shift of one and a half scrape intervals, 22.5 s at 15 s, off the
+scrape grid.
 
 | Comparator | Setting | Value | Default replaced | Sized by | Source |
 |---|---|---|---|---|---|
@@ -183,7 +186,9 @@ reports, its runtime flags, and, when docker is reachable, the running
 container's image ID, `.Config.Image`, `RepoDigests`, `Architecture` and `Os`.
 The sources are:
 
-- Prometheus: `/api/v1/status/buildinfo` and `/api/v1/status/flags`.
+- Prometheus: `/api/v1/status/buildinfo`, `/api/v1/status/flags`, and
+  `/api/v1/status/config` for settings that live in `prometheus.yml` with no
+  flag (recorded under `config_settings`, today the TSDB out-of-order window).
 - VictoriaMetrics: the `vm_app_version` series on `/metrics` (`short_version`
   is the version, the full `version` label the revision) and `/flags`. Its
   `/api/v1/status/buildinfo` returns a fixed Prometheus-compatibility version
@@ -219,7 +224,7 @@ The document's shape, abbreviated:
     }
   },
   "comparators": {
-    "prometheus": {"version": "3.13.1", "revision": "...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
+    "prometheus": {"version": "3.13.1", "revision": "...", "runtime_flags": {"...": "..."}, "config_settings": {"storage.tsdb.out_of_order_time_window": "1h"}, "image": {"...": "..."}},
     "victoriametrics": {"version": "v1.115.0", "revision": "victoria-metrics-...-tags-v1.115.0-0-g...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
     "mimir": {
       "version": "3.2.3",

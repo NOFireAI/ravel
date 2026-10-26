@@ -88,6 +88,7 @@ write() {
 prom="${TMP}/prom"
 write "${prom}/api/v1/status/buildinfo" '{"status":"success","data":{"version":"3.13.1","revision":"promrev123","branch":"HEAD","goVersion":"go1.25.1"}}'
 write "${prom}/api/v1/status/flags" '{"status":"success","data":{"web.enable-remote-write-receiver":"true","storage.tsdb.retention.time":"45d"}}'
+write "${prom}/api/v1/status/config" '{"status":"success","data":{"yaml":"global:\n  scrape_interval: 15s\nstorage:\n  tsdb:\n    out_of_order_time_window: 1h\n"}}'
 
 vm="${TMP}/vm"
 write "${vm}/metrics" '# HELP x
@@ -199,6 +200,8 @@ check "a fields" "${out_a}" <<EOF
 d["comparators"]["prometheus"]["version"] == "3.13.1"
 d["comparators"]["prometheus"]["revision"] == "promrev123"
 d["comparators"]["prometheus"]["runtime_flags"]["storage.tsdb.retention.time"] == "45d"
+d["comparators"]["prometheus"]["config_settings"]["storage.tsdb.out_of_order_time_window"] == "1h"
+d["urls_queried"]["prometheus"]["config_settings"] == "${prom_url}/api/v1/status/config"
 d["comparators"]["victoriametrics"]["version"] == "v1.115.0"
 d["comparators"]["victoriametrics"]["revision"] == "victoria-metrics-20250331-131035-tags-v1.115.0-0-gabcdef1"
 d["comparators"]["victoriametrics"]["runtime_flags"]["retentionPeriod"] == "45d"
@@ -320,6 +323,7 @@ if [[ -s "${out_g}" ]]; then pass "g document written"; else fail "g document wr
 check "g fields" "${out_g}" <<EOF
 sorted(d["comparators"]["prometheus"]["version"]) == ["unavailable"]
 ("not buildinfo JSON" in d["comparators"]["prometheus"]["version"]["unavailable"]) == True
+sorted(d["comparators"]["prometheus"]["config_settings"]) == ["unavailable"]
 d["comparators"]["mimir"]["version"] == "2.14.2"
 EOF
 

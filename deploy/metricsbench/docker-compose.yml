@@ -129,10 +129,11 @@ services:
       # out-of-order window to set; v1.115.0's docs (docs/victoriametrics/
       # README.md, "Backfilling") say it "accepts historical data in arbitrary
       # order of time via any supported ingestion method", bounded only by
-      # -retentionPeriod above. So a sample shifted back 1.5 scrape intervals
-      # (22.5s at 15s) is stored here as it is by the 1h windows on Prometheus
-      # and Mimir; Prometheus without its window rejects the whole Remote
-      # Write 1.0 request with HTTP 400 on such a sample.
+      # -retentionPeriod above. So the out-of-order sample ADR-0927 amendment B
+      # specifies (shifted back 1.5 scrape intervals, 22.5s at 15s, off the
+      # grid) is stored here as it is by the 1h windows on Prometheus and
+      # Mimir; Prometheus without its window rejects the whole Remote Write
+      # 1.0 request with HTTP 400 on such a sample.
       #
       # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
       # Each one that fires is a budget refusal, not an engine error; the
