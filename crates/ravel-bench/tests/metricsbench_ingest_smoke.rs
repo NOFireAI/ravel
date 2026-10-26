@@ -233,6 +233,11 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     assert_eq!(profile["run"]["anchor_source"], "explicit");
     assert_eq!(profile["run"]["anchor_ms"].as_i64(), Some(anchor_ms));
     assert_eq!(
+        report["systems"][0]["ingest"]["elapsed_basis"], "timed_segments",
+        "the artifact says what elapsed_secs measures, so a reader can tell it from a \
+         wall-time report written before the streaming replay"
+    );
+    assert_eq!(
         profile["run"]["total_samples_generated"].as_u64(),
         Some(gen_report.emitted_samples),
         "the bin generated the stream this test regenerated from the same anchor"
@@ -394,7 +399,10 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     assert_eq!(substrate["backend_bills_requests"].as_bool(), Some(false));
 }
 
-/// The replay's batch size, the bin's own `--batch-size` default.
+/// The replay batch size these tests pass explicitly (`run_lane` and
+/// `run_lane_with_steps` hand it to `--batch-size`). The bin's own default
+/// is 500; a larger batch is a looser bound, so the ratio assertions below
+/// hold at the default too.
 const MEMORY_BATCH: usize = 4096;
 
 /// Bytes the global allocator holds now that it did not hold when `region`

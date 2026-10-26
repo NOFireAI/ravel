@@ -114,6 +114,15 @@ to `generated_lines`, `generated_lines` equals the generator's
 `emitted_samples`, `malformed` is zero, and the offered samples split exactly
 into accepted, rejected and dropped.
 
+Because generation runs inside the replay, `elapsed_secs` is the sum of the
+timed write segments (the `write_values` calls and the final flush for the
+Ravel row; each encode-and-POST for a comparator row) and never includes
+generating or classifying the stream, while `cpu_secs` covers the whole
+replay, generation included. Every `ingest` block carries
+`elapsed_basis: "timed_segments"` so a report written before this change,
+whose `elapsed_secs` was the replay's wall time, cannot be compared with one
+written after it by throughput alone.
+
 `substrate`:
 - `store_backend`: the `--store` kind (`memory` or `s3`).
 - `endpoint_host`: the configured S3 endpoint's host, when `--store s3` and

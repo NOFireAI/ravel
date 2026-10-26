@@ -277,6 +277,10 @@ impl LatencyReport {
     }
 }
 
+/// The one value [`IngestPhase::elapsed_basis`] takes today: `elapsed_secs`
+/// is the sum of the timed write segments, never the replay's wall time.
+pub const ELAPSED_BASIS_TIMED_SEGMENTS: &str = "timed_segments";
+
 /// The ingest phase of one system's replay. Ingest and query phases are
 /// recorded separately (ADR-0927 decision 9); this lane owns ingest, the query
 /// lane owns query.
@@ -318,6 +322,12 @@ pub struct IngestPhase {
     /// comparator's segments are its genuine per-batch encode and POST, which
     /// is real client work for that lane.
     pub elapsed_secs: f64,
+    /// What `elapsed_secs` measures, so two artifacts can be told apart
+    /// before their throughput figures are compared: always
+    /// [`ELAPSED_BASIS_TIMED_SEGMENTS`] for a report this code writes.
+    /// Reports written before this field existed measured the replay's wall
+    /// time including admission and encoding, and carry no marker.
+    pub elapsed_basis: String,
     /// Accepted logical samples per second.
     pub logical_points_per_sec: f64,
     /// Bytes of the snappy-compressed RW1.0 body offered (the wire shape every
@@ -1371,6 +1381,9 @@ where
         let Some(batch) = source.next_batch(batch_size - pending.len())? else {
             break;
         };
+        if batch.is_empty() {
+            break;
+        }
         for sample in batch {
             *offered += 1;
             match sample.validate() {
@@ -1528,6 +1541,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         batches,
         retries: snapshot.put.attempts.saturating_sub(snapshot.put.calls),
         elapsed_secs,
+        elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
         logical_points_per_sec: accepted_samples as f64 / elapsed_secs,
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
@@ -1764,6 +1778,7 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         batches,
         retries,
         elapsed_secs,
+        elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
         logical_points_per_sec: accepted_samples as f64 / elapsed_secs,
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
@@ -1877,6 +1892,7 @@ mod tests {
             batches: 1,
             retries: 0,
             elapsed_secs: 1.0,
+            elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
             logical_points_per_sec: 1.0,
             wire_bytes: 10,
             wire_bytes_per_sec: 10.0,
