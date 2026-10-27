@@ -76,6 +76,8 @@ mod logs_contains_route;
 mod logs_count_from_stats;
 #[path = "logs_declared_columns.rs"]
 mod logs_declared_columns;
+#[path = "logs_decoded_cache.rs"]
+mod logs_decoded_cache;
 #[path = "logs_declared_minmax_from_stamps.rs"]
 mod logs_declared_minmax_from_stamps;
 #[path = "logs_differential.rs"]
