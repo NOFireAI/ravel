@@ -1028,8 +1028,9 @@ decoder.
 
 Without a byte bound, the decoded snapshot-part cache and the decoded
 name-postings cache are bounded per tenant by entry count only, and the
-number of tenants they hold entries for is not bounded. Once the catalog shares the process budget with SQL, cached decodes
-from many tenants can hold a large share of it: SQL's reservations cannot
+number of tenants they hold entries for is not bounded. Once the catalog
+shares the process budget with SQL, cached decodes from many tenants can
+hold a large share of it: SQL's reservations cannot
 make these caches give memory back, and decision 6's eviction pass runs only
 for a refused catalog decode, and is skipped when the bytes are held outside
 the caches.
@@ -1058,4 +1059,6 @@ caches combined, across every tenant:
 - Evictions made by the bound are counted in
   `Catalog::decoded_cache_byte_bound_evictions`, apart from decision 6's
   memory-pressure pass (`Catalog::decoded_cache_memory_evictions`). An
-  entry refused for being larger than the bound is counted in neither.
+  entry refused for being larger than the bound is counted in neither, but
+  in `Catalog::decoded_cache_byte_bound_refusals`, so a cache that refuses
+  every insert can be told apart from one that is cold.
