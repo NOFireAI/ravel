@@ -562,3 +562,92 @@ passes no row carries one and the provenance config carries
 pass excluded for a recorded external cause is listed in `exclusions` with
 that cause (`a_pass_exclusion_needs_a_cause`). Version 3 drops the
 report-level `geomean_ms`: decision 6 rules out one figure across engines.
+
+## Portable query run (`metricsbench_query`)
+
+`metricsbench_query` runs the query corpus over HTTP against every engine one
+ingest run loaded and writes a version-3 report
+(`crates/ravel-bench/src/metrics_query.rs`,
+`crates/ravel-bench/src/bin/metricsbench_query.rs`):
+
+```sh
+cargo run --release -p ravel-bench --bin metricsbench_report -- provenance \
+  --workload benchmarks/metrics/workload.json \
+  --corpus benchmarks/metrics/metrics.corpus.json > provenance.json
+RAVEL_TOKEN=... cargo run --release -p ravel-bench --bin metricsbench_query -- \
+  --ingest-report ingest.json \
+  --workload benchmarks/metrics/workload.json \
+  --corpus benchmarks/metrics/metrics.corpus.json \
+  --provenance provenance.json \
+  --engine name=prometheus,url=http://127.0.0.1:9090 \
+  --engine name=ravel,url=http://127.0.0.1:9201,bearer_env=RAVEL_TOKEN \
+  --engine name=victoriametrics,url=http://127.0.0.1:8428 \
+  --engine name=mimir,url=http://127.0.0.1:9009/prometheus \
+  --warmup-passes 1 --passes 5 --reps-per-pass 3 --out report.json
+```
+
+`--engine` takes `name=` (`prometheus`, `ravel`, `victoriametrics` or
+`mimir`), an optional `url=` query base, and an optional `bearer_env=` naming
+the environment variable that holds a bearer token. The token is read from
+the environment only; it is not an argument, and the report records neither
+it nor the variable's value (`the_corpus_runs_against_every_engine_and_validates`
+asserts the header arrived and that the token text is absent from the report,
+stdout and stderr). `ravel-in-process` is not a valid name: that row has no
+HTTP endpoint (amendment section A; `engine_specs_parse_and_refuse`). The
+Mimir tenant header is not sent; run Mimir with multi-tenancy off.
+
+**Ingest binding.** Every query time comes from the ingest report, not from
+the clock. `bind` reads `profile.name` and `profile.run.steps`, `anchor_ms`,
+`workload_version`, `workload_digest`, `seed` and `stream_digest`, and exits
+65 when any is missing. It exits 65 when the workload file's digest, version
+or seed differ from the run's (`a_workload_digest_mismatch_refuses_the_run`),
+when the corpus file's digest differs from the provenance's `corpus_digest`
+or the provenance's `generator_digest` is not the run's workload digest, and
+when any portable ingest row (every row but `ravel-in-process`) fails
+`check_row_band6` or `check_row_accounting`, before any query is sent (the
+digest checks are in `bind` and in the binary's `run_main`;
+`a_band6_failure_refuses_the_run`). An engine's query URL is its ingest
+row's `readback.query_url` when the row records one, else `url=`; an engine
+with neither, or with no ingest row, exits 65. Ravel is queried with
+`min_commit_token` set to its row's `last_commit_token`, the joined
+per-shard list, verbatim
+(`ravel_receives_the_full_multi_shard_commit_token`). The anchor, step count,
+stream digest, pass counts and query URLs are recorded in the provenance
+config.
+
+An instant entry is evaluated at the newest generated sample, `anchor_ms +
+(steps - 1) * scrape_interval_secs * 1000`. A range entry is one
+`/api/v1/query_range` request per repetition over the profile's `range_eval`
+grid, as offsets back from that sample, and no instant query per grid point
+(amendment section E; `a_range_entry_is_one_range_request_per_repetition`).
+A grid reaching before the run's first step exits 65 (`QueryGrid::from_run`).
+
+**The oracle row.** Prometheus is required (`BindError::NoOracle`). In every
+pass, for every entry, Prometheus is queried first, and its first answer in
+that pass is the oracle every other engine's repetitions are compared against
+with `metrics_correctness::classify` (decision 4). Its own rows carry
+`oracle: true` and are classified and timed under the same rules as every
+other row. A classification error, such as an oracle that fails or answers
+empty on an entry not marked intended-empty, voids the run with exit 65
+naming the entry and the engine, and no report is written
+(`a_classify_error_voids_the_run`).
+
+**Unsupported classes.** An entry whose query names a workload family of kind
+`native_histogram` is `unsupported_construct` on every engine whose ingest
+row lists `native_histogram` in `unsupported_classes`, today VictoriaMetrics.
+The status is set before any comparison, the query is still sent, and the
+row's citation and a summary of the answer go to stderr, since a report row
+has no message field. The entry stays in that engine's `corpus` denominator
+(`an_unsupported_class_entry_is_unsupported_not_incorrect`). The family is
+found from the query text (`needs_native_histograms`), because no corpus
+construct name says "native histogram".
+
+**Passes and timing.** `--warmup-passes` (default 1) passes run first and are
+discarded. Then each of `--passes` (default 5) passes runs every entry
+`--reps-per-pass` (default 3) times per engine; the pass's status is its first
+non-`ok` repetition and its figure the median repetition latency. Only `ok`
+rows carry `min_ms`/`median_ms`/`max_ms`, `reps_per_pass`, `pass_medians_ms`
+and, with five or more passes, `rel_mad_pct` (`only_ok_rows_carry_latency`).
+`cases_expected` is written from the corpus before any query. The assembled
+report goes through `report_schema::validate` before it is written; a report
+that fails is not written and the exit is 70.
