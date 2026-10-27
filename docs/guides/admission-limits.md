@@ -14,8 +14,9 @@ resolve at startup, and others are fixed defaults:
 - Unset, `--fetch-concurrency` follows the core count.
 - The two SQL memory ceilings and `--cache-max-bytes` follow the memory of
   the host (`MemTotal`, capped by the cgroup limit in a container).
-- `--max-segments` (1,000,000) and the engine deadline (11 minutes) are fixed
-  defaults that do not vary with the host.
+- `--max-segments` (1,000,000), `--max-series` (10,000), `--max-samples`
+  (10,000,000) and the engine deadline (11 minutes) are fixed defaults that
+  do not vary with the host.
 
 Read the resolved values from the startup log.
 
