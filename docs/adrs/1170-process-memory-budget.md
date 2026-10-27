@@ -1780,7 +1780,10 @@ whenever `--memory-budget-bytes` is set or the host's memory size can be
 read. It is unlimited in `gateway` mode (the gateway amendment) and on a
 host whose memory size cannot be read with no `--memory-budget-bytes`, where
 the remainder starts from `u64::MAX`; there the catalog's behaviour is
-unchanged and the two counters above read 0.
+unchanged, no decoded-cache byte bound is set, and
+`ravel_catalog_decode_reserve_retries_total`,
+`ravel_catalog_decoded_cache_memory_evictions_total` and the two byte-bound
+counters read 0.
 
 `a_part_decode_over_the_process_budget_answers_422`,
 `the_catalog_charges_the_servers_own_budget` and
