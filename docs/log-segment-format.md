@@ -398,7 +398,10 @@ count entries, sorted ascending by (name bytes, type):
 Fixed columns occupy reserved column ids 0..=9 (`ts`, `observed_ts`,
 `stream_ref`, `severity_num`, `severity_text`, `body`, `trace_id`,
 `span_id`, `flags`, `attrs_raw`) and never appear in FIELD_DIR. Dynamic
-attribute columns start at column id 10. A key observed with two value
+attribute columns start at column id 10. Which name gets which dynamic
+column id is the writer's choice (ADR-3217 decision 8 lets a load declare
+the order); a reader resolves every name through FIELD_DIR and must not
+assume any assignment. A key observed with two value
 types yields two entries (per-type splitting). At most 1000 dynamic
 columns per object; overflow keys are encoded into the `attrs_raw` fixed
 column (canonical bytes, column id 9), which is scan-queryable but not

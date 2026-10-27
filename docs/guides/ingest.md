@@ -1736,9 +1736,12 @@ group, in the given order.
   columns' chunks sit next to each other right after the fixed columns.
 - Why: a query that projects the named columns together reads them as one
   chunk run, one region of the object, instead of one region per column.
-  On a single-drive RustFS or MinIO each region costs about 1.5 MB of disk
-  read whatever the range asks for (measured on c6a.4xlarge); a store that
-  serves a range with one file read pays only the bytes asked for.
+  On a single-drive RustFS the first read of a region costs about 2 to 4 MB
+  of disk beyond the bytes the range asks for (measured on c6a.4xlarge).
+  Averaged over every GET of a statement, including GETs that land in a
+  region already read, that is about 0.4 to 0.8 MB of disk per GET. A
+  store that serves a range with one file read pays only the bytes asked
+  for.
 - The reader is unaffected. PAGE_DIR gives each chunk's offset, and a query
   resolves a column name to its id through FIELD_DIR, which stays sorted by
   name. Objects with and without an order read back the same records.
@@ -1749,6 +1752,10 @@ group, in the given order.
   gives columns to the first names in the new order. A named column takes a
   column that a name earlier in the alphabet would otherwise have had, and
   that name's values are stored in the overflow attributes instead.
+  The displaced name can be an indexed field or a numeric field. In that
+  object it then has no postings or no per-block statistics, so a query
+  that filters on it prunes fewer blocks and reads more. Results stay
+  exact. Name such fields in the order too, so they keep their columns.
 - The order applies only to the objects that the load writes. Compaction
   writes its objects in name order, with PAGE_DIR still exact for them.
 - A metrics or spans load warns and ignores the flag.
