@@ -23,12 +23,15 @@
 #                                       say diagnostic: true; Prometheus alone
 #                                       started with the override; ingest into
 #                                       Prometheus only
-#   g  --keep                        -> exit 0, no down -v, stamps say kept
+#   g  --keep, --passes, --reps      -> exit 0, no down -v, stamps say kept;
+#                                       --passes and --reps reach the query run
 #   h  usage and refusals            -> 64 on an unknown flag, 65 on a missing
 #                                       bin, an off-grid anchor, an out-dir
 #                                       holding a report, leftover volumes
 #   i  qualify fails                 -> exit 70, step qualify, torn down
 #   j  no fold gauge on /metrics     -> stamps ravel_catalog_fold "absent"
+#   k  capture exits 1 (partial)     -> exit 70, step capture, no query run,
+#                                       torn down
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -84,7 +87,7 @@ case "$1" in
           shift
           printf '%s\n' "$@" >"${STUB_STATE}.services"
         else
-          printf '%s\n' rustfs prometheus victoriametrics mimir ravel >"${STUB_STATE}.services"
+          printf '%s\n' rustfs prometheus victoriametrics mimir ravel-server >"${STUB_STATE}.services"
           printf '%s\n' createbuckets ravel-qualify >"${STUB_STATE}.oneshots"
         fi
         ;;
@@ -237,12 +240,13 @@ STUB
 cat >"${BIN}/capture" <<'STUB'
 #!/usr/bin/env bash
 printf 'capture %s\n' "$*" >>"${STUB_LOG}"
+[ -z "${STUB_CAPTURE_EXIT:-}" ] || exit "${STUB_CAPTURE_EXIT}"
 cat >"$2" <<'JSON'
 {"comparators": {
   "prometheus": {"version": "3.5.0", "image": {"container": "metricsbench-prometheus-1", "repo_digests": ["prom/prometheus@sha256:1111111111111111111111111111111111111111111111111111111111111111"]}},
   "victoriametrics": {"version": "v1.120.0", "image": {"container": "metricsbench-victoriametrics-1", "repo_digests": ["victoriametrics/victoria-metrics@sha256:2222222222222222222222222222222222222222222222222222222222222222"]}},
   "mimir": {"version": "2.16.0", "image": {"container": "metricsbench-mimir-1", "repo_digests": ["grafana/mimir@sha256:3333333333333333333333333333333333333333333333333333333333333333"]}},
-  "ravel": {"version": "0.1.0", "image": {"container": "metricsbench-ravel-1", "repo_digests": ["ghcr.io/nofireai/ravel-server@sha256:42116db1a8b2b0da52b5bc71219678d9b32d42aefb61ba46152ba9f9968d5ca7"]}}
+  "ravel": {"version": "0.1.0", "image": {"container": "metricsbench-ravel-server-1", "repo_digests": ["ghcr.io/nofireai/ravel-server@sha256:42116db1a8b2b0da52b5bc71219678d9b32d42aefb61ba46152ba9f9968d5ca7"]}}
 }}
 JSON
 STUB
@@ -322,7 +326,7 @@ expect_err() {
 
 # --- a: success --------------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/a/out")
-run_case a "${args[@]}" --rss-band ravel:1:1000000000
+run_case a "${args[@]}" --rss-band ravel-server:1:1000000000
 expect_rc a 0
 for f in stamps.json ingest.json effective-config.json provenance.json report.json memory-summary.json memory.jsonl compose.log; do
   expect_file a "$f"
@@ -337,7 +341,7 @@ check "a: instance type unknown without IMDS" 'j("stamps.json")["instance_type"]
 check "a: comparator image digests from the capture" 'j("stamps.json")["comparator_images"]["mimir"]["repo_digests"][0].endswith("3333333333333333333333333333333333333333333333333333333333333333")'
 check "a: fold gauge stamped" 'j("stamps.json")["ravel_catalog_fold"] == "1761000000"'
 check "a: Mimir readiness line stamped" 'j("stamps.json")["mimir_readiness"].startswith("ingest read-back for mimir matched")'
-check "a: memory summary has peak and final bytes, band ok" 'j("memory-summary.json")["containers"]["metricsbench-ravel-1"]["peak_bytes"] == 100*1024*1024 and j("memory-summary.json")["containers"]["metricsbench-ravel-1"]["final_bytes"] == 100*1024*1024 and j("memory-summary.json")["bands"][0]["verdict"] == "ok" and j("memory-summary.json")["oom_killed"] == []'
+check "a: memory summary has peak and final bytes, band ok" 'j("memory-summary.json")["containers"]["metricsbench-ravel-server-1"]["peak_bytes"] == 100*1024*1024 and j("memory-summary.json")["containers"]["metricsbench-ravel-server-1"]["final_bytes"] == 100*1024*1024 and j("memory-summary.json")["bands"][0]["verdict"] == "ok" and j("memory-summary.json")["oom_killed"] == []'
 check "a: teardown stamped" 'j("stamps.json")["teardown"] == "docker compose down -v"'
 expect_log "a: compose brought up with both files" "ravel.yml up -d"
 expect_log "a: torn down with down -v" " down -v"
@@ -369,9 +373,9 @@ expect_no_file c stamps.json
 
 # --- d: rss band breach ------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/d/out")
-STUB_MEM_ravel=2GiB run_case d "${args[@]}" --rss-band ravel:0:1073741824
+STUB_MEM_ravel_server=2GiB run_case d "${args[@]}" --rss-band ravel-server:0:1073741824
 expect_rc d 75
-expect_err "d: message names the band" "--rss-band ravel:0:1073741824 above"
+expect_err "d: message names the band" "--rss-band ravel-server:0:1073741824 above"
 check "d: summary records the band above" 'j("memory-summary.json")["bands"][0]["verdict"] == "above" and j("memory-summary.json")["bands"][0]["peak_bytes"] == 2*1024**3 and j("memory-summary.json")["verdict"] == "band_violated"'
 check "d: stamps name step memory, exit 75" 'j("stamps.json")["failed_step"] == "memory" and j("stamps.json")["exit_code"] == 75'
 expect_log "d: torn down" " down -v"
@@ -402,8 +406,10 @@ expect_log "f: torn down" " down -v"
 
 # --- g: --keep ---------------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/g/out")
-run_case g "${args[@]}" --keep
+run_case g "${args[@]}" --keep --passes 2 --reps 1
 expect_rc g 0
+expect_log "g: --passes and --reps reach the query run" "--passes 2 --reps-per-pass 1"
+check "g: stamps record passes and reps" 'j("stamps.json")["passes"] == "2" and j("stamps.json")["reps_per_pass"] == "1"'
 expect_no_log "g: no down -v" " down -v"
 check "g: stamps say kept" 'j("stamps.json")["teardown"] == "kept (--keep)"'
 
@@ -438,6 +444,14 @@ mapfile -t args < <(full_args "${TMP}/j/out")
 STUB_NO_FOLD=1 run_case j "${args[@]}"
 expect_rc j 0
 check "j: fold stamped absent" 'j("stamps.json")["ravel_catalog_fold"] == "absent"'
+
+# --- k: partial capture ------------------------------------------------------
+mapfile -t args < <(full_args "${TMP}/k/out")
+STUB_CAPTURE_EXIT=1 run_case k "${args[@]}"
+expect_rc k 70
+check "k: stamps name step capture" 'j("stamps.json")["failed_step"] == "capture"'
+expect_no_log "k: no query run" "metricsbench_query"
+expect_log "k: torn down" " down -v"
 
 echo
 echo "${passes} passed, ${fails} failed"

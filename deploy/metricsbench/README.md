@@ -434,10 +434,124 @@ The document's shape, abbreviated:
 }
 ```
 
-A run report cites this file by path and by its sha256 digest. Until the
-MetricsBench runner calls the script before each measurement pass, this
-section is its caller. Its cases run in CI's `doc-scripts` job:
+A run report cites this file by path and by its sha256 digest. `run.sh`
+(below) calls it after ingest and before the query passes. Its cases run in CI's `doc-scripts` job:
 `deploy/metricsbench/tests/capture-effective-config.test.sh`.
+
+## Running a profile end to end
+
+`run.sh` drives one profile through the whole set and stamps what ran. From
+the repository root, with the three bins built
+(`cargo build --release --locked -p ravel-bench --bin metricsbench_ingest
+--bin metricsbench_query --bin metricsbench_report`):
+
+```sh
+deploy/metricsbench/run.sh \
+  --profile ci \
+  --ravel-image ghcr.io/nofireai/ravel-server:manual-0bf5fed@sha256:42116db1a8b2b0da52b5bc71219678d9b32d42aefb61ba46152ba9f9968d5ca7 \
+  --ravel-source-commit 0bf5fedb2834df7dc87f8086701dd289b049efb0 \
+  --bin-dir target/release \
+  --out-dir metricsbench-out
+```
+
+This is the command `metricsbench-nightly.yml` runs. Every claim below names
+the case in `deploy/metricsbench/tests/run.test.sh` that proves it; the cases
+stub docker, curl, the three bins and the capture script, and run in CI's
+`doc-scripts` job.
+
+| Flag | Meaning |
+|---|---|
+| `--profile NAME` | A profile in `benchmarks/metrics/workload.json`. |
+| `--ravel-image REF@sha256:DIGEST` | The Ravel image, set as `RAVEL_IMAGE`. A reference without a digest is refused with exit 65 (case c). |
+| `--ravel-source-commit SHA` | The full commit the image was built from, stamped as given (case a). |
+| `--bin-dir DIR` | Holds `metricsbench_ingest`, `metricsbench_query` and `metricsbench_report`. A missing one is refused with exit 65 (case h). |
+| `--out-dir DIR` | Created if absent. One that already holds `stamps.json`, `report.json`, `ingest.json` or `falsification.json` is refused with exit 65 (case h). |
+| `--anchor-ms N` | The replay anchor, which must be on the profile's scrape grid (exit 65 otherwise, case h). Default: the profile's window ending at least 10 minutes before the run, on the grid, stamped `anchor_source` as from the clock. Ravel drops samples older than its 45-day `--max-ingest-lag`, so a fixed old anchor fails Ravel's read-back. |
+| `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. |
+| `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
+| `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
+| `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
+
+A compose project `metricsbench` that already has containers or volumes is
+refused with exit 65 before anything starts (case h), since an earlier run's
+data would be measured.
+
+Steps, in order, stopping at the first failure:
+
+1. `up`: `docker compose -f docker-compose.yml -f ravel.yml up -d` (case a).
+2. `qualify`: `createbuckets` and `ravel-qualify` exited 0; otherwise exit
+   70 naming the step (case i).
+3. `image`: `docker image inspect` of the Ravel image, which must list the
+   digest the reference names; the result is stamped (case a).
+4. `ready`: Prometheus `/-/ready`, VictoriaMetrics `/health`, Mimir
+   `/ready` and Ravel `/api/v1/status/buildinfo` each answer 200 (case a).
+5. `sampler`: every 5 s after the previous sample, the memory use of every
+   running compose container from `docker stats --no-stream` is appended to
+   `memory.jsonl` (case a).
+6. `ingest`: `metricsbench_ingest` into all four portable endpoints with
+   their read-back query URLs, output `ingest.json`. Ravel's token reaches it
+   only through `--ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN`, never on
+   a command line (case a). A failing ingest exits 70 naming the step and the
+   stack is still torn down (case b).
+7. `mimir-readiness`: the ingest row for Mimir read back exactly what it
+   accepted; the line is stamped (case a).
+8. `capture`: `capture-effective-config.sh` into `effective-config.json`,
+   which must exit 0; a partial capture (exit 1) fails the step with exit
+   70 before any query runs (case k).
+9. `provenance`: `metricsbench_report provenance` into `provenance.json`,
+   pinning Prometheus, VictoriaMetrics and Mimir at the version and digest
+   the capture recorded (case a). Its `ravel_git_commit` is
+   `--ravel-source-commit`, not this checkout.
+10. `fold-state`: `ravel_catalog_fold_last_success_timestamp_seconds` from
+    Ravel's `/metrics` (case a), or `absent` (case j).
+11. `query`: `metricsbench_query` against all four engines into
+    `report.json` (case a).
+12. `validate`: `metricsbench_report validate report.json` exits 0 (case a).
+13. `memory`: the sampler stops, `memory-summary.json` records peak and
+    final bytes per container and `OOMKilled` from `docker inspect` (case a),
+    and every `--rss-band` is checked (case d). An OOM-killed container exits
+    75 (case e).
+
+Whatever the outcome, the compose logs go to `compose.log` and the stack is
+torn down with `docker compose ... down -v` unless `--keep` is given (cases
+a, b, d, f, i, k). On a failed step the memory summary is still written (case
+b).
+
+`stamps.json` is written before the first step and completed at the end
+(case a). It holds `ravel_image.reference` and `ravel_image.resolved` (the
+`docker image inspect` digests), `ravel_source_commit`, `harness_commit`
+(`git rev-parse HEAD` of the checkout holding `--bin-dir`, or
+`unavailable: ...` outside one), `run_script_commit`, `profile`, `anchor_ms`
+and `anchor_source`, `started_at` and `ended_at`, `store_kind: rustfs`,
+`instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
+comparator's image block as the capture recorded it), `ravel_catalog_fold`,
+`mimir_readiness`, `steps_completed`, `failed_step`, `exit_code`, `status`
+and `teardown`.
+
+### The falsification run
+
+With `--diagnostic-prometheus-max-samples N`, `run.sh` instead writes a
+compose override setting Prometheus' `--query.max-samples=N` into
+`<out>/prometheus-max-samples.override.yml`, starts Prometheus alone with it,
+ingests the profile into Prometheus only, and sends `mb_long_range_7d_avg`'s
+query once as an instant query at the newest sample. `falsification.json`
+records the HTTP status, `status`, `errorType`, `error` and the result's
+series count; no `report.json` is written and stamps say `diagnostic: true`
+(case f). `--ravel-image` and `--ravel-source-commit` are optional here,
+since no Ravel starts.
+
+```sh
+deploy/metricsbench/run.sh --profile history --bin-dir target/release \
+  --out-dir falsify-out --diagnostic-prometheus-max-samples 50000000
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every step passed (cases a, f, g). |
+| 64 | Usage error (case h). |
+| 65 | A refused input; nothing was started (cases c, h). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k). |
+| 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
 
@@ -476,8 +590,8 @@ is checked against its own expected count:
   workflow under `.github/workflows`, carries an `@sha256:` digest. Image
   references that come from a shell variable are excluded by exact match,
   since the variable holds either a locally built tag or a reference the
-  workflow already resolved to a digest. Both the total (17) and the
-  pin-required count (11) equal their expected totals. Backslash
+  workflow already resolved to a digest. Both the total (12) and the
+  pin-required count (6) equal their expected totals. Backslash
   continuations are joined before matching, here-doc bodies are skipped, and
   every invocation on a line is scanned, not just the first.
 
