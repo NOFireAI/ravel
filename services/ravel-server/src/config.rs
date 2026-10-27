@@ -1924,6 +1924,39 @@ pub struct Cli {
     #[arg(long = "max-segments", value_name = "N")]
     pub max_segments: Option<usize>,
 
+    /// Cap on the distinct series a single PromQL query may materialize,
+    /// threaded into `ravel_query::EngineConfig::max_series`. Over it the query
+    /// is refused with `query matched N series, exceeding the limit of M`
+    /// (HTTP 422, `errorType` `execution`), never truncated. Counted once per
+    /// query over the pooled scalar series of every selector. Default when
+    /// unset: `ravel_query::DEFAULT_MAX_SERIES` (10,000), host-independent: a
+    /// series count bounds plan width, and the bytes behind it are bounded by
+    /// the memory budget. Process-wide, with no limits-file key, because
+    /// per-tenant query limits are not enforced today. Must be at least 1.
+    #[arg(
+        long = "max-series",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub max_series: Option<usize>,
+
+    /// Cap on the total samples (summed across series, after cross-segment
+    /// dedup) a single PromQL query may materialize, threaded into
+    /// `ravel_query::EngineConfig::max_samples`. Over it the query is refused
+    /// with `query matched N samples, exceeding the limit of M` (HTTP 422,
+    /// `errorType` `execution`), never truncated. Also sizes the range-query
+    /// selector-cache cap, two float copies of this many samples (16 bytes
+    /// each), which charges the memory budget. Default when unset:
+    /// `ravel_query::DEFAULT_MAX_SAMPLES` (10,000,000), host-independent.
+    /// Process-wide, with no limits-file key, because per-tenant query limits
+    /// are not enforced today. Must be at least 1.
+    #[arg(
+        long = "max-samples",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub max_samples: Option<usize>,
+
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
     /// this process admits at once, across every listener (public and mTLS)
@@ -3303,6 +3336,10 @@ pub struct QueryBudgets {
     pub promql_fetch_fanout: usize,
     /// Per-query segment fan-out cap. Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
+    /// Per-query PromQL series cap. Reaches `EngineConfig::max_series`.
+    pub max_series: usize,
+    /// Per-query PromQL samples cap. Reaches `EngineConfig::max_samples`.
+    pub max_samples: usize,
     /// Per-query SQL memory-pool ceiling. Reaches `SqlConfig::max_query_bytes`.
     pub sql_max_query_bytes: usize,
     /// Per-tenant SQL memory ceiling. Reaches the `SqlExecutor`'s per-tenant
@@ -3390,6 +3427,8 @@ impl Default for QueryBudgets {
             sql_partition_count: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             promql_fetch_fanout: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+            max_series: ravel_query::DEFAULT_MAX_SERIES,
+            max_samples: ravel_query::DEFAULT_MAX_SAMPLES,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
@@ -3495,6 +3534,8 @@ impl QueryBudgets {
             sql_partition_count: Some(self.sql_partition_count),
             promql_fetch_fanout: Some(self.promql_fetch_fanout),
             max_segments: self.max_segments,
+            max_series: self.max_series,
+            max_samples: self.max_samples,
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_request_cost_bytes: resolved.request_cost_bytes,
             logs_projection_break_even_bytes: resolved.projection_break_even_bytes,
@@ -4283,6 +4324,10 @@ pub struct PerformanceFlags {
     pub max_concurrent_queries: Option<u64>,
     /// `--max-segments`.
     pub max_segments: Option<usize>,
+    /// `--max-series`.
+    pub max_series: Option<usize>,
+    /// `--max-samples`.
+    pub max_samples: Option<usize>,
     /// `--cache-max-bytes`.
     pub cache_max_bytes: Option<u64>,
     /// `--catalog-cache-max-bytes` (ADR-2023): independent of
@@ -4399,6 +4444,11 @@ pub struct ResolvedPerformanceDefaults {
     pub catalog_resolve_interim_cap_applied: bool,
     /// Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
+    /// Reaches `EngineConfig::max_series`.
+    pub max_series: usize,
+    /// Reaches `EngineConfig::max_samples`, and from there the range-query
+    /// selector-cache cap (`ravel_promql::selector_cache_cap_for_pool`).
+    pub max_samples: usize,
     /// Reaches the query fetcher cache's byte ceiling
     /// (`store::build_cache`). NOT the catalog byte cache: that has its own
     /// [`Self::catalog_cache_max_bytes`], resolved from its own flag
@@ -4549,6 +4599,8 @@ pub struct PerformanceSources {
     pub promql_fetch_fanout: &'static str,
     pub catalog_resolve_concurrency: &'static str,
     pub max_segments: &'static str,
+    pub max_series: &'static str,
+    pub max_samples: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
     pub column_stats_cache_max_bytes: &'static str,
@@ -4671,6 +4723,8 @@ fn resolve_knob(
 ///   of `memory_remainder_bytes` (`sql_pools_remainder_capped` when either
 ///   was). An explicit flag for either is never capped.
 /// - `max_segments`: [`DERIVED_MAX_SEGMENTS`].
+/// - `max_series`: [`ravel_query::DEFAULT_MAX_SERIES`].
+/// - `max_samples`: [`ravel_query::DEFAULT_MAX_SAMPLES`].
 /// - `query_deadline`: [`DERIVED_QUERY_DEADLINE`].
 ///
 /// The per-query SQL pool and the per-tenant ceiling are then reconciled so
@@ -4750,6 +4804,14 @@ pub fn resolve_performance_defaults(
     let (max_segments, segments_source) = match flags.max_segments {
         Some(n) => (n, PERF_SOURCE_FLAG),
         None => (DERIVED_MAX_SEGMENTS, PERF_SOURCE_DERIVED),
+    };
+    let (max_series, series_source) = match flags.max_series {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (ravel_query::DEFAULT_MAX_SERIES, PERF_SOURCE_DERIVED),
+    };
+    let (max_samples, samples_source) = match flags.max_samples {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (ravel_query::DEFAULT_MAX_SAMPLES, PERF_SOURCE_DERIVED),
     };
 
     // ADR-1170 decision 3, amended by issue #1255: one process-wide
@@ -5021,6 +5083,8 @@ pub fn resolve_performance_defaults(
         catalog_resolve_query_concurrency_input: query_concurrency_input,
         catalog_resolve_interim_cap_applied,
         max_segments,
+        max_series,
+        max_samples,
         cache_max_bytes,
         catalog_cache_max_bytes,
         column_stats_cache_max_bytes,
@@ -5041,6 +5105,8 @@ pub fn resolve_performance_defaults(
             promql_fetch_fanout: promql_fetch_fanout_source,
             catalog_resolve_concurrency: catalog_resolve_source,
             max_segments: segments_source,
+            max_series: series_source,
+            max_samples: samples_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
             column_stats_cache_max_bytes: column_stats_cache_source,
@@ -5356,6 +5422,18 @@ impl ResolvedPerformanceDefaults {
             "performance default resolved"
         );
         tracing::info!(
+            setting = "max_series",
+            value = self.max_series,
+            source = self.sources.max_series,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "max_samples",
+            value = self.max_samples,
+            source = self.sources.max_samples,
+            "performance default resolved"
+        );
+        tracing::info!(
             setting = "cache_max_bytes",
             value = self.cache_max_bytes,
             source = self.sources.cache_max_bytes,
@@ -5401,6 +5479,15 @@ impl ResolvedPerformanceDefaults {
                 setting = "memory_budget_bytes",
                 value = self.memory_budget_bytes,
                 source = self.sources.memory_budget_bytes,
+                "performance default resolved"
+            );
+            // Derived from max_samples, not carved from the budget: each
+            // range-query selector-cache entry is charged to the budget, which
+            // refuses before this cap is reached when it is the smaller.
+            tracing::info!(
+                setting = "selector_cache_max_bytes",
+                value = ravel_promql::selector_cache_cap_for_pool(self.max_samples),
+                source = self.sources.max_samples,
                 "performance default resolved"
             );
             // A flag or fallback budget subtracted no reserve, so the field
@@ -6922,6 +7009,8 @@ impl Cli {
             sql_partition_count: resolved.sql_partition_count,
             promql_fetch_fanout: resolved.promql_fetch_fanout,
             max_segments: resolved.max_segments,
+            max_series: resolved.max_series,
+            max_samples: resolved.max_samples,
             sql_max_query_bytes: resolved.sql_max_query_bytes,
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
@@ -8427,6 +8516,8 @@ impl Cli {
             catalog_resolve_concurrency: self.catalog_resolve_concurrency,
             max_concurrent_queries: self.max_concurrent_queries,
             max_segments: self.max_segments,
+            max_series: self.max_series,
+            max_samples: self.max_samples,
             cache_max_bytes: self.cache_max_bytes,
             catalog_cache_max_bytes: self.catalog_cache_max_bytes,
             column_stats_cache_max_bytes: self.column_stats_cache_max_bytes,
