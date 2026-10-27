@@ -8,10 +8,10 @@ import type {
   AgentDefinition,
   AnyAgentDefinition,
   AnyMessageDefinition,
+  AnyToolDefinition,
   Handler,
   MessageDefinition,
   Schema,
-  ToolDefinition,
 } from "../types.js";
 
 export type {
@@ -75,7 +75,7 @@ export interface ServeOptions {
   readonly url: string;
   readonly token: string;
   readonly agents: readonly AnyAgentDefinition[];
-  readonly tools?: readonly ToolDefinition[];
+  readonly tools?: readonly AnyToolDefinition[];
 }
 
 export interface WorkerHandle {

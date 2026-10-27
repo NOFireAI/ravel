@@ -77,6 +77,14 @@ export interface MessageDefinition<
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AnyMessageDefinition<S = any> = MessageDefinition<any, any, S>;
 
+/**
+ * A tool definition whatever its input and output schemas. `run` takes the
+ * input contravariantly, so a list of tools needs `any` here for the same
+ * reason `AnyMessageDefinition` does.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AnyToolDefinition = ToolDefinition<any, any>;
+
 export interface AgentDefinition<
   N extends string = string,
   St extends Schema = Schema,

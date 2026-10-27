@@ -1,8 +1,9 @@
 /**
  * Client entry: send messages to agents and follow their operations. It
  * imports no module from this package's worker, tools or testing entries and
- * no node: builtin, which index.test.ts enforces over this package's own
- * module graph; the test does not follow third-party packages.
+ * none of the child_process, fs and net builtins, which index.test.ts
+ * enforces over this package's own module graph; the test does not follow
+ * third-party packages.
  */
 import { notImplemented } from "../not-implemented.js";
 import type {
