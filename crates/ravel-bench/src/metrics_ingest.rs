@@ -875,9 +875,11 @@ pub struct SystemIngestResult {
     /// that stores every class.
     #[serde(default)]
     pub unsupported_classes: Vec<UnsupportedClassRecord>,
-    /// The tenant the row wrote under: `--tenant` on the in-process row,
-    /// `--ravel-tenant` on the portable Ravel row, `None` on a comparator,
-    /// which is sent no tenant.
+    /// The tenant the row wrote under, as declared by the operator:
+    /// `--tenant` on the in-process row, `--ravel-tenant` on the portable
+    /// Ravel row, `None` on a comparator, which is sent no tenant. Declared,
+    /// not observed: no response carries a tenant and [`CommitToken`] holds
+    /// none.
     #[serde(default)]
     pub tenant: Option<String>,
     /// What the receiver's query API returned for the replayed data, against
@@ -2955,8 +2957,9 @@ pub struct HttpReplayConfig {
     /// the row: neither `endpoint` nor `client_behavior` carries it
     /// (`tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_latest_token_of_every_shard`).
     pub bearer_token: Option<String>,
-    /// The tenant the row records it wrote under (`--ravel-tenant` for the
-    /// portable Ravel row); `None` for a comparator.
+    /// The tenant the operator declares the row wrote under (`--ravel-tenant`
+    /// for the portable Ravel row), recorded as given: no response carries a
+    /// tenant to check it against. `None` for a comparator.
     pub tenant: Option<String>,
     /// Logical points (samples and native histograms) per RW1.0 request.
     pub batch_size: usize,
@@ -3256,7 +3259,10 @@ fn go_quote(value: &str) -> String {
 /// ends `The affected sample has timestamp <RFC3339Nano> and is from series
 /// <series>`, the series as `mimirpb.FromLabelAdaptersToString` prints it,
 /// the metric name then `{name="value", ...}` over the other labels in wire
-/// order (sorted here), or the bare name when there are none.
+/// order (sorted here), or the bare name when there are none. The bare form
+/// is a prefix of the labelled one and of any longer metric name, so a body
+/// names a point only where its needle is not followed by `{` or a metric
+/// name character ([`mimir_body_names`]).
 fn mimir_sample_needle(point: &LogicalPoint) -> String {
     let (metric, labels) = match point {
         LogicalPoint::Sample(s) => (&s.metric, &s.labels),
@@ -3278,6 +3284,22 @@ fn mimir_sample_needle(point: &LogicalPoint) -> String {
         "timestamp {} and is from series {series}",
         go_rfc3339_nano_ms(point.ts_ms())
     )
+}
+
+/// Whether a Mimir 400 body names the point `needle` renders: some
+/// occurrence of the needle ends the body or is followed by a character that
+/// cannot continue the series rendering, so `series m` does not match inside
+/// `series m{instance="a"}` or `series mx`
+/// (`tests::a_bare_mimir_needle_is_not_named_by_its_labelled_series`,
+/// `tests::a_mimir_needle_is_not_named_by_a_longer_metric_name`,
+/// `tests::a_mimir_needle_is_named_when_its_sample_is`).
+fn mimir_body_names(body: &str, needle: &str) -> bool {
+    body.match_indices(needle).any(|(at, _)| {
+        body[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c != '{' && !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+    })
 }
 
 /// An HTTP replay's row and the plan its read-back checks.
@@ -3422,7 +3444,7 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
             }
             BatchOutcome::SoftRejected(body) => {
                 let needles: Vec<String> = chunk.iter().map(mimir_sample_needle).collect();
-                let named: Vec<bool> = needles.iter().map(|n| body.contains(n.as_str())).collect();
+                let named: Vec<bool> = needles.iter().map(|n| mimir_body_names(&body, n)).collect();
                 let none_named = !named.iter().any(|n| *n);
                 for (point, is_named) in chunk.iter().zip(named) {
                     if none_named || is_named {
@@ -3701,17 +3723,7 @@ pub async fn readback_over_http(
         tokens: &tokens,
     };
     let (Some(min_ts), Some(max_ts)) = (plan.min_ts_ms, plan.max_ts_ms) else {
-        return Ok(Readback {
-            query_url: config.query_url.clone(),
-            series_count: 0,
-            sample_count: 0,
-            histogram_series_count: expected.histogram_series_count.map(|_| 0),
-            histogram_sample_count: expected.histogram_sample_count.map(|_| 0),
-            stale_marker_honored: None,
-            matches_expected: expected == ReadbackExpected::default(),
-            mismatches: Vec::new(),
-            expected,
-        });
+        return Ok(empty_window_readback(config.query_url.clone(), expected));
     };
     let window = [("start", seconds(min_ts)), ("end", seconds(max_ts))];
     let range_ms = max_ts - min_ts + 1;
@@ -3819,9 +3831,36 @@ pub async fn readback_over_http(
     })
 }
 
-/// A millisecond timestamp as the API's decimal seconds.
+/// The read-back of a plan that holds no point, so has no window to query:
+/// every figure reads zero, and an `expected` other than the default is
+/// named as a mismatch, so `matches_expected` is false only with a reason
+/// (`tests::an_empty_window_readback_names_why_it_does_not_match`).
+fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readback {
+    let mut mismatches = Vec::new();
+    if expected != ReadbackExpected::default() {
+        mismatches.push(format!(
+            "no point was sent, so no window was queried, but the plan expected {expected:?}"
+        ));
+    }
+    Readback {
+        query_url,
+        series_count: 0,
+        sample_count: 0,
+        histogram_series_count: expected.histogram_series_count.map(|_| 0),
+        histogram_sample_count: expected.histogram_sample_count.map(|_| 0),
+        stale_marker_honored: None,
+        matches_expected: mismatches.is_empty(),
+        mismatches,
+        expected,
+    }
+}
+
+/// A millisecond timestamp as the API's decimal seconds, a negative one
+/// signed as a whole (`tests::seconds_renders_negative_milliseconds`).
 fn seconds(ts_ms: i64) -> String {
-    format!("{}.{:03}", ts_ms.div_euclid(1_000), ts_ms.rem_euclid(1_000))
+    let sign = if ts_ms < 0 { "-" } else { "" };
+    let abs = ts_ms.unsigned_abs();
+    format!("{sign}{}.{:03}", abs / 1_000, abs % 1_000)
 }
 
 /// One receiver's Prometheus HTTP API, with Ravel's commit-token fence.
@@ -6179,6 +6218,120 @@ mod tests {
             mimir_sample_needle(&bare),
             "timestamp 2025-10-09T08:53:45Z and is from series m"
         );
+    }
+
+    /// A Mimir 400 body's text around one needle: the start of Mimir's
+    /// `sampleError` message before it, and `rest` after it.
+    fn mimir_body(needle: &str, rest: &str) -> String {
+        format!(
+            "failed pushing to ingester: user=anonymous: the sample has been rejected \
+             because another sample with a more recent timestamp has already been \
+             ingested and out-of-order samples are not allowed \
+             (err-mimir-sample-out-of-order). The affected sample has {needle}{rest}"
+        )
+    }
+
+    fn needle_at_ms(metric: &str, labels: &[(&str, &str)]) -> String {
+        mimir_sample_needle(&LogicalPoint::Sample(LogicalSample {
+            metric: metric.to_string(),
+            labels: labels
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            ts_ms: 1_760_000_010_000,
+            value: 1.0,
+        }))
+    }
+
+    /// The label-less needle of `m` is a prefix of the needle of
+    /// `m{instance="a"}` at the same millisecond, and a body naming only the
+    /// labelled point does not name the label-less one.
+    ///
+    /// TO SEE THIS FAIL: make `mimir_body_names` return `body.contains(needle)`.
+    #[test]
+    fn a_bare_mimir_needle_is_not_named_by_its_labelled_series() {
+        let bare = needle_at_ms("m", &[]);
+        let labelled = needle_at_ms("m", &[("instance", "a")]);
+        assert!(labelled.starts_with(&bare));
+        for rest in ["", "\n"] {
+            let body = mimir_body(&labelled, rest);
+            assert!(!mimir_body_names(&body, &bare), "{body}");
+        }
+    }
+
+    /// The needle of `m` is a prefix of the needle of `mx`, and a body naming
+    /// only `mx` does not name `m`.
+    ///
+    /// TO SEE THIS FAIL: make `mimir_body_names` return `body.contains(needle)`,
+    /// or refuse only a following `{`.
+    #[test]
+    fn a_mimir_needle_is_not_named_by_a_longer_metric_name() {
+        let m = needle_at_ms("m", &[]);
+        let longer = needle_at_ms("mx", &[]);
+        assert!(longer.starts_with(&m));
+        for rest in ["", "\n"] {
+            let body = mimir_body(&longer, rest);
+            assert!(!mimir_body_names(&body, &m), "{body}");
+        }
+    }
+
+    /// Each needle is named when its sample is: at the end of the body,
+    /// followed by the rest of Mimir's message, and after a prefix-sharing
+    /// needle that does not name it.
+    #[test]
+    fn a_mimir_needle_is_named_when_its_sample_is() {
+        let bare = needle_at_ms("m", &[]);
+        let labelled = needle_at_ms("m", &[("instance", "a")]);
+        let longer = needle_at_ms("mx", &[]);
+        for needle in [&bare, &labelled, &longer] {
+            for rest in ["", "\n", " (sample 1 of 2)\n"] {
+                let body = mimir_body(needle, rest);
+                assert!(mimir_body_names(&body, needle), "{body}");
+            }
+        }
+        for decoy in [&labelled, &longer] {
+            let body = format!("{}{}", mimir_body(decoy, "\n"), mimir_body(&bare, "\n"));
+            assert!(mimir_body_names(&body, &bare), "{body}");
+        }
+    }
+
+    /// The no-point read-back reports `matches_expected` false only with a
+    /// mismatch line naming why.
+    ///
+    /// TO SEE THIS FAIL: set `matches_expected` to
+    /// `expected == ReadbackExpected::default()` and leave `mismatches` empty.
+    #[test]
+    fn an_empty_window_readback_names_why_it_does_not_match() {
+        let clean = empty_window_readback("http://q".to_string(), ReadbackExpected::default());
+        assert!(clean.matches_expected);
+        assert!(clean.mismatches.is_empty());
+        let expected = ReadbackExpected {
+            series_count: 2,
+            sample_count: 3,
+            histogram_series_count: Some(1),
+            histogram_sample_count: Some(1),
+            stale_marker_honored: Some(true),
+        };
+        let readback = empty_window_readback("http://q".to_string(), expected.clone());
+        assert!(!readback.matches_expected);
+        assert_eq!(readback.matches_expected, readback.mismatches.is_empty());
+        assert_eq!(readback.mismatches.len(), 1);
+        assert!(
+            readback.mismatches[0].contains("series_count: 2"),
+            "{:?}",
+            readback.mismatches
+        );
+        assert_eq!(readback.expected, expected);
+        assert_eq!(readback.histogram_series_count, Some(0));
+    }
+
+    #[test]
+    fn seconds_renders_negative_milliseconds() {
+        assert_eq!(seconds(-1), "-0.001");
+        assert_eq!(seconds(-1_000), "-1.000");
+        assert_eq!(seconds(-1_500), "-1.500");
+        assert_eq!(seconds(0), "0.000");
+        assert_eq!(seconds(1_500), "1.500");
     }
 
     /// A VictoriaMetrics 2xx acknowledges native histograms it cannot store:
