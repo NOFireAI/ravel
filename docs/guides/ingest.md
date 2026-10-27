@@ -1747,8 +1747,12 @@ group, in the given order.
 - The reader is unaffected. PAGE_DIR gives each chunk's offset, and a query
   resolves a column name to its id through FIELD_DIR, which stays sorted by
   name. Objects with and without an order read back the same records.
-- A name the data never carries is skipped. An empty name, a name with
-  leading or trailing spaces, or a name given twice is refused before
+- A name the data never carries is skipped. Before it reads a row, a logs
+  load prints `warning: --chunk-order names <name>, which no mapped
+  attribute carries` for each name that no `[[attribute]]` or
+  `[[resource_attribute]]` key of the mapping names. A mapped key that no
+  row carries is still skipped without a warning. An empty name, a name
+  with leading or trailing spaces, or a name given twice is refused before
   anything is read.
 - An object with more attribute names than the writer's dynamic column cap
   gives columns to the first names in the new order. A named column takes a
