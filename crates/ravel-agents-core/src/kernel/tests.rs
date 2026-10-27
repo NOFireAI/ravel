@@ -709,6 +709,356 @@ fn a_missing_agent_only_accepts_create() {
     assert_eq!(sim.head().root_revision, 1);
 }
 
+fn cancel_cmd(head: &Head, accept_seq: u64) -> Command {
+    Command::Cancel(Cancel {
+        fence: inc_fence(head),
+        accept_seq,
+    })
+}
+
+fn commit_intent_cmd(head: &Head, key: &str, policy: RecoveryPolicy) -> Command {
+    Command::CommitIntent(CommitIntent {
+        fence: turn_fence(head),
+        intent: intent(key, policy),
+    })
+}
+
+fn authorize_cmd(authority: Authority, effect_id: Id128, attempt: u32) -> Command {
+    Command::AuthorizeAttempt(AuthorizeAttempt {
+        authority,
+        effect_id,
+        attempt,
+    })
+}
+
+fn effect_result_cmd(head: &Head, effect_id: Id128, attempt: u32) -> Command {
+    Command::RecordEffectResult(RecordEffectResult {
+        fence: inc_fence(head),
+        effect_id,
+        attempt,
+        result: blob(b"result"),
+    })
+}
+
+fn step_cmd(head: &Head, status: StepStatus) -> Command {
+    Command::RecordStep(RecordStep {
+        fence: turn_fence(head),
+        step_key: "lookup".to_string(),
+        tool_name: "db".to_string(),
+        tool_version: "1".to_string(),
+        input_hash: identity::step_input_hash("db", "1", b"a"),
+        status,
+        output: None,
+    })
+}
+
+#[test]
+fn a_cancel_requested_before_a_retryable_failure_consumes_the_input_as_cancelled() {
+    let mut sim = Sim::started();
+    let turn_id = sim.head().active_turn.as_ref().expect("turn").turn_id;
+    assert_eq!(
+        sim.run(&cancel_cmd(sim.head(), 1)),
+        Reply::CancelRequested { accept_seq: 1 }
+    );
+    // Budget left: a kernel that honours the cancel only once retries are
+    // exhausted would retry here.
+    let fail = fail_cmd(sim.head(), false, 3);
+    let Transition::Publish {
+        head,
+        effects,
+        reply,
+    } = sim.step(&fail).expect("fail applies")
+    else {
+        panic!("a cancelled failure must publish");
+    };
+    assert_eq!(reply, Reply::Cancelled { accept_seq: 1 });
+    assert_eq!(effects, vec![Effect::OperationTerminal { accept_seq: 1 }]);
+    assert!(head.inbox.is_empty());
+    assert_eq!(head.active_turn, None);
+    assert_eq!(head.state_version, 0);
+    assert_eq!(head.state, None);
+    assert_eq!(
+        head.results,
+        vec![ResultEntry {
+            accept_seq: 1,
+            status: ResultStatus::Cancelled,
+            output: None,
+            error: String::new(),
+            turn_id: Some(turn_id),
+            dead_lettered: false,
+            finished_unix_ns: sim.now,
+        }]
+    );
+    assert_eq!(sim.run(&begin_cmd(sim.head())), Reply::Idle);
+    assert_eq!(
+        sim.step(&fail).expect("retry"),
+        Transition::Unchanged {
+            reply: Reply::AlreadyCommitted { accept_seq: 1 }
+        }
+    );
+}
+
+#[test]
+fn a_cancel_between_a_retryable_failure_and_the_retry_settles_the_input() {
+    let mut sim = Sim::started();
+    let failed_turn = sim.head().active_turn.as_ref().expect("turn").turn_id;
+    assert_eq!(
+        sim.run(&fail_cmd(sim.head(), false, 3)),
+        Reply::TurnRetry {
+            accept_seq: 1,
+            failed_attempts: 1
+        }
+    );
+    assert_eq!(
+        sim.run(&cancel_cmd(sim.head(), 1)),
+        Reply::Cancelled { accept_seq: 1 }
+    );
+    let head = sim.head();
+    assert!(head.inbox.is_empty());
+    assert_eq!(head.results.len(), 1);
+    assert_eq!(head.results[0].status, ResultStatus::Cancelled);
+    // A turn ran for this input, so the result names it.
+    assert_eq!(head.results[0].turn_id, Some(failed_turn));
+    assert_eq!(head.state_version, 0);
+    // The retry's begin_turn finds nothing to start.
+    assert_eq!(sim.run(&begin_cmd(sim.head())), Reply::Idle);
+}
+
+#[test]
+fn fail_turn_is_refused_while_a_manual_attempt_is_in_doubt() {
+    let mut sim = Sim::started();
+    let Reply::IntentCommitted { effect_id } = sim.run(&commit_intent_cmd(
+        sim.head(),
+        "charge",
+        RecoveryPolicy::Manual,
+    )) else {
+        panic!("intent not committed");
+    };
+    let owner = Authority::Owner(owner_fence(sim.head()));
+    sim.run(&authorize_cmd(owner.clone(), effect_id, 1));
+    assert!(matches!(
+        sim.run(&authorize_cmd(owner, effect_id, 2)),
+        Reply::Blocked(_)
+    ));
+    assert_eq!(sim.head().effects[0].status, EffectStatus::InDoubt);
+    for terminal in [false, true] {
+        let error = sim
+            .step(&fail_cmd(sim.head(), terminal, 3))
+            .expect_err("fail_turn must wait for reconciliation");
+        assert_eq!(error.kind, ErrorKind::EffectInDoubt);
+        assert!(error.reason.contains("NoEffectInDoubt"), "{}", error.reason);
+        assert_eq!(
+            sim.refuse(&fail_cmd(sim.head(), terminal, 3)),
+            ErrorKind::EffectInDoubt
+        );
+    }
+    // Reconciled, the input may fail and retry, and the retry finds the
+    // effect completed instead of dispatching it again.
+    sim.run(&authorize_cmd(
+        Authority::Reconcile(inc_fence(sim.head())),
+        effect_id,
+        2,
+    ));
+    sim.run(&effect_result_cmd(sim.head(), effect_id, 2));
+    assert_eq!(
+        sim.run(&fail_cmd(sim.head(), false, 3)),
+        Reply::TurnRetry {
+            accept_seq: 1,
+            failed_attempts: 1
+        }
+    );
+    sim.run(&begin_cmd(sim.head()));
+    assert_eq!(
+        sim.step(&commit_intent_cmd(sim.head(), "charge", RecoveryPolicy::Manual))
+            .expect("recommit"),
+        Transition::Unchanged {
+            reply: Reply::IntentCommitted { effect_id }
+        }
+    );
+    assert_eq!(
+        sim.step(&authorize_cmd(
+            Authority::Owner(owner_fence(sim.head())),
+            effect_id,
+            3
+        ))
+        .expect("authorize"),
+        Transition::Unchanged {
+            reply: Reply::EffectCompleted {
+                effect_id,
+                result: Some(blob(b"result")),
+                attempt: 2
+            }
+        }
+    );
+}
+
+#[test]
+fn fail_turn_is_refused_while_an_attempt_is_authorized_without_a_result() {
+    for policy in [RecoveryPolicy::Manual, RecoveryPolicy::AtLeastOnce] {
+        let mut sim = Sim::started();
+        let Reply::IntentCommitted { effect_id } =
+            sim.run(&commit_intent_cmd(sim.head(), "charge", policy))
+        else {
+            panic!("intent not committed");
+        };
+        sim.run(&authorize_cmd(
+            Authority::Owner(owner_fence(sim.head())),
+            effect_id,
+            1,
+        ));
+        assert_eq!(sim.head().effects[0].status, EffectStatus::Authorized);
+        for terminal in [false, true] {
+            let error = sim
+                .step(&fail_cmd(sim.head(), terminal, 3))
+                .expect_err("fail_turn must wait for the attempt's result");
+            assert_eq!(error.kind, ErrorKind::EffectInDoubt, "{policy:?}");
+            assert!(
+                error.reason.contains("NoAuthorizedAttemptPending"),
+                "{}",
+                error.reason
+            );
+        }
+        sim.run(&effect_result_cmd(sim.head(), effect_id, 1));
+        assert_eq!(
+            sim.run(&fail_cmd(sim.head(), false, 3)),
+            Reply::TurnRetry {
+                accept_seq: 1,
+                failed_attempts: 1
+            }
+        );
+    }
+}
+
+#[test]
+fn a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt() {
+    let mut sim = Sim::started();
+    let first_turn = sim.head().active_turn.as_ref().expect("turn").turn_id;
+    let Reply::StepRecorded(step) = sim.run(&step_cmd(sim.head(), StepStatus::Completed)) else {
+        panic!("step not recorded");
+    };
+    let Reply::IntentCommitted { effect_id } = sim.run(&commit_intent_cmd(
+        sim.head(),
+        "ping",
+        RecoveryPolicy::AtLeastOnce,
+    )) else {
+        panic!("intent not committed");
+    };
+    sim.run(&fail_cmd(sim.head(), false, 3));
+    // The transcript and the journal carry over into the retry.
+    assert_eq!(sim.head().steps, vec![step.clone()]);
+    assert_eq!(sim.head().effects.len(), 1);
+    sim.run(&begin_cmd(sim.head()));
+    assert_ne!(
+        sim.head().active_turn.as_ref().expect("turn").turn_id,
+        first_turn
+    );
+    assert_eq!(
+        sim.step(&step_cmd(sim.head(), StepStatus::Started))
+            .expect("replay"),
+        Transition::Unchanged {
+            reply: Reply::StepReplayed(step)
+        }
+    );
+    assert_eq!(
+        sim.step(&commit_intent_cmd(
+            sim.head(),
+            "ping",
+            RecoveryPolicy::AtLeastOnce
+        ))
+        .expect("recommit"),
+        Transition::Unchanged {
+            reply: Reply::IntentCommitted { effect_id }
+        }
+    );
+    sim.run(&Command::CompleteTurn(complete_cmd(sim.head(), b"s")));
+    assert_eq!(sim.head().effects.len(), 1);
+    assert_eq!(sim.head().steps, Vec::new());
+}
+
+#[test]
+fn a_retried_retryable_failure_answers_the_same_turn_retry() {
+    let retry = Reply::TurnRetry {
+        accept_seq: 1,
+        failed_attempts: 1,
+    };
+    // A plain turn, then one resumed by a new owner: its turn id was minted
+    // under the previous epoch, so the fence's epoch cannot rebuild it.
+    for takeover in [false, true] {
+        let mut sim = Sim::started();
+        if takeover {
+            sim.run(&takeover_cmd(sim.head(), "w2"));
+            assert!(matches!(
+                sim.run(&begin_cmd(sim.head())),
+                Reply::TurnResumed(_)
+            ));
+        }
+        let fail = fail_cmd(sim.head(), false, 3);
+        assert_eq!(sim.run(&fail), retry);
+        // The reply was lost and the worker sends the same command again.
+        assert_eq!(
+            sim.step(&fail).expect("retry"),
+            Transition::Unchanged {
+                reply: retry.clone()
+            }
+        );
+        sim.run(&begin_cmd(sim.head()));
+        assert_eq!(
+            sim.step(&fail).expect("retry after the next begin"),
+            Transition::Unchanged {
+                reply: retry.clone()
+            }
+        );
+    }
+}
+
+#[test]
+fn a_commit_whose_base_state_version_is_one_behind_is_ownership_lost() {
+    let mut sim = Sim::started();
+    sim.run(&Command::CompleteTurn(complete_cmd(sim.head(), b"s1")));
+    sim.run(&enqueue_cmd(sim.head(), "r2", b"p2"));
+    sim.run(&begin_cmd(sim.head()));
+    assert_eq!(sim.head().state_version, 1);
+    let mut stale = complete_cmd(sim.head(), b"s2");
+    stale.fence.base_state_version -= 1;
+    let stale = Command::CompleteTurn(stale);
+    let error = sim.step(&stale).expect_err("a stale base is refused");
+    assert_eq!(error.kind, ErrorKind::OwnershipLost);
+    assert_eq!(error.reason, "base state version moved");
+    assert_eq!(sim.refuse(&stale), ErrorKind::OwnershipLost);
+}
+
+#[test]
+fn every_fenced_command_refuses_a_stale_fence() {
+    let mut live = Sim::started();
+    live.run(&commit_intent_cmd(live.head(), "i0", RecoveryPolicy::Manual));
+    live.run(&Command::ScheduleTimer(ScheduleTimer {
+        fence: inc_fence(live.head()),
+        timer: TimerSpec {
+            timer_key: timer_key(0),
+            due_unix_ns: 0,
+            handler: "h".to_string(),
+            payload: None,
+        },
+    }));
+    let mut gone = Sim::started();
+    gone.run(&Command::Tombstone(Tombstone {
+        fence: inc_fence(gone.head()),
+    }));
+    let mut named = std::collections::BTreeSet::new();
+    for sim in [&mut live, &mut gone] {
+        for (stale_epoch, shapes) in [(true, OWNER_FENCE_SHAPES), (false, FENCE_SHAPES)] {
+            for which in 0..shapes {
+                let command = stale_command(sim.head(), which, stale_epoch);
+                named.insert(command.name());
+                let expected = stale_kind(sim.head(), stale_epoch);
+                assert_eq!(sim.refuse(&command), expected, "{command:?}");
+            }
+        }
+    }
+    assert_eq!(named.len(), 14, "{named:?}");
+    assert!(!named.contains("create"));
+}
+
 /// One abstract step of the property test. The harness turns it into a
 /// command against the current root, fenced the way a well-behaved caller
 /// would fence it, except for the `Stale*` steps.
@@ -810,8 +1160,16 @@ fn effect_at(head: &Head, pick: u8) -> Option<&EffectRecord> {
     head.effects.get(pick as usize % head.effects.len())
 }
 
+/// Fence shapes `stale_command` builds: the 14 commands that carry a fence,
+/// with `AuthorizeAttempt` once per authority. `Create` names the agent by
+/// its key and carries no fence.
+const FENCE_SHAPES: u8 = 15;
+/// The first `OWNER_FENCE_SHAPES` shapes carry an epoch.
+const OWNER_FENCE_SHAPES: u8 = 7;
+
 /// A fence-carrying command against `head`, with `epoch` or `incarnation`
-/// replaced by a value that is not the current one.
+/// replaced by a value that is not the current one. A stale epoch picks one
+/// of the owner-fenced shapes, a stale incarnation any shape.
 fn stale_command(head: &Head, which: u8, stale_epoch: bool) -> Command {
     let mut owner = owner_fence(head);
     let mut inc = inc_fence(head);
@@ -836,12 +1194,25 @@ fn stale_command(head: &Head, which: u8, stale_epoch: bool) -> Command {
         handler_version: "1".to_string(),
         handler_digest: Hash256([1; 32]),
     };
-    match (which % 4, stale_epoch) {
-        (0, _) => Command::BeginTurn(BeginTurn {
+    let effect = effect_at(head, which);
+    let effect_id = effect.map_or(Id128([0; 16]), |e| e.effect_id);
+    let shape = if stale_epoch {
+        which % OWNER_FENCE_SHAPES
+    } else {
+        which % FENCE_SHAPES
+    };
+    match shape {
+        0 => Command::Takeover(Takeover {
+            incarnation: owner.incarnation,
+            owner_id: "w-stale".to_string(),
+            observed_epoch: owner.epoch,
+            lease_hint_unix_ns: 0,
+        }),
+        1 => Command::BeginTurn(BeginTurn {
             fence: owner,
             handlers: vec![pin()],
         }),
-        (1, _) => Command::CompleteTurn(CompleteTurn {
+        2 => Command::CompleteTurn(CompleteTurn {
             fence: turn,
             observed_root_revision: head.root_revision,
             new_state: blob(b"stale"),
@@ -850,24 +1221,84 @@ fn stale_command(head: &Head, which: u8, stale_epoch: bool) -> Command {
             timer_changes: Vec::new(),
             intents: Vec::new(),
         }),
-        (2, _) => Command::FailTurn(FailTurn {
+        3 => Command::FailTurn(FailTurn {
             fence: turn,
             error: String::new(),
-            terminal: true,
-            max_attempts: 1,
+            terminal: which % 2 == 0,
+            max_attempts: 3,
         }),
-        (_, true) => Command::AuthorizeAttempt(AuthorizeAttempt {
+        4 => Command::RecordStep(RecordStep {
+            fence: turn,
+            step_key: "s0".to_string(),
+            tool_name: "db".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: identity::step_input_hash("db", "1", &[0]),
+            status: StepStatus::Completed,
+            output: None,
+        }),
+        5 => Command::CommitIntent(CommitIntent {
+            fence: turn,
+            intent: intent("i0", RecoveryPolicy::AtLeastOnce),
+        }),
+        6 => Command::AuthorizeAttempt(AuthorizeAttempt {
             authority: Authority::Owner(owner),
-            effect_id: effect_at(head, which).map_or(Id128([0; 16]), |e| e.effect_id),
-            attempt: effect_at(head, which).map_or(1, |e| e.attempt + 1),
+            effect_id,
+            attempt: effect.map_or(1, |e| e.attempt + 1),
         }),
-        (_, false) => Command::Enqueue(Enqueue {
+        7 => Command::AuthorizeAttempt(AuthorizeAttempt {
+            authority: Authority::Reconcile(inc),
+            effect_id,
+            attempt: effect.map_or(1, |e| e.attempt + 1),
+        }),
+        8 => Command::RecordEffectResult(RecordEffectResult {
+            fence: inc,
+            effect_id,
+            attempt: effect.map_or(1, |e| e.attempt.max(1)),
+            result: blob(b"stale"),
+        }),
+        9 => Command::Enqueue(Enqueue {
             fence: inc,
             request_id: "stale".to_string(),
             handler: "h".to_string(),
             request_hash: Hash256([0; 32]),
             payload: None,
         }),
+        10 => Command::Cancel(Cancel {
+            fence: inc,
+            accept_seq: head.next_accept_seq.saturating_sub(1).max(1),
+        }),
+        11 => Command::ScheduleTimer(ScheduleTimer {
+            fence: inc,
+            timer: TimerSpec {
+                timer_key: timer_key(0),
+                due_unix_ns: 0,
+                handler: "h".to_string(),
+                payload: None,
+            },
+        }),
+        12 => Command::FireTimer(FireTimer {
+            fence: inc,
+            timer_id: identity::timer_id(head.incarnation, &timer_key(0)),
+            generation: head
+                .timers
+                .first()
+                .map_or(0, |t| t.generation),
+        }),
+        13 => Command::CancelTimer(CancelTimer {
+            fence: inc,
+            timer_key: timer_key(0),
+        }),
+        _ => Command::Tombstone(Tombstone { fence: inc }),
+    }
+}
+
+/// The error a stale fence must get: a stale epoch on a live agent is
+/// `OwnershipLost`, anything else names an incarnation that is not live.
+fn stale_kind(head: &Head, stale_epoch: bool) -> ErrorKind {
+    if head.lifecycle == Lifecycle::Active && stale_epoch {
+        ErrorKind::OwnershipLost
+    } else {
+        ErrorKind::AgentGone
     }
 }
 
@@ -1073,12 +1504,8 @@ fn run_ops(ops: &[Op], coverage: &mut Coverage) -> Result<(), TestCaseError> {
                 )));
             };
             let expected = match &before {
-                Some(h)
-                    if h.lifecycle == Lifecycle::Active && matches!(op, Op::StaleEpoch { .. }) =>
-                {
-                    ErrorKind::OwnershipLost
-                }
-                _ => ErrorKind::AgentGone,
+                Some(h) => stale_kind(h, matches!(op, Op::StaleEpoch { .. })),
+                None => ErrorKind::AgentGone,
             };
             prop_assert_eq!(error.kind, expected, "{:?}", command);
             coverage.stale_refusals += 1;

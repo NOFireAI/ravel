@@ -1305,6 +1305,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_repeated_format_version_field_is_gated_on_its_decoded_value() {
+        // Field 1 written twice: the leading 1 passes the peek, and protobuf
+        // keeps the last value, 2.
+        let mut bytes = sample_head().encode();
+        let seal = bytes.split_off(bytes.len() - 6);
+        bytes.extend_from_slice(&[0x08, 0x02]);
+        bytes.extend_from_slice(&seal);
+        assert_eq!(peek_format_version(&bytes), Ok(FORMAT_VERSION));
+        assert_eq!(
+            Head::decode(&bytes),
+            Err(CodecError::UnsupportedFormat { found: 2 })
+        );
+    }
+
+    #[test]
     fn decode_drops_nothing_it_does_not_refuse() {
         // An unknown field on a version 1 record is not carried forward:
         // re-encoding builds a fresh message, so the bytes differ.

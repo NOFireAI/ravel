@@ -215,6 +215,35 @@ mod tests {
         );
     }
 
+    /// `bytes` with field 1 written again, as `version`, before the seal.
+    fn with_second_version(mut bytes: Vec<u8>, version: u8) -> Vec<u8> {
+        let seal = bytes.split_off(bytes.len() - 6);
+        bytes.extend_from_slice(&[0x08, version]);
+        bytes.extend_from_slice(&seal);
+        bytes
+    }
+
+    #[test]
+    fn a_repeated_format_version_field_is_gated_on_its_decoded_value() {
+        let found: Result<(), CodecError> = Err(CodecError::UnsupportedFormat { found: 2 });
+        let page = with_second_version(encode_inbox_page(&[]), 2);
+        assert_eq!(peek_format_version(&page), Ok(FORMAT_VERSION));
+        assert_eq!(decode_inbox_page(&page).map(|_| ()), found.clone());
+        let table = with_second_version(encode_timer_table(&[]), 2);
+        assert_eq!(decode_timer_table(&table).map(|_| ()), found.clone());
+        let transcript = with_second_version(encode_step_transcript(Id128([1; 16]), &[]), 2);
+        assert_eq!(decode_step_transcript(&transcript).map(|_| ()), found.clone());
+        let journal = with_second_version(encode_effect_journal(Id128([1; 16]), &[]), 2);
+        assert_eq!(decode_effect_journal(&journal).map(|_| ()), found.clone());
+        let snapshot = StateSnapshot {
+            state_version: 1,
+            content_type: String::new(),
+            state: Vec::new(),
+        };
+        let snapshot = with_second_version(snapshot.encode(), 2);
+        assert_eq!(StateSnapshot::decode(&snapshot).map(|_| ()), found);
+    }
+
     type Flips = Vec<(prop::sample::Index, u8)>;
 
     fn flips() -> impl Strategy<Value = Flips> {
