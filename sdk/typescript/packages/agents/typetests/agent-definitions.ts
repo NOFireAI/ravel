@@ -149,16 +149,14 @@ defineTool({
   run: () => Promise.resolve({ value: 1 }),
 });
 
-// A concrete tool from defineTool must be accepted wherever a tool list is
-// taken: run's input parameter is contravariant, so a list typed over the
-// bare Schema default refused every real tool (PR #3366 review).
+// Tool lists accept a tool from defineTool and an explicitly typed
+// ToolDefinition either way: TypeScript's measured variance for the generic
+// interface admits a narrower instantiation in a list. These two must keep
+// compiling.
 export const serveWithTool = () =>
   serveAgents({ url: "http://127.0.0.1:0", token: "t", agents: [counter], tools: [lookup] });
 export const harnessWithTool = () => createTestHarness({ agents: [counter], tools: [lookup] });
 
-// The same with run's parameter written out: this is the form that a list
-// typed over the bare Schema default refuses, since unknown is not
-// assignable to the annotated input.
 const lookupInput = z.object({ key: z.string() });
 const lookupOutput = z.object({ value: z.number() });
 const annotated: ToolDefinition<typeof lookupInput, typeof lookupOutput> = {
@@ -174,3 +172,41 @@ export const serveWithAnnotatedTool = () =>
   serveAgents({ url: "http://127.0.0.1:0", token: "t", agents: [counter], tools: [annotated] });
 export const harnessWithAnnotatedTool = () =>
   createTestHarness({ agents: [counter], tools: [annotated] });
+
+// A fresh object literal inside the list is checked structurally against the
+// element type, and run's input parameter is contravariant, so a list typed
+// over the bare Schema default refuses it (TS2322: unknown is not assignable
+// to the annotated input). This is the form AnyToolDefinition exists for,
+// and the one that fails if the option types revert to ToolDefinition[].
+export const serveWithLiteralTool = () =>
+  serveAgents({
+    url: "http://127.0.0.1:0",
+    token: "t",
+    agents: [counter],
+    tools: [
+      {
+        kind: "tool",
+        name: "literal",
+        version: "1",
+        input: lookupInput,
+        output: lookupOutput,
+        recovery: "manual",
+        run: (input: { key: string }) => Promise.resolve({ value: input.key.length }),
+      },
+    ],
+  });
+export const harnessWithLiteralTool = () =>
+  createTestHarness({
+    agents: [counter],
+    tools: [
+      {
+        kind: "tool",
+        name: "literal",
+        version: "1",
+        input: lookupInput,
+        output: lookupOutput,
+        recovery: "manual",
+        run: (input: { key: string }) => Promise.resolve({ value: input.key.length }),
+      },
+    ],
+  });
