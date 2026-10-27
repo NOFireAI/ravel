@@ -16,7 +16,11 @@
 //! passes. In each pass, per corpus entry, the oracle is queried first and
 //! its first answer of the pass is the answer every other engine's
 //! repetitions are classified against with [`classify`]. A
-//! [`ClassifyError`] voids the run ([`RunError::Classify`]). A range entry is
+//! [`ClassifyError`] voids the run ([`RunError::Classify`]), except that an
+//! oracle answer lost to a timeout or a transport failure is first re-sent up
+//! to [`RunOptions::oracle_retries`] times ([`oracle_answer`]). The retried
+//! requests answer the oracle only: Prometheus' own row keeps the outcome of
+//! the first attempt. A range entry is
 //! one `/api/v1/query_range` request per repetition over the profile's
 //! `range_eval` grid (amendment E).
 //!
@@ -31,7 +35,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ravel_promql_difftest::corpus::ComparisonMode;
-use ravel_promql_difftest::prometheus_client::{PrometheusClient, QueryOutcome};
+use ravel_promql_difftest::prometheus_client::{
+    PrometheusClient, QueryOutcome, TransportErrorKind,
+};
 
 use crate::metrics_correctness::{
     Classified, ClassifyError, Denominators, Engine, EntryExpectation, OracleAnswer, classify,
@@ -459,13 +465,47 @@ pub fn needs_native_histograms(entry: &CorpusEntry, workload: &WorkloadFile) -> 
         .any(|word| native.contains(&word))
 }
 
-/// The pass and repetition counts and the per-query deadline.
+/// The pass and repetition counts, the per-query deadline, and the oracle
+/// retry budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunOptions {
     pub warmup_passes: u32,
     pub passes: u32,
     pub reps_per_pass: u32,
     pub deadline: Duration,
+    /// How many more times an oracle query lost to a timeout or a transport
+    /// failure is re-sent before the run is void.
+    pub oracle_retries: u32,
+}
+
+/// The fixed pause before each oracle retry.
+pub const ORACLE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// One re-sent oracle query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleRetry {
+    pub entry: String,
+    /// The timed pass, from 1.
+    pub pass: u32,
+    /// The repetition whose outcome was unavailable, from 1.
+    pub repetition: u32,
+    /// The retry's attempt number; the first attempt is 1, so the first
+    /// retry is 2.
+    pub attempt: u32,
+}
+
+/// Whether an oracle outcome is worth re-sending: a timeout, or a transport
+/// failure before a complete body arrived. An answer that arrived (any HTTP
+/// status, a body over the cap, a complete body that is not JSON) is not.
+pub fn oracle_retryable(outcome: &QueryOutcome) -> bool {
+    match outcome {
+        QueryOutcome::Timeout { .. } => true,
+        QueryOutcome::Transport { kind, .. } => matches!(
+            kind,
+            TransportErrorKind::Connect | TransportErrorKind::Request | TransportErrorKind::Body
+        ),
+        QueryOutcome::Envelope { .. } | QueryOutcome::BodyTooLarge { .. } => false,
+    }
 }
 
 /// Why a run produced no report.
@@ -489,6 +529,8 @@ pub struct RunOutput {
     pub cases_expected: Vec<ExpectedCase>,
     pub measurements: Vec<Measurement>,
     pub denominators: Vec<EngineDenominators>,
+    /// Every oracle retry the run used, in the order sent.
+    pub oracle_retries: Vec<OracleRetry>,
 }
 
 /// The cases a run over `entries` and `engines` must report, one per
@@ -583,7 +625,8 @@ pub async fn run(
         })
         .collect();
 
-    for _ in 0..options.passes {
+    let mut oracle_retries: Vec<OracleRetry> = Vec::new();
+    for pass in 1..=options.passes {
         for (entry_index, entry) in entries.iter().enumerate() {
             let expectation = EntryExpectation {
                 intended_empty: entry.expected.intended_empty,
@@ -595,7 +638,7 @@ pub async fn run(
             for (engine_index, engine) in binding.engines.iter().enumerate() {
                 let record = &mut records[engine_index][entry_index];
                 let mut reps: Vec<(Classified, f64)> = Vec::new();
-                for _ in 0..options.reps_per_pass {
+                for repetition in 1..=options.reps_per_pass {
                     let outcome = send(
                         &clients[engine_index],
                         entry,
@@ -610,7 +653,17 @@ pub async fn run(
                         source,
                     };
                     if engine.engine == Engine::Prometheus && oracle.is_none() {
-                        oracle = Some(OracleAnswer::from_outcome(&outcome).map_err(void)?);
+                        let answer = oracle_answer(
+                            &clients[engine_index],
+                            entry,
+                            &binding.grid,
+                            &options,
+                            &outcome,
+                            (pass, repetition),
+                            &mut oracle_retries,
+                        )
+                        .await;
+                        oracle = Some(answer.map_err(void)?);
                     }
                     if let Some(citation) = &record.unsupported_citation {
                         record.unsupported_answer = Some(summarize(&outcome));
@@ -687,7 +740,54 @@ pub async fn run(
         cases_expected,
         measurements,
         denominators,
+        oracle_retries,
     })
+}
+
+/// The oracle's answer for one entry in one pass. `first` is the outcome of
+/// the Prometheus repetition that asked, and that repetition is classified
+/// from `first` whatever happens here: a retry is a separate request that
+/// answers the oracle only, so it can never make Prometheus' row faster or
+/// turn its timeout into `ok`. While the latest outcome is
+/// [`oracle_retryable`] and the budget lasts, the query is re-sent after
+/// [`ORACLE_RETRY_BACKOFF`]; each retry is appended to `retries` and named on
+/// stderr. An exhausted budget, or an outcome that is not retryable, returns
+/// the [`ClassifyError::OracleUnavailable`] of the last outcome.
+async fn oracle_answer(
+    client: &PrometheusClient,
+    entry: &CorpusEntry,
+    grid: &QueryGrid,
+    options: &RunOptions,
+    first: &QueryOutcome,
+    (pass, repetition): (u32, u32),
+    retries: &mut Vec<OracleRetry>,
+) -> Result<OracleAnswer, ClassifyError> {
+    let mut answer = OracleAnswer::from_outcome(first);
+    let mut retryable = oracle_retryable(first);
+    let mut last = summarize(first);
+    let mut attempt = 1;
+    while answer.is_err() && retryable && attempt <= options.oracle_retries {
+        attempt += 1;
+        eprintln!(
+            "metricsbench_query: oracle retry: entry `{}`, pass {pass}, repetition {repetition}, \
+             attempt {attempt} of {}: {}",
+            entry.id,
+            options.oracle_retries + 1,
+            last,
+        );
+        tokio::time::sleep(ORACLE_RETRY_BACKOFF).await;
+        let outcome = send(client, entry, grid, options.deadline).await;
+        retries.push(OracleRetry {
+            entry: entry.id.clone(),
+            pass,
+            repetition,
+            attempt,
+        });
+        answer = OracleAnswer::from_outcome(&outcome);
+        retryable = oracle_retryable(&outcome);
+        last = summarize(&outcome);
+    }
+    answer
 }
 
 /// The report row for one case, and the row-level classification its
@@ -856,6 +956,50 @@ mod tests {
         assert!(parse_engine_spec("url=http://x").is_err());
         assert!(parse_engine_spec("name=mimir,token=abc").is_err());
         assert!(parse_engine_spec("name=mimir,name=ravel").is_err());
+    }
+
+    #[test]
+    fn only_lost_oracle_requests_are_retryable() {
+        use ravel_promql_difftest::prometheus_client::{QueryTiming, TimeoutPhase};
+        let timing = QueryTiming::default();
+        let transport = |kind, http_status| QueryOutcome::Transport {
+            kind,
+            http_status,
+            message: String::new(),
+            timing,
+        };
+        assert!(oracle_retryable(&QueryOutcome::Timeout {
+            phase: TimeoutPhase::Headers,
+            elapsed: Duration::from_secs(1),
+            timing,
+        }));
+        assert!(oracle_retryable(&transport(
+            TransportErrorKind::Connect,
+            None
+        )));
+        assert!(oracle_retryable(&transport(
+            TransportErrorKind::Request,
+            None
+        )));
+        assert!(oracle_retryable(&transport(
+            TransportErrorKind::Body,
+            Some(200)
+        )));
+        assert!(!oracle_retryable(&transport(
+            TransportErrorKind::Decode,
+            Some(502)
+        )));
+        assert!(!oracle_retryable(&QueryOutcome::BodyTooLarge {
+            limit: 1,
+            timing,
+        }));
+        for http_status in [200, 422, 503] {
+            assert!(!oracle_retryable(&QueryOutcome::Envelope {
+                http_status,
+                body: serde_json::json!({"status": "error"}),
+                timing,
+            }));
+        }
     }
 
     #[test]
