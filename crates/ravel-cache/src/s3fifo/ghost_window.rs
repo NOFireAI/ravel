@@ -11,10 +11,13 @@
 //!   read once per thousand reads of 25 MB objects that an interactive scan
 //!   reads continuously, the scan looping over 0.20 to 1.3 times the cache
 //!   or reading a new object every time.
+//! - W2b, W2's cache and hot set against a scan of 1.3 MB entries looping
+//!   over 0.25 or 0.35 of the cache among one-off cold reads, the repeated
+//!   scan the shipped sizing newly promotes into main.
 //! - W3, ADR-2677's loop case at W1's cache: a loop of 0.5 to 3 times the
 //!   cache, of 1.3 MB or 25 MB entries, read five times, then a second one.
 //!
-//! The `w1_`, `w2_` and `w3_` tests pin the shipped sizing against the key
+//! The `w1_`, `w2_`, `w2b_` and `w3_` tests pin the shipped sizing against the key
 //! window it replaced; `ghost_window_report` prints every candidate.
 
 use super::*;
@@ -258,6 +261,90 @@ pub(super) fn run_w2(window: Window, scan: Scan, established: bool, scan_reads: 
     }
 }
 
+/// W2b's scan and cold entry size, under the 20 MB at which the key window
+/// stops being narrower than the shipped byte window at W2's geometry.
+const W2B_ENTRY: u64 = 1_300_000;
+
+/// The fractions of `W2_MAX_BYTES` W2b's repeated scan loops over.
+const W2B_FRACTIONS: [f64; 2] = [0.25, 0.35];
+
+/// The bytes read during one loop of W2b's scan, cold reads included, in
+/// multiples of `W2_MAX_BYTES`. Just over the cache, so a scan entry leaves
+/// probation before its next read and only a ghost that remembers it can
+/// promote it.
+const W2B_LOOP_PERIOD: f64 = 1.1;
+
+/// W2b's length in reads of 1.3 MB entries: 156 GB, about 13.6 times the
+/// cache and six of the hot set's 25 GB intervals.
+const W2B_READS: u64 = 120_000;
+
+/// W2b: a scan looping over `fraction` of `W2_MAX_BYTES` in 1.3 MB entries,
+/// each scan read followed by enough reads of 1.3 MB entries never read
+/// again that one loop spans [`W2B_LOOP_PERIOD`] times the cache, and W2's
+/// hot set read once per 25 GB of that traffic, W2's interval in bytes. The
+/// hot set is read twice before the traffic when `established`, else first
+/// read once the first 25 GB have gone by. Rates count every read after the
+/// first of each hot range and every scan read after the first loop.
+pub(super) fn run_w2b(window: Window, fraction: f64, established: bool) -> W2 {
+    let metrics = CacheMetrics::default();
+    let mut fifo = fifo_with(CacheLimits::new(W2_MAX_BYTES, 1_000_000, 64 * MIB), window);
+    let hot = |n: u64| key(1, 1_000_000 + n, HOT_RANGE);
+    let interval = SCAN_READS_PER_HOT_READ * SCAN_OBJECT;
+    let hot_from = if established {
+        for _ in 0..2 {
+            for n in 0..HOT_RANGES {
+                read(&mut fifo, hot(n), &metrics);
+            }
+        }
+        0
+    } else {
+        interval
+    };
+    let loop_len = (W2_MAX_BYTES as f64 * fraction / W2B_ENTRY as f64) as u64;
+    let cold_per_scan = W2B_LOOP_PERIOD / fraction - 1.0;
+    let mut hot_reads = if established { HOT_RANGES } else { 0 };
+    let (mut hot_hits, mut hot_rereads) = (0u64, 0u64);
+    let (mut scan_hits, mut scan_rereads) = (0u64, 0u64);
+    let (mut scan_reads, mut cold_reads, mut cold_due) = (0u64, 0u64, 0.0f64);
+    for r in 0..W2B_READS {
+        if cold_due >= 1.0 {
+            cold_due -= 1.0;
+            read(&mut fifo, key(3, cold_reads, W2B_ENTRY), &metrics);
+            cold_reads += 1;
+        } else {
+            let k = key(2, scan_reads % loop_len, W2B_ENTRY);
+            let hit = read(&mut fifo, k, &metrics);
+            if scan_reads >= loop_len {
+                scan_rereads += 1;
+                scan_hits += u64::from(hit);
+            }
+            scan_reads += 1;
+            cold_due += cold_per_scan;
+        }
+        let read_bytes = (r + 1) * W2B_ENTRY;
+        if read_bytes < hot_from {
+            continue;
+        }
+        let due = (read_bytes - hot_from) * HOT_RANGES / interval
+            + if established { HOT_RANGES } else { 0 };
+        while hot_reads < due {
+            let hit = read(&mut fifo, hot(hot_reads % HOT_RANGES), &metrics);
+            if hot_reads >= HOT_RANGES {
+                hot_rereads += 1;
+                hot_hits += u64::from(hit);
+            }
+            hot_reads += 1;
+        }
+    }
+    W2 {
+        hot: hot_hits as f64 / hot_rereads as f64,
+        hot_rereads,
+        scan: scan_hits as f64 / scan_rereads as f64,
+        scan_hits,
+        evictions: metrics.snapshot().evictions,
+    }
+}
+
 /// W3's entry sizes: the ClickBench range size and W2's scan object.
 pub(super) const LOOP_ENTRIES: [u64; 2] = [1_300_000, SCAN_OBJECT];
 
@@ -399,6 +486,54 @@ fn w2_a_repeated_scan_of_up_to_0_35_of_the_cache_evicts_nothing() {
     }
 }
 
+/// W2b, the repeated scan the shipped sizing newly promotes into main: a
+/// loop of 0.25 or 0.35 of the cache in 1.3 MB entries, among one-off cold
+/// reads that keep the cache evicting. The hot set is served no lower than
+/// under the key window before #3270, read before the scan (1.000 under
+/// both) or first read during it (0.000 under both). The scan's re-reads are
+/// served 0.912 where the key window served none: a scan entry leaves
+/// probation before its next read, the shipped ghost still holds it, and the
+/// scan settles in main without crowding the hot set out, since the loop and
+/// the hot set together stay under main's 0.9 of the cache.
+///
+/// No ghost width lowers the hot set here. A ghost as wide as the cache, or
+/// unbounded, serves the first-read hot set 0.764, above the shipped 0.000,
+/// by remembering its 16 KiB keys across the 25 GB interval; the scan and
+/// the established hot set are served the same as under the shipped sizing.
+///
+/// FLIP: `GHOST_WINDOW_BYTES_TENTHS = 0` (the key window alone) serves the
+/// scan 0.000 under the shipped sizing.
+#[test]
+fn w2b_a_repeated_scan_reaching_main_leaves_the_hot_set_served() {
+    let turnover = 5 * W2_MAX_BYTES / W2B_ENTRY;
+    for fraction in W2B_FRACTIONS {
+        for established in [true, false] {
+            let shipped = run_w2b(Window::Shipped, fraction, established);
+            let before = run_w2b(Window::LargestEntryKeys, fraction, established);
+            let case = format!("{fraction} C loop, established={established}");
+            for (name, r) in [("shipped", &shipped), ("before #3270", &before)] {
+                assert!(
+                    r.evictions >= turnover,
+                    "{case}, {name}: {} evictions, under five caches of entries",
+                    r.evictions
+                );
+            }
+            assert!(
+                shipped.hot >= before.hot,
+                "{case}: hot {:.4}, before #3270 {:.4}",
+                shipped.hot,
+                before.hot
+            );
+            assert!(
+                shipped.scan > 0.9 && before.scan_hits == 0,
+                "{case}: scan {:.4}, before #3270 {:.4}",
+                shipped.scan,
+                before.scan
+            );
+        }
+    }
+}
+
 /// The ghost queue holds at most twice the key cap plus 65 slots, live and
 /// stale, and the map at most the key cap, under a churn that forgets ghosts
 /// while new ones keep the count at the cap. The stale slots do pile up: the
@@ -527,6 +662,17 @@ fn ghost_window_report() {
                 let r = run_w2(window, scan, established, reads);
                 println!(
                     "W2 {name}: {scan:?} established_first={established} hot {:.4} over {} rereads, scan {:.3}, {} evictions",
+                    r.hot, r.hot_rereads, r.scan, r.evictions
+                );
+            }
+        }
+    }
+    for (name, window) in candidates(W2_MAX_BYTES) {
+        for fraction in W2B_FRACTIONS {
+            for established in [true, false] {
+                let r = run_w2b(window, fraction, established);
+                println!(
+                    "W2b {name}: {fraction} C loop established_first={established} hot {:.4} over {} rereads, scan {:.4}, {} evictions",
                     r.hot, r.hot_rereads, r.scan, r.evictions
                 );
             }
