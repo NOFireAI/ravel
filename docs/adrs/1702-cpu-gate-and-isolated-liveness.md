@@ -1021,3 +1021,41 @@ Decision 6's rule is unchanged: the statistics decode still reserves before
 it decodes, its header checks still run before any reservation, and a body
 declared over the decoder's ceiling is still charged 0 and refused by the
 decoder.
+
+## Amendment (2026-10-27): the decoded-cache byte bound amendment (issue #3244)
+
+<!-- amendment-applies: none reason="adds a byte bound on the decoded-output caches beside decision 6's eviction pass; decision 6 and the earlier amendments stand as written and no earlier wording is retired" -->
+
+Without a byte bound, the decoded snapshot-part cache and the decoded
+name-postings cache are bounded per tenant by entry count only, and the
+number of tenants they hold entries for is not bounded. Once the catalog shares the process budget with SQL, cached decodes
+from many tenants can hold a large share of it: SQL's reservations cannot
+make these caches give memory back, and decision 6's eviction pass runs only
+for a refused catalog decode, and is skipped when the bytes are held outside
+the caches.
+
+The catalog therefore takes an optional byte bound,
+`CatalogConfig::decoded_cache_max_bytes` (also settable with
+`Catalog::with_decoded_cache_max_bytes`). It is unset by default, and with it
+unset the caches behave as before. When set, it is one figure for the two
+caches combined, across every tenant:
+
+- It counts the reservation bytes the cached entries hold, not the size of
+  the raw objects they were decoded from. After each insert into either
+  cache, entries of either cache are evicted least-recently-used across
+  every tenant until the two caches together hold at most the bound.
+- It caps what the caches hold, not what is charged to the budget. An
+  evicted value that a live resolve still holds stays charged until that
+  resolve drops it.
+- The two caches' held bytes are read under separate locks, so concurrent
+  inserts can leave the caches briefly above the bound. They hold at most
+  the bound once an insert's eviction completes, absent concurrent inserts.
+- An entry whose own reservation is larger than the bound is not cached and
+  evicts nothing; the resolve that decoded it still uses it, and it is
+  decoded again on every resolve that needs it. With a bound below the
+  decoders' 256 MiB part ceiling (`DEFAULT_MAX_SNAPSHOT_PART_BYTES`), the
+  largest parts can fall in that case.
+- Evictions made by the bound are counted in
+  `Catalog::decoded_cache_byte_bound_evictions`, apart from decision 6's
+  memory-pressure pass (`Catalog::decoded_cache_memory_evictions`). An
+  entry refused for being larger than the bound is counted in neither.
