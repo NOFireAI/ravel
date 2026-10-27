@@ -1057,6 +1057,17 @@ impl CachedColumn {
         }
     }
 
+    /// Handles to this column's buffers, this one included.
+    pub(crate) fn strong_count(&self) -> usize {
+        match self {
+            CachedColumn::I64(c) => Arc::strong_count(c),
+            CachedColumn::F64(v) => Arc::strong_count(v),
+            CachedColumn::Bool(v) => Arc::strong_count(v),
+            CachedColumn::Str(c) => Arc::strong_count(c),
+            CachedColumn::Fixed(v) => Arc::strong_count(v),
+        }
+    }
+
     /// Whether both handles point at the same buffers.
     #[cfg(test)]
     pub(crate) fn ptr_eq(&self, other: &CachedColumn) -> bool {

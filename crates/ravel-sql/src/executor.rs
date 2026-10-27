@@ -123,7 +123,7 @@ use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot};
-use ravel_logseg::decoded_cache::DecodedCacheSnapshot;
+use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -713,10 +713,16 @@ pub(crate) struct StatementRequest {
 
 /// One statement's decoded-column cache figures: the counters its scans moved
 /// and the cache's resident bytes when the statement finished.
+///
+/// `pressure` is the cache's process-wide pressure evictions between the
+/// statement's start and its end: the budget's evictor does not know which
+/// statement's reservation asked, so a concurrent statement's evictions land
+/// here too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DecodedCacheStats {
     pub counters: DecodedCacheSnapshot,
     pub resident_bytes: u64,
+    pub pressure: PressureSnapshot,
 }
 
 /// What the executor actually did, for tests and operator metrics.
@@ -2282,6 +2288,11 @@ impl SqlExecutor {
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         let cache_mark = self.fetcher.cache_ram_metrics().map(CacheCounterMark::take);
+        let pressure_mark = self
+            .log_fetcher
+            .decoded_cache()
+            .map(|cache| cache.pressure_counters())
+            .unwrap_or_default();
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -2429,6 +2440,7 @@ impl SqlExecutor {
                             .map(|cache| DecodedCacheStats {
                                 counters: phase_accounting.decoded_cache_snapshot(),
                                 resident_bytes: cache.resident_bytes(),
+                                pressure: cache.pressure_counters().since(&pressure_mark),
                             });
                     let phase_snapshot = phase_accounting.snapshot();
                     let accounting = phase_snapshot.pooled();

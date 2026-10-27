@@ -3499,6 +3499,20 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     decoded_cache_max_bytes,
                     Some(process_memory_budget.clone()),
                 ));
+                // A refused reservation from any other consumer evicts unheld
+                // entries first (ADR-3326 decision 4). Weak, because the cache
+                // already holds the budget.
+                let evictee = Arc::downgrade(&cache);
+                if process_memory_budget
+                    .register_evictor(Box::new(move |want| {
+                        evictee
+                            .upgrade()
+                            .map_or(0, |cache| cache.evict_for_pressure(want))
+                    }))
+                    .is_err()
+                {
+                    anyhow::bail!("process memory budget already has an evictor");
+                }
                 let Some(executor) = Arc::get_mut(&mut state.executor) else {
                     anyhow::bail!("SQL executor shared before the decoded cache was installed");
                 };

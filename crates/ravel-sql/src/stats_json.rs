@@ -181,7 +181,9 @@ pub fn cache_json(cache: &StatementCacheStats) -> Json {
 
 /// The decoded-column cache's figures for one statement, rendered under
 /// `stats.decodedCache` (ADR-3326 Stage 0). The counters are the statement's
-/// own; `residentBytes` is the process-wide cache size when it finished.
+/// own; `residentBytes` is the process-wide cache size when it finished, and
+/// the two pressure figures are the budget evictor's work over the statement's
+/// lifetime (see [`DecodedCacheStats`]).
 pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
     json!({
         "hits": stats.counters.hits,
@@ -190,6 +192,8 @@ pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
         "evictions": stats.counters.evictions,
         "ghostHits": stats.counters.ghost_hits,
         "residentBytes": stats.resident_bytes,
+        "pressureEvictions": stats.pressure.evictions,
+        "pressureFreedBytes": stats.pressure.freed_bytes,
     })
 }
 
@@ -264,7 +268,7 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
-    /// `decoded_cache_json` renders exactly the six ADR-3326 keys, each
+    /// `decoded_cache_json` renders exactly the eight ADR-3326 keys, each
     /// carrying its own distinct source figure.
     #[test]
     fn decoded_cache_json_names_every_field_exactly_once() {
@@ -277,6 +281,10 @@ mod tests {
                 ghost_hits: 5,
             },
             resident_bytes: 6,
+            pressure: ravel_logseg::decoded_cache::PressureSnapshot {
+                evictions: 7,
+                freed_bytes: 8,
+            },
         };
         let rendered = decoded_cache_json(&stats);
         assert_eq!(
@@ -288,6 +296,8 @@ mod tests {
                 "evictions": 4,
                 "ghostHits": 5,
                 "residentBytes": 6,
+                "pressureEvictions": 7,
+                "pressureFreedBytes": 8,
             })
         );
     }
