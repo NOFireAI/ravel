@@ -1502,10 +1502,11 @@ plus the target divided by 100,000,000 bytes per second, the time a
 flush the age trigger released may spend encoding a target-sized object
 before its PUT starts. At the 60 s default delay the stock
 1,850,000,000 target adds 18.5 s, a 138.5 s deadline; a 7,400,000,000
-target at `--max-flush-delay 90s` gets 224 s. `--target-bytes 1`, and a
-target at or below one batch's per-shard slice, add nothing, so their
-deadline stays the delay plus 60 s. The stderr geometry line prints the
-deadline as `ack deadline <N>s`.
+target at `--max-flush-delay 90s` gets 224 s. Only `--target-bytes 1`
+adds nothing, so its deadline stays the delay plus 60 s. A
+`--target-bytes` above 360,000,000,000, whose encode time would exceed
+an hour, is refused. The stderr geometry line prints the deadline as
+`ack deadline <N>s`.
 
 - `--ack-margin <SECONDS>` replaces the whole margin, encode allowance
   included, so the deadline becomes the larger of 60 s and
