@@ -165,8 +165,9 @@ to the shared budget and evicts it under pressure instead.
     are owned `Vec`s.
 - **Hits share the entry by `Arc`**, so a hit copies nothing. Today that
   holds only for `I64Column` and `DictValues`. Making the other forms
-  shareable is a representation change in `DecodedBlock`, delivered with
-  decision 2's layout (Delivery, step 1). Until it lands no other kind is
+  shareable is a representation change in `DecodedBlock`, delivered as its
+  own pull request after decision 2's layout (Delivery, step 2). Until it
+  lands no other kind is
   cached, because a hit that clones a column costs what the model counts
   as free. Steps 3 and 4 run on the hit exactly as on a fresh decode.
 
@@ -248,12 +249,13 @@ anything is built (Measurement).
   separate carve.
 - **A hit is charged once.** Today the scan charges the whole decoded
   block to its resident reservation (`crates/ravel-sql/src/logs_scan/scan.rs:663`,
-  `DecodedBlock::decoded_heap_bytes`, `crates/ravel-logseg/src/columnar.rs:435-445`;
-  the fetch side does the same at `crates/ravel-query/src/log_fetcher.rs:1347`).
-  For a column served from the cache, those bytes are excluded from that
-  figure, because the entry's reservation already covers them. A pinned
-  test asserts the scan's charge for a block with one cached column and
-  one fresh column.
+  `DecodedBlock::decoded_heap_bytes`, `crates/ravel-logseg/src/columnar.rs:435-445`).
+  For a column served from the cache, the scan's charge at that call site
+  leaves out the column's bytes, because the entry's reservation already
+  covers them. `decoded_heap_bytes` itself is unchanged for its other
+  callers (`crates/ravel-maintain/src/rlog.rs:2265`,
+  `crates/ravel-logseg/src/ranged.rs:717`). A pinned test asserts the
+  scan's charge for a block with one cached column and one fresh column.
 - **The reservation travels with the bytes.** It is owned by the shared
   buffer and released when the last `Arc` drops, not when the entry leaves
   the index. Evicting an entry a live scan still holds removes it from the
@@ -268,8 +270,12 @@ anything is built (Measurement).
   (`crates/ravel-memory/src/lib.rs:262`). A cache that grows RSS closes the
   gate before it reaches the limit, so evicting only on the limit would
   refuse queries while the cache still holds memory. It refuses only if
-  evicting every unreferenced entry would not make room, the same rule as
-  ADR-1702's eviction-skip amendment. This needs a
+  evicting every unreferenced entry would not make room. This narrows
+  ADR-1702's eviction-skip test. That test counts entries a live reader
+  still holds and errs toward running the pass
+  (`docs/adrs/1702-cpu-gate-and-isolated-liveness.md:629-633`). Here a
+  referenced entry's bytes stay resident after eviction, so counting them
+  would admit a reservation the host has no room for. This needs a
   registered-evictor hook on `MemoryBudget`, which does not exist today.
   The catalog's `DecodedCaches::evict_until_fits`
   (`crates/ravel-catalog/src/cache.rs:1173-1240`) is crate-private and is
@@ -359,12 +365,14 @@ work, and the readout names the step that missed.
 
 ### Delivery, after Stage 0 passes
 
-1. The decision 2 layout, together with the representation change that
-   puts every decoded column form behind an `Arc` (decision 1), as its own
-   pull request and A/B.
-2. The cache with the cap defaulting to 0, the hook of decision 4, the
+1. The decision 2 layout, as its own pull request and A/B, banded against
+   its 0.960 standalone ceiling.
+2. The representation change that puts every decoded column form behind
+   an `Arc` (decision 1), as its own pull request. Its A/B bands no
+   regression, since nothing copies before the cache exists.
+3. The cache with the cap defaulting to 0, the hook of decision 4, the
    tests of decision 5 and the metrics.
-3. The default cap, chosen from Stage 0 and the owner's decision 6, with a
+4. The default cap, chosen from Stage 0 and the owner's decision 6, with a
    paired A/B on the reference box, bands pre-registered on #3326.
 
 ## Consequences
