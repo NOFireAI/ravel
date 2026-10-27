@@ -988,11 +988,19 @@ impl<V> DecodedTenantCache<V> {
 ///
 /// # Eviction rule
 ///
-/// Two bounds, both least-recently-used:
+/// Three bounds, all least-recently-used:
 ///
 /// - Per tenant, the configured entry cap (`snapshot_cache_parts` for
 ///   [`PartCache`], `postings_cache_entries` for [`PostingsCache`]), applied
 ///   on insert.
+/// - Across every tenant of BOTH caches, on insert, the byte bound
+///   (`decoded_cache_max_bytes`, unset by default): after the per-tenant
+///   insert, [`DecodedCaches`] drops entries least-recently-used first until
+///   the two caches together hold at most that many reservation bytes
+///   ([`DecodedEntry::reserved_bytes`], not the raw object size). A value
+///   whose own reservation exceeds the bound is not cached at all, so it
+///   cannot flush the other entries. The two caches are read under separate
+///   locks, so concurrent inserts can leave them briefly above the bound.
 /// - Across every tenant of BOTH caches, on memory pressure:
 ///   [`DecodedCaches::evict_until_fits`] drops entries least-recently-used
 ///   first until the refused reservation would fit. Without it, a finite
@@ -1002,7 +1010,7 @@ impl<V> DecodedTenantCache<V> {
 ///   that would not fit even with both caches empty takes no such pass: see
 ///   [`crate::Catalog::reserve_decoded`].
 ///
-/// An entry evicted by either bound releases its reservation only when the
+/// An entry evicted by any of these bounds releases its reservation only when the
 /// last `Arc` to it drops. A resolve that is still holding the value keeps it
 /// charged to the budget after the cache has forgotten it, so an eviction
 /// pass can free less than the entries it dropped were charged; the pass
@@ -1121,6 +1129,15 @@ impl<V> DecodedCache<V> {
             .map_or(0, |cache| cache.entries.len())
     }
 
+    /// Whether `key` is resident for `tenant`, without marking it used.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, tenant: &TenantHash, key: &str) -> bool {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .is_some_and(|cache| cache.entries.contains_key(key))
+    }
+
     /// Number of entries currently resident across every tenant.
     #[cfg(test)]
     pub(crate) fn total_entries(&self) -> usize {
@@ -1133,7 +1150,9 @@ impl<V> DecodedCache<V> {
 }
 
 impl<T> DecodedCache<Charged<T>> {
-    pub(crate) fn insert(
+    /// Private: production inserts go through [`DecodedCaches::insert_part`]
+    /// and [`DecodedCaches::insert_postings`], which apply the byte bound.
+    fn insert(
         &self,
         tenant: TenantHash,
         key: String,
@@ -1175,6 +1194,16 @@ pub(crate) struct DecodedCaches {
     postings: PostingsCache,
     /// Entries dropped by [`Self::evict_until_fits`], cumulative.
     memory_evictions: AtomicU64,
+    /// The byte bound on [`Self::reserved_bytes`] applied after each insert
+    /// (`CatalogConfig::decoded_cache_max_bytes`); `u64::MAX` when unset.
+    max_bytes: AtomicU64,
+    /// Entries dropped by the byte bound, cumulative. Kept apart from
+    /// [`Self::memory_evictions`], which counts only evictions made for a
+    /// refused decode.
+    byte_bound_evictions: AtomicU64,
+    /// Values not cached because their own reservation exceeds the byte
+    /// bound, cumulative. Each one is decoded again on its next use.
+    byte_bound_refusals: AtomicU64,
 }
 
 impl Default for DecodedCaches {
@@ -1184,6 +1213,9 @@ impl Default for DecodedCaches {
             parts: PartCache::with_clock(Arc::clone(&clock)),
             postings: PostingsCache::with_clock(clock),
             memory_evictions: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(u64::MAX),
+            byte_bound_evictions: AtomicU64::new(0),
+            byte_bound_refusals: AtomicU64::new(0),
         }
     }
 }
@@ -1195,6 +1227,87 @@ impl DecodedCaches {
 
     pub(crate) fn postings(&self) -> &PostingsCache {
         &self.postings
+    }
+
+    /// Set the byte bound on the reservation bytes both caches hold together;
+    /// `None` removes it. Applied from the next insert on.
+    pub(crate) fn set_max_bytes(&self, max: Option<u64>) {
+        self.max_bytes
+            .store(max.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Cache a decoded snapshot part for `tenant` under the per-tenant entry
+    /// cap `capacity` and the byte bound. See [`Self::insert_bounded`].
+    pub(crate) fn insert_part(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<ChargedPart>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        self.insert_bounded(&self.parts, tenant, key, value, bytes, capacity);
+    }
+
+    /// Cache a decoded name-postings object for `tenant` under the per-tenant
+    /// entry cap `capacity` and the byte bound. See [`Self::insert_bounded`].
+    pub(crate) fn insert_postings(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<ChargedPostings>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        self.insert_bounded(&self.postings, tenant, key, value, bytes, capacity);
+    }
+
+    /// Insert into `cache`, then drop least-recently-used entries across every
+    /// tenant of both caches while [`Self::reserved_bytes`] is above the byte
+    /// bound. A value whose own reservation exceeds the bound is refused
+    /// before the insert, leaving both caches untouched: admitting it and then
+    /// evicting would drop every other entry and then it too. Such a value is
+    /// counted in [`Self::byte_bound_refusals`]; the caller still uses the
+    /// `Arc` it holds. With no bound set, the insert skips the held-bytes
+    /// scan, which takes both caches' locks.
+    fn insert_bounded<T>(
+        &self,
+        cache: &DecodedCache<Charged<T>>,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<Charged<T>>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        let max = self.max_bytes.load(Ordering::Relaxed);
+        if value.reserved_bytes() > max {
+            self.byte_bound_refusals.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        cache.insert(tenant, key, value, bytes, capacity);
+        if max == u64::MAX {
+            return;
+        }
+        let mut dropped = 0;
+        while self.reserved_bytes() > max {
+            if !self.evict_one_lru() {
+                break;
+            }
+            dropped += 1;
+        }
+        self.byte_bound_evictions
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Entries dropped by the byte bound since this catalog was built.
+    pub(crate) fn byte_bound_evictions(&self) -> u64 {
+        self.byte_bound_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Values not cached because their own reservation exceeds the byte
+    /// bound, since this catalog was built.
+    pub(crate) fn byte_bound_refusals(&self) -> u64 {
+        self.byte_bound_refusals.load(Ordering::Relaxed)
     }
 
     /// Drop everything cached for `tenant` in both caches (ADR-0069
@@ -2955,6 +3068,236 @@ mod tests {
         caches.evict_tenant(&other);
         assert_eq!(caches.reserved_bytes(), 0);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A part charged `reserved` bytes against `budget`. Its raw object size
+    /// is passed separately on insert, so the two figures can differ.
+    fn reserved_part(budget: &Arc<ravel_memory::MemoryBudget>, reserved: u64) -> Arc<ChargedPart> {
+        Arc::new(Charged::new(
+            decoded_part(1),
+            budget.reserve(reserved).expect("the test budget admits it"),
+        ))
+    }
+
+    fn reserved_postings(
+        budget: &Arc<ravel_memory::MemoryBudget>,
+        reserved: u64,
+    ) -> Arc<ChargedPostings> {
+        Arc::new(Charged::new(
+            decoded_postings(),
+            budget.reserve(reserved).expect("the test budget admits it"),
+        ))
+    }
+
+    /// Issue #3244: the byte bound is one figure over both caches and every
+    /// tenant. Three tenants each insert a part and a postings object of 30
+    /// reserved bytes (raw size 1) under a bound of 100; every insert past the
+    /// third evicts exactly one entry, the least-recently-used across both
+    /// caches and all tenants, leaving the held figure at exactly 90.
+    ///
+    /// FLIP: (a) bound each tenant's own held bytes instead and no tenant ever
+    /// passes 100, so the held figure after insert 4 reads 120, not 90. (b)
+    /// bound only the part cache's held bytes and the parts never pass 90, so
+    /// the same assert reads 120. (c) compare `DecodedEntry::bytes` (1 per
+    /// entry) against the bound and nothing is evicted: 120 again. (e) count
+    /// these evictions into `memory_evictions` instead and
+    /// `byte_bound_evictions()` reads 0, not 3 (`memory_evictions()` then reads
+    /// 3, not 0).
+    #[test]
+    fn the_byte_bound_evicts_least_recently_used_across_tenants_and_caches() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (a, b, c) = (
+            TenantHash([0x31; 16]),
+            TenantHash([0x32; 16]),
+            TenantHash([0x33; 16]),
+        );
+        let caches = DecodedCaches::default();
+        caches.set_max_bytes(Some(100));
+
+        caches.insert_part(a, "a1".to_string(), reserved_part(&budget, 30), 1, 10);
+        assert_eq!(caches.reserved_bytes(), 30);
+        caches.insert_postings(b, "b1".to_string(), reserved_postings(&budget, 30), 1, 10);
+        assert_eq!(caches.reserved_bytes(), 60);
+        caches.insert_part(c, "c1".to_string(), reserved_part(&budget, 30), 1, 10);
+        assert_eq!(caches.reserved_bytes(), 90);
+        // Using "a1" makes "b1" the least-recently-used.
+        assert!(
+            caches
+                .parts()
+                .get(&a, "a1", &QueryAccounting::new())
+                .is_some()
+        );
+
+        // A postings insert for tenant a evicts tenant b's older postings.
+        caches.insert_postings(a, "a2".to_string(), reserved_postings(&budget, 30), 1, 10);
+        assert_eq!(caches.reserved_bytes(), 90);
+        assert!(!caches.postings().contains(&b, "b1"));
+        // A part insert for tenant b evicts tenant c's older part.
+        caches.insert_part(b, "b2".to_string(), reserved_part(&budget, 30), 1, 10);
+        assert_eq!(caches.reserved_bytes(), 90);
+        assert!(!caches.parts().contains(&c, "c1"));
+        // A postings insert for tenant c evicts tenant a's part, now oldest.
+        caches.insert_postings(c, "c2".to_string(), reserved_postings(&budget, 30), 1, 10);
+        assert_eq!(caches.reserved_bytes(), 90);
+
+        assert!(!caches.parts().contains(&a, "a1"));
+        assert!(caches.postings().contains(&a, "a2"));
+        assert!(caches.parts().contains(&b, "b2"));
+        assert!(caches.postings().contains(&c, "c2"));
+        assert_eq!(caches.parts().total_entries(), 1);
+        assert_eq!(caches.postings().total_entries(), 2);
+        assert_eq!(caches.byte_bound_evictions(), 3);
+        assert_eq!(caches.memory_evictions(), 0);
+        assert_eq!(
+            budget.reserved(),
+            90,
+            "the evicted entries' reservations went back"
+        );
+    }
+
+    /// Issue #3244: an insert into either cache evicts an older entry held in
+    /// the other one, in both directions.
+    ///
+    /// FLIP: (b) bound the part cache alone and the postings insert in the
+    /// first half evicts nothing, so `parts().total_entries()` reads 1, not 0;
+    /// bound the postings cache alone and the second half fails the same way.
+    #[test]
+    fn the_byte_bound_evicts_across_the_two_caches() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let tenant = TenantHash([0x34; 16]);
+
+        let caches = DecodedCaches::default();
+        caches.set_max_bytes(Some(50));
+        caches.insert_part(
+            tenant,
+            "part".to_string(),
+            reserved_part(&budget, 30),
+            1,
+            10,
+        );
+        caches.insert_postings(
+            tenant,
+            "post".to_string(),
+            reserved_postings(&budget, 30),
+            1,
+            10,
+        );
+        assert_eq!(caches.parts().total_entries(), 0, "the older part goes");
+        assert!(caches.postings().contains(&tenant, "post"));
+        assert_eq!(caches.reserved_bytes(), 30);
+        assert_eq!(caches.byte_bound_evictions(), 1);
+
+        let caches = DecodedCaches::default();
+        caches.set_max_bytes(Some(50));
+        caches.insert_postings(
+            tenant,
+            "post".to_string(),
+            reserved_postings(&budget, 30),
+            1,
+            10,
+        );
+        caches.insert_part(
+            tenant,
+            "part".to_string(),
+            reserved_part(&budget, 30),
+            1,
+            10,
+        );
+        assert_eq!(
+            caches.postings().total_entries(),
+            0,
+            "the older postings go"
+        );
+        assert!(caches.parts().contains(&tenant, "part"));
+        assert_eq!(caches.reserved_bytes(), 30);
+        assert_eq!(caches.byte_bound_evictions(), 1);
+    }
+
+    /// Issue #3244: a value whose own reservation exceeds the bound is not
+    /// cached and evicts nothing; the caller's `Arc` keeps it charged until
+    /// dropped.
+    ///
+    /// FLIP: (d) drop the oversize early return in
+    /// `DecodedCaches::insert_bounded` and the insert evicts both earlier
+    /// entries and then the oversize one, so `contains(&a, "a1")` fails.
+    #[test]
+    fn an_entry_larger_than_the_byte_bound_is_not_cached() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (a, b, c) = (
+            TenantHash([0x35; 16]),
+            TenantHash([0x36; 16]),
+            TenantHash([0x37; 16]),
+        );
+        let caches = DecodedCaches::default();
+        caches.set_max_bytes(Some(100));
+        caches.insert_part(a, "a1".to_string(), reserved_part(&budget, 30), 1, 10);
+        caches.insert_postings(b, "b1".to_string(), reserved_postings(&budget, 30), 1, 10);
+
+        let oversize = reserved_part(&budget, 101);
+        caches.insert_part(c, "c1".to_string(), Arc::clone(&oversize), 1, 10);
+        assert!(caches.parts().contains(&a, "a1"));
+        assert!(caches.postings().contains(&b, "b1"));
+        assert!(!caches.parts().contains(&c, "c1"));
+        assert_eq!(caches.reserved_bytes(), 60);
+        assert_eq!(caches.byte_bound_evictions(), 0);
+        assert_eq!(caches.byte_bound_refusals(), 1);
+        assert_eq!(budget.reserved(), 161);
+        drop(oversize);
+        assert_eq!(budget.reserved(), 60);
+
+        // A value of exactly the bound is cached, evicting the other two.
+        caches.insert_postings(c, "c2".to_string(), reserved_postings(&budget, 100), 1, 10);
+        assert!(caches.postings().contains(&c, "c2"));
+        assert_eq!(caches.reserved_bytes(), 100);
+        assert_eq!(caches.byte_bound_evictions(), 2);
+        assert_eq!(
+            caches.byte_bound_refusals(),
+            1,
+            "a value at the bound is cached"
+        );
+    }
+
+    /// Issue #3244: with no byte bound, the default, the held bytes are not
+    /// limited: only the per-tenant entry caps evict.
+    #[test]
+    fn no_byte_bound_by_default() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let caches = DecodedCaches::default();
+        for i in 0..4u8 {
+            let tenant = TenantHash([0x40 + i; 16]);
+            caches.insert_part(
+                tenant,
+                "p".to_string(),
+                reserved_part(&budget, 1 << 40),
+                1,
+                10,
+            );
+            caches.insert_postings(
+                tenant,
+                "q".to_string(),
+                reserved_postings(&budget, 1 << 40),
+                1,
+                10,
+            );
+        }
+        assert_eq!(caches.reserved_bytes(), 8 << 40);
+        assert_eq!(caches.parts().total_entries(), 4);
+        assert_eq!(caches.postings().total_entries(), 4);
+        assert_eq!(caches.byte_bound_evictions(), 0);
+
+        // Removing a bound restores the same behaviour.
+        caches.set_max_bytes(Some(1));
+        caches.set_max_bytes(None);
+        caches.insert_part(
+            TenantHash([0x50; 16]),
+            "p".to_string(),
+            reserved_part(&budget, 1 << 40),
+            1,
+            10,
+        );
+        assert_eq!(caches.reserved_bytes(), 9 << 40);
+        assert_eq!(caches.byte_bound_evictions(), 0);
+        assert_eq!(caches.byte_bound_refusals(), 0);
     }
 
     // -----------------------------------------------------------------

@@ -77,8 +77,9 @@ compared across rows.
 ### 3. Acknowledgement semantics are reported, never normalised
 
 Ravel's Remote Write surface is **strict-mode only, unconditionally**: a 2xx
-means the data object and its commit record are both durably stored, and the
-response carries `x-ravel-commit-token`. Buffered mode exists but Remote Write
+means the data object and its commit record are both durably stored (the
+2026-10-27 amendment, section E, corrects this to "every point ravel-server
+admitted is durable"), and the response carries `x-ravel-commit-token`. Buffered mode exists but Remote Write
 cannot reach it; it is an OTLP-only header.
 
 Every ingestion result states what that system's acknowledgement means. A
@@ -157,7 +158,7 @@ lands in `refused` on every engine):
 |---|---|---|---|---|
 | `ok` | answered, oracle agrees | yes | yes | **yes** |
 | `incorrect` | answered, oracle disagrees | yes | yes | no |
-| `partial` | answered, but from an incomplete result set: the engine returned data together with a partial or warning signal | yes | yes | no |
+| `partial` | answered, but from an incomplete result set: the engine returned data together with a partial or warning signal (the 2026-10-27 amendment, section A, retires "or warning": only a completeness signal sets `partial`) | yes | yes | no |
 | `timeout` | no answer within the per-query deadline | yes | no | no |
 | `error` | transport or server error that is not one of the above | yes | no | no |
 | `unsupported_construct` | the engine does not implement it | yes | no | no |
@@ -235,7 +236,8 @@ counterpart in Ravel to measure:
 
 A corpus entry that needs any of those is not written, rather than written and
 reported `unsupported_construct`: the category means the engine cannot evaluate
-a query it was given, and these are not queries. The gap is recorded here so it
+a query it was given (the 2026-10-27 amendment, section D, widens it to a
+payload class the engine cannot store), and these are not queries. The gap is recorded here so it
 is visible without a corpus entry standing in for it.
 
 ### 7. The diagnostic lane exposes what is already measured
@@ -370,7 +372,8 @@ whether Ravel is fast.
 The 2026-10-26 amendment changes this list: band 1 depends on each
 profile's declared range-evaluation grid (section E), band 4 becomes the
 per-type line accounting of section D, and section B adds band 6, the
-cross-row accepted-set digest.
+cross-row accepted-set digest. The 2026-10-27 amendment, section D, computes
+band 6 per payload class.
 
 ## Lane boundary
 
@@ -541,9 +544,10 @@ out of order and never a duplicate. This retires the generator's pinned
 invariant that every timestamp stays on the scrape grid: after the change
 only unshifted samples do. A shifted sample is not always a regression on
 its series (two consecutive shifted steps leave the second half an
-interval ahead of the first), so the generator test keeps counting
-shifted and regressed samples separately and its pinned counts move with
-the new offset.
+interval ahead of the first; the 2026-10-27 amendment, section B, corrects
+this: two consecutive shifted samples of one series stay one full interval
+apart), so the generator test keeps counting shifted and regressed samples
+separately and its pinned counts move with the new offset.
 Every receiver runs a frozen, disclosed out-of-order window longer than
 the shift: Prometheus `storage.tsdb.out_of_order_time_window`, Mimir
 `limits.out_of_order_time_window`, VictoriaMetrics' default acceptance
@@ -555,11 +559,16 @@ per-batch status alone, and each row carries a digest of its accepted
 accepted set must equal its expected set, which is the generated stream
 minus that row's named payload exclusions (section D; a row's `offered`
 set is exactly this, so the expected-set digest is the digest of what the
-row offered). Every portable row carries the same exclusion set, because
+row offered). Every portable row carries the same exclusion set (the
+2026-10-27 amendment, section D, computes band 6 per payload class and lets
+a receiver exclude a class it cannot store), because
 the portable lane sends every payload type it carries to every receiver;
 a lane that excludes a type another portable row carries is a diagnostic
-row. The run fails when any two portable rows' expected-set digests differ
-or any row's accepted-set digest differs from its expected-set digest. The
+row (the 2026-10-27 amendment, section D, keeps such a receiver portable
+when the class is one it cannot store). The run fails when any two portable
+rows' expected-set digests differ or any row's accepted-set digest differs
+from its expected-set digest (the 2026-10-27 amendment, section D, applies
+both comparisons per payload class). The
 portable lane's drop budget is zero: a dropped or rejected sample on any
 receiver fails this band, and a row that needs a non-zero budget is a
 diagnostic row, not a portable one. The generator change moves
@@ -605,8 +614,10 @@ markers travel as the Prometheus stale NaN bit pattern, reusing
 another declaration, exempted from the non-finite rejection exactly for
 that pattern.
 Every row, comparator rows included, is banded on
-`offered == accepted + rejected + dropped` and on its declared drop budget,
-and the row records rejections by HTTP status.
+`offered == accepted + rejected + dropped` (the 2026-10-27 amendment,
+section D, adds a per-class unsupported term for a class the receiver
+cannot store) and on its declared drop budget, and the row records
+rejections by HTTP status.
 
 ### E. Range evaluation grids and empty answers
 
@@ -650,7 +661,9 @@ corpus can reach are set explicitly and disclosed in `deploy/metricsbench/`
 `-search.maxQueryDuration`, `-search.maxUniqueTimeseries`; Mimir
 `querier.query_store_after`, `querier.query_ingesters_within`,
 `bucket_store.sync_interval`, `compactor.cleanup_interval`,
-`querier.max_samples`, `max_fetched_chunks_per_query`), and the status
+`querier.max_samples`, `max_fetched_chunks_per_query`; the 2026-10-27
+amendment, section C, removes `querier.max_samples` from the Mimir bounds
+and names the ones that fire), and the status
 mapper carries a per-engine table of budget-error signatures so a limit
 that fires lands in `refused` with reason `budget` rather than in `error`.
 A historical replay into Mimir is followed by a readiness precondition
@@ -678,3 +691,154 @@ mapper and budget table).
 Nothing here changes a persistent format: the workload manifest and corpus
 are benchmark artifacts versioned by their own `version` field, not frozen
 storage contracts.
+
+## Amendment (2026-10-27): warnings never set `partial`, Mimir's query bounds, band 6 per payload class, and what a Ravel Remote Write 2xx acknowledges
+
+<!-- amendment-applies: sections="3. Acknowledgement semantics are reported, never normalised|6. Every outcome has a status, and refusals are not gaps|Bands pre-registered for the first reference run|Amendment (2026-10-26): the portable lane drives Ravel over HTTP, anomalies are the same logical data on every receiver, and the stream is a pure function of its run parameters" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="together with a partial or warning signal" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="the data object and its commit record are both durably stored" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="`querier.max_samples`, `max_fetched_chunks_per_query`" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="Every portable row carries the same exclusion set" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="leave the second half an interval ahead of the first" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="a lane that excludes a type another portable row carries is a diagnostic row" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="`offered == accepted + rejected + dropped`" pointer="2026-10-27 amendment" -->
+<!-- amendment-supersedes: phrase="the category means the engine cannot evaluate a query it was given" pointer="2026-10-27 amendment" -->
+
+Context. Implementing the status mapper (T3), the comparator limits (T4c)
+and the payload types on the wire (T1c) under epic #2821 found five places
+where the text above says something the engines or the code do not do.
+Issue #3304 collects them. This amendment changes no persistent format.
+
+### A. `partial` and warnings
+
+Decision 6's status table defines `partial` as data returned "together with
+a partial or warning signal". The status mapper never lets a warning or an
+info change a status: it records them as annotations and compares `status`
+and `data` only (`crates/ravel-bench/src/metrics_correctness.rs:39-47`, and
+the test `warnings_and_infos_are_recorded_and_never_change_the_status` at
+`:940`). A Prometheus or Mimir warning reports a condition of the
+evaluation, such as a mix of histogram and float inputs (the test fixture
+at `metrics_correctness.rs:942` uses that warning text), not a missing part
+of the result.
+
+Decision: "or warning" is retired. `partial` is reachable only on an engine
+with a completeness signal: Ravel's top-level `partial: true` and
+VictoriaMetrics' `isPartial: true`
+(`crates/ravel-bench/src/metrics_correctness.rs:684-690`). The Prometheus
+v3.13.1 HTTP API envelope (`docs/querying/api.md` at tag v3.13.1) carries
+`status`, `data`, `errorType`, `error`, `warnings` and `infos` and no
+completeness field, and the mapper reads none for Mimir 3.2.3 either
+(`metrics_correctness.rs:689`). On those two engines `partial` is
+unreachable by construction, not because the harness cannot see it. The
+MetricsBench Prometheus configures no `remote_read` (none appears under
+`deploy/metricsbench/`), so it has no remote source whose failure could
+surface as a warning on an incomplete answer.
+
+### B. The out-of-order shift keeps consecutive shifted samples one interval apart
+
+Section B of the 2026-10-26 amendment places a shifted sample one and a
+half intervals back, off the scrape grid. The generator subtracts
+`3 * interval_ms / 2` from the step's own timestamp
+(`crates/ravel-bench/src/metrics_gen.rs:635-637`), and step `n` is stamped
+at `base + n * interval`. Two consecutive shifted samples of one series, at
+steps `n` and `n + 1`, therefore land at `base + (n - 1.5) * interval` and
+`base + (n - 0.5) * interval`: one full interval apart from each other. The
+shift moves samples off the grid; it does not halve the sample spacing.
+
+### C. Mimir's query bounds
+
+Section F of the 2026-10-26 amendment lists `querier.max_samples` among the
+Mimir limits that bound a query. Mimir 3.2.3 queriers run the Mimir query
+engine (MQE) by default (`deploy/metricsbench/docker-compose.yml:262-268`),
+and MQE does not enforce `querier.max_samples`: with it set to 100, a query
+over 28,801 samples returned 200 (`deploy/metricsbench/README.md:104-105`,
+issue #3304). The value stays frozen for the Prometheus engine Mimir falls
+back to for expressions MQE does not support
+(`deploy/metricsbench/README.md:112-113`), but it is not one of the bounds
+on the default engine.
+
+Decision: `querier.max_samples` is removed from the list of Mimir limits
+that bound a query. The Mimir bounds that do fire are
+`limits.max_fetched_chunks_per_query`,
+`limits.max_estimated_memory_consumption_per_query` (frozen at 2 GiB,
+2,147,483,648 bytes, since #3305; `deploy/metricsbench/README.md:89`),
+`limits.max_total_query_length` and `querier.timeout`
+(`deploy/metricsbench/README.md:87-91`). The status mapper's budget table
+carries a signature for each of the four
+(`crates/ravel-bench/src/metrics_correctness.rs:371-390`).
+
+### D. Band 6 is computed per payload class
+
+VictoriaMetrics v1.115.0's Remote Write parser reads only `labels` (field
+1) and `samples` (field 2) of each `TimeSeries` and skips every other field
+without an error (`lib/prompb/prompb.go` at tag v1.115.0,
+`TimeSeries.unmarshalProtobuf`). A native histogram sent to it is dropped
+and the request still answers 2xx, so section B's rule that every portable
+row carries the same exclusion set would fail band 6 on VictoriaMetrics for
+a class it cannot store, not for a sample it lost.
+
+Decision: band 6 is computed per payload class: scalar, stale marker and
+native histogram (the classes of section D of the 2026-10-26 amendment).
+
+- A class a receiver cannot store, shown by that receiver's pinned source
+  or its documentation, is excluded from band 6 for that receiver only. The
+  citation is recorded in that receiver's report row; an exclusion with no
+  citation is not an exclusion.
+- Corpus entries that need an excluded class are classified
+  `unsupported_construct` on that engine, and stay in its corpus
+  denominator. This widens decision 6's definition of that status from
+  "cannot evaluate a query it was given" to also cover "cannot store a
+  payload class the query needs". Such an engine evaluates the query and
+  answers an empty result, which the data comparison would otherwise call
+  `incorrect`. The status comes from a declaration, not from the response:
+  the query runner reads the receiver's ingest row, finds the class in its
+  cited unsupported classes, and sets `unsupported_construct` before any
+  data comparison, with the citation as the row's message. The query is
+  still sent and its answer recorded, so an engine version that starts
+  storing the class shows up as a changed answer. The status mapper's
+  response-driven path never produces this status for a 2xx answer, and
+  does not need to.
+- Every other row is still compared on that class, and every row is still
+  compared on every class it does not exclude.
+- A receiver that drops part of a class it does support still fails band 6.
+  The drop budget of the 2026-10-26 amendment stays zero.
+- The exclusion applies on the receiving side only. The lane still sends
+  every payload class to every portable receiver, so every portable row's
+  offered set, and its expected-set digest, is the same whole stream, and
+  the cross-row equality of expected-set digests holds for every class. The
+  comparison of a row's accepted set against its expected set is made only
+  for the classes that row does not exclude.
+- The points of an excluded class that a receiver acknowledged but cannot
+  store are counted in that row's own per-class unsupported counter, not in
+  `excluded_native_histogram` or `excluded_stale_marker`. Those two count
+  what the lane never sent. Band 4's per-row identity gains the term:
+  offered equals accepted plus rejected plus dropped plus unsupported, per
+  class. A receiver with an excluded class stays a portable row; it is not
+  a diagnostic row.
+
+### E. What a Ravel Remote Write 2xx acknowledges
+
+Decision 3 says a Ravel Remote Write 2xx means "the data object and its
+commit record are both durably stored". That is true of what was written
+but says nothing of what was not. ADR-0051 pins partial admission on Remote
+Write (`docs/adrs/0051-tenant-admission-control.md:136-144`): an
+active-series cap breach drops the over-cap series and lowers the written
+count inside a 2xx (`services/ravel-server/src/remote_write.rs:507-512`),
+and points rejected in normalization are counted as dropped
+(`remote_write.rs:280-288`, `:479`) while the request still answers 204
+(`remote_write.rs:593`). The written counts travel only in the Remote Write
+2.0 response headers (`remote_write.rs:608-616`), and the portable lane
+sends 1.0 (decision 2), so a portable-lane 2xx from Ravel carries no count
+of what was kept.
+
+Decision: decision 3's sentence is corrected to: a Ravel Remote Write 2xx
+means every point ravel-server admitted is durable (strict mode only,
+`remote_write.rs:461-462`). The MetricsBench Ravel row's acceptance is
+confirmed by reading the data back, the accepted-set digest of band 6, not
+by the response.
+
+Consequences. Decision 6's `partial` row, decision 3's acknowledgement
+sentence, and sections B and F of the 2026-10-26 amendment carry inline
+pointers here. Task routing under #2821 is unchanged: T3 already maps
+warnings as recorded here, T4c owns the Mimir budget table, and T1c owns
+band 6 and the per-class exclusions.

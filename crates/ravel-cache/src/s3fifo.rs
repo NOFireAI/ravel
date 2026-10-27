@@ -1,4 +1,4 @@
-//! S3-FIFO eviction (ADR-0046 decision 6, amended 2026-08-02): a small FIFO
+//! S3-FIFO eviction (ADR-0046 decision 6 and its 2026-10-26 amendment): a small FIFO
 //! probation queue, a main FIFO for entries that proved themselves, and a
 //! ghost queue of keys evicted from probation before they got a second
 //! chance.
@@ -35,7 +35,19 @@
 //! requested again) is inserted directly into the main queue, since a
 //! second request within the ghost window is exactly the "worth keeping"
 //! signal that would otherwise take a full second access in probation to
-//! detect.
+//! detect. The ghost window is the wider of `max_bytes / max_entry_bytes`
+//! keys and keys whose evicted sizes sum to 30% of `max_bytes`, and never
+//! spans more than the cache (see [`S3Fifo::new`]). Its key count is also
+//! capped, so how far it reaches depends on entry size. Above
+//! `ghost_window_bytes / ghost_max_keys` (0.3 times 1,000 times
+//! `GHOST_KEY_BYTES`, about 45.6 KB, at any cache size where neither the
+//! key window nor `max_entries` clamps the cap) the byte window binds, and
+//! a repeated read of up to about 40% of the cache (probation plus the byte
+//! window) is promoted, more where the key window is wider.
+//! Below it the key cap binds and the reach is probation plus
+//! `ghost_max_keys` entries: at a 6,954,184,212-byte cache, 45,751 keys of
+//! 16 KiB span 749.6 MB, about 10.8% of it, so a repeated read of up to
+//! about 21% of the cache is promoted.
 //!
 //! # Access intent (ADR-3072 decision 3b)
 //!
@@ -79,7 +91,7 @@
 //! The sketches and the region's rank map are charged inside `max_bytes` and
 //! capped at one percent of it ([`S3Fifo::bookkeeping_bytes`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::AccessIntent;
 use crate::key::CacheKey;
@@ -106,6 +118,29 @@ const SKETCH_LEN: usize = 64;
 
 /// Bookkeeping is held to `max_bytes / BOOKKEEPING_BUDGET_DIVISOR`.
 const BOOKKEEPING_BUDGET_DIVISOR: u64 = 100;
+
+/// The ghost's byte window in tenths of `max_bytes`: the issue #3270
+/// simulations (`s3fifo/ghost_window.rs`) serve every repeated ClickBench
+/// statement from 2.5 tenths on, and change no scan-resistance figure at 3.
+const GHOST_WINDOW_BYTES_TENTHS: u64 = 3;
+
+/// The ghost is held outside `max_bytes`, so its key count is capped at
+/// `max_bytes / GHOST_MEMORY_DIVISOR / GHOST_KEY_BYTES`. That budgets one
+/// queue slot and one map entry per key; the real worst case is about three
+/// times it. The queue holds up to twice the key cap plus 65 slots before
+/// `S3Fifo::compact_ghost_queue` drops the stale ones, the map holds up to
+/// one key over the cap before the trim, both round their capacity up as they
+/// grow (the map can double once more to clear removed slots), and neither
+/// gives capacity back. At a 6,954,184,212-byte cache (45,751 keys, a 6.95 MB
+/// budget) that is 131,072 queue slots of 72 bytes and 131,072 map buckets of
+/// 81 bytes, about 20.1 MB. That is per `S3Fifo`: a server started with
+/// `--cache-dir` builds two from the same limits, one per tier, so about
+/// 40.2 MB in all (ADR-0046's 2026-10-26 amendment).
+const GHOST_MEMORY_DIVISOR: u64 = 1_000;
+
+/// One ghost key's queue slot and map entry, before table and queue slack.
+const GHOST_KEY_BYTES: u64 =
+    (std::mem::size_of::<(CacheKey, u64)>() + std::mem::size_of::<(CacheKey, Ghost)>()) as u64;
 
 /// A tenant's pass window closes after at least this many times `max_bytes`
 /// of its traffic, and after at most [`WINDOW_CEILING_MULTIPLE`] times.
@@ -277,16 +312,34 @@ fn splitmix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A key in the ghost queue: the sequence number of its live slot in
+/// `S3Fifo::ghost`, and the size it was evicted at.
+struct Ghost {
+    seq: u64,
+    size: u64,
+}
+
 pub(crate) struct S3Fifo<V> {
     entries: HashMap<CacheKey, Entry<V>>,
     small: VecDeque<CacheKey>,
     main: VecDeque<CacheKey>,
-    ghost: VecDeque<CacheKey>,
-    ghost_set: HashSet<CacheKey>,
+    /// Ghost keys oldest first, each with the sequence number it was pushed
+    /// at. A slot whose number differs from its key's entry in `ghosts` is
+    /// stale (the key was forgotten) and is skipped when it reaches the front.
+    ghost: VecDeque<(CacheKey, u64)>,
+    ghosts: HashMap<CacheKey, Ghost>,
+    ghost_seq: u64,
+    ghost_bytes: u64,
     small_bytes: u64,
     main_bytes: u64,
     small_quota_bytes: u64,
-    ghost_capacity: usize,
+    /// Ghost keys are trimmed oldest first while there are more than
+    /// `ghost_max_keys` of them, or while they are past both windows: more
+    /// than `ghost_window_keys` keys and more than `ghost_window_bytes` of
+    /// evicted sizes.
+    ghost_max_keys: usize,
+    ghost_window_keys: usize,
+    ghost_window_bytes: u64,
     region: BulkRegion,
     region_share_bytes: u64,
     bookkeeping_budget: u64,
@@ -299,39 +352,54 @@ impl<V: Clone> S3Fifo<V> {
         // skewed access patterns; at least 1 byte so a tiny configured
         // cache still has a probation queue to evict from.
         let small_quota_bytes = (limits.max_bytes / 10).max(1);
-        // The ghost window must approximate the RESIDENT capacity, not
-        // `max_entries`. Whichever of the two bounds binds first decides how
-        // many entries actually fit, and the byte bound is normally the
-        // binding one, so sizing the ghost from `max_entries` alone can make
-        // it many times larger than the cache.
+        // A ghost window wider than the cache means every key from a
+        // completed scan is still remembered when the next scan starts, so
+        // each one is admitted straight to `main`, bypassing probation, and
+        // the second pass evicts the working set the first pass survived.
+        // Scan resistance would then hold for exactly one pass, while
+        // ADR-0046 decision 6 exists because the compactor and the folder
+        // scan cold data continuously. Hence the key window: `max_bytes /
+        // max_entry_bytes` is a lower bound on resident capacity, since
+        // `max_entry_bytes` is the largest entry there can be.
         //
-        // That is not a tuning detail. A ghost window wider than the cache
-        // means every key from a completed scan is still remembered when the
-        // next scan starts, so each one is admitted straight to `main`,
-        // bypassing probation, and the second pass evicts the working set the
-        // first pass survived. Scan resistance would then hold for exactly one
-        // pass, while ADR-0046 decision 6 exists because the compactor and the
-        // folder scan cold data continuously.
-        //
-        // `max_entry_bytes` is the smallest entry size we can be sure of, so
-        // `max_bytes / max_entry_bytes` is a lower bound on resident capacity;
-        // take the tighter of that and `max_entries`.
+        // A key window alone is narrow in bytes when entries are small: at
+        // 1.3 MB entries under a 64 MiB cap it spans 2% of `max_bytes`, and
+        // a statement reading more than probation plus that per call is
+        // never served from the cache however often it repeats. So the ghost
+        // also keeps keys while their evicted sizes sum to at most
+        // `GHOST_WINDOW_BYTES_TENTHS` of `max_bytes` (ADR-0046 decision 6,
+        // amendment 2026-10-26). The window is the wider of the two, so it
+        // never shrinks below the key window, and never spans more than the
+        // cache. The ghost is not charged to `max_bytes`, so its key count is
+        // capped at one per mille of `max_bytes` in ghost bookkeeping, never
+        // below the key window and never above `max_entries`.
         let capacity_from_bytes = limits
             .max_bytes
             .checked_div(limits.max_entry_bytes.max(1))
             .unwrap_or(0) as usize;
-        let ghost_capacity = capacity_from_bytes.min(limits.max_entries).max(1);
+        let ghost_window_keys = capacity_from_bytes.min(limits.max_entries).max(1);
+        let ghost_window_bytes = limits.max_bytes / 10 * GHOST_WINDOW_BYTES_TENTHS;
+        let ghost_max_keys = (limits.max_bytes / GHOST_MEMORY_DIVISOR / GHOST_KEY_BYTES)
+            .try_into()
+            .unwrap_or(usize::MAX)
+            .max(ghost_window_keys)
+            .min(limits.max_entries)
+            .max(1);
         let region_share_bytes = (limits.max_bytes as f64 * limits.effective_bulk_share()) as u64;
         S3Fifo {
             entries: HashMap::new(),
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
-            ghost_set: HashSet::new(),
+            ghosts: HashMap::new(),
+            ghost_seq: 0,
+            ghost_bytes: 0,
             small_bytes: 0,
             main_bytes: 0,
             small_quota_bytes,
-            ghost_capacity,
+            ghost_max_keys,
+            ghost_window_keys,
+            ghost_window_bytes,
             region: BulkRegion::default(),
             region_share_bytes,
             bookkeeping_budget: limits.max_bytes / BOOKKEEPING_BUDGET_DIVISOR,
@@ -559,13 +627,53 @@ impl<V: Clone> S3Fifo<V> {
     /// by every admission that stores the key, so a resident key is never
     /// also a ghost; only an interactive admission promotes on the result.
     fn forget_ghost(&mut self, key: &CacheKey) -> bool {
-        if !self.ghost_set.remove(key) {
+        let Some(ghost) = self.ghosts.remove(key) else {
             return false;
-        }
-        if let Some(pos) = self.ghost.iter().position(|k| k == key) {
-            self.ghost.remove(pos);
-        }
+        };
+        self.ghost_bytes -= ghost.size;
+        self.compact_ghost_queue();
         true
+    }
+
+    /// Remembers `key`, just evicted from probation at `size` bytes, then
+    /// trims the oldest ghost keys until the key cap holds and the ghost is
+    /// inside its key window or its byte window.
+    fn remember_ghost(&mut self, key: CacheKey, size: u64) {
+        self.ghost_seq += 1;
+        let seq = self.ghost_seq;
+        if let Some(stale) = self.ghosts.insert(key, Ghost { seq, size }) {
+            self.ghost_bytes -= stale.size;
+        }
+        self.ghost_bytes += size;
+        self.ghost.push_back((key, seq));
+        while self.ghosts.len() > self.ghost_max_keys
+            || (self.ghosts.len() > self.ghost_window_keys
+                && self.ghost_bytes > self.ghost_window_bytes)
+        {
+            let Some((oldest, seq)) = self.ghost.pop_front() else {
+                break;
+            };
+            if self
+                .ghosts
+                .get(&oldest)
+                .is_some_and(|ghost| ghost.seq == seq)
+                && let Some(ghost) = self.ghosts.remove(&oldest)
+            {
+                self.ghost_bytes -= ghost.size;
+            }
+        }
+        self.compact_ghost_queue();
+    }
+
+    /// Drops stale slots once they outnumber the live ones, so the queue
+    /// stays within twice the ghost count and a forget stays O(1) amortized.
+    fn compact_ghost_queue(&mut self) {
+        if self.ghost.len() <= 2 * self.ghosts.len() + 64 {
+            return;
+        }
+        let ghosts = &self.ghosts;
+        self.ghost
+            .retain(|(key, seq)| ghosts.get(key).is_some_and(|ghost| ghost.seq == *seq));
     }
 
     fn insert_bulk(
@@ -1041,13 +1149,7 @@ impl<V: Clone> S3Fifo<V> {
             Step::Skipped
         } else {
             metrics.record_eviction();
-            self.ghost.push_back(key);
-            self.ghost_set.insert(key);
-            while self.ghost.len() > self.ghost_capacity {
-                if let Some(oldest) = self.ghost.pop_front() {
-                    self.ghost_set.remove(&oldest);
-                }
-            }
+            self.remember_ghost(key, size);
             Step::Evicted(key)
         }
     }
@@ -1169,7 +1271,8 @@ mod tests {
     /// existed: no `insert_bulk` branch in `insert_with_intent`, no intent
     /// term in `promote_to_main`, and `hit_interactive` for the `BulkScan`
     /// arm of `get_with_intent`) serves 0 touches on pass 2, since a ghost
-    /// window of one key promotes nothing. Promoting every bulk miss to main
+    /// window of 300 keys behind 100 in probation promotes nothing of a
+    /// 2,000-key loop. Promoting every bulk miss to main
     /// (`promote_to_main` true for `BulkScan`, no `insert_bulk` branch) serves
     /// 0 as well. FIFO eviction inside the region also serves 0; see
     /// `a_reordered_bulk_scan_serves_the_same_subset`.
@@ -1178,8 +1281,8 @@ mod tests {
         const N: u64 = 2_000;
         const C: u64 = 1_000;
         const ENTRY: u64 = 64 * 1024;
-        // The server's 64 MiB entry cap, against which today's ghost sizing
-        // remembers max_bytes / max_entry_bytes keys: here one.
+        // The server's 64 MiB entry cap, against which the ghost's key window
+        // is one key and its byte window 300 entries.
         let limits = CacheLimits::new(C * ENTRY, 1_000_000, 64 * 1024 * 1024);
         let metrics = CacheMetrics::default();
         let mut fifo = S3Fifo::<()>::new(limits);
@@ -1516,7 +1619,7 @@ mod tests {
             assert_eq!(fifo.main_bytes(), 0, "a maintenance read reached main");
         }
         let ghost_key = last_evicted.expect("the scan evicted from probation");
-        assert!(fifo.ghost_set.contains(&ghost_key));
+        assert!(fifo.ghosts.contains_key(&ghost_key));
         fifo.insert_with_intent(ghost_key, (), ENTRY, AccessIntent::Maintenance, &metrics);
         assert_eq!(
             fifo.main_bytes(),
@@ -1833,19 +1936,22 @@ mod tests {
     ///
     /// FLIP: removing the `forget_ghost` call from `insert_bulk` fails the
     /// bulk assertion; reverting the interactive path to
-    /// `intent == AccessIntent::Interactive && self.ghost_set.remove(&key)`
+    /// `intent == AccessIntent::Interactive && self.forget_ghost(&key)`
     /// (the ghost entry kept for maintenance) fails the maintenance one and
     /// leaves the re-admitted key out of main.
     #[test]
     fn a_maintenance_or_bulk_admission_clears_the_ghost_entry() {
         const ENTRY: u64 = 64 * 1024;
-        // Ghost window max_bytes / max_entry_bytes = 20 keys.
+        // Ghost window: the wider of max_bytes / max_entry_bytes = 20 keys
+        // and 30% of max_bytes = 30 entries.
         let limits = CacheLimits::new(100 * ENTRY, 1_000, 5 * ENTRY);
         let metrics = CacheMetrics::default();
+        const WINDOW: u64 = 30;
 
         for intent in [AccessIntent::Maintenance, AccessIntent::BulkScan] {
             let mut fifo = S3Fifo::<()>::new(limits);
-            assert_eq!(fifo.ghost_capacity, 20);
+            assert_eq!(fifo.ghost_window_keys, 20);
+            assert_eq!(fifo.ghost_window_bytes, WINDOW * ENTRY);
             for n in 0..90 {
                 fifo.insert(key(1, n, ENTRY), (), ENTRY, &metrics);
                 assert!(fifo.get(&key(1, n, ENTRY)).is_some());
@@ -1863,13 +1969,13 @@ mod tests {
             let ghosted = key(2, 1, ENTRY);
             fifo.insert(ghosted, (), ENTRY, &metrics);
             while !insert_filler(&mut fifo).contains(&ghosted) {}
-            assert!(fifo.ghost_set.contains(&ghosted));
+            assert!(fifo.ghosts.contains_key(&ghosted));
 
             let (stored, _) = fifo.insert_with_intent(ghosted, (), ENTRY, intent, &metrics);
             assert!(stored && fifo.contains(&ghosted), "{intent:?} admitted it");
             assert_eq!(fifo.main_bytes(), 90 * ENTRY, "{intent:?} never promotes");
             assert!(
-                !fifo.ghost_set.contains(&ghosted) && !fifo.ghost.contains(&ghosted),
+                !fifo.ghosts.contains_key(&ghosted),
                 "{intent:?} admission left the key in the ghost queue"
             );
             if intent != AccessIntent::Maintenance {
@@ -1879,8 +1985,9 @@ mod tests {
             // Evict it again, then re-admit it interactively inside the ghost
             // window, after the older ghost copy would have been trimmed.
             while !insert_filler(&mut fifo).contains(&ghosted) {}
-            assert_eq!(fifo.ghost.iter().filter(|k| **k == ghosted).count(), 1);
-            for _ in 0..fifo.ghost_capacity - 2 {
+            let live = |(k, seq): &&(CacheKey, u64)| *k == ghosted && fifo.ghosts[k].seq == *seq;
+            assert_eq!(fifo.ghost.iter().filter(live).count(), 1);
+            for _ in 0..WINDOW - 2 {
                 insert_filler(&mut fifo);
             }
             fifo.insert(ghosted, (), ENTRY, &metrics);
@@ -1889,6 +1996,39 @@ mod tests {
                 "a ghost hit inside the window promotes to main"
             );
         }
+    }
+
+    /// The ghost's byte window is wide in keys when entries are small, and the
+    /// ghost lives outside `max_bytes`: its key count stops at one per mille
+    /// of `max_bytes` in ghost bookkeeping, and its queue at twice that.
+    ///
+    /// FLIP: `ghost_max_keys` at `limits.max_entries` in `S3Fifo::new` reads
+    /// 1,000,000 against the cap of 657; with the two count assertions
+    /// dropped, the ghost grows on into its 30 MB window and the queue passes
+    /// `2 * cap + 64` slots.
+    #[test]
+    fn the_ghost_key_count_is_capped_by_its_memory() {
+        const ENTRY: u64 = 1024;
+        let limits = CacheLimits::new(100_000_000, 1_000_000, 64 * 1024 * 1024);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<()>::new(limits);
+        let cap = (limits.max_bytes / GHOST_MEMORY_DIVISOR / GHOST_KEY_BYTES) as usize;
+        assert_eq!(GHOST_KEY_BYTES, 152);
+        assert_eq!(cap, 657);
+        assert_eq!(fifo.ghost_max_keys, cap);
+        assert!(fifo.ghost_window_bytes / ENTRY > 20 * cap as u64);
+
+        for n in 0..200_000 {
+            fifo.insert(key(1, n, ENTRY), (), ENTRY, &metrics);
+            assert!(fifo.ghosts.len() <= cap);
+            assert!(fifo.ghost.len() <= 2 * cap + 64);
+        }
+        assert_eq!(fifo.ghosts.len(), cap);
+        assert_eq!(
+            fifo.ghost_bytes,
+            fifo.ghosts.values().map(|ghost| ghost.size).sum::<u64>()
+        );
+        assert_within_bounds(&fifo);
     }
 
     /// A region entry no read touches lives one to two pass windows of its
@@ -2210,3 +2350,7 @@ mod tests {
         assert_within_bounds(&fifo);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ghost_window;

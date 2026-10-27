@@ -132,7 +132,15 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
         "only the in-process Ravel row without endpoints"
     );
     let ravel = &systems[0];
-    assert_eq!(ravel["system"], "ravel");
+    assert_eq!(ravel["system"], "ravel-in-process");
+    assert_eq!(
+        ravel["endpoint"], "in-process",
+        "the in-process row is never read as the portable Ravel row"
+    );
+    assert!(
+        ravel.get("last_commit_token").is_none(),
+        "only the portable Ravel row records a last commit token"
+    );
     assert_eq!(
         ravel["ack_semantics"], "durable_on_ack",
         "Ravel's strict Remote Write surface is durable-on-ack"
@@ -176,7 +184,7 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
     let queries = report["queries"].as_array().expect("queries array present");
     let ravel_query = queries
         .iter()
-        .find(|q| q["system"] == "ravel")
+        .find(|q| q["system"] == "ravel-in-process")
         .expect("a ravel query-phase row exists");
     assert!(
         ravel_query["min_commit_tokens"]
@@ -273,8 +281,9 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         "the bin generated the stream this test regenerated from the same anchor"
     );
 
-    // Every row's stream counts are the generator's per-type figures, and the
-    // scalar accounting names the two excluded kinds.
+    // Every row's stream counts are the generator's per-type figures, and
+    // every type is offered: stale markers as samples, native histograms as
+    // their own class, both accepted through the in-process `IngestPoint`.
     let ravel = &report["systems"][0];
     let counts = &ravel["ingest"]["stream_counts"];
     assert_eq!(
@@ -291,22 +300,31 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         Some(gen_report.stale_markers)
     );
     assert_eq!(counts["malformed"].as_u64(), Some(0));
+    let ingest = &ravel["ingest"];
     assert_eq!(
-        ravel["ingest"]["offered_samples"].as_u64(),
-        Some(gen_report.float_samples),
-        "the replay offers exactly the scalar lines"
+        ingest["offered_samples"].as_u64(),
+        Some(gen_report.float_samples + gen_report.stale_markers),
+        "the replay offers every scalar and every stale marker as a sample"
     );
-    let excluded_native = ravel["ingest"]["excluded_native_histogram"]
-        .as_u64()
-        .expect("excluded_native_histogram");
-    let excluded_stale = ravel["ingest"]["excluded_stale_marker"]
-        .as_u64()
-        .expect("excluded_stale_marker");
-    assert_eq!(excluded_native, gen_report.native_histogram_samples);
-    assert_eq!(excluded_stale, gen_report.stale_markers);
+    assert_eq!(
+        ingest["accepted_samples"].as_u64(),
+        ingest["offered_samples"].as_u64()
+    );
+    assert_eq!(
+        ingest["offered_histograms"].as_u64(),
+        Some(gen_report.native_histogram_samples),
+        "native histograms are their own offered class"
+    );
+    assert_eq!(
+        ingest["accepted_histograms"].as_u64(),
+        Some(gen_report.native_histogram_samples),
+        "the in-process path accepts every native histogram"
+    );
+    assert_eq!(ingest["excluded_native_histogram"].as_u64(), Some(0));
+    assert_eq!(ingest["excluded_stale_marker"].as_u64(), Some(0));
     assert!(
-        excluded_native > 0 && excluded_stale > 0,
-        "the ci stream carries both excluded kinds at {STEPS} steps"
+        gen_report.native_histogram_samples > 0 && gen_report.stale_markers > 0,
+        "the ci stream carries both kinds at {STEPS} steps"
     );
 
     // This run truncates the profile (STEPS < samples_per_series, asserted
@@ -458,6 +476,30 @@ fn a_missing_or_off_grid_anchor_exits_64() {
     assert!(stderr.contains("9223372036854 ms"), "{stderr}");
 }
 
+/// The portable Ravel row's token comes from the environment variable the
+/// flag names: an unset variable, or the flag without `--ravel-endpoint`,
+/// exits 64 before anything is generated.
+#[test]
+fn a_bearer_token_env_that_cannot_be_read_exits_64() {
+    let _serial = serial();
+    let anchor = on_grid_anchor(1).to_string();
+    let var = "METRICSBENCH_SMOKE_TOKEN_NEVER_SET";
+    let (code, stderr) = run_refused(&[
+        "--anchor-ms",
+        &anchor,
+        "--ravel-endpoint",
+        "http://127.0.0.1:9/api/v1/write",
+        "--ravel-bearer-token-env",
+        var,
+    ]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains(var), "{stderr}");
+
+    let (code, stderr) = run_refused(&["--anchor-ms", &anchor, "--ravel-bearer-token-env", var]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(stderr.contains("needs --ravel-endpoint"), "{stderr}");
+}
+
 /// The same anchor replays the same stream and offers the same tuples; a
 /// different anchor changes both digests.
 #[test]
@@ -517,12 +559,16 @@ fn streaming_peak(steps: u64) -> i64 {
         offered += batch.len() as u64;
     }
     let (_, counts) = stream.finish().expect("drained stream closes");
-    assert_eq!(offered, counts.scalar);
+    assert_eq!(
+        offered,
+        counts.scalar + counts.stale_marker + counts.native_histogram
+    );
     peak
 }
 
 /// The negative control: the whole stream materialised, bytes then every
-/// scalar sample, as the pre-streaming lane held it.
+/// scalar sample, as the pre-streaming lane held it. Scalars alone already
+/// grow with history, which is all the control has to show.
 fn materialised_live(steps: u64) -> i64 {
     let workload = ci_workload();
     let region = Region::new(GLOBAL);

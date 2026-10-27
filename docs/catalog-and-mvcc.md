@@ -2219,7 +2219,13 @@ pinning are unchanged:
    `CatalogError::FieldMismatch`, never a fallback: an isolation breach,
    not a performance event). Fetch parts not in the decoded-part cache
    (immutable, keyed by part key, verified against HEAD's blake3 before
-   decode, bounded per tenant by `snapshot_cache_parts`); a postings
+   decode, bounded per tenant by `snapshot_cache_parts`; the decoded-part
+   and postings caches together are also bounded across every tenant by
+   `CatalogConfig::decoded_cache_max_bytes`, unbounded by default, which
+   counts the bytes their entries' reservations hold and evicts
+   least-recently-used entries of either cache after an insert; a decoded
+   value whose own reservation is larger than that bound is not cached and
+   is decoded again on each resolve that needs it); a postings
    object's tenant_hash is checked the same hard-fail way before its
    entries are trusted. Before decoding a part or postings object, the
    resolve reserves its header-declared uncompressed length (clamped to

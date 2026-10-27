@@ -99,13 +99,14 @@
 //! probe thresholds ([`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`],
 //! [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`]) whenever
 //! `SqlConfig::skip_partial_aggregation` is on, which it is by default. This is
-//! a memory decision, not a determinism one: the partial stage keeps one hash
-//! table per input partition, so a key whose distinct values appear in every
-//! partition costs `partitions x distinct` entries before the final stage ever
-//! merges them. Giving up early bounds that at `partitions x probe rows`. It
-//! cannot change a result -- the final stage sees the same rows and computes
-//! the same groups either way -- so it is orthogonal to the determinism rules
-//! above.
+//! a memory and CPU decision, not a determinism one: the partial stage keeps
+//! one hash table per input partition, so a key whose distinct values appear
+//! in every partition costs `partitions x distinct` entries before the final
+//! stage ever merges them. Giving up early bounds that at `partitions x probe
+//! rows`, and on a key that barely reduces it saves hashing every row twice
+//! (issue #3231). It cannot change a result -- the final stage sees the same
+//! rows and computes the same groups either way -- so it is orthogonal to the
+//! determinism rules above.
 //!
 //! Spill (ADR-0954): the disk manager is configured explicitly in both
 //! directions, never left to DataFusion's default. [`build_session`] takes a
@@ -480,25 +481,34 @@ pub const EXCLUDED_TABLE_FUNCTIONS: [&str; 2] = ["generate_series", "range"];
 /// at all on a partition that holds fewer rows than that, which is the common
 /// case here once `target_partitions` divides a tenant's hour.
 ///
-/// Not smaller: [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`] is judged from a
-/// sample of exactly this many rows, and a smaller sample starts reading a
-/// genuinely reducible mid-cardinality key as unreducible.
+/// Not smaller: [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`] is first judged on a
+/// sample of this many rows (and re-judged over every row seen until the
+/// partition skips), and a smaller first sample starts reading a genuinely
+/// reducible mid-cardinality key as unreducible.
 pub const SKIP_PARTIAL_AGGREGATION_PROBE_ROWS: usize = 8192;
 
 /// Distinct-groups-to-rows ratio above which a partial aggregation partition
 /// gives up
 /// (`datafusion.execution.skip_partial_aggregation_probe_ratio_threshold`,
-/// DataFusion's default 0.8). Issue #680.
+/// DataFusion's default 0.8). Issues #680, #3231.
 ///
-/// At 0.5 a partition stops aggregating when its probe found a new group for
-/// more than every other row: at that ratio the partial stage is spending a
-/// hash-table entry per two rows and returning at most a factor of two, which
-/// does not pay for `partitions` copies of the state. Below it the partial
-/// stage still reduces enough to be worth its memory and nothing changes.
-/// Skipping never changes a result, only where the state lives; a
-/// falsely-skipped partition costs rows pushed to the final stage, never a
-/// wrong group.
-pub const SKIP_PARTIAL_AGGREGATION_PROBE_RATIO: f64 = 0.5;
+/// A partition skips once its probe finds a new group for more than one row in
+/// ten. DataFusion compares strictly (`groups / rows > ratio`) and, until the
+/// partition skips, re-reads the ratio over all the rows it has seen after
+/// every batch past [`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`]. Above this ratio,
+/// hashing and inserting each row in both the partial and the final stage
+/// costs more CPU than the partial stage saves on string and high-cardinality
+/// keys. Keys between 0.1 and 0.5 that still reduce (a phrase key with heavy
+/// repetition, for example) skip too, and pay a small cost in the repartition
+/// and the final stage, which then receive every row instead of one per
+/// group.
+///
+/// A skipped partition emits the groups its probe accumulated and then holds
+/// no partial state, so the pre-final state stays near `partitions x probe
+/// rows` instead of `partitions x distinct`. Skipping never changes a result,
+/// only where the state lives: the final stage sees the same rows and computes
+/// the same groups either way.
+pub const SKIP_PARTIAL_AGGREGATION_PROBE_RATIO: f64 = 0.1;
 
 /// An `ObjectStoreRegistry` that holds nothing and registers nothing.
 ///

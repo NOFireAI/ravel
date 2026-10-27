@@ -180,6 +180,9 @@ the large one, so it is where the working set actually lives. A scan that
 evicts it converts every subsequent query back into the cold path this
 epic was written to remove.
 
+How long S3-FIFO remembers a key evicted from probation is set by the ghost
+window amendment below (issue #3270).
+
 ### 7. No encryption inside Ravel
 
 The disk tier stores object bytes in plaintext. Deployments requiring
@@ -353,3 +356,117 @@ until `S3Store` surfaces the real `x-amz-version-id`, every S3 file is
 pinned by ETag alone (ADR-2040's pinning amendment), so the bound applies
 to every S3 bucket, versioned or not. GCS files, and Azure files on a
 bucket with versioning on, are pinned by version and are outside it.
+
+## Amendment (2026-10-26): the S3-FIFO ghost window covers 30% of the cache in bytes (issue #3270)
+
+<!-- amendment-applies: sections="6. Scan-resistant eviction" pointer="ghost window amendment" -->
+
+Decision 6 chose S3-FIFO and left its ghost queue unsized. The
+implementation sized it at `max_bytes / max_entry_bytes` keys, the
+smallest resident capacity the entry cap allows, so that a ghost could
+never span more than the cache and readmit a completed scan straight to
+main. At the server's 64 MiB entry cap that is about 100 keys at a 7 GB
+cache. In bytes, it is as wide as the cache for 64 MiB entries and about
+2% of it for the 1.3 MB ranges ClickBench reads, so a statement whose
+bytes per call exceed the probation queue (10% of `max_bytes`) plus that
+2% is never served from the cache, however often it repeats. The ClickBench
+hot sweep measured q29 and q31 to q33 (1.3 to 2.3 GB per call against a
+6.95 GB cache) fetched in full on every timed call.
+
+The ghost now keeps a key while it is inside either window: the key window
+above, or the most recent probation evictions whose sizes sum to at most
+30% of `max_bytes`. The window is the wider of the two, so it is never
+narrower than before for any entry size and never spans more than the
+cache. The ghost lives outside `max_bytes` and outside `bookkeeping_bytes`,
+which are unchanged; its key count is capped at one per mille of
+`max_bytes` in ghost bookkeeping at 152 bytes a key (45,751 keys at
+6,954,184,212 bytes), never below the key window and never above
+`max_entries`. Which bound sets the ghost's reach depends on range size.
+Above `ghost_window_bytes / ghost_max_keys` (0.3 times 1,000 times 152
+bytes, about 45.6 KB, at any cache size where neither the key window nor
+`max_entries` clamps the cap) the byte window binds, and a repeated read of
+up to about 40% of the cache (probation plus the byte window) is promoted
+on its second call, more where the key window is wider. Below it the key
+cap binds, and the reach is probation plus 45,751 ranges: for 16 KiB ranges
+at 6,954,184,212 bytes that is 749.6 MB of remembered evictions, about
+10.8% of `max_bytes`, so a repeated read of up to about 21% of the cache is
+promoted. The 152 bytes are one queue slot and one map
+entry; the real worst case is about three times that budget. The queue
+keeps up to twice the key cap plus 65 slots before it drops stale ones,
+both containers round their capacity up as they grow, the map can double
+once more to clear removed slots, and neither gives capacity back: at
+6,954,184,212 bytes that is 131,072 queue slots of 72 bytes and 131,072 map
+buckets of 81 bytes, about 20.1 MB against the 6.95 MB budget. That figure
+is per `S3Fifo`: a server started with `--cache-dir` builds two with the same
+limits, one for the RAM tier and one for the disk tier
+(`services/ravel-server/src/store.rs`, `build_cache`), so about 40.2 MB in
+all.
+Both tiers use this policy (`DiskCache` builds the same `S3Fifo`, with the
+same limits on the server). The ghost holds keys and sizes only, in
+memory, so the disk tier's restart behaviour is unchanged. Access intents
+(ADR-3072 decision 3b) and the bulk region are unchanged, and ADR-2677's
+decision 3 deferral stands: this adds no loop policy.
+
+The figures come from a deterministic simulation of the policy,
+`crates/ravel-cache/src/s3fifo/ghost_window.rs`, whose tests pin them:
+
+- W1, the hot sweep (6,954,184,212-byte cache, 43 statements, a warm call
+  and three timed calls each): the key window served q31, q32 and q33
+  0.000 on calls 2 and 3. The shipped window serves every statement 1.000
+  on calls 2 and 3. The model serves q29 1.000 under both windows, where
+  the sweep measured it fetched; the model's statement order and column
+  sizes are an approximation of the sweep's.
+- W2, decision 6 at the server geometry ADR-2677's deferral cites (an
+  11.5 GB cache, a 33 MB hot set of 16 KiB ranges read once per thousand
+  25 MB scan reads), against scans of 300, 440 and 600 looping objects and
+  of unique objects, with the hot set read before the scan or first read
+  during it: the hot set's hit rate equals the key window's in all eight
+  cases (0.1413 against the 600-object loop with the hot set established).
+  The scan's own rate is equal in seven and one re-read lower of 14,400 in
+  the eighth. Against a repeated scan of 92, 115 or 161 looping objects
+  (0.20, 0.25 and 0.35 of the cache), both sizings serve the hot set and
+  the scan's re-reads 1.000 in all six cases, but those cases cannot tell
+  ghost sizings apart: the loop and the hot set fit in the cache, nothing
+  is evicted, and an unbounded ghost serves the same 1.000.
+- W2b, the regime this amendment creates (the same 11.5 GB cache and hot
+  set, against a repeated scan of 0.25 or 0.35 of the cache in 1.3 MB
+  entries, entries small enough that the key window was the narrower
+  bound, with one-off cold reads keeping the cache full: 79,190 to
+  120,794 evictions per run): the repeated scan now reaches main, and
+  its re-reads are served 0.9118 where the key window served them 0.0000.
+  The hot set's hit rate is never below the key window's. It is 1.0000
+  under both windows when the hot set was read before the traffic, and
+  0.0000 under both when it was first read after a 25 GB interval, which
+  outlasts probation and the byte window alike; only a much wider ghost
+  serves that case: 0.7641 under a ghost as wide as the cache or wider, and
+  under a byte window of main's quota (0.9 of the cache) against the 0.35
+  loop only (0.0000 against the 0.25 loop).
+- W3, a loop of 0.5 to 3 times the cache in 1.3 MB or 25 MB entries, read
+  five times, then a second such loop: no pass is served less than under
+  the key window, and a first loop of 1.05 times the cache in 1.3 MB
+  entries is served 0.857 on its third pass and 0.810 after, where it was
+  served nothing.
+
+The candidates that were not chosen, from the same simulation's
+`ghost_window_report` (`cargo test -p ravel-cache --release --
+--ignored --nocapture ghost_window_report`):
+
+| Ghost window | W1 calls 2-3 short | W2 against the 600-object loop, hot set established (key window: hot 0.1413, scan 0.645) | W3 against the key window |
+|---|---|---|---|
+| 10% of `max_bytes` in bytes alone | q32, q33 | hot 1.0000, scan 0.000 | equal or better |
+| 20% in bytes alone | q32 | hot 1.0000, scan 0.000 | equal or better |
+| 25% in bytes alone | none | hot 1.0000, scan 0.000 | 1.3-times loop of 25 MB entries 0.695 to 0.000 on its third pass |
+| 30% in bytes alone | none | hot 1.0000, scan 0.000 | equal or better |
+| 50%, 90% or 100% in bytes, or unbounded | none | hot 0.1210, scan 0.545 | equal or better |
+
+A byte window alone narrows the window for entries above 30% of
+`max_entry_bytes` (about 20 MB at a 64 MiB cap), and at the server
+geometry that stops promoting a cold loop of 25 MB objects just over the
+cache, which keeps a hot set established before the scan (hot rate 1.0)
+and serves the loop nothing. That trade is the one ADR-2677's deferral
+left open, so the shipped window keeps the key window and changes neither
+case. A byte window of 50% or more promotes more of that loop than the key
+window does and lowers the hot set's rate to 0.1210; at 30% it stays under
+the roughly 37% of the cache the key window spans in 25 MB objects, and
+changes neither figure. 25% would leave q32 about 160 MB of margin; 30%
+leaves about 510 MB.

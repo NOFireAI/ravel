@@ -580,6 +580,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         for p in prune {
             flatten(p, &mut prune_arms);
         }
+        let reads = FilterSectionReads::for_scan([content], prune);
 
         // Coarse ts range: intersect every TsRange arm.
         let mut ts_min = i64::MIN;
@@ -633,7 +634,9 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         // field is unindexed or capped returns `Ok(None)` and is skipped
         // (falls through to bloom + exact scan); a corrupt section or entry
         // degrades the same way and sets `postings_degraded`.
-        if let Some(desc) = &self.postings {
+        if reads.postings
+            && let Some(desc) = &self.postings
+        {
             // Both the exact `content` Equals arms and the prune-only arms drive
             // postings pruning; an unindexed or capped field on either falls
             // through to bloom + exact scan via the `Ok(None)` path below.
@@ -698,12 +701,12 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         }
         stats.blocks_after_postings = candidates.len() as u32;
 
-        // Bloom pruning. BLOOM is read only when an arm has a shape
+        // Bloom pruning. BLOOM is read only when a content arm has a shape
         // `bloom_arms` can map to it; whether the section covers that arm's
         // column is known only after the parse. A parse failure, including a
         // covered-column list that fails its crc or its validation, degrades
         // to no bloom pruning.
-        let bloom_bytes = if arms.iter().any(|a| bloom_shaped(a)) {
+        let bloom_bytes = if reads.bloom {
             Some(self.section_stored(&self.bloom)?)
         } else {
             None
@@ -1126,6 +1129,77 @@ fn source_extent<'s, S: ByteSource + ?Sized>(
         return Err(LogSegError::Corrupted(format!("{what} out of bounds")));
     }
     source.read(offset, len)
+}
+
+/// The filter sections [`RlogReader::scan_blocks`] may read for one
+/// `(content, prune)` pair, so a ranged fetch places exactly these and the
+/// scan never reads a section the fetch left out.
+///
+/// BLOOM is read when a `content` arm is [`bloom_shaped`]; a `prune` arm
+/// never reads it. POSTINGS is read when a `content` or `prune` arm is an
+/// `Equals` on an attribute, the shape [`RlogReader::postings_arms`] and
+/// [`RlogReader::prune_postings_arms`] probe. Both are upper bounds, so a
+/// `true` here can place a section the scan then prunes nothing with: a BLOOM
+/// arm is dropped when its field resolves to no column the section covers.
+/// A POSTINGS arm prunes nothing when its attribute resolves to no dynamic
+/// column, when the object holds no POSTINGS section, when that section is
+/// the v1 layout (on which the scan declines equality pruning), when the
+/// section holds no entry for the column (an unindexed or capped field), when
+/// a `prune` arm's `Str` literal names an attribute that also has a non-`Str`
+/// column, or when the section or its term block is corrupt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilterSectionReads {
+    pub bloom: bool,
+    pub postings: bool,
+}
+
+impl FilterSectionReads {
+    /// What a scan of `content` (each predicate And-flattened, as
+    /// `scan_blocks` flattens its `content`) with prune channel `prune` reads.
+    pub fn for_scan<'p>(
+        content: impl IntoIterator<Item = &'p Predicate>,
+        prune: impl IntoIterator<Item = &'p Predicate>,
+    ) -> Self {
+        let mut reads = Self::default();
+        for p in content {
+            reads.add(p, true);
+        }
+        for p in prune {
+            reads.add(p, false);
+        }
+        reads
+    }
+
+    fn add(&mut self, arm: &Predicate, content: bool) {
+        match arm {
+            Predicate::And(arms) => {
+                for a in arms {
+                    self.add(a, content);
+                }
+            }
+            Predicate::HasWord { .. } | Predicate::Equals { .. } => {
+                self.bloom |= content && bloom_shaped(arm);
+                self.postings |= postings_shaped(arm);
+            }
+            Predicate::TsRange { .. }
+            | Predicate::StreamIn(_)
+            | Predicate::Contains { .. }
+            | Predicate::NumRange { .. }
+            | Predicate::NumNotEq { .. } => {}
+        }
+    }
+}
+
+/// Whether `arm` has the shape [`RlogReader::postings_arms`] and
+/// [`RlogReader::prune_postings_arms`] probe: `Equals` on an attribute.
+fn postings_shaped(arm: &Predicate) -> bool {
+    matches!(
+        arm,
+        Predicate::Equals {
+            field: FieldSel::Attr(_),
+            ..
+        }
+    )
 }
 
 /// Whether `arm` has a shape [`RlogReader::bloom_arms`] can map to BLOOM:
@@ -3835,6 +3909,132 @@ mod tests {
         let mut a = [0u8; 16];
         a[0] = n;
         LogStreamId(a)
+    }
+
+    /// Every `Predicate` variant, alone in each channel, against the sections
+    /// `scan_blocks` reads for it, then combined arms.
+    #[test]
+    fn filter_section_reads_per_variant_and_channel() {
+        let none = FilterSectionReads::default();
+        let bloom = FilterSectionReads {
+            bloom: true,
+            postings: false,
+        };
+        let postings = FilterSectionReads {
+            bloom: false,
+            postings: true,
+        };
+        let both = FilterSectionReads {
+            bloom: true,
+            postings: true,
+        };
+        let attr = |n: &str| FieldSel::Attr(n.to_string());
+        let has_word = Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "w".into(),
+        };
+        let short_str = Predicate::Equals {
+            field: attr("k"),
+            value: AttrValue::Str("x".repeat(64)),
+        };
+        let long_str = Predicate::Equals {
+            field: attr("k"),
+            value: AttrValue::Str("x".repeat(65)),
+        };
+        let i64_eq = Predicate::Equals {
+            field: attr("k"),
+            value: AttrValue::I64(1),
+        };
+        let body_eq = Predicate::Equals {
+            field: FieldSel::Body,
+            value: AttrValue::Str("x".into()),
+        };
+        let contains = Predicate::Contains {
+            key: "k".into(),
+            needle: "x".into(),
+            negated: false,
+        };
+        let not_contains = Predicate::Contains {
+            key: "k".into(),
+            needle: "x".into(),
+            negated: true,
+        };
+        let cases: Vec<(&str, Predicate, FilterSectionReads, FilterSectionReads)> = vec![
+            // (name, arm, as content, as prune)
+            ("And(empty)", Predicate::And(Vec::new()), none, none),
+            (
+                "TsRange",
+                Predicate::TsRange {
+                    min_ns: 0,
+                    max_ns: 1,
+                },
+                none,
+                none,
+            ),
+            ("StreamIn", Predicate::StreamIn(vec![sid(1)]), none, none),
+            ("HasWord", has_word.clone(), bloom, none),
+            ("Equals short Str attr", short_str.clone(), both, postings),
+            ("Equals long Str attr", long_str, postings, postings),
+            ("Equals I64 attr", i64_eq, postings, postings),
+            ("Equals short Str body", body_eq, bloom, none),
+            ("Contains", contains.clone(), none, none),
+            ("NOT Contains", not_contains, none, none),
+            (
+                "NumRange",
+                Predicate::NumRange {
+                    field: attr("n"),
+                    ty: FieldType::I64,
+                    min: Some(0),
+                    max: None,
+                },
+                none,
+                none,
+            ),
+            (
+                "NumNotEq",
+                Predicate::NumNotEq {
+                    field: attr("n"),
+                    value: 0,
+                },
+                none,
+                none,
+            ),
+            (
+                "And(Contains, HasWord)",
+                Predicate::And(vec![contains.clone(), has_word.clone()]),
+                bloom,
+                none,
+            ),
+            (
+                "And(And(Contains), short Str attr)",
+                Predicate::And(vec![Predicate::And(vec![contains.clone()]), short_str]),
+                both,
+                postings,
+            ),
+        ];
+        for (name, arm, content, prune) in cases {
+            assert_eq!(
+                FilterSectionReads::for_scan([&arm], []),
+                content,
+                "{name} as content"
+            );
+            assert_eq!(
+                FilterSectionReads::for_scan([], [&arm]),
+                prune,
+                "{name} as prune"
+            );
+        }
+        // Arms from both channels union.
+        assert_eq!(
+            FilterSectionReads::for_scan(
+                [&contains, &has_word],
+                [&Predicate::Equals {
+                    field: attr("k"),
+                    value: AttrValue::Bool(true),
+                }]
+            ),
+            both
+        );
     }
 
     fn rec(stream: u8, ts: i64, body: &str) -> LogRecord {

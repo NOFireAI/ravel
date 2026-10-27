@@ -824,13 +824,15 @@ impl Catalog {
         // eligible load re-fetches the stats object with no reuse.
         let column_stats_cache = (config.column_stats_cache_max_bytes != 0)
             .then(|| ColumnStatsCache::new(config.column_stats_cache_max_bytes));
+        let decoded = DecodedCaches::default();
+        decoded.set_max_bytes(config.decoded_cache_max_bytes);
         Ok(Catalog {
             store,
             config,
             cache: RecordCache::default(),
             compaction_cache: CompactionRecordCache::default(),
             head_cache: HeadCache::default(),
-            decoded: Arc::new(DecodedCaches::default()),
+            decoded: Arc::new(decoded),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
             #[cfg(test)]
@@ -888,6 +890,19 @@ impl Catalog {
     #[must_use]
     pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
         self.memory_budget = budget;
+        self
+    }
+
+    /// Bound the reservation bytes the decoded snapshot-part and name-postings
+    /// caches hold together, across every tenant, to `max`
+    /// ([`CatalogConfig::decoded_cache_max_bytes`]). For a caller that derives
+    /// the bound from the budget it passes to [`Catalog::with_memory_budget`].
+    /// Applied from the next insert on: entries already cached are not evicted
+    /// until then.
+    #[must_use]
+    pub fn with_decoded_cache_max_bytes(mut self, max: u64) -> Self {
+        self.config.decoded_cache_max_bytes = Some(max);
+        self.decoded.set_max_bytes(Some(max));
         self
     }
 
@@ -989,6 +1004,23 @@ impl Catalog {
     /// reservation, cumulative (ADR-1702 decision 6).
     pub fn decoded_cache_memory_evictions(&self) -> u64 {
         self.decoded.memory_evictions()
+    }
+
+    /// Decoded-output cache entries dropped by the byte bound
+    /// ([`CatalogConfig::decoded_cache_max_bytes`]), cumulative. Not counted in
+    /// [`Catalog::decoded_cache_memory_evictions`]. A value not cached because
+    /// its own reservation exceeds the bound counts nothing here: nothing was
+    /// evicted for it ([`Catalog::decoded_cache_byte_bound_refusals`]).
+    pub fn decoded_cache_byte_bound_evictions(&self) -> u64 {
+        self.decoded.byte_bound_evictions()
+    }
+
+    /// Decoded parts and postings objects not cached because their own
+    /// reservation exceeds the byte bound
+    /// ([`CatalogConfig::decoded_cache_max_bytes`]), cumulative. Each one is
+    /// decoded again by the next resolve that needs it.
+    pub fn decoded_cache_byte_bound_refusals(&self) -> u64 {
+        self.decoded.byte_bound_refusals()
     }
 
     /// Decode reservations retried after such an eviction pass, cumulative.
@@ -1633,6 +1665,12 @@ impl Catalog {
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
     pub(crate) fn part_cache(&self) -> &PartCache {
         self.decoded.parts()
+    }
+
+    /// `pub(crate)`: the insert path for both decoded-output caches, which
+    /// applies the byte bound.
+    pub(crate) fn decoded_caches(&self) -> &DecodedCaches {
+        &self.decoded
     }
 
     /// Resolve exact per-segment column statistics for `(tenant, signal)`
@@ -13107,6 +13145,102 @@ mod tests {
         );
         drop(starting);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #3244: under a byte bound smaller than the one decoded part, a
+    /// resolve still succeeds, the part is not cached, and once the resolve's
+    /// result drops the budget is back at its figure from before the resolve,
+    /// with the catalog still alive. A second resolve finds nothing cached
+    /// and succeeds the same way.
+    ///
+    /// FLIP: (d) drop the oversize early return in
+    /// `DecodedCaches::insert_bounded` (cache.rs); the part is still evicted
+    /// by the loop, but `decoded_cache_byte_bound_evictions()` reads 1, not 0.
+    #[tokio::test]
+    async fn a_part_larger_than_the_byte_bound_resolves_uncached() {
+        let (store, range, now_ns, declared) = folded_one_part_fixture().await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let starting = budget.reserve(7).expect("the starting figure fits");
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone())
+            .with_decoded_cache_max_bytes(declared - 1);
+        assert_eq!(catalog.config().decoded_cache_max_bytes, Some(declared - 1));
+
+        let snapshot = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("resolve under the byte bound");
+        assert_eq!(snapshot.segments.len(), 1, "the folded segment is served");
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(catalog.decoded_part_cache_reserved_bytes(), 0);
+        drop(snapshot);
+        assert_eq!(budget.reserved(), 7);
+
+        assert_eq!(catalog.decoded_cache_byte_bound_evictions(), 0);
+        assert_eq!(catalog.decoded_cache_byte_bound_refusals(), 1);
+        let again = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("second resolve");
+        assert_eq!(again.segments.len(), 1);
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        drop(again);
+        assert_eq!(budget.reserved(), 7);
+        assert_eq!(catalog.decoded_cache_byte_bound_evictions(), 0);
+        assert_eq!(
+            catalog.decoded_cache_byte_bound_refusals(),
+            2,
+            "the part was refused again on the second resolve"
+        );
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        drop(starting);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #3244: the bound set through [`CatalogConfig`] evicts at resolve.
+    /// Under a bound of exactly one decoded part, the pruned resolve caches
+    /// the part and then the postings object, which evicts the part.
+    ///
+    /// FLIP: drop the `set_max_bytes` call in [`Catalog::new`] and nothing is
+    /// evicted, so `decoded_part_cache_reserved_bytes()` reads `part_len`.
+    #[tokio::test]
+    async fn the_configured_byte_bound_evicts_at_resolve() {
+        let (store, range, now_ns, part_len) = folded_one_part_fixture().await;
+        let postings_len = install_fixture_postings(&store).await;
+        assert!(
+            postings_len <= part_len,
+            "the postings object fits the bound"
+        );
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                decoded_cache_max_bytes: Some(part_len),
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        let snapshot = catalog
+            .resolve_pruned(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now_ns,
+                Some("any_metric"),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(
+            (
+                catalog.decoded_part_cache_reserved_bytes(),
+                catalog.decoded_postings_cache_reserved_bytes()
+            ),
+            (0, postings_len)
+        );
+        assert_eq!(catalog.decoded_cache_byte_bound_evictions(), 1);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
     }
 
     /// Adds a postings object bound to [`folded_one_part_fixture`]'s one part
