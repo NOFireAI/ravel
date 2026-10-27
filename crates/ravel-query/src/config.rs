@@ -723,6 +723,14 @@ pub enum EngineConfigError {
     /// `--promql-fetch-fanout`).
     #[error("promql_fetch_fanout must be at least 1")]
     ZeroPromqlFetchFanout,
+    /// [`EngineConfig::max_series`] was zero (ravel-server's `--max-series`):
+    /// every query matching a series would be refused.
+    #[error("max_series must be at least 1")]
+    ZeroMaxSeries,
+    /// [`EngineConfig::max_samples`] was zero (ravel-server's
+    /// `--max-samples`): every query matching a sample would be refused.
+    #[error("max_samples must be at least 1")]
+    ZeroMaxSamples,
 }
 
 /// [`crate::QueryEngine`] resource limits and concurrency. Every limit is
@@ -900,6 +908,12 @@ impl EngineConfig {
         }
         if self.promql_fetch_fanout() == 0 {
             return Err(EngineConfigError::ZeroPromqlFetchFanout);
+        }
+        if self.max_series == 0 {
+            return Err(EngineConfigError::ZeroMaxSeries);
+        }
+        if self.max_samples == 0 {
+            return Err(EngineConfigError::ZeroMaxSamples);
         }
         Ok(())
     }
@@ -1587,6 +1601,34 @@ mod tests {
             cfg.validate(),
             Err(EngineConfigError::ZeroPromqlFetchFanout)
         );
+    }
+
+    #[test]
+    fn zero_max_series_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            max_series: 0,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroMaxSeries));
+        let one = EngineConfig {
+            max_series: 1,
+            ..EngineConfig::default()
+        };
+        assert_eq!(one.validate(), Ok(()));
+    }
+
+    #[test]
+    fn zero_max_samples_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            max_samples: 0,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroMaxSamples));
+        let one = EngineConfig {
+            max_samples: 1,
+            ..EngineConfig::default()
+        };
+        assert_eq!(one.validate(), Ok(()));
     }
 
     /// ADR-1195: no default moves. With all three knobs unset, every

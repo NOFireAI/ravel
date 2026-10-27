@@ -1763,6 +1763,8 @@ fn executor_engine_config(settings: &ExecutorSettings) -> Result<EngineConfig, E
             EngineConfigError::ZeroFetchConcurrency => "--fetch-concurrency",
             EngineConfigError::ZeroFetchBound => "logs_max_fetch_run_bytes",
             EngineConfigError::ZeroPromqlFetchFanout => "promql_fetch_fanout",
+            EngineConfigError::ZeroMaxSeries => "max_series",
+            EngineConfigError::ZeroMaxSamples => "max_samples",
         };
         Error::from(ExecutorConfigError { flag, source })
     })?;
