@@ -79,9 +79,12 @@ services:
       # (predicted; a falsification run is pre-registered on #2821). The
       # largest peak in the corpus is a range query's output matrix:
       # mb_full_range_avg_over_time on cardinality returns 400,000 series x
-      # 121 grid points = 48,400,000 points, inside 2% of the default. The
-      # bound is set so no corpus statement is refused on this count; the 4g
-      # envelope is the memory bound.
+      # 121 grid points = 48,400,000 points, 3.2% under the default. The
+      # raised value covers the case where the falsification run refutes the
+      # per-series model and the flag counts samples read instead: the same
+      # statement then reads 400,000 x 240 = 96,000,000, above the default.
+      # The bound is set so no corpus statement is refused on this count; the
+      # 4g envelope is the memory bound.
       - "--query.max-samples=500000000"
       # Query timeout: equals the 3.13.1 default 2m, written so the effective
       # config capture shows it and a default change cannot move it silently.
@@ -154,7 +157,8 @@ services:
       # capture shows it. Unlike Prometheus' flag, this counts every raw
       # sample the query reads across all its series. The largest in the
       # corpus is mb_full_range_avg_over_time on cardinality: 400,000 series x
-      # 240 samples (a 30m window over a 30m grid at 15s) = 96,000,000.
+      # 240 samples (the 30m grid plus the 30m window, 1h at 15s) =
+      # 96,000,000.
       - "-search.maxSamplesPerQuery=1000000000"
       # Query duration: replaces the default 30s with 120s, equal to the
       # Prometheus comparator's --query.timeout, so a history statement the
