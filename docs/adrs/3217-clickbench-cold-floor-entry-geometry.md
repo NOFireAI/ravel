@@ -1049,11 +1049,9 @@ longer holds. The ack deadline is `max(60 s, delay + 60 s + target /
 in `services/ravel-cli/src/load/mod.rs`, #3273). The divisor is a
 conservative single-core encode rate derived from #3273's 928k-row flush,
 which started its PUT 59 s after its age trigger at a 7.4e9 target: about
-1.25e8 estimate bytes per second. Only a target of 1 adds nothing; a
-target at or below one batch's per-shard slice was also exempt until
-#3289, which removed the exemption because shards do not split a batch
-evenly, and which refuses a target above 360,000,000,000 (one hour of
-encode allowance). `ravel-cli load --ack-margin
+1.25e8 estimate bytes per second. A target at or below
+one batch's per-shard slice adds nothing (retired, see the ack deadline
+bound amendment below). `ravel-cli load --ack-margin
 <SECONDS>` replaces the whole margin, encode allowance included (#3273).
 At the large tier (7,400,000,000, 90 s) the deadline is 224 s instead of
 150 s; at the 15 GB tier (3,700,000,000, 60 s) 157 s instead of 120 s; at
@@ -1077,3 +1075,21 @@ stated: the cold sum fell 34.5 s, arm B 308.4 s against arm A 342.9 s
 (#3217 comment 6407026515), while q02, q08 and q15 each gained one region
 per object (#3217 comment 6407026515). The `--chunk-order` list is tuned
 under #3283.
+
+## Amendment (2026-10-27): the ack deadline bound, no slice exemption and a one-hour target cap
+
+<!-- amendment-applies: sections="Amendment (2026-10-26): decision 6 mechanism, the depth flush and the ack deadline" pointer="ack deadline bound amendment" -->
+
+Issue #3289 changed two parts of the ack deadline that the decision 6
+mechanism amendment describes.
+
+- The encode allowance no longer exempts a target at or below one
+  batch's estimated per-shard slice. The exemption assumed batches split
+  evenly across shards. They do not (#3273), so a shard's buffer under
+  such a target can still fill across batches and be released by the age
+  trigger near the target's size. Only a target of 1
+  (`PER_BATCH_TARGET_BYTES`) adds nothing now.
+- The target is bounded at 360,000,000,000 bytes (`MAX_TARGET_BYTES`),
+  one hour of encode allowance at 100,000,000 bytes per second. A
+  `--target-bytes` above it is refused for logs, metrics and spans loads,
+  and a target the loader derives with the flag unset is clamped to it.
