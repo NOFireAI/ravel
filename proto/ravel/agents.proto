@@ -139,11 +139,8 @@ message InboxEntry {
   ObjectRef payload = 8;  // absent for an empty payload
   int64 accepted_unix_ns = 9;
   uint32 failed_attempts = 10;
-  // Set by Cancel while a turn runs this input. A FailTurn on that turn, or a
-  // BeginTurn reaching this entry, consumes the input as cancelled.
-  bool cancel_requested = 11;
   // The turn that last failed retryably on this input; empty until one has.
-  bytes last_failed_turn_id = 12;  // 16 bytes when set
+  bytes last_failed_turn_id = 11;  // 16 bytes when set
 }
 
 message Receipt {
