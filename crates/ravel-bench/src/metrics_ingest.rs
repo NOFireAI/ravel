@@ -2988,6 +2988,9 @@ pub const COMMIT_TOKEN_HEADER: &str = "x-ravel-commit-token";
 pub struct ReadbackPlan {
     receiver: Receiver,
     series: HashMap<[u8; 32], SeriesTally>,
+    /// Every metric name sent, so the cardinality read-back counts only
+    /// series this replay could have written.
+    metrics: BTreeSet<String>,
     histogram_metrics: BTreeSet<String>,
     probes: BTreeMap<PayloadClass, Probe>,
     /// The stale marker probe's timestamp and its series' newest float
@@ -3031,6 +3034,7 @@ impl ReadbackPlan {
         ReadbackPlan {
             receiver,
             series: HashMap::new(),
+            metrics: BTreeSet::new(),
             histogram_metrics: BTreeSet::new(),
             probes: BTreeMap::new(),
             stale_probe: None,
@@ -3051,6 +3055,9 @@ impl ReadbackPlan {
         let ts_ms = point.ts_ms();
         self.min_ts_ms = Some(self.min_ts_ms.map_or(ts_ms, |m| m.min(ts_ms)));
         self.max_ts_ms = Some(self.max_ts_ms.map_or(ts_ms, |m| m.max(ts_ms)));
+        if !self.metrics.contains(metric.as_str()) {
+            self.metrics.insert(metric.clone());
+        }
         let tally = self.series.entry(key).or_default();
         let prior_scalar = tally.last_scalar_ts_ms;
         tally.classes |= class_bit(class);
@@ -3729,7 +3736,13 @@ pub async fn readback_over_http(
     let range_ms = max_ts - min_ts + 1;
 
     let series_count = reader
-        .series_count("{__name__=~\".+\"}", &window)
+        .series_count(
+            &format!(
+                "{{__name__=~\"{}\"}}",
+                promql_escape(&exact_alternation(&plan.metrics))
+            ),
+            &window,
+        )
         .await
         .map_err(fail)?;
     let mut sample_count = 0u64;
@@ -6643,7 +6656,9 @@ mod tests {
                                 .find(|(k, _)| k == "match[]")
                                 .map(|(_, v)| v)
                                 .unwrap_or_default();
-                            let n = if matcher.contains("mb_native") {
+                            // The histogram probe names only `mb_native`;
+                            // the cardinality read names every metric sent.
+                            let n = if matcher.contains("mb_native") && !matcher.contains('|') {
                                 1
                             } else {
                                 3 + extra_series
@@ -6761,6 +6776,25 @@ mod tests {
             for query in &seen {
                 assert_eq!(query.matches("min_commit_token=").count(), 3, "{query}");
             }
+            let matchers: Vec<String> = seen
+                .iter()
+                .flat_map(|raw| {
+                    reqwest::Url::parse(&format!("http://stub/?{raw}"))
+                        .expect("query parses")
+                        .query_pairs()
+                        .filter(|(k, _)| k == "match[]")
+                        .map(|(_, v)| v.into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                matchers,
+                vec![
+                    r#"{__name__=~"a|b|mb_native"}"#.to_string(),
+                    r#"{__name__=~"mb_native"}"#.to_string(),
+                ],
+                "the cardinality read names only the metrics sent"
+            );
         }
     }
 
@@ -6826,6 +6860,8 @@ mod tests {
         .expect("a pre-change row loads");
         assert_eq!(row.last_commit_token, None);
 
+        // `anchor_source` is the field #3298 removed: a run block written
+        // before it carries the key, and must still load.
         let run: RunRecord = serde_json::from_str(
             r#"{"steps": 5, "total_series_created": 1000, "logical_input_bytes": 4096,
                 "total_samples_generated": 5000, "scaling_label_cardinality": 1000,

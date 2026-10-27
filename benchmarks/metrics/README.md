@@ -334,7 +334,9 @@ bin refuses it as unbacked durability
 
 After each HTTP replay the bin reads the row back over the receiver's
 Prometheus query API and records `readback`: `series_count` (distinct series
-`/api/v1/series` returns over the replay window), `sample_count`
+`/api/v1/series` returns over the replay window for the metric names the
+replay sent, so a receiver's own series, such as a self-scrape, are not
+counted), `sample_count`
 (`count_over_time` over one probe series per float class, evaluated at the
 newest timestamp sent over the whole window), `histogram_series_count` (the
 native-histogram metrics' series, absent on a receiver that does not store
