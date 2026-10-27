@@ -282,12 +282,14 @@ rule's basis as `acceptance_basis`:
   (`metrics_ingest::tests::victoriametrics_acknowledges_histograms_it_cannot_store`).
 - Ravel: a 2xx is a durable acknowledgement and a 400 rejects the request;
   ravel-server answers 204 after admission or normalization drops too, so its
-  accepted set is confirmed by the read-back below.
+  accepted set is checked by the read-back below.
 
 `accepted_samples` and `accepted_histograms` count the points a row's rule
 accepted. A Remote Write 1.0 response carries no written count, so on an
-`acknowledged` row they are what the receiver acknowledged; the read-back is
-what confirms them stored.
+`acknowledged` row they are what the receiver acknowledged. The read-back
+checks them only in part: it counts series and reads one probe series per
+class, so it catches a dropped series, or a dropped point in a probe series,
+not every dropped point.
 
 `endpoint` on an HTTP row is the URL passed. The portable Ravel row writes to
 `ravel-server`'s `/api/v1/write`. With `--ravel-bearer-token-env <VAR>` it

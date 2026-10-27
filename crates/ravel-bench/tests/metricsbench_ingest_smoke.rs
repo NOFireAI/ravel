@@ -236,8 +236,8 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         .expect("generator builds for the ci profile");
     let expected_total_series_created = generator.total_series_created(STEPS);
 
-    // A now-based on-grid anchor, so the strict write lands in a plausible
-    // ingest window and the test can regenerate the same stream.
+    // A fixed on-grid anchor, so every run replays the same stream and the
+    // test can regenerate it.
     let anchor_ms = on_grid_anchor();
     let (_, gen_report) = Generator::new(&workload, "ci", anchor_ms)
         .expect("generator builds")

@@ -253,9 +253,12 @@ pub enum AcceptanceBasis {
     /// From the receiver's response alone: a 2xx, or a 400 whose body names
     /// the samples it refused.
     Acknowledged,
-    /// From the response, then confirmed by reading the data back over the
+    /// From the response, then checked by reading the data back over the
     /// receiver's query API: a Remote Write 1.0 response carries no written
-    /// count, and ravel-server answers 204 after partial-admission drops.
+    /// count, and ravel-server answers 204 after partial-admission drops. The
+    /// read-back counts series and one probe series per class, so it catches
+    /// a dropped series or a dropped point in a probe series, not every
+    /// dropped point.
     ReadBack,
 }
 
@@ -672,7 +675,8 @@ pub struct IngestPhase {
     /// every sample of the request its body does not name. A Remote Write 1.0
     /// response carries no written count, so on an `acknowledged` row a point
     /// the receiver drops after a 2xx is still counted here; the portable
-    /// Ravel row is `read_back`, and its `readback` checks the stored set.
+    /// Ravel row is `read_back`, and its `readback` checks the series count
+    /// and one probe series per class against it, not every point.
     /// Samples of a class the receiver cannot store are under
     /// `unsupported_samples` instead.
     pub accepted_samples: u64,
