@@ -37,7 +37,8 @@ The decode path for one block (all on `main` 2c0528a1b):
    `BlockScan::next_block_columnar` and `decode_block`
    (`crates/ravel-logseg/src/reader.rs:1422`, `:1470`).
 2. `decode_v4_block_with` (`reader.rs:1739`) reads the projected pages,
-   skipping pages outside the projection (`:1786-1791`). The projection
+   skipping pages outside the projection (`:1761-1764` for dictionary
+   pages, `:1796-1800` for data pages). The projection
    includes every column a pushed predicate names
    (`crates/ravel-sql/src/logs_scan/mod.rs:254-266`). Through
    `read_block_pages_with_shared_dicts` and `decode_columns`
@@ -46,7 +47,13 @@ The decode path for one block (all on `main` 2c0528a1b):
    - `I64Column { values: Arc<[i64]>, validity }` (`block.rs:1048`);
    - `StrColumn::Plain(Vec<Option<Vec<u8>>>)` or
      `StrColumn::Dict(DictColumn { Arc<DictValues>, keys: Vec<i32> })`
-     (`block.rs:785-787`, `:1858-1882`).
+     (`block.rs:785-787`, `:797-800`, `:1858-1882`);
+   - f64, bool and fixed-width columns as owned
+     `Vec<Option<u64>>`, `Vec<Option<bool>>` and `Vec<Option<Vec<u8>>>`
+     (`block.rs:1226-1230`).
+
+   Of these, only `I64Column`'s values and a dictionary's `DictValues` sit
+   behind an `Arc` today; every other form is an owned `Vec`.
 3. `block_survivors` (`reader.rs:1526`, `:2171`) evaluates the pushed
    predicate over the whole block. `build_survivor_values` (`:1535`)
    narrows a Contains-tested column to the survivors
@@ -59,7 +66,9 @@ function of the object's bytes, the block index and the column id:
 - no row selection narrows it, since no path decodes a subset of a page's
   rows;
 - late materialization's second phase decodes whole blocks and picks rows
-  by position (`logs_scan/mod.rs:2808-2860`);
+  by position (`logs_scan/mod.rs:2808-2860`). It reaches the decoder
+  through the row path (`next_block_on_gate`), not the columnar path, so
+  this ADR does not serve it from the cache;
 - the tenant's declared-column list enters only at step 4.
 
 Steps 3 and 4 depend on the statement. In the profile, step 2
@@ -148,17 +157,23 @@ to the shared budget and evicts it under pressure instead.
   column id, and a layout tag.
 - **Value:** the decoded column as `decode_columns` produces it for a
   column that no Contains arm defers:
-  - `I64Column` (`Arc<[i64]>` plus validity);
-  - a dictionary column as `Arc<DictValues>` plus `Arc<[i32]>` keys;
-  - a plain string column in decision 2's layout;
-  - f64, bool and fixed-width columns as they decode.
-- **Hits share the entry by `Arc`**, so a hit copies nothing. Steps 3 and
-  4 run on the hit exactly as on a fresh decode.
+  - `I64Column` (`Arc<[i64]>` plus validity), shareable as it is;
+  - a dictionary column as `Arc<DictValues>` plus `Arc<[i32]>` keys and an
+    `Arc`'d validity, where today's `DictColumn` holds `keys: Vec<i32>`;
+  - a plain string column in decision 2's layout, behind an `Arc`;
+  - f64, bool and fixed-width columns in `Arc`'d buffers, where today they
+    are owned `Vec`s.
+- **Hits share the entry by `Arc`**, so a hit copies nothing. Today that
+  holds only for `I64Column` and `DictValues`. Making the other forms
+  shareable is a representation change in `DecodedBlock`, delivered with
+  decision 2's layout (Delivery, step 1). Until it lands no other kind is
+  cached, because a hit that clones a column costs what the model counts
+  as free. Steps 3 and 4 run on the hit exactly as on a fresh decode.
 
 Exclusions, each a property the implementation tests:
 - **Deferred Contains columns.** A column a Contains arm defers is decoded
   with its dictionary unvalidated and then narrowed to survivors
-  (`reader.rs:1766-1780`, `:1554-1580`), so it is neither cached nor served
+  (`reader.rs:1766-1784`, `:1554-1580`), so it is neither cached nor served
   from the cache. Caching a validated copy for later Contains statements
   is a separate decision, not taken here.
 - **Narrowed values never populate an entry.** No narrowed, survivor-only
@@ -185,9 +200,20 @@ The decoder produces this layout for every plain string page, cached or
 not. This is the plain-page layout lever from #3231 (realistic ceiling
 0.960 on its own). On its own it fails the program's 0.95 rule, so it
 lands only as the first step of this lever: its own pull request with its
-own A/B, merged only once Stage 0 has passed. Consumers of `StrColumn::Plain` (the contains kernel,
-`build_str_block`, the row path) read cells through the existing
-accessor, so no consumer changes meaning.
+own A/B, merged only once Stage 0 has passed.
+
+Only one consumer reads plain cells through the `cell()` accessor
+(`crates/ravel-logseg/src/block.rs:982`). The others destructure
+`StrColumn::Plain` and use the `Vec<Option<Vec<u8>>>` payload directly:
+- the contains and equality kernels (`reader.rs:2292`, `:2320`, `:2439`,
+  `:2810`);
+- `str_dict` (`block.rs:1494`);
+- `decoded_heap_bytes` (`block.rs:1374`).
+
+The layout PR rewrites each site against offsets. `decoded_heap_bytes`
+is a memory-charge figure whose value changes with the layout, so that PR
+pins the new figure in a test, beside the existing kernel tests and the
+proptest against row-by-row `eval` that pin answers.
 
 ### 3. Admission lets a statement's later tries hit, and a one-pass scan does not displace a working set
 
@@ -220,14 +246,30 @@ anything is built (Measurement).
   buffers hold, taken best effort as the PromQL selector cache does
   (`crates/ravel-promql/src/selector_cache.rs:537`). The cache is not a
   separate carve.
+- **A hit is charged once.** Today the scan charges the whole decoded
+  block to its resident reservation (`crates/ravel-sql/src/logs_scan/scan.rs:663`,
+  `DecodedBlock::decoded_heap_bytes`, `crates/ravel-logseg/src/columnar.rs:435-445`;
+  the fetch side does the same at `crates/ravel-query/src/log_fetcher.rs:1347`).
+  For a column served from the cache, those bytes are excluded from that
+  figure, because the entry's reservation already covers them. A pinned
+  test asserts the scan's charge for a block with one cached column and
+  one fresh column.
+- **The reservation travels with the bytes.** It is owned by the shared
+  buffer and released when the last `Arc` drops, not when the entry leaves
+  the index. Evicting an entry a live scan still holds removes it from the
+  index but frees nothing until that scan drops it. A pressure-eviction
+  pass therefore counts toward the request only the bytes of entries it
+  holds the last reference to. Evicting a referenced entry does not
+  pretend to free memory the host still holds.
 - **Eviction under pressure:** when a reservation from any other consumer
   would be refused, the budget first asks the decoded cache to evict until
   the request fits. Both refusal causes trigger the pass: the budget's
   limit, and the host memory gate that `try_reserve` also checks
   (`crates/ravel-memory/src/lib.rs:262`). A cache that grows RSS closes the
   gate before it reaches the limit, so evicting only on the limit would
-  refuse queries while the cache still holds memory. It refuses only if evicting every entry would not make
-  room, the same rule as ADR-1702's eviction-skip amendment. This needs a
+  refuse queries while the cache still holds memory. It refuses only if
+  evicting every unreferenced entry would not make room, the same rule as
+  ADR-1702's eviction-skip amendment. This needs a
   registered-evictor hook on `MemoryBudget`, which does not exist today.
   The catalog's `DecodedCaches::evict_until_fits`
   (`crates/ravel-catalog/src/cache.rs:1173-1240`) is crate-private and is
@@ -245,9 +287,13 @@ anything is built (Measurement).
   hit. It asserts identical results and identical errors.
 - A property test asserts that a cached column equals a fresh decode, bit
   for bit, for every column kind and layout.
-- The counters `contains_cells_tested` and `str_cells_validated` keep
-  their meaning. A hit validates nothing new, so a cached column's
-  validation state is part of the entry.
+- A cached column's UTF-8 validation state is part of the entry, so a hit
+  validates nothing again. `str_cells_validated` therefore counts
+  validation work done by this statement. A hot try served from the cache
+  reports fewer cells than the cold try that filled it. The counter
+  documentation says so, and the differential test asserts results and
+  errors, not counters. `contains_cells_tested` is unaffected, because
+  Contains-tested columns are not cached.
 
 ### 6. Whether the ClickBench entry runs with the cache is an owner decision
 
@@ -280,6 +326,8 @@ Every hot figure from a run with the cache on states the cap in its stamp.
    with a full scan larger than the cap.
 2. **Measurement branch** (not for merge): an unvalidated prototype of
    decisions 1, 3 and 4 with the cap flag, over today's string layout.
+   It wraps each cached column in an `Arc` itself, so its hits copy
+   nothing, and it charges each hit once.
    Run it paired against `main` on one c6a.4xlarge, using the `cpuab`
    stage (A B B A B A A B). Cap 8 GB in one pair and 4 GB in a second.
    Report:
@@ -299,7 +347,7 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 | Simulation: try-3 hit share for statements whose set fits, chosen policy, 8 GB | at least 0.95 | under 0.80 | predicted |
 | Simulation: interactive working set retained through a scan larger than the cap, chosen policy | at least 0.90 | under 0.50 | predicted |
 | Branch at 8 GB, today's string layout: hot geomean, B/A | 0.76 to 0.88 | above 0.92 | predicted |
-| Branch at 8 GB: q04 server CPU, B/A | 0.30 to 0.50 | above 0.70 | predicted |
+| Branch at 8 GB: q04 (BulkScan) server CPU on try 3, B/A | 0.30 to 0.50 | above 0.70 | predicted |
 | Branch at 8 GB: q34 (modelled set 10.5 GB, larger than the cap) hot wall, B/A | 0.95 to 1.05 | above 1.10 | predicted |
 | Branch at 8 GB: any statement refused for memory or above 1.10 hot wall | none | any | predicted |
 | Branch at 8 GB, full entry run with the concurrent phase: QPS | at least 0.60 and at least main's on the same box minus 5% | under 0.60 | ADR-3217 standing bar (#3217 comment 6366582370) |
@@ -311,7 +359,9 @@ work, and the readout names the step that missed.
 
 ### Delivery, after Stage 0 passes
 
-1. The decision 2 layout, its own pull request and A/B.
+1. The decision 2 layout, together with the representation change that
+   puts every decoded column form behind an `Arc` (decision 1), as its own
+   pull request and A/B.
 2. The cache with the cap defaulting to 0, the hook of decision 4, the
    tests of decision 5 and the metrics.
 3. The default cap, chosen from Stage 0 and the owner's decision 6, with a
