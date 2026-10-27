@@ -796,6 +796,14 @@ fn a_cancel_requested_before_a_retryable_failure_consumes_the_input_as_cancelled
             reply: Reply::AlreadyCommitted { accept_seq: 1 }
         }
     );
+    // A terminal failure of a cancelled turn is a cancel too.
+    let mut sim = Sim::started();
+    sim.run(&cancel_cmd(sim.head(), 1));
+    assert_eq!(
+        sim.run(&fail_cmd(sim.head(), true, 3)),
+        Reply::Cancelled { accept_seq: 1 }
+    );
+    assert_eq!(sim.head().results[0].status, ResultStatus::Cancelled);
 }
 
 #[test]
@@ -924,6 +932,27 @@ fn fail_turn_is_refused_while_an_attempt_is_authorized_without_a_result() {
             Reply::TurnRetry {
                 accept_seq: 1,
                 failed_attempts: 1
+            }
+        );
+        // The retry is answered with the recorded result, not a new attempt.
+        sim.run(&begin_cmd(sim.head()));
+        assert_eq!(
+            sim.run(&commit_intent_cmd(sim.head(), "charge", policy)),
+            Reply::IntentCommitted { effect_id }
+        );
+        assert_eq!(
+            sim.step(&authorize_cmd(
+                Authority::Owner(owner_fence(sim.head())),
+                effect_id,
+                2,
+            ))
+            .expect("authorize on the retry"),
+            Transition::Unchanged {
+                reply: Reply::EffectCompleted {
+                    effect_id,
+                    result: Some(blob(b"result")),
+                    attempt: 1,
+                }
             }
         );
     }
