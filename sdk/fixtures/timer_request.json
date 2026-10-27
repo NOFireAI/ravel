@@ -1,0 +1,10 @@
+{
+  "agent": {
+    "kind": "order",
+    "key": "o-1"
+  },
+  "timer_key": "payment-reminder",
+  "due_unix_ns": 1767229200000000000,
+  "handler": "remind",
+  "payload": null
+}

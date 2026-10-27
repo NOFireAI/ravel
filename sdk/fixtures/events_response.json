@@ -1,0 +1,14 @@
+{
+  "events": [
+    {
+      "event_seq": 1,
+      "accept_seq": 1,
+      "turn_id": "d746246fc5bd6d52e210c7e1883ca81e",
+      "event_type": "order_placed",
+      "payload": {
+        "sku": "A-1"
+      }
+    }
+  ],
+  "next_cursor": "2"
+}

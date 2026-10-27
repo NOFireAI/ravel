@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root.join("ravel/sys.proto"),
         root.join("ravel/queryfrag.proto"),
         root.join("ravel/parquet_table.proto"),
+        root.join("ravel/agents.proto"),
     ];
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());

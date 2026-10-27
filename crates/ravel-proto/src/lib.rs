@@ -46,6 +46,14 @@ pub mod parquet_table {
     }
 }
 
+/// Ravel Agents records under `t/<tenant_hash>/ag/` (ADR-3331): the
+/// CAS-mutable `AgentHead` and the immutable objects it references.
+pub mod agents {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/ravel.agents.v1.rs"));
+    }
+}
+
 /// Distributed read fan-out fragment protocol (ADR-0071). Unlike every other
 /// module here, this is a TRANSIENT wire contract between query processes, not
 /// a persistent stored format: no byte defined here is ever written to object

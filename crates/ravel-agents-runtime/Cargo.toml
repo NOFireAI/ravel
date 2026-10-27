@@ -1,0 +1,10 @@
+[package]
+name = "ravel-agents-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ravel Agents coordinator: ownership epochs, turn dispatch, steps, effects, timers and the reconciliation sweep (ADR-3331)."
+
+[lints]
+workspace = true
