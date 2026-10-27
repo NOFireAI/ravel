@@ -302,8 +302,7 @@ impl Kernel {
             };
         };
         self.check_strings(head, command)?;
-        self.check_growth_headroom(head, command)?;
-        match command {
+        let outcome = match command {
             Command::Create(c) => self.create(head, c),
             Command::Enqueue(c) => self.enqueue(head, c, now_unix_ns),
             Command::Takeover(c) => self.takeover(head, c),
@@ -319,7 +318,8 @@ impl Kernel {
             Command::CommitIntent(c) => self.commit_intent(head, c),
             Command::AuthorizeAttempt(c) => self.authorize_attempt(head, c),
             Command::RecordEffectResult(c) => self.record_effect_result(head, c),
-        }
+        };
+        self.check_growth_headroom(command, outcome)
     }
 
     /// Every caller-supplied string a command carries is at most
@@ -328,6 +328,22 @@ impl Kernel {
     /// cap in the command meant to reach a terminal state.
     fn check_strings(&self, head: &Head, command: &Command) -> Result<(), AgentError> {
         let cap = self.limits.max_string_bytes;
+        if caller_strings(command).iter().any(|s| s.len() > cap) {
+            return Err(fail(
+                head,
+                ErrorKind::BudgetExceeded,
+                "a caller-supplied string exceeds the string cap",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Every caller-supplied string a command carries, in a fixed order; the
+/// precondition table lists `CallerStringsWithinCap` exactly for the commands
+/// that return a non-empty set here.
+pub(crate) fn caller_strings(command: &Command) -> Vec<&str> {
+    {
         let mut strings: Vec<&str> = Vec::new();
         match command {
             Command::Create(_) | Command::Cancel(_) | Command::Tombstone(_) => {}
@@ -384,24 +400,23 @@ impl Kernel {
             }
             Command::RecordEffectResult(_) => {}
         }
-        if strings.iter().any(|s| s.len() > cap) {
-            return Err(fail(
-                head,
-                ErrorKind::BudgetExceeded,
-                "a caller-supplied string exceeds the string cap",
-            ));
-        }
-        Ok(())
+        strings
     }
+}
 
+impl Kernel {
     /// A command that grows the root without ending a turn must leave
-    /// `Limits::terminal_headroom_bytes` free under the byte cap. Terminal
-    /// commands (`CompleteTurn`, `FailTurn`, `Cancel`, `Tombstone`) and the
-    /// commands that only move a turn along (`Takeover`, `BeginTurn`,
-    /// `CancelTimer`, `RecordEffectResult`) face only the cap itself in
-    /// `publish`, so an accepted input can always be completed, failed or
-    /// cancelled.
-    fn check_growth_headroom(&self, head: &Head, command: &Command) -> Result<(), AgentError> {
+    /// `Limits::terminal_headroom_bytes` free under the byte cap in the root
+    /// it publishes. Terminal commands (`CompleteTurn`, `FailTurn`, `Cancel`,
+    /// `Tombstone`) and the commands that only move a turn along (`Takeover`,
+    /// `BeginTurn`, `CancelTimer`, `RecordEffectResult`) face only the cap
+    /// itself in `publish`, so an accepted input can always be completed,
+    /// failed or cancelled. The check reads the published root, not the
+    /// observed one: an idempotent retry that answers `Unchanged` (a
+    /// duplicate enqueue, a step replay, an already-authorized attempt) is
+    /// never refused, so a client near the cap can still resolve what it
+    /// already published.
+    fn check_growth_headroom(&self, command: &Command, outcome: Outcome) -> Outcome {
         let grows = matches!(
             command,
             Command::Enqueue(_)
@@ -411,22 +426,25 @@ impl Kernel {
                 | Command::FireTimer(_)
                 | Command::AuthorizeAttempt(_)
         );
+        let transition = outcome?;
         if !grows {
-            return Ok(());
+            return Ok(transition);
         }
-        let used = head.encode().len();
+        let Transition::Publish { head, .. } = &transition else {
+            return Ok(transition);
+        };
         let cap = self
             .limits
             .max_head_bytes
             .saturating_sub(self.limits.terminal_headroom_bytes);
-        if used >= cap {
+        if head.encode().len() > cap {
             return Err(fail(
                 head,
                 ErrorKind::BudgetExceeded,
-                "HEAD is within the terminal headroom of its byte cap",
+                "HEAD would enter the terminal headroom of its byte cap",
             ));
         }
-        Ok(())
+        Ok(transition)
     }
 
     fn publish(
