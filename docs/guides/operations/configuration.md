@@ -1844,13 +1844,14 @@ object written before keeps its own field list, and
 
 ## Per-query budgets
 
-Six flags bound what one query can spend. Unset, each resolves at startup:
+Eight flags bound what one query can spend. Unset, each resolves at startup:
 
 | Flags | Unset, resolves from |
 |---|---|
 | `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy `--fetch-concurrency`, which sets all three) | The core count. |
 | The two SQL ceilings | Memory: shares of `MemTotal`, capped by the cgroup memory limit when the process runs in a container. |
 | `--max-segments` | No host resource. It is a fixed 1,000,000 on every host. |
+| `--max-series` and `--max-samples` | No host resource. They are a fixed 10,000 and 10,000,000 on every host. |
 
 Set, the flag value is used verbatim, with one reconciliation. The per-query
 SQL pool is clamped to an explicit per-tenant ceiling set below it, and the
@@ -1866,6 +1867,8 @@ published ClickBench run used.
 | `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. Host cores and query parallelism vs. per-partition overhead. |
 | `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
 | `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
+| `--max-series` | fixed: 10,000 (host-independent) | 10,000 | Distinct series one PromQL query may materialize. A count that bounds plan width; the bytes behind it are bounded by the memory budget. Process-wide, with no limits-file key. |
+| `--max-samples` | fixed: 10,000,000 (host-independent) | 10,000,000 | Total samples one PromQL query may materialize. Also sizes the range-query selector-cache cap (`2 x max_samples x 16` bytes). Process-wide, with no limits-file key. A distributed query's per-slice response caps do not follow it (see the Budgets section of [the query engine reference](../../query-engine.md)). |
 | `--sql-max-query-bytes` | derived: 50% of MemTotal, 256 MiB if memory is unknown | 16,106,127,360 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. The derived value equals the tenant's whole SQL share, so a lone statement may use all of it; concurrent statements still share the per-tenant ceiling. To keep the earlier split, set this flag to half of `--sql-tenant-max-bytes`, 25% of MemTotal. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
 | `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
 

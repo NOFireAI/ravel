@@ -483,8 +483,8 @@ a silent truncation:
 | Budget | Default | Error when exceeded |
 |---|---|---|
 | Segments touched | fixed: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
-| Distinct series | 10,000 | `query matched {count} series, exceeding the limit of {max}` |
-| Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
+| Distinct series | fixed: 10,000 (`--max-series`) | `query matched {count} series, exceeding the limit of {max}` |
+| Samples materialized | fixed: 10,000,000 (`--max-samples`) | `query matched {count} samples, exceeding the limit of {max}` |
 | Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--promql-fetch-fanout`, or `--store-get-concurrency` for the shared object-store GET ceiling) | (not user-visible; throughput knob only) |
 | Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
