@@ -517,7 +517,7 @@ the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Six of these budgets are process-wide server flags. None is per-tenant. An
+Eight of these budgets are process-wide server flags. None is per-tenant. An
 unset flag resolves at startup, and only some resolve **from host
 resources**:
 
@@ -527,6 +527,8 @@ resources**:
 - The two SQL ceilings follow memory: shares of `MemTotal`, capped by the
   cgroup memory limit in a container.
 - `--max-segments` is a fixed 1,000,000 on every host.
+- `--max-series` and `--max-samples` are a fixed 10,000 and 10,000,000 on
+  every host.
 
 Ravel uses a nonzero flag value verbatim, with one exception: it clamps the
 per-query SQL pool to an explicit per-tenant ceiling that is set below it. The
@@ -540,6 +542,8 @@ published ClickBench run used these settings.
 | `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
 | `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
+| `--max-series <N>` | `EngineConfig::max_series` | fixed: 10,000 (host-independent) | 10,000 |
+| `--max-samples <N>` | `EngineConfig::max_samples`, and the selector-cache cap derived from it | fixed: 10,000,000 (host-independent) | 10,000,000 |
 | `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 50% of MemTotal, the tenant's share (256 MiB if unknown) | 16,106,127,360 |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
 
