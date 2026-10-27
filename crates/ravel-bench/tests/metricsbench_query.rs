@@ -97,6 +97,8 @@ enum Answer {
     Correct,
     /// The fixed series with a different value.
     Diverge,
+    /// The fixed series two ULPs above the correct value.
+    TwoUlps,
     /// `success` with no series.
     Empty,
     /// HTTP 422, Mimir's chunk-limit refusal.
@@ -189,6 +191,7 @@ async fn answer(
     match stub.script.get(&query).copied().unwrap_or(Answer::Correct) {
         Answer::Correct => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
         Answer::Diverge => axum::Json(json!({"status": "success", "data": series("99", kind, &params)})).into_response(),
+        Answer::TwoUlps => axum::Json(json!({"status": "success", "data": series("1.5000000000000004", kind, &params)})).into_response(),
         Answer::Empty => {
             let result_type = if kind == "instant" { "vector" } else { "matrix" };
             axum::Json(json!({"status": "success", "data": {"resultType": result_type, "result": []}})).into_response()
@@ -944,4 +947,76 @@ async fn a_classify_error_voids_the_run() {
     assert!(err.contains("mb_single_gauge_instant"), "{err}");
     assert!(err.contains("the run is void"), "{err}");
     assert!(!run.out.exists());
+}
+
+/// The runner hands each entry's `tolerance_ulps` to the comparator. The
+/// checked-in `mb_full_range_avg_over_time` declares one, so Ravel answering
+/// two ULPs off the oracle classifies `ok`; the same entry with its tolerance
+/// removed classifies `incorrect`, because absent means bit-exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_tolerance_reaches_the_comparator() {
+    use ravel_bench::metrics_query::{RunOptions, bind, parse_engine_spec, run};
+
+    let corpus = ravel_bench::promql_corpus::load_corpus(
+        repo_root().join("benchmarks/metrics/metrics.corpus.json"),
+    )
+    .expect("checked-in corpus");
+    let tolerant = corpus
+        .into_iter()
+        .find(|e| e.id == "mb_full_range_avg_over_time")
+        .expect("the full-range entry");
+    assert_eq!(tolerant.tolerance_ulps, Some(1_048_576));
+    let mut exact = tolerant.clone();
+    exact.id = "mb_full_range_avg_over_time_exact".to_string();
+    exact.tolerance_ulps = None;
+
+    let (_prometheus, p) = spawn_stub(&[], None).await;
+    let (_ravel, r) = spawn_stub(&[(&tolerant.promql, Answer::TwoUlps)], Some(RAVEL_TOKEN)).await;
+    let urls = Urls {
+        prometheus: p,
+        ravel: r.clone(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec(&format!("name=ravel,url={r},bearer_env={RAVEL_TOKEN_ENV}"))
+            .expect("spec"),
+    ];
+    let binding = bind(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| Some(RAVEL_TOKEN.to_string()),
+    )
+    .expect("bind");
+    let output = run(
+        &binding,
+        &[tolerant, exact],
+        &workload,
+        RunOptions {
+            warmup_passes: 0,
+            passes: 1,
+            reps_per_pass: 1,
+            deadline: Duration::from_secs(5),
+        },
+    )
+    .await
+    .expect("run");
+    let status = |id: &str| {
+        output
+            .measurements
+            .iter()
+            .find(|m| m.engine == Some(Engine::Ravel) && m.id == id)
+            .unwrap_or_else(|| panic!("no ravel row for {id}"))
+            .status
+    };
+    assert_eq!(status("mb_full_range_avg_over_time"), ResultStatus::Ok);
+    assert_eq!(
+        status("mb_full_range_avg_over_time_exact"),
+        ResultStatus::Incorrect
+    );
 }
