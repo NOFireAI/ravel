@@ -59,7 +59,7 @@
 //! namespace under the same root.
 //!
 //! **Read-time verification is crc32c, and that is the whole of it**
-//! (decision 4, amended 2026-08-02). `CacheKey` is `(tenant_hash,
+//! (decision 4). `CacheKey` is `(tenant_hash,
 //! content_hash, offset, len)`, where `content_hash` is the blake3 of the
 //! *whole object* an entry is a byte sub-range of, and the key carries no
 //! object size -- so this crate has no way to identify the full-object case
@@ -107,7 +107,7 @@
 //! the startup scan, so an in-place upgrade closes the same exposure on a
 //! cache tree that already exists.
 //!
-//! **Eviction is S3-FIFO** (decision 6, amended 2026-08-02), the same
+//! **Eviction is S3-FIFO** (decision 6 and its 2026-10-26 amendment), the same
 //! policy and the same implementation the RAM tier uses (see [`crate::s3fifo`]):
 //! this tier instantiates `S3Fifo<()>`, since the payload itself lives on
 //! disk rather than in the eviction structure, and passes the entry size in

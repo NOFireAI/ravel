@@ -1,4 +1,4 @@
-//! S3-FIFO eviction (ADR-0046 decision 6, amended 2026-08-02): a small FIFO
+//! S3-FIFO eviction (ADR-0046 decision 6 and its 2026-10-26 amendment): a small FIFO
 //! probation queue, a main FIFO for entries that proved themselves, and a
 //! ghost queue of keys evicted from probation before they got a second
 //! chance.
