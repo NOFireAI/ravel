@@ -489,3 +489,44 @@ fn tagged_bodies_reject_an_unknown_tag() {
     let bad = json!({"outcome": "maybe", "lease": serde_json::to_value(lease()).expect("lease")});
     assert!(serde_json::from_value::<WorkerCommitRequest>(bad).is_err());
 }
+
+/// A nanosecond time past 2^53, which a JSON number would round in a
+/// JavaScript client.
+const PRECISE_UNIX_NS: i64 = 1_767_225_600_123_456_789;
+
+#[test]
+fn unix_ns_fields_are_decimal_strings() {
+    let exact = serde_json::Value::String(PRECISE_UNIX_NS.to_string());
+    let result = serde_json::to_value(ResultBody {
+        finished_unix_ns: PRECISE_UNIX_NS,
+        ..result_body()
+    })
+    .expect("serialize");
+    assert_eq!(result["finished_unix_ns"], exact);
+    let timer = serde_json::to_value(TimerRequest {
+        agent: agent(),
+        timer_key: "k".to_string(),
+        due_unix_ns: PRECISE_UNIX_NS,
+        handler: "h".to_string(),
+        payload: json!(null),
+    })
+    .expect("serialize");
+    assert_eq!(timer["due_unix_ns"], exact);
+    let change = serde_json::to_value(TimerChangeBody::Schedule {
+        timer_key: "k".to_string(),
+        due_unix_ns: PRECISE_UNIX_NS,
+        handler: "h".to_string(),
+        payload: json!(null),
+    })
+    .expect("serialize");
+    assert_eq!(change["due_unix_ns"], exact);
+    let decoded: TimerChangeBody = serde_json::from_value(change).expect("decode");
+    assert!(matches!(
+        decoded,
+        TimerChangeBody::Schedule { due_unix_ns, .. } if due_unix_ns == PRECISE_UNIX_NS
+    ));
+    // A JSON number is refused rather than read after a client rounded it.
+    let mut number = result;
+    number["finished_unix_ns"] = json!(PRECISE_UNIX_NS);
+    assert!(serde_json::from_value::<ResultBody>(number).is_err());
+}

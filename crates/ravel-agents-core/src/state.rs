@@ -278,6 +278,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uppercase_hex_is_malformed() {
+        let agent = "ab".repeat(16);
+        let id = "cd".repeat(16);
+        for (kind, agent, item) in [
+            ("effect", agent.to_uppercase(), id.clone()),
+            ("effect", agent.clone(), id.to_uppercase()),
+            ("step", agent.clone(), "Cd".repeat(16)),
+            ("op", agent.to_uppercase(), "1".to_string()),
+        ] {
+            let text = format!("v1:{kind}:{agent}:1:{item}");
+            assert_eq!(
+                Handle::decode(&raw(&text)),
+                Err(HandleError::Malformed),
+                "{text}"
+            );
+        }
+        assert!(Handle::decode(&raw(&format!("v1:effect:{agent}:1:{id}"))).is_ok());
+    }
+
     fn item() -> impl Strategy<Value = HandleItem> {
         prop_oneof![
             any::<u64>().prop_map(HandleItem::Operation),
@@ -292,6 +312,32 @@ mod tests {
         fn handles_round_trip(agent in any::<[u8; 16]>(), incarnation in any::<u64>(), item in item()) {
             let handle = Handle { agent: AgentId(agent), incarnation, item };
             prop_assert_eq!(Handle::decode(&handle.encode()), Ok(handle));
+        }
+
+        // One handle, one token: any token that decodes is the one its
+        // handle encodes to, whatever case its hex digits were written in.
+        #[test]
+        fn a_decoded_token_is_the_canonical_one(
+            agent in any::<[u8; 16]>(),
+            incarnation in any::<u64>(),
+            item in item(),
+            upper in any::<prop::sample::Index>(),
+        ) {
+            let handle = Handle { agent: AgentId(agent), incarnation, item };
+            let canonical = handle.encode();
+            let text = String::from_utf8(URL_SAFE_NO_PAD.decode(&canonical).expect("base64"))
+                .expect("utf8");
+            let at = upper.index(text.len());
+            let mut variant = text.clone();
+            variant.replace_range(at..=at, &text[at..=at].to_uppercase());
+            let token = raw(&variant);
+            match Handle::decode(&token) {
+                Ok(decoded) => {
+                    prop_assert_eq!(&decoded, &handle);
+                    prop_assert_eq!(decoded.encode(), token);
+                }
+                Err(error) => prop_assert_eq!(error, HandleError::Malformed),
+            }
         }
 
         #[test]
