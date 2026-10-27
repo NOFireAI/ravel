@@ -230,10 +230,12 @@ const WRITE_ACK_DEADLINE_MARGIN: Duration = Duration::from_secs(60);
 /// trigger, about 1.25e8 estimate bytes per second.
 pub const ENCODE_BYTES_PER_SECOND: u64 = 100_000_000;
 
-/// The largest `--target-bytes` a load accepts: the target whose
+/// The largest flush target a load runs with: the target whose
 /// [`encode_allowance`] is one hour at [`ENCODE_BYTES_PER_SECOND`],
 /// 360,000,000,000 bytes. With `--ack-margin` unset, a larger target would add
-/// more than an hour to every Strict write's ack deadline.
+/// more than an hour to every Strict write's ack deadline. A `--target-bytes`
+/// above it is refused ([`validate_target_bytes`]); a derived target above it
+/// is clamped to it ([`resolve_geometry`]).
 pub const MAX_TARGET_BYTES: u64 = ENCODE_BYTES_PER_SECOND * 3_600;
 
 /// The encode time [`write_ack_deadline`] allows a flush of `target_bytes`:
