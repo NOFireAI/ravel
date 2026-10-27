@@ -406,6 +406,11 @@ const POSTINGS_CACHE: &str =
     r#"ravel_catalog_decoded_cache_reserved_bytes{mode="query",cache="postings"}"#;
 const RETRIES: &str = "ravel_catalog_decode_reserve_retries_total";
 const EVICTIONS: &str = "ravel_catalog_decoded_cache_memory_evictions_total";
+const BOUND_EVICTIONS: &str = "ravel_catalog_decoded_cache_byte_bound_evictions_total";
+const BOUND_REFUSALS: &str = "ravel_catalog_decoded_cache_byte_bound_refusals_total";
+/// A process budget whose 1% (the server's decoded-cache byte bound) is
+/// below the fixture's part while the whole budget holds it many times over.
+const SMALL_LIMIT: u64 = 1_000_000;
 
 /// A process budget one byte smaller than the part's entry body refuses the
 /// part decode: 422 `execution` with the budget's own figures. The part is
@@ -544,6 +549,88 @@ async fn the_fetch_gauge_counts_the_catalogs_held_decodes() {
         "pinned figures: part {} bytes, postings {} bytes, probe segment {} bytes",
         folded.part_bytes, folded.postings_bytes, folded.probe_segment_bytes
     );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A finite process budget bounds the catalog's decoded caches at 1% of it.
+/// With a part larger than that bound and a postings object below it, each
+/// query answers 200, the part is decoded and not cached (one byte-bound
+/// refusal per query, its reservation released with the query), and the
+/// postings object is cached and held by the budget. Nothing is evicted.
+///
+/// FLIP: drop `.with_decoded_cache_max_bytes(..)` from the catalog build in
+/// `ravel_server::start`, or pass it `process_memory_budget.limit()` instead
+/// of the 1% figure, and the part is cached, so the `BOUND_REFUSALS`
+/// assertion after the first query fails with 0 against 1. Export the two
+/// counters' values swapped and the same assertion fails with 0 against 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_part_over_one_percent_of_the_budget_is_not_cached() {
+    let store = Arc::new(MemoryStore::new());
+    let folded = fold_fixture(&store).await;
+    let bound = SMALL_LIMIT / 100;
+    assert!(
+        folded.postings_bytes <= bound && bound < folded.part_bytes,
+        "the fixture must put the postings ({} bytes) within and the part ({} bytes) over the \
+         {bound}-byte bound",
+        folded.postings_bytes,
+        folded.part_bytes
+    );
+    assert!(
+        folded.part_bytes + folded.postings_bytes + folded.probe_segment_bytes < SMALL_LIMIT,
+        "the whole budget must hold one query's decodes and fetch"
+    );
+    let running = start_query_server(store.clone(), SMALL_LIMIT).await;
+    let budget = running.process_memory_budget();
+    assert_eq!(budget.reserved(), 0);
+
+    for query in 1..=2u64 {
+        let (status, body) = query_probe(&running, folded.query_time_s).await;
+        assert_probe_answered(status, &body);
+
+        let after = scrape(&running).await;
+        assert_eq!(
+            sample(&after, &format!(r#"{BOUND_REFUSALS}{{mode="query"}}"#)),
+            query,
+            "{after}"
+        );
+        assert_eq!(sample(&after, PART_CACHE), 0, "{after}");
+        assert_eq!(
+            sample(&after, POSTINGS_CACHE),
+            folded.postings_bytes,
+            "{after}"
+        );
+        assert_eq!(
+            sample(&after, &format!(r#"{BOUND_EVICTIONS}{{mode="query"}}"#)),
+            0,
+            "{after}"
+        );
+        assert_eq!(
+            sample(&after, &format!(r#"{EVICTIONS}{{mode="query"}}"#)),
+            0,
+            "{after}"
+        );
+        // The refused part's charge leaves with the query; only the cached
+        // postings stay reserved.
+        assert_eq!(budget.reserved(), folded.postings_bytes);
+        if query == 1 {
+            assert!(
+                help(&after, BOUND_EVICTIONS).contains("to stay within the caches' byte bound"),
+                "{after}"
+            );
+            assert!(
+                help(&after, BOUND_REFUSALS).contains("each is decoded again by the next query"),
+                "{after}"
+            );
+            for family in [BOUND_EVICTIONS, BOUND_REFUSALS] {
+                assert!(
+                    help(&after, family).contains("reads 0 where that budget is unlimited")
+                        || help(&after, family).contains("Reads 0 where that budget is unlimited"),
+                    "{after}"
+                );
+            }
+        }
+    }
 
     running.shutdown().await.expect("graceful shutdown");
 }
