@@ -34,10 +34,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use ravel_promql_difftest::comparator::ulp_distance;
 use ravel_promql_difftest::corpus::ComparisonMode;
 use ravel_promql_difftest::prometheus_client::{
     PrometheusClient, QueryOutcome, TransportErrorKind,
 };
+use serde_json::Value as Json;
 
 use crate::metrics_correctness::{
     Classified, ClassifyError, Denominators, Engine, EntryExpectation, OracleAnswer, classify,
@@ -482,7 +484,7 @@ pub struct RunOptions {
 pub const ORACLE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// One re-sent oracle query.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OracleRetry {
     pub entry: String,
     /// The timed pass, from 1.
@@ -548,6 +550,231 @@ pub struct RunOutput {
     pub denominators: Vec<EngineDenominators>,
     /// Every oracle retry the run used, in the order sent.
     pub oracle_retries: Vec<OracleRetry>,
+    /// One per (entry, engine other than the oracle), engine-major in the
+    /// binding's engine order.
+    pub ulp_gaps: Vec<UlpGap>,
+}
+
+/// The `--diagnostics` sidecar: figures a pre-registered check needs that
+/// the version-3 report does not carry. It is not part of the report and
+/// `report_schema::validate` never reads it.
+#[derive(Debug, serde::Serialize)]
+pub struct Diagnostics<'a> {
+    pub profile: &'a str,
+    pub corpus_digest: &'a str,
+    pub oracle: &'static str,
+    pub ulp_gaps: &'a [UlpGap],
+    pub oracle_retries: &'a [OracleRetry],
+}
+
+/// The largest ULP gap between one engine's answers to one entry and the
+/// oracle's, over every timed pass and repetition, for the diagnostics
+/// sidecar. Only answers classified against the oracle are measured; an
+/// entry unsupported on the engine by declaration measures none.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UlpGap {
+    pub entry: String,
+    pub engine: &'static str,
+    /// The largest [`ulp_distance`] over every finite value pair of every
+    /// aligned answer; `None` when no aligned answer had one.
+    pub max_ulps: Option<u64>,
+    /// Answers with the oracle's series set and timestamps.
+    pub aligned_answers: u64,
+    /// Answers that did not align: a refusal, an error, a timeout, or a
+    /// different result type, series set, series length or timestamp.
+    pub unaligned_answers: u64,
+    /// The value pairs compared across the aligned answers.
+    pub value_pairs: u64,
+    /// The value pairs among those where a NaN or an infinity met anything
+    /// but itself, which [`ulp_distance`] has no count for.
+    pub non_finite_mismatches: u64,
+}
+
+impl UlpGap {
+    fn new(entry: &str, engine: Engine) -> Self {
+        UlpGap {
+            entry: entry.to_string(),
+            engine: system_name(engine),
+            max_ulps: None,
+            aligned_answers: 0,
+            unaligned_answers: 0,
+            value_pairs: 0,
+            non_finite_mismatches: 0,
+        }
+    }
+
+    /// Folds in one answer: `answer` is the body of a 2xx envelope, or
+    /// `None` for any other outcome.
+    fn add(&mut self, oracle: &Json, answer: Option<&Json>) {
+        let mut pairs = ValuePairs::default();
+        if answer.is_some_and(|a| pairs.answer(oracle, a).is_some()) {
+            self.aligned_answers += 1;
+            self.value_pairs += pairs.count;
+            self.non_finite_mismatches += pairs.non_finite;
+            self.max_ulps = self.max_ulps.max(pairs.max_ulps);
+        } else {
+            self.unaligned_answers += 1;
+        }
+    }
+}
+
+/// The value pairs of one answer aligned with the oracle's. Each method
+/// returns `None` at the first point where the two shapes differ.
+#[derive(Default)]
+struct ValuePairs {
+    max_ulps: Option<u64>,
+    count: u64,
+    non_finite: u64,
+}
+
+impl ValuePairs {
+    fn answer(&mut self, oracle: &Json, other: &Json) -> Option<()> {
+        if oracle["status"].as_str() != Some("success")
+            || other["status"].as_str() != Some("success")
+        {
+            return None;
+        }
+        let kind = oracle["data"]["resultType"].as_str()?;
+        if other["data"]["resultType"].as_str() != Some(kind) {
+            return None;
+        }
+        let (o, a) = (&oracle["data"]["result"], &other["data"]["result"]);
+        match kind {
+            "scalar" => self.sample(o, a),
+            "vector" | "matrix" => {
+                let (o, a) = (series_by_labels(o)?, series_by_labels(a)?);
+                if o.len() != a.len() {
+                    return None;
+                }
+                for ((o_key, o), (a_key, a)) in o.iter().zip(&a) {
+                    if o_key != a_key {
+                        return None;
+                    }
+                    if kind == "vector" {
+                        self.element(o, a)?;
+                    } else {
+                        self.steps(&o["values"], &a["values"], Self::sample)?;
+                        self.steps(&o["histograms"], &a["histograms"], Self::histogram)?;
+                    }
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn element(&mut self, o: &Json, a: &Json) -> Option<()> {
+        match (o.get("histogram"), a.get("histogram")) {
+            (Some(o), Some(a)) => self.histogram(o, a),
+            (None, None) => self.sample(&o["value"], &a["value"]),
+            _ => None,
+        }
+    }
+
+    /// Pairs a matrix series' steps by position; an absent array is empty.
+    fn steps(
+        &mut self,
+        o: &Json,
+        a: &Json,
+        pair: fn(&mut Self, &Json, &Json) -> Option<()>,
+    ) -> Option<()> {
+        let (o, a) = (steps_of(o)?, steps_of(a)?);
+        if o.len() != a.len() {
+            return None;
+        }
+        for (o, a) in o.iter().zip(a) {
+            pair(self, o, a)?;
+        }
+        Some(())
+    }
+
+    fn sample(&mut self, o: &Json, a: &Json) -> Option<()> {
+        let (o_ts, o) = timestamped(o)?;
+        let (a_ts, a) = timestamped(a)?;
+        if o_ts != a_ts {
+            return None;
+        }
+        self.value(parse_value(o.as_str()?)?, parse_value(a.as_str()?)?);
+        Some(())
+    }
+
+    /// A native histogram's `count` and `sum`, the two floats the comparator
+    /// compares under the ULP rule; its buckets compare exactly there.
+    fn histogram(&mut self, o: &Json, a: &Json) -> Option<()> {
+        let (o_ts, o) = timestamped(o)?;
+        let (a_ts, a) = timestamped(a)?;
+        if o_ts != a_ts {
+            return None;
+        }
+        for field in ["count", "sum"] {
+            self.value(
+                parse_value(o[field].as_str()?)?,
+                parse_value(a[field].as_str()?)?,
+            );
+        }
+        Some(())
+    }
+
+    fn value(&mut self, o: f64, a: f64) {
+        self.count += 1;
+        match ulp_distance(o, a) {
+            Some(d) => self.max_ulps = self.max_ulps.max(Some(d)),
+            None => self.non_finite += 1,
+        }
+    }
+}
+
+/// A vector or matrix result keyed by its sorted label set; `None` when it
+/// is not an array of labelled elements or two elements share a label set.
+fn series_by_labels(result: &Json) -> Option<BTreeMap<Vec<(String, String)>, &Json>> {
+    let mut by_labels = BTreeMap::new();
+    for elem in result.as_array()? {
+        let mut labels: Vec<(String, String)> = elem["metric"]
+            .as_object()?
+            .iter()
+            .map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect::<Option<_>>()?;
+        labels.sort();
+        if by_labels.insert(labels, elem).is_some() {
+            return None;
+        }
+    }
+    Some(by_labels)
+}
+
+fn steps_of(steps: &Json) -> Option<&[Json]> {
+    match steps {
+        Json::Null => Some(&[]),
+        other => other.as_array().map(Vec::as_slice),
+    }
+}
+
+/// A `[timestamp, value]` pair.
+fn timestamped(pair: &Json) -> Option<(f64, &Json)> {
+    match pair.as_array()?.as_slice() {
+        [ts, value] => Some((ts.as_f64()?, value)),
+        _ => None,
+    }
+}
+
+/// A Prometheus sample value string.
+fn parse_value(s: &str) -> Option<f64> {
+    match s {
+        "NaN" => Some(f64::NAN),
+        "+Inf" => Some(f64::INFINITY),
+        "-Inf" => Some(f64::NEG_INFINITY),
+        other => other.parse().ok(),
+    }
+}
+
+/// The body of a 2xx envelope.
+fn answer_body(outcome: &QueryOutcome) -> Option<&Json> {
+    match outcome {
+        QueryOutcome::Envelope {
+            http_status, body, ..
+        } if (200..300).contains(http_status) => Some(body),
+        _ => None,
+    }
 }
 
 /// The cases a run over `entries` and `engines` must report, one per
@@ -642,6 +869,17 @@ pub async fn run(
         })
         .collect();
 
+    // ulp_gaps[engine][entry]
+    let mut ulp_gaps: Vec<Vec<UlpGap>> = binding
+        .engines
+        .iter()
+        .map(|engine| {
+            entries
+                .iter()
+                .map(|entry| UlpGap::new(&entry.id, engine.engine))
+                .collect()
+        })
+        .collect();
     let mut oracle_retries: Vec<OracleRetry> = Vec::new();
     for pass in 1..=options.passes {
         for (entry_index, entry) in entries.iter().enumerate() {
@@ -700,6 +938,12 @@ pub async fn run(
                     let classified =
                         classify(engine.engine, &outcome, oracle.as_ref(), &expectation)
                             .map_err(void)?;
+                    if engine.engine != Engine::Prometheus
+                        && let Some(oracle) = &oracle
+                    {
+                        ulp_gaps[engine_index][entry_index]
+                            .add(oracle.envelope(), answer_body(&outcome));
+                    }
                     reps.push((classified, latency_ms));
                 }
                 let latencies: Vec<f64> = reps.iter().map(|(_, ms)| *ms).collect();
@@ -758,6 +1002,13 @@ pub async fn run(
         measurements,
         denominators,
         oracle_retries,
+        ulp_gaps: binding
+            .engines
+            .iter()
+            .zip(ulp_gaps)
+            .filter(|(engine, _)| engine.engine != Engine::Prometheus)
+            .flat_map(|(_, gaps)| gaps)
+            .collect(),
     })
 }
 

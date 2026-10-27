@@ -20,9 +20,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
+use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
-    BindError, EngineSpec, RunOptions, bind, endpoints, parse_engine_spec, run,
+    BindError, Diagnostics, EngineSpec, RunOptions, bind, endpoints, parse_engine_spec, run,
+    system_name,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
@@ -81,6 +83,11 @@ struct Args {
     /// Where the report is written.
     #[arg(long)]
     out: PathBuf,
+    /// Where to write the diagnostics sidecar (each non-oracle engine's
+    /// largest ULP gap to the oracle per entry, and every oracle retry),
+    /// after the report. Not part of the report.
+    #[arg(long)]
+    diagnostics: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -183,7 +190,7 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         deadline: Duration::from_millis(args.query_timeout_ms),
         oracle_retries: args.oracle_retries,
     };
-    let output = run(&binding, &entries, &workload, options)
+    let mut output = run(&binding, &entries, &workload, options)
         .await
         .map_err(|e| (EX_DATAERR, e.to_string()))?;
 
@@ -233,10 +240,10 @@ async fn run_main(args: Args) -> Result<(), Failure> {
 
     let report = MetricsBenchReport {
         provenance,
-        measurements: output.measurements,
+        measurements: std::mem::take(&mut output.measurements),
         geomean_ms: None,
-        cases_expected: output.cases_expected,
-        denominators: output.denominators,
+        cases_expected: std::mem::take(&mut output.cases_expected),
+        denominators: std::mem::take(&mut output.denominators),
         exclusions: Vec::new(),
     };
     validate(&report).map_err(|e| {
@@ -249,5 +256,21 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         .map_err(|e| (EX_SOFTWARE, format!("cannot serialize the report: {e}")))?;
     std::fs::write(&args.out, json)
         .map_err(|e| (EX_IOERR, format!("{}: {e}", args.out.display())))?;
+    if let Some(path) = &args.diagnostics {
+        let diagnostics = Diagnostics {
+            profile: &binding.run.profile,
+            corpus_digest: &corpus_digest,
+            oracle: system_name(Engine::Prometheus),
+            ulp_gaps: &output.ulp_gaps,
+            oracle_retries: &output.oracle_retries,
+        };
+        let json = serde_json::to_vec_pretty(&diagnostics).map_err(|e| {
+            (
+                EX_SOFTWARE,
+                format!("cannot serialize the diagnostics: {e}"),
+            )
+        })?;
+        std::fs::write(path, json).map_err(|e| (EX_IOERR, format!("{}: {e}", path.display())))?;
+    }
     Ok(())
 }
