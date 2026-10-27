@@ -103,6 +103,9 @@ enum Answer {
     RefuseChunks,
     /// No answer before the runner's deadline.
     Hang,
+    /// [`Answer::Hang`] on the first `n` requests for the query, then
+    /// [`Answer::Correct`].
+    HangFirst(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -163,12 +166,21 @@ async fn answer(
         .map(|(_, v)| v.clone())
         .collect();
     let params: HashMap<String, String> = pairs.into_iter().collect();
-    stub.requests.lock().unwrap().push(Recorded {
-        path,
-        params: params.clone(),
-        min_commit_tokens,
-        authorization: authorization.clone(),
-    });
+    let query = params.get("query").cloned().unwrap_or_default();
+    let earlier = {
+        let mut requests = stub.requests.lock().unwrap();
+        let earlier = requests
+            .iter()
+            .filter(|r| r.params.get("query") == Some(&query))
+            .count();
+        requests.push(Recorded {
+            path,
+            params: params.clone(),
+            min_commit_tokens,
+            authorization: authorization.clone(),
+        });
+        earlier
+    };
     if let Some(token) = &stub.bearer
         && authorization.as_deref() != Some(format!("Bearer {token}").as_str())
     {
@@ -185,8 +197,12 @@ async fn answer(
     } else {
         "range"
     };
-    let query = params.get("query").cloned().unwrap_or_default();
-    match stub.script.get(&query).copied().unwrap_or(Answer::Correct) {
+    let scripted = match stub.script.get(&query).copied().unwrap_or(Answer::Correct) {
+        Answer::HangFirst(n) if earlier < n => Answer::Hang,
+        Answer::HangFirst(_) => Answer::Correct,
+        other => other,
+    };
+    match scripted {
         Answer::Correct => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
         Answer::Diverge => axum::Json(json!({"status": "success", "data": series("99", kind, &params)})).into_response(),
         Answer::Empty => {
@@ -202,7 +218,7 @@ async fn answer(
             })),
         )
             .into_response(),
-        Answer::Hang => {
+        Answer::Hang | Answer::HangFirst(_) => {
             tokio::time::sleep(Duration::from_secs(30)).await;
             axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response()
         }
@@ -460,6 +476,16 @@ const WARMUP: u32 = 1;
 /// Writes the fixtures and runs the bin to completion off the runtime, so
 /// the stubs keep serving while it runs.
 async fn run_bin(ingest: MetricsIngestReport, urls: &Urls) -> Run {
+    run_bin_with(ingest, urls, WARMUP, &[]).await
+}
+
+/// [`run_bin`] with `warmup` warmup passes and `extra` arguments appended.
+async fn run_bin_with(
+    ingest: MetricsIngestReport,
+    urls: &Urls,
+    warmup: u32,
+    extra: &[&str],
+) -> Run {
     let dir = tempfile::tempdir().expect("tempdir");
     let corpus_bytes = serde_json::to_vec_pretty(&corpus()).expect("corpus");
     let corpus_path = dir.path().join("corpus.json");
@@ -498,10 +524,11 @@ async fn run_bin(ingest: MetricsIngestReport, urls: &Urls) -> Run {
         .arg(format!("name=victoriametrics,url={}", urls.victoriametrics))
         .arg("--engine")
         .arg(format!("name=mimir,url={}", urls.mimir))
-        .args(["--warmup-passes", &WARMUP.to_string()])
+        .args(["--warmup-passes", &warmup.to_string()])
         .args(["--passes", &PASSES.to_string()])
         .args(["--reps-per-pass", &REPS.to_string()])
         .args(["--query-timeout-ms", "1000"])
+        .args(extra)
         .arg("--out")
         .arg(&out)
         .env(RAVEL_TOKEN_ENV, RAVEL_TOKEN);
@@ -944,4 +971,110 @@ async fn a_classify_error_voids_the_run() {
     assert!(err.contains("mb_single_gauge_instant"), "{err}");
     assert!(err.contains("the run is void"), "{err}");
     assert!(!run.out.exists());
+}
+
+fn config<'a>(report: &'a MetricsBenchReport, key: &str) -> Option<&'a str> {
+    report
+        .provenance
+        .config
+        .iter()
+        .find(|c| c.key == key)
+        .map(|c| c.value.as_str())
+}
+
+/// An oracle query that times out once is re-sent, and the run completes:
+/// the other engines are classified against the retried answer, the
+/// provenance config records one retry on the entry, and Prometheus' own row
+/// keeps the first attempt's timeout. Fails against a runner that does not
+/// retry (the run is void) and against one that records the retried
+/// attempt on Prometheus' row (every pass would be `ok`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::HangFirst(1))], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin_with(ingest_report(&s.urls), &s.urls, 0, &[]).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+
+    assert_eq!(config(&report, "oracle_retries"), Some("2"));
+    assert_eq!(config(&report, "oracle_retries_used"), Some("1"));
+    assert_eq!(
+        config(&report, "oracle_retry_entries"),
+        Some("mb_single_gauge_instant")
+    );
+    assert!(
+        err.contains(
+            "oracle retry: entry `mb_single_gauge_instant`, pass 1, repetition 1, attempt 2 of 3"
+        ),
+        "{err}"
+    );
+    // One request per repetition, plus the one retry.
+    assert_eq!(
+        s.prometheus.count("/api/v1/query", GAUGE),
+        (PASSES * REPS) as usize + 1
+    );
+
+    let p = row(&report, Engine::Prometheus, "mb_single_gauge_instant");
+    assert_eq!(p.pass_statuses[0], ResultStatus::Timeout);
+    assert!(
+        p.pass_statuses[1..].iter().all(|s| *s == ResultStatus::Ok),
+        "{:?}",
+        p.pass_statuses
+    );
+    assert_ne!(p.status, ResultStatus::Ok);
+    for (engine, status) in [
+        (Engine::Ravel, ResultStatus::Ok),
+        (Engine::VictoriaMetrics, ResultStatus::Incorrect),
+        (Engine::Mimir, ResultStatus::Ok),
+    ] {
+        let m = row(&report, engine, "mb_single_gauge_instant");
+        assert_eq!(m.pass_statuses, vec![status; PASSES as usize], "{engine:?}");
+    }
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
+        .arg("validate")
+        .arg(&run.out)
+        .output()
+        .expect("run metricsbench_report");
+    assert!(validated.status.success(), "{}", stderr(&validated));
+}
+
+/// An oracle that times out on every attempt the budget allows voids the
+/// run as an unretried failure does: exit 65, nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oracle_timeout_past_the_retry_budget_voids_the_run() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::HangFirst(2))], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin_with(ingest_report(&s.urls), &s.urls, 0, &["--oracle-retries", "1"]).await;
+    let err = stderr(&run.output);
+    assert_eq!(run.output.status.code(), Some(65), "{err}");
+    assert!(err.contains("the run is void"), "{err}");
+    assert!(err.contains("mb_single_gauge_instant"), "{err}");
+    assert!(err.contains("oracle timed out"), "{err}");
+    assert!(!run.out.exists());
+    assert_eq!(s.prometheus.count("/api/v1/query", GAUGE), 2);
+}
+
+/// A 4xx from the oracle is an answer, not a lost request: it is not
+/// retried and voids the run. Fails against a runner that retries every
+/// non-`ok` oracle outcome (three requests would reach the stub).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oracle_4xx_is_not_retried() {
+    let mut s = stubs().await;
+    let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::RefuseChunks)], None).await;
+    s.prometheus = prometheus;
+    s.urls.prometheus = url;
+    let run = run_bin_with(ingest_report(&s.urls), &s.urls, 0, &[]).await;
+    let err = stderr(&run.output);
+    assert_eq!(run.output.status.code(), Some(65), "{err}");
+    assert!(err.contains("oracle answered HTTP 422"), "{err}");
+    assert!(!err.contains("oracle retry"), "{err}");
+    assert!(!run.out.exists());
+    assert_eq!(s.prometheus.count("/api/v1/query", GAUGE), 1);
 }
