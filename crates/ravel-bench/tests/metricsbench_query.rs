@@ -618,6 +618,8 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
 
     // Every (engine, entry) case is expected, written from the corpus.
     assert_eq!(report.cases_expected.len(), 16);
+    assert_eq!(config(&report, "oracle_retries_used"), Some("0"));
+    assert_eq!(config(&report, "oracle_retry_entries"), Some("none"));
 
     use ResultStatus::*;
     let expected: &[(Engine, &str, ResultStatus)] = &[
@@ -1051,7 +1053,13 @@ async fn an_oracle_timeout_past_the_retry_budget_voids_the_run() {
     let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::HangFirst(2))], None).await;
     s.prometheus = prometheus;
     s.urls.prometheus = url;
-    let run = run_bin_with(ingest_report(&s.urls), &s.urls, 0, &["--oracle-retries", "1"]).await;
+    let run = run_bin_with(
+        ingest_report(&s.urls),
+        &s.urls,
+        0,
+        &["--oracle-retries", "1"],
+    )
+    .await;
     let err = stderr(&run.output);
     assert_eq!(run.output.status.code(), Some(65), "{err}");
     assert!(err.contains("the run is void"), "{err}");

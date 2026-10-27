@@ -959,6 +959,50 @@ mod tests {
     }
 
     #[test]
+    fn only_lost_oracle_requests_are_retryable() {
+        use ravel_promql_difftest::prometheus_client::{QueryTiming, TimeoutPhase};
+        let timing = QueryTiming::default();
+        let transport = |kind, http_status| QueryOutcome::Transport {
+            kind,
+            http_status,
+            message: String::new(),
+            timing,
+        };
+        assert!(oracle_retryable(&QueryOutcome::Timeout {
+            phase: TimeoutPhase::Headers,
+            elapsed: Duration::from_secs(1),
+            timing,
+        }));
+        assert!(oracle_retryable(&transport(
+            TransportErrorKind::Connect,
+            None
+        )));
+        assert!(oracle_retryable(&transport(
+            TransportErrorKind::Request,
+            None
+        )));
+        assert!(oracle_retryable(&transport(
+            TransportErrorKind::Body,
+            Some(200)
+        )));
+        assert!(!oracle_retryable(&transport(
+            TransportErrorKind::Decode,
+            Some(502)
+        )));
+        assert!(!oracle_retryable(&QueryOutcome::BodyTooLarge {
+            limit: 1,
+            timing,
+        }));
+        for http_status in [200, 422, 503] {
+            assert!(!oracle_retryable(&QueryOutcome::Envelope {
+                http_status,
+                body: serde_json::json!({"status": "error"}),
+                timing,
+            }));
+        }
+    }
+
+    #[test]
     fn median_of_even_and_odd_counts() {
         assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
         assert_eq!(median(&[10.0, 12.0, 11.0, 15.0]), 11.5);
