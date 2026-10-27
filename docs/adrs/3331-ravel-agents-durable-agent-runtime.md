@@ -257,7 +257,9 @@ Two layers: a pure transition kernel in `ravel-agents-core` (used by the
 protocol, the TLA+ traceability rows and the reference-machine tests), and
 an async handler runner in each SDK built on durable steps.
 
-A step id is derived from incarnation, turn id and step key. The journal
+A step id is derived from incarnation, turn id and step key (superseded:
+see the step identity amendment below, which derives it from the accept
+sequence so a retry replays the failed attempt's steps). The journal
 records tool name, tool version, canonical input hash and, on completion,
 the result object and its hash. A completed step replays from its record;
 a step key reused with a different tool identity or input hash fails
@@ -590,3 +592,29 @@ store, and the feature disabled. Price inputs are labelled assumptions.
   denied while `Cargo.toml` forbids it; `docs/guides/getting-started.md`
   says `make demo` builds release while the script runs debug; ADR-0066
   finding 2 about the format-change skill is stale.
+
+## Amendment (2026-10-27): step and effect identity follow the input, not the attempt
+
+<!-- amendment-applies: sections="7. Durable steps and tools" pointer="step identity amendment" -->
+<!-- amendment-supersedes: phrase="A step id is derived from incarnation, turn id and step key" pointer="step identity amendment" -->
+
+The checkpoint review of the first kernel (#3334) showed that deriving
+effect identities from the turn id, which carries the failed-attempt count,
+minted a fresh effect id on every retry. A `manual` effect left in doubt by
+a retryable handler failure was then re-dispatched under the new id, and a
+`provider_idempotency` retry would have sent the provider a different key.
+
+Decision 7 now reads: a step id and an effect id are derived from the
+incarnation, the input's accept sequence and the step or intent key. The
+turn id alone carries the attempt count. A retry of the same input reuses
+the failed attempt's step transcript and effect journal, so a completed
+step or effect replays from its record and an authorized attempt without a
+result keeps its identity. `FailTurn` is refused with `EffectInDoubt` while
+any effect of the active turn is authorized without a recorded result or is
+in doubt, so a retry cannot start until reconciliation resolves the
+attempt. An `at_least_once` effect that was never authorized may be
+dispatched on the retry, which its policy allows. The kernel tests
+`a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt`,
+`fail_turn_is_refused_while_a_manual_attempt_is_in_doubt` and
+`fail_turn_is_refused_while_an_attempt_is_authorized_without_a_result`
+pin this.
