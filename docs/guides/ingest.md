@@ -1739,9 +1739,10 @@ group, in the given order.
   On a single-drive RustFS the first read of a region costs about 2 to 4 MB
   of disk beyond the bytes the range asks for (measured on c6a.4xlarge).
   Averaged over every GET of a statement, including GETs that land in a
-  region already read, that is about 0.4 to 0.8 MB of disk per GET. A
-  store that serves a range with one file read pays only the bytes asked
-  for.
+  region already read, the measured over-read was 0.4 to 0.6 MB of disk
+  per GET depending on the query, and about 0.8 MB after a device-level
+  correction. A store that serves a range with one file read pays only
+  the bytes asked for.
 - The reader is unaffected. PAGE_DIR gives each chunk's offset, and a query
   resolves a column name to its id through FIELD_DIR, which stays sorted by
   name. Objects with and without an order read back the same records.
