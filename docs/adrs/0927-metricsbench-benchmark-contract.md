@@ -842,3 +842,33 @@ sentence, and sections B and F of the 2026-10-26 amendment carry inline
 pointers here. Task routing under #2821 is unchanged: T3 already maps
 warnings as recorded here, T4c owns the Mimir budget table, and T1c owns
 band 6 and the per-class exclusions.
+
+## Amendment (2026-10-28): Ravel's per-query ceilings join the frozen limits
+
+<!-- amendment-applies: none reason="adds Ravel's two newly configurable per-query ceilings to the set the 2026-10-26 amendment section F already requires every comparator to freeze and disclose; retires no earlier wording" -->
+
+Context. Section F of the 2026-10-26 amendment freezes and discloses every
+comparator's query limits that the corpus can reach, and section A makes
+Ravel one more comparator. Ravel's series and sample ceilings were compiled
+in at 10,000 and 10,000,000 with no flag, so the portable Ravel row would
+have refused 15 of 21 cardinality entries (13 before native histograms were
+on the wire), 5 of 24 history entries and 12 of 22 churn entries for a
+reason no comparator shares (decision recorded on
+#2821 and #3306). #3306 made both configurable as `--max-series` and
+`--max-samples`.
+
+Decision: the portable lane freezes Ravel's `--max-series` at 1,000,000 and
+`--max-samples` at 500,000,000 in `deploy/metricsbench/ravel.yml`, disclosed
+in that directory's "Frozen limits" table, with the other frozen limits.
+`--max-series` equals VictoriaMetrics' `-search.maxUniqueTimeseries` and the
+cardinality profile's active series. `--max-samples` equals Prometheus'
+`--query.max-samples` and Mimir's `querier.max_samples`. The counts are not
+the same quantity on each engine: Ravel counts total materialized samples
+after dedup, Prometheus peak resident samples. The bytes behind Ravel's
+counts are bounded by its memory budget, whose `memory exhausted` refusal is
+a budget refusal like any other comparator's.
+
+Consequences. A Ravel image for the portable lane must carry both flags
+(main after #3306, or a release after 0.27.0). Neither flag has a
+limits-file key: per-tenant query limits are not enforced today, and a key
+there would disclose a per-tenant bound that does not exist.

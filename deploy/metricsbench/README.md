@@ -39,6 +39,11 @@ RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:<tag>@sha256:<digest> \
     -f deploy/metricsbench/ravel.yml up -d
 ```
 
+The image must carry `--max-series` and `--max-samples` (#3306), which no
+release up to 0.27.0 does: ravel-server refuses an unknown flag at startup.
+Use a release after 0.27.0, or a `publish-images` manual build of a main
+commit that contains #3306 (tagged `manual-<short sha>`).
+
 The overlay adds two services. `ravel-qualify` runs `ravel-cli --store s3
 store qualify` once, after `createbuckets`, because `ravel-server` refuses to
 start on an S3 store that has not been qualified. `ravel-server` then starts
@@ -211,8 +216,8 @@ scrape grid.
 | Ravel | `--gc-max-query-duration` (query deadline) | `120s` | `11m` (derived) | Lowered to Prometheus' `--query.timeout`; a hit is refused(budget) | `--gc-max-query-duration <DURATION>  This process's query-engine deadline ... Default when unset: derived (host-independent): 11m` |
 | Ravel | `--max-segments` | `1000000` | `1000000` (derived, unchanged) | Kept: 4 shards at the 2 s flush age write 2 objects per second of ingest, so 1,000,000 needs 500,000 s (5.8 d) of replay before compaction; a hit is refused(budget) | `--max-segments <N> ... Default when unset: derived (host-independent): 1,000,000` |
 | Ravel | `--max-s3-requests` | `343400` | `343400` (derived, unchanged) | Kept: at one GET per object and 2 objects per second, a read over the whole uncompacted replay reaches it after 171,700 s (47.7 h) of ingest; a hit is refused(budget) | `--max-s3-requests <COUNT> ... That is 343,400 at the default 4 shards, the 2s flush cadence and the catalog's default 4,800s seal margin` |
-| Ravel | max series per query | `10000` | `10000` (unchanged, no flag) | Refused, not raised: no flag in the pinned image. Predicted to refuse 15 of the 21 cardinality entries (every one but the three `absent` and three `single` entries) | `crates/ravel-query/src/config.rs`, `DEFAULT_MAX_SERIES: usize = 10_000` |
-| Ravel | max samples per query | `10000000` | `10000000` (unchanged, no flag) | Refused, not raised: no flag in the pinned image. Predicted to refuse, on history: `mb_long_range_7d_avg` (about 40.3M), `mb_fanout_total_rate` and `mb_selective_error_ratio` (about 17.3M each), `mb_full_range_avg_over_time` (about 23.5M), `mb_long_range_subquery_max` (about 17.3M) | `crates/ravel-query/src/config.rs`, `DEFAULT_MAX_SAMPLES: usize = 10_000_000` |
+| Ravel | `--max-series` | `1000000` | `10000` | Raised (#3306): the cardinality profile's 1,000,000 active series, equal to VictoriaMetrics' `-search.maxUniqueTimeseries`; the widest corpus union is 700,000 series. At the default, 15 of the 21 cardinality entries would be refused | `--max-series <N>  Cap on the distinct series a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SERIES (10,000)` |
+| Ravel | `--max-samples` | `500000000` | `10000000` | Raised (#3306) to Prometheus' and Mimir's value. Ravel counts total materialized samples after dedup, where Prometheus counts peak resident samples, so the equal numbers are not equal semantics. The bytes behind them are bounded by `--memory-budget-bytes`, which refuses an oversized materialization `memory exhausted` first. At the default, 5 history entries would be refused, the largest `mb_long_range_7d_avg` at about 40.3M | `--max-samples <N>  Cap on the total samples (summed across series, after cross-segment dedup) a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SAMPLES (10,000,000)` |
 | Ravel | points per range series | `11000` | `11000` (unchanged, no flag) | Kept, same as Prometheus and Mimir: history's grid is 289 points | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_RANGE_POINTS: usize = 11_000` |
 | Ravel | total evaluation points per query | `1000000` | `1000000` (unchanged, no flag) | Kept: `mb_long_range_subquery_max` (`[1d:5m]`, 289 points) over the 289-point grid is 83,521 | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000` |
 
