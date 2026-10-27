@@ -77,9 +77,12 @@ services:
       # 4,000 gauge series) with a 7d window of 7 * 86400 / 15 = 40,320
       # samples each, so it peaks near one window plus its 1,000-point output
       # (predicted; a falsification run is pre-registered on #2821). The
-      # largest peak in the corpus is a range query's output matrix:
-      # mb_full_range_avg_over_time on cardinality returns 400,000 series x
-      # 121 grid points = 48,400,000 points, 3.2% under the default. The
+      # largest peak in the corpus is a range query's intermediate matrix:
+      # mb_full_range_avg_over_time on cardinality evaluates
+      # avg_over_time over 400,000 series x 121 grid points = 48,400,000
+      # points before avg() collapses them to one series (predicted from the
+      # engine evaluating an aggregation's argument over the whole range
+      # first), 3.2% under the default. The
       # raised value covers the case where the falsification run refutes the
       # per-series model and the flag counts samples read instead: the same
       # statement then reads 400,000 x 240 = 96,000,000, above the default.
