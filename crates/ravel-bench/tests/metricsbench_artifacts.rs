@@ -603,7 +603,7 @@ fn a_version_1_corpus_is_refused_by_the_version_2_loader() {
 }
 
 #[test]
-fn the_two_repaired_joins_say_why_and_no_entry_is_intended_empty() {
+fn the_modified_entries_say_why_and_no_entry_is_intended_empty() {
     let entries = load_corpus(corpus_path()).expect("corpus loads");
     let modified: Vec<&str> = entries
         .iter()
@@ -612,7 +612,11 @@ fn the_two_repaired_joins_say_why_and_no_entry_is_intended_empty() {
         .collect();
     assert_eq!(
         modified,
-        vec!["mb_join_cpu_on_build_version", "mb_join_saturated_and_busy"]
+        vec![
+            "mb_full_range_avg_over_time",
+            "mb_join_cpu_on_build_version",
+            "mb_join_saturated_and_busy"
+        ]
     );
     let by_id = |id: &str| entries.iter().find(|e| e.id == id).expect("entry present");
     assert!(

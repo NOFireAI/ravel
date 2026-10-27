@@ -1816,6 +1816,58 @@ mod tests {
     }
 
     #[test]
+    fn the_full_range_entry_collapses_its_answer_and_says_why() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/metrics/metrics.corpus.json");
+        let entries = load_corpus(path).expect("the checked-in corpus loads");
+        let entry = entries
+            .iter()
+            .find(|e| e.id == "mb_full_range_avg_over_time")
+            .expect("entry present");
+        assert_eq!(
+            entry.promql,
+            "avg(avg_over_time(metricsbench_gauge_cpu_percent[30m]))"
+        );
+        assert_eq!(entry.class, Some(CostClass::FullRange));
+        assert_eq!(entry.eval, EvalKind::Range);
+        assert_eq!(entry.profiles, vec!["cardinality", "history", "churn"]);
+        assert_eq!(
+            entry.constructs,
+            vec![
+                "aggregate expression",
+                "avg",
+                "function call",
+                "avg_over_time",
+                "matrix selector",
+                "vector selector"
+            ]
+        );
+        let reason = entry
+            .modified
+            .reason()
+            .expect("the rewrite is disclosed as a modification");
+        assert!(!reason.trim().is_empty());
+        assert!(reason.contains("256 MiB"), "{reason}");
+
+        // Answer size on cardinality: the scan still selects every gauge
+        // series. Uncollapsed, the answer held one series per selected series;
+        // `avg` without `by` answers one series over the same 121-point grid.
+        let workload = checked_in_workload();
+        let profile = workload
+            .profile("cardinality")
+            .expect("cardinality declared");
+        let selectors = read_selectors(&entry.promql).expect("selectors read");
+        assert_eq!(selectors.len(), 1);
+        let selected = visit_series(&workload, profile, &selectors[0], |_| true)
+            .expect("visit runs")
+            .expect("the family exists");
+        let points = profile.range_eval.points();
+        assert_eq!(selected, 400_000);
+        assert_eq!(points, 121);
+        assert_eq!(selected * points, 48_400_000, "the uncollapsed answer");
+    }
+
+    #[test]
     fn the_selector_check_stops_at_the_first_matching_series() {
         // A selector that pins the first instance must be answered after one
         // label set, not after the cardinality profile's 400,000 gauge
