@@ -70,14 +70,18 @@ services:
       # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
       # Each one that fires is a budget refusal, not an engine error; the
       # README's "Frozen limits" table lists value, sizing and error text.
-      # Max samples: replaces the 3.13.1 default 50000000. Sized to the history
-      # profile's longest range window, 7d (mb_long_range_7d_avg), across all
-      # 10,000 series at 15s: 7 * 86400 / 15 = 40,320 samples per series, times
-      # 10,000 = 403,200,000; 500000000 leaves 24% headroom. The corpus entry
-      # itself selects one job's gauge, about a tenth of that. The bound is set
-      # so no corpus statement is refused, not as a memory guard: at an 8-byte
-      # timestamp plus an 8-byte value per sample, 403,200,000 samples exceed
-      # the 4g envelope, so such a selection would fail on memory first.
+      # Max samples: replaces the 3.13.1 default 50000000. The flag bounds the
+      # samples a query holds in memory at its peak, not the samples it reads:
+      # a range function over a matrix selector is evaluated one series at a
+      # time. mb_long_range_7d_avg selects 1,000 series (one job of history's
+      # 4,000 gauge series) with a 7d window of 7 * 86400 / 15 = 40,320
+      # samples each, so it peaks near one window plus its 1,000-point output
+      # (predicted; a falsification run is pre-registered on #2821). The
+      # largest peak in the corpus is a range query's output matrix:
+      # mb_full_range_avg_over_time on cardinality returns 400,000 series x
+      # 121 grid points = 48,400,000 points, inside 2% of the default. The
+      # bound is set so no corpus statement is refused on this count; the 4g
+      # envelope is the memory bound.
       - "--query.max-samples=500000000"
       # Query timeout: equals the 3.13.1 default 2m, written so the effective
       # config capture shows it and a default change cannot move it silently.
@@ -147,9 +151,10 @@ services:
       # step, is 24 * 12 + 1 = 289 points, far inside 20000.
       - "-search.maxPointsPerTimeseries=20000"
       # Raw samples per query: equals the default 1000000000, written so the
-      # capture shows it. Covers the history profile's bound of 10,000 series
-      # times the longest range window, 7d at 15s (40,320 samples per series):
-      # 403,200,000.
+      # capture shows it. Unlike Prometheus' flag, this counts every raw
+      # sample the query reads across all its series. The largest in the
+      # corpus is mb_full_range_avg_over_time on cardinality: 400,000 series x
+      # 240 samples (a 30m window over a 30m grid at 15s) = 96,000,000.
       - "-search.maxSamplesPerQuery=1000000000"
       # Query duration: replaces the default 30s with 120s, equal to the
       # Prometheus comparator's --query.timeout, so a history statement the

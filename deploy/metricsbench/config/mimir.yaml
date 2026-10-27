@@ -125,9 +125,10 @@ querier:
   # 25h, and the querier merges the overlap.
   query_store_after: 0s
   # Sample budget: replaces the default 50000000 with the Prometheus
-  # comparator's 500000000, sized the same way: history's longest range
-  # window, 7d at 15s, is 40,320 samples per series; times 10,000 series is
-  # 403,200,000. -help-all says to set it on the query-frontend too under
+  # comparator's 500000000, sized the same way (see docker-compose.yml): it
+  # counts the samples a query holds at its peak, and the corpus's largest
+  # peak is mb_full_range_avg_over_time's 48,400,000-point output matrix on
+  # cardinality. -help-all says to set it on the query-frontend too under
   # sharding; in -target=all both read this one value. Under the default
   # Mimir query engine this budget did not fire (a 100-sample limit let a
   # 28,801-sample query return 200 on the 3.2.3 binary); that engine's
