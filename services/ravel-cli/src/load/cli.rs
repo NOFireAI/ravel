@@ -522,6 +522,9 @@ pub(crate) async fn run_fold_warning_to(
         }
         MappingSection::Logs(logs) => logs,
     };
+    for warning in unknown_chunk_order_warnings(chunk_order, &mapping) {
+        let _ = writeln!(warnings, "{warning}");
+    }
     for warning in ruled_bytes_column_warnings(
         mapping
             .resource_attributes
@@ -1015,6 +1018,30 @@ pub(super) fn unused_chunk_order_warning(
             chunk_order.get().join(",")
         )
     })
+}
+
+/// One warning per `--chunk-order` name that no `[[attribute]]` or
+/// `[[resource_attribute]]` key of a logs `mapping` carries, in the order
+/// given. The RLOG writer skips such a name; this says so before the load
+/// reads a row.
+pub(super) fn unknown_chunk_order_warnings(
+    chunk_order: RlogChunkOrder,
+    mapping: &Mapping,
+) -> Vec<String> {
+    let carried: std::collections::HashSet<&str> = mapping
+        .resource_attributes
+        .iter()
+        .chain(&mapping.attributes)
+        .map(|a| a.key.as_str())
+        .collect();
+    chunk_order
+        .get()
+        .iter()
+        .filter(|name| !carried.contains(**name))
+        .map(|name| {
+            format!("warning: --chunk-order names {name}, which no mapped attribute carries")
+        })
+        .collect()
 }
 
 /// Print the metrics load's completion summary to stdout.

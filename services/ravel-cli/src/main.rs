@@ -5146,6 +5146,17 @@ mod tests {
             err.contains("invalid --chunk-order: RLOG chunk order name 1 is empty"),
             "{err}"
         );
+        for padded in [" a", "a "] {
+            let err = order_of(&["--chunk-order", padded])
+                .expect_err("a whitespace-padded name is refused");
+            assert!(
+                err.contains(&format!(
+                    "invalid --chunk-order: RLOG chunk order name {padded:?} has leading or \
+                     trailing whitespace"
+                )),
+                "{err}"
+            );
+        }
     }
 
     /// Issue #1184's classification: `load`, `typed-attr-column set`,
