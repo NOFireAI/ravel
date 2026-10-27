@@ -632,6 +632,14 @@ fn the_modified_entries_say_why_and_no_entry_is_intended_empty() {
             .ends_with("rate(metricsbench_requests_total[5m]) > 0.5")
     );
 
+    // Exactly one entry loosens the comparison: the collapsed mean, whose
+    // answer depends on summation order. Every other entry is bit-exact.
+    let tolerant: Vec<(&str, u32)> = entries
+        .iter()
+        .filter_map(|e| e.tolerance_ulps.map(|t| (e.id.as_str(), t)))
+        .collect();
+    assert_eq!(tolerant, vec![("mb_full_range_avg_over_time", 1 << 20)]);
+
     // No entry is intended-empty: the two native-histogram entries lost the
     // marker once the ingest lane put native histograms on the wire (T1c of
     // #2821). The three absent entries are not marked either: absent()

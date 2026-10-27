@@ -1482,6 +1482,62 @@ mod tests {
         gate_corpus(&[disclosed]).expect("a modified entry with a reason gates clean");
     }
 
+    fn tolerant(id: &str, tolerance_ulps: u32) -> CorpusEntry {
+        let mut e = entry(id, Some(CostClass::FullRange));
+        e.modified = Modification::Modified {
+            reason: "collapsed to one mean; summation order costs up to 400,119 ULPs".to_string(),
+        };
+        e.tolerance_ulps = Some(tolerance_ulps);
+        e
+    }
+
+    #[test]
+    fn gate_rejects_a_zero_ulp_tolerance() {
+        let err = gate_corpus(&[tolerant("zero", 0)]).expect_err("tolerance_ulps 0 must fail");
+        assert!(
+            matches!(&err, CorpusError::ZeroToleranceUlps { entry_id } if entry_id == "zero"),
+            "wrong error variant: {err:?}"
+        );
+        assert!(err.to_string().contains("omitting tolerance_ulps"), "{err}");
+
+        // A non-zero tolerance on a disclosed entry passes, so the check
+        // rejects the zero rather than the field.
+        gate_corpus(&[tolerant("wide", 1 << 20)]).expect("a disclosed tolerance gates clean");
+    }
+
+    #[test]
+    fn gate_rejects_a_tolerance_without_a_modified_reason() {
+        let mut undisclosed = tolerant("undisclosed", 1 << 20);
+        undisclosed.modified = Modification::Verbatim;
+        let err =
+            gate_corpus(&[undisclosed]).expect_err("an undisclosed tolerance must fail the gate");
+        assert!(
+            matches!(&err, CorpusError::UndisclosedTolerance { entry_id, tolerance_ulps }
+                if entry_id == "undisclosed" && *tolerance_ulps == 1 << 20),
+            "wrong error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tolerance_ulps_is_optional_and_parses_from_json() {
+        let bare = serde_json::json!({
+            "id": "a",
+            "promql": "up",
+            "constructs": ["vector selector"]
+        });
+        let parsed: CorpusEntry = serde_json::from_value(bare).expect("absent field parses");
+        assert_eq!(parsed.tolerance_ulps, None);
+
+        let declared = serde_json::json!({
+            "id": "a",
+            "promql": "up",
+            "constructs": ["vector selector"],
+            "tolerance_ulps": 1048576
+        });
+        let parsed: CorpusEntry = serde_json::from_value(declared).expect("declared field parses");
+        assert_eq!(parsed.tolerance_ulps, Some(1_048_576));
+    }
+
     #[test]
     fn gate_rejects_a_construct_the_registry_does_not_carry() {
         let mut bad = entry("unknown_construct", Some(CostClass::HighFanOut));
@@ -1898,6 +1954,8 @@ mod tests {
             .expect("the rewrite is disclosed as a modification");
         assert!(!reason.trim().is_empty());
         assert!(reason.contains("256 MiB"), "{reason}");
+        assert_eq!(entry.tolerance_ulps, Some(1_048_576));
+        assert!(reason.contains("400,119 ULPs"), "{reason}");
 
         // Answer size on cardinality: the scan still selects every gauge
         // series. Uncollapsed, the answer held one series per selected series;
