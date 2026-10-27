@@ -3290,7 +3290,9 @@ fn mimir_sample_needle(point: &LogicalPoint) -> String {
 /// occurrence of the needle ends the body or is followed by a character that
 /// cannot continue the series rendering, so `series m` does not match inside
 /// `series m{instance="a"}` or `series mx`
-/// (`tests::a_mimir_needle_matches_only_a_complete_series`).
+/// (`tests::a_bare_mimir_needle_is_not_named_by_its_labelled_series`,
+/// `tests::a_mimir_needle_is_not_named_by_a_longer_metric_name`,
+/// `tests::a_mimir_needle_is_named_when_its_sample_is`).
 fn mimir_body_names(body: &str, needle: &str) -> bool {
     body.match_indices(needle).any(|(at, _)| {
         body[at + needle.len()..]
@@ -6218,51 +6220,79 @@ mod tests {
         );
     }
 
-    /// A body names a point only where its needle is a complete series: the
-    /// bare needle of `m` is not named by a body naming `m{instance="a"}` at
-    /// the same millisecond, nor by one naming `mx`, and each needle is named
-    /// at the end of the body and before the rest of Mimir's message.
+    /// A Mimir 400 body's text around one needle: the start of Mimir's
+    /// `sampleError` message before it, and `rest` after it.
+    fn mimir_body(needle: &str, rest: &str) -> String {
+        format!(
+            "failed pushing to ingester: user=anonymous: the sample has been rejected \
+             because another sample with a more recent timestamp has already been \
+             ingested and out-of-order samples are not allowed \
+             (err-mimir-sample-out-of-order). The affected sample has {needle}{rest}"
+        )
+    }
+
+    fn needle_at_ms(metric: &str, labels: &[(&str, &str)]) -> String {
+        mimir_sample_needle(&LogicalPoint::Sample(LogicalSample {
+            metric: metric.to_string(),
+            labels: labels
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            ts_ms: 1_760_000_010_000,
+            value: 1.0,
+        }))
+    }
+
+    /// The label-less needle of `m` is a prefix of the needle of
+    /// `m{instance="a"}` at the same millisecond, and a body naming only the
+    /// labelled point does not name the label-less one.
     ///
-    /// TO SEE THIS FAIL: make `mimir_body_names` return `body.contains(needle)`;
-    /// the first two assertions fail. Make it refuse only a following `{`;
-    /// the `mx` assertion fails.
+    /// TO SEE THIS FAIL: make `mimir_body_names` return `body.contains(needle)`.
     #[test]
-    fn a_mimir_needle_matches_only_a_complete_series() {
-        let sample = |metric: &str, labels: Vec<(String, String)>| {
-            LogicalPoint::Sample(LogicalSample {
-                metric: metric.to_string(),
-                labels,
-                ts_ms: 1_760_000_010_000,
-                value: 1.0,
-            })
-        };
-        let bare = mimir_sample_needle(&sample("m", Vec::new()));
-        let labelled = mimir_sample_needle(&sample(
-            "m",
-            vec![("instance".to_string(), "a".to_string())],
-        ));
-        let longer = mimir_sample_needle(&sample("mx", Vec::new()));
-        let prefix = "send data to ingesters: failed pushing to ingester: user=anonymous:                       the sample has been rejected because another sample with a more recent                       timestamp has already been ingested and out-of-order samples are not                       allowed (err-mimir-sample-out-of-order). The affected sample has ";
-        let rest = "\n";
-
-        let names_labelled = format!("{prefix}{labelled}");
-        assert!(
-            !mimir_body_names(&names_labelled, &bare),
-            "{names_labelled}"
-        );
-        let names_longer = format!("{prefix}{longer}{rest}");
-        assert!(!mimir_body_names(&names_longer, &bare), "{names_longer}");
-
-        for needle in [&bare, &labelled, &longer] {
-            let at_end = format!("{prefix}{needle}");
-            assert!(mimir_body_names(&at_end, needle), "{at_end}");
-            let followed = format!("{prefix}{needle}{rest}");
-            assert!(mimir_body_names(&followed, needle), "{followed}");
-            let then_another = format!("{prefix}{needle}\n{prefix}{labelled}");
-            assert!(mimir_body_names(&then_another, needle), "{then_another}");
+    fn a_bare_mimir_needle_is_not_named_by_its_labelled_series() {
+        let bare = needle_at_ms("m", &[]);
+        let labelled = needle_at_ms("m", &[("instance", "a")]);
+        assert!(labelled.starts_with(&bare));
+        for rest in ["", "\n"] {
+            let body = mimir_body(&labelled, rest);
+            assert!(!mimir_body_names(&body, &bare), "{body}");
         }
-        let both = format!("{prefix}{labelled}\n{prefix}{bare}");
-        assert!(mimir_body_names(&both, &bare), "{both}");
+    }
+
+    /// The needle of `m` is a prefix of the needle of `mx`, and a body naming
+    /// only `mx` does not name `m`.
+    ///
+    /// TO SEE THIS FAIL: make `mimir_body_names` return `body.contains(needle)`,
+    /// or refuse only a following `{`.
+    #[test]
+    fn a_mimir_needle_is_not_named_by_a_longer_metric_name() {
+        let m = needle_at_ms("m", &[]);
+        let longer = needle_at_ms("mx", &[]);
+        assert!(longer.starts_with(&m));
+        for rest in ["", "\n"] {
+            let body = mimir_body(&longer, rest);
+            assert!(!mimir_body_names(&body, &m), "{body}");
+        }
+    }
+
+    /// Each needle is named when its sample is: at the end of the body,
+    /// followed by the rest of Mimir's message, and after a prefix-sharing
+    /// needle that does not name it.
+    #[test]
+    fn a_mimir_needle_is_named_when_its_sample_is() {
+        let bare = needle_at_ms("m", &[]);
+        let labelled = needle_at_ms("m", &[("instance", "a")]);
+        let longer = needle_at_ms("mx", &[]);
+        for needle in [&bare, &labelled, &longer] {
+            for rest in ["", "\n", " (sample 1 of 2)\n"] {
+                let body = mimir_body(needle, rest);
+                assert!(mimir_body_names(&body, needle), "{body}");
+            }
+        }
+        for decoy in [&labelled, &longer] {
+            let body = format!("{}{}", mimir_body(decoy, "\n"), mimir_body(&bare, "\n"));
+            assert!(mimir_body_names(&body, &bare), "{body}");
+        }
     }
 
     /// The no-point read-back reports `matches_expected` false only with a
