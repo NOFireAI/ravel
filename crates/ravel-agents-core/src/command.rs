@@ -268,10 +268,12 @@ pub enum Precondition {
     /// applies to (`Enqueue`, `RecordStep`, `CommitIntent`, `ScheduleTimer`,
     /// `FireTimer`, `CompleteTurn`, an owner's `AuthorizeAttempt`, unless it
     /// answers `Reply::Blocked`) also leaves `Limits::reserved_bytes` free.
-    /// What that buys is exactly this: every outstanding input can still be
-    /// ended by `FailTurn` with an error within `Limits::max_error_bytes`, or
-    /// by `Cancel`, all of them, in any order
-    /// (`tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`).
+    /// What that buys is exactly this: this precondition never refuses a
+    /// `FailTurn` with an error within `Limits::max_error_bytes`, or a
+    /// `Cancel`, that ends an outstanding input, for all of them in any order
+    /// (`tests::every_outstanding_input_can_be_failed_at_the_byte_cap`,
+    /// `tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`).
+    /// Their other preconditions still apply.
     /// A `CompleteTurn` that does not fit is refused `BudgetExceeded`
     /// (`tests::a_completion_that_does_not_fit_is_refused_and_the_turn_can_still_fail`).
     HeadBelowByteCap,

@@ -60,12 +60,13 @@ use crate::identity::{self, Hash256, Id128};
 /// Logical caps enforced inside the kernel (decision 9's per-tenant quotas
 /// are applied per agent here; the store adds the tenant totals).
 ///
-/// The byte cap carries one guarantee: while an input is outstanding it can
-/// be ended by `FailTurn` with an error of at most `max_error_bytes`, or by
-/// `Cancel`, and that holds for every outstanding input together, in any
-/// order, with any interleaving of the commands the growth guard exempts
-/// (`tests::every_outstanding_input_can_be_failed_at_the_byte_cap`,
+/// The byte cap carries one guarantee: it never refuses a `FailTurn` with an
+/// error of at most `max_error_bytes`, or a `Cancel`, that ends an
+/// outstanding input, and that holds for every outstanding input together,
+/// in any order, with any interleaving of the commands the growth guard
+/// exempts (`tests::every_outstanding_input_can_be_failed_at_the_byte_cap`,
 /// `tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`).
+/// Their other preconditions, such as `NoEffectInDoubt`, still apply.
 /// A `CompleteTurn` carries no such guarantee: one whose root would enter the
 /// reserve below is refused `BudgetExceeded`, and the handler fails the turn
 /// or emits less
@@ -663,8 +664,9 @@ impl Kernel {
     /// inbox and the per-effect reserve for every effect not yet completed.
     /// Every exempt publish fits inside what those reserve, so the terminal
     /// paths named on [`Limits`] stay open
-    /// (`tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`),
-    /// and a latch is recorded however full the root is
+    /// (`tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`,
+    /// `tests::pending_effects_settle_inside_the_reserve`), and a latch is
+    /// recorded however far into the reserve the root already is
     /// (`tests::a_blocking_replay_is_recorded_inside_the_reserve`,
     /// `tests::a_manual_attempt_enters_in_doubt_inside_the_reserve`). An
     /// exempt publish still faces the cap itself in `publish`. The check

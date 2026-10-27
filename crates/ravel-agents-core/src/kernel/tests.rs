@@ -1903,15 +1903,12 @@ fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
                 break;
             }
         }
-        if accepted % 5 == 0 {
+        if accepted.is_multiple_of(5) {
             sim.run(&widest_takeover(sim.head(), limits.max_owner_bytes));
             takeovers += 1;
         }
-        if accepted % 3 == 0 {
-            assert!(matches!(
-                sim.run(&begin(sim.head())),
-                Reply::TurnStarted(_)
-            ));
+        if accepted.is_multiple_of(3) {
+            assert!(matches!(sim.run(&begin(sim.head())), Reply::TurnStarted(_)));
             let retry = Command::FailTurn(FailTurn {
                 fence: turn_fence(sim.head()),
                 error: error.clone(),
@@ -1928,10 +1925,7 @@ fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
     let (mut failed, mut cancelled) = (0usize, 0usize);
     for n in 0..accepted {
         let transition = if n % 2 == 0 {
-            assert!(matches!(
-                sim.run(&begin(sim.head())),
-                Reply::TurnStarted(_)
-            ));
+            assert!(matches!(sim.run(&begin(sim.head())), Reply::TurnStarted(_)));
             let cmd = Command::FailTurn(FailTurn {
                 fence: turn_fence(sim.head()),
                 error: error.clone(),
@@ -1943,8 +1937,9 @@ fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
             })
         } else {
             let last = sim.head().inbox.last().expect("an input").accept_seq;
-            sim.step(&cancel_cmd(sim.head(), last))
-                .unwrap_or_else(|e| panic!("a cancel must publish for every outstanding input: {e:?}"))
+            sim.step(&cancel_cmd(sim.head(), last)).unwrap_or_else(|e| {
+                panic!("a cancel must publish for every outstanding input: {e:?}")
+            })
         };
         match transition.reply() {
             Reply::TurnFailed { .. } => failed += 1,
@@ -2400,16 +2395,21 @@ fn pending_effects_settle_inside_the_reserve() {
         }
     }
     assert!(ids.len() >= 10, "{}", ids.len());
-    sim.run(&widest_takeover(sim.head(), sim.kernel.limits.max_owner_bytes));
+    sim.run(&widest_takeover(
+        sim.head(),
+        sim.kernel.limits.max_owner_bytes,
+    ));
     let reconcile = Authority::Reconcile(inc_fence(sim.head()));
     for id in &ids {
         for attempt in [1, u32::MAX] {
             let cmd = authorize_cmd(reconcile.clone(), *id, attempt);
             if attempt == u32::MAX {
                 // Jump the attempt varint to its widest through the journal.
-                if let Some(effect) = sim.head.as_mut().and_then(|h| {
-                    h.effects.iter_mut().find(|e| e.effect_id == *id)
-                }) {
+                if let Some(effect) = sim
+                    .head
+                    .as_mut()
+                    .and_then(|h| h.effects.iter_mut().find(|e| e.effect_id == *id))
+                {
                     effect.attempt = u32::MAX - 1;
                 }
             }
@@ -2532,5 +2532,7 @@ fn the_reserves_cover_the_growth_they_stand_for() {
     }
     assert_eq!(effect, 60);
     assert!(effect <= PENDING_EFFECT_RESERVE_BYTES);
-    eprintln!("slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {effect}");
+    eprintln!(
+        "slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {effect}"
+    );
 }
