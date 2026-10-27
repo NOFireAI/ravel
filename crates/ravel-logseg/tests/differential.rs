@@ -6,10 +6,11 @@
 #![allow(clippy::expect_used)]
 
 use proptest::prelude::*;
+use proptest::sample::Index;
 use ravel_logseg::tokenizer::tokens;
 use ravel_logseg::{
-    AttrValue, ColumnSelection, ColumnarLogBatch, FieldSel, LogRecord, LogStreamId, ObjectIdentity,
-    Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
+    AttrValue, ColumnSelection, ColumnarLogBatch, FieldSel, FieldType, LogRecord, LogStreamId,
+    ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
 };
 
 const STREAMS: u8 = 6;
@@ -290,16 +291,19 @@ fn write_object(corpus: &[LogRecord]) -> Vec<u8> {
             block_target_records: 32,
             ..RlogConfig::default()
         },
+        &[],
         corpus,
         false,
     )
 }
 
-/// `corpus` written with `chunk_order` (ADR-3217 decision 8) into row groups
-/// of two blocks, through the columnar path when `columnar` is set.
+/// `corpus` written with `chunk_order` (ADR-3217 decision 8) and POSTINGS on
+/// the `indexed` names into row groups of two blocks, through the columnar
+/// path when `columnar` is set.
 fn write_object_ordered(
     corpus: &[LogRecord],
     chunk_order: &'static [&'static str],
+    indexed: &[&str],
     columnar: bool,
 ) -> Vec<u8> {
     let cfg = RlogConfig {
@@ -308,10 +312,10 @@ fn write_object_ordered(
         chunk_order,
         ..RlogConfig::default()
     };
-    write_with(cfg, corpus, columnar)
+    write_with(cfg, indexed, corpus, columnar)
 }
 
-fn write_with(cfg: RlogConfig, corpus: &[LogRecord], columnar: bool) -> Vec<u8> {
+fn write_with(cfg: RlogConfig, indexed: &[&str], corpus: &[LogRecord], columnar: bool) -> Vec<u8> {
     let identity = ObjectIdentity {
         tenant_hash: [0u8; 16],
         shard: 0,
@@ -319,7 +323,8 @@ fn write_with(cfg: RlogConfig, corpus: &[LogRecord], columnar: bool) -> Vec<u8> 
         writer_epoch: 0,
         writer_seq: 0,
     };
-    let mut w = RlogWriter::new(cfg, identity);
+    let mut w = RlogWriter::new(cfg, identity)
+        .with_indexed_fields(indexed.iter().map(|n| n.to_string()).collect());
     if columnar {
         w.push_columnar(ColumnarLogBatch::from_records(corpus))
             .expect("push_columnar");
@@ -337,11 +342,105 @@ fn arb_chunk_order() -> impl Strategy<Value = Vec<&'static str>> {
     proptest::sample::subsequence(NAMES.to_vec(), 1..=NAMES.len()).prop_shuffle()
 }
 
+/// The attribute names an object indexes in POSTINGS: at least one, chosen
+/// independently of the chunk order.
+fn arb_indexed() -> impl Strategy<Value = Vec<&'static str>> {
+    proptest::sample::subsequence(NAMES.to_vec(), 1..=NAMES.len())
+}
+
+/// How a corpus attribute becomes an arm (see [`picked_arms`]).
+#[derive(Clone, Copy, Debug)]
+enum PickShape {
+    ContentEquals,
+    PruneEquals,
+    RangePoint,
+    RangeFrom,
+    RangeTo,
+}
+
+/// Attributes drawn from the corpus by (record, attribute) index, so the
+/// arms built from them name terms and values the object holds.
+fn arb_picks() -> impl Strategy<Value = Vec<(Index, Index, PickShape)>> {
+    let shape = prop_oneof![
+        Just(PickShape::ContentEquals),
+        Just(PickShape::PruneEquals),
+        Just(PickShape::RangePoint),
+        Just(PickShape::RangeFrom),
+        Just(PickShape::RangeTo),
+    ];
+    proptest::collection::vec((any::<Index>(), any::<Index>(), shape), 1..6)
+}
+
+/// A numeric attribute value as a `NumRange` column type and bound bits; none
+/// for a non-numeric value or a NaN, which `NumRange` must not be given.
+fn num_bound(value: &AttrValue) -> Option<(FieldType, u64)> {
+    match value {
+        AttrValue::I64(x) => Some((FieldType::I64, *x as u64)),
+        AttrValue::F64(f) if !f.is_nan() => Some((FieldType::F64, f.to_bits())),
+        AttrValue::Bool(b) => Some((FieldType::Bool, u64::from(*b))),
+        _ => None,
+    }
+}
+
+/// The picked attributes as `(content, prune)` arms. A content `Equals`
+/// filters exactly and probes POSTINGS when its name is indexed; a prune
+/// `Equals` probes POSTINGS only; a `NumRange`, placed in the prune channel
+/// since that is the only one it prunes from, prunes on the attribute's
+/// SKIP_IDX stats. A range pick on a non-numeric value becomes a prune
+/// `Equals`.
+fn picked_arms(
+    corpus: &[LogRecord],
+    picks: &[(Index, Index, PickShape)],
+) -> (Vec<Predicate>, Vec<Predicate>) {
+    let mut content = Vec::new();
+    let mut prune = Vec::new();
+    for (rec, attr, shape) in picks {
+        let rec = &corpus[rec.index(corpus.len())];
+        if rec.attrs.is_empty() {
+            continue;
+        }
+        let (name, value) = &rec.attrs[attr.index(rec.attrs.len())];
+        let field = FieldSel::Attr(name.clone());
+        let equals = Predicate::Equals {
+            field: field.clone(),
+            value: value.clone(),
+        };
+        let range = |min, max| {
+            num_bound(value).map(|(ty, _)| Predicate::NumRange {
+                field: field.clone(),
+                ty,
+                min,
+                max,
+            })
+        };
+        let bits = num_bound(value).map(|(_, bits)| bits);
+        let arm = match shape {
+            PickShape::ContentEquals => {
+                content.push(equals);
+                continue;
+            }
+            PickShape::PruneEquals => None,
+            PickShape::RangePoint => range(bits, bits),
+            PickShape::RangeFrom => range(bits, None),
+            PickShape::RangeTo => range(None, bits),
+        };
+        prune.push(arm.unwrap_or(equals));
+    }
+    (content, prune)
+}
+
 /// Every record the block scan returns under `columns`, block by block.
-fn scan_projected(object: &[u8], pred: &Predicate, columns: &ColumnSelection) -> Vec<LogRecord> {
+fn scan_projected(
+    object: &[u8],
+    pred: &Predicate,
+    prune: &[Predicate],
+    columns: &ColumnSelection,
+) -> Vec<LogRecord> {
     let cfg = RlogConfig::default();
     let reader = RlogReader::new(object, &cfg).expect("open");
-    let mut cursor = reader.scan_blocks(pred, &[], columns).expect("scan_blocks");
+    let mut cursor = reader
+        .scan_blocks(pred, prune, columns)
+        .expect("scan_blocks");
     let mut out = Vec::new();
     while let Some(rows) = cursor.next_block(object).expect("next_block") {
         out.extend(rows);
@@ -363,38 +462,54 @@ proptest! {
     }
 
     /// A declared chunk order changes which name gets which column id and
-    /// nothing a read returns: the pruned scan, and the block scan projected
-    /// onto the declared names, agree with the default-order object on both
-    /// writer paths.
+    /// nothing a read returns: the pruned scan, the same scan with a prune
+    /// channel, and the block scan projected onto the declared names agree
+    /// with the default-order object on both writer paths.
+    ///
+    /// Both objects index a generated set of names in POSTINGS, and the arms
+    /// drawn from the corpus reach the id-keyed indexes with terms the object
+    /// holds: an `Equals` on an indexed name probes POSTINGS from either
+    /// channel, and a prune `NumRange` on a numeric attribute prunes on its
+    /// SKIP_IDX stat. Where the declared order moves an attribute's id, an
+    /// index entry keyed by the wrong id prunes a different block set than
+    /// the default object's, which the comparison sees as missing rows.
     #[test]
     fn chunk_order_reads_equal_the_default_order(
         corpus in arb_corpus(),
         pred in arb_predicate(),
+        picks in arb_picks(),
         order in arb_chunk_order(),
+        indexed in arb_indexed(),
         columnar in any::<bool>(),
     ) {
         let order: &'static [&'static str] = order.leak();
-        let default_object = write_object_ordered(&corpus, &[], columnar);
-        let ordered_object = write_object_ordered(&corpus, order, columnar);
+        let (content, prune) = picked_arms(&corpus, &picks);
+        let pred = Predicate::And(vec![pred, Predicate::And(content)]);
+        let default_object = write_object_ordered(&corpus, &[], &indexed, columnar);
+        let ordered_object = write_object_ordered(&corpus, order, &indexed, columnar);
         let cfg = RlogConfig::default();
-        let scan = |object: &[u8]| {
+        let scan = |object: &[u8], prune: &[Predicate]| {
             RlogReader::new(object, &cfg)
                 .expect("open")
-                .scan(&pred)
+                .scan_pruned(&pred, prune)
                 .expect("scan")
                 .0
         };
-        let got = scan(&ordered_object);
-        prop_assert_eq!(normalize(got.clone()), normalize(scan(&default_object)));
+        let got = scan(&ordered_object, &[]);
+        prop_assert_eq!(normalize(got.clone()), normalize(scan(&default_object, &[])));
         prop_assert_eq!(normalize(got), normalize(naive_eval(&corpus, &pred)));
+        prop_assert_eq!(
+            normalize(scan(&ordered_object, &prune)),
+            normalize(scan(&default_object, &prune))
+        );
 
         let mut columns = ColumnSelection::fixed_only().with_body().with_severity_text();
         for name in order.iter().take(2) {
             columns = columns.with_attr(*name);
         }
         prop_assert_eq!(
-            normalize(scan_projected(&ordered_object, &pred, &columns)),
-            normalize(scan_projected(&default_object, &pred, &columns))
+            normalize(scan_projected(&ordered_object, &pred, &prune, &columns)),
+            normalize(scan_projected(&default_object, &pred, &prune, &columns))
         );
     }
 }
