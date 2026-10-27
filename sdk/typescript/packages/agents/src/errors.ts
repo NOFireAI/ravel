@@ -108,7 +108,11 @@ export class EffectInDoubt extends RavelAgentsError {
   readonly retry = "reconcile";
 }
 
-/** The agent's receipt index reached its logical cap. */
+/**
+ * The agent's mailbox depth reached its logical cap. The mailbox drains as
+ * turns complete, so the same send may succeed later. A receipt-index cap,
+ * which never drains, is `BudgetExceeded`.
+ */
 export class MailboxFull extends RavelAgentsError {
   override readonly name = "MailboxFull";
   readonly code = "MailboxFull";
