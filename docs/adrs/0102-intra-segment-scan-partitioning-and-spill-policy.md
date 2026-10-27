@@ -220,11 +220,11 @@ probe's own cost is `partitions x this`), and
 `datafusion.execution.skip_partial_aggregation_probe_ratio_threshold` from 0.8
 to 0.5 (give up when the probe found a new group for more than every other row,
 where the partial stage returns at most a factor of two and cannot pay for
-`partitions` copies of itself). Not lower on either: the ratio is judged from a
-sample of that many rows, and a smaller sample starts misjudging genuinely
-reducible mid-cardinality keys as unreducible. The ratio is now 0.1, on CPU
-grounds; see the probe ratio amendment (#3231) at the end of this ADR. The row
-threshold is unchanged.
+`partitions` copies of itself). The row threshold is not lower: the ratio is
+first judged on a sample of that many rows, and a smaller sample starts
+misjudging genuinely reducible mid-cardinality keys as unreducible. The ratio
+is now 0.1, on CPU grounds; see the probe ratio amendment (#3231) at the end of
+this ADR. The row threshold is unchanged.
 
 Neither option can change a result. Skipping decides only whether a partition
 pre-aggregates its rows or forwards them; the final stage sees the same rows and
