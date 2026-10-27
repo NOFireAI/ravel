@@ -424,6 +424,17 @@ The figures come from a deterministic simulation of the policy,
   the scan's re-reads 1.000 in all six cases, but those cases cannot tell
   ghost sizings apart: the loop and the hot set fit in the cache, nothing
   is evicted, and an unbounded ghost serves the same 1.000.
+- W2b, the regime this amendment creates (the same 11.5 GB cache and hot
+  set, against a repeated scan of 0.25 or 0.35 of the cache in 1.3 MB
+  entries, entries small enough that the key window was the narrower
+  bound, with one-off cold reads keeping the cache full: 79,190 to
+  120,794 evictions per run): the repeated scan now reaches main, and
+  its re-reads are served 0.9118 where the key window served them 0.0000.
+  The hot set's hit rate is never below the key window's. It is 1.0000
+  under both windows when the hot set was read before the traffic, and
+  0.0000 under both when it was first read after a 25 GB interval, which
+  outlasts probation and the byte window alike; only a ghost as wide as
+  the cache or wider serves that case (0.7641).
 - W3, a loop of 0.5 to 3 times the cache in 1.3 MB or 25 MB entries, read
   five times, then a second such loop: no pass is served less than under
   the key window, and a first loop of 1.05 times the cache in 1.3 MB
