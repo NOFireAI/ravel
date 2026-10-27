@@ -36,10 +36,18 @@
 //! second request within the ghost window is exactly the "worth keeping"
 //! signal that would otherwise take a full second access in probation to
 //! detect. The ghost window is the wider of `max_bytes / max_entry_bytes`
-//! keys and keys whose evicted sizes sum to 30% of `max_bytes`, so a
-//! repeated read of up to about 40% of the cache (probation plus the byte
-//! window) is promoted whatever its entry size, while the window never spans
-//! more than the cache (see [`S3Fifo::new`]).
+//! keys and keys whose evicted sizes sum to 30% of `max_bytes`, and never
+//! spans more than the cache (see [`S3Fifo::new`]). Its key count is also
+//! capped, so how far it reaches depends on entry size. Above
+//! `ghost_window_bytes / ghost_max_keys` (0.3 times 1,000 times
+//! `GHOST_KEY_BYTES`, about 45.6 KB, at any cache size where neither the
+//! key window nor `max_entries` clamps the cap) the byte window binds, and
+//! a repeated read of up to about 40% of the cache (probation plus the byte
+//! window) is promoted, more where the key window is wider.
+//! Below it the key cap binds and the reach is probation plus
+//! `ghost_max_keys` entries: at a 6,954,184,212-byte cache, 45,751 keys of
+//! 16 KiB span 749.6 MB, about 10.8% of it, so a repeated read of up to
+//! about 21% of the cache is promoted.
 //!
 //! # Access intent (ADR-3072 decision 3b)
 //!
@@ -116,8 +124,16 @@ const BOOKKEEPING_BUDGET_DIVISOR: u64 = 100;
 /// statement from 2.5 tenths on, and change no scan-resistance figure at 3.
 const GHOST_WINDOW_BYTES_TENTHS: u64 = 3;
 
-/// The ghost is held outside `max_bytes`, so its key count is capped to keep
-/// its queue slots and map entries within `max_bytes / GHOST_MEMORY_DIVISOR`.
+/// The ghost is held outside `max_bytes`, so its key count is capped at
+/// `max_bytes / GHOST_MEMORY_DIVISOR / GHOST_KEY_BYTES`. That budgets one
+/// queue slot and one map entry per key; the real worst case is about three
+/// times it. The queue holds up to twice the key cap plus 65 slots before
+/// `S3Fifo::compact_ghost_queue` drops the stale ones, the map holds up to
+/// one key over the cap before the trim, both round their capacity up as they
+/// grow (the map can double once more to clear removed slots), and neither
+/// gives capacity back. At a 6,954,184,212-byte cache (45,751 keys, a 6.95 MB
+/// budget) that is 131,072 queue slots of 72 bytes and 131,072 map buckets of
+/// 81 bytes, about 20.1 MB.
 const GHOST_MEMORY_DIVISOR: u64 = 1_000;
 
 /// One ghost key's queue slot and map entry, before table and queue slack.

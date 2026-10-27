@@ -377,12 +377,26 @@ The ghost now keeps a key while it is inside either window: the key window
 above, or the most recent probation evictions whose sizes sum to at most
 30% of `max_bytes`. The window is the wider of the two, so it is never
 narrower than before for any entry size and never spans more than the
-cache. A repeated read of up to about 40% of the cache (probation plus the
-byte window) is promoted on its second call whatever its range size. The
-ghost lives outside `max_bytes` and outside `bookkeeping_bytes`, which are
-unchanged; its key count is capped at one per mille of `max_bytes` in
-ghost bookkeeping (152 bytes a key before table slack, so about 46,000 keys
-at 6.95 GB), never below the key window and never above `max_entries`.
+cache. The ghost lives outside `max_bytes` and outside `bookkeeping_bytes`,
+which are unchanged; its key count is capped at one per mille of
+`max_bytes` in ghost bookkeeping at 152 bytes a key (45,751 keys at
+6,954,184,212 bytes), never below the key window and never above
+`max_entries`. Which bound sets the ghost's reach depends on range size.
+Above `ghost_window_bytes / ghost_max_keys` (0.3 times 1,000 times 152
+bytes, about 45.6 KB, at any cache size where neither the key window nor
+`max_entries` clamps the cap) the byte window binds, and a repeated read of
+up to about 40% of the cache (probation plus the byte window) is promoted
+on its second call, more where the key window is wider. Below it the key
+cap binds, and the reach is probation plus 45,751 ranges: for 16 KiB ranges
+at 6,954,184,212 bytes that is 749.6 MB of remembered evictions, about
+10.8% of `max_bytes`, so a repeated read of up to about 21% of the cache is
+promoted. The 152 bytes are one queue slot and one map
+entry; the real worst case is about three times that budget. The queue
+keeps up to twice the key cap plus 65 slots before it drops stale ones,
+both containers round their capacity up as they grow, the map can double
+once more to clear removed slots, and neither gives capacity back: at
+6,954,184,212 bytes that is 131,072 queue slots of 72 bytes and 131,072 map
+buckets of 81 bytes, about 20.1 MB against the 6.95 MB budget.
 Both tiers use this policy (`DiskCache` builds the same `S3Fifo`, with the
 same limits on the server). The ghost holds keys and sizes only, in
 memory, so the disk tier's restart behaviour is unchanged. Access intents
@@ -405,7 +419,11 @@ The figures come from a deterministic simulation of the policy,
   during it: the hot set's hit rate equals the key window's in all eight
   cases (0.1413 against the 600-object loop with the hot set established).
   The scan's own rate is equal in seven and one re-read lower of 14,400 in
-  the eighth.
+  the eighth. Against a repeated scan of 92, 115 or 161 looping objects
+  (0.20, 0.25 and 0.35 of the cache), both sizings serve the hot set and
+  the scan's re-reads 1.000 in all six cases, but those cases cannot tell
+  ghost sizings apart: the loop and the hot set fit in the cache, nothing
+  is evicted, and an unbounded ghost serves the same 1.000.
 - W3, a loop of 0.5 to 3 times the cache in 1.3 MB or 25 MB entries, read
   five times, then a second such loop: no pass is served less than under
   the key window, and a first loop of 1.05 times the cache in 1.3 MB
