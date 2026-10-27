@@ -44,7 +44,7 @@
 //!
 //! ```json
 //! {
-//!   "version": 2,
+//!   "version": 3,
 //!   "entries": [
 //!     {
 //!       "id": "mb_fanout_total_rate",
@@ -77,7 +77,7 @@ use crate::metrics_workload::{FamilyKind, Profile, WorkloadFile};
 /// The corpus format version this module reads and writes. A file declaring any
 /// other version is rejected rather than parsed optimistically: the field exists
 /// so a future format change is a loud error, not a silently misread document.
-pub const CORPUS_FORMAT_VERSION: u32 = 2;
+pub const CORPUS_FORMAT_VERSION: u32 = 3;
 
 /// Whether a query was rewritten in a way that changes what it computes.
 ///
@@ -1530,7 +1530,7 @@ mod tests {
         // otherwise parse as a corpus with zero entries, and a zero-entry
         // corpus passes all five checks vacuously.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_corpus(&dir, "typo.json", r#"{"version": 2, "entires": []}"#);
+        let path = write_corpus(&dir, "typo.json", r#"{"version": 3, "entires": []}"#);
         let err = load_corpus(&path).expect_err("a misspelled `entries` key must fail");
         assert!(matches!(&err, CorpusError::Parse { .. }), "{err:?}");
         assert!(err.to_string().contains("entires"), "{err}");
@@ -1542,7 +1542,7 @@ mod tests {
         let path = write_corpus(
             &dir,
             "corpus.json",
-            "{\"version\": 2, \"entries\": [{\"id\":",
+            "{\"version\": 3, \"entries\": [{\"id\":",
         );
         let err = load_corpus(&path).expect_err("malformed JSON must fail");
         match &err {
@@ -1580,7 +1580,28 @@ mod tests {
                 err,
                 CorpusError::UnsupportedVersion {
                     found: 7,
-                    expected: 2,
+                    expected: 3,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_2_corpus_is_refused_after_the_full_range_rewrite() {
+        // Version 3 changed what `mb_full_range_avg_over_time` computes, so a
+        // version-2 file is a different corpus and must not load as this one.
+        assert_eq!(CORPUS_FORMAT_VERSION, 3);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_corpus(&dir, "corpus.json", r#"{"version": 2, "entries": []}"#);
+        let err = load_corpus(&path).expect_err("a version-2 corpus must fail");
+        assert!(
+            matches!(
+                err,
+                CorpusError::UnsupportedVersion {
+                    found: 2,
+                    expected: 3,
                     ..
                 }
             ),
@@ -1595,7 +1616,7 @@ mod tests {
             &dir,
             "corpus.json",
             r#"{
-              "version": 2,
+              "version": 3,
               "entries": [
                 {
                   "id": "mb_a",
@@ -1792,6 +1813,58 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../benchmarks/metrics/workload.json");
         crate::metrics_workload::load_workload(path).expect("the checked-in manifest loads")
+    }
+
+    #[test]
+    fn the_full_range_entry_collapses_its_answer_and_says_why() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/metrics/metrics.corpus.json");
+        let entries = load_corpus(path).expect("the checked-in corpus loads");
+        let entry = entries
+            .iter()
+            .find(|e| e.id == "mb_full_range_avg_over_time")
+            .expect("entry present");
+        assert_eq!(
+            entry.promql,
+            "avg(avg_over_time(metricsbench_gauge_cpu_percent[30m]))"
+        );
+        assert_eq!(entry.class, Some(CostClass::FullRange));
+        assert_eq!(entry.eval, EvalKind::Range);
+        assert_eq!(entry.profiles, vec!["cardinality", "history", "churn"]);
+        assert_eq!(
+            entry.constructs,
+            vec![
+                "aggregate expression",
+                "avg",
+                "function call",
+                "avg_over_time",
+                "matrix selector",
+                "vector selector"
+            ]
+        );
+        let reason = entry
+            .modified
+            .reason()
+            .expect("the rewrite is disclosed as a modification");
+        assert!(!reason.trim().is_empty());
+        assert!(reason.contains("256 MiB"), "{reason}");
+
+        // Answer size on cardinality: the scan still selects every gauge
+        // series. Uncollapsed, the answer held one series per selected series;
+        // `avg` without `by` answers one series over the same 121-point grid.
+        let workload = checked_in_workload();
+        let profile = workload
+            .profile("cardinality")
+            .expect("cardinality declared");
+        let selectors = read_selectors(&entry.promql).expect("selectors read");
+        assert_eq!(selectors.len(), 1);
+        let selected = visit_series(&workload, profile, &selectors[0], |_| true)
+            .expect("visit runs")
+            .expect("the family exists");
+        let points = profile.range_eval.points();
+        assert_eq!(selected, 400_000);
+        assert_eq!(points, 121);
+        assert_eq!(selected * points, 48_400_000, "the uncollapsed answer");
     }
 
     #[test]

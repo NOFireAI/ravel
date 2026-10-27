@@ -583,27 +583,29 @@ fn a_version_1_manifest_is_refused_naming_the_missing_range_eval_block() {
 }
 
 #[test]
-fn a_version_1_corpus_is_refused_by_the_version_2_loader() {
+fn version_1_and_2_corpora_are_refused_by_the_version_3_loader() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = corrupt_corpus(&dir, "corpus.v1.json", |doc| {
-        doc["version"] = serde_json::json!(1);
-    });
-    let err = load_corpus(&path).expect_err("a version-1 corpus must fail");
-    assert!(
-        matches!(
-            err,
-            CorpusError::UnsupportedVersion {
-                found: 1,
-                expected: 2,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
+    for old in [1u32, 2] {
+        let path = corrupt_corpus(&dir, &format!("corpus.v{old}.json"), |doc| {
+            doc["version"] = serde_json::json!(old);
+        });
+        let err = load_corpus(&path).expect_err("an older corpus version must fail");
+        assert!(
+            matches!(
+                err,
+                CorpusError::UnsupportedVersion {
+                    found,
+                    expected: 3,
+                    ..
+                } if found == old
+            ),
+            "{err:?}"
+        );
+    }
 }
 
 #[test]
-fn the_two_repaired_joins_say_why_and_no_entry_is_intended_empty() {
+fn the_modified_entries_say_why_and_no_entry_is_intended_empty() {
     let entries = load_corpus(corpus_path()).expect("corpus loads");
     let modified: Vec<&str> = entries
         .iter()
@@ -612,7 +614,11 @@ fn the_two_repaired_joins_say_why_and_no_entry_is_intended_empty() {
         .collect();
     assert_eq!(
         modified,
-        vec!["mb_join_cpu_on_build_version", "mb_join_saturated_and_busy"]
+        vec![
+            "mb_full_range_avg_over_time",
+            "mb_join_cpu_on_build_version",
+            "mb_join_saturated_and_busy"
+        ]
     );
     let by_id = |id: &str| entries.iter().find(|e| e.id == id).expect("entry present");
     assert!(
