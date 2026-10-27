@@ -48,7 +48,7 @@ use ravel_logseg::record::{COL_FLAGS, COL_STREAM_REF, COL_TS};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
     AttrValue, ColumnSelection, FieldSel, FieldType, LogRecord, LogSegError, Predicate, RlogConfig,
-    RlogWriter, read_section, stream_attrs_bytes,
+    RlogReader, RlogWriter, read_section, stream_attrs_bytes,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -837,6 +837,11 @@ async fn one_row_group_of_120_blocks_reads_three_far_apart_columns_in_three_gets
 /// `ts`/`stream_ref`/`a93` projection of the test above stays 3 runs whatever
 /// the order, which this test also pins.
 ///
+/// The records the two reads fetch are decoded and compared field by field,
+/// and the declared-order read's are checked against the written rows, so a
+/// read that returns another column's values for a projected attribute fails
+/// here and not only in a byte count.
+///
 /// Non-vacuity: with `chunk_order` dropped from `wide_object_ordered`'s
 /// config, the declared object is the default one: its ids stay 103, 56 and
 /// 10 and the declared-order assertion fails, and past it the read is the
@@ -861,14 +866,22 @@ async fn chunk_order_reads_three_far_apart_attribute_columns_in_one_chunk_run() 
                 Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
             let seg = seg_ref(bytes.len() as u64, &recs);
             let acc = QueryAccounting::new();
-            let (_got, stats) = BlockRangeFetcher::new(store)
+            let (got, stats) = BlockRangeFetcher::new(store)
                 .with_whole_object_threshold(0)
                 .with_suffix_len(tail_len(&bytes))
                 .with_coalesce_gap(gap)
                 .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
                 .await
                 .expect("projected fetch");
-            (stats, recording.full_gets())
+            let mut cursor = RlogReader::from_source(&got, &RlogConfig::default())
+                .expect("open the fetched object")
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &sel)
+                .expect("scan the fetched object");
+            let mut fetched = Vec::new();
+            while let Some(rows) = cursor.next_block(&got).expect("decode a fetched block") {
+                fetched.extend(rows);
+            }
+            (fetched, stats, recording.full_gets())
         }
     };
     let attr_ids = |bytes: &[u8]| -> Vec<u32> {
@@ -899,7 +912,7 @@ async fn chunk_order_reads_three_far_apart_attribute_columns_in_one_chunk_run() 
         4,
         "the fixed run and one per attribute: {runs:?}"
     );
-    let (stats, full_gets) = read(default.clone()).await;
+    let (default_records, stats, full_gets) = read(default.clone()).await;
     assert!(
         !stats.whole_object && full_gets == 0,
         "no whole-object read"
@@ -916,7 +929,7 @@ async fn chunk_order_reads_three_far_apart_attribute_columns_in_one_chunk_run() 
         2,
         "the fixed run and one attribute run: {runs:?}"
     );
-    let (stats, full_gets) = read(ordered.clone()).await;
+    let (ordered_records, stats, full_gets) = read(ordered.clone()).await;
     assert!(
         !stats.whole_object && full_gets == 0,
         "no whole-object read"
@@ -930,6 +943,31 @@ async fn chunk_order_reads_three_far_apart_attribute_columns_in_one_chunk_run() 
         stats.block_bytes_fetched,
         expected_stored_page_bytes(&ordered, &all_blocks, Some(&ids)),
         "the projected chunks' bytes and nothing between them"
+    );
+
+    // The declared order changes the read shape and nothing it returns: the
+    // two objects' fetched records are equal field by field, and each carries
+    // the written values of exactly the projected attributes, so the
+    // comparison cannot pass on two equally empty or equally wrong reads.
+    assert_eq!(ordered_records.len(), recs.len(), "every record comes back");
+    for (got, written) in ordered_records.iter().zip(&recs) {
+        let want: Vec<(String, AttrValue)> = written
+            .attrs
+            .iter()
+            .filter(|(name, _)| ORDER.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(want.len(), ORDER.len(), "the fixture carries every name");
+        assert_eq!(
+            (got.ts_ns, got.observed_ts_ns, &got.attrs),
+            (written.ts_ns, written.observed_ts_ns, &want),
+            "record at ts {} reads its own projected values",
+            written.ts_ns
+        );
+    }
+    assert_eq!(
+        ordered_records, default_records,
+        "the declared-order read returns the default-order read's records"
     );
 
     // The test above's projection: naming `a93` gives it id 10, and the body
