@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "entries": [
     {
       "id": "mb_absent_instant",
@@ -156,15 +156,22 @@
     {
       "id": "mb_full_range_avg_over_time",
       "class": "full_range",
-      "promql": "avg_over_time(metricsbench_gauge_cpu_percent[30m])",
+      "promql": "avg(avg_over_time(metricsbench_gauge_cpu_percent[30m]))",
       "eval": "range",
       "profiles": ["cardinality", "history", "churn"],
       "constructs": [
+        "aggregate expression",
+        "avg",
         "function call",
         "avg_over_time",
         "matrix selector",
         "vector selector"
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 3 wraps the query in avg(): the output collapses from one series per input series to one series, while the scanned data is unchanged; uncollapsed, the cardinality answer is 400,000 series x 121 points = 48,400,000 points, about 1.3 GB of JSON, which exceeds the harness's 256 MiB response cap, so no engine's answer could be compared"
+        }
+      }
     },
     {
       "id": "mb_full_range_max_by_job",

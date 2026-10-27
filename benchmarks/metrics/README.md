@@ -6,7 +6,7 @@ gated by code rather than read by hand:
 | File | What it is | Loader and gate |
 |---|---|---|
 | `workload.json` | The workload manifest (format version 2): seed, generator configuration, metric families, label distributions, and the four profiles with their range-evaluation grids | `ravel_bench::metrics_workload::load_workload` |
-| `metrics.corpus.json` | The PromQL query corpus (format version 2): 24 queries, each with stable id, typed cost class, the registry constructs it exercises, and whether its answer is intended to be empty | `ravel_bench::promql_corpus::load_corpus`, then `ravel_bench::promql_corpus::gate_corpus_against_workload` |
+| `metrics.corpus.json` | The PromQL query corpus (format version 3): 24 queries, each with stable id, typed cost class, the registry constructs it exercises, and whether its answer is intended to be empty | `ravel_bench::promql_corpus::load_corpus`, then `ravel_bench::promql_corpus::gate_corpus_against_workload` |
 
 Both gates run before the first sample is generated:
 
@@ -460,11 +460,27 @@ Corpus version 2 repairs two join entries, each carrying its reason in
   `> 10`. The counter advances by 0 to 15 per 15-second scrape, so the
   per-second rate is at most 1.0 and a threshold of 10 is never met.
 
+Corpus version 3 rewrites `mb_full_range_avg_over_time` from
+`avg_over_time(metricsbench_gauge_cpu_percent[30m])` to
+`avg(avg_over_time(metricsbench_gauge_cpu_percent[30m]))`, with the reason in
+`modified`. The scan is unchanged: every gauge series is still read over its
+30-minute window. Only the output collapses, from one series per input series
+to one series. On cardinality the old answer was 400,000 series x 121 grid
+points = 48,400,000 points, roughly 1.3 GB of JSON, above the harness's
+256 MiB response-body cap (`DEFAULT_MAX_BODY_BYTES` in
+`crates/ravel-promql-difftest/src/prometheus_client.rs`), so the oracle answer
+was unavailable and no engine's answer could be compared. The new answer is
+one series of 121 points. The entry keeps its id, its `full_range` class
+(decision 5 classifies by physical work), range evaluation and profiles
+(`promql_corpus::tests::the_full_range_entry_collapses_its_answer_and_says_why`).
+A version-3 loader refuses a version-2 corpus
+(`promql_corpus::tests::a_version_2_corpus_is_refused_after_the_full_range_rewrite`).
+
 An entry may carry `expected: {"intended_empty": true, "reason": "..."}`; the
 gate refuses the flag without a non-blank reason. An empty oracle answer on an
 entry without it is an invalid fixture, not an engine result (ADR-0927,
 2026-10-26 amendment, decision E). No entry carries it
-(`metricsbench_artifacts::the_two_repaired_joins_say_why_and_no_entry_is_intended_empty`):
+(`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`):
 `mb_histogram_native_p95` and `mb_histogram_native_fraction` carried it until
 the ingest lane put native histograms on the wire (task T1c of #2821). The
 three `absent*` entries are not marked:
