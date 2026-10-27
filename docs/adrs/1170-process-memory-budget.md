@@ -1706,7 +1706,26 @@ and postings caches peaked at 924,705 bytes, while SQL and fetch reached 0.96
 of the shared budget with 9 budget refusals, all with the catalog unwired.
 About 1 MB of decoded catalog state joins a pool already that full, so a part
 or postings decode is refused only at the moments the pool is nearly
-exhausted by everything else.
+exhausted by everything else. That run's process budget was 20.48 GB (the
+same comment), so the 924,705-byte peak is about 0.45% of the 1% bound
+below (about 204.8 MB) and far under 1% of the budget.
+
+The server bounds the decoded part and postings caches together at 1% of
+the budget (`CATALOG_DECODED_CACHE_BUDGET_DIVISOR` in
+`services/ravel-server/src/lib.rs`, through ADR-1702's decoded-cache byte
+bound amendment), because SQL's reservations cannot make those caches give
+memory back. Cached catalog decodes therefore hold at most 1% of the shared
+pool once each insert's eviction completes, absent concurrent inserts. The
+bound caps what the caches hold, not what is charged: a decode still in use
+by a query stays charged until that query drops it, whether it is cached or
+not. A part or postings object whose charge is larger than 1% of the budget
+is not cached; it is decoded again on each query that needs it and counted
+on `ravel_catalog_decoded_cache_byte_bound_refusals_total`, and entries the
+bound evicts are counted on
+`ravel_catalog_decoded_cache_byte_bound_evictions_total`. With a budget
+under 100 bytes the bound is 0, so no part or postings object with a nonzero
+charge is cached. Where the budget is unlimited (below) no bound is set and
+both counters read 0.
 
 A separate carve for the catalog's decodes was considered and rejected. A
 carve must admit the largest object the decoders accept, 256 MiB for each
@@ -1769,5 +1788,9 @@ unchanged and the two counters above read 0.
 `services/ravel-server/tests/catalog_memory_budget_e2e.rs` pin the 422 with
 the budget's own figures through `ravel_server::start`, the shared `Arc`
 against a copy of its size, and the fetch gauge against the decoded-cache
-gauge. `a_refused_postings_decode_fails_the_tick_and_the_next_tick_retries`
+gauge. `a_part_over_one_percent_of_the_budget_is_not_cached` in the same file
+pins the 1% bound: under a 1,000,000-byte budget the fixture's part is
+decoded on each query, refused by the cache and released with the query,
+while its postings object is cached.
+`a_refused_postings_decode_fails_the_tick_and_the_next_tick_retries`
 in `services/ravel-server/src/fold.rs` pins the fold tick.
