@@ -57,7 +57,8 @@ struct Args {
     #[arg(long)]
     provenance: PathBuf,
     /// `name=<prometheus|ravel|victoriametrics|mimir>[,url=<query base>][,bearer_env=VAR]`,
-    /// repeatable. Prometheus is required.
+    /// repeatable. Prometheus is required. `url=` is used only when the
+    /// engine's ingest row records no read-back query URL.
     #[arg(long = "engine", required = true)]
     engines: Vec<String>,
     /// Untimed passes before the timed ones.

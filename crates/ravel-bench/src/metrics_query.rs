@@ -157,7 +157,10 @@ pub enum BindError {
         "engine `{system}`: environment variable `{var}` named by bearer_env is unset or empty"
     )]
     BearerUnset { system: &'static str, var: String },
-    #[error("the Ravel ingest row has no `last_commit_token` to pass as min_commit_token")]
+    #[error(
+        "the Ravel ingest row has no commit token (`commit_tokens_by_shard` or \
+         `last_commit_token`) to pass as min_commit_token"
+    )]
     NoCommitToken,
     #[error(
         "the profile's range grid starts {start_offset_secs}s before the newest sample, but the \
@@ -385,6 +388,7 @@ pub fn bind(
             .readback
             .as_ref()
             .map(|rb| rb.query_url.clone())
+            .filter(|u| !u.trim().is_empty())
             .or_else(|| spec.url.clone())
             .ok_or(BindError::NoUrl(system))?;
         let bearer_token =
@@ -398,15 +402,25 @@ pub fn bind(
                 })?),
             };
         let extra_params = if spec.engine == Engine::Ravel {
-            let tokens = row
-                .last_commit_token
-                .as_deref()
-                .ok_or(BindError::NoCommitToken)?;
-            tokens
-                .split(',')
-                .filter(|t| !t.is_empty())
-                .map(|t| (MIN_COMMIT_TOKEN_PARAM.to_string(), t.to_string()))
-                .collect()
+            let tokens: Vec<String> = match &row.commit_tokens_by_shard {
+                Some(by_shard) => by_shard.values().cloned().collect(),
+                None => row
+                    .last_commit_token
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::to_string)
+                    .collect(),
+            };
+            let params: Vec<(String, String)> = tokens
+                .into_iter()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| (MIN_COMMIT_TOKEN_PARAM.to_string(), t))
+                .collect();
+            if params.is_empty() {
+                return Err(BindError::NoCommitToken);
+            }
+            params
         } else {
             Vec::new()
         };
@@ -812,17 +826,10 @@ fn status_name(status: ResultStatus) -> String {
         .unwrap_or_else(|| format!("{status:?}"))
 }
 
-/// The median, averaging the two middle values of an even count; `NaN` for
-/// an empty slice.
+/// The median `report_schema::validate` recomputes, so producer and checker
+/// share one definition; `NaN` for an empty slice.
 fn median(values: &[f64]) -> f64 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let n = sorted.len();
-    match n {
-        0 => f64::NAN,
-        _ if n % 2 == 1 => sorted[n / 2],
-        _ => (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0,
-    }
+    crate::report_schema::median(values).unwrap_or(f64::NAN)
 }
 
 /// Every engine's query URL, for the provenance config.
