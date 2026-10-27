@@ -212,10 +212,7 @@ mod tests {
             agent_id(&kind("ab"), &key("c")),
             agent_id(&kind("a"), &key("bc"))
         );
-        assert_ne!(
-            step_id(1, 1, "x"),
-            effect_id(1, 1, "x")
-        );
+        assert_ne!(step_id(1, 1, "x"), effect_id(1, 1, "x"));
         assert_ne!(step_id(1, 2, "x"), step_id(1, 1, "x"));
         assert_ne!(request_hash("ab", b"c"), request_hash("a", b"bc"));
     }
