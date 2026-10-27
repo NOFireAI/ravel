@@ -1453,7 +1453,14 @@ impl DecodedBlock {
         total += self.i64_cols.slot_bytes();
         total += self.f64_cols.slot_bytes();
         total += self.bool_cols.slot_bytes();
-        total += self.str_cols.slot_bytes();
+        // The `OnceLock` a shared column needs is wider than the `OnceCell` it
+        // replaced; charge the slot as before so a disabled cache charges
+        // exactly what main charges.
+        total += self.str_cols.slot_bytes().saturating_sub(
+            self.str_cols.cols.capacity()
+                * (std::mem::size_of::<OnceLock<LegacyDict>>()
+                    - std::mem::size_of::<std::cell::OnceCell<LegacyDict>>()),
+        );
         total += self.fixed_cols.slot_bytes();
         // A column-reference column shares its target's buffers; they are
         // resident once.
