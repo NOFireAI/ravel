@@ -16,6 +16,7 @@ pub mod block;
 pub mod columnar;
 pub mod columnar_batch;
 pub mod columns;
+pub mod decoded_cache;
 pub mod dict_values;
 pub mod error;
 pub mod field_dir;

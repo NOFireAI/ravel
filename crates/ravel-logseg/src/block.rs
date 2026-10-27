@@ -9,10 +9,10 @@
 //! placing and checksum-verifying them belongs to the writer's `BlocksBuilder`
 //! and to `crate::reader::decode_v4_block`.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::dict_values::{DictValues, Validity};
 use crate::encoding::{
@@ -804,7 +804,7 @@ pub(crate) struct DictColumn {
     narrow: bool,
     /// The pre-D3 view ([`StrDictColumn::dict`](crate::StrDictColumn::dict)
     /// and its ids), built on first use. The scan's own readers use the keys.
-    legacy: OnceCell<LegacyDict>,
+    legacy: OnceLock<LegacyDict>,
     /// The bytes [`heap_bytes`](Self::heap_bytes) charges for `values`: a
     /// row group dictionary's referenced share
     /// ([`DictValues::share_heap_bytes`]), a block's own dictionary in full.
@@ -866,7 +866,7 @@ impl DictColumn {
             keys,
             present: bits,
             narrow,
-            legacy: OnceCell::new(),
+            legacy: OnceLock::new(),
             values_charge,
         })
     }
@@ -925,7 +925,7 @@ impl DictColumn {
         self.values_charge = values.heap_bytes();
         self.values = values;
         self.narrow = true;
-        self.legacy = OnceCell::new();
+        self.legacy = OnceLock::new();
     }
 
     fn cell(&self, row: usize) -> Option<&[u8]> {
@@ -983,6 +983,84 @@ impl StrColumn {
             StrColumn::Dict(d) => d.cell(row),
         }
     }
+
+    /// A dictionary-form string column holds its distinct values once plus a
+    /// narrow id per row, not one owned buffer per row: charging it as though
+    /// every row still owned a `Vec<u8>` would over-report by the
+    /// deduplication factor and make `ravel-sql` charge its pool for memory
+    /// that no longer exists (ADR-0099 decision 4).
+    fn heap_bytes(&self) -> usize {
+        match self {
+            StrColumn::Plain(v) => bytes_cells_heap_bytes(v),
+            StrColumn::Dict(d) => d.heap_bytes(),
+        }
+    }
+}
+
+fn f64_heap_bytes(v: &Vec<Option<u64>>) -> usize {
+    v.capacity() * std::mem::size_of::<Option<u64>>()
+}
+
+fn bool_heap_bytes(v: &Vec<Option<bool>>) -> usize {
+    v.capacity() * std::mem::size_of::<Option<bool>>()
+}
+
+fn bytes_cells_heap_bytes(v: &Vec<Option<Vec<u8>>>) -> usize {
+    v.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+        + v.iter().flatten().map(Vec::capacity).sum::<usize>()
+}
+
+/// One decoded column shared by `Arc` between a block and the decoded-column
+/// cache (ADR-3326 decision 1). Cloning it clones the `Arc`, never the data.
+#[derive(Clone)]
+pub(crate) enum CachedColumn {
+    I64(Arc<I64Column>),
+    F64(Arc<Vec<Option<u64>>>),
+    Bool(Arc<Vec<Option<bool>>>),
+    Str(Arc<StrColumn>),
+    Fixed(Arc<Vec<Option<Vec<u8>>>>),
+}
+
+impl CachedColumn {
+    /// The column's decoded heap bytes, the per-column term of
+    /// [`DecodedBlock::decoded_heap_bytes`]. A column-reference integer column
+    /// is counted in full here even though it shares its target's buffer.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            CachedColumn::I64(c) => c.heap_bytes(),
+            CachedColumn::F64(v) => f64_heap_bytes(v),
+            CachedColumn::Bool(v) => bool_heap_bytes(v),
+            CachedColumn::Str(c) => c.heap_bytes(),
+            CachedColumn::Fixed(v) => bytes_cells_heap_bytes(v),
+        }
+    }
+
+    /// The column's row count, the `record_count` of the block it came from.
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            CachedColumn::I64(c) => c.len(),
+            CachedColumn::F64(v) => v.len(),
+            CachedColumn::Bool(v) => v.len(),
+            CachedColumn::Str(c) => match c.as_ref() {
+                StrColumn::Plain(v) => v.len(),
+                StrColumn::Dict(d) => d.rows(),
+            },
+            CachedColumn::Fixed(v) => v.len(),
+        }
+    }
+
+    /// Whether both handles point at the same buffers.
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &CachedColumn) -> bool {
+        match (self, other) {
+            (CachedColumn::I64(a), CachedColumn::I64(b)) => Arc::ptr_eq(a, b),
+            (CachedColumn::F64(a), CachedColumn::F64(b)) => Arc::ptr_eq(a, b),
+            (CachedColumn::Bool(a), CachedColumn::Bool(b)) => Arc::ptr_eq(a, b),
+            (CachedColumn::Str(a), CachedColumn::Str(b)) => Arc::ptr_eq(a, b),
+            (CachedColumn::Fixed(a), CachedColumn::Fixed(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// A block's decoded columns of one storage kind, addressed by column id.
@@ -995,7 +1073,9 @@ impl StrColumn {
 struct ColMap<T> {
     /// One slot per column id; `None` where the block carries no such column
     /// (absent from every row, or projected away by the scan's column filter).
-    cols: Vec<Option<T>>,
+    /// Each column sits behind an `Arc` so the decoded-column cache can share
+    /// it with later blocks without copying (ADR-3326 decision 1).
+    cols: Vec<Option<Arc<T>>>,
 }
 
 impl<T> ColMap<T> {
@@ -1004,16 +1084,30 @@ impl<T> ColMap<T> {
     }
 
     fn get(&self, column_id: u32) -> Option<&T> {
+        self.cols
+            .get(column_id as usize)
+            .and_then(Option::as_ref)
+            .map(Arc::as_ref)
+    }
+
+    fn get_arc(&self, column_id: u32) -> Option<&Arc<T>> {
         self.cols.get(column_id as usize).and_then(Option::as_ref)
     }
 
+    /// The column, mutable, only while this block is its sole owner. A column
+    /// shared with the decoded-column cache is never mutated in place.
     fn get_mut(&mut self, column_id: u32) -> Option<&mut T> {
         self.cols
             .get_mut(column_id as usize)
             .and_then(Option::as_mut)
+            .and_then(Arc::get_mut)
     }
 
     fn insert(&mut self, column_id: u32, value: T) {
+        self.insert_arc(column_id, Arc::new(value));
+    }
+
+    fn insert_arc(&mut self, column_id: u32, value: Arc<T>) {
         let idx = column_id as usize;
         if idx >= self.cols.len() {
             self.cols.resize_with(idx + 1, || None);
@@ -1021,8 +1115,11 @@ impl<T> ColMap<T> {
         self.cols[idx] = Some(value);
     }
 
-    fn values(&self) -> impl Iterator<Item = &T> {
-        self.cols.iter().flatten()
+    fn entries(&self) -> impl Iterator<Item = (u32, &T)> {
+        self.cols
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.as_deref().map(|c| (i as u32, c)))
     }
 
     /// Bytes held by the slot vector itself, excluding whatever the slots point
@@ -1342,6 +1439,15 @@ impl DecodedBlock {
     /// decoded column, bounded by the scan's column selection and negligible
     /// against the cells.
     pub fn decoded_heap_bytes(&self) -> usize {
+        self.heap_bytes_excluding(&[])
+    }
+
+    /// [`Self::decoded_heap_bytes`] less the bytes of the columns in `served`,
+    /// whose buffers a decoded-column cache entry already holds and charges
+    /// (ADR-3326 decision 4). An integer column sharing a served column's
+    /// buffer (a column reference) is left out with it. Equal to
+    /// `decoded_heap_bytes` when `served` is empty.
+    pub fn heap_bytes_excluding(&self, served: &[u32]) -> usize {
         let mut total = 0usize;
         // The slot vectors themselves, before the columns they hold.
         total += self.i64_cols.slot_bytes();
@@ -1351,42 +1457,62 @@ impl DecodedBlock {
         total += self.fixed_cols.slot_bytes();
         // A column-reference column shares its target's buffers; they are
         // resident once.
-        let mut counted: Vec<&I64Column> = Vec::new();
-        for c in self.i64_cols.values() {
+        let mut counted: Vec<&I64Column> = self
+            .i64_cols
+            .entries()
+            .filter(|(id, _)| served.contains(id))
+            .map(|(_, c)| c)
+            .collect();
+        for (_, c) in self.i64_cols.entries().filter(|(id, _)| !served.contains(id)) {
             if !counted.iter().any(|seen| seen.shares_buffer_with(c)) {
                 total += c.heap_bytes();
                 counted.push(c);
             }
         }
-        for v in self.f64_cols.values() {
-            total += v.capacity() * std::mem::size_of::<Option<u64>>();
+        for (_, v) in self.f64_cols.entries().filter(|(id, _)| !served.contains(id)) {
+            total += f64_heap_bytes(v);
         }
-        for v in self.bool_cols.values() {
-            total += v.capacity() * std::mem::size_of::<Option<bool>>();
+        for (_, v) in self.bool_cols.entries().filter(|(id, _)| !served.contains(id)) {
+            total += bool_heap_bytes(v);
         }
-        // A dictionary-form string column holds its distinct values once plus a
-        // narrow id per row, not one owned buffer per row: charging it as though
-        // every row still owned a `Vec<u8>` would over-report by the
-        // deduplication factor and make `ravel-sql` charge its pool for memory
-        // that no longer exists (ADR-0099 decision 4).
-        for col in self.str_cols.values() {
-            match col {
-                StrColumn::Plain(v) => {
-                    total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
-                    for cell in v.iter().flatten() {
-                        total += cell.capacity();
-                    }
-                }
-                StrColumn::Dict(d) => total += d.heap_bytes(),
-            }
+        for (_, col) in self.str_cols.entries().filter(|(id, _)| !served.contains(id)) {
+            total += col.heap_bytes();
         }
-        for v in self.fixed_cols.values() {
-            total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
-            for cell in v.iter().flatten() {
-                total += cell.capacity();
-            }
+        for (_, v) in self.fixed_cols.entries().filter(|(id, _)| !served.contains(id)) {
+            total += bytes_cells_heap_bytes(v);
         }
         total
+    }
+
+    /// Column `column_id` as a shareable handle, `None` when the block does not
+    /// carry it. Clones an `Arc`, never the column.
+    pub(crate) fn cached_column(&self, column_id: u32) -> Option<CachedColumn> {
+        if let Some(c) = self.i64_cols.get_arc(column_id) {
+            return Some(CachedColumn::I64(Arc::clone(c)));
+        }
+        if let Some(c) = self.f64_cols.get_arc(column_id) {
+            return Some(CachedColumn::F64(Arc::clone(c)));
+        }
+        if let Some(c) = self.bool_cols.get_arc(column_id) {
+            return Some(CachedColumn::Bool(Arc::clone(c)));
+        }
+        if let Some(c) = self.str_cols.get_arc(column_id) {
+            return Some(CachedColumn::Str(Arc::clone(c)));
+        }
+        self.fixed_cols
+            .get_arc(column_id)
+            .map(|c| CachedColumn::Fixed(Arc::clone(c)))
+    }
+
+    /// Places a column served from the decoded-column cache into the block.
+    fn seed(&mut self, column_id: u32, col: &CachedColumn) {
+        match col {
+            CachedColumn::I64(c) => self.i64_cols.insert_arc(column_id, Arc::clone(c)),
+            CachedColumn::F64(c) => self.f64_cols.insert_arc(column_id, Arc::clone(c)),
+            CachedColumn::Bool(c) => self.bool_cols.insert_arc(column_id, Arc::clone(c)),
+            CachedColumn::Str(c) => self.str_cols.insert_arc(column_id, Arc::clone(c)),
+            CachedColumn::Fixed(c) => self.fixed_cols.insert_arc(column_id, Arc::clone(c)),
+        }
     }
     /// Column resolutions by id since decode: see [`Self::col_lookups`].
     pub fn column_lookups(&self) -> u64 {
@@ -1603,7 +1729,16 @@ pub fn read_block_pages(
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
-    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &[], &[], plans, counters)
+    read_block_pages_with_shared_dicts(
+        record_count,
+        descs,
+        page_bytes,
+        &[],
+        &[],
+        plans,
+        counters,
+        &[],
+    )
 }
 
 /// [`read_block_pages`] for a block whose row group carries string
@@ -1632,6 +1767,7 @@ pub fn read_block_pages_with_dicts(
         &[],
         plans,
         counters,
+        &[],
     )
 }
 
@@ -1647,6 +1783,7 @@ pub(crate) fn read_block_pages_with_shared_dicts(
     deferred: &[u32],
     plans: &[ColumnPlan],
     counters: PageCounters,
+    cached: &[(u32, CachedColumn)],
 ) -> Result<DecodedBlock, LogSegError> {
     if record_count > MAX_RECORDS as usize {
         return Err(LogSegError::Corrupted(format!(
@@ -1680,6 +1817,7 @@ pub(crate) fn read_block_pages_with_shared_dicts(
         deferred,
         plans,
         counters,
+        cached,
     )
 }
 
@@ -1741,6 +1879,7 @@ fn decode_columns(
     deferred: &[u32],
     plans: &[ColumnPlan],
     counters: PageCounters,
+    cached: &[(u32, CachedColumn)],
 ) -> Result<DecodedBlock, LogSegError> {
     if descs.len() != page_bytes.len() {
         return Err(LogSegError::Corrupted(
@@ -1783,6 +1922,11 @@ fn decode_columns(
         int_values_buffers: 0,
         str_cells_validated: 0,
     };
+    // Columns served from the decoded-column cache go in first, so a
+    // column-reference page decoded below finds its target either way.
+    for (column_id, col) in cached {
+        out.seed(*column_id, col);
+    }
 
     for column_id in order {
         let idxs = &groups[&column_id];

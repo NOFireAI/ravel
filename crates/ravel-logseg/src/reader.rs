@@ -16,9 +16,10 @@ use memchr::memmem;
 use ravel_types::logstream::AttrValue;
 
 use crate::block::{
-    ColumnIdSet, ColumnPlan, DecodedBlock, I64Column, PageCounters, StrColumn,
+    CachedColumn, ColumnIdSet, ColumnPlan, DecodedBlock, I64Column, PageCounters, StrColumn,
     read_block_pages_with_shared_dicts,
 };
+use crate::decoded_cache::DecodedCacheAttach;
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::dict_values::{DictValues, EntryTexts};
@@ -784,6 +785,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             surviving: Vec::new(),
             dicts: DictCache::default(),
             dict_memo: DictArmMemo::default(),
+            decoded_cache: None,
+            served: Vec::new(),
         })
     }
 
@@ -911,6 +914,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             surviving: Vec::new(),
             dicts: DictCache::default(),
             dict_memo: DictArmMemo::default(),
+            decoded_cache: None,
+            served: Vec::new(),
         }
     }
 
@@ -1295,9 +1300,25 @@ pub struct BlockScan {
     /// Per-arm work over a shared dictionary, reused by the blocks of its row
     /// group.
     dict_memo: DictArmMemo,
+    /// The decoded-column cache the columnar exit reads and fills, `None`
+    /// when the process runs without one (ADR-3326).
+    decoded_cache: Option<DecodedCacheAttach>,
+    /// Column ids of [`Self::current`] served from the decoded-column cache.
+    served: Vec<u32>,
 }
 
 impl BlockScan {
+    /// Reads and fills `cache` on the columnar exit from the next decode on.
+    pub fn attach_decoded_cache(&mut self, cache: DecodedCacheAttach) {
+        self.decoded_cache = Some(cache);
+    }
+
+    /// Column ids of the block the columnar exit last returned that were
+    /// served from the decoded-column cache rather than decoded.
+    pub fn served_columns(&self) -> &[u32] {
+        &self.served
+    }
+
     /// Pruning counters. `blocks_total`/`blocks_after_*` are final from
     /// construction; `blocks_scanned`, `pages_decoded`, and `pages_skipped`
     /// grow as blocks are drained, so read this after the last
@@ -1376,7 +1397,7 @@ impl BlockScan {
         &mut self,
         object_bytes: &S,
     ) -> Result<Option<Vec<LogRecord>>, LogSegError> {
-        if !self.decode_block(object_bytes)? {
+        if !self.decode_block(object_bytes, false)? {
             return Ok(None);
         }
         let Some(decoded) = self.current.take() else {
@@ -1423,7 +1444,7 @@ impl BlockScan {
         &mut self,
         object_bytes: &S,
     ) -> Result<Option<ColumnarBlockView<'_>>, LogSegError> {
-        if !self.decode_block(object_bytes)? {
+        if !self.decode_block(object_bytes, true)? {
             return Ok(None);
         }
         let Some(decoded) = self.current.as_ref() else {
@@ -1447,12 +1468,10 @@ impl BlockScan {
             ts.and_then(|c| c.get(row))
                 .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {COL_TS}")))?;
         }
-        Ok(Some(ColumnarBlockView::new(
-            &self.stream_dir,
-            &self.field_dir,
-            decoded,
-            &self.surviving,
-        )))
+        Ok(Some(
+            ColumnarBlockView::new(&self.stream_dir, &self.field_dir, decoded, &self.surviving)
+                .with_served(&self.served),
+        ))
     }
 
     /// The decode primitive both exits run on: locate the next surviving block,
@@ -1467,14 +1486,22 @@ impl BlockScan {
     /// surviving row set is computed once, by one predicate evaluation, so a
     /// columnar view cannot disagree with the records `next_block` would have
     /// produced for the same block.
+    ///
+    /// Only the columnar exit (`columnar`) reads and fills the decoded-column
+    /// cache: an eligible column (projected, not deferred by a Contains arm)
+    /// found there is seeded into the block and its pages are neither read nor
+    /// decoded; a missed one is offered to the cache after the whole-block
+    /// decode, before any survivor narrowing.
     fn decode_block<S: ByteSource + ?Sized>(
         &mut self,
         object_bytes: &S,
+        columnar: bool,
     ) -> Result<bool, LogSegError> {
         // Release the previous block before decoding the next, so peak resident
         // decoded memory stays one block rather than two.
         self.current = None;
         self.surviving.clear();
+        self.served.clear();
 
         let Some(loc) = self.blocks.get(self.next).cloned() else {
             return Ok(false);
@@ -1491,6 +1518,28 @@ impl BlockScan {
             loc.block_index,
             &mut self.dicts,
         )?;
+        let mut hits: Vec<(u32, CachedColumn)> = Vec::new();
+        let mut missed: Vec<u32> = Vec::new();
+        if let (true, Some(attach)) = (columnar, self.decoded_cache.as_ref()) {
+            for p in &pages {
+                let cid = p.desc.column_id;
+                let projected = self.columns.as_ref().is_none_or(|s| s.contains(&cid));
+                if !projected
+                    || self.deferred.contains(&cid)
+                    || hits.iter().any(|(c, _)| *c == cid)
+                    || missed.contains(&cid)
+                {
+                    continue;
+                }
+                match attach
+                    .cache
+                    .lookup(&attach.key(loc.block_index, cid), &attach.counters)
+                {
+                    Some(col) if col.rows() == loc.record_count => hits.push((cid, col)),
+                    _ => missed.push(cid),
+                }
+            }
+        }
         let mut decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
@@ -1501,7 +1550,21 @@ impl BlockScan {
             &self.deferred,
             &self.plans,
             self.columns.as_ref(),
+            &hits,
         )?;
+        if let Some(attach) = self.decoded_cache.as_ref() {
+            for &cid in &missed {
+                if let Some(col) = decoded.cached_column(cid) {
+                    attach.cache.offer(
+                        attach.key(loc.block_index, cid),
+                        &col,
+                        attach.intent,
+                        &attach.counters,
+                    );
+                }
+            }
+        }
+        self.served.extend(hits.iter().map(|(c, _)| *c));
         self.stats.str_cells_validated = self
             .stats
             .str_cells_validated
@@ -1627,6 +1690,7 @@ pub(crate) fn decode_v4_block(
         &[],
         plans,
         columns,
+        &[],
     )
 }
 
@@ -1746,10 +1810,14 @@ fn decode_v4_block_with<'s>(
     deferred: &[u32],
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
+    cached: &[(u32, CachedColumn)],
 ) -> Result<DecodedBlock, LogSegError> {
-    let wanted = |cid: u32| match columns {
-        None => true,
-        Some(set) => set.contains(&cid),
+    let wanted = |cid: u32| {
+        let projected = match columns {
+            None => true,
+            Some(set) => set.contains(&cid),
+        };
+        projected && !cached.iter().any(|(c, _)| *c == cid)
     };
     let mut descs: Vec<crate::page::PageDesc> = Vec::with_capacity(pages.len());
     let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(pages.len());
@@ -1832,6 +1900,7 @@ fn decode_v4_block_with<'s>(
         deferred,
         plans,
         counters,
+        cached,
     )?;
     block.add_str_cells_validated(validated);
     Ok(block)
@@ -6730,6 +6799,98 @@ mod tests {
             cursor.stats().pages_skipped > 0,
             "the projected selection must leave pages undecoded"
         );
+    }
+
+    /// A block with cached `ts` and `stream_ref` and a freshly decoded body
+    /// charges the scan only the body (and the slot vectors): the resident
+    /// charge is the decoded figure less the cached entries' bytes, the body's
+    /// pages are the only ones decoded, and the row path never reads the cache
+    /// (ADR-3326 decision 4).
+    #[test]
+    fn decoded_cache_hit_is_charged_once_and_decodes_only_missing_columns() {
+        use crate::decoded_cache::{DecodedCacheAttach, DecodedCacheCounters, DecodedColumnCache};
+        use ravel_types::accounting::AccessIntent;
+
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let recs: Vec<LogRecord> = (0..12)
+            .map(|i| rec(0, 100 + i, &format!("body number {i}")))
+            .collect();
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let all_rows = Predicate::And(Vec::new());
+        let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
+        let attach = |counters: &Arc<DecodedCacheCounters>| DecodedCacheAttach {
+            cache: Arc::clone(&cache),
+            tenant: [7; 16],
+            object: [9; 32],
+            intent: AccessIntent::Interactive,
+            counters: Arc::clone(counters),
+        };
+
+        let cold = Arc::new(DecodedCacheCounters::default());
+        let mut first = reader
+            .scan_blocks(&all_rows, &[], &ColumnSelection::fixed_only())
+            .expect("open cursor");
+        first.attach_decoded_cache(attach(&cold));
+        while let Some(view) = first.next_block_columnar(&obj).expect("columnar exit") {
+            assert!(view.served_columns().is_empty());
+            assert_eq!(view.resident_charge_bytes(), view.decoded_bytes());
+        }
+        assert_eq!(cold.snapshot().admissions, 6, "ts and stream_ref of 3 blocks");
+
+        // The row path neither reads nor fills the cache.
+        let rows_counters = Arc::new(DecodedCacheCounters::default());
+        let mut rows = reader
+            .scan_blocks(&all_rows, &[], &ColumnSelection::fixed_only())
+            .expect("open cursor");
+        rows.attach_decoded_cache(attach(&rows_counters));
+        while rows.next_block(&obj).expect("row exit").is_some() {}
+        assert_eq!(rows_counters.snapshot(), Default::default());
+
+        let hot = Arc::new(DecodedCacheCounters::default());
+        let mut second = reader
+            .scan_blocks(&all_rows, &[], &ColumnSelection::fixed_only().with_body())
+            .expect("open cursor");
+        second.attach_decoded_cache(attach(&hot));
+        let mut blocks = 0u32;
+        while let Some(block) = second.next_block_index() {
+            let block = block as u32;
+            let view = second
+                .next_block_columnar(&obj)
+                .expect("columnar exit")
+                .expect("a block");
+            let mut served = view.served_columns().to_vec();
+            served.sort_unstable();
+            let mut want = vec![COL_TS, COL_STREAM_REF];
+            want.sort_unstable();
+            assert_eq!(served, want);
+            let cached: u64 = served
+                .iter()
+                .map(|&c| {
+                    cache
+                        .entry_bytes(&attach(&hot).key(block, c))
+                        .expect("served column is resident")
+                })
+                .sum();
+            assert!(cached > 0);
+            assert_eq!(
+                view.resident_charge_bytes() as u64,
+                view.decoded_bytes() as u64 - cached,
+                "the scan's charge leaves out exactly the cached columns' bytes"
+            );
+            assert_eq!(
+                view.pages_decoded(),
+                1,
+                "only the body's value page is decoded on a partial hit"
+            );
+            blocks += 1;
+        }
+        assert_eq!(blocks, 3);
+        let s = hot.snapshot();
+        assert_eq!((s.hits, s.misses, s.admissions), (6, 3, 3));
     }
 
     /// `ColumnarBlockView::str_dict` hands out a dictionary-encoded string
