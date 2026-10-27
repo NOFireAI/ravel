@@ -245,23 +245,23 @@ check "docker_run_variable_ref_is_exempt: exempt marker is used, not [UNPINNED]"
 # A docker run whose image argument sits on a backslash-continued line, not
 # the same physical line as "docker run", is still found: the scanner joins
 # continuation lines before matching. Mutating the digest on the
-# continuation line (metricsbench-nightly.yml's RustFS start spans lines
-# 67-71, with the image on line 71) must be caught and reported at the
+# continuation line (dr-rehearsal.yml's RustFS start spans lines
+# 142-146, with the image on line 146) must be caught and reported at the
 # invocation's start line, proving the join actually ran rather than the
 # image happening to be on the same line as "docker run".
 d="$(new_tree docker-run-with-line-continuation-is-scanned)"
-mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
+mutate "${d}/.github/workflows/dr-rehearsal.yml" \
   's#ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#ghcr.io/rustfs/rustfs:latest#'
 check "docker_run_with_line_continuation_is_scanned" "${d}" 1 \
-  "metricsbench-nightly.yml:67: ghcr.io/rustfs/rustfs:latest"
+  "dr-rehearsal.yml:142: ghcr.io/rustfs/rustfs:latest"
 
 # Removing one docker-run invocation must fail the exact-count assertion,
 # not silently scan fewer references.
 d="$(new_tree docker-run-wrong-count)"
-mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
+mutate "${d}/.github/workflows/dr-rehearsal.yml" \
   '/^          docker run -d --name rustfs \\$/,/^            ghcr\.io\/rustfs\/rustfs:1\.0\.0@sha256:/d'
 check "removing a docker run line fails the docker-run-image count assertion" \
-  "${d}" 1 "found 12 docker run/pull/create image references, expected exactly 13"
+  "${d}" 1 "found 11 docker run/pull/create image references, expected exactly 12"
 
 # A second invocation on the same logical line is scanned too. Chaining with
 # && is ordinary shell, and a scanner that stops at the first `docker` on the

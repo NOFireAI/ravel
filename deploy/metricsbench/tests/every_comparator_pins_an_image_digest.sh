@@ -210,15 +210,19 @@ RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.27.0}'
 # object-store-contract and bench-smoke, metricsbench-nightly.yml) moved to
 # the runner's own aws CLI (issue #2036). Lowered 15->13 when ci.yml's
 # `quickstart` job and its two telemetrygen runs were removed (ADR-0081 A6).
-RUN_IMAGE_EXPECTED_COUNT=13
+# Lowered 13->12 when metricsbench-nightly.yml stopped starting its own
+# RustFS container and ran deploy/metricsbench/run.sh against the compose
+# stack instead (issue #940).
+RUN_IMAGE_EXPECTED_COUNT=12
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
 # RUN_IMAGE_EXPECTED_COUNT. Raised 11->12 with the dr-rehearsal object-store run,
 # which is digest pinned. Lowered 12->9 with the three AWS CLI runs above,
 # all of which were digest pinned. Lowered 9->7 with the two telemetrygen
-# runs above, both digest pinned.
-RUN_IMAGE_EXPECTED_PINNED_COUNT=7
+# runs above, both digest pinned. Lowered 7->6 with metricsbench-nightly.yml's
+# RustFS run above, which was digest pinned.
+RUN_IMAGE_EXPECTED_PINNED_COUNT=6
 
 # The exact text of an extracted image argument (same stripping as the
 # extraction below: the whitespace-delimited token itself, quotes included
