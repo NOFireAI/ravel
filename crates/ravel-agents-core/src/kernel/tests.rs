@@ -1677,10 +1677,10 @@ fn terminal_commands_keep_a_path_through_the_byte_cap() {
     let sim = Sim::started();
     let head = sim.head().clone();
     let used = head.encode().len();
-    // A cap that leaves no growth room but keeps the terminal headroom.
+    // A cap that leaves no growth room but keeps one input's reserve.
     let limits = Limits {
-        max_head_bytes: used + 4 * 1024,
-        terminal_headroom_bytes: 4 * 1024,
+        max_head_bytes: used + 512,
+        terminal_reserve_per_input_bytes: 512,
         ..Limits::default()
     };
     let kernel = Kernel::new(limits);
@@ -1734,7 +1734,7 @@ fn terminal_commands_keep_a_path_through_the_byte_cap() {
 #[test]
 fn an_oversized_caller_string_is_refused_before_any_transition() {
     let mut sim = Sim::started();
-    let cap = sim.kernel.limits.max_string_bytes;
+    let cap = sim.kernel.limits.max_error_bytes;
     let fence = turn_fence(sim.head());
     let long = Command::FailTurn(FailTurn {
         fence: fence.clone(),
@@ -1793,7 +1793,64 @@ fn the_precondition_table_names_the_string_cap_for_every_command_with_caller_str
             effect_id: Id128([9; 16]),
             attempt: 1,
         }),
+        Command::BeginTurn(BeginTurn {
+            fence: turn_fence(&head).owner,
+            handlers: vec![HandlerPin {
+                handler: "h".to_string(),
+                version: "1".to_string(),
+                digest: Hash256([1; 32]),
+            }],
+        }),
+        Command::ScheduleTimer(ScheduleTimer {
+            fence: inc_fence(&head),
+            timer: TimerSpec {
+                timer_key: "t".to_string(),
+                due_unix_ns: 0,
+                handler: "h".to_string(),
+                payload: None,
+            },
+        }),
+        Command::FireTimer(FireTimer {
+            fence: inc_fence(&head),
+            timer_id: Id128([3; 16]),
+            generation: 1,
+        }),
+        Command::CancelTimer(CancelTimer {
+            fence: inc_fence(&head),
+            timer_key: "t".to_string(),
+        }),
+        Command::RecordStep(RecordStep {
+            fence: turn_fence(&head),
+            step_key: "s".to_string(),
+            tool_name: "db".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: identity::step_input_hash("db", "1", b"a"),
+            status: StepStatus::Started,
+            output: None,
+        }),
+        Command::CommitIntent(CommitIntent {
+            fence: turn_fence(&head),
+            intent: IntentSpec {
+                intent_key: "send".to_string(),
+                tool_name: "mail".to_string(),
+                tool_version: "1".to_string(),
+                input_hash: identity::step_input_hash("mail", "1", b"x"),
+                policy: RecoveryPolicy::Manual,
+                input: None,
+            },
+        }),
+        Command::RecordEffectResult(RecordEffectResult {
+            fence: inc_fence(&head),
+            effect_id: Id128([9; 16]),
+            attempt: 1,
+            result: ObjectRef::of(b"r"),
+        }),
     ];
+    assert_eq!(
+        samples.len(),
+        16,
+        "one sample per Command variant, AuthorizeAttempt once per authority"
+    );
     for command in &samples {
         let has_strings = !crate::kernel::caller_strings(command).is_empty();
         let listed = command.preconditions().contains(&CallerStringsWithinCap);
@@ -1807,4 +1864,62 @@ fn the_precondition_table_names_the_string_cap_for_every_command_with_caller_str
         );
     }
     sim.run(&enqueue_cmd(&head, "r2", b"p"));
+}
+
+#[test]
+fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
+    // Fill the inbox under a generous cap, then shrink the cap to exactly
+    // what the growth guard would have left: used + reserve per input.
+    let mut sim = Sim::new();
+    sim.run(&create_cmd());
+    let n = 24usize;
+    for i in 0..n {
+        sim.run(&enqueue_cmd(sim.head(), &format!("r{i}"), b"p"));
+    }
+    let head = sim.head().clone();
+    let reserve = Limits::default().terminal_reserve_per_input_bytes;
+    let limits = Limits {
+        max_head_bytes: head.encode().len() + reserve * n,
+        ..Limits::default()
+    };
+    let error = "e".repeat(limits.max_error_bytes);
+    let mut sim = Sim::with_limits(limits);
+    sim.head = Some(head);
+    assert_eq!(
+        sim.refuse(&enqueue_cmd(sim.head(), "one-more", b"p")),
+        ErrorKind::BudgetExceeded,
+        "the root is at its growth cap"
+    );
+    sim.run(&Command::Takeover(Takeover {
+        incarnation: sim.head().incarnation,
+        owner_id: "w1".to_string(),
+        observed_epoch: sim.head().epoch,
+        lease_hint_unix_ns: 0,
+    }));
+    for _ in 0..n {
+        assert!(matches!(
+            sim.run(&Command::BeginTurn(BeginTurn {
+                fence: owner_fence(sim.head()),
+                handlers: vec![HandlerPin {
+                    handler: "h".to_string(),
+                    version: "1".to_string(),
+                    digest: Hash256([1; 32]),
+                }],
+            })),
+            Reply::TurnStarted(_) | Reply::TurnResumed(_)
+        ));
+        let reply = sim.run(&Command::FailTurn(FailTurn {
+            fence: turn_fence(sim.head()),
+            error: error.clone(),
+            terminal: true,
+            max_attempts: 1,
+        }));
+        assert!(
+            matches!(reply, Reply::TurnFailed { .. }),
+            "a terminal failure must publish for every outstanding input: {reply:?}"
+        );
+        assert!(sim.head().encode().len() <= sim.kernel.limits.max_head_bytes);
+    }
+    assert!(sim.head().inbox.is_empty());
+    assert_eq!(sim.head().results.len(), n);
 }
