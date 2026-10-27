@@ -23,6 +23,11 @@
 //! and the anchor, so a clock-derived anchor would make every run a different
 //! stream. A missing or invalid anchor exits 64.
 //!
+//! `--no-in-process-row` drops the in-process row for a run of portable rows
+//! only: no store is opened and no post-ingest query runs, and the report
+//! says `in_process_row: "skipped"`. Band 6 still runs across the portable
+//! rows (`check_band6_across_rows`).
+//!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
 //! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
 #![allow(clippy::expect_used)]
@@ -37,7 +42,7 @@ use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, GeneratedStream, HttpReplayConfig, MetricsIngestReport,
     PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver, RowAccountingViolation,
-    RunProvenance, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
+    IN_PROCESS_SYSTEM, RunProvenance, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
     build_profile_record, check_anchor, check_expected_digests_agree, check_row_accounting,
     check_row_band6, check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
     replay_over_http_with_plan, workload_digest,
@@ -84,9 +89,16 @@ struct Args {
     /// Missing or invalid, the run exits 64.
     #[arg(long, allow_negative_numbers = true)]
     anchor_ms: Option<i64>,
-    /// The object store backing the in-process Ravel path.
+    /// The object store backing the in-process Ravel path. Unused with
+    /// `--no-in-process-row`.
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,
+    /// Build no in-process row: open no store, run no post-ingest query, and
+    /// replay into the portable rows only. Needs at least one portable
+    /// endpoint. For profiles whose in-process store would not fit beside the
+    /// engines on the host.
+    #[arg(long)]
+    no_in_process_row: bool,
     /// Ingest shard count.
     #[arg(long, default_value_t = 4)]
     shards: u32,
@@ -97,6 +109,7 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     ack_timeout_secs: u64,
     /// Tenant the in-process row writes under, recorded as its `tenant`.
+    /// Unused with `--no-in-process-row`.
     #[arg(long, default_value = "metricsbench")]
     tenant: String,
     /// `ravel-server` `/api/v1/write` endpoint, the portable Ravel row
@@ -106,8 +119,9 @@ struct Args {
     ravel_endpoint: Option<String>,
     /// The tenant `ravel-server` resolves the portable Ravel row's requests
     /// to (from its bearer token, or its dev default), recorded as that row's
-    /// `tenant`. Required with `--ravel-endpoint`, and it must equal
-    /// `--tenant`, so the two Ravel rows describe one tenant's data.
+    /// `tenant`. Required with `--ravel-endpoint`, and unless
+    /// `--no-in-process-row` is given it must equal `--tenant`, so the two
+    /// Ravel rows describe one tenant's data.
     #[arg(long)]
     ravel_tenant: Option<String>,
     /// Base URL of `ravel-server`'s Prometheus query API, for the portable
@@ -187,6 +201,12 @@ enum RunError {
         "--ravel-tenant needs --ravel-endpoint: there is no portable Ravel row to record it on"
     )]
     TenantWithoutEndpoint,
+    #[error(
+        "--no-in-process-row needs at least one portable endpoint (--ravel-endpoint, \
+         --prometheus-endpoint, --victoriametrics-endpoint or --mimir-endpoint): a run with no \
+         rows measures nothing"
+    )]
+    NoRows,
     #[error("{0}")]
     Band6(#[from] Band6Violation),
     #[error(
@@ -247,10 +267,10 @@ enum RunError {
         source: Box<RowAccountingViolation>,
     },
     #[error(
-        "the Ravel replay accepted zero samples, so it measured nothing; a stream that ingests \
-         nothing is a failed run, not an empty result"
+        "the {system} replay accepted zero samples, so it measured nothing; a stream that \
+         ingests nothing is a failed run, not an empty result"
     )]
-    NothingIngested,
+    NothingIngested { system: String },
     #[error("the post-ingest read-your-write query phase failed: {0}")]
     Query(String),
 }
@@ -290,8 +310,9 @@ fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Result<
     Ok(anchor_ms)
 }
 
-/// The portable Ravel row's tenant: required with `--ravel-endpoint` and
-/// equal to `--tenant`, and refused without it.
+/// The portable Ravel row's tenant: required with `--ravel-endpoint`, equal
+/// to `--tenant` when there is an in-process row to compare it with, and
+/// refused without the endpoint.
 fn resolve_ravel_tenant(args: &Args) -> Result<Option<String>, RunError> {
     if args.ravel_endpoint.is_none() {
         if args.ravel_tenant.is_some() {
@@ -302,7 +323,7 @@ fn resolve_ravel_tenant(args: &Args) -> Result<Option<String>, RunError> {
     let Some(ravel_tenant) = &args.ravel_tenant else {
         return Err(RunError::MissingRavelTenant);
     };
-    if *ravel_tenant != args.tenant {
+    if !args.no_in_process_row && *ravel_tenant != args.tenant {
         return Err(RunError::TenantMismatch {
             tenant: args.tenant.clone(),
             ravel_tenant: ravel_tenant.clone(),
@@ -338,6 +359,24 @@ fn resolve_query_urls(args: &Args) -> Result<(), RunError> {
     Ok(())
 }
 
+/// `--no-in-process-row` with no portable endpoint is refused: it would
+/// replay into no row at all
+/// (`tests::skipping_the_in_process_row_needs_a_portable_endpoint`).
+fn resolve_rows(args: &Args) -> Result<(), RunError> {
+    let any_portable = [
+        &args.ravel_endpoint,
+        &args.prometheus_endpoint,
+        &args.victoriametrics_endpoint,
+        &args.mimir_endpoint,
+    ]
+    .iter()
+    .any(|e| e.is_some());
+    if args.no_in_process_row && !any_portable {
+        return Err(RunError::NoRows);
+    }
+    Ok(())
+}
+
 /// The process exit code for a failed run.
 fn exit_code(err: &RunError) -> i32 {
     match err {
@@ -350,7 +389,8 @@ fn exit_code(err: &RunError) -> i32 {
         | RunError::TenantMismatch { .. }
         | RunError::TenantWithoutEndpoint
         | RunError::MissingQueryUrl { .. }
-        | RunError::QueryUrlWithoutEndpoint { .. } => EXIT_USAGE,
+        | RunError::QueryUrlWithoutEndpoint { .. }
+        | RunError::NoRows => EXIT_USAGE,
         _ => 1,
     }
 }
@@ -374,14 +414,11 @@ fn resolve_bearer_token(args: &Args) -> Result<Option<String>, RunError> {
 
 /// Close a drained stream and check one row against it: the classification
 /// identity of band 4, then the row's offering identity and the split of its
-/// offered points, then band 6 for each class the row stores. A portable row
-/// passes the in-process row's scalar expected digest as `in_process_scalar`
-/// and must carry the same one.
+/// offered points, then band 6 for each class the row stores.
 fn close_row(
     label: &str,
     stream: GeneratedStream<'_>,
     row: &SystemIngestResult,
-    in_process_scalar: Option<&str>,
 ) -> Result<(GenerationReport, StreamCounts), RunError> {
     let (report, counts) = stream
         .finish()
@@ -395,12 +432,27 @@ fn close_row(
         source,
     })?;
     check_row_band6(row)?;
-    check_scalar_expected(
-        label,
-        row.ingest.expected_digests.get(PayloadClass::Scalar),
-        in_process_scalar,
-    )?;
     Ok((report, counts))
+}
+
+/// Band 6 across rows: every portable row carries the same expected digest
+/// for every class, and, when the run has an in-process row, the same scalar
+/// expected digest as that row's `in_process_scalar`. Without an in-process
+/// row only that second comparison is skipped
+/// (`tests::portable_rows_still_cross_check_without_the_in_process_row`).
+fn check_band6_across_rows(
+    in_process_scalar: Option<&str>,
+    portable: &[&SystemIngestResult],
+) -> Result<(), RunError> {
+    for row in portable {
+        check_scalar_expected(
+            &row.system,
+            row.ingest.expected_digests.get(PayloadClass::Scalar),
+            in_process_scalar,
+        )?;
+    }
+    check_expected_digests_agree(portable, &PayloadClass::ALL)?;
+    Ok(())
 }
 
 /// A portable row's expected scalar digest `got` equals the in-process
@@ -430,6 +482,7 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let ravel_bearer_token = resolve_bearer_token(args)?;
     let ravel_tenant = resolve_ravel_tenant(args)?;
     resolve_query_urls(args)?;
+    resolve_rows(args)?;
     // `load_workload` read the same file; a second read for the digest keeps
     // the loader's signature unchanged.
     let manifest_bytes = std::fs::read(&args.workload).map_err(|e| {
@@ -448,70 +501,71 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         Ok(GeneratedStream::new(generator, steps))
     };
 
-    // The in-process Ravel path: strict, durable-on-ack, commit tokens.
-    let (store, store_metrics) = store_and_metrics_from_env(args.store);
-    let backend_bills_requests = backend_bills_requests(args.store);
-    let substrate = Substrate {
-        store_backend: args.store.to_string(),
-        endpoint_host: endpoint_host_from_env(args.store),
-        backend_bills_requests,
-    };
-    let ravel_cfg = RavelReplayConfig {
-        store,
-        store_metrics,
-        backend_bills_requests,
-        shards: args.shards,
-        batch_size: args.batch_size,
-        ack_timeout_secs: args.ack_timeout_secs,
-        tenant: TenantId::new(args.tenant.clone()),
-    };
-    let mut ravel_stream = stream_from_anchor()?;
-    let ravel = replay_into_ravel(&ravel_cfg, &mut ravel_stream)
-        .await
-        .map_err(|e| RunError::Replay(e.to_string()))?;
+    let mut rows = Vec::new();
+    let mut query = None;
+    let mut substrate = None;
+    // The generator report every row's regeneration must match: the
+    // in-process replay's, else the first portable row's.
+    let mut reference: Option<GenerationReport> = None;
+    if !args.no_in_process_row {
+        // The in-process Ravel path: strict, durable-on-ack, commit tokens.
+        let (store, store_metrics) = store_and_metrics_from_env(args.store);
+        let backend_bills_requests = backend_bills_requests(args.store);
+        substrate = Some(Substrate {
+            store_backend: args.store.to_string(),
+            endpoint_host: endpoint_host_from_env(args.store),
+            backend_bills_requests,
+        });
+        let ravel_cfg = RavelReplayConfig {
+            store,
+            store_metrics,
+            backend_bills_requests,
+            shards: args.shards,
+            batch_size: args.batch_size,
+            ack_timeout_secs: args.ack_timeout_secs,
+            tenant: TenantId::new(args.tenant.clone()),
+        };
+        let mut ravel_stream = stream_from_anchor()?;
+        let ravel = replay_into_ravel(&ravel_cfg, &mut ravel_stream)
+            .await
+            .map_err(|e| RunError::Replay(e.to_string()))?;
 
-    // Band 4: the stream closes against the generator and the Ravel
-    // accounting closes over every line.
-    let (gen_report, _) = close_row("ravel (in-process)", ravel_stream, &ravel.result, None)?;
-    let in_process_scalar = ravel
-        .result
-        .ingest
-        .expected_digests
-        .get(PayloadClass::Scalar)
-        .to_string();
-    if ravel.result.ingest.accepted_samples == 0 {
-        return Err(RunError::NothingIngested);
+        // Band 4: the stream closes against the generator and the Ravel
+        // accounting closes over every line.
+        let (gen_report, _) = close_row("ravel (in-process)", ravel_stream, &ravel.result)?;
+        if ravel.result.ingest.accepted_samples == 0 {
+            return Err(RunError::NothingIngested {
+                system: IN_PROCESS_SYSTEM.to_string(),
+            });
+        }
+        reference = Some(gen_report);
+
+        // Post-ingest read-your-write query phase (ADR-0927 decision 3): pass
+        // the strict writes' commit tokens as `min_commit_token` and evaluate
+        // an instant query at the replay's newest sample, so the read
+        // resolves the exact committed segments deterministically. Recorded
+        // as its own phase, separate from ingest (decision 9). Runs while
+        // `ravel` is still whole, before its result row is moved into `rows`.
+        let query_expr =
+            ravel
+                .first_metric
+                .clone()
+                .ok_or_else(|| RunError::NothingIngested {
+                    system: IN_PROCESS_SYSTEM.to_string(),
+                })?;
+        query = Some(
+            query_after_replay(&ravel, &query_expr)
+                .await
+                .map_err(|e| RunError::Query(e.to_string()))?,
+        );
+        rows.push(ravel.result);
     }
-
-    // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
-    // generator's exact counts for the figures that are not directly declared
-    // (total series created, logical input bytes) -- never derived from the
-    // offered sample count.
-    let profile_record = build_profile_record(
-        &workload,
-        profile,
-        steps,
-        gen_report.bytes,
-        &gen_report,
-        provenance,
-    )
-    .map_err(|e| RunError::Generate(e.to_string()))?;
-
-    // Post-ingest read-your-write query phase (ADR-0927 decision 3): pass the
-    // strict writes' commit tokens as `min_commit_token` and evaluate an instant
-    // query at the replay's newest sample, so the read resolves the exact
-    // committed segments deterministically. Recorded as its own phase, separate
-    // from ingest (decision 9). Runs while `ravel` is still whole, before its
-    // result row is moved into `rows`.
-    let query_expr = ravel
-        .first_metric
-        .clone()
-        .ok_or(RunError::NothingIngested)?;
-    let query = query_after_replay(&ravel, &query_expr)
-        .await
-        .map_err(|e| RunError::Query(e.to_string()))?;
-
-    let mut rows = vec![ravel.result];
+    let in_process_scalar = rows.first().map(|r| {
+        r.ingest
+            .expected_digests
+            .get(PayloadClass::Scalar)
+            .to_string()
+    });
 
     // Portable rows, only those a caller supplied an endpoint for. Their
     // `system` values are the names the query runner joins on.
@@ -567,13 +621,24 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
                 source,
             })?;
         let mut row = outcome.result;
-        let (report, _) = close_row(system, stream, &row, Some(&in_process_scalar))?;
-        if report.digest != gen_report.digest {
-            return Err(RunError::StreamDiverged {
-                system: system.to_string(),
-                expected: gen_report.digest.clone(),
-                got: report.digest,
-            });
+        let (report, _) = close_row(system, stream, &row)?;
+        match &reference {
+            Some(expected) if report.digest != expected.digest => {
+                return Err(RunError::StreamDiverged {
+                    system: system.to_string(),
+                    expected: expected.digest.clone(),
+                    got: report.digest,
+                });
+            }
+            Some(_) => {}
+            None => {
+                if row.ingest.accepted_samples == 0 {
+                    return Err(RunError::NothingIngested {
+                        system: system.to_string(),
+                    });
+                }
+                reference = Some(report);
+            }
         }
         let readback_cfg = ReadbackConfig {
             query_url: query_url.clone(),
@@ -596,13 +661,34 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         portable.push(row);
     }
     let portable_refs: Vec<&SystemIngestResult> = portable.iter().collect();
-    check_expected_digests_agree(&portable_refs, &PayloadClass::ALL)?;
+    check_band6_across_rows(in_process_scalar.as_deref(), &portable_refs)?;
     rows.extend(portable);
+    // `resolve_rows` refused a run with neither an in-process nor a portable
+    // row, so one of them set the reference.
+    let gen_report = reference.ok_or(RunError::NoRows)?;
 
-    Ok(MetricsIngestReport::new(rows)
-        .with_query(query)
-        .with_profile(profile_record)
-        .with_substrate(substrate))
+    // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
+    // generator's exact counts for the figures that are not directly declared
+    // (total series created, logical input bytes) -- never derived from the
+    // offered sample count.
+    let profile_record = build_profile_record(
+        &workload,
+        profile,
+        steps,
+        gen_report.bytes,
+        &gen_report,
+        provenance,
+    )
+    .map_err(|e| RunError::Generate(e.to_string()))?;
+
+    let mut report = MetricsIngestReport::new(rows).with_profile(profile_record);
+    if let Some(query) = query {
+        report = report.with_query(query);
+    }
+    if let Some(substrate) = substrate {
+        report = report.with_substrate(substrate);
+    }
+    Ok(report)
 }
 
 #[tokio::main]
