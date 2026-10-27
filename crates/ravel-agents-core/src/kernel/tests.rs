@@ -877,8 +877,12 @@ fn fail_turn_is_refused_while_a_manual_attempt_is_in_doubt() {
     );
     sim.run(&begin_cmd(sim.head()));
     assert_eq!(
-        sim.step(&commit_intent_cmd(sim.head(), "charge", RecoveryPolicy::Manual))
-            .expect("recommit"),
+        sim.step(&commit_intent_cmd(
+            sim.head(),
+            "charge",
+            RecoveryPolicy::Manual
+        ))
+        .expect("recommit"),
         Transition::Unchanged {
             reply: Reply::IntentCommitted { effect_id }
         }
@@ -1059,7 +1063,11 @@ fn a_commit_whose_base_state_version_is_one_behind_is_ownership_lost() {
 #[test]
 fn every_fenced_command_refuses_a_stale_fence() {
     let mut live = Sim::started();
-    live.run(&commit_intent_cmd(live.head(), "i0", RecoveryPolicy::Manual));
+    live.run(&commit_intent_cmd(
+        live.head(),
+        "i0",
+        RecoveryPolicy::Manual,
+    ));
     live.run(&Command::ScheduleTimer(ScheduleTimer {
         fence: inc_fence(live.head()),
         timer: TimerSpec {
@@ -1253,7 +1261,7 @@ fn stale_command(head: &Head, which: u8, stale_epoch: bool) -> Command {
         3 => Command::FailTurn(FailTurn {
             fence: turn,
             error: String::new(),
-            terminal: which % 2 == 0,
+            terminal: which.is_multiple_of(2),
             max_attempts: 3,
         }),
         4 => Command::RecordStep(RecordStep {
@@ -1308,10 +1316,7 @@ fn stale_command(head: &Head, which: u8, stale_epoch: bool) -> Command {
         12 => Command::FireTimer(FireTimer {
             fence: inc,
             timer_id: identity::timer_id(head.incarnation, &timer_key(0)),
-            generation: head
-                .timers
-                .first()
-                .map_or(0, |t| t.generation),
+            generation: head.timers.first().map_or(0, |t| t.generation),
         }),
         13 => Command::CancelTimer(CancelTimer {
             fence: inc,
