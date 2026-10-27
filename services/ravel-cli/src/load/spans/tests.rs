@@ -2537,6 +2537,71 @@ mod default_geometry {
         assert_eq!(span_objects(store.as_ref()).await, 0);
     }
 
+    /// The ack deadline the spans loader announces through its geometry hook
+    /// and reports, for a one-batch load at `--max-flush-delay 90s` and
+    /// `--target-bytes 3,700,000,000`.
+    async fn announced_ack_deadline(ack_margin: Option<Duration>) -> Duration {
+        let (_dir, pq) = fixture(BATCH_ROWS, 1);
+        let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+        let announced = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&announced);
+        let hook: GeometryHook = Arc::new(move |g: &LoadGeometry| {
+            *sink.lock().expect("hook lock") = Some(*g);
+        });
+        let mut report = SpansLoadReport::default();
+        load_spans_into(
+            &mut report,
+            Arc::new(MemoryStore::new()),
+            &pq,
+            "acme",
+            &mapping,
+            1,
+            BATCH_ROWS,
+            0,
+            GeometryRequest {
+                ack_margin,
+                ..GeometryRequest::explicit(3_700_000_000, 1)
+            },
+            Some(hook),
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(Duration::from_secs(90)),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            Arc::new(TenantRules::none()),
+        )
+        .await
+        .expect("load succeeds");
+        let announced = announced
+            .lock()
+            .expect("hook lock")
+            .expect("the geometry was announced");
+        assert_eq!(report.layout_report().geometry, Some(announced));
+        announced.ack_deadline
+    }
+
+    /// Issue #3289: `--ack-margin` and the flush target's encode allowance
+    /// both reach the spans loader's ack deadline. At a 90 s delay,
+    /// `--ack-margin 7` gives exactly 97 s, and no margin gives 90 + 60 + 37 s
+    /// for a 3.7e9 target.
+    ///
+    /// Prove-the-test: pass `None` for `request.ack_margin` at the
+    /// `with_ack_deadline` call in `load_spans_into` and the first case fails
+    /// at `left: 187s, right: 97s`; pass a geometry with target 0 there and
+    /// the second fails at `left: 150s, right: 187s`.
+    #[tokio::test]
+    async fn the_spans_loader_runs_with_the_ack_margin_and_the_encode_allowance() {
+        assert_eq!(
+            announced_ack_deadline(Some(Duration::from_secs(7))).await,
+            Duration::from_secs(97),
+            "--ack-margin 7 at a 90s delay"
+        );
+        assert_eq!(
+            announced_ack_deadline(None).await,
+            Duration::from_secs(187),
+            "90 + 60 + 3,700,000,000 / 100,000,000"
+        );
+    }
+
     /// With `--target-bytes` and `--pipeline-depth` unset, 51 batches of
     /// 10,000 spans on one shard make exactly ceil(510,000 / 250,000) = 3
     /// objects: every 25th batch reaches the derived target (250,000 times
