@@ -1,0 +1,306 @@
+// Ravel Agents persistent records under `t/<tenant_hash>/ag/` (ADR-3331).
+//
+// Persistent contract: field numbers in this file are frozen from the commit
+// that introduced it. Add fields with new numbers; never renumber, retype or
+// reuse one.
+//
+// AgentHead is the one CAS-mutable record per agent (ADR-0066 amendment R1):
+// it is read, modified and written back under CAS, so every additive field
+// change to it bumps its format_version, rolled out readers before writers.
+// Every other top-level message here is an immutable object, written once
+// with CreateIfAbsent under `o/<object_hash>`.
+//
+// Every top-level message carries `format_version` as field 1. Version 1 is
+// the only version this release reads; a reader refuses any other as an
+// unsupported format and never re-encodes it.
+//
+// Every top-level message ends with `seal`, which holds 0x52414731 ("RAG1"),
+// is the highest field number in its message, and is declared last, so the
+// encoder writes it last and a strict byte prefix of an encoding decodes
+// without it and is refused as truncated. A field added later takes a number
+// below 2047 and is declared before `seal`.
+//
+// Every message is top-level (no nested messages), so the classification
+// test in crates/ravel-catalog/tests scans this file with the same flat
+// parser it uses for sys.proto.
+syntax = "proto3";
+
+package ravel.agents.v1;
+
+enum LifecycleStatus {
+  LIFECYCLE_STATUS_UNSPECIFIED = 0;  // never written
+  LIFECYCLE_STATUS_ACTIVE = 1;
+  LIFECYCLE_STATUS_TOMBSTONED = 2;
+}
+
+// How the inbox, receipt, result and event lists are held. Format version 1
+// reads only INLINE: the lists live in the repeated fields of AgentHead and
+// every page reference is unset. PAGED is reserved for the index-page
+// representation of ADR-3331 milestone 6, which ships as AgentHead format
+// version 2.
+enum IndexRepresentation {
+  INDEX_REPRESENTATION_UNSPECIFIED = 0;  // never written
+  INDEX_REPRESENTATION_INLINE = 1;
+  INDEX_REPRESENTATION_PAGED = 2;
+}
+
+enum CancellationState {
+  CANCELLATION_STATE_UNSPECIFIED = 0;  // never written
+  CANCELLATION_STATE_NONE = 1;
+  CANCELLATION_STATE_REQUESTED = 2;
+}
+
+// Why an active turn cannot complete until something outside the worker acts.
+enum TurnBlock {
+  TURN_BLOCK_UNSPECIFIED = 0;  // never written
+  TURN_BLOCK_NONE = 1;
+  TURN_BLOCK_NON_DETERMINISTIC_REPLAY = 2;
+}
+
+enum InputSource {
+  INPUT_SOURCE_UNSPECIFIED = 0;  // never written
+  INPUT_SOURCE_MESSAGE = 1;
+  INPUT_SOURCE_TIMER = 2;
+}
+
+enum ResultStatus {
+  RESULT_STATUS_UNSPECIFIED = 0;  // never written
+  RESULT_STATUS_COMPLETED = 1;
+  RESULT_STATUS_FAILED = 2;
+  RESULT_STATUS_CANCELLED = 3;
+}
+
+enum TimerStatus {
+  TIMER_STATUS_UNSPECIFIED = 0;  // never written
+  TIMER_STATUS_SCHEDULED = 1;
+  TIMER_STATUS_DELIVERED = 2;
+  TIMER_STATUS_CANCELLED = 3;
+}
+
+enum StepStatus {
+  STEP_STATUS_UNSPECIFIED = 0;  // never written
+  STEP_STATUS_STARTED = 1;
+  STEP_STATUS_COMPLETED = 2;
+}
+
+// ADR-3331 decision 7: what may happen after an ambiguous attempt.
+enum RecoveryPolicy {
+  RECOVERY_POLICY_UNSPECIFIED = 0;  // never written
+  RECOVERY_POLICY_PROVIDER_IDEMPOTENCY = 1;
+  RECOVERY_POLICY_AT_LEAST_ONCE = 2;
+  RECOVERY_POLICY_MANUAL = 3;
+}
+
+enum EffectStatus {
+  EFFECT_STATUS_UNSPECIFIED = 0;  // never written
+  EFFECT_STATUS_INTENT = 1;
+  EFFECT_STATUS_AUTHORIZED = 2;
+  EFFECT_STATUS_IN_DOUBT = 3;
+  EFFECT_STATUS_COMPLETED = 4;
+}
+
+// A reference to an immutable object at
+// `t/<tenant_hash>/ag/<agent_id>/o/<hex(object_hash)>`.
+message ObjectRef {
+  bytes object_hash = 1;  // blake3-256 of the object bytes, 32 bytes
+  uint64 size_bytes = 2;
+}
+
+// Logical quota counters, recomputed from the record on every transition.
+message QuotaCounters {
+  uint64 referenced_bytes = 1;
+  uint64 mailbox_depth = 2;
+  uint64 receipt_count = 3;
+  uint64 timer_count = 4;
+}
+
+message ActiveTurn {
+  uint64 input_accept_seq = 1;
+  bytes turn_id = 2;  // 16 bytes
+  uint64 base_state_version = 3;
+  string handler = 4;
+  string handler_version = 5;
+  bytes handler_digest = 6;  // 32 bytes
+  CancellationState cancellation = 7;
+  TurnBlock block = 8;
+  int64 started_unix_ns = 9;
+}
+
+message InboxEntry {
+  uint64 accept_seq = 1;
+  string handler = 2;
+  InputSource source = 3;
+  // Set when source is MESSAGE.
+  string request_id = 4;
+  bytes request_hash = 5;  // 32 bytes
+  // Set when source is TIMER.
+  bytes timer_id = 6;  // 16 bytes
+  uint64 timer_generation = 7;
+  ObjectRef payload = 8;  // absent for an empty payload
+  int64 accepted_unix_ns = 9;
+  uint32 failed_attempts = 10;
+  // The turn that last failed retryably on this input; empty until one has.
+  bytes last_failed_turn_id = 11;  // 16 bytes when set
+}
+
+message Receipt {
+  string request_id = 1;
+  string handler = 2;
+  bytes request_hash = 3;  // 32 bytes
+  uint64 accept_seq = 4;
+}
+
+message ResultEntry {
+  uint64 accept_seq = 1;
+  ResultStatus status = 2;
+  ObjectRef output = 3;
+  string error = 4;
+  bytes turn_id = 5;  // empty when no turn ran
+  bool dead_lettered = 6;
+  int64 finished_unix_ns = 7;
+}
+
+message EventEntry {
+  uint64 event_seq = 1;
+  uint64 accept_seq = 2;
+  bytes turn_id = 3;
+  string event_type = 4;
+  ObjectRef payload = 5;
+}
+
+message TimerEntry {
+  bytes timer_id = 1;  // 16 bytes
+  string timer_key = 2;
+  uint64 generation = 3;
+  int64 due_unix_ns = 4;
+  string handler = 5;
+  ObjectRef payload = 6;
+  TimerStatus status = 7;
+}
+
+message StepRecord {
+  bytes step_id = 1;  // 16 bytes
+  string step_key = 2;
+  string tool_name = 3;
+  string tool_version = 4;
+  bytes input_hash = 5;  // 32 bytes
+  StepStatus status = 6;
+  ObjectRef output = 7;
+}
+
+message EffectRecord {
+  bytes effect_id = 1;  // 16 bytes
+  string step_key = 2;
+  string tool_name = 3;
+  string tool_version = 4;
+  bytes input_hash = 5;  // 32 bytes
+  RecoveryPolicy policy = 6;
+  EffectStatus status = 7;
+  uint32 attempt = 8;
+  ObjectRef result = 9;
+  uint32 result_attempt = 10;
+  bytes turn_id = 11;  // the turn that committed the intent
+}
+
+message OutboxIntent {
+  bytes effect_id = 1;  // 16 bytes
+  string intent_key = 2;
+  string tool_name = 3;
+  string tool_version = 4;
+  RecoveryPolicy policy = 5;
+  ObjectRef input = 6;
+  bytes turn_id = 7;
+}
+
+// The mutable root of one agent at `t/<tenant_hash>/ag/<agent_id>/head`.
+message AgentHead {
+  uint32 format_version = 1;  // = 1
+  bytes tenant_hash = 2;      // 16 bytes
+  string kind = 3;
+  string key = 4;
+  uint64 incarnation = 5;
+  uint64 root_revision = 6;
+  string owner_id = 7;
+  uint64 epoch = 8;
+  int64 owner_lease_hint_unix_ns = 9;  // advisory
+  uint64 state_version = 10;
+  ObjectRef state = 11;  // reference and size of the StateSnapshot
+  IndexRepresentation representation = 12;
+  ObjectRef inbox_page = 13;  // PAGED only
+  uint64 next_accept_seq = 14;
+  ObjectRef receipt_index = 15;  // PAGED only
+  ActiveTurn active_turn = 16;
+  ObjectRef step_transcript = 17;  // PAGED only
+  ObjectRef effect_journal = 18;   // PAGED only
+  ObjectRef outbox = 19;           // PAGED only
+  ObjectRef timer_table = 20;      // PAGED only
+  uint64 timer_generation = 21;
+  ObjectRef result_index = 22;  // PAGED only
+  ObjectRef event_page = 23;    // PAGED only
+  uint64 next_event_seq = 24;
+  LifecycleStatus lifecycle = 25;
+  QuotaCounters quota = 26;
+  // INLINE representation lists.
+  repeated InboxEntry inbox = 27;
+  repeated Receipt receipts = 28;
+  repeated ResultEntry results = 29;
+  repeated EventEntry events = 30;
+  repeated TimerEntry timers = 31;
+  repeated StepRecord steps = 32;
+  repeated EffectRecord effects = 33;
+  repeated OutboxIntent outbox_intents = 34;
+  fixed32 seal = 2047;
+}
+
+message InboxPage {
+  uint32 format_version = 1;  // = 1
+  repeated InboxEntry entries = 2;
+  fixed32 seal = 2047;
+}
+
+message ReceiptPage {
+  uint32 format_version = 1;  // = 1
+  repeated Receipt entries = 2;
+  fixed32 seal = 2047;
+}
+
+message ResultPage {
+  uint32 format_version = 1;  // = 1
+  repeated ResultEntry entries = 2;
+  fixed32 seal = 2047;
+}
+
+message EventPage {
+  uint32 format_version = 1;  // = 1
+  repeated EventEntry entries = 2;
+  fixed32 seal = 2047;
+}
+
+message StepTranscript {
+  uint32 format_version = 1;  // = 1
+  bytes turn_id = 2;
+  repeated StepRecord steps = 3;
+  fixed32 seal = 2047;
+}
+
+message EffectJournal {
+  uint32 format_version = 1;  // = 1
+  bytes turn_id = 2;
+  repeated EffectRecord effects = 3;
+  fixed32 seal = 2047;
+}
+
+message TimerTable {
+  uint32 format_version = 1;  // = 1
+  repeated TimerEntry timers = 2;
+  fixed32 seal = 2047;
+}
+
+// Envelope of one agent state version. `state` is opaque to Ravel.
+message StateSnapshot {
+  uint32 format_version = 1;  // = 1
+  uint64 state_version = 2;
+  string content_type = 3;
+  bytes state = 4;
+  fixed32 seal = 2047;
+}

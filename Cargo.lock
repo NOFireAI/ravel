@@ -4454,6 +4454,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-agents-client"
+version = "0.27.0"
+
+[[package]]
+name = "ravel-agents-core"
+version = "0.27.0"
+dependencies = [
+ "base64 0.23.0",
+ "blake3",
+ "hex",
+ "proptest",
+ "prost",
+ "ravel-object-store",
+ "ravel-proto",
+ "ravel-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "ravel-agents-runtime"
+version = "0.27.0"
+
+[[package]]
+name = "ravel-agents-sim"
+version = "0.27.0"
+
+[[package]]
+name = "ravel-agents-store"
+version = "0.27.0"
+
+[[package]]
 name = "ravel-alerting"
 version = "0.27.0"
 dependencies = [

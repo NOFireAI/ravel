@@ -19,6 +19,11 @@
 //! so a message that never got a Rust reader is still caught. It is scoped to
 //! ravel-catalog because that crate owns three of the versioned records and its
 //! test gate (`cargo test -p ravel-catalog`) always runs it.
+//!
+//! The same guard covers `proto/ravel/agents.proto` (ADR-3331 decision 3)
+//! through its own table, `agents_classification_table()`: `AgentHead` is
+//! the one CAS-mutable root, and every other versioned agents message is an
+//! immutable object written under `o/` with `CreateIfAbsent`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,10 +91,61 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
     ])
 }
 
+/// The checked-in classification of every `format_version`-carrying message in
+/// `proto/ravel/agents.proto` (ADR-3331 decision 3). Adding a versioned agents
+/// message without adding it here fails `agents_classification_is_complete`.
+fn agents_classification_table() -> BTreeMap<&'static str, Class> {
+    use Class::{CasMutable, Immutable};
+    BTreeMap::from([
+        // The per-agent root at `ag/<agent_id>/head`: read, modified and
+        // written back under CAS, so every additive change bumps the version.
+        ("AgentHead", CasMutable(&[1])),
+        // Content-addressed objects under `ag/<agent_id>/o/`, written once
+        // with CreateIfAbsent and never rewritten.
+        ("InboxPage", Immutable(&[1])),
+        ("ReceiptPage", Immutable(&[1])),
+        ("ResultPage", Immutable(&[1])),
+        ("EventPage", Immutable(&[1])),
+        ("StepTranscript", Immutable(&[1])),
+        ("EffectJournal", Immutable(&[1])),
+        ("TimerTable", Immutable(&[1])),
+        ("StateSnapshot", Immutable(&[1])),
+    ])
+}
+
 /// The checked-in proto text this guard classifies.
 fn sys_proto_text() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../proto/ravel/sys.proto");
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read sys.proto at {path}: {e}"))
+    proto_text("sys.proto")
+}
+
+fn agents_proto_text() -> String {
+    proto_text("agents.proto")
+}
+
+fn proto_text(file: &str) -> String {
+    let path = format!("{}/../../proto/ravel/{file}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {file} at {path}: {e}"))
+}
+
+/// Every message `proto` versions is in `table` and the reverse, with a floor
+/// so a parser that enumerates nothing cannot pass against an empty table.
+fn assert_complete(file: &str, proto: &str, table: &BTreeMap<&'static str, Class>) {
+    let in_proto = messages_with_format_version(proto);
+    let classified: BTreeSet<String> = table.keys().map(|s| s.to_string()).collect();
+    let unclassified: Vec<&String> = in_proto.difference(&classified).collect();
+    assert!(
+        unclassified.is_empty(),
+        "{file} messages carrying format_version with no classification: {unclassified:?}"
+    );
+    let stale: Vec<&String> = classified.difference(&in_proto).collect();
+    assert!(
+        stale.is_empty(),
+        "the {file} table names messages not in {file} (renamed or removed?): {stale:?}"
+    );
+    assert!(
+        !in_proto.is_empty(),
+        "the parser enumerated no versioned messages in {file}"
+    );
 }
 
 /// The set of top-level `message` names in `proto` that declare a `format_version`
@@ -195,6 +251,47 @@ fn classification_is_complete() {
     );
 }
 
+/// The agents proto has exactly the nine versioned messages ADR-3331 decision 3
+/// lists, each classified, with `AgentHead` the only CAS-mutable one.
+#[test]
+fn agents_classification_is_complete() {
+    let proto = agents_proto_text();
+    let table = agents_classification_table();
+    assert_complete("agents.proto", &proto, &table);
+    assert_eq!(messages_with_format_version(&proto).len(), 9);
+    let cas: Vec<&str> = table
+        .iter()
+        .filter(|(_, class)| matches!(class, Class::CasMutable(_)))
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(cas, ["AgentHead"]);
+}
+
+/// No message name is classified in both tables, so a message moved between
+/// the two protos cannot keep a stale class in the other.
+#[test]
+fn the_sys_and_agents_tables_are_disjoint() {
+    let sys = classification_table();
+    let shared: Vec<&str> = agents_classification_table()
+        .into_keys()
+        .filter(|name| sys.contains_key(name))
+        .collect();
+    assert!(shared.is_empty(), "classified in both tables: {shared:?}");
+}
+
+/// The agents guard bites the same way the sys guard does.
+#[test]
+fn a_new_versioned_agents_message_is_detected_as_unclassified() {
+    let mut proto = agents_proto_text();
+    proto.push_str("\nmessage FuturePage {\n  uint32 format_version = 1;\n}\n");
+    let in_proto = messages_with_format_version(&proto);
+    let table = agents_classification_table();
+    assert!(in_proto.contains("FuturePage"));
+    assert!(!table.contains_key("FuturePage"));
+    let missed = std::panic::catch_unwind(|| assert_complete("agents.proto", &proto, &table));
+    assert!(missed.is_err(), "an unclassified agents message must fail");
+}
+
 /// Every read-version slice in the table that belongs to a reader THIS crate owns
 /// is the closed set that reader's own `MIN_READ_VERSION..=MAX_READ_VERSION`
 /// constants define. Widening a gate without updating the table therefore fails
@@ -252,10 +349,14 @@ fn catalog_read_sets_match_their_readers_constants() {
 /// Every CasMutable supported set is non-empty and includes version 1 (the
 /// original floor); every Immutable record reads exactly {1} today, except
 /// `WorkerHeartbeat`, which reads exactly {2} (ADR-3130 decision 2). Pins the
-/// table's own shape so a typo (an empty set, a missing 1) cannot pass.
+/// table's own shape so a typo (an empty set, a missing 1) cannot pass. The
+/// agents table is held to the same shape: every agents record reads {1}.
 #[test]
 fn classification_table_is_well_formed() {
-    for (name, class) in classification_table() {
+    for (name, class) in classification_table()
+        .into_iter()
+        .chain(agents_classification_table())
+    {
         match class {
             Class::CasMutable(versions) => {
                 assert!(!versions.is_empty(), "{name}: CasMutable set is empty");
