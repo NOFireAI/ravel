@@ -727,3 +727,61 @@ and, with five or more passes, `rel_mad_pct` (`only_ok_rows_carry_latency`).
 `cases_expected` is written from the corpus before any query. The assembled
 report goes through `report_schema::validate` before it is written; a report
 that fails is not written and the exit is 70.
+
+**Diagnostics sidecar.** `--diagnostics <path>` writes a second JSON file
+after the report, holding figures pre-registered checks need that the
+version-3 report does not carry. It is diagnostic, not part of the report:
+`report_schema::validate` never reads it, and without the flag no file is
+written and the run is unchanged
+(`the_corpus_runs_against_every_engine_and_validates`). An unwritable path
+exits 74 after the report is already written (the sidecar write is the last
+step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
+(`metrics_query::Diagnostics`):
+
+- `profile`, `corpus_digest` and `oracle` name the run it describes
+  (`the_diagnostics_sidecar_records_the_largest_ulp_gap`).
+- `oracle_retries`: every oracle retry in the order sent, each with `entry`,
+  `pass`, `repetition` and `attempt`, the same four values the stderr line
+  names (`an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt`).
+- `ulp_gaps`: one object per entry and engine other than the oracle, for
+  every entry, tolerance or not (`metrics_query::UlpGap`). `max_ulps` is the
+  largest `comparator::ulp_distance` between a value of the oracle's answer
+  for the pass and the paired value of the engine's answer, over every step,
+  repetition and timed pass; an exact entry shows 0. Only answers classified
+  against the oracle are measured, so warmup passes and an entry unsupported
+  on the engine by declaration are not. An answer is aligned when it is a
+  2xx `success` envelope of the oracle's result type with the same label
+  sets and, series by series, the same number of steps at the same
+  timestamps; series pair by label set, steps by position, and a native
+  histogram contributes its `count` and `sum`
+  (`ulp_gaps_pair_series_by_labels_and_steps_by_position`). Every other
+  answer (a refusal, an error, a timeout, a shape mismatch) counts in
+  `unaligned_answers`, and `max_ulps` is null when no aligned answer had a
+  finite value pair
+  (`the_diagnostics_sidecar_records_the_largest_ulp_gap`). `aligned_answers`
+  and `value_pairs` count what was measured. A NaN or an infinity paired with
+  anything but itself has no distance; it counts in `non_finite_mismatches`
+  and leaves `max_ulps` to the other pairs
+  (`a_non_finite_mismatch_is_counted_not_measured`). The distance counts
+  representable steps on the ordered bit line, `-0.0` and `0.0` being one
+  point, and two NaNs are 0 apart (`ulp_distance_*` tests in
+  `crates/ravel-promql-difftest/src/comparator.rs`).
+
+```json
+{
+  "profile": "ci",
+  "corpus_digest": "blake3:...",
+  "oracle": "prometheus",
+  "ulp_gaps": [
+    {"entry": "mb_single_counter_rate", "engine": "ravel", "max_ulps": 3,
+     "aligned_answers": 10, "unaligned_answers": 0, "value_pairs": 20,
+     "non_finite_mismatches": 0},
+    {"entry": "mb_selective_job_rate_sum", "engine": "mimir", "max_ulps": null,
+     "aligned_answers": 0, "unaligned_answers": 10, "value_pairs": 0,
+     "non_finite_mismatches": 0}
+  ],
+  "oracle_retries": [
+    {"entry": "mb_single_gauge_instant", "pass": 1, "repetition": 1, "attempt": 2}
+  ]
+}
+```
