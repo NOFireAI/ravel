@@ -1,7 +1,8 @@
 /**
- * Client entry: send messages to agents and follow their operations. Safe to
- * bundle for any runtime; it imports no server-only module, which
- * index.test.ts enforces.
+ * Client entry: send messages to agents and follow their operations. It
+ * imports no module from this package's worker, tools or testing entries and
+ * no node: builtin, which index.test.ts enforces over this package's own
+ * module graph; the test does not follow third-party packages.
  */
 import { notImplemented } from "../not-implemented.js";
 import type {
