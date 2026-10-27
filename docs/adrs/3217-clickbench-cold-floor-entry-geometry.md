@@ -825,15 +825,15 @@ Follow-ups the design leaves to the builder or to a later pass:
   every block-level index 1:1, ADR-0699 rejected alternative 1); an
   object-level string dictionary or one zstd frame per chunk (ADR-2135
   rejected alternatives, `docs/adrs/2135-rlog-v5-storage-footprint.md:345-350`).
-  Chunk order inside a row group was first listed here as a format change.
-  It is neither out nor a format change: see the decision 8 chunk order
-  amendment below (the format doc states ascending column id,
-  `docs/log-segment-format.md:483-486`; byte order puts URL at slot 87 and
-  UserID at 99 of 104, so the change would help).
   zstd 19 is out on load time (5,498 s against 931 s, one measurement). A
   device read-ahead setting in `install` is neither a flag nor a cache
   tier, but whether the benchmark allows a block-device setting is an
-  owner question and it is not proposed.
+  owner question and it is not proposed. Chunk order inside a row group
+  was first listed in this bullet as a format change. It is neither out
+  nor a format change: see the decision 8 chunk order amendment below (the
+  format doc states ascending column id,
+  `docs/log-segment-format.md:483-486`; byte order puts URL at slot 87 and
+  UserID at 99 of 104, so the change would help).
 
 ## Measurement
 
@@ -1009,12 +1009,14 @@ The ClickBench load passes the co-projected sets `CounterID`/`EventDate`/
 Expected effect, as the ticket pre-registers it:
 
 - Per-object disk bytes on q9 to q19 and q33 fall by one region's cost,
-  1.5 to 3 MB each. The region cost is the store's file reads beyond the
-  requested bytes on the first read of a region: 2 to 4 MB per cold
-  region in the RustFS probe (#3217 comment 6384802590). It is a different
-  quantity from the over-read `O` in Context (0.39 to 0.62 MB per GET by
-  statement, about 0.8 device-corrected), which averages over every GET of
-  a statement, including GETs into a region already read.
+  1.5 to 3 MB each. That band is the one pre-registered and is not
+  restated. Region cost here means the store's file reads beyond the
+  requested bytes on the first read of a region; the RustFS probe
+  (#3217 comment 6384802590) later measured 2 to 4 MB per cold region. It
+  is a different quantity from the over-read `O` in Context (0.39 to 0.62
+  MB per GET by statement, about 0.8 as the device check's tail-corrected
+  figure), which averages over every GET of a statement, including GETs
+  into a region already read.
 - The cold sum falls by 15 to 35 s (predicted).
 - 43 of 43 answers stay byte-equal (predicted).
 - The hot sum stays inside 54 to 64 s (predicted).
