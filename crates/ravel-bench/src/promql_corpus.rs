@@ -13,7 +13,8 @@
 //! 3. non-empty construct list,
 //! 4. non-blank modification reason,
 //! 5. every named construct known to the registry,
-//! 6. non-blank reason on every intended-empty entry.
+//! 6. non-blank reason on every intended-empty entry,
+//! 7. every ULP tolerance non-zero and on a modified entry.
 //!
 //! Check 5 differs from the SQL corpus in one deliberate way. The SQL gate
 //! requires each construct to be `SupportedAndCovered`; ADR-0927 decision 5
@@ -55,15 +56,17 @@
 //!       "profiles": ["cardinality", "ci"],
 //!       "upstream_id": null,
 //!       "modified": {"modified": {"reason": "..."}},
-//!       "expected": {"intended_empty": false}
+//!       "expected": {"intended_empty": false},
+//!       "tolerance_ulps": 1048576
 //!     }
 //!   ]
 //! }
 //! ```
 //!
-//! `eval`, `profiles`, `upstream_id`, `modified` and `expected` may be
-//! omitted; they default to [`EvalKind::Instant`], every profile, no upstream
-//! id, [`Modification::Verbatim`], and an answer that must not be empty.
+//! `eval`, `profiles`, `upstream_id`, `modified`, `expected` and
+//! `tolerance_ulps` may be omitted; they default to [`EvalKind::Instant`],
+//! every profile, no upstream id, [`Modification::Verbatim`], an answer that
+//! must not be empty, and bit-exact comparison.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -243,6 +246,12 @@ pub struct CorpusEntry {
     /// What the oracle answer is expected to be.
     #[serde(default)]
     pub expected: Expected,
+    /// The ADR-0025 ULP tolerance the comparator applies to this entry's
+    /// sample values, or `None` for bit-exact comparison. [`gate_corpus`]
+    /// check 7 refuses `Some(0)`, which is bit-exact spelled a second way,
+    /// and a tolerance on an entry whose `modified` field states no reason.
+    #[serde(default)]
+    pub tolerance_ulps: Option<u32>,
 }
 
 impl CorpusEntry {
@@ -361,6 +370,28 @@ pub enum CorpusError {
         /// The id of the offending entry.
         entry_id: String,
     },
+    /// An entry declares a ULP tolerance of zero. Bit-exact comparison is
+    /// spelled by leaving the field out, so there is one spelling to read.
+    #[error(
+        "promql corpus entry `{entry_id}` declares tolerance_ulps 0; bit-exact comparison is \
+         spelled by omitting tolerance_ulps"
+    )]
+    ZeroToleranceUlps {
+        /// The id of the offending entry.
+        entry_id: String,
+    },
+    /// An entry declares a ULP tolerance without a `modified` reason, so the
+    /// loosened comparison would be undisclosed.
+    #[error(
+        "promql corpus entry `{entry_id}` declares tolerance_ulps {tolerance_ulps} but is not \
+         flagged modified; a tolerance must be disclosed with its basis in the modified reason"
+    )]
+    UndisclosedTolerance {
+        /// The id of the offending entry.
+        entry_id: String,
+        /// The tolerance it declares.
+        tolerance_ulps: u32,
+    },
     /// The textual reader could not take an entry apart. The gate refuses
     /// rather than skipping the entry, so a query outside what it reads cannot
     /// pass unchecked.
@@ -451,7 +482,7 @@ pub fn known_construct_names() -> BTreeSet<&'static str> {
     REGISTRY.iter().map(|c| c.name).collect()
 }
 
-/// Apply the six ordered checks to a corpus, identically for the checked-in
+/// Apply the seven ordered checks to a corpus, identically for the checked-in
 /// artifact and for an external file.
 pub fn gate_corpus(entries: &[CorpusEntry]) -> Result<(), CorpusError> {
     let known = known_construct_names();
@@ -530,6 +561,24 @@ pub fn gate_corpus(entries: &[CorpusEntry]) -> Result<(), CorpusError> {
             return Err(CorpusError::EmptyIntendedEmptyReason {
                 entry_id: entry.id.clone(),
             });
+        }
+    }
+
+    // 7. A ULP tolerance is non-zero and disclosed. Check 4 already refused a
+    //    blank reason, so `is_modified` here means a stated one.
+    for entry in entries {
+        if let Some(tolerance_ulps) = entry.tolerance_ulps {
+            if tolerance_ulps == 0 {
+                return Err(CorpusError::ZeroToleranceUlps {
+                    entry_id: entry.id.clone(),
+                });
+            }
+            if !entry.modified.is_modified() {
+                return Err(CorpusError::UndisclosedTolerance {
+                    entry_id: entry.id.clone(),
+                    tolerance_ulps,
+                });
+            }
         }
     }
     Ok(())
@@ -1307,6 +1356,7 @@ mod tests {
             upstream_id: None,
             modified: Modification::Verbatim,
             expected: Expected::default(),
+            tolerance_ulps: None,
         }
     }
 
