@@ -135,6 +135,10 @@ const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 /// the ones already in the batch.
 const AUDIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// The catalog's decoded part and postings caches may hold at most 1% of the
+/// process memory budget (ADR-1170, catalog decode charge amendment).
+const CATALOG_DECODED_CACHE_BUDGET_DIVISOR: u64 = 100;
+
 /// The `--audit-mode` value a resolved [`ServerConfig::audit_pipeline`]
 /// stands for, as spelled on the command line, for the startup log line.
 fn query_audit_mode_label(audit: Option<&ravel_maintain::AuditPipelineConfig>) -> &'static str {
@@ -2931,13 +2935,21 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // resolving task. ADR-1170 (issue #3244 amendment): those decodes and the
     // fold's postings decode reserve against the same process budget the
     // query engine and SQL executor hold, so a refusal there is a refusal of
-    // the one shared number rather than of a private copy.
-    let catalog = Arc::new(
-        Arc::into_inner(catalog)
-            .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
-            .with_read_gate(cpu_gates.read.clone())
-            .with_memory_budget(process_memory_budget.clone()),
-    );
+    // the one shared number rather than of a private copy. SQL cannot make
+    // the catalog's decoded caches give memory back, so a finite budget also
+    // bounds what those caches may hold of it; an unlimited one leaves the
+    // catalog's default.
+    let catalog = Arc::into_inner(catalog)
+        .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
+        .with_read_gate(cpu_gates.read.clone())
+        .with_memory_budget(process_memory_budget.clone());
+    let catalog = Arc::new(if process_memory_budget.limit() == u64::MAX {
+        catalog
+    } else {
+        catalog.with_decoded_cache_max_bytes(
+            process_memory_budget.limit() / CATALOG_DECODED_CACHE_BUDGET_DIVISOR,
+        )
+    });
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
     // spawns `maintain::spawn` below and therefore has discovery counters to

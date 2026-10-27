@@ -2790,6 +2790,13 @@ pub struct CatalogCountersSnapshot {
     /// Decoded-output cache entries dropped by an eviction pass
     /// ([`ravel_catalog::Catalog::decoded_cache_memory_evictions`]).
     pub decoded_cache_memory_evictions: u64,
+    /// Decoded-output cache entries dropped to stay within the caches' byte
+    /// bound ([`ravel_catalog::Catalog::decoded_cache_byte_bound_evictions`]).
+    pub decoded_cache_byte_bound_evictions: u64,
+    /// Decoded parts and postings objects not cached because each alone
+    /// exceeds the caches' byte bound
+    /// ([`ravel_catalog::Catalog::decoded_cache_byte_bound_refusals`]).
+    pub decoded_cache_byte_bound_refusals: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
     /// Supervisor restarts of each signal's fold loop, in
@@ -2823,6 +2830,8 @@ impl Default for CatalogCountersSnapshot {
             decoded_postings_cache_reserved_bytes: 0,
             decode_reserve_retries: 0,
             decoded_cache_memory_evictions: 0,
+            decoded_cache_byte_bound_evictions: 0,
+            decoded_cache_byte_bound_refusals: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
             fold_refold_requests_dropped: 0,
@@ -2852,6 +2861,8 @@ impl CatalogCountersSnapshot {
             decoded_postings_cache_reserved_bytes: catalog.decoded_postings_cache_reserved_bytes(),
             decode_reserve_retries: catalog.decode_reserve_retries(),
             decoded_cache_memory_evictions: catalog.decoded_cache_memory_evictions(),
+            decoded_cache_byte_bound_evictions: catalog.decoded_cache_byte_bound_evictions(),
+            decoded_cache_byte_bound_refusals: catalog.decoded_cache_byte_bound_refusals(),
             fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
                 signal,
                 cycles: catalog.fold_cycles(signal),
@@ -3062,6 +3073,32 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_decoded_cache_memory_evictions_total",
         &[Label::Mode(mode)],
         snapshot.decoded_cache_memory_evictions,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_evictions_total",
+        "Decoded snapshot-part and name-postings cache entries the catalog dropped to stay within the caches' byte bound, 1% of the shared ADR-1170 process memory budget; reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes), since no bound is set there.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_evictions_total",
+        &[Label::Mode(mode)],
+        snapshot.decoded_cache_byte_bound_evictions,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_refusals_total",
+        "Decoded snapshot parts and name-postings objects the catalog did not cache because each alone is larger than the caches' byte bound, 1% of the shared ADR-1170 process memory budget; each is decoded again by the next query that needs it. Reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes), since no bound is set there.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_refusals_total",
+        &[Label::Mode(mode)],
+        snapshot.decoded_cache_byte_bound_refusals,
     );
 
     // The fold families carry a `signal` label because the fold is one
