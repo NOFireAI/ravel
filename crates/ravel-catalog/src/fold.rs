@@ -3503,7 +3503,7 @@ impl Catalog {
         }
 
         let decoded = Arc::new(decoded);
-        self.postings_cache().insert(
+        self.decoded_caches().insert_postings(
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
