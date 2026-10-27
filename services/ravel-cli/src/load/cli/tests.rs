@@ -840,3 +840,74 @@ async fn every_signal_refuses_a_target_bytes_above_the_one_hour_bound() {
         );
     }
 }
+
+/// A logs mapping with a record attribute `user` and a resource attribute
+/// `service.name`.
+const CHUNK_ORDER_MAPPING: &str = r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[attribute]]
+key = "user"
+column = "user"
+type = "str"
+"#;
+
+fn chunk_order(names: &[&str]) -> RlogChunkOrder {
+    RlogChunkOrder::new(names.iter().map(|n| n.to_string()).collect()).expect("valid order")
+}
+
+/// A `--chunk-order` name no mapped key carries gets exactly one warning
+/// naming it; a mapped record key gets none.
+#[test]
+fn chunk_order_warns_once_for_a_name_the_mapping_does_not_carry() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["user", "typo"]), &mapping),
+        vec!["warning: --chunk-order names typo, which no mapped attribute carries".to_string()]
+    );
+}
+
+/// An order naming only mapped keys, record or resource, warns about
+/// nothing, and neither does the default order.
+#[test]
+fn chunk_order_naming_only_mapped_keys_warns_about_nothing() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["user"]), &mapping),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unknown_chunk_order_warnings(RlogChunkOrder::DEFAULT, &mapping),
+        Vec::<String>::new()
+    );
+}
+
+/// A `[[resource_attribute]]` key counts as carried.
+#[test]
+fn chunk_order_counts_a_resource_attribute_key_as_carried() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["service.name", "user"]), &mapping),
+        Vec::<String>::new()
+    );
+}
+
+/// Several unknown names warn one line each, in the order the flag gives
+/// them, not sorted.
+#[test]
+fn chunk_order_warns_about_unknown_names_in_the_order_given() {
+    let mapping = parse_mapping(CHUNK_ORDER_MAPPING).expect("mapping parses");
+    assert_eq!(
+        unknown_chunk_order_warnings(chunk_order(&["zeta", "user", "alpha"]), &mapping),
+        vec![
+            "warning: --chunk-order names zeta, which no mapped attribute carries".to_string(),
+            "warning: --chunk-order names alpha, which no mapped attribute carries".to_string(),
+        ]
+    );
+}

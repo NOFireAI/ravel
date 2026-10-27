@@ -164,3 +164,54 @@ async fn load_chunk_order_reaches_the_written_column_ids() {
         "the default: alphabetical ids"
     );
 }
+
+/// The built `ravel-cli load --signal logs --chunk-order user,typo` warns on
+/// stderr, before the load, about `typo`, which no mapped attribute carries,
+/// and says nothing about `user`, which the mapping maps. The load still
+/// succeeds: the writer skips the unknown name.
+#[test]
+fn the_binary_warns_about_a_chunk_order_name_no_mapped_attribute_carries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parquet = dir.path().join("logs.parquet");
+    let mapping = dir.path().join("mapping.toml");
+    std::fs::write(&mapping, MAPPING).expect("write mapping");
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_nanos() as i64;
+    write_fixture(&parquet, now_ns - 60_000_000_000);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"));
+    for (key, _) in std::env::vars() {
+        if key.starts_with("RAVEL_") {
+            cmd.env_remove(key);
+        }
+    }
+    let out = cmd
+        .args([
+            "--store",
+            "memory",
+            "--tenant-hash-unkeyed",
+            "load",
+            "--signal",
+            "logs",
+            "--parquet",
+        ])
+        .arg(&parquet)
+        .args(["--tenant", "acme", "--mapping"])
+        .arg(&mapping)
+        .args(["--chunk-order", "user,typo"])
+        .output()
+        .expect("ravel-cli runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let chunk_order_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("warning: --chunk-order names "))
+        .collect();
+    assert_eq!(
+        chunk_order_lines,
+        vec!["warning: --chunk-order names typo, which no mapped attribute carries"],
+        "{stderr}"
+    );
+}
