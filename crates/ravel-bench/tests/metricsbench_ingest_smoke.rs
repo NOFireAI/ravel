@@ -644,3 +644,364 @@ fn streaming_replay_memory_does_not_grow_with_history_length() {
         "the materialised control grew only {materialised_ratio:.3}x for 4x the steps"
     );
 }
+
+/// One point a [`StubTsdb`] stored: a float's bits, or a native histogram.
+#[derive(Clone, Copy)]
+enum StubPoint {
+    Float(u64),
+    Histogram,
+}
+
+/// Every series a stub receiver stored, keyed by its sorted label pairs
+/// (`__name__` included), each holding `(ts_ms, point)`.
+type StubTsdb = std::sync::Arc<
+    Mutex<std::collections::BTreeMap<Vec<(String, String)>, Vec<(i64, StubPoint)>>>,
+>;
+
+/// A stub Remote Write 1.0 receiver with just enough of the Prometheus query
+/// API for the lane's read-back: it stores what it is sent and answers
+/// `/api/v1/series` over a `__name__=~` alternation, `count_over_time` over an
+/// exact selector, and an instant exact selector honouring stale markers.
+fn stub_receiver(db: StubTsdb) -> axum::Router {
+    use ravel_remote_write::proto::prometheus::WriteRequest;
+
+    let write_db = db.clone();
+    let series_db = db.clone();
+    axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let db = write_db.clone();
+                async move {
+                    let raw = snap::raw::Decoder::new()
+                        .decompress_vec(&body)
+                        .expect("snappy body");
+                    let request = <WriteRequest as prost::Message>::decode(raw.as_slice())
+                        .expect("WriteRequest");
+                    let mut db = db.lock().unwrap();
+                    for ts in request.timeseries {
+                        let mut labels: Vec<(String, String)> =
+                            ts.labels.into_iter().map(|l| (l.name, l.value)).collect();
+                        labels.sort();
+                        let points = db.entry(labels).or_default();
+                        for s in ts.samples {
+                            points.push((s.timestamp, StubPoint::Float(s.value.to_bits())));
+                        }
+                        for h in ts.histograms {
+                            points.push((h.timestamp, StubPoint::Histogram));
+                        }
+                    }
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        )
+        .route(
+            "/api/v1/series",
+            axum::routing::get(
+                move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
+                    let db = series_db.clone();
+                    async move {
+                        let param = |k: &str| {
+                            params
+                                .iter()
+                                .find(|(name, _)| name == k)
+                                .map(|(_, v)| v.clone())
+                                .expect("series parameter")
+                        };
+                        let names = name_alternation(&param("match[]"));
+                        let start = seconds_to_ms(&param("start"));
+                        let end = seconds_to_ms(&param("end"));
+                        let db = db.lock().unwrap();
+                        let data: Vec<serde_json::Value> = db
+                            .iter()
+                            .filter(|(labels, points)| {
+                                labels
+                                    .iter()
+                                    .any(|(k, v)| k == "__name__" && names.contains(v))
+                                    && points.iter().any(|(ts, _)| (start..=end).contains(ts))
+                            })
+                            .map(|(labels, _)| {
+                                serde_json::Value::Object(
+                                    labels
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.clone().into()))
+                                        .collect(),
+                                )
+                            })
+                            .collect();
+                        axum::Json(serde_json::json!({"status": "success", "data": data}))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/query",
+            axum::routing::get(
+                move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
+                    let db = db.clone();
+                    async move {
+                        let param = |k: &str| {
+                            params
+                                .iter()
+                                .find(|(name, _)| name == k)
+                                .map(|(_, v)| v.clone())
+                                .expect("query parameter")
+                        };
+                        let query = param("query");
+                        let time = param("time");
+                        let at = seconds_to_ms(&time);
+                        let db = db.lock().unwrap();
+                        let result = if let Some(inner) = query
+                            .strip_prefix("count_over_time(")
+                            .and_then(|q| q.strip_suffix("ms])"))
+                        {
+                            let (selector, range) = inner.rsplit_once('[').expect("range");
+                            let range: i64 = range.parse().expect("range ms");
+                            let count = db.get(&exact_selector(selector)).map_or(0, |points| {
+                                points
+                                    .iter()
+                                    .filter(|(ts, p)| {
+                                        *ts > at - range
+                                            && *ts <= at
+                                            && !matches!(p, StubPoint::Float(b) if *b == STALE_MARKER_BITS)
+                                    })
+                                    .count()
+                            });
+                            if count == 0 {
+                                Vec::new()
+                            } else {
+                                vec![serde_json::json!({"metric": {}, "value": [time, count.to_string()]})]
+                            }
+                        } else {
+                            let latest = db.get(&exact_selector(&query)).and_then(|points| {
+                                points
+                                    .iter()
+                                    .filter(|(ts, _)| *ts <= at && *ts > at - 300_000)
+                                    .max_by_key(|(ts, _)| *ts)
+                                    .copied()
+                            });
+                            match latest {
+                                Some((_, StubPoint::Float(b))) if b != STALE_MARKER_BITS => {
+                                    vec![serde_json::json!({"metric": {}, "value": [time, "1"]})]
+                                }
+                                Some((_, StubPoint::Histogram)) => {
+                                    vec![serde_json::json!({"metric": {}, "value": [time, "1"]})]
+                                }
+                                _ => Vec::new(),
+                            }
+                        };
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": {"resultType": "vector", "result": result},
+                        }))
+                    }
+                },
+            ),
+        )
+}
+
+use ravel_promql_difftest::generator::STALE_MARKER_BITS;
+
+/// The API's decimal seconds as milliseconds.
+fn seconds_to_ms(text: &str) -> i64 {
+    let (whole, frac) = text.split_once('.').unwrap_or((text, "0"));
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().expect("fraction");
+    let whole: i64 = whole.parse().expect("seconds");
+    if text.starts_with('-') {
+        whole * 1_000 - ms
+    } else {
+        whole * 1_000 + ms
+    }
+}
+
+/// Undo PromQL string escaping.
+fn unescape_promql(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The metric names of a `{__name__=~"a|b"}` matcher of escaped literals.
+fn name_alternation(matcher: &str) -> Vec<String> {
+    let regex = matcher
+        .strip_prefix("{__name__=~\"")
+        .and_then(|m| m.strip_suffix("\"}"))
+        .expect("a __name__ alternation");
+    let regex = unescape_promql(regex);
+    let mut names = vec![String::new()];
+    let mut chars = regex.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => names
+                .last_mut()
+                .expect("name")
+                .extend(chars.next()),
+            '|' => names.push(String::new()),
+            other => names.last_mut().expect("name").push(other),
+        }
+    }
+    names
+}
+
+/// The sorted label pairs of an exact `{k="v",...}` selector.
+fn exact_selector(selector: &str) -> Vec<(String, String)> {
+    let body = selector
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .expect("a braced selector");
+    let mut labels = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (name, after) = rest.split_once("=\"").expect("an exact matcher");
+        let mut value = String::new();
+        let mut chars = after.char_indices();
+        let mut end = after.len();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => value.extend(chars.next().map(|(_, c)| c)),
+                '"' => {
+                    end = i + 1;
+                    break;
+                }
+                other => value.push(other),
+            }
+        }
+        labels.push((name.to_string(), value));
+        rest = after[end..].strip_prefix(',').unwrap_or(&after[end..]);
+    }
+    labels.sort();
+    labels
+}
+
+/// `--no-in-process-row` with two stub portable receivers: the run opens no
+/// store, the report carries no `ravel-in-process` row, no query phase and no
+/// substrate, says `in_process_row: "skipped"`, and still closes band 6 on
+/// each portable row, whose expected digests agree. The in-process run's
+/// expected digests equal theirs, so the portable rows replayed the stream
+/// the in-process row would have.
+#[test]
+fn without_the_in_process_row_the_portable_rows_still_close_band_6() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut urls = Vec::new();
+    for _ in 0..2 {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        let app = stub_receiver(StubTsdb::default());
+        runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        urls.push(format!("http://{addr}"));
+    }
+    let anchor = on_grid_anchor().to_string();
+    let prometheus_write = format!("{}/api/v1/write", urls[0]);
+    let mimir_write = format!("{}/api/v1/write", urls[1]);
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "2",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--store",
+            "s3",
+            "--http-batch-size",
+            "4096",
+            "--prometheus-endpoint",
+            &prometheus_write,
+            "--prometheus-query-url",
+            &urls[0],
+            "--mimir-endpoint",
+            &mimir_write,
+            "--mimir-query-url",
+            &urls[1],
+        ])
+        // An S3 store on a port nothing listens on: a run that opened and
+        // wrote to it would fail.
+        .env("RAVEL_S3_ENDPOINT", "http://127.0.0.1:9")
+        .env("RAVEL_S3_ALLOW_HTTP", "true")
+        .env("RAVEL_S3_BUCKET", "unreachable")
+        .env("RAVEL_S3_REGION", "us-east-1")
+        .env("RAVEL_S3_ACCESS_KEY_ID", "unused")
+        .env("RAVEL_S3_SECRET_ACCESS_KEY", "unused")
+        .output()
+        .expect("spawn metricsbench_ingest");
+    assert!(
+        output.status.success(),
+        "status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is a JSON report");
+    assert_eq!(report["in_process_row"], "skipped");
+    assert!(report.get("substrate").is_none(), "no store was opened");
+    assert!(report.get("queries").is_none(), "no in-process query phase");
+    let systems = report["systems"].as_array().expect("systems");
+    let names: Vec<&str> = systems
+        .iter()
+        .map(|r| r["system"].as_str().expect("system"))
+        .collect();
+    assert_eq!(names, ["prometheus", "mimir"]);
+    for row in systems {
+        assert_eq!(
+            row["ingest"]["expected_digests"], row["ingest"]["accepted_digests"],
+            "band 6 on {}",
+            row["system"]
+        );
+        assert_eq!(row["readback"]["matches_expected"], true, "{row}");
+    }
+    assert_eq!(
+        systems[0]["ingest"]["expected_digests"],
+        systems[1]["ingest"]["expected_digests"]
+    );
+    assert!(
+        report["profile"]["run"]["stream_digest"].is_string(),
+        "the profile record is built from the first portable row's stream"
+    );
+
+    let in_process = run_lane_with_steps(2, on_grid_anchor());
+    assert_eq!(in_process["in_process_row"], "present");
+    assert_eq!(
+        in_process["systems"][0]["ingest"]["expected_digests"],
+        systems[0]["ingest"]["expected_digests"]
+    );
+    assert_eq!(
+        in_process["profile"]["run"]["stream_digest"],
+        report["profile"]["run"]["stream_digest"]
+    );
+}
+
+/// `--no-in-process-row` with no portable endpoint would measure nothing, so
+/// it exits 64 before anything is generated.
+#[test]
+fn skipping_the_in_process_row_with_no_endpoint_exits_64() {
+    let _serial = serial();
+    let anchor = on_grid_anchor().to_string();
+    let (code, stderr) = run_refused(&["--anchor-ms", &anchor, "--no-in-process-row"]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains("--no-in-process-row needs at least one portable endpoint"),
+        "{stderr}"
+    );
+}
