@@ -55,10 +55,38 @@ use crate::head::{
     RecoveryPolicy, ResultEntry, ResultStatus, StepRecord, StepStatus, TimerEntry, TimerStatus,
     TurnBlock,
 };
-use crate::identity::{self, Id128};
+use crate::identity::{self, Hash256, Id128};
 
 /// Logical caps enforced inside the kernel (decision 9's per-tenant quotas
 /// are applied per agent here; the store adds the tenant totals).
+///
+/// The byte cap carries one guarantee: while an input is outstanding it can
+/// be ended by `FailTurn` with an error of at most `max_error_bytes`, or by
+/// `Cancel`, and that holds for every outstanding input together, in any
+/// order, with any interleaving of the commands the growth guard exempts
+/// (`tests::every_outstanding_input_can_be_failed_at_the_byte_cap`,
+/// `tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`).
+/// A `CompleteTurn` carries no such guarantee: one whose root would enter the
+/// reserve below is refused `BudgetExceeded`, and the handler fails the turn
+/// or emits less
+/// (`tests::a_completion_that_does_not_fit_is_refused_and_the_turn_can_still_fail`).
+///
+/// The guard leaves three amounts free under `max_head_bytes`, each
+/// measured on the prost encoding
+/// (`tests::the_reserves_cover_the_growth_they_stand_for`):
+///
+/// - A fixed slack for the exempt growth of which a root holds at most one
+///   copy: one `ActiveTurn` at its widest (handler `max_string_bytes`,
+///   version `max_version_bytes`, every integer at its longest varint, 1186
+///   bytes at the defaults) plus a `Takeover` delta (owner id
+///   `max_owner_bytes` and its tag 66, epoch 11, lease hint 11), the
+///   `root_revision` (11) and `quota.referenced_bytes` (11) varints at their
+///   longest: 1296 bytes at the defaults. `BeginTurn` and `Takeover` replace
+///   these fields rather than
+///   add to them, so one slack covers any number of them.
+/// - `terminal_reserve_per_input_bytes` for each input in the inbox.
+/// - `PENDING_EFFECT_RESERVE_BYTES` for each journaled effect that is not
+///   `Completed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_mailbox_depth: u64,
@@ -66,18 +94,40 @@ pub struct Limits {
     pub max_timers: u64,
     pub max_head_bytes: usize,
     /// Longest caller-supplied string (request id, handler, keys, tool
-    /// identity, owner id) a command may carry.
+    /// identity) a command may carry.
     pub max_string_bytes: usize,
+    /// Longest owner id a `Takeover`, `BeginTurn` or turn fence may carry.
+    /// The root holds one, so it is part of the fixed slack.
+    pub max_owner_bytes: usize,
+    /// Longest handler version a turn fence or `HandlerPin` may carry; the
+    /// active turn copies one.
+    pub max_version_bytes: usize,
     /// Longest error text a `FailTurn` may carry; it is retained verbatim in
     /// the input's result entry, so it is bounded tighter than other strings.
     pub max_error_bytes: usize,
-    /// Bytes a command that grows the root without ending a turn must leave
-    /// free under `max_head_bytes` for EACH input still in the inbox, so every
-    /// accepted input has room for the result entry its `CompleteTurn`,
-    /// `FailTurn` or `Cancel` publishes. It must cover a result entry carrying
-    /// `max_error_bytes` of error text plus the entry's fixed fields.
+    /// Most events one `CompleteTurn` may buffer.
+    pub max_events_per_turn: u64,
+    /// Most effect intents one `CompleteTurn` may journal.
+    pub max_intents_per_turn: u64,
+    /// Bytes the growth guard leaves free for EACH input in the inbox. An
+    /// input's own exempt growth is a retryable `FailTurn` (failed attempts
+    /// 6, last failed turn id 18, the entry's length prefix 1: 25 bytes) and
+    /// then the result entry its terminal `FailTurn` or `Cancel` publishes
+    /// (field tag 2, length prefix 2, accept seq 11, status 2, turn id 18,
+    /// dead-lettered flag 2, finish time 11, the error's tag and length 3:
+    /// 51 bytes plus the error). So this must be at least
+    /// `max_error_bytes + 76`: 332 at the defaults, which reserve 512. The
+    /// entry the terminal publish removes is not credited.
     pub terminal_reserve_per_input_bytes: usize,
 }
+
+/// Bytes the growth guard leaves free for each journaled effect that is not
+/// `Completed`: a `Reconcile` authorization or a `RecordEffectResult` may
+/// still grow it, and both are exempt. The attempt varint (6), the result
+/// reference (47), the result attempt varint (6), the record's length prefix
+/// (1) and a status change (2, though prost writes every status in one byte
+/// either way) come to 62.
+pub const PENDING_EFFECT_RESERVE_BYTES: usize = 64;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -87,9 +137,86 @@ impl Default for Limits {
             max_timers: 64,
             max_head_bytes: MAX_HEAD_BYTES,
             max_string_bytes: 1024,
+            max_owner_bytes: 64,
+            max_version_bytes: 64,
             max_error_bytes: 256,
+            max_events_per_turn: 32,
+            max_intents_per_turn: 16,
             terminal_reserve_per_input_bytes: 512,
         }
+    }
+}
+
+impl Limits {
+    /// The fixed slack described on [`Limits`], measured as the encoded size
+    /// of a root whose singleton fields sit at their widest minus the same
+    /// root at its narrowest. `template` supplies the agent's identity, which
+    /// both roots share.
+    pub fn exempt_growth_slack_bytes(&self, template: &Head) -> usize {
+        let narrow = Head {
+            tenant: template.tenant,
+            kind: template.kind.clone(),
+            key: template.key.clone(),
+            incarnation: template.incarnation,
+            root_revision: 0,
+            owner_id: String::new(),
+            epoch: 0,
+            owner_lease_hint_unix_ns: 0,
+            state_version: 0,
+            state: None,
+            next_accept_seq: 1,
+            active_turn: None,
+            timer_generation: 0,
+            next_event_seq: 1,
+            lifecycle: Lifecycle::Active,
+            quota: Quota::default(),
+            inbox: Vec::new(),
+            receipts: Vec::new(),
+            results: Vec::new(),
+            events: Vec::new(),
+            timers: Vec::new(),
+            steps: Vec::new(),
+            effects: Vec::new(),
+            outbox: Vec::new(),
+        };
+        let wide = Head {
+            root_revision: u64::MAX,
+            owner_id: "o".repeat(self.max_owner_bytes),
+            epoch: u64::MAX,
+            owner_lease_hint_unix_ns: i64::MIN,
+            active_turn: Some(ActiveTurn {
+                input_accept_seq: u64::MAX,
+                turn_id: Id128([u8::MAX; 16]),
+                base_state_version: u64::MAX,
+                handler: "h".repeat(self.max_string_bytes),
+                handler_version: "v".repeat(self.max_version_bytes),
+                handler_digest: Hash256([u8::MAX; 32]),
+                cancellation: Cancellation::Requested,
+                block: TurnBlock::NonDeterministicReplay,
+                started_unix_ns: i64::MIN,
+            }),
+            quota: Quota {
+                referenced_bytes: u64::MAX,
+                ..Quota::default()
+            },
+            ..narrow.clone()
+        };
+        wide.encode().len().saturating_sub(narrow.encode().len())
+    }
+
+    /// Bytes the growth guard keeps free under `max_head_bytes` for `head`.
+    pub fn reserved_bytes(&self, head: &Head) -> usize {
+        let pending = head
+            .effects
+            .iter()
+            .filter(|e| e.status != EffectStatus::Completed)
+            .count();
+        self.exempt_growth_slack_bytes(head)
+            .saturating_add(
+                self.terminal_reserve_per_input_bytes
+                    .saturating_mul(head.inbox.len()),
+            )
+            .saturating_add(PENDING_EFFECT_RESERVE_BYTES.saturating_mul(pending))
     }
 }
 
@@ -329,9 +456,12 @@ impl Kernel {
     }
 
     /// Every caller-supplied string a command carries is at most
-    /// `Limits::max_string_bytes`, checked before any transition so an
-    /// oversized string cannot be the thing that pushes a root over its byte
-    /// cap in the command meant to reach a terminal state.
+    /// `Limits::max_string_bytes`, an owner id at most `max_owner_bytes`, a
+    /// handler version at most `max_version_bytes`, and a `CompleteTurn`
+    /// carries at most `max_events_per_turn` events and
+    /// `max_intents_per_turn` intents. All are checked before any transition:
+    /// the fixed slack the growth guard reserves is sized from the owner and
+    /// version caps, so an owner id or version past them would void it.
     fn check_strings(&self, head: &Head, command: &Command) -> Result<(), AgentError> {
         let cap = self.limits.max_string_bytes;
         if caller_strings(command).iter().any(|s| s.len() > cap) {
@@ -340,6 +470,40 @@ impl Kernel {
                 ErrorKind::BudgetExceeded,
                 "a caller-supplied string exceeds the string cap",
             ));
+        }
+        let (owners, versions) = identity_strings(command);
+        if owners.iter().any(|s| s.len() > self.limits.max_owner_bytes) {
+            return Err(fail(
+                head,
+                ErrorKind::BudgetExceeded,
+                "the owner id exceeds its cap",
+            ));
+        }
+        if versions
+            .iter()
+            .any(|s| s.len() > self.limits.max_version_bytes)
+        {
+            return Err(fail(
+                head,
+                ErrorKind::BudgetExceeded,
+                "a handler version exceeds its cap",
+            ));
+        }
+        if let Command::CompleteTurn(c) = command {
+            if c.events.len() as u64 > self.limits.max_events_per_turn {
+                return Err(fail(
+                    head,
+                    ErrorKind::BudgetExceeded,
+                    "EventsBelowCap: the turn buffers too many events",
+                ));
+            }
+            if c.intents.len() as u64 > self.limits.max_intents_per_turn {
+                return Err(fail(
+                    head,
+                    ErrorKind::BudgetExceeded,
+                    "IntentsBelowCap: the turn journals too many intents",
+                ));
+            }
         }
         if let Command::FailTurn(c) = command
             && c.error.len() > self.limits.max_error_bytes
@@ -419,42 +583,107 @@ pub(crate) fn caller_strings(command: &Command) -> Vec<&str> {
     }
 }
 
-impl Kernel {
-    /// A command that grows the root without ending a turn must leave
-    /// `Limits::terminal_reserve_per_input_bytes` free under the byte cap for
-    /// every input in the published root's inbox. Terminal commands
-    /// (`CompleteTurn`, `FailTurn`, `Cancel`, `Tombstone`) and the commands
-    /// that only move a turn along (`Takeover`, `BeginTurn`, `CancelTimer`,
-    /// `RecordEffectResult`) face only the cap itself in `publish`. Each
-    /// terminal publish removes one inbox entry and adds one result entry of
-    /// at most the reserve, so every accepted input can be completed, failed
-    /// or cancelled in turn (`tests::every_outstanding_input_can_be_failed_at_the_byte_cap`).
-    /// The check reads the published root, not the observed one: an
-    /// idempotent retry that answers `Unchanged` (a duplicate enqueue, a step
-    /// replay, an already-authorized attempt) is never refused, so a client
-    /// near the cap can still resolve what it already published.
-    fn check_growth_headroom(&self, command: &Command, outcome: Outcome) -> Outcome {
-        let grows = matches!(
-            command,
-            Command::Enqueue(_)
-                | Command::RecordStep(_)
-                | Command::CommitIntent(_)
-                | Command::ScheduleTimer(_)
-                | Command::FireTimer(_)
-                | Command::AuthorizeAttempt(_)
-        );
-        let transition = outcome?;
-        if !grows {
-            return Ok(transition);
+/// The owner ids and handler versions a command carries, bounded by
+/// `Limits::max_owner_bytes` and `Limits::max_version_bytes`.
+fn identity_strings(command: &Command) -> (Vec<&str>, Vec<&str>) {
+    let mut owners: Vec<&str> = Vec::new();
+    let mut versions: Vec<&str> = Vec::new();
+    let fence = match command {
+        Command::CompleteTurn(c) => Some(&c.fence),
+        Command::FailTurn(c) => Some(&c.fence),
+        Command::RecordStep(c) => Some(&c.fence),
+        Command::CommitIntent(c) => Some(&c.fence),
+        _ => None,
+    };
+    if let Some(fence) = fence {
+        owners.push(fence.owner.owner_id.as_str());
+        versions.push(fence.handler_version.as_str());
+    }
+    match command {
+        Command::Takeover(c) => owners.push(c.owner_id.as_str()),
+        Command::BeginTurn(c) => {
+            owners.push(c.fence.owner_id.as_str());
+            versions.extend(c.handlers.iter().map(|p| p.version.as_str()));
         }
-        let Transition::Publish { head, .. } = &transition else {
+        Command::AuthorizeAttempt(c) => {
+            if let Authority::Owner(o) = &c.authority {
+                owners.push(o.owner_id.as_str());
+            }
+        }
+        Command::CompleteTurn(_)
+        | Command::FailTurn(_)
+        | Command::RecordStep(_)
+        | Command::CommitIntent(_)
+        | Command::Create(_)
+        | Command::Enqueue(_)
+        | Command::Cancel(_)
+        | Command::ScheduleTimer(_)
+        | Command::FireTimer(_)
+        | Command::CancelTimer(_)
+        | Command::Tombstone(_)
+        | Command::RecordEffectResult(_) => {}
+    }
+    (owners, versions)
+}
+
+/// Whether the growth guard applies to a publish. Exempt are the terminal
+/// paths (`FailTurn`, `Cancel`), the commands that only move a turn or an
+/// owner along (`Takeover`, `BeginTurn`, `CancelTimer`, `Tombstone`,
+/// `Create`), the latches (a publish answering `Reply::Blocked`, which
+/// blocks the turn or marks an effect `InDoubt`), and what an effect needs
+/// to settle (`RecordEffectResult`, a `Reconcile` authorization). Refusing a
+/// latch would let the next `CompleteTurn` commit past it.
+fn guarded(command: &Command, reply: &Reply) -> bool {
+    if matches!(reply, Reply::Blocked(_)) {
+        return false;
+    }
+    match command {
+        Command::Enqueue(_)
+        | Command::RecordStep(_)
+        | Command::CommitIntent(_)
+        | Command::ScheduleTimer(_)
+        | Command::FireTimer(_)
+        | Command::CompleteTurn(_) => true,
+        Command::AuthorizeAttempt(c) => matches!(c.authority, Authority::Owner(_)),
+        Command::Create(_)
+        | Command::Takeover(_)
+        | Command::BeginTurn(_)
+        | Command::FailTurn(_)
+        | Command::Cancel(_)
+        | Command::CancelTimer(_)
+        | Command::Tombstone(_)
+        | Command::RecordEffectResult(_) => false,
+    }
+}
+
+impl Kernel {
+    /// A guarded publish (see [`guarded`]) must leave
+    /// `Limits::reserved_bytes` of the published root free under the byte
+    /// cap: the fixed slack, the per-input reserve for every input in the
+    /// inbox and the per-effect reserve for every effect not yet completed.
+    /// Every exempt publish fits inside what those reserve, so the terminal
+    /// paths named on [`Limits`] stay open
+    /// (`tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`),
+    /// and a latch is recorded however full the root is
+    /// (`tests::a_blocking_replay_is_recorded_inside_the_reserve`,
+    /// `tests::a_manual_attempt_enters_in_doubt_inside_the_reserve`). An
+    /// exempt publish still faces the cap itself in `publish`. The check
+    /// reads the published root, not the observed one: an idempotent retry
+    /// that answers `Unchanged` (a duplicate enqueue, a step replay, an
+    /// already-authorized attempt) is never refused, so a client near the cap
+    /// can still resolve what it already published.
+    fn check_growth_headroom(&self, command: &Command, outcome: Outcome) -> Outcome {
+        let transition = outcome?;
+        let Transition::Publish { head, reply, .. } = &transition else {
             return Ok(transition);
         };
-        let reserve = self
+        if !guarded(command, reply) {
+            return Ok(transition);
+        }
+        let cap = self
             .limits
-            .terminal_reserve_per_input_bytes
-            .saturating_mul(head.inbox.len());
-        let cap = self.limits.max_head_bytes.saturating_sub(reserve);
+            .max_head_bytes
+            .saturating_sub(self.limits.reserved_bytes(head));
         if head.encode().len() > cap {
             return Err(fail(
                 head,

@@ -1688,7 +1688,7 @@ fn terminal_commands_keep_a_path_through_the_byte_cap() {
     let refuse = |cmd: &Command| {
         kernel
             .apply(Some(&head), cmd, now, &DerivedIds)
-            .expect_err("growth must be refused")
+            .expect_err("a guarded publish must be refused")
             .kind
     };
     assert_eq!(
@@ -1711,24 +1711,25 @@ fn terminal_commands_keep_a_path_through_the_byte_cap() {
             ..
         }
     ));
-    assert!(matches!(
-        kernel
-            .apply(
-                Some(&head),
-                &Command::CompleteTurn(complete_cmd(&head, b"s")),
-                now,
-                &DerivedIds
-            )
-            .expect("a terminal command publishes under the headroom")
-            .reply(),
-        Reply::TurnCommitted { .. }
-    ));
+    // A completion is guarded: it may not spend the slack the terminal
+    // paths stand on.
+    assert_eq!(
+        refuse(&Command::CompleteTurn(complete_cmd(&head, b"s"))),
+        ErrorKind::BudgetExceeded
+    );
     assert!(
         kernel
             .apply(Some(&head), &fail_cmd(&head, true, 1), now, &DerivedIds)
             .is_ok(),
         "a terminal failure publishes under the headroom"
     );
+    assert!(matches!(
+        kernel
+            .apply(Some(&head), &cancel_cmd(&head, 1), now, &DerivedIds)
+            .expect("a cancel publishes under the headroom")
+            .reply(),
+        Reply::CancelRequested { accept_seq: 1 }
+    ));
 }
 
 #[test]
@@ -1869,30 +1870,528 @@ fn the_precondition_table_names_the_string_cap_for_every_command_with_caller_str
 #[test]
 fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
     // Let the growth guard decide how full the inbox may get under a fixed
-    // cap, then fail every accepted input with a full-length error: each
-    // terminal publish must fit, which only holds when the reserve scales
-    // with the inputs outstanding.
-    let limits = Limits {
-        max_head_bytes: 24 * 1024,
-        max_mailbox_depth: 10_000,
-        max_receipts: 10_000,
-        ..Limits::default()
-    };
+    // cap while exempt growth is interleaved with the fill (takeovers by the
+    // widest owner id, turns pinned to the widest handler version and failed
+    // retryably), then end every accepted input, alternating a terminal
+    // failure with a full-length error and a cancel: each terminal publish
+    // must fit.
+    let limits = byte_capped(24 * 1024);
     let error = "e".repeat(limits.max_error_bytes);
+    let pins = vec![HandlerPin {
+        handler: "h".to_string(),
+        version: "v".repeat(limits.max_version_bytes),
+        digest: Hash256([1; 32]),
+    }];
+    let begin = |head: &Head| {
+        Command::BeginTurn(BeginTurn {
+            fence: owner_fence(head),
+            handlers: pins.clone(),
+        })
+    };
     let mut sim = Sim::with_limits(limits);
     sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w1"));
     let mut accepted = 0usize;
+    let mut takeovers = 0usize;
+    let mut retries = 0usize;
     loop {
         let cmd = enqueue_cmd(sim.head(), &format!("r{accepted}"), b"p");
-        match sim
-            .kernel
-            .apply(Some(sim.head()), &cmd, sim.now, &DerivedIds)
-        {
-            Ok(transition) => {
-                if let Some(head) = transition.head() {
-                    sim.head = Some(head.clone());
+        match sim.step(&cmd) {
+            Ok(_) => accepted += 1,
+            Err(e) => {
+                assert_eq!(e.kind, ErrorKind::BudgetExceeded);
+                break;
+            }
+        }
+        if accepted % 5 == 0 {
+            sim.run(&widest_takeover(sim.head(), limits.max_owner_bytes));
+            takeovers += 1;
+        }
+        if accepted % 3 == 0 {
+            assert!(matches!(
+                sim.run(&begin(sim.head())),
+                Reply::TurnStarted(_)
+            ));
+            let retry = Command::FailTurn(FailTurn {
+                fence: turn_fence(sim.head()),
+                error: error.clone(),
+                terminal: false,
+                max_attempts: u32::MAX,
+            });
+            assert!(matches!(sim.run(&retry), Reply::TurnRetry { .. }));
+            retries += 1;
+        }
+    }
+    assert!(accepted >= 8, "the cap admits a real inbox: {accepted}");
+    assert!(takeovers >= 1 && retries >= 2, "{takeovers} {retries}");
+    sim.run(&widest_takeover(sim.head(), limits.max_owner_bytes));
+    let (mut failed, mut cancelled) = (0usize, 0usize);
+    for n in 0..accepted {
+        let transition = if n % 2 == 0 {
+            assert!(matches!(
+                sim.run(&begin(sim.head())),
+                Reply::TurnStarted(_)
+            ));
+            let cmd = Command::FailTurn(FailTurn {
+                fence: turn_fence(sim.head()),
+                error: error.clone(),
+                terminal: true,
+                max_attempts: 1,
+            });
+            sim.step(&cmd).unwrap_or_else(|e| {
+                panic!("a terminal failure must publish for every outstanding input: {e:?}")
+            })
+        } else {
+            let last = sim.head().inbox.last().expect("an input").accept_seq;
+            sim.step(&cancel_cmd(sim.head(), last))
+                .unwrap_or_else(|e| panic!("a cancel must publish for every outstanding input: {e:?}"))
+        };
+        match transition.reply() {
+            Reply::TurnFailed { .. } => failed += 1,
+            Reply::Cancelled { .. } => cancelled += 1,
+            other => panic!("not a terminal reply: {other:?}"),
+        }
+        assert!(sim.head().encode().len() <= sim.kernel.limits.max_head_bytes);
+    }
+    assert!(sim.head().inbox.is_empty());
+    assert_eq!(sim.head().results.len(), accepted);
+    assert_eq!(failed + cancelled, accepted);
+    assert!(cancelled >= 4, "{cancelled}");
+}
+
+/// Limits with the logical caps out of the way, so only bytes refuse.
+fn byte_capped(max_head_bytes: usize) -> Limits {
+    Limits {
+        max_head_bytes,
+        max_mailbox_depth: 100_000,
+        max_receipts: 100_000,
+        max_timers: 100_000,
+        ..Limits::default()
+    }
+}
+
+fn enqueue_for(head: &Head, request_id: &str, handler: &str) -> Command {
+    Command::Enqueue(Enqueue {
+        fence: inc_fence(head),
+        request_id: request_id.to_string(),
+        handler: handler.to_string(),
+        request_hash: identity::request_hash(handler, b"p"),
+        payload: Some(blob(b"p")),
+    })
+}
+
+/// Grow the root under the guard until it refuses, with inputs and then with
+/// timers, which are smaller, so the root ends just under the guard's
+/// threshold. Returns the inputs accepted.
+fn fill_under_the_guard(sim: &mut Sim, handler: &str) -> usize {
+    let mut accepted = 0usize;
+    loop {
+        let cmd = enqueue_for(sim.head(), &format!("fill-{accepted}"), handler);
+        match sim.step(&cmd) {
+            Ok(_) => accepted += 1,
+            Err(e) => {
+                assert_eq!(e.kind, ErrorKind::BudgetExceeded, "{e:?}");
+                break;
+            }
+        }
+    }
+    for n in 0.. {
+        let cmd = Command::ScheduleTimer(ScheduleTimer {
+            fence: inc_fence(sim.head()),
+            timer: TimerSpec {
+                timer_key: format!("t{n}"),
+                due_unix_ns: i64::MAX,
+                handler: "h".to_string(),
+                payload: None,
+            },
+        });
+        if let Err(e) = sim.step(&cmd) {
+            assert_eq!(e.kind, ErrorKind::BudgetExceeded, "{e:?}");
+            break;
+        }
+    }
+    accepted
+}
+
+/// A takeover by an owner id of `owner_len` bytes with the longest lease
+/// hint encoding: the largest growth a `Takeover` can publish.
+fn widest_takeover(head: &Head, owner_len: usize) -> Command {
+    Command::Takeover(Takeover {
+        incarnation: head.incarnation,
+        owner_id: "o".repeat(owner_len),
+        observed_epoch: head.epoch,
+        lease_hint_unix_ns: i64::MIN,
+    })
+}
+
+#[test]
+fn a_blocking_replay_is_recorded_inside_the_reserve() {
+    let mut sim = Sim::with_limits(byte_capped(24 * 1024));
+    sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w1"));
+    sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+    sim.run(&begin_cmd(sim.head()));
+    sim.run(&step_cmd(sim.head(), StepStatus::Completed));
+    fill_under_the_guard(&mut sim, "h");
+    sim.run(&widest_takeover(sim.head(), 64));
+    // The root is now inside the reserve: an ordinary step is growth.
+    let mut other = step_cmd(sim.head(), StepStatus::Completed);
+    if let Command::RecordStep(step) = &mut other {
+        step.step_key = "other".to_string();
+    }
+    assert_eq!(sim.refuse(&other), ErrorKind::BudgetExceeded);
+
+    let mut mismatched = step_cmd(sim.head(), StepStatus::Completed);
+    if let Command::RecordStep(step) = &mut mismatched {
+        step.input_hash = identity::step_input_hash("db", "1", b"b");
+    }
+    let reply = sim
+        .step(&mismatched)
+        .expect("the latch is recorded inside the reserve")
+        .reply()
+        .clone();
+    assert!(
+        matches!(&reply, Reply::Blocked(e) if e.kind == ErrorKind::NonDeterministicReplay),
+        "{reply:?}"
+    );
+    assert_eq!(
+        sim.head().active_turn.as_ref().expect("turn").block,
+        TurnBlock::NonDeterministicReplay
+    );
+    assert_eq!(
+        sim.refuse(&Command::CompleteTurn(complete_cmd(sim.head(), b"s"))),
+        ErrorKind::NonDeterministicReplay
+    );
+}
+
+#[test]
+fn a_manual_attempt_enters_in_doubt_inside_the_reserve() {
+    let mut sim = Sim::with_limits(byte_capped(24 * 1024));
+    sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w1"));
+    sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+    sim.run(&begin_cmd(sim.head()));
+    let Reply::IntentCommitted { effect_id } = sim.run(&commit_intent_cmd(
+        sim.head(),
+        "charge",
+        RecoveryPolicy::Manual,
+    )) else {
+        panic!("intent not committed");
+    };
+    sim.run(&authorize_cmd(
+        Authority::Owner(owner_fence(sim.head())),
+        effect_id,
+        1,
+    ));
+    fill_under_the_guard(&mut sim, "h");
+    sim.run(&widest_takeover(sim.head(), 64));
+    assert_eq!(
+        sim.refuse(&commit_intent_cmd(
+            sim.head(),
+            "other",
+            RecoveryPolicy::Manual
+        )),
+        ErrorKind::BudgetExceeded
+    );
+
+    let reply = sim
+        .step(&authorize_cmd(
+            Authority::Owner(owner_fence(sim.head())),
+            effect_id,
+            2,
+        ))
+        .expect("the in-doubt latch is recorded inside the reserve")
+        .reply()
+        .clone();
+    assert!(
+        matches!(&reply, Reply::Blocked(e) if e.kind == ErrorKind::EffectInDoubt),
+        "{reply:?}"
+    );
+    assert_eq!(sim.head().effects[0].status, EffectStatus::InDoubt);
+    assert_eq!(
+        sim.refuse(&fail_cmd(sim.head(), true, 1)),
+        ErrorKind::EffectInDoubt
+    );
+    assert_eq!(
+        sim.refuse(&Command::CompleteTurn(complete_cmd(sim.head(), b"s"))),
+        ErrorKind::EffectInDoubt
+    );
+    // Reconciliation and its result are recorded inside the reserve too, and
+    // then the input can fail.
+    assert!(matches!(
+        sim.step(&authorize_cmd(
+            Authority::Reconcile(inc_fence(sim.head())),
+            effect_id,
+            2,
+        ))
+        .expect("a reconcile authorization is recorded inside the reserve")
+        .reply(),
+        Reply::AttemptAuthorized { attempt: 2, .. }
+    ));
+    sim.run(&effect_result_cmd(sim.head(), effect_id, 2));
+    let error = "e".repeat(sim.kernel.limits.max_error_bytes);
+    let fail = Command::FailTurn(FailTurn {
+        fence: turn_fence(sim.head()),
+        error,
+        terminal: true,
+        max_attempts: 1,
+    });
+    assert!(matches!(sim.run(&fail), Reply::TurnFailed { .. }));
+}
+
+/// Fill under the guard at `limits`, apply the largest growth the guard
+/// exempts (a takeover by an `owner_len`-byte owner, then turns pinned to a
+/// `version_len`-byte handler version), and drain every input by a
+/// retryable failure and then a terminal one with a full-length error.
+/// `Err` names the first publish that was refused.
+fn drain_after_worst_exempt_growth(
+    limits: Limits,
+    handler: &str,
+    owner_len: usize,
+    version_len: usize,
+) -> Result<usize, String> {
+    let mut sim = Sim::with_limits(limits);
+    sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w"));
+    let accepted = fill_under_the_guard(&mut sim, handler);
+    sim.step(&widest_takeover(sim.head(), owner_len))
+        .map_err(|e| format!("takeover: {e:?}"))?;
+    let pins = vec![HandlerPin {
+        handler: handler.to_string(),
+        version: "v".repeat(version_len),
+        digest: Hash256([1; 32]),
+    }];
+    let error = "e".repeat(limits.max_error_bytes);
+    for input in 0..accepted {
+        for attempt in 0..2 {
+            let begin = Command::BeginTurn(BeginTurn {
+                fence: owner_fence(sim.head()),
+                handlers: pins.clone(),
+            });
+            match sim.step(&begin) {
+                Ok(t) if matches!(t.reply(), Reply::TurnStarted(_)) => {}
+                other => return Err(format!("input {input} begin {attempt}: {other:?}")),
+            }
+            let fail = Command::FailTurn(FailTurn {
+                fence: turn_fence(sim.head()),
+                error: error.clone(),
+                terminal: false,
+                max_attempts: 2,
+            });
+            sim.step(&fail)
+                .map_err(|e| format!("input {input} fail {attempt}: {e:?}"))?;
+        }
+    }
+    if !sim.head().inbox.is_empty() {
+        return Err(format!("{} inputs left", sim.head().inbox.len()));
+    }
+    Ok(accepted)
+}
+
+/// `byte_capped` with owner ids and versions as wide as other strings, so an
+/// identity bound missing from the slack is larger than the spare the
+/// per-input reserve carries at the defaults.
+fn wide_identity(max_head_bytes: usize) -> Limits {
+    Limits {
+        max_owner_bytes: 1024,
+        max_version_bytes: 1024,
+        ..byte_capped(max_head_bytes)
+    }
+}
+
+#[test]
+fn the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth() {
+    let long_handler = "h".repeat(Limits::default().max_string_bytes);
+    let mut failures = Vec::new();
+    let mut drained = 0usize;
+    let mut runs = 0usize;
+    for limits_at in [byte_capped as fn(usize) -> Limits, wide_identity] {
+        for handler in ["h", long_handler.as_str()] {
+            for cap in (1200..=8192).step_by(64) {
+                runs += 1;
+                let limits = limits_at(cap);
+                match drain_after_worst_exempt_growth(
+                    limits,
+                    handler,
+                    limits.max_owner_bytes,
+                    limits.max_version_bytes,
+                ) {
+                    Ok(n) => drained += n,
+                    Err(e) => failures.push(format!(
+                        "owner cap {} handler {} B, cap {cap}: {e}",
+                        limits.max_owner_bytes,
+                        handler.len()
+                    )),
                 }
-                accepted += 1;
+            }
+        }
+    }
+    assert_eq!(runs, 4 * 110);
+    assert!(
+        failures.is_empty(),
+        "{} of {runs} caps failed; first: {}",
+        failures.len(),
+        failures[0]
+    );
+    // The fill admits real inboxes, so the drain is not vacuous.
+    assert!(drained >= 800, "only {drained} inputs drained");
+}
+
+#[test]
+fn a_completion_that_does_not_fit_is_refused_and_the_turn_can_still_fail() {
+    let mut sim = Sim::with_limits(byte_capped(24 * 1024));
+    sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w1"));
+    sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+    sim.run(&begin_cmd(sim.head()));
+    fill_under_the_guard(&mut sim, "h");
+    let limits = sim.kernel.limits;
+    let mut wide = complete_cmd(sim.head(), b"s");
+    wide.events = (0..limits.max_events_per_turn)
+        .map(|n| EventSpec {
+            event_type: format!("{n:0>64}"),
+            payload: Some(blob(b"e")),
+        })
+        .collect();
+    let before = sim.head().clone();
+    let error = sim
+        .step(&Command::CompleteTurn(wide))
+        .expect_err("a completion past the reserve is refused");
+    assert_eq!(error.kind, ErrorKind::BudgetExceeded);
+    assert_eq!(sim.head(), &before, "a refusal published");
+    // Emitting less fits; failing always does.
+    assert!(matches!(
+        sim.kernel
+            .apply(
+                Some(sim.head()),
+                &Command::CompleteTurn(complete_cmd(sim.head(), b"s")),
+                sim.now,
+                &DerivedIds
+            )
+            .expect("a smaller completion fits")
+            .reply(),
+        Reply::TurnCommitted { .. }
+    ));
+    let fail = Command::FailTurn(FailTurn {
+        fence: turn_fence(sim.head()),
+        error: "e".repeat(limits.max_error_bytes),
+        terminal: true,
+        max_attempts: 1,
+    });
+    assert!(matches!(sim.run(&fail), Reply::TurnFailed { .. }));
+}
+
+#[test]
+fn a_completion_over_the_event_or_intent_count_is_refused_before_any_transition() {
+    use crate::command::Precondition::{EventsBelowCap, IntentsBelowCap};
+    let mut sim = Sim::started();
+    let limits = sim.kernel.limits;
+    let events = |n: u64| -> Vec<EventSpec> {
+        (0..n)
+            .map(|i| EventSpec {
+                event_type: format!("e{i}"),
+                payload: None,
+            })
+            .collect()
+    };
+    let intents = |n: u64| -> Vec<IntentSpec> {
+        (0..n)
+            .map(|i| intent(&format!("i{i}"), RecoveryPolicy::AtLeastOnce))
+            .collect()
+    };
+    let mut over = complete_cmd(sim.head(), b"s");
+    over.events = events(limits.max_events_per_turn + 1);
+    let over = Command::CompleteTurn(over);
+    assert!(over.preconditions().contains(&EventsBelowCap));
+    assert!(over.preconditions().contains(&IntentsBelowCap));
+    let error = sim.step(&over).expect_err("too many events");
+    assert_eq!(error.kind, ErrorKind::BudgetExceeded);
+    assert!(error.reason.contains("EventsBelowCap"), "{}", error.reason);
+    let mut over = complete_cmd(sim.head(), b"s");
+    over.intents = intents(limits.max_intents_per_turn + 1);
+    let error = sim
+        .step(&Command::CompleteTurn(over))
+        .expect_err("too many intents");
+    assert_eq!(error.kind, ErrorKind::BudgetExceeded);
+    assert!(error.reason.contains("IntentsBelowCap"), "{}", error.reason);
+    assert!(sim.head().active_turn.is_some(), "a refusal published");
+    let mut at = complete_cmd(sim.head(), b"s");
+    at.events = events(limits.max_events_per_turn);
+    at.intents = intents(limits.max_intents_per_turn);
+    assert!(matches!(
+        sim.run(&Command::CompleteTurn(at)),
+        Reply::TurnCommitted { .. }
+    ));
+}
+
+#[test]
+fn an_owner_id_or_handler_version_over_its_cap_is_refused() {
+    let mut sim = Sim::new();
+    sim.run(&create_cmd());
+    let limits = sim.kernel.limits;
+    let over = widest_takeover(sim.head(), limits.max_owner_bytes + 1);
+    assert_eq!(sim.refuse(&over), ErrorKind::BudgetExceeded);
+    sim.run(&widest_takeover(sim.head(), limits.max_owner_bytes));
+    sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+    let pin_of = |len: usize| HandlerPin {
+        version: "v".repeat(len),
+        ..pin()
+    };
+    // An over-long pin is refused even when it is not the one that matches.
+    let over = Command::BeginTurn(BeginTurn {
+        fence: owner_fence(sim.head()),
+        handlers: vec![
+            pin_of(limits.max_version_bytes),
+            HandlerPin {
+                handler: "other".to_string(),
+                ..pin_of(limits.max_version_bytes + 1)
+            },
+        ],
+    });
+    assert_eq!(sim.refuse(&over), ErrorKind::BudgetExceeded);
+    assert!(matches!(
+        sim.run(&Command::BeginTurn(BeginTurn {
+            fence: owner_fence(sim.head()),
+            handlers: vec![pin_of(limits.max_version_bytes)],
+        })),
+        Reply::TurnStarted(_)
+    ));
+    let mut fence = turn_fence(sim.head());
+    fence.handler_version = "v".repeat(limits.max_version_bytes + 1);
+    let fail = Command::FailTurn(FailTurn {
+        fence,
+        error: "boom".to_string(),
+        terminal: true,
+        max_attempts: 1,
+    });
+    assert_eq!(sim.refuse(&fail), ErrorKind::BudgetExceeded);
+}
+
+#[test]
+fn pending_effects_settle_inside_the_reserve() {
+    // Journal and authorize effects up to the guard, push the root into the
+    // reserve, then reconcile every effect and record its result (both
+    // exempt) and fail the input.
+    let mut sim = Sim::with_limits(Limits {
+        max_intents_per_turn: 1_000,
+        ..byte_capped(8 * 1024)
+    });
+    sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w1"));
+    sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+    sim.run(&begin_cmd(sim.head()));
+    let mut ids = Vec::new();
+    for n in 0.. {
+        match sim.step(&commit_intent_cmd(
+            sim.head(),
+            &format!("k{n}"),
+            RecoveryPolicy::AtLeastOnce,
+        )) {
+            Ok(t) => {
+                let Reply::IntentCommitted { effect_id } = t.reply() else {
+                    panic!("{t:?}");
+                };
+                ids.push(*effect_id);
             }
             Err(e) => {
                 assert_eq!(e.kind, ErrorKind::BudgetExceeded);
@@ -1900,43 +2399,138 @@ fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
             }
         }
     }
-    assert!(accepted >= 8, "the cap admits a real inbox: {accepted}");
-    sim.run(&Command::Takeover(Takeover {
-        incarnation: sim.head().incarnation,
-        owner_id: "w1".to_string(),
-        observed_epoch: sim.head().epoch,
-        lease_hint_unix_ns: 0,
-    }));
-    for _ in 0..accepted {
-        assert!(matches!(
-            sim.run(&Command::BeginTurn(BeginTurn {
-                fence: owner_fence(sim.head()),
-                handlers: vec![HandlerPin {
-                    handler: "h".to_string(),
-                    version: "1".to_string(),
-                    digest: Hash256([1; 32]),
-                }],
-            })),
-            Reply::TurnStarted(_) | Reply::TurnResumed(_)
-        ));
-        let cmd = Command::FailTurn(FailTurn {
-            fence: turn_fence(sim.head()),
-            error: error.clone(),
-            terminal: true,
-            max_attempts: 1,
-        });
-        let outcome = sim
-            .kernel
-            .apply(Some(sim.head()), &cmd, sim.now, &DerivedIds);
-        let transition = outcome.unwrap_or_else(|e| {
-            panic!("a terminal failure must publish for every outstanding input: {e:?}")
-        });
-        assert!(matches!(transition.reply(), Reply::TurnFailed { .. }));
-        if let Some(head) = transition.head() {
-            sim.head = Some(head.clone());
+    assert!(ids.len() >= 10, "{}", ids.len());
+    sim.run(&widest_takeover(sim.head(), sim.kernel.limits.max_owner_bytes));
+    let reconcile = Authority::Reconcile(inc_fence(sim.head()));
+    for id in &ids {
+        for attempt in [1, u32::MAX] {
+            let cmd = authorize_cmd(reconcile.clone(), *id, attempt);
+            if attempt == u32::MAX {
+                // Jump the attempt varint to its widest through the journal.
+                if let Some(effect) = sim.head.as_mut().and_then(|h| {
+                    h.effects.iter_mut().find(|e| e.effect_id == *id)
+                }) {
+                    effect.attempt = u32::MAX - 1;
+                }
+            }
+            sim.step(&cmd)
+                .unwrap_or_else(|e| panic!("reconcile {attempt}: {e:?}"));
         }
-        assert!(sim.head().encode().len() <= sim.kernel.limits.max_head_bytes);
+        sim.step(&Command::RecordEffectResult(RecordEffectResult {
+            fence: inc_fence(sim.head()),
+            effect_id: *id,
+            attempt: u32::MAX,
+            result: ObjectRef {
+                size_bytes: u64::MAX / 2,
+                ..blob(b"result")
+            },
+        }))
+        .unwrap_or_else(|e| panic!("record result: {e:?}"));
     }
-    assert!(sim.head().inbox.is_empty());
-    assert_eq!(sim.head().results.len(), accepted);
+    let fail = Command::FailTurn(FailTurn {
+        fence: turn_fence(sim.head()),
+        error: "e".repeat(sim.kernel.limits.max_error_bytes),
+        terminal: true,
+        max_attempts: 1,
+    });
+    assert!(matches!(sim.run(&fail), Reply::TurnFailed { .. }));
+}
+
+#[test]
+fn the_reserves_cover_the_growth_they_stand_for() {
+    let limits = Limits::default();
+    let mut sim = Sim::new();
+    sim.run(&create_cmd());
+    let empty = sim.head().clone();
+    let size = |head: &Head| head.encode().len();
+
+    // The fixed slack, pinned at the defaults (see the `Limits` doc), and
+    // the real growth of the widest takeover and turn on a fresh root.
+    let slack = limits.exempt_growth_slack_bytes(&empty);
+    assert_eq!(slack, 1296, "update the arithmetic on `Limits`");
+    let long_handler = "h".repeat(limits.max_string_bytes);
+    sim.run(&enqueue_for(sim.head(), "r1", &long_handler));
+    let before = size(sim.head());
+    sim.run(&widest_takeover(sim.head(), limits.max_owner_bytes));
+    sim.run(&Command::BeginTurn(BeginTurn {
+        fence: owner_fence(sim.head()),
+        handlers: vec![HandlerPin {
+            handler: long_handler.clone(),
+            version: "v".repeat(limits.max_version_bytes),
+            digest: Hash256([1; 32]),
+        }],
+    }));
+    let grown = size(sim.head()) - before;
+    assert!(grown <= slack, "{grown} > {slack}");
+
+    // Per input: the widest retryable-failure growth over entry sizes on
+    // both sides of the one- and two-byte length prefixes, then the widest
+    // result entry.
+    let mut retry = 0usize;
+    for len in (1..=200).chain([limits.max_string_bytes]) {
+        let mut fresh = empty.clone();
+        fresh.inbox.push(InboxEntry {
+            accept_seq: u64::MAX,
+            handler: "h".repeat(len),
+            source: InputSource::Message {
+                request_id: "r".to_string(),
+                request_hash: Hash256([1; 32]),
+            },
+            payload: None,
+            accepted_unix_ns: i64::MIN,
+            failed_attempts: 0,
+            last_failed_turn_id: None,
+        });
+        let mut failed = fresh.clone();
+        failed.inbox[0].failed_attempts = u32::MAX;
+        failed.inbox[0].last_failed_turn_id = Some(Id128([u8::MAX; 16]));
+        retry = retry.max(size(&failed) - size(&fresh));
+    }
+    assert_eq!(retry, 25);
+    let mut finished = empty.clone();
+    finished.results.push(ResultEntry {
+        accept_seq: u64::MAX,
+        status: ResultStatus::Failed,
+        output: None,
+        error: "e".repeat(limits.max_error_bytes),
+        turn_id: Some(Id128([u8::MAX; 16])),
+        dead_lettered: true,
+        finished_unix_ns: i64::MIN,
+    });
+    let result = size(&finished) - size(&empty);
+    assert_eq!(result, limits.max_error_bytes + 51);
+    assert!(retry + result <= limits.terminal_reserve_per_input_bytes);
+
+    // Per pending effect: from a fresh intent to completed at the widest
+    // attempt and result, over step key sizes on both sides of the prefixes.
+    let mut effect = 0usize;
+    for len in (1..=200).chain([limits.max_string_bytes]) {
+        let mut journaled = empty.clone();
+        journaled.effects.push(EffectRecord {
+            effect_id: Id128([1; 16]),
+            step_key: "k".repeat(len),
+            tool_name: "t".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: Hash256([1; 32]),
+            policy: RecoveryPolicy::Manual,
+            status: EffectStatus::Intent,
+            attempt: 0,
+            result: None,
+            result_attempt: 0,
+            turn_id: Id128([1; 16]),
+        });
+        let mut settled = journaled.clone();
+        let slot = &mut settled.effects[0];
+        slot.status = EffectStatus::Completed;
+        slot.attempt = u32::MAX;
+        slot.result = Some(ObjectRef {
+            size_bytes: u64::MAX,
+            ..blob(b"result")
+        });
+        slot.result_attempt = u32::MAX;
+        effect = effect.max(size(&settled) - size(&journaled));
+    }
+    assert_eq!(effect, 60);
+    assert!(effect <= PENDING_EFFECT_RESERVE_BYTES);
+    eprintln!("slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {effect}");
 }

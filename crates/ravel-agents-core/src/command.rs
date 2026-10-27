@@ -264,14 +264,26 @@ pub enum Precondition {
     AttemptAuthorized,
     /// The timer generation is the scheduled one and is due.
     TimerGenerationCurrent,
-    /// The encoded root stays under the byte cap; a command that grows the
-    /// root without ending a turn also leaves
-    /// `Limits::terminal_reserve_per_input_bytes` free for every input still
-    /// in the inbox, so each terminal command has room to publish its result.
+    /// The encoded root stays under the byte cap. A publish the growth guard
+    /// applies to (`Enqueue`, `RecordStep`, `CommitIntent`, `ScheduleTimer`,
+    /// `FireTimer`, `CompleteTurn`, an owner's `AuthorizeAttempt`, unless it
+    /// answers `Reply::Blocked`) also leaves `Limits::reserved_bytes` free.
+    /// What that buys is exactly this: every outstanding input can still be
+    /// ended by `FailTurn` with an error within `Limits::max_error_bytes`, or
+    /// by `Cancel`, all of them, in any order
+    /// (`tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`).
+    /// A `CompleteTurn` that does not fit is refused `BudgetExceeded`
+    /// (`tests::a_completion_that_does_not_fit_is_refused_and_the_turn_can_still_fail`).
     HeadBelowByteCap,
     /// Every caller-supplied string in the command is at most
-    /// `Limits::max_string_bytes`.
+    /// `Limits::max_string_bytes`, an owner id at most
+    /// `Limits::max_owner_bytes` and a handler version at most
+    /// `Limits::max_version_bytes`.
     CallerStringsWithinCap,
+    /// A turn commit buffers at most `Limits::max_events_per_turn` events.
+    EventsBelowCap,
+    /// A turn commit journals at most `Limits::max_intents_per_turn` intents.
+    IntentsBelowCap,
 }
 
 impl Command {
@@ -333,6 +345,8 @@ impl Command {
                 TurnNotBlocked,
                 NoEffectInDoubt,
                 TimersBelowCap,
+                EventsBelowCap,
+                IntentsBelowCap,
                 HeadBelowByteCap,
                 CallerStringsWithinCap,
             ],
