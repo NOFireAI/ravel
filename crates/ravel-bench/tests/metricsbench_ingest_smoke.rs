@@ -654,9 +654,8 @@ enum StubPoint {
 
 /// Every series a stub receiver stored, keyed by its sorted label pairs
 /// (`__name__` included), each holding `(ts_ms, point)`.
-type StubTsdb = std::sync::Arc<
-    Mutex<std::collections::BTreeMap<Vec<(String, String)>, Vec<(i64, StubPoint)>>>,
->;
+type StubTsdb =
+    std::sync::Arc<Mutex<std::collections::BTreeMap<Vec<(String, String)>, Vec<(i64, StubPoint)>>>>;
 
 /// A stub Remote Write 1.0 receiver with just enough of the Prometheus query
 /// API for the lane's read-back: it stores what it is sent and answers
@@ -843,10 +842,7 @@ fn name_alternation(matcher: &str) -> Vec<String> {
     let mut chars = regex.chars();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => names
-                .last_mut()
-                .expect("name")
-                .extend(chars.next()),
+            '\\' => names.last_mut().expect("name").extend(chars.next()),
             '|' => names.push(String::new()),
             other => names.last_mut().expect("name").push(other),
         }

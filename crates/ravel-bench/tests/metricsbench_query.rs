@@ -22,9 +22,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ravel_bench::metrics_correctness::{Engine, RefusalReason};
 use ravel_bench::metrics_ingest::{
-    ClassDigests, IngestPhase, LatencyReport, MetricsIngestReport, PayloadClass, ProfileRecord,
-    Readback, ReadbackExpected, RunRecord, ScalingLabelRecord, StreamCounts, SystemIngestResult,
-    UNSUPPORTED_CLASSES, UnsupportedClassRecord, workload_digest,
+    ClassDigests, IN_PROCESS_SYSTEM, InProcessRow, IngestPhase, LatencyReport, MetricsIngestReport,
+    PayloadClass, ProfileRecord, Readback, ReadbackExpected, RunRecord, ScalingLabelRecord,
+    StreamCounts, SystemIngestResult, UNSUPPORTED_CLASSES, UnsupportedClassRecord, workload_digest,
 };
 use ravel_bench::report_schema::{
     Backend, Comparator, Hardware, Measurement, MetricsBenchReport, Provenance, QueryKind,
@@ -929,6 +929,24 @@ async fn a_band6_failure_refuses_the_run() {
     for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
         assert!(stub.requests().is_empty());
     }
+}
+
+/// An ingest report from a `--no-in-process-row` run, which holds portable
+/// rows only and says `in_process_row: "skipped"`, binds and runs: `bind`
+/// reads no in-process row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ingest_report_without_the_in_process_row_binds() {
+    let s = stubs().await;
+    let ingest = ingest_report(&s.urls);
+    assert!(ingest.row(IN_PROCESS_SYSTEM).is_none());
+    assert_eq!(ingest.in_process_row, InProcessRow::Skipped);
+    assert_eq!(
+        serde_json::to_value(&ingest).expect("serialize")["in_process_row"],
+        "skipped"
+    );
+    let run = run_bin(ingest, &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    assert!(run.out.exists());
 }
 
 /// A workload file other than the one the ingest run replayed refuses.

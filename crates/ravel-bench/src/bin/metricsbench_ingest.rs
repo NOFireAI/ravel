@@ -40,12 +40,12 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    AnchorError, Band6Violation, GeneratedStream, HttpReplayConfig, MetricsIngestReport,
-    PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver, RowAccountingViolation,
-    IN_PROCESS_SYSTEM, RunProvenance, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
-    build_profile_record, check_anchor, check_expected_digests_agree, check_row_accounting,
-    check_row_band6, check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
-    replay_over_http_with_plan, workload_digest,
+    AnchorError, Band6Violation, GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM,
+    MetricsIngestReport, PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver,
+    RowAccountingViolation, RunProvenance, StreamBandViolation, StreamCounts, Substrate,
+    SystemIngestResult, build_profile_record, check_anchor, check_expected_digests_agree,
+    check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
+    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -546,13 +546,12 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         // resolves the exact committed segments deterministically. Recorded
         // as its own phase, separate from ingest (decision 9). Runs while
         // `ravel` is still whole, before its result row is moved into `rows`.
-        let query_expr =
-            ravel
-                .first_metric
-                .clone()
-                .ok_or_else(|| RunError::NothingIngested {
-                    system: IN_PROCESS_SYSTEM.to_string(),
-                })?;
+        let query_expr = ravel
+            .first_metric
+            .clone()
+            .ok_or_else(|| RunError::NothingIngested {
+                system: IN_PROCESS_SYSTEM.to_string(),
+            })?;
         query = Some(
             query_after_replay(&ravel, &query_expr)
                 .await
@@ -664,8 +663,9 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     check_band6_across_rows(in_process_scalar.as_deref(), &portable_refs)?;
     rows.extend(portable);
     // `resolve_rows` refused a run with neither an in-process nor a portable
-    // row, so one of them set the reference.
-    let gen_report = reference.ok_or(RunError::NoRows)?;
+    // row before anything was generated, so one of them set the reference.
+    let gen_report =
+        reference.ok_or_else(|| RunError::Generate("no row replayed the stream".to_string()))?;
 
     // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
     // generator's exact counts for the figures that are not directly declared
