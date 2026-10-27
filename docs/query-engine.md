@@ -1301,17 +1301,36 @@ same RAII `reserve` API, so they read under `component="fetch"`.
 
 ## Budgets (static config)
 
-Per query: max segments touched (1024, a cap on the one shared snapshot,
-not per selector), max concurrent GETs (8, applied both across selectors
-and across one selector's own segments), max matched series (10k) and max
-samples (10M) enforced independently per selector (a query with several
-selectors, e.g. a future binary/aggregate expression, grants each its own
-full budget rather than splitting one budget across them), max
-range-evaluation points per query (11,000, matching the Prometheus
+Per query: max segments touched (a cap on the one shared snapshot, not
+per selector; `EngineConfig::default()` is 1024, ravel-server sets
+`--max-segments` and derives 1,000,000, `DERIVED_MAX_SEGMENTS`, when it is
+unset), max concurrent GETs (8, applied both across selectors and across
+one selector's own segments), max matched series and max samples
+(ravel-server's `--max-series` and `--max-samples`, default
+`DEFAULT_MAX_SERIES` 10,000 and `DEFAULT_MAX_SAMPLES` 10,000,000 when
+unset, resolved in `resolve_performance_defaults`), max range-evaluation
+points per query (11,000, matching the Prometheus
 resolution limit), wall deadline (server maximum, default
 30 s). The `timeout` param can only lower the deadline: values above the
 server maximum are clamped to it. Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
+
+The series and samples caps are counts: they bound the plan's width, not
+its bytes. The bytes a query holds are bounded by the memory budget
+(ADR-1170), which fetch reservations and selector-cache entries are
+charged to. The float series of every selector are pooled and checked
+once against both caps (`merge_soa_runs` in
+`crates/ravel-query/src/engine.rs`; see the merge step under "Flow"
+above), so a multi-selector query shares one budget rather than
+granting each selector its own; histogram series are merged and checked
+per selector (`merge_histogram_soa_runs`). Over a cap the query is
+refused with `query matched N series, exceeding the limit of M` (or the
+samples form), answered as HTTP 422 with `errorType` `execution`. Both
+flags are process-wide and have no limits-file key: `[defaults]` and
+`[tenants.<id>]` promise per-tenant scope, and per-tenant query limits
+are not enforced today. `--max-samples` also sets the selector-cache cap
+described above (`2 * max_samples * 16` bytes, 320,000,000 at the
+default), which startup logs as `selector_cache_max_bytes`.
 
 ### Budgets under distributed fan-out (ADR-0071)
 

@@ -1924,6 +1924,38 @@ pub struct Cli {
     #[arg(long = "max-segments", value_name = "N")]
     pub max_segments: Option<usize>,
 
+    /// Cap on the distinct series a single PromQL query may materialize,
+    /// threaded into `ravel_query::EngineConfig::max_series`. Over it the query
+    /// is refused with `query matched N series, exceeding the limit of M`
+    /// (HTTP 422, `errorType` `execution`), never truncated. Default when
+    /// unset: `ravel_query::DEFAULT_MAX_SERIES` (10,000), host-independent: a
+    /// series count bounds plan width, and the bytes behind it are bounded by
+    /// the memory budget. Process-wide, with no limits-file key, because
+    /// per-tenant query limits are not enforced today. Must be at least 1.
+    #[arg(
+        long = "max-series",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub max_series: Option<usize>,
+
+    /// Cap on the total samples (summed across series, after cross-segment
+    /// dedup) a single PromQL query may materialize, threaded into
+    /// `ravel_query::EngineConfig::max_samples`. Over it the query is refused
+    /// with `query matched N samples, exceeding the limit of M` (HTTP 422,
+    /// `errorType` `execution`), never truncated. Also sizes the range-query
+    /// selector-cache cap, two float copies of this many samples (16 bytes
+    /// each), which charges the memory budget. Default when unset:
+    /// `ravel_query::DEFAULT_MAX_SAMPLES` (10,000,000), host-independent.
+    /// Process-wide, with no limits-file key, because per-tenant query limits
+    /// are not enforced today. Must be at least 1.
+    #[arg(
+        long = "max-samples",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub max_samples: Option<usize>,
+
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
     /// this process admits at once, across every listener (public and mTLS)
@@ -3303,6 +3335,10 @@ pub struct QueryBudgets {
     pub promql_fetch_fanout: usize,
     /// Per-query segment fan-out cap. Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
+    /// Per-query PromQL series cap. Reaches `EngineConfig::max_series`.
+    pub max_series: usize,
+    /// Per-query PromQL samples cap. Reaches `EngineConfig::max_samples`.
+    pub max_samples: usize,
     /// Per-query SQL memory-pool ceiling. Reaches `SqlConfig::max_query_bytes`.
     pub sql_max_query_bytes: usize,
     /// Per-tenant SQL memory ceiling. Reaches the `SqlExecutor`'s per-tenant
@@ -3390,6 +3426,8 @@ impl Default for QueryBudgets {
             sql_partition_count: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             promql_fetch_fanout: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+            max_series: ravel_query::DEFAULT_MAX_SERIES,
+            max_samples: ravel_query::DEFAULT_MAX_SAMPLES,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
@@ -3495,6 +3533,8 @@ impl QueryBudgets {
             sql_partition_count: Some(self.sql_partition_count),
             promql_fetch_fanout: Some(self.promql_fetch_fanout),
             max_segments: self.max_segments,
+            max_series: self.max_series,
+            max_samples: self.max_samples,
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_request_cost_bytes: resolved.request_cost_bytes,
             logs_projection_break_even_bytes: resolved.projection_break_even_bytes,
@@ -4283,6 +4323,10 @@ pub struct PerformanceFlags {
     pub max_concurrent_queries: Option<u64>,
     /// `--max-segments`.
     pub max_segments: Option<usize>,
+    /// `--max-series`.
+    pub max_series: Option<usize>,
+    /// `--max-samples`.
+    pub max_samples: Option<usize>,
     /// `--cache-max-bytes`.
     pub cache_max_bytes: Option<u64>,
     /// `--catalog-cache-max-bytes` (ADR-2023): independent of
@@ -4399,6 +4443,11 @@ pub struct ResolvedPerformanceDefaults {
     pub catalog_resolve_interim_cap_applied: bool,
     /// Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
+    /// Reaches `EngineConfig::max_series`.
+    pub max_series: usize,
+    /// Reaches `EngineConfig::max_samples`, and from there the range-query
+    /// selector-cache cap (`ravel_promql::selector_cache_cap_for_pool`).
+    pub max_samples: usize,
     /// Reaches the query fetcher cache's byte ceiling
     /// (`store::build_cache`). NOT the catalog byte cache: that has its own
     /// [`Self::catalog_cache_max_bytes`], resolved from its own flag
@@ -4549,6 +4598,8 @@ pub struct PerformanceSources {
     pub promql_fetch_fanout: &'static str,
     pub catalog_resolve_concurrency: &'static str,
     pub max_segments: &'static str,
+    pub max_series: &'static str,
+    pub max_samples: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
     pub column_stats_cache_max_bytes: &'static str,
@@ -4671,6 +4722,8 @@ fn resolve_knob(
 ///   of `memory_remainder_bytes` (`sql_pools_remainder_capped` when either
 ///   was). An explicit flag for either is never capped.
 /// - `max_segments`: [`DERIVED_MAX_SEGMENTS`].
+/// - `max_series`: [`ravel_query::DEFAULT_MAX_SERIES`].
+/// - `max_samples`: [`ravel_query::DEFAULT_MAX_SAMPLES`].
 /// - `query_deadline`: [`DERIVED_QUERY_DEADLINE`].
 ///
 /// The per-query SQL pool and the per-tenant ceiling are then reconciled so
@@ -4750,6 +4803,14 @@ pub fn resolve_performance_defaults(
     let (max_segments, segments_source) = match flags.max_segments {
         Some(n) => (n, PERF_SOURCE_FLAG),
         None => (DERIVED_MAX_SEGMENTS, PERF_SOURCE_DERIVED),
+    };
+    let (max_series, series_source) = match flags.max_series {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (ravel_query::DEFAULT_MAX_SERIES, PERF_SOURCE_DERIVED),
+    };
+    let (max_samples, samples_source) = match flags.max_samples {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (ravel_query::DEFAULT_MAX_SAMPLES, PERF_SOURCE_DERIVED),
     };
 
     // ADR-1170 decision 3, amended by issue #1255: one process-wide
@@ -5021,6 +5082,8 @@ pub fn resolve_performance_defaults(
         catalog_resolve_query_concurrency_input: query_concurrency_input,
         catalog_resolve_interim_cap_applied,
         max_segments,
+        max_series,
+        max_samples,
         cache_max_bytes,
         catalog_cache_max_bytes,
         column_stats_cache_max_bytes,
@@ -5041,6 +5104,8 @@ pub fn resolve_performance_defaults(
             promql_fetch_fanout: promql_fetch_fanout_source,
             catalog_resolve_concurrency: catalog_resolve_source,
             max_segments: segments_source,
+            max_series: series_source,
+            max_samples: samples_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
             column_stats_cache_max_bytes: column_stats_cache_source,
@@ -5356,6 +5421,18 @@ impl ResolvedPerformanceDefaults {
             "performance default resolved"
         );
         tracing::info!(
+            setting = "max_series",
+            value = self.max_series,
+            source = self.sources.max_series,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "max_samples",
+            value = self.max_samples,
+            source = self.sources.max_samples,
+            "performance default resolved"
+        );
+        tracing::info!(
             setting = "cache_max_bytes",
             value = self.cache_max_bytes,
             source = self.sources.cache_max_bytes,
@@ -5401,6 +5478,15 @@ impl ResolvedPerformanceDefaults {
                 setting = "memory_budget_bytes",
                 value = self.memory_budget_bytes,
                 source = self.sources.memory_budget_bytes,
+                "performance default resolved"
+            );
+            // Derived from max_samples, not carved from the budget: each
+            // range-query selector-cache entry is charged to the budget, which
+            // refuses before this cap is reached when it is the smaller.
+            tracing::info!(
+                setting = "selector_cache_max_bytes",
+                value = ravel_promql::selector_cache_cap_for_pool(self.max_samples),
+                source = self.sources.max_samples,
                 "performance default resolved"
             );
             // A flag or fallback budget subtracted no reserve, so the field
@@ -6922,6 +7008,8 @@ impl Cli {
             sql_partition_count: resolved.sql_partition_count,
             promql_fetch_fanout: resolved.promql_fetch_fanout,
             max_segments: resolved.max_segments,
+            max_series: resolved.max_series,
+            max_samples: resolved.max_samples,
             sql_max_query_bytes: resolved.sql_max_query_bytes,
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
@@ -8427,6 +8515,8 @@ impl Cli {
             catalog_resolve_concurrency: self.catalog_resolve_concurrency,
             max_concurrent_queries: self.max_concurrent_queries,
             max_segments: self.max_segments,
+            max_series: self.max_series,
+            max_samples: self.max_samples,
             cache_max_bytes: self.cache_max_bytes,
             catalog_cache_max_bytes: self.catalog_cache_max_bytes,
             column_stats_cache_max_bytes: self.column_stats_cache_max_bytes,
@@ -11328,6 +11418,246 @@ mod tests {
         assert_ne!(DERIVED_MAX_SEGMENTS, EngineConfig::default().max_segments);
     }
 
+    /// Issue #3306 reachability: `--max-series` reaches the running engine's
+    /// `EngineConfig::max_series` and nothing else.
+    ///
+    /// Flip-line proof: drop `max_series: self.max_series` from
+    /// `QueryBudgets::apply_to_engine` and the engine keeps 10,000; write
+    /// `max_samples: self.max_series` there and `max_samples` reads 7.
+    #[test]
+    fn max_series_is_reachable_from_cli() {
+        assert_ne!(7, ravel_query::DEFAULT_MAX_SERIES);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-series", "7"]).expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.max_series, 7,
+            "the running engine's max_series must be the configured flag"
+        );
+        assert_eq!(
+            engine.max_samples,
+            ravel_query::DEFAULT_MAX_SAMPLES,
+            "--max-series must not reach max_samples"
+        );
+    }
+
+    /// Issue #3306 reachability: `--max-samples` reaches the running engine's
+    /// `EngineConfig::max_samples` and nothing else.
+    ///
+    /// Flip-line proof: drop `max_samples: self.max_samples` from
+    /// `QueryBudgets::apply_to_engine` and the engine keeps 10,000,000; write
+    /// `max_series: self.max_samples` there and `max_series` reads 9.
+    #[test]
+    fn max_samples_is_reachable_from_cli() {
+        assert_ne!(9, ravel_query::DEFAULT_MAX_SAMPLES);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-samples", "9"]).expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.max_samples, 9,
+            "the running engine's max_samples must be the configured flag"
+        );
+        assert_eq!(
+            engine.max_series,
+            ravel_query::DEFAULT_MAX_SERIES,
+            "--max-samples must not reach max_series"
+        );
+    }
+
+    /// Issue #3306: unset, both caps resolve to the ravel-query defaults with
+    /// the host-independent `derived` label, and `apply_to_engine` writes them
+    /// over whatever the base config carried rather than keeping the base.
+    #[test]
+    fn unset_max_series_and_max_samples_resolve_to_the_ravel_query_defaults() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.max_series, 10_000);
+        assert_eq!(resolved.max_samples, 10_000_000);
+        assert_eq!(resolved.max_series, ravel_query::DEFAULT_MAX_SERIES);
+        assert_eq!(resolved.max_samples, ravel_query::DEFAULT_MAX_SAMPLES);
+        assert_eq!(resolved.sources.max_series, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.max_samples, PERF_SOURCE_DERIVED);
+
+        let base = ravel_query::EngineConfig {
+            max_series: 3,
+            max_samples: 5,
+            ..ravel_query::EngineConfig::default()
+        };
+        let engine = cli
+            .query_budgets(&resolved)
+            .expect("budgets resolve")
+            .apply_to_engine(base)
+            .expect("engine config resolves");
+        assert_eq!(engine.max_series, 10_000);
+        assert_eq!(engine.max_samples, 10_000_000);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-series", "4", "--max-samples", "6"])
+            .expect("flags parse");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.sources.max_series, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.sources.max_samples, PERF_SOURCE_FLAG);
+    }
+
+    /// Issue #3306: a zero cap is refused by clap at parse time, before any
+    /// resolution runs.
+    #[test]
+    fn zero_max_series_or_max_samples_is_refused_at_parse_time() {
+        for flag in ["--max-series", "--max-samples"] {
+            let err = Cli::try_parse_from(["ravel-server", flag, "0"])
+                .expect_err(&format!("{flag} 0 must not parse"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{flag} 0: {err}"
+            );
+            assert!(err.to_string().contains(flag), "{flag} 0: {err}");
+            Cli::try_parse_from(["ravel-server", flag, "1"])
+                .unwrap_or_else(|e| panic!("{flag} 1 must parse: {e}"));
+        }
+    }
+
+    /// Issue #3306: `--max-series 2` against a query matching three series is
+    /// refused by the engine built from the CLI, with the refusal text the
+    /// MetricsBench harness matches on, byte for byte.
+    #[tokio::test]
+    async fn max_series_flag_refuses_a_wider_query_with_the_unchanged_text() {
+        use std::sync::Arc;
+
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let ts_ns = NS_PER_HOUR;
+        let tenant = TenantId::new("series-cap");
+        let tenant_hash = tenant.hash();
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+
+        let series: Vec<SeriesInput> = (0..3)
+            .map(|i| {
+                let labels = LabelSet::new(vec![
+                    Label {
+                        name: "__name__".to_string(),
+                        value: "m".to_string(),
+                    },
+                    Label {
+                        name: "i".to_string(),
+                        value: i.to_string(),
+                    },
+                ])
+                .expect("valid labels");
+                SeriesInput {
+                    series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
+                    labels,
+                    samples: vec![Sample { ts_ns, value: 1.0 }],
+                }
+            })
+            .collect();
+        let writer_id = uuid::Uuid::from_u128(3_306);
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        assert_eq!(written.summary.series_count, 3);
+        let rec = record::build(record::NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(
+                &data_key,
+                written.bytes,
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put data object");
+        publish::publish(
+            store.as_ref(),
+            &rec,
+            &ravel_commit::publish::RetryPolicy::default(),
+        )
+        .await
+        .expect("publish");
+
+        let catalog = Arc::new(
+            ravel_catalog::Catalog::new(store.clone(), ravel_catalog::CatalogConfig::default())
+                .expect("catalog"),
+        );
+        let run = |config: ravel_query::EngineConfig| {
+            let engine =
+                ravel_query::QueryEngine::new(Arc::clone(&catalog), Arc::clone(&store), config);
+            async move {
+                engine
+                    .instant(
+                        tenant_hash,
+                        "m",
+                        ts_ns / 1_000_000,
+                        &[],
+                        4 * NS_PER_HOUR,
+                        Duration::from_secs(30),
+                    )
+                    .await
+            }
+        };
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-series", "2"]).expect("flag parses");
+        let err = run(engine_from(&cli))
+            .await
+            .expect_err("three series over a limit of two must be refused");
+        assert!(
+            matches!(
+                err,
+                ravel_query::QueryError::TooManySeries { count: 3, max: 2 }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "query matched 3 series, exceeding the limit of 2"
+        );
+
+        // The same store under the default cap answers, so the refusal above
+        // is the flag's doing.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let (value, _coverage) = run(engine_from(&cli))
+            .await
+            .expect("three series are within the default 10,000");
+        match value {
+            ravel_promql::Value::Vector(v) => assert_eq!(v.len(), 3),
+            other => panic!("expected an instant vector, got {other:?}"),
+        }
+    }
+
     /// ADR-0107 reachability: `--logs-block-range-threshold` must reach the
     /// `EngineConfig` `build_sql_state` reads when it builds the logs fetcher,
     /// not stop at a parsed field. Same wiring trace as
@@ -13433,6 +13763,66 @@ mod tests {
             ] {
                 let needle = format!("setting=\"{setting}\"");
                 assert_eq!(joined.matches(&needle).count(), 1, "source {source}");
+            }
+        }
+    }
+
+    /// Issue #3306: startup logs `max_series`, `max_samples` and the
+    /// selector-cache cap derived from `max_samples` once each, with value
+    /// and source, both unset and flagged.
+    ///
+    /// Prove-the-test: pass `self.max_series` to `selector_cache_cap_for_pool`
+    /// in `emit()` and the derived case reads `value=320000`, not
+    /// `value=320000000`.
+    #[test]
+    fn emit_logs_series_samples_and_selector_cache_cap() {
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let flagged = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                max_series: Some(7),
+                max_samples: Some(9),
+                ..PerformanceFlags::default()
+            },
+        );
+        for (resolved, source, expected) in [
+            (
+                derived,
+                PERF_SOURCE_DERIVED,
+                [
+                    ("max_series", "10000"),
+                    ("max_samples", "10000000"),
+                    ("selector_cache_max_bytes", "320000000"),
+                ],
+            ),
+            (
+                flagged,
+                PERF_SOURCE_FLAG,
+                [
+                    ("max_series", "7"),
+                    ("max_samples", "9"),
+                    ("selector_cache_max_bytes", "288"),
+                ],
+            ),
+        ] {
+            let (captured, _guard) = capture_events(tracing::Level::INFO);
+            resolved.emit(reference_host());
+            let lines = captured.lock();
+            for (setting, value) in expected {
+                let needle = format!("setting=\"{setting}\"");
+                let matching: Vec<&String> = lines.iter().filter(|l| l.contains(&needle)).collect();
+                assert_eq!(matching.len(), 1, "{setting} once, lines: {lines:?}");
+                assert!(
+                    matching[0].contains(&format!("value={value} "))
+                        || matching[0].ends_with(&format!("value={value}")),
+                    "{setting} must carry value={value}: {}",
+                    matching[0]
+                );
+                assert!(
+                    matching[0].contains(&format!("source=\"{source}\"")),
+                    "{setting} must carry source {source}: {}",
+                    matching[0]
+                );
             }
         }
     }
