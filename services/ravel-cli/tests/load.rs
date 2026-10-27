@@ -1047,7 +1047,7 @@ async fn small_batches_with_a_large_target_merge_without_deadlock() {
             &pq,
             1,
             BATCH_ROWS,
-            1 << 40,
+            load::MAX_TARGET_BYTES as usize,
             Some(Duration::from_secs(3600)),
             options,
         ),

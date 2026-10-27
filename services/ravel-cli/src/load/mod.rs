@@ -230,17 +230,26 @@ const WRITE_ACK_DEADLINE_MARGIN: Duration = Duration::from_secs(60);
 /// trigger, about 1.25e8 estimate bytes per second.
 pub const ENCODE_BYTES_PER_SECOND: u64 = 100_000_000;
 
+/// The largest `--target-bytes` a load accepts: the target whose
+/// [`encode_allowance`] is one hour at [`ENCODE_BYTES_PER_SECOND`],
+/// 360,000,000,000 bytes. With `--ack-margin` unset, a larger target would add
+/// more than an hour to every Strict write's ack deadline.
+pub const MAX_TARGET_BYTES: u64 = ENCODE_BYTES_PER_SECOND * 3_600;
+
 /// The encode time [`write_ack_deadline`] allows a flush of `target_bytes`:
 /// `target_bytes / ENCODE_BYTES_PER_SECOND`, exact to the nanosecond. Zero for
-/// a target at or below [`PER_BATCH_TARGET_BYTES`] or one batch's estimated
-/// per-shard slice (`slice_est_bytes`), since each write then flushes about
-/// one slice, which the fixed margin always covered.
-pub(crate) fn encode_allowance(target_bytes: usize, slice_est_bytes: u64) -> Duration {
-    let target = target_bytes as u64;
-    if target_bytes <= PER_BATCH_TARGET_BYTES || target <= slice_est_bytes {
+/// a target at or below [`PER_BATCH_TARGET_BYTES`], since each write then
+/// flushes its own batch, which the fixed margin always covered. Any larger
+/// target gets the allowance, even one at or below a batch's estimated
+/// per-shard slice: shards do not split a batch evenly, so a shard's real
+/// slice can sit under that estimate and its buffer accumulate across batches
+/// until the age trigger releases it near the target's size.
+pub(crate) fn encode_allowance(target_bytes: usize) -> Duration {
+    if target_bytes <= PER_BATCH_TARGET_BYTES {
         return Duration::ZERO;
     }
-    let nanos = u128::from(target) * 1_000_000_000 / u128::from(ENCODE_BYTES_PER_SECOND);
+    let nanos =
+        u128::from(target_bytes as u64) * 1_000_000_000 / u128::from(ENCODE_BYTES_PER_SECOND);
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
@@ -261,16 +270,34 @@ pub(crate) fn write_ack_deadline(
     max_flush_delay: Option<Duration>,
     ack_margin: Option<Duration>,
     target_bytes: usize,
-    slice_est_bytes: u64,
 ) -> Duration {
     let margin = ack_margin.unwrap_or_else(|| {
-        WRITE_ACK_DEADLINE_MARGIN.saturating_add(encode_allowance(target_bytes, slice_est_bytes))
+        WRITE_ACK_DEADLINE_MARGIN.saturating_add(encode_allowance(target_bytes))
     });
     WRITE_ACK_DEADLINE_FLOOR.max(
         max_flush_delay
             .unwrap_or(Duration::ZERO)
             .saturating_add(margin),
     )
+}
+
+/// Reject a `--target-bytes` of zero, which cannot express a target, and one
+/// above [`MAX_TARGET_BYTES`], whose encode allowance would exceed an hour.
+/// Every signal's loader calls this before its first read.
+pub(crate) fn validate_target_bytes(target_bytes: Option<usize>) -> Result<(), LoadError> {
+    match target_bytes {
+        Some(0) => Err(LoadError::Setup(
+            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
+             given"
+                .to_string(),
+        )),
+        Some(t) if t as u64 > MAX_TARGET_BYTES => Err(LoadError::Setup(format!(
+            "--target-bytes must be at most {MAX_TARGET_BYTES} (the bytes a flush is allowed one \
+             hour to encode at {ENCODE_BYTES_PER_SECOND} bytes per second, the encode time an \
+             unset --ack-margin adds to every Strict write's ack deadline); {t} was given"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The message refusing `--ack-margin 0`: a zero margin leaves the released

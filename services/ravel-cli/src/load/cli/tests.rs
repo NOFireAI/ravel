@@ -761,3 +761,82 @@ async fn a_failed_default_load_flushes_before_it_reports() {
         "the geometry line was in the sink at the first data-object PUT"
     );
 }
+
+/// Issue #3289: `ravel-cli load --target-bytes N` refuses a target above
+/// `MAX_TARGET_BYTES` on every signal, before any row is read, and accepts
+/// the bound itself. The parquet path does not exist, so an accepted target
+/// gets as far as opening the input and fails there instead.
+///
+/// Prove-the-test: drop the `validate_target_bytes` call from the logs
+/// loader's guards and the logs case reaches the input; drop it from
+/// `GeometryRequest::validate` and the metrics and spans cases do.
+#[tokio::test]
+async fn every_signal_refuses_a_target_bytes_above_the_one_hour_bound() {
+    use ravel_object_store::memory::MemoryStore;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.parquet");
+    let mappings = [
+        (SignalArg::Logs, "ts_column = \"ts\"\nts_unit = \"nanos\"\n"),
+        (
+            SignalArg::Metrics,
+            "[metrics]\nname = \"probe\"\nvalue_column = \"value\"\nts_column = \"ts\"\n\
+             ts_unit = \"nanos\"\nkind = \"gauge\"\n",
+        ),
+        (
+            SignalArg::Spans,
+            "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+             name_column = \"name\"\nstart_ts_column = \"start_ns\"\nstart_ts_unit = \"nanos\"\n\
+             end_ts_column = \"end_ns\"\nend_ts_unit = \"nanos\"\n",
+        ),
+    ];
+    for (signal, mapping) in mappings {
+        let mapping_path = dir.path().join(format!("{signal:?}.toml"));
+        std::fs::write(&mapping_path, mapping).expect("write mapping");
+        let run = |target_bytes: usize| {
+            let missing = missing.clone();
+            let mapping_path = mapping_path.clone();
+            async move {
+                let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+                let mut sink: Vec<u8> = Vec::new();
+                run_warning_to(
+                    store,
+                    &missing,
+                    "acme",
+                    &mapping_path,
+                    signal,
+                    1,
+                    10_000,
+                    0,
+                    None,
+                    Some(1),
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    DEFAULT_DECODE_QUEUE_BATCHES,
+                    Some(target_bytes),
+                    None,
+                    RlogZstdLevel::DEFAULT,
+                    None,
+                    NOW_NS,
+                    &mut sink,
+                )
+                .await
+                .expect_err("the input does not exist")
+                .to_string()
+            }
+        };
+        let refused = run(360_000_000_001).await;
+        assert!(
+            refused.starts_with("--target-bytes must be at most 360000000000 "),
+            "{signal:?}: {refused}"
+        );
+        assert!(
+            refused.ends_with("; 360000000001 was given"),
+            "{signal:?}: {refused}"
+        );
+        let accepted = run(360_000_000_000).await;
+        assert!(
+            !accepted.contains("--target-bytes"),
+            "{signal:?}: the bound itself is accepted and the load reaches its input: {accepted}"
+        );
+    }
+}

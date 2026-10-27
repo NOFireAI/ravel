@@ -753,7 +753,9 @@ enum Command {
         /// that ack waits for one: the size trigger, the depth flush, the
         /// wall-clock age trigger (`--max-flush-delay`, 60s by default) or, at
         /// the end of the input, the loader's own force-flush. `0` is
-        /// rejected.
+        /// rejected, and so is a target above 360,000,000,000
+        /// (`MAX_TARGET_BYTES`), whose encode allowance in the ack deadline
+        /// (see `--ack-margin`) would exceed one hour.
         #[arg(long, value_name = "BYTES")]
         target_bytes: Option<usize>,
         /// How long a shard buffer may age before the router flushes it,
@@ -800,8 +802,8 @@ enum Command {
         /// (`ENCODE_BYTES_PER_SECOND`), the time a flush released by the age
         /// trigger may spend encoding a target-sized object before its PUT
         /// starts. At the 60 s default delay the stock 1,850,000,000 target
-        /// adds 18.5 s, a 138.5 s deadline; a target at or below one batch's
-        /// per-shard slice, `--target-bytes 1` included, adds nothing. Given,
+        /// adds 18.5 s, a 138.5 s deadline; only `--target-bytes 1` adds
+        /// nothing. Given,
         /// it replaces that whole margin. The stderr geometry line prints the
         /// deadline the load runs with. `0` is rejected.
         #[arg(long, value_name = "SECONDS", value_parser = ravel_cli::load::parse_ack_margin)]
