@@ -181,6 +181,12 @@ enum RunError {
     },
     #[error("--{flag}-endpoint needs --{flag}-query-url: every HTTP row is read back")]
     MissingQueryUrl { flag: &'static str },
+    #[error("--{flag}-query-url needs --{flag}-endpoint: there is no {flag} row to read back")]
+    QueryUrlWithoutEndpoint { flag: &'static str },
+    #[error(
+        "--ravel-tenant needs --ravel-endpoint: there is no portable Ravel row to record it on"
+    )]
+    TenantWithoutEndpoint,
     #[error("{0}")]
     Band6(#[from] Band6Violation),
     #[error(
@@ -285,9 +291,12 @@ fn resolve_anchor(args: &Args, scrape_interval_secs: u64, steps: u64) -> Result<
 }
 
 /// The portable Ravel row's tenant: required with `--ravel-endpoint` and
-/// equal to `--tenant`.
+/// equal to `--tenant`, and refused without it.
 fn resolve_ravel_tenant(args: &Args) -> Result<Option<String>, RunError> {
     if args.ravel_endpoint.is_none() {
+        if args.ravel_tenant.is_some() {
+            return Err(RunError::TenantWithoutEndpoint);
+        }
         return Ok(None);
     }
     let Some(ravel_tenant) = &args.ravel_tenant else {
@@ -302,7 +311,8 @@ fn resolve_ravel_tenant(args: &Args) -> Result<Option<String>, RunError> {
     Ok(Some(ravel_tenant.clone()))
 }
 
-/// Each supplied endpoint's query URL, refused when one is missing.
+/// Each supplied endpoint's query URL, refused when one is missing, and each
+/// query URL refused when its endpoint is.
 fn resolve_query_urls(args: &Args) -> Result<(), RunError> {
     for (flag, endpoint, query_url) in [
         ("ravel", &args.ravel_endpoint, &args.ravel_query_url),
@@ -321,6 +331,9 @@ fn resolve_query_urls(args: &Args) -> Result<(), RunError> {
         if endpoint.is_some() && query_url.is_none() {
             return Err(RunError::MissingQueryUrl { flag });
         }
+        if endpoint.is_none() && query_url.is_some() {
+            return Err(RunError::QueryUrlWithoutEndpoint { flag });
+        }
     }
     Ok(())
 }
@@ -335,7 +348,9 @@ fn exit_code(err: &RunError) -> i32 {
         | RunError::BearerWithoutEndpoint
         | RunError::MissingRavelTenant
         | RunError::TenantMismatch { .. }
-        | RunError::MissingQueryUrl { .. } => EXIT_USAGE,
+        | RunError::TenantWithoutEndpoint
+        | RunError::MissingQueryUrl { .. }
+        | RunError::QueryUrlWithoutEndpoint { .. } => EXIT_USAGE,
         _ => 1,
     }
 }
@@ -713,5 +728,28 @@ mod tests {
             "http://m/prometheus",
         ]))
         .expect("query url given");
+    }
+
+    #[test]
+    fn a_query_url_without_its_endpoint_is_refused() {
+        for flag in ["ravel", "prometheus", "victoriametrics", "mimir"] {
+            let query_flag = format!("--{flag}-query-url");
+            let err = resolve_query_urls(&args(&[query_flag.as_str(), "http://q"]))
+                .expect_err("query url without endpoint");
+            assert!(
+                matches!(err, RunError::QueryUrlWithoutEndpoint { flag: f } if f == flag),
+                "{err}"
+            );
+            assert_eq!(exit_code(&err), 64);
+        }
+    }
+
+    #[test]
+    fn a_ravel_tenant_without_the_ravel_endpoint_is_refused() {
+        let err = resolve_ravel_tenant(&args(&["--ravel-tenant", "metricsbench"]))
+            .expect_err("tenant without endpoint");
+        assert!(matches!(err, RunError::TenantWithoutEndpoint), "{err}");
+        assert_eq!(exit_code(&err), 64);
+        assert_eq!(resolve_ravel_tenant(&args(&[])).expect("neither"), None);
     }
 }
