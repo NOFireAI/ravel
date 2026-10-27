@@ -2536,3 +2536,73 @@ fn the_reserves_cover_the_growth_they_stand_for() {
         "slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {effect}"
     );
 }
+
+#[test]
+fn an_owner_retry_authorization_is_answered_inside_the_reserve() {
+    for policy in [
+        RecoveryPolicy::AtLeastOnce,
+        RecoveryPolicy::ProviderIdempotency,
+    ] {
+        let mut sim = Sim::with_limits(byte_capped(24 * 1024));
+        sim.run(&create_cmd());
+        sim.run(&takeover_cmd(sim.head(), "w1"));
+        sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+        sim.run(&begin_cmd(sim.head()));
+        let Reply::IntentCommitted { effect_id } =
+            sim.run(&commit_intent_cmd(sim.head(), "send", policy))
+        else {
+            panic!("intent not committed");
+        };
+        sim.run(&authorize_cmd(
+            Authority::Owner(owner_fence(sim.head())),
+            effect_id,
+            1,
+        ));
+        fill_under_the_guard(&mut sim, "h");
+        // The worker died; a new owner takes over inside the reserve.
+        sim.run(&widest_takeover(sim.head(), 64));
+        assert_eq!(
+            sim.refuse(&commit_intent_cmd(sim.head(), "other", policy)),
+            ErrorKind::BudgetExceeded,
+            "the root is inside the reserve"
+        );
+        let reply = sim
+            .step(&authorize_cmd(
+                Authority::Owner(owner_fence(sim.head())),
+                effect_id,
+                2,
+            ))
+            .unwrap_or_else(|e| {
+                panic!("{policy:?}: the retry authorization is answered inside the reserve: {e:?}")
+            })
+            .reply()
+            .clone();
+        assert!(
+            matches!(reply, Reply::AttemptAuthorized { attempt: 2, .. }),
+            "{policy:?}: {reply:?}"
+        );
+        sim.run(&effect_result_cmd(sim.head(), effect_id, 2));
+        let fail = Command::FailTurn(FailTurn {
+            fence: turn_fence(sim.head()),
+            error: "e".repeat(sim.kernel.limits.max_error_bytes),
+            terminal: true,
+            max_attempts: 1,
+        });
+        assert!(matches!(sim.run(&fail), Reply::TurnFailed { .. }));
+    }
+}
+
+#[test]
+fn a_reserve_below_the_result_floor_is_raised_to_it() {
+    let kernel = Kernel::new(Limits {
+        max_error_bytes: 1024,
+        terminal_reserve_per_input_bytes: 512,
+        ..Limits::default()
+    });
+    assert_eq!(
+        kernel.limits.terminal_reserve_per_input_bytes,
+        1024 + RESULT_ENTRY_OVERHEAD_BYTES
+    );
+    let kernel = Kernel::new(Limits::default());
+    assert_eq!(kernel.limits.terminal_reserve_per_input_bytes, 512);
+}
