@@ -285,8 +285,9 @@ anything is built (Measurement).
 - **Cap:** a `--decoded-cache-max-bytes` flag sets the cap, with a default
   expressed as a share of the memory budget. Stage 0 picks the default;
   until then it is 0, which disables the cache.
-- **Metrics:** occupancy, hits, misses, admissions, ghost hits and
-  pressure evictions are exported, per tenant and per process.
+- **Metrics:** occupancy, hits, misses, admissions, ghost hits,
+  pressure evictions and margin skips are exported, per tenant and per
+  process.
 
 ### 5. Answers do not change
 
@@ -349,6 +350,10 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 3. **Erasure check.** Read whether erasure completion purges the fetch
    cache's entries for the object. If it does, decision 1 purges the
    decoded cache the same way.
+4. **q33 simulation and re-run.** After the first paired runs, Stage 0
+   adds a simulation of q33's shape and an 8 GB re-run with the admission
+   margin (see the admission-headroom amendment below). The last two rows
+   of the table are theirs.
 
 | Stage 0 figure | Band | Miss | Basis |
 |---|---|---|---|
@@ -361,6 +366,8 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 | Branch at 8 GB, full entry run with the concurrent phase: QPS | at least 0.60 and at least main's on the same box minus 5% | under 0.60 | ADR-3217 standing bar (#3217 comment 6366582370) |
 | Branch at 8 GB, full entry run with the concurrent phase: error ratio | at most 0.058 | above 0.058 | ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
+| Simulation, q33 shape, with the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | predicted (admission-headroom amendment) |
+| Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | #3326 comment 6448580460 |
 
 The bands are copied to #3326 before launch. A miss on any row stops the
 work, and the readout names the step that missed.
@@ -372,7 +379,8 @@ work, and the readout names the step that missed.
 2. The representation change that puts every decoded column form behind
    an `Arc` (decision 1), as its own pull request. Its A/B bands no
    regression, since nothing copies before the cache exists.
-3. The cache with the cap defaulting to 0, the hook of decision 4, the
+3. The cache with the cap defaulting to 0, the hook of decision 4 and
+   its admission margin (see the admission-headroom amendment below), the
    tests of decision 5 and the metrics.
 4. The default cap, chosen from Stage 0 and the owner's decision 6, with a
    paired A/B on the reference box, bands pre-registered on #3326.
@@ -383,8 +391,10 @@ work, and the readout names the step that missed.
   fit. Cold runs are unchanged, because the cache starts empty after the
   restart.
 - The process holds decoded data that the fetch cache already holds in
-  compressed form, up to the cap. The budget hook keeps queries ahead of
-  the cache, but RSS can be higher between statements than today; the
+  compressed form, up to the cap. The budget hook and the admission
+  margin together keep queries ahead of the cache; the hook alone did not
+  (see the admission-headroom amendment below). RSS can be higher between
+  statements than today; the
   jemalloc purge thread (`services/ravel-server/src/main.rs:769-774`)
   returns freed pages.
 - A pressure eviction adds latency to the reservation that triggers it,
@@ -410,16 +420,20 @@ work, and the readout names the step that missed.
 
 ## Amendment (2026-10-27): admission keeps a headroom margin
 
-<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries" pointer="admission-headroom amendment" -->
+<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries|Stage 0, before any code that merges|Delivery, after Stage 0 passes|Consequences" pointer="admission-headroom amendment" -->
 
 Stage 0 measured a prototype of decisions 1, 3 and 4 on paired box runs
 against `main` (#3326 comments 6447399361 and 6450626784):
 
-| Run | Hot geomean B/A | q33 | Basis |
-|---|---|---|---|
-| `dc8-20261027T1431Z`, 8 GB cap, no pressure hook | 0.749 | refused on 4 of 4 runs | #3326 comment 6447399361 |
-| `dc4-20261027T1431Z`, 4 GB cap, no pressure hook | 0.839 | refused on 4 of 4 runs | #3326 comment 6447399361 |
-| `dc8h-20261027T1717Z`, 8 GB cap, with the decision 4 hook | 0.749 | refused on 4 of 4 runs | #3326 comment 6450626784 |
+| Run | Hot geomean B/A, 43 statements | Without q33, 42 statements | q33 | Basis |
+|---|---|---|---|---|
+| `dc8-20261027T1431Z`, 8 GB cap, no pressure hook | 0.749 | 0.753 | refused on 4 of 4 runs | #3326 comment 6447399361 |
+| `dc4-20261027T1431Z`, 4 GB cap, no pressure hook | 0.839 | 0.846 | refused on 4 of 4 runs | #3326 comment 6447399361 |
+| `dc8h-20261027T1717Z`, 8 GB cap, with the decision 4 hook | 0.749 | 0.753 | refused on 4 of 4 runs | #3326 comment 6450626784 |
+
+The 43-statement figure counts q33's B time as the time it took to be
+refused, so it is not comparable with a sweep in which q33 answers. The
+42-statement figure leaves q33 out of both arms.
 
 With the hook in place q33 was still refused, on both the aggregate
 envelope and the tenant accountant's process charge, and both paths reach
@@ -431,16 +445,28 @@ retries. Evicting on refusal is therefore not enough while admission can
 take back what eviction freed. This explanation is not yet measured: a
 refused response carries no statistics.
 
-Decision 4 gains one rule. A column is admitted only when, after its
-reservation, the process budget's unreserved bytes are at least the
-headroom margin, `max(1 GiB, 5% of the budget's limit)`, and the host
-memory gate is open. Below the margin a miss is decoded and served as
-today, and nothing is admitted.
+Decision 4 gains one rule. A column of `bytes` is admitted only if
+`reserved + bytes + margin <= limit` and the host memory gate is open,
+where `margin = max(1 GiB, 5% of the budget's limit)`. The test and the
+reservation are one step on the budget's ledger, evaluated on the
+projected total before any byte is taken. A reserve-then-check would
+briefly hold the bytes the hook just freed, which is the window the rule
+closes. Below the margin, a miss is decoded and served as today, and
+nothing is admitted.
 
-- **The freed bytes go to the refused caller.** The shortfalls Stage 0
-  recorded were 132 to 147 MB per refused reservation, under the 1 GiB
-  floor of the margin. The bytes the hook frees for that caller stay
-  below the margin, so no admission can take them before the retry.
+- **The freed bytes go to the refused caller.** The refused requests
+  Stage 0 recorded asked for 132 to 147 MB each (the requested bytes in
+  the refusal messages, not the overshoot past the limit). That is under
+  the 1 GiB floor of the margin. While the refused caller retries, the
+  unreserved bytes are below the margin, so no admission can take them.
+- **On a small budget the margin turns admission off.** The margin is
+  measured against the process budget, which is the remainder after the
+  fetch, catalog and column-statistics carves, not host memory. On the
+  reference box that remainder is 18.9 GB and the margin is the 1 GiB
+  floor. On a budget near or under 1 GiB, a nonzero cap admits nothing.
+  The margin-skip counter shows it, and the server logs a warning at
+  startup when the cap is nonzero and the budget's limit is under twice
+  the margin.
 - **The margin is stateless.** It needs no back-off timer or recovery
   rule. Once the query that took the memory releases it, the margin is
   met again and admission resumes.
