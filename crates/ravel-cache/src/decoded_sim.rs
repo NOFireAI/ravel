@@ -1,0 +1,791 @@
+//! ADR-3326 Stage 0 item 1: a simulation of the decoded column block cache's
+//! admission policy (docs/adrs/3326-decoded-column-block-cache.md, decisions
+//! 3 and 4, Measurement). It models no cache this crate ships.
+//!
+//! Entries are keyed by (block, column) with a byte size, under one byte
+//! budget, with two policies:
+//!
+//! - P1 "chosen": an Interactive access admits on first decode; a BulkScan
+//!   access admits only on a second touch, through a ghost key list whose
+//!   window spans the whole budget in bytes. A ghost hit admits the entry on
+//!   that access, and the access is still a miss.
+//! - P2 "first-touch": every access admits on first decode.
+//!
+//! Both evict with CLOCK over admitted entries, weighted by bytes: the hand
+//! evicts until the new entry fits, an entry is inserted with its reference
+//! bit clear and a hit sets it, and an entry larger than the budget is never
+//! admitted.
+//!
+//! Trace A is the ClickBench protocol: the cache is emptied before each
+//! statement, which then runs three tries over its (block, column) keys.
+//! Trace B is production-shaped: a 2 GB interactive working set read in
+//! round-robin passes, with a 12 GB one-pass bulk scan of fresh keys after
+//! every 500 working-set accesses, at an 8 GB budget.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::OnceLock;
+
+const GB: u64 = 1_000_000_000;
+const MB: u64 = 1_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Intent {
+    Interactive,
+    BulkScan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Policy {
+    Chosen,
+    FirstTouch,
+}
+
+impl Policy {
+    fn name(self) -> &'static str {
+        match self {
+            Policy::Chosen => "P1",
+            Policy::FirstTouch => "P2",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    Compact,
+    Today,
+}
+
+impl Layout {
+    fn name(self) -> &'static str {
+        match self {
+            Layout::Compact => "compact",
+            Layout::Today => "today",
+        }
+    }
+}
+
+type Key = (u64, &'static str);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Counts {
+    hits: u64,
+    misses: u64,
+    hit_bytes: u64,
+    miss_bytes: u64,
+    admissions: u64,
+    evictions: u64,
+    ghost_hits: u64,
+}
+
+impl Counts {
+    fn accesses(&self) -> u64 {
+        self.hits + self.misses
+    }
+
+    /// None when nothing was accessed.
+    fn byte_share(&self) -> Option<f64> {
+        let total = self.hit_bytes + self.miss_bytes;
+        (total > 0).then(|| self.hit_bytes as f64 / total as f64)
+    }
+
+    fn count_share(&self) -> Option<f64> {
+        let total = self.accesses();
+        (total > 0).then(|| self.hits as f64 / total as f64)
+    }
+}
+
+struct Entry {
+    bytes: u64,
+    referenced: bool,
+}
+
+struct Sim {
+    policy: Policy,
+    budget: u64,
+    used: u64,
+    entries: HashMap<Key, Entry>,
+    /// The CLOCK ring; the hand is the front.
+    ring: VecDeque<Key>,
+    /// Ghost keys in insertion order, each with its bytes and the sequence
+    /// number it was recorded under; a slot whose sequence no longer matches
+    /// `ghost_live` was consumed by a ghost hit.
+    ghost: VecDeque<(Key, u64, u64)>,
+    ghost_live: HashMap<Key, u64>,
+    ghost_bytes: u64,
+    ghost_seq: u64,
+    counts: Counts,
+}
+
+impl Sim {
+    fn new(policy: Policy, budget: u64) -> Self {
+        Self {
+            policy,
+            budget,
+            used: 0,
+            entries: HashMap::new(),
+            ring: VecDeque::new(),
+            ghost: VecDeque::new(),
+            ghost_live: HashMap::new(),
+            ghost_bytes: 0,
+            ghost_seq: 0,
+            counts: Counts::default(),
+        }
+    }
+
+    fn contains(&self, key: &Key) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// One decode request. True on a hit: the key was admitted at access time.
+    fn access(&mut self, key: Key, bytes: u64, intent: Intent) -> bool {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.referenced = true;
+            self.counts.hits += 1;
+            self.counts.hit_bytes += bytes;
+            return true;
+        }
+        self.counts.misses += 1;
+        self.counts.miss_bytes += bytes;
+        let admit = match (self.policy, intent) {
+            (Policy::FirstTouch, _) | (Policy::Chosen, Intent::Interactive) => true,
+            (Policy::Chosen, Intent::BulkScan) => {
+                if self.ghost_live.remove(&key).is_some() {
+                    self.ghost_bytes -= bytes;
+                    self.counts.ghost_hits += 1;
+                    true
+                } else {
+                    self.record_ghost(key, bytes);
+                    false
+                }
+            }
+        };
+        if admit {
+            self.admit(key, bytes);
+        }
+        false
+    }
+
+    fn record_ghost(&mut self, key: Key, bytes: u64) {
+        if bytes > self.budget {
+            return;
+        }
+        while self.ghost_bytes + bytes > self.budget {
+            let Some((old, old_bytes, seq)) = self.ghost.pop_front() else {
+                break;
+            };
+            if self.ghost_live.get(&old) == Some(&seq) {
+                self.ghost_live.remove(&old);
+                self.ghost_bytes -= old_bytes;
+            }
+        }
+        self.ghost_seq += 1;
+        self.ghost.push_back((key, bytes, self.ghost_seq));
+        self.ghost_live.insert(key, self.ghost_seq);
+        self.ghost_bytes += bytes;
+    }
+
+    fn admit(&mut self, key: Key, bytes: u64) {
+        if bytes > self.budget {
+            return;
+        }
+        while self.used + bytes > self.budget {
+            let victim = self
+                .ring
+                .pop_front()
+                .expect("ring holds every admitted entry");
+            let entry = self.entries.get_mut(&victim).expect("ring key is admitted");
+            if entry.referenced {
+                entry.referenced = false;
+                self.ring.push_back(victim);
+            } else {
+                self.used -= entry.bytes;
+                self.entries.remove(&victim);
+                self.counts.evictions += 1;
+            }
+        }
+        self.entries.insert(
+            key,
+            Entry {
+                bytes,
+                referenced: false,
+            },
+        );
+        self.ring.push_back(key);
+        self.used += bytes;
+        self.counts.admissions += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trace A: the ClickBench protocol.
+
+/// stmt, intent, blocks_scanned, then `name:bytes_per_block_compact:bytes_per_block_today`
+/// per column, or NOT_CACHED.
+const TRACE_A: &str = "
+q01 bulkScan 0 NOT_CACHED
+q02 interactive 6747 ts:60444:60444 stream_ref:30222:30222 AdvEngineID:60444:60444
+q03 bulkScan 13235 ts:60444:60444 stream_ref:30222:30222 AdvEngineID:60444:60444 ResolutionWidth:60444:60444
+q04 bulkScan 13235 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444
+q05 bulkScan 13235 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444
+q06 bulkScan 13235 ts:60444:60444 stream_ref:30222:30222 SearchPhrase:147335:419335
+q07 bulkScan 0 NOT_CACHED
+q08 interactive 6747 ts:60444:60444 stream_ref:30222:30222 AdvEngineID:60444:60444
+q09 interactive 13235 ts:60444:60444 stream_ref:30222:30222 RegionID:60444:60444 UserID:60444:60444
+q10 interactive 13235 ts:60444:60444 stream_ref:30222:30222 RegionID:60444:60444 AdvEngineID:60444:60444 ResolutionWidth:60444:60444 UserID:60444:60444
+q11 interactive 13235 ts:60444:60444 stream_ref:30222:30222 MobilePhoneModel:33999:305999 UserID:60444:60444
+q12 interactive 13235 ts:60444:60444 stream_ref:30222:30222 MobilePhone:60444:60444 MobilePhoneModel:33999:305999 UserID:60444:60444
+q13 interactive 13235 ts:60444:60444 stream_ref:30222:30222 SearchPhrase:147335:419335
+q14 interactive 13235 ts:60444:60444 stream_ref:30222:30222 SearchPhrase:147335:419335 UserID:60444:60444
+q15 interactive 13235 ts:60444:60444 stream_ref:30222:30222 SearchEngineID:60444:60444 SearchPhrase:147335:419335
+q16 interactive 13235 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444
+q17 interactive 13235 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444 SearchPhrase:147335:419335
+q18 interactive 13235 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444 SearchPhrase:147335:419335
+q19 interactive 13235 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444 EventTime:60444:60444 SearchPhrase:147335:419335
+q20 interactive 6418 ts:60444:60444 stream_ref:30222:30222 UserID:60444:60444
+q21 interactive 13235 NOT_CACHED
+q22 interactive 13235 NOT_CACHED
+q23 interactive 13235 NOT_CACHED
+q24 interactive 10997 NOT_CACHED
+q25 interactive 243 ts:60444:60444 stream_ref:30222:30222 SearchPhrase:147335:419335 EventTime:60444:60444
+q26 interactive 13235 ts:60444:60444 stream_ref:30222:30222 SearchPhrase:147335:419335
+q27 interactive 244 ts:60444:60444 stream_ref:30222:30222 SearchPhrase:147335:419335 EventTime:60444:60444
+q28 interactive 13235 ts:60444:60444 stream_ref:30222:30222 CounterID:60444:60444 URL:429919:701919
+q29 interactive 13235 ts:60444:60444 stream_ref:30222:30222 Referer:319606:591605
+q30 bulkScan 13235 ts:60444:60444 stream_ref:30222:30222 ResolutionWidth:60444:60444
+q31 interactive 13235 ts:60444:60444 stream_ref:30222:30222 SearchEngineID:60444:60444 ClientIP:60444:60444 IsRefresh:60444:60444 ResolutionWidth:60444:60444 SearchPhrase:147335:419335
+q32 interactive 13235 ts:60444:60444 stream_ref:30222:30222 WatchID:60444:60444 ClientIP:60444:60444 IsRefresh:60444:60444 ResolutionWidth:60444:60444 SearchPhrase:147335:419335
+q33 interactive 13235 ts:60444:60444 stream_ref:30222:30222 WatchID:60444:60444 ClientIP:60444:60444 IsRefresh:60444:60444 ResolutionWidth:60444:60444
+q34 interactive 13235 ts:60444:60444 stream_ref:30222:30222 URL:429919:701919
+q35 interactive 13235 ts:60444:60444 stream_ref:30222:30222 URL:429919:701919
+q36 interactive 13235 ts:60444:60444 stream_ref:30222:30222 ClientIP:60444:60444
+q37 interactive 138 ts:60444:60444 stream_ref:30222:30222 URL:429919:701919 CounterID:60444:60444 EventDate:60444:60444 DontCountHits:60444:60444 IsRefresh:60444:60444
+q38 interactive 138 ts:60444:60444 stream_ref:30222:30222 Title:305250:577249 CounterID:60444:60444 EventDate:60444:60444 DontCountHits:60444:60444 IsRefresh:60444:60444
+q39 interactive 122 ts:60444:60444 stream_ref:30222:30222 URL:429919:701919 CounterID:60444:60444 EventDate:60444:60444 IsRefresh:60444:60444 IsLink:60444:60444 IsDownload:60444:60444
+q40 interactive 138 ts:60444:60444 stream_ref:30222:30222 TraficSourceID:60444:60444 SearchEngineID:60444:60444 AdvEngineID:60444:60444 Referer:319606:591605 URL:429919:701919 CounterID:60444:60444 EventDate:60444:60444 IsRefresh:60444:60444 URLHash:60444:60444
+q41 interactive 138 ts:60444:60444 stream_ref:30222:30222 URLHash:60444:60444 EventDate:60444:60444 CounterID:60444:60444 IsRefresh:60444:60444 TraficSourceID:60444:60444 RefererHash:60444:60444
+q42 interactive 138 ts:60444:60444 stream_ref:30222:30222 WindowClientWidth:60444:60444 WindowClientHeight:60444:60444 CounterID:60444:60444 EventDate:60444:60444 IsRefresh:60444:60444 DontCountHits:60444:60444 URLHash:60444:60444
+q43 interactive 138 ts:60444:60444 stream_ref:30222:30222 EventTime:60444:60444 CounterID:60444:60444 EventDate:60444:60444 IsRefresh:60444:60444 DontCountHits:60444:60444
+";
+
+const BUDGETS: [u64; 3] = [4 * GB, 8 * GB, 12 * GB];
+const LAYOUTS: [Layout; 2] = [Layout::Compact, Layout::Today];
+const POLICIES: [Policy; 2] = [Policy::Chosen, Policy::FirstTouch];
+
+struct Column {
+    name: &'static str,
+    compact: u64,
+    today: u64,
+}
+
+impl Column {
+    fn bytes(&self, layout: Layout) -> u64 {
+        match layout {
+            Layout::Compact => self.compact,
+            Layout::Today => self.today,
+        }
+    }
+}
+
+struct Statement {
+    name: &'static str,
+    intent: Intent,
+    blocks: u64,
+    /// Empty for NOT_CACHED.
+    columns: Vec<Column>,
+}
+
+impl Statement {
+    fn set_bytes(&self, layout: Layout) -> u64 {
+        self.blocks * self.columns.iter().map(|c| c.bytes(layout)).sum::<u64>()
+    }
+
+    fn cached(&self) -> bool {
+        !self.columns.is_empty()
+    }
+}
+
+fn statements() -> Vec<Statement> {
+    TRACE_A
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next().expect("stmt");
+            let intent = match fields.next().expect("intent") {
+                "interactive" => Intent::Interactive,
+                "bulkScan" => Intent::BulkScan,
+                other => panic!("unknown intent {other}"),
+            };
+            let blocks: u64 = fields.next().expect("blocks").parse().expect("blocks");
+            let columns = fields
+                .filter(|field| *field != "NOT_CACHED")
+                .map(|field| {
+                    let mut parts = field.split(':');
+                    let name = parts.next().expect("column name");
+                    let compact = parts.next().expect("compact").parse().expect("compact");
+                    let today = parts.next().expect("today").parse().expect("today");
+                    Column {
+                        name,
+                        compact,
+                        today,
+                    }
+                })
+                .collect();
+            Statement {
+                name,
+                intent,
+                blocks,
+                columns,
+            }
+        })
+        .collect()
+}
+
+/// One statement under one policy, budget and layout: the counts of each try.
+struct StatementRun {
+    tries: [Counts; 3],
+}
+
+fn run_statement(stmt: &Statement, policy: Policy, budget: u64, layout: Layout) -> StatementRun {
+    // The protocol restarts the server before each statement.
+    let mut sim = Sim::new(policy, budget);
+    let mut tries = [Counts::default(); 3];
+    for try_counts in &mut tries {
+        let before = sim.counts;
+        for block in 0..stmt.blocks {
+            for column in &stmt.columns {
+                sim.access((block, column.name), column.bytes(layout), stmt.intent);
+            }
+        }
+        *try_counts = diff(sim.counts, before);
+    }
+    StatementRun { tries }
+}
+
+fn diff(after: Counts, before: Counts) -> Counts {
+    Counts {
+        hits: after.hits - before.hits,
+        misses: after.misses - before.misses,
+        hit_bytes: after.hit_bytes - before.hit_bytes,
+        miss_bytes: after.miss_bytes - before.miss_bytes,
+        admissions: after.admissions - before.admissions,
+        evictions: after.evictions - before.evictions,
+        ghost_hits: after.ghost_hits - before.ghost_hits,
+    }
+}
+
+struct TraceARow {
+    layout: Layout,
+    budget: u64,
+    stmt: usize,
+    fits: bool,
+    runs: [StatementRun; 2],
+}
+
+struct TraceA {
+    statements: Vec<Statement>,
+    rows: Vec<TraceARow>,
+}
+
+fn trace_a() -> &'static TraceA {
+    static TRACE: OnceLock<TraceA> = OnceLock::new();
+    TRACE.get_or_init(|| {
+        let statements = statements();
+        let mut rows = Vec::new();
+        for layout in LAYOUTS {
+            for budget in BUDGETS {
+                for (i, stmt) in statements.iter().enumerate() {
+                    rows.push(TraceARow {
+                        layout,
+                        budget,
+                        stmt: i,
+                        fits: stmt.set_bytes(layout) <= budget,
+                        runs: POLICIES.map(|p| run_statement(stmt, p, budget, layout)),
+                    });
+                }
+            }
+        }
+        TraceA { statements, rows }
+    })
+}
+
+fn policy_index(policy: Policy) -> usize {
+    POLICIES.iter().position(|p| *p == policy).expect("policy")
+}
+
+/// Try-3 byte hit share of every statement whose set fits and that caches
+/// anything, for one policy, budget and layout.
+fn fitting_try3(
+    trace: &TraceA,
+    policy: Policy,
+    budget: u64,
+    layout: Layout,
+) -> Vec<(&'static str, f64)> {
+    let p = policy_index(policy);
+    trace
+        .rows
+        .iter()
+        .filter(|r| r.layout == layout && r.budget == budget && r.fits)
+        .filter_map(|r| {
+            let share = r.runs[p].tries[2].byte_share()?;
+            Some((trace.statements[r.stmt].name, share))
+        })
+        .collect()
+}
+
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+fn share(value: Option<f64>) -> String {
+    value.map_or_else(|| "  -  ".to_string(), |v| format!("{v:.3}"))
+}
+
+fn print_trace_a(trace: &TraceA) {
+    println!("== Trace A: ClickBench protocol, cache emptied per statement, three tries");
+    println!(
+        "   cell = try byte hit share / count hit share; adm/ev/gh = admissions/evictions/ghost hits over the three tries"
+    );
+    for layout in LAYOUTS {
+        for budget in BUDGETS {
+            println!();
+            println!("-- layout {}, budget {} GB", layout.name(), budget / GB);
+            println!(
+                "stmt intent blocks set_GB fits | P1 try1 try2 try3 adm/ev/gh | P2 try1 try2 try3 adm/ev/gh"
+            );
+            for row in trace
+                .rows
+                .iter()
+                .filter(|r| r.layout == layout && r.budget == budget)
+            {
+                let stmt = &trace.statements[row.stmt];
+                let mut line = format!(
+                    "{} {} {:>5} {:>6.3} {} ",
+                    stmt.name,
+                    match stmt.intent {
+                        Intent::Interactive => "int ",
+                        Intent::BulkScan => "bulk",
+                    },
+                    stmt.blocks,
+                    stmt.set_bytes(layout) as f64 / GB as f64,
+                    if !stmt.cached() {
+                        "n/c"
+                    } else if row.fits {
+                        "yes"
+                    } else {
+                        "no "
+                    },
+                );
+                for (policy, run) in POLICIES.iter().zip(&row.runs) {
+                    line.push_str(&format!("| {} ", policy.name()));
+                    for t in &run.tries {
+                        line.push_str(&format!(
+                            "{}/{} ",
+                            share(t.byte_share()),
+                            share(t.count_share())
+                        ));
+                    }
+                    let adm: u64 = run.tries.iter().map(|t| t.admissions).sum();
+                    let ev: u64 = run.tries.iter().map(|t| t.evictions).sum();
+                    let gh: u64 = run.tries.iter().map(|t| t.ghost_hits).sum();
+                    line.push_str(&format!("{adm}/{ev}/{gh} "));
+                }
+                println!("{}", line.trim_end());
+            }
+        }
+    }
+    println!();
+    println!(
+        "== Trace A summary: try-3 byte hit share over statements whose set fits (NOT_CACHED excluded)"
+    );
+    println!("policy layout budget_GB n_fitting min median");
+    for policy in POLICIES {
+        for layout in LAYOUTS {
+            for budget in BUDGETS {
+                let shares: Vec<f64> = fitting_try3(trace, policy, budget, layout)
+                    .into_iter()
+                    .map(|(_, s)| s)
+                    .collect();
+                let min = shares.iter().copied().fold(f64::INFINITY, f64::min);
+                println!(
+                    "{} {:<7} {:>2} {:>2} {:.3} {:.3}",
+                    policy.name(),
+                    layout.name(),
+                    budget / GB,
+                    shares.len(),
+                    min,
+                    median(&shares)
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trace B: a working set through scans larger than the budget.
+
+const W_BLOCKS: u64 = 2_000;
+const W_PASSES: u64 = 20;
+const SCAN_BLOCKS: u64 = 12_000;
+const SCAN_EVERY: u64 = 500;
+const B_BUDGET: u64 = 8 * GB;
+const SCANS: usize = (W_BLOCKS * W_PASSES / SCAN_EVERY) as usize;
+
+struct ScanRow {
+    /// W's admitted bytes over W's 2 GB, just before and just after the scan.
+    before: f64,
+    after: f64,
+}
+
+impl ScanRow {
+    /// The share of what W had admitted before the scan that survives it.
+    fn retained(&self) -> f64 {
+        if self.before == 0.0 {
+            1.0
+        } else {
+            self.after / self.before
+        }
+    }
+}
+
+struct TraceB {
+    scans: Vec<ScanRow>,
+    /// W's hit share per pass.
+    passes: Vec<f64>,
+    /// W's hit share over passes 2..=20.
+    steady: f64,
+    counts: Counts,
+}
+
+fn w_admitted_share(sim: &Sim) -> f64 {
+    let admitted = (0..W_BLOCKS).filter(|b| sim.contains(&(*b, "w"))).count() as u64;
+    admitted as f64 / W_BLOCKS as f64
+}
+
+fn run_trace_b(policy: Policy) -> TraceB {
+    let mut sim = Sim::new(policy, B_BUDGET);
+    let mut scans = Vec::new();
+    let mut passes = Vec::new();
+    let mut accesses = 0u64;
+    let (mut steady_hits, mut steady_total) = (0u64, 0u64);
+    for pass in 0..W_PASSES {
+        let mut hits = 0u64;
+        for block in 0..W_BLOCKS {
+            if sim.access((block, "w"), MB, Intent::Interactive) {
+                hits += 1;
+            }
+            accesses += 1;
+            if accesses.is_multiple_of(SCAN_EVERY) {
+                let before = w_admitted_share(&sim);
+                // Every scan reads blocks no earlier scan read.
+                let first = scans.len() as u64 * SCAN_BLOCKS;
+                for scan_block in first..first + SCAN_BLOCKS {
+                    sim.access((scan_block, "bulk"), MB, Intent::BulkScan);
+                }
+                let after = w_admitted_share(&sim);
+                scans.push(ScanRow { before, after });
+            }
+        }
+        passes.push(hits as f64 / W_BLOCKS as f64);
+        if pass > 0 {
+            steady_hits += hits;
+            steady_total += W_BLOCKS;
+        }
+    }
+    TraceB {
+        scans,
+        passes,
+        steady: steady_hits as f64 / steady_total as f64,
+        counts: sim.counts,
+    }
+}
+
+fn trace_b() -> &'static [TraceB; 2] {
+    static TRACE: OnceLock<[TraceB; 2]> = OnceLock::new();
+    TRACE.get_or_init(|| POLICIES.map(run_trace_b))
+}
+
+fn print_trace_b(traces: &[TraceB; 2]) {
+    println!(
+        "== Trace B: W = 2,000 x 1 MB interactive, 12,000 x 1 MB fresh BulkScan after every 500 W accesses, 20 W passes, budget 8 GB"
+    );
+    println!(
+        "   W_before/W_after = W's admitted bytes over its 2 GB around the scan; retained = after / before"
+    );
+    println!("scan pass | P1 W_before W_after retained | P2 W_before W_after retained");
+    for i in 0..SCANS {
+        let mut line = format!("{:>4} {:>4} ", i + 1, i as u64 * SCAN_EVERY / W_BLOCKS + 1);
+        for (policy, trace) in POLICIES.iter().zip(traces) {
+            let row = &trace.scans[i];
+            line.push_str(&format!(
+                "| {} {:.3} {:.3} {:.3} ",
+                policy.name(),
+                row.before,
+                row.after,
+                row.retained()
+            ));
+        }
+        println!("{}", line.trim_end());
+    }
+    println!();
+    println!("pass | P1 W_hit_share | P2 W_hit_share");
+    for pass in 0..W_PASSES as usize {
+        println!(
+            "{:>4} | {:.3} | {:.3}",
+            pass + 1,
+            traces[0].passes[pass],
+            traces[1].passes[pass]
+        );
+    }
+    println!();
+    for (policy, trace) in POLICIES.iter().zip(traces) {
+        let min_retained = trace
+            .scans
+            .iter()
+            .map(ScanRow::retained)
+            .fold(f64::INFINITY, f64::min);
+        let c = trace.counts;
+        println!(
+            "{}: W steady-state hit share (passes 2-20) {:.3}; min retained {:.3}; hits {} misses {} admissions {} evictions {} ghost_hits {}",
+            policy.name(),
+            trace.steady,
+            min_retained,
+            c.hits,
+            c.misses,
+            c.admissions,
+            c.evictions,
+            c.ghost_hits
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+
+#[test]
+fn policy_mechanics() {
+    let mut sim = Sim::new(Policy::Chosen, 3 * MB);
+    // BulkScan: try 1 records a ghost, try 2 admits on the ghost hit, try 3 hits.
+    assert!(!sim.access((0, "c"), MB, Intent::BulkScan));
+    assert!(!sim.contains(&(0, "c")));
+    assert!(!sim.access((0, "c"), MB, Intent::BulkScan));
+    assert_eq!(sim.counts.ghost_hits, 1);
+    assert!(sim.access((0, "c"), MB, Intent::BulkScan));
+    // Interactive admits on first decode.
+    assert!(!sim.access((1, "c"), MB, Intent::Interactive));
+    assert!(sim.contains(&(1, "c")));
+    // Larger than the budget: never admitted.
+    sim.access((9, "c"), 4 * MB, Intent::Interactive);
+    assert!(!sim.contains(&(9, "c")));
+    // CLOCK: (0) and (1) are referenced, (2) is not; admitting 2 MB evicts
+    // the unreferenced entry first, then the oldest after one sweep.
+    sim.access((1, "c"), MB, Intent::Interactive);
+    sim.access((2, "c"), MB, Intent::Interactive);
+    sim.access((3, "c"), 2 * MB, Intent::Interactive);
+    assert!(!sim.contains(&(2, "c")));
+    assert!(sim.contains(&(3, "c")));
+    assert!(sim.used <= sim.budget);
+    assert_eq!(
+        sim.counts.evictions, 2,
+        "evicted (2) and one of the cleared entries"
+    );
+
+    // First-touch admits a BulkScan read at once.
+    let mut sim = Sim::new(Policy::FirstTouch, 3 * MB);
+    sim.access((0, "c"), MB, Intent::BulkScan);
+    assert!(sim.contains(&(0, "c")));
+}
+
+#[test]
+fn trace_a_parses_43_statements() {
+    let stmts = statements();
+    assert_eq!(stmts.len(), 43, "Trace A rows: {}", stmts.len());
+    let not_cached: Vec<_> = stmts
+        .iter()
+        .filter(|s| !s.cached())
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(not_cached, ["q01", "q07", "q21", "q22", "q23", "q24"]);
+    let bulk: Vec<_> = stmts
+        .iter()
+        .filter(|s| s.intent == Intent::BulkScan)
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(bulk, ["q01", "q03", "q04", "q05", "q06", "q07", "q30"]);
+}
+
+/// Figure (a): Trace A, P1, 8 GB, compact sizes: every fitting statement's
+/// try-3 byte hit share is at least 0.95.
+#[test]
+fn trace_a_chosen_8gb_compact_fitting_try3_at_least_095() {
+    let shares = fitting_try3(trace_a(), Policy::Chosen, 8 * GB, Layout::Compact);
+    assert!(!shares.is_empty(), "no fitting statement at 8 GB compact");
+    let low: Vec<_> = shares.iter().filter(|(_, s)| *s < 0.95).collect();
+    let min = shares.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+    assert!(
+        low.is_empty(),
+        "Trace A P1 8 GB compact: try-3 byte hit share min {min:.3} over {} fitting statements; under 0.95: {low:?}",
+        shares.len()
+    );
+}
+
+/// Figure (b): Trace B, P1: W retained at least 0.90 through every bulk scan.
+#[test]
+fn trace_b_chosen_retains_w_at_least_090() {
+    let trace = &trace_b()[policy_index(Policy::Chosen)];
+    assert_eq!(trace.scans.len(), SCANS, "bulk scans run");
+    let retained: Vec<f64> = trace.scans.iter().map(ScanRow::retained).collect();
+    let min = retained.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        min >= 0.90,
+        "Trace B P1: W retained min {min:.3} over {} scans, band at least 0.90",
+        retained.len()
+    );
+    // After the first full pass, W's whole 2 GB is admitted after every scan.
+    let first_full = (W_BLOCKS / SCAN_EVERY) as usize;
+    let min_after = trace.scans[first_full..]
+        .iter()
+        .map(|r| r.after)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        min_after >= 0.90,
+        "Trace B P1: W admitted share after scans from pass 2 on, min {min_after:.3}, band at least 0.90"
+    );
+}
+
+/// Figure (c): Trace B, P2: the comparison, printed with no band.
+#[test]
+fn trace_b_first_touch_retained_reported() {
+    let trace = &trace_b()[policy_index(Policy::FirstTouch)];
+    assert_eq!(trace.scans.len(), SCANS, "bulk scans run");
+    let min = trace
+        .scans
+        .iter()
+        .map(ScanRow::retained)
+        .fold(f64::INFINITY, f64::min);
+    let mean = trace.scans.iter().map(ScanRow::retained).sum::<f64>() / SCANS as f64;
+    println!(
+        "Trace B P2: W retained min {min:.3} mean {mean:.3} over {SCANS} scans; steady-state W hit share {:.3}",
+        trace.steady
+    );
+}
+
+#[test]
+fn decoded_sim_report() {
+    let trace = trace_a();
+    assert_eq!(
+        trace.rows.len(),
+        43 * BUDGETS.len() * LAYOUTS.len(),
+        "Trace A rows"
+    );
+    print_trace_a(trace);
+    println!();
+    print_trace_b(trace_b());
+}

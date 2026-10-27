@@ -98,6 +98,9 @@
 
 mod cache;
 mod clock;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod decoded_sim;
 pub mod disk;
 mod key;
 mod limits;
