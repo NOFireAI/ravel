@@ -252,7 +252,9 @@ Each HTTP receiver gets a row only when its endpoint is passed, and its
 `system` value is the name the query runner joins on. Every HTTP endpoint
 needs its query URL, the base its `/api/v1/query` and `/api/v1/series` are
 appended to; the bin exits 64 without it
-(`metricsbench_ingest::tests::every_endpoint_needs_its_query_url`):
+(`metricsbench_ingest::tests::every_endpoint_needs_its_query_url`), and
+exits 64 on a query URL given without its endpoint
+(`metricsbench_ingest::tests::a_query_url_without_its_endpoint_is_refused`):
 
 | Flag | Query URL flag | `system` | Ack | `acceptance_basis` |
 |---|---|---|---|---|
@@ -297,12 +299,17 @@ The token is not written into the report: neither `endpoint` nor
 `client_behavior` carries it
 (`metrics_ingest::tests::the_portable_ravel_row_sends_the_bearer_and_keeps_the_latest_token_of_every_shard`).
 
-Every row records its `tenant`. The in-process row writes under `--tenant`
-(default `metricsbench`). The portable Ravel row records `--ravel-tenant`,
-the tenant ravel-server resolves its requests to, which `--ravel-endpoint`
-requires and which must equal `--tenant`, so both Ravel rows describe one
-tenant's data; the bin exits 64 otherwise
-(`metricsbench_ingest_smoke::a_missing_or_mismatched_ravel_tenant_exits_64`).
+Every row records its `tenant`. The in-process row writes under
+`--tenant` (default `metricsbench`). The portable Ravel row records
+`--ravel-tenant`, the tenant the operator declares ravel-server resolves its
+requests to. It is declared, not observed: nothing on the wire carries it and
+a `CommitToken` holds no tenant (its fields, `crates/ravel-types/src/lib.rs`,
+are shard, writer, epoch, sequence and ingest hour). `--ravel-endpoint` requires it and it must
+equal `--tenant`, so both Ravel rows describe one tenant's data; the bin
+exits 64 otherwise
+(`metricsbench_ingest_smoke::a_missing_or_mismatched_ravel_tenant_exits_64`),
+and exits 64 on `--ravel-tenant` given without `--ravel-endpoint`
+(`metricsbench_ingest::tests::a_ravel_tenant_without_the_ravel_endpoint_is_refused`).
 A comparator is sent no tenant and records none.
 
 The portable Ravel row records `commit_tokens_by_shard`, the latest
@@ -310,7 +317,12 @@ The portable Ravel row records `commit_tokens_by_shard`, the latest
 server joins one token per shard a request touched with commas), and
 `last_commit_token`, those tokens joined with commas in shard order: a
 read-your-write fence over every shard the replay wrote, not only the shards
-the last request touched. A header entry that does not decode as a commit
+the last request touched. The query API decodes each `min_commit_token`
+parameter as one token (`decode_commit_tokens` in
+`crates/ravel-query/src/http/params.rs`), so a consumer splits
+`last_commit_token` on commas and passes one parameter per token, or passes
+the values of `commit_tokens_by_shard`, as the read-back does
+(`ApiReader::get` in `crates/ravel-bench/src/metrics_ingest.rs`). A header entry that does not decode as a commit
 token fails the replay
 (`metrics_ingest::tests::an_undecodable_commit_token_is_refused`). The row
 stays `durable_on_ack` only when some response carried a token; otherwise the
