@@ -240,8 +240,9 @@ pub struct BoundEngine {
     pub engine: Engine,
     pub query_url: String,
     bearer_token: Option<String>,
-    /// `min_commit_token` for Ravel, verbatim from its row's
-    /// `last_commit_token`; empty for every other engine.
+    /// One `min_commit_token` per token in Ravel's `last_commit_token`, the
+    /// comma-joined per-shard list, since the query API decodes each
+    /// parameter as a single token; empty for every other engine.
     pub extra_params: Vec<(String, String)>,
     /// The classes the engine's ingest row cites as unsupported, with the
     /// citation.
@@ -397,11 +398,15 @@ pub fn bind(
                 })?),
             };
         let extra_params = if spec.engine == Engine::Ravel {
-            let token = row
+            let tokens = row
                 .last_commit_token
-                .clone()
+                .as_deref()
                 .ok_or(BindError::NoCommitToken)?;
-            vec![(MIN_COMMIT_TOKEN_PARAM.to_string(), token)]
+            tokens
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| (MIN_COMMIT_TOKEN_PARAM.to_string(), t.to_string()))
+                .collect()
         } else {
             Vec::new()
         };

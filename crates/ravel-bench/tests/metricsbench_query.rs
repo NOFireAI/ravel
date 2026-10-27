@@ -109,6 +109,9 @@ enum Answer {
 struct Recorded {
     path: &'static str,
     params: HashMap<String, String>,
+    /// Every `min_commit_token` value, in order; `params` keeps one value
+    /// per name.
+    min_commit_tokens: Vec<String>,
     authorization: Option<String>,
 }
 
@@ -148,15 +151,22 @@ async fn answer(
     stub: Stub,
     path: &'static str,
     headers: HeaderMap,
-    params: HashMap<String, String>,
+    pairs: Vec<(String, String)>,
 ) -> Response {
     let authorization = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let min_commit_tokens = pairs
+        .iter()
+        .filter(|(k, _)| k == "min_commit_token")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let params: HashMap<String, String> = pairs.into_iter().collect();
     stub.requests.lock().unwrap().push(Recorded {
         path,
         params: params.clone(),
+        min_commit_tokens,
         authorization: authorization.clone(),
     });
     if let Some(token) = &stub.bearer
@@ -209,7 +219,7 @@ async fn spawn_stub(script: &[(&str, Answer)], bearer: Option<&str>) -> (Stub, S
         .route(
             "/api/v1/query",
             get(
-                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<HashMap<String, String>>| {
+                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<Vec<(String, String)>>| {
                     answer(s, "/api/v1/query", h, p)
                 },
             ),
@@ -217,7 +227,7 @@ async fn spawn_stub(script: &[(&str, Answer)], bearer: Option<&str>) -> (Stub, S
         .route(
             "/api/v1/query_range",
             get(
-                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<HashMap<String, String>>| {
+                |State(s): State<Stub>, h: HeaderMap, Query(p): Query<Vec<(String, String)>>| {
                     answer(s, "/api/v1/query_range", h, p)
                 },
             ),
@@ -743,8 +753,10 @@ async fn a_range_entry_is_one_range_request_per_repetition() {
     }
 }
 
-/// Ravel receives its row's `last_commit_token`, the full multi-shard list,
-/// verbatim on every query.
+/// Ravel receives every shard's token from its row's `last_commit_token` on
+/// every query, one `min_commit_token` parameter per token: the query API
+/// decodes each parameter as a single token, so the comma-joined list sent
+/// as one value would be refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ravel_receives_the_full_multi_shard_commit_token() {
     let s = stubs().await;
@@ -752,11 +764,10 @@ async fn ravel_receives_the_full_multi_shard_commit_token() {
     assert!(run.output.status.success(), "{}", stderr(&run.output));
     let requests = s.ravel.requests();
     assert!(!requests.is_empty());
+    let expected: Vec<String> = RAVEL_COMMIT_TOKEN.split(',').map(str::to_string).collect();
+    assert_eq!(expected.len(), 3);
     for r in &requests {
-        assert_eq!(
-            r.params.get("min_commit_token").map(String::as_str),
-            Some(RAVEL_COMMIT_TOKEN)
-        );
+        assert_eq!(r.min_commit_tokens, expected);
     }
     for other in [&s.prometheus, &s.victoriametrics, &s.mimir] {
         assert!(
