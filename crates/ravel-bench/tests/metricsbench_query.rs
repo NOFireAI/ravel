@@ -813,6 +813,62 @@ async fn an_unsupported_class_entry_is_unsupported_not_incorrect() {
     assert!(err.contains("0 series"), "{err}");
 }
 
+/// A Ravel row whose tokens are all empty refuses to bind rather than
+/// querying Ravel with no read-your-write fence: exit 65, nothing written,
+/// no query sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ravel_row_with_no_commit_token_refuses_the_run() {
+    for joined in [",", ""] {
+        let s = stubs().await;
+        let mut ingest = ingest_report(&s.urls);
+        let ravel = ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == "ravel")
+            .expect("ravel row");
+        ravel.commit_tokens_by_shard = None;
+        ravel.last_commit_token = Some(joined.to_string());
+        let run = run_bin(ingest, &s.urls).await;
+        assert_eq!(
+            run.output.status.code(),
+            Some(65),
+            "{joined:?}: {}",
+            stderr(&run.output)
+        );
+        assert!(
+            stderr(&run.output).contains("no commit token"),
+            "{}",
+            stderr(&run.output)
+        );
+        assert!(!run.out.exists());
+        for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
+            assert!(stub.requests().is_empty());
+        }
+    }
+}
+
+/// The per-shard map is the token source when the row carries it: a
+/// `last_commit_token` that disagrees with it is not what Ravel receives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_tokens_come_from_the_per_shard_map() {
+    let s = stubs().await;
+    let mut ingest = ingest_report(&s.urls);
+    let ravel = ingest
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "ravel")
+        .expect("ravel row");
+    ravel.last_commit_token = Some(",".to_string());
+    let run = run_bin(ingest, &s.urls).await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let expected: Vec<String> = RAVEL_COMMIT_TOKEN.split(',').map(str::to_string).collect();
+    let requests = s.ravel.requests();
+    assert!(!requests.is_empty());
+    for r in &requests {
+        assert_eq!(r.min_commit_tokens, expected);
+    }
+}
+
 /// A portable ingest row failing band 6 voids the binding: exit 65, the
 /// reason named, nothing written, no query sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

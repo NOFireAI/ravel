@@ -608,10 +608,14 @@ when any portable ingest row (every row but `ravel-in-process`) fails
 digest checks are in `bind` and in the binary's `run_main`;
 `a_band6_failure_refuses_the_run`). An engine's query URL is its ingest
 row's `readback.query_url` when the row records one, else `url=`; an engine
-with neither, or with no ingest row, exits 65. Ravel is queried with one
-`min_commit_token` per token in its row's `last_commit_token`, the joined
-per-shard list, since the query API decodes each parameter as one token
-(`ravel_receives_the_full_multi_shard_commit_token`). The anchor, step count,
+with neither, or with no ingest row, exits 65. An empty recorded URL counts
+as none. Ravel is queried with one `min_commit_token` per token, since the
+query API decodes each parameter as one token. The tokens come from its row's
+`commit_tokens_by_shard`, or from `last_commit_token` split on commas when the
+row has no map (`ravel_receives_the_full_multi_shard_commit_token`,
+`ravel_tokens_come_from_the_per_shard_map`). A Ravel row with no token exits
+65 rather than query without the fence
+(`a_ravel_row_with_no_commit_token_refuses_the_run`). The anchor, step count,
 stream digest, pass counts and query URLs are recorded in the provenance
 config.
 

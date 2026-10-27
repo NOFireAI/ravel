@@ -546,7 +546,7 @@ pub const REL_MAD_REL_TOLERANCE: f64 = 1e-9;
 /// for the same reason as [`REL_MAD_REL_TOLERANCE`].
 pub const PASS_SUMMARY_REL_TOLERANCE: f64 = 1e-9;
 
-fn median(values: &[f64]) -> Option<f64> {
+pub(crate) fn median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
