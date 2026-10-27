@@ -59,7 +59,7 @@
 //! namespace under the same root.
 //!
 //! **Read-time verification is crc32c, and that is the whole of it**
-//! (decision 4). `CacheKey` is `(tenant_hash,
+//! (decision 4 and its amendment). `CacheKey` is `(tenant_hash,
 //! content_hash, offset, len)`, where `content_hash` is the blake3 of the
 //! *whole object* an entry is a byte sub-range of, and the key carries no
 //! object size -- so this crate has no way to identify the full-object case

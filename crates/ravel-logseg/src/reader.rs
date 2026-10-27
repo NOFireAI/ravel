@@ -1140,11 +1140,13 @@ fn source_extent<'s, S: ByteSource + ?Sized>(
 /// `Equals` on an attribute, the shape [`RlogReader::postings_arms`] and
 /// [`RlogReader::prune_postings_arms`] probe. Both are upper bounds, so a
 /// `true` here can place a section the scan then prunes nothing with: a BLOOM
-/// arm is dropped when its field resolves to no column the section covers,
-/// and a POSTINGS arm when its attribute resolves to no dynamic column, when
-/// the object holds no POSTINGS section, when that section is the v1 layout,
-/// on which the scan declines equality pruning, or when the section holds no
-/// entry for the column (an unindexed or capped field).
+/// arm is dropped when its field resolves to no column the section covers.
+/// A POSTINGS arm prunes nothing when its attribute resolves to no dynamic
+/// column, when the object holds no POSTINGS section, when that section is
+/// the v1 layout (on which the scan declines equality pruning), when the
+/// section holds no entry for the column (an unindexed or capped field), when
+/// a `prune` arm's `Str` literal names an attribute that also has a non-`Str`
+/// column, or when the section or its term block is corrupt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilterSectionReads {
     pub bloom: bool,

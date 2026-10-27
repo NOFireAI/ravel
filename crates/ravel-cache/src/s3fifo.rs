@@ -133,7 +133,9 @@ const GHOST_WINDOW_BYTES_TENTHS: u64 = 3;
 /// grow (the map can double once more to clear removed slots), and neither
 /// gives capacity back. At a 6,954,184,212-byte cache (45,751 keys, a 6.95 MB
 /// budget) that is 131,072 queue slots of 72 bytes and 131,072 map buckets of
-/// 81 bytes, about 20.1 MB.
+/// 81 bytes, about 20.1 MB. That is per `S3Fifo`: a server started with
+/// `--cache-dir` builds two from the same limits, one per tier, so about
+/// 40.2 MB in all (ADR-0046's 2026-10-26 amendment).
 const GHOST_MEMORY_DIVISOR: u64 = 1_000;
 
 /// One ghost key's queue slot and map entry, before table and queue slack.
