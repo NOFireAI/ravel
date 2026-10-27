@@ -2,10 +2,16 @@
 //!
 //! `AgentHead` is CAS-mutable, so the decoder is a gate: it reads only
 //! `format_version == 1` with the `INLINE` representation and refuses
-//! anything else as a typed [`CodecError`] before any field is trusted. The
+//! anything else as a typed [`CodecError`] before any field is trusted
+//! (`a_newer_format_version_is_refused_before_the_rest_is_read`,
+//! `paged_representation_and_page_refs_are_refused_by_version_one`,
+//! `a_repeated_format_version_field_is_gated_on_its_decoded_value`). The
 //! encoder never re-encodes a decoded prost value; it builds a fresh
-//! `AgentHead` from the typed [`Head`], so a field this binary does not know
-//! can never be carried forward, or silently dropped, by a CAS write.
+//! `AgentHead` from the typed [`Head`]. A field this binary does not know,
+//! inside a version 1 record, is therefore dropped by the next CAS write
+//! (`an_unknown_field_within_version_1_is_dropped_on_re_encode`), which is
+//! why every additive change to `AgentHead` bumps `format_version` (ADR-0066
+//! R1): a newer writer's record is refused here before anything is dropped.
 
 use prost::Message as _;
 use ravel_proto::agents::v1 as pb;
@@ -75,9 +81,17 @@ pub fn peek_format_version(bytes: &[u8]) -> Result<u32, CodecError> {
                 .format_version
         }
     };
+    check_format_version(version).map(|()| FORMAT_VERSION)
+}
+
+/// Gate on the `format_version` a full decode settled on. Protobuf keeps the
+/// last occurrence of a repeated scalar field, so a record that writes field
+/// 1 twice passes [`peek_format_version`] on its first occurrence and only
+/// this check sees the value the decoded message carries.
+pub(crate) fn check_format_version(version: u32) -> Result<(), CodecError> {
     match version {
         0 => Err(CodecError::MissingFormatVersion),
-        FORMAT_VERSION => Ok(FORMAT_VERSION),
+        FORMAT_VERSION => Ok(()),
         found => Err(CodecError::UnsupportedFormat { found }),
     }
 }
@@ -191,6 +205,11 @@ pub struct InboxEntry {
     pub payload: Option<ObjectRef>,
     pub accepted_unix_ns: i64,
     pub failed_attempts: u32,
+    /// Set by `Cancel` while a turn runs this input; the input is consumed as
+    /// cancelled by the next `FailTurn` or `BeginTurn` that reaches it.
+    pub cancel_requested: bool,
+    /// The turn that last failed retryably on this input.
+    pub last_failed_turn_id: Option<Id128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,6 +336,7 @@ impl Head {
     pub fn decode(bytes: &[u8]) -> Result<Head, CodecError> {
         peek_format_version(bytes)?;
         let raw = pb::AgentHead::decode(bytes).map_err(|e| CodecError::Decode(e.to_string()))?;
+        check_format_version(raw.format_version)?;
         check_seal(raw.seal)?;
         Head::from_proto(raw)
     }
@@ -553,6 +573,11 @@ pub(crate) fn inbox_to_proto(e: &InboxEntry) -> pb::InboxEntry {
         payload: e.payload.map(ref_to_proto),
         accepted_unix_ns: e.accepted_unix_ns,
         failed_attempts: e.failed_attempts,
+        cancel_requested: e.cancel_requested,
+        last_failed_turn_id: e
+            .last_failed_turn_id
+            .map(|t| t.0.to_vec())
+            .unwrap_or_default(),
         ..Default::default()
     };
     match &e.source {
@@ -599,6 +624,12 @@ pub(crate) fn inbox_from_proto(e: pb::InboxEntry) -> Result<InboxEntry, CodecErr
         payload: ref_from_proto(e.payload, "inbox.payload")?,
         accepted_unix_ns: e.accepted_unix_ns,
         failed_attempts: e.failed_attempts,
+        cancel_requested: e.cancel_requested,
+        last_failed_turn_id: if e.last_failed_turn_id.is_empty() {
+            None
+        } else {
+            Some(id128(&e.last_failed_turn_id, "inbox.last_failed_turn_id")?)
+        },
     })
 }
 
@@ -873,9 +904,20 @@ pub(crate) mod tests {
             proptest::option::of(object_ref()),
             any::<i64>(),
             any::<u32>(),
+            any::<bool>(),
+            proptest::option::of(id()),
         )
             .prop_map(
-                |(accept_seq, handler, source, payload, accepted_unix_ns, failed_attempts)| {
+                |(
+                    accept_seq,
+                    handler,
+                    source,
+                    payload,
+                    accepted_unix_ns,
+                    failed_attempts,
+                    cancel_requested,
+                    last_failed_turn_id,
+                )| {
                     InboxEntry {
                         accept_seq,
                         handler,
@@ -883,6 +925,8 @@ pub(crate) mod tests {
                         payload,
                         accepted_unix_ns,
                         failed_attempts,
+                        cancel_requested,
+                        last_failed_turn_id,
                     }
                 },
             )
@@ -1320,9 +1364,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decode_drops_nothing_it_does_not_refuse() {
-        // An unknown field on a version 1 record is not carried forward:
-        // re-encoding builds a fresh message, so the bytes differ.
+    fn an_unknown_field_within_version_1_is_dropped_on_re_encode() {
+        // A v1 reader accepts a field it does not know inside a v1 record and
+        // drops it on re-encode, which is why every additive change to
+        // AgentHead bumps format_version (ADR-0066 R1): only the version gate
+        // keeps a CAS write from losing a newer writer's field.
         let head = sample_head();
         let mut bytes = head.encode();
         // field 1000, varint 1, inserted before the seal
@@ -1332,10 +1378,11 @@ pub(crate) mod tests {
         let decoded = Head::decode(&bytes).expect("decodes");
         assert_eq!(decoded, head);
         assert_eq!(decoded.encode(), head.encode());
+        assert_ne!(decoded.encode(), bytes);
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2_000))]
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
 
         // decode(encode(h)) == h makes encode injective: equal bytes for two
         // heads would decode to one head.

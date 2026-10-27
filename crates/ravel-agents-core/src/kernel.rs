@@ -14,6 +14,34 @@
 //! incarnation). A turn commit publishes the new state, the consumed input,
 //! its result, the buffered events, the timer changes and the new effect
 //! intents in that one root.
+//!
+//! A retryable `FailTurn` keeps the input in the inbox and keeps its step
+//! transcript and effect journal. Step and effect ids derive from the input's
+//! `accept_seq`, not from the turn id, so the retry (a new turn id) replays
+//! the failed attempt's completed steps and finds its journaled effects under
+//! the same ids
+//! (`tests::a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt`).
+//! `FailTurn` is refused with `EffectInDoubt` while any effect of the input
+//! is `InDoubt` (`NoEffectInDoubt`) or `Authorized` without a result
+//! (`NoAuthorizedAttemptPending`)
+//! (`tests::fail_turn_is_refused_while_a_manual_attempt_is_in_doubt`,
+//! `tests::fail_turn_is_refused_while_an_attempt_is_authorized_without_a_result`).
+//! So a retry never re-dispatches an effect the failed attempt authorized:
+//! that effect has a recorded result before the input can fail, and the
+//! retry's `AuthorizeAttempt` answers with it. The only effect an
+//! `at_least_once` retry may execute is one that was never authorized (an
+//! intent the failed attempt journaled and did not dispatch, or one the retry
+//! commits itself). Besides effects, a retry re-runs the handler code between
+//! journaled steps and any step recorded `Started` but never `Completed`.
+//!
+//! A cancel requested while a turn runs is never lost to a retry: a
+//! `FailTurn` on that turn, retryable or not, consumes the input as
+//! cancelled (`tests::a_cancel_requested_before_a_retryable_failure_consumes_the_input_as_cancelled`),
+//! a cancel arriving between the failure and the retry's `BeginTurn` settles
+//! the waiting input at once
+//! (`tests::a_cancel_between_a_retryable_failure_and_the_retry_settles_the_input`),
+//! and `BeginTurn` never starts an input whose entry carries a cancel request
+//! (`tests::begin_turn_never_starts_an_input_whose_entry_carries_a_cancel_request`).
 
 use crate::command::{
     Authority, AuthorizeAttempt, BeginTurn, Cancel, CancelTimer, Command, CommitIntent,
@@ -444,9 +472,10 @@ impl Kernel {
                 )),
             };
         };
-        if fence.base_state_version != turn.base_state_version
-            || head.state_version != turn.base_state_version
-        {
+        // Only complete_turn moves state_version, and it ends the turn, so an
+        // active turn's base is always the root's state_version (asserted on
+        // every published root by the property test's `check_root`).
+        if fence.base_state_version != turn.base_state_version {
             return Err(fail(
                 head,
                 ErrorKind::OwnershipLost,
@@ -524,6 +553,8 @@ impl Kernel {
             payload: c.payload,
             accepted_unix_ns: now,
             failed_attempts: 0,
+            cancel_requested: false,
+            last_failed_turn_id: None,
         });
         new.receipts.push(Receipt {
             request_id: c.request_id.clone(),
@@ -597,6 +628,9 @@ impl Kernel {
         let Some(next) = head.inbox.first() else {
             return unchanged(Reply::Idle);
         };
+        if next.cancel_requested {
+            return self.settle_cancelled(head, next.accept_seq, now);
+        }
         let Some(pin) = c.handlers.iter().find(|p| p.handler == next.handler) else {
             return Err(fail(
                 head,
@@ -641,6 +675,34 @@ impl Kernel {
         Ok(())
     }
 
+    /// Consume a waiting input as cancelled: no turn is active on it. Its
+    /// result names the turn that last failed on it, if one ran.
+    fn settle_cancelled(&self, head: &Head, accept_seq: u64, now: i64) -> Outcome {
+        let turn_id = head
+            .inbox
+            .iter()
+            .find(|e| e.accept_seq == accept_seq)
+            .and_then(|e| e.last_failed_turn_id);
+        let mut new = head.clone();
+        Self::take_input(head, &mut new, accept_seq)?;
+        drop_input_steps(&mut new, accept_seq);
+        new.results.push(ResultEntry {
+            accept_seq,
+            status: ResultStatus::Cancelled,
+            output: None,
+            error: String::new(),
+            turn_id,
+            dead_lettered: false,
+            finished_unix_ns: now,
+        });
+        self.publish(
+            Some(head),
+            new,
+            vec![Effect::OperationTerminal { accept_seq }],
+            Reply::Cancelled { accept_seq },
+        )
+    }
+
     fn complete_turn(&self, head: &Head, c: &CompleteTurn, now: i64) -> Outcome {
         let turn = match Self::check_turn(head, &c.fence)? {
             Ok(turn) => turn,
@@ -653,25 +715,22 @@ impl Kernel {
                 "turn is blocked by a non-deterministic replay",
             ));
         }
-        if head
-            .effects
-            .iter()
-            .any(|e| e.turn_id == turn.turn_id && e.status == EffectStatus::InDoubt)
-        {
+        if input_effects(head, turn.input_accept_seq).any(|e| e.status == EffectStatus::InDoubt) {
             return Err(fail(
                 head,
                 ErrorKind::EffectInDoubt,
-                "an effect of this turn is in doubt",
+                "NoEffectInDoubt: an effect of this turn is in doubt",
             ));
         }
         let accept_seq = turn.input_accept_seq;
         let turn_id = turn.turn_id;
+        let cancelled = cancel_requested(head, turn);
         let mut new = head.clone();
         Self::take_input(head, &mut new, accept_seq)?;
         new.active_turn = None;
         new.steps.clear();
         let mut effects = vec![Effect::OperationTerminal { accept_seq }];
-        if turn.cancellation == Cancellation::Requested {
+        if cancelled {
             new.results.push(ResultEntry {
                 accept_seq,
                 status: ResultStatus::Cancelled,
@@ -726,7 +785,7 @@ impl Kernel {
             self.check_timer_cap(&new)?;
             let mut dispatched = Vec::new();
             for intent in &c.intents {
-                if let Some(effect_id) = add_intent(head, &mut new, turn_id, intent)? {
+                if let Some(effect_id) = add_intent(head, &mut new, accept_seq, turn_id, intent)? {
                     new.outbox.push(OutboxIntent {
                         effect_id,
                         intent_key: intent.intent_key.clone(),
@@ -762,14 +821,65 @@ impl Kernel {
     }
 
     fn fail_turn(&self, head: &Head, c: &FailTurn, now: i64) -> Outcome {
+        Self::check_owner(head, &c.fence.owner)?;
+        // A retry of a retryable failure that already published: the input
+        // still waits, and its entry names the turn that failed.
+        if let Some(entry) = head
+            .inbox
+            .iter()
+            .find(|e| e.last_failed_turn_id == Some(c.fence.turn_id))
+        {
+            return unchanged(Reply::TurnRetry {
+                accept_seq: entry.accept_seq,
+                failed_attempts: entry.failed_attempts,
+            });
+        }
         let turn = match Self::check_turn(head, &c.fence)? {
             Ok(turn) => turn,
             Err(accept_seq) => return unchanged(Reply::AlreadyCommitted { accept_seq }),
         };
         let accept_seq = turn.input_accept_seq;
+        for effect in input_effects(head, accept_seq) {
+            match effect.status {
+                EffectStatus::InDoubt => {
+                    return Err(fail(
+                        head,
+                        ErrorKind::EffectInDoubt,
+                        "NoEffectInDoubt: an effect of this input awaits reconciliation",
+                    ));
+                }
+                EffectStatus::Authorized => {
+                    return Err(fail(
+                        head,
+                        ErrorKind::EffectInDoubt,
+                        "NoAuthorizedAttemptPending: an authorized attempt has no result",
+                    ));
+                }
+                EffectStatus::Intent | EffectStatus::Completed => {}
+            }
+        }
+        if cancel_requested(head, turn) {
+            let mut new = head.clone();
+            Self::take_input(head, &mut new, accept_seq)?;
+            new.active_turn = None;
+            new.steps.clear();
+            new.results.push(ResultEntry {
+                accept_seq,
+                status: ResultStatus::Cancelled,
+                output: None,
+                error: String::new(),
+                turn_id: Some(turn.turn_id),
+                dead_lettered: false,
+                finished_unix_ns: now,
+            });
+            let mut effects = vec![Effect::OperationTerminal { accept_seq }];
+            if !new.inbox.is_empty() {
+                effects.push(Effect::WakeWorker);
+            }
+            return self.publish(Some(head), new, effects, Reply::Cancelled { accept_seq });
+        }
         let mut new = head.clone();
         new.active_turn = None;
-        new.steps.clear();
         let entry = new
             .inbox
             .iter_mut()
@@ -784,6 +894,8 @@ impl Kernel {
         let failed_attempts = entry.failed_attempts.saturating_add(1);
         if !c.terminal && failed_attempts < c.max_attempts {
             entry.failed_attempts = failed_attempts;
+            entry.last_failed_turn_id = Some(turn.turn_id);
+            // The transcript and journal stay for the retry.
             return self.publish(
                 Some(head),
                 new,
@@ -796,6 +908,7 @@ impl Kernel {
         }
         let dead_lettered = !c.terminal;
         Self::take_input(head, &mut new, accept_seq)?;
+        new.steps.clear();
         new.results.push(ResultEntry {
             accept_seq,
             status: ResultStatus::Failed,
@@ -842,6 +955,9 @@ impl Kernel {
             if let Some(turn) = new.active_turn.as_mut() {
                 turn.cancellation = Cancellation::Requested;
             }
+            if let Some(entry) = new.inbox.iter_mut().find(|e| e.accept_seq == c.accept_seq) {
+                entry.cancel_requested = true;
+            }
             return self.publish(
                 Some(head),
                 new,
@@ -858,27 +974,7 @@ impl Kernel {
                 "operation was never accepted",
             ));
         }
-        let mut new = head.clone();
-        Self::take_input(head, &mut new, c.accept_seq)?;
-        new.results.push(ResultEntry {
-            accept_seq: c.accept_seq,
-            status: ResultStatus::Cancelled,
-            output: None,
-            error: String::new(),
-            turn_id: None,
-            dead_lettered: false,
-            finished_unix_ns: now,
-        });
-        self.publish(
-            Some(head),
-            new,
-            vec![Effect::OperationTerminal {
-                accept_seq: c.accept_seq,
-            }],
-            Reply::Cancelled {
-                accept_seq: c.accept_seq,
-            },
-        )
+        self.settle_cancelled(head, c.accept_seq, now)
     }
 
     fn check_timer_cap(&self, new: &Head) -> Result<(), AgentError> {
@@ -943,6 +1039,8 @@ impl Kernel {
             payload: timer.payload,
             accepted_unix_ns: now,
             failed_attempts: 0,
+            cancel_requested: false,
+            last_failed_turn_id: None,
         });
         if let Some(t) = new.timers.iter_mut().find(|t| t.timer_id == c.timer_id) {
             t.status = TimerStatus::Delivered;
@@ -975,7 +1073,7 @@ impl Kernel {
     }
 
     fn tombstone(&self, head: &Head, c: &Tombstone) -> Outcome {
-        if head.lifecycle == Lifecycle::Tombstoned {
+        if head.lifecycle == Lifecycle::Tombstoned && c.fence.incarnation == head.incarnation {
             return unchanged(Reply::AlreadyTombstoned);
         }
         Self::check_incarnation(head, &c.fence)?;
@@ -995,7 +1093,7 @@ impl Kernel {
 
     fn record_step(&self, head: &Head, c: &RecordStep) -> Outcome {
         let turn = Self::require_running(head, &c.fence)?;
-        let step_id = identity::step_id(head.incarnation, turn.turn_id, &c.step_key);
+        let step_id = identity::step_id(head.incarnation, turn.input_accept_seq, &c.step_key);
         if let Some(existing) = head.steps.iter().find(|s| s.step_id == step_id) {
             if existing.tool_name != c.tool_name
                 || existing.tool_version != c.tool_version
@@ -1026,7 +1124,11 @@ impl Kernel {
 
     fn commit_intent(&self, head: &Head, c: &CommitIntent) -> Outcome {
         let turn = Self::require_running(head, &c.fence)?;
-        let effect_id = identity::effect_id(head.incarnation, turn.turn_id, &c.intent.intent_key);
+        let effect_id = identity::effect_id(
+            head.incarnation,
+            turn.input_accept_seq,
+            &c.intent.intent_key,
+        );
         if let Some(existing) = head.effects.iter().find(|e| e.effect_id == effect_id) {
             if !same_intent(existing, &c.intent) {
                 return self.block_turn(head, "intent key reused with a different tool or input");
@@ -1034,7 +1136,13 @@ impl Kernel {
             return unchanged(Reply::IntentCommitted { effect_id });
         }
         let mut new = head.clone();
-        add_intent(head, &mut new, turn.turn_id, &c.intent)?;
+        add_intent(
+            head,
+            &mut new,
+            turn.input_accept_seq,
+            turn.turn_id,
+            &c.intent,
+        )?;
         self.publish(
             Some(head),
             new,
@@ -1188,14 +1296,38 @@ fn same_intent(existing: &EffectRecord, intent: &IntentSpec) -> bool {
         && existing.policy == intent.policy
 }
 
+/// The effects journaled for the input `accept_seq`, by any of its turns.
+fn input_effects(head: &Head, accept_seq: u64) -> impl Iterator<Item = &EffectRecord> {
+    head.effects.iter().filter(move |e| {
+        e.effect_id == identity::effect_id(head.incarnation, accept_seq, &e.step_key)
+    })
+}
+
+/// Drop the step transcript of the input `accept_seq`, carried over from a
+/// retryable failure.
+fn drop_input_steps(new: &mut Head, accept_seq: u64) {
+    let incarnation = new.incarnation;
+    new.steps
+        .retain(|s| s.step_id != identity::step_id(incarnation, accept_seq, &s.step_key));
+}
+
+fn cancel_requested(head: &Head, turn: &ActiveTurn) -> bool {
+    turn.cancellation == Cancellation::Requested
+        || head
+            .inbox
+            .iter()
+            .any(|e| e.accept_seq == turn.input_accept_seq && e.cancel_requested)
+}
+
 /// Journal an intent. `Ok(None)` when the same intent is already journaled.
 fn add_intent(
     head: &Head,
     new: &mut Head,
+    accept_seq: u64,
     turn_id: Id128,
     intent: &IntentSpec,
 ) -> Result<Option<Id128>, AgentError> {
-    let effect_id = identity::effect_id(new.incarnation, turn_id, &intent.intent_key);
+    let effect_id = identity::effect_id(new.incarnation, accept_seq, &intent.intent_key);
     if let Some(existing) = new.effects.iter().find(|e| e.effect_id == effect_id) {
         if same_intent(existing, intent) {
             return Ok(None);

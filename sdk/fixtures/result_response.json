@@ -5,6 +5,6 @@
     "output": null,
     "error": "card declined",
     "dead_lettered": true,
-    "finished_unix_ns": 1767225600000000000
+    "finished_unix_ns": "1767225600000000000"
   }
 }

@@ -50,7 +50,7 @@ fn effect() -> String {
     Handle {
         agent: agent_id(),
         incarnation: 1,
-        item: HandleItem::Effect(identity::effect_id(1, turn_id(), "send-receipt")),
+        item: HandleItem::Effect(identity::effect_id(1, 1, "send-receipt")),
     }
     .encode()
 }
@@ -181,6 +181,16 @@ fn samples() -> Vec<Sample> {
                     error: Some("card declined".to_string()),
                     dead_lettered: true,
                     finished_unix_ns: 1_767_225_600_000_000_000,
+                }),
+            },
+        ),
+        sample(
+            "result_response_nanosecond",
+            ResultResponse {
+                operation: operation(),
+                result: Some(ResultBody {
+                    finished_unix_ns: PRECISE_UNIX_NS,
+                    ..result_body()
                 }),
             },
         ),
@@ -335,7 +345,7 @@ fn samples() -> Vec<Sample> {
                     state: json!({"items": []}),
                     payload: json!({"sku": "A-1", "qty": 2}),
                     steps: vec![StepBody {
-                        step_id: identity::step_id(1, turn_id(), "price").to_hex(),
+                        step_id: identity::step_id(1, 1, "price").to_hex(),
                         step_key: "price".to_string(),
                         tool_name: "catalog.price".to_string(),
                         tool_version: "1".to_string(),

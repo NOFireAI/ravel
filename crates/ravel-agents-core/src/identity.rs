@@ -116,11 +116,19 @@ pub fn request_hash(handler: &str, payload: &[u8]) -> Hash256 {
     Hash256(derive("request", &[handler.as_bytes(), payload]))
 }
 
-/// Step id from incarnation, turn id and step key (ADR-3331 decision 7).
-pub fn step_id(incarnation: u64, turn_id: Id128, step_key: &str) -> Id128 {
+/// Step id from incarnation, the input's accept_seq and the step key. Every
+/// attempt at one input (a retry after a retryable failure, a turn resumed
+/// under a new epoch) derives the same id for the same key, so a retry
+/// replays the failed attempt's completed steps instead of re-running them
+/// (`kernel::tests::a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt`).
+pub fn step_id(incarnation: u64, accept_seq: u64, step_key: &str) -> Id128 {
     derive_128(
         "step",
-        &[&incarnation.to_le_bytes(), &turn_id.0, step_key.as_bytes()],
+        &[
+            &incarnation.to_le_bytes(),
+            &accept_seq.to_le_bytes(),
+            step_key.as_bytes(),
+        ],
     )
 }
 
@@ -132,14 +140,17 @@ pub fn step_input_hash(tool_name: &str, tool_version: &str, input: &[u8]) -> Has
     ))
 }
 
-/// Effect id from incarnation, turn id and the intent key; the id a
-/// `provider_idempotency` tool passes to the provider.
-pub fn effect_id(incarnation: u64, turn_id: Id128, intent_key: &str) -> Id128 {
+/// Effect id from incarnation, the input's accept_seq and the intent key; the
+/// id a `provider_idempotency` tool passes to the provider. It does not
+/// change across attempts at one input, so a retried turn recommitting the
+/// same intent finds the failed attempt's effect record and never dispatches
+/// it under a second id.
+pub fn effect_id(incarnation: u64, accept_seq: u64, intent_key: &str) -> Id128 {
     derive_128(
         "effect",
         &[
             &incarnation.to_le_bytes(),
-            &turn_id.0,
+            &accept_seq.to_le_bytes(),
             intent_key.as_bytes(),
         ],
     )
@@ -152,7 +163,8 @@ pub fn timer_id(incarnation: u64, timer_key: &str) -> Id128 {
 
 /// Turn id from incarnation, the input, the owner epoch that began the turn
 /// and the input's earlier failed attempts, so a retried input runs under a
-/// new turn id and its step ids never collide with the failed attempt's.
+/// new turn id and a fence from the failed attempt cannot act on the retry.
+/// Step and effect ids do not include it; see [`step_id`].
 pub fn turn_id(incarnation: u64, accept_seq: u64, epoch: u64, failed_attempts: u32) -> Id128 {
     derive_128(
         "turn",
@@ -201,9 +213,10 @@ mod tests {
             agent_id(&kind("a"), &key("bc"))
         );
         assert_ne!(
-            step_id(1, Id128([0; 16]), "x"),
-            effect_id(1, Id128([0; 16]), "x")
+            step_id(1, 1, "x"),
+            effect_id(1, 1, "x")
         );
+        assert_ne!(step_id(1, 2, "x"), step_id(1, 1, "x"));
         assert_ne!(request_hash("ab", b"c"), request_hash("a", b"bc"));
     }
 
