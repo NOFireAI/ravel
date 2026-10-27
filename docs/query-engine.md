@@ -1205,10 +1205,11 @@ pool, which draws on the same budget, so while fetched bytes and the data
 decoded from them are both live the two ledgers can count overlapping bytes
 (ADR-1170's SQL cross-boundary overlap). The
 catalog resolve charges its own decodes the same way
-(`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), as does the
-`/api/v1/metadata` cache (`MetadataCache::with_memory_budget`), but both still
-default to an unlimited budget and the server does not yet pass them the real
-one, so those reservations account without refusing. These guards come from the
+(`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), and the server
+passes it this same process budget, so a catalog decode that does not fit is
+refused too. The `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`)
+still defaults to an unlimited budget and the server does not pass it the real
+one, so its reservations account without refusing. These guards come from the
 same RAII `reserve` API, so they read under `component="fetch"`.
 
 ## Endpoints (Prometheus compatibility subset)

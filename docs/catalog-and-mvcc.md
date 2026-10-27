@@ -2230,8 +2230,9 @@ pinning are unchanged:
    entries are trusted. Before decoding a part or postings object, the
    resolve reserves its header-declared uncompressed length (clamped to
    the decoder's ceiling) against the catalog's `MemoryBudget`
-   (`Catalog::with_memory_budget`, unlimited by default; ADR-1702
-   decision 6), and the reservation lives with the decoded value, in the
+   (`Catalog::with_memory_budget`, unlimited by default; ravel-server
+   passes its process budget; ADR-1702 decision 6, ADR-1170), and the
+   reservation lives with the decoded value, in the
    decoded-part and postings caches included, until it is dropped. Both
    tenant_hash checks read the object's peeked header and run BEFORE that
    reservation: an isolation breach must be reported as one even when the

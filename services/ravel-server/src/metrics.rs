@@ -375,8 +375,9 @@ pub enum Label {
     /// `ravel_memory_reserved_bytes` sample is: `Sql` is
     /// `MemoryBudget::sql_reserved()` (the raw-counter API
     /// `TenantMemoryAccountant` uses), `Fetch` is
-    /// `MemoryBudget::fetch_reserved()` (bytes held by a live `Reservation`;
-    /// that method's doc lists who holds them). The two counters are disjoint by
+    /// `MemoryBudget::fetch_reserved()` (bytes held by a live `Reservation`,
+    /// the catalog's decode reservations among them; that method's doc lists
+    /// the other holders). The two counters are disjoint by
     /// construction (`ravel_memory::MemoryBudget` tracks fetch reservations
     /// separately from the total, so `sql_reserved` is the total minus
     /// `fetch_reserved`, never the total itself), so summing both samples
@@ -620,7 +621,8 @@ impl AllocatorStat {
 /// (`ravel_memory::TenantMemoryAccountant`), all sharing the one process
 /// `MemoryBudget` through its raw `try_reserve`/`reserve_unchecked`/`release`
 /// counter API; `Fetch` is every live `Reservation` against that same budget,
-/// `MemoryBudget::fetch_reserved()` (that method's doc lists who holds them).
+/// `MemoryBudget::fetch_reserved()` (that method's doc lists who holds them;
+/// the catalog's snapshot-part and name-postings decodes hold some too).
 /// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
 /// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2788,6 +2790,13 @@ pub struct CatalogCountersSnapshot {
     /// Decoded-output cache entries dropped by an eviction pass
     /// ([`ravel_catalog::Catalog::decoded_cache_memory_evictions`]).
     pub decoded_cache_memory_evictions: u64,
+    /// Decoded-output cache entries dropped to stay within the caches' byte
+    /// bound ([`ravel_catalog::Catalog::decoded_cache_byte_bound_evictions`]).
+    pub decoded_cache_byte_bound_evictions: u64,
+    /// Decoded parts and postings objects not cached because each alone
+    /// exceeds the caches' byte bound
+    /// ([`ravel_catalog::Catalog::decoded_cache_byte_bound_refusals`]).
+    pub decoded_cache_byte_bound_refusals: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
     /// Supervisor restarts of each signal's fold loop, in
@@ -2821,6 +2830,8 @@ impl Default for CatalogCountersSnapshot {
             decoded_postings_cache_reserved_bytes: 0,
             decode_reserve_retries: 0,
             decoded_cache_memory_evictions: 0,
+            decoded_cache_byte_bound_evictions: 0,
+            decoded_cache_byte_bound_refusals: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
             fold_refold_requests_dropped: 0,
@@ -2850,6 +2861,8 @@ impl CatalogCountersSnapshot {
             decoded_postings_cache_reserved_bytes: catalog.decoded_postings_cache_reserved_bytes(),
             decode_reserve_retries: catalog.decode_reserve_retries(),
             decoded_cache_memory_evictions: catalog.decoded_cache_memory_evictions(),
+            decoded_cache_byte_bound_evictions: catalog.decoded_cache_byte_bound_evictions(),
+            decoded_cache_byte_bound_refusals: catalog.decoded_cache_byte_bound_refusals(),
             fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
                 signal,
                 cycles: catalog.fold_cycles(signal),
@@ -3039,7 +3052,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_decode_reserve_retries_total",
-        "Catalog decode reservations retried after the decoded-output caches dropped entries to make room; moves only when the catalog's memory budget refuses a reservation, and the server leaves that budget unlimited.",
+        "Catalog decode reservations retried after the decoded-output caches dropped entries to make room; moves only when the shared ADR-1170 process memory budget refuses a catalog decode reservation that dropping cached entries could admit, so it reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes) and never moves on a refusal the host-memory gate made.",
         "counter",
     );
     write_sample(
@@ -3052,7 +3065,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_decoded_cache_memory_evictions_total",
-        "Decoded snapshot-part and name-postings cache entries the catalog dropped to make room for a refused decode reservation; moves only when the catalog's memory budget refuses a reservation, and the server leaves that budget unlimited.",
+        "Decoded snapshot-part and name-postings cache entries the catalog dropped to make room for a refused decode reservation; moves only when the shared ADR-1170 process memory budget refuses a catalog decode reservation that dropping cached entries could admit, so it reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes) and never moves on a refusal the host-memory gate made.",
         "counter",
     );
     write_sample(
@@ -3060,6 +3073,32 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_decoded_cache_memory_evictions_total",
         &[Label::Mode(mode)],
         snapshot.decoded_cache_memory_evictions,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_evictions_total",
+        "Decoded snapshot-part and name-postings cache entries the catalog dropped to stay within the caches' byte bound, 1% of the shared ADR-1170 process memory budget; reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes), since no bound is set there.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_evictions_total",
+        &[Label::Mode(mode)],
+        snapshot.decoded_cache_byte_bound_evictions,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_refusals_total",
+        "Decoded snapshot parts and name-postings objects the catalog did not cache because each alone is larger than the caches' byte bound, 1% of the shared ADR-1170 process memory budget; each is decoded again by the next query that needs it. Reads 0 where that budget is unlimited (gateway mode, or an unknown host memory size with no --memory-budget-bytes), since no bound is set there.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_decoded_cache_byte_bound_refusals_total",
+        &[Label::Mode(mode)],
+        snapshot.decoded_cache_byte_bound_refusals,
     );
 
     // The fold families carry a `signal` label because the fold is one
@@ -3520,7 +3559,10 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 ///
 /// `ravel_memory_reserved_bytes{component="fetch"}` is
 /// `MemoryBudget::fetch_reserved()`: bytes currently held by a live
-/// `ravel_memory::Reservation` (that method's doc lists who holds them).
+/// `ravel_memory::Reservation` (that method's doc lists who holds them),
+/// including the catalog's snapshot-part and name-postings decode
+/// reservations, cached or in flight, since `crate::start` builds the
+/// catalog with `Catalog::with_memory_budget` on this same budget.
 /// `component="sql"`
 /// is `MemoryBudget::sql_reserved()`, the total minus the fetch share, i.e.
 /// `TenantMemoryAccountant`'s raw-counter reservations -- never the whole
@@ -3561,7 +3603,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_reserved_bytes",
-        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live Reservation (the fetchers among others; see MemoryBudget::fetch_reserved in ravel-memory for the list); the two are disjoint. They sum to the budget's reserved total when no reservation is changing; while fetch reservations change during a scrape, each figure can be off by the summed sizes of the reservations that changed.",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live Reservation (the fetchers and the catalog's snapshot-part and name-postings decodes among others; see MemoryBudget::fetch_reserved in ravel-memory for the list); the two are disjoint. They sum to the budget's reserved total when no reservation is changing; while fetch reservations change during a scrape, each figure can be off by the summed sizes of the reservations that changed.",
         "gauge",
     );
     write_sample(
