@@ -128,9 +128,10 @@ pub fn dynamic_column_warnings(
 /// objects are compressed, so a target read off an observed object size is
 /// several times below the content of the rows that object holds. On top of
 /// that the comparison runs once per write, after a whole batch's per-shard
-/// slice has merged, so any target at or below one slice's content
-/// (`--batch-rows / --shards` rows' worth) is already exceeded by the first
-/// write into an empty buffer and flushes it, exactly as `1` does.
+/// slice has merged, so at an even split any target at or below one slice's
+/// content (`--batch-rows / --shards` rows' worth) is already exceeded by the
+/// first write into an empty buffer and flushes it, exactly as `1` does. A
+/// shard whose real slice sits under that can accumulate across batches.
 ///
 /// The loader cannot compute that footprint before it runs, so this reports the
 /// outcome from figures [`LoadReport`] already carries. `tokens` holds one entry
