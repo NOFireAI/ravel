@@ -54,7 +54,9 @@ BrokenHeadBeforeDependency(c) ==
     /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
 \* Overwrite instead of CasVersion, on a root that moved only by another
-\* sender's enqueue since this client read it.
+\* sender's enqueue since this client read it. The other sender used a
+\* different request id, so the overwrite drops an input rather than
+\* rewriting an identical one.
 BrokenOverwriteStaleRoot(c) ==
     /\ OverwriteStaleRoot
     /\ cl[c].pc = "dep"
@@ -63,6 +65,7 @@ BrokenOverwriteStaleRoot(c) ==
            h == cl[c].obs
            cur == Head(ak)
        IN /\ cur # h
+          /\ SameRid(c, cur) = {}
           /\ cur.inc = h.inc /\ cur.tomb = h.tomb /\ cur.epoch = h.epoch
           /\ cur.owner = h.owner /\ cur.timer = h.timer
           /\ cur.results = h.results /\ cur.active = h.active
