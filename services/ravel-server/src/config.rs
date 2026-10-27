@@ -5487,8 +5487,10 @@ impl ResolvedPerformanceDefaults {
                 "performance default resolved"
             );
             // Derived from max_samples, not carved from the budget: each
-            // range-query selector-cache entry is charged to the budget, which
-            // refuses before this cap is reached when it is the smaller.
+            // range-query selector-cache entry is charged to the budget. When
+            // the budget is the smaller, it refuses the entry's reservation
+            // and the selector falls back to uncached reads before the cache
+            // grows to this cap.
             tracing::info!(
                 setting = "selector_cache_max_bytes",
                 value = ravel_promql::selector_cache_cap_for_pool(self.max_samples),
