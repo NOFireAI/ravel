@@ -3,9 +3,11 @@
 Status: Proposed (2026-10-27). Adds a new persistent namespace
 (`t/<tenant_hash>/ag/`), a new protobuf file (`proto/ravel/agents.proto`),
 and a new cargo feature (`agents`) on `ravel-server`. Changes no existing
-persistent format, no commit-token meaning, and no telemetry contract. Amends
-ADR-1374 (decisions D2 and D7: a write profile for MCP tools) and ADR-0068
-(a second simulation driver family). Epic #3331.
+persistent format, no commit-token meaning, and no telemetry contract. The
+one existing rule it tightens: `ag` becomes a reserved Parquet table name
+(decision 2). Amends ADR-1374 (decisions D2 and D7: a write profile for MCP
+tools; D9: the MCP guide's path) and ADR-0068 (a second simulation driver
+family). Epic #3331.
 
 Source documents: `ravel-agents-implementation-plan.md` and
 `ravel-agents-claude-prompt.md` (26 October 2026). Their baseline was
@@ -34,7 +36,7 @@ seams:
   (`lib.rs:688-693`). `ravel-fleet` already does GET-then-CAS in production
   (`crates/ravel-fleet/src/claim.rs:509-518`).
 - `FaultStore::DuplicateDelivery` applies a conditional put and then
-  reports a lost acknowledgement (`crates/ravel-object-store/src/fault.rs:857-860`),
+  reports a lost acknowledgement (`crates/ravel-object-store/src/fault.rs:864-866`),
   and the shared TLA+ store module has `PutCasVersionLostResponse`
   (`formal/tla/common/RavelObjectStore.tla:196-199`). "Write applied,
   response lost" is already representable in tests and models.
@@ -69,8 +71,14 @@ guide (`docs/guides/agents.md`, `README.md:360`).
 The product is **Ravel Agents**. The existing MCP guide moves from
 `docs/guides/agents.md` to `docs/guides/mcp-server.md` and its README
 heading becomes "MCP server for AI agents", so the two surfaces do not
-share a page name. The MCP tools stay under the `mcp` feature; the new
-runtime is the `agents` feature.
+share a page name. The move updates every link to the old path:
+`README.md:363`, `docs/README.md:66`, `docs/reference/mcp.md:15` and `:82`,
+`docs/adrs/1374-agent-mcp-server.md:530` (an amendment to ADR-1374 D9,
+which names that path as the MCP documentation) and
+`docs/adrs/1658-documentation-claims-registry.md:18` and `:176`.
+`scripts/check_docs.py` resolves relative links, so a missed one fails the
+doc gate. The MCP tools stay under the `mcp` feature; the new runtime is
+the `agents` feature.
 
 New workspace crates, each pinned by path and version in
 `[workspace.dependencies]`:
@@ -112,7 +120,12 @@ key the crate builds is checked with `is_addressable_key` before any store
 call and a failure is a typed `KeyError`.
 
 The segment `ag` joins `IAM_GRANT_SEGMENTS` in
-`crates/ravel-pqtable/src/names.rs`, gets explicit rows in every
+`crates/ravel-pqtable/src/names.rs`. That retroactively refuses a Parquet
+table named `ag`, which `validate_table` accepts today; an existing table of
+that name stops resolving and its manifests classify as
+`StrayClass::ReservedName` through the existing repair path
+(`crates/ravel-pqtable/src/repair.rs:380-416`), which is the migration.
+The segment gets explicit rows in every
 `deploy/iam/*.json` template (the gateway and query roles may GET, PUT and
 list under `t/*/ag/*`; the maintain role may only list and GET), and gets
 its rows in the `docs/catalog-and-mvcc.md` key table. The telemetry sweep
@@ -124,10 +137,16 @@ this release and stays disabled.
 
 `proto/ravel/agents.proto` (new file, registered in
 `crates/ravel-proto/build.rs`) defines `AgentHead` with
-`uint32 format_version = 1` first. The format-version classification test
-widens its scope to this file. Format version 1 is the only supported
-version before v1.0 (ADR-0027's regime); a HEAD with a newer version is a
-typed `UnsupportedFormat` state that is read but never CAS-written.
+`uint32 format_version = 1` first. `AgentHead` is a CAS-mutable record in
+ADR-0066's vocabulary: it is read, modified and written back under CAS, so
+every additive field change to it bumps `format_version` (ADR-0066
+amendment R1). The classification test in
+`crates/ravel-catalog/tests/sys_proto_format_version_classification.rs`
+widens its scope to this file and stays in `ravel-catalog`; the agents gate
+lane in decision 14 therefore names `-p ravel-catalog` so the row is checked
+in scope, not only at merge. Format version 1 is the only supported version
+until milestone 6; a HEAD with a newer version is a typed
+`UnsupportedFormat` state that is read but never CAS-written.
 
 HEAD carries, as fields or as references to immutable index pages:
 
@@ -156,8 +175,12 @@ HEAD bytes are capped at 256 KiB and a command that would exceed the cap
 fails typed (`BudgetExceeded`) before any store call. Milestone 1 uses a
 bounded inline inbox and receipt list with hard caps; milestone 6 replaces
 them with bounded immutable index pages so that send, receipt lookup and
-wake read at most one page of history. Both representations are format
-version 1 features chosen by a field, so the switch is not a format bump.
+wake read at most one page of history. The page references are new fields,
+so milestone 6 is format version 2, rolled out readers before writers as
+ADR-0066 requires: a version 1 writer that decoded a version 2 HEAD would
+drop the page references on re-encode and CAS away accepted messages. A
+version 1 binary refuses a version 2 HEAD as `UnsupportedFormat`; the
+milestone 6 task ships the reader one release before the writer.
 
 ### 4. The publication rule
 
@@ -445,8 +468,12 @@ suite's vocabulary (must-violate, exit 12): crash, lost response,
 takeover, competing senders, duplicate physical execution under
 `at_least_once`, blocked effect.
 
-Budgets: exhaustive `budget_s` 3000, 3000 and 3000, which keeps the area
-under the 9000 s nightly ceiling. Smoke configs land with the specs;
+Budgets: exhaustive `budget_s` 3000, 3000 and 3000. The bound is the
+160-minute per-area job in `tla-nightly.yml`, and `scripts/check-tla.test.sh`
+asserts at least 600 s of headroom under it, so 9000 s is the largest sum
+an area may carry today and this area sits exactly on it, as the
+maintenance area does; any later increase raises the workflow ceiling in
+the same change. Smoke configs land with the specs;
 `live` and `positive` configs land unbanded and a measurement task writes
 `bands.tsv` and `results.md` from a real run. `traceability.md` lands in
 the same wave as the kernel symbols it names; rows for not-yet-built code
@@ -480,7 +507,8 @@ an absent key on S3 and RustFS is pinned there, since today only
 
 `scripts/gates.sh` gains `want_agents` (clippy and tests for
 `-p ravel-server --features agents`, tests selected by name because the
-new flags change `cli_reference`) and `want_mcp`, mirrored in
+new flags change `cli_reference`, plus `-p ravel-catalog` for the
+classification test) and `want_mcp`, mirrored in
 `scripts/affected-tests.sh` and `scripts/gates.test.sh`. `ci.yml` gains a
 `features-agents` job, a `features-mcp` job, lint clippy steps, `changes`
 outputs for `agents_area` and `sdk_area`, and the `sdk` job. The epic asks
@@ -526,9 +554,10 @@ store, and the feature disabled. Price inputs are labelled assumptions.
   but the admission layer on that listener is ingest-shaped (byte budget,
   pending acks), and the SDK would need a gRPC client in both languages.
   Lost to HTTP long-poll with a deadline under the shutdown drain.
-- **HEAD messages inside `sys.proto`.** Would force the classification
-  test's existing rows to change; a new file keeps the frozen file
-  untouched and widens the test's scope instead.
+- **HEAD messages inside `sys.proto`.** `sys.proto` is a frozen contract
+  and every edit to it goes through the format-change procedure; a new
+  file keeps it untouched, and the classification test widens its scope
+  to the new file instead.
 - **Reusing the MCP cursor codec for event cursors.** It is MAC-keyed by a
   per-process secret and does not survive a restart. Lost to a durable
   cursor that is the committed event seq.
