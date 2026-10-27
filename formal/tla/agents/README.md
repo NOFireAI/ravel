@@ -140,11 +140,16 @@ are checked without timers (smoke), and timers and liveness are checked with
 one sender and `MaxRevision = 4` (exhaustive). A second timer generation does
 not fit either: the exhaustive config at `MaxTimerGen = 2` passed 3.9 million
 distinct states with 1.4 million queued when the 3000 s budget ran out
-(2 workers, 2 GiB). So only `stale-timer-generation-fired`, which runs at
-`MaxTimerGen = 2`, reaches a replaced generation; a `FireTimer` that ignored
-the generation would pass every config at `MaxTimerGen = 1` and is caught by
-that negative alone. Raising the exhaustive bound is T20's call once the
-nightly lane has measured it.
+(2 workers, 2 GiB). So only the two configs that run at `MaxTimerGen = 2`
+reach a replaced generation: `stale-timer-generation-fired`, whose mutant TLC
+catches at the first stale fire, which a cancelled generation already
+produces at depth 10, and the `second-generation-reachable` probe, which
+asserts that a root carrying generation 2 is reached under those bounds. A
+`FireTimer` that ignored the generation passes every config at
+`MaxTimerGen = 1`; under the probe's bounds the eleven invariants are checked
+on every state TLC visits before the probe violation, which is where that
+mutant trips `TimerGenerationDeliveredOnce`. Raising the exhaustive bound is
+T20's call once the nightly lane has measured it.
 
 `View` drops the store's version integers and keeps, for each held CAS token,
 only whether it equals the current HEAD version. Nothing reads a version
@@ -186,11 +191,13 @@ invariants (`OneLogicalCompletion`, `TurnCommitAtomic`, `NoStaleOwnerCommit`,
 `CancellationRespected` and `TenantIncarnationIsolation`); the `.expect` names
 `OneLogicalCompletion` because it is the first of them in the config.
 
-Reachability probes, each the smoke config with every switch off and one probe
+Reachability probes, each a config with every switch off and one probe
 invariant that must be violated (exit 12): `crash-reachable`
 (`CrashUnreachable`), `lost-response-reachable` (`LostResponseUnreachable`),
-`takeover-reachable` (`TakeoverUnreachable`) and `competing-senders-reachable`
-(`CompetingSendersUnreachable`). Three read store or operation state;
+`takeover-reachable` (`TakeoverUnreachable`), `competing-senders-reachable`
+(`CompetingSendersUnreachable`) and, at the stale-timer bounds rather than the
+smoke config, `second-generation-reachable` (`SecondGenerationUnreachable`).
+Four read store or operation state;
 `CrashUnreachable` reads `crashedOnce`, which `WorkerCrash` records, so it
 witnesses that the crash action fired rather than that it was enabled. A
 violation shows the smoke config reaches that situation and the invariants
