@@ -997,6 +997,14 @@ impl StrColumn {
     }
 }
 
+/// The bytes one `str_cols` slot charges: `Option<StrColumn>` as it was with a
+/// `OnceCell` legacy view. The `OnceLock` a column shared with the
+/// decoded-column cache needs is wider, and charging it would make a disabled
+/// cache charge more than main.
+const STR_SLOT_CHARGE: usize = std::mem::size_of::<Option<StrColumn>>()
+    - (std::mem::size_of::<OnceLock<LegacyDict>>()
+        - std::mem::size_of::<std::cell::OnceCell<LegacyDict>>());
+
 fn f64_heap_bytes(v: &Vec<Option<u64>>) -> usize {
     v.capacity() * std::mem::size_of::<Option<u64>>()
 }
@@ -1453,14 +1461,7 @@ impl DecodedBlock {
         total += self.i64_cols.slot_bytes();
         total += self.f64_cols.slot_bytes();
         total += self.bool_cols.slot_bytes();
-        // The `OnceLock` a shared column needs is wider than the `OnceCell` it
-        // replaced; charge the slot as before so a disabled cache charges
-        // exactly what main charges.
-        total += self.str_cols.slot_bytes().saturating_sub(
-            self.str_cols.cols.capacity()
-                * (std::mem::size_of::<OnceLock<LegacyDict>>()
-                    - std::mem::size_of::<std::cell::OnceCell<LegacyDict>>()),
-        );
+        total += self.str_cols.cols.capacity() * STR_SLOT_CHARGE;
         total += self.fixed_cols.slot_bytes();
         // A column-reference column shares its target's buffers; they are
         // resident once.
@@ -2763,7 +2764,7 @@ mod tests {
         // than the assertion loosening to an inequality: an exact figure is
         // available here, and a `>=` would stop pinning the dictionary
         // footprint this test exists to check.
-        let slots = 11 * std::mem::size_of::<Option<StrColumn>>();
+        let slots = 11 * STR_SLOT_CHARGE;
         assert_eq!(
             dec.decoded_heap_bytes(),
             dict_figure + slots,
