@@ -1956,6 +1956,173 @@ mod tests {
         .expect("run_tick")
     }
 
+    /// Records the `error` field of every warn-level event.
+    #[derive(Default, Clone)]
+    struct WarnErrorCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnErrorCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Visitor<'a>(&'a parking_lot::Mutex<Vec<String>>);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0.lock().push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Visitor(&self.0));
+        }
+    }
+
+    /// The raw bytes of the tenant's metrics HEAD.
+    async fn metrics_head_bytes(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Bytes {
+        let key = format!(
+            "t/{}/catalog/{}/HEAD",
+            tenant.to_hex(),
+            Signal::Metrics.key_prefix()
+        );
+        store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data
+    }
+
+    /// Issue #3244: a scheduled fold tick whose previous-postings decode the
+    /// process memory budget refuses fails that tenant's fold with the typed
+    /// `CatalogError::MemoryExhausted`, logs it, and leaves the HEAD where it
+    /// was; once the held memory is released, the next tick folds. The budget
+    /// holds a reservation that leaves one byte less room than the postings
+    /// body declares, so the refusal names the exact figures.
+    ///
+    /// FLIP: build `budgeted` without `.with_memory_budget(...)` and the first
+    /// tick folds, so the `report.failed` assertion fails with `[]` against
+    /// `[tenant]`.
+    #[tokio::test]
+    async fn a_refused_postings_decode_fails_the_tick_and_the_next_tick_retries() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let inner = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("fold-tick-postings-refusal");
+        let tenant = tenant_id.hash();
+        inner
+            .put(
+                &format!("t/{}/marker", tenant.to_hex()),
+                Bytes::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the tenant prefix discovery lists");
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let config = CatalogConfig {
+            shard_count: 1,
+            ..CatalogConfig::default()
+        };
+
+        publish_metric_segment(store.as_ref(), &tenant_id, 1, 10).await;
+        let unlimited = Catalog::new(store.clone(), config).expect("catalog builds");
+        let first = unlimited
+            .fold(
+                &tenant,
+                Signal::Metrics,
+                Uuid::from_u128(1),
+                margin_seals(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.watermark_hour, Some(10), "{first:?}");
+
+        let head_before = metrics_head_bytes(store.as_ref(), &tenant).await;
+        let head = ravel_catalog::decode_head(&head_before).expect("HEAD decodes");
+        let postings_ref = head.postings.expect("the first fold built postings");
+        let postings_bytes = store
+            .get(&postings_ref.key, GetRange::Full)
+            .await
+            .expect("postings present")
+            .data;
+        let part_blake3: Vec<[u8; 32]> = head
+            .parts
+            .iter()
+            .map(|part| part.blake3.as_slice().try_into().expect("32-byte blake3"))
+            .collect();
+        let declared = ravel_catalog::decode_postings(
+            &postings_bytes,
+            &ravel_catalog::PostingsLimits::default(),
+            &part_blake3,
+        )
+        .expect("postings decode")
+        .header
+        .body_uncompressed_len;
+        assert!(declared > 0, "the postings have a body to charge");
+
+        publish_metric_segment(store.as_ref(), &tenant_id, 2, 11).await;
+        const LIMIT: u64 = 1 << 30;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LIMIT));
+        let held_bytes = LIMIT - (declared - 1);
+        let held = budget.reserve(held_bytes).expect("room for the held bytes");
+        let budgeted = Catalog::new(store.clone(), config)
+            .expect("catalog builds")
+            .with_memory_budget(budget.clone());
+
+        let captured = WarnErrorCapture::default();
+        let refold = RefoldQueue::default();
+        let refused = {
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tick_at(&budgeted, store.as_ref(), tenant, &refold, margin_seals(11)).await
+        };
+        assert_eq!(refused.failed, vec![tenant], "{refused:?}");
+        assert!(refused.folded.is_empty(), "{refused:?}");
+        let expected =
+            ravel_catalog::CatalogError::MemoryExhausted(ravel_memory::MemoryExhausted {
+                requested: declared,
+                reserved: held_bytes,
+                limit: LIMIT,
+                cause: ravel_memory::ExhaustionCause::Accounted,
+            })
+            .to_string();
+        assert_eq!(
+            expected,
+            format!(
+                "catalog decode refused: memory exhausted: requested {declared} bytes, \
+                 {held_bytes} of {LIMIT} byte limit already reserved"
+            )
+        );
+        assert_eq!(*captured.0.lock(), vec![expected]);
+        assert_eq!(
+            metrics_head_bytes(store.as_ref(), &tenant).await,
+            head_before,
+            "a refused fold publishes no HEAD"
+        );
+        assert_eq!(budget.reserved(), held_bytes, "the refusal charged nothing");
+        assert_eq!(
+            budgeted.decode_reserve_retries(),
+            0,
+            "no eviction could help"
+        );
+
+        drop(held);
+        let retried = tick_at(&budgeted, store.as_ref(), tenant, &refold, margin_seals(11)).await;
+        assert_eq!(retried.folded, vec![tenant], "{retried:?}");
+        assert!(retried.failed.is_empty(), "{retried:?}");
+        let head_after = metrics_head_bytes(store.as_ref(), &tenant).await;
+        let head_after = ravel_catalog::decode_head(&head_after).expect("HEAD decodes");
+        assert_eq!(head_after.watermark_hour, 11);
+    }
+
     /// A held-open fold whose held range is quiet stays a no-op, but its
     /// targeted re-fold pass reconciles a requested hour below that range
     /// (995, outside 998..=1000, already clean), and the tick dequeues it. A

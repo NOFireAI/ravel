@@ -210,7 +210,10 @@ impl MemoryBudget {
     ///   `CREATE EXTERNAL TABLE`, through [`reserve`];
     /// - `ravel-promql`'s range-query selector cache, one reservation per
     ///   cached selector read, through [`reserve_best_effort`]. Its entries are
-    ///   evaluator memory rather than fetch buffers, but are counted here.
+    ///   evaluator memory rather than fetch buffers, but are counted here;
+    /// - `ravel-catalog`'s snapshot-part, postings and column-statistics
+    ///   decodes, through [`reserve`] (`Catalog::with_memory_budget`); a
+    ///   decoded part or postings entry keeps its reservation while cached.
     ///
     /// `try_reserve` and `reserve_unchecked` (the raw counter API SQL's
     /// `TenantMemoryAccountant` uses exclusively) never touch this counter, so

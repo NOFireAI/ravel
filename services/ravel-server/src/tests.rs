@@ -385,9 +385,10 @@ fn promql_harness(
     promql_harness_on(store, process_memory_budget, cache, catalog)
 }
 
-/// [`promql_harness`] over a caller-built `Catalog`, for a test that charges
-/// the catalog's decodes to the process budget (`Catalog::with_memory_budget`)
-/// the way `crate::start` does.
+/// [`promql_harness`] over a caller-built `Catalog`. This function does not
+/// charge the catalog to `process_memory_budget`; a test that wants the
+/// wiring `crate::start` has builds `catalog` with
+/// `Catalog::with_memory_budget` on that same `Arc`.
 fn promql_harness_on(
     store: Arc<dyn ObjectStoreBackend>,
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
