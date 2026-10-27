@@ -10,7 +10,8 @@
 //! first decode, any other intent on a second touch through a ghost key list
 //! whose window spans the cap in bytes. Eviction is CLOCK weighted by bytes.
 //! Each entry holds a best-effort reservation on the process
-//! [`MemoryBudget`]; an entry that cannot reserve is not admitted.
+//! [`MemoryBudget`]; an entry that cannot reserve, or whose reservation would
+//! leave the budget under [`admission_margin`], is not admitted.
 //!
 //! [`decode_columns`]: crate::block
 
@@ -18,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ravel_memory::{MemoryBudget, Reservation};
+use ravel_memory::{ExhaustionCause, MemoryBudget, Reservation};
 use ravel_types::accounting::AccessIntent;
 
 use crate::block::CachedColumn;
@@ -45,6 +46,7 @@ pub struct DecodedCacheCounters {
     admissions: AtomicU64,
     evictions: AtomicU64,
     ghost_hits: AtomicU64,
+    margin_skips: AtomicU64,
 }
 
 /// A point-in-time copy of [`DecodedCacheCounters`].
@@ -55,6 +57,17 @@ pub struct DecodedCacheSnapshot {
     pub admissions: u64,
     pub evictions: u64,
     pub ghost_hits: u64,
+    /// Admissions skipped because the reservation would have left the budget
+    /// under [`admission_margin`], though its limit would have admitted it.
+    pub margin_skips: u64,
+}
+
+/// The unreserved bytes an admission must leave on a budget of `limit`
+/// (ADR-3326 amendment "admission keeps a headroom margin"):
+/// `max(1 GiB, 5% of limit)`.
+#[must_use]
+pub fn admission_margin(limit: u64) -> u64 {
+    (limit / 20).max(1 << 30)
 }
 
 impl DecodedCacheSnapshot {
@@ -67,6 +80,7 @@ impl DecodedCacheSnapshot {
             admissions: self.admissions.saturating_add(other.admissions),
             evictions: self.evictions.saturating_add(other.evictions),
             ghost_hits: self.ghost_hits.saturating_add(other.ghost_hits),
+            margin_skips: self.margin_skips.saturating_add(other.margin_skips),
         }
     }
 }
@@ -79,6 +93,7 @@ impl DecodedCacheCounters {
             admissions: self.admissions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
+            margin_skips: self.margin_skips.load(Ordering::Relaxed),
         }
     }
 
@@ -174,14 +189,18 @@ impl DecodedColumnCache {
     /// order, entries no live scan holds until `want` bytes are freed or none
     /// remains, releasing each one's reservation, and returns the bytes
     /// freed. An entry a scan still holds stays and counts for nothing.
-    pub fn evict_for_pressure(&self, want: u64) -> u64 {
+    /// Each pass logs one INFO line; `cause` is the refusal it answers.
+    pub fn evict_for_pressure(&self, want: u64, cause: ExhaustionCause) -> u64 {
         let mut evicted = Vec::new();
         let mut freed = 0u64;
+        let mut held = 0u64;
+        let resident_after;
         {
             let mut inner = self.lock();
             let n = inner.slots.len();
-            // Two sweeps: the first may only clear reference bits.
-            for _ in 0..n.saturating_mul(2) {
+            // Two sweeps: the first may only clear reference bits. Held
+            // entries are counted on the first, so none counts twice.
+            for step in 0..n.saturating_mul(2) {
                 if freed >= want {
                     break;
                 }
@@ -191,6 +210,9 @@ impl DecodedColumnCache {
                     continue;
                 };
                 if slot.col.strong_count() > 1 {
+                    if step < n {
+                        held = held.saturating_add(slot.bytes);
+                    }
                     continue;
                 }
                 if slot.referenced {
@@ -205,7 +227,17 @@ impl DecodedColumnCache {
                     evicted.push(slot);
                 }
             }
+            resident_after = inner.resident;
         }
+        tracing::info!(
+            target: "ravel_logseg::decoded_cache",
+            asked_bytes = want,
+            freed_bytes = freed,
+            resident_bytes_after = resident_after,
+            held_bytes = held,
+            cause = cause.name(),
+            "decoded cache pressure eviction"
+        );
         self.pressure_evictions
             .fetch_add(evicted.len() as u64, Ordering::Relaxed);
         self.pressure_freed_bytes
@@ -309,10 +341,23 @@ impl DecodedColumnCache {
             }
         }
         let reservation = match &self.budget {
-            Some(budget) => match budget.reserve_best_effort(bytes) {
-                Ok(r) => Some(r),
-                Err(_) => return,
-            },
+            Some(budget) => {
+                match budget.reserve_best_effort_keeping(bytes, admission_margin(budget.limit())) {
+                    Ok(r) => Some(r),
+                    Err(refusal) => {
+                        if refusal.cause == ExhaustionCause::Accounted
+                            && refusal
+                                .reserved
+                                .checked_add(bytes)
+                                .is_some_and(|total| total <= refusal.limit)
+                        {
+                            inner.process.margin_skips += 1;
+                            DecodedCacheCounters::bump(&counters.margin_skips, 1);
+                        }
+                        return;
+                    }
+                }
+            }
             None => None,
         };
         let evicted = Self::evict_until(&mut inner, self.max_bytes.saturating_sub(bytes));
@@ -517,7 +562,7 @@ mod tests {
         let held = col(8);
         let idle = col(8);
         let bytes = held.heap_bytes() as u64;
-        let budget = Arc::new(MemoryBudget::new(1 << 30));
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
         let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
         let c = DecodedCacheCounters::default();
         cache.offer(key(0, 1), &held, AccessIntent::Interactive, &c);
@@ -525,7 +570,7 @@ mod tests {
         drop(idle);
         assert_eq!(budget.reserved(), 2 * bytes);
 
-        let freed = cache.evict_for_pressure(u64::MAX);
+        let freed = cache.evict_for_pressure(u64::MAX, ExhaustionCause::Accounted);
         assert_eq!(freed, bytes, "only the unheld entry frees");
         assert_eq!(budget.reserved(), bytes, "its reservation is released");
         assert_eq!(cache.entry_bytes(&key(0, 1)), Some(bytes), "held stays");
@@ -539,10 +584,18 @@ mod tests {
         );
 
         drop(held);
-        assert_eq!(cache.evict_for_pressure(1), bytes, "unheld now");
+        assert_eq!(
+            cache.evict_for_pressure(1, ExhaustionCause::Accounted),
+            bytes,
+            "unheld now"
+        );
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), 0);
-        assert_eq!(cache.evict_for_pressure(1), 0, "nothing left");
+        assert_eq!(
+            cache.evict_for_pressure(1, ExhaustionCause::Accounted),
+            0,
+            "nothing left"
+        );
         assert_eq!(cache.pressure_counters().evictions, 2);
     }
 
@@ -550,7 +603,7 @@ mod tests {
     fn an_admitted_entry_holds_its_reservation_until_evicted() {
         let v = col(8);
         let bytes = v.heap_bytes() as u64;
-        let budget = Arc::new(MemoryBudget::new(1 << 30));
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
         let cache = DecodedColumnCache::new(bytes, Some(Arc::clone(&budget)));
         let c = DecodedCacheCounters::default();
         cache.offer(key(0, 1), &v, AccessIntent::Interactive, &c);
@@ -558,5 +611,131 @@ mod tests {
         cache.offer(key(1, 1), &v, AccessIntent::Interactive, &c);
         assert_eq!(budget.reserved(), bytes);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn the_margin_is_a_gib_or_five_percent_of_the_limit() {
+        assert_eq!(admission_margin(64 << 20), 1 << 30);
+        assert_eq!(admission_margin(20 << 30), 1 << 30);
+        assert_eq!(admission_margin(40 << 30), 2 << 30);
+        assert_eq!(admission_margin(u64::MAX), u64::MAX / 20);
+    }
+
+    /// One offer of `v` against a 4 GiB budget with `free` bytes unreserved:
+    /// whether it was admitted, and the counters.
+    fn offer_with_free(v: &CachedColumn, free: u64) -> (bool, DecodedCacheSnapshot) {
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        budget.reserve_unchecked((4 << 30) - free);
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+        cache.offer(key(0, 1), v, AccessIntent::Interactive, &c);
+        let admitted = cache.len() == 1;
+        (admitted, c.snapshot())
+    }
+
+    /// Admission is skipped, and counted as a margin skip, exactly when the
+    /// entry's reservation would leave fewer than the margin unreserved: one
+    /// byte under skips, exactly at the margin and one byte above admit. A
+    /// refusal the limit alone makes is not a margin skip.
+    ///
+    /// FLIP: make `admission_margin` return 0 and the one-byte-under offer is
+    /// admitted.
+    #[test]
+    fn admission_is_skipped_exactly_below_the_margin() {
+        let v = col(8);
+        let b = v.heap_bytes() as u64;
+        // The 1 GiB floor on a 4 GiB budget, written out so a changed margin
+        // moves the outcome rather than the inputs.
+        let margin: u64 = 1 << 30;
+
+        let (admitted, s) = offer_with_free(&v, margin + b - 1);
+        assert!(!admitted, "one byte under the margin");
+        assert_eq!((s.admissions, s.margin_skips), (0, 1));
+
+        let (admitted, s) = offer_with_free(&v, margin + b);
+        assert!(admitted, "exactly at the margin");
+        assert_eq!((s.admissions, s.margin_skips), (1, 0));
+
+        let (admitted, s) = offer_with_free(&v, margin + b + 1);
+        assert!(admitted, "one byte above the margin");
+        assert_eq!((s.admissions, s.margin_skips), (1, 0));
+
+        let (admitted, s) = offer_with_free(&v, b - 1);
+        assert!(!admitted, "the limit refuses");
+        assert_eq!((s.admissions, s.margin_skips), (0, 0));
+    }
+
+    /// A closed host gate skips admission whatever the margin, and it is not
+    /// a margin skip.
+    #[test]
+    fn a_closed_gate_skips_admission() {
+        let v = col(8);
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        budget.set_host_memory_gate(false, 4, 5);
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+        cache.offer(key(0, 1), &v, AccessIntent::Interactive, &c);
+        assert!(cache.is_empty());
+        assert_eq!(c.snapshot().margin_skips, 0);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The race the amendment closes. A query holds the whole budget but the
+    /// one cache entry, and a reservation of the entry's size is refused. The
+    /// budget's evictor (the server's wiring: evict through a weak handle)
+    /// frees the entry and then, before it returns and so before the refused
+    /// caller retries, offers a new column of the same size, standing in for
+    /// another partition's miss landing between the eviction and the retry.
+    /// The margin skips that admission, so the freed bytes are still there
+    /// and the retry is admitted.
+    ///
+    /// FLIP: make `admission_margin` return 0 and the in-between offer takes
+    /// the freed bytes: the retry is refused and the first `expect` fails.
+    #[test]
+    fn an_admission_between_eviction_and_retry_does_not_take_the_freed_bytes() {
+        const LIMIT: u64 = 4 << 30;
+        let v1 = col(8);
+        let b = v1.heap_bytes() as u64;
+        let budget = Arc::new(MemoryBudget::new(LIMIT));
+        let cache = Arc::new(DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget))));
+        let c = Arc::new(DecodedCacheCounters::default());
+        cache.offer(key(0, 1), &v1, AccessIntent::Interactive, &c);
+        drop(v1);
+        assert_eq!(cache.len(), 1);
+
+        let offered = Arc::new(AtomicU64::new(0));
+        let evictee = Arc::downgrade(&cache);
+        let (between, counted) = (Arc::clone(&c), Arc::clone(&offered));
+        assert!(
+            budget
+                .register_evictor(Box::new(move |want, cause| {
+                    let Some(cache) = evictee.upgrade() else {
+                        return 0;
+                    };
+                    let freed = cache.evict_for_pressure(want, cause);
+                    cache.offer(key(1, 1), &col(8), AccessIntent::Interactive, &between);
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    freed
+                }))
+                .is_ok()
+        );
+
+        budget
+            .try_reserve(LIMIT - b)
+            .expect("the query takes the rest");
+        assert_eq!(budget.unreserved(), 0);
+        budget
+            .try_reserve(b)
+            .expect("the freed entry's bytes reach the refused caller");
+        assert_eq!(
+            offered.load(Ordering::Relaxed),
+            1,
+            "an offer ran in between"
+        );
+        let s = c.snapshot();
+        assert_eq!((s.admissions, s.margin_skips), (1, 1));
+        assert!(cache.is_empty());
+        assert_eq!(budget.reserved(), LIMIT);
+        assert_eq!(budget.accounted_refusals(), 0);
     }
 }

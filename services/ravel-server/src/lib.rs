@@ -3504,10 +3504,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 // already holds the budget.
                 let evictee = Arc::downgrade(&cache);
                 if process_memory_budget
-                    .register_evictor(Box::new(move |want| {
+                    .register_evictor(Box::new(move |want, cause| {
                         evictee
                             .upgrade()
-                            .map_or(0, |cache| cache.evict_for_pressure(want))
+                            .map_or(0, |cache| cache.evict_for_pressure(want, cause))
                     }))
                     .is_err()
                 {

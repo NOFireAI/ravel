@@ -44,9 +44,10 @@ pub struct MemoryBudget {
 }
 
 /// A pressure evictor: asked to free at least the given number of bytes held
-/// on the budget, it returns the bytes it actually freed. It must count only
-/// bytes whose reservations it has already released.
-pub type Evictor = dyn Fn(u64) -> u64 + Send + Sync;
+/// on the budget, for a refusal of the given cause, it returns the bytes it
+/// actually freed. It must count only bytes whose reservations it has already
+/// released.
+pub type Evictor = dyn Fn(u64, ExhaustionCause) -> u64 + Send + Sync;
 
 impl fmt::Debug for MemoryBudget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -363,12 +364,24 @@ impl MemoryBudget {
                 .saturating_add(n)
                 .max(ledger_shortfall),
         };
-        let freed = evictor(shortfall);
+        let freed = evictor(shortfall, refusal.cause);
         drop(guard);
-        match refusal.cause {
+        let retried = match refusal.cause {
             ExhaustionCause::HostMemory { .. } if freed >= shortfall => self.admit_ledger(n),
             _ => self.admit(n),
+        };
+        if let Err(standing) = &retried {
+            tracing::warn!(
+                target: "ravel_memory",
+                requested = n,
+                freed,
+                reserved = standing.reserved,
+                limit = standing.limit,
+                cause = standing.cause.name(),
+                "reservation refused after the pressure evictor ran"
+            );
         }
+        retried
     }
 
     /// `try_reserve`'s gate and ledger checks, counting nothing: the one
@@ -389,10 +402,20 @@ impl MemoryBudget {
     ///
     /// [`admit`]: MemoryBudget::admit
     fn admit_ledger(&self, n: u64) -> Result<(), MemoryExhausted> {
+        self.admit_ledger_under(n, self.limit)
+    }
+
+    /// [`admit_ledger`] against `ceiling` (at most `limit`) in place of
+    /// `limit`: the check and the CAS are one step, so concurrent callers
+    /// never take the ledger past `ceiling` together. A refusal still reports
+    /// `limit`.
+    ///
+    /// [`admit_ledger`]: MemoryBudget::admit_ledger
+    fn admit_ledger_under(&self, n: u64, ceiling: u64) -> Result<(), MemoryExhausted> {
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
             let next = match current.checked_add(n) {
-                Some(next) if next <= self.limit => next,
+                Some(next) if next <= ceiling => next,
                 _ => {
                     return Err(MemoryExhausted {
                         requested: n,
@@ -603,6 +626,36 @@ impl MemoryBudget {
         Ok(self.fetch_reservation(n))
     }
 
+    /// [`reserve_best_effort`] that also keeps at least `headroom` bytes
+    /// unreserved after the reservation: it admits only while the gate is
+    /// open and `reserved() + n <= limit - headroom`. The headroom check and
+    /// the reservation are one CAS, so concurrent callers cannot all pass a
+    /// check only one of them fits. A refusal for the headroom alone is an
+    /// [`ExhaustionCause::Accounted`] one whose `reserved + requested` is
+    /// still within `limit`.
+    ///
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
+    pub fn reserve_best_effort_keeping(
+        self: &Arc<Self>,
+        n: u64,
+        headroom: u64,
+    ) -> Result<Reservation, MemoryExhausted> {
+        if n > 0
+            && !self.gate_open()
+            && let Some(refusal) = self.refuse_host_memory(n)
+        {
+            return Err(refusal);
+        }
+        self.admit_ledger_under(n, self.limit.saturating_sub(headroom))?;
+        Ok(self.fetch_reservation(n))
+    }
+
+    /// Bytes the ledger could still admit: `limit - reserved()`, saturating
+    /// at 0 when a `reserve_unchecked` caller took it past `limit`.
+    pub fn unreserved(&self) -> u64 {
+        self.limit.saturating_sub(self.reserved())
+    }
+
     /// A guard over `n` bytes already admitted to the ledger, counted in
     /// `fetch_reserved()`.
     fn fetch_reservation(self: &Arc<Self>, n: u64) -> Reservation {
@@ -682,6 +735,16 @@ pub enum ExhaustionCause {
     /// figures as the refusal read them: the host's available memory in
     /// bytes, and the floor it is below.
     HostMemory { available: u64, floor: u64 },
+}
+
+impl ExhaustionCause {
+    /// The cause's name in log fields: `limit` or `host_gate`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ExhaustionCause::Accounted => "limit",
+            ExhaustionCause::HostMemory { .. } => "host_gate",
+        }
+    }
 }
 
 impl fmt::Display for MemoryExhausted {
@@ -1215,7 +1278,7 @@ mod tests {
         asked: Arc<std::sync::Mutex<Vec<u64>>>,
     ) -> Box<Evictor> {
         let held = std::sync::Mutex::new(Some(held));
-        Box::new(move |want| {
+        Box::new(move |want, _| {
             asked.lock().expect("asked").push(want);
             if !frees {
                 return 0;
@@ -1361,7 +1424,7 @@ mod tests {
         let counted = Arc::clone(&calls);
         assert!(
             budget
-                .register_evictor(Box::new(move |_| {
+                .register_evictor(Box::new(move |_, _| {
                     counted.fetch_add(1, Ordering::Relaxed);
                     if let Some(budget) = inner.upgrade() {
                         budget.try_reserve(1).expect_err("nested: still full");
@@ -1372,7 +1435,86 @@ mod tests {
         );
         budget.try_reserve(1).expect_err("nothing freed");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert!(budget.register_evictor(Box::new(|_| 0)).is_err());
+        assert!(budget.register_evictor(Box::new(|_, _| 0)).is_err());
+    }
+
+    /// A budget of `limit` with `limit - free` bytes already reserved.
+    fn budget_with_free(limit: u64, free: u64) -> Arc<MemoryBudget> {
+        let budget = Arc::new(MemoryBudget::new(limit));
+        budget.reserve_unchecked(limit - free);
+        assert_eq!(budget.unreserved(), free);
+        budget
+    }
+
+    /// `reserve_best_effort_keeping` refuses exactly when the reservation would
+    /// leave fewer than `headroom` bytes unreserved: one byte under refuses
+    /// (reporting a total still within the limit), at the headroom and one
+    /// byte over admit. A closed gate refuses even with the headroom met.
+    #[test]
+    fn keeping_refuses_exactly_below_the_headroom() {
+        const HEADROOM: u64 = 1_000;
+        const N: u64 = 100;
+        let under = budget_with_free(10_000, HEADROOM + N - 1);
+        let err = under
+            .reserve_best_effort_keeping(N, HEADROOM)
+            .expect_err("one byte under the headroom");
+        assert_eq!(err.cause, ExhaustionCause::Accounted);
+        assert!(err.reserved + err.requested <= err.limit, "{err:?}");
+        assert_eq!(under.unreserved(), HEADROOM + N - 1, "nothing reserved");
+        assert_eq!(under.accounted_refusals(), 0, "best effort counts nothing");
+
+        let at = budget_with_free(10_000, HEADROOM + N);
+        let r = at
+            .reserve_best_effort_keeping(N, HEADROOM)
+            .expect("exactly at the headroom");
+        assert_eq!(at.unreserved(), HEADROOM);
+        assert_eq!(at.fetch_reserved(), N);
+        drop(r);
+
+        let over = budget_with_free(10_000, HEADROOM + N + 1);
+        let _r = over
+            .reserve_best_effort_keeping(N, HEADROOM)
+            .expect("one byte above the headroom");
+        assert_eq!(over.unreserved(), HEADROOM + 1);
+
+        let gated = budget_with_free(10_000, 5_000);
+        gated.set_host_memory_gate(false, 4, 5);
+        let err = gated
+            .reserve_best_effort_keeping(N, HEADROOM)
+            .expect_err("closed gate");
+        assert!(matches!(err.cause, ExhaustionCause::HostMemory { .. }));
+    }
+
+    /// N threads racing `reserve_best_effort_keeping` on a budget with room
+    /// for one reservation above the headroom (and `n - 1` bytes to spare)
+    /// admit exactly one, and the headroom holds. A check read apart from the
+    /// CAS would let several pass.
+    #[test]
+    fn concurrent_keeping_reservations_never_eat_into_the_headroom() {
+        const HEADROOM: u64 = 1 << 30;
+        const N: u64 = 4_096;
+        const THREADS: usize = 16;
+        for _ in 0..200 {
+            let budget = budget_with_free(4 << 30, HEADROOM + 2 * N - 1);
+            let barrier = std::sync::Barrier::new(THREADS);
+            let admitted: Vec<Reservation> = thread::scope(|s| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            budget.reserve_best_effort_keeping(N, HEADROOM).ok()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().expect("thread"))
+                    .collect()
+            });
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(budget.unreserved(), HEADROOM + N - 1);
+            assert!(budget.unreserved() >= HEADROOM);
+        }
     }
 
     #[test]

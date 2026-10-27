@@ -191,6 +191,7 @@ pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
         "admissions": stats.counters.admissions,
         "evictions": stats.counters.evictions,
         "ghostHits": stats.counters.ghost_hits,
+        "marginSkips": stats.counters.margin_skips,
         "residentBytes": stats.resident_bytes,
         "pressureEvictions": stats.pressure.evictions,
         "pressureFreedBytes": stats.pressure.freed_bytes,
@@ -268,7 +269,7 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
-    /// `decoded_cache_json` renders exactly the eight ADR-3326 keys, each
+    /// `decoded_cache_json` renders exactly the nine ADR-3326 keys, each
     /// carrying its own distinct source figure.
     #[test]
     fn decoded_cache_json_names_every_field_exactly_once() {
@@ -279,6 +280,7 @@ mod tests {
                 admissions: 3,
                 evictions: 4,
                 ghost_hits: 5,
+                margin_skips: 9,
             },
             resident_bytes: 6,
             pressure: ravel_logseg::decoded_cache::PressureSnapshot {
@@ -295,6 +297,7 @@ mod tests {
                 "admissions": 3,
                 "evictions": 4,
                 "ghostHits": 5,
+                "marginSkips": 9,
                 "residentBytes": 6,
                 "pressureEvictions": 7,
                 "pressureFreedBytes": 8,

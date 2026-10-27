@@ -31,12 +31,13 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const ROWS: usize = 500;
 const DECODED_CACHE: u64 = 64 * 1024 * 1024;
 const STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE severity_text = 'INFO'";
-const FIELDS: [&str; 8] = [
+const FIELDS: [&str; 9] = [
     "hits",
     "misses",
     "admissions",
     "evictions",
     "ghostHits",
+    "marginSkips",
     "residentBytes",
     "pressureEvictions",
     "pressureFreedBytes",

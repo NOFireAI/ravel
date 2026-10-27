@@ -33,7 +33,9 @@ const TENANT: &str = "acme";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const ROWS: usize = 1_000;
 const BODY_BYTES: usize = 1_536;
-const PROCESS_BUDGET: u64 = 64 * 1024 * 1024;
+/// 64 MiB above the decoded cache's 1 GiB admission margin, so the wide
+/// statement's columns can be admitted.
+const PROCESS_BUDGET: u64 = (1 << 30) + 64 * 1024 * 1024;
 const DECODED_CACHE: u64 = 64 * 1024 * 1024;
 const WIDE: &str = "SELECT count(*) AS n, sum(length(body)) AS b FROM logs \
                     WHERE severity_text = 'INFO'";
