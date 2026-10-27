@@ -80,6 +80,33 @@ fn within_ulps(a: f64, b: f64, max_ulps: u32) -> bool {
     ordered_key(a).abs_diff(ordered_key(b)) <= u64::from(max_ulps)
 }
 
+/// The number of representable f64 steps between `a` and `b`, counted on
+/// the same ordered bit line [`within_ulps`] measures, except that `-0.0`
+/// and `0.0` are one point on it, so a pair straddling zero counts the
+/// steps on each side. This is a measure, not a match rule: `within_ulps`
+/// still never matches across the zero boundary. Two NaNs (of any payload)
+/// are 0 apart, as the comparator treats them as one class; any other pair
+/// with a NaN or an infinity is `None` unless both bit patterns are equal.
+pub fn ulp_distance(a: f64, b: f64) -> Option<u64> {
+    if a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()) {
+        return Some(0);
+    }
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    Some(distance_key(a).abs_diff(distance_key(b)))
+}
+
+/// [`ordered_key`] with both zeros mapped to one key.
+fn distance_key(x: f64) -> u64 {
+    let magnitude = x.to_bits() & !(1u64 << 63);
+    if x.is_sign_negative() {
+        (1u64 << 63) - magnitude
+    } else {
+        (1u64 << 63) + magnitude
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Match,
@@ -706,6 +733,48 @@ mod tests {
             compare(ComparisonMode::Unordered, Some(4), &prom, &ravel),
             Verdict::Mismatch(_)
         ));
+    }
+
+    #[test]
+    fn ulp_distance_counts_representable_steps() {
+        let up = |x: f64, n: u64| f64::from_bits(x.to_bits() + n);
+        assert_eq!(ulp_distance(1.5, 1.5), Some(0));
+        assert_eq!(ulp_distance(1.5, up(1.5, 1)), Some(1));
+        assert_eq!(ulp_distance(up(1.5, 3), 1.5), Some(3));
+        assert_eq!(ulp_distance(-1.5, -up(1.5, 2)), Some(2));
+        // The step below 2.0 is half the step above it.
+        assert_eq!(
+            ulp_distance(f64::from_bits(2.0f64.to_bits() - 1), up(2.0, 1)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn ulp_distance_across_zero_treats_both_zeros_as_one_point() {
+        let tiny = f64::from_bits(1);
+        assert_eq!(ulp_distance(-0.0, 0.0), Some(0));
+        assert_eq!(ulp_distance(0.0, tiny), Some(1));
+        assert_eq!(ulp_distance(-0.0, tiny), Some(1));
+        assert_eq!(ulp_distance(-tiny, 0.0), Some(1));
+        assert_eq!(ulp_distance(-tiny, tiny), Some(2));
+        assert_eq!(
+            ulp_distance(-f64::from_bits(5), f64::from_bits(7)),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn ulp_distance_is_none_for_a_non_finite_mismatch() {
+        let other_nan = f64::from_bits(f64::NAN.to_bits() ^ 1);
+        assert!(other_nan.is_nan());
+        assert_eq!(ulp_distance(f64::NAN, other_nan), Some(0));
+        assert_eq!(ulp_distance(f64::INFINITY, f64::INFINITY), Some(0));
+        assert_eq!(ulp_distance(f64::NEG_INFINITY, f64::NEG_INFINITY), Some(0));
+        assert_eq!(ulp_distance(f64::NAN, 1.0), None);
+        assert_eq!(ulp_distance(1.0, f64::NAN), None);
+        assert_eq!(ulp_distance(f64::INFINITY, f64::MAX), None);
+        assert_eq!(ulp_distance(f64::INFINITY, f64::NEG_INFINITY), None);
+        assert_eq!(ulp_distance(f64::NAN, f64::INFINITY), None);
     }
 
     #[test]

@@ -99,6 +99,9 @@ enum Answer {
     Diverge,
     /// The fixed series two ULPs above the correct value.
     TwoUlps,
+    /// The fixed series one ULP above the correct value at the first step
+    /// and three above it at the second; an instant answer is one above.
+    RampUlps,
     /// `success` with no series.
     Empty,
     /// HTTP 422, Mimir's chunk-limit refusal.
@@ -150,6 +153,12 @@ fn series(value: &str, kind: &'static str, params: &HashMap<String, String>) -> 
         let end: f64 = params["end"].parse().unwrap();
         json!({"resultType": "matrix", "result": [{"metric": metric, "values": [[start, value], [end, value]]}]})
     }
+}
+
+/// The correct value, 1.5, moved `n` representable steps up, as the
+/// shortest string that parses back to it.
+fn ulps_above_correct(n: u64) -> String {
+    f64::from_bits(1.5f64.to_bits() + n).to_string()
 }
 
 async fn answer(
@@ -208,6 +217,13 @@ async fn answer(
         Answer::Correct => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
         Answer::Diverge => axum::Json(json!({"status": "success", "data": series("99", kind, &params)})).into_response(),
         Answer::TwoUlps => axum::Json(json!({"status": "success", "data": series("1.5000000000000004", kind, &params)})).into_response(),
+        Answer::RampUlps => {
+            let mut data = series(&ulps_above_correct(1), kind, &params);
+            if kind == "range" {
+                data["result"][0]["values"][1][1] = json!(ulps_above_correct(3));
+            }
+            axum::Json(json!({"status": "success", "data": data})).into_response()
+        }
         Answer::Empty => {
             let result_type = if kind == "instant" { "vector" } else { "matrix" };
             axum::Json(json!({"status": "success", "data": {"resultType": result_type, "result": []}})).into_response()
@@ -469,6 +485,8 @@ fn provenance(corpus_bytes: &[u8]) -> Provenance {
 struct Run {
     output: Output,
     out: PathBuf,
+    /// Written only by a [`run_bin_corpus`] that asked for it.
+    diagnostics: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -489,8 +507,22 @@ async fn run_bin_with(
     warmup: u32,
     extra: &[&str],
 ) -> Run {
+    run_bin_corpus(ingest, urls, warmup, extra, &corpus(), false).await
+}
+
+/// [`run_bin_with`] over `corpus`, with `--diagnostics` at
+/// [`Run::diagnostics`] when `diagnostics` is set.
+async fn run_bin_corpus(
+    ingest: MetricsIngestReport,
+    urls: &Urls,
+    warmup: u32,
+    extra: &[&str],
+    corpus: &Json,
+    diagnostics: bool,
+) -> Run {
     let dir = tempfile::tempdir().expect("tempdir");
-    let corpus_bytes = serde_json::to_vec_pretty(&corpus()).expect("corpus");
+    let diagnostics_path = dir.path().join("diagnostics.json");
+    let corpus_bytes = serde_json::to_vec_pretty(corpus).expect("corpus");
     let corpus_path = dir.path().join("corpus.json");
     std::fs::write(&corpus_path, &corpus_bytes).expect("write corpus");
     let ingest_path = dir.path().join("ingest.json");
@@ -535,6 +567,9 @@ async fn run_bin_with(
         .arg("--out")
         .arg(&out)
         .env(RAVEL_TOKEN_ENV, RAVEL_TOKEN);
+    if diagnostics {
+        command.arg("--diagnostics").arg(&diagnostics_path);
+    }
     let output =
         tokio::task::spawn_blocking(move || command.output().expect("run metricsbench_query"))
             .await
@@ -542,6 +577,7 @@ async fn run_bin_with(
     Run {
         output,
         out,
+        diagnostics: diagnostics_path,
         _dir: dir,
     }
 }
@@ -607,6 +643,7 @@ async fn the_corpus_runs_against_every_engine_and_validates() {
     );
     let text = std::fs::read_to_string(&run.out).expect("report written");
     let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    assert!(!run.diagnostics.exists(), "no --diagnostics, no sidecar");
 
     let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
         .arg("validate")
@@ -1063,7 +1100,8 @@ fn config<'a>(report: &'a MetricsBenchReport, key: &str) -> Option<&'a str> {
 /// An oracle query that times out once is re-sent, and the run completes:
 /// the other engines are classified against the retried answer, the
 /// provenance config records one retry on the entry, and Prometheus' own row
-/// keeps the first attempt's timeout. Fails against a runner that does not
+/// keeps the first attempt's timeout. The diagnostics sidecar records the
+/// retry's entry, pass, repetition and attempt. Fails against a runner that does not
 /// retry (the run is void) and against one that records the retried
 /// attempt on Prometheus' row (every pass would be `ok`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1072,9 +1110,15 @@ async fn an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt() {
     let (prometheus, url) = spawn_stub(&[(GAUGE, Answer::HangFirst(1))], None).await;
     s.prometheus = prometheus;
     s.urls.prometheus = url;
-    let run = run_bin_with(ingest_report(&s.urls), &s.urls, 0, &[]).await;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
     let err = stderr(&run.output);
     assert!(run.output.status.success(), "{err}");
+    let diagnostics: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(
+        diagnostics["oracle_retries"],
+        json!([{"entry": "mb_single_gauge_instant", "pass": 1, "repetition": 1, "attempt": 2}])
+    );
     let report: MetricsBenchReport =
         serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
 
@@ -1161,4 +1205,103 @@ async fn an_oracle_4xx_is_not_retried() {
     assert!(!err.contains("oracle retry"), "{err}");
     assert!(!run.out.exists());
     assert_eq!(s.prometheus.count("/api/v1/query", GAUGE), 1);
+}
+
+/// The diagnostics sidecar's `ulp_gaps` entry for (`entry`, `engine`).
+fn ulp_gap<'a>(diagnostics: &'a Json, entry: &str, engine: &str) -> &'a Json {
+    diagnostics["ulp_gaps"]
+        .as_array()
+        .expect("ulp_gaps")
+        .iter()
+        .find(|g| g["entry"] == entry && g["engine"] == engine)
+        .unwrap_or_else(|| panic!("no ulp gap for {engine}/{entry}"))
+}
+
+/// `--diagnostics` writes each non-oracle engine's largest ULP gap to the
+/// oracle per entry, over every step, repetition and pass. Ravel answers
+/// the range entry one ULP off at its first step and three at its second,
+/// inside the entry's 16-ULP tolerance, so the row is `ok` and the gap is 3:
+/// fails against a sidecar that keeps the first step's distance (1) and
+/// against one that writes 0 whenever the comparator matched. Ravel's
+/// two-ULP instant answer records 2, an exact answer 0, and a refusal, a
+/// timeout and an unsupported-by-declaration entry null.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_diagnostics_sidecar_records_the_largest_ulp_gap() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(COUNTER_RATE, Answer::RampUlps), (GAUGE, Answer::TwoUlps)],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let mut corpus = corpus();
+    let entry = &mut corpus["entries"][1];
+    assert_eq!(entry["id"], "mb_single_counter_rate");
+    entry["tolerance_ulps"] = json!(16);
+    entry["modified"] = json!({"modified": {"reason": "diagnostics test tolerance"}});
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus, true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_counter_rate").status,
+        ResultStatus::Ok
+    );
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_gauge_instant").status,
+        ResultStatus::Incorrect
+    );
+
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(d["profile"], "ci");
+    assert_eq!(d["oracle"], "prometheus");
+    let corpus_bytes = serde_json::to_vec_pretty(&corpus).expect("corpus");
+    assert_eq!(
+        d["corpus_digest"],
+        format!("blake3:{}", blake3::hash(&corpus_bytes).to_hex())
+    );
+    assert_eq!(d["oracle_retries"], json!([]));
+    // Three non-oracle engines by four entries; the oracle has none.
+    assert_eq!(d["ulp_gaps"].as_array().expect("ulp_gaps").len(), 12);
+
+    let answers = u64::from(PASSES * REPS);
+    let ramp = ulp_gap(&d, "mb_single_counter_rate", "ravel");
+    assert_eq!(ramp["max_ulps"], 3, "{ramp}");
+    assert_eq!(ramp["aligned_answers"], answers);
+    assert_eq!(ramp["unaligned_answers"], 0);
+    assert_eq!(ramp["value_pairs"], 2 * answers);
+    assert_eq!(ramp["non_finite_mismatches"], 0);
+    assert_eq!(
+        ulp_gap(&d, "mb_single_gauge_instant", "ravel")["max_ulps"],
+        2
+    );
+    let exact = ulp_gap(&d, "mb_selective_job_rate_sum", "ravel");
+    assert_eq!(exact["max_ulps"], 0, "{exact}");
+    assert_eq!(exact["aligned_answers"], answers);
+    assert_eq!(
+        ulp_gap(&d, "mb_single_counter_rate", "victoriametrics")["max_ulps"],
+        0
+    );
+
+    for (entry, engine, unaligned) in [
+        ("mb_selective_job_rate_sum", "mimir", answers),
+        ("mb_single_counter_rate", "mimir", answers),
+        ("mb_histogram_native_p95", "victoriametrics", 0),
+    ] {
+        let gap = ulp_gap(&d, entry, engine);
+        assert_eq!(gap["max_ulps"], Json::Null, "{engine}/{entry}: {gap}");
+        assert_eq!(gap["aligned_answers"], 0, "{engine}/{entry}: {gap}");
+        assert_eq!(
+            gap["unaligned_answers"], unaligned,
+            "{engine}/{entry}: {gap}"
+        );
+    }
+    let diverged = ulp_gap(&d, "mb_single_gauge_instant", "victoriametrics");
+    assert!(
+        diverged["max_ulps"].as_u64().expect("aligned") > 1 << 40,
+        "{diverged}"
+    );
 }
