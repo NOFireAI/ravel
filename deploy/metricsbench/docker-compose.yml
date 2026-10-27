@@ -83,8 +83,10 @@ services:
       # raised value covers the case where the falsification run refutes the
       # per-series model and the flag counts samples read instead: the same
       # statement then reads 400,000 x 240 = 96,000,000, above the default.
-      # The bound is set so no corpus statement is refused on this count; the
-      # 4g envelope is the memory bound.
+      # Any value above that refuses no corpus statement on this count;
+      # 500000000 is the one value frozen alike for Prometheus, Mimir's
+      # querier.max_samples and Ravel's --max-samples (#3306). The 4g
+      # envelope is the memory bound.
       - "--query.max-samples=500000000"
       # Query timeout: equals the 3.13.1 default 2m, written so the effective
       # config capture shows it and a default change cannot move it silently.

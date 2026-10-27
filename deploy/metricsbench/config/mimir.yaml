@@ -222,13 +222,20 @@ limits:
   # Chunk budget: replaces the default 2000000 (-querier.max-fetched-chunks-
   # per-query). Sized at 120 samples per chunk, which the 3.2.3 binary
   # produced for this stream shape (a shipped 2h block of 20 series at 15s
-  # held 9,600 samples in 80 chunks). A query cannot fetch more chunks than
-  # the profile holds, and the cardinality profile's whole stream is
-  # 1,000,000 series * 360 samples / 120 = 3,000,000 chunks, up to 4,000,000
-  # where a 2h block boundary cuts each series once; out-of-order chunks (at
-  # most 32 samples, -blocks-storage.tsdb.out-of-order-capacity-max) add to
-  # it, and 5000000 covers both. The largest history read,
-  # mb_long_range_7d_avg, is 1,000 * 40,320 / 120 = 336,000 chunks.
+  # held 9,600 samples in 80 chunks). Sized per statement, counting a
+  # shipped block twice: with query_ingesters_within and query_store_after
+  # both 0s, the querier fetches the overlap from the ingester and the
+  # store-gateway alike. The largest read in the corpus is
+  # mb_full_range_avg_over_time on cardinality, 96,000,000 samples (see
+  # docker-compose.yml) = 800,000 chunks, up to 1,200,000 where a 2h block
+  # boundary cuts each series once; counted twice, 2,400,000, above the
+  # default. The largest history read, mb_long_range_7d_avg, is
+  # 1,000 * 40,320 / 120 = 336,000 chunks (672,000 counted twice).
+  # Out-of-order chunks (at most 32 samples,
+  # -blocks-storage.tsdb.out-of-order-capacity-max) add at most one per
+  # out-of-order sample: one in 800 (workload.json out_of_order_one_in),
+  # 450,000 across cardinality's whole 360,000,000-sample stream. 5000000
+  # covers the sum.
   max_fetched_chunks_per_query: 5000000
   # Mimir query engine memory budget: replaces the default 0 ("0 to
   # disable") with 2 GiB. -help-all marks it [experimental] and says it is
