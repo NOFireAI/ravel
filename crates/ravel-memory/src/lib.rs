@@ -19,16 +19,20 @@
 //! #2806): a flag that, while closed, makes every `try_reserve` of more than
 //! zero bytes refuse with [`ExhaustionCause::HostMemory`], whatever the
 //! ledger holds. See [`MemoryBudget::set_host_memory_gate`].
+//!
+//! A budget can carry one evictor (ADR-3326 decision 4): a callback a refused
+//! `try_reserve` asks to free memory before the refusal stands. See
+//! [`MemoryBudget::register_evictor`].
 
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::{Arc, OnceLock};
 
 /// A process-wide (or scope-wide) accounting of reserved bytes against a
 /// fixed limit. All operations are lock-free and safe to call from any
 /// number of threads concurrently.
-#[derive(Debug)]
 pub struct MemoryBudget {
     limit: u64,
     reserved: AtomicU64,
@@ -36,6 +40,47 @@ pub struct MemoryBudget {
     handoff_overlap: AtomicU64,
     gate: ResidentGate,
     refusals: RefusalCounts,
+    evictor: OnceLock<Box<Evictor>>,
+}
+
+/// A pressure evictor: asked to free at least the given number of bytes held
+/// on the budget, it returns the bytes it actually freed. It must count only
+/// bytes whose reservations it has already released.
+pub type Evictor = dyn Fn(u64) -> u64 + Send + Sync;
+
+impl fmt::Debug for MemoryBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryBudget")
+            .field("limit", &self.limit)
+            .field("reserved", &self.reserved)
+            .field("fetch_reserved", &self.fetch_reserved)
+            .field("handoff_overlap", &self.handoff_overlap)
+            .field("gate", &self.gate)
+            .field("refusals", &self.refusals)
+            .field("evictor", &self.evictor.get().is_some())
+            .finish()
+    }
+}
+
+thread_local! {
+    /// Set while this thread runs an evictor, so a reservation the evictor
+    /// itself makes cannot call back into one.
+    static EVICTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Holds [`EVICTING`] set for its lifetime; `None` when it was already set.
+struct EvictingGuard;
+
+impl EvictingGuard {
+    fn enter() -> Option<Self> {
+        EVICTING.with(|flag| (!flag.replace(true)).then_some(EvictingGuard))
+    }
+}
+
+impl Drop for EvictingGuard {
+    fn drop(&mut self) {
+        EVICTING.with(|flag| flag.set(false));
+    }
 }
 
 /// The memory gate's state (ADR-2633 section 1, as amended for issues #2806
@@ -99,7 +144,29 @@ impl MemoryBudget {
                 accounted: AtomicU64::new(0),
                 gate: AtomicU64::new(0),
             },
+            evictor: OnceLock::new(),
         }
+    }
+
+    /// Registers this budget's one evictor. Returns the evictor back when one
+    /// is already registered.
+    ///
+    /// Once registered, a `try_reserve` (and so a [`reserve`]) that its gate or
+    /// ledger check would refuse first calls the evictor with the shortfall
+    /// and checks once more; the refusal stands, and is counted, only if that
+    /// second check refuses too. For a ledger refusal the shortfall is the
+    /// bytes over `limit`, and the second check is the ordinary one. For a
+    /// gate refusal it is the larger of the request plus the bytes the host
+    /// reading is below the floor and the ledger's own shortfall; when the
+    /// evictor freed at least that much, the second check waives the gate
+    /// (which only the sampler reopens) and applies the ledger alone.
+    /// [`reserve_best_effort`] never calls the evictor, and neither does a
+    /// reservation made while this thread is already running one.
+    ///
+    /// [`reserve`]: MemoryBudget::reserve
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
+    pub fn register_evictor(&self, evictor: Box<Evictor>) -> Result<(), Box<Evictor>> {
+        self.evictor.set(evictor)
     }
 
     /// Records a host available-memory reading, the floor it was compared
@@ -257,11 +324,51 @@ impl MemoryBudget {
     /// `u64::MAX`, still refuses at the ceiling instead of recording fewer
     /// bytes than it admitted).
     ///
+    /// Eviction rule: with an evictor registered, either refusal first asks it
+    /// to free the shortfall and checks once more (see [`register_evictor`]).
+    ///
     /// [`accounted_refusals`]: MemoryBudget::accounted_refusals
     /// [`gate_refusals`]: MemoryBudget::gate_refusals
+    /// [`register_evictor`]: MemoryBudget::register_evictor
     pub fn try_reserve(&self, n: u64) -> Result<(), MemoryExhausted> {
-        self.admit(n)
-            .inspect_err(|refusal| self.count_refusal(refusal))
+        match self.admit(n) {
+            Ok(()) => Ok(()),
+            Err(refusal) => self
+                .evict_and_retry(n, refusal)
+                .inspect_err(|refusal| self.count_refusal(refusal)),
+        }
+    }
+
+    /// The registered evictor's one chance to turn `refusal` into an
+    /// admission; see [`register_evictor`] for the shortfall and the retry.
+    ///
+    /// [`register_evictor`]: MemoryBudget::register_evictor
+    #[cold]
+    #[inline(never)]
+    fn evict_and_retry(&self, n: u64, refusal: MemoryExhausted) -> Result<(), MemoryExhausted> {
+        let Some(evictor) = self.evictor.get() else {
+            return Err(refusal);
+        };
+        let Some(guard) = EvictingGuard::enter() else {
+            return Err(refusal);
+        };
+        let ledger_shortfall = refusal
+            .reserved
+            .checked_add(n)
+            .map_or(u64::MAX, |total| total.saturating_sub(self.limit));
+        let shortfall = match refusal.cause {
+            ExhaustionCause::Accounted => ledger_shortfall,
+            ExhaustionCause::HostMemory { available, floor } => floor
+                .saturating_sub(available)
+                .saturating_add(n)
+                .max(ledger_shortfall),
+        };
+        let freed = evictor(shortfall);
+        drop(guard);
+        match refusal.cause {
+            ExhaustionCause::HostMemory { .. } if freed >= shortfall => self.admit_ledger(n),
+            _ => self.admit(n),
+        }
     }
 
     /// `try_reserve`'s gate and ledger checks, counting nothing: the one
@@ -275,6 +382,13 @@ impl MemoryBudget {
         {
             return Err(refusal);
         }
+        self.admit_ledger(n)
+    }
+
+    /// The ledger half of [`admit`]: the limit and overflow rules alone.
+    ///
+    /// [`admit`]: MemoryBudget::admit
+    fn admit_ledger(&self, n: u64) -> Result<(), MemoryExhausted> {
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
             let next = match current.checked_add(n) {
@@ -1090,6 +1204,175 @@ mod tests {
             reserved / 128 != gate / 128,
             "reserved at offset {reserved} shares the gate's block at {gate}"
         );
+    }
+
+    /// An evictor over a held reservation: each call records the bytes it was
+    /// asked for, then drops up to `frees` bytes of `held` (all of it, or
+    /// nothing when `frees` is 0) and reports what it dropped.
+    fn evictor_over(
+        held: Reservation,
+        frees: bool,
+        asked: Arc<std::sync::Mutex<Vec<u64>>>,
+    ) -> Box<Evictor> {
+        let held = std::sync::Mutex::new(Some(held));
+        Box::new(move |want| {
+            asked.lock().expect("asked").push(want);
+            if !frees {
+                return 0;
+            }
+            held.lock().expect("held").take().map_or(0, |r| r.size())
+        })
+    }
+
+    /// At the limit, a refused reservation is admitted when the evictor frees
+    /// enough, asked for exactly the bytes over the limit; one that frees too
+    /// little leaves the refusal standing and counted; with no evictor the
+    /// refusal is as before.
+    ///
+    /// FLIP: return `Err(refusal)` at the top of `evict_and_retry` and the
+    /// first `expect` fails.
+    #[test]
+    fn an_evictor_turns_a_ledger_refusal_into_an_admission_only_when_it_frees_enough() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        let held = budget.reserve(80).expect("80 of 100");
+        budget.try_reserve(20).expect("100 of 100");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            budget
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .is_ok()
+        );
+        budget
+            .try_reserve(30)
+            .expect("the evictor frees 80, so 30 fits");
+        assert_eq!(*asked.lock().expect("asked"), vec![30]);
+        assert_eq!(budget.reserved(), 50);
+        assert_eq!(budget.accounted_refusals(), 0);
+
+        let starved = Arc::new(MemoryBudget::new(100));
+        let held = starved.reserve(80).expect("80 of 100");
+        starved.try_reserve(20).expect("100 of 100");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            starved
+                .register_evictor(evictor_over(held, false, Arc::clone(&asked)))
+                .is_ok()
+        );
+        let err = starved.try_reserve(30).expect_err("nothing freed");
+        assert_eq!(err.cause, ExhaustionCause::Accounted);
+        assert_eq!(*asked.lock().expect("asked"), vec![30]);
+        assert_eq!(starved.reserved(), 100);
+        assert_eq!(starved.accounted_refusals(), 1);
+
+        let bare = Arc::new(MemoryBudget::new(100));
+        bare.try_reserve(100).expect("100 of 100");
+        assert_eq!(
+            bare.try_reserve(30).expect_err("no evictor"),
+            MemoryExhausted {
+                requested: 30,
+                reserved: 100,
+                limit: 100,
+                cause: ExhaustionCause::Accounted,
+            }
+        );
+        assert_eq!(bare.accounted_refusals(), 1);
+    }
+
+    /// A closed gate refusal asks the evictor for the request plus the bytes
+    /// the host is below its floor, and admits through the ledger alone when
+    /// that much was freed; a shorter free keeps the gate refusal.
+    #[test]
+    fn an_evictor_turns_a_gate_refusal_into_an_admission_only_when_it_frees_enough() {
+        let budget = Arc::new(MemoryBudget::new(1_000));
+        let held = budget.reserve(500).expect("500 of 1000");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            budget
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .is_ok()
+        );
+        budget.set_host_memory_gate(false, 300, 600);
+        budget
+            .try_reserve(10)
+            .expect("500 freed covers 300 below the floor plus 10");
+        assert_eq!(*asked.lock().expect("asked"), vec![310]);
+        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.gate_refusals(), 0);
+
+        let short = Arc::new(MemoryBudget::new(1_000));
+        let held = short.reserve(100).expect("100 of 1000");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            short
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .is_ok()
+        );
+        short.set_host_memory_gate(false, 300, 600);
+        let err = short
+            .try_reserve(10)
+            .expect_err("100 freed is short of 310");
+        assert!(matches!(err.cause, ExhaustionCause::HostMemory { .. }));
+        assert_eq!(*asked.lock().expect("asked"), vec![310]);
+        assert_eq!(short.reserved(), 0, "the evictor still released its 100");
+        assert_eq!(short.gate_refusals(), 1);
+
+        let bare = Arc::new(MemoryBudget::new(1_000));
+        bare.set_host_memory_gate(false, 300, 600);
+        bare.try_reserve(10).expect_err("no evictor, closed gate");
+        assert_eq!(bare.gate_refusals(), 1);
+    }
+
+    /// `reserve_best_effort` refuses without asking the evictor.
+    ///
+    /// FLIP: call `try_reserve` in place of `admit` in `reserve_best_effort`
+    /// and `asked` is `[1]`.
+    #[test]
+    fn best_effort_never_calls_the_evictor() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        let held = budget.reserve(100).expect("100 of 100");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            budget
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .is_ok()
+        );
+        budget
+            .reserve_best_effort(1)
+            .expect_err("a full ledger refuses the best-effort path");
+        budget.set_host_memory_gate(false, 4, 5);
+        budget
+            .reserve_best_effort(0)
+            .expect("zero bytes pass the closed gate");
+        budget
+            .reserve_best_effort(1)
+            .expect_err("a closed gate refuses the best-effort path");
+        assert!(asked.lock().expect("asked").is_empty());
+        assert_eq!(budget.reserved(), 100);
+    }
+
+    /// A reservation the evictor makes while it runs does not call back into
+    /// it, and a second registration is handed back.
+    #[test]
+    fn the_evictor_is_not_reentered_and_registers_once() {
+        let budget = Arc::new(MemoryBudget::new(10));
+        budget.try_reserve(10).expect("10 of 10");
+        let calls = Arc::new(AtomicU64::new(0));
+        let inner = Arc::downgrade(&budget);
+        let counted = Arc::clone(&calls);
+        assert!(
+            budget
+                .register_evictor(Box::new(move |_| {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    if let Some(budget) = inner.upgrade() {
+                        budget.try_reserve(1).expect_err("nested: still full");
+                    }
+                    0
+                }))
+                .is_ok()
+        );
+        budget.try_reserve(1).expect_err("nothing freed");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(budget.register_evictor(Box::new(|_| 0)).is_err());
     }
 
     #[test]

@@ -113,11 +113,31 @@ struct Inner {
     process: DecodedCacheSnapshot,
 }
 
+/// Process-wide totals of [`DecodedColumnCache::evict_for_pressure`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PressureSnapshot {
+    pub evictions: u64,
+    pub freed_bytes: u64,
+}
+
+impl PressureSnapshot {
+    /// The figures moved since `mark`, saturating.
+    #[must_use]
+    pub fn since(&self, mark: &PressureSnapshot) -> PressureSnapshot {
+        PressureSnapshot {
+            evictions: self.evictions.saturating_sub(mark.evictions),
+            freed_bytes: self.freed_bytes.saturating_sub(mark.freed_bytes),
+        }
+    }
+}
+
 /// The process-wide decoded-column cache.
 pub struct DecodedColumnCache {
     max_bytes: u64,
     budget: Option<Arc<MemoryBudget>>,
     inner: Mutex<Inner>,
+    pressure_evictions: AtomicU64,
+    pressure_freed_bytes: AtomicU64,
 }
 
 impl std::fmt::Debug for DecodedColumnCache {
@@ -137,7 +157,62 @@ impl DecodedColumnCache {
             max_bytes,
             budget,
             inner: Mutex::new(Inner::default()),
+            pressure_evictions: AtomicU64::new(0),
+            pressure_freed_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Pressure evictions since construction.
+    pub fn pressure_counters(&self) -> PressureSnapshot {
+        PressureSnapshot {
+            evictions: self.pressure_evictions.load(Ordering::Relaxed),
+            freed_bytes: self.pressure_freed_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The budget's pressure evictor (ADR-3326 decision 4): evicts, in CLOCK
+    /// order, entries no live scan holds until `want` bytes are freed or none
+    /// remains, releasing each one's reservation, and returns the bytes
+    /// freed. An entry a scan still holds stays and counts for nothing.
+    pub fn evict_for_pressure(&self, want: u64) -> u64 {
+        let mut evicted = Vec::new();
+        let mut freed = 0u64;
+        {
+            let mut inner = self.lock();
+            let n = inner.slots.len();
+            // Two sweeps: the first may only clear reference bits.
+            for _ in 0..n.saturating_mul(2) {
+                if freed >= want {
+                    break;
+                }
+                let i = inner.hand % n;
+                inner.hand = (i + 1) % n;
+                let Some(slot) = inner.slots[i].as_mut() else {
+                    continue;
+                };
+                if slot.col.strong_count() > 1 {
+                    continue;
+                }
+                if slot.referenced {
+                    slot.referenced = false;
+                    continue;
+                }
+                if let Some(slot) = inner.slots[i].take() {
+                    inner.index.remove(&slot.key);
+                    inner.resident = inner.resident.saturating_sub(slot.bytes);
+                    inner.free.push(i);
+                    freed = freed.saturating_add(slot.bytes);
+                    evicted.push(slot);
+                }
+            }
+        }
+        self.pressure_evictions
+            .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+        self.pressure_freed_bytes
+            .fetch_add(freed, Ordering::Relaxed);
+        // Buffers and reservations go outside the lock.
+        drop(evicted);
+        freed
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -428,6 +503,47 @@ mod tests {
         cache.offer(key(0, 1), &v, AccessIntent::Interactive, &c);
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The pressure evictor skips an entry a scan still holds and counts only
+    /// the bytes of the entry it held the last handle to, whose reservation it
+    /// released. Asked for more than every unheld entry holds, it returns
+    /// what it freed rather than the request.
+    ///
+    /// FLIP: drop the `strong_count() > 1` skip in `evict_for_pressure` and
+    /// the held entry is evicted, `freed` reads `2 * bytes`.
+    #[test]
+    fn pressure_eviction_never_evicts_or_counts_an_entry_a_scan_holds() {
+        let held = col(8);
+        let idle = col(8);
+        let bytes = held.heap_bytes() as u64;
+        let budget = Arc::new(MemoryBudget::new(1 << 30));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+        cache.offer(key(0, 1), &held, AccessIntent::Interactive, &c);
+        cache.offer(key(1, 1), &idle, AccessIntent::Interactive, &c);
+        drop(idle);
+        assert_eq!(budget.reserved(), 2 * bytes);
+
+        let freed = cache.evict_for_pressure(u64::MAX);
+        assert_eq!(freed, bytes, "only the unheld entry frees");
+        assert_eq!(budget.reserved(), bytes, "its reservation is released");
+        assert_eq!(cache.entry_bytes(&key(0, 1)), Some(bytes), "held stays");
+        assert_eq!(cache.entry_bytes(&key(1, 1)), None);
+        assert_eq!(
+            cache.pressure_counters(),
+            PressureSnapshot {
+                evictions: 1,
+                freed_bytes: bytes,
+            }
+        );
+
+        drop(held);
+        assert_eq!(cache.evict_for_pressure(1), bytes, "unheld now");
+        assert!(cache.is_empty());
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(cache.evict_for_pressure(1), 0, "nothing left");
+        assert_eq!(cache.pressure_counters().evictions, 2);
     }
 
     #[test]
