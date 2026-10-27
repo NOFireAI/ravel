@@ -1868,35 +1868,46 @@ fn the_precondition_table_names_the_string_cap_for_every_command_with_caller_str
 
 #[test]
 fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
-    // Fill the inbox under a generous cap, then shrink the cap to exactly
-    // what the growth guard would have left: used + reserve per input.
-    let mut sim = Sim::new();
-    sim.run(&create_cmd());
-    let n = 24usize;
-    for i in 0..n {
-        sim.run(&enqueue_cmd(sim.head(), &format!("r{i}"), b"p"));
-    }
-    let head = sim.head().clone();
-    let reserve = Limits::default().terminal_reserve_per_input_bytes;
+    // Let the growth guard decide how full the inbox may get under a fixed
+    // cap, then fail every accepted input with a full-length error: each
+    // terminal publish must fit, which only holds when the reserve scales
+    // with the inputs outstanding.
     let limits = Limits {
-        max_head_bytes: head.encode().len() + reserve * n,
+        max_head_bytes: 24 * 1024,
+        max_mailbox_depth: 10_000,
+        max_receipts: 10_000,
         ..Limits::default()
     };
     let error = "e".repeat(limits.max_error_bytes);
     let mut sim = Sim::with_limits(limits);
-    sim.head = Some(head);
-    assert_eq!(
-        sim.refuse(&enqueue_cmd(sim.head(), "one-more", b"p")),
-        ErrorKind::BudgetExceeded,
-        "the root is at its growth cap"
-    );
+    sim.run(&create_cmd());
+    let mut accepted = 0usize;
+    loop {
+        let cmd = enqueue_cmd(sim.head(), &format!("r{accepted}"), b"p");
+        match sim
+            .kernel
+            .apply(Some(sim.head()), &cmd, sim.now, &DerivedIds)
+        {
+            Ok(transition) => {
+                if let Some(head) = transition.head() {
+                    sim.head = Some(head.clone());
+                }
+                accepted += 1;
+            }
+            Err(e) => {
+                assert_eq!(e.kind, ErrorKind::BudgetExceeded);
+                break;
+            }
+        }
+    }
+    assert!(accepted >= 8, "the cap admits a real inbox: {accepted}");
     sim.run(&Command::Takeover(Takeover {
         incarnation: sim.head().incarnation,
         owner_id: "w1".to_string(),
         observed_epoch: sim.head().epoch,
         lease_hint_unix_ns: 0,
     }));
-    for _ in 0..n {
+    for _ in 0..accepted {
         assert!(matches!(
             sim.run(&Command::BeginTurn(BeginTurn {
                 fence: owner_fence(sim.head()),
@@ -1908,18 +1919,24 @@ fn every_outstanding_input_can_be_failed_at_the_byte_cap() {
             })),
             Reply::TurnStarted(_) | Reply::TurnResumed(_)
         ));
-        let reply = sim.run(&Command::FailTurn(FailTurn {
+        let cmd = Command::FailTurn(FailTurn {
             fence: turn_fence(sim.head()),
             error: error.clone(),
             terminal: true,
             max_attempts: 1,
-        }));
-        assert!(
-            matches!(reply, Reply::TurnFailed { .. }),
-            "a terminal failure must publish for every outstanding input: {reply:?}"
-        );
+        });
+        let outcome = sim
+            .kernel
+            .apply(Some(sim.head()), &cmd, sim.now, &DerivedIds);
+        let transition = outcome.unwrap_or_else(|e| {
+            panic!("a terminal failure must publish for every outstanding input: {e:?}")
+        });
+        assert!(matches!(transition.reply(), Reply::TurnFailed { .. }));
+        if let Some(head) = transition.head() {
+            sim.head = Some(head.clone());
+        }
         assert!(sim.head().encode().len() <= sim.kernel.limits.max_head_bytes);
     }
     assert!(sim.head().inbox.is_empty());
-    assert_eq!(sim.head().results.len(), n);
+    assert_eq!(sim.head().results.len(), accepted);
 }
