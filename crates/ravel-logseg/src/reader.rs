@@ -1138,9 +1138,10 @@ fn source_extent<'s, S: ByteSource + ?Sized>(
 /// BLOOM is read when a `content` arm is [`bloom_shaped`]; a `prune` arm
 /// never reads it. POSTINGS is read when a `content` or `prune` arm is an
 /// `Equals` on an attribute, the shape [`RlogReader::postings_arms`] and
-/// [`RlogReader::prune_postings_arms`] probe, and then only when the object
-/// has the section and the attribute resolves to a column, so `postings` is
-/// an upper bound.
+/// [`RlogReader::prune_postings_arms`] probe. Both are upper bounds: the scan
+/// still drops an arm whose field resolves to no column the section covers,
+/// so a `true` here can place a section that the scan then prunes nothing
+/// with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilterSectionReads {
     pub bloom: bool,

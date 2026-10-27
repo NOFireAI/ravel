@@ -481,9 +481,10 @@ pub const EXCLUDED_TABLE_FUNCTIONS: [&str; 2] = ["generate_series", "range"];
 /// at all on a partition that holds fewer rows than that, which is the common
 /// case here once `target_partitions` divides a tenant's hour.
 ///
-/// Not smaller: [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`] is judged from a
-/// sample of exactly this many rows, and a smaller sample starts reading a
-/// genuinely reducible mid-cardinality key as unreducible.
+/// Not smaller: [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`] is first judged on a
+/// sample of this many rows (and re-judged over every row seen until the
+/// partition skips), and a smaller first sample starts reading a genuinely
+/// reducible mid-cardinality key as unreducible.
 pub const SKIP_PARTIAL_AGGREGATION_PROBE_ROWS: usize = 8192;
 
 /// Distinct-groups-to-rows ratio above which a partial aggregation partition
