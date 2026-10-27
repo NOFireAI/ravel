@@ -175,7 +175,12 @@ services:
       # after dedup, Prometheus peak resident ones, so equal numbers are not
       # equal semantics. Bytes are bounded by the memory budget above: an
       # oversized materialization is refused "memory exhausted" before this
-      # count is reached. A hit is refused(budget).
+      # count is reached. A hit is refused(budget). This flag also sizes the
+      # per-query range selector-cache cap, 2 x max_samples x 16 bytes:
+      # 16,000,000,000 here against 320,000,000 at the default, so the cap is
+      # inert and the 3 GiB memory budget alone bounds a range query's cached
+      # selector copies; an entry the budget cannot hold falls back to
+      # uncached reads.
       - "--max-samples"
       - "500000000"
       # Points per range series (11,000) and total range evaluation points
