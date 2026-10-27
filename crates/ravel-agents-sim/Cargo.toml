@@ -1,0 +1,10 @@
+[package]
+name = "ravel-agents-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Dev-only deterministic simulation of Ravel Agents (ADR-3331 decision 13). No crate depends on it."
+
+[lints]
+workspace = true

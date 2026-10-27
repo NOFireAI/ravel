@@ -1,0 +1,10 @@
+[package]
+name = "ravel-agents-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ravel Agents publication skeleton over the object store (ADR-3331 decision 4)."
+
+[lints]
+workspace = true

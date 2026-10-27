@@ -1,0 +1,10 @@
+{
+  "code": "outcome_unknown",
+  "retry": "resolve_operation",
+  "reason": "store did not confirm the write",
+  "ids": {
+    "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+    "incarnation": 1,
+    "operation": "djE6b3A6MTljZDBlNjg3Njk5MTMxNGMxYjZkYmQ4YmQxMjkyOTc6MTox"
+  }
+}
