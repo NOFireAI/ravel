@@ -307,7 +307,8 @@ fn encode_allowance_is_zero_only_at_the_per_batch_target() {
 /// `--target-bytes` is bounded by the target whose encode allowance is one
 /// hour, derived from `ENCODE_BYTES_PER_SECOND` (issue #3289): 360,000,000,000
 /// is accepted and one byte more is refused with a message naming the flag,
-/// the bound and the value. Zero is still refused.
+/// the bound and the value, with `--ack-margin` given as well as unset. Zero
+/// is still refused.
 ///
 /// Prove-the-test: write the bound as `> MAX_TARGET_BYTES + 1` (or as a
 /// literal off by any amount) and the 360,000,000,001 case is accepted;
@@ -323,13 +324,21 @@ fn validate_target_bytes_refuses_a_target_whose_encode_allowance_exceeds_an_hour
     assert!(validate_target_bytes(None).is_ok());
     assert!(validate_target_bytes(Some(1)).is_ok());
     assert!(validate_target_bytes(Some(360_000_000_000)).is_ok());
+    let refusal = "--target-bytes must be at most 360000000000 (one hour of encode at 100000000 \
+                   bytes per second, the allowance the ack deadline adds when --ack-margin is \
+                   unset); 360000000001 was given";
     match validate_target_bytes(Some(360_000_000_001)) {
-        Err(LoadError::Setup(msg)) => {
-            assert!(msg.contains("--target-bytes"), "{msg}");
-            assert!(msg.contains("at most 360000000000"), "{msg}");
-            assert!(msg.contains("360000000001 was given"), "{msg}");
-        }
+        Err(LoadError::Setup(msg)) => assert_eq!(msg, refusal),
         other => panic!("expected a setup error: {other:?}"),
+    }
+    // A given --ack-margin replaces the allowance but not the bound.
+    let with_margin = GeometryRequest {
+        ack_margin: Some(Duration::from_secs(60)),
+        ..GeometryRequest::explicit(360_000_000_001, 1)
+    };
+    match with_margin.validate() {
+        Err(LoadError::Setup(msg)) => assert_eq!(msg, refusal),
+        other => panic!("expected a setup error with --ack-margin given: {other:?}"),
     }
     match validate_target_bytes(Some(0)) {
         Err(LoadError::Setup(msg)) => assert!(msg.contains("at least 1"), "{msg}"),

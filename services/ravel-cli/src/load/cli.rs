@@ -145,26 +145,26 @@ pub fn target_bytes_no_effect_warning(
     batch_rows: usize,
     shards: u32,
 ) -> Option<String> {
-    layout_no_effect_warning(
+    let geometry = LoadGeometry {
         target_bytes,
-        TargetSource::Flag,
-        &report.tokens,
-        batch_rows,
-        shards,
-    )
+        target_source: TargetSource::Flag,
+        ..LoadGeometry::default()
+    };
+    layout_no_effect_warning(&geometry, &report.tokens, batch_rows, shards)
 }
 
 /// [`target_bytes_no_effect_warning`] over any signal's ack tokens, for a
 /// target given by the flag or derived from [`DEFAULT_OBJECT_ROWS`]. Every
 /// signal's loader computes it once the load finished and stores it on its
-/// report.
+/// report. A derived target clamped to [`MAX_TARGET_BYTES`] is named as
+/// clamped, as the geometry line names it.
 pub fn layout_no_effect_warning(
-    target_bytes: usize,
-    source: TargetSource,
+    geometry: &LoadGeometry,
     tokens: &[CommitToken],
     batch_rows: usize,
     shards: u32,
 ) -> Option<String> {
+    let target_bytes = geometry.target_bytes;
     if target_bytes <= PER_BATCH_TARGET_BYTES {
         return None;
     }
@@ -188,8 +188,13 @@ pub fn layout_no_effect_warning(
         // target. Saying the target did nothing would blame the wrong lever.
         return None;
     }
-    let target = match source {
+    let target = match geometry.target_source {
         TargetSource::Flag => format!("--target-bytes {target_bytes}"),
+        TargetSource::Derived if geometry.target_clamped() => format!(
+            "the derived flush target of {target_bytes} bytes ({DEFAULT_OBJECT_ROWS} rows at the \
+             first batch's estimated {} bytes per row, clamped to the {MAX_TARGET_BYTES} maximum)",
+            geometry.est_bytes_per_row
+        ),
         TargetSource::Derived => format!(
             "the derived flush target of {target_bytes} bytes ({DEFAULT_OBJECT_ROWS} rows at the \
              first batch's estimated bytes per row)"
@@ -205,8 +210,8 @@ pub fn layout_no_effect_warning(
          batch arrives and no target value can make it accumulate -- check the pipeline \
          depth and write cadence before changing the target. Separately, the target is compared \
          against the buffer's estimated UNCOMPRESSED object content, not the stored object \
-         size, and the check runs once per write after a whole batch has merged. So a target at \
-         or below one batch's per-shard slice (about {slice} rows here, at --batch-rows \
+         size, and the check runs once per write after a whole batch has merged. So at an even \
+         split a target at or below one batch's per-shard slice (about {slice} rows here, at --batch-rows \
          {batch_rows} over {shards} shards) is already exceeded by the first write into an empty \
          buffer and flushes it. For objects that span several batches, raise --target-bytes \
          above that slice's estimated content, or lower --batch-rows.",
