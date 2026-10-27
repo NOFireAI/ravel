@@ -205,9 +205,6 @@ pub struct InboxEntry {
     pub payload: Option<ObjectRef>,
     pub accepted_unix_ns: i64,
     pub failed_attempts: u32,
-    /// Set by `Cancel` while a turn runs this input; the input is consumed as
-    /// cancelled by the next `FailTurn` or `BeginTurn` that reaches it.
-    pub cancel_requested: bool,
     /// The turn that last failed retryably on this input.
     pub last_failed_turn_id: Option<Id128>,
 }
@@ -573,7 +570,6 @@ pub(crate) fn inbox_to_proto(e: &InboxEntry) -> pb::InboxEntry {
         payload: e.payload.map(ref_to_proto),
         accepted_unix_ns: e.accepted_unix_ns,
         failed_attempts: e.failed_attempts,
-        cancel_requested: e.cancel_requested,
         last_failed_turn_id: e
             .last_failed_turn_id
             .map(|t| t.0.to_vec())
@@ -624,7 +620,6 @@ pub(crate) fn inbox_from_proto(e: pb::InboxEntry) -> Result<InboxEntry, CodecErr
         payload: ref_from_proto(e.payload, "inbox.payload")?,
         accepted_unix_ns: e.accepted_unix_ns,
         failed_attempts: e.failed_attempts,
-        cancel_requested: e.cancel_requested,
         last_failed_turn_id: if e.last_failed_turn_id.is_empty() {
             None
         } else {
@@ -904,7 +899,6 @@ pub(crate) mod tests {
             proptest::option::of(object_ref()),
             any::<i64>(),
             any::<u32>(),
-            any::<bool>(),
             proptest::option::of(id()),
         )
             .prop_map(
@@ -915,7 +909,6 @@ pub(crate) mod tests {
                     payload,
                     accepted_unix_ns,
                     failed_attempts,
-                    cancel_requested,
                     last_failed_turn_id,
                 )| {
                     InboxEntry {
@@ -925,7 +918,6 @@ pub(crate) mod tests {
                         payload,
                         accepted_unix_ns,
                         failed_attempts,
-                        cancel_requested,
                         last_failed_turn_id,
                     }
                 },

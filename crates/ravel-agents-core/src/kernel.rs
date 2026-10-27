@@ -37,11 +37,10 @@
 //! A cancel requested while a turn runs is never lost to a retry: a
 //! `FailTurn` on that turn, retryable or not, consumes the input as
 //! cancelled (`tests::a_cancel_requested_before_a_retryable_failure_consumes_the_input_as_cancelled`),
-//! a cancel arriving between the failure and the retry's `BeginTurn` settles
-//! the waiting input at once
-//! (`tests::a_cancel_between_a_retryable_failure_and_the_retry_settles_the_input`),
-//! and `BeginTurn` never starts an input whose entry carries a cancel request
-//! (`tests::begin_turn_never_starts_an_input_whose_entry_carries_a_cancel_request`).
+//! and a cancel arriving between the failure and the retry's `BeginTurn`
+//! settles the waiting input at once
+//! (`tests::a_cancel_between_a_retryable_failure_and_the_retry_settles_the_input`).
+//! The request lives on the active turn; every path that ends a turn reads it.
 
 use crate::command::{
     Authority, AuthorizeAttempt, BeginTurn, Cancel, CancelTimer, Command, CommitIntent,
@@ -553,7 +552,6 @@ impl Kernel {
             payload: c.payload,
             accepted_unix_ns: now,
             failed_attempts: 0,
-            cancel_requested: false,
             last_failed_turn_id: None,
         });
         new.receipts.push(Receipt {
@@ -628,9 +626,6 @@ impl Kernel {
         let Some(next) = head.inbox.first() else {
             return unchanged(Reply::Idle);
         };
-        if next.cancel_requested {
-            return self.settle_cancelled(head, next.accept_seq, now);
-        }
         let Some(pin) = c.handlers.iter().find(|p| p.handler == next.handler) else {
             return Err(fail(
                 head,
@@ -724,13 +719,12 @@ impl Kernel {
         }
         let accept_seq = turn.input_accept_seq;
         let turn_id = turn.turn_id;
-        let cancelled = cancel_requested(head, turn);
         let mut new = head.clone();
         Self::take_input(head, &mut new, accept_seq)?;
         new.active_turn = None;
         new.steps.clear();
         let mut effects = vec![Effect::OperationTerminal { accept_seq }];
-        if cancelled {
+        if turn.cancellation == Cancellation::Requested {
             new.results.push(ResultEntry {
                 accept_seq,
                 status: ResultStatus::Cancelled,
@@ -858,7 +852,7 @@ impl Kernel {
                 EffectStatus::Intent | EffectStatus::Completed => {}
             }
         }
-        if cancel_requested(head, turn) {
+        if turn.cancellation == Cancellation::Requested {
             let mut new = head.clone();
             Self::take_input(head, &mut new, accept_seq)?;
             new.active_turn = None;
@@ -955,9 +949,6 @@ impl Kernel {
             if let Some(turn) = new.active_turn.as_mut() {
                 turn.cancellation = Cancellation::Requested;
             }
-            if let Some(entry) = new.inbox.iter_mut().find(|e| e.accept_seq == c.accept_seq) {
-                entry.cancel_requested = true;
-            }
             return self.publish(
                 Some(head),
                 new,
@@ -1039,7 +1030,6 @@ impl Kernel {
             payload: timer.payload,
             accepted_unix_ns: now,
             failed_attempts: 0,
-            cancel_requested: false,
             last_failed_turn_id: None,
         });
         if let Some(t) = new.timers.iter_mut().find(|t| t.timer_id == c.timer_id) {
@@ -1309,14 +1299,6 @@ fn drop_input_steps(new: &mut Head, accept_seq: u64) {
     let incarnation = new.incarnation;
     new.steps
         .retain(|s| s.step_id != identity::step_id(incarnation, accept_seq, &s.step_key));
-}
-
-fn cancel_requested(head: &Head, turn: &ActiveTurn) -> bool {
-    turn.cancellation == Cancellation::Requested
-        || head
-            .inbox
-            .iter()
-            .any(|e| e.accept_seq == turn.input_accept_seq && e.cancel_requested)
 }
 
 /// Journal an intent. `Ok(None)` when the same intent is already journaled.

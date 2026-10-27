@@ -825,44 +825,6 @@ fn a_cancel_between_a_retryable_failure_and_the_retry_settles_the_input() {
 }
 
 #[test]
-fn begin_turn_never_starts_an_input_whose_entry_carries_a_cancel_request() {
-    let mut sim = Sim::started();
-    let failed_turn = sim.head().active_turn.as_ref().expect("turn").turn_id;
-    sim.run(&step_cmd(sim.head(), StepStatus::Completed));
-    sim.run(&fail_cmd(sim.head(), false, 3));
-    sim.run(&enqueue_cmd(sim.head(), "r2", b"p2"));
-    assert_eq!(sim.head().steps.len(), 1);
-    // A root the kernel's own Cancel never leaves behind (it settles a
-    // waiting input at once), so construct it: a waiting input flagged.
-    let mut flagged = sim.head().clone();
-    flagged.inbox[0].cancel_requested = true;
-    sim.head = Some(flagged);
-    let Transition::Publish {
-        head,
-        effects,
-        reply,
-    } = sim.step(&begin_cmd(sim.head())).expect("begin applies")
-    else {
-        panic!("settling the flagged input must publish");
-    };
-    assert_eq!(reply, Reply::Cancelled { accept_seq: 1 });
-    assert_eq!(effects, vec![Effect::OperationTerminal { accept_seq: 1 }]);
-    assert_eq!(head.active_turn, None);
-    assert_eq!(head.steps, Vec::new());
-    assert_eq!(
-        head.inbox.iter().map(|e| e.accept_seq).collect::<Vec<_>>(),
-        vec![2]
-    );
-    assert_eq!(head.results.len(), 1);
-    assert_eq!(head.results[0].status, ResultStatus::Cancelled);
-    assert_eq!(head.results[0].turn_id, Some(failed_turn));
-    let Reply::TurnStarted(turn) = sim.run(&begin_cmd(sim.head())) else {
-        panic!("the next input starts");
-    };
-    assert_eq!(turn.input_accept_seq, 2);
-}
-
-#[test]
 fn fail_turn_is_refused_while_a_manual_attempt_is_in_doubt() {
     let mut sim = Sim::started();
     let Reply::IntentCommitted { effect_id } = sim.run(&commit_intent_cmd(
