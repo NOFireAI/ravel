@@ -1142,8 +1142,9 @@ fn source_extent<'s, S: ByteSource + ?Sized>(
 /// `true` here can place a section the scan then prunes nothing with: a BLOOM
 /// arm is dropped when its field resolves to no column the section covers,
 /// and a POSTINGS arm when its attribute resolves to no dynamic column, when
-/// the object holds no POSTINGS section, or when that section is the v1
-/// layout, on which the scan declines equality pruning.
+/// the object holds no POSTINGS section, when that section is the v1 layout,
+/// on which the scan declines equality pruning, or when the section holds no
+/// entry for the column (an unindexed or capped field).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilterSectionReads {
     pub bloom: bool,

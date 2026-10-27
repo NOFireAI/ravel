@@ -396,7 +396,11 @@ keeps up to twice the key cap plus 65 slots before it drops stale ones,
 both containers round their capacity up as they grow, the map can double
 once more to clear removed slots, and neither gives capacity back: at
 6,954,184,212 bytes that is 131,072 queue slots of 72 bytes and 131,072 map
-buckets of 81 bytes, about 20.1 MB against the 6.95 MB budget.
+buckets of 81 bytes, about 20.1 MB against the 6.95 MB budget. That figure
+is per `S3Fifo`: a server started with `--cache-dir` builds two with the same
+limits, one for the RAM tier and one for the disk tier
+(`services/ravel-server/src/store.rs`, `build_cache`), so about 40.2 MB in
+all.
 Both tiers use this policy (`DiskCache` builds the same `S3Fifo`, with the
 same limits on the server). The ghost holds keys and sizes only, in
 memory, so the disk tier's restart behaviour is unchanged. Access intents
@@ -433,8 +437,9 @@ The figures come from a deterministic simulation of the policy,
   The hot set's hit rate is never below the key window's. It is 1.0000
   under both windows when the hot set was read before the traffic, and
   0.0000 under both when it was first read after a 25 GB interval, which
-  outlasts probation and the byte window alike; only a ghost as wide as
-  the cache or wider serves that case (0.7641).
+  outlasts probation and the byte window alike; only a much wider ghost
+  serves that case: 0.7641 with a byte window of main's quota (0.9 of the
+  cache) or more.
 - W3, a loop of 0.5 to 3 times the cache in 1.3 MB or 25 MB entries, read
   five times, then a second such loop: no pass is served less than under
   the key window, and a first loop of 1.05 times the cache in 1.3 MB
