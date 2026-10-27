@@ -21,6 +21,11 @@
 //! Trace B is production-shaped: a 2 GB interactive working set read in
 //! round-robin passes, with a 12 GB one-pass bulk scan of fresh keys after
 //! every 500 working-set accesses, at an 8 GB budget.
+//!
+//! Trace C is the admission-headroom amendment's q33 shape: 16 partitions
+//! interleave column admissions with aggregate growth against one memory
+//! budget, under best-effort admission (B) and admission with a headroom
+//! margin (M).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -667,6 +672,264 @@ fn print_trace_b(traces: &[TraceB; 2]) {
 }
 
 // ---------------------------------------------------------------------------
+// Trace C: q33 against one memory budget, with and without a headroom margin.
+
+const GIB: u64 = 1 << 30;
+const C_LIMIT: u64 = 20 * GB;
+const C_OTHER: u64 = 3 * GB;
+const C_ENTRY: u64 = 60_444;
+const C_PARTITIONS: usize = 16;
+const C_BLOCKS: u64 = 13_235;
+const C_COLUMNS: usize = 4;
+const C_GROW_EVERY: u64 = 64;
+const C_GROW: u64 = 117_440_512;
+const C_AGG_TARGET: u64 = 10 * GB;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// Reserve whenever the entry fits the budget limit.
+    BestEffort,
+    /// Reserve only when the unreserved bytes after it stay at least the margin.
+    Margin,
+}
+
+impl Admission {
+    fn name(self) -> &'static str {
+        match self {
+            Admission::BestEffort => "B",
+            Admission::Margin => "M",
+        }
+    }
+}
+
+const C_RUNS: [(Admission, u64); 4] = [
+    (Admission::BestEffort, 8 * GB),
+    (Admission::Margin, 8 * GB),
+    (Admission::Margin, 4 * GB),
+    (Admission::Margin, 12 * GB),
+];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TraceCStats {
+    /// Aggregate reservations refused after the evictor and one retry. The
+    /// run continues past a refusal (the grow is dropped) so later ones count.
+    refusals: u64,
+    first_refusal_block: Option<u64>,
+    peak_aggregate: u64,
+    grows: u64,
+    admissions: u64,
+    skipped_margin: u64,
+    skipped_limit: u64,
+    cap_evictions: u64,
+    evictor_passes: u64,
+    evictor_freed: u64,
+    min_unreserved: u64,
+    resident_end: u64,
+}
+
+struct TraceC {
+    admission: Admission,
+    cap: u64,
+    margin: u64,
+    reserved: u64,
+    /// Key to the number of partitions holding it; a held entry is never evicted.
+    entries: HashMap<u64, u32>,
+    /// The CLOCK ring; the hand is the front. Every key is fresh, so no
+    /// reference bit is ever set and the hand only skips held entries.
+    ring: VecDeque<u64>,
+    resident: u64,
+    next_key: u64,
+    aggregate: u64,
+    stats: TraceCStats,
+}
+
+impl TraceC {
+    fn new(admission: Admission, cap: u64) -> Self {
+        let n = cap / C_ENTRY;
+        let resident = n * C_ENTRY;
+        let reserved = C_OTHER + resident;
+        Self {
+            admission,
+            cap,
+            margin: GIB.max(C_LIMIT / 20),
+            reserved,
+            entries: (0..n).map(|k| (k, 0)).collect(),
+            ring: (0..n).collect(),
+            resident,
+            next_key: n,
+            aggregate: 0,
+            stats: TraceCStats {
+                min_unreserved: C_LIMIT - reserved,
+                ..TraceCStats::default()
+            },
+        }
+    }
+
+    fn unreserved(&self) -> u64 {
+        C_LIMIT - self.reserved
+    }
+
+    fn note_unreserved(&mut self) {
+        self.stats.min_unreserved = self.stats.min_unreserved.min(self.unreserved());
+    }
+
+    /// Evicts the first unheld entry under the hand and releases its
+    /// reservation. None when every entry is held.
+    fn evict_one(&mut self) -> Option<u64> {
+        for _ in 0..self.ring.len() {
+            let key = self.ring.pop_front()?;
+            if self.entries.get(&key).copied().unwrap_or(0) > 0 {
+                self.ring.push_back(key);
+                continue;
+            }
+            self.entries.remove(&key);
+            self.resident -= C_ENTRY;
+            self.reserved -= C_ENTRY;
+            return Some(C_ENTRY);
+        }
+        None
+    }
+
+    /// One column offered for admission through the best-effort path: reserve
+    /// first, then evict down to the cap. Some(key) when admitted.
+    fn offer(&mut self, hold: bool) -> Option<u64> {
+        let after = self.reserved + C_ENTRY;
+        if after > C_LIMIT {
+            self.stats.skipped_limit += 1;
+            return None;
+        }
+        if self.admission == Admission::Margin && C_LIMIT - after < self.margin {
+            self.stats.skipped_margin += 1;
+            return None;
+        }
+        self.reserved = after;
+        self.note_unreserved();
+        let key = self.next_key;
+        self.next_key += 1;
+        self.entries.insert(key, u32::from(hold));
+        self.ring.push_back(key);
+        self.resident += C_ENTRY;
+        self.stats.admissions += 1;
+        while self.resident > self.cap {
+            if self.evict_one().is_none() {
+                break;
+            }
+            self.stats.cap_evictions += 1;
+        }
+        Some(key)
+    }
+
+    fn try_grow(&mut self) -> bool {
+        if self.reserved + C_GROW > C_LIMIT {
+            return false;
+        }
+        self.reserved += C_GROW;
+        self.aggregate += C_GROW;
+        self.note_unreserved();
+        self.stats.grows += 1;
+        self.stats.peak_aggregate = self.stats.peak_aggregate.max(self.aggregate);
+        true
+    }
+
+    /// A checked aggregate reservation at `block`: on refusal the evictor
+    /// frees unheld entries for the shortfall, every other partition makes its
+    /// next admission offer, and the caller retries once.
+    fn grow(&mut self, block: u64) {
+        if self.try_grow() {
+            return;
+        }
+        let shortfall = self.reserved + C_GROW - C_LIMIT;
+        self.stats.evictor_passes += 1;
+        let mut freed = 0;
+        while freed < shortfall {
+            match self.evict_one() {
+                Some(bytes) => freed += bytes,
+                None => break,
+            }
+        }
+        self.stats.evictor_freed += freed;
+        for _ in 1..C_PARTITIONS {
+            self.offer(false);
+        }
+        if !self.try_grow() {
+            self.stats.refusals += 1;
+            self.stats.first_refusal_block.get_or_insert(block);
+        }
+    }
+
+    fn hold(&mut self, key: u64, delta: i32) {
+        if let Some(pins) = self.entries.get_mut(&key) {
+            *pins = pins.saturating_add_signed(delta);
+        }
+    }
+}
+
+fn run_trace_c(admission: Admission, cap: u64) -> TraceCStats {
+    let mut sim = TraceC::new(admission, cap);
+    let mut held: Vec<Vec<u64>> = vec![Vec::new(); C_PARTITIONS];
+    let mut local = [0u64; C_PARTITIONS];
+    for block in 0..C_BLOCKS {
+        let p = (block % C_PARTITIONS as u64) as usize;
+        for key in std::mem::take(&mut held[p]) {
+            sim.hold(key, -1);
+        }
+        for _ in 0..C_COLUMNS {
+            if let Some(key) = sim.offer(true) {
+                held[p].push(key);
+            }
+        }
+        local[p] += 1;
+        if local[p].is_multiple_of(C_GROW_EVERY) && sim.aggregate < C_AGG_TARGET {
+            sim.grow(block);
+        }
+    }
+    sim.stats.resident_end = sim.resident;
+    sim.stats
+}
+
+fn trace_c() -> &'static [TraceCStats; 4] {
+    static TRACE: OnceLock<[TraceCStats; 4]> = OnceLock::new();
+    TRACE.get_or_init(|| C_RUNS.map(|(admission, cap)| run_trace_c(admission, cap)))
+}
+
+fn trace_c_run(admission: Admission, cap: u64) -> TraceCStats {
+    let i = C_RUNS
+        .iter()
+        .position(|r| *r == (admission, cap))
+        .expect("Trace C run");
+    trace_c()[i]
+}
+
+fn print_trace_c(runs: &[TraceCStats; 4]) {
+    println!(
+        "== Trace C: q33 shape, limit 20 GB, other 3 GB, 16 partitions, 13,235 blocks x 4 columns x 60,444 B, +117,440,512 B aggregate per partition every 64 blocks until 10 GB, margin max(1 GiB, 5% of limit)"
+    );
+    println!(
+        "pol cap_GB refusals first_block grows peak_agg_GB cache_end_GB admissions skip_margin skip_limit cap_evict evictor_passes evictor_freed_MB min_unreserved_MB"
+    );
+    for ((admission, cap), s) in C_RUNS.iter().zip(runs) {
+        println!(
+            "{:<3} {:>6} {:>8} {:>11} {:>5} {:>11.3} {:>12.3} {:>10} {:>11} {:>10} {:>9} {:>14} {:>16.1} {:>17.1}",
+            admission.name(),
+            cap / GB,
+            s.refusals,
+            s.first_refusal_block
+                .map_or_else(|| "-".to_string(), |b| b.to_string()),
+            s.grows,
+            s.peak_aggregate as f64 / GB as f64,
+            s.resident_end as f64 / GB as f64,
+            s.admissions,
+            s.skipped_margin,
+            s.skipped_limit,
+            s.cap_evictions,
+            s.evictor_passes,
+            s.evictor_freed as f64 / MB as f64,
+            s.min_unreserved as f64 / MB as f64,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 
 #[test]
@@ -788,4 +1051,64 @@ fn decoded_sim_report() {
     print_trace_a(trace);
     println!();
     print_trace_b(trace_b());
+}
+
+/// Trace C (a): best-effort admission refuses q33's aggregate at least once.
+#[test]
+fn trace_c_best_effort_8gb_refuses() {
+    let s = trace_c_run(Admission::BestEffort, 8 * GB);
+    assert!(
+        s.refusals >= 1,
+        "Trace C B 8 GB: {} refusals (first at block {:?}), peak aggregate {} B, {} evictor passes freeing {} B; band at least 1",
+        s.refusals,
+        s.first_refusal_block,
+        s.peak_aggregate,
+        s.evictor_passes,
+        s.evictor_freed
+    );
+}
+
+/// Trace C (b): the margin keeps q33's aggregate admitted at an 8 GB cap.
+#[test]
+fn trace_c_margin_8gb_never_refuses() {
+    let s = trace_c_run(Admission::Margin, 8 * GB);
+    assert_eq!(
+        s.refusals, 0,
+        "Trace C M 8 GB: {} refusals (first at block {:?}), peak aggregate {} B",
+        s.refusals, s.first_refusal_block, s.peak_aggregate
+    );
+    assert!(
+        s.peak_aggregate >= C_AGG_TARGET && s.evictor_passes > 0,
+        "Trace C M 8 GB: peak aggregate {} B (target {C_AGG_TARGET}), {} evictor passes; the run must reach the target under pressure",
+        s.peak_aggregate,
+        s.evictor_passes
+    );
+}
+
+/// Trace C (c): the margin keeps q33's aggregate admitted at 4 GB and 12 GB.
+#[test]
+fn trace_c_margin_4gb_and_12gb_never_refuse() {
+    for cap in [4 * GB, 12 * GB] {
+        let s = trace_c_run(Admission::Margin, cap);
+        assert_eq!(
+            s.refusals,
+            0,
+            "Trace C M {} GB: {} refusals (first at block {:?}), peak aggregate {} B",
+            cap / GB,
+            s.refusals,
+            s.first_refusal_block,
+            s.peak_aggregate
+        );
+        assert!(
+            s.peak_aggregate >= C_AGG_TARGET,
+            "Trace C M {} GB: peak aggregate {} B, target {C_AGG_TARGET}",
+            cap / GB,
+            s.peak_aggregate
+        );
+    }
+}
+
+#[test]
+fn decoded_sim_trace_c_report() {
+    print_trace_c(trace_c());
 }
