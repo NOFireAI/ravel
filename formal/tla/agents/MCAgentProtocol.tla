@@ -6,7 +6,7 @@
 (* Each negative config sets exactly one switch and names the property it  *)
 (* must violate.                                                           *)
 (***************************************************************************)
-EXTENDS AgentProtocol
+EXTENDS AgentProtocol, TLC
 
 CONSTANTS
     AckBeforeCas,                \* respond to the sender before the enqueue CAS
@@ -36,16 +36,22 @@ ASSUME StaleTurnRebase \in BOOLEAN
 BrokenAckBeforeCas(c) ==
     /\ AckBeforeCas
     /\ cl[c].pc = "dep"
-    /\ acked' = [acked EXCEPT ![c] =
-                   [ak |-> cl[c].ak, rcpt |-> NewReceipt(cl[c].obs, cl[c].rid, Hc(c))]]
-    /\ SetCl(c, [cl[c] EXCEPT !.pc = "acked", !.ver = 0, !.obs = NoC])
-    /\ UNCHANGED <<sVars, wk, co, live, crashedOnce, due, lastCas>>
+    /\ AckWith(c, [ak |-> cl[c].ak, rcpt |-> NewReceipt(cl[c].obs, cl[c].rid, Hc(c))])
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<sVars, wk, co, crashedOnce, due>>
 
+\* The enqueue CAS straight after the read, without the payload PUT.
 BrokenHeadBeforeDependency(c) ==
     /\ HeadBeforeDependency
-    /\ cl[c].pc = "read"
-    /\ SameRid(c) = {}
-    /\ EnqueueCas(c)
+    /\ cl[c].pc = "start"
+    /\ HeadUp(cl[c].ak)
+    /\ LET ak == cl[c].ak
+           h == Head(ak)
+       IN /\ ~h.tomb
+          /\ SameRid(c, h) = {}
+          /\ CasNow(ak, EnqueueHead(h, cl[c].rid, Hc(c)))
+          /\ AckWith(c, [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))])
+    /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
 \* Overwrite instead of CasVersion, on a root that moved only by another
 \* sender's enqueue since this client read it.
@@ -62,77 +68,81 @@ BrokenOverwriteStaleRoot(c) ==
           /\ cur.results = h.results /\ cur.active = h.active
           /\ Store!PutOverwrite(CK(c), EnqueueHead(h, cl[c].rid, Hc(c)))
           /\ RecordCas(ak)
-          /\ SetCl(c, [cl[c] EXCEPT !.pc = "casok",
-                         !.handle = [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))]])
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked>>
+          /\ AckWith(c, [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))])
+    /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
 \* Proceed to the payload PUT although HEAD already holds a receipt for this
 \* request id under a different payload hash.
 BrokenRequestHashMismatchAccepted(c) ==
     /\ RequestHashMismatchAccepted
-    /\ cl[c].pc = "read"
-    /\ \E r \in SameRid(c) : r.hash # Hc(c)
-    /\ Store!PutCreateIfAbsent(ObjKey(cl[c].ak, Hc(c)), Hc(c))
-    /\ SetCl(c, [cl[c] EXCEPT !.pc = "dep"])
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked, lastCas>>
+    /\ cl[c].pc \in {"start", "unknown"}
+    /\ HeadUp(cl[c].ak)
+    /\ LET ak == cl[c].ak
+           h == Head(ak)
+       IN /\ ~h.tomb
+          /\ \E r \in SameRid(c, h) : r.hash # Hc(c)
+          /\ Store!PutCreateIfAbsent(ObjKey(ak, Hc(c)), Hc(c))
+          /\ SetCl(c, [cl[c] EXCEPT !.pc = "dep", !.ver = Store!VersionOf(CK(c)), !.obs = h])
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<wk, co, crashedOnce, due, acked>>
 
 \* --- Broken worker steps --------------------------------------------------
 
 BrokenEpochCheckedOutsideCas(w) ==
     /\ EpochCheckedOutsideCas
-    /\ live[w]
-    /\ wk[w].pc = "rread"
-    /\ LET h == Ob(w)
-       IN /\ ~OwnResult(w) /\ ~h.tomb
+    /\ wk[w].pc = "rebase"
+    /\ HeadUp(wk[w].ak)
+    /\ LET ak == wk[w].ak
+           h == Head(ak)
+       IN /\ ~OwnResult(w, h) /\ ~h.tomb
           /\ (h.owner # w \/ h.epoch # wk[w].epoch)
           /\ h.active.turn = wk[w].turn /\ h.sv = wk[w].base
-          /\ WorkerCas(w, CompleteHead(h, wk[w], "completed", w), "idle", "rebase")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+          /\ CasNow(ak, CompleteHead(h, wk[w], "completed", w))
+    /\ SetWk(w, WorkerIdle)
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 BrokenStaleTurnRebase(w) ==
     /\ StaleTurnRebase
-    /\ live[w]
-    /\ wk[w].pc = "rread"
-    /\ LET h == Ob(w)
-       IN /\ ~OwnResult(w) /\ ~h.tomb
+    /\ wk[w].pc = "rebase"
+    /\ HeadUp(wk[w].ak)
+    /\ LET ak == wk[w].ak
+           h == Head(ak)
+       IN /\ ~OwnResult(w, h) /\ ~h.tomb
           /\ h.owner = w /\ h.epoch = wk[w].epoch /\ h.sv = wk[w].base
           /\ h.active.turn # wk[w].turn
-          /\ WorkerCas(w, CompleteHead(h, wk[w], "completed", w), "idle", "rebase")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+          /\ CasNow(ak, CompleteHead(h, wk[w], "completed", w))
+    /\ SetWk(w, WorkerIdle)
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 BrokenCursorWithoutResult(w) ==
     /\ CursorWithoutResult
-    /\ live[w]
     /\ wk[w].pc = "dep"
     /\ WorkerCas(w, [CompleteHead(Ob(w), wk[w], "completed", w) EXCEPT
                        !.results = Ob(w).results], "idle", "rebase")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 BrokenReceiptDiscarded(w) ==
     /\ ReceiptDiscarded
-    /\ live[w]
     /\ wk[w].pc = "dep"
     /\ \E r \in Ob(w).receipts : r.seq = wk[w].seq
     /\ WorkerCas(w, [CompleteHead(Ob(w), wk[w], "completed", w) EXCEPT
                        !.receipts = {r \in Ob(w).receipts : r.seq # wk[w].seq}],
                  "idle", "rebase")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 \* --- Broken timer steps ---------------------------------------------------
 
-\* Fire from a hint whose generation the observed root no longer has armed.
-BrokenStaleTimerGenerationFired(ak) ==
+\* Fire from a hint whose generation the root no longer has armed.
+BrokenStaleTimerGenerationFired(ak, g) ==
     /\ StaleTimerGenerationFired
-    /\ co[ak].pc = "fire"
-    /\ LET h == co[ak].obs
-           g == co[ak].gen
+    /\ Store!Present(HintKey(ak, g))
+    /\ g =< due[ak]
+    /\ HeadUp(ak)
+    /\ LET h == Head(ak)
        IN /\ ~(h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb)
-          /\ Store!PutCasVersion(HeadKey(ak), co[ak].ver,
-                [h EXCEPT !.rev = @ + 1, !.inputs = @ \cup {TimerInput(h, g)},
-                          !.inbox = @ \cup {h.nextSeq}, !.nextSeq = @ + 1])
-          /\ IF CasOk(ak, co[ak].ver) THEN RecordCas(ak) ELSE UNCHANGED lastCas
-    /\ co' = [co EXCEPT ![ak] = CoordIdle(co[ak].hinted)]
-    /\ UNCHANGED <<cl, wk, live, crashedOnce, due, acked>>
+          /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.inputs = @ \cup {TimerInput(h, g)},
+                                  !.inbox = @ \cup {h.nextSeq}, !.nextSeq = @ + 1])
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* The sweep sees a hint before its generation is due and deletes it.
 BrokenEarlyHintForgotten(ak, g) ==
@@ -140,7 +150,8 @@ BrokenEarlyHintForgotten(ak, g) ==
     /\ Store!Present(HintKey(ak, g))
     /\ due[ak] < g
     /\ Store!Delete(HintKey(ak, g))
-    /\ UNCHANGED aVars
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 Broken ==
     \/ \E c \in Clients :
@@ -150,14 +161,41 @@ Broken ==
          \/ BrokenEpochCheckedOutsideCas(w) \/ BrokenStaleTurnRebase(w)
          \/ BrokenCursorWithoutResult(w) \/ BrokenReceiptDiscarded(w)
     \/ \E ak \in AKs :
-         \/ BrokenStaleTimerGenerationFired(ak)
-         \/ \E g \in 1..MaxTimerGen : BrokenEarlyHintForgotten(ak, g)
+         \/ \E g \in 1..MaxTimerGen :
+              BrokenStaleTimerGenerationFired(ak, g) \/ BrokenEarlyHintForgotten(ak, g)
 
 MCNext == Next \/ Broken
 
 MCSpec == Init /\ [][MCNext]_vars
 
 MCFairSpec == MCSpec /\ Fairness
+
+\* --- State view for the safety configs -----------------------------------
+
+\* The store mints every version from one global counter, so two orderings of
+\* independent writes (a payload PUT and another agent's HEAD CAS) reach
+\* states that differ only in version integers. Nothing here reads a version
+\* except to compare a held CAS token with the current HEAD version, and a
+\* token that is not current never becomes current again, because versions
+\* are never reused. The view keeps that comparison and drops the integers
+\* (lastModified is advisory and unread). This is sound for invariants only:
+\* a config with a PROPERTY runs without VIEW.
+\* No action, invariant or initial state names a particular worker, so two
+\* states that differ by a renaming of workers satisfy the same invariants.
+\* Like the view, the symmetry is for invariant-only configs.
+WorkerSymmetry == Permutations(Workers)
+
+Current(ak, v) == HeadUp(ak) /\ v = Store!VersionOf(HeadKey(ak))
+
+View ==
+    <<{<<k, store[k].content>> : k \in {x \in AllKeys : store[x].present}},
+      {<<c, cl[c].pc, cl[c].ak, cl[c].rid, cl[c].inp, Current(cl[c].ak, cl[c].ver),
+         cl[c].obs, cl[c].handle>> : c \in Clients},
+      {<<w, wk[w].pc, wk[w].ak, Current(wk[w].ak, wk[w].ver), wk[w].obs, wk[w].turn,
+         wk[w].seq, wk[w].base, wk[w].epoch, wk[w].inc>> : w \in Workers},
+      co, crashedOnce, due, acked, uploads, listState,
+      IF lastCas = NoCas THEN <<>>
+      ELSE <<lastCas.ak, lastCas.before, lastCas.after, lastCas.va > lastCas.vb>>>>
 
 \* --- Reachability probes (each must be reported violated) -----------------
 

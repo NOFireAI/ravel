@@ -17,15 +17,17 @@
 (* a HEAD command; timer generations, wake hints and the reconciliation    *)
 (* sweep; tombstone and recreate with an incarnation bump.                 *)
 (*                                                                         *)
-(* Every read, dependency write, HEAD CAS, acknowledgement, crash and      *)
-(* recovery is its own action. Every store call goes through               *)
-(* RavelObjectStore, instantiated unchanged.                               *)
+(* Every dependency write, HEAD CAS and crash is its own action. A read   *)
+(* is folded into the step that acts on it only where no other write sits *)
+(* between them (CasNow, ReadHead explain why that loses no behaviour).   *)
+(* Every store call goes through RavelObjectStore, instantiated unchanged.*)
 (*                                                                         *)
 (* Assumed, not checked:                                                   *)
 (*   - The store honours its contract (common/RavelObjectStore.tla).      *)
 (*   - A transient store failure applies nothing and leaves the caller    *)
 (*     free to retry the same step; it is a stuttering step here. A lost  *)
-(*     response is modelled explicitly, since it applies the effect.      *)
+(*     response on a HEAD CAS is modelled explicitly, since it applies    *)
+(*     the effect and leaves the caller an unknown outcome.               *)
 (*   - Handler code is a black box: a turn either completes (one new      *)
 (*     state version) or fails (state unchanged). Nothing here claims     *)
 (*     that worker code is deterministic.                                 *)
@@ -37,7 +39,9 @@
 (* resolution; history paging; quotas.                                    *)
 (*                                                                         *)
 (* Witnesses: `lastCas` holds the HEAD content and version read from the  *)
-(* store immediately before and after the most recent HEAD write;         *)
+(* store immediately before and after the HEAD write the step just taken  *)
+(* made, and NoCas after a step that wrote no HEAD (the write was checked *)
+(* in the state right after it, and forgetting it merges states);         *)
 (* `acked` holds the handle each client was returned. Every invariant     *)
 (* reads the store, lastCas or acked, never a flag the action under check *)
 (* sets about itself.                                                     *)
@@ -120,19 +124,18 @@ VARIABLES
     store, lastModified, versionCounter, uploads, listState,  \* the store
     cl,           \* [Clients -> client operation in flight]
     wk,           \* [Workers -> worker operation in flight]
-    co,           \* [AKs -> sweep/firing coordinator state]
-    live,         \* [Workers -> BOOLEAN]
+    co,           \* [AKs -> highest timer generation the scheduler hinted]
     crashedOnce,  \* SUBSET Workers: model bound, each worker crashes once
     due,          \* [AKs -> highest due timer generation] (environment)
     acked,        \* [Clients -> handle returned to the client, or NoHandle]
-    lastCas       \* witness: HEAD before and after the last HEAD write
+    lastCas       \* witness: HEAD before and after this step's HEAD write
 
 Store == INSTANCE RavelObjectStore
              WITH Keys <- AllKeys, Content <- AgentContent,
                   NoContent <- NoC, Clients <- Clients
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
-aVars == <<cl, wk, co, live, crashedOnce, due, acked, lastCas>>
+aVars == <<cl, wk, co, crashedOnce, due, acked, lastCas>>
 vars  == <<sVars, aVars>>
 
 Min(S) == CHOOSE x \in S : \A y \in S : x =< y
@@ -157,6 +160,17 @@ RecordCas(ak) ==
                 va |-> store'[HeadKey(ak)].version]
 
 CasOk(ak, v) == Store!CasResult(HeadKey(ak), v) = "Ok"
+
+\* A step that reads HEAD and CASes the version it read, with no other write
+\* in between, is one action here. A CAS on a stale read fails with
+\* PreconditionFailed and changes nothing, and the caller re-reads and
+\* retries, so the failed attempt is a stutter and folding the read into the
+\* CAS loses no behaviour. CasNow is that folded CAS on the current version.
+\* Where a dependency PUT sits between the read and the CAS (enqueue, turn
+\* completion) the two stay separate actions.
+CasNow(ak, new) ==
+    /\ Store!PutCasVersion(HeadKey(ak), Store!VersionOf(HeadKey(ak)), new)
+    /\ RecordCas(ak)
 
 \* --- Root transitions (pure functions of an observed HEAD) ---------------
 
@@ -211,7 +225,6 @@ WorkerIdle ==
     [pc |-> "idle", ak |-> CHOOSE ak \in AKs : TRUE, ver |-> 0, obs |-> NoC,
      turn |-> 0, seq |-> 0, base |-> 0, epoch |-> 0, inc |-> 0]
 
-CoordIdle(hinted) == [pc |-> "idle", ver |-> 0, obs |-> NoC, gen |-> 0, hinted |-> hinted]
 
 \* Each client picks its agent key, request id and payload. The first client's
 \* choice is pinned: every other choice is the same up to renaming, so this
@@ -229,12 +242,11 @@ Init ==
     /\ cl[FirstClient].ak = FirstChoice.ak
     /\ cl[FirstClient].rid = FirstChoice.rid
     /\ cl[FirstClient].inp = FirstChoice.inp
-    /\ wk = [w \in Workers |-> WorkerIdle]
-    /\ co = [ak \in AKs |-> CoordIdle(0)]
-    /\ live = [w \in Workers |-> TRUE]
+    /\ wk \in [Workers -> {WorkerIdle}]
+    /\ co \in [AKs -> {0}]
     /\ crashedOnce = {}
-    /\ due = [ak \in AKs |-> 0]
-    /\ acked = [c \in Clients |-> NoHandle]
+    /\ due \in [AKs -> {0}]
+    /\ acked \in [Clients -> {NoHandle}]
     /\ lastCas = NoCas
 
 \* --- Agent creation, destroy and recreate ---------------------------------
@@ -243,15 +255,12 @@ CreateHead(ak) ==
     /\ ~HeadUp(ak)
     /\ Store!PutCreateIfAbsent(HeadKey(ak), FreshHead(ak, 1, 1, NoWorker, 0, 0, 0))
     /\ RecordCas(ak)
-    /\ UNCHANGED <<cl, wk, co, live, crashedOnce, due, acked>>
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
-\* Administrative writes are one read and one CAS on the version read. Their
-\* read and CAS are folded into one step here: an administrator's CAS that
-\* fails on a stale read changes nothing and is retried, which is a stutter.
+\* Administrative writes are one read and one CAS on the version read.
 AdminCas(ak, new) ==
-    /\ Store!PutCasVersion(HeadKey(ak), Store!VersionOf(HeadKey(ak)), new)
-    /\ RecordCas(ak)
-    /\ UNCHANGED <<cl, wk, co, live, crashedOnce, due, acked>>
+    /\ CasNow(ak, new)
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* Destroy sets the tombstone; an armed timer is cancelled with the agent.
 Destroy(ak) ==
@@ -275,67 +284,66 @@ Recreate(ak) ==
 
 CK(c) == HeadKey(cl[c].ak)
 Hc(c) == PayloadHash[cl[c].inp]
-SameRid(c) == {r \in cl[c].obs.receipts : r.rid = cl[c].rid}
+SameRid(c, h) == {r \in h.receipts : r.rid = cl[c].rid}
 
 SetCl(c, f) == cl' = [cl EXCEPT ![c] = f]
 
-\* GET HEAD and keep its version as the CAS token. From "acked" this is the
-\* read that precedes a cancel. A tombstoned HEAD, or a handle minted under
-\* another incarnation, answers AgentGone.
+\* Respond to the client with a handle and forget the in-flight operation.
+AckWith(c, handle) ==
+    /\ acked' = [acked EXCEPT ![c] = handle]
+    /\ SetCl(c, [cl[c] EXCEPT !.pc = "acked", !.ver = 0, !.obs = NoC, !.handle = handle])
+
+\* GET HEAD (first attempt, or the re-read after an unknown outcome) and act
+\* on it. A tombstoned HEAD answers AgentGone. A receipt for the request id
+\* answers the recorded handle when the hash matches (idempotent retry) and
+\* IdempotencyConflict when it does not. Otherwise PUT the payload with
+\* CreateIfAbsent and keep the version read as the CAS token.
+\*
+\* Folding: the read answers from its own result, and a write landing
+\* between the read and the payload PUT is the same as one landing between
+\* the PUT and the CAS (the CAS fails either way), so read, response and
+\* PUT are one step. AlreadyExists on the PUT is a success, since the key is
+\* the payload's content hash; for the same reason a lost response on it is
+\* not its own action: the retry answers AlreadyExists.
 ReadHead(c) ==
-    /\ cl[c].pc \in {"start", "acked"}
+    /\ cl[c].pc \in {"start", "unknown"}
     /\ HeadUp(cl[c].ak)
-    /\ LET h == Head(cl[c].ak)
-           gone == h.tomb \/ (cl[c].pc = "acked" /\ h.inc # acked[c].rcpt.inc)
-       IN SetCl(c, [cl[c] EXCEPT
-                     !.ver = IF gone THEN 0 ELSE Store!VersionOf(CK(c)),
-                     !.obs = IF gone THEN NoC ELSE h,
-                     !.pc = IF gone THEN "gone"
-                            ELSE IF cl[c].pc = "start" THEN "read" ELSE "cread"])
-    /\ UNCHANGED <<sVars, wk, co, live, crashedOnce, due, acked, lastCas>>
-
-\* The re-read after an unknown outcome. The decision it feeds (Ack on a
-\* receipt with the same hash, a conflict on a different hash, otherwise a
-\* fresh attempt) is the same one a first read feeds.
-EnqueueResolve(c) ==
-    /\ cl[c].pc = "unknown"
-    /\ HeadUp(cl[c].ak)
-    /\ LET h == Head(cl[c].ak)
-       IN SetCl(c, [cl[c] EXCEPT !.ver = IF h.tomb THEN 0 ELSE Store!VersionOf(CK(c)),
-                                 !.obs = IF h.tomb THEN NoC ELSE h,
-                                 !.pc = IF h.tomb THEN "gone" ELSE "read"])
-    /\ UNCHANGED <<sVars, wk, co, live, crashedOnce, due, acked, lastCas>>
-
-\* PUT the payload with CreateIfAbsent. AlreadyExists is a success: the key
-\* is the payload's content hash, so the read-back comparison always agrees.
-PutDependency(c) ==
-    /\ \/ cl[c].pc = "read" /\ SameRid(c) = {}
-       \/ cl[c].pc = "depunk"
-    /\ Store!PutCreateIfAbsent(ObjKey(cl[c].ak, Hc(c)), Hc(c))
-    /\ SetCl(c, [cl[c] EXCEPT !.pc = "dep"])
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked, lastCas>>
-
-PutDependencyLostResponse(c) ==
-    /\ cl[c].pc = "read"
-    /\ SameRid(c) = {}
-    /\ Store!PutCreateIfAbsentLostResponse(ObjKey(cl[c].ak, Hc(c)), Hc(c))
-    /\ SetCl(c, [cl[c] EXCEPT !.pc = "depunk"])
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked, lastCas>>
+    /\ LET ak == cl[c].ak
+           h == Head(ak)
+       IN IF h.tomb
+            THEN /\ SetCl(c, [cl[c] EXCEPT !.pc = "gone", !.ver = 0, !.obs = NoC])
+                 /\ UNCHANGED <<sVars, acked>>
+          ELSE IF SameRid(c, h) # {}
+            THEN /\ LET r == CHOOSE x \in SameRid(c, h) : TRUE
+                    IN IF r.hash = Hc(c)
+                         THEN AckWith(c, [ak |-> ak, rcpt |-> r])
+                         ELSE /\ SetCl(c, [cl[c] EXCEPT !.pc = "conflict", !.ver = 0,
+                                                        !.obs = NoC])
+                              /\ UNCHANGED acked
+                 /\ UNCHANGED sVars
+            ELSE /\ Store!PutCreateIfAbsent(ObjKey(ak, Hc(c)), Hc(c))
+                 /\ SetCl(c, [cl[c] EXCEPT !.pc = "dep", !.ver = Store!VersionOf(CK(c)),
+                                           !.obs = h])
+                 /\ UNCHANGED acked
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
 \* The enqueue CAS: links the payload, allocates accept_seq, records the
-\* receipt. PreconditionFailed sends the client back to re-read.
+\* receipt. On success the client is answered with the handle it wrote (the
+\* response is part of the step: a gap before it only delays the answer).
+\* PreconditionFailed sends the client back to re-read.
 EnqueueCas(c) ==
     LET ak == cl[c].ak
         h == cl[c].obs
         new == EnqueueHead(h, cl[c].rid, Hc(c))
     IN /\ Store!PutCasVersion(CK(c), cl[c].ver, new)
        /\ IF CasOk(ak, cl[c].ver)
-            THEN /\ SetCl(c, [cl[c] EXCEPT !.pc = "casok",
-                                 !.handle = [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))]])
+            THEN /\ AckWith(c, [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))])
                  /\ RecordCas(ak)
             ELSE /\ SetCl(c, [cl[c] EXCEPT !.pc = "start", !.ver = 0, !.obs = NoC])
-                 /\ UNCHANGED lastCas
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked>>
+                 /\ lastCas' = NoCas
+                 /\ UNCHANGED acked
+    /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
 CasHead(c) ==
     /\ cl[c].pc = "dep"
@@ -348,26 +356,9 @@ CasHeadLostResponse(c) ==
     /\ LET ak == cl[c].ak
            new == EnqueueHead(cl[c].obs, cl[c].rid, Hc(c))
        IN /\ Store!PutCasVersionLostResponse(CK(c), cl[c].ver, new)
-          /\ IF CasOk(ak, cl[c].ver) THEN RecordCas(ak) ELSE UNCHANGED lastCas
+          /\ IF CasOk(ak, cl[c].ver) THEN RecordCas(ak) ELSE lastCas' = NoCas
     /\ SetCl(c, [cl[c] EXCEPT !.pc = "unknown", !.ver = 0, !.obs = NoC])
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked>>
-
-\* Respond to the client. After a successful CAS: the handle it wrote. After
-\* a read that found the request id: the recorded handle when the hash
-\* matches (idempotent retry), IdempotencyConflict when it does not.
-Ack(c) ==
-    /\ \/ /\ cl[c].pc = "casok"
-          /\ acked' = [acked EXCEPT ![c] = cl[c].handle]
-          /\ SetCl(c, [cl[c] EXCEPT !.pc = "acked", !.ver = 0, !.obs = NoC])
-       \/ /\ cl[c].pc = "read"
-          /\ SameRid(c) # {}
-          /\ LET r == CHOOSE x \in SameRid(c) : TRUE
-             IN IF r.hash = Hc(c)
-                  THEN /\ acked' = [acked EXCEPT ![c] = [ak |-> cl[c].ak, rcpt |-> r]]
-                       /\ SetCl(c, [cl[c] EXCEPT !.pc = "acked", !.ver = 0, !.obs = NoC])
-                  ELSE /\ UNCHANGED acked
-                       /\ SetCl(c, [cl[c] EXCEPT !.pc = "conflict", !.ver = 0, !.obs = NoC])
-    /\ UNCHANGED <<sVars, wk, co, live, crashedOnce, due, lastCas>>
+    /\ UNCHANGED <<wk, co, crashedOnce, due, acked>>
 
 \* --- Client: cancel -------------------------------------------------------
 
@@ -375,22 +366,22 @@ Ack(c) ==
 \* cancelled result; an active one is consumed too and its turn cleared, so
 \* the owner's completion CAS fails and its rebase finds the turn gone. An
 \* input that already has a result answers AlreadyCompleted. The command
-\* carries the handle's incarnation.
+\* carries the handle's incarnation; a tombstoned HEAD or another
+\* incarnation answers AgentGone. Those two answers write nothing, so only
+\* the cancel that writes is an action. Read and CAS are one step (CasNow).
 Cancel(c) ==
-    /\ cl[c].pc = "cread"
+    /\ cl[c].pc = "acked"
+    /\ HeadUp(cl[c].ak)
     /\ LET ak == cl[c].ak
-           h == cl[c].obs
+           h == Head(ak)
            s == acked[c].rcpt.seq
-       IN IF (\E r \in h.results : r.seq = s) \/ h.rev >= MaxRevision
-            THEN /\ SetCl(c, [cl[c] EXCEPT !.pc = "done", !.ver = 0, !.obs = NoC])
-                 /\ UNCHANGED <<sVars, lastCas>>
-            ELSE /\ Store!PutCasVersion(CK(c), cl[c].ver, CancelHead(h, s, acked[c].rcpt.inc))
-                 /\ IF CasOk(ak, cl[c].ver)
-                      THEN /\ RecordCas(ak)
-                           /\ SetCl(c, [cl[c] EXCEPT !.pc = "done", !.ver = 0, !.obs = NoC])
-                      ELSE /\ UNCHANGED lastCas
-                           /\ SetCl(c, [cl[c] EXCEPT !.pc = "acked", !.ver = 0, !.obs = NoC])
-    /\ UNCHANGED <<wk, co, live, crashedOnce, due, acked>>
+       IN /\ ~h.tomb
+          /\ h.inc = acked[c].rcpt.inc
+          /\ ~\E r \in h.results : r.seq = s
+          /\ h.rev < MaxRevision
+          /\ CasNow(ak, CancelHead(h, s, acked[c].rcpt.inc))
+    /\ SetCl(c, [cl[c] EXCEPT !.pc = "done"])
+    /\ UNCHANGED <<wk, co, crashedOnce, due, acked>>
 
 \* --- Worker ---------------------------------------------------------------
 
@@ -399,173 +390,143 @@ Ob(w) == wk[w].obs
 
 SetWk(w, f) == wk' = [wk EXCEPT ![w] = f]
 
-CanTakeover(w) ==
-    /\ ~Ob(w).tomb
-    /\ Ob(w).owner # w
-    /\ Ob(w).epoch < MaxEpoch
-    /\ (Ob(w).inbox # {} \/ Ob(w).timer.st = "armed")
-
-CanBegin(w) ==
-    /\ ~Ob(w).tomb
-    /\ Ob(w).owner = w
-    /\ Ob(w).active.turn = 0
-    /\ Ob(w).inbox # {}
-
-CanRun(w) ==
-    /\ ~Ob(w).tomb
-    /\ Ob(w).owner = w
-    /\ Ob(w).active.turn # 0
-
-Progress(w) == CanTakeover(w) \/ CanBegin(w) \/ CanRun(w)
-
-\* A root on which worker w has a step to take: a takeover, a turn to begin
-\* or run, or a timer to schedule or cancel.
-Offers(w, h) ==
-    /\ ~h.tomb
-    /\ \/ h.owner # w /\ h.epoch < MaxEpoch /\ (h.inbox # {} \/ h.timer.st = "armed")
-       \/ h.owner = w /\ (h.inbox # {} \/ h.active.turn # 0)
-       \/ h.owner = w /\ (h.timer.st = "armed" \/ h.timer.gen < MaxTimerGen)
-
-\* GET HEAD. From "idle" this is a fresh read, and from "read" the re-read of
-\* a worker whose last read offered no progress; either is taken only when
-\* the root it returns offers the worker a step, since a read that leads
-\* nowhere is a stutter. From "rebase" it is the re-read after a failed or
-\* unknown completion CAS.
-WorkerRead(w) ==
-    /\ live[w]
-    /\ \/ /\ wk[w].pc = "idle" \/ (wk[w].pc = "read" /\ ~Progress(w))
-          /\ \E ak \in AKs :
-               /\ HeadUp(ak)
-               /\ Offers(w, Head(ak))
-               /\ SetWk(w, [WorkerIdle EXCEPT !.pc = "read", !.ak = ak,
-                              !.ver = Store!VersionOf(HeadKey(ak)), !.obs = Head(ak)])
-       \/ /\ wk[w].pc = "rebase"
-          /\ SetWk(w, [wk[w] EXCEPT !.pc = "rread", !.ver = Store!VersionOf(WK(w)),
-                                    !.obs = Head(wk[w].ak)])
-    /\ UNCHANGED <<sVars, cl, co, live, crashedOnce, due, acked, lastCas>>
-
-\* An owner command CASes the observed root; it is validated against the
-\* epoch, owner and turn of that root because the CAS pins its version.
+\* Owner commands are validated against the epoch, owner and turn of the root
+\* they read, because their CAS pins that root's version. Takeover,
+\* BeginTurn, ScheduleTimer, CancelTimer and the rebase read and CAS in one
+\* step (CasNow). A turn's completion is two steps: its output object is
+\* written between the read and the CAS, and WorkerCas is that CAS on the
+\* version read before the output PUT.
 WorkerCas(w, new, okPc, failPc) ==
     /\ Store!PutCasVersion(WK(w), wk[w].ver, new)
     /\ IF CasOk(wk[w].ak, wk[w].ver)
          THEN /\ RecordCas(wk[w].ak)
               /\ SetWk(w, IF okPc = "idle" THEN WorkerIdle ELSE [wk[w] EXCEPT !.pc = okPc])
-         ELSE /\ UNCHANGED lastCas
+         ELSE /\ lastCas' = NoCas
               /\ SetWk(w, IF failPc = "idle" THEN WorkerIdle ELSE [wk[w] EXCEPT !.pc = failPc])
 
-Takeover(w) ==
-    /\ live[w]
-    /\ wk[w].pc = "read"
-    /\ CanTakeover(w)
-    /\ WorkerCas(w, [Ob(w) EXCEPT !.rev = @ + 1, !.epoch = @ + 1, !.owner = w], "idle", "idle")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+\* Claim an agent with work (pending input or an armed timer) by advancing
+\* its epoch.
+Takeover(w, ak) ==
+    /\ wk[w].pc = "idle"
+    /\ HeadUp(ak)
+    /\ LET h == Head(ak)
+       IN /\ ~h.tomb
+          /\ h.owner # w
+          /\ h.epoch < MaxEpoch
+          /\ (h.inbox # {} \/ h.timer.st = "armed")
+          /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.epoch = @ + 1, !.owner = w])
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* Bind the lowest accepted input to a fresh turn id and the base state
 \* version. The owner then resumes it from HEAD like any later owner would.
-BeginTurn(w) ==
-    /\ live[w]
-    /\ wk[w].pc = "read"
-    /\ CanBegin(w)
-    /\ LET h == Ob(w)
-       IN WorkerCas(w, [h EXCEPT !.rev = @ + 1, !.turns = @ + 1,
-                         !.active = [turn |-> h.turns + 1, seq |-> Min(h.inbox),
-                                     base |-> h.sv, inc |-> h.inc]],
-                    "idle", "idle")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+BeginTurn(w, ak) ==
+    /\ wk[w].pc = "idle"
+    /\ HeadUp(ak)
+    /\ LET h == Head(ak)
+       IN /\ ~h.tomb
+          /\ h.owner = w
+          /\ h.active.turn = 0
+          /\ h.inbox # {}
+          /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.turns = @ + 1,
+                           !.active = [turn |-> h.turns + 1, seq |-> Min(h.inbox),
+                                       base |-> h.sv, inc |-> h.inc]])
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
-\* Run the active turn (the handler is a black box) and PUT its output
-\* object (new state snapshot and result) with CreateIfAbsent. The output is
-\* a function of the turn, so a resumed or rebased turn writes the same key.
-PutTurnOutput(w) ==
-    /\ live[w]
-    /\ wk[w].pc = "read"
-    /\ CanRun(w)
-    /\ LET a == Ob(w).active
-       IN /\ Store!PutCreateIfAbsent(ObjKey(wk[w].ak, OutId(a.turn)), OutId(a.turn))
-          /\ SetWk(w, [wk[w] EXCEPT !.pc = "dep", !.turn = a.turn, !.seq = a.seq,
-                                    !.base = a.base, !.epoch = Ob(w).epoch, !.inc = a.inc])
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked, lastCas>>
+\* GET HEAD, run its active turn (the handler is a black box) and PUT the
+\* output object (new state snapshot and result) with CreateIfAbsent. The
+\* output is a function of the turn, so a resumed turn writes the same key.
+\* The version read is the token for the completion CAS.
+PutTurnOutput(w, ak) ==
+    /\ wk[w].pc = "idle"
+    /\ HeadUp(ak)
+    /\ LET h == Head(ak)
+           a == h.active
+       IN /\ ~h.tomb
+          /\ h.owner = w
+          /\ a.turn # 0
+          /\ Store!PutCreateIfAbsent(ObjKey(ak, OutId(a.turn)), OutId(a.turn))
+          /\ SetWk(w, [pc |-> "dep", ak |-> ak, ver |-> Store!VersionOf(HeadKey(ak)),
+                       obs |-> h, turn |-> a.turn, seq |-> a.seq, base |-> a.base,
+                       epoch |-> h.epoch, inc |-> a.inc])
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 \* The final turn CAS: new state, consumed input and its result together.
 CompleteTurn(w) ==
-    /\ live[w]
     /\ wk[w].pc = "dep"
     /\ WorkerCas(w, CompleteHead(Ob(w), wk[w], "completed", w), "idle", "rebase")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 CompleteTurnLostResponse(w) ==
-    /\ live[w]
     /\ wk[w].pc = "dep"
     /\ Store!PutCasVersionLostResponse(WK(w), wk[w].ver, CompleteHead(Ob(w), wk[w], "completed", w))
-    /\ IF CasOk(wk[w].ak, wk[w].ver) THEN RecordCas(wk[w].ak) ELSE UNCHANGED lastCas
+    /\ IF CasOk(wk[w].ak, wk[w].ver) THEN RecordCas(wk[w].ak) ELSE lastCas' = NoCas
     /\ SetWk(w, [wk[w] EXCEPT !.pc = "rebase"])
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 \* A handler failure consumes the input with a failure result and leaves the
 \* state unchanged. A failed CAS leaves the turn active for a later attempt.
 FailTurn(w) ==
-    /\ live[w]
     /\ wk[w].pc = "dep"
     /\ WorkerCas(w, CompleteHead(Ob(w), wk[w], "failed", w), "idle", "idle")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
-OwnResult(w) ==
-    \E r \in Ob(w).results : r.seq = wk[w].seq /\ r.turn = wk[w].turn
+OwnResult(w, h) ==
+    \E r \in h.results : r.seq = wk[w].seq /\ r.turn = wk[w].turn
 
-\* After a failed or unknown completion: if the re-read root carries this
+\* After a failed or unknown completion, re-read HEAD. If it carries this
 \* turn's result, the commit landed. Otherwise reapply the transition on the
 \* new root only when owner, epoch, active turn and base state version still
 \* match; anything else is OwnershipLost.
 CompleteTurnRebase(w) ==
-    /\ live[w]
-    /\ wk[w].pc = "rread"
-    /\ LET h == Ob(w)
-       IN IF ~OwnResult(w) /\ ~h.tomb /\ h.owner = w /\ h.epoch = wk[w].epoch
+    /\ wk[w].pc = "rebase"
+    /\ LET ak == wk[w].ak
+           h == Head(ak)
+       IN IF ~OwnResult(w, h) /\ ~h.tomb /\ h.owner = w /\ h.epoch = wk[w].epoch
                 /\ h.active.turn = wk[w].turn /\ h.sv = wk[w].base
-            THEN WorkerCas(w, CompleteHead(h, wk[w], "completed", w), "idle", "rebase")
-            ELSE /\ SetWk(w, WorkerIdle)
-                 /\ UNCHANGED <<sVars, lastCas>>
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+            THEN CasNow(ak, CompleteHead(h, wk[w], "completed", w))
+            ELSE /\ UNCHANGED sVars
+                 /\ lastCas' = NoCas
+    /\ SetWk(w, WorkerIdle)
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
-ScheduleTimer(w) ==
-    /\ live[w]
-    /\ wk[w].pc = "read"
-    /\ ~Ob(w).tomb
-    /\ Ob(w).owner = w
-    /\ Ob(w).timer.st # "armed"
-    /\ Ob(w).timer.gen < MaxTimerGen
-    /\ WorkerCas(w, [Ob(w) EXCEPT !.rev = @ + 1,
-                       !.timer = [gen |-> Ob(w).timer.gen + 1, st |-> "armed"]],
-                 "idle", "idle")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+ScheduleTimer(w, ak) ==
+    /\ wk[w].pc = "idle"
+    /\ HeadUp(ak)
+    /\ LET h == Head(ak)
+       IN /\ ~h.tomb
+          /\ h.owner = w
+          /\ h.timer.st # "armed"
+          /\ h.timer.gen < MaxTimerGen
+          /\ CasNow(ak, [h EXCEPT !.rev = @ + 1,
+                           !.timer = [gen |-> h.timer.gen + 1, st |-> "armed"]])
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* Cancel an armed generation. On a root whose generation was already
 \* delivered the CAS precondition fails and the re-read answers AlreadyFired.
-CancelTimer(w) ==
-    /\ live[w]
-    /\ wk[w].pc = "read"
-    /\ ~Ob(w).tomb
-    /\ Ob(w).owner = w
-    /\ Ob(w).timer.st = "armed"
-    /\ WorkerCas(w, [Ob(w) EXCEPT !.rev = @ + 1, !.timer.st = "cancelled"], "idle", "idle")
-    /\ UNCHANGED <<cl, co, live, crashedOnce, due, acked>>
+CancelTimer(w, ak) ==
+    /\ wk[w].pc = "idle"
+    /\ HeadUp(ak)
+    /\ LET h == Head(ak)
+       IN /\ ~h.tomb
+          /\ h.owner = w
+          /\ h.timer.st = "armed"
+          /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.timer.st = "cancelled"])
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
-\* A crash loses the worker's in-memory operation and nothing durable. A
-\* crash with nothing in flight is a pause, which interleaving already covers.
+\* A crash loses the worker's in-memory operation and nothing durable; the
+\* restarted worker starts from idle. The downtime between crash and restart
+\* is a run of other processes' steps, which interleaving already covers. A
+\* crash is taken only after the turn output is written or while a
+\* completion's outcome is unknown: every other worker step is a single
+\* action, so a crash anywhere else loses nothing.
 WorkerCrash(w) ==
-    /\ live[w]
-    /\ wk[w].pc # "idle"
+    /\ wk[w].pc \in {"dep", "rebase"}
     /\ w \notin crashedOnce
-    /\ live' = [live EXCEPT ![w] = FALSE]
     /\ crashedOnce' = crashedOnce \cup {w}
     /\ SetWk(w, WorkerIdle)
-    /\ UNCHANGED <<sVars, cl, co, due, acked, lastCas>>
-
-WorkerRecover(w) ==
-    /\ ~live[w]
-    /\ live' = [live EXCEPT ![w] = TRUE]
-    /\ UNCHANGED <<sVars, cl, wk, co, crashedOnce, due, acked, lastCas>>
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<sVars, cl, co, due, acked>>
 
 \* --- Timers, hints and the sweep -------------------------------------------
 
@@ -576,10 +537,11 @@ WorkerRecover(w) ==
 WriteHint(ak) ==
     /\ HeadUp(ak)
     /\ Head(ak).timer.st = "armed"
-    /\ co[ak].hinted < Head(ak).timer.gen
+    /\ co[ak] < Head(ak).timer.gen
     /\ Store!PutOverwrite(HintKey(ak, Head(ak).timer.gen), <<"hint", Head(ak).timer.gen>>)
-    /\ co' = [co EXCEPT ![ak].hinted = Head(ak).timer.gen]
-    /\ UNCHANGED <<cl, wk, live, crashedOnce, due, acked, lastCas>>
+    /\ co' = [co EXCEPT ![ak] = Head(ak).timer.gen]
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<cl, wk, crashedOnce, due, acked>>
 
 \* Time passes for the armed generation (environment; no clock is read).
 TimerDue(ak) ==
@@ -587,7 +549,8 @@ TimerDue(ak) ==
     /\ Head(ak).timer.st = "armed"
     /\ due[ak] < Head(ak).timer.gen
     /\ due' = [due EXCEPT ![ak] = Head(ak).timer.gen]
-    /\ UNCHANGED <<sVars, cl, wk, co, live, crashedOnce, acked, lastCas>>
+    /\ lastCas' = NoCas
+    /\ UNCHANGED <<sVars, cl, wk, co, crashedOnce, acked>>
 
 \* The sweep lists a hint whose generation is not yet due. It keeps the hint
 \* for a later pass: nothing changes.
@@ -596,71 +559,57 @@ HintObservedEarly(ak, g) ==
     /\ due[ak] < g
     /\ UNCHANGED vars
 
-\* The sweep reads the HEAD named by a due hint.
-SweepRead(ak, g) ==
-    /\ co[ak].pc = "idle"
+\* The sweep serves a due hint: it reads the HEAD the hint names and, when
+\* that root has the hint's generation armed, fires it with one CAS that
+\* marks the generation delivered and enqueues the timer message (read and
+\* CAS are one step, see CasNow). A hint for a generation the root no longer
+\* has armed fires nothing and is deleted; generations never re-arm, so that
+\* root never needs the hint again.
+FireTimer(ak, g) ==
     /\ Store!Present(HintKey(ak, g))
     /\ g =< due[ak]
     /\ HeadUp(ak)
-    /\ co' = [co EXCEPT ![ak] = [@ EXCEPT !.pc = "fire",
-                                          !.ver = Store!VersionOf(HeadKey(ak)),
-                                          !.obs = Head(ak), !.gen = g]]
-    /\ UNCHANGED <<sVars, cl, wk, live, crashedOnce, due, acked, lastCas>>
-
-\* Firing is one CAS that marks the generation delivered and enqueues the
-\* timer message. A hint for a generation the observed root no longer has
-\* armed fires nothing and is deleted; generations never re-arm, so that
-\* root never needs the hint again.
-FireTimer(ak) ==
-    /\ co[ak].pc = "fire"
-    /\ LET h == co[ak].obs
-           g == co[ak].gen
+    /\ LET h == Head(ak)
        IN IF h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb
-            THEN /\ Store!PutCasVersion(HeadKey(ak), co[ak].ver, FireHead(h, g))
-                 /\ IF CasOk(ak, co[ak].ver) THEN RecordCas(ak) ELSE UNCHANGED lastCas
+            THEN CasNow(ak, FireHead(h, g))
             ELSE /\ Store!Delete(HintKey(ak, g))
-                 /\ UNCHANGED lastCas
-    /\ co' = [co EXCEPT ![ak] = CoordIdle(co[ak].hinted)]
-    /\ UNCHANGED <<cl, wk, live, crashedOnce, due, acked>>
+                 /\ lastCas' = NoCas
+    /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* --- Specification --------------------------------------------------------
 
 Next ==
     \/ \E ak \in AKs : CreateHead(ak) \/ Destroy(ak) \/ Recreate(ak)
     \/ \E c \in Clients :
-         \/ ReadHead(c) \/ EnqueueResolve(c) \/ PutDependency(c)
-         \/ PutDependencyLostResponse(c) \/ CasHead(c) \/ CasHeadLostResponse(c)
-         \/ Ack(c) \/ Cancel(c)
+         \/ ReadHead(c) \/ CasHead(c) \/ CasHeadLostResponse(c) \/ Cancel(c)
     \/ \E w \in Workers :
-         \/ WorkerRead(w) \/ Takeover(w) \/ BeginTurn(w) \/ PutTurnOutput(w)
          \/ CompleteTurn(w) \/ CompleteTurnLostResponse(w) \/ CompleteTurnRebase(w)
-         \/ FailTurn(w) \/ ScheduleTimer(w) \/ CancelTimer(w)
-         \/ WorkerCrash(w) \/ WorkerRecover(w)
+         \/ FailTurn(w) \/ WorkerCrash(w)
+         \/ \E ak \in AKs :
+              \/ Takeover(w, ak) \/ BeginTurn(w, ak) \/ PutTurnOutput(w, ak)
+              \/ ScheduleTimer(w, ak) \/ CancelTimer(w, ak)
     \/ \E ak \in AKs :
-         \/ WriteHint(ak) \/ TimerDue(ak) \/ FireTimer(ak)
-         \/ \E g \in 1..MaxTimerGen : HintObservedEarly(ak, g) \/ SweepRead(ak, g)
+         \/ WriteHint(ak) \/ TimerDue(ak)
+         \/ \E g \in 1..MaxTimerGen : HintObservedEarly(ak, g) \/ FireTimer(ak, g)
 
 Spec == Init /\ [][Next]_vars
 
-\* Liveness assumptions: every crashed worker recovers (a surviving
-\* compatible worker), live workers keep reading and acting on accepted work,
-\* the scheduler writes its hint and the sweep keeps serving due hints. Store
+\* Liveness assumptions: a crashed worker restarts (a compatible worker
+\* stays available), workers keep acting on accepted work, the scheduler
+\* writes its hint and the sweep keeps serving due hints. Store
 \* availability: a transient failure is a stutter, which weak fairness rules
 \* out forever; contention is bounded because every writer is.
 Fairness ==
     /\ \A w \in Workers :
-         /\ WF_vars(WorkerRecover(w))
-         /\ WF_vars(WorkerRead(w))
-         /\ WF_vars(Takeover(w))
-         /\ WF_vars(BeginTurn(w))
-         /\ WF_vars(PutTurnOutput(w))
+         /\ WF_vars(\E ak \in AKs : Takeover(w, ak))
+         /\ WF_vars(\E ak \in AKs : BeginTurn(w, ak))
+         /\ WF_vars(\E ak \in AKs : PutTurnOutput(w, ak))
          /\ WF_vars(CompleteTurn(w))
          /\ WF_vars(CompleteTurnRebase(w))
     /\ \A ak \in AKs :
          /\ WF_vars(CreateHead(ak))
          /\ WF_vars(WriteHint(ak))
-         /\ WF_vars(\E g \in 1..MaxTimerGen : SweepRead(ak, g))
-         /\ WF_vars(FireTimer(ak))
+         /\ WF_vars(\E g \in 1..MaxTimerGen : FireTimer(ak, g))
 
 FairSpec == Spec /\ Fairness
 
