@@ -732,9 +732,11 @@ enum Command {
         /// attribute names and values, and fixed per-row fields over the rows
         /// the buffer holds; metrics and spans use their routers' own
         /// estimates. The check runs once per write, after a batch's
-        /// per-shard slice has merged, so a target at or below one slice's
-        /// estimate (`--batch-rows / --shards` rows) is exceeded by the first
-        /// write into an empty buffer and reproduces the `1` layout. A load
+        /// per-shard slice has merged, so at an even split a target at or
+        /// below one slice's estimate (`--batch-rows / --shards` rows) is
+        /// exceeded by the first write into an empty buffer and reproduces
+        /// the `1` layout; a shard whose slice falls under that estimate can
+        /// still accumulate across batches. A load
         /// whose target turned out to lay the objects out exactly as `1`
         /// would have says so on stderr and in the load report.
         ///

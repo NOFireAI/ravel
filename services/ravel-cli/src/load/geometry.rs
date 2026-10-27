@@ -195,6 +195,17 @@ impl LoadGeometry {
         depth_flush_runs(self.target_bytes)
     }
 
+    /// Whether this is a derived target [`resolve_geometry`] clamped to
+    /// [`MAX_TARGET_BYTES`]: [`DEFAULT_OBJECT_ROWS`] times the rounded-up
+    /// per-row estimate exceeds the bound. A derived target exactly at the
+    /// bound is not clamped.
+    pub fn target_clamped(&self) -> bool {
+        self.target_source == TargetSource::Derived
+            && self.target_bytes as u64 == MAX_TARGET_BYTES
+            && (DEFAULT_OBJECT_ROWS as u128).saturating_mul(u128::from(self.est_bytes_per_row))
+                > u128::from(MAX_TARGET_BYTES)
+    }
+
     /// The depth the rows bound derives for this load: [`Self::rows_depth`],
     /// plus the margin only when the depth flush runs.
     pub fn rows_bound(&self) -> usize {
@@ -645,9 +656,7 @@ fn target_source_text(g: &LoadGeometry) -> String {
         TargetSource::Flag => "--target-bytes".to_string(),
         TargetSource::Derived => {
             let rows = DEFAULT_OBJECT_ROWS;
-            let unclamped = (rows as u128).saturating_mul(u128::from(g.est_bytes_per_row));
-            if g.target_bytes as u64 == MAX_TARGET_BYTES && unclamped > u128::from(MAX_TARGET_BYTES)
-            {
+            if g.target_clamped() {
                 return format!(
                     "derived: {rows} rows x {} estimated bytes per row, clamped to the \
                      {MAX_TARGET_BYTES} maximum",

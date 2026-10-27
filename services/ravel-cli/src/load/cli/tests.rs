@@ -253,6 +253,82 @@ async fn the_entry_point_reports_a_target_bytes_that_changed_nothing() {
     );
 }
 
+/// The whole no-effect warning for `--target-bytes 4096` over two writes on
+/// one shard at `--batch-rows 16` and 4 shards.
+const FLAG_4096_NO_EFFECT_WARNING: &str = "warning: --target-bytes 4096 did not change this \
+     load's object layout. All 2 (batch, shard) writes flushed as their own object (2 objects), \
+     which is what --target-bytes 1 produces, and at least one shard took two or more writes \
+     without accumulating them. This is the OBSERVED layout, not proof the target was the lever: \
+     with --pipeline-depth 1, or when the gap between a shard's writes exceeds the \
+     max-flush-delay clock, the age trigger flushes a waiting buffer before the next batch \
+     arrives and no target value can make it accumulate -- check the pipeline depth and write \
+     cadence before changing the target. Separately, the target is compared against the \
+     buffer's estimated UNCOMPRESSED object content, not the stored object size, and the check \
+     runs once per write after a whole batch has merged. So at an even split a target at or \
+     below one batch's per-shard slice (about 4 rows here, at --batch-rows 16 over 4 shards) is \
+     already exceeded by the first write into an empty buffer and flushes it. For objects that \
+     span several batches, raise --target-bytes above that slice's estimated content, or lower \
+     --batch-rows.";
+
+/// Issue #3376: a derived target clamped to `MAX_TARGET_BYTES` is named as
+/// clamped in the no-effect warning, as the geometry line names it, rather
+/// than as `DEFAULT_OBJECT_ROWS` times the per-row estimate, which it is not.
+/// A derived target exactly at the bound and one well under it keep the
+/// per-row wording.
+///
+/// Prove-the-test: drop the `TargetSource::Derived if
+/// geometry.target_clamped()` arm in `layout_no_effect_warning` and the
+/// clamped case fails (the warning reads "(250000 rows at the first batch's
+/// estimated bytes per row)"); print the clamp note for every derived target
+/// and the at-bound case fails; drop the per-row explanation from the
+/// unclamped arm and the 1000000 case fails.
+#[test]
+fn the_no_effect_warning_names_a_clamped_derived_target_as_clamped() {
+    let token = |seq: u64| CommitToken {
+        shard: 0,
+        writer_id: uuid::Uuid::nil(),
+        epoch: 1,
+        seq,
+        ingest_hour_bucket: 7,
+    };
+    let inert = [token(1), token(2)];
+    let warning_for = |est_bytes: usize| {
+        let geometry = resolve_geometry(None, Some(1), 4, 16, 1, est_bytes, None);
+        layout_no_effect_warning(&geometry, &inert, 16, 4)
+            .expect("two writes, two objects, one shard: the target did nothing")
+    };
+    let expected =
+        |target: &str| FLAG_4096_NO_EFFECT_WARNING.replacen("--target-bytes 4096", target, 1);
+
+    // 250,000 x 2,000,000 = 500,000,000,000, over the bound.
+    let clamped = warning_for(2_000_000);
+    assert_eq!(
+        clamped,
+        expected(
+            "the derived flush target of 360000000000 bytes (250000 rows at the first batch's \
+             estimated 2000000 bytes per row, clamped to the 360000000000 maximum)"
+        )
+    );
+    assert!(!clamped.contains("500000000000"), "{clamped}");
+
+    // 250,000 x 1,440,000 is the bound itself: nothing was clamped.
+    assert_eq!(
+        warning_for(1_440_000),
+        expected(
+            "the derived flush target of 360000000000 bytes (250000 rows at the first batch's \
+             estimated bytes per row)"
+        )
+    );
+
+    assert_eq!(
+        warning_for(4),
+        expected(
+            "the derived flush target of 1000000 bytes (250000 rows at the first batch's \
+             estimated bytes per row)"
+        )
+    );
+}
+
 /// [`target_bytes_no_effect_warning`]'s three preconditions, each pinned by
 /// the case that would misfire without it. `writes` is
 /// `LoadReport::tokens`, one entry per (batch, shard) ack, so a flush that
@@ -282,14 +358,7 @@ fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
     let inert = report(vec![token(0, 1), token(0, 2)]);
     let warning = target_bytes_no_effect_warning(4096, &inert, 16, 4)
         .expect("two writes, two objects, one shard: the target did nothing");
-    assert!(
-        warning.contains("All 2 (batch, shard) writes flushed as their own object (2 objects)"),
-        "the message reports the observed counts: {warning}"
-    );
-    assert!(
-        warning.contains("about 4 rows here, at --batch-rows 16 over 4 shards"),
-        "and the slice threshold it derives from the geometry: {warning}"
-    );
+    assert_eq!(warning, FLAG_4096_NO_EFFECT_WARNING);
 
     assert!(
         target_bytes_no_effect_warning(PER_BATCH_TARGET_BYTES, &inert, 16, 4).is_none(),

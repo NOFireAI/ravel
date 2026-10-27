@@ -1344,13 +1344,8 @@ pub(super) async fn load_spans_into(
         shards: Vec::new(),
         totals,
     };
-    report.target_bytes_no_effect_warning = layout_no_effect_warning(
-        geometry.target_bytes,
-        geometry.target_source,
-        &report.tokens,
-        batch_rows,
-        shards,
-    );
+    report.target_bytes_no_effect_warning =
+        layout_no_effect_warning(&geometry, &report.tokens, batch_rows, shards);
     report.geometry = Some(geometry);
     report.realign_gave_up = window.realign_gave_up();
     report.elapsed = started.elapsed();
