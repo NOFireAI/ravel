@@ -133,7 +133,7 @@ jobs:
           # normative-doc change does not check the model still matches the
           # prose; it puts the suite in front of that change's reviewer.
           formal_area=false
-          if echo "$changed" | grep -qE '^formal/|^scripts/check-tla\.sh$|^crates/ravel-object-store/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^crates/ravel-maintain/|^crates/ravel-fleet/|^crates/ravel-query/|^services/ravel-server/|^docs/object-store-contract\.md$|^docs/consistency-model\.md$|^docs/catalog-and-mvcc\.md$|^docs/deletion-and-gc\.md$|^docs/ingest\.md$'; then
+          if echo "$changed" | grep -qE '^formal/|^scripts/check-tla\.sh$|^crates/ravel-object-store/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^crates/ravel-maintain/|^crates/ravel-agents-|^crates/ravel-fleet/|^crates/ravel-query/|^services/ravel-server/|^docs/object-store-contract\.md$|^docs/consistency-model\.md$|^docs/catalog-and-mvcc\.md$|^docs/deletion-and-gc\.md$|^docs/ingest\.md$'; then
             formal_area=true
           fi
           # docs/formal-only: every changed path is prose (.md/.svg), a TLA+
@@ -584,7 +584,7 @@ jobs:
       # infrastructure loss.
       fail-fast: false
       matrix:
-        area: [catalog, commit, common, lifecycle, maintenance, resharding]
+        area: [agents, catalog, commit, common, lifecycle, maintenance, resharding]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -644,7 +644,7 @@ jobs:
       # matrix above; the marker step below is what asserts that, by comparing
       # the marker names (each written by the matrix entry that produced it)
       # against this value.
-      EXPECTED: catalog commit common lifecycle maintenance resharding
+      EXPECTED: agents catalog commit common lifecycle maintenance resharding
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

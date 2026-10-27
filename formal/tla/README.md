@@ -2,13 +2,15 @@
 
 Machine-checked models of Ravel's concurrency and durability contracts, and
 the harness that runs them. Decided by ADR-1113. The harness, the shared
-object-store module, and the CI lane are shipped, covering the six areas
-below with seven specification modules in all: one per protocol area except
+object-store module, and the CI lane are shipped, covering the seven areas
+below with eight specification modules in all: one per protocol area except
 maintenance, which holds two, `MaintenanceOwnership.tla` (ADR-0065, shipped
 behaviour) and `CompactionClaims.tla` (ADR-1029, a proposed design over a
 landed claim primitive nothing calls yet, checked as a design, not as
-shipped behaviour). `REPORT.md` is the suite-wide report; `TRACEABILITY.md`
-indexes every area's Rust traceability table.
+shipped behaviour). The agents area (ADR-3331) models a runtime that is not
+built yet, so it too is checked as a design. `REPORT.md` is the suite-wide
+report over the six areas ADR-1113 planned; `TRACEABILITY.md` indexes every
+area's Rust traceability table.
 
 ## Layout
 
@@ -36,7 +38,7 @@ in the directory is a model-check entry module, and an area may hold more than
 one. For each module and kind (smoke, exhaustive) the harness prefers the
 per-module `MC<Spec>.<kind>.cfg` and falls back to the bare `<kind>.cfg` (valid
 only where the area has a single spec); it fails when a smoke module has no
-config. All areas planned by ADR-1113 are shipped:
+config. All areas planned by ADR-1113 are shipped, and ADR-3331 adds agents:
 
 | Area | Contract modeled | Specification(s) | Config lanes | Status |
 |---|---|---|---|---|
@@ -46,10 +48,12 @@ config. All areas planned by ADR-1113 are shipped:
 | [lifecycle](lifecycle/) | retention, erasure, legal holds, physical GC | `LifecycleGC.tla` | smoke, exhaustive, 7 negative, plus an ungated rejected-design candidate | shipped, with ADR-0064's out-of-window case open |
 | [resharding](resharding/) | generation-versioned online resharding | `OnlineResharding.tla` | smoke, exhaustive, 5 negative, plus several ungated liveness and simulation configs | shipped |
 | [maintenance](maintenance/) | maintenance ownership (shipped) and advisory claims (proposed) | `MaintenanceOwnership.tla`, `CompactionClaims.tla` | smoke, exhaustive (per spec), 12 negative | ownership: shipped; claims: proposed design over a landed primitive |
+| [agents](agents/) | agent HEAD enqueue, request identity, takeover, turn completion, cancellation, timers (ADR-3331) | `AgentProtocol.tla` | smoke, exhaustive, 14 negative (10 broken-behavior, 4 reachability probes) | design for an unbuilt runtime; no traceability.md or results.md yet |
 
 Each area's own `README.md` explains its abstraction boundary and what it
 does and does not model; `results.md` carries its recorded figures;
-`REPORT.md` (this directory) is the suite-wide report across all six.
+`REPORT.md` (this directory) is the suite-wide report across the six
+ADR-1113 areas; it does not cover agents yet.
 
 ## Running
 
