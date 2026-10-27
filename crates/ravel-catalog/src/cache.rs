@@ -1201,6 +1201,9 @@ pub(crate) struct DecodedCaches {
     /// [`Self::memory_evictions`], which counts only evictions made for a
     /// refused decode.
     byte_bound_evictions: AtomicU64,
+    /// Values not cached because their own reservation exceeds the byte
+    /// bound, cumulative. Each one is decoded again on its next use.
+    byte_bound_refusals: AtomicU64,
 }
 
 impl Default for DecodedCaches {
@@ -1212,6 +1215,7 @@ impl Default for DecodedCaches {
             memory_evictions: AtomicU64::new(0),
             max_bytes: AtomicU64::new(u64::MAX),
             byte_bound_evictions: AtomicU64::new(0),
+            byte_bound_refusals: AtomicU64::new(0),
         }
     }
 }
@@ -1263,7 +1267,9 @@ impl DecodedCaches {
     /// bound. A value whose own reservation exceeds the bound is refused
     /// before the insert, leaving both caches untouched: admitting it and then
     /// evicting would drop every other entry and then it too. Such a value is
-    /// counted nowhere; the caller still uses the `Arc` it holds.
+    /// counted in [`Self::byte_bound_refusals`]; the caller still uses the
+    /// `Arc` it holds. With no bound set, the insert skips the held-bytes
+    /// scan, which takes both caches' locks.
     fn insert_bounded<T>(
         &self,
         cache: &DecodedCache<Charged<T>>,
@@ -1275,9 +1281,13 @@ impl DecodedCaches {
     ) {
         let max = self.max_bytes.load(Ordering::Relaxed);
         if value.reserved_bytes() > max {
+            self.byte_bound_refusals.fetch_add(1, Ordering::Relaxed);
             return;
         }
         cache.insert(tenant, key, value, bytes, capacity);
+        if max == u64::MAX {
+            return;
+        }
         let mut dropped = 0;
         while self.reserved_bytes() > max {
             if !self.evict_one_lru() {
@@ -1292,6 +1302,12 @@ impl DecodedCaches {
     /// Entries dropped by the byte bound since this catalog was built.
     pub(crate) fn byte_bound_evictions(&self) -> u64 {
         self.byte_bound_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Values not cached because their own reservation exceeds the byte
+    /// bound, since this catalog was built.
+    pub(crate) fn byte_bound_refusals(&self) -> u64 {
+        self.byte_bound_refusals.load(Ordering::Relaxed)
     }
 
     /// Drop everything cached for `tenant` in both caches (ADR-0069
@@ -3224,6 +3240,7 @@ mod tests {
         assert!(!caches.parts().contains(&c, "c1"));
         assert_eq!(caches.reserved_bytes(), 60);
         assert_eq!(caches.byte_bound_evictions(), 0);
+        assert_eq!(caches.byte_bound_refusals(), 1);
         assert_eq!(budget.reserved(), 161);
         drop(oversize);
         assert_eq!(budget.reserved(), 60);
@@ -3233,6 +3250,11 @@ mod tests {
         assert!(caches.postings().contains(&c, "c2"));
         assert_eq!(caches.reserved_bytes(), 100);
         assert_eq!(caches.byte_bound_evictions(), 2);
+        assert_eq!(
+            caches.byte_bound_refusals(),
+            1,
+            "a value at the bound is cached"
+        );
     }
 
     /// Issue #3244: with no byte bound, the default, the held bytes are not
@@ -3275,6 +3297,7 @@ mod tests {
         );
         assert_eq!(caches.reserved_bytes(), 9 << 40);
         assert_eq!(caches.byte_bound_evictions(), 0);
+        assert_eq!(caches.byte_bound_refusals(), 0);
     }
 
     // -----------------------------------------------------------------

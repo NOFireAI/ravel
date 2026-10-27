@@ -1010,9 +1010,17 @@ impl Catalog {
     /// ([`CatalogConfig::decoded_cache_max_bytes`]), cumulative. Not counted in
     /// [`Catalog::decoded_cache_memory_evictions`]. A value not cached because
     /// its own reservation exceeds the bound counts nothing here: nothing was
-    /// evicted for it.
+    /// evicted for it ([`Catalog::decoded_cache_byte_bound_refusals`]).
     pub fn decoded_cache_byte_bound_evictions(&self) -> u64 {
         self.decoded.byte_bound_evictions()
+    }
+
+    /// Decoded parts and postings objects not cached because their own
+    /// reservation exceeds the byte bound
+    /// ([`CatalogConfig::decoded_cache_max_bytes`]), cumulative. Each one is
+    /// decoded again by the next resolve that needs it.
+    pub fn decoded_cache_byte_bound_refusals(&self) -> u64 {
+        self.decoded.byte_bound_refusals()
     }
 
     /// Decode reservations retried after such an eviction pass, cumulative.
@@ -13170,6 +13178,7 @@ mod tests {
         assert_eq!(budget.reserved(), 7);
 
         assert_eq!(catalog.decoded_cache_byte_bound_evictions(), 0);
+        assert_eq!(catalog.decoded_cache_byte_bound_refusals(), 1);
         let again = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
             .await
@@ -13179,6 +13188,11 @@ mod tests {
         drop(again);
         assert_eq!(budget.reserved(), 7);
         assert_eq!(catalog.decoded_cache_byte_bound_evictions(), 0);
+        assert_eq!(
+            catalog.decoded_cache_byte_bound_refusals(),
+            2,
+            "the part was refused again on the second resolve"
+        );
         assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
         drop(starting);
         assert_eq!(budget.reserved(), 0);
