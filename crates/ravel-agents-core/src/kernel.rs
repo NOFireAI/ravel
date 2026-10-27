@@ -66,12 +66,17 @@ pub struct Limits {
     pub max_timers: u64,
     pub max_head_bytes: usize,
     /// Longest caller-supplied string (request id, handler, keys, tool
-    /// identity, owner id, error text) a command may carry.
+    /// identity, owner id) a command may carry.
     pub max_string_bytes: usize,
+    /// Longest error text a `FailTurn` may carry; it is retained verbatim in
+    /// the input's result entry, so it is bounded tighter than other strings.
+    pub max_error_bytes: usize,
     /// Bytes a command that grows the root without ending a turn must leave
-    /// free under `max_head_bytes`, so `CompleteTurn`, `FailTurn`, `Cancel`
-    /// and `Tombstone` always have room to publish.
-    pub terminal_headroom_bytes: usize,
+    /// free under `max_head_bytes` for EACH input still in the inbox, so every
+    /// accepted input has room for the result entry its `CompleteTurn`,
+    /// `FailTurn` or `Cancel` publishes. It must cover a result entry carrying
+    /// `max_error_bytes` of error text plus the entry's fixed fields.
+    pub terminal_reserve_per_input_bytes: usize,
 }
 
 impl Default for Limits {
@@ -82,7 +87,8 @@ impl Default for Limits {
             max_timers: 64,
             max_head_bytes: MAX_HEAD_BYTES,
             max_string_bytes: 1024,
-            terminal_headroom_bytes: 16 * 1024,
+            max_error_bytes: 256,
+            terminal_reserve_per_input_bytes: 512,
         }
     }
 }
@@ -335,6 +341,15 @@ impl Kernel {
                 "a caller-supplied string exceeds the string cap",
             ));
         }
+        if let Command::FailTurn(c) = command
+            && c.error.len() > self.limits.max_error_bytes
+        {
+            return Err(fail(
+                head,
+                ErrorKind::BudgetExceeded,
+                "the failure error text exceeds its cap",
+            ));
+        }
         Ok(())
     }
 }
@@ -406,16 +421,18 @@ pub(crate) fn caller_strings(command: &Command) -> Vec<&str> {
 
 impl Kernel {
     /// A command that grows the root without ending a turn must leave
-    /// `Limits::terminal_headroom_bytes` free under the byte cap in the root
-    /// it publishes. Terminal commands (`CompleteTurn`, `FailTurn`, `Cancel`,
-    /// `Tombstone`) and the commands that only move a turn along (`Takeover`,
-    /// `BeginTurn`, `CancelTimer`, `RecordEffectResult`) face only the cap
-    /// itself in `publish`, so an accepted input can always be completed,
-    /// failed or cancelled. The check reads the published root, not the
-    /// observed one: an idempotent retry that answers `Unchanged` (a
-    /// duplicate enqueue, a step replay, an already-authorized attempt) is
-    /// never refused, so a client near the cap can still resolve what it
-    /// already published.
+    /// `Limits::terminal_reserve_per_input_bytes` free under the byte cap for
+    /// every input in the published root's inbox. Terminal commands
+    /// (`CompleteTurn`, `FailTurn`, `Cancel`, `Tombstone`) and the commands
+    /// that only move a turn along (`Takeover`, `BeginTurn`, `CancelTimer`,
+    /// `RecordEffectResult`) face only the cap itself in `publish`. Each
+    /// terminal publish removes one inbox entry and adds one result entry of
+    /// at most the reserve, so every accepted input can be completed, failed
+    /// or cancelled in turn (`tests::every_outstanding_input_can_be_failed_at_the_byte_cap`).
+    /// The check reads the published root, not the observed one: an
+    /// idempotent retry that answers `Unchanged` (a duplicate enqueue, a step
+    /// replay, an already-authorized attempt) is never refused, so a client
+    /// near the cap can still resolve what it already published.
     fn check_growth_headroom(&self, command: &Command, outcome: Outcome) -> Outcome {
         let grows = matches!(
             command,
@@ -433,15 +450,16 @@ impl Kernel {
         let Transition::Publish { head, .. } = &transition else {
             return Ok(transition);
         };
-        let cap = self
+        let reserve = self
             .limits
-            .max_head_bytes
-            .saturating_sub(self.limits.terminal_headroom_bytes);
+            .terminal_reserve_per_input_bytes
+            .saturating_mul(head.inbox.len());
+        let cap = self.limits.max_head_bytes.saturating_sub(reserve);
         if head.encode().len() > cap {
             return Err(fail(
                 head,
                 ErrorKind::BudgetExceeded,
-                "HEAD would enter the terminal headroom of its byte cap",
+                "HEAD would enter the terminal reserve of its byte cap",
             ));
         }
         Ok(transition)

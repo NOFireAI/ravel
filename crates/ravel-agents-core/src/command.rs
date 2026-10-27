@@ -265,8 +265,9 @@ pub enum Precondition {
     /// The timer generation is the scheduled one and is due.
     TimerGenerationCurrent,
     /// The encoded root stays under the byte cap; a command that grows the
-    /// root without ending a turn also leaves `Limits::terminal_headroom_bytes`
-    /// free, so a terminal command always has room to publish its result.
+    /// root without ending a turn also leaves
+    /// `Limits::terminal_reserve_per_input_bytes` free for every input still
+    /// in the inbox, so each terminal command has room to publish its result.
     HeadBelowByteCap,
     /// Every caller-supplied string in the command is at most
     /// `Limits::max_string_bytes`.
