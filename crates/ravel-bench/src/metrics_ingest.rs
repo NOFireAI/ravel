@@ -6790,7 +6790,7 @@ mod tests {
             assert_eq!(
                 matchers,
                 vec![
-                    r#"{__name__=~"a|b|mb_native"}"#.to_string(),
+                    r#"{__name__=~"mb_gauge|mb_native"}"#.to_string(),
                     r#"{__name__=~"mb_native"}"#.to_string(),
                 ],
                 "the cardinality read names only the metrics sent"
