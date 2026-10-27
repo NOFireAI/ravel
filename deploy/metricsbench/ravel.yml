@@ -163,11 +163,24 @@ services:
       # range reads per object bring that earlier. A hit is refused(budget).
       - "--max-s3-requests"
       - "343400"
-      # Series per query (10,000), samples per query (10,000,000), points
-      # per range series (11,000) and total range evaluation points
+      # Series per query: replaces the default 10000 (#3306). 1,000,000 is
+      # the cardinality profile's active series and VictoriaMetrics'
+      # -search.maxUniqueTimeseries; the widest corpus union is 700,000
+      # series. A hit is refused(budget).
+      - "--max-series"
+      - "1000000"
+      # Samples per query: replaces the default 10000000 (#3306), the
+      # value Prometheus' --query.max-samples and Mimir's
+      # querier.max_samples carry. Ravel counts total materialized samples
+      # after dedup, Prometheus peak resident ones, so equal numbers are not
+      # equal semantics. Bytes are bounded by the memory budget above: an
+      # oversized materialization is refused "memory exhausted" before this
+      # count is reached. A hit is refused(budget).
+      - "--max-samples"
+      - "500000000"
+      # Points per range series (11,000) and total range evaluation points
       # (1,000,000) are compiled into the image and have no flag; the
-      # README's "Frozen limits" table lists them and which corpus entries
-      # they refuse.
+      # README's "Frozen limits" table lists them.
       # Admission limits and the per-query scanned-byte budget.
       - "--limits-file"
       - "/etc/ravel/limits.toml"
