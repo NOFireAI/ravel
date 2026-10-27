@@ -1049,8 +1049,11 @@ longer holds. The ack deadline is `max(60 s, delay + 60 s + target /
 in `services/ravel-cli/src/load/mod.rs`, #3273). The divisor is a
 conservative single-core encode rate derived from #3273's 928k-row flush,
 which started its PUT 59 s after its age trigger at a 7.4e9 target: about
-1.25e8 estimate bytes per second. A target at or below
-one batch's per-shard slice adds nothing. `ravel-cli load --ack-margin
+1.25e8 estimate bytes per second. Only a target of 1 adds nothing; a
+target at or below one batch's per-shard slice was also exempt until
+#3289, which removed the exemption because shards do not split a batch
+evenly, and which refuses a target above 360,000,000,000 (one hour of
+encode allowance). `ravel-cli load --ack-margin
 <SECONDS>` replaces the whole margin, encode allowance included (#3273).
 At the large tier (7,400,000,000, 90 s) the deadline is 224 s instead of
 150 s; at the 15 GB tier (3,700,000,000, 60 s) 157 s instead of 120 s; at
