@@ -126,6 +126,7 @@ use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
+use ravel_logseg::decoded_cache::DecodedCacheSnapshot;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
@@ -710,6 +711,14 @@ pub(crate) struct StatementRequest {
     pub budgets: Option<RequestBudgets>,
 }
 
+/// One statement's decoded-column cache figures: the counters its scans moved
+/// and the cache's resident bytes when the statement finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodedCacheStats {
+    pub counters: DecodedCacheSnapshot,
+    pub resident_bytes: u64,
+}
+
 /// What the executor actually did, for tests and operator metrics.
 ///
 /// Not `Copy`: [`Self::window_predicate`] carries the applied predicate text,
@@ -839,6 +848,10 @@ pub struct SqlStats {
     /// the executor reads uncached, and on the Flight SQL and distributed
     /// paths, which do not classify.
     pub cache: Option<StatementCacheStats>,
+    /// The decoded-column cache's movement over the successful attempt
+    /// (ADR-3326 Stage 0 prototype). `None` when the executor's log fetcher
+    /// carries no decoded cache, which is the default.
+    pub decoded_cache: Option<DecodedCacheStats>,
     /// The successful attempt's `LogsScanExec` wall-clock timing, read off the
     /// same DataFusion metric set as the block counters. All zero for a plan
     /// with no logs scan.
@@ -2400,6 +2413,13 @@ impl SqlExecutor {
                     stats.cache = cache_mark
                         .as_ref()
                         .map(|mark| mark.since(phase_accounting.access_intent()));
+                    stats.decoded_cache =
+                        self.log_fetcher
+                            .decoded_cache()
+                            .map(|cache| DecodedCacheStats {
+                                counters: phase_accounting.decoded_cache_snapshot(),
+                                resident_bytes: cache.resident_bytes(),
+                            });
                     let phase_snapshot = phase_accounting.snapshot();
                     let accounting = phase_snapshot.pooled();
                     if let Some(key) = read_bytes_key {

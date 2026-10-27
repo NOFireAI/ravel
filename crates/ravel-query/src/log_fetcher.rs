@@ -65,6 +65,7 @@ use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_logseg::block::NumStat;
+use ravel_logseg::decoded_cache::{DecodedCacheAttach, DecodedColumnCache};
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
 use ravel_logseg::key_index::{
@@ -411,6 +412,14 @@ pub struct LogSegmentScan {
 }
 
 impl LogSegmentScan {
+    /// Reads and fills `cache` on the columnar exit (ADR-3326). The row exit
+    /// never touches it.
+    pub fn attach_decoded_cache(&mut self, cache: DecodedCacheAttach) {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.attach_decoded_cache(cache);
+        }
+    }
+
     /// The reader's pruning counters. `blocks_scanned`, `pages_decoded`, and
     /// `pages_skipped` grow as blocks are drained; read this after the last
     /// [`next_block`](Self::next_block) for the whole segment's figures.
@@ -821,6 +830,8 @@ pub struct LogSegmentFetcher {
     /// The read CPU gate [`LogSegmentScan::next_block_on_gate`] decodes blocks
     /// on (ADR-1702 decision 4). `None`, the default, decodes inline.
     read_gate: Option<Arc<ReadGate>>,
+    /// The process decoded-column cache (ADR-3326); `None` disables it.
+    decoded_cache: Option<Arc<DecodedColumnCache>>,
 }
 
 impl LogSegmentFetcher {
@@ -842,6 +853,7 @@ impl LogSegmentFetcher {
             wire_bytes,
             memory_budget,
             read_gate: None,
+            decoded_cache: None,
         }
     }
 
@@ -1004,6 +1016,20 @@ impl LogSegmentFetcher {
         self.block_range = self.block_range.with_read_gate(Arc::clone(&gate));
         self.read_gate = Some(gate);
         self
+    }
+
+    /// Shares `cache` with every columnar scan opened through this fetcher
+    /// whose caller attaches it (ADR-3326). Without this call there is no
+    /// decoded-column cache and every scan decodes as before.
+    #[must_use]
+    pub fn with_decoded_cache(mut self, cache: Arc<DecodedColumnCache>) -> Self {
+        self.decoded_cache = Some(cache);
+        self
+    }
+
+    /// The process decoded-column cache, `None` when disabled.
+    pub fn decoded_cache(&self) -> Option<&Arc<DecodedColumnCache>> {
+        self.decoded_cache.as_ref()
     }
 
     /// Opens the pruned scan over `bytes` ([`open_scan`](Self::open_scan), or,

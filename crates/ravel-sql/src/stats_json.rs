@@ -29,7 +29,7 @@ use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
 use ravel_types::accounting::{AccessIntent, AccountedOp};
 use serde_json::{Value as Json, json};
 
-use crate::{IntentCacheCounts, SignalStats, SqlStats, StatementCacheStats};
+use crate::{DecodedCacheStats, IntentCacheCounts, SignalStats, SqlStats, StatementCacheStats};
 
 /// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
 /// exactly once: a phase added to the enum cannot be silently dropped from
@@ -179,6 +179,20 @@ pub fn cache_json(cache: &StatementCacheStats) -> Json {
     })
 }
 
+/// The decoded-column cache's figures for one statement, rendered under
+/// `stats.decodedCache` (ADR-3326 Stage 0). The counters are the statement's
+/// own; `residentBytes` is the process-wide cache size when it finished.
+pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
+    json!({
+        "hits": stats.counters.hits,
+        "misses": stats.counters.misses,
+        "admissions": stats.counters.admissions,
+        "evictions": stats.counters.evictions,
+        "ghostHits": stats.counters.ghost_hits,
+        "residentBytes": stats.resident_bytes,
+    })
+}
+
 /// An [`AccessIntent`]'s name in `stats.cache`, the same spelling as its
 /// per-intent key there.
 fn intent_name(intent: AccessIntent) -> &'static str {
@@ -248,6 +262,34 @@ mod tests {
         assert_eq!(total_requests, 5, "one GET recorded per phase");
         assert_eq!(total_bytes, snapshot.pooled().total_s3_bytes());
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
+    }
+
+    /// `decoded_cache_json` renders exactly the six ADR-3326 keys, each
+    /// carrying its own distinct source figure.
+    #[test]
+    fn decoded_cache_json_names_every_field_exactly_once() {
+        let stats = DecodedCacheStats {
+            counters: ravel_logseg::decoded_cache::DecodedCacheSnapshot {
+                hits: 1,
+                misses: 2,
+                admissions: 3,
+                evictions: 4,
+                ghost_hits: 5,
+            },
+            resident_bytes: 6,
+        };
+        let rendered = decoded_cache_json(&stats);
+        assert_eq!(
+            rendered,
+            json!({
+                "hits": 1,
+                "misses": 2,
+                "admissions": 3,
+                "evictions": 4,
+                "ghostHits": 5,
+                "residentBytes": 6,
+            })
+        );
     }
 
     /// `cache_json`'s key set is exactly the six keys below, each per-intent

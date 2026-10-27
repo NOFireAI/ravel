@@ -57,6 +57,20 @@ pub struct DecodedCacheSnapshot {
     pub ghost_hits: u64,
 }
 
+impl DecodedCacheSnapshot {
+    /// Field-wise saturating sum, for totalling several handles' counters.
+    #[must_use]
+    pub fn saturating_add(&self, other: &DecodedCacheSnapshot) -> DecodedCacheSnapshot {
+        DecodedCacheSnapshot {
+            hits: self.hits.saturating_add(other.hits),
+            misses: self.misses.saturating_add(other.misses),
+            admissions: self.admissions.saturating_add(other.admissions),
+            evictions: self.evictions.saturating_add(other.evictions),
+            ghost_hits: self.ghost_hits.saturating_add(other.ghost_hits),
+        }
+    }
+}
+
 impl DecodedCacheCounters {
     pub fn snapshot(&self) -> DecodedCacheSnapshot {
         DecodedCacheSnapshot {
