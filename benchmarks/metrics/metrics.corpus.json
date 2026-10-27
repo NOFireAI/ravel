@@ -169,9 +169,10 @@
       ],
       "modified": {
         "modified": {
-          "reason": "corpus version 3 wraps the query in avg(): the output collapses from one series per input series to one series, while the scanned data is unchanged; uncollapsed, the cardinality answer is 400,000 series x 121 points = 48,400,000 points, about 1.3 GB of JSON, which exceeds the harness's 256 MiB response cap, so no engine's answer could be compared"
+          "reason": "corpus version 3 wraps the query in avg(): the output collapses from one series per input series to one series, while the scanned data is unchanged; uncollapsed, the cardinality answer is 400,000 series x 121 points = 48,400,000 points, about 1.3 GB of JSON, which exceeds the harness's 256 MiB response cap, so no engine's answer could be compared; the collapse makes each step one mean over every gauge series, so the entry carries tolerance_ulps 1048576 (2^20) and summation order alone cannot read as incorrect: naive summation of n non-negative values errs by at most n-1 ULPs of the sum, n is 400,000 gauge series on cardinality (1,000,000 x 400/1000), 4,000 on history and 20,000 active on churn, the inner avg_over_time adds at most 119 ULPs over the 120 samples a 30m window holds at a 15s scrape, and the two divisions add one more, so the bound is 399,999 + 119 + 1 = 400,119 ULPs, under 2^20"
         }
-      }
+      },
+      "tolerance_ulps": 1048576
     },
     {
       "id": "mb_full_range_max_by_job",

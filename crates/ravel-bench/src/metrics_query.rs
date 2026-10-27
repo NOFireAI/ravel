@@ -587,7 +587,7 @@ pub async fn run(
         for (entry_index, entry) in entries.iter().enumerate() {
             let expectation = EntryExpectation {
                 intended_empty: entry.expected.intended_empty,
-                tolerance_ulps: None,
+                tolerance_ulps: entry.tolerance_ulps,
                 mode: ComparisonMode::Unordered,
                 constructs: entry.constructs.clone(),
             };

@@ -476,6 +476,30 @@ one series of 121 points. The entry keeps its id, its `full_range` class
 A version-3 loader refuses a version-2 corpus
 (`promql_corpus::tests::a_version_2_corpus_is_refused_after_the_full_range_rewrite`).
 
+An entry may carry `tolerance_ulps`, the ULP tolerance the difftest comparator
+applies to its sample values. Absent means bit-exact, as before; the runner
+passes the field to the comparator unchanged
+(`metricsbench_query::an_entry_tolerance_reaches_the_comparator`). The gate
+refuses `tolerance_ulps: 0`, since bit-exact is spelled by leaving the field
+out (`promql_corpus::tests::gate_rejects_a_zero_ulp_tolerance`), and refuses a
+tolerance on an entry whose `modified` field states no reason, so a loosened
+comparison is never undisclosed
+(`promql_corpus::tests::gate_rejects_a_tolerance_without_a_modified_reason`).
+
+`mb_full_range_avg_over_time` is the only entry with a tolerance
+(`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`):
+`1048576`, 2^20. After the collapse each step's answer is one mean over every
+selected gauge series, and an engine that sums them in another order, or with
+compensated summation, differs in the last bits while every per-series answer
+is exact. The basis, also stated in the entry's `modified` reason: naive
+summation of n non-negative values (cpu percent) errs by at most n-1 ULPs of
+the sum. n is the gauge family's series count, `active_series x 400/1000`:
+400,000 on cardinality, 4,000 on history, 20,000 active on churn. The inner
+`avg_over_time` adds at most 119 ULPs over the 120 samples a left-open 30-minute
+window holds at a 15-second scrape, and the two divisions add one more. The
+cardinality bound is 399,999 + 119 + 1 = 400,119 ULPs, under 2^20 by a factor
+of about 2.6.
+
 An entry may carry `expected: {"intended_empty": true, "reason": "..."}`; the
 gate refuses the flag without a non-blank reason. An empty oracle answer on an
 entry without it is an invalid fixture, not an engine result (ADR-0927,
