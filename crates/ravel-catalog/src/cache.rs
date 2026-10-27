@@ -3084,8 +3084,9 @@ mod tests {
     /// bound only the part cache's held bytes and the parts never pass 90, so
     /// the same assert reads 120. (c) compare `DecodedEntry::bytes` (1 per
     /// entry) against the bound and nothing is evicted: 120 again. (e) count
-    /// these evictions into `memory_evictions` and the final
-    /// `memory_evictions() == 0` assert fails with 3.
+    /// these evictions into `memory_evictions` instead and
+    /// `byte_bound_evictions()` reads 0, not 3 (`memory_evictions()` then reads
+    /// 3, not 0).
     #[test]
     fn the_byte_bound_evicts_least_recently_used_across_tenants_and_caches() {
         let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -3202,8 +3203,7 @@ mod tests {
     ///
     /// FLIP: (d) drop the oversize early return in
     /// `DecodedCaches::insert_bounded` and the insert evicts both earlier
-    /// entries and then the oversize one, so `contains(&a, "a1")` fails and
-    /// the counter reads 3, not 0.
+    /// entries and then the oversize one, so `contains(&a, "a1")` fails.
     #[test]
     fn an_entry_larger_than_the_byte_bound_is_not_cached() {
         let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
