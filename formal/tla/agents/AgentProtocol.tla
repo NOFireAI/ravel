@@ -502,8 +502,9 @@ ScheduleTimer(w, ak) ==
                            !.timer = [gen |-> h.timer.gen + 1, st |-> "armed"]])
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
-\* Cancel an armed generation. On a root whose generation was already
-\* delivered the CAS precondition fails and the re-read answers AlreadyFired.
+\* Cancel an armed generation. CancelTimer is enabled only while the timer is
+\* armed, so the AlreadyFired outcome of ADR-3331 decision 8 is not modelled
+\* here (the README lists it under what is not modelled).
 CancelTimer(w, ak) ==
     /\ wk[w].pc = "idle"
     /\ HeadUp(ak)

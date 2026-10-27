@@ -16,7 +16,7 @@ object-store contract rather than a hand-rolled map.
 ## What this model claims (ADR-1113 D12)
 
 TLC checked this finite model under the bounds and assumptions in each `.cfg`.
-This model verifies the protocol design; implementation conformance is argued
+This model checks the protocol design under those bounds; implementation conformance is argued
 in the traceability table and asserted by the named Rust tests, not proved.
 That table does not exist yet: `traceability.md` lands with the kernel symbols
 it names (task T10), and the agents crates it would cite are not built. Safety
@@ -137,7 +137,14 @@ states without finishing, and the one-client exhaustive config at
 `MaxRevision = 6` had not finished after 9 minutes (about 866,000 distinct
 states). So competing senders
 are checked without timers (smoke), and timers and liveness are checked with
-one sender and `MaxRevision = 4` (exhaustive).
+one sender and `MaxRevision = 4` (exhaustive). A second timer generation does
+not fit either: the exhaustive config at `MaxTimerGen = 2` passed 3.9 million
+distinct states with 1.4 million queued when the 3000 s budget ran out
+(2 workers, 2 GiB). So only `stale-timer-generation-fired`, which runs at
+`MaxTimerGen = 2`, reaches a replaced generation; a `FireTimer` that ignored
+the generation would pass every config at `MaxTimerGen = 1` and is caught by
+that negative alone. Raising the exhaustive bound is T20's call once the
+nightly lane has measured it.
 
 `View` drops the store's version integers and keeps, for each held CAS token,
 only whether it equals the current HEAD version. Nothing reads a version
@@ -169,21 +176,25 @@ for each.
 
 The first eight are the smoke config with one switch on. The two timer
 negatives cannot be: the smoke config has no timers. `stale-timer-generation-fired`
-uses the exhaustive bounds with the smoke config's view, symmetry and
-invariants; `early-hint-forgotten` is a liveness negative under `MCFairSpec`
+uses the exhaustive bounds at `MaxTimerGen = 2` with the smoke config's view,
+symmetry and invariants; `early-hint-forgotten` is a liveness negative under `MCFairSpec`
 with one worker and `MaxEpoch = 1`, and no view or symmetry.
 
-`stale-turn-rebase` is the distinguishing test for `OneLogicalCompletion`: the
-rebase skips only the active-turn check, and a cancelled input gains a second,
-completed result.
+`stale-turn-rebase` skips only the active-turn check in the rebase, and a
+cancelled input gains a second, completed result. The mutant breaks five
+invariants (`OneLogicalCompletion`, `TurnCommitAtomic`, `NoStaleOwnerCommit`,
+`CancellationRespected` and `TenantIncarnationIsolation`); the `.expect` names
+`OneLogicalCompletion` because it is the first of them in the config.
 
 Reachability probes, each the smoke config with every switch off and one probe
 invariant that must be violated (exit 12): `crash-reachable`
 (`CrashUnreachable`), `lost-response-reachable` (`LostResponseUnreachable`),
 `takeover-reachable` (`TakeoverUnreachable`) and `competing-senders-reachable`
-(`CompetingSendersUnreachable`). Each reads state, not a flag the fault action
-sets, so a violation shows the smoke config reaches that situation and the
-invariants above are checked against it.
+(`CompetingSendersUnreachable`). Three read store or operation state;
+`CrashUnreachable` reads `crashedOnce`, which `WorkerCrash` records, so it
+witnesses that the crash action fired rather than that it was enabled. A
+violation shows the smoke config reaches that situation and the invariants
+above are checked against it.
 
 ## Folded steps
 
