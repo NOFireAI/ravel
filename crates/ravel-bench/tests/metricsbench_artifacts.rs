@@ -583,23 +583,25 @@ fn a_version_1_manifest_is_refused_naming_the_missing_range_eval_block() {
 }
 
 #[test]
-fn a_version_1_corpus_is_refused_by_the_version_2_loader() {
+fn version_1_and_2_corpora_are_refused_by_the_version_3_loader() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = corrupt_corpus(&dir, "corpus.v1.json", |doc| {
-        doc["version"] = serde_json::json!(1);
-    });
-    let err = load_corpus(&path).expect_err("a version-1 corpus must fail");
-    assert!(
-        matches!(
-            err,
-            CorpusError::UnsupportedVersion {
-                found: 1,
-                expected: 2,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
+    for old in [1u32, 2] {
+        let path = corrupt_corpus(&dir, &format!("corpus.v{old}.json"), |doc| {
+            doc["version"] = serde_json::json!(old);
+        });
+        let err = load_corpus(&path).expect_err("an older corpus version must fail");
+        assert!(
+            matches!(
+                err,
+                CorpusError::UnsupportedVersion {
+                    found,
+                    expected: 3,
+                    ..
+                } if found == old
+            ),
+            "{err:?}"
+        );
+    }
 }
 
 #[test]
