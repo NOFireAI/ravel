@@ -734,7 +734,135 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use ravel_bench::metrics_ingest::{ClassDigests, IngestPhase, LatencyReport};
+
     use super::*;
+
+    /// A portable row whose expected (and accepted) digest is `scalar` for
+    /// the scalar class and fixed for the other two.
+    fn portable_row(system: &str, scalar: &str) -> SystemIngestResult {
+        let digests = ClassDigests {
+            scalar: scalar.to_string(),
+            stale_marker: "d2".to_string(),
+            native_histogram: "d3".to_string(),
+        };
+        let ingest = IngestPhase {
+            stream_counts: StreamCounts {
+                generated_lines: 10,
+                scalar: 6,
+                native_histogram: 2,
+                stale_marker: 2,
+                malformed: 0,
+            },
+            excluded_native_histogram: 0,
+            excluded_stale_marker: 0,
+            offered_samples: 8,
+            offered_digest: "offered".to_string(),
+            accepted_samples: 8,
+            rejected_samples: 0,
+            offered_histograms: 2,
+            accepted_histograms: 2,
+            rejected_histograms: 0,
+            dropped_histograms: 0,
+            histograms_rejected_by_status: BTreeMap::new(),
+            retry_exhausted_histograms: 0,
+            histograms_retry_exhausted_by_status: BTreeMap::new(),
+            dropped_samples: 0,
+            dropped_batches: 0,
+            rejected_by_status: BTreeMap::new(),
+            retry_exhausted_samples: 0,
+            retry_exhausted_by_status: BTreeMap::new(),
+            unsupported_samples: 0,
+            unsupported_histograms: 0,
+            expected_digests: digests.clone(),
+            accepted_digests: digests,
+            batches: 1,
+            retries: 0,
+            elapsed_secs: 1.0,
+            elapsed_basis: "test fixture".to_string(),
+            logical_points_per_sec: 10.0,
+            wire_bytes: 100,
+            wire_bytes_per_sec: 100.0,
+            ack_latency_ms: LatencyReport {
+                p50: 1.0,
+                p95: 1.0,
+                p99: 1.0,
+                max: 1.0,
+                count: 1,
+            },
+            peak_rss_bytes: None,
+            cpu_secs: None,
+        };
+        SystemIngestResult::buffered_http_row(system, "http://x/api/v1/write", "test", ingest)
+    }
+
+    /// Without an in-process row, two portable rows whose expected digests
+    /// differ still fail band 6; only the comparison with an in-process
+    /// scalar digest is skipped.
+    #[test]
+    fn portable_rows_still_cross_check_without_the_in_process_row() {
+        let prometheus = portable_row("prometheus", "aa");
+        let mimir = portable_row("mimir", "aa");
+        let diverged = portable_row("mimir", "ab");
+        check_band6_across_rows(None, &[&prometheus, &mimir]).expect("rows agree");
+        let err = check_band6_across_rows(None, &[&prometheus, &diverged])
+            .expect_err("portable rows differ");
+        assert!(
+            matches!(
+                &err,
+                RunError::Band6(Band6Violation::ExpectedDiverged {
+                    class: PayloadClass::Scalar,
+                    first_system,
+                    second_system,
+                    ..
+                }) if first_system == "prometheus" && second_system == "mimir"
+            ),
+            "{err}"
+        );
+
+        let with_in_process = check_band6_across_rows(Some("ab"), &[&prometheus, &mimir])
+            .expect_err("in-process scalar differs");
+        assert!(
+            matches!(
+                &with_in_process,
+                RunError::ScalarExpectedDiverged { system, expected, got }
+                    if system == "prometheus" && expected == "ab" && got == "aa"
+            ),
+            "{with_in_process}"
+        );
+        check_band6_across_rows(Some("aa"), &[&prometheus, &mimir]).expect("all agree");
+    }
+
+    #[test]
+    fn skipping_the_in_process_row_needs_a_portable_endpoint() {
+        let err = resolve_rows(&args(&["--no-in-process-row"])).expect_err("no rows");
+        assert!(matches!(err, RunError::NoRows), "{err}");
+        assert_eq!(exit_code(&err), EXIT_USAGE);
+        resolve_rows(&args(&[])).expect("the in-process row alone");
+        resolve_rows(&args(&[
+            "--no-in-process-row",
+            "--prometheus-endpoint",
+            "http://p/api/v1/write",
+        ]))
+        .expect("a portable row");
+    }
+
+    /// With no in-process row there is no second Ravel row for the portable
+    /// one's tenant to match, so `--tenant` is not compared.
+    #[test]
+    fn without_the_in_process_row_the_ravel_tenant_stands_alone() {
+        let tenant = resolve_ravel_tenant(&args(&[
+            "--no-in-process-row",
+            "--ravel-endpoint",
+            "http://x/api/v1/write",
+            "--ravel-tenant",
+            "b",
+        ]))
+        .expect("no in-process tenant to match");
+        assert_eq!(tenant.as_deref(), Some("b"));
+    }
 
     fn args(extra: &[&str]) -> Args {
         let mut argv = vec!["metricsbench_ingest", "--profile", "ci"];
