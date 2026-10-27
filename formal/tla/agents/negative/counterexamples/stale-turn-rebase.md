@@ -36,7 +36,9 @@ input:
 
     results |-> { [ inc |-> 1, epoch |-> 0, owner |-> noworker, turn |-> 0, sv |-> 0, seq |-> 0, kind |-> "cancelled" ], [ inc |-> 1, epoch |-> 1, owner |-> w1, turn |-> 1, sv |-> 1, seq |-> 0, kind |-> "completed" ] }
 
-`OneLogicalCompletion` allows at most one result per accepted input. The same
-state also breaks `CancellationRespected` (a cancelled input completed), which
-TLC does not report because it stops at the first invariant in config order.
+`OneLogicalCompletion` allows at most one result per accepted input. Run once
+per invariant, the same mutant also breaks `TurnCommitAtomic`,
+`NoStaleOwnerCommit`, `CancellationRespected` (a cancelled input completed)
+and `TenantIncarnationIsolation`; TLC reports only `OneLogicalCompletion`
+because it stops at the first violated invariant in config order.
 The correct model (switch FALSE) drops the turn on the rebase.

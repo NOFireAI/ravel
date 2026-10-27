@@ -202,7 +202,8 @@ View ==
 
 \* --- Reachability probes (each must be reported violated) -----------------
 
-\* Each probe reads state, not a flag the fault action sets.
+\* Three probes read store or operation state; CrashUnreachable reads the
+\* crashedOnce witness WorkerCrash records, so it shows the action fired.
 
 \* A worker crashed with an operation in flight.
 CrashUnreachable == crashedOnce = {}
