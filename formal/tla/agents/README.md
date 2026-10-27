@@ -24,13 +24,16 @@ and liveness are stated separately below, and every liveness result carries its
 fairness assumptions. The object store's own conformance to its contract is an
 assumption, stated as such and not checked here.
 
-No `results.md` exists yet either: recorded figures and measured bands are task
-T20. `bands.tsv` carries one row, for `MCAgentProtocol.exhaustive.cfg`, that
-sets only `budget_s` (3000, ADR-3331 decision 13); its distinct band is the
-full `0`-`999999999` range and its depth cells are `-`, so the harness enforces
-nothing on it. The harness requires the distinct cells to be integers, so that
-range is the placeholder for an unmeasured row; `formal/tla/README.md` does not
-define an unmeasured form.
+No `results.md` exists yet: recorded figures are task T20. `bands.tsv`
+carries two rows. The `MCAgentProtocol.smoke.cfg` row pins the required lane
+at 335000 to 342000 distinct states (measured 338707 with 2 workers) with
+depth waived by `-`, so a change that narrows what the smoke run reaches fails
+that lane. The `MCAgentProtocol.exhaustive.cfg` row sets only `budget_s`
+(3000, ADR-3331 decision 13); its distinct band is the full `0`-`999999999`
+range and its depth cells are `-`, so the harness enforces nothing on it
+until T20 measures it on the nightly runner. The harness requires the distinct
+cells to be integers, so that range is the placeholder for an unmeasured row;
+`formal/tla/README.md` does not define an unmeasured form.
 
 ## Scope
 
@@ -146,10 +149,12 @@ catches at the first stale fire, which a cancelled generation already
 produces at depth 10, and the `second-generation-reachable` probe, which
 asserts that a root carrying generation 2 is reached under those bounds. A
 `FireTimer` that ignored the generation passes every config at
-`MaxTimerGen = 1`; under the probe's bounds the eleven invariants are checked
-on every state TLC visits before the probe violation, which is where that
-mutant trips `TimerGenerationDeliveredOnce`. Raising the exhaustive bound is
-T20's call once the nightly lane has measured it.
+`MaxTimerGen = 1`. The probe lists only its own invariant. The config that
+checks the eleven invariants at those bounds is `stale-timer-generation-fired`,
+and it runs with its mutant switched on, so no shipped config checks the
+clean spec's invariants on a generation-2 state; a hand run of the exhaustive
+config at `MaxTimerGen = 2` is the only check of that today. Raising the
+exhaustive bound is T20's call once the nightly lane has measured it.
 
 `View` drops the store's version integers and keeps, for each held CAS token,
 only whether it equals the current HEAD version. Nothing reads a version
@@ -200,8 +205,10 @@ smoke config, `second-generation-reachable` (`SecondGenerationUnreachable`).
 Four read store or operation state;
 `CrashUnreachable` reads `crashedOnce`, which `WorkerCrash` records, so it
 witnesses that the crash action fired rather than that it was enabled. A
-violation shows the smoke config reaches that situation and the invariants
-above are checked against it.
+violation shows the probe's config reaches that situation; for the four
+probes at smoke bounds the smoke run checks the eleven invariants on those
+states, and for `second-generation-reachable` only the stale-timer negative
+shares its bounds, with its mutant on.
 
 ## Folded steps
 
