@@ -1332,6 +1332,17 @@ are not enforced today. `--max-samples` also sets the selector-cache cap
 described above (`2 * max_samples * 16` bytes, 320,000,000 at the
 default), which startup logs as `selector_cache_max_bytes`.
 
+Neither flag moves the per-slice caps a coordinator applies to a
+distributed query's worker responses. `MAX_SLICE_RESPONSE_BYTES`
+(230,331,648 wire bytes, sized from `DEFAULT_MAX_SAMPLES`) and
+`MAX_SLICE_RESPONSE_FRAMES` (1,048,576) in
+`crates/ravel-query/src/distrib/codec.rs` are compiled in, and
+`slice_byte_cap` ignores the configuration. A distributed query on a
+server raised above the defaults can therefore be refused for a slice's
+wire size (`slice returned N response frame wire bytes, exceeding the
+per-slice limit of ...`) before it reaches the configured samples cap.
+A single-process query is bounded by the flags alone.
+
 ### Budgets under distributed fan-out (ADR-0071)
 
 A distributed query dispatches the query's **whole** budget to every slice,
