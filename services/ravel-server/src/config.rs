@@ -1927,7 +1927,9 @@ pub struct Cli {
     /// Cap on the distinct series a single PromQL query may materialize,
     /// threaded into `ravel_query::EngineConfig::max_series`. Over it the query
     /// is refused with `query matched N series, exceeding the limit of M`
-    /// (HTTP 422, `errorType` `execution`), never truncated. Default when
+    /// (HTTP 422, `errorType` `execution`), never truncated. A distributed
+    /// query's per-slice frame cap (`MAX_SLICE_RESPONSE_FRAMES`) is compiled
+    /// in and does not follow this flag. Default when
     /// unset: `ravel_query::DEFAULT_MAX_SERIES` (10,000), host-independent: a
     /// series count bounds plan width, and the bytes behind it are bounded by
     /// the memory budget. Process-wide, with no limits-file key, because
@@ -1943,7 +1945,11 @@ pub struct Cli {
     /// dedup) a single PromQL query may materialize, threaded into
     /// `ravel_query::EngineConfig::max_samples`. Over it the query is refused
     /// with `query matched N samples, exceeding the limit of M` (HTTP 422,
-    /// `errorType` `execution`), never truncated. Also sizes the range-query
+    /// `errorType` `execution`), never truncated. A distributed query's
+    /// per-slice response caps (`MAX_SLICE_RESPONSE_BYTES`, 230,331,648 wire
+    /// bytes, and `MAX_SLICE_RESPONSE_FRAMES`) are compiled in and do not
+    /// follow this flag, so above the default a slice can be refused for its
+    /// wire size before this cap is reached. Also sizes the range-query
     /// selector-cache cap, two float copies of this many samples (16 bytes
     /// each), which charges the memory budget. Default when unset:
     /// `ravel_query::DEFAULT_MAX_SAMPLES` (10,000,000), host-independent.
