@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build rustfs rustfs-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
+.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build rustfs rustfs-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap test-sdk lint-sdk
 
 check: fmt clippy test
 
@@ -48,6 +48,15 @@ doc-drift:
 check-docs:
 	python3 scripts/check_docs.py
 	python3 scripts/check-doc-claims.py
+
+# TypeScript Agents SDK (ADR-3331 decision 11). Each target installs the
+# locked dependencies with `npm ci` once, then runs its scripts. Needs Node 22
+# (.node-version).
+test-sdk:
+	cd sdk/typescript && npm ci && npm run typecheck && npm test
+
+lint-sdk:
+	cd sdk/typescript && npm ci && npm run lint
 
 build:
 	cargo build --workspace --release
