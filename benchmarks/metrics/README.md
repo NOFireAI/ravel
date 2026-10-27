@@ -691,10 +691,12 @@ naming the entry and the engine, and no report is written
 before a complete body arrived (`TransportErrorKind` `Connect`, `Request` or
 `Body`) is re-sent up to `--oracle-retries` more times (default 2), with a
 fixed `ORACLE_RETRY_BACKOFF` of one second before each retry
-(`metrics_query::oracle_answer`). An answer that arrived is not retried: any
-HTTP status, 4xx included, a body over the cap, or a complete body that is
-not JSON (`oracle_retryable`; `only_lost_oracle_requests_are_retryable`,
-`an_oracle_4xx_is_not_retried`). A retry is a separate request that answers
+(`metrics_query::oracle_answer`). A 502, 503 or 504 is retried the same way,
+with a JSON body or without, since a gateway or an overloaded server is saying
+"not now", not answering. Any other answer that arrived is not retried: any
+other HTTP status, 4xx and 500 included, a body over the cap, or a complete
+body that is not JSON (`oracle_retryable`;
+`only_lost_oracle_requests_are_retryable`, `an_oracle_4xx_is_not_retried`). A retry is a separate request that answers
 the oracle only: the Prometheus repetition that asked is classified from its
 first attempt, so a timed-out repetition stays a timeout on Prometheus' row
 and a retry cannot make that row faster

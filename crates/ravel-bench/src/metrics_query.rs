@@ -494,18 +494,35 @@ pub struct OracleRetry {
     pub attempt: u32,
 }
 
-/// Whether an oracle outcome is worth re-sending: a timeout, or a transport
-/// failure before a complete body arrived. An answer that arrived (any HTTP
-/// status, a body over the cap, a complete body that is not JSON) is not.
+/// Whether an oracle outcome is worth re-sending: a timeout, a transport
+/// failure before a complete body arrived, or a 502, 503 or 504 (a gateway or
+/// an overloaded server saying "not now"), whether its body is a JSON envelope
+/// or not. Any other answer that arrived (another status, 4xx and 500
+/// included, a body over the cap, a complete body that is not JSON) is not.
 pub fn oracle_retryable(outcome: &QueryOutcome) -> bool {
     match outcome {
         QueryOutcome::Timeout { .. } => true,
-        QueryOutcome::Transport { kind, .. } => matches!(
-            kind,
-            TransportErrorKind::Connect | TransportErrorKind::Request | TransportErrorKind::Body
-        ),
-        QueryOutcome::Envelope { .. } | QueryOutcome::BodyTooLarge { .. } => false,
+        QueryOutcome::Transport {
+            kind, http_status, ..
+        } => {
+            matches!(
+                kind,
+                TransportErrorKind::Connect
+                    | TransportErrorKind::Request
+                    | TransportErrorKind::Body
+            ) || (matches!(kind, TransportErrorKind::Decode)
+                && matches!(*http_status, Some(s) if transient_http_status(s)))
+        }
+        QueryOutcome::Envelope { http_status, .. } => transient_http_status(*http_status),
+        QueryOutcome::BodyTooLarge { .. } => false,
     }
+}
+
+/// A status that says the server could not answer now rather than that the
+/// query is wrong: 502 Bad Gateway, 503 Service Unavailable, 504 Gateway
+/// Timeout.
+fn transient_http_status(status: u16) -> bool {
+    matches!(status, 502..=504)
 }
 
 /// Why a run produced no report.
@@ -985,15 +1002,28 @@ mod tests {
             TransportErrorKind::Body,
             Some(200)
         )));
-        assert!(!oracle_retryable(&transport(
-            TransportErrorKind::Decode,
-            Some(502)
-        )));
+        for http_status in [502, 503, 504] {
+            assert!(oracle_retryable(&transport(
+                TransportErrorKind::Decode,
+                Some(http_status)
+            )));
+            assert!(oracle_retryable(&QueryOutcome::Envelope {
+                http_status,
+                body: serde_json::json!({"status": "error"}),
+                timing,
+            }));
+        }
+        for http_status in [Some(200), Some(500), None] {
+            assert!(!oracle_retryable(&transport(
+                TransportErrorKind::Decode,
+                http_status
+            )));
+        }
         assert!(!oracle_retryable(&QueryOutcome::BodyTooLarge {
             limit: 1,
             timing,
         }));
-        for http_status in [200, 422, 503] {
+        for http_status in [200, 400, 422, 500, 501, 505] {
             assert!(!oracle_retryable(&QueryOutcome::Envelope {
                 http_status,
                 body: serde_json::json!({"status": "error"}),
