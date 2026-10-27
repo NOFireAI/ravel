@@ -280,6 +280,8 @@ anything is built (Measurement).
   The catalog's `DecodedCaches::evict_until_fits`
   (`crates/ravel-catalog/src/cache.rs:1173-1240`) is crate-private and is
   not wired in the server (`services/ravel-server/src/lib.rs:2930`).
+  The hook alone does not keep a query admitted, so admission also keeps
+  a headroom margin (see the admission-headroom amendment below).
 - **Cap:** a `--decoded-cache-max-bytes` flag sets the cap, with a default
   expressed as a share of the memory budget. Stage 0 picks the default;
   until then it is 0, which disables the cache.
@@ -405,3 +407,52 @@ work, and the readout names the step that missed.
   q33 about 0.8 GB of slack, against an aggregate state of 10.09 GB.
 - **Shrink the fetch cache to make room.** Rejected for now: hot tries
   are served from it (#3231), and a decoded miss falls back to it.
+
+## Amendment (2026-10-27): admission keeps a headroom margin
+
+<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries" pointer="admission-headroom amendment" -->
+
+Stage 0 measured a prototype of decisions 1, 3 and 4 on paired box runs
+against `main` (#3326 comments 6447399361 and 6450626784):
+
+| Run | Hot geomean B/A | q33 | Basis |
+|---|---|---|---|
+| `dc8-20261027T1431Z`, 8 GB cap, no pressure hook | 0.749 | refused on 4 of 4 runs | #3326 comment 6447399361 |
+| `dc4-20261027T1431Z`, 4 GB cap, no pressure hook | 0.839 | refused on 4 of 4 runs | #3326 comment 6447399361 |
+| `dc8h-20261027T1717Z`, 8 GB cap, with the decision 4 hook | 0.749 | refused on 4 of 4 runs | #3326 comment 6450626784 |
+
+With the hook in place q33 was still refused, on both the aggregate
+envelope and the tenant accountant's process charge, and both paths reach
+`MemoryBudget::try_reserve`. The cache stays at its cap through q33: while
+the aggregate grows, q33's own column misses are admitted on 16 partitions
+through `reserve_best_effort`. Bytes the hook frees for a refused
+reservation are open to the next admission before the refused caller
+retries. Evicting on refusal is therefore not enough while admission can
+take back what eviction freed. This explanation is not yet measured: a
+refused response carries no statistics.
+
+Decision 4 gains one rule. A column is admitted only when, after its
+reservation, the process budget's unreserved bytes are at least the
+headroom margin, `max(1 GiB, 5% of the budget's limit)`, and the host
+memory gate is open. Below the margin a miss is decoded and served as
+today, and nothing is admitted.
+
+- **The freed bytes go to the refused caller.** The shortfalls Stage 0
+  recorded were 132 to 147 MB per refused reservation, under the 1 GiB
+  floor of the margin. The bytes the hook frees for that caller stay
+  below the margin, so no admission can take them before the retry.
+- **The margin is stateless.** It needs no back-off timer or recovery
+  rule. Once the query that took the memory releases it, the margin is
+  met again and admission resumes.
+- **The pressure hook is instrumented.** Each pass logs the bytes asked,
+  the bytes freed, the cache's resident bytes and the bytes it could not
+  evict because a live scan held them. A refusal that survives the hook
+  can then be read from the server log, since the refused response
+  carries no statistics.
+
+Stage 0 continues with this rule before anything merges. A simulation of
+the q33 shape comes first: 16 partitions interleave column admissions with
+aggregate growth against one budget. It checks that the aggregate is never
+refused with the margin and is refused without it. Then the 8 GB pair is
+re-run against the bands registered on #3326 (comment 6448580460), with
+the same rows.
