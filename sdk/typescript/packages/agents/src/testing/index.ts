@@ -4,11 +4,11 @@
  */
 import type { AgentClient } from "../client/index.js";
 import { notImplemented } from "../not-implemented.js";
-import type { AnyAgentDefinition, ToolDefinition } from "../types.js";
+import type { AnyAgentDefinition, AnyToolDefinition } from "../types.js";
 
 export interface TestHarnessOptions {
   readonly agents: readonly AnyAgentDefinition[];
-  readonly tools?: readonly ToolDefinition[];
+  readonly tools?: readonly AnyToolDefinition[];
 }
 
 export interface TestHarness {

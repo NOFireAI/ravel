@@ -7,7 +7,9 @@
 import { z } from "zod";
 import { createClient } from "@ravel/agents/client";
 import { defineTool } from "@ravel/agents/tools";
-import { defineAgent, message } from "@ravel/agents/worker";
+import { defineAgent, message, serveAgents } from "@ravel/agents/worker";
+import { createTestHarness } from "@ravel/agents/testing";
+import type { ToolDefinition } from "@ravel/agents";
 
 type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2
   ? true
@@ -146,3 +148,29 @@ defineTool({
   recovery: "exactly_once",
   run: () => Promise.resolve({ value: 1 }),
 });
+
+// A concrete tool from defineTool must be accepted wherever a tool list is
+// taken: run's input parameter is contravariant, so a list typed over the
+// bare Schema default refused every real tool (PR #3366 review).
+export const serveWithTool = () =>
+  serveAgents({ url: "http://127.0.0.1:0", token: "t", agents: [counter], tools: [lookup] });
+export const harnessWithTool = () => createTestHarness({ agents: [counter], tools: [lookup] });
+
+// The same with run's parameter written out: this is the form that a list
+// typed over the bare Schema default refuses, since unknown is not
+// assignable to the annotated input.
+const lookupInput = z.object({ key: z.string() });
+const lookupOutput = z.object({ value: z.number() });
+const annotated: ToolDefinition<typeof lookupInput, typeof lookupOutput> = {
+  kind: "tool",
+  name: "annotated",
+  version: "1",
+  input: lookupInput,
+  output: lookupOutput,
+  recovery: "manual",
+  run: (input: { key: string }) => Promise.resolve({ value: input.key.length }),
+};
+export const serveWithAnnotatedTool = () =>
+  serveAgents({ url: "http://127.0.0.1:0", token: "t", agents: [counter], tools: [annotated] });
+export const harnessWithAnnotatedTool = () =>
+  createTestHarness({ agents: [counter], tools: [annotated] });
