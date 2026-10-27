@@ -1283,6 +1283,70 @@ mod tests {
         }
     }
 
+    fn matrix(series: &[(&str, &[(f64, &str)])]) -> Json {
+        let result: Vec<Json> = series
+            .iter()
+            .map(|(instance, steps)| {
+                let values: Vec<Json> = steps
+                    .iter()
+                    .map(|(t, v)| serde_json::json!([t, v]))
+                    .collect();
+                serde_json::json!({"metric": {"instance": instance}, "values": values})
+            })
+            .collect();
+        serde_json::json!({"status": "success", "data": {"resultType": "matrix", "result": result}})
+    }
+
+    fn gap_of(oracle: &Json, answer: Option<&Json>) -> UlpGap {
+        let mut gap = UlpGap::new("e", Engine::Ravel);
+        gap.add(oracle, answer);
+        gap
+    }
+
+    #[test]
+    fn ulp_gaps_pair_series_by_labels_and_steps_by_position() {
+        let oracle = matrix(&[("a", &[(1.0, "1.5"), (2.0, "2")]), ("b", &[(1.0, "4")])]);
+        let one_above_two = f64::from_bits(2.0f64.to_bits() + 1).to_string();
+        let reordered = matrix(&[
+            ("b", &[(1.0, "4")]),
+            ("a", &[(1.0, "1.5"), (2.0, &one_above_two)]),
+        ]);
+        let gap = gap_of(&oracle, Some(&reordered));
+        assert_eq!(gap.max_ulps, Some(1));
+        assert_eq!((gap.aligned_answers, gap.value_pairs), (1, 3));
+        for other in [
+            matrix(&[("a", &[(1.0, "1.5"), (3.0, "2")]), ("b", &[(1.0, "4")])]),
+            matrix(&[("a", &[(1.0, "1.5")]), ("b", &[(1.0, "4")])]),
+            matrix(&[("a", &[(1.0, "1.5"), (2.0, "2")]), ("c", &[(1.0, "4")])]),
+            matrix(&[("a", &[(1.0, "1.5"), (2.0, "2")])]),
+        ] {
+            let gap = gap_of(&oracle, Some(&other));
+            assert_eq!(
+                (gap.max_ulps, gap.aligned_answers, gap.unaligned_answers),
+                (None, 0, 1),
+                "{other}"
+            );
+        }
+        let gap = gap_of(&oracle, None);
+        assert_eq!((gap.max_ulps, gap.unaligned_answers), (None, 1));
+    }
+
+    #[test]
+    fn a_non_finite_mismatch_is_counted_not_measured() {
+        let oracle = matrix(&[("a", &[(1.0, "NaN"), (2.0, "+Inf"), (3.0, "1")])]);
+        let same = gap_of(&oracle, Some(&oracle));
+        assert_eq!((same.max_ulps, same.non_finite_mismatches), (Some(0), 0));
+        let other = matrix(&[("a", &[(1.0, "1"), (2.0, "+Inf"), (3.0, "1")])]);
+        let gap = gap_of(&oracle, Some(&other));
+        assert_eq!(gap.max_ulps, Some(0));
+        assert_eq!((gap.value_pairs, gap.non_finite_mismatches), (3, 1));
+        let only = matrix(&[("a", &[(1.0, "NaN")])]);
+        let finite = matrix(&[("a", &[(1.0, "1")])]);
+        let gap = gap_of(&only, Some(&finite));
+        assert_eq!((gap.max_ulps, gap.aligned_answers), (None, 1));
+        assert_eq!(gap.non_finite_mismatches, 1);
+    }
+
     #[test]
     fn median_of_even_and_odd_counts() {
         assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);

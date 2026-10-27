@@ -5,15 +5,17 @@
 //! ([`ravel_bench::report_schema`]). The binding, the pass structure and the
 //! classification live in [`ravel_bench::metrics_query`]; this file reads the
 //! inputs, resolves bearer tokens from the environment, and writes the report
-//! only after [`ravel_bench::report_schema::validate`] accepts it.
+//! only after [`ravel_bench::report_schema::validate`] accepts it. With
+//! `--diagnostics` it then writes the [`ravel_bench::metrics_query::Diagnostics`]
+//! sidecar, which is not part of the report.
 //!
-//! Exit codes: 0 the report was written; 64 a usage error (an `--engine`
+//! Exit codes: 0 the report (and any sidecar) was written; 64 a usage error (an `--engine`
 //! value that does not parse); 65 the inputs cannot bind a run or the run is
 //! void (a digest mismatch, a band-6 or accounting failure on a portable
 //! ingest row, an engine with no URL or no ingest row, a classification
 //! error); 66 an input file is unreadable or malformed; 70 the assembled
 //! report fails validation, in which case nothing is written; 74 the report
-//! could not be written.
+//! or the sidecar could not be written.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
