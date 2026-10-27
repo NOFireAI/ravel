@@ -26,7 +26,7 @@ that gate (see "Query corpus" below) runs in
 `crates/ravel-bench/tests/metricsbench_artifacts.rs` against the checked-in
 pair.
 
-## Version 2
+## Versions
 
 Both files moved to format version 2 together (ADR-0927, 2026-10-26
 amendment, decisions B and E). A version-2 loader refuses a version-1 file:
@@ -34,6 +34,10 @@ the manifest by the `range_eval` block it lacks, the corpus by its version
 number. There is no compatibility path. The stream changed with the
 out-of-order shift (see "Determinism"), so a version-1 stream is reproduced
 from the version-1 files in git history, not by this build.
+
+Since then the two version independently. The corpus is at version 3 (see
+"Corpus version 3" below) and the workload manifest stays at version 2; a
+corpus change does not alter the stream.
 
 `--profile` has no default. The profile selects which data the run touches and
 every alternative is plausible on any target, so a silent default is refused.
