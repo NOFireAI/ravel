@@ -482,9 +482,10 @@ passes the field to the comparator unchanged
 (`metricsbench_query::an_entry_tolerance_reaches_the_comparator`). The gate
 refuses `tolerance_ulps: 0`, since bit-exact is spelled by leaving the field
 out (`promql_corpus::tests::gate_rejects_a_zero_ulp_tolerance`), and refuses a
-tolerance on an entry whose `modified` field states no reason, so a loosened
-comparison is never undisclosed
+tolerance on an entry that is not flagged modified with a reason
 (`promql_corpus::tests::gate_rejects_a_tolerance_without_a_modified_reason`).
+The gate does not check that the reason explains the tolerance; the entry's
+own reason has to.
 
 `mb_full_range_avg_over_time` is the only entry with a tolerance
 (`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`):
@@ -496,9 +497,15 @@ summation of n non-negative values (cpu percent) errs by at most n-1 ULPs of
 the sum. n is the gauge family's series count, `active_series x 400/1000`:
 400,000 on cardinality, 4,000 on history, 20,000 active on churn. The inner
 `avg_over_time` adds at most 119 ULPs over the 120 samples a left-open 30-minute
-window holds at a 15-second scrape, and the two divisions add one more. The
-cardinality bound is 399,999 + 119 + 1 = 400,119 ULPs, under 2^20 by a factor
-of about 2.6.
+window holds at a 15-second scrape, and the two divisions add one more. One
+engine's answer on cardinality is within 399,999 + 119 + 1 = 400,119 ULPs of
+the exact mean. The comparator compares two engines, either of which may err
+in the opposite direction, so the difference it sees is bounded by 800,238
+ULPs, under 2^20 by a factor of about 1.31. A profile with roughly 1.3 times
+cardinality's gauge series would exceed it. The gap is predicted, not
+measured: ADR-0025 pairs every tolerance with a measured gap, and the first
+comparable run under #2821 is pre-registered to measure this one and record
+the figure in the entry's reason.
 
 An entry may carry `expected: {"intended_empty": true, "reason": "..."}`; the
 gate refuses the flag without a non-blank reason. An empty oracle answer on an
