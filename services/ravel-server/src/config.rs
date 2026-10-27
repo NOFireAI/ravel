@@ -11419,6 +11419,247 @@ mod tests {
         assert_ne!(DERIVED_MAX_SEGMENTS, EngineConfig::default().max_segments);
     }
 
+    /// Issue #3306 reachability: `--max-series` reaches the running engine's
+    /// `EngineConfig::max_series` and nothing else.
+    ///
+    /// Flip-line proof: drop `max_series: self.max_series` from
+    /// `QueryBudgets::apply_to_engine` and the engine keeps 10,000; write
+    /// `max_samples: self.max_series` there and `max_samples` reads 7.
+    #[test]
+    fn max_series_is_reachable_from_cli() {
+        assert_ne!(7, ravel_query::DEFAULT_MAX_SERIES);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-series", "7"]).expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.max_series, 7,
+            "the running engine's max_series must be the configured flag"
+        );
+        assert_eq!(
+            engine.max_samples,
+            ravel_query::DEFAULT_MAX_SAMPLES,
+            "--max-series must not reach max_samples"
+        );
+    }
+
+    /// Issue #3306 reachability: `--max-samples` reaches the running engine's
+    /// `EngineConfig::max_samples` and nothing else.
+    ///
+    /// Flip-line proof: drop `max_samples: self.max_samples` from
+    /// `QueryBudgets::apply_to_engine` and the engine keeps 10,000,000; write
+    /// `max_series: self.max_samples` there and `max_series` reads 9.
+    #[test]
+    fn max_samples_is_reachable_from_cli() {
+        assert_ne!(9, ravel_query::DEFAULT_MAX_SAMPLES);
+
+        let cli =
+            Cli::try_parse_from(["ravel-server", "--max-samples", "9"]).expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.max_samples, 9,
+            "the running engine's max_samples must be the configured flag"
+        );
+        assert_eq!(
+            engine.max_series,
+            ravel_query::DEFAULT_MAX_SERIES,
+            "--max-samples must not reach max_series"
+        );
+    }
+
+    /// Issue #3306: unset, both caps resolve to the ravel-query defaults with
+    /// the host-independent `derived` label, and `apply_to_engine` writes them
+    /// over whatever the base config carried rather than keeping the base.
+    #[test]
+    fn unset_max_series_and_max_samples_resolve_to_the_ravel_query_defaults() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.max_series, 10_000);
+        assert_eq!(resolved.max_samples, 10_000_000);
+        assert_eq!(resolved.max_series, ravel_query::DEFAULT_MAX_SERIES);
+        assert_eq!(resolved.max_samples, ravel_query::DEFAULT_MAX_SAMPLES);
+        assert_eq!(resolved.sources.max_series, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.max_samples, PERF_SOURCE_DERIVED);
+
+        let base = ravel_query::EngineConfig {
+            max_series: 3,
+            max_samples: 5,
+            ..ravel_query::EngineConfig::default()
+        };
+        let engine = cli
+            .query_budgets(&resolved)
+            .expect("budgets resolve")
+            .apply_to_engine(base)
+            .expect("engine config resolves");
+        assert_eq!(engine.max_series, 10_000);
+        assert_eq!(engine.max_samples, 10_000_000);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-series", "4", "--max-samples", "6"])
+            .expect("flags parse");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.sources.max_series, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.sources.max_samples, PERF_SOURCE_FLAG);
+    }
+
+    /// Issue #3306: a zero cap is refused by clap at parse time, before any
+    /// resolution runs.
+    #[test]
+    fn zero_max_series_or_max_samples_is_refused_at_parse_time() {
+        for flag in ["--max-series", "--max-samples"] {
+            let err = Cli::try_parse_from(["ravel-server", flag, "0"])
+                .expect_err(&format!("{flag} 0 must not parse"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{flag} 0: {err}"
+            );
+            assert!(err.to_string().contains(flag), "{flag} 0: {err}");
+            Cli::try_parse_from(["ravel-server", flag, "1"])
+                .unwrap_or_else(|e| panic!("{flag} 1 must parse: {e}"));
+        }
+    }
+
+    /// Issue #3306: `--max-series 2` against a query matching three series is
+    /// refused by the engine built from the CLI, with the refusal text the
+    /// MetricsBench harness matches on, byte for byte.
+    #[tokio::test]
+    async fn max_series_flag_refuses_a_wider_query_with_the_unchanged_text() {
+        use std::sync::Arc;
+
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let ts_ns = NS_PER_HOUR;
+        let tenant = TenantId::new("series-cap");
+        let tenant_hash = tenant.hash();
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+
+        let series: Vec<SeriesInput> = (0..3)
+            .map(|i| {
+                let labels = LabelSet::new(vec![
+                    Label {
+                        name: "__name__".to_string(),
+                        value: "m".to_string(),
+                    },
+                    Label {
+                        name: "i".to_string(),
+                        value: i.to_string(),
+                    },
+                ])
+                .expect("valid labels");
+                SeriesInput {
+                    series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
+                    labels,
+                    samples: vec![Sample { ts_ns, value: 1.0 }],
+                }
+            })
+            .collect();
+        let writer_id = uuid::Uuid::from_u128(3_306);
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        assert_eq!(written.summary.series_count, 3);
+        let rec = record::build(record::NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(
+                &data_key,
+                written.bytes,
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put data object");
+        publish::publish(
+            store.as_ref(),
+            &rec,
+            &ravel_commit::publish::RetryPolicy::default(),
+        )
+        .await
+        .expect("publish");
+
+        let catalog = Arc::new(
+            ravel_catalog::Catalog::new(store.clone(), ravel_catalog::CatalogConfig::default())
+                .expect("catalog"),
+        );
+        let run = |config: ravel_query::EngineConfig| {
+            let engine =
+                ravel_query::QueryEngine::new(Arc::clone(&catalog), Arc::clone(&store), config);
+            async move {
+                engine
+                    .instant(
+                        tenant_hash,
+                        "m",
+                        ts_ns / 1_000_000,
+                        &[],
+                        4 * NS_PER_HOUR,
+                        Duration::from_secs(30),
+                    )
+                    .await
+            }
+        };
+
+        let cli = Cli::try_parse_from(["ravel-server", "--max-series", "2"]).expect("flag parses");
+        let err = run(engine_from(&cli))
+            .await
+            .expect_err("three series over a limit of two must be refused");
+        assert!(
+            matches!(
+                err,
+                ravel_query::QueryError::TooManySeries { count: 3, max: 2 }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "query matched 3 series, exceeding the limit of 2"
+        );
+
+        // The same store under the default cap answers, so the refusal above
+        // is the flag's doing.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let (value, _coverage) = run(engine_from(&cli))
+            .await
+            .expect("three series are within the default 10,000");
+        match value {
+            ravel_promql::Value::Vector(v) => assert_eq!(v.len(), 3),
+            other => panic!("expected an instant vector, got {other:?}"),
+        }
+    }
+
     /// ADR-0107 reachability: `--logs-block-range-threshold` must reach the
     /// `EngineConfig` `build_sql_state` reads when it builds the logs fetcher,
     /// not stop at a parsed field. Same wiring trace as
