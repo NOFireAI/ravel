@@ -63,7 +63,7 @@ fn record(ts: i64, i: usize) -> LogRecord {
         "service.name".to_string(),
         AttrValue::Str("api".to_string()),
     )];
-    let c = if i % 3 == 0 {
+    let c = if i.is_multiple_of(3) {
         format!("has-x-{ts}")
     } else {
         format!("none-{ts}")
@@ -302,7 +302,11 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
         let mut cold_misses = 0;
         for run in 0..=HOT_RUNS {
             if run == first_serving_run {
-                before = st.served.iter().map(|n| cache.column_hits(ids(n))).collect();
+                before = st
+                    .served
+                    .iter()
+                    .map(|n| cache.column_hits(ids(n)))
+                    .collect();
             }
             let outcome = cached
                 .execute(t.hash(), &request(st.sql))

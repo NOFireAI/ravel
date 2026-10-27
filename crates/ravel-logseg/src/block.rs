@@ -1463,22 +1463,42 @@ impl DecodedBlock {
             .filter(|(id, _)| served.contains(id))
             .map(|(_, c)| c)
             .collect();
-        for (_, c) in self.i64_cols.entries().filter(|(id, _)| !served.contains(id)) {
+        for (_, c) in self
+            .i64_cols
+            .entries()
+            .filter(|(id, _)| !served.contains(id))
+        {
             if !counted.iter().any(|seen| seen.shares_buffer_with(c)) {
                 total += c.heap_bytes();
                 counted.push(c);
             }
         }
-        for (_, v) in self.f64_cols.entries().filter(|(id, _)| !served.contains(id)) {
+        for (_, v) in self
+            .f64_cols
+            .entries()
+            .filter(|(id, _)| !served.contains(id))
+        {
             total += f64_heap_bytes(v);
         }
-        for (_, v) in self.bool_cols.entries().filter(|(id, _)| !served.contains(id)) {
+        for (_, v) in self
+            .bool_cols
+            .entries()
+            .filter(|(id, _)| !served.contains(id))
+        {
             total += bool_heap_bytes(v);
         }
-        for (_, col) in self.str_cols.entries().filter(|(id, _)| !served.contains(id)) {
+        for (_, col) in self
+            .str_cols
+            .entries()
+            .filter(|(id, _)| !served.contains(id))
+        {
             total += col.heap_bytes();
         }
-        for (_, v) in self.fixed_cols.entries().filter(|(id, _)| !served.contains(id)) {
+        for (_, v) in self
+            .fixed_cols
+            .entries()
+            .filter(|(id, _)| !served.contains(id))
+        {
             total += bytes_cells_heap_bytes(v);
         }
         total
@@ -1775,6 +1795,7 @@ pub fn read_block_pages_with_dicts(
 /// block shares rather than copies (ADR-2773 decision D3). A per-block
 /// dictionary of a column in `deferred` is left unvalidated
 /// ([`decode_columns`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_block_pages_with_shared_dicts(
     record_count: usize,
     descs: &[PageDesc],
@@ -1871,6 +1892,7 @@ fn referenced_i64(
 /// left out of the result exactly as an absent column would be. A per-block
 /// dictionary (tag 7) of a column in `deferred` is left
 /// [unvalidated](DictValues::unvalidated) for the scan's survivor-only build.
+#[allow(clippy::too_many_arguments)]
 fn decode_columns(
     record_count: usize,
     descs: &[PageDesc],

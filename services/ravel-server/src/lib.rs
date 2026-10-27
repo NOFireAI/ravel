@@ -3503,7 +3503,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     anyhow::bail!("SQL executor shared before the decoded cache was installed");
                 };
                 executor.set_decoded_cache(cache);
-                tracing::info!(decoded_cache_max_bytes, "decoded column-block cache enabled");
+                tracing::info!(
+                    decoded_cache_max_bytes,
+                    "decoded column-block cache enabled"
+                );
             }
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).

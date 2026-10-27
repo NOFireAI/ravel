@@ -19,9 +19,9 @@ use crate::block::{
     CachedColumn, ColumnIdSet, ColumnPlan, DecodedBlock, I64Column, PageCounters, StrColumn,
     read_block_pages_with_shared_dicts,
 };
-use crate::decoded_cache::DecodedCacheAttach;
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
+use crate::decoded_cache::DecodedCacheAttach;
 use crate::dict_values::{DictValues, EntryTexts};
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
@@ -6839,7 +6839,11 @@ mod tests {
             assert!(view.served_columns().is_empty());
             assert_eq!(view.resident_charge_bytes(), view.decoded_bytes());
         }
-        assert_eq!(cold.snapshot().admissions, 6, "ts and stream_ref of 3 blocks");
+        assert_eq!(
+            cold.snapshot().admissions,
+            6,
+            "ts and stream_ref of 3 blocks"
+        );
 
         // The row path neither reads nor fills the cache.
         let rows_counters = Arc::new(DecodedCacheCounters::default());
