@@ -438,8 +438,9 @@ The figures come from a deterministic simulation of the policy,
   under both windows when the hot set was read before the traffic, and
   0.0000 under both when it was first read after a 25 GB interval, which
   outlasts probation and the byte window alike; only a much wider ghost
-  serves that case: 0.7641 with a byte window of main's quota (0.9 of the
-  cache) or more.
+  serves that case: 0.7641 under a ghost as wide as the cache or wider, and
+  under a byte window of main's quota (0.9 of the cache) against the 0.35
+  loop only (0.0000 against the 0.25 loop).
 - W3, a loop of 0.5 to 3 times the cache in 1.3 MB or 25 MB entries, read
   five times, then a second such loop: no pass is served less than under
   the key window, and a first loop of 1.05 times the cache in 1.3 MB
