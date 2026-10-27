@@ -9,7 +9,8 @@
 //! - W2, ADR-0046 decision 6 at the server geometry ADR-2677's decision 3
 //!   deferral cites: an 11.5 GB cache, a 33 MB hot set of 16 KiB ranges each
 //!   read once per thousand reads of 25 MB objects that an interactive scan
-//!   reads continuously.
+//!   reads continuously, the scan looping over 0.20 to 1.3 times the cache
+//!   or reading a new object every time.
 //! - W3, ADR-2677's loop case at W1's cache: a loop of 0.5 to 3 times the
 //!   cache, of 1.3 MB or 25 MB entries, read five times, then a second one.
 //!
@@ -197,6 +198,7 @@ pub(super) struct W2 {
     pub(super) hot_rereads: u64,
     pub(super) scan: f64,
     pub(super) scan_hits: u64,
+    pub(super) evictions: u64,
 }
 
 /// W2 for `scan_reads` scan reads, with the hot set read twice back to back
@@ -252,6 +254,7 @@ pub(super) fn run_w2(window: Window, scan: Scan, established: bool, scan_reads: 
             scan_hits as f64 / scan_rereads as f64
         },
         scan_hits,
+        evictions: metrics.snapshot().evictions,
     }
 }
 
@@ -358,6 +361,82 @@ fn w2_the_hot_set_is_served_as_well_as_before_under_every_scan() {
     );
 }
 
+/// The repeated scans of [`w2_a_repeated_scan_of_up_to_0_35_of_the_cache_evicts_nothing`]:
+/// 92, 115 and 161 objects of 25 MB, 0.20, 0.25 and 0.35 of `W2_MAX_BYTES`.
+const W2_REPEATED_LOOPS: [u64; 3] = [92, 115, 161];
+
+/// W2 against a repeated scan of 0.20, 0.25 or 0.35 of the cache: the hot
+/// set and the scan's re-reads are served 1.000 under the shipped sizing and
+/// under the key window before #3270, with the hot set read before the scan
+/// or first read during it.
+///
+/// These cases do not tell ghost sizings apart, and no ghost width fails
+/// them: the loop and the hot set together stay under `max_bytes`, so
+/// nothing is evicted and no key reaches the ghost. An unbounded ghost and a
+/// zero-byte one serve the same 1.000. The test pins that, so a case that
+/// starts evicting has to be read again rather than passing as evidence.
+///
+/// FLIP: evicting above a quarter of `max_bytes` (`self.limits.max_bytes / 4`
+/// in `evict_to_bounds`'s loop condition) evicts against the 115-object loop.
+#[test]
+fn w2_a_repeated_scan_of_up_to_0_35_of_the_cache_evicts_nothing() {
+    for n in W2_REPEATED_LOOPS {
+        for established in [true, false] {
+            let reads = if established { 12_000 } else { 15_000 };
+            let shipped = run_w2(Window::Shipped, Scan::Loop(n), established, reads);
+            let before = run_w2(Window::LargestEntryKeys, Scan::Loop(n), established, reads);
+            for (name, r) in [("shipped", &shipped), ("before #3270", &before)] {
+                assert!(
+                    r.evictions == 0 && r.hot >= 1.0 && r.scan >= 1.0,
+                    "{n}-object loop, established={established}, {name}: {} evictions, hot {:.4}, scan {:.4}",
+                    r.evictions,
+                    r.hot,
+                    r.scan
+                );
+            }
+            assert!(shipped.hot >= before.hot);
+        }
+    }
+}
+
+/// The ghost queue holds at most twice the key cap plus 65 slots, live and
+/// stale, and the map at most the key cap, under a churn that forgets ghosts
+/// while new ones keep the count at the cap. The stale slots do pile up: the
+/// queue passes twice the cap.
+///
+/// FLIP: compacting at `4 * self.ghosts.len() + 64` in `compact_ghost_queue`
+/// lets the queue pass twice the cap plus 65.
+#[test]
+fn ghost_queue_slots_stay_within_twice_the_key_cap() {
+    let metrics = CacheMetrics::default();
+    let mut fifo = fifo_with(
+        CacheLimits::new(152_000_000, 1_000_000, 64 * MIB),
+        Window::Shipped,
+    );
+    let cap = fifo.ghost_max_keys;
+    assert_eq!(cap, 1_000);
+    let (mut peak_slots, mut peak_keys) = (0, 0);
+    // Tenant 5's keys are never read again and keep the ghost at its cap;
+    // tenants 6 to 8 are read again shortly after probation evicts them, so
+    // each leaves a stale slot behind.
+    for i in 0..30_000u64 {
+        read(&mut fifo, key(5, i, HOT_RANGE), &metrics);
+        for tenant in 6..=8 {
+            read(&mut fifo, key(tenant, i, HOT_RANGE), &metrics);
+            if let Some(back) = i.checked_sub(300) {
+                read(&mut fifo, key(tenant, back, HOT_RANGE), &metrics);
+            }
+        }
+        peak_slots = peak_slots.max(fifo.ghost.len());
+        peak_keys = peak_keys.max(fifo.ghosts.len());
+    }
+    assert_eq!(peak_keys, cap);
+    assert!(
+        peak_slots > 2 * cap && peak_slots <= 2 * cap + 65,
+        "peak queue slots {peak_slots} against a cap of {cap} keys"
+    );
+}
+
 /// W3: every pass of every loop, at both entry sizes and from half the cache
 /// to three times it, is served at least as well as under the key window
 /// before #3270, and a loop just over the cache of ClickBench-sized entries
@@ -438,14 +517,17 @@ fn ghost_window_report() {
             Scan::Loop(600),
             Scan::Loop(440),
             Scan::Loop(300),
+            Scan::Loop(W2_REPEATED_LOOPS[2]),
+            Scan::Loop(W2_REPEATED_LOOPS[1]),
+            Scan::Loop(W2_REPEATED_LOOPS[0]),
             Scan::Unique,
         ] {
             for established in [true, false] {
                 let reads = if established { 12_000 } else { 15_000 };
                 let r = run_w2(window, scan, established, reads);
                 println!(
-                    "W2 {name}: {scan:?} established_first={established} hot {:.4} over {} rereads, scan {:.3}",
-                    r.hot, r.hot_rereads, r.scan
+                    "W2 {name}: {scan:?} established_first={established} hot {:.4} over {} rereads, scan {:.3}, {} evictions",
+                    r.hot, r.hot_rereads, r.scan, r.evictions
                 );
             }
         }
