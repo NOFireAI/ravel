@@ -352,8 +352,9 @@ Every hot figure from a run with the cache on states the cap in its stamp.
    decoded cache the same way.
 4. **q33 simulation and re-run.** After the first paired runs, Stage 0
    adds a simulation of q33's shape and an 8 GB re-run with the admission
-   margin (see the admission-headroom amendment below). The last two rows
-   of the table are theirs.
+   margin (see the admission-headroom amendment below). The last three
+   rows of the table are theirs: the simulation's control arm, its margin
+   arm, and the re-run.
 
 | Stage 0 figure | Band | Miss | Basis |
 |---|---|---|---|
@@ -366,7 +367,8 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 | Branch at 8 GB, full entry run with the concurrent phase: QPS | at least 0.60 and at least main's on the same box minus 5% | under 0.60 | ADR-3217 standing bar (#3217 comment 6366582370) |
 | Branch at 8 GB, full entry run with the concurrent phase: error ratio | at most 0.058 | above 0.058 | ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
-| Simulation, q33 shape, with the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | predicted (admission-headroom amendment) |
+| Simulation, q33 shape, without the margin (control): aggregate refusals at an 8 GB cap | at least one | none | measured 2026-10-27: 116, #3326 comment 6452444728 |
+| Simulation, q33 shape, with the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | measured 2026-10-27: 0 at each cap, #3326 comment 6452444728 |
 | Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | #3326 comment 6448580460 |
 
 The bands are copied to #3326 before launch. A miss on any row stops the
