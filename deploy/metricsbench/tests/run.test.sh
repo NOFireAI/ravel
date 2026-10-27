@@ -23,6 +23,8 @@
 #                                       say diagnostic: true; Prometheus alone
 #                                       started with the override; ingest into
 #                                       Prometheus only
+#   f2 diagnostic on a profile the   -> exit 65, nothing started, no stamps
+#      entry is not declared for
 #   g  --keep, --passes, --reps      -> exit 0, no down -v, stamps say kept;
 #                                       --passes and --reps reach the query run
 #   h  usage and refusals            -> 64 on an unknown flag, 65 on a missing
@@ -388,7 +390,7 @@ expect_err "e: message names the container" "metricsbench-mimir-1 was OOM-killed
 check "e: summary names the OOM-killed container" 'j("memory-summary.json")["oom_killed"] == ["metricsbench-mimir-1"] and j("memory-summary.json")["containers"]["metricsbench-mimir-1"]["oom_killed"] is True and j("memory-summary.json")["verdict"] == "oom_killed"'
 
 # --- f: diagnostic -----------------------------------------------------------
-run_case f --profile ci --bin-dir "${BIN}" --out-dir "${TMP}/f/out" --anchor-ms "${ANCHOR}" \
+run_case f --profile history --bin-dir "${BIN}" --out-dir "${TMP}/f/out" --anchor-ms "${ANCHOR}" \
   --diagnostic-prometheus-max-samples 1000
 expect_rc f 0
 expect_file f falsification.json
@@ -403,6 +405,14 @@ expect_log "f: ingest into Prometheus" "--prometheus-endpoint http://127.0.0.1:9
 expect_no_log "f: no other endpoint" "--ravel-endpoint"
 expect_no_log "f: no query run" "metricsbench_query"
 expect_log "f: torn down" " down -v"
+
+# --- f2: diagnostic on a profile the entry is not declared for ---------------
+run_case f2 --profile ci --bin-dir "${BIN}" --out-dir "${TMP}/f2/out" --anchor-ms "${ANCHOR}" \
+  --diagnostic-prometheus-max-samples 1000
+expect_rc f2 65
+expect_err "f2: refusal says it falsifies nothing" "falsifies nothing"
+expect_no_log "f2: nothing started" "compose -f"
+expect_no_file f2 stamps.json
 
 # --- g: --keep ---------------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/g/out")

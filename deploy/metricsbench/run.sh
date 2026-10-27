@@ -364,6 +364,13 @@ elif op == "corpus-query":
             print(e["promql"])
             sys.exit(0)
     sys.exit(3)
+elif op == "corpus-entry-profiles":
+    corpus, entry = args
+    for e in load(corpus).get("entries", []):
+        if e.get("id") == entry:
+            print(" ".join(e.get("profiles", [])))
+            sys.exit(0)
+    sys.exit(3)
 elif op == "falsification":
     body_path, code, out_path, entry, query, at, max_samples, profile = args
     doc = {"entry": entry, "query": query, "time": at, "profile": profile,
@@ -493,6 +500,17 @@ for f in stamps.json report.json falsification.json ingest.json; do
 done
 grid="$(py profile-grid "$WORKLOAD" "$profile")" ||
   refuse "the workload ${WORKLOAD} declares no profile '$profile'"
+if [ "$diagnostic" -eq 1 ]; then
+  # The falsification query only tests --query.max-samples on a profile whose
+  # window the entry declares; elsewhere it loads a few samples, cannot reach
+  # the limit, and a "success" would falsify nothing.
+  entry_profiles="$(py corpus-entry-profiles "$CORPUS" "$FALSIFICATION_ENTRY")" ||
+    refuse "the corpus has no entry ${FALSIFICATION_ENTRY}"
+  case " ${entry_profiles} " in
+    *" ${profile} "*) ;;
+    *) refuse "--diagnostic-prometheus-max-samples sends ${FALSIFICATION_ENTRY}, which the corpus declares for '${entry_profiles}', not '${profile}'; on this profile it cannot reach the limit and falsifies nothing" ;;
+  esac
+fi
 interval_secs="${grid%% *}"
 duration_secs="${grid##* }"
 interval_ms=$((interval_secs * 1000))
@@ -537,23 +555,25 @@ bin_dir="$(cd "$bin_dir" && pwd)"
 STAMPS="${out_dir}/stamps.json"
 
 instance_type() {
-  local token="" code
+  # The IMDS session token and the answer stay outside the out-dir, which a
+  # caller may upload as an artifact.
+  local token="" code scratch
+  scratch="$(mktemp -d)" || { echo "unknown"; return 0; }
   code="$(curl -sS --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
-    -o "${out_dir}/.imds-token" -w '%{http_code}' "${IMDS}/latest/api/token" 2>/dev/null)" || code=""
+    -o "${scratch}/token" -w '%{http_code}' "${IMDS}/latest/api/token" 2>/dev/null)" || code=""
   if [ "$code" = "200" ]; then
-    token="$(cat "${out_dir}/.imds-token")"
+    token="$(cat "${scratch}/token")"
   fi
-  rm -f "${out_dir}/.imds-token"
   if [ -n "$token" ]; then
     code="$(curl -sS --max-time 2 -H "X-aws-ec2-metadata-token: ${token}" \
-      -o "${out_dir}/.imds-type" -w '%{http_code}' "${IMDS}/latest/meta-data/instance-type" 2>/dev/null)" || code=""
-    if [ "$code" = "200" ] && [ -s "${out_dir}/.imds-type" ]; then
-      cat "${out_dir}/.imds-type"
-      rm -f "${out_dir}/.imds-type"
+      -o "${scratch}/type" -w '%{http_code}' "${IMDS}/latest/meta-data/instance-type" 2>/dev/null)" || code=""
+    if [ "$code" = "200" ] && [ -s "${scratch}/type" ]; then
+      cat "${scratch}/type"
+      rm -rf "$scratch"
       return 0
     fi
   fi
-  rm -f "${out_dir}/.imds-type"
+  rm -rf "$scratch"
   echo "unknown"
 }
 
@@ -563,7 +583,6 @@ git_head() {
 
 host_instance_type="$(instance_type)"
 printf '{}\n' >"$STAMPS" || refuse "cannot write $STAMPS"
-STAMPS_READY=1
 stamp_str schema "metricsbench-run-stamps/1"
 stamp_str status running
 stamp_set diagnostic "$([ "$diagnostic" -eq 1 ] && echo true || echo false)"
