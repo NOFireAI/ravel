@@ -232,8 +232,8 @@ pub const ENCODE_BYTES_PER_SECOND: u64 = 100_000_000;
 
 /// The largest `--target-bytes` a load accepts: the target whose
 /// [`encode_allowance`] is one hour at [`ENCODE_BYTES_PER_SECOND`],
-/// 360,000,000,000 bytes. A larger target would raise every Strict write's
-/// ack deadline past an hour.
+/// 360,000,000,000 bytes. With `--ack-margin` unset, a larger target would add
+/// more than an hour to every Strict write's ack deadline.
 pub const MAX_TARGET_BYTES: u64 = ENCODE_BYTES_PER_SECOND * 3_600;
 
 /// The encode time [`write_ack_deadline`] allows a flush of `target_bytes`:
@@ -292,9 +292,9 @@ pub(crate) fn validate_target_bytes(target_bytes: Option<usize>) -> Result<(), L
                 .to_string(),
         )),
         Some(t) if t as u64 > MAX_TARGET_BYTES => Err(LoadError::Setup(format!(
-            "--target-bytes must be at most {MAX_TARGET_BYTES} (the target a flush encodes in one \
-             hour at {ENCODE_BYTES_PER_SECOND} bytes per second, which every Strict write's ack \
-             deadline adds); {t} was given"
+            "--target-bytes must be at most {MAX_TARGET_BYTES} (the bytes a flush is allowed one \
+             hour to encode at {ENCODE_BYTES_PER_SECOND} bytes per second, the encode time an \
+             unset --ack-margin adds to every Strict write's ack deadline); {t} was given"
         ))),
         _ => Ok(()),
     }
