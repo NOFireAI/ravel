@@ -1927,8 +1927,7 @@ pub struct Cli {
     /// Cap on the distinct series a single PromQL query may materialize,
     /// threaded into `ravel_query::EngineConfig::max_series`. Over it the query
     /// is refused with `query matched N series, exceeding the limit of M`
-    /// (HTTP 422, `errorType` `execution`), never truncated. Counted once per
-    /// query over the pooled scalar series of every selector. Default when
+    /// (HTTP 422, `errorType` `execution`), never truncated. Default when
     /// unset: `ravel_query::DEFAULT_MAX_SERIES` (10,000), host-independent: a
     /// series count bounds plan width, and the bytes behind it are bounded by
     /// the memory budget. Process-wide, with no limits-file key, because
@@ -13765,6 +13764,66 @@ mod tests {
             ] {
                 let needle = format!("setting=\"{setting}\"");
                 assert_eq!(joined.matches(&needle).count(), 1, "source {source}");
+            }
+        }
+    }
+
+    /// Issue #3306: startup logs `max_series`, `max_samples` and the
+    /// selector-cache cap derived from `max_samples` once each, with value
+    /// and source, both unset and flagged.
+    ///
+    /// Prove-the-test: pass `self.max_series` to `selector_cache_cap_for_pool`
+    /// in `emit()` and the derived case reads `value=320000`, not
+    /// `value=320000000`.
+    #[test]
+    fn emit_logs_series_samples_and_selector_cache_cap() {
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let flagged = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                max_series: Some(7),
+                max_samples: Some(9),
+                ..PerformanceFlags::default()
+            },
+        );
+        for (resolved, source, expected) in [
+            (
+                derived,
+                PERF_SOURCE_DERIVED,
+                [
+                    ("max_series", "10000"),
+                    ("max_samples", "10000000"),
+                    ("selector_cache_max_bytes", "320000000"),
+                ],
+            ),
+            (
+                flagged,
+                PERF_SOURCE_FLAG,
+                [
+                    ("max_series", "7"),
+                    ("max_samples", "9"),
+                    ("selector_cache_max_bytes", "288"),
+                ],
+            ),
+        ] {
+            let (captured, _guard) = capture_events(tracing::Level::INFO);
+            resolved.emit(reference_host());
+            let lines = captured.lock();
+            for (setting, value) in expected {
+                let needle = format!("setting=\"{setting}\"");
+                let matching: Vec<&String> = lines.iter().filter(|l| l.contains(&needle)).collect();
+                assert_eq!(matching.len(), 1, "{setting} once, lines: {lines:?}");
+                assert!(
+                    matching[0].contains(&format!("value={value} "))
+                        || matching[0].ends_with(&format!("value={value}")),
+                    "{setting} must carry value={value}: {}",
+                    matching[0]
+                );
+                assert!(
+                    matching[0].contains(&format!("source=\"{source}\"")),
+                    "{setting} must carry source {source}: {}",
+                    matching[0]
+                );
             }
         }
     }
