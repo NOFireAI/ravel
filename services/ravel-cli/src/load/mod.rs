@@ -234,8 +234,9 @@ pub const ENCODE_BYTES_PER_SECOND: u64 = 100_000_000;
 /// [`encode_allowance`] is one hour at [`ENCODE_BYTES_PER_SECOND`],
 /// 360,000,000,000 bytes. With `--ack-margin` unset, a larger target would add
 /// more than an hour to every Strict write's ack deadline. A `--target-bytes`
-/// above it is refused ([`validate_target_bytes`]); a derived target above it
-/// is clamped to it ([`resolve_geometry`]).
+/// above it is refused ([`validate_target_bytes`]) whether or not
+/// `--ack-margin` is given; a derived target above it is clamped to it
+/// ([`resolve_geometry`]).
 pub const MAX_TARGET_BYTES: u64 = ENCODE_BYTES_PER_SECOND * 3_600;
 
 /// The encode time [`write_ack_deadline`] allows a flush of `target_bytes`:
@@ -285,7 +286,8 @@ pub(crate) fn write_ack_deadline(
 
 /// Reject a `--target-bytes` of zero, which cannot express a target, and one
 /// above [`MAX_TARGET_BYTES`], whose encode allowance would exceed an hour.
-/// Every signal's loader calls this before its first read.
+/// The bound holds whether or not `--ack-margin` is given. Every signal's
+/// loader calls this before its first read.
 pub(crate) fn validate_target_bytes(target_bytes: Option<usize>) -> Result<(), LoadError> {
     match target_bytes {
         Some(0) => Err(LoadError::Setup(
@@ -294,9 +296,9 @@ pub(crate) fn validate_target_bytes(target_bytes: Option<usize>) -> Result<(), L
                 .to_string(),
         )),
         Some(t) if t as u64 > MAX_TARGET_BYTES => Err(LoadError::Setup(format!(
-            "--target-bytes must be at most {MAX_TARGET_BYTES} (the bytes a flush is allowed one \
-             hour to encode at {ENCODE_BYTES_PER_SECOND} bytes per second, the encode time an \
-             unset --ack-margin adds to every Strict write's ack deadline); {t} was given"
+            "--target-bytes must be at most {MAX_TARGET_BYTES} (one hour of encode at \
+             {ENCODE_BYTES_PER_SECOND} bytes per second, the allowance the ack deadline adds \
+             when --ack-margin is unset); {t} was given"
         ))),
         _ => Ok(()),
     }

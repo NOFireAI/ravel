@@ -1343,7 +1343,9 @@ at the window's 312,500 rows on four shards (320,000 on one). With an
 uneven spread, the shards that received fewer rows close below that, and
 with a memory-bound or capped depth objects hold at most about depth x
 `--batch-rows` / `--shards` rows. Rows wider than the first batch's reach
-the target sooner and close on size with fewer rows.
+the target sooner and close on size with fewer rows. A derived target is
+clamped to 360,000,000,000 bytes, the bound above which an explicit
+`--target-bytes` is refused.
 
 Object count is a first-order query-cost variable. Every later query over
 the affected range pays the per-object cost (LIST, footer read, per-object
@@ -1539,7 +1541,10 @@ load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> esti
 The stderr line names `depth flush on` or `depth flush off`, then the
 Strict ack deadline every write of the load waits under (`--max-flush-delay`
 plus its margin, see `--ack-margin`), in seconds.
-The flush target names `--target-bytes` when the flag set it. The depth
+The flush target names `--target-bytes` when the flag set it. A derived
+target clamped to 360,000,000,000 bytes reads `(derived: 250000 rows x <N>
+estimated bytes per row, clamped to the 360000000000 maximum)` on both
+lines, and the `target warning` names it as clamped too. The depth
 line names which bound decided it (`memory bound decided it: ...`), or
 `--pipeline-depth` when the flag set it. The `depth realign` line appears
 only while the depth flush is on, and reads `gave up 1 time(s): ...` with
@@ -1740,7 +1745,7 @@ group, in the given order.
   On a single-drive RustFS the first read of a region costs about 2 to 4 MB
   of disk beyond the bytes the range asks for (measured on c6a.4xlarge).
   Averaged over every GET of a statement, including GETs that land in a
-  region already read, the measured over-read was 0.4 to 0.6 MB of disk
+  region already read, the measured over-read was 0.39 to 0.62 MB of disk
   per GET depending on the query, and about 0.8 MB after a device-level
   correction. A store that serves a range with one file read pays only
   the bytes asked for.

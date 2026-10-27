@@ -210,9 +210,10 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 /// submit the batch that releases it (see the flush-target comment inside).
 ///
 /// The target is measured in the router's estimated buffered footprint and is
-/// tested once per write, so a value at or below one batch's per-shard slice
-/// changes nothing at all; [`target_bytes_no_effect_warning`] documents that
-/// arithmetic and is what reports the case to the operator.
+/// tested once per write, so at an even split a value at or below one batch's
+/// per-shard slice lays the objects out as `1` does ([`PER_BATCH_TARGET_BYTES`]
+/// covers a skewed split); [`target_bytes_no_effect_warning`] is what reports
+/// that outcome to the operator.
 ///
 /// `max_flush_delay` is the `--max-flush-delay` lever (`None` = the
 /// [`IngestConfig::default`] age trigger). It is the third constraint on when a
@@ -477,8 +478,9 @@ pub(super) async fn load_with_drain_reflush_period(
     // later batch that pushes the buffer over the target, for the depth flush
     // below, or for the age trigger (`max_flush_delay`). The target is measured
     // against the shard's uncompressed object-content estimate and tested once
-    // per write after a whole batch's slice has merged: below one slice's
-    // content it changes nothing (`target_bytes_no_effect_warning`).
+    // per write after a whole batch's slice has merged: at an even split,
+    // below one slice's content it lays the objects out as `1` does
+    // (`PER_BATCH_TARGET_BYTES`).
     //
     // `max_inflight_flushes` is the inner concurrency window (issue #807):
     // `pipeline_depth` bounds the writes the loader keeps outstanding, this
@@ -1020,13 +1022,8 @@ pub(super) async fn load_with_drain_reflush_period(
     report.metrics = router.metrics().snapshot();
     report.flush_trigger_mix = router.metrics().flush_trigger_mix_by_shard();
     report.depth_flushes_by_shard = depth_flushes_by_shard.into_iter().collect();
-    report.target_bytes_no_effect_warning = layout_no_effect_warning(
-        geometry.target_bytes,
-        geometry.target_source,
-        &report.tokens,
-        batch_rows,
-        shards,
-    );
+    report.target_bytes_no_effect_warning =
+        layout_no_effect_warning(&geometry, &report.tokens, batch_rows, shards);
     report.geometry = geometry_resolved.then_some(geometry);
     report.realign_gave_up = window.realign_gave_up();
     #[cfg(feature = "stage-timing")]

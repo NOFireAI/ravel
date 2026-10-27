@@ -1012,7 +1012,7 @@ Expected effect, as the ticket pre-registers it:
   1.5 to 3 MB each. That band is the one pre-registered and is not
   restated. Region cost here means the store's file reads beyond the
   requested bytes on the first read of a region; the RustFS probe
-  (#3217 comment 6384802590) later measured 2 to 4 MB per cold region. It
+  (#3217 comment 6384802590) measured 2 to 4 MB per cold region. It
   is a different quantity from the over-read `O` in Context (0.39 to 0.62
   MB per GET by statement, about 0.8 as the device check's tail-corrected
   figure), which averages over every GET of a statement, including GETs
