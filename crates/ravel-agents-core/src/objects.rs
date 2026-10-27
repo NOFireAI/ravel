@@ -10,7 +10,7 @@ use ravel_proto::agents::v1 as pb;
 
 use crate::head::{
     CodecError, EffectRecord, EventEntry, FORMAT_VERSION, InboxEntry, Receipt, ResultEntry, SEAL,
-    StepRecord, TimerEntry, check_seal, effect_from_proto, effect_to_proto, event_from_proto,
+    StepRecord, TimerEntry, check_format_version, check_seal, effect_from_proto, effect_to_proto, event_from_proto,
     event_to_proto, inbox_from_proto, inbox_to_proto, peek_format_version, receipt_from_proto,
     receipt_to_proto, result_from_proto, result_to_proto, step_from_proto, step_to_proto,
     timer_from_proto, timer_to_proto,
@@ -19,11 +19,13 @@ use crate::identity::Id128;
 
 fn decode_gated<M: prost::Message + Default>(
     bytes: &[u8],
-    seal: impl Fn(&M) -> u32,
+    version_and_seal: impl Fn(&M) -> (u32, u32),
 ) -> Result<M, CodecError> {
     peek_format_version(bytes)?;
     let message = M::decode(bytes).map_err(|e| CodecError::Decode(e.to_string()))?;
-    check_seal(seal(&message))?;
+    let (version, seal) = version_and_seal(&message);
+    check_format_version(version)?;
+    check_seal(seal)?;
     Ok(message)
 }
 
@@ -43,7 +45,7 @@ macro_rules! entry_page {
         }
 
         pub fn $decode(bytes: &[u8]) -> Result<Vec<$entry>, CodecError> {
-            let page: pb::$msg = decode_gated(bytes, |m: &pb::$msg| m.seal)?;
+            let page: pb::$msg = decode_gated(bytes, |m: &pb::$msg| (m.format_version, m.seal))?;
             page.entries.into_iter().map($from).collect()
         }
     };
@@ -92,7 +94,7 @@ pub fn encode_timer_table(timers: &[TimerEntry]) -> Vec<u8> {
 }
 
 pub fn decode_timer_table(bytes: &[u8]) -> Result<Vec<TimerEntry>, CodecError> {
-    let table: pb::TimerTable = decode_gated(bytes, |m: &pb::TimerTable| m.seal)?;
+    let table: pb::TimerTable = decode_gated(bytes, |m: &pb::TimerTable| (m.format_version, m.seal))?;
     table.timers.into_iter().map(timer_from_proto).collect()
 }
 
@@ -107,7 +109,7 @@ pub fn encode_step_transcript(turn_id: Id128, steps: &[StepRecord]) -> Vec<u8> {
 }
 
 pub fn decode_step_transcript(bytes: &[u8]) -> Result<(Id128, Vec<StepRecord>), CodecError> {
-    let transcript: pb::StepTranscript = decode_gated(bytes, |m: &pb::StepTranscript| m.seal)?;
+    let transcript: pb::StepTranscript = decode_gated(bytes, |m: &pb::StepTranscript| (m.format_version, m.seal))?;
     let turn_id = turn(&transcript.turn_id, "step_transcript.turn_id")?;
     let steps = transcript
         .steps
@@ -128,7 +130,7 @@ pub fn encode_effect_journal(turn_id: Id128, effects: &[EffectRecord]) -> Vec<u8
 }
 
 pub fn decode_effect_journal(bytes: &[u8]) -> Result<(Id128, Vec<EffectRecord>), CodecError> {
-    let journal: pb::EffectJournal = decode_gated(bytes, |m: &pb::EffectJournal| m.seal)?;
+    let journal: pb::EffectJournal = decode_gated(bytes, |m: &pb::EffectJournal| (m.format_version, m.seal))?;
     let turn_id = turn(&journal.turn_id, "effect_journal.turn_id")?;
     let effects = journal
         .effects
@@ -159,7 +161,7 @@ impl StateSnapshot {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<StateSnapshot, CodecError> {
-        let raw: pb::StateSnapshot = decode_gated(bytes, |m: &pb::StateSnapshot| m.seal)?;
+        let raw: pb::StateSnapshot = decode_gated(bytes, |m: &pb::StateSnapshot| (m.format_version, m.seal))?;
         Ok(StateSnapshot {
             state_version: raw.state_version,
             content_type: raw.content_type,
@@ -251,7 +253,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(500))]
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
 
         #[test]
         fn inbox_page_round_trips(e in vec(inbox_entry(), 0..4), f in flips()) {

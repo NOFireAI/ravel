@@ -27,7 +27,7 @@
     },
     "steps": [
       {
-        "step_id": "7e4127967e7bc3ee17ba2c453a98e3ba",
+        "step_id": "88d329fe1671dd64c430d4ff2c24ffce",
         "step_key": "price",
         "tool_name": "catalog.price",
         "tool_version": "1",

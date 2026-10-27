@@ -233,7 +233,7 @@ fn turn_commit_publishes_state_input_result_events_and_intents_together() {
     assert_eq!(events, vec![(1, 1, "shipped"), (2, 1, "billed")]);
     assert_eq!(after.next_event_seq, 3);
     // 5. the effect intents, journaled and in the outbox
-    let effect_id = identity::effect_id(1, turn.turn_id, "send-receipt");
+    let effect_id = identity::effect_id(1, turn.input_accept_seq, "send-receipt");
     assert_eq!(after.effects.len(), 1);
     assert_eq!(after.effects[0].effect_id, effect_id);
     assert_eq!(after.effects[0].status, EffectStatus::Intent);
@@ -822,6 +822,44 @@ fn a_cancel_between_a_retryable_failure_and_the_retry_settles_the_input() {
     assert_eq!(head.state_version, 0);
     // The retry's begin_turn finds nothing to start.
     assert_eq!(sim.run(&begin_cmd(sim.head())), Reply::Idle);
+}
+
+#[test]
+fn begin_turn_never_starts_an_input_whose_entry_carries_a_cancel_request() {
+    let mut sim = Sim::started();
+    let failed_turn = sim.head().active_turn.as_ref().expect("turn").turn_id;
+    sim.run(&step_cmd(sim.head(), StepStatus::Completed));
+    sim.run(&fail_cmd(sim.head(), false, 3));
+    sim.run(&enqueue_cmd(sim.head(), "r2", b"p2"));
+    assert_eq!(sim.head().steps.len(), 1);
+    // A root the kernel's own Cancel never leaves behind (it settles a
+    // waiting input at once), so construct it: a waiting input flagged.
+    let mut flagged = sim.head().clone();
+    flagged.inbox[0].cancel_requested = true;
+    sim.head = Some(flagged);
+    let Transition::Publish {
+        head,
+        effects,
+        reply,
+    } = sim.step(&begin_cmd(sim.head())).expect("begin applies")
+    else {
+        panic!("settling the flagged input must publish");
+    };
+    assert_eq!(reply, Reply::Cancelled { accept_seq: 1 });
+    assert_eq!(effects, vec![Effect::OperationTerminal { accept_seq: 1 }]);
+    assert_eq!(head.active_turn, None);
+    assert_eq!(head.steps, Vec::new());
+    assert_eq!(
+        head.inbox.iter().map(|e| e.accept_seq).collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(head.results.len(), 1);
+    assert_eq!(head.results[0].status, ResultStatus::Cancelled);
+    assert_eq!(head.results[0].turn_id, Some(failed_turn));
+    let Reply::TurnStarted(turn) = sim.run(&begin_cmd(sim.head())) else {
+        panic!("the next input starts");
+    };
+    assert_eq!(turn.input_accept_seq, 2);
 }
 
 #[test]

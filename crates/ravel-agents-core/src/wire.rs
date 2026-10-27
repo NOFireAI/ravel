@@ -5,9 +5,36 @@
 //! `wire::fixtures` test; a change to any body shows up as a fixture diff. Field names are snake_case, handles are the opaque
 //! tokens of [`crate::state::Handle`], ids and hashes are lowercase hex, and
 //! application payloads are arbitrary JSON values.
+//!
+//! Every `*_unix_ns` field is a JSON string holding the canonical decimal
+//! form of an `i64` (no sign on zero or positives, no leading zeros), and a
+//! JSON number there is refused. Nanoseconds since the epoch exceed 2^53, the
+//! largest integer a JavaScript number holds exactly, so a number would be
+//! rounded by the SDK's `JSON.parse`
+//! (`wire::fixtures::unix_ns_fields_are_decimal_strings`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Serde codec for `*_unix_ns` fields: an `i64` as a canonical decimal
+/// string.
+mod unix_ns {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(value: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match text.parse::<i64>() {
+            Ok(value) if value.to_string() == text => Ok(value),
+            _ => Err(D::Error::custom(
+                "a *_unix_ns field must be a canonical decimal i64 string",
+            )),
+        }
+    }
+}
 
 use crate::error::{AgentError, SafeIds};
 use crate::head::{EffectStatus, RecoveryPolicy, ResultStatus, StepStatus};
@@ -173,6 +200,7 @@ pub struct ResultBody {
     pub output: Option<Value>,
     pub error: Option<String>,
     pub dead_lettered: bool,
+    #[serde(with = "unix_ns")]
     pub finished_unix_ns: i64,
 }
 
@@ -266,6 +294,7 @@ pub struct EventsResponse {
 pub struct TimerRequest {
     pub agent: AgentRef,
     pub timer_key: String,
+    #[serde(with = "unix_ns")]
     pub due_unix_ns: i64,
     pub handler: String,
     pub payload: Value,
@@ -410,6 +439,7 @@ pub struct EventSpecBody {
 pub enum TimerChangeBody {
     Schedule {
         timer_key: String,
+        #[serde(with = "unix_ns")]
         due_unix_ns: i64,
         handler: String,
         payload: Value,

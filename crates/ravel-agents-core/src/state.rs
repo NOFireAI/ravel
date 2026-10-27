@@ -60,10 +60,13 @@ pub fn operation_state(head: &Head, accept_seq: u64) -> Option<OperationState> {
         .as_ref()
         .filter(|t| t.input_accept_seq == accept_seq)
     {
-        let in_doubt = head
-            .effects
-            .iter()
-            .any(|e| e.turn_id == turn.turn_id && e.status == EffectStatus::InDoubt);
+        // Match by input, not by `turn_id`: an intent journaled by a failed
+        // attempt keeps that attempt's turn id when the retry dispatches it.
+        let in_doubt = head.effects.iter().any(|e| {
+            e.status == EffectStatus::InDoubt
+                && e.effect_id
+                    == crate::identity::effect_id(head.incarnation, accept_seq, &e.step_key)
+        });
         return Some(if turn.block != TurnBlock::None || in_doubt {
             OperationState::Blocked
         } else {
@@ -168,10 +171,10 @@ impl Handle {
         ) else {
             return Err(HandleError::Malformed);
         };
-        let agent = AgentId::from_hex(agent).ok_or(HandleError::Malformed)?;
+        let agent = AgentId::from_hex(lower_hex(agent)?).ok_or(HandleError::Malformed)?;
         let incarnation = parse_decimal(incarnation)?;
         let id = || {
-            hex::decode(item)
+            hex::decode(lower_hex(item)?)
                 .ok()
                 .and_then(|b| Id128::from_slice(&b))
                 .ok_or(HandleError::Malformed)
@@ -200,6 +203,15 @@ impl Handle {
             });
         }
         Ok(handle)
+    }
+}
+
+// Canonical lowercase hex only, so one handle has exactly one token.
+fn lower_hex(s: &str) -> Result<&str, HandleError> {
+    if s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(s)
+    } else {
+        Err(HandleError::Malformed)
     }
 }
 
@@ -308,6 +320,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
         #[test]
         fn handles_round_trip(agent in any::<[u8; 16]>(), incarnation in any::<u64>(), item in item()) {
             let handle = Handle { agent: AgentId(agent), incarnation, item };

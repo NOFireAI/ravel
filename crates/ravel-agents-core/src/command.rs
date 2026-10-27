@@ -243,8 +243,11 @@ pub enum Precondition {
     HandlerAvailable,
     /// The turn is not blocked by a non-deterministic replay.
     TurnNotBlocked,
-    /// No effect of the turn is in doubt.
+    /// No effect of the turn's input is in doubt.
     NoEffectInDoubt,
+    /// No effect of the turn's input has an authorized attempt without a
+    /// result.
+    NoAuthorizedAttemptPending,
     /// A request id already recorded carries the same request hash.
     RequestHashMatches,
     /// The mailbox is below its depth cap.
@@ -330,6 +333,8 @@ impl Command {
                 ActiveTurnMatches,
                 BaseStateVersionMatches,
                 HandlerMatches,
+                NoEffectInDoubt,
+                NoAuthorizedAttemptPending,
                 HeadBelowByteCap,
             ],
             Command::Cancel(_) => &[AgentActive, IncarnationMatches, HeadBelowByteCap],
