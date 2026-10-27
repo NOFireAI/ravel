@@ -140,7 +140,8 @@ fn figure(decoded: &Value, field: &str) -> u64 {
 
 /// FLIP: make the server's registered evictor return 0 without evicting
 /// (`services/ravel-server/src/lib.rs`, the `register_evictor` call) and the
-/// narrow statement is refused with "process memory budget exhausted".
+/// narrow statement's object fetch is refused ("fetch memory exhausted"), a
+/// 422 where `run` asserts 200.
 #[tokio::test]
 async fn a_full_budget_admits_a_statement_by_evicting_unheld_cache_entries() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

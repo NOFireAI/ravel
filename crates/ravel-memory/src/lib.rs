@@ -27,8 +27,8 @@
 use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::{Arc, OnceLock};
 
 /// A process-wide (or scope-wide) accounting of reserved bytes against a
 /// fixed limit. All operations are lock-free and safe to call from any
@@ -1220,10 +1220,7 @@ mod tests {
             if !frees {
                 return 0;
             }
-            held.lock()
-                .expect("held")
-                .take()
-                .map_or(0, |r| r.size())
+            held.lock().expect("held").take().map_or(0, |r| r.size())
         })
     }
 
@@ -1311,7 +1308,9 @@ mod tests {
                 .is_ok()
         );
         short.set_host_memory_gate(false, 300, 600);
-        let err = short.try_reserve(10).expect_err("100 freed is short of 310");
+        let err = short
+            .try_reserve(10)
+            .expect_err("100 freed is short of 310");
         assert!(matches!(err.cause, ExhaustionCause::HostMemory { .. }));
         assert_eq!(*asked.lock().expect("asked"), vec![310]);
         assert_eq!(short.reserved(), 0, "the evictor still released its 100");
