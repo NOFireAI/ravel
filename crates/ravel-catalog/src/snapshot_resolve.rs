@@ -576,7 +576,7 @@ impl Catalog {
         }
 
         let decoded = Arc::new(decoded);
-        self.postings_cache().insert(
+        self.decoded_caches().insert_postings(
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
@@ -915,7 +915,7 @@ impl Catalog {
                 return OnePartOutcome::Unusable;
             }
         };
-        self.part_cache().insert(
+        self.decoded_caches().insert_part(
             *tenant,
             part_ref.key.clone(),
             decoded.clone(),

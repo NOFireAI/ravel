@@ -988,11 +988,19 @@ impl<V> DecodedTenantCache<V> {
 ///
 /// # Eviction rule
 ///
-/// Two bounds, both least-recently-used:
+/// Three bounds, all least-recently-used:
 ///
 /// - Per tenant, the configured entry cap (`snapshot_cache_parts` for
 ///   [`PartCache`], `postings_cache_entries` for [`PostingsCache`]), applied
 ///   on insert.
+/// - Across every tenant of BOTH caches, on insert, the byte bound
+///   (`decoded_cache_max_bytes`, unset by default): after the per-tenant
+///   insert, [`DecodedCaches`] drops entries least-recently-used first until
+///   the two caches together hold at most that many reservation bytes
+///   ([`DecodedEntry::reserved_bytes`], not the raw object size). A value
+///   whose own reservation exceeds the bound is not cached at all, so it
+///   cannot flush the other entries. The two caches are read under separate
+///   locks, so concurrent inserts can leave them briefly above the bound.
 /// - Across every tenant of BOTH caches, on memory pressure:
 ///   [`DecodedCaches::evict_until_fits`] drops entries least-recently-used
 ///   first until the refused reservation would fit. Without it, a finite
@@ -1002,7 +1010,7 @@ impl<V> DecodedTenantCache<V> {
 ///   that would not fit even with both caches empty takes no such pass: see
 ///   [`crate::Catalog::reserve_decoded`].
 ///
-/// An entry evicted by either bound releases its reservation only when the
+/// An entry evicted by any of these bounds releases its reservation only when the
 /// last `Arc` to it drops. A resolve that is still holding the value keeps it
 /// charged to the budget after the cache has forgotten it, so an eviction
 /// pass can free less than the entries it dropped were charged; the pass
@@ -1133,7 +1141,9 @@ impl<V> DecodedCache<V> {
 }
 
 impl<T> DecodedCache<Charged<T>> {
-    pub(crate) fn insert(
+    /// Private: production inserts go through [`DecodedCaches::insert_part`]
+    /// and [`DecodedCaches::insert_postings`], which apply the byte bound.
+    fn insert(
         &self,
         tenant: TenantHash,
         key: String,
@@ -1175,6 +1185,13 @@ pub(crate) struct DecodedCaches {
     postings: PostingsCache,
     /// Entries dropped by [`Self::evict_until_fits`], cumulative.
     memory_evictions: AtomicU64,
+    /// The byte bound on [`Self::reserved_bytes`] applied after each insert
+    /// (`CatalogConfig::decoded_cache_max_bytes`); `u64::MAX` when unset.
+    max_bytes: AtomicU64,
+    /// Entries dropped by the byte bound, cumulative. Kept apart from
+    /// [`Self::memory_evictions`], which counts only evictions made for a
+    /// refused decode.
+    byte_bound_evictions: AtomicU64,
 }
 
 impl Default for DecodedCaches {
@@ -1184,6 +1201,8 @@ impl Default for DecodedCaches {
             parts: PartCache::with_clock(Arc::clone(&clock)),
             postings: PostingsCache::with_clock(clock),
             memory_evictions: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(u64::MAX),
+            byte_bound_evictions: AtomicU64::new(0),
         }
     }
 }
@@ -1195,6 +1214,75 @@ impl DecodedCaches {
 
     pub(crate) fn postings(&self) -> &PostingsCache {
         &self.postings
+    }
+
+    /// Set the byte bound on the reservation bytes both caches hold together;
+    /// `None` removes it. Applied from the next insert on.
+    pub(crate) fn set_max_bytes(&self, max: Option<u64>) {
+        self.max_bytes
+            .store(max.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Cache a decoded snapshot part for `tenant` under the per-tenant entry
+    /// cap `capacity` and the byte bound. See [`Self::insert_bounded`].
+    pub(crate) fn insert_part(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<ChargedPart>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        self.insert_bounded(&self.parts, tenant, key, value, bytes, capacity);
+    }
+
+    /// Cache a decoded name-postings object for `tenant` under the per-tenant
+    /// entry cap `capacity` and the byte bound. See [`Self::insert_bounded`].
+    pub(crate) fn insert_postings(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<ChargedPostings>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        self.insert_bounded(&self.postings, tenant, key, value, bytes, capacity);
+    }
+
+    /// Insert into `cache`, then drop least-recently-used entries across every
+    /// tenant of both caches while [`Self::reserved_bytes`] is above the byte
+    /// bound. A value whose own reservation exceeds the bound is refused
+    /// before the insert, leaving both caches untouched: admitting it and then
+    /// evicting would drop every other entry and then it too. Such a value is
+    /// counted nowhere; the caller still uses the `Arc` it holds.
+    fn insert_bounded<T>(
+        &self,
+        cache: &DecodedCache<Charged<T>>,
+        tenant: TenantHash,
+        key: String,
+        value: Arc<Charged<T>>,
+        bytes: u64,
+        capacity: usize,
+    ) {
+        let max = self.max_bytes.load(Ordering::Relaxed);
+        if value.reserved_bytes() > max {
+            return;
+        }
+        cache.insert(tenant, key, value, bytes, capacity);
+        let mut dropped = 0;
+        while self.reserved_bytes() > max {
+            if !self.evict_one_lru() {
+                break;
+            }
+            dropped += 1;
+        }
+        self.byte_bound_evictions
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Entries dropped by the byte bound since this catalog was built.
+    pub(crate) fn byte_bound_evictions(&self) -> u64 {
+        self.byte_bound_evictions.load(Ordering::Relaxed)
     }
 
     /// Drop everything cached for `tenant` in both caches (ADR-0069

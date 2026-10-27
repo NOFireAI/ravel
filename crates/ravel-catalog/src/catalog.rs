@@ -824,13 +824,15 @@ impl Catalog {
         // eligible load re-fetches the stats object with no reuse.
         let column_stats_cache = (config.column_stats_cache_max_bytes != 0)
             .then(|| ColumnStatsCache::new(config.column_stats_cache_max_bytes));
+        let decoded = DecodedCaches::default();
+        decoded.set_max_bytes(config.decoded_cache_max_bytes);
         Ok(Catalog {
             store,
             config,
             cache: RecordCache::default(),
             compaction_cache: CompactionRecordCache::default(),
             head_cache: HeadCache::default(),
-            decoded: Arc::new(DecodedCaches::default()),
+            decoded: Arc::new(decoded),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
             #[cfg(test)]
@@ -888,6 +890,19 @@ impl Catalog {
     #[must_use]
     pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
         self.memory_budget = budget;
+        self
+    }
+
+    /// Bound the reservation bytes the decoded snapshot-part and name-postings
+    /// caches hold together, across every tenant, to `max`
+    /// ([`CatalogConfig::decoded_cache_max_bytes`]). For a caller that derives
+    /// the bound from the budget it passes to [`Catalog::with_memory_budget`].
+    /// Applied from the next insert on: entries already cached are not evicted
+    /// until then.
+    #[must_use]
+    pub fn with_decoded_cache_max_bytes(mut self, max: u64) -> Self {
+        self.config.decoded_cache_max_bytes = Some(max);
+        self.decoded.set_max_bytes(Some(max));
         self
     }
 
@@ -989,6 +1004,15 @@ impl Catalog {
     /// reservation, cumulative (ADR-1702 decision 6).
     pub fn decoded_cache_memory_evictions(&self) -> u64 {
         self.decoded.memory_evictions()
+    }
+
+    /// Decoded-output cache entries dropped by the byte bound
+    /// ([`CatalogConfig::decoded_cache_max_bytes`]), cumulative. Not counted in
+    /// [`Catalog::decoded_cache_memory_evictions`]. A value not cached because
+    /// its own reservation exceeds the bound counts nothing here: nothing was
+    /// evicted for it.
+    pub fn decoded_cache_byte_bound_evictions(&self) -> u64 {
+        self.decoded.byte_bound_evictions()
     }
 
     /// Decode reservations retried after such an eviction pass, cumulative.
@@ -1633,6 +1657,12 @@ impl Catalog {
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
     pub(crate) fn part_cache(&self) -> &PartCache {
         self.decoded.parts()
+    }
+
+    /// `pub(crate)`: the insert path for both decoded-output caches, which
+    /// applies the byte bound.
+    pub(crate) fn decoded_caches(&self) -> &DecodedCaches {
+        &self.decoded
     }
 
     /// Resolve exact per-segment column statistics for `(tenant, signal)`
