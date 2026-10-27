@@ -687,6 +687,25 @@ empty on an entry not marked intended-empty, voids the run with exit 65
 naming the entry and the engine, and no report is written
 (`a_classify_error_voids_the_run`).
 
+**Oracle retries.** An oracle answer lost to a timeout or a transport failure
+before a complete body arrived (`TransportErrorKind` `Connect`, `Request` or
+`Body`) is re-sent up to `--oracle-retries` more times (default 2), with a
+fixed `ORACLE_RETRY_BACKOFF` of one second before each retry
+(`metrics_query::oracle_answer`). An answer that arrived is not retried: any
+HTTP status, 4xx included, a body over the cap, or a complete body that is
+not JSON (`oracle_retryable`; `only_lost_oracle_requests_are_retryable`,
+`an_oracle_4xx_is_not_retried`). A retry is a separate request that answers
+the oracle only: the Prometheus repetition that asked is classified from its
+first attempt, so a timed-out repetition stays a timeout on Prometheus' row
+and a retry cannot make that row faster
+(`an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt`).
+Each retry prints one stderr line naming the entry, the pass, the
+repetition and the attempt. The provenance config records the budget as
+`oracle_retries`, the number used as `oracle_retries_used`, and the retried
+entries, comma-joined, as `oracle_retry_entries` (`none` when there were
+none). When the budget is spent the run is void as above, exit 65 and no
+report (`an_oracle_timeout_past_the_retry_budget_voids_the_run`).
+
 **Unsupported classes.** An entry whose query names a workload family of kind
 `native_histogram` is `unsupported_construct` on every engine whose ingest
 row lists `native_histogram` in `unsupported_classes`, today VictoriaMetrics.

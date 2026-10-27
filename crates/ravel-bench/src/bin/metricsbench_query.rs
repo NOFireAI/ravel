@@ -73,6 +73,11 @@ struct Args {
     /// The deadline of one query, in milliseconds.
     #[arg(long, default_value_t = 120_000)]
     query_timeout_ms: u64,
+    /// How many more times an oracle query that timed out or failed in
+    /// transport is re-sent before the run is void. Prometheus' own row keeps
+    /// the first attempt's outcome.
+    #[arg(long, default_value_t = 2)]
+    oracle_retries: u32,
     /// Where the report is written.
     #[arg(long)]
     out: PathBuf,
@@ -176,6 +181,7 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         passes: args.passes,
         reps_per_pass: args.reps_per_pass,
         deadline: Duration::from_millis(args.query_timeout_ms),
+        oracle_retries: args.oracle_retries,
     };
     let output = run(&binding, &entries, &workload, options)
         .await
@@ -194,6 +200,27 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         config,
         "query_timeout_ms",
         args.query_timeout_ms.to_string(),
+    );
+    set_config(config, "oracle_retries", args.oracle_retries.to_string());
+    set_config(
+        config,
+        "oracle_retries_used",
+        output.oracle_retries.len().to_string(),
+    );
+    let mut retried: Vec<&str> = Vec::new();
+    for r in &output.oracle_retries {
+        if !retried.contains(&r.entry.as_str()) {
+            retried.push(&r.entry);
+        }
+    }
+    set_config(
+        config,
+        "oracle_retry_entries",
+        if retried.is_empty() {
+            "none".to_string()
+        } else {
+            retried.join(",")
+        },
     );
     for (system, url) in endpoints(&binding) {
         set_config(config, &format!("query_url.{system}"), url);
