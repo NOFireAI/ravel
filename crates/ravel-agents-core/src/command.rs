@@ -390,6 +390,7 @@ impl Command {
                 EpochMatches,
                 EffectStateAdmits,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::AuthorizeAttempt(AuthorizeAttempt {
                 authority: Authority::Reconcile(_),

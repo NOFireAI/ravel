@@ -1695,6 +1695,22 @@ fn terminal_commands_keep_a_path_through_the_byte_cap() {
         refuse(&enqueue_cmd(&head, "r-growth", b"p")),
         ErrorKind::BudgetExceeded
     );
+    // An idempotent retry publishes nothing, so it is answered even here.
+    assert!(matches!(
+        kernel
+            .apply(
+                Some(&head),
+                &enqueue_cmd(&head, "r1", b"p1"),
+                now,
+                &DerivedIds
+            )
+            .expect("a duplicate send is answered from its receipt")
+            .reply(),
+        Reply::Accepted {
+            duplicate: true,
+            ..
+        }
+    ));
     assert!(matches!(
         kernel
             .apply(
@@ -1741,4 +1757,54 @@ fn an_oversized_caller_string_is_refused_before_any_transition() {
         sim.run(&exact),
         Reply::TurnFailed { .. } | Reply::TurnRetry { .. }
     ));
+}
+
+#[test]
+fn the_precondition_table_names_the_string_cap_for_every_command_with_caller_strings() {
+    use crate::command::Precondition::CallerStringsWithinCap;
+    let mut sim = Sim::started();
+    let head = sim.head().clone();
+    let owner = turn_fence(&head).owner;
+    let samples = vec![
+        create_cmd(),
+        enqueue_cmd(&head, "r2", b"p"),
+        Command::Takeover(Takeover {
+            incarnation: head.incarnation,
+            owner_id: "w2".to_string(),
+            observed_epoch: head.epoch,
+            lease_hint_unix_ns: 0,
+        }),
+        Command::CompleteTurn(complete_cmd(&head, b"s")),
+        fail_cmd(&head, true, 1),
+        Command::Cancel(Cancel {
+            fence: inc_fence(&head),
+            accept_seq: 1,
+        }),
+        Command::Tombstone(Tombstone {
+            fence: inc_fence(&head),
+        }),
+        Command::AuthorizeAttempt(AuthorizeAttempt {
+            authority: Authority::Owner(owner),
+            effect_id: Id128([9; 16]),
+            attempt: 1,
+        }),
+        Command::AuthorizeAttempt(AuthorizeAttempt {
+            authority: Authority::Reconcile(inc_fence(&head)),
+            effect_id: Id128([9; 16]),
+            attempt: 1,
+        }),
+    ];
+    for command in &samples {
+        let has_strings = !crate::kernel::caller_strings(command).is_empty();
+        let listed = command.preconditions().contains(&CallerStringsWithinCap);
+        assert_eq!(
+            has_strings,
+            listed,
+            "{}: caller strings {} but the table {} CallerStringsWithinCap",
+            command.name(),
+            if has_strings { "present" } else { "absent" },
+            if listed { "lists" } else { "omits" }
+        );
+    }
+    sim.run(&enqueue_cmd(&head, "r2", b"p"));
 }
