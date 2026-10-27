@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        area: [catalog, commit, common, lifecycle, maintenance, resharding]
+        area: [agents, catalog, commit, common, lifecycle, maintenance, resharding]
     runs-on: ubuntu-latest
     timeout-minutes: 160
     steps:
