@@ -48,9 +48,11 @@ services:
   # This is NOT an object-storage durability guarantee and must never be placed
   # in the same column as Ravel's durable-on-ack S3 result (ADR-0927 decision 3).
   # Left on Docker Hub deliberately: this is the only registry that
-  # publishes prom/prometheus, and this compose file is not run by any CI
-  # job, so it carries none of the anonymous-pull-allowance pressure a per-PR
-  # job would (rationale in deploy/README.md).
+  # publishes prom/prometheus. The one CI job that runs this compose file is
+  # metricsbench-nightly, once a day and not gating a merge, so it carries
+  # one daily anonymous pull rather than the pressure a per-PR job would; a
+  # rate-limited pull fails that night's run with "pull access denied"
+  # (rationale in deploy/README.md).
   prometheus:
     image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
     command:

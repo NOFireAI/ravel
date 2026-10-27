@@ -538,7 +538,10 @@ query once as an instant query at the newest sample. `falsification.json`
 records the HTTP status, `status`, `errorType`, `error` and the result's
 series count; no `report.json` is written and stamps say `diagnostic: true`
 (case f). `--ravel-image` and `--ravel-source-commit` are optional here,
-since no Ravel starts.
+since no Ravel starts. A `--profile` the corpus does not declare
+`mb_long_range_7d_avg` for (today only `history`) is refused with exit 65
+before anything starts: elsewhere the query loads too few samples to reach
+the limit, and its success would falsify nothing (case f2).
 
 ```sh
 deploy/metricsbench/run.sh --profile history --bin-dir target/release \

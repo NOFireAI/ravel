@@ -111,12 +111,16 @@ rationale.
 ECR Public does throttle unauthenticated pulls per source IP on its own
 terms, answering a burst with `toomanyrequests: Rate exceeded`, which
 `docker run` reports as exit 125. The CI jobs that create a RustFS bucket
-(ci.yml's `object-store-contract` and `bench-smoke`, and
-metricsbench-nightly's `metricsbench-rustfs`) do not pull the AWS CLI image:
-they create their bucket with the aws CLI the GitHub runner image ships
+(ci.yml's `object-store-contract` and `bench-smoke`) do not pull the AWS CLI
+image: they create their bucket with the aws CLI the GitHub runner image ships
 (`scripts/ci-create-bucket.sh`). The documented quickstart runs
 `createbucket` from ECR Public, and the scheduled `quickstart-published`
-workflow is the only lane that runs it; it does not gate a merge. The same
+workflow runs it; it does not gate a merge. metricsbench-nightly's
+`metricsbench-rustfs` runs the whole deploy/metricsbench compose stack
+through `deploy/metricsbench/run.sh`, so it pulls the AWS CLI image for that
+stack's `createbuckets` service, and Prometheus, VictoriaMetrics and Mimir
+from Docker Hub, once a day. It does not gate a merge either: a throttled
+pull fails that night's run and nothing else. The same
 image is also pulled by `docker-compose/rustfs.yml`,
 `deploy/k8s`, `scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, the
 MetricsBench compose file, and the interop-nightly Flight SQL test.
