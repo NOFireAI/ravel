@@ -21,7 +21,10 @@ Trace (6 states, depth 6):
 The enqueue writes HEAD with CasVersion on the version it read, so a root
 that moved since is refused and the sender re-reads. The switch writes with
 an unconditional overwrite when the only change since the read is another
-sender's enqueue (same owner, epoch, timer, results and active turn).
+sender's enqueue (same owner, epoch, timer, results and active turn). The
+switch also requires that the other sender used a different request id: with
+the same request id and payload the overwrite rewrites an identical input
+record, which loses nothing and only breaks `MonotonicIdentity`.
 
 ## Why it is a real bug if it ever held
 
