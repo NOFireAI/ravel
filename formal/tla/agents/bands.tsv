@@ -1,6 +1,9 @@
-# Unmeasured placeholder: the distinct band is the full 0-999999999 range and
-# depth is not enforced, so this row only sets the exhaustive budget_s. A
-# single local run (2 workers) measured 362907 distinct at depth 27; the row
-# gets a real band once the nightly lane has measured it on its own runner.
+# Smoke band: measured 338707 distinct at depth 26 with 2 workers; depth is
+# "-" because TLC's reported BFS depth overshoots by a level under
+# -workers auto. The exhaustive row is an unmeasured placeholder: its distinct
+# band is the full 0-999999999 range, so it only sets budget_s; a single local
+# run (2 workers) measured 362907 distinct at depth 27, and the row gets a real
+# band once the nightly lane has measured it on its own runner.
 cfg	min_distinct	max_distinct	min_depth	max_depth	budget_s
+MCAgentProtocol.smoke.cfg	335000	342000	-	-
 MCAgentProtocol.exhaustive.cfg	0	999999999	-	-	3000

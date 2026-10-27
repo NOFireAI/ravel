@@ -224,6 +224,11 @@ LostResponseUnreachable ==
 \* so epoch 2 means a worker took over from another worker.
 TakeoverUnreachable == \A ak \in AKs : HeadUp(ak) => Head(ak).epoch =< 1
 
+\* A timer generation was replaced: generation 1 is the first schedule, so a
+\* root carrying generation 2 means a cancelled or delivered generation was
+\* followed by a new schedule.
+SecondGenerationUnreachable == \A ak \in AKs : HeadUp(ak) => Head(ak).timer.gen =< 1
+
 \* A sender is about to CAS a root another sender's enqueue already moved.
 CompetingSendersUnreachable ==
     ~\E c \in Clients :
