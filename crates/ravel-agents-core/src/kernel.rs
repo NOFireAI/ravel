@@ -123,12 +123,19 @@ pub struct Limits {
 }
 
 /// Bytes the growth guard leaves free for each journaled effect that is not
-/// `Completed`: a `Reconcile` authorization or a `RecordEffectResult` may
-/// still grow it, and both are exempt. The attempt varint (6), the result
+/// `Completed`: a `Reconcile` authorization, an owner's retry authorization
+/// of an effect already `Authorized` or `InDoubt`, or a `RecordEffectResult`
+/// may still grow it, and all three are exempt. The attempt varint (6), the result
 /// reference (47), the result attempt varint (6), the record's length prefix
 /// (1) and a status change (2, though prost writes every status in one byte
 /// either way) come to 62.
 pub const PENDING_EFFECT_RESERVE_BYTES: usize = 64;
+
+/// Bytes a terminal result entry costs beyond its error text, plus the
+/// retryable `FailTurn` growth that precedes it: the 51 plus 25 the `Limits`
+/// doc derives. `Kernel::new` keeps `terminal_reserve_per_input_bytes` at or
+/// above `max_error_bytes` plus this.
+pub const RESULT_ENTRY_OVERHEAD_BYTES: usize = 76;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -414,7 +421,18 @@ fn intent_strings(intent: &IntentSpec) -> [&str; 3] {
 }
 
 impl Kernel {
-    pub fn new(limits: Limits) -> Kernel {
+    /// `terminal_reserve_per_input_bytes` is raised to the floor the `Limits`
+    /// doc derives (`max_error_bytes + RESULT_ENTRY_OVERHEAD_BYTES`) when a
+    /// caller configures less, so the terminal guarantee does not depend on
+    /// the caller reading that doc
+    /// (`tests::a_reserve_below_the_result_floor_is_raised_to_it`).
+    pub fn new(mut limits: Limits) -> Kernel {
+        let floor = limits
+            .max_error_bytes
+            .saturating_add(RESULT_ENTRY_OVERHEAD_BYTES);
+        if limits.terminal_reserve_per_input_bytes < floor {
+            limits.terminal_reserve_per_input_bytes = floor;
+        }
         Kernel { limits }
     }
 
@@ -453,7 +471,7 @@ impl Kernel {
             Command::AuthorizeAttempt(c) => self.authorize_attempt(head, c),
             Command::RecordEffectResult(c) => self.record_effect_result(head, c),
         };
-        self.check_growth_headroom(command, outcome)
+        self.check_growth_headroom(head, command, outcome)
     }
 
     /// Every caller-supplied string a command carries is at most
@@ -634,7 +652,7 @@ fn identity_strings(command: &Command) -> (Vec<&str>, Vec<&str>) {
 /// blocks the turn or marks an effect `InDoubt`), and what an effect needs
 /// to settle (`RecordEffectResult`, a `Reconcile` authorization). Refusing a
 /// latch would let the next `CompleteTurn` commit past it.
-fn guarded(command: &Command, reply: &Reply) -> bool {
+fn guarded(observed: &Head, command: &Command, reply: &Reply) -> bool {
     if matches!(reply, Reply::Blocked(_)) {
         return false;
     }
@@ -645,7 +663,21 @@ fn guarded(command: &Command, reply: &Reply) -> bool {
         | Command::ScheduleTimer(_)
         | Command::FireTimer(_)
         | Command::CompleteTurn(_) => true,
-        Command::AuthorizeAttempt(c) => matches!(c.authority, Authority::Owner(_)),
+        // The first owner authorization of an effect adds the attempt record
+        // and is guarded. A later owner authorization of an effect already
+        // `Authorized` or `InDoubt` is the retry a new owner issues after a
+        // crash (decision 7's at_least_once and provider_idempotency
+        // recovery); it only replaces the attempt number, fits in the
+        // per-effect reserve, and must not be refused inside the reserve, or
+        // the input could neither be retried nor failed
+        // (`tests::an_owner_retry_authorization_is_answered_inside_the_reserve`).
+        Command::AuthorizeAttempt(c) => match &c.authority {
+            Authority::Reconcile(_) => false,
+            Authority::Owner(_) => !observed.effects.iter().any(|e| {
+                e.effect_id == c.effect_id
+                    && matches!(e.status, EffectStatus::Authorized | EffectStatus::InDoubt)
+            }),
+        },
         Command::Create(_)
         | Command::Takeover(_)
         | Command::BeginTurn(_)
@@ -674,12 +706,17 @@ impl Kernel {
     /// that answers `Unchanged` (a duplicate enqueue, a step replay, an
     /// already-authorized attempt) is never refused, so a client near the cap
     /// can still resolve what it already published.
-    fn check_growth_headroom(&self, command: &Command, outcome: Outcome) -> Outcome {
+    fn check_growth_headroom(
+        &self,
+        observed: &Head,
+        command: &Command,
+        outcome: Outcome,
+    ) -> Outcome {
         let transition = outcome?;
         let Transition::Publish { head, reply, .. } = &transition else {
             return Ok(transition);
         };
-        if !guarded(command, reply) {
+        if !guarded(observed, command, reply) {
             return Ok(transition);
         }
         let cap = self
