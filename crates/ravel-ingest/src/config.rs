@@ -622,11 +622,6 @@ impl RlogChunkOrder {
     pub fn get(self) -> &'static [&'static str] {
         self.0
     }
-
-    /// The names, in order.
-    pub fn as_slice(&self) -> &[&'static str] {
-        self.0
-    }
 }
 
 impl Default for RlogChunkOrder {
