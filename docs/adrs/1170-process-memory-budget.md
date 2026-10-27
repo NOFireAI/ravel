@@ -1730,8 +1730,14 @@ What a refusal does, by decode kind:
   ADR-1702's column-statistics budget-skip amendment).
 - A fold tick whose previous-postings decode is refused fails for that
   tenant with the typed error, logged at warn as "catalog fold failed", and
-  does not advance the HEAD; the next tick retries it. The scheduled fold
-  runs in `all` and `maintain` modes.
+  does not advance the HEAD; the next tick retries it. A previous postings
+  object that no eviction could admit, because the bytes held outside the
+  decoded caches leave no room for it or it is larger than the whole
+  limit, is refused the same way on every tick, and that tenant's fold
+  stays failed while that holds. For an object larger than the whole limit
+  it always holds, so that tenant's fold does not advance until the budget
+  is raised (ADR-1702 decision 6). The scheduled fold runs in `all` and
+  `maintain` modes.
 
 The host-memory gate amendment's gate sits in front of the same budget, so
 the catalog inherits it. A catalog decode the gate refuses (the
