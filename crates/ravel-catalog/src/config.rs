@@ -537,6 +537,15 @@ pub struct CatalogConfig {
     /// Bound on decoded name-postings objects cached per tenant.
     /// Default [`DEFAULT_POSTINGS_CACHE_ENTRIES`].
     pub postings_cache_entries: usize,
+    /// Bound on the reservation bytes the decoded snapshot-part cache and the
+    /// decoded name-postings cache hold together, across every tenant
+    /// (issue #3244). After an insert, entries of either cache are evicted
+    /// least-recently-used across every tenant until the two together hold at
+    /// most this many bytes; a decoded value whose own reservation is larger
+    /// is not cached. `None`, the default, sets no byte bound: only the
+    /// per-tenant entry caps above apply. [`crate::Catalog::new`] reads it;
+    /// [`crate::Catalog::with_decoded_cache_max_bytes`] sets it afterwards.
+    pub decoded_cache_max_bytes: Option<u64>,
     /// Bound on the total number of (tenant, signal) entries
     /// [`crate::cache::HeadCache`] holds at once, process-wide. Default
     /// [`DEFAULT_HEAD_CACHE_CAPACITY`].
@@ -767,6 +776,7 @@ impl Default for CatalogConfig {
             max_snapshot_part_bytes: snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
             max_postings_bytes: snapshot_format::DEFAULT_MAX_POSTINGS_BYTES,
             postings_cache_entries: DEFAULT_POSTINGS_CACHE_ENTRIES,
+            decoded_cache_max_bytes: None,
             head_cache_capacity: DEFAULT_HEAD_CACHE_CAPACITY,
             byte_cache_max_bytes: DEFAULT_BYTE_CACHE_MAX_BYTES,
             byte_cache_max_entries: DEFAULT_BYTE_CACHE_MAX_ENTRIES,
