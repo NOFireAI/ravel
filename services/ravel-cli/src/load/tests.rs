@@ -218,7 +218,7 @@ fn max_flush_delay_set_reaches_the_config_exactly() {
 /// `write_ack_deadline` and the 10m case fails at `left: 60s, right: 660s`.
 #[test]
 fn write_ack_deadline_scales_with_the_configured_flush_delay() {
-    let ack = |delay| write_ack_deadline(delay, None, PER_BATCH_TARGET_BYTES, 0);
+    let ack = |delay| write_ack_deadline(delay, None, PER_BATCH_TARGET_BYTES);
     assert_eq!(
         ack(None),
         Duration::from_secs(60),
@@ -251,43 +251,90 @@ fn write_ack_deadline_scales_with_the_configured_flush_delay() {
 /// with the delay instead (`delay + delay`) and it fails at `180s`.
 #[test]
 fn write_ack_deadline_adds_the_encode_time_of_a_target_sized_flush() {
-    const SLICE: u64 = 4_000_000;
     assert_eq!(ENCODE_BYTES_PER_SECOND, 100_000_000);
     assert_eq!(
-        write_ack_deadline(None, None, 1_850_000_000, SLICE),
+        write_ack_deadline(None, None, 1_850_000_000),
         Duration::from_millis(78_500),
         "an unset delay at the stock 1.85e9 target: the 60s margin plus 18.5s of encode"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::from_secs(30)), None, 1_850_000_000, SLICE),
+        write_ack_deadline(Some(Duration::from_secs(30)), None, 1_850_000_000),
         Duration::from_millis(108_500),
         "a 30s delay at the stock target: 30 + 60 + 18.5"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::from_secs(60)), None, 1_850_000_000, SLICE),
+        write_ack_deadline(Some(Duration::from_secs(60)), None, 1_850_000_000),
         Duration::from_millis(138_500),
         "the CLI's 60s default delay at the stock target: 60 + 60 + 18.5"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::from_secs(90)), None, 7_400_000_000, SLICE),
+        write_ack_deadline(Some(Duration::from_secs(90)), None, 7_400_000_000),
         Duration::from_secs(224),
         "a 90s delay at a 7.4e9 target: 90 + 60 + 74, not the 150s a flat margin gives"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::from_secs(90)), None, 1, SLICE),
+        write_ack_deadline(Some(Duration::from_secs(90)), None, 1),
         Duration::from_secs(150),
         "--target-bytes 1 flushes per batch and adds nothing"
     );
     assert_eq!(
-        write_ack_deadline(Some(Duration::from_secs(90)), None, 3_000_000, SLICE),
-        Duration::from_secs(150),
-        "a target below one batch's per-shard slice flushes per batch and adds nothing"
+        write_ack_deadline(Some(Duration::from_secs(90)), None, 3_000_000),
+        Duration::from_millis(150_030),
+        "a target that may sit below one batch's per-shard slice still gets its 30ms"
     );
+}
+
+/// The encode allowance's only zero case is the per-batch target (issue
+/// #3289): `PER_BATCH_TARGET_BYTES` adds nothing and one byte more, a
+/// two-byte target, adds 20 ns. No slice estimate exempts a larger target,
+/// since a skewed shard's real slice can be below the estimate and its buffer
+/// accumulate to the target across batches.
+///
+/// Prove-the-test: restore a `target <= slice_est_bytes` exemption (with any
+/// non-zero estimate) and the `PER_BATCH_TARGET_BYTES + 1` case fails at
+/// `left: 0ns, right: 20ns`.
+#[test]
+fn encode_allowance_is_zero_only_at_the_per_batch_target() {
+    assert_eq!(encode_allowance(PER_BATCH_TARGET_BYTES), Duration::ZERO);
     assert_eq!(
-        encode_allowance(PER_BATCH_TARGET_BYTES, 0),
-        Duration::ZERO,
-        "the per-batch target adds nothing even when the slice estimate is zero"
+        encode_allowance(PER_BATCH_TARGET_BYTES + 1),
+        Duration::from_nanos(20),
+        "two bytes at 100,000,000 bytes per second"
     );
+    assert_eq!(encode_allowance(3_700_000_000), Duration::from_secs(37));
+}
+
+/// `--target-bytes` is bounded by the target whose encode allowance is one
+/// hour, derived from `ENCODE_BYTES_PER_SECOND` (issue #3289): 360,000,000,000
+/// is accepted and one byte more is refused with a message naming the flag,
+/// the bound and the value. Zero is still refused.
+///
+/// Prove-the-test: write the bound as `> MAX_TARGET_BYTES + 1` (or as a
+/// literal off by any amount) and the 360,000,000,001 case is accepted;
+/// compare with `>=` and the 360,000,000,000 case is refused.
+#[test]
+fn validate_target_bytes_refuses_a_target_whose_encode_allowance_exceeds_an_hour() {
+    assert_eq!(MAX_TARGET_BYTES, 360_000_000_000);
+    assert_eq!(
+        encode_allowance(360_000_000_000),
+        Duration::from_secs(3_600),
+        "the bound is the target with exactly one hour of encode allowance"
+    );
+    assert!(validate_target_bytes(None).is_ok());
+    assert!(validate_target_bytes(Some(1)).is_ok());
+    assert!(validate_target_bytes(Some(360_000_000_000)).is_ok());
+    match validate_target_bytes(Some(360_000_000_001)) {
+        Err(LoadError::Setup(msg)) => {
+            assert!(msg.contains("--target-bytes"), "{msg}");
+            assert!(msg.contains("at most 360000000000"), "{msg}");
+            assert!(msg.contains("360000000001 was given"), "{msg}");
+        }
+        other => panic!("expected a setup error: {other:?}"),
+    }
+    match validate_target_bytes(Some(0)) {
+        Err(LoadError::Setup(msg)) => assert!(msg.contains("at least 1"), "{msg}"),
+        other => panic!("expected a setup error: {other:?}"),
+    }
 }
 
 /// `--ack-margin` replaces the whole margin, the encode allowance included,
@@ -296,12 +343,7 @@ fn write_ack_deadline_adds_the_encode_time_of_a_target_sized_flush() {
 fn ack_margin_replaces_the_whole_margin() {
     let margin = Some(Duration::from_secs(60));
     assert_eq!(
-        write_ack_deadline(
-            Some(Duration::from_secs(90)),
-            margin,
-            7_400_000_000,
-            4_000_000
-        ),
+        write_ack_deadline(Some(Duration::from_secs(90)), margin, 7_400_000_000),
         Duration::from_secs(150),
         "--ack-margin 60 drops the 74s encode allowance"
     );
@@ -309,14 +351,13 @@ fn ack_margin_replaces_the_whole_margin() {
         write_ack_deadline(
             Some(Duration::from_secs(90)),
             Some(Duration::from_secs(600)),
-            1,
-            4_000_000
+            1
         ),
         Duration::from_secs(690),
         "--ack-margin 600 widens the margin at a per-batch target"
     );
     assert_eq!(
-        write_ack_deadline(None, Some(Duration::from_secs(1)), 7_400_000_000, 0),
+        write_ack_deadline(None, Some(Duration::from_secs(1)), 7_400_000_000),
         Duration::from_secs(60),
         "a 1s margin with no delay still meets the floor"
     );
@@ -324,8 +365,7 @@ fn ack_margin_replaces_the_whole_margin() {
         write_ack_deadline(
             Some(Duration::from_secs(90)),
             Some(Duration::from_secs(1)),
-            7_400_000_000,
-            0
+            7_400_000_000
         ),
         Duration::from_secs(91),
         "the floor applies to the whole deadline, not to the margin: 90 + 1, not 90 + 60"

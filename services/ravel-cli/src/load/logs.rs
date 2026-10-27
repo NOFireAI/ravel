@@ -430,14 +430,9 @@ pub(super) async fn load_with_drain_reflush_period(
     // Same shape as the guards above: `--target-bytes` is the operator-facing
     // flush-target lever (issue #801). A target of 0 is not a smaller target
     // than 1, it is the same one (an estimate `>= 0` holds for an empty buffer),
-    // so it is rejected rather than silently behaving as 1.
-    if target_bytes == Some(0) {
-        return Err(LoadError::Setup(
-            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
-             given"
-                .to_string(),
-        ));
-    }
+    // so it is rejected rather than silently behaving as 1. The upper bound is
+    // shared with the metrics and spans loaders.
+    validate_target_bytes(target_bytes)?;
     validate_ack_margin(load_memory.as_ref().and_then(|o| o.ack_margin))?;
 
     let limits = LogIngestLimits::default();
