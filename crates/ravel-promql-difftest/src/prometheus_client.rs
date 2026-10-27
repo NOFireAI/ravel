@@ -187,6 +187,26 @@ pub struct PrometheusClient {
     base_url: String,
     deadline: Duration,
     max_body_bytes: u64,
+    /// Sent as `Authorization: Bearer` on every request. Redacted from
+    /// `Debug`; never formatted into an error.
+    bearer_token: Option<String>,
+    /// Appended to the parameters of every query request.
+    extra_params: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for PrometheusClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrometheusClient")
+            .field("base_url", &self.base_url)
+            .field("deadline", &self.deadline)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("extra_params", &self.extra_params)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PrometheusClient {
@@ -205,6 +225,31 @@ impl PrometheusClient {
             base_url: base_url.into(),
             deadline,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            bearer_token: None,
+            extra_params: Vec::new(),
+        }
+    }
+
+    /// Sends `Authorization: Bearer <token>` on every request (queries,
+    /// readiness probes and remote write). The token is not part of the
+    /// client's `Debug` output and is never copied into an error.
+    pub fn with_bearer_token(mut self, token: String) -> Self {
+        self.bearer_token = Some(token);
+        self
+    }
+
+    /// Appends `params` to every `/api/v1/query` and `/api/v1/query_range`
+    /// request, after the query's own parameters (MetricsBench passes
+    /// Ravel's `min_commit_token` this way).
+    pub fn with_extra_params(mut self, params: Vec<(String, String)>) -> Self {
+        self.extra_params = params;
+        self
+    }
+
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.bearer_token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
         }
     }
 
@@ -240,8 +285,7 @@ impl PrometheusClient {
             // the overall timeout: bound each send by what remains of it.
             let probe = tokio::time::timeout_at(
                 deadline,
-                self.control
-                    .get(format!("{}/-/ready", self.base_url))
+                self.authorized(self.control.get(format!("{}/-/ready", self.base_url)))
                     .send(),
             )
             .await;
@@ -260,8 +304,7 @@ impl PrometheusClient {
     /// POSTs a pre-encoded (protobuf + snappy) Remote Write 1.0 body.
     pub async fn remote_write(&self, body: Vec<u8>) -> Result<(), PrometheusClientError> {
         let resp = self
-            .control
-            .post(format!("{}/api/v1/write", self.base_url))
+            .authorized(self.control.post(format!("{}/api/v1/write", self.base_url)))
             .header("Content-Encoding", "snappy")
             .header("Content-Type", "application/x-protobuf")
             .header("X-Prometheus-Remote-Write-Version", "0.1.0")
@@ -373,9 +416,10 @@ impl PrometheusClient {
         let deadline_at = start + deadline;
         let mut timing = QueryTiming::default();
 
-        let send = client
-            .get(format!("{}{}", self.base_url, path))
+        let send = self
+            .authorized(client.get(format!("{}{}", self.base_url, path)))
             .query(params)
+            .query(&self.extra_params)
             .send();
         let mut resp = match tokio::time::timeout_at(deadline_at, send).await {
             Err(_) => return timeout(TimeoutPhase::Headers, start, timing),
@@ -529,6 +573,7 @@ fn ms_to_seconds_str(ms: i64) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -579,6 +624,105 @@ mod tests {
         // The default deadline never enters the cache.
         let _ = client.client_for(DEFAULT_QUERY_DEADLINE);
         assert_eq!(client.cached_override_clients(), MAX_OVERRIDE_CLIENTS);
+    }
+
+    const SECRET: &str = "s3cr3t-bearer-token-value";
+
+    #[test]
+    fn debug_output_redacts_the_bearer_token() {
+        let client = PrometheusClient::new("http://127.0.0.1:9")
+            .with_bearer_token(SECRET.to_string())
+            .with_extra_params(vec![("min_commit_token".into(), "t1,t2".into())]);
+        let debug = format!("{client:?}");
+        assert!(!debug.contains(SECRET), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("min_commit_token"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_carry_the_bearer_token() {
+        // Bind then drop, so the port refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let client =
+            PrometheusClient::with_deadline(format!("http://{addr}"), Duration::from_secs(5))
+                .with_bearer_token(SECRET.to_string());
+        let outcome = client
+            .instant_query_with_deadline("up", 0, Duration::from_secs(5))
+            .await;
+        let rendered = format!("{outcome:?}");
+        assert!(
+            matches!(outcome, QueryOutcome::Transport { .. }),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        let error = outcome.into_result().expect_err("refused connect");
+        assert!(!error.to_string().contains(SECRET), "{error}");
+        let write = client
+            .remote_write(Vec::new())
+            .await
+            .expect_err("refused connect");
+        assert!(!write.to_string().contains(SECRET), "{write}");
+        assert!(!format!("{write:?}").contains(SECRET), "{write:?}");
+    }
+
+    #[tokio::test]
+    async fn bearer_header_and_extra_params_reach_every_query() {
+        use axum::extract::RawQuery;
+        use axum::http::HeaderMap;
+        type Seen = std::sync::Arc<Mutex<Vec<(Option<String>, String)>>>;
+        let seen: Seen = Default::default();
+        let record = |seen: Seen| {
+            move |headers: HeaderMap, RawQuery(query): RawQuery| {
+                let seen = seen.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((auth, query.unwrap_or_default()));
+                    axum::Json(
+                        serde_json::json!({"status":"success","data":{"resultType":"vector","result":[]}}),
+                    )
+                }
+            }
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/query", axum::routing::get(record(seen.clone())))
+            .route(
+                "/api/v1/query_range",
+                axum::routing::get(record(seen.clone())),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let client = PrometheusClient::new(format!("http://{addr}"))
+            .with_bearer_token(SECRET.to_string())
+            .with_extra_params(vec![("min_commit_token".into(), "a:1,b:2".into())]);
+        client.instant_query("up", 1_000).await.expect("instant");
+        client
+            .range_query("up", 0, 60_000, 15_000)
+            .await
+            .expect("range");
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (auth, query) in &seen {
+            assert_eq!(auth.as_deref(), Some(format!("Bearer {SECRET}").as_str()));
+            assert!(
+                query.ends_with("&min_commit_token=a%3A1%2Cb%3A2"),
+                "{query}"
+            );
+        }
     }
 
     #[test]
