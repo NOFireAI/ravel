@@ -3489,6 +3489,22 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 ),
                 bulk_scan_min_bytes.value,
             )?;
+            // ADR-3326 Stage 0: `--decoded-cache-max-bytes` above zero installs
+            // one process-wide decoded-column cache on the logs fetcher, its
+            // entries charged to the process memory budget. Zero builds none.
+            let mut state = state;
+            let decoded_cache_max_bytes = config.query_budgets.decoded_cache_max_bytes;
+            if decoded_cache_max_bytes > 0 {
+                let cache = Arc::new(ravel_logseg::decoded_cache::DecodedColumnCache::new(
+                    decoded_cache_max_bytes,
+                    Some(process_memory_budget.clone()),
+                ));
+                let Some(executor) = Arc::get_mut(&mut state.executor) else {
+                    anyhow::bail!("SQL executor shared before the decoded cache was installed");
+                };
+                executor.set_decoded_cache(cache);
+                tracing::info!(decoded_cache_max_bytes, "decoded column-block cache enabled");
+            }
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).
             // `mtls_sql_query_state` below is built from `state.clone()` after

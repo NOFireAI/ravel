@@ -1842,6 +1842,16 @@ impl SqlExecutor {
         self
     }
 
+    /// Installs the process decoded-column cache on the logs fetcher, which the
+    /// `logs`, `alerts` and `audit` scans read through (ADR-3326 Stage 0). With
+    /// one installed every statement's [`SqlStats::decoded_cache`] is `Some`.
+    pub fn set_decoded_cache(
+        &mut self,
+        cache: Arc<ravel_logseg::decoded_cache::DecodedColumnCache>,
+    ) {
+        self.log_fetcher = self.log_fetcher.clone().with_decoded_cache(cache);
+    }
+
     /// The `min_grace_ms` `execute_ddl` passes to
     /// `ravel_pqtable::writer::apply`: [`Self::with_ddl_min_grace_ms`]'s
     /// value, or [`crate::ddl::DEFAULT_MIN_GRACE_MS`] when none was set.
