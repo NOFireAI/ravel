@@ -17,8 +17,8 @@
 //! - W3, ADR-2677's loop case at W1's cache: a loop of 0.5 to 3 times the
 //!   cache, of 1.3 MB or 25 MB entries, read five times, then a second one.
 //!
-//! The `w1_`, `w2_`, `w2b_` and `w3_` tests pin the shipped sizing against the key
-//! window it replaced; `ghost_window_report` prints every candidate.
+//! The `w1_`, `w2_`, `w2b_` and `w3_` tests pin the shipped sizing against
+//! the key window it replaced; `ghost_window_report` prints every candidate.
 
 use super::*;
 
