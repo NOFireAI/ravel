@@ -1,0 +1,13 @@
+{
+  "effects": [
+    {
+      "effect": "djE6ZWZmZWN0OjE5Y2QwZTY4NzY5OTEzMTRjMWI2ZGJkOGJkMTI5Mjk3OjE6NzQ1YzkzM2FhYjM1ZTQxMGMyYTQ2MzUxYzdjNGM5YWY",
+      "turn_id": "d746246fc5bd6d52e210c7e1883ca81e",
+      "tool_name": "payments.charge",
+      "tool_version": "2",
+      "policy": "manual",
+      "status": "in_doubt",
+      "attempt": 2
+    }
+  ]
+}

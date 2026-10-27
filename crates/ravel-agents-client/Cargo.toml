@@ -1,0 +1,10 @@
+[package]
+name = "ravel-agents-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rust HTTP client for the Ravel Agents API (ADR-3331)."
+
+[lints]
+workspace = true

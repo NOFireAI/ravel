@@ -1,0 +1,11 @@
+{
+  "worker_id": "worker-a",
+  "handlers": [
+    {
+      "handler": "place",
+      "version": "1.0.0",
+      "digest": "3c20eb97686b101673103ee45ac9cb5f678f30cbee12933adc1f8b0a9868085f"
+    }
+  ],
+  "wait_ms": 20000
+}
