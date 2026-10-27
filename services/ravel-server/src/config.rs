@@ -11451,8 +11451,7 @@ mod tests {
     fn max_samples_is_reachable_from_cli() {
         assert_ne!(9, ravel_query::DEFAULT_MAX_SAMPLES);
 
-        let cli =
-            Cli::try_parse_from(["ravel-server", "--max-samples", "9"]).expect("flag parses");
+        let cli = Cli::try_parse_from(["ravel-server", "--max-samples", "9"]).expect("flag parses");
         let engine = engine_from(&cli);
         assert_eq!(
             engine.max_samples, 9,
