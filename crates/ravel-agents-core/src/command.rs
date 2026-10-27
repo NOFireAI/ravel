@@ -264,8 +264,13 @@ pub enum Precondition {
     AttemptAuthorized,
     /// The timer generation is the scheduled one and is due.
     TimerGenerationCurrent,
-    /// The encoded root stays under `MAX_HEAD_BYTES`.
+    /// The encoded root stays under the byte cap; a command that grows the
+    /// root without ending a turn also leaves `Limits::terminal_headroom_bytes`
+    /// free, so a terminal command always has room to publish its result.
     HeadBelowByteCap,
+    /// Every caller-supplied string in the command is at most
+    /// `Limits::max_string_bytes`.
+    CallerStringsWithinCap,
 }
 
 impl Command {
@@ -300,12 +305,14 @@ impl Command {
                 MailboxBelowCap,
                 ReceiptsBelowCap,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::Takeover(_) => &[
                 AgentActive,
                 IncarnationMatches,
                 ObservedEpochMatches,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::BeginTurn(_) => &[
                 AgentActive,
@@ -313,6 +320,7 @@ impl Command {
                 EpochMatches,
                 HandlerAvailable,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::CompleteTurn(_) => &[
                 AgentActive,
@@ -325,6 +333,7 @@ impl Command {
                 NoEffectInDoubt,
                 TimersBelowCap,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::FailTurn(_) => &[
                 AgentActive,
@@ -336,6 +345,7 @@ impl Command {
                 NoEffectInDoubt,
                 NoAuthorizedAttemptPending,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::Cancel(_) => &[AgentActive, IncarnationMatches, HeadBelowByteCap],
             Command::ScheduleTimer(_) => &[
@@ -343,6 +353,7 @@ impl Command {
                 IncarnationMatches,
                 TimersBelowCap,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::FireTimer(_) => &[
                 AgentActive,
@@ -351,7 +362,12 @@ impl Command {
                 MailboxBelowCap,
                 HeadBelowByteCap,
             ],
-            Command::CancelTimer(_) => &[AgentActive, IncarnationMatches, HeadBelowByteCap],
+            Command::CancelTimer(_) => &[
+                AgentActive,
+                IncarnationMatches,
+                HeadBelowByteCap,
+                CallerStringsWithinCap,
+            ],
             Command::Tombstone(_) => &[IncarnationMatches, HeadBelowByteCap],
             Command::RecordStep(_) | Command::CommitIntent(_) => &[
                 AgentActive,
@@ -360,8 +376,10 @@ impl Command {
                 ActiveTurnMatches,
                 BaseStateVersionMatches,
                 HandlerMatches,
+                TurnNotBlocked,
                 StepMatchesJournal,
                 HeadBelowByteCap,
+                CallerStringsWithinCap,
             ],
             Command::AuthorizeAttempt(AuthorizeAttempt {
                 authority: Authority::Owner(_),

@@ -65,6 +65,13 @@ pub struct Limits {
     pub max_receipts: u64,
     pub max_timers: u64,
     pub max_head_bytes: usize,
+    /// Longest caller-supplied string (request id, handler, keys, tool
+    /// identity, owner id, error text) a command may carry.
+    pub max_string_bytes: usize,
+    /// Bytes a command that grows the root without ending a turn must leave
+    /// free under `max_head_bytes`, so `CompleteTurn`, `FailTurn`, `Cancel`
+    /// and `Tombstone` always have room to publish.
+    pub terminal_headroom_bytes: usize,
 }
 
 impl Default for Limits {
@@ -74,6 +81,8 @@ impl Default for Limits {
             max_receipts: 1024,
             max_timers: 64,
             max_head_bytes: MAX_HEAD_BYTES,
+            max_string_bytes: 1024,
+            terminal_headroom_bytes: 16 * 1024,
         }
     }
 }
@@ -255,6 +264,21 @@ fn unchanged(reply: Reply) -> Outcome {
     Ok(Transition::Unchanged { reply })
 }
 
+fn turn_fence_strings(fence: &TurnFence) -> [&str; 2] {
+    [
+        fence.owner.owner_id.as_str(),
+        fence.handler_version.as_str(),
+    ]
+}
+
+fn intent_strings(intent: &IntentSpec) -> [&str; 3] {
+    [
+        intent.intent_key.as_str(),
+        intent.tool_name.as_str(),
+        intent.tool_version.as_str(),
+    ]
+}
+
 impl Kernel {
     pub fn new(limits: Limits) -> Kernel {
         Kernel { limits }
@@ -277,6 +301,8 @@ impl Kernel {
                 )),
             };
         };
+        self.check_strings(head, command)?;
+        self.check_growth_headroom(head, command)?;
         match command {
             Command::Create(c) => self.create(head, c),
             Command::Enqueue(c) => self.enqueue(head, c, now_unix_ns),
@@ -294,6 +320,113 @@ impl Kernel {
             Command::AuthorizeAttempt(c) => self.authorize_attempt(head, c),
             Command::RecordEffectResult(c) => self.record_effect_result(head, c),
         }
+    }
+
+    /// Every caller-supplied string a command carries is at most
+    /// `Limits::max_string_bytes`, checked before any transition so an
+    /// oversized string cannot be the thing that pushes a root over its byte
+    /// cap in the command meant to reach a terminal state.
+    fn check_strings(&self, head: &Head, command: &Command) -> Result<(), AgentError> {
+        let cap = self.limits.max_string_bytes;
+        let mut strings: Vec<&str> = Vec::new();
+        match command {
+            Command::Create(_) | Command::Cancel(_) | Command::Tombstone(_) => {}
+            Command::Enqueue(c) => strings.extend([c.request_id.as_str(), c.handler.as_str()]),
+            Command::Takeover(c) => strings.push(c.owner_id.as_str()),
+            Command::BeginTurn(c) => {
+                strings.push(c.fence.owner_id.as_str());
+                for pin in &c.handlers {
+                    strings.extend([pin.handler.as_str(), pin.version.as_str()]);
+                }
+            }
+            Command::CompleteTurn(c) => {
+                strings.extend(turn_fence_strings(&c.fence));
+                for e in &c.events {
+                    strings.push(e.event_type.as_str());
+                }
+                for t in &c.timer_changes {
+                    match t {
+                        TimerChange::Schedule(spec) => {
+                            strings.extend([spec.timer_key.as_str(), spec.handler.as_str()]);
+                        }
+                        TimerChange::Cancel { timer_key } => strings.push(timer_key.as_str()),
+                    }
+                }
+                for i in &c.intents {
+                    strings.extend(intent_strings(i));
+                }
+            }
+            Command::FailTurn(c) => {
+                strings.extend(turn_fence_strings(&c.fence));
+                strings.push(c.error.as_str());
+            }
+            Command::ScheduleTimer(c) => {
+                strings.extend([c.timer.timer_key.as_str(), c.timer.handler.as_str()]);
+            }
+            Command::FireTimer(_) => {}
+            Command::CancelTimer(c) => strings.push(c.timer_key.as_str()),
+            Command::RecordStep(c) => {
+                strings.extend(turn_fence_strings(&c.fence));
+                strings.extend([
+                    c.step_key.as_str(),
+                    c.tool_name.as_str(),
+                    c.tool_version.as_str(),
+                ]);
+            }
+            Command::CommitIntent(c) => {
+                strings.extend(turn_fence_strings(&c.fence));
+                strings.extend(intent_strings(&c.intent));
+            }
+            Command::AuthorizeAttempt(c) => {
+                if let Authority::Owner(o) = &c.authority {
+                    strings.push(o.owner_id.as_str());
+                }
+            }
+            Command::RecordEffectResult(_) => {}
+        }
+        if strings.iter().any(|s| s.len() > cap) {
+            return Err(fail(
+                head,
+                ErrorKind::BudgetExceeded,
+                "a caller-supplied string exceeds the string cap",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A command that grows the root without ending a turn must leave
+    /// `Limits::terminal_headroom_bytes` free under the byte cap. Terminal
+    /// commands (`CompleteTurn`, `FailTurn`, `Cancel`, `Tombstone`) and the
+    /// commands that only move a turn along (`Takeover`, `BeginTurn`,
+    /// `CancelTimer`, `RecordEffectResult`) face only the cap itself in
+    /// `publish`, so an accepted input can always be completed, failed or
+    /// cancelled.
+    fn check_growth_headroom(&self, head: &Head, command: &Command) -> Result<(), AgentError> {
+        let grows = matches!(
+            command,
+            Command::Enqueue(_)
+                | Command::RecordStep(_)
+                | Command::CommitIntent(_)
+                | Command::ScheduleTimer(_)
+                | Command::FireTimer(_)
+                | Command::AuthorizeAttempt(_)
+        );
+        if !grows {
+            return Ok(());
+        }
+        let used = head.encode().len();
+        let cap = self
+            .limits
+            .max_head_bytes
+            .saturating_sub(self.limits.terminal_headroom_bytes);
+        if used >= cap {
+            return Err(fail(
+                head,
+                ErrorKind::BudgetExceeded,
+                "HEAD is within the terminal headroom of its byte cap",
+            ));
+        }
+        Ok(())
     }
 
     fn publish(
@@ -698,6 +831,10 @@ impl Kernel {
         )
     }
 
+    /// `CompleteTurn` is refused while an effect of the input is in doubt, but
+    /// not while one is merely authorized without a result: a handler that
+    /// completed awaited the attempt it authorized and knows its outcome, which
+    /// a failing handler does not, so `FailTurn` refuses both.
     fn complete_turn(&self, head: &Head, c: &CompleteTurn, now: i64) -> Outcome {
         let turn = match Self::check_turn(head, &c.fence)? {
             Ok(turn) => turn,

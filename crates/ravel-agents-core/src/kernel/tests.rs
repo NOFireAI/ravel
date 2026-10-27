@@ -1518,6 +1518,7 @@ fn run_ops(ops: &[Op], coverage: &mut Coverage) -> Result<(), TestCaseError> {
         max_receipts: 6,
         max_timers: 2,
         max_head_bytes: MAX_HEAD_BYTES,
+        ..Limits::default()
     });
     for op in ops {
         if let Op::Advance { s } = op {
@@ -1627,4 +1628,117 @@ fn kernel_sequences_keep_the_head_invariants() {
     for (name, seen, floor) in floors {
         assert!(seen >= floor, "{name}: {seen} below {floor}; {c:?}");
     }
+}
+
+#[test]
+fn the_precondition_table_names_turn_not_blocked_wherever_the_kernel_blocks() {
+    let mut sim = Sim::started();
+    let step = |head: &Head, input: &[u8]| {
+        Command::RecordStep(RecordStep {
+            fence: turn_fence(head),
+            step_key: "lookup".to_string(),
+            tool_name: "db".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: identity::step_input_hash("db", "1", input),
+            status: StepStatus::Completed,
+            output: None,
+        })
+    };
+    sim.run(&step(sim.head(), b"a"));
+    assert!(matches!(
+        sim.run(&step(sim.head(), b"b")),
+        Reply::Blocked(_)
+    ));
+    let intent = Command::CommitIntent(CommitIntent {
+        fence: turn_fence(sim.head()),
+        intent: IntentSpec {
+            intent_key: "send".to_string(),
+            tool_name: "mail".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: identity::step_input_hash("mail", "1", b"x"),
+            policy: RecoveryPolicy::Manual,
+            input: None,
+        },
+    });
+    for command in [step(sim.head(), b"a"), intent] {
+        assert_eq!(sim.refuse(&command), ErrorKind::NonDeterministicReplay);
+        assert!(
+            command
+                .preconditions()
+                .contains(&crate::command::Precondition::TurnNotBlocked),
+            "{} is refused on a blocked turn but its table omits TurnNotBlocked",
+            command.name()
+        );
+    }
+}
+
+#[test]
+fn terminal_commands_keep_a_path_through_the_byte_cap() {
+    let sim = Sim::started();
+    let head = sim.head().clone();
+    let used = head.encode().len();
+    // A cap that leaves no growth room but keeps the terminal headroom.
+    let limits = Limits {
+        max_head_bytes: used + 4 * 1024,
+        terminal_headroom_bytes: 4 * 1024,
+        ..Limits::default()
+    };
+    let kernel = Kernel::new(limits);
+    let now = sim.now;
+    let refuse = |cmd: &Command| {
+        kernel
+            .apply(Some(&head), cmd, now, &DerivedIds)
+            .expect_err("growth must be refused")
+            .kind
+    };
+    assert_eq!(
+        refuse(&enqueue_cmd(&head, "r-growth", b"p")),
+        ErrorKind::BudgetExceeded
+    );
+    assert!(matches!(
+        kernel
+            .apply(
+                Some(&head),
+                &Command::CompleteTurn(complete_cmd(&head, b"s")),
+                now,
+                &DerivedIds
+            )
+            .expect("a terminal command publishes under the headroom")
+            .reply(),
+        Reply::TurnCommitted { .. }
+    ));
+    assert!(
+        kernel
+            .apply(Some(&head), &fail_cmd(&head, true, 1), now, &DerivedIds)
+            .is_ok(),
+        "a terminal failure publishes under the headroom"
+    );
+}
+
+#[test]
+fn an_oversized_caller_string_is_refused_before_any_transition() {
+    let mut sim = Sim::started();
+    let cap = sim.kernel.limits.max_string_bytes;
+    let fence = turn_fence(sim.head());
+    let long = Command::FailTurn(FailTurn {
+        fence: fence.clone(),
+        error: "e".repeat(cap + 1),
+        terminal: true,
+        max_attempts: 1,
+    });
+    assert_eq!(sim.refuse(&long), ErrorKind::BudgetExceeded);
+    assert!(
+        sim.head().active_turn.is_some(),
+        "the refused command changed nothing"
+    );
+    let exact = Command::FailTurn(FailTurn {
+        fence,
+        error: "e".repeat(cap),
+        terminal: true,
+        max_attempts: 1,
+    });
+    assert!(matches!(
+        sim.run(&exact),
+        Reply::TurnFailed { .. } | Reply::TurnRetry { .. }
+    ));
 }
