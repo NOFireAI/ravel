@@ -511,7 +511,10 @@ Steps, in order, stopping at the first failure:
 10. `fold-state`: `ravel_catalog_fold_last_success_timestamp_seconds` from
     Ravel's `/metrics` (case a), or `absent` (case j).
 11. `query`: `metricsbench_query` against all four engines into
-    `report.json` (case a).
+    `report.json`, with `--diagnostics diagnostics.json` for the per-entry
+    ULP gaps against the oracle and every oracle retry (case a; the
+    sidecar's fields are in benchmarks/metrics/README.md, "Portable query
+    run").
 12. `validate`: `metricsbench_report validate report.json` exits 0 (case a).
 13. `memory`: the sampler stops, `memory-summary.json` records peak and
     final bytes per container and `OOMKilled` from `docker inspect` (case a),

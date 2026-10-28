@@ -353,6 +353,7 @@ expect_log "a: ingest given all four endpoints" "--mimir-endpoint http://127.0.0
 expect_log "a: ingest gets Ravel's token by env var name" "--ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN"
 expect_log "a: the token reached ingest's environment" "metricsbench_ingest env token=set"
 expect_log "a: query given all four engines" "--engine name=mimir,url=http://127.0.0.1:9009/prometheus"
+expect_log "a: query writes the diagnostics sidecar" "--diagnostics ${OUT}/diagnostics.json"
 expect_log "a: report validated by path" "metricsbench_report validate ${OUT}/report.json"
 expect_log "a: provenance pins the comparators from the capture" "--comparator mimir=2.16.0=sha256:3333"
 expect_no_log "a: the token never on a command line" "metricsbench-token"
