@@ -1,6 +1,7 @@
 # ADR-3326: a byte-budgeted cache of decoded column blocks for log scans
 
-Status: Proposed (2026-10-27). Issue #3326, under epic #3231 (hot-path
+Status: Accepted (2026-10-28; Stage 0 passed, see the Stage 0 result
+amendment). Issue #3326, under epic #3231 (hot-path
 program, workstream E). No persistent format change: the cache holds
 in-process copies of what the reader already decodes from immutable
 objects, and nothing it holds is written anywhere.
@@ -188,7 +189,9 @@ Exclusions, each a property the implementation tests:
 Entries of an object no longer referenced by any snapshot age out by
 eviction, as its raw bytes do in the fetch cache. Whether erasure
 completion purges both caches eagerly for the compliance path (ADR-0042)
-is a Stage 0 check below, not an assumption.
+is a Stage 0 check below, not an assumption. It does not, so every entry
+also carries the fetch cache's maximum age (see the Stage 0 result
+amendment below).
 
 ### 2. Plain string columns use one values buffer plus offsets
 
@@ -320,7 +323,9 @@ The cache holds source columns ahead of every predicate and operator, and
 the restart before each first try empties it, so cold runs are unaffected.
 The owner withdrew the fold from the competing entry on fairness grounds
 (ADR-3217, decision 2 fairness amendment). Whether the entry runs with a
-nonzero default is the owner's decision, recorded here once it is made.
+nonzero default is the owner's decision. It was made on 2026-10-28: the
+entry runs with the cache once it ships (see the Stage 0 result amendment
+below).
 Every hot figure from a run with the cache on states the cap in its stamp.
 
 ## Measurement
@@ -359,7 +364,8 @@ Every hot figure from a run with the cache on states the cap in its stamp.
    the simulation's control arm, its margin arm, and the re-run. Both ran
    on 2026-10-27. The simulation met its rows. The re-run missed its row,
    which led to a second simulation and re-run (see the evictor-slack
-   amendment below). Their rows are the last three of the table.
+   amendment below). Their rows are the last three of the table. Stage 0
+   passed on 2026-10-28 (see the Stage 0 result amendment below).
 
 | Stage 0 figure | Band | Miss | Basis |
 |---|---|---|---|
@@ -377,7 +383,7 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 | Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | missed, measured 2026-10-27: 0 of 4, #3326 comment 6455179106 |
 | Simulation, q33 shape with racing checked reservations, evictor freeing the exact shortfall (control): aggregate refusals at an 8 GB cap | at least one | none | met, measured 2026-10-28: 75, #3326 comment 6459628404 |
 | Simulation, same shape, evictor freeing the shortfall plus the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | met, measured 2026-10-28: 0 at each cap, #3326 comment 6459628404 |
-| Branch at 8 GB, evictor slack added to margin build: q33 answers on every B run | yes | any B run refused | predicted (evictor-slack amendment) |
+| Branch at 8 GB, evictor slack added to margin build: q33 answers on every B run | yes | any B run refused | met, measured 2026-10-28: 4 of 4, #3326 comment 6461898958 |
 
 The bands are copied to #3326 before launch. A miss on any row stops the
 work, and the readout names the step that missed.
@@ -557,11 +563,55 @@ the margin.
 - **The cost is a larger eviction per pass:** the shortfall plus
   `max(1 GiB, 5% of the limit)` of cached columns per refused
   reservation. On the reference box the margin is the 1 GiB floor (its
-  remainder is 18.9 GB, so 5% is 0.95 GB), and at the shortfalls Stage 0
-  saw (132 to 147 MB) a pass evicts about 1.2 GB. On a budget above about
+  remainder is 18.9 GB, so 5% is 0.95 GB). At the request sizes Stage 0
+  recorded (132 to 147 MB, which were also the shortfalls because the
+  budget was at its limit) a pass evicts about 1.2 GB. On a budget above about
   21.5 GB the 5% term is larger. The cache refills once the query
   releases its memory and the admission margin is met again.
 
 Stage 0 continues with this change. A prototype adds it to the measurement
 branch, and the 8 GB pair is re-run against the same bands, with the last
 row of the Stage 0 table, pre-registered on #3326 before launch.
+
+## Amendment (2026-10-28): Stage 0 result, the entry decision and the age bound
+
+<!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|Stage 0, before any code that merges|6. Whether the ClickBench entry runs with the cache is an owner decision" pointer="Stage 0 result amendment" -->
+
+**Stage 0 passed on 2026-10-28.** Every row of the Stage 0 table is met.
+
+| Stage 0 step | Result | Basis |
+|---|---|---|
+| Admission simulation (Traces A and B) | try-3 hit share 1.000 for every fitting statement at 8 GB; the interactive set retained 1.000 through scans larger than the cap | #3326 comment 6441843449 |
+| q33-shape simulations (Traces C and D) | without the margin or with an exact-shortfall evictor: refused; with the margin and the evictor's slack: no refusal at 4, 8 or 12 GB | #3326 comments 6452444728 and 6459628404 |
+| Paired 8 GB run with the hook, the margin and the slack (`dc8s-20261028T0428Z`) | hot geomean 0.7675 over 43 statements; q04 try-3 CPU 0.309; q34 0.776; q33 answers 4 of 4; no refusal stood after the evictor | #3326 comment 6461898958 |
+| Erasure check | no purge on erasure anywhere in main; see the age bound below | #3326 comment 6461939175 |
+| Full entry runs, one per arm (`qps-20261028T0558Z-A` and `-B`) | QPS 0.817 against main's 0.777; error ratio 0.058 against main's 0.064; cold sum 0.997 of main | #3326 comment 6462646965 |
+
+The full entry runs are the first measurement under the ClickBench
+protocol, which restarts the server before each statement. The hot
+geomean there was 0.719 of main and the hot sum 0.738. The two arms ran on
+separate boxes, so these figures carry box-to-box noise; the paired figure
+above is the banded one.
+
+**Decision 1 gains an age bound.** Erasure completion purges no cache in
+main. The fetch cache bounds erased residue by age: 23 hours per entry
+plus a 1 hour sweep (`crates/ravel-cache/src/limits.rs:1-14`). ADR-0064's
+acceptance criterion, that a later query cannot return erased bytes from
+a cache, covers every tier (`docs/adrs/0064-selective-subject-erasure.md:101-104`).
+The decoded cache therefore carries the same maximum age, from the same
+constants, and drops an entry at its first access or sweep after that
+age. The other two protections already hold:
+- a rewritten part has a new content hash, so snapshots taken after the
+  rewrite never read the old entries;
+- a block with an erasure pending is decoded on the row path, which the
+  decoded cache neither reads nor fills.
+
+ADR-0064's promise of tombstone-style invalidation for RAM-tier decoded
+structures is not implemented in main. That is filed as #3401 and is not
+decided here.
+
+**Decision 6 is decided.** The owner decided on 2026-10-28 that the
+ClickBench entry runs with the cache once the delivery steps ship. The
+entry's default cap is chosen in Delivery step 4 from a paired A/B on the
+reference box, with its bands registered on #3326. Every hot figure from a
+run with the cache on states the cap in its stamp, as decision 6 requires.
