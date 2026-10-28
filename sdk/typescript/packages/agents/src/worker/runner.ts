@@ -19,7 +19,13 @@ import type {
   Schema,
   ToolDefinition,
 } from "../types.js";
-import type { EventSpecBody, OperationStatus, StepBody, TurnAssignment } from "../wire/index.js";
+import {
+  type EventSpecBody,
+  heldLease,
+  type OperationStatus,
+  type StepBody,
+  type TurnAssignment,
+} from "../wire/index.js";
 import type { PolledTurn, StepRecordRequest, StepRecordResponse, Transport } from "./transport.js";
 
 /**
@@ -79,10 +85,8 @@ function seededRandom(seed: Uint8Array): () => number {
   };
 }
 
-function u64le(value: number): Uint8Array {
-  const out = new Uint8Array(8);
-  new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
-  return out;
+function fromHex(hex: string): Uint8Array {
+  return Uint8Array.from({ length: hex.length / 2 }, (_, i) => parseInt(hex.slice(i * 2, i * 2 + 2), 16));
 }
 
 function errorText(error: unknown): string {
@@ -112,9 +116,7 @@ class Turn<S> {
     const a = turn.assignment;
     this.transcript = new Map(a.steps.map((s) => [s.step_key, s]));
     this.draft = state;
-    this.random = seededRandom(
-      derive("random", [a.lease.agent_id, u64le(a.lease.incarnation), u64le(a.accept_seq)]),
-    );
+    this.random = seededRandom(fromHex(a.lease.random_seed));
   }
 
   private get assignment(): TurnAssignment {
@@ -135,7 +137,7 @@ class Turn<S> {
 
   context(): HandlerContext<S> {
     const a = this.assignment;
-    const startedMs = Number(this.turn.startedUnixNs / 1_000_000n);
+    const startedMs = Number(a.lease.recorded_unix_ns / 1_000_000n);
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const turn = this;
     return {
@@ -234,7 +236,7 @@ class Turn<S> {
     const parsed = tool.input.parse(input);
     const inputHash = stepInputHash(tool.name, tool.version, canonicalBytes(jsonForm(parsed)));
     const request: StepRecordRequest = {
-      lease: this.assignment.lease,
+      lease: heldLease(this.assignment.lease),
       step_key: key,
       tool_name: tool.name,
       tool_version: tool.version,
@@ -384,7 +386,7 @@ export async function runTurn(
       const state = agent.state.safeParse(turn.state);
       if (state.success) {
         const response = await transport.commit({
-          lease: a.lease,
+          lease: heldLease(a.lease),
           outcome: "completed",
           state: state.data as StepBody["output"] & {},
           output: completed.output as StepBody["output"] & {},
@@ -397,7 +399,7 @@ export async function runTurn(
       failure = { error: `state does not parse: ${state.error.message}`, terminal: true };
     }
     const response = await transport.commit({
-      lease: a.lease,
+      lease: heldLease(a.lease),
       outcome: "failed",
       error: failure?.error ?? "handler failed",
       terminal: failure?.terminal ?? false,

@@ -18,7 +18,15 @@ import {
   RavelAgentsError as RavelAgentsErrorClass,
   UnsupportedFormat,
 } from "../errors.js";
-import { agentId, canonicalBytes, effectId, requestHash, stepId, turnId } from "../identity.js";
+import {
+  agentId,
+  canonicalBytes,
+  effectId,
+  requestHash,
+  stepId,
+  turnId,
+  turnRandomSeed,
+} from "../identity.js";
 import type { AnyAgentDefinition, AnyToolDefinition } from "../types.js";
 import { bodyFromError, ERROR_CODES } from "../wire/errors.js";
 import {
@@ -50,7 +58,11 @@ import {
   type TurnLease,
   type WorkerCommitRequest,
   type WorkerCommitResponse,
+  type WorkerHeartbeatRequest,
+  type WorkerHeartbeatResponse,
   type WorkerPollRequest,
+  type WorkerRegisterRequest,
+  type WorkerRegisterResponse,
 } from "../wire/index.js";
 import { handlerDigest, serveAgents, type TurnReport, type WorkerHandle } from "../worker/index.js";
 import type {
@@ -65,6 +77,8 @@ type Json = z.output<typeof SendRequest>["payload"];
 
 /** 2026-01-01T00:00:00Z, the fake's clock at creation. */
 const DEFAULT_START_UNIX_NS = 1_767_225_600_000_000_000n;
+/** How far past the fake's clock a heartbeat extends a lease. */
+const LEASE_NS = 30_000_000_000n;
 const API = "/api/v1/agents/";
 
 export interface ReceivedRequest {
@@ -196,6 +210,7 @@ export class FakeCoordinator implements Transport {
   private waiters = new Set<() => void>();
   private clock: bigint;
   private nextOperation = 1;
+  private nextWorker = 1;
   private closed = false;
 
   constructor(options: FakeCoordinatorOptions) {
@@ -338,6 +353,18 @@ export class FakeCoordinator implements Transport {
 
   // ---- Transport -------------------------------------------------------
 
+  register(_request: WorkerRegisterRequest): Promise<WorkerRegisterResponse> {
+    const id = this.nextWorker++;
+    return Promise.resolve({ worker_id: `w-${id.toString(16).padStart(16, "0")}` });
+  }
+
+  heartbeat(request: WorkerHeartbeatRequest): Promise<WorkerHeartbeatResponse> {
+    return new Promise((resolve) => {
+      this.fenced(request.lease);
+      resolve({ lease_expires_unix_ns: this.clock + LEASE_NS });
+    });
+  }
+
   async poll(request: WorkerPollRequest, signal: AbortSignal): Promise<PolledTurn | null> {
     const until = Date.now() + request.wait_ms;
     for (;;) {
@@ -383,7 +410,11 @@ export class FakeCoordinator implements Transport {
       agent.leased = { operation: next.id, lease };
       return {
         assignment: structuredClone({
-          lease,
+          lease: {
+            ...lease,
+            recorded_unix_ns: next.startedUnixNs,
+            random_seed: turnRandomSeed(agent.agentId, agent.incarnation, next.acceptSeq),
+          },
           agent: { kind: agent.kind, key: agent.key },
           operation: next.id,
           accept_seq: next.acceptSeq,
@@ -392,7 +423,6 @@ export class FakeCoordinator implements Transport {
           payload: next.payload,
           steps: [...next.steps.values()].map((s) => this.stepBody(s)),
         }),
-        startedUnixNs: next.startedUnixNs,
       };
     }
     return null;

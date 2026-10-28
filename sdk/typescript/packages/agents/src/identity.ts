@@ -223,6 +223,13 @@ export function effectId(incarnation: number, acceptSeq: number, intentKey: stri
   );
 }
 
+/** `wire::turn_random_seed`: the seed a poll's lease carries, as lowercase hex. */
+export function turnRandomSeed(agentIdHex: string, incarnation: number, acceptSeq: number): string {
+  return toHex(
+    derive("random", [agentIdHex, u64le(BigInt(incarnation)), u64le(BigInt(acceptSeq))]).subarray(0, 16),
+  );
+}
+
 /** `identity::turn_id`, as lowercase hex. */
 export function turnId(incarnation: number, acceptSeq: number, epoch: number, failedAttempts: number): string {
   const attempts = new Uint8Array(4);
