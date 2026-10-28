@@ -28,7 +28,7 @@ assumption, stated as such and not checked here.
 
 No `results.md` exists yet: recorded figures are task T20. `bands.tsv`
 carries two rows. The `MCAgentProtocol.smoke.cfg` row pins the required lane
-at 335000 to 342000 distinct states (measured 338707 with 2 workers) with
+at 275000 to 281000 distinct states (measured 278143 with 2 workers) with
 depth waived by `-`, so a change that narrows what the smoke run reaches fails
 that lane. The `MCAgentProtocol.exhaustive.cfg` row sets only `budget_s`
 (3000, ADR-3331 decision 13); its distinct band is the full `0`-`999999999`
@@ -243,6 +243,23 @@ argued here, not checked.
   writes nothing, so it is a stutter with no action of its own (the comment
   on `FireTimer` says so); `early-hint-forgotten.cfg` checks that deleting
   it instead is caught.
+
+## Differences from the kernel
+
+Where the model and `ravel-agents-core`'s kernel disagreed, the kernel is the
+intended behaviour and the model follows it:
+
+- Recreate clears the owner and restarts the timer generation at 0, as
+  `Kernel::create` does; the epoch is kept. A wake hint names the incarnation
+  it was written for, and `FireTimer` fires only a hint of the current
+  incarnation. `MonotonicIdentity` checks the timer generation only across
+  writes within one incarnation, and checks no turn counter (the kernel has
+  none).
+
+Remaining differences, each also stated in its `traceability.md` row:
+
+- The model's `turns` counter names output objects and survives a recreate;
+  the kernel derives turn ids and has no counter.
 
 ## Gaps
 

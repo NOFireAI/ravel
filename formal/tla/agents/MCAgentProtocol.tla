@@ -139,7 +139,7 @@ BrokenStaleTimerGenerationFired(ak, g) ==
     /\ g =< due[ak]
     /\ HeadUp(ak)
     /\ LET h == Head(ak)
-       IN /\ ~(h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb)
+       IN /\ ~(h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb /\ HintInc(ak, g) = h.inc)
           /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.inputs = @ \cup {TimerInput(h, g)},
                                   !.inbox = @ \cup {h.nextSeq}, !.nextSeq = @ + 1])
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
