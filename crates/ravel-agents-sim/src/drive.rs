@@ -1125,8 +1125,8 @@ impl Rig {
         let mut head = Head::decode(&got.data).map_err(|e| format!("head decode: {e:?}"))?;
         for (list, page) in head.index.unloaded() {
             let dep = head.index.directory(list).pages[page].page;
-            let key = object_key(&TENANT, &agent(), &dep.hash)
-                .map_err(|e| format!("page key: {e:?}"))?;
+            let key =
+                object_key(&TENANT, &agent(), &dep.hash).map_err(|e| format!("page key: {e:?}"))?;
             let got = runtime
                 .block_on(self.memory.get(&key, GetRange::Full))
                 .map_err(|e| format!("page read: {e}"))?;
