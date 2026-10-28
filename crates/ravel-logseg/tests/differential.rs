@@ -15,6 +15,8 @@ use ravel_logseg::{
 
 const STREAMS: u8 = 6;
 const TS_MAX: i64 = 400;
+/// `arb_typed_attr`'s `I64` values lie in `-NARROW_I64..NARROW_I64`.
+const NARROW_I64: i64 = 8;
 const NAMES: &[&str] = &["svc", "env", "code", "user", "path", "dur", "flag", "host"];
 const WORDS: &[&str] = &[
     "timeout",
@@ -77,31 +79,114 @@ fn arb_record() -> impl Strategy<Value = LogRecord> {
         proptest::option::of(any::<[u8; 16]>()),
     )
         .prop_map(|(stream, ts, body, sev, raw_attrs, trace)| {
-            let mut seen = std::collections::HashSet::new();
-            let mut attrs = Vec::new();
-            for (name, v) in raw_attrs {
-                if seen.insert(name) {
-                    attrs.push((name.to_string(), v));
-                }
-            }
-            LogRecord {
-                stream_id: sid(stream),
-                stream_attrs: stream_blob(stream),
-                ts_ns: ts,
-                observed_ts_ns: ts,
-                severity_num: sev,
-                severity_text: if sev % 2 == 0 { "INFO" } else { "WARN" }.to_string(),
-                body,
-                trace_id: trace,
-                span_id: None,
-                flags: 0,
-                attrs,
-            }
+            make_record(stream, ts, body, sev, raw_attrs, trace)
         })
+}
+
+fn make_record(
+    stream: u8,
+    ts: i64,
+    body: String,
+    sev: u8,
+    raw_attrs: Vec<(&'static str, AttrValue)>,
+    trace: Option<[u8; 16]>,
+) -> LogRecord {
+    let mut seen = std::collections::HashSet::new();
+    let mut attrs = Vec::new();
+    for (name, v) in raw_attrs {
+        if seen.insert(name) {
+            attrs.push((name.to_string(), v));
+        }
+    }
+    LogRecord {
+        stream_id: sid(stream),
+        stream_attrs: stream_blob(stream),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: sev,
+        severity_text: if sev % 2 == 0 { "INFO" } else { "WARN" }.to_string(),
+        body,
+        trace_id: trace,
+        span_id: None,
+        flags: 0,
+        attrs,
+    }
 }
 
 fn arb_corpus() -> impl Strategy<Value = Vec<LogRecord>> {
     proptest::collection::vec(arb_record(), 1..250)
+}
+
+/// The chunk-order test's attributes for a record of `stream` at `ts`, typed
+/// by name and banded so the arms built from them prune part of an object.
+/// The writer lays records out by stream and then timestamp, so a value banded
+/// by either sits in some blocks and not others: per stream, `svc` draws from
+/// two adjacent words, `code` from a four-wide `I64` band, `user` from two
+/// adjacent members of an `F64` set holding -0.0, 0.0 and a NaN payload, and
+/// `flag` leans true on even streams; `dur` draws a two-wide `I64` band that
+/// rises with the timestamp. The `I64` bands lie in `-NARROW_I64..NARROW_I64`
+/// plus their width, so they straddle zero. `env` and `path` draw any word or
+/// the empty string in every block. `host` keeps [`arb_value`]'s mixed types
+/// and full ranges, so a `Str` prune on a name that also has a non-`Str`
+/// column, an open bound every block satisfies, and `Bytes` stay reachable.
+fn arb_typed_attr(stream: u8, ts: i64) -> impl Strategy<Value = (&'static str, AttrValue)> {
+    const FLOATS: [f64; 6] = [-2.5, -0.0, 0.0, 1.0, 3.5, f64::NAN];
+    let s = usize::from(stream);
+    let svc = vec![WORDS[s % WORDS.len()], WORDS[(s + 1) % WORDS.len()]];
+    let user: Vec<f64> = [FLOATS[s % FLOATS.len()], FLOATS[(s + 1) % FLOATS.len()]]
+        .iter()
+        .map(|f| {
+            if f.is_nan() {
+                f64::from_bits(f.to_bits() | 0x7)
+            } else {
+                *f
+            }
+        })
+        .collect();
+    let code = i64::from(stream) * 3 - NARROW_I64;
+    let dur = ts * 2 * NARROW_I64 / TS_MAX - NARROW_I64;
+    let word = prop_oneof![
+        4 => proptest::sample::select(WORDS).prop_map(|w| AttrValue::Str(w.to_string())),
+        1 => Just(AttrValue::Str(String::new())),
+    ];
+    let even = stream % 2 == 0;
+    prop_oneof![
+        1 => (
+            Just("svc"),
+            proptest::sample::select(svc).prop_map(|w| AttrValue::Str(w.to_string()))
+        ),
+        2 => (proptest::sample::select(&["env", "path"][..]), word),
+        1 => (Just("code"), (code..code + 4).prop_map(AttrValue::I64)),
+        1 => (Just("dur"), (dur..dur + 2).prop_map(AttrValue::I64)),
+        1 => (
+            Just("flag"),
+            proptest::bool::weighted(if even { 0.9 } else { 0.1 }).prop_map(AttrValue::Bool)
+        ),
+        1 => (Just("user"), proptest::sample::select(user).prop_map(AttrValue::F64)),
+        1 => (Just("host"), arb_value()),
+    ]
+}
+
+/// A record for the chunk-order test, its attributes from [`arb_typed_attr`].
+fn arb_typed_record() -> impl Strategy<Value = LogRecord> {
+    (0u8..STREAMS, 0i64..TS_MAX)
+        .prop_flat_map(|(stream, ts)| {
+            (
+                Just(stream),
+                Just(ts),
+                arb_body(),
+                0u8..30,
+                proptest::collection::vec(arb_typed_attr(stream, ts), 0..4),
+                proptest::option::of(any::<[u8; 16]>()),
+            )
+        })
+        .prop_map(|(stream, ts, body, sev, raw_attrs, trace)| {
+            make_record(stream, ts, body, sev, raw_attrs, trace)
+        })
+}
+
+fn arb_typed_corpus() -> impl Strategy<Value = Vec<LogRecord>> {
+    proptest::collection::vec(arb_typed_record(), 1..250)
 }
 
 fn arb_field() -> impl Strategy<Value = FieldSel> {
@@ -359,7 +444,11 @@ enum PickShape {
 }
 
 /// Attributes drawn from the corpus by (record, attribute) index, so the
-/// arms built from them name terms and values the object holds.
+/// arms built from them name terms and values the object holds. Three in four
+/// content picks share one anchor record, so the content arms match at least
+/// that record and a prune arm drawn from any record has rows left to prune;
+/// the rest draw their own record, which keeps content arms no single record
+/// satisfies reachable.
 fn arb_picks() -> impl Strategy<Value = Vec<(Index, Index, PickShape)>> {
     let shape = prop_oneof![
         Just(PickShape::ContentEquals),
@@ -368,7 +457,48 @@ fn arb_picks() -> impl Strategy<Value = Vec<(Index, Index, PickShape)>> {
         Just(PickShape::RangeFrom),
         Just(PickShape::RangeTo),
     ];
-    proptest::collection::vec((any::<Index>(), any::<Index>(), shape), 1..6)
+    let pick = (
+        any::<Index>(),
+        proptest::bool::weighted(0.75),
+        any::<Index>(),
+        shape,
+    );
+    (any::<Index>(), proptest::collection::vec(pick, 1..6)).prop_map(|(anchor, picks)| {
+        picks
+            .into_iter()
+            .map(|(rec, anchored, attr, shape)| {
+                let content = matches!(shape, PickShape::ContentEquals);
+                (if anchored && content { anchor } else { rec }, attr, shape)
+            })
+            .collect()
+    })
+}
+
+/// One case of [`chunk_order_reads_equal_the_default_order`]: corpus, random
+/// content predicate, picks, chunk order, indexed names, writer path.
+type ChunkOrderCase = (
+    Vec<LogRecord>,
+    Predicate,
+    Vec<(Index, Index, PickShape)>,
+    Vec<&'static str>,
+    Vec<&'static str>,
+    bool,
+);
+
+/// The generators of [`chunk_order_reads_equal_the_default_order`], shared
+/// with [`chunk_order_prune_channel_prunes_partially`]. The random content
+/// predicate is empty three times in four: an [`arb_predicate`] conjunction
+/// matches no row in most cases, and a case with no row left leaves the prune
+/// channel nothing to remove.
+fn arb_chunk_order_case() -> impl Strategy<Value = ChunkOrderCase> {
+    (
+        arb_typed_corpus(),
+        prop_oneof![3 => Just(Predicate::And(Vec::new())), 1 => arb_predicate()],
+        arb_picks(),
+        arb_chunk_order(),
+        arb_indexed(),
+        any::<bool>(),
+    )
 }
 
 /// A numeric attribute value as a `NumRange` column type and bound bits; none
@@ -387,18 +517,19 @@ fn num_bound(value: &AttrValue) -> Option<(FieldType, u64)> {
 /// `Equals` probes POSTINGS only; a `NumRange`, placed in the prune channel
 /// since that is the only one it prunes from, prunes on the attribute's
 /// SKIP_IDX stats. A range pick on a non-numeric value becomes a prune
-/// `Equals`.
+/// `Equals`. Picks index the records that carry an attribute.
 fn picked_arms(
     corpus: &[LogRecord],
     picks: &[(Index, Index, PickShape)],
 ) -> (Vec<Predicate>, Vec<Predicate>) {
     let mut content = Vec::new();
     let mut prune = Vec::new();
+    let carriers: Vec<&LogRecord> = corpus.iter().filter(|r| !r.attrs.is_empty()).collect();
+    if carriers.is_empty() {
+        return (content, prune);
+    }
     for (rec, attr, shape) in picks {
-        let rec = &corpus[rec.index(corpus.len())];
-        if rec.attrs.is_empty() {
-            continue;
-        }
+        let rec = carriers[rec.index(carriers.len())];
         let (name, value) = &rec.attrs[attr.index(rec.attrs.len())];
         let field = FieldSel::Attr(name.clone());
         let equals = Predicate::Equals {
@@ -427,6 +558,79 @@ fn picked_arms(
         prune.push(arm.unwrap_or(equals));
     }
     (content, prune)
+}
+
+/// Whether `rec` carries what a prune arm built by [`picked_arms`] keeps: the
+/// `Equals` value, or a value of the `NumRange` type inside its bounds under
+/// the order the skip index folds by (`i64` signed, `f64` by `total_cmp`,
+/// `bool` as 0/1). A NaN value counts as outside every range, which can only
+/// shrink the set the guard in [`chunk_order_reads_equal_the_default_order`]
+/// requires.
+fn satisfies_prune_arm(rec: &LogRecord, arm: &Predicate) -> bool {
+    match arm {
+        Predicate::Equals { .. } => eval(rec, arm),
+        Predicate::NumRange {
+            field: FieldSel::Attr(name),
+            ty,
+            min,
+            max,
+        } => rec.attrs.iter().any(|(k, v)| {
+            k == name
+                && num_bound(v).is_some_and(|(vty, bits)| {
+                    vty == *ty
+                        && min.is_none_or(|m| bits_cmp(*ty, m, bits).is_le())
+                        && max.is_none_or(|m| bits_cmp(*ty, bits, m).is_le())
+                })
+        }),
+        _ => unreachable!("picked_arms builds Equals and NumRange prune arms only"),
+    }
+}
+
+fn bits_cmp(ty: FieldType, a: u64, b: u64) -> std::cmp::Ordering {
+    match ty {
+        FieldType::F64 => f64::from_bits(a).total_cmp(&f64::from_bits(b)),
+        FieldType::I64 => (a as i64).cmp(&(b as i64)),
+        _ => a.cmp(&b),
+    }
+}
+
+/// Whether every key of `sub` appears in `sup` at least as often; both sorted,
+/// as [`normalize`] returns them.
+fn is_sub_multiset(sub: &[Vec<u8>], sup: &[Vec<u8>]) -> bool {
+    let mut rest = sup.iter();
+    sub.iter().all(|k| rest.by_ref().any(|s| s == k))
+}
+
+/// What a case's prune channel does to the rows the default-order object's
+/// content scan returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PruneEffect {
+    /// The picks built no prune arm.
+    NoArm,
+    /// The same rows come back, including a content scan that returns none.
+    Nothing,
+    /// Some rows are removed and some kept: the only effect under which an
+    /// index keyed by the wrong column id changes the compared row set.
+    Partial,
+    /// Every row is removed.
+    Empty,
+}
+
+fn prune_effect(object: &[u8], content: &Predicate, prune: &[Predicate]) -> PruneEffect {
+    if prune.is_empty() {
+        return PruneEffect::NoArm;
+    }
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(object, &cfg).expect("open");
+    let rows = |prune: &[Predicate]| reader.scan_pruned(content, prune).expect("scan").0.len();
+    let (all, kept) = (rows(&[]), rows(prune));
+    if kept == all {
+        PruneEffect::Nothing
+    } else if kept == 0 {
+        PruneEffect::Empty
+    } else {
+        PruneEffect::Partial
+    }
 }
 
 /// Every record the block scan returns under `columns`, block by block.
@@ -473,14 +677,14 @@ proptest! {
     /// SKIP_IDX stat. Where the declared order moves an attribute's id, an
     /// index entry keyed by the wrong id prunes a different block set than
     /// the default object's, which the comparison sees as missing rows.
+    ///
+    /// The pruned reads must also keep every content match that satisfies
+    /// each prune arm, and nothing outside the content matches, so two reads
+    /// that prune to the same wrong rows, or to nothing, do not pass as
+    /// agreement.
     #[test]
     fn chunk_order_reads_equal_the_default_order(
-        corpus in arb_corpus(),
-        pred in arb_predicate(),
-        picks in arb_picks(),
-        order in arb_chunk_order(),
-        indexed in arb_indexed(),
-        columnar in any::<bool>(),
+        (corpus, pred, picks, order, indexed, columnar) in arb_chunk_order_case(),
     ) {
         let order: &'static [&'static str] = order.leak();
         let (content, prune) = picked_arms(&corpus, &picks);
@@ -496,11 +700,28 @@ proptest! {
                 .0
         };
         let got = scan(&ordered_object, &[]);
+        let matches = naive_eval(&corpus, &pred);
         prop_assert_eq!(normalize(got.clone()), normalize(scan(&default_object, &[])));
-        prop_assert_eq!(normalize(got), normalize(naive_eval(&corpus, &pred)));
-        prop_assert_eq!(
-            normalize(scan(&ordered_object, &prune)),
-            normalize(scan(&default_object, &prune))
+        prop_assert_eq!(normalize(got), normalize(matches.clone()));
+        let pruned = normalize(scan(&ordered_object, &prune));
+        prop_assert_eq!(&pruned, &normalize(scan(&default_object, &prune)));
+        let must_keep = normalize(
+            matches
+                .iter()
+                .filter(|r| prune.iter().all(|arm| satisfies_prune_arm(r, arm)))
+                .cloned()
+                .collect(),
+        );
+        prop_assert!(
+            is_sub_multiset(&must_keep, &pruned),
+            "the prune channel dropped a content match that satisfies every prune arm: \
+             {} such rows, {} kept",
+            must_keep.len(),
+            pruned.len()
+        );
+        prop_assert!(
+            is_sub_multiset(&pruned, &normalize(matches)),
+            "the pruned read returned a row the content predicate does not match"
         );
 
         let mut columns = ColumnSelection::fixed_only().with_body().with_severity_text();
@@ -512,4 +733,61 @@ proptest! {
             normalize(scan_projected(&default_object, &pred, &prune, &columns))
         );
     }
+}
+
+/// Seed and case count of [`chunk_order_prune_channel_prunes_partially`].
+const COVERAGE_SEED: [u8; 32] = [7; 32];
+const COVERAGE_CASES: usize = 200;
+// measured 2026-10-28: 69 of 200 partial, 11 no arm and 24 empty with seed
+// [7; 32]. The floor is two thirds of the partial count rounded down, each
+// ceiling one and a half times its count rounded up.
+const PARTIAL_FLOOR: usize = 46;
+const NOARM_CEIL: usize = 17;
+const EMPTY_CEIL: usize = 36;
+
+/// Pins the coverage of [`chunk_order_reads_equal_the_default_order`]'s prune
+/// comparison: run through the same generators on a fixed seed, enough cases
+/// must remove part of the compared row set, and few may build no prune arm
+/// or remove every row, since those compare nothing a wrong column id moves.
+#[test]
+fn chunk_order_prune_channel_prunes_partially() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+
+    let mut runner = TestRunner::new_with_rng(
+        Config::default(),
+        TestRng::from_seed(RngAlgorithm::ChaCha, &COVERAGE_SEED),
+    );
+    let strategy = arb_chunk_order_case();
+    let mut effects = Vec::with_capacity(COVERAGE_CASES);
+    for _ in 0..COVERAGE_CASES {
+        let (corpus, pred, picks, _order, indexed, columnar) = strategy
+            .new_tree(&mut runner)
+            .expect("generate a case")
+            .current();
+        let (content, prune) = picked_arms(&corpus, &picks);
+        let pred = Predicate::And(vec![pred, Predicate::And(content)]);
+        let object = write_object_ordered(&corpus, &[], &indexed, columnar);
+        effects.push(prune_effect(&object, &pred, &prune));
+    }
+    let count = |e: PruneEffect| effects.iter().filter(|&&x| x == e).count();
+    let summary = [
+        PruneEffect::NoArm,
+        PruneEffect::Nothing,
+        PruneEffect::Partial,
+        PruneEffect::Empty,
+    ]
+    .map(|e| (e, count(e)));
+    assert!(
+        count(PruneEffect::Partial) >= PARTIAL_FLOOR,
+        "partial prunes below the floor of {PARTIAL_FLOOR}: {summary:?}"
+    );
+    assert!(
+        count(PruneEffect::NoArm) <= NOARM_CEIL,
+        "no-arm cases above the ceiling of {NOARM_CEIL}: {summary:?}"
+    );
+    assert!(
+        count(PruneEffect::Empty) <= EMPTY_CEIL,
+        "empty prunes above the ceiling of {EMPTY_CEIL}: {summary:?}"
+    );
 }
