@@ -820,9 +820,11 @@ pub struct Cli {
 
     /// Repeatable `token=tenant` pair for the static bearer map. The tenant
     /// may end in `;` and a comma-separated capability list drawn from `ddl`
-    /// (tenant-scoped DDL) and `ipcrypt` (the IPCrypt SQL functions), each at
-    /// most once: `acme;ddl`, `acme;ipcrypt` and `acme;ddl,ipcrypt` all name
-    /// tenant `acme`. Any other suffix fails startup.
+    /// (tenant-scoped DDL), `ipcrypt` (the IPCrypt SQL functions), `agents`,
+    /// `agents_worker` and `agents_admin` (the Ravel Agents roles, which no
+    /// route checks yet), each at most once: `acme;ddl`, `acme;ipcrypt` and
+    /// `acme;ddl,ipcrypt,agents` all name tenant `acme`. Any other suffix
+    /// fails startup.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
@@ -1483,6 +1485,33 @@ pub struct Cli {
     /// silently doing nothing.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_ipcrypt_claim: Option<String>,
+
+    /// Boolean claim that grants the `agents` capability (ADR-3331 decision
+    /// 9), for Ravel Agents client operations, read like `--oidc-ddl-claim`:
+    /// only the JSON boolean `true` grants it. Unset (the default), the
+    /// capability is never granted via OIDC. Setting it without OIDC enabled
+    /// fails startup rather than silently doing nothing. No route checks the
+    /// capability yet: `/api/v1/agents/health` is the only agents route.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_agents_claim: Option<String>,
+
+    /// Boolean claim that grants the `agents_worker` capability (ADR-3331
+    /// decision 9), for Ravel Agents worker registration, turn commits and
+    /// effect completion, read like `--oidc-ddl-claim`. It does not grant
+    /// `agents`. Unset (the default), the capability is never granted via
+    /// OIDC. Setting it without OIDC enabled fails startup rather than
+    /// silently doing nothing. No route checks the capability yet.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_agents_worker_claim: Option<String>,
+
+    /// Boolean claim that grants the `agents_admin` capability (ADR-3331
+    /// decision 9), for Ravel Agents reconciliation, read like
+    /// `--oidc-ddl-claim`. It grants neither `agents` nor `agents_worker`.
+    /// Unset (the default), the capability is never granted via OIDC. Setting
+    /// it without OIDC enabled fails startup rather than silently doing
+    /// nothing. No route checks the capability yet.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_agents_admin_claim: Option<String>,
 
     /// How often the JWKS document is refetched, in seconds (ADR-0042
     /// decision 6). Only used when OIDC is enabled. Zero is refused at
@@ -2437,6 +2466,92 @@ pub struct Cli {
     )]
     pub mcp_max_body_bytes: u64,
 
+    /// Serve the Ravel Agents API under `/api/v1/agents/` (ADR-3331 decision
+    /// 9). Off by default. Declared in every build, but a build without the
+    /// `agents` cargo feature refuses it at startup rather than ignoring it.
+    /// Valid only under `--mode all` and `--mode query`; the routes mount on
+    /// both the public HTTP listener and the mTLS listener when one is
+    /// configured. This release mounts only `GET /api/v1/agents/health`,
+    /// which reports the mode and the settings below.
+    #[arg(long)]
+    pub agents: bool,
+
+    /// Most agent turns this process activates at once (ADR-3331 decision 9).
+    /// `0` is rejected. Parsed and reported on `/api/v1/agents/health` and
+    /// `/metrics`; the coordinator that enforces it is not in this release.
+    #[arg(
+        long = "agents-activation-concurrency",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_ACTIVATION_CONCURRENCY
+    )]
+    pub agents_activation_concurrency: usize,
+
+    /// Most worker long-polls this process holds open at once (ADR-3331
+    /// decision 9). `0` is rejected. Parsed and reported only in this
+    /// release, like `--agents-activation-concurrency`.
+    #[arg(
+        long = "agents-poll-concurrency",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_POLL_CONCURRENCY
+    )]
+    pub agents_poll_concurrency: usize,
+
+    /// Bytes of process memory the agents runtime may hold (ADR-3331 decision
+    /// 9). Parsed and reported only in this release: no reservation is taken
+    /// from the process memory budget yet.
+    #[arg(
+        long = "agents-memory-budget",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_AGENTS_MEMORY_BUDGET_BYTES
+    )]
+    pub agents_memory_budget: u64,
+
+    /// Most live agents one tenant may hold (ADR-3331 decision 9 logical
+    /// quota). Parsed and reported only in this release; the agents store
+    /// enforces it once it lands.
+    #[arg(
+        long = "agents-max-agents",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_MAX_AGENTS
+    )]
+    pub agents_max_agents: u64,
+
+    /// Most accepted inputs one agent's mailbox may hold (ADR-3331 decision 9
+    /// logical quota). Parsed and reported only in this release.
+    #[arg(
+        long = "agents-max-mailbox",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_MAX_MAILBOX
+    )]
+    pub agents_max_mailbox: u64,
+
+    /// Most bytes of objects one agent's root may reference (ADR-3331
+    /// decision 9 logical quota). Parsed and reported only in this release.
+    #[arg(
+        long = "agents-max-state-bytes",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_AGENTS_MAX_STATE_BYTES
+    )]
+    pub agents_max_state_bytes: u64,
+
+    /// Most idempotency receipts one agent retains (ADR-3331 decision 9
+    /// logical quota). Parsed and reported only in this release.
+    #[arg(
+        long = "agents-max-receipts",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_MAX_RECEIPTS
+    )]
+    pub agents_max_receipts: u64,
+
+    /// Most pending timers one agent may hold (ADR-3331 decision 9 logical
+    /// quota). Parsed and reported only in this release.
+    #[arg(
+        long = "agents-max-timers",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_MAX_TIMERS
+    )]
+    pub agents_max_timers: u64,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -3314,6 +3429,73 @@ impl Default for McpConfig {
 /// The D7 request body cap: 1 MiB.
 pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
 
+/// The Ravel Agents surface's settings (ADR-3331 decision 9), resolved from
+/// `--agents` and the `--agents-*` budget and quota flags.
+///
+/// Like [`McpConfig`], these ride on [`QueryBudgets`] because the agents
+/// routes mount on the query router. Only `enabled` changes behaviour in this
+/// release: it mounts `GET /api/v1/agents/health`. The budgets and quotas are
+/// parsed, validated and reported on that route and on `/metrics`; the
+/// coordinator and store that enforce them land in later tasks of epic #3331.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentsConfig {
+    /// Whether the agents routes are mounted at all. Off unless `--agents`
+    /// was passed, so a build with the `agents` feature serves nothing by
+    /// default.
+    pub enabled: bool,
+    /// Most agent turns activated at once in this process.
+    pub activation_concurrency: usize,
+    /// Most worker long-polls held open at once in this process.
+    pub poll_concurrency: usize,
+    /// Bytes of process memory the agents runtime may hold.
+    pub memory_budget_bytes: u64,
+    /// Most live agents one tenant may hold.
+    pub max_agents: u64,
+    /// Most accepted inputs one agent's mailbox may hold.
+    pub max_mailbox: u64,
+    /// Most bytes of objects one agent's root may reference.
+    pub max_state_bytes: u64,
+    /// Most idempotency receipts one agent may retain.
+    pub max_receipts: u64,
+    /// Most pending timers one agent may hold.
+    pub max_timers: u64,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        AgentsConfig {
+            enabled: false,
+            activation_concurrency: DEFAULT_AGENTS_ACTIVATION_CONCURRENCY,
+            poll_concurrency: DEFAULT_AGENTS_POLL_CONCURRENCY,
+            memory_budget_bytes: DEFAULT_AGENTS_MEMORY_BUDGET_BYTES,
+            max_agents: DEFAULT_AGENTS_MAX_AGENTS,
+            max_mailbox: DEFAULT_AGENTS_MAX_MAILBOX,
+            max_state_bytes: DEFAULT_AGENTS_MAX_STATE_BYTES,
+            max_receipts: DEFAULT_AGENTS_MAX_RECEIPTS,
+            max_timers: DEFAULT_AGENTS_MAX_TIMERS,
+        }
+    }
+}
+
+/// `--agents-activation-concurrency` default.
+pub const DEFAULT_AGENTS_ACTIVATION_CONCURRENCY: usize = 64;
+/// `--agents-poll-concurrency` default.
+pub const DEFAULT_AGENTS_POLL_CONCURRENCY: usize = 1024;
+/// `--agents-memory-budget` default: 256 MiB.
+pub const DEFAULT_AGENTS_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// `--agents-max-agents` default.
+pub const DEFAULT_AGENTS_MAX_AGENTS: u64 = 100_000;
+/// `--agents-max-mailbox` default, equal to the kernel's
+/// `Limits::max_mailbox_depth`.
+pub const DEFAULT_AGENTS_MAX_MAILBOX: u64 = 256;
+/// `--agents-max-state-bytes` default: 64 MiB.
+pub const DEFAULT_AGENTS_MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
+/// `--agents-max-receipts` default, equal to the kernel's
+/// `Limits::max_receipts`.
+pub const DEFAULT_AGENTS_MAX_RECEIPTS: u64 = 1024;
+/// `--agents-max-timers` default, equal to the kernel's `Limits::max_timers`.
+pub const DEFAULT_AGENTS_MAX_TIMERS: u64 = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
     /// The legacy combined knob (ADR-0087). Since ADR-1195 the three resolved
@@ -3413,6 +3595,9 @@ pub struct QueryBudgets {
     /// The MCP surface's settings (ADR-1374). Not a query budget; it rides
     /// here because this is the query-surface configuration `start` receives.
     pub mcp: McpConfig,
+    /// The Ravel Agents surface's settings (ADR-3331 decision 9). Not a query
+    /// budget; it rides here for the same reason as [`Self::mcp`].
+    pub agents: AgentsConfig,
     /// `--fold-lag-interval-secs`: the interval of the fold another tier runs,
     /// which [`crate::query::build_engine_config`] classifies fold lag against
     /// in place of this process's own fold interval (ADR-1306 decision 6).
@@ -3447,6 +3632,7 @@ impl Default for QueryBudgets {
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
             column_stats_cache_max_bytes: ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
             mcp: McpConfig::default(),
+            agents: AgentsConfig::default(),
             fold_lag_interval: None,
             sql_spill: SqlSpillSettings::default(),
         }
@@ -6213,13 +6399,17 @@ impl Cli {
                 .map_err(|e: ravel_tenant_resolve::TenantSuffixError| {
                     anyhow::anyhow!(
                         "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
-                         CAPABILITIES a comma-separated list of ddl and ipcrypt"
+                         CAPABILITIES a comma-separated list of ddl, ipcrypt, agents, \
+                         agents_worker and agents_admin"
                     )
                 })?;
             let principal = Principal {
                 tenant: TenantId::new(tenant),
                 ddl: capabilities.ddl,
                 ipcrypt: capabilities.ipcrypt,
+                agents: capabilities.agents,
+                agents_worker: capabilities.agents_worker,
+                agents_admin: capabilities.agents_admin,
             };
             // A token repeated with a different tenant or capability would
             // otherwise resolve by flag or line order. An identical repeat
@@ -6510,8 +6700,26 @@ impl Cli {
         if self.oidc_ipcrypt_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-ipcrypt-claim must be non-empty");
         }
+        let agents_claims = [
+            (&self.oidc_agents_claim, "--oidc-agents-claim"),
+            (&self.oidc_agents_worker_claim, "--oidc-agents-worker-claim"),
+            (&self.oidc_agents_admin_claim, "--oidc-agents-admin-claim"),
+        ];
+        for (claim, flag) in agents_claims {
+            if claim.as_deref() == Some("") {
+                anyhow::bail!("{flag} must be non-empty");
+            }
+        }
 
         if oidc.is_none() {
+            for (claim, flag) in agents_claims {
+                if claim.is_some() {
+                    anyhow::bail!(
+                        "{flag} was set but OIDC is not enabled (set --oidc-issuer and \
+                         --oidc-jwks-url)"
+                    );
+                }
+            }
             if self.oidc_tenant_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-tenant-claim was set but OIDC is not enabled (set --oidc-issuer and \
@@ -7034,6 +7242,17 @@ impl Cli {
                 enabled: self.mcp,
                 allowed_origins: self.mcp_allowed_origins.clone(),
                 max_body_bytes: self.mcp_max_body_bytes,
+            },
+            agents: AgentsConfig {
+                enabled: self.agents,
+                activation_concurrency: self.agents_activation_concurrency,
+                poll_concurrency: self.agents_poll_concurrency,
+                memory_budget_bytes: self.agents_memory_budget,
+                max_agents: self.agents_max_agents,
+                max_mailbox: self.agents_max_mailbox,
+                max_state_bytes: self.agents_max_state_bytes,
+                max_receipts: self.agents_max_receipts,
+                max_timers: self.agents_max_timers,
             },
             fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
             sql_spill: SqlSpillSettings {
@@ -8079,6 +8298,43 @@ impl Cli {
                  only by a query-serving process, so under --mode {:?} this flag would be \
                  silently inert. Drop --mcp, or run --mode all or --mode query.",
                 self.mode
+            );
+        }
+
+        // ADR-3331 decision 9: `--agents` is declared in every build, so a
+        // build without the feature must refuse it instead of ignoring it.
+        #[cfg(not(feature = "agents"))]
+        if self.agents {
+            anyhow::bail!(
+                "--agents requires a ravel-server built with the `agents` cargo feature; this \
+                 build does not carry it. Drop --agents, or rebuild with --features agents."
+            );
+        }
+
+        // The agents routes mount from the same query block as `POST /mcp`,
+        // so the same reasoning as the `--mcp` refusal above applies.
+        if self.agents && !self.mode.installs_query_audit_pipeline() {
+            anyhow::bail!(
+                "--agents is only supported under --mode all or --mode query: the agents routes \
+                 are mounted only by a query-serving process, so under --mode {:?} this flag \
+                 would be silently inert. Drop --agents, or run --mode all or --mode query.",
+                self.mode
+            );
+        }
+
+        if self.agents_activation_concurrency == 0 {
+            anyhow::bail!(
+                "--agents-activation-concurrency 0 would never activate an agent turn; set a \
+                 positive limit or leave the flag unset for the default of \
+                 {DEFAULT_AGENTS_ACTIVATION_CONCURRENCY}"
+            );
+        }
+
+        if self.agents_poll_concurrency == 0 {
+            anyhow::bail!(
+                "--agents-poll-concurrency 0 would refuse every worker long-poll; set a positive \
+                 limit or leave the flag unset for the default of \
+                 {DEFAULT_AGENTS_POLL_CONCURRENCY}"
             );
         }
 
@@ -17199,6 +17455,164 @@ mod tests {
             .expect("--mcp under --mode query is accepted");
     }
 
+    /// Every `--agents*` flag parses into its own field and reaches
+    /// [`QueryBudgets::agents`] through [`Cli::query_budgets`], the path
+    /// `main` hands to `start`. Distinct values per flag, so a swapped
+    /// mapping fails.
+    #[test]
+    fn agents_flags_parse_and_reach_query_budgets() {
+        let parsed = Cli::try_parse_from([
+            "ravel-server",
+            "--agents",
+            "--agents-activation-concurrency",
+            "3",
+            "--agents-poll-concurrency",
+            "5",
+            "--agents-memory-budget",
+            "7000",
+            "--agents-max-agents",
+            "11",
+            "--agents-max-mailbox",
+            "13",
+            "--agents-max-state-bytes",
+            "17000",
+            "--agents-max-receipts",
+            "19",
+            "--agents-max-timers",
+            "23",
+        ])
+        .expect("every agents flag parses");
+        assert!(parsed.agents);
+        let budgets = parsed
+            .query_budgets(&resolved_from(&parsed))
+            .expect("budgets resolve");
+        assert_eq!(
+            budgets.agents,
+            AgentsConfig {
+                enabled: true,
+                activation_concurrency: 3,
+                poll_concurrency: 5,
+                memory_budget_bytes: 7000,
+                max_agents: 11,
+                max_mailbox: 13,
+                max_state_bytes: 17000,
+                max_receipts: 19,
+                max_timers: 23,
+            }
+        );
+    }
+
+    /// With no `--agents*` flag the surface is off and every setting is its
+    /// documented default, which is also [`AgentsConfig::default`].
+    #[test]
+    fn agents_flags_default_to_off_and_the_documented_values() {
+        let unset = cli(&[]);
+        assert!(!unset.agents);
+        let budgets = unset
+            .query_budgets(&resolved_from(&unset))
+            .expect("budgets resolve");
+        assert_eq!(budgets.agents, AgentsConfig::default());
+        assert_eq!(
+            budgets.agents,
+            AgentsConfig {
+                enabled: false,
+                activation_concurrency: 64,
+                poll_concurrency: 1024,
+                memory_budget_bytes: 256 * 1024 * 1024,
+                max_agents: 100_000,
+                max_mailbox: 256,
+                max_state_bytes: 64 * 1024 * 1024,
+                max_receipts: 1024,
+                max_timers: 64,
+            }
+        );
+    }
+
+    /// A non-numeric or negative value for each numeric agents flag is a parse
+    /// error, not a silent default.
+    #[test]
+    fn agents_numeric_flags_refuse_non_numeric_values() {
+        for flag in [
+            "--agents-activation-concurrency",
+            "--agents-poll-concurrency",
+            "--agents-memory-budget",
+            "--agents-max-agents",
+            "--agents-max-mailbox",
+            "--agents-max-state-bytes",
+            "--agents-max-receipts",
+            "--agents-max-timers",
+        ] {
+            for value in ["many", "-1"] {
+                assert!(
+                    Cli::try_parse_from(["ravel-server", flag, value]).is_err(),
+                    "{flag} {value} must not parse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agents_zero_activation_or_poll_concurrency_is_refused() {
+        for flag in [
+            "--agents-activation-concurrency",
+            "--agents-poll-concurrency",
+        ] {
+            let err = cli(&[flag, "0"])
+                .validate()
+                .expect_err("a zero agents concurrency must refuse startup");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("{flag} 0")), "names the flag: {msg}");
+        }
+    }
+
+    /// The agents routes mount only from lib.rs's query block, so `--agents`
+    /// under gateway or maintain mode is refused, naming the supported modes.
+    #[cfg(feature = "agents")]
+    #[test]
+    fn agents_in_a_non_query_mode_is_refused() {
+        for mode in ["gateway", "maintain"] {
+            let err = cli(&["--mode", mode, "--agents"])
+                .validate()
+                .expect_err("--agents outside a query-serving mode must refuse startup");
+            let msg = err.to_string();
+            assert!(msg.contains("--agents"), "error names the flag: {msg}");
+            assert!(
+                msg.contains("--mode all") && msg.contains("--mode query"),
+                "error names the supported modes: {msg}"
+            );
+        }
+    }
+
+    #[cfg(feature = "agents")]
+    #[test]
+    fn agents_in_query_and_all_modes_is_accepted() {
+        for mode in ["all", "query"] {
+            cli(&["--mode", mode, "--agents"])
+                .validate()
+                .expect("--agents under a query-serving mode is accepted");
+        }
+    }
+
+    /// ADR-3331 decision 9: a build without the `agents` feature refuses
+    /// `--agents` in every mode instead of ignoring it.
+    #[cfg(not(feature = "agents"))]
+    #[test]
+    fn agents_without_the_feature_is_refused() {
+        for mode in ["all", "query", "gateway", "maintain"] {
+            let err = cli(&["--mode", mode, "--agents"])
+                .validate()
+                .expect_err("--agents without the agents feature must refuse startup");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--agents") && msg.contains("`agents` cargo feature"),
+                "error names the flag and the feature: {msg}"
+            );
+        }
+        cli(&["--mode", "all"])
+            .validate()
+            .expect("no --agents starts in a build without the feature");
+    }
+
     #[test]
     fn fragment_flags_under_gateway_mode_fail_validate() {
         // Issue #94: fragment_service is built only under Mode::All | Mode::Query
@@ -18968,6 +19382,9 @@ mod tests {
                         tenant: TenantId::new("acme"),
                         ddl,
                         ipcrypt,
+                        agents: false,
+                        agents_worker: false,
+                        agents_admin: false,
                     }),
                     "{token}"
                 );
@@ -19210,6 +19627,70 @@ mod tests {
             err.to_string().contains("--oidc-ipcrypt-claim"),
             "error names the flag: {err}"
         );
+    }
+
+    const OIDC_AGENTS_CLAIM_FLAGS: [&str; 3] = [
+        "--oidc-agents-claim",
+        "--oidc-agents-worker-claim",
+        "--oidc-agents-admin-claim",
+    ];
+
+    #[test]
+    fn oidc_agents_claims_parse_into_their_own_fields() {
+        let parsed = Cli::try_parse_from([
+            "ravel-server",
+            "--oidc-agents-claim",
+            "can_agents",
+            "--oidc-agents-worker-claim",
+            "can_work",
+            "--oidc-agents-admin-claim",
+            "can_admin",
+        ])
+        .expect("the three agents claim flags parse");
+        assert_eq!(parsed.oidc_agents_claim.as_deref(), Some("can_agents"));
+        assert_eq!(parsed.oidc_agents_worker_claim.as_deref(), Some("can_work"));
+        assert_eq!(parsed.oidc_agents_admin_claim.as_deref(), Some("can_admin"));
+        let unset = Cli::try_parse_from(["ravel-server"]).expect("no flags parse");
+        assert_eq!(unset.oidc_agents_claim, None);
+        assert_eq!(unset.oidc_agents_worker_claim, None);
+        assert_eq!(unset.oidc_agents_admin_claim, None);
+    }
+
+    #[test]
+    fn oidc_agents_claim_empty_fails_startup() {
+        for flag in OIDC_AGENTS_CLAIM_FLAGS {
+            let err = cli(&[
+                "--oidc-issuer",
+                "https://issuer.example",
+                "--oidc-jwks-url",
+                "https://issuer.example/jwks",
+                "--oidc-audience",
+                "ravel",
+                flag,
+                "",
+            ])
+            .parse_auth_resolvers()
+            .expect_err("an empty agents claim fails startup");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{flag} must be non-empty")),
+                "error names {flag}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_agents_claim_without_oidc_fails_startup() {
+        for flag in OIDC_AGENTS_CLAIM_FLAGS {
+            let err = cli(&[flag, "can_agents"])
+                .parse_auth_resolvers()
+                .expect_err("an agents claim with no OIDC fails startup");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{flag} was set but OIDC is not enabled")),
+                "error names {flag}: {err}"
+            );
+        }
     }
 
     /// `--s3-upload-integrity` and `--s3-request-stored-checksum` reach the

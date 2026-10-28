@@ -637,6 +637,8 @@ fn metrics_app(store: Arc<dyn ObjectStoreBackend>, cache: &ReadCache) -> Router 
         sql_slice_rejects: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_tls_dials: None,
+        #[cfg(feature = "agents")]
+        agents: None,
         durable_auth: None,
         ingest_byte_metrics: Arc::new(ravel_server::ingest_byte_metrics::IngestByteMetrics::new()),
         normalize_reject_metrics: Arc::new(

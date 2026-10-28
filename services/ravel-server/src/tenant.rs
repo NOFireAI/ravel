@@ -126,10 +126,16 @@ pub struct OidcCapabilityClaims {
     pub ddl: Option<String>,
     /// `--oidc-ipcrypt-claim` (ADR-2993 decision 6).
     pub ipcrypt: Option<String>,
+    /// `--oidc-agents-claim` (ADR-3331 decision 9).
+    pub agents: Option<String>,
+    /// `--oidc-agents-worker-claim` (ADR-3331 decision 9).
+    pub agents_worker: Option<String>,
+    /// `--oidc-agents-admin-claim` (ADR-3331 decision 9).
+    pub agents_admin: Option<String>,
 }
 
 /// Same as [`build_auth_resolver`], but the static bearer map carries a
-/// [`Principal`] (tenant plus the `ddl` and `ipcrypt` capabilities) per token
+/// [`Principal`] (tenant plus its capabilities) per token
 /// instead of a bare [`TenantId`], and `claims` names the boolean OIDC claims
 /// that grant each capability when OIDC is configured. This is a parameter
 /// rather than a field on [`crate::config::OidcSettings`] so that struct's
@@ -149,6 +155,9 @@ pub fn build_auth_resolver_with_principals(
         for (claim, flag) in [
             (&claims.ddl, "--oidc-ddl-claim"),
             (&claims.ipcrypt, "--oidc-ipcrypt-claim"),
+            (&claims.agents, "--oidc-agents-claim"),
+            (&claims.agents_worker, "--oidc-agents-worker-claim"),
+            (&claims.agents_admin, "--oidc-agents-admin-claim"),
         ] {
             if claim.is_some() {
                 anyhow::bail!(
@@ -185,6 +194,15 @@ pub fn build_auth_resolver_with_principals(
         }
         if let Some(ipcrypt_claim) = claims.ipcrypt {
             oidc_resolver = oidc_resolver.with_ipcrypt_claim(ipcrypt_claim);
+        }
+        if let Some(agents_claim) = claims.agents {
+            oidc_resolver = oidc_resolver.with_agents_claim(agents_claim);
+        }
+        if let Some(agents_worker_claim) = claims.agents_worker {
+            oidc_resolver = oidc_resolver.with_agents_worker_claim(agents_worker_claim);
+        }
+        if let Some(agents_admin_claim) = claims.agents_admin {
+            oidc_resolver = oidc_resolver.with_agents_admin_claim(agents_admin_claim);
         }
         resolvers.push(Arc::new(oidc_resolver));
         oidc_refresh = Some(OidcRefreshParams {
@@ -342,7 +360,7 @@ mod tests {
             AuthResolverSettings::default(),
             OidcCapabilityClaims {
                 ddl: Some("ravel_ddl".to_string()),
-                ipcrypt: None,
+                ..OidcCapabilityClaims::default()
             },
         );
         let err = result.err().expect("a ddl claim with no OIDC must fail");
@@ -359,8 +377,8 @@ mod tests {
             false,
             AuthResolverSettings::default(),
             OidcCapabilityClaims {
-                ddl: None,
                 ipcrypt: Some("ravel_ipcrypt".to_string()),
+                ..OidcCapabilityClaims::default()
             },
         );
         let err = result
@@ -370,6 +388,47 @@ mod tests {
             err.to_string().contains("--oidc-ipcrypt-claim"),
             "the error names the flag: {err}"
         );
+    }
+
+    #[test]
+    fn each_oidc_agents_claim_without_oidc_is_an_error_naming_its_flag() {
+        let claim = || Some("ravel_agents".to_string());
+        for (claims, flag) in [
+            (
+                OidcCapabilityClaims {
+                    agents: claim(),
+                    ..OidcCapabilityClaims::default()
+                },
+                "--oidc-agents-claim",
+            ),
+            (
+                OidcCapabilityClaims {
+                    agents_worker: claim(),
+                    ..OidcCapabilityClaims::default()
+                },
+                "--oidc-agents-worker-claim",
+            ),
+            (
+                OidcCapabilityClaims {
+                    agents_admin: claim(),
+                    ..OidcCapabilityClaims::default()
+                },
+                "--oidc-agents-admin-claim",
+            ),
+        ] {
+            let err = build_auth_resolver_with_principals(
+                HashMap::new(),
+                false,
+                AuthResolverSettings::default(),
+                claims,
+            )
+            .err()
+            .expect("an agents claim with no OIDC must fail");
+            assert!(
+                err.to_string().contains(&format!("{flag} was set")),
+                "the error names {flag}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -384,6 +443,9 @@ mod tests {
             OidcCapabilityClaims {
                 ddl: Some("ravel_ddl".to_string()),
                 ipcrypt: Some("ravel_ipcrypt".to_string()),
+                agents: Some("ravel_agents".to_string()),
+                agents_worker: Some("ravel_agents_worker".to_string()),
+                agents_admin: Some("ravel_agents_admin".to_string()),
             },
         )
         .expect("capability claims with OIDC configured build");
