@@ -35,7 +35,7 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    before starting node, and reports the bin's exit code and stderr when it
    fails. `agents dev` prints this command once its server is ready. Test:
    `scaffold_runs_the_sdk_generator_and_refuses_a_non_empty_dir_before_spawning`
-   (`services/ravel-cli/tests/agents_commands.rs`).
+   (`ravel-cli`'s `agents_commands` suite).
 
    The project holds one agent, `order`, whose `checkout` handler prices a
    line through a durable step against a local price-list fixture, the
