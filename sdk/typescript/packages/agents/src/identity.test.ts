@@ -88,7 +88,7 @@ describe("identity", () => {
     ["a Map", { m: new Map() }],
     ["a Set", [new Set()]],
     ["a bigint", { n: 1n }],
-    ["undefined inside an object", { u: undefined }],
+    ["undefined inside an object that did not go through the JSON form", { u: undefined }],
     ["a function", { f: () => 1 }],
     ["a non-finite number", { n: Number.NaN }],
     ["a class instance", { c: new (class Point { readonly x = 1; })() }],
@@ -101,5 +101,12 @@ describe("identity", () => {
     expect(canonicalJson(jsonForm({ at, list: [at] }))).toBe(
       '{"at":"2026-01-01T00:00:00.000Z","list":["2026-01-01T00:00:00.000Z"]}',
     );
+  });
+
+  it("the JSON form drops undefined members and writes undefined items as null, as JSON.stringify does", () => {
+    const value = { cursor: undefined, keep: 1, nested: { gone: undefined }, list: [undefined, 2] };
+    expect(canonicalJson(jsonForm(value))).toBe(JSON.stringify({ keep: 1, list: [null, 2], nested: {} }));
+    expect(canonicalJson(jsonForm({ cursor: undefined }))).toBe(canonicalJson(jsonForm({})));
+    expect(() => canonicalJson(jsonForm(undefined))).toThrow(InvalidStepInput);
   });
 });
