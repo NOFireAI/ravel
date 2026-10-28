@@ -27,9 +27,10 @@ npm run example:assistant
 
 `RAVEL_URL` defaults to `http://127.0.0.1:4318`, and the question to "How
 does a worker recover a step after a crash?" (pass another as arguments
-after `--`). For the default question it prints the operation id, the
-articles found (`kb-2, kb-3`), the answer and the tools that ran
-(`kb.search, kb.draft`).
+after `--`). It prints the operation id, the articles found, the answer and
+the tools that ran. No test runs `main.ts`; the figures for the default
+question are asserted through the kill-and-recover path below
+(`RESULT_ARTICLES` `kb-2,kb-3`).
 
 ## Kill and recover
 
@@ -44,12 +45,18 @@ journal is the SDK's in-memory one, so both workers must share a process
 - `at_least_once` kills inside `kb.draft`. `kb.search` was journaled and is
   replayed without running; `kb.draft` runs again under the same effect id
   as attempt 2. Test: `worker killed inside an at_least_once step recovers
-  the same operation on restart` (`packages/agents/e2e/recover.test.ts`).
+  the same operation on restart, replaying steps from the in-memory
+  journal` (`packages/agents/e2e/recover.test.ts`).
 - `manual` kills inside `desk.ticket`. Worker B does not file a second
-  ticket: the turn is abandoned with `EffectInDoubt` until the effect is
-  reconciled with the ticket the killed run filed, `T-1001`. Test: `worker
-  killed inside a manual step blocks as EffectInDoubt until reconciled`
-  (same file).
+  ticket: the turn is abandoned with `EffectInDoubt` until the journal's
+  effect is reconciled, through the journal, with the ticket the killed run
+  filed, `T-1001`. Test: `worker killed inside a manual step blocks as
+  EffectInDoubt in the in-memory journal until reconciled there` (same
+  file).
+
+The same operation id on the resend, the takeover by worker B and the single
+commit come from the server; the replay, the attempts and the in-doubt block
+come from the in-memory journal.
 
 `npm run test:e2e` runs both against a server it starts. The demo
 `demo/agents-kill-and-recover.sh` runs both through `kill-and-recover.ts`,
@@ -57,6 +64,8 @@ which prints one `KEY=value` line per figure, and asserts each:
 
 | Figure | at_least_once | manual |
 |---|---|---|
+| `OPERATION_ID` | printed once, a non-empty base64url handle | the same, and not at_least_once's id |
+| `RETRIED_OPERATION_ID` | equal to `OPERATION_ID` | equal to `OPERATION_ID` |
 | `RETRIED_SAME_OPERATION` | `true` | `true` |
 | `WORKERS_DIFFER` | `true` | `true` |
 | `SEARCH_RUNS` | `1` | `1` |
@@ -78,4 +87,6 @@ which prints one `KEY=value` line per figure, and asserts each:
 `RESULT_ANSWER` must equal the drafted answer in both. Run it from the
 repository root after building the server with `cargo build --locked -p
 ravel-server --features agents`; `RAVEL_AGENTS_DEMO_STORE=memory` runs it
-without docker.
+without docker. With the RustFS store it stops the container on exit only
+if it started it. It needs node 22.15 or later 22.x (`module.registerHooks`
+in `examples/ts-hooks.js`).

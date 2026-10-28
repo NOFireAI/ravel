@@ -1,29 +1,39 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runKillAndRecover } from "../../../examples/assistant/scenario.js";
-import { plan, type RunningServer, startServer, TOKENS } from "./server.js";
+import { decide, plan, type RunningServer, startServer, TOKENS } from "./server.js";
 
 const target = plan();
+const decision = decide(target);
 
 const ANSWER =
   "A worker that dies mid-turn is replaced and the turn is re-run. " +
   "A step whose result is journaled is replayed, never run again.";
 
-describe.skipIf(target.missing !== undefined)(
+if (decision.kind === "fail") {
+  describe(`kill and recover against ravel-server (${target.store})`, () => {
+    it("has its prerequisites (RAVEL_E2E_REQUIRE=1)", () => {
+      throw new Error(decision.reason);
+    });
+  });
+}
+
+describe.skipIf(decision.kind !== "run")(
   `kill and recover against ravel-server (${target.store})${
-    target.missing === undefined ? "" : `: SKIPPED, ${target.missing}`
+    decision.kind === "skip" ? `: SKIPPED, ${decision.reason}` : ""
   }`,
   () => {
-    let server: RunningServer;
+    let server: RunningServer | undefined;
     beforeAll(async () => {
       server = await startServer(target.binary, target.store);
     });
     afterAll(async () => {
-      await server.stop();
+      await server?.stop();
     });
 
-    const scenario = (policy: "at_least_once" | "manual") =>
-      runKillAndRecover({
+    const scenario = (policy: "at_least_once" | "manual") => {
+      if (server === undefined) throw new Error("ravel-server did not start");
+      return runKillAndRecover({
         url: server.url,
         clientToken: TOKENS.client,
         workerToken: TOKENS.worker,
@@ -31,8 +41,13 @@ describe.skipIf(target.missing !== undefined)(
         key: `e2e-${policy}-${randomUUID()}`,
         requestId: `e2e-request-${randomUUID()}`,
       });
+    };
 
-    it("worker killed inside an at_least_once step recovers the same operation on restart", async () => {
+    // The server proves the same operation id, the takeover by a second
+    // worker and the single commit; step replay, effect attempts and the
+    // EffectInDoubt block come from the SDK's in-memory step journal until
+    // the server's step and effect routes are paired (README, "Wire gaps").
+    it("worker killed inside an at_least_once step recovers the same operation on restart, replaying steps from the in-memory journal", async () => {
       const run = await scenario("at_least_once");
 
       expect(run.operationId).toMatch(/\S/);
@@ -54,7 +69,7 @@ describe.skipIf(target.missing !== undefined)(
       expect(run.inDoubt).toBeNull();
     });
 
-    it("worker killed inside a manual step blocks as EffectInDoubt until reconciled", async () => {
+    it("worker killed inside a manual step blocks as EffectInDoubt in the in-memory journal until reconciled there", async () => {
       const run = await scenario("manual");
 
       expect(run.retriedOperationId).toBe(run.operationId);

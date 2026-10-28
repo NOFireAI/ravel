@@ -68,9 +68,16 @@ case "$STORE" in
   *) fail "RAVEL_AGENTS_DEMO_STORE=$STORE is neither rustfs nor memory" ;;
 esac
 command -v curl >/dev/null 2>&1 || fail "curl not found on PATH"
-command -v node >/dev/null 2>&1 || fail "node not found on PATH; the SDK needs node 22"
-node_major=$(node -p 'process.versions.node.split(".")[0]')
-[[ "$node_major" == "22" ]] || fail "node $node_major found; the SDK needs node 22"
+command -v node >/dev/null 2>&1 || fail "node not found on PATH; the SDK needs node 22.15 or later 22.x"
+# 22.15.0 is the first 22.x with module.registerHooks, which the driver's
+# loader hook (sdk/typescript/examples/ts-hooks.js) uses.
+node_version=$(node -p 'process.versions.node')
+node_major=${node_version%%.*}
+node_minor=${node_version#*.}
+node_minor=${node_minor%%.*}
+if [[ "$node_major" != "22" ]] || (( node_minor < 15 )); then
+  fail "node $node_version found; the SDK needs node 22.15 or later 22.x"
+fi
 [[ -x "$SERVER_BIN" ]] || fail "ravel-server not found at $SERVER_BIN; build it with" \
   "'cargo build --locked -p ravel-server --features agents' or set RAVEL_SERVER_BIN"
 [[ -d "$sdk_dir/node_modules" ]] || fail "SDK dependencies missing; run 'npm ci' in $sdk_dir"
@@ -100,9 +107,14 @@ trap cleanup EXIT
 
 store_args=(--store memory)
 if [[ "$STORE" == "rustfs" ]]; then
-  log "starting the compose RustFS store"
-  compose up -d rustfs
-  started_store=1
+  # A RustFS container that was already running is left running on exit.
+  if [[ -n "$(compose ps --quiet --status running rustfs)" ]]; then
+    log "using the compose RustFS store that is already running"
+  else
+    log "starting the compose RustFS store"
+    compose up -d rustfs
+    started_store=1
+  fi
   compose run --rm createbucket
   # The compose file's published development credentials.
   store_args=(--store s3 --s3-endpoint http://127.0.0.1:9000 --s3-allow-http
@@ -166,9 +178,26 @@ expect_band() {
   log "ok $key=$got (expected within [$lo, $hi])"
 }
 
+# Sets operation_id from FILE once OPERATION_ID is printed exactly once, is a
+# non-empty operation handle (unpadded base64url), and equals
+# RETRIED_OPERATION_ID, the operation the resend under the same request id got.
+# It sets a variable rather than printing, so a miss exits the script instead
+# of a command-substitution subshell.
+operation_id=""
+expect_operation() {
+  local file=$1 id
+  id=$(figure "$file" OPERATION_ID)
+  [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || fail "OPERATION_ID=$id, expected a non-empty base64url operation handle"
+  log "ok OPERATION_ID=$id (expected a non-empty base64url operation handle)"
+  expect "$file" RETRIED_OPERATION_ID "$id"
+  operation_id=$id
+}
+
 log "scenario at_least_once: kill inside kb.draft"
 alo="$work_dir/at_least_once.out"
 run_driver at_least_once "$alo"
+expect_operation "$alo"
+alo_operation=$operation_id
 expect "$alo" RETRIED_SAME_OPERATION true
 expect "$alo" WORKERS_DIFFER true
 expect "$alo" SEARCH_RUNS 1
@@ -188,6 +217,10 @@ expect_band "$alo" RECOVERY_MS "$RECOVERY_MS_MIN" "$RECOVERY_MS_MAX"
 log "scenario manual: kill inside desk.ticket"
 man="$work_dir/manual.out"
 run_driver manual "$man"
+expect_operation "$man"
+man_operation=$operation_id
+[[ "$man_operation" != "$alo_operation" ]] ||
+  fail "manual OPERATION_ID=$man_operation, expected a different operation from at_least_once's"
 expect "$man" RETRIED_SAME_OPERATION true
 expect "$man" WORKERS_DIFFER true
 expect "$man" IN_DOUBT_ERROR EffectInDoubt
@@ -206,8 +239,11 @@ expect "$man" RESULT_ANSWER "$ANSWER"
 expect "$man" ANSWERED 1
 expect_band "$man" RECOVERY_MS "$RECOVERY_MS_MIN" "$RECOVERY_MS_MAX"
 
-echo "at_least_once operation: $(figure "$alo" OPERATION_ID)"
-echo "at_least_once result:    $(figure "$alo" RESULT_ANSWER)"
-echo "manual operation:        $(figure "$man" OPERATION_ID)"
-echo "manual result:           ticket $(figure "$man" RESULT_TICKET)"
+# Both values were asserted above; assigned first so a miss here still exits.
+alo_answer=$(figure "$alo" RESULT_ANSWER)
+man_ticket=$(figure "$man" RESULT_TICKET)
+echo "at_least_once operation: $alo_operation"
+echo "at_least_once result:    $alo_answer"
+echo "manual operation:        $man_operation"
+echo "manual result:           ticket $man_ticket"
 log "PASSED"
