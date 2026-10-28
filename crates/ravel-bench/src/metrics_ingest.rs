@@ -1543,6 +1543,32 @@ pub struct MetricsIngestReport {
     /// Empty when no post-ingest query ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queries: Vec<SystemQueryResult>,
+    /// Rows the stall ceiling stopped (ADR-0927, 2026-10-28 amendment,
+    /// decision 7). A stopped row has no closed ingest figures, so it is
+    /// kept here rather than in `systems`; a report holding one is refused
+    /// as a run result (`metrics_query::BindError::Stalled`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalled: Vec<StalledRow>,
+}
+
+/// A row stopped by [`LaneError::IngestStalled`], with the figures the stall
+/// check stopped it on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StalledRow {
+    /// The row's system, as in [`SystemIngestResult::system`].
+    pub system: String,
+    /// The write endpoint the row sent to.
+    pub endpoint: String,
+    /// The projected total ingest wall time.
+    pub projected_secs: f64,
+    /// The ceiling the projection exceeded.
+    pub ceiling_secs: u64,
+    /// Points offered when the check ran.
+    pub offered_points: u64,
+    /// Points the whole stream offers.
+    pub stream_points: u64,
+    /// The stall error as the bin printed it.
+    pub error: String,
 }
 
 impl MetricsIngestReport {
@@ -1561,6 +1587,7 @@ impl MetricsIngestReport {
             substrate: None,
             systems,
             queries: Vec::new(),
+            stalled: Vec::new(),
         }
     }
 

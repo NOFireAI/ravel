@@ -1459,3 +1459,181 @@ fn a_report_whose_readback_failed_does_not_bind() {
         "{err}"
     );
 }
+
+/// With `--diagnostic-after-failed-ingest`, an ingest report whose mimir row
+/// failed its read-back is queried as a diagnostic: the report says
+/// `run_verdict: "failed"` and names band 6 on mimir in `failed_bands`, every
+/// engine is still measured, and `metricsbench_report validate` refuses it as a
+/// diagnostic of a failed run. Without the flag the same input refuses (65)
+/// and writes nothing.
+///
+/// TO SEE THIS FAIL: drop the `--diagnostic-after-failed-ingest` branch in
+/// `metricsbench_query`'s `run_main` (bind with `bind` always): the flagged run
+/// then exits 65 like the unflagged one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_readback_is_queried_as_a_diagnostic_only_with_the_flag() {
+    let s = stubs().await;
+    let failed = || {
+        let mut ingest = ingest_report(&s.urls);
+        let row = ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == "mimir")
+            .expect("mimir row");
+        row.readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+        ingest
+    };
+
+    let refused = run_bin(failed(), &s.urls).await;
+    assert_eq!(
+        refused.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&refused.output)
+    );
+    assert!(!refused.out.exists());
+
+    let run = run_bin_with(
+        failed(),
+        &s.urls,
+        WARMUP,
+        &["--diagnostic-after-failed-ingest"],
+    )
+    .await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let text = std::fs::read_to_string(&run.out).expect("report written");
+    let json: Json = serde_json::from_str(&text).expect("report parses");
+    assert_eq!(json["run_verdict"], "failed", "{json}");
+    let bands = json["failed_bands"].as_array().expect("failed_bands");
+    assert_eq!(bands.len(), 1, "{json}");
+    assert_eq!(bands[0]["band"], 6);
+    assert_eq!(bands[0]["check"], "readback");
+    assert_eq!(bands[0]["system"], "mimir");
+    assert!(
+        bands[0]["reason"].as_str().expect("reason").contains("422"),
+        "{json}"
+    );
+    let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    for engine in [
+        Engine::Prometheus,
+        Engine::Ravel,
+        Engine::VictoriaMetrics,
+        Engine::Mimir,
+    ] {
+        assert!(
+            report.measurements.iter().any(|m| m.engine == Some(engine)),
+            "no measurement for {engine:?}"
+        );
+    }
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
+        .arg("validate")
+        .arg(&run.out)
+        .output()
+        .expect("run metricsbench_report");
+    assert!(!validated.status.success());
+    assert!(
+        stderr(&validated).contains("diagnostic of a failed run"),
+        "{}",
+        stderr(&validated)
+    );
+}
+
+/// A stalled row binds only as a diagnostic: `bind` refuses it, and
+/// `bind_diagnostic` leaves the stalled engine out of the binding and names
+/// the stall as a failed check with no band number. A stalled oracle refuses
+/// even as a diagnostic, and a report with no failed row is not one.
+///
+/// TO SEE THIS FAIL: drop the `is_stalled` skip in `bind_rows`' engine loop:
+/// the diagnostic bind then refuses with no ingest row for mimir.
+#[test]
+fn a_stalled_row_binds_only_as_a_diagnostic_and_leaves_its_engine_out() {
+    use ravel_bench::metrics_ingest::StalledRow;
+    use ravel_bench::metrics_query::{
+        BindError, bind, bind_diagnostic, endpoints, parse_engine_spec,
+    };
+    use ravel_bench::report_schema::FailedCheck;
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec("name=mimir,url=http://127.0.0.1:9").expect("spec"),
+    ];
+    let stalled = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest.systems.retain(|r| r.system != system);
+        ingest.stalled = vec![StalledRow {
+            system: system.to_string(),
+            endpoint: "http://127.0.0.1:9/api/v1/push".to_string(),
+            projected_secs: 9_000.0,
+            ceiling_secs: 600,
+            offered_points: 50,
+            stream_points: 1_000,
+            error: "projected 9000 s past the 600 s ceiling".to_string(),
+        }];
+        ingest
+    };
+
+    let err = bind(
+        &stalled("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("bind refuses a stalled row");
+    assert!(
+        matches!(&err, BindError::Stalled { system, .. } if system == "mimir"),
+        "{err}"
+    );
+
+    let (binding, failed) = bind_diagnostic(
+        &stalled("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a stalled comparator binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, None);
+    assert_eq!(failed[0].check, FailedCheck::Stall);
+    assert_eq!(failed[0].system, "mimir");
+
+    let err = bind_diagnostic(
+        &stalled("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a stalled oracle refuses");
+    assert!(
+        matches!(&err, BindError::Stalled { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+
+    let err = bind_diagnostic(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("no failed row, no diagnostic");
+    assert!(matches!(err, BindError::NoFailedRow), "{err}");
+}
