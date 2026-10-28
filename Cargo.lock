@@ -4485,6 +4485,16 @@ version = "0.27.0"
 [[package]]
 name = "ravel-agents-store"
 version = "0.27.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "proptest",
+ "ravel-agents-core",
+ "ravel-object-store",
+ "ravel-types",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "ravel-alerting"
