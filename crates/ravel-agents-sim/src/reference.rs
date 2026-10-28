@@ -21,7 +21,8 @@
 //!   so a completion that committed first wins; an input not yet started
 //!   is cancelled at once; a running input records the request and its next
 //!   commit ends it `cancelled` (decision 5, `CancelResponse.requested`).
-//! - A timer key has one generation at a time. A due event fires a
+//! - One timer generation counter per agent, shared by every timer key, so
+//!   a timer key has one generation at a time. A due event fires a
 //!   generation at most once, a stale or cancelled generation fires
 //!   nothing, and cancelling after the firing reports `AlreadyFired`
 //!   (decision 8).
@@ -196,6 +197,9 @@ struct Life {
     state_version: u64,
     running: Option<u64>,
     timers: HashMap<String, Timer>,
+    /// One generation counter per agent (ADR-3331 decision 3 keeps a single
+    /// timer generation counter in HEAD), shared by every timer key.
+    timer_generation: u64,
 }
 
 impl Life {
@@ -209,6 +213,7 @@ impl Life {
             state_version: 0,
             running: None,
             timers: HashMap::new(),
+            timer_generation: 0,
         }
     }
 
@@ -547,10 +552,8 @@ impl ReferenceMachine {
             Ok(life) => life,
             Err(reply) => return reply,
         };
-        let generation = match life.timers.get(timer_key) {
-            Some(timer) => timer.generation + 1,
-            None => FIRST_TIMER_GENERATION,
-        };
+        life.timer_generation += 1;
+        let generation = life.timer_generation;
         life.timers.insert(
             timer_key.to_string(),
             Timer {
@@ -1136,7 +1139,27 @@ mod tests {
 
         fn handle() -> impl Strategy<Value = Handle> {
             let agent = machine().agent_id();
-            (1u64..=3, 1u64..=5).prop_map(move |(inc, seq)| Handle::operation(agent, inc, seq))
+            // Bias toward the live incarnation's first inputs so turns are
+            // started and committed often enough to exercise the commit
+            // rules; the uniform tail keeps stale handles in the mix.
+            prop_oneof![
+                4 => Just((1u64, 1u64)),
+                3 => Just((1u64, 2u64)),
+                2 => Just((1u64, 3u64)),
+                2 => Just((2u64, 1u64)),
+                1 => (1u64..=3, 1u64..=5),
+            ]
+            .prop_map(move |(inc, seq)| Handle::operation(agent, inc, seq))
+        }
+
+        /// Every generated history starts with a Create, so the rest of the
+        /// events act on a live agent often enough to reach turn commits
+        /// (`the_property_generator_reaches_commits` pins the rate).
+        fn events() -> impl Strategy<Value = Vec<Event>> {
+            prop::collection::vec(event(), 0..48).prop_map(|mut events| {
+                events.insert(0, Event::Client(ClientOp::Create));
+                events
+            })
         }
 
         fn event() -> impl Strategy<Value = Event> {
@@ -1202,11 +1225,115 @@ mod tests {
             }
         }
 
+        #[test]
+        fn timer_generations_are_counted_per_agent_not_per_key() {
+            let m = machine();
+            let h = history(vec![
+                (client(ClientOp::Create), created(1, true)),
+                (
+                    client(ClientOp::SetTimer {
+                        timer_key: "t0".into(),
+                        handler: "remind".into(),
+                        payload: Vec::new(),
+                    }),
+                    Reply::TimerSet {
+                        timer: m.timer(1, "t0"),
+                        generation: 1,
+                    },
+                ),
+                (
+                    client(ClientOp::SetTimer {
+                        timer_key: "t1".into(),
+                        handler: "remind".into(),
+                        payload: Vec::new(),
+                    }),
+                    Reply::TimerSet {
+                        timer: m.timer(1, "t1"),
+                        generation: 2,
+                    },
+                ),
+                (
+                    client(ClientOp::SetTimer {
+                        timer_key: "t0".into(),
+                        handler: "remind".into(),
+                        payload: Vec::new(),
+                    }),
+                    Reply::TimerSet {
+                        timer: m.timer(1, "t0"),
+                        generation: 3,
+                    },
+                ),
+            ]);
+            h.check(machine())
+                .expect("one generation counter per agent");
+        }
+
+        #[test]
+        fn a_new_incarnation_starts_at_state_version_zero_after_a_completion() {
+            let m = machine();
+            let op = m.operation(1, 1);
+            let h = history(vec![
+                (client(ClientOp::Create), created(1, true)),
+                (send("r1", b"hi"), accepted(op, false)),
+                (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+                (
+                    Event::TurnCompleted {
+                        operation: op,
+                        output: b"ok".to_vec(),
+                    },
+                    committed(OperationStatus::Completed, 1),
+                ),
+                (
+                    client(ClientOp::State),
+                    Reply::State {
+                        incarnation: 1,
+                        state_version: 1,
+                    },
+                ),
+                (
+                    client(ClientOp::Destroy),
+                    Reply::Destroyed { incarnation: 1 },
+                ),
+                (client(ClientOp::Create), created(2, true)),
+                (
+                    client(ClientOp::State),
+                    Reply::State {
+                        incarnation: 2,
+                        state_version: 0,
+                    },
+                ),
+            ]);
+            h.check(machine())
+                .expect("state version resets with the incarnation");
+        }
+
+        #[test]
+        fn the_property_generator_reaches_commits() {
+            use proptest::strategy::ValueTree;
+            use proptest::test_runner::TestRunner;
+            let mut runner = TestRunner::deterministic();
+            let strategy = events();
+            let mut commits = 0usize;
+            for _ in 0..1_000 {
+                let events = strategy.new_tree(&mut runner).expect("strategy").current();
+                let mut m = machine();
+                for event in &events {
+                    if matches!(m.apply(event), Reply::Committed { .. }) {
+                        commits += 1;
+                    }
+                }
+            }
+            assert!(
+                commits >= 200,
+                "the generator must reach commits often: {commits} in 1000 cases"
+            );
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(5_000))]
 
             #[test]
-            fn reference_machine_invariants_hold(events in prop::collection::vec(event(), 0..48)) {
+            fn reference_machine_invariants_hold(events in events()) {
                 let mut m = machine();
                 let mut terminal: HashMap<Handle, OperationStatus> = HashMap::new();
                 let mut state_version: HashMap<u64, u64> = HashMap::new();
