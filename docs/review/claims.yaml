@@ -36,7 +36,7 @@
   note: "SERVED_TOOLS holds ravel_capabilities and ravel_get_trace; dispatch answers the other seven catalog names with ToolError::NotShipped, and the bound test pins the list against dispatch."
 
 - id: agents-mcp-ships
-  doc: docs/guides/agents.md
+  doc: docs/guides/mcp-server.md
   quote: "The tools ship behind the `mcp` cargo feature and the `--mcp` flag, both off by default."
   kind: positive
   binds:
@@ -46,7 +46,7 @@
   note: "Replaced the banner saying the POST /mcp route does not exist until the feature ships."
 
 - id: agents-mcp-one-tool-served
-  doc: docs/guides/agents.md
+  doc: docs/guides/mcp-server.md
   quote: "Two tools are served today, `ravel_capabilities` and `ravel_get_trace`."
   kind: positive
   binds:

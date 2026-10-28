@@ -1190,6 +1190,7 @@ applies if you find one outside your task scope.
 | ravel-segment | docs/segment-format.md |
 | ravel-logseg | docs/log-segment-format.md |
 | ravel-commit, ravel-catalog | docs/catalog-and-mvcc.md |
+| ravel-agents-core, ravel-agents-store | docs/agents.md, docs/adrs/3331 |
 | ravel-ingest | docs/ingest.md, docs/consistency-model.md |
 | ravel-otlp | docs/adrs/0005 (mapping note), crate module docs |
 | ravel-otap | docs/otap-ingest.md, proto/otel-arrow/docs/ |

@@ -15,7 +15,8 @@ the claim, its source sentence, a verdict, the evidence and a note, and
 found contradictions the docs still carry.
 
 Three survive on `main`. `README.md:331-334` and
-`docs/guides/agents.md:3-5` say the `mcp` cargo feature, the `--mcp` flag and
+the MCP guide (then `docs/guides/agents.md:3-5`, now
+`docs/guides/mcp-server.md` after ADR-3331 decision 1) say the `mcp` cargo feature, the `--mcp` flag and
 `POST /mcp` do not exist in a build; the feature is defined
 (`services/ravel-server/Cargo.toml:230-239`), `crates/ravel-mcp` exists, and
 `docs/reference/mcp.md:3-9` describes the route as shipped. `PROGRESS.md:70-77`
@@ -173,7 +174,8 @@ flowchart LR
 - The docs/README.md index gains no new page; `docs/review/` holds data,
   not documentation.
 - Follow-up tasks:
-  1. The MCP wording in README.md and docs/guides/agents.md, and the
+  1. The MCP wording in README.md and docs/guides/mcp-server.md (then
+     docs/guides/agents.md), and the
      PROGRESS.md audit paragraph, corrected against the shipped code.
   2. `scripts/check-doc-claims.py`, its unittest module, the registry
      seeded from the matrix, and the CI and Makefile wiring, in one
