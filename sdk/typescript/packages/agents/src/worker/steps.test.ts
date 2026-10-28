@@ -258,6 +258,8 @@ describe("steps", () => {
     const coordinator = new FakeCoordinator({ agents: [agent] });
     // Another attempt's result reaches the journal first.
     const transport: Transport = {
+      register: (request) => coordinator.register(request),
+      heartbeat: (request) => coordinator.heartbeat(request),
       poll: (request, signal) => coordinator.poll(request, signal),
       recordStep: (request) => coordinator.recordStep(request),
       failEffect: (request) => coordinator.failEffect(request),
@@ -444,7 +446,6 @@ describe("turns", () => {
     harness = createTestHarness({ agents: [] });
     const report = await runTurn(
       {
-        startedUnixNs: 0n,
         assignment: {
           lease: {
             agent_id: "a",
@@ -456,6 +457,8 @@ describe("turns", () => {
             handler_version: "2",
             handler_digest: "d",
             observed_root_revision: 0,
+            recorded_unix_ns: 0n,
+            random_seed: "00000000000000000000000000000000",
           },
           agent: { kind: "counter", key: "c-1" },
           operation: "op-1",
@@ -480,7 +483,6 @@ describe("turns", () => {
     const turn = (digest: string) =>
       runTurn(
         {
-          startedUnixNs: 0n,
           assignment: {
             lease: {
               agent_id: "a",
@@ -492,6 +494,8 @@ describe("turns", () => {
               handler_version: counter.version,
               handler_digest: digest,
               observed_root_revision: 0,
+              recorded_unix_ns: 0n,
+              random_seed: "00000000000000000000000000000000",
             },
             agent: { kind: "counter", key: "c-1" },
             operation: "op-1",
@@ -557,6 +561,8 @@ describe("turns", () => {
         await new Promise((resolve) => setImmediate(resolve));
         return null;
       },
+      register: () => Promise.reject(new Error("unused")),
+      heartbeat: () => Promise.reject(new Error("unused")),
       recordStep: () => Promise.reject(new Error("unused")),
       failEffect: () => Promise.reject(new Error("unused")),
       commit: () => Promise.reject(new Error("unused")),

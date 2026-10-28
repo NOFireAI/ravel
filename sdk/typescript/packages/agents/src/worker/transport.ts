@@ -4,15 +4,15 @@
  * `/api/v1/agents/worker/...` routes implements the same interface once a
  * server exists, and both drive the same runner.
  *
- * `poll`, `commit` and `completeEffect` carry the wire bodies of
- * `crates/ravel-agents-core/src/wire.rs`. Three things the runner needs have no
- * wire body yet, so their shapes here are SDK-local and provisional:
- * `recordStep`, which fuses three kernel commands into one call (`RecordStep`
- * to journal the step or read back its record, `CommitIntent` for the effect,
- * and `AuthorizeAttempt`, which is where the answer's `effect` and `attempt`
- * come from; an HTTP transport maps it to more than one route), recording a
- * tool's failure as its attempt's result, and a recorded start time for the
- * turn.
+ * `register`, `heartbeat`, `poll`, `commit` and `completeEffect` carry the
+ * wire bodies of `crates/ravel-agents-core/src/wire.rs`. A polled lease
+ * carries the turn's recorded time and random seed. Two things the runner
+ * needs have no wire body yet, so their shapes here are SDK-local and
+ * provisional: `recordStep`, which fuses three kernel commands into one call
+ * (`RecordStep` to journal the step or read back its record, `CommitIntent`
+ * for the effect, and `AuthorizeAttempt`, which is where the answer's `effect`
+ * and `attempt` come from; an HTTP transport maps it to more than one route),
+ * and recording a tool's failure as its attempt's result.
  */
 import type {
   EffectCompleteRequest,
@@ -23,14 +23,19 @@ import type {
   TurnLease,
   WorkerCommitRequest,
   WorkerCommitResponse,
+  WorkerHeartbeatRequest,
+  WorkerHeartbeatResponse,
   WorkerPollRequest,
+  WorkerRegisterRequest,
+  WorkerRegisterResponse,
 } from "../wire/index.js";
 
-/** One leased turn. */
+/**
+ * One leased turn. `assignment.lease.recorded_unix_ns` is the turn's
+ * `ctx.now()` and `assignment.lease.random_seed` seeds its `ctx.random()`.
+ */
 export interface PolledTurn {
   readonly assignment: TurnAssignment;
-  /** When the coordinator first started this input; the turn's `ctx.now()`. */
-  readonly startedUnixNs: bigint;
 }
 
 /** Journal a step as started, mirroring the kernel's `RecordStep`. */
@@ -71,6 +76,10 @@ export interface EffectFailRequest {
  * `EffectInDoubt` for a step the coordinator refuses.
  */
 export interface Transport {
+  /** Register the handlers this worker runs; the answer names the worker for later polls. */
+  register(request: WorkerRegisterRequest): Promise<WorkerRegisterResponse>;
+  /** Extend a held lease; rejects with `OwnershipLost` once the lease is stale. */
+  heartbeat(request: WorkerHeartbeatRequest): Promise<WorkerHeartbeatResponse>;
   /** Long-poll for a turn; resolves `null` when the wait elapses with no work. */
   poll(request: WorkerPollRequest, signal: AbortSignal): Promise<PolledTurn | null>;
   /**

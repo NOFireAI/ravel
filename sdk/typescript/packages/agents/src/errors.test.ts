@@ -19,6 +19,9 @@ const EXPECTED: Record<string, RetryHint> = {
 /** Raised by the step runner and never carried on the wire. */
 const SDK_LOCAL = ["ConcurrentStepError", "InvalidStepInput"];
 
+/** The server's 401 and 403, which carry no `ErrorBody`. */
+const AUTH = ["Forbidden"];
+
 type ErrorClass = new (message: string, options?: errors.RavelAgentsErrorOptions) => RavelAgentsError;
 
 function errorClasses(): [string, ErrorClass][] {
@@ -30,8 +33,19 @@ function errorClasses(): [string, ErrorClass][] {
 }
 
 describe("typed errors", () => {
-  it("exports exactly the eleven ADR-3331 errors and the two SDK-local ones", () => {
-    expect(errorClasses().map(([name]) => name).sort()).toEqual([...Object.keys(EXPECTED), ...SDK_LOCAL].sort());
+  it("exports exactly the eleven ADR-3331 errors, the auth refusal and the two SDK-local ones", () => {
+    expect(errorClasses().map(([name]) => name).sort()).toEqual(
+      [...Object.keys(EXPECTED), ...AUTH, ...SDK_LOCAL].sort(),
+    );
+  });
+
+  it("the auth refusal is typed, carries its HTTP status and is never retried", () => {
+    const err = new errors.Forbidden(403, "this route requires the agents capability");
+    expect(err).toBeInstanceOf(RavelAgentsError);
+    expect(err.code).toBe("Forbidden");
+    expect(err.name).toBe("Forbidden");
+    expect(err.retry).toBe("never");
+    expect(err.status).toBe(403);
   });
 
   it("the SDK-local errors are typed and never retried", () => {

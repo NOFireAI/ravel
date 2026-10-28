@@ -6,10 +6,11 @@
  * third-party packages.
  */
 import type { z } from "zod";
-import { OutcomeUnknown, UnsupportedFormat } from "../errors.js";
+import { Forbidden, OutcomeUnknown, UnsupportedFormat } from "../errors.js";
 import type { AnyAgentDefinition, MessageNames, PayloadOf, ResultOf } from "../types.js";
 import { errorFromBody } from "../wire/errors.js";
 import {
+  AuthErrorBody,
   CallRequest,
   CallResponse,
   CancelRequest,
@@ -300,6 +301,11 @@ export function createClient(options: ClientOptions): RavelAgentsClient {
         if (error.retry !== "backoff") throw error;
         last = error;
         continue;
+      }
+      if (response.status === 401 || response.status === 403) {
+        const refused = AuthErrorBody.safeParse(json);
+        const detail = refused.success ? `${refused.data.errorType}: ${refused.data.error}` : "credential refused";
+        throw new Forbidden(response.status, `${route}: HTTP ${String(response.status)} ${detail}`);
       }
       if (response.status >= 500) {
         last = new OutcomeUnknown(`${route}: HTTP ${String(response.status)}`);

@@ -6,6 +6,7 @@ import { ERROR_CODES } from "../wire/errors.js";
 import { defineAgent } from "../worker/index.js";
 import {
   createClient,
+  Forbidden,
   IdempotencyConflict,
   OperationFailed,
   OutcomeUnknown,
@@ -204,6 +205,31 @@ describe("client", () => {
     await expect(client.agent<typeof greeter>("greeter", "g-1").send("greet", { name: "a" })).rejects.toBeInstanceOf(
       UnsupportedFormat,
     );
+  });
+
+  it("a 401 or 403 with the server's plain error body is Forbidden, not retried", async () => {
+    for (const [status, errorType, error] of [
+      [401, "unauthorized", "authentication required"],
+      [403, "forbidden", "this route requires the agents capability"],
+    ] as const) {
+      let calls = 0;
+      const client = createClient({
+        url: "http://x.invalid",
+        token: "t",
+        fetch: () => {
+          calls += 1;
+          return Promise.resolve(new Response(JSON.stringify({ status: "error", errorType, error }), { status }));
+        },
+      });
+      const refused: unknown = await client
+        .agent<typeof greeter>("greeter", "g-1")
+        .send("greet", { name: "a" })
+        .catch((e: unknown) => e);
+      expect(refused, String(status)).toBeInstanceOf(Forbidden);
+      expect(refused).toMatchObject({ code: "Forbidden", retry: "never", status });
+      expect((refused as Error).message).toContain(`${errorType}: ${error}`);
+      expect(calls).toBe(1);
+    }
   });
 
   it("sends the bearer token and the wire body", async () => {
