@@ -4379,8 +4379,13 @@ pub const READBACK_QUERY_STALE_MARKER: &str = "stale_marker";
 pub const READBACK_COUNT_WINDOW: i64 = 86_400_000;
 
 /// One `count_over_time` window of a read-back: the instant query at
-/// `end_ms` over `[range_ms ms]`, which covers `(end_ms - range_ms, end_ms]`
-/// (a PromQL range selector is open on the left).
+/// `end_ms` over `[range_ms ms]`, which covers `(end_ms - range_ms, end_ms]`.
+/// The split counts a boundary sample once only because every read-back
+/// engine's range is open on the left: Prometheus and Mimir (Prometheus
+/// 3.x), Ravel (`crates/ravel-promql/src/source.rs`, the range window), and
+/// VictoriaMetrics v1.115.0, whose `app/vmselect/promql/rollup.go` takes
+/// `tStart := tEnd - window` and keeps the samples after `tStart` up to and
+/// including `tEnd` (`seekFirstTimestampIdxAfter`, then `values[i:j]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CountWindow {
     /// The evaluation time of the instant query.
