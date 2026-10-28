@@ -208,10 +208,11 @@ fi
 # `flight-lane` feature left main uncompilable under
 # `--features sql-latency,profiling,flight-lane` because nothing gated it.
 #
-# Mirrors CI's `lint`, `sql`, `flight-sql`, and `features` jobs. In scoped
-# mode each lane runs when a crate it covers is in the closure computed above,
-# so `-p ravel-query` runs the sql, flight-sql and esql lanes (ravel-sql and
-# ravel-server depend on it) and `-p ravel-affinity` runs none.
+# Mirrors CI's `lint`, `sql`, `flight-sql`, `features`, `features-agents` and
+# `features-mcp` jobs. In scoped mode each lane runs when a crate it covers is
+# in the closure computed above, so `-p ravel-query` runs the sql, agents, mcp,
+# flight-sql and esql lanes (ravel-sql and ravel-server depend on it) and
+# `-p ravel-affinity` runs none.
 #
 # Under --dry-run every cargo command below is printed by `run` and not
 # executed, so the printed list is the list a real run executes.
@@ -274,7 +275,24 @@ run_feature_lane() {
   fi
 }
 
+# run_filtered_feature_lane <feature> <filter> <cargo args...>: the
+# feature lane above, with the tests narrowed to those whose path contains
+# <filter> (a positional test-name filter, which nextest and `cargo test` both
+# take). Clippy still lints every target under the feature.
+run_filtered_feature_lane() {
+  local feature="$1" filter="$2"
+  shift 2
+  run cargo clippy --locked "$@" --features "${feature}" --all-targets -- -D warnings
+  if [[ ${have_nextest} -eq 1 ]]; then
+    run cargo nextest run --locked "$@" --features "${feature}" "${filter}"
+  else
+    run cargo test --locked "$@" --features "${feature}" "${filter}"
+  fi
+}
+
 want_sql=0
+want_agents=0
+want_mcp=0
 want_flight_sql=0
 want_esql=0
 want_bench=0
@@ -283,6 +301,8 @@ want_cli_sql_explain=0
 want_ingest_shipping=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
+  want_agents=1
+  want_mcp=1
   want_flight_sql=1
   want_esql=1
   want_bench=1
@@ -293,6 +313,12 @@ else
   for c in "${gate_crates[@]}"; do
     case "${c}" in
       ravel-server) want_sql=1 ;;
+    esac
+    case "${c}" in
+      ravel-server) want_agents=1 ;;
+    esac
+    case "${c}" in
+      ravel-server) want_mcp=1 ;;
     esac
     case "${c}" in
       ravel-server | ravel-sql) want_flight_sql=1 ;;
@@ -322,6 +348,27 @@ fi
 run_feature_lanes() {
   if [[ ${want_sql} -eq 1 ]]; then
     run_feature_lane sql -p ravel-server
+  fi
+  # ravel-server's `agents` feature (ADR-3331 decision 14): the agents router,
+  # flags and metric families compile only under it. The tests are selected
+  # by the name filter `agents` because `tests/cli_reference.rs` pins the
+  # flag page of a build with no optional features and fails by construction
+  # under any feature that adds a flag. The classification test stays in
+  # ravel-catalog and covers proto/ravel/agents.proto (ADR-3331 decision 3),
+  # so the lane names it and a scoped run that does not reach ravel-catalog
+  # still checks it.
+  if [[ ${want_agents} -eq 1 ]]; then
+    run_filtered_feature_lane agents agents -p ravel-server
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification
+    else
+      run cargo test --locked -p ravel-catalog --test sys_proto_format_version_classification
+    fi
+  fi
+  # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
+  # compile only under it. Filtered by `mcp` for the same cli_reference reason.
+  if [[ ${want_mcp} -eq 1 ]]; then
+    run_filtered_feature_lane mcp mcp -p ravel-server
   fi
   if [[ ${want_flight_sql} -eq 1 ]]; then
     run_feature_lane flight-sql -p ravel-server -p ravel-sql
@@ -376,8 +423,24 @@ run_feature_lanes() {
   fi
 }
 
+# The TypeScript SDK gate (scripts/gates-sdk.sh: npm ci, lint, typecheck and
+# test under sdk/typescript). Workspace mode only: scoped mode selects cargo
+# packages and the SDK is not one, so no -p argument reaches it. It refuses
+# with exit 64 when node is absent or not the major sdk/typescript/.node-version
+# pins, which fails the workspace gate.
+want_sdk=0
+if [[ ${#crate_args[@]} -eq 0 ]]; then
+  want_sdk=1
+fi
+run_sdk_gate() {
+  if [[ ${want_sdk} -eq 1 ]]; then
+    run "$(dirname "$0")/gates-sdk.sh"
+  fi
+}
+
 if [[ ${dry_run} -eq 1 ]]; then
   echo "gates.sh: dry run; the cargo commands below are printed, not run, and fmt and the source guards are skipped"
+  run_sdk_gate
   run_cargo_gates
   run_feature_lanes
   exit 0
@@ -578,6 +641,7 @@ echo "==> scripts/guards/check-test-suites-run.sh"
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
 check_ingest_memory_flag_docs "${config_rs}"
 
+run_sdk_gate
 run_cargo_gates
 run_feature_lanes
 

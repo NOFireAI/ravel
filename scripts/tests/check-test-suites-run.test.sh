@@ -322,5 +322,97 @@ commit_all "${d}"
 out="$(run_guard "${d}")"; rc=$?
 check_eq "a workflows dir with no yml exits 2, not 0" "2" "${rc}"
 
+# --- TypeScript suites: their runner must be tracked and wired ----------
+# vitest discovers sdk/**.test.ts by pattern, so the guard checks the one
+# runner, scripts/gates-sdk.sh, rather than each file.
+
+# add_ts_suite <repo> <path>: a tracked-to-be TypeScript suite.
+add_ts_suite() {
+  mkdir -p "$1/$(dirname "$2")"
+  printf 'import { it } from "vitest";\nit("x", () => {});\n' >"$1/$2"
+}
+
+# add_sdk_runner <repo> [wired]
+add_sdk_runner() {
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$1/scripts/gates-sdk.sh"
+  chmod +x "$1/scripts/gates-sdk.sh"
+  if [[ "${2:-no}" == "wired" ]]; then
+    printf '      - run: scripts/gates-sdk.sh\n' >>"$1/.github/workflows/ci.yml"
+  fi
+}
+
+d="$(new_repo ts_wired)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/x.test.ts"
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/deep/y.test.ts"
+add_sdk_runner "${d}" wired
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "TypeScript suites with a wired, tracked runner pass (0)" "0" "${rc}"
+check_contains "and the summary counts them" "2 TypeScript test suite(s) under sdk/" "${out}"
+
+# Mutation: drop the TypeScript scan; this case then exits 0.
+d="$(new_repo ts_unwired)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/x.test.ts"
+add_sdk_runner "${d}"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "TypeScript suites whose runner no workflow names fail (1)" "1" "${rc}"
+check_contains "and say the runner runs nowhere" "scripts/gates-sdk.sh runs in no workflow" "${out}"
+
+# Mutation: match the raw workflow files instead of the stripped text.
+d="$(new_repo ts_comment)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/x.test.ts"
+add_sdk_runner "${d}"
+printf '      # scripts/gates-sdk.sh used to run here\n      - name: run scripts/gates-sdk.sh\n        run: echo no\n' \
+  >>"${d}/.github/workflows/ci.yml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a runner named only in a comment or name: fails (1)" "1" "${rc}"
+
+# Mutation: drop the boundaries on the runner match.
+d="$(new_repo ts_prefix)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/x.test.ts"
+add_sdk_runner "${d}"
+printf '      - run: scripts/old-gates-sdk.sh\n' >>"${d}/.github/workflows/ci.yml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a runner covered only as another name's substring fails (1)" "1" "${rc}"
+
+# Mutation: drop the tracked-runner check.
+d="$(new_repo ts_untracked_runner)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/x.test.ts"
+printf '      - run: scripts/gates-sdk.sh\n' >>"${d}/.github/workflows/ci.yml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a wired runner that is not tracked fails (1)" "1" "${rc}"
+check_contains "and says it is not tracked" "scripts/gates-sdk.sh is not tracked" "${out}"
+
+# No TypeScript suites: nothing to require, and nothing claimed about them.
+d="$(new_repo ts_none)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "no TypeScript suites and no runner pass (0)" "0" "${rc}"
+check_true "and the summary says nothing about TypeScript" \
+  "$([[ "${out}" != *"TypeScript"* ]] && echo 1 || echo 0)"
+
+# Both kinds orphaned at once: one exit 1 naming both.
+d="$(new_repo ts_and_shell)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_suite "${d}" "scripts/tests/beta.test.sh"
+add_ts_suite "${d}" "sdk/typescript/packages/a/src/x.test.ts"
+add_sdk_runner "${d}"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a shell and a TypeScript orphan together fail (1)" "1" "${rc}"
+check_contains "and the shell orphan is named" "ORPHAN    scripts/tests/beta.test.sh" "${out}"
+check_contains "and the TypeScript runner is named" "scripts/gates-sdk.sh runs in no workflow" "${out}"
+check_contains "and the shell summary still prints" "1 of 2 shell test suite(s) run in no CI job." "${out}"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]

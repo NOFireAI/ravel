@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Cases for the scoped selection in scripts/gates.sh and scripts/affected-tests.sh
 # (issue #2877): scoped mode gates the reverse-dependency closure of the named
-# crates, and the sql, flight-sql and esql lanes follow that closure.
+# crates, and the sql, agents, mcp, flight-sql and esql lanes follow that
+# closure. The SDK gate runs in workspace mode only.
 #
 # Run by the doc-scripts job in .github/workflows/ci.yml, and by hand with
 #   bash scripts/gates.test.sh
@@ -117,6 +118,12 @@ stage_clippy='==> cargo clippy --locked -p ravel-logseg -p ravel-ingest --featur
 cli_explain_clippy='==> cargo clippy --locked -p ravel-cli --features sql-explain --all-targets -- -D warnings'
 cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-explain'
 ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings'
+agents_clippy='==> cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings'
+agents_test='==> cargo nextest run --locked -p ravel-server --features agents agents'
+agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification'
+mcp_clippy='==> cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings'
+mcp_test='==> cargo nextest run --locked -p ravel-server --features mcp mcp'
+sdk_gate_re='^==> .*/gates-sdk\.sh$'
 
 # --- gates.sh --dry-run -------------------------------------------------
 
@@ -131,6 +138,14 @@ check_eq "gates -p ravel-query: flight-sql lane clippy" "1" "$(count "${out}" "$
 check_eq "gates -p ravel-query: flight-sql lane tests" "1" "$(count "${out}" "${flight_test}")"
 check_eq "gates -p ravel-query: esql lane clippy" "1" "$(count "${out}" "${esql_clippy}")"
 check_eq "gates -p ravel-query: esql lane tests" "1" "$(count "${out}" "${esql_test}")"
+check_eq "gates -p ravel-query: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
+check_eq "gates -p ravel-query: agents lane tests" "1" "$(count "${out}" "${agents_test}")"
+check_eq "gates -p ravel-query: agents lane classification test" "1" \
+  "$(count "${out}" "${agents_classification}")"
+check_eq "gates -p ravel-query: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
+check_eq "gates -p ravel-query: mcp lane tests" "1" "$(count "${out}" "${mcp_test}")"
+check_eq "gates -p ravel-query: no SDK gate in scoped mode" "0" \
+  "$(count_matching "${out}" "${sdk_gate_re}")"
 check_eq "gates -p ravel-query: scoped clippy covers ravel-sql and ravel-server" "1" \
   "$(count_matching "${out}" '^==> cargo clippy --locked (-p [a-z-]+ )*-p ravel-sql (-p [a-z-]+ )*--all-targets' )"
 check_eq "gates -p ravel-query: scoped clippy names ravel-server" "1" \
@@ -210,6 +225,21 @@ check_eq "gates -p ravel-esql: esql lane clippy" "1" "$(count "${out}" "${esql_c
 check_eq "gates -p ravel-esql: esql lane tests" "1" "$(count "${out}" "${esql_test}")"
 check_eq "gates -p ravel-esql: sql lane clippy" "1" "$(count "${out}" "${sql_clippy}")"
 
+# -p ravel-types: every crate depends on it, ravel-server included, so the
+# agents and mcp lanes run.
+run_stubbed types bash "${SCRIPTS}/gates.sh" -p ravel-types --dry-run
+out="${tmp}/types.out"
+check_eq "gates -p ravel-types: exit 0" "0" "${rc}"
+check_eq "gates -p ravel-types: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
+check_eq "gates -p ravel-types: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
+
+# -p ravel-logseg: ravel-cli and ravel-bench depend on it, ravel-server does
+# not, so neither the agents nor the mcp lane runs.
+check_eq "gates -p ravel-logseg: no agents lane" "0" \
+  "$(count "${tmp}/logseg.out" "${agents_clippy}")"
+check_eq "gates -p ravel-logseg: no mcp lane" "0" \
+  "$(count "${tmp}/logseg.out" "${mcp_clippy}")"
+
 # -p ravel-logseg reaches no crate the esql lane covers.
 check_eq "gates -p ravel-logseg: no esql lane" "0" \
   "$(count "${tmp}/logseg.out" "${esql_clippy}")"
@@ -228,7 +258,14 @@ check_eq "gates --dry-run: esql lane" "1" "$(count "${out}" "${esql_clippy}")"
 check_eq "gates --dry-run: sql-explain lane" "1" "$(count "${out}" "${cli_explain_clippy}")"
 check_eq "gates --dry-run: ravel-ingest shipping-features clippy" "1" \
   "$(count "${out}" "${ingest_shipping_clippy}")"
-check_eq "gates --dry-run: feature lane clippy runs" "7" \
+check_eq "gates --dry-run: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
+check_eq "gates --dry-run: agents lane tests" "1" "$(count "${out}" "${agents_test}")"
+check_eq "gates --dry-run: agents lane classification test" "1" \
+  "$(count "${out}" "${agents_classification}")"
+check_eq "gates --dry-run: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
+check_eq "gates --dry-run: mcp lane tests" "1" "$(count "${out}" "${mcp_test}")"
+check_eq "gates --dry-run: SDK gate" "1" "$(count_matching "${out}" "${sdk_gate_re}")"
+check_eq "gates --dry-run: feature lane clippy runs" "9" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
 check_eq "gates --dry-run: no cargo call" "0" "$(wc -l <"${tmp}/workspace.calls" | tr -d ' ')"
 
@@ -270,12 +307,20 @@ check_eq "affected-tests -p ravel-query: flight-sql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql')"
 check_eq "affected-tests -p ravel-query: esql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features esql')"
+check_eq "affected-tests -p ravel-query: agents tests" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents agents')"
+check_eq "affected-tests -p ravel-query: classification test" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-catalog --test sys_proto_format_version_classification')"
+check_eq "affected-tests -p ravel-query: mcp tests" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp mcp')"
 
 # Neither crate in the closure: no feature run.
 run_stubbed at-affinity bash "${SCRIPTS}/affected-tests.sh" -p ravel-affinity
 check_eq "affected-tests -p ravel-affinity: exit 0" "0" "${rc}"
 check_eq "affected-tests -p ravel-affinity: no feature run" "0" \
   "$(count_matching "${tmp}/at-affinity.calls" '--features')"
+check_eq "affected-tests -p ravel-affinity: no classification test" "0" \
+  "$(count_matching "${tmp}/at-affinity.calls" 'sys_proto_format_version_classification')"
 
 # A failing sql run fails the script, after the flight-sql run still ran.
 CARGO_STUB_FAIL_ON="--features sql" run_stubbed at-fail bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
@@ -288,6 +333,16 @@ CARGO_STUB_FAIL_ON="--features esql" run_stubbed at-esql-fail bash "${SCRIPTS}/a
 check_eq "affected-tests, esql run fails: exit 3" "3" "${rc}"
 check_eq "affected-tests, esql run fails: sql still ran" "1" \
   "$(count_matching "${tmp}/at-esql-fail.calls" '--features sql$')"
+
+# A failing agents run fails the script too, after the mcp run still ran.
+CARGO_STUB_FAIL_ON="--features agents" run_stubbed at-agents-fail bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
+check_eq "affected-tests, agents run fails: exit 3" "3" "${rc}"
+check_eq "affected-tests, agents run fails: mcp still ran" "1" \
+  "$(count_matching "${tmp}/at-agents-fail.calls" '--features mcp mcp$')"
+
+# A failing mcp run fails the script.
+CARGO_STUB_FAIL_ON="--features mcp" run_stubbed at-mcp-fail bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
+check_eq "affected-tests, mcp run fails: exit 3" "3" "${rc}"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]
