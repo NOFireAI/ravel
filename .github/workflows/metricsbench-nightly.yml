@@ -3,7 +3,8 @@ name: metricsbench-nightly
 # Scheduled MetricsBench lane (issues #939 and #940, ADR-0927).
 #
 # Runs deploy/metricsbench/run.sh against the full compose stack (RustFS,
-# Prometheus, VictoriaMetrics, Mimir and Ravel from a pinned image): it
+# Prometheus, VictoriaMetrics, Mimir and Ravel built from the commit this run
+# checked out): it
 # replays the sample stream into all four engines over Remote Write 1.0,
 # reads each one back, runs the PromQL corpus against all four with
 # Prometheus as the oracle, validates the resulting report, and samples every
@@ -11,6 +12,16 @@ name: metricsbench-nightly
 # effective-config.json, provenance.json, report.json, memory.jsonl,
 # memory-summary.json, compose.log and each step's log) is uploaded, so a
 # run is reproducible from what it stamped.
+#
+# Ravel under test: the root Dockerfile's server target, built here from
+# github.sha and kept local (publish-images.yml publishes only on tags and
+# manual dispatch, ADR-0037 decision 4, so no per-commit image exists to pull,
+# and this workflow pushes nothing). run.sh takes it as
+# --ravel-image ravel-server:nightly-<sha> --ravel-image-id <its Id>, refuses
+# the run unless `docker image inspect` reports that Id, and stamps
+# ravel_image.kind "local-build" with the Id and the source commit
+# (deploy/metricsbench/tests/run.test.sh case p). A local-build run is never
+# publishable: run.sh accepts --ravel-image-id with --profile ci only.
 #
 # Profile: `ci`. MetricsBench pins three orthogonal comparable profiles
 # (cardinality/history/churn) plus the CI-sized `ci` profile (ADR-0927
@@ -21,7 +32,8 @@ name: metricsbench-nightly
 # hides a request-count defect, so only the real-S3 lane (bench-s3.yml)
 # produces publishable numbers. This lane is a RustFS diagnostic/correctness
 # run, so it uses the `ci` profile, whose artifact carries its own
-# non-comparability marker.
+# non-comparability marker. Building Ravel from the run's own commit keeps it
+# non-comparable on a second count: no two nights measure the same Ravel.
 #
 # NON-BLOCKING by construction (ADR-0070, ADR-0075): this workflow triggers
 # only on a schedule and on manual dispatch, never on push/pull_request/
@@ -49,16 +61,24 @@ permissions:
 jobs:
   metricsbench-rustfs:
     runs-on: ubuntu-latest
-    # 75 minutes. A cold release build of the three bins takes most of 30
-    # minutes on its own; run.sh then pulls five images and waits for each of
-    # four engines in turn. METRICSBENCH_READY_TRIES below gives each engine
-    # 75 tries: 2.5 minutes when a refused connection fails fast, and up to
-    # 8.75 minutes (75 x the 2 s interval plus curl's 5 s cap) when a port
-    # accepts and does not answer, so up to 35 minutes for four. Then it
-    # replays the ci profile (120,000 samples) into four engines and runs 20
-    # corpus entries x 6 passes x 3 reps against four engines, each query
-    # capped at 120 s. The budget leaves the out-dir upload room to run.
-    timeout-minutes: 75
+    # 140 minutes = 57 + 30 + 35 + 9 + 9:
+    #   57  the cold `docker build --target server` of the root Dockerfile,
+    #       a full workspace compile at the Dockerfile's CARGO_BUILD_JOBS=2
+    #       with no cache (ci.yml's docker-build job measured about 57 on a
+    #       constrained host);
+    #   30  the cold release build of the three bins, most of 30 on its own;
+    #   35  the engine readiness bound: METRICSBENCH_READY_TRIES below gives
+    #       each engine 75 tries, 2.5 minutes when a refused connection fails
+    #       fast and up to 8.75 (75 x the 2 s interval plus curl's 5 s cap)
+    #       when a port accepts and does not answer, so up to 35 for four;
+    #   9   the ci profile's in-process row (120,000 samples into a memory
+    #       store), about 500 s;
+    #   9   the four HTTP rows' ingest and read-back, 20 corpus entries x 6
+    #       passes x 3 reps against four engines, and the out-dir upload.
+    # The per-row ingest ceiling (600 s, run.sh case m) and each query's
+    # 120 s cap bound a stalled row or query, not a healthy run; a run that
+    # spends several of those bounds at once outlasts this budget.
+    timeout-minutes: 140
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -75,14 +95,23 @@ jobs:
           cargo build --release --locked -p ravel-bench \
             --bin metricsbench_ingest --bin metricsbench_query \
             --bin metricsbench_report
+      # The same command ci.yml's docker-build job runs, tagged locally. The
+      # image is never pushed: ADR-0037 decision 4 keeps publishing off plain
+      # main commits, and this run only needs it on this runner.
+      - name: Build the Ravel server image from this commit
+        run: docker build --target server -t "ravel-server:nightly-${{ github.sha }}" .
+      - name: Read the built image's Id
+        id: ravel-image
+        run: |
+          id="$(docker image inspect --format '{{.Id}}' "ravel-server:nightly-${{ github.sha }}")"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
       - name: Run the ci profile end to end
         env:
-          # The first published ravel-server image carrying the
-          # --max-series/--max-samples flags ravel.yml passes. run.sh refuses
-          # a reference without a digest, and stamps the source commit
-          # alongside it rather than trusting the binary's own version.
-          RAVEL_IMAGE_REF: ghcr.io/nofireai/ravel-server:manual-0bf5fed@sha256:42116db1a8b2b0da52b5bc71219678d9b32d42aefb61ba46152ba9f9968d5ca7
-          RAVEL_SOURCE_COMMIT: 0bf5fedb2834df7dc87f8086701dd289b049efb0
+          RAVEL_IMAGE_REF: ravel-server:nightly-${{ github.sha }}
+          # run.sh refuses the run unless the tag still has this Id, and
+          # stamps it as a local build rather than a published image.
+          RAVEL_IMAGE_ID: ${{ steps.ravel-image.outputs.id }}
+          RAVEL_SOURCE_COMMIT: ${{ github.sha }}
           # 75 tries per engine (the bound is in the timeout comment above).
           # run.sh's default of 300 would let four stalled engines outlast
           # the job timeout, which cancels the out-dir upload below.
@@ -96,6 +125,7 @@ jobs:
           deploy/metricsbench/run.sh \
             --profile ci \
             --ravel-image "$RAVEL_IMAGE_REF" \
+            --ravel-image-id "$RAVEL_IMAGE_ID" \
             --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
             --bin-dir target/release \
             --out-dir metricsbench-out
