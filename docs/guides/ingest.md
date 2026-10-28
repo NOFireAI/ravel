@@ -1759,7 +1759,18 @@ group, in the given order.
   load prints `warning: --chunk-order names <name>, which no mapped
   attribute carries` for each name that no `[[attribute]]` or
   `[[resource_attribute]]` key of the mapping names. A mapped key that no
-  row carries is still skipped without a warning. An empty name, a name
+  row carries is still skipped without a warning.
+- A string or bytes `[[resource_attribute]]` key gets a column only if it
+  is one of the tenant's indexed fields, which the load reads from the
+  store when it flushes, not before. For a name that the mapping carries
+  only as such a key, the load prints `warning: --chunk-order names <name>,
+  a string resource attribute, which gets a column only if it is an
+  indexed field` (`a bytes resource attribute` for a bytes key). If the
+  key is not indexed, the name is skipped. A numeric resource key gets a
+  column whether or not it is indexed, and a key that is also an
+  `[[attribute]]` gets one from the rows that carry it, so neither is
+  warned about.
+- An empty name, a name
   with leading or trailing spaces, or a name given twice is refused before
   anything is read.
 - An object with more attribute names than the writer's dynamic column cap

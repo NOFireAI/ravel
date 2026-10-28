@@ -984,3 +984,213 @@ fn chunk_order_warns_about_unknown_names_in_the_order_given() {
         ]
     );
 }
+
+/// A logs mapping with a string resource key `service.name`, an i64 resource
+/// key `process.pid`, a bytes resource key `trace.blob`, a string record key
+/// `user`, and a string key `cloud.region` mapped as both.
+const STRING_RESOURCE_MAPPING: &str = r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[resource_attribute]]
+key = "process.pid"
+column = "pid"
+type = "i64"
+
+[[resource_attribute]]
+key = "trace.blob"
+column = "blob"
+type = "bytes"
+
+[[resource_attribute]]
+key = "cloud.region"
+column = "region"
+type = "str"
+
+[[attribute]]
+key = "user"
+column = "user"
+type = "str"
+
+[[attribute]]
+key = "cloud.region"
+column = "region"
+type = "str"
+"#;
+
+/// Issue #3276: of a string resource key, an i64 resource key and a string
+/// record key, only the string resource key is warned about, since only it
+/// depends on the tenant's indexed fields for a column; a bytes resource key
+/// is warned about the same way, naming its type.
+///
+/// Prove-the-test: before `string_resource_chunk_order_warnings` there is no
+/// such warning and the first assertion fails; warn for every resource key
+/// and it fails on `process.pid`.
+#[test]
+fn chunk_order_warns_only_about_a_string_resource_key() {
+    let mapping = parse_mapping(STRING_RESOURCE_MAPPING).expect("mapping parses");
+    assert_eq!(
+        string_resource_chunk_order_warnings(
+            chunk_order(&["service.name", "process.pid", "user"]),
+            &mapping
+        ),
+        vec![
+            "warning: --chunk-order names service.name, a string resource attribute, which \
+             gets a column only if it is an indexed field"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        string_resource_chunk_order_warnings(chunk_order(&["user", "trace.blob"]), &mapping),
+        vec![
+            "warning: --chunk-order names trace.blob, a bytes resource attribute, which gets \
+             a column only if it is an indexed field"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        unknown_chunk_order_warnings(
+            chunk_order(&["service.name", "process.pid", "user", "trace.blob"]),
+            &mapping
+        ),
+        Vec::<String>::new(),
+        "every name is mapped, so the unknown-name warning stays quiet"
+    );
+}
+
+/// A string key mapped as both a `[[resource_attribute]]` and an
+/// `[[attribute]]` is carried per record and gets a column, so it is not
+/// warned about.
+///
+/// Prove-the-test: drop the `record_keys` filter and `cloud.region` is
+/// warned about.
+#[test]
+fn chunk_order_does_not_warn_about_a_key_also_mapped_per_record() {
+    let mapping = parse_mapping(STRING_RESOURCE_MAPPING).expect("mapping parses");
+    assert_eq!(
+        string_resource_chunk_order_warnings(chunk_order(&["cloud.region", "user"]), &mapping),
+        Vec::<String>::new()
+    );
+}
+
+/// Issue #3276 end to end: a logs load whose `--chunk-order` names a string
+/// resource key, an i64 resource key, a string record key and a string key
+/// mapped as both prints the string-resource warning for the first and for
+/// nothing else, and the RLOG object it writes has FIELD_DIR columns for the
+/// other three and none for the first. If the writer ever grants that column
+/// on its own, the last assertion names the warning as stale.
+///
+/// Prove-the-test: before `string_resource_chunk_order_warnings` the sink has
+/// no chunk-order line and the first assertion fails.
+#[tokio::test]
+async fn chunk_order_string_resource_warning_matches_the_written_columns() {
+    use ravel_logseg::{FieldType, RlogConfig, RlogReader};
+    use ravel_object_store::GetRange;
+    use ravel_object_store::memory::MemoryStore;
+
+    const WARNING: &str = "warning: --chunk-order names service.name, a string resource \
+                           attribute, which gets a column only if it is an indexed field";
+
+    let (dir, pq) = write_parquet(&batch(vec![
+        ("ts", i64_col(vec![NOW_NS; 2])),
+        ("svc", str_col(vec!["api", "api"])),
+        ("pid", i64_col(vec![7, 7])),
+        ("blob", str_col(vec!["b", "b"])),
+        ("region", str_col(vec!["eu", "eu"])),
+        ("user", str_col(vec!["ann", "bob"])),
+    ]));
+    let mapping_path = dir.path().join("mapping.toml");
+    // STRING_RESOURCE_MAPPING less its bytes key, which would need a binary
+    // column and is covered by the unit test.
+    std::fs::write(
+        &mapping_path,
+        STRING_RESOURCE_MAPPING.replace(
+            "[[resource_attribute]]\nkey = \"trace.blob\"\ncolumn = \"blob\"\ntype = \"bytes\"\n",
+            "",
+        ),
+    )
+    .expect("write mapping");
+    assert!(
+        !std::fs::read_to_string(&mapping_path)
+            .expect("read mapping")
+            .contains("trace.blob")
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(NOW_NS);
+    let sink = SharedSink::default();
+    let mut warnings = sink.clone();
+    run_fold_warning_to(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping_path,
+        SignalArg::Logs,
+        1,
+        2,
+        0,
+        Some(1),
+        Some(1),
+        DEFAULT_MAX_INFLIGHT_FLUSHES,
+        DEFAULT_DECODE_QUEUE_BATCHES,
+        Some(1),
+        None,
+        None,
+        RlogZstdLevel::DEFAULT,
+        RlogGroupTargetBlocks::DEFAULT,
+        chunk_order(&["service.name", "process.pid", "user", "cloud.region"]),
+        LoadMemoryRequest::Derived {
+            host_total_bytes: Some(64 << 30),
+        },
+        false,
+        &IpcryptPolicy::empty(),
+        NOW_NS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        &mut warnings,
+    )
+    .await
+    .expect("load succeeds");
+
+    let emitted = sink.text();
+    assert_eq!(
+        emitted
+            .lines()
+            .filter(|l| l.starts_with("warning: --chunk-order"))
+            .collect::<Vec<_>>(),
+        vec![WARNING],
+        "{emitted}"
+    );
+
+    let objects = list_data_objects(store.as_ref()).await;
+    assert_eq!(objects.len(), 1, "{objects:?}");
+    let got = store
+        .get(&objects[0].0, GetRange::Full)
+        .await
+        .expect("get object");
+    let directories = RlogReader::new(got.data.as_ref(), &RlogConfig::default())
+        .expect("open rlog")
+        .directories();
+    let columns: Vec<(&str, FieldType)> = directories
+        .field_dir()
+        .entries()
+        .iter()
+        .map(|e| (e.name.as_str(), e.ty))
+        .collect();
+    for want in [
+        ("process.pid", FieldType::I64),
+        ("user", FieldType::Str),
+        ("cloud.region", FieldType::Str),
+    ] {
+        assert!(columns.contains(&want), "no {want:?} column: {columns:?}");
+    }
+    assert!(
+        !columns.iter().any(|(name, _)| *name == "service.name"),
+        "the writer gave service.name a column although no indexed field names it, so the \
+         warning `{WARNING}` is stale: {columns:?}"
+    );
+}
