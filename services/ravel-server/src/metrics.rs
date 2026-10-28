@@ -3985,8 +3985,8 @@ impl DecodedCacheMetrics {
 }
 
 /// The ADR-3326 decoded column-block cache families, `{mode}` only: occupancy
-/// as gauges, and the process-wide hit, miss, admission, ghost-hit, margin-skip,
-/// pressure-eviction and age-drop counts as counters.
+/// as gauges, and the process-wide hit, miss, admission, eviction, ghost-hit,
+/// margin-skip, pressure-eviction and age-drop counts as counters.
 fn render_decoded_cache_family(out: &mut String, mode: Mode, m: &DecodedCacheMetrics) {
     let gauges = [
         (
@@ -4024,6 +4024,11 @@ fn render_decoded_cache_family(out: &mut String, mode: Mode, m: &DecodedCacheMet
             "ravel_decoded_cache_admissions_total",
             "Decoded columns admitted to the decoded column-block cache.",
             m.counters.admissions,
+        ),
+        (
+            "ravel_decoded_cache_evictions_total",
+            "Entries the decoded column-block cache's CLOCK evicted to make room for an admission.",
+            m.counters.evictions,
         ),
         (
             "ravel_decoded_cache_ghost_hits_total",
