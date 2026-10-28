@@ -29,7 +29,8 @@
 //!
 //! # Mapping production answers to [`Reply`]
 //!
-//! Every choice below is exercised by the test named with it.
+//! Each choice below names the test that exercises it, or says that no
+//! schedule reaches it yet.
 //!
 //! - `Coordinator::create` answers [`Reply::Created`] with its incarnation
 //!   and `created` flag (every schedule's setup).
@@ -55,8 +56,12 @@
 //! - `Coordinator::cancel` answers [`Reply::Cancel`] with its status and
 //!   `requested` flag (`schedules::races::cancel_racing_completion_one_wins`).
 //! - [`Proc::operation`] reads through `AgentStore::resolve` and answers
-//!   [`Reply::Status`], or [`Reply::UnknownOperation`] when the root has no
-//!   input under the handle (`schedules::senders::competing_senders_take_distinct_accept_seqs`).
+//!   [`Reply::Status`] (`schedules::senders::competing_senders_take_distinct_accept_seqs`),
+//!   or [`Reply::UnknownOperation`] when the root has no input under the
+//!   handle. No schedule queries a handle with no input yet, so the
+//!   `UnknownOperation` answers of [`Proc::operation`] and [`Proc::result`]
+//!   and the `Resolved(None)` answer of [`Proc::resolve`] are mappings no
+//!   test has reached; the milestone 3 schedules add one.
 //! - [`Proc::result`] reads HEAD once and answers [`Reply::Result`]: `None`
 //!   while the input is not terminal, else its status, the output object's
 //!   bytes, and the error string with `""` read as no error
@@ -671,11 +676,6 @@ impl Rig {
 
     pub fn build(&self) -> Result<Run, String> {
         self.recorder.build()
-    }
-
-    /// Every process the rig made, setup included, in creation order.
-    pub fn procs(&self) -> Vec<ProcHandle> {
-        lock(&self.procs).clone()
     }
 
     /// The process named `name`; the last one when the name repeats.
