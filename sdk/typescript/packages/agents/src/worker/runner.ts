@@ -354,7 +354,10 @@ export async function runTurn(
     return { outcome: "abandoned", ...base, error };
   }
 
-  const stateParse = agent.state.safeParse(a.state);
+  // The coordinator holds no state object until an agent's first commit and
+  // polls that turn with a null state; the turn starts from `initialState`.
+  const fresh = a.state === null && a.lease.base_state_version === 0;
+  const stateParse = agent.state.safeParse(fresh ? agent.initialState : a.state);
   const turn = new Turn<unknown>(polled, stateParse.success ? stateParse.data : undefined, transport, signal);
   let completed: { output: unknown } | undefined;
   let failure: { error: string; terminal: boolean } | undefined;

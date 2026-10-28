@@ -326,9 +326,19 @@ describe("serveAgents over HttpTransport", () => {
     }),
   });
 
-  async function serveOnce(seed: string) {
-    const lease = { ...pollFixture.assignment.lease, handler_digest: handlerDigest(clockAgent, "place"), random_seed: seed };
-    const assignment = { ...pollFixture.assignment, lease, steps: [] };
+  async function serveOnce(seed: string, polled: { state?: unknown; base_state_version?: number } = {}) {
+    const lease = {
+      ...pollFixture.assignment.lease,
+      handler_digest: handlerDigest(clockAgent, "place"),
+      random_seed: seed,
+      ...(polled.base_state_version === undefined ? {} : { base_state_version: polled.base_state_version }),
+    };
+    const assignment = {
+      ...pollFixture.assignment,
+      lease,
+      steps: [],
+      ...("state" in polled ? { state: polled.state } : {}),
+    };
     let served = false;
     const commits: unknown[] = [];
     const reports: TurnReport[] = [];
@@ -356,8 +366,8 @@ describe("serveAgents over HttpTransport", () => {
     } finally {
       await worker.close();
     }
-    const commit = commits[0] as { output: { now: number; random: number } };
-    return { ownerId: worker.ownerId, sent, output: commit.output, reports };
+    const commit = commits[0] as { outcome: string; state?: unknown; error?: string; output: { now: number; random: number } };
+    return { ownerId: worker.ownerId, sent, commit, output: commit.output, reports };
   }
 
   it("registers, polls under the minted id and runs the turn with the lease's time and seed", async () => {
@@ -371,6 +381,16 @@ describe("serveAgents over HttpTransport", () => {
     const other = await serveOnce("00000000000000000000000000000001");
     expect(again.output.random).toBe(first.output.random);
     expect(other.output.random).not.toBe(first.output.random);
+  });
+
+  it("starts a never-committed agent's turn from initialState when the server polls a null state", async () => {
+    const fresh = await serveOnce("8f8d1b06b1618bd08db0300dbba36423", { state: null, base_state_version: 0 });
+    expect(fresh.commit.outcome).toBe("completed");
+    expect(fresh.commit.state).toEqual({ items: [] });
+    // A null state on an agent that has committed is not a fresh agent.
+    const committed = await serveOnce("8f8d1b06b1618bd08db0300dbba36423", { state: null, base_state_version: 3 });
+    expect(committed.commit.outcome).toBe("failed");
+    expect(committed.commit.error).toMatch(/^state does not parse/);
   });
 
   it("uses the tool's effect id and attempt from the journal", async () => {
