@@ -66,7 +66,7 @@ pinned by `keys::tests::layout_matches_the_adr_table`).
 | Key | Builder | Mutability | Write mode |
 |---|---|---|---|
 | `t/<tenant_hash>/ag/<agent_id>/head` | `head_key` | the one mutable record per agent | `CreateIfAbsent` on create, then `CasVersion` |
-| `t/<tenant_hash>/ag/<agent_id>/o/<object_hash>` | `object_key` | immutable: payloads, state snapshots, outputs | `CreateIfAbsent`; on `AlreadyExists` the writer reads back and compares the content hash |
+| `t/<tenant_hash>/ag/<agent_id>/o/<object_hash>` | `object_key` | immutable: payloads, state snapshots, outputs, index pages | `CreateIfAbsent`; on `AlreadyExists` the writer reads back and compares the content hash |
 | `t/<tenant_hash>/ag/_wake/<due_bucket>/<agent_id>` | `wake_key` | advisory wake hint; may be absent, duplicated, stale or early | `Overwrite` |
 | `t/<tenant_hash>/ag/_dir/<agent_id>` | `dir_key` | advisory listing entry | `CreateIfAbsent`, empty body |
 
@@ -104,17 +104,20 @@ in ADR-0066's sense (amendment R1), so every additive field change bumps
 Encoding rules, each pinned by a `head::tests` test:
 
 - `format_version` is field 1 and is gated before any other field is
-  trusted. Only version 1 with the `INLINE` representation decodes; a newer
-  version is `UnsupportedFormat`
+  trusted. Version 1 (every list `INLINE`) and version 2 (every list
+  `PAGED`) decode; a newer version is `UnsupportedFormat`, and a
+  representation that does not match its version is refused
   (`a_newer_format_version_is_refused_before_the_rest_is_read`,
-  `paged_representation_and_page_refs_are_refused_by_version_one`,
-  `a_repeated_format_version_field_is_gated_on_its_decoded_value`).
+  `a_representation_that_does_not_match_the_version_is_refused`,
+  `a_repeated_format_version_field_is_gated_on_its_decoded_value`). The
+  encoder writes version 2 only; a version 1 binary refuses it as
+  `UnsupportedFormat` (`a_version_one_reader_refuses_a_version_two_head`).
 - The record ends with a `seal` field, `0x52414731` ("RAG1"); a missing or
   wrong seal is a typed error (`the_seal_is_the_last_six_bytes`,
   `missing_or_wrong_seal_is_typed`, `every_strict_prefix_is_a_typed_error`).
 - The encoder builds a fresh message from `Head`, so a field this binary
   does not know is dropped on the next write
-  (`an_unknown_field_within_version_1_is_dropped_on_re_encode`). This is
+  (`an_unknown_field_within_version_2_is_dropped_on_re_encode`). This is
   why a newer version must be refused rather than read.
 - Encoded HEAD is capped at 256 KiB (`MAX_HEAD_BYTES`); a transition past
   the cap fails `BudgetExceeded` (kernel test
@@ -126,7 +129,7 @@ Encoding rules, each pinned by a `head::tests` test:
   `crates/ravel-agents-store/src/publish.rs`; ADR-3331 decision 3). No test
   asserts the checksum yet.
 
-Fields of `Head` (format version 1):
+Fields of `Head` (format version 2):
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -154,10 +157,45 @@ Fields of `Head` (format version 1):
 | `steps` | `Vec<StepRecord>` | the durable step transcript: step id, key, tool name and version, input hash, status, output |
 | `effects` | `Vec<EffectRecord>` | the effect journal: effect id, step key, tool identity, input hash, recovery policy, status (`Intent`, `Authorized`, `InDoubt`, `Completed`), attempt, result |
 | `outbox` | `Vec<OutboxIntent>` | effect intents committed by a turn and not yet dispatched |
+| `index` | `Index` | one `Directory` per paged list (`inbox`, `receipts`, `results`, `events`, `timers`; `AgentHead` fields 35 to 39): the `PageRef`s of its sealed pages in key order and `tail_from`, the first key the inline `Vec` above holds |
 
-Version 1 keeps the inbox, receipts and other indexes inline in HEAD with
-hard caps. Milestone 6 moves them to immutable index pages, which is format
-version 2, rolled out readers before writers (ADR-3331 decision 3).
+### Index pages
+
+Format version 2 (ADR-3331 decision 3 and its index-page amendment) keeps
+only the open tail of the inbox, receipts, results, events and timers in
+HEAD. The rest sits in sealed index pages, `o/<object_hash>` objects that
+hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
+`TimerTable` message. The code is `crates/ravel-agents-core/src/pages.rs`.
+
+- A page holds at most `Limits::max_page_entries` entries (default 64) and a
+  list at most `Limits::max_index_pages` pages (default 512). Past either
+  bound the command fails `BudgetExceeded` (`pages::tests::a_full_page_refuses_the_next_append_typed`,
+  `pages::tests::a_full_directory_refuses_the_next_page_typed`).
+- Each `PageRef` records the page's first key, object, entry count and
+  referenced bytes; a receipt page also carries the sorted 4-byte blake3
+  fingerprints of its request ids, a timer page its earliest due time.
+- A full page of the tail seals once its entries cannot change: inbox,
+  receipts and events always; results below the oldest pending input;
+  timers below the lowest generation still scheduled
+  (`pages::tests::timer_pages_never_hold_a_scheduled_timer`,
+  `pages::tests::results_seal_below_the_lowest_pending_input`).
+- The store writes every sealed page with `CreateIfAbsent` before the CAS
+  that first references it (store test
+  `tests::pages::pages_are_written_before_the_cas_that_references_them`);
+  a retry after a lost CAS writes byte-identical pages under the same hashes
+  (`tests::pages::a_lost_cas_reuses_the_page_hash_on_retry`).
+- A command GETs only the pages `Kernel::pages_needed` names. A new send
+  reads no page, a repeat send or a receipt lookup at most one, a wake no
+  timer page, and `read_events` reads by `event_seq` range
+  (`tests::pages::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`,
+  `tests::pages::events_are_read_by_seq_range`). `read_head`, the inspection
+  read, GETs every page.
+- A version 1 HEAD migrates on the next command's own CAS; the HEAD it
+  writes is version 2 and under the byte cap (kernel test
+  `one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`, store test
+  `tests::pages::a_version_one_head_migrates_on_the_next_cas`). Reader and
+  writer ship in one release: a version 1 binary refuses the version 2 HEAD
+  as `UnsupportedFormat` and never re-encodes it.
 
 A HEAD is not deleted. `destroy` sets `Tombstoned`; `create` on a tombstoned
 agent bumps `incarnation` in the same HEAD, and a handle from an earlier
