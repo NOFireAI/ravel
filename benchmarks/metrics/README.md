@@ -432,8 +432,16 @@ Prometheus query API and records `readback`: `series_count` (distinct series
 `/api/v1/series` returns over the replay window for the metric names the
 replay sent, so a receiver's own series, such as a self-scrape, are not
 counted), `sample_count`
-(`count_over_time` over one probe series per float class, evaluated at the
-newest timestamp sent over the whole window), `histogram_series_count` (the
+(`count_over_time` over one probe series per float class, summed over
+consecutive windows of at most one day, `READBACK_COUNT_WINDOW`, newest
+first: the first ends at the newest timestamp sent, each next one ends where
+the previous began, and the oldest reaches just past the oldest timestamp
+sent, so each sample falls in exactly one window
+(`metrics_ingest::tests::count_windows_partition_the_replay_window`); a
+receiver that refuses a range over one day, as Prometheus's
+`--query.max-samples` does on a 30-day replay, still reads back
+(`metrics_ingest::tests::a_two_day_readback_counts_by_day_windows_under_a_one_day_limit`),
+and the `ci` profile's replay is one window), `histogram_series_count` (the
 native-histogram metrics' series, absent on a receiver that does not store
 them), `histogram_sample_count`, `stale_marker_honored` (an instant query at
 the marker's timestamp returns no sample for its series), `expected` (the
@@ -454,7 +462,11 @@ names the query and how long it ran. Each query, body read included, has
 `--http-timeout-secs`. `query_ms` records each query's wall time in
 milliseconds, keyed `series`, `samples.0` and on per probe,
 `histogram_series`, `histogram_samples` and `stale_marker` (the last read's;
-`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`).
+`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`);
+a count query's entry is its total over every window, and `query_windows`
+records how many windows each count query (`samples.0` on, and
+`histogram_samples`) ran
+(`metrics_ingest::tests::a_two_day_readback_counts_by_day_windows_under_a_one_day_limit`).
 The `/api/v1/series` answer is counted as it streams, so a 1,000,000-series
 answer is never held whole in memory
 (`metrics_ingest::tests::series_count_streams_a_200000_series_answer`); an
@@ -462,7 +474,14 @@ answer whose `status` is not `success`, or a body cut short, is refused
 (`metrics_ingest::tests::series_count_refuses_an_error_answer_and_a_truncated_body`).
 The bin fails when `matches_expected` is false
 (`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`,
-`metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`).
+`metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`)
+or a read-back query fails, and stops at that row. It still prints the report
+for the rows replayed so far, the failed one included with its mismatching
+`readback` or, when a query failed, its error in `readback_error`, and exits
+with the same code as before
+(`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`).
+`metricsbench_query` refuses such a report as a run result
+(`metricsbench_query::a_report_whose_readback_failed_does_not_bind`).
 
 #### Band 6: accepted digests per class
 

@@ -1012,3 +1012,94 @@ fn skipping_the_in_process_row_with_no_endpoint_exits_64() {
         "{stderr}"
     );
 }
+
+/// A read-back that fails still leaves the report: with a receiver that
+/// stores every write and answers 500 to every query, the bin exits 1 as
+/// before, and `ingest.json`, written from its stdout as
+/// `deploy/metricsbench/run.sh` writes it, holds the row's ingest figures
+/// with `readback_error` set and no `readback`.
+///
+/// TO SEE THIS FAIL: in `run`, return `RunFailure::from(error)` (no report)
+/// for a failed read-back, as the bin did before it printed one: the exit
+/// code still matches, and `ingest.json` is empty.
+#[test]
+fn a_failed_readback_still_prints_the_report() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind stub");
+    let addr = listener.local_addr().expect("addr");
+    let refuse = || async {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "query refused",
+        )
+    };
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route("/api/v1/series", axum::routing::get(refuse))
+        .route("/api/v1/query", axum::routing::get(refuse));
+    runtime.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let url = format!("http://{addr}");
+    let write = format!("{url}/api/v1/write");
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    let stdout = std::fs::File::create(&ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "1",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "5",
+            "--prometheus-endpoint",
+            &write,
+            "--prometheus-query-url",
+            &url,
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("reading prometheus back failed"),
+        "{stderr}"
+    );
+
+    let text = std::fs::read_to_string(&ingest_json).expect("read ingest.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&text).expect("ingest.json is a JSON report");
+    let systems = report["systems"].as_array().expect("systems");
+    assert_eq!(systems.len(), 1, "{report}");
+    let row = &systems[0];
+    assert_eq!(row["system"], "prometheus");
+    let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
+    assert!(offered > 0, "{row}");
+    assert_eq!(row["ingest"]["accepted_samples"], offered, "{row}");
+    assert!(row.get("readback").is_none(), "{row}");
+    let error = row["readback_error"].as_str().expect("readback_error");
+    assert!(error.contains("500"), "{error}");
+    assert!(
+        report["profile"]["run"]["stream_digest"].is_string(),
+        "{report}"
+    );
+}

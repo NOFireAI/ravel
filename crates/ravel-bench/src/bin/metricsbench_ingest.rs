@@ -44,11 +44,11 @@ use ravel_bench::metrics_ingest::{
     HttpReplayConfig, IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, RavelReplayConfig,
     ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance, STALL_GRACE, STALL_RECHECK,
     StallCeiling, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
-    build_profile_record, check_anchor, check_expected_digests_agree, check_row_accounting,
-    check_row_band6, check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
-    replay_over_http_with_plan, workload_digest,
+    SystemQueryResult, build_profile_record, check_anchor, check_expected_digests_agree,
+    check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
+    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
 };
-use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
+use ravel_bench::metrics_workload::{Profile, WorkloadFile, load_workload};
 use ravel_types::TenantId;
 
 /// The exit code for a usage error (BSD `EX_USAGE`): a missing or invalid run
@@ -524,7 +524,73 @@ fn check_scalar_expected(
     }
 }
 
-async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
+/// A failed run: the error, and the report of the rows replayed before it
+/// when the failure was a read-back, so their ingest figures are still
+/// printed
+/// (`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`).
+struct RunFailure {
+    error: RunError,
+    report: Option<MetricsIngestReport>,
+}
+
+impl From<RunError> for RunFailure {
+    fn from(error: RunError) -> Self {
+        RunFailure {
+            error,
+            report: None,
+        }
+    }
+}
+
+/// What every report of one run is built from besides its rows.
+struct ReportContext<'a> {
+    workload: &'a WorkloadFile,
+    profile: &'a Profile,
+    steps: u64,
+    provenance: RunProvenance,
+}
+
+impl ReportContext<'_> {
+    /// The report over `rows`, with the profile record built from the
+    /// reference stream's generator report.
+    fn assemble(
+        &self,
+        rows: Vec<SystemIngestResult>,
+        reference: Option<&GenerationReport>,
+        query: Option<SystemQueryResult>,
+        substrate: Option<Substrate>,
+    ) -> Result<MetricsIngestReport, RunError> {
+        // `resolve_rows` refused a run with neither an in-process nor a portable
+        // row before anything was generated, so one of them set the reference.
+        let gen_report = reference
+            .ok_or_else(|| RunError::Generate("no row replayed the stream".to_string()))?;
+
+        // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
+        // generator's exact counts for the figures that are not directly declared
+        // (total series created, logical input bytes) -- never derived from the
+        // offered sample count.
+        let profile_record = build_profile_record(
+            self.workload,
+            self.profile,
+            self.steps,
+            gen_report.bytes,
+            gen_report,
+            self.provenance.clone(),
+        )
+        .map_err(|e| RunError::Generate(e.to_string()))?;
+
+        let mut report = MetricsIngestReport::new(rows).with_profile(profile_record);
+        if let Some(query) = query {
+            report = report.with_query(query);
+        }
+        if let Some(substrate) = substrate {
+            report = report.with_substrate(substrate);
+        }
+        Ok(report)
+    }
+}
+
+async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
     let workload = load_workload(&args.workload).map_err(|e| RunError::Workload(e.to_string()))?;
     let steps = resolve_steps(args, &workload)?;
     let profile = workload.profile(&args.profile).ok_or_else(|| {
@@ -544,9 +610,14 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
             args.workload.display()
         ))
     })?;
-    let provenance = RunProvenance {
-        workload_digest: workload_digest(&manifest_bytes),
-        anchor_ms,
+    let context = ReportContext {
+        workload: &workload,
+        profile,
+        steps,
+        provenance: RunProvenance {
+            workload_digest: workload_digest(&manifest_bytes),
+            anchor_ms,
+        },
     };
     let stream_from_anchor = || -> Result<GeneratedStream<'_>, RunError> {
         let generator = Generator::new(&workload, &args.profile, anchor_ms)
@@ -587,9 +658,9 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         // accounting closes over every line.
         let (gen_report, _) = close_row("ravel (in-process)", ravel_stream, &ravel.result)?;
         if ravel.result.ingest.accepted_samples == 0 {
-            return Err(RunError::NothingIngested {
+            return Err(RunFailure::from(RunError::NothingIngested {
                 system: IN_PROCESS_SYSTEM.to_string(),
-            });
+            }));
         }
         reference = Some(gen_report);
 
@@ -692,18 +763,18 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         let (report, _) = close_row(system, stream, &row)?;
         match &reference {
             Some(expected) if report.digest != expected.digest => {
-                return Err(RunError::StreamDiverged {
+                return Err(RunFailure::from(RunError::StreamDiverged {
                     system: system.to_string(),
                     expected: expected.digest.clone(),
                     got: report.digest,
-                });
+                }));
             }
             Some(_) => {}
             None => {
                 if row.ingest.accepted_samples == 0 {
-                    return Err(RunError::NothingIngested {
+                    return Err(RunFailure::from(RunError::NothingIngested {
                         system: system.to_string(),
-                    });
+                    }));
                 }
                 reference = Some(report);
             }
@@ -714,51 +785,38 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
             timeout_secs: args.readback_timeout_secs,
             settle_secs: args.readback_settle_secs,
         };
-        let readback = readback_over_http(&readback_cfg, &row, &outcome.plan)
-            .await
-            .map_err(|source| RunError::Readback {
-                system: system.to_string(),
-                source,
-            })?;
-        if !readback.matches_expected {
-            return Err(RunError::ReadbackMismatch {
-                system: system.to_string(),
-                mismatches: readback.mismatches.join("; "),
-            });
-        }
-        row.readback = Some(readback);
+        let failed = match readback_over_http(&readback_cfg, &row, &outcome.plan).await {
+            Ok(readback) => {
+                let failed = (!readback.matches_expected).then(|| RunError::ReadbackMismatch {
+                    system: system.to_string(),
+                    mismatches: readback.mismatches.join("; "),
+                });
+                row.readback = Some(readback);
+                failed
+            }
+            Err(source) => {
+                row.readback_error = Some(source.to_string());
+                Some(RunError::Readback {
+                    system: system.to_string(),
+                    source,
+                })
+            }
+        };
         portable.push(row);
+        if let Some(error) = failed {
+            // The rows replayed so far are printed with the failed one marked,
+            // so their ingest figures survive the exit.
+            rows.extend(portable);
+            let report = context
+                .assemble(rows, reference.as_ref(), query, substrate)
+                .ok();
+            return Err(RunFailure { error, report });
+        }
     }
     let portable_refs: Vec<&SystemIngestResult> = portable.iter().collect();
     check_band6_across_rows(in_process_scalar.as_deref(), &portable_refs)?;
     rows.extend(portable);
-    // `resolve_rows` refused a run with neither an in-process nor a portable
-    // row before anything was generated, so one of them set the reference.
-    let gen_report =
-        reference.ok_or_else(|| RunError::Generate("no row replayed the stream".to_string()))?;
-
-    // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
-    // generator's exact counts for the figures that are not directly declared
-    // (total series created, logical input bytes) -- never derived from the
-    // offered sample count.
-    let profile_record = build_profile_record(
-        &workload,
-        profile,
-        steps,
-        gen_report.bytes,
-        &gen_report,
-        provenance,
-    )
-    .map_err(|e| RunError::Generate(e.to_string()))?;
-
-    let mut report = MetricsIngestReport::new(rows).with_profile(profile_record);
-    if let Some(query) = query {
-        report = report.with_query(query);
-    }
-    if let Some(substrate) = substrate {
-        report = report.with_substrate(substrate);
-    }
-    Ok(report)
+    Ok(context.assemble(rows, reference.as_ref(), query, substrate)?)
 }
 
 #[tokio::main]
@@ -795,9 +853,13 @@ async fn main() {
                 );
             }
         }
-        Err(err) => {
-            eprintln!("metricsbench_ingest: {err}");
-            std::process::exit(exit_code(&err));
+        Err(RunFailure { error, report }) => {
+            if let Some(report) = report {
+                let json = serde_json::to_string_pretty(&report).expect("serialize report");
+                println!("{json}");
+            }
+            eprintln!("metricsbench_ingest: {error}");
+            std::process::exit(exit_code(&error));
         }
     }
 }
