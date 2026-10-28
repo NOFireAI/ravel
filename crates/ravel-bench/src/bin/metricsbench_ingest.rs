@@ -1029,4 +1029,53 @@ mod tests {
         assert_eq!(exit_code(&err), 64);
         assert_eq!(resolve_ravel_tenant(&args(&[])).expect("neither"), None);
     }
+
+    /// The HTTP rows default to Prometheus' 50 shards and 2000 points per
+    /// request (ADR-0927, 2026-10-28 amendment, decision 1), with no stall
+    /// ceiling unless one is given.
+    #[test]
+    fn http_rows_default_to_50_shards_of_2000_points() {
+        let defaults = args(&[]);
+        assert_eq!(defaults.http_shards, 50);
+        assert_eq!(defaults.http_batch_size, 2000);
+        assert_eq!(defaults.max_ingest_secs, None);
+        let given = args(&["--max-ingest-secs", "600"]);
+        assert_eq!(given.max_ingest_secs, Some(600));
+    }
+
+    /// Zero shards or zero points per request is a usage error.
+    #[test]
+    fn zero_shards_or_batch_size_exits_64() {
+        resolve_http_settings(&args(&[])).expect("defaults");
+        for (flag, name) in [("--http-shards", "http-shards"), ("--http-batch-size", "http-batch-size")] {
+            let err = resolve_http_settings(&args(&[flag, "0"])).expect_err("zero");
+            assert!(
+                matches!(err, RunError::ZeroHttpSetting { flag: f, .. } if f == name),
+                "{err}"
+            );
+            assert_eq!(exit_code(&err), 64);
+        }
+    }
+
+    /// A stalled row exits 1, the code a band violation exits with.
+    #[test]
+    fn a_stalled_row_exits_like_a_band_violation() {
+        let err = RunError::Http {
+            system: "prometheus".to_string(),
+            source: ravel_bench::metrics_ingest::LaneError::IngestStalled {
+                system: "prometheus".to_string(),
+                projected_secs: 1_200.0,
+                ceiling_secs: 600,
+                offered_points: 50,
+                stream_points: 1_000,
+            },
+        };
+        assert_eq!(exit_code(&err), 1);
+        let text = err.to_string();
+        assert!(
+            text.contains("projected 1200 s") && text.contains("600 s ceiling")
+                && text.contains("50 of 1000 points"),
+            "{text}"
+        );
+    }
 }

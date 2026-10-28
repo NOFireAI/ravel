@@ -503,6 +503,16 @@ for f in stamps.json report.json falsification.json ingest.json; do
 done
 grid="$(py profile-grid "$WORKLOAD" "$profile")" ||
   refuse "the workload ${WORKLOAD} declares no profile '$profile'"
+# Each HTTP row stops once its projected ingest wall time passes this ceiling
+# (ADR-0927, 2026-10-28 amendment, decision 7), so a stalled receiver fails
+# the run in minutes instead of holding the host for days.
+case "$profile" in
+  ci) max_ingest_secs=600 ;;
+  cardinality) max_ingest_secs=14400 ;;
+  history) max_ingest_secs=7200 ;;
+  churn) max_ingest_secs=18000 ;;
+  *) refuse "no ingest wall-time ceiling is set for profile '$profile'; add one to run.sh" ;;
+esac
 if [ "$diagnostic" -eq 1 ]; then
   # The falsification query only tests --query.max-samples on a profile whose
   # window the entry declares; elsewhere it loads a few samples, cannot reach
@@ -825,6 +835,7 @@ run_diagnostic() {
   # history profile would not fit in memory.
   stamp_str in_process_row skipped
   run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" --no-in-process-row \
+    --max-ingest-secs "$max_ingest_secs" \
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE"
 
   query="$(py corpus-query "$CORPUS" "$FALSIFICATION_ENTRY")" ||
@@ -891,6 +902,7 @@ run_full() {
     stamp_str in_process_row skipped
   fi
   run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" "${in_process[@]}" \
+    --max-ingest-secs "$max_ingest_secs" \
     --ravel-endpoint "${RAVEL_BASE}/api/v1/write" --ravel-tenant "$RAVEL_TENANT" \
     --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE" \
