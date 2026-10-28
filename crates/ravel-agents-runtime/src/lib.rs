@@ -12,9 +12,13 @@
 //! coordinator over an existing store resumes every agent from HEAD alone
 //! (`tests::cold_restart_resumes_the_active_turn_from_head_alone`).
 //!
-//! Nothing in `ravel-server` reaches this crate yet: task T11 (#3345) adds
-//! the HTTP routes and T12b (#3351) the live SDK tests. The simulation crate
-//! (T13, #3346) drives it directly.
+//! Timers ([`Coordinator::schedule_timer`], [`Coordinator::cancel_timer`])
+//! fire only from the reconciliation sweep in `sweep`, which reads HEAD for
+//! every agent it acts on. The sweep runs from [`Coordinator::sweep_once`]
+//! and, once [`Coordinator::with_sweep`] enabled it, from worker polls on an
+//! injected interval. Nothing in `ravel-server` schedules either until T19
+//! (#3353). The simulation crate (T13, #3346) drives the coordinator
+//! directly.
 //!
 //! The bodies are the `ravel_agents_core::wire` types wherever one exists.
 //! Calls with no wire type yet (worker registration, heartbeat, activation,
@@ -53,6 +57,8 @@ mod effects;
 mod failure;
 mod metrics;
 mod ownership;
+mod sweep;
+mod timers;
 mod unload;
 
 pub use effects::{
@@ -60,8 +66,12 @@ pub use effects::{
     UNKNOWN_OUTCOME_RETRIES,
 };
 pub use failure::FailOutcome;
-pub use metrics::AgentsMetricsSnapshot;
+pub use metrics::{AgentsMetricsSnapshot, SweepMetricsSnapshot};
 pub use ownership::TakeoverReason;
+pub use sweep::{
+    DEFAULT_SWEEP_INTERVAL_MS, DEFAULT_SWEEP_MAX_HEAD_GETS, DEFAULT_SWEEP_MAX_LIST_PAGES,
+    SweepConfig, SweepReport,
+};
 
 use metrics::Metrics;
 use ownership::LeaseTable;
@@ -176,8 +186,19 @@ pub struct Coordinator {
     pub(crate) metrics: Metrics,
     /// The effect attempts this coordinator dispatched and has seen no
     /// result for, by agent and effect id (see `effects`). An entry is
-    /// dropped once a root of a later epoch is seen or the agent unloads.
+    /// dropped in three ways: a root of a later epoch is seen, the agent
+    /// unloads, or a root shows the entry's input settled
+    /// (`prune_open_attempts`).
     pub(crate) open_attempts: Mutex<HashMap<(AgentId, Id128), effects::OpenAttempt>>,
+    pub(crate) sweep: SweepConfig,
+    /// Whether worker polls start sweep passes; set by `with_sweep`.
+    pub(crate) sweep_on_poll: bool,
+    /// Where the next sweep pass resumes. Held for the whole pass, so two
+    /// passes never run at once.
+    pub(crate) sweep_cursor: tokio::sync::Mutex<sweep::SweepCursor>,
+    /// When a poll last started a sweep pass, in the injected clock's
+    /// nanoseconds; `i64::MIN` before the first.
+    pub(crate) last_sweep_unix_ns: AtomicI64,
 }
 
 impl Coordinator {
@@ -201,6 +222,10 @@ impl Coordinator {
             wake: Notify::new(),
             metrics: Metrics::default(),
             open_attempts: Mutex::new(HashMap::new()),
+            sweep: SweepConfig::default(),
+            sweep_on_poll: false,
+            sweep_cursor: tokio::sync::Mutex::new(sweep::SweepCursor::default()),
+            last_sweep_unix_ns: AtomicI64::new(i64::MIN),
         }
     }
 

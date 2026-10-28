@@ -637,6 +637,152 @@ async fn a_failed_wake_hint_does_not_fail_the_command() {
     assert_eq!(backend.fault_count(Op::Put, FaultKind::Permanent), 1);
 }
 
+/// Write an empty hint at `bucket` for `agent`, as `after_publish` would.
+async fn put_hint(backend: &MemoryStore, bucket: i64, agent: &AgentId) -> String {
+    let key = wake_key(
+        &tenant(),
+        DueBucket::for_due(bucket * ravel_agents_core::keys::WAKE_BUCKET_WIDTH_NS).expect("bucket"),
+        agent,
+    )
+    .expect("wake key");
+    backend
+        .put(&key, Bytes::new(), PutOptions::default())
+        .await
+        .expect("put hint");
+    key
+}
+
+#[tokio::test]
+async fn wake_hints_list_after_a_cursor_in_due_order() {
+    let backend = Arc::new(MemoryStore::with_page_size(2));
+    let store = store_with(backend.clone(), StoreLimits::default());
+    let a = agent_id(&kind(), &key("a"));
+    let b = agent_id(&kind(), &key("b"));
+    let late = put_hint(&backend, 30, &a).await;
+    let early_b = put_hint(&backend, 4, &b).await;
+    let early_a = put_hint(&backend, 4, &a).await;
+    // A key under the prefix that is not a hint moves the cursor and is
+    // otherwise skipped.
+    let prefix = ravel_agents_core::keys::wake_prefix(&tenant()).expect("prefix");
+    let stray = format!("{prefix}00000000000000000009/not-an-agent");
+    backend
+        .put(&stray, Bytes::new(), PutOptions::default())
+        .await
+        .expect("put stray");
+    let mut early = [(early_a.clone(), a), (early_b.clone(), b)];
+    early.sort();
+
+    let before = store.counters();
+    let first = store.list_wake_hints(None).await.expect("list");
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|h| (h.key.clone(), h.bucket, h.agent))
+            .collect::<Vec<_>>(),
+        vec![
+            (early[0].0.clone(), 4, early[0].1),
+            (early[1].0.clone(), 4, early[1].1)
+        ]
+    );
+    assert!(first.more);
+    let second = store
+        .list_wake_hints(first.last_key.as_deref())
+        .await
+        .expect("list");
+    assert_eq!(second.last_key.as_deref(), Some(late.as_str()));
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|h| (h.bucket, h.agent))
+            .collect::<Vec<_>>(),
+        vec![(30, a)]
+    );
+    let third = store
+        .list_wake_hints(second.last_key.as_deref())
+        .await
+        .expect("list");
+    assert!(third.items.is_empty());
+    assert_eq!(third.last_key, None);
+    assert!(!third.more);
+    let delta = store.counters().since(&before);
+    assert_eq!(delta.resolve.list, 3);
+    assert_eq!(delta.total().requests(), 3);
+}
+
+#[tokio::test]
+async fn dir_entries_list_after_a_cursor() {
+    let store = store_with(
+        Arc::new(MemoryStore::with_page_size(2)),
+        StoreLimits::default(),
+    );
+    let mut expected = Vec::new();
+    for i in 0..3 {
+        expected.push(
+            store
+                .create(kind(), key(&format!("o-{i}")))
+                .await
+                .expect("create")
+                .agent,
+        );
+    }
+    expected.sort();
+    let before = store.counters();
+    let first = store.list_dir_after(None).await.expect("list");
+    assert_eq!(
+        first.items.iter().map(|e| e.agent).collect::<Vec<_>>(),
+        expected[..2]
+    );
+    assert!(first.more);
+    let rest = store
+        .list_dir_after(Some(&first.items[0].key))
+        .await
+        .expect("list");
+    assert_eq!(
+        rest.items.iter().map(|e| e.agent).collect::<Vec<_>>(),
+        expected[1..]
+    );
+    // A full last page may still report more; the next listing settles it.
+    let end = store
+        .list_dir_after(rest.last_key.as_deref())
+        .await
+        .expect("list");
+    assert!(end.items.is_empty());
+    assert!(!end.more);
+    assert_eq!(store.counters().since(&before).resolve.list, 3);
+}
+
+#[tokio::test]
+async fn a_wake_hint_delete_is_counted_and_idempotent() {
+    let backend = Arc::new(MemoryStore::new());
+    let store = store_with(backend.clone(), StoreLimits::default());
+    let key = put_hint(&backend, 4, &agent()).await;
+    let hint = store
+        .list_wake_hints(None)
+        .await
+        .expect("list")
+        .items
+        .remove(0);
+    assert_eq!(hint.key, key);
+    let before = store.counters();
+    store.delete_wake_hint(&hint).await.expect("delete");
+    store.delete_wake_hint(&hint).await.expect("delete again");
+    assert_eq!(store.wake_hint_deletes(), 2);
+    assert_eq!(store.counters().since(&before).total().requests(), 0);
+    assert!(backend.head(&key).await.is_err());
+
+    let foreign = WakeHint {
+        key: "t/other/ag/_wake/00000000000000000004/x".to_string(),
+        ..hint
+    };
+    assert_eq!(
+        store.delete_wake_hint(&foreign).await.map_err(|e| e.kind),
+        Err(ErrorKind::StoreUnavailable)
+    );
+    assert_eq!(store.wake_hint_deletes(), 2);
+}
+
 // ---- model equivalence ----
 
 #[derive(Debug, Clone)]
