@@ -1354,8 +1354,7 @@ fn a_later_hard_failure_after_a_failed_readback_keeps_the_report() {
 
     let mimir = &systems[2];
     assert_eq!(
-        mimir["ingest"]["accepted_samples"],
-        mimir["ingest"]["offered_samples"],
+        mimir["ingest"]["accepted_samples"], mimir["ingest"]["offered_samples"],
         "{mimir}"
     );
     assert!(mimir.get("row_failure").is_none(), "{mimir}");

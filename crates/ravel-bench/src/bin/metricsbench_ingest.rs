@@ -54,13 +54,13 @@ use ravel_bench::harness::{
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, FailedReplay,
-    GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport, PayloadClass,
-    ProfileRecord, RavelReplayConfig, ReadbackConfig, Receiver, RowAccountingViolation, RowFailure, RunProvenance,
-    STALL_GRACE, STALL_RECHECK, StallCeiling, StalledRow, StreamBandViolation, StreamCounts,
-    Substrate, SystemIngestResult, SystemQueryResult, build_profile_record, check_anchor,
-    check_expected_digests_agree, check_row_accounting, check_row_band6, check_stream_band,
-    query_after_replay, readback_over_http, replay_into_ravel, replay_over_http_with_plan,
-    workload_digest,
+    GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport,
+    PayloadClass, ProfileRecord, RavelReplayConfig, ReadbackConfig, Receiver,
+    RowAccountingViolation, RowFailure, RunProvenance, STALL_GRACE, STALL_RECHECK, StallCeiling,
+    StalledRow, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
+    SystemQueryResult, build_profile_record, check_anchor, check_expected_digests_agree,
+    check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
+    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{Profile, WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -1102,7 +1102,10 @@ mod tests {
         let refs: Vec<&SystemIngestResult> = rows.iter().collect();
         let err = check_band6_across_rows(None, &refs).expect_err("mimir's expected set differs");
         record_across_rows_failure(&mut rows, &err);
-        let failure = rows[2].row_failure.as_ref().expect("mimir carries the failure");
+        let failure = rows[2]
+            .row_failure
+            .as_ref()
+            .expect("mimir carries the failure");
         assert_eq!(failure.band, Some(6));
         assert_eq!(failure.error, err.to_string());
         assert!(rows[..2].iter().all(|r| r.row_failure.is_none()));
