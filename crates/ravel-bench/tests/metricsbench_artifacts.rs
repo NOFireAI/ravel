@@ -583,9 +583,9 @@ fn a_version_1_manifest_is_refused_naming_the_missing_range_eval_block() {
 }
 
 #[test]
-fn version_1_and_2_corpora_are_refused_by_the_version_3_loader() {
+fn version_1_2_and_3_corpora_are_refused_by_the_version_4_loader() {
     let dir = tempfile::tempdir().expect("tempdir");
-    for old in [1u32, 2] {
+    for old in [1u32, 2, 3] {
         let path = corrupt_corpus(&dir, &format!("corpus.v{old}.json"), |doc| {
             doc["version"] = serde_json::json!(old);
         });
@@ -595,7 +595,7 @@ fn version_1_and_2_corpora_are_refused_by_the_version_3_loader() {
                 err,
                 CorpusError::UnsupportedVersion {
                     found,
-                    expected: 3,
+                    expected: 4,
                     ..
                 } if found == old
             ),
@@ -615,7 +615,12 @@ fn the_modified_entries_say_why_and_no_entry_is_intended_empty() {
     assert_eq!(
         modified,
         vec![
+            "mb_selective_job_rate_sum",
+            "mb_selective_region_avg",
+            "mb_selective_error_ratio",
+            "mb_fanout_total_rate",
             "mb_full_range_avg_over_time",
+            "mb_full_range_counter_increase",
             "mb_join_cpu_on_build_version",
             "mb_join_saturated_and_busy"
         ]
@@ -632,13 +637,24 @@ fn the_modified_entries_say_why_and_no_entry_is_intended_empty() {
             .ends_with("rate(metricsbench_requests_total[5m]) > 0.5")
     );
 
-    // Exactly one entry loosens the comparison: the collapsed mean, whose
-    // answer depends on summation order. Every other entry is bit-exact.
+    // Six entries loosen the comparison, each one whose answer sums floats
+    // across series and so depends on summation order. Every other entry is
+    // bit-exact.
     let tolerant: Vec<(&str, u32)> = entries
         .iter()
         .filter_map(|e| e.tolerance_ulps.map(|t| (e.id.as_str(), t)))
         .collect();
-    assert_eq!(tolerant, vec![("mb_full_range_avg_over_time", 1 << 20)]);
+    assert_eq!(
+        tolerant,
+        vec![
+            ("mb_selective_job_rate_sum", 1 << 18),
+            ("mb_selective_region_avg", 1 << 19),
+            ("mb_selective_error_ratio", 1 << 20),
+            ("mb_fanout_total_rate", 1 << 20),
+            ("mb_full_range_avg_over_time", 1 << 20),
+            ("mb_full_range_counter_increase", 1 << 20),
+        ]
+    );
 
     // No entry is intended-empty: the two native-histogram entries lost the
     // marker once the ingest lane put native histograms on the wire (T1c of
