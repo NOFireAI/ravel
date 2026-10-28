@@ -554,19 +554,15 @@ TimerDue(ak) ==
     /\ lastCas' = NoCas
     /\ UNCHANGED <<sVars, cl, wk, co, crashedOnce, acked>>
 
-\* The sweep lists a hint whose generation is not yet due. It keeps the hint
-\* for a later pass: nothing changes.
-HintObservedEarly(ak, g) ==
-    /\ Store!Present(HintKey(ak, g))
-    /\ due[ak] < g
-    /\ UNCHANGED vars
-
 \* The sweep serves a due hint: it reads the HEAD the hint names and, when
 \* that root has the hint's generation armed, fires it with one CAS that
 \* marks the generation delivered and enqueues the timer message (read and
 \* CAS are one step, see CasNow). A hint for a generation the root no longer
 \* has armed fires nothing and is deleted; generations never re-arm, so that
-\* root never needs the hint again.
+\* root never needs the hint again. A sweep pass that lists a hint whose
+\* generation is not yet due keeps it and changes nothing, so it is a
+\* stutter and has no action; the EarlyHintForgotten negative shows that
+\* deleting it instead loses the timer.
 FireTimer(ak, g) ==
     /\ Store!Present(HintKey(ak, g))
     /\ g =< due[ak]
@@ -592,7 +588,7 @@ Next ==
               \/ ScheduleTimer(w, ak) \/ CancelTimer(w, ak)
     \/ \E ak \in AKs :
          \/ WriteHint(ak) \/ TimerDue(ak)
-         \/ \E g \in 1..MaxTimerGen : HintObservedEarly(ak, g) \/ FireTimer(ak, g)
+         \/ \E g \in 1..MaxTimerGen : FireTimer(ak, g)
 
 Spec == Init /\ [][Next]_vars
 
