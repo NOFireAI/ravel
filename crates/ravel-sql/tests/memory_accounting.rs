@@ -730,11 +730,13 @@ async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
 /// a ratio exactly would be a change detector: the row path holds a
 /// `Vec<LogRecord>` (a per-record struct, a cloned STREAM_DIR blob and an owned
 /// `String` per record), the columnar path holds the decoded block plus the
-/// Arrow batches built from it. On this fixture the columnar peak is a little
-/// under half the row path's, so a factor of 3 leaves room in both directions
-/// while still failing the defect it exists to catch: charging the batches
-/// alone put the columnar peak at under a quarter of the row path's.
-const MAX_COLUMNAR_UNDERCHARGE: usize = 3;
+/// Arrow batches built from it. Since plain string columns decode into one
+/// values buffer plus offsets (ADR-3326 decision 2), the columnar peak on this
+/// fixture is 697,534 bytes against the row path's 2,104,634, about a third.
+/// A factor of 4 admits that while still failing the defect it exists to
+/// catch: charging the batches alone put the columnar peak at under a quarter
+/// of the row path's.
+const MAX_COLUMNAR_UNDERCHARGE: usize = 4;
 
 /// The columnar path's pool charge must be the same order of magnitude as the
 /// row path's for the same data, because it holds the same data.
