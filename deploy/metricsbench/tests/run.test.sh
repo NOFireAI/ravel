@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Cases for run.sh, the MetricsBench end-to-end driver, with docker, curl,
-# the three metricsbench bins and capture-effective-config.sh replaced by
-# stubs that log every call. Nothing here starts a container.
+# uname, sha256sum, the three metricsbench bins and
+# capture-effective-config.sh replaced by stubs that log every call. Nothing
+# here starts a container or downloads anything. The sha256sum stub answers
+# run.sh's pinned s3s-fs constant for the bytes the curl stub serves as that
+# arch's asset, and the real hash for anything else, so the comparison under
+# test is run.sh's own.
 #
 #   a  success run                   -> exit 0; stamps, ingest, effective-config,
 #                                       provenance, report and memory-summary
@@ -45,11 +49,21 @@
 #                                       --readback-timeout-secs (ci 30,
 #                                       cardinality 900, history 300, churn
 #                                       900)
-#   n  RustFS log copy               -> teardown copies rustfs:/logs into
-#                                       <out>/rustfs-logs before down -v, on
-#                                       success (a) and on failure (b); a
-#                                       failed copy is stamped and said, the
-#                                       exit code stays 0, still torn down
+#   n  s3s-fs fetch                  -> a (empty cache): the x86_64 asset is
+#                                       downloaded, cached executable, stamped
+#                                       (object_store) and its path reaches
+#                                       compose up as S3S_FS_BIN; n1: a cached
+#                                       binary with the pinned sha256 is
+#                                       reused, no download; n2: a download
+#                                       with another sha256 exits 65, step
+#                                       fetch-s3s-fs, nothing cached or
+#                                       started; n3: a cached binary with
+#                                       another sha256 exits 65, no download,
+#                                       nothing started; n4: an arch other
+#                                       than x86_64/aarch64 exits 65 before
+#                                       stamps; n5: aarch64 fetches its own
+#                                       asset; n6: a failed download exits 70;
+#                                       f: a diagnostic run fetches nothing
 #   p  local-build image           -> --ravel-image REF --ravel-image-id ID passes
 #                                       when docker image inspect reports Id ID;
 #                                       stamps and provenance say local-build
@@ -58,7 +72,7 @@
 #                                       profile other than ci; both forms, or
 #                                       neither, or an id without
 #                                       --ravel-image, exit 64
-#   o  descriptor limits             -> prometheus, victoriametrics, rustfs,
+#   o  descriptor limits             -> prometheus, victoriametrics, s3s,
 #                                       mimir (docker-compose.yml) and
 #                                       ravel-server (ravel.yml) each carry
 #                                       ulimits nofile soft and hard 524288,
@@ -93,6 +107,11 @@ ANCHOR=1760000010000
 
 BIN="${TMP}/bin"
 mkdir -p "${BIN}"
+REAL_UNAME="$(command -v uname)"
+
+S3S_RELEASE="s3s-fs-0.17.0-ravel.1"
+S3S_SHA_X86_64="0ac5480b51389c1913f9645d0e1ff2ff1dfdd3a44bb396a7cb74c5e91176c01f"
+S3S_SHA_AARCH64="6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717ad"
 
 # --- stubs -------------------------------------------------------------------
 
@@ -113,12 +132,13 @@ case "$1" in
     case "$sub" in
       up)
         [ "${STUB_UP_EXIT:-0}" -eq 0 ] || exit "${STUB_UP_EXIT}"
+        printf 'docker-env up S3S_FS_BIN=%s\n' "${S3S_FS_BIN-<unset>}" >>"${STUB_LOG}"
         echo up >"${STUB_STATE}"
         if [ "$#" -gt 1 ]; then
           shift
           printf '%s\n' "$@" >"${STUB_STATE}.services"
         else
-          printf '%s\n' rustfs prometheus victoriametrics mimir ravel-server >"${STUB_STATE}.services"
+          printf '%s\n' s3s prometheus victoriametrics mimir ravel-server >"${STUB_STATE}.services"
           printf '%s\n' createbuckets ravel-qualify >"${STUB_STATE}.oneshots"
         fi
         ;;
@@ -146,13 +166,6 @@ JSON
         ;;
       logs)
         echo "stub compose logs"
-        ;;
-      cp)
-        if [ "${STUB_CP_EXIT:-0}" -ne 0 ]; then
-          echo "stub: no such container path" >&2
-          exit "${STUB_CP_EXIT}"
-        fi
-        mkdir -p "$2" && echo "stub rustfs log" >"$2/rustfs.log"
         ;;
     esac
     ;;
@@ -202,7 +215,8 @@ exit 0
 STUB
 
 # curl: readiness 200, IMDS unreachable, /metrics with or without the fold
-# gauge, and Prometheus' refusal of the falsification query.
+# gauge, Prometheus' refusal of the falsification query, and the s3s-fs
+# release asset as stub bytes (STUB_S3S_BYTES replaces them).
 cat >"${BIN}/curl" <<'STUB'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"${STUB_LOG}"
@@ -218,6 +232,10 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   *imds.invalid*) exit 7 ;;
+  */releases/download/s3s-fs-0.17.0-ravel.1/s3s-fs-linux-*)
+    [ -z "${STUB_S3S_CURL_EXIT:-}" ] || exit "${STUB_S3S_CURL_EXIT}"
+    printf '%s' "${STUB_S3S_BYTES:-stub-s3s-fs-${url##*-linux-}}" >"$out"
+    ;;
   */metrics)
     if [ -n "${STUB_NO_FOLD:-}" ]; then
       printf '# no fold yet\nravel_up 1\n' >"$out"
@@ -232,6 +250,30 @@ case "$url" in
     ;;
   *) printf 200 ;;
 esac
+STUB
+
+# uname: -m answers STUB_ARCH (default x86_64); anything else is the real one.
+cat >"${BIN}/uname" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-m" ]; then
+  echo "${STUB_ARCH:-x86_64}"
+else
+  exec "${STUB_REAL_UNAME}" "$@"
+fi
+STUB
+
+# sha256sum: the pinned constant for the curl stub's bytes for that arch, the
+# real sha256 for any other content.
+cat >"${BIN}/sha256sum" <<STUB
+#!/usr/bin/env bash
+printf 'sha256sum %s\n' "\$*" >>"\${STUB_LOG}"
+[ -f "\$1" ] || exit 1
+case "\$(cat "\$1")" in
+  stub-s3s-fs-x86_64) h=${S3S_SHA_X86_64} ;;
+  stub-s3s-fs-aarch64) h=${S3S_SHA_AARCH64} ;;
+  *) h="\$(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "\$1")" ;;
+esac
+printf '%s  %s\n' "\$h" "\$1"
 STUB
 
 # metricsbench_ingest: an ingest report with a row per endpoint flag given.
@@ -308,7 +350,8 @@ run_case() {
   : >"${LOG}"
   rc=0
   PATH="${BIN}:${PATH}" \
-    STUB_LOG="${LOG}" STUB_STATE="${TMP}/${name}/state" \
+    STUB_LOG="${LOG}" STUB_STATE="${TMP}/${name}/state" STUB_REAL_UNAME="${REAL_UNAME}" \
+    METRICSBENCH_S3S_FS_CACHE="${TMP}/${name}/cache" \
     METRICSBENCH_CAPTURE="${BIN}/capture" \
     METRICSBENCH_SAMPLE_INTERVAL=0.1 \
     METRICSBENCH_READY_TRIES=3 METRICSBENCH_READY_INTERVAL=0 \
@@ -367,19 +410,6 @@ expect_err() {
   if grep -qF -- "$2" "${ERR}"; then pass "$1"; else fail "$1 (no '$2' in stderr: $(cat "${ERR}"))"; fi
 }
 
-# expect_cp_before_down LABEL: teardown asked for RustFS's /logs, into the
-# out-dir, before the down -v that destroys the container.
-expect_cp_before_down() {
-  local cp_line down_line
-  cp_line="$(grep -nF -- "ravel.yml cp rustfs:/logs ${OUT}/rustfs-logs" "${LOG}" | head -n 1 | cut -d: -f1)"
-  down_line="$(grep -nF -- " down -v" "${LOG}" | head -n 1 | cut -d: -f1)"
-  if [ -n "${cp_line}" ] && [ -n "${down_line}" ] && [ "${cp_line}" -lt "${down_line}" ]; then
-    pass "$1: RustFS's /logs copied before down -v"
-  else
-    fail "$1: RustFS's /logs not copied before down -v (cp line '${cp_line}', down line '${down_line}')"
-  fi
-}
-
 # --- a: success --------------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/a/out")
 run_case a "${args[@]}" --rss-band ravel-server:1:1000000000
@@ -388,12 +418,12 @@ for f in stamps.json ingest.json effective-config.json provenance.json report.js
   expect_file a "$f"
 done
 check "a: stamps status passed, exit 0" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["exit_code"] == 0'
-check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["up","qualify","image","ready","sampler","ingest","mimir-readiness","capture","provenance","fold-state","query","validate","memory"]'
+check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","capture","provenance","fold-state","query","validate","memory"]'
 check "a: published image kind stamped, no image_id" 'j("stamps.json")["ravel_image"]["kind"] == "published" and "image_id" not in j("stamps.json")["ravel_image"]'
 expect_log "a: provenance says the image is published" "--config ravel_image_kind=published"
 expect_no_log "a: provenance carries no local image id" "ravel_image_id="
 check "a: image reference and resolved digest stamped" 'j("stamps.json")["ravel_image"]["reference"] == "'"${IMAGE}"'" and j("stamps.json")["ravel_image"]["resolved"]["digest_matches_reference"] is True'
-check "a: source commit, store kind, profile, anchor stamped" 'j("stamps.json")["ravel_source_commit"] == "'"${COMMIT}"'" and j("stamps.json")["store_kind"] == "rustfs" and j("stamps.json")["profile"] == "ci" and j("stamps.json")["anchor_ms"] == '"${ANCHOR}"' and j("stamps.json")["anchor_source"] == "flag"'
+check "a: source commit, store kind, profile, anchor stamped" 'j("stamps.json")["ravel_source_commit"] == "'"${COMMIT}"'" and j("stamps.json")["store_kind"] == "s3s-fs" and j("stamps.json")["profile"] == "ci" and j("stamps.json")["anchor_ms"] == '"${ANCHOR}"' and j("stamps.json")["anchor_source"] == "flag"'
 check "a: harness commit stamped (unavailable outside git)" 'j("stamps.json")["harness_commit"].startswith("unavailable")'
 check "a: start and end times stamped" 'j("stamps.json")["started_at"].endswith("Z") and j("stamps.json")["ended_at"].endswith("Z")'
 check "a: instance type unknown without IMDS" 'j("stamps.json")["instance_type"] == "unknown"'
@@ -414,9 +444,18 @@ expect_log "a: provenance pins the comparators from the capture" "--comparator m
 expect_no_log "a: the token never on a command line" "metricsbench-token"
 expect_log "a: ci keeps the in-process row on a memory store" "--store memory --tenant metricsbench"
 check "a: stamps say the in-process row is present" 'j("stamps.json")["in_process_row"] == "present"'
-expect_cp_before_down a
-check "a: stamps say RustFS's logs were copied" 'j("stamps.json")["rustfs_logs"] == "copied to rustfs-logs/"'
-expect_file a rustfs-logs/rustfs.log
+A_BIN="${TMP}/a/cache/${S3S_RELEASE}/s3s-fs-linux-x86_64"
+expect_log "a: the x86_64 asset downloaded" "https://github.com/NOFireAI/s3s/releases/download/${S3S_RELEASE}/s3s-fs-linux-x86_64"
+check "a: object_store stamped from the download" 'j("stamps.json")["object_store"] == {"implementation": "s3s-fs", "release": "'"${S3S_RELEASE}"'", "arch": "x86_64", "sha256": "'"${S3S_SHA_X86_64}"'", "url": "https://github.com/NOFireAI/s3s/releases/download/'"${S3S_RELEASE}"'/s3s-fs-linux-x86_64", "path": "'"${A_BIN}"'", "source": "download"}'
+if [ -x "${A_BIN}" ] && [ "$(cat "${A_BIN}")" = "stub-s3s-fs-x86_64" ]; then
+  pass "a: the verified download is cached executable"
+else
+  fail "a: no executable verified binary at ${A_BIN}"
+fi
+expect_log "a: compose up gets the binary path" "docker-env up S3S_FS_BIN=${A_BIN}"
+expect_log "a: provenance records the store" "--store-backend s3s-fs --region us-east-1 --endpoint http://s3s:9000"
+expect_log "a: provenance records the store's release" "--config store_release=${S3S_RELEASE}"
+expect_log "a: provenance records the store's sha256" "--config store_sha256=${S3S_SHA_X86_64}"
 
 # --- b: ingest fails ---------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/b/out")
@@ -427,7 +466,6 @@ check "b: stamps name step ingest, status failed" 'j("stamps.json")["failed_step
 expect_no_file b report.json
 expect_log "b: still torn down" " down -v"
 expect_file b memory-summary.json
-expect_cp_before_down b
 
 # --- c: image without a digest -----------------------------------------------
 run_case c --profile ci --ravel-image ghcr.io/nofireai/ravel-server:latest --ravel-source-commit "${COMMIT}" \
@@ -472,8 +510,8 @@ expect_no_log "f: no memory store" "--store memory"
 check "f: stamps say the in-process row is skipped" 'j("stamps.json")["in_process_row"] == "skipped"'
 expect_no_log "f: no query run" "metricsbench_query"
 expect_log "f: torn down" " down -v"
-expect_no_log "f: no RustFS log copy without RustFS" " cp rustfs:/logs"
-check "f: stamps say the RustFS log copy does not apply" 'j("stamps.json")["rustfs_logs"].startswith("not applicable")'
+expect_no_log "f: no s3s-fs download" "s3s-fs-linux"
+check "f: stamps say the object store does not apply" 'j("stamps.json")["object_store"].startswith("not applicable")'
 
 # --- f2: diagnostic on a profile the entry is not declared for ---------------
 run_case f2 --profile ci --bin-dir "${BIN}" --out-dir "${TMP}/f2/out" --anchor-ms "${ANCHOR}" \
@@ -507,7 +545,7 @@ mapfile -t args < <(full_args "${TMP}/h4/out")
 run_case h4 "${args[@]}"
 expect_rc "h out-dir holds a report" 65
 mapfile -t args < <(full_args "${TMP}/h5/out")
-STUB_LEFTOVER_VOLUME=metricsbench_rustfs-data run_case h5 "${args[@]}"
+STUB_LEFTOVER_VOLUME=metricsbench_s3s-data run_case h5 "${args[@]}"
 expect_rc "h leftover volume" 65
 expect_no_log "h leftover volume: nothing started" " up -d"
 
@@ -573,13 +611,65 @@ else
   fail "m: DEFAULT_HTTP_BATCH_SIZE is not 2000 in ${INGEST_SRC}"
 fi
 
-# --- n: RustFS log copy fails ----------------------------------------------------
-mapfile -t args < <(full_args "${TMP}/n/out")
-STUB_CP_EXIT=1 run_case n "${args[@]}"
-expect_rc n 0
-check "n: stamps say the copy failed, run passed" 'j("stamps.json")["rustfs_logs"].startswith("copy failed (exit 1)") and j("stamps.json")["status"] == "passed"'
-expect_err "n: the failed copy is said" "copying RustFS's /logs failed (exit 1)"
-expect_log "n: still torn down" " down -v"
+# --- n: s3s-fs fetch ------------------------------------------------------------
+# seed_cache CASE ARCH BYTES: a cached s3s-fs binary for CASE's run.
+seed_cache() {
+  mkdir -p "${TMP}/$1/cache/${S3S_RELEASE}"
+  printf '%s' "$3" >"${TMP}/$1/cache/${S3S_RELEASE}/s3s-fs-linux-$2"
+  chmod 0755 "${TMP}/$1/cache/${S3S_RELEASE}/s3s-fs-linux-$2"
+}
+
+N1_BIN="${TMP}/n1/cache/${S3S_RELEASE}/s3s-fs-linux-x86_64"
+seed_cache n1 x86_64 stub-s3s-fs-x86_64
+mapfile -t args < <(full_args "${TMP}/n1/out")
+run_case n1 "${args[@]}"
+expect_rc "n1 cached match" 0
+expect_no_log "n1 cached match: no download" "releases/download"
+expect_log "n1 cached match: the cached binary was hashed" "sha256sum ${N1_BIN}"
+check "n1 cached match: stamped from the cache with the pinned sha256" 'j("stamps.json")["object_store"]["source"] == "cache" and j("stamps.json")["object_store"]["sha256"] == "'"${S3S_SHA_X86_64}"'" and j("stamps.json")["object_store"]["path"] == "'"${N1_BIN}"'"'
+expect_log "n1 cached match: compose up gets the cached path" "docker-env up S3S_FS_BIN=${N1_BIN}"
+
+mapfile -t args < <(full_args "${TMP}/n2/out")
+STUB_S3S_BYTES=tampered run_case n2 "${args[@]}"
+expect_rc "n2 download mismatch" 65
+expect_err "n2 download mismatch: refusal names the pinned sha256" "not the pinned ${S3S_SHA_X86_64}"
+check "n2 download mismatch: stamps name step fetch-s3s-fs, exit 65" 'j("stamps.json")["failed_step"] == "fetch-s3s-fs" and j("stamps.json")["exit_code"] == 65 and j("stamps.json")["steps_completed"] == [] and j("stamps.json")["object_store"] is None'
+expect_no_log "n2 download mismatch: nothing started" " up -d"
+if [ -z "$(ls -A "${TMP}/n2/cache/${S3S_RELEASE}" 2>/dev/null)" ]; then
+  pass "n2 download mismatch: nothing cached"
+else
+  fail "n2 download mismatch: the cache holds $(ls -A "${TMP}/n2/cache/${S3S_RELEASE}")"
+fi
+
+seed_cache n3 x86_64 tampered
+mapfile -t args < <(full_args "${TMP}/n3/out")
+run_case n3 "${args[@]}"
+expect_rc "n3 cached mismatch" 65
+expect_err "n3 cached mismatch: refusal names the cached file" "the cached ${TMP}/n3/cache/${S3S_RELEASE}/s3s-fs-linux-x86_64 has sha256"
+check "n3 cached mismatch: stamps name step fetch-s3s-fs" 'j("stamps.json")["failed_step"] == "fetch-s3s-fs" and j("stamps.json")["exit_code"] == 65'
+expect_no_log "n3 cached mismatch: no download" "releases/download"
+expect_no_log "n3 cached mismatch: nothing started" " up -d"
+
+mapfile -t args < <(full_args "${TMP}/n4/out")
+STUB_ARCH=arm64 run_case n4 "${args[@]}"
+expect_rc "n4 unknown arch" 65
+expect_err "n4 unknown arch: refusal names the arch" "no s3s-fs release asset is pinned for host arch 'arm64'"
+expect_no_log "n4 unknown arch: no download" "releases/download"
+expect_no_log "n4 unknown arch: nothing started" "compose -f"
+expect_no_file n4 stamps.json
+
+mapfile -t args < <(full_args "${TMP}/n5/out")
+STUB_ARCH=aarch64 run_case n5 "${args[@]}"
+expect_rc "n5 aarch64" 0
+expect_log "n5 aarch64: the aarch64 asset downloaded" "/releases/download/${S3S_RELEASE}/s3s-fs-linux-aarch64"
+check "n5 aarch64: stamped with the aarch64 sha256" 'j("stamps.json")["object_store"]["arch"] == "aarch64" and j("stamps.json")["object_store"]["sha256"] == "'"${S3S_SHA_AARCH64}"'" and j("stamps.json")["host"]["arch"] == "aarch64"'
+expect_log "n5 aarch64: provenance records the aarch64 sha256" "--config store_sha256=${S3S_SHA_AARCH64}"
+
+mapfile -t args < <(full_args "${TMP}/n6/out")
+STUB_S3S_CURL_EXIT=22 run_case n6 "${args[@]}"
+expect_rc "n6 download fails" 70
+check "n6 download fails: stamps name step fetch-s3s-fs" 'j("stamps.json")["failed_step"] == "fetch-s3s-fs" and j("stamps.json")["exit_code"] == 70'
+expect_no_log "n6 download fails: nothing started" " up -d"
 
 # --- p: local-build image ------------------------------------------------------
 LOCAL_REF="ravel-server:nightly-${COMMIT}"
@@ -633,7 +723,7 @@ expect_no_log "p id without --ravel-image: nothing started" "compose -f"
 # A service's block runs from its two-space key to the next key at two spaces
 # or less; the four ulimits lines must appear in it, in order.
 for pair in docker-compose.yml:prometheus docker-compose.yml:victoriametrics \
-  docker-compose.yml:rustfs docker-compose.yml:mimir ravel.yml:ravel-server; do
+  docker-compose.yml:s3s docker-compose.yml:mimir ravel.yml:ravel-server; do
   file="${pair%%:*}"
   svc="${pair#*:}"
   if python3 -I - "${HERE}/../${file}" "${svc}" <<'PY'; then

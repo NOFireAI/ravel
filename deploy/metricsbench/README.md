@@ -9,7 +9,7 @@ same queries; no Ravel-only instrumentation is ever folded into a cross-engine
 score (ADR-0927 decision 1).
 
 Ravel, the system under test, is not in `docker-compose.yml`. It runs from the
-overlay `ravel.yml` in this directory, on the same RustFS and at the same
+overlay `ravel.yml` in this directory, on the same s3s-fs and at the same
 envelope as the comparators (see "Ravel in the portable lane" below).
 `deploy/docker-compose/ravel.yml` is the product quickstart, not a benchmark
 deployment, and MetricsBench does not use it.
@@ -20,11 +20,40 @@ deployment, and MetricsBench does not use it.
 |---|---|---|---|---|
 | `prometheus` | Reference PromQL engine, pinned to v3.13.1 (the same version ADR-0927 uses as the correctness oracle) | **Local-disk TSDB.** Ack = in-memory head + on-disk WAL. Not object storage. | `http://127.0.0.1:9090/api/v1/write` | `http://127.0.0.1:9090/api/v1/query` |
 | `victoriametrics` | Single-node VictoriaMetrics, accepts Prometheus remote write natively | **Local-disk storage.** Ack = local storage write. Not object storage. | `http://127.0.0.1:8428/api/v1/write` | `http://127.0.0.1:8428/prometheus/api/v1/query` |
-| `mimir` | Grafana Mimir 3.2.3 monolithic (`-target=all`); the ADR-0927 object-storage-native PromQL system | **Object storage (S3).** Ack = local WAL; blocks ship to S3 (RustFS here) later. See caveat below. | `http://127.0.0.1:9009/api/v1/push` | `http://127.0.0.1:9009/prometheus/api/v1/query` |
+| `mimir` | Grafana Mimir 3.2.3 monolithic (`-target=all`); the ADR-0927 object-storage-native PromQL system | **Object storage (S3).** Ack = local WAL; blocks ship to S3 (s3s-fs here) later. See caveat below. | `http://127.0.0.1:9009/api/v1/push` | `http://127.0.0.1:9009/prometheus/api/v1/query` |
 
-Supporting services: `rustfs` (S3 backend for Mimir and Ravel) and
-`createbuckets` (a one-shot AWS CLI container that creates Mimir's buckets and
-Ravel's `ravel-metricsbench` bucket, then exits).
+Supporting services: `s3s` (s3s-fs, the S3 backend for Mimir and Ravel, see
+"The object store" below) and `createbuckets` (a one-shot AWS CLI container
+that creates Mimir's buckets and Ravel's `ravel-metricsbench` bucket, then
+exits).
+
+### The object store
+
+The stack's S3 endpoint is s3s-fs, the file-system backend of the s3s project,
+at the `s3s-fs-0.17.0-ravel.1` release of the `NOFireAI/s3s` fork (ADR-0927
+amendment 2026-10-29). It replaced RustFS, which sat at its one-CPU cap while
+ravel-server idled, so the store bounded the Ravel row. Figures measured on
+RustFS are not compared with figures measured on s3s-fs.
+
+No image carries the binary. `run.sh`'s `fetch-s3s-fs` step downloads the
+release asset for the host arch (`s3s-fs-linux-x86_64` or
+`s3s-fs-linux-aarch64`) into a cache outside the output directory, refuses it
+with exit 65 unless its sha256 equals the constant `run.sh` carries, and
+exports its path as `S3S_FS_BIN`; `docker-compose.yml` bind-mounts that path
+read-only into the `s3s` service and refuses to start without it. The pinned
+values:
+
+| Arch (`uname -m`) | sha256 |
+|---|---|
+| `x86_64` | `0ac5480b51389c1913f9645d0e1ff2ff1dfdd3a44bb396a7cb74c5e91176c01f` |
+| `aarch64` | `6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717ad` |
+
+The binary is linked against glibc and runs on the same
+`gcr.io/distroless/cc-debian12:nonroot` digest the root `Dockerfile` builds
+on, as root (`user: "0:0"`) so it can write the root-owned named volume
+`s3s-data`. Its envelope is the one RustFS had, `cpus: "1.0"` and
+`memory: 2g` (`docker-compose.yml`, the `s3s` block). It logs to stdout, so
+its log lands in `compose.log` with every other service's.
 
 ## Ravel in the portable lane
 
@@ -52,7 +81,7 @@ counterpart of Mimir's `-target=all`).
 
 | Service | What it is | Durability / storage | Remote Write 1.0 endpoint | PromQL query endpoint |
 |---|---|---|---|---|
-| `ravel-server` | Ravel, `--mode all`, 4 ingest shards, one tenant `metricsbench` | **Object storage (S3), strict Remote Write.** A 2xx means the data object and the commit record are durable in object storage before the ack (ADR-0927 decision 3). No volume: no state lives on local disk. RustFS here, so the ADR-0927 decision 10 caveat above applies. | `http://127.0.0.1:4318/api/v1/write` | `http://127.0.0.1:4318/api/v1/query` |
+| `ravel-server` | Ravel, `--mode all`, 4 ingest shards, one tenant `metricsbench` | **Object storage (S3), strict Remote Write.** A 2xx means the data object and the commit record are durable in object storage before the ack (ADR-0927 decision 3). No volume: no state lives on local disk. s3s-fs here, so the ADR-0927 decision 10 caveat above applies. | `http://127.0.0.1:4318/api/v1/write` | `http://127.0.0.1:4318/api/v1/query` |
 
 Every write and query carries `Authorization: Bearer metricsbench-token`
 (`--tenant-token metricsbench-token=metricsbench`). `/api/v1/status/buildinfo`
@@ -101,7 +130,8 @@ as every other system here.
 **Compose stack (2026-10-26, ravel-server 0.27.0, darwin/arm64 Docker).**
 `RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:0.27.0 docker compose -f
 docker-compose.yml -f ravel.yml up -d rustfs createbuckets ravel-qualify
-ravel-server` brought the overlay up on the stack's RustFS. Results:
+ravel-server` brought the overlay up on the stack's object store, then
+RustFS (the service was named `rustfs`). Results:
 
 | Step or request | Result |
 |---|---|
@@ -140,8 +170,8 @@ changes. Results:
 
 Prometheus and VictoriaMetrics persist to **local disk**. Mimir is
 **object-storage-native** and writes its durable blocks to S3 — but in this stack
-S3 is provided by **RustFS**, which is local-disk-backed and charges no
-per-request fees. Per ADR-0927 decision 10 (ADR-0075 decision 3), a RustFS result
+S3 is provided by **s3s-fs**, which is local-disk-backed and charges no
+per-request fees. Per ADR-0927 decision 10 (ADR-0075 decision 3), an s3s-fs result
 is valid for correctness and CI only and is **never a publishable performance or
 cost result**; a real-S3 substrate is required for that, exactly as Ravel's own
 publishable numbers require real S3. Each service block in
@@ -220,7 +250,7 @@ scrape grid.
 | Ravel | `--max-samples` | `500000000` | `10000000` | Raised (#3306) to Prometheus' and Mimir's value. Ravel counts total materialized samples after dedup, where Prometheus counts peak resident samples, so the equal numbers are not equal semantics; the comparator counting the same quantity is VictoriaMetrics' `-search.maxSamplesPerQuery`, at twice this value. No corpus entry comes near either: the largest read is 96,000,000. The bytes behind them are bounded by `--memory-budget-bytes`, which refuses an oversized materialization `memory exhausted` first. The flag also sizes the range selector-cache cap (2 x max_samples x 16 bytes): 16,000,000,000 bytes here, against 320,000,000 at the default, so that cap is inert and the memory budget alone bounds a range query's cached selector copies. At the default, 5 history entries would be refused, the largest `mb_long_range_7d_avg` at about 40.3M | `--max-samples <N>  Cap on the total samples (summed across series, after cross-segment dedup) a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SAMPLES (10,000,000)` |
 | Ravel | points per range series | `11000` | `11000` (unchanged, no flag) | Kept, same as Prometheus and Mimir: history's grid is 289 points | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_RANGE_POINTS: usize = 11_000` |
 | Ravel | total evaluation points per query | `1000000` | `1000000` (unchanged, no flag) | Kept: `mb_long_range_subquery_max` (`[1d:5m]`, 289 points) over the 289-point grid is 83,521 | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000` |
-| All five: Prometheus, VictoriaMetrics, Mimir, Ravel, RustFS | `ulimits.nofile` (docker-compose.yml, ravel.yml) | `524288` soft and hard | Docker's container default: soft `1024`, hard `524288` | Equal descriptors for every long-running service, at Docker's hard default. The Go engines (Prometheus, VictoriaMetrics, Mimir) raise their soft limit to the hard limit themselves, so for them this changes nothing; ravel-server and RustFS do not (#3412), so without it they run at 1,024 descriptors | Default as recorded on #2821; each service's block is pinned by `tests/run.test.sh` case o |
+| All five: Prometheus, VictoriaMetrics, Mimir, Ravel, s3s-fs | `ulimits.nofile` (docker-compose.yml, ravel.yml) | `524288` soft and hard | Docker's container default: soft `1024`, hard `524288` | Equal descriptors for every long-running service, at Docker's hard default. The Go engines (Prometheus, VictoriaMetrics, Mimir) raise their soft limit to the hard limit themselves, so for them this changes nothing; ravel-server does not (#3412), and the s3s-fs release binary imports neither `setrlimit` nor `prlimit` (`nm -D`), so without it they run at 1,024 descriptors | Default as recorded on #2821; each service's block is pinned by `tests/run.test.sh` case o |
 
 Limits the corpus does not reach, left at their defaults: VictoriaMetrics
 `-search.maxSamplesPerSeries` (default 30000000; history holds 172,800 samples
@@ -264,7 +294,7 @@ What each comparator returns when a limit fires. Observed on 2026-10-26 by
 running each limit at a deliberately tiny value against the pinned versions'
 upstream release binaries for linux/arm64 (Prometheus 3.13.1, VictoriaMetrics
 v1.115.0, Mimir 3.2.3 with this directory's `config/mimir.yaml` and a
-filesystem bucket in place of RustFS), then restoring the pinned value. The
+filesystem bucket in place of the stack's S3 store), then restoring the pinned value. The
 error text is the `error` field of the JSON body; numbers inside it vary with
 the query.
 
@@ -530,7 +560,7 @@ Steps, in order, stopping at the first failure:
    in-process diagnostic row on a memory store (case a); every other profile
    passes `--no-in-process-row` (case l), since cardinality's and history's
    streams do not fit in memory beside four engine containers and the
-   stack's RustFS is the engines' own store. Those runs lose one check: the
+   stack's s3s-fs is the engines' own store. Those runs lose one check: the
    portable rows' expected scalar digests are not compared with an
    in-process reference, only with each other (band 6 across rows).
    Each HTTP row is sent on the bin's defaults, 50 series shards of up to
@@ -580,12 +610,22 @@ Steps, in order, stopping at the first failure:
 Whatever the outcome, the compose logs go to `compose.log` and the stack is
 torn down with `docker compose ... down -v` unless `--keep` is given (cases
 a, b, d, f, i, k). On a failed step the memory summary is still written (case
-b). Before that teardown, `docker compose cp rustfs:/logs` copies RustFS's
-own log directory into `rustfs-logs/`, on success and on failure (cases a and
-b), since `down -v` destroys the container that holds it. A failed copy is
-stamped and written to `rustfs-logs-copy.log` and leaves the exit code as it
-was (case n); the diagnostic mode starts no RustFS and copies nothing (case
-f).
+b). s3s-fs logs to stdout, so its log is in `compose.log`; nothing is copied
+out of its container. The `s3s` service is in the service list `compose.log`
+is taken over (case o).
+
+Before the stack starts, the `fetch-s3s-fs` step resolves the s3s-fs binary
+(see "The object store"). A binary already in the cache whose sha256 equals
+the pin is reused without a download (case n1); a cached binary with another
+sha256 is refused with exit 65 and nothing is downloaded (case n3); a download
+whose sha256 differs is refused with exit 65, nothing is cached and nothing
+starts (case n2); a failed download exits 70 naming the step (case n6). A host
+arch other than `x86_64` or `aarch64` is refused with exit 65 before anything
+starts (case n4), and `aarch64` fetches its own asset against its own pin
+(case n5). The cache is `$METRICSBENCH_S3S_FS_CACHE`, else
+`$XDG_CACHE_HOME/ravel-metricsbench`, else `~/.cache/ravel-metricsbench`, so
+the run's output directory does not carry the binary. The diagnostic mode
+starts no object store and fetches nothing (case f).
 
 `stamps.json` is written before the first step and completed at the end
 (case a). It holds `ravel_image.kind` (`published` or `local-build`, cases a
@@ -594,11 +634,13 @@ case p), `ravel_image.resolved` (the `docker image inspect` result),
 `ravel_source_commit`, `harness_commit`
 (`git rev-parse HEAD` of the checkout holding `--bin-dir`, or
 `unavailable: ...` outside one), `run_script_commit`, `profile`, `anchor_ms`
-and `anchor_source`, `started_at` and `ended_at`, `store_kind: rustfs`,
+and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.arch`,
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
 `mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
-f), `rustfs_logs` (cases a, f and n), `steps_completed`, `failed_step`,
+f), `object_store` (release, arch, sha256, URL, cached path and whether it
+came from the cache or a download; `not applicable` in the diagnostic mode;
+cases a, f, n1 and n5), `steps_completed`, `failed_step`,
 `exit_code`, `status` and `teardown`.
 
 ### The falsification run
@@ -625,8 +667,8 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 |---|---|
 | 0 | Every step passed (cases a, f, g). |
 | 64 | Usage error (cases h, p). |
-| 65 | A refused input; nothing was started (cases c, h, p). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k). |
+| 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
@@ -636,7 +678,7 @@ deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
 ```
 
 Besides this directory's compose file, the script checks image and action
-pins across the repository. All six categories run in one invocation and each
+pins across the repository. All seven categories run in one invocation and each
 is checked against its own expected count:
 
 - **Compose images** (this directory, `docker-compose.yml` and the
@@ -678,7 +720,16 @@ is checked against its own expected count:
   their expected number, so an image added there without a digest fails the
   check rather than going unnoticed.
 
-Exit 0 means all six categories passed. Any unpinned reference, any missing
+- **s3s-fs binary sha256** (`run.sh` and `docker-compose.yml`): `run.sh`
+  carries both pinned sha256 constants exactly once each and maps each arch
+  to its own; `fetch_s3s_fs` downloads exactly once and compares the cached
+  binary and the download against the pin, each mismatch exiting 65, before
+  it moves the download into the cache and exports `S3S_FS_BIN`; and
+  `docker-compose.yml` takes the binary only from `${S3S_FS_BIN:?...}`, with
+  no default. Each of these is shown failing by a case in
+  `tests/every_comparator_pins_an_image_digest.test.sh` (`s3s_*`).
+
+Exit 0 means all seven categories passed. Any unpinned reference, any missing
 required comparator, or a reference count that drifts from any category's
 expected number fails the check with a non-zero exit. The script prints what
 it checked and how many references it found in each category.
@@ -703,9 +754,10 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
   | grep -i docker-content-digest
 ```
 
-**`ghcr.io/rustfs/rustfs` and `public.ecr.aws/aws-cli/aws-cli`** (see
-deploy/README.md for why the object store and its client live off Docker Hub)
-each issue a bearer token from their own auth endpoint rather than accepting
+**`public.ecr.aws/aws-cli/aws-cli`**, and the quickstart's
+`ghcr.io/rustfs/rustfs` that the example below resolves (see deploy/README.md
+for why the object store and its client live off Docker Hub), each issue a
+bearer token from their own auth endpoint rather than accepting
 one minted for Docker Hub, so the recipe is the same shape with a different
 token URL per registry.
 
@@ -731,12 +783,16 @@ curl -sI -H "Authorization: Bearer <TOKEN>" \
 # 3. The docker-content-digest response header is the pinned digest.
 ```
 
+**`gcr.io/distroless/cc-debian12:nonroot`**, the `s3s` service's base, is not
+resolved separately: it is the digest the root `Dockerfile` and
+`Dockerfile.prebuilt` already pin, copied unchanged.
+
 | Image | Tag | Digest |
 |---|---|---|
 | `prom/prometheus` | `v3.13.1` | `sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893` |
 | `victoriametrics/victoria-metrics` | `v1.115.0` | `sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb` |
 | `grafana/mimir` | `3.2.3` | `sha256:0ed56db7d7713707eff00224ddd4c3096afa6cf1cbe43a6f9391c537f1416099` |
-| `ghcr.io/rustfs/rustfs` | `1.0.0` | `sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff` |
+| `gcr.io/distroless/cc-debian12` | `nonroot` | `sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f` |
 | `public.ecr.aws/aws-cli/aws-cli` | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
 
 The tag is kept in each `image:` reference alongside the digest for human
@@ -745,6 +801,8 @@ readability; the digest is what pins the run.
 ### Pins shared with deploy/docker-compose/ravel.yml and rustfs.yml
 
 The two quickstart compose files are scanned by the same script as its fourth
-category (see above). Their RustFS and AWS CLI pins are the same tag and digest
-as the ones above. `deploy/README.md` lists all four of their pins and why
+category (see above). Their AWS CLI pin is the same tag and digest as the one
+above. Their RustFS pin, `ghcr.io/rustfs/rustfs:1.0.0` at
+`sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`, is
+no longer used by this stack. `deploy/README.md` lists all four of their pins and why
 these registries were chosen.

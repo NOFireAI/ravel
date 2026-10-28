@@ -2,7 +2,7 @@ name: metricsbench-nightly
 
 # Scheduled MetricsBench lane (issues #939 and #940, ADR-0927).
 #
-# Runs deploy/metricsbench/run.sh against the full compose stack (RustFS,
+# Runs deploy/metricsbench/run.sh against the full compose stack (s3s-fs,
 # Prometheus, VictoriaMetrics, Mimir and Ravel built from the commit this run
 # checked out): it
 # replays the sample stream into all four engines over Remote Write 1.0,
@@ -27,10 +27,10 @@ name: metricsbench-nightly
 # (cardinality/history/churn) plus the CI-sized `ci` profile (ADR-0927
 # decision 11). The comparable profiles range from 360,000,000 to
 # 1,728,000,000 samples and cannot run inside a GitHub-hosted runner, and
-# RustFS is explicitly NOT an acceptable substrate for a performance or cost
+# s3s-fs is explicitly NOT an acceptable substrate for a performance or cost
 # claim (ADR-0927 decision 10): removing per-request fees is exactly what
 # hides a request-count defect, so only the real-S3 lane (bench-s3.yml)
-# produces publishable numbers. This lane is a RustFS diagnostic/correctness
+# produces publishable numbers. This lane is an s3s-fs diagnostic/correctness
 # run, so it uses the `ci` profile, whose artifact carries its own
 # non-comparability marker. Building Ravel from the run's own commit keeps it
 # non-comparable on a second count: no two nights measure the same Ravel.
@@ -59,6 +59,8 @@ permissions:
   contents: read
 
 jobs:
+  # The job id and artifact name keep their RustFS-era names: deploy/README.md
+  # cites the job id.
   metricsbench-rustfs:
     runs-on: ubuntu-latest
     # 140 minutes = 57 + 30 + 35 + 9 + 9:
