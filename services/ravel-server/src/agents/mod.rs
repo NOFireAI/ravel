@@ -59,13 +59,41 @@ pub const ROUTES: &[(&str, &str, Capability)] = &[
     ("POST", "/api/v1/agents/timers/cancel", Capability::Agents),
     ("GET", "/api/v1/agents/timers", Capability::Agents),
     ("GET", "/api/v1/agents/inspector", Capability::Agents),
-    ("POST", "/api/v1/agents/worker/register", Capability::AgentsWorker),
-    ("POST", "/api/v1/agents/worker/poll", Capability::AgentsWorker),
-    ("POST", "/api/v1/agents/worker/commit", Capability::AgentsWorker),
-    ("POST", "/api/v1/agents/worker/heartbeat", Capability::AgentsWorker),
-    ("POST", "/api/v1/agents/worker/step", Capability::AgentsWorker),
-    ("POST", "/api/v1/agents/worker/effects/complete", Capability::AgentsWorker),
-    ("POST", "/api/v1/agents/worker/effects/fail", Capability::AgentsWorker),
+    (
+        "POST",
+        "/api/v1/agents/worker/register",
+        Capability::AgentsWorker,
+    ),
+    (
+        "POST",
+        "/api/v1/agents/worker/poll",
+        Capability::AgentsWorker,
+    ),
+    (
+        "POST",
+        "/api/v1/agents/worker/commit",
+        Capability::AgentsWorker,
+    ),
+    (
+        "POST",
+        "/api/v1/agents/worker/heartbeat",
+        Capability::AgentsWorker,
+    ),
+    (
+        "POST",
+        "/api/v1/agents/worker/step",
+        Capability::AgentsWorker,
+    ),
+    (
+        "POST",
+        "/api/v1/agents/worker/effects/complete",
+        Capability::AgentsWorker,
+    ),
+    (
+        "POST",
+        "/api/v1/agents/worker/effects/fail",
+        Capability::AgentsWorker,
+    ),
     ("GET", "/api/v1/agents/effects", Capability::Agents),
     ("GET", "/api/v1/agents/effects/{effect}", Capability::Agents),
     ("POST", "/api/v1/agents/reconcile", Capability::AgentsAdmin),
@@ -223,19 +251,59 @@ fn mounted() -> Vec<(&'static str, &'static str, MethodRouter<routes::Api>)> {
         ("POST", "/api/v1/agents/cancel", post(routes::cancel)),
         ("GET", "/api/v1/agents/state", get(routes::state)),
         ("POST", "/api/v1/agents/events", post(routes::events)),
-        ("POST", "/api/v1/agents/timers", post(routes::timer_schedule)),
-        ("POST", "/api/v1/agents/timers/cancel", post(routes::timer_cancel)),
+        (
+            "POST",
+            "/api/v1/agents/timers",
+            post(routes::timer_schedule),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/timers/cancel",
+            post(routes::timer_cancel),
+        ),
         ("GET", "/api/v1/agents/timers", get(routes::timers)),
         ("GET", "/api/v1/agents/inspector", get(routes::inspector)),
-        ("POST", "/api/v1/agents/worker/register", post(routes::worker_register)),
-        ("POST", "/api/v1/agents/worker/poll", post(routes::worker_poll)),
-        ("POST", "/api/v1/agents/worker/commit", post(routes::worker_commit)),
-        ("POST", "/api/v1/agents/worker/heartbeat", post(routes::worker_heartbeat)),
-        ("POST", "/api/v1/agents/worker/step", post(routes::worker_step)),
-        ("POST", "/api/v1/agents/worker/effects/complete", post(routes::effect_complete)),
-        ("POST", "/api/v1/agents/worker/effects/fail", post(routes::effect_fail)),
+        (
+            "POST",
+            "/api/v1/agents/worker/register",
+            post(routes::worker_register),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/poll",
+            post(routes::worker_poll),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/commit",
+            post(routes::worker_commit),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/heartbeat",
+            post(routes::worker_heartbeat),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/step",
+            post(routes::worker_step),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/effects/complete",
+            post(routes::effect_complete),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/effects/fail",
+            post(routes::effect_fail),
+        ),
         ("GET", "/api/v1/agents/effects", get(routes::effects)),
-        ("GET", "/api/v1/agents/effects/{effect}", get(routes::effect_inspect)),
+        (
+            "GET",
+            "/api/v1/agents/effects/{effect}",
+            get(routes::effect_inspect),
+        ),
         ("POST", "/api/v1/agents/reconcile", post(routes::reconcile)),
         ("POST", "/api/v1/agents/sweep", post(routes::sweep)),
     ]
@@ -456,9 +524,19 @@ mod tests {
         }
         assert!(page.contains("/api/v1/agents/reconcile"));
         assert!(page.contains("[\"preview\"]"), "previews are labelled");
-        assert!(page.contains("el(\"details\""), "raw payloads sit in <details>");
+        assert!(
+            page.contains("el(\"details\""),
+            "raw payloads sit in <details>"
+        );
         assert!(page.contains("\"Authorization\": \"Bearer \""));
-        for external in ["<script src", "<link", "@import", "http://", "https://", "url("] {
+        for external in [
+            "<script src",
+            "<link",
+            "@import",
+            "http://",
+            "https://",
+            "url(",
+        ] {
             assert!(!page.contains(external), "external asset: {external}");
         }
     }

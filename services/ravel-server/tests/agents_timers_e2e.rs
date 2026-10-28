@@ -22,7 +22,9 @@ use bytes::Bytes;
 use ravel_agents_core::head::Head;
 use ravel_agents_core::identity::agent_id;
 use ravel_agents_core::keys::{AgentKey, AgentKind, head_key};
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -389,7 +391,8 @@ fn agent(key: &str) -> Value {
 }
 
 async fn create(api: &Api, key: &str) {
-    api.ok(CLIENT, "create", &json!({"agent": agent(key)})).await;
+    api.ok(CLIENT, "create", &json!({"agent": agent(key)}))
+        .await;
 }
 
 async fn schedule(api: &Api, key: &str, timer_key: &str, due_unix_ns: i64) -> Value {
@@ -501,7 +504,11 @@ async fn due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint()
     assert_eq!(report["head_gets"], json!(1), "{report}");
     assert_eq!(after.0 - before.0, 1, "wake LISTs the store served");
     assert_eq!(after.1 - before.1, 1, "dir LISTs the store served");
-    assert_eq!(after.2 - before.2, 2, "HEAD GETs: the pass's read and the fire CAS's");
+    assert_eq!(
+        after.2 - before.2,
+        2,
+        "HEAD GETs: the pass's read and the fire CAS's"
+    );
 
     let listed = timers(&api, "o-1").await;
     assert_eq!(listed["timers"][0]["status"], json!("delivered"));
@@ -810,10 +817,7 @@ async fn sweep_route_counts_match_the_store_and_needs_agents_admin() {
     fixture.advance(120 * SECOND_NS);
 
     let scrape = api.scrape().await;
-    assert_eq!(
-        value(&scrape, "ravel_agents_sweep_interval_ms", "mode="),
-        0
-    );
+    assert_eq!(value(&scrape, "ravel_agents_sweep_interval_ms", "mode="), 0);
     let passes = value(&scrape, "ravel_agents_sweep_passes_total", "mode=");
     let before = fixture.requests.snapshot();
     let report = api.sweep().await;
@@ -831,7 +835,11 @@ async fn sweep_route_counts_match_the_store_and_needs_agents_admin() {
         "{report}"
     );
     assert_eq!(report["head_gets"], json!(2), "{report}");
-    assert_eq!(after.2 - before.2, 4, "the pass's reads and the fire CASes'");
+    assert_eq!(
+        after.2 - before.2,
+        4,
+        "the pass's reads and the fire CASes'"
+    );
 
     let scrape = api.scrape().await;
     let sample = |name: &str| value(&scrape, name, "mode=");
@@ -891,10 +899,7 @@ async fn inspector_is_served_to_agents_tokens_with_every_section() {
         .await
         .expect("request completes");
     assert_eq!(page.status(), StatusCode::OK);
-    assert_eq!(
-        page.headers()["content-type"],
-        "text/html; charset=utf-8"
-    );
+    assert_eq!(page.headers()["content-type"], "text/html; charset=utf-8");
     let csp = page.headers()["content-security-policy"]
         .to_str()
         .expect("ascii policy")

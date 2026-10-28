@@ -320,16 +320,18 @@ impl AgentsRuntime {
         coordinators
             .iter()
             .map(|t| t.coordinator.sweep_metrics())
-            .fold(SweepMetricsSnapshot::default(), |a, b| SweepMetricsSnapshot {
-                passes: a.passes + b.passes,
-                wake_list_pages: a.wake_list_pages + b.wake_list_pages,
-                dir_list_pages: a.dir_list_pages + b.dir_list_pages,
-                head_gets: a.head_gets + b.head_gets,
-                hints_read: a.hints_read + b.hints_read,
-                hints_deleted: a.hints_deleted + b.hints_deleted,
-                timers_fired: a.timers_fired + b.timers_fired,
-                agents_loaded: a.agents_loaded + b.agents_loaded,
-                dir_entries_repaired: a.dir_entries_repaired + b.dir_entries_repaired,
+            .fold(SweepMetricsSnapshot::default(), |a, b| {
+                SweepMetricsSnapshot {
+                    passes: a.passes + b.passes,
+                    wake_list_pages: a.wake_list_pages + b.wake_list_pages,
+                    dir_list_pages: a.dir_list_pages + b.dir_list_pages,
+                    head_gets: a.head_gets + b.head_gets,
+                    hints_read: a.hints_read + b.hints_read,
+                    hints_deleted: a.hints_deleted + b.hints_deleted,
+                    timers_fired: a.timers_fired + b.timers_fired,
+                    agents_loaded: a.agents_loaded + b.agents_loaded,
+                    dir_entries_repaired: a.dir_entries_repaired + b.dir_entries_repaired,
+                }
             })
     }
 }
@@ -410,7 +412,10 @@ mod tests {
         assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
         let late = id(u128::MAX);
         index.record(agent(1), late, 1, result);
-        assert!(index.of(agent(1), late).is_empty(), "a full index took a new effect");
+        assert!(
+            index.of(agent(1), late).is_empty(),
+            "a full index took a new effect"
+        );
 
         index.forget(agent(0), id(1));
         assert!(index.of(agent(0), id(1)).is_empty());

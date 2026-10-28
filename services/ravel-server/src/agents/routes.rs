@@ -29,14 +29,16 @@ use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    ActiveTurnBody, AgentRef, AttemptState, InputSourceBody, MailboxEntryBody, CURSOR_EXPIRED_CODE, CallRequest, CursorExpiredBody, CursorRestart, SafeIdsBody, CallResponse, CancelRequest, CreateAgentRequest,
+    ActiveTurnBody, AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest, CallResponse,
+    CancelRequest, CancelTimerRequest, CreateAgentRequest, CursorExpiredBody, CursorRestart,
     EffectAttemptBody, EffectBody, EffectCompleteRequest, EffectCompleteResponse,
     EffectEvidenceBody, EffectFailRequest, EffectInspectResponse, EffectsResponse, ErrorBody,
-    EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
-    ReconcileDecision, ReconcileRequest, CancelTimerRequest, SweepResponse, TimerBody, TimerRequest, TimersResponse, ReconcileResponse, ResolveRequest, ResolveResponse,
-    ResultBody, ResultResponse, SendRequest, StateResponse, StepBody, StepRecordRequest,
-    StepRecordResponse, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
-    WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
+    EventBody, EventsRequest, EventsResponse, InputSourceBody, MailboxEntryBody, OperationResponse,
+    OperationStatus, ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest,
+    ResolveResponse, ResultBody, ResultResponse, SafeIdsBody, SendRequest, StateResponse, StepBody,
+    StepRecordRequest, StepRecordResponse, SweepResponse, TimerBody, TimerRequest, TimersResponse,
+    WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest,
+    WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};
@@ -113,7 +115,7 @@ pub(super) enum Refusal {
     Auth(ServiceError),
     Agent(AgentError),
     /// An `events` cursor below the retained window (410).
-    CursorExpired(CursorExpiredBody),
+    CursorExpired(Box<CursorExpiredBody>),
 }
 
 impl From<AgentError> for Refusal {
@@ -127,7 +129,7 @@ impl IntoResponse for Refusal {
         match self {
             Refusal::Auth(error) => error.into_response(),
             Refusal::Agent(error) => agent_error(&error),
-            Refusal::CursorExpired(body) => (StatusCode::GONE, Json(body)).into_response(),
+            Refusal::CursorExpired(body) => (StatusCode::GONE, Json(*body)).into_response(),
         }
     }
 }
@@ -463,17 +465,17 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             .events
             .first()
             .map_or(head.next_event_seq, |e| e.event_seq);
-        if let Some(cursor) = after {
-            if cursor.saturating_add(1) < oldest {
-                return Err(Refusal::CursorExpired(CursorExpiredBody {
-                    code: CURSOR_EXPIRED_CODE.to_string(),
-                    cursor: cursor.to_string(),
-                    oldest_cursor: oldest.saturating_sub(1).to_string(),
-                    restart: CursorRestart::RestartFromOldestCursor,
-                    reason: "events below this cursor are no longer retained".to_string(),
-                    ids: SafeIdsBody::from(&ids_for(&agent)),
-                }));
-            }
+        if let Some(cursor) = after
+            && cursor.saturating_add(1) < oldest
+        {
+            return Err(Refusal::CursorExpired(Box::new(CursorExpiredBody {
+                code: CURSOR_EXPIRED_CODE.to_string(),
+                cursor: cursor.to_string(),
+                oldest_cursor: oldest.saturating_sub(1).to_string(),
+                restart: CursorRestart::RestartFromOldestCursor,
+                reason: "events below this cursor are no longer retained".to_string(),
+                ids: SafeIdsBody::from(&ids_for(&agent)),
+            })));
         }
         let after = after.unwrap_or(0);
         let wanted = |e: &&EventEntry| {

@@ -2836,12 +2836,14 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // Built in every `agents` build so `/metrics` reports the settings even
     // without `--agents`; it touches the store only when a route is called.
     #[cfg(feature = "agents")]
-    let agents_runtime = Arc::new(agents::AgentsRuntime::new(
-        agents::AgentsSettings::from_server_config(&config),
-        agents_readiness.clone(),
-        store.clone(),
-    )
-    .with_clock(config.query_budgets.agents.clock.clone()));
+    let agents_runtime = Arc::new(
+        agents::AgentsRuntime::new(
+            agents::AgentsSettings::from_server_config(&config),
+            agents_readiness.clone(),
+            store.clone(),
+        )
+        .with_clock(config.query_budgets.agents.clock.clone()),
+    );
     #[cfg(feature = "agents")]
     if config.query_budgets.agents.enabled {
         readiness_sources.push(agents_readiness.clone() as Arc<dyn health::IngestHealth>);

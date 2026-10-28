@@ -157,6 +157,7 @@ async fn agents_router_mounts_on_both_listeners_only_with_feature_and_flag() {
                 "activation_concurrency": 3,
                 "poll_concurrency": 5,
                 "memory_budget_bytes": 7000,
+                "sweep_interval_ms": 5000,
                 "quotas": {
                     "max_agents": 11,
                     "max_mailbox": 13,

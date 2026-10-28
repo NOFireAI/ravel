@@ -3489,7 +3489,11 @@ pub struct AgentsClock(pub Option<Arc<dyn Fn() -> i64 + Send + Sync>>);
 
 impl std::fmt::Debug for AgentsClock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "injected" } else { "system" })
+        f.write_str(if self.0.is_some() {
+            "injected"
+        } else {
+            "system"
+        })
     }
 }
 
