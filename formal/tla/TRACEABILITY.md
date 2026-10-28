@@ -13,9 +13,9 @@ named in every area table and fails when one no longer exists.
 | lifecycle | `lifecycle/LifecycleGC.tla` | 29 | ravel-maintain, ravel-commit, ravel-query, ravel-catalog | [lifecycle/traceability.md](lifecycle/traceability.md) |
 | resharding | `resharding/OnlineResharding.tla` | 19 | ravel-ingest, ravel-catalog, ravel-commit, ravel-types, services/ravel-cli | [resharding/traceability.md](resharding/traceability.md) |
 | maintenance | `maintenance/MaintenanceOwnership.tla`, `maintenance/CompactionClaims.tla` | 45 | ravel-fleet, ravel-maintain, services/ravel-cli, services/ravel-server | [maintenance/traceability.md](maintenance/traceability.md) |
-| agents | `agents/AgentProtocol.tla` | 31 | ravel-agents-core, ravel-agents-store | [agents/traceability.md](agents/traceability.md) |
+| agents | `agents/AgentProtocol.tla`, `agents/AgentEffects.tla`, `agents/AgentIntegrated.tla` | 51 | ravel-agents-core, ravel-agents-store | [agents/traceability.md](agents/traceability.md) |
 
-Total: 179 traceability rows across the suite.
+Total: 199 traceability rows across the suite.
 
 ## Test debt
 
@@ -44,7 +44,7 @@ covers it.
 - `LostClaimNeverPublishesThroughGuardedPath` —
   `crates/ravel-fleet/src/claim.rs::renew` — same reason as `GuardedPublish`
 
-### agents (6 rows, test gap)
+### agents (13 rows, test gap)
 
 - `Destroy` — `crates/ravel-agents-core/src/kernel.rs::Kernel::tombstone` —
   the tombstone leaves a scheduled timer in HEAD and `check_active` refuses
@@ -71,4 +71,26 @@ covers it.
   test reaches the "HEAD names a different agent" refusal or
   `Kernel::create`'s tenant and agent check
 
-Total test-debt rows: 10 (lifecycle 1, maintenance 3, agents 6).
+- `ReplayIntentDrift` (`crates/ravel-agents-core/src/kernel.rs::Kernel::commit_intent`):
+  no test recommits an intent key with a different input hash and asserts
+  the turn is blocked with the intent unchanged
+- `AdminRecordResult` (`crates/ravel-agents-core/src/kernel.rs::Kernel::record_effect_result`):
+  no test records a result directly on an `InDoubt` effect; every manual
+  test authorizes a reconcile attempt first
+- `CommitCancelled` (`crates/ravel-agents-core/src/kernel.rs::Kernel::complete_turn`):
+  no test requests a cancel while an effect of the turn is `InDoubt` and
+  asserts the completion is refused until reconciliation
+- `PutPayloadLostResponse` (`crates/ravel-agents-store/src/publish.rs::AgentStore::put_object_at`):
+  no test loses the response of a payload PUT that applied and asserts the
+  retried enqueue is accepted with one payload object
+- `StepTranscriptCompatible` (`crates/ravel-agents-core/src/kernel.rs::Kernel::commit_intent`):
+  the intent half, the same gap as `ReplayIntentDrift`
+- `DispatchRequiresCommittedAuthorization` (`crates/ravel-agents-core/src/kernel.rs::Kernel::authorize_attempt`):
+  no test asserts the refusal of an effect that is not journaled; the
+  dispatcher itself lands with T14
+- `CancellationRespected` (effects form,
+  `crates/ravel-agents-core/src/kernel.rs::Kernel::require_running`): the
+  kernel does not read the cancel request before a step, intent or
+  authorization; that rule and its test land with the runner in T14
+
+Total test-debt rows: 17 (lifecycle 1, maintenance 3, agents 13).
