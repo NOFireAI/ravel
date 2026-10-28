@@ -4,7 +4,11 @@
 # lane, each pinned to an immutable image DIGEST and each given identical CPU and
 # memory limits so no comparator wins on hardware. Bring the set up with:
 #
-#   docker compose -f deploy/metricsbench/docker-compose.yml up -d
+#   S3S_FS_BIN=/path/to/verified/s3s-fs \
+#     docker compose -f deploy/metricsbench/docker-compose.yml up -d
+#
+# S3S_FS_BIN is the s3s-fs binary run.sh's fetch_s3s_fs step downloads and
+# checks; compose refuses to start without it (the s3s service below).
 #
 # The MetricsBench harness (crates/ravel-bench, sibling task M1) drives every
 # comparator here over Prometheus Remote Write 1.0 for ingest and the Prometheus
@@ -24,10 +28,10 @@
 # DURABILITY AND STORAGE ARCHITECTURE differ per system and are NOT
 # interchangeable. Prometheus and VictoriaMetrics here persist to a local-disk
 # TSDB. Mimir is object-storage-native and writes its blocks to S3 (backed by
-# RustFS in this stack). Per ADR-0927 decision 10 (ADR-0075 decision 3), a
+# s3s-fs in this stack). Per ADR-0927 decision 10 (ADR-0075 decision 3), a
 # local S3-compatible store removes per-request fees and is therefore valid
 # ONLY for correctness and CI, never for a publishable performance or cost
-# claim. A local-disk or RustFS result here is never an S3-equivalent result;
+# claim. A local-disk or s3s-fs result here is never an S3-equivalent result;
 # each service block below states its own durability so the distinction is
 # readable without the ADR open.
 #
@@ -113,7 +117,7 @@ services:
     # DESCRIPTOR LIMIT (disclosed, equal on every long-running service):
     # nofile 524288 soft and hard, the Docker hard default. The Go engines
     # raise their soft limit to the hard limit themselves; ravel-server and
-    # RustFS do not (#3412), so without this they run at the 1,024 soft
+    # s3s-fs do not (#3412), so without this they run at the 1,024 soft
     # default. README "Frozen limits" carries the row.
     ulimits:
       nofile:
@@ -218,26 +222,34 @@ services:
           memory: 4g
 
   # --- Object storage for the object-storage-native comparator -----------
-  # RustFS backing Mimir's S3 blocks storage. NOTE (ADR-0927 decision 10):
-  # RustFS is local-disk-backed and free of per-request fees, so any Mimir
-  # figure taken against it is a correctness/functional result, NOT a
-  # publishable cost or performance result. A real-S3 substrate is required for
-  # that, exactly as Ravel's own publishable lane requires real S3.
-  # ghcr.io rather than Docker Hub: rationale in deploy/README.md.
-  rustfs:
-    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
-    # `server` is the default subcommand, so the command line is the data
-    # directory plus the console flags; the console serves nothing until
-    # --console-enable is passed. Publishing it keeps the previous stack's
-    # browsable view of the blocks bucket.
-    command: ["--console-enable", "--console-address", ":9001", "/data"]
-    ports:
-      - "127.0.0.1:9101:9001"
+  # s3s-fs backing Mimir's S3 blocks storage (ADR-0927 amendment 2026-10-29).
+  # NOTE (ADR-0927 decision 10): s3s-fs is local-disk-backed and free of
+  # per-request fees, so any Mimir figure taken against it is a
+  # correctness/functional result, NOT a publishable cost or performance
+  # result. A real-S3 substrate is required for that, exactly as Ravel's own
+  # publishable lane requires real S3.
+  #
+  # The binary is not in an image: run.sh's fetch_s3s_fs step downloads the
+  # s3s-fs-0.17.0-ravel.1 release asset for the host arch, refuses it unless
+  # its sha256 equals the constant run.sh carries, and exports its path as
+  # S3S_FS_BIN, which is bind-mounted read-only below. The pin guard
+  # (tests/every_comparator_pins_an_image_digest.sh, category 7) fails if
+  # either constant or the comparison goes. The base image is the same
+  # distroless/cc digest the root Dockerfile builds on; the binary is linked
+  # against glibc and needs nothing else from the image. It runs as root
+  # (user 0:0) so it can write the named volume, which Docker creates
+  # root-owned.
+  s3s:
+    image: gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/s3s-fs"]
+    command: ["--host", "0.0.0.0", "--port", "9000", "/data"]
     environment:
-      RUSTFS_ACCESS_KEY: mimir
-      RUSTFS_SECRET_KEY: mimir-dev-secret
+      S3S_FS_ACCESS_KEY: mimir
+      S3S_FS_SECRET_KEY: mimir-dev-secret
     volumes:
-      - rustfs-data:/data
+      - ${S3S_FS_BIN:?S3S_FS_BIN must name the verified s3s-fs binary; run.sh sets it}:/usr/local/bin/s3s-fs:ro
+      - s3s-data:/data
     # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
     ulimits:
       nofile:
@@ -251,7 +263,7 @@ services:
 
   createbuckets:
     image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
-    depends_on: [rustfs]
+    depends_on: [s3s]
     environment:
       AWS_ACCESS_KEY_ID: mimir
       AWS_SECRET_ACCESS_KEY: mimir-dev-secret
@@ -261,21 +273,22 @@ services:
     # all three buckets so a fresh store does not stall Mimir startup. The
     # until-loop is the readiness wait: this one-shot exits 0 only once the
     # buckets exist, which mimir depends_on below. Each bucket is created only
-    # if head-bucket does not find it, so a rerun on the kept rustfs-data
-    # volume still exits 0 whatever RustFS answers to a repeated CreateBucket.
-    # ravel-metricsbench is Ravel's bucket, used only when ravel.yml is layered
-    # on this file; it is created here so one one-shot owns the RustFS
-    # buckets. All four stay plain (no Object Lock): Ravel's store qualify
-    # reports Object Lock but does not require it unless asked to, and bucket
-    # immutability is not what this lane measures.
+    # if head-bucket does not find it, so a rerun on the kept s3s-data volume
+    # still exits 0: s3s-fs answers a repeated CreateBucket with
+    # BucketAlreadyExists. ravel-metricsbench is Ravel's bucket, used only
+    # when ravel.yml is layered on this file; it is created here so one
+    # one-shot owns the store's buckets. All four stay plain (no Object
+    # Lock): Ravel's store qualify reports Object Lock but does not require
+    # it unless asked to, and bucket immutability is not what this lane
+    # measures.
     entrypoint: >
       /bin/sh -c "
-      until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
-        echo 'waiting for rustfs'; sleep 1;
+      until aws --endpoint-url http://s3s:9000 s3api list-buckets >/dev/null 2>&1; do
+        echo 'waiting for s3s'; sleep 1;
       done &&
       for b in mimir-blocks mimir-ruler mimir-alertmanager ravel-metricsbench; do
-        aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket $$b ||
-        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket $$b || exit 1;
+        aws --endpoint-url http://s3s:9000 s3api head-bucket --bucket $$b ||
+        aws --endpoint-url http://s3s:9000 s3api create-bucket --bucket $$b || exit 1;
       done"
 
   # --- Mimir (object-storage-native PromQL system) -----------------------
@@ -286,7 +299,7 @@ services:
   #
   # DURABILITY AND STORAGE ARCHITECTURE: the distributor accepts Remote Write at
   # /api/v1/push; the ingester holds recent samples in an in-memory head with a
-  # local write-ahead log, then ships each cut TSDB block to S3 (RustFS here;
+  # local write-ahead log, then ships each cut TSDB block to S3 (s3s-fs here;
   # -blocks-storage.tsdb.ship-interval in Mimir 3.2.3's -help-all), where the
   # compactor later merges it. So an ack is a local-WAL guarantee and the S3
   # copy appears LATER, after block upload. This ack-vs-object-storage-visibility
@@ -353,5 +366,5 @@ services:
 volumes:
   prometheus-data:
   victoriametrics-data:
-  rustfs-data:
+  s3s-data:
   mimir-data:
