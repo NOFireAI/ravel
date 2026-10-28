@@ -39,19 +39,33 @@
 //! `timers::Coordinator::fire_due` issues on the generation HEAD holds.
 //!
 //! The directory half lists `_dir/` entries (`AgentStore::list_dir_after`),
-//! not HEADs. A `_dir` entry is written only by a create
-//! (`Effect::WriteDirEntry` from the kernel's `create_new` and `create`; the
-//! store repeats the PUT when a create finds the agent exists), and a failed
-//! PUT of it is logged and not repaired (`write_dir_entry` in
-//! `ravel-agents-store`).
-//! An agent without one is reached only through its hints: the directory
-//! half reads nothing for it
+//! not HEADs, as the directory amendment to ADR-3331 decision 8 records.
+//! The index is complete by construction: a create writes the agent's
+//! `_dir` entry before the HEAD write that creates it and fails without
+//! writing HEAD when the entry cannot be written
+//! (`ravel-agents-store`'s `a_create_whose_dir_entry_fails_writes_no_head`),
+//! so every agent with a HEAD has an entry. An entry whose HEAD is absent
+//! costs one read and is skipped.
+//!
+//! An entry can still go missing outside the runtime, for example by hand.
+//! Such an agent is reached only through its hints, and the pass then
+//! writes the entry back: after the directory half, every agent the wake
+//! half read with a HEAD present and whose entry the directory half did not
+//! list in the same pass gets one `CreateIfAbsent` PUT
+//! (`tests::a_hint_reached_agent_gets_its_missing_dir_entry_back`). An agent
+//! the directory half listed gets none, so a tenant whose directory fits one
+//! pass pays nothing for the repair; in a larger one, a hint-reached agent
+//! outside the pass's directory slice costs one PUT that answers
+//! `AlreadyExists`. The repair issues no read, and at most one PUT per HEAD
+//! read the wake half made, so the GET budget bounds it. A PUT that fails is
+//! logged and tried again on the next pass that reaches the agent
 //! (`tests::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`,
-//! where no entry is written). A due timer on such an agent whose hint was
-//! lost or deleted by the race above stays unfired until a later schedule
-//! writes a new hint or a create rewrites the entry. ADR-3331 decision 8
-//! has the sweep list HEADs; this listing of the advisory index is where
-//! the code departs from it.
+//! where every repair PUT is refused).
+//!
+//! A listing page whose keys the store cannot address, or that do not parse
+//! as hints or agent ids, still moves its half's cursor past the page
+//! (`tests::a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it`,
+//! `tests::a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it`).
 //!
 //! # Bounds and fairness
 //!
@@ -77,10 +91,19 @@
 //!
 //! A pass runs from [`Coordinator::sweep_once`], and from worker polls once
 //! [`Coordinator::with_sweep`] enabled it, at most once per
-//! [`SweepConfig::interval_ms`] across every poller. Nothing in
-//! `ravel-server` schedules either yet; T19 (#3353) does.
+//! [`SweepConfig::interval_ms`] across every poller. A poll runs one only
+//! after its scan found nothing to dispatch, so a ready assignment never
+//! waits for a pass (`tests::a_poll_with_a_ready_turn_runs_no_sweep_pass`),
+//! and a pass that fired a timer or loaded an agent makes the same poll scan
+//! again before it waits
+//! (`tests::an_idle_poll_sweeps_on_the_interval_and_takes_what_the_pass_fired`).
+//! Nothing in `ravel-server` schedules either yet; T19 (#3353) does.
+//!
+//! Each pass's counters are a flat [`SweepReport`], summed into
+//! [`crate::SweepMetricsSnapshot`] for `ravel-server` to render. Nothing
+//! renders them until T19 does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
@@ -122,7 +145,8 @@ impl Default for SweepConfig {
     }
 }
 
-/// What one pass did.
+/// What one pass did: a flat set of counters, with no per-phase split. The
+/// store's own counters split the same requests by phase.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
     /// LISTs issued, wake and directory halves together.
@@ -137,6 +161,9 @@ pub struct SweepReport {
     pub timers_fired: u64,
     /// Agents with work the pass added to the dispatch set.
     pub agents_loaded: u64,
+    /// Missing `_dir` entries the pass wrote back for agents it reached
+    /// through a hint.
+    pub dir_entries_repaired: u64,
 }
 
 /// Where the next pass resumes: the last key each half processed.
@@ -160,6 +187,10 @@ struct Pass {
     lists_left: u32,
     gets_left: u32,
     seen: HashMap<AgentId, Seen>,
+    /// Agents the wake half read with a HEAD present, in read order.
+    hinted: Vec<AgentId>,
+    /// Agents whose `_dir` entry the directory half listed.
+    listed: HashSet<AgentId>,
     now: i64,
 }
 
@@ -195,10 +226,12 @@ impl Coordinator {
     /// A pass from a worker poll, when enabled and the interval has passed.
     /// Pollers claim the slot by compare-exchange on the last-pass stamp, so
     /// pollers woken together run one pass; one that finds a pass running
-    /// skips it.
-    pub(crate) async fn sweep_from_poll(&self) {
+    /// skips it. Only a poll that found nothing to dispatch calls this, so a
+    /// ready assignment never waits for a pass. Returns whether the pass
+    /// fired a timer or loaded an agent, which is new work to scan for.
+    pub(crate) async fn sweep_from_poll(&self) -> bool {
         if !self.sweep_on_poll {
-            return;
+            return false;
         }
         let interval = ms_to_ns(self.sweep.interval_ms);
         let last = self.last_sweep_unix_ns.load(Ordering::Acquire);
@@ -209,13 +242,19 @@ impl Coordinator {
                 .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
-            return;
+            return false;
         }
         let Ok(mut cursor) = self.sweep_cursor.try_lock() else {
-            return;
+            return false;
         };
-        if let Err(error) = self.sweep_pass(&mut cursor).await {
-            tracing::warn!(%error, "agents sweep pass failed");
+        match self.sweep_pass(&mut cursor).await {
+            Ok(report) => report.timers_fired > 0 || report.agents_loaded > 0,
+            Err(error) => {
+                tracing::warn!(%error, "agents sweep pass failed");
+                // A failed half still ran the other; scan again in case it
+                // found work.
+                true
+            }
         }
     }
 
@@ -226,12 +265,17 @@ impl Coordinator {
             lists_left: config.max_list_pages / 2,
             gets_left: config.max_head_gets / 2,
             seen: HashMap::new(),
+            hinted: Vec::new(),
+            listed: HashSet::new(),
             now: self.now(),
         };
         let wake = self.sweep_wake(&mut pass, cursor).await;
         pass.lists_left += config.max_list_pages - config.max_list_pages / 2;
         pass.gets_left += config.max_head_gets - config.max_head_gets / 2;
         let dir = self.sweep_dir(&mut pass, cursor).await;
+        if dir.is_ok() {
+            self.repair_dir_entries(&mut pass).await;
+        }
         self.record_sweep(&pass.report);
         wake.and(dir).map(|()| pass.report)
     }
@@ -259,6 +303,9 @@ impl Coordinator {
                         return Ok(());
                     }
                     self.visit(pass, &hint.agent).await;
+                    if pass.seen.get(&hint.agent).is_some_and(|s| s.head.is_some()) {
+                        pass.hinted.push(hint.agent);
+                    }
                 }
                 pass.report.hints_read += 1;
                 let stale = pass
@@ -275,8 +322,13 @@ impl Coordinator {
                 cursor.wake = None;
                 return Ok(());
             }
-            if page.last_key.is_some() {
-                cursor.wake = page.last_key;
+            // The page's raw last key, which moves the cursor past keys that
+            // parsed into no hint. A page reporting more always has one; if
+            // a backend ever returned none, ending the half beats re-listing
+            // the same page.
+            match page.last_key {
+                Some(last) => cursor.wake = Some(last),
+                None => return Ok(()),
             }
         }
     }
@@ -289,6 +341,8 @@ impl Coordinator {
             pass.lists_left -= 1;
             pass.report.list_pages += 1;
             let page = self.store.list_dir_after(cursor.dir.as_deref()).await?;
+            pass.listed
+                .extend(page.items.iter().map(|entry| entry.agent));
             for entry in &page.items {
                 if !pass.seen.contains_key(&entry.agent) {
                     if pass.gets_left == 0 {
@@ -302,8 +356,30 @@ impl Coordinator {
                 cursor.dir = None;
                 return Ok(());
             }
-            if page.last_key.is_some() {
-                cursor.dir = page.last_key;
+            match page.last_key {
+                Some(last) => cursor.dir = Some(last),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Restore the `_dir` entry of every agent the wake half reached whose
+    /// HEAD exists and whose entry the directory half did not list in this
+    /// pass: one `CreateIfAbsent` PUT each, which is `AlreadyExists` when
+    /// the entry is there after all. At most one per HEAD read the wake half
+    /// made, so the GET budget bounds it.
+    async fn repair_dir_entries(&self, pass: &mut Pass) {
+        let hinted = std::mem::take(&mut pass.hinted);
+        for agent in hinted {
+            if pass.listed.contains(&agent) {
+                continue;
+            }
+            match self.store.ensure_dir_entry(&agent).await {
+                Ok(true) => pass.report.dir_entries_repaired += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(agent = %agent.to_hex(), %error, "agents sweep could not repair a dir entry");
+                }
             }
         }
     }

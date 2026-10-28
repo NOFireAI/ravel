@@ -293,7 +293,10 @@ impl IdSource for DerivedIds {
 /// Work the coordinator does after the CAS that published the root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    /// `CreateIfAbsent` the `_dir/<agent_id>` listing entry.
+    /// `CreateIfAbsent` the `_dir/<agent_id>` listing entry. The one effect
+    /// done before the CAS rather than after it: the store writes it ahead
+    /// of the HEAD write that creates the incarnation and refuses the create
+    /// when it fails, so every agent with a HEAD has an entry.
     WriteDirEntry,
     /// Offer the agent to a polling worker.
     WakeWorker,

@@ -230,12 +230,18 @@ What the store tests pin about the rule:
 - A dependency whose stored bytes do not match their hash is a typed error
   (`a_corrupt_dependency_write_is_a_typed_error`,
   `a_corrupt_dependency_read_is_a_typed_error`).
-- The `_dir` entry and the `_wake` hint are written after the HEAD write;
-  a failure to write either does not fail the command, which still reports
-  what its CAS published (`a_failed_wake_hint_does_not_fail_the_command`);
-  the failure is logged, which no test asserts. A create that finds the
-  agent already active re-creates a missing `_dir` entry with
-  `CreateIfAbsent` (`a_create_that_finds_the_root_repairs_the_dir_entry`).
+- A create writes the `_dir` entry with `CreateIfAbsent` before the HEAD
+  write, and a create whose entry cannot be written fails with
+  `StoreUnavailable` and writes no HEAD
+  (`a_create_whose_dir_entry_fails_writes_no_head`), so every agent with a
+  HEAD has an entry (ADR-3331, the directory amendment to decision 8). A
+  create that finds the agent already active re-creates a missing `_dir`
+  entry with `CreateIfAbsent`
+  (`a_create_that_finds_the_root_repairs_the_dir_entry`).
+- The `_wake` hint is written after the HEAD write; a failure to write it
+  does not fail the command, which still reports what its CAS published
+  (`a_failed_wake_hint_does_not_fail_the_command`); the failure is logged,
+  which no test asserts.
 
 The store counts GET, PUT, CAS, LIST and conflicts per phase (resolve,
 build, store, publish) in its own counters (`counters.rs`); the store tests
@@ -382,7 +388,7 @@ of a running server.
 | A `manual` effect in doubt blocks the turn until reconciled | in the crates (kernel); end to end in M3 | kernel `a_manual_effect_goes_in_doubt_and_blocks_the_turn_until_reconciled` |
 | A step replayed with a different input blocks the turn | in the crates (kernel); end to end in M3 | kernel `a_step_replayed_with_another_input_blocks_the_turn` |
 | A timer fires once; a cancel after the firing reports `AlreadyFired` | in the crates (kernel); end to end in M4 | kernel `timers_fire_once_and_a_late_cancel_reports_already_fired` |
-| A timer fires without its wake hint | in the crates (runtime sweep); end to end in M4 | runtime `a_lost_hint_is_found_by_the_directory_half`, `a_schedule_whose_hint_was_never_written_still_fires_when_due`; the directory half reaches the agent within `ceil(agents / directory GETs per pass)` passes (`a_bounded_pass_walks_the_directory_in_list_order_across_passes`), and an agent with neither a hint nor a `_dir` entry is not reached (`sweep` module docs) |
+| A timer fires without its wake hint | in the crates (runtime sweep); end to end in M4 | runtime `a_lost_hint_is_found_by_the_directory_half`, `a_schedule_whose_hint_was_never_written_still_fires_when_due`; the directory half reaches the agent within `ceil(agents / directory GETs per pass)` passes (`a_bounded_pass_walks_the_directory_in_list_order_across_passes`); every agent with a HEAD has a `_dir` entry because a create writes it first (store `a_create_whose_dir_entry_fails_writes_no_head`), a hint-reached agent whose entry went missing gets it back (`a_hint_reached_agent_gets_its_missing_dir_entry_back`), and a listing page of unaddressable keys still moves the cursor (`a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it`, `a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it`) |
 | Wake hints are deleted when no longer needed | in the crates (runtime sweep); end to end in M4 | runtime `fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation`, `duplicate_hints_for_one_generation_fire_it_once`; a hint is deleted only after a HEAD read in the same pass shows no timer armed in its bucket, and a premature one is kept (`a_premature_hint_fires_nothing_and_is_kept`) |
 | Destroy tombstones; recreate bumps the incarnation and refuses old handles | in the crates (M1) | kernel `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store `create_on_a_tombstoned_agent_bumps_the_incarnation` |
 | Kernel sequences keep the HEAD invariants | in the crates (M1) | kernel `kernel_sequences_keep_the_head_invariants` |

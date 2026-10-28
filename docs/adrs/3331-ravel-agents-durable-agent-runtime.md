@@ -109,6 +109,9 @@ and the tenant IAM scope apply without new machinery:
 | `t/<tenant_hash>/ag/_wake/<due_bucket>/<agent_id>` | advisory wake hint; may be absent, duplicated, stale, or early | `Overwrite`; deleted after the authoritative root no longer needs it |
 | `t/<tenant_hash>/ag/_dir/<agent_id>` | advisory listing entry for bounded pagination | `CreateIfAbsent` |
 
+A create writes the `_dir` entry before the HEAD write and fails when it
+cannot (see the directory amendment below).
+
 `agent_id` is `hex(blake3("ravel-agent-v1" || len(kind) || kind || len(key) || key)[..16])`,
 built with the length-prefixed scheme of `SeriesId::compute`
 (`crates/ravel-types/src/lib.rs:425-470`). The raw `kind` and `key` are
@@ -297,7 +300,8 @@ cancellation that arrives after the firing CAS returns `AlreadyFired`.
 
 Wake hints under `_wake/` are accelerators only. The coordinator runs a
 fair, bounded-per-pass reconciliation sweep over `t/<tenant_hash>/ag/`
-for every admitted tenant that lists HEADs and acts on any accepted
+for every admitted tenant that lists HEADs (see the directory amendment
+below: it lists the `_dir` index) and acts on any accepted
 work, due timer or active turn the hints missed. The sweep's LIST and GET
 counts per pass are metrics and a milestone 6 benchmark. Safety never
 depends on clocks; timer accuracy and takeover speed do, and the guide
@@ -618,3 +622,44 @@ dispatched on the retry, which its policy allows. The kernel tests
 `fail_turn_is_refused_while_a_manual_attempt_is_in_doubt` and
 `fail_turn_is_refused_while_an_attempt_is_authorized_without_a_result`
 pin this.
+
+## Amendment (2026-10-28): the sweep lists the directory, and the directory is complete
+
+<!-- amendment-applies: sections="8. Timers, hints and the sweep|2. Namespace and key layout" pointer="directory amendment" -->
+<!-- amendment-supersedes: phrase="that lists HEADs" pointer="directory amendment" -->
+
+The sweep in `ravel-agents-runtime` (#3348) cannot list HEADs within a
+bounded pass: HEAD keys sit one level below each `<agent_id>`, among that
+agent's objects, so a flat listing of `t/<tenant_hash>/ag/` pages through
+every object of every agent, and the delimited listing that would return
+one prefix per agent (`list_delimited`) takes no page token or start key,
+so a pass can neither cap it nor resume it. The directory half of the
+sweep lists the `_dir/` index instead, which pages and resumes after a
+key, and reads HEAD for each entry. Review of that change found the
+index was not complete: a create wrote its `_dir` entry after the HEAD
+write and only logged a failure, so an agent whose entry PUT failed and
+whose wake hint was also lost had a due timer no pass reached.
+
+Decision 8 now reads: the sweep lists `_wake/` hints and then the `_dir/`
+index, and reads HEAD for every agent either one names. Three rules make
+the index complete:
+
+- A create writes the `_dir` entry with `CreateIfAbsent` before the HEAD
+  write that creates the incarnation, and a create whose entry cannot be
+  written fails with `StoreUnavailable` and writes no HEAD. So every agent
+  that has a HEAD has an entry. An entry without a HEAD is harmless: the
+  sweep reads HEAD, finds it absent and skips it. The store test
+  `a_create_whose_dir_entry_fails_writes_no_head` pins this.
+- A create that finds the agent already active writes the entry again,
+  as before.
+- When the sweep reaches an agent through a hint, finds its HEAD, and the
+  directory half did not list the agent's entry in the same pass, it
+  writes the entry back with one `CreateIfAbsent` PUT. The repair issues
+  no read and at most one PUT per HEAD read of the wake half, so the
+  pass's GET budget bounds it. The runtime test
+  `a_hint_reached_agent_gets_its_missing_dir_entry_back` pins one PUT when
+  the entry is missing and none when it is listed.
+
+The entry stays advisory in one sense: a reader never acts on it without
+reading HEAD. The key layout and the write mode in decision 2 are
+unchanged.

@@ -4,6 +4,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ravel_agents_core::head::TimerStatus;
+use ravel_agents_core::keys::{dir_key, dir_prefix, wake_prefix};
+use ravel_agents_core::wire::TimerRequest;
+use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
@@ -12,7 +15,9 @@ use ravel_types::TenantHash;
 use serde_json::json;
 
 use crate::tests::{T0, create, head, id_of, poll_now, send, worker};
-use crate::timers::tests::{SEC, TENANT, hint_keys, rig, rig_over, schedule, status, tick_inputs};
+use crate::timers::tests::{
+    SEC, TENANT, hint_keys, rig, rig_over, schedule, status, tick_inputs, timer,
+};
 use crate::{SweepConfig, SweepMetricsSnapshot, SweepReport};
 
 fn lost_hints() -> Arc<FaultStore<MemoryStore>> {
@@ -104,6 +109,7 @@ async fn a_lost_hint_is_found_by_the_directory_half() {
             hints_deleted: 0,
             timers_fired: 1,
             agents_loaded: 0,
+            dir_entries_repaired: 0,
         }
     );
     assert_eq!(tick_inputs(&head(&r.store, "o-1").await), 1);
@@ -169,9 +175,14 @@ async fn a_bounded_pass_walks_the_directory_in_list_order_across_passes() {
 
 #[tokio::test(start_paused = true)]
 async fn the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes() {
-    // No `_dir` entry is ever written, so only the wake half reaches an agent.
+    // The agents are created over the plain store, their `_dir` entries are
+    // then removed, and the sweeping coordinator's store refuses every
+    // `_dir` PUT, so the repair cannot restore them and only the wake half
+    // reaches an agent.
+    let shared = Arc::new(MemoryStore::new());
+    let setup = rig_over(shared.clone(), SweepConfig::default());
     let fault = Arc::new(FaultStore::new(
-        MemoryStore::new(),
+        shared.clone(),
         FaultPlan::empty().with_rule(
             Rule::new(Op::Put, ScriptedFault::Permanent("dir lost".to_string()))
                 .with_key_contains("/_dir/")
@@ -191,11 +202,14 @@ async fn the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes(
     // hints and never reach the later ones.
     let keys: Vec<String> = (0..5).map(|i| format!("o-{i}")).collect();
     for key in &keys {
-        create(&r.co, key).await;
-        schedule(&r.co, key, "a", T0 + SEC).await;
-        schedule(&r.co, key, "b", T0 + 50 * SEC).await;
+        create(&setup.co, key).await;
+        schedule(&setup.co, key, "a", T0 + SEC).await;
+        schedule(&setup.co, key, "b", T0 + 50 * SEC).await;
+        shared
+            .delete(&dir_key(&TENANT, &id_of(key)).expect("dir key"))
+            .await
+            .expect("delete dir entry");
     }
-    assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 5);
     assert_eq!(hint_keys(r.backend.as_ref()).await.len(), 5);
     r.now.advance(SEC);
     // Wake keys share one bucket, so LIST order is agent id order.
@@ -237,6 +251,91 @@ async fn the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes(
     // Half of a cap of four per pass, and the directory half reads nothing.
     assert_eq!(reports, vec![(2, 2, 2, 0), (2, 2, 2, 0), (1, 1, 1, 0)]);
     assert_eq!(hint_keys(r.backend.as_ref()).await.len(), 5);
+    // Each agent the wake half read got one refused repair PUT.
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 5);
+    assert_eq!(r.co.sweep_metrics().dir_entries_repaired, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hint_reached_agent_gets_its_missing_dir_entry_back() {
+    let r = rig();
+    create(&r.co, "o-1").await;
+    let dir = dir_key(&TENANT, &id_of("o-1")).expect("dir key");
+
+    // Entry present: the directory half lists it, so no PUT.
+    schedule(&r.co, "o-1", "a", T0 + SEC).await;
+    r.now.advance(SEC);
+    let before = r.store.counters();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    let spent = r.store.counters().since(&before);
+    assert_eq!((pass.timers_fired, pass.dir_entries_repaired), (1, 0));
+    assert_eq!(spent.publish.put, 0);
+    let fire_gets = spent.resolve.get;
+
+    // Entry missing: one conditional PUT writes it back.
+    r.backend.delete(&dir).await.expect("delete dir entry");
+    schedule(&r.co, "o-1", "b", r.now.get() + SEC).await;
+    r.now.advance(SEC);
+    let before = r.store.counters();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    let spent = r.store.counters().since(&before);
+    assert_eq!((pass.timers_fired, pass.dir_entries_repaired), (1, 1));
+    assert_eq!(spent.publish.put, 1);
+    assert_eq!(spent.resolve.get, fire_gets, "the repair reads nothing");
+    r.backend.head(&dir).await.expect("dir entry restored");
+    assert_eq!(r.co.sweep_metrics().dir_entries_repaired, 1);
+
+    // Restored: the next pass lists it and writes nothing.
+    let before = r.store.counters();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    assert_eq!(pass.dir_entries_repaired, 0);
+    assert_eq!(r.store.counters().since(&before).publish.put, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_with_a_ready_turn_runs_no_sweep_pass() {
+    let r = rig();
+    create(&r.co, "o-1").await;
+    let w = worker(&r.co, "v1");
+    // The first poll lists the directory and runs the first pass.
+    assert!(poll_now(&r.co, &w, "v1").await.is_none());
+    assert_eq!(r.co.sweep_metrics().passes, 1);
+
+    send(&r.co, "o-1", "r-1", json!(1)).await;
+    r.now.advance(5 * SEC);
+    let before = r.store.counters();
+    let assigned = poll_now(&r.co, &w, "v1").await;
+    assert!(assigned.is_some(), "the ready turn is assigned");
+    assert_eq!(r.co.sweep_metrics().passes, 1, "no pass on this poll");
+    assert_eq!(r.store.counters().since(&before).resolve.list, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_poll_sweeps_on_the_interval_and_takes_what_the_pass_fired() {
+    let r = rig();
+    create(&r.co, "o-1").await;
+    let w = worker(&r.co, "v1");
+    assert!(poll_now(&r.co, &w, "v1").await.is_none());
+    assert_eq!(r.co.sweep_metrics().passes, 1);
+    // A timer whose input the worker handles, due one interval from now.
+    r.co.schedule_timer(&TimerRequest {
+        handler: "step".to_string(),
+        ..timer("o-1", "t", T0 + 5 * SEC)
+    })
+    .await
+    .expect("schedule");
+
+    r.now.advance(5 * SEC - 1);
+    assert!(poll_now(&r.co, &w, "v1").await.is_none());
+    assert_eq!(r.co.sweep_metrics().passes, 1);
+
+    r.now.advance(1);
+    let assigned = poll_now(&r.co, &w, "v1").await;
+    assert_eq!(r.co.sweep_metrics().passes, 2);
+    assert_eq!(r.co.sweep_metrics().timers_fired, 1);
+    // The same non-waiting poll scans again after the pass and takes the
+    // input the fire enqueued.
+    assert!(assigned.is_some(), "the fired timer's turn is assigned");
 }
 
 #[tokio::test(start_paused = true)]
@@ -260,6 +359,7 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
         hints_deleted: 1,
         timers_fired: 1,
         agents_loaded: 2,
+        dir_entries_repaired: 0,
     };
     assert_eq!(pass, expected);
     assert_eq!(
@@ -272,6 +372,7 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
             hints_deleted: 1,
             timers_fired: 1,
             agents_loaded: 2,
+            dir_entries_repaired: 0,
         }
     );
     let spent = r.store.counters().since(&store_before);
@@ -299,6 +400,7 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
             hints_deleted: 1,
             timers_fired: 1,
             agents_loaded: 2,
+            dir_entries_repaired: 0,
         }
     );
     assert_eq!(r.co.sweep_metrics(), SweepMetricsSnapshot::default());
@@ -324,6 +426,79 @@ async fn polls_start_at_most_one_pass_per_interval() {
     r.now.advance(1);
     poll_now(&r.co, &w, "v1").await;
     assert_eq!(r.co.sweep_metrics().passes, 2);
+}
+
+/// Two keys under `prefix` that sort before every real entry and that no
+/// operation can address, written as a foreign writer would.
+fn plant_unaddressable(backend: &MemoryStore, prefix: &str) {
+    for name in ["0//a", "0//b"] {
+        backend.insert_foreign(&format!("{prefix}{name}"), bytes::Bytes::new());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it() {
+    let backend = Arc::new(MemoryStore::with_page_size(2));
+    let r = rig_over(backend.clone(), SweepConfig::default());
+    create(&r.co, "o-1").await;
+    schedule(&r.co, "o-1", "t", T0 + SEC).await;
+    // The listing fills its first page with these two keys and reports
+    // more, so the page parses into no hint.
+    plant_unaddressable(&backend, &wake_prefix(&TENANT).expect("prefix"));
+    r.now.advance(SEC);
+
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    // Page one: the two planted keys. Page two: the real hint, and the
+    // listing ends there. Then one directory page, whose entry the wake
+    // half already read.
+    assert_eq!(
+        pass,
+        SweepReport {
+            list_pages: 3,
+            head_gets: 1,
+            hints_read: 1,
+            hints_deleted: 1,
+            timers_fired: 1,
+            agents_loaded: 0,
+            dir_entries_repaired: 0,
+        }
+    );
+    assert_eq!(tick_inputs(&head(&r.store, "o-1").await), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it() {
+    let fault = Arc::new(FaultStore::new(
+        MemoryStore::with_page_size(2),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("hint lost".to_string()))
+                .with_key_contains("/_wake/")
+                .with_occurrence(Occurrence::Always),
+        ),
+    ));
+    let r = rig_over(fault.clone(), SweepConfig::default());
+    create(&r.co, "o-1").await;
+    schedule(&r.co, "o-1", "t", T0 + SEC).await;
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 1);
+    plant_unaddressable(fault.inner(), &dir_prefix(&TENANT).expect("prefix"));
+    r.now.advance(SEC);
+
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    // One empty wake page, then the planted directory page, then the page
+    // holding the agent's entry.
+    assert_eq!(
+        pass,
+        SweepReport {
+            list_pages: 3,
+            head_gets: 1,
+            hints_read: 0,
+            hints_deleted: 0,
+            timers_fired: 1,
+            agents_loaded: 0,
+            dir_entries_repaired: 0,
+        }
+    );
+    assert_eq!(tick_inputs(&head(&r.store, "o-1").await), 1);
 }
 
 #[tokio::test(start_paused = true)]

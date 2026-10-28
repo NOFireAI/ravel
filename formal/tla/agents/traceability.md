@@ -108,9 +108,13 @@ above in the task that builds its symbol.
   schedule no timers yet. Model difference: the model reaches a timer only
   through its hint and assumes the hint write under `Fairness` (the
   HEAD-listing half of the sweep is not modelled). The code's backstop for
-  a lost hint is the `_dir` listing, not a HEAD listing, so an agent with
-  neither (its create-time `_dir` PUT failed and its hint was lost) is not
-  reached; the `sweep` module docs state the bound and the gap.
+  a lost hint is the `_dir` listing, not a HEAD listing (ADR-3331, the
+  directory amendment to decision 8). The listing is complete because a
+  create writes the entry before HEAD and fails without it
+  (`crates/ravel-agents-store/src/tests.rs::a_create_whose_dir_entry_fails_writes_no_head`),
+  and a hint-reached agent whose entry went missing gets it back
+  (`crates/ravel-agents-runtime/src/sweep/tests.rs::a_hint_reached_agent_gets_its_missing_dir_entry_back`);
+  the `sweep` module docs state the bound.
 - The effect runner: T14 built the coordinator's step and effect path
   (`Coordinator::run_step`, `record_result`, `reconcile_attach`,
   `reconcile_authorize` in `crates/ravel-agents-runtime/src/effects.rs`),
