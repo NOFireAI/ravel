@@ -19,8 +19,10 @@
 # file happened to name. `${RAVEL_IMAGE:?...}` makes compose itself refuse:
 # `docker compose ... config` and `up` exit non-zero with the message below
 # when RAVEL_IMAGE is unset or empty. Pass a digest-pinned reference so the
-# run is reproducible; capture-effective-config.sh records the resolved image
-# id either way. Both services use the same image: ravel-cli ships in it.
+# run is reproducible, or, for the nightly's `ci` run only, a local tag that
+# run.sh has checked against --ravel-image-id (an image already on the host is
+# not pulled); capture-effective-config.sh records the resolved image id
+# either way. Both services use the same image: ravel-cli ships in it.
 #
 # DURABILITY: object storage (RustFS here, bucket ravel-metricsbench). Remote
 # Write is strict: a 2xx means the data object and the commit record are
@@ -54,7 +56,7 @@ services:
   # --require-bucket-protection, and immutability is not what this lane
   # measures.
   ravel-qualify:
-    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned or a checked local tag}
     depends_on:
       createbuckets:
         condition: service_completed_successfully
@@ -65,7 +67,7 @@ services:
 
   # --- Ravel ---------------------------------------------------------------
   ravel-server:
-    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned or a checked local tag}
     depends_on:
       ravel-qualify:
         condition: service_completed_successfully
