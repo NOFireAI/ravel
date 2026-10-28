@@ -437,6 +437,106 @@ Fetch and decode an idempotency marker by its exact object key (`t/<tenant_hash>
 | --- | --- | --- | --- |
 | `<KEY>` |  |  | Object store key of the marker |
 
+## agents
+
+Ravel Agents (ADR-3331 decision 11): read agent state straight from the bucket, settle an effect through the server, start a development server, and scaffold the TypeScript example
+
+_No flags._
+
+### agents dev
+
+Start a development server on the compose RustFS store: bring RustFS up when the bucket does not answer, wait for the `createbucket` service, run `store qualify`, then start `ravel-server --agents` on loopback with a fresh token holding the agents, agents_worker and agents_admin capabilities for tenant `dev`, and print it. Refuses the memory store, an omitted `--store` included, before starting anything
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--compose-file` |  | `deploy/docker-compose/rustfs.yml` | The compose file that defines the `rustfs` and `createbucket` services |
+| `--json` |  |  | Print the ready line as JSON |
+| `--listen` |  | `127.0.0.1:4318` | HTTP listener for the server; refused unless loopback |
+| `--listen-grpc` |  | `127.0.0.1:4317` | OTLP gRPC listener for the server; refused unless loopback |
+| `--server-bin` | `RAVEL_SERVER_BIN` | `ravel-server` | The `ravel-server` binary to start; it must be built with the `agents` feature |
+
+### agents scaffold
+
+Write the TypeScript assistant example into DIR. Refuses a DIR that exists and is not empty
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the files written as JSON |
+| `<DIR>` |  |  | Directory to create or fill |
+
+### agents list
+
+List the tenant's agents from the bucket's agent directory, one bounded page at a time
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--cursor` |  |  | The `next_cursor` a previous page printed |
+| `--json` |  |  | Print the page as JSON |
+| `--limit` |  | `100` | Most agents to print; above 1000 is refused |
+| `--tenant` |  |  | Tenant id (hashed under the bucket's pinned scheme) |
+
+### agents inspect
+
+Print an agent's HEAD from the bucket: state version, state, active turn, mailbox depth and timers. Needs no server
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the `state` route's body plus the HEAD fields as JSON |
+| `--key` |  |  | The agent's key; with `--kind`, instead of the id |
+| `--kind` |  |  | The agent's kind; with `--key`, instead of the id |
+| `--tenant` |  |  | Tenant id (hashed under the bucket's pinned scheme) |
+| `<AGENT>` |  |  | The agent id (32 hex characters), as `agents list` prints it |
+
+### agents operation
+
+Print an operation's status from its agent's HEAD in the bucket
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the `operation` route's body as JSON |
+| `--tenant` |  |  | Tenant id (hashed under the bucket's pinned scheme) |
+| `<HANDLE>` |  |  | The operation handle `send` or `call` returned |
+
+### agents events
+
+Print one page of an agent's events from the bucket, after a cursor
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--cursor` |  |  | The `next_cursor` a previous page printed; omitted reads from the first event |
+| `--json` |  |  | Print the `events` route's body as JSON |
+| `--key` |  |  | The agent's key; with `--kind`, instead of the id |
+| `--kind` |  |  | The agent's kind; with `--key`, instead of the id |
+| `--limit` |  | `100` | Most events to print; above 1000 is refused |
+| `--tenant` |  |  | Tenant id (hashed under the bucket's pinned scheme) |
+| `<AGENT>` |  |  | The agent id (32 hex characters), as `agents list` prints it |
+
+### agents effects
+
+Print every effect an agent's HEAD journals, from the bucket
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the `effects` route's body as JSON |
+| `--key` |  |  | The agent's key; with `--kind`, instead of the id |
+| `--kind` |  |  | The agent's kind; with `--key`, instead of the id |
+| `--tenant` |  |  | Tenant id (hashed under the bucket's pinned scheme) |
+| `<AGENT>` |  |  | The agent id (32 hex characters), as `agents list` prints it |
+
+### agents reconcile
+
+Settle an effect in doubt through the server: attach the result the operator confirmed, or authorize one more attempt. Needs a token with the agents_admin capability
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--attach-result` |  |  | The confirmed result, as JSON |
+| `--attempt` |  |  | The attempt the decision is about |
+| `--authorize-attempt` |  |  | Authorize the next attempt instead |
+| `--json` |  |  | Print the `reconcile` route's body as JSON |
+| `--token` | `RAVEL_AGENTS_TOKEN` |  | Bearer token with agents_admin |
+| `--url` |  | `http://127.0.0.1:4318` | The server's HTTP root |
+| `<EFFECT>` |  |  | The effect handle, as `agents effects` or `agents operation` prints it |
+
 ## tenancy
 
 Inspect the bucket's tenant-hash scheme marker (ADR-0050 section 3)
