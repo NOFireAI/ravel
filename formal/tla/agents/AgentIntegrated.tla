@@ -38,7 +38,8 @@
 (*     Replay drift, retryable failures and admin reconciliation are      *)
 (*     AgentEffects's; here an effect in doubt stays in doubt.            *)
 (*   - Under provider_idempotency the provider deduplicates every         *)
-(*     dispatch of the effect id.                                         *)
+(*     dispatch of the effect id; the runner re-dispatches the journaled  *)
+(*     attempt with no write.                                              *)
 (*   - One tenant, one agent, one incarnation: tombstone, recreate and    *)
 (*     tenant isolation are AgentProtocol's.                              *)
 (*   - No real time. A written hint may be served by the sweep at any    *)
@@ -217,6 +218,25 @@ RecordResultHead(h, att, val) ==
 \* The owner may act on its turn only while the turn is uncancelled.
 Running(h) == h.active.turn # 0 /\ ~h.active.creq
 
+\* The client input settled cancelled. The kernel answers LateResultIgnored
+\* to a result for it, and to a result from an attempt older than the
+\* journaled one.
+InputCancelled(h) ==
+    \E r \in h.results, x \in h.inputs :
+        /\ x.src = "client"
+        /\ r.seq = x.seq
+        /\ r.kind = "cancelled"
+ResultAdmitted(h, att) ==
+    /\ h.eff.st \in {"authorized", "indoubt"}
+    /\ att = h.eff.att
+    /\ ~InputCancelled(h)
+
+\* provider_idempotency re-dispatches attempt 1 without a write, so its
+\* bound is on dispatches rather than on attempts.
+DispatchBudgetLeft(h) ==
+    IF h.eff.pol = "provider_idempotency" THEN Len(calls) < MaxAttempt
+    ELSE h.eff.att < MaxAttempt
+
 \* --- Initial state --------------------------------------------------------
 
 ClientIdle == [pc |-> "start", ver |-> 0, obs |-> NoC, handle |-> NoHandle]
@@ -390,18 +410,24 @@ AuthorizeFirst(w) ==
 
 \* An attempt read authorized without a result, not held from this worker's
 \* own dispatch, is ambiguous. Under manual the next authorization publishes
-\* InDoubt and dispatches nothing; otherwise it authorizes attempt + 1.
+\* InDoubt and dispatches nothing; under provider_idempotency the same
+\* effect id and attempt are re-dispatched with no write; under
+\* at_least_once it authorizes attempt + 1.
 Reauthorize(w) ==
     /\ Ready(w)
     /\ Own(w)
     /\ Running(O(w))
     /\ ClientTurn(O(w))
     /\ O(w).eff.st = "authorized"
-    /\ O(w).eff.att < MaxAttempt
+    /\ DispatchBudgetLeft(O(w))
     /\ LET h == O(w)
-       IN IF h.eff.pol = "manual"
-            THEN CasThen(w, [Bump(h) EXCEPT !.eff.st = "indoubt"], WorkerIdle)
-            ELSE CasThen(w, AuthorizeHead(h, h.eff.att + 1),
+       IN CASE h.eff.pol = "manual" ->
+                 CasThen(w, [Bump(h) EXCEPT !.eff.st = "indoubt"], WorkerIdle)
+            [] h.eff.pol = "provider_idempotency" ->
+                 /\ SetWk(w, [WorkerIdle EXCEPT !.pc = "exec", !.att = h.eff.att])
+                 /\ UNCHANGED sVars
+            [] OTHER ->
+                 CasThen(w, AuthorizeHead(h, h.eff.att + 1),
                          [WorkerIdle EXCEPT !.pc = "exec", !.att = h.eff.att + 1])
     /\ WUnchanged
 
@@ -466,21 +492,22 @@ Respond(w) ==
 
 LoseResponse(w) ==
     /\ wk[w].pc = "await"
-    /\ wk[w].att < MaxAttempt
+    /\ IF pol = "provider_idempotency" THEN Len(calls) < MaxAttempt
+       ELSE wk[w].att < MaxAttempt
     /\ SetWk(w, WorkerIdle)
     /\ UNCHANGED sVars
     /\ WUnchanged
 
 \* Record a held provider result (fenced by incarnation only). A completed
-\* effect answers without a write.
+\* effect, an older attempt or a cancelled input answers without a write.
 RecordHeldResult(w) ==
     /\ wk[w].pc = "ready"
     /\ Fresh(w)
     /\ wk[w].held = "result"
-    /\ IF O(w).eff.st = "completed"
-         THEN /\ SetWk(w, WorkerIdle)
+    /\ IF ResultAdmitted(O(w), wk[w].att)
+         THEN CasThen(w, RecordResultHead(O(w), wk[w].att, wk[w].val), WorkerIdle)
+         ELSE /\ SetWk(w, WorkerIdle)
               /\ UNCHANGED sVars
-         ELSE CasThen(w, RecordResultHead(O(w), wk[w].att, wk[w].val), WorkerIdle)
     /\ WUnchanged
 
 \* The result-completion endpoint, for an attempt whose dispatcher lost the
@@ -488,8 +515,7 @@ RecordHeldResult(w) ==
 ResultCallback(i) ==
     /\ RootUp
     /\ i \in PhysCalls
-    /\ Root.eff.st \in {"authorized", "indoubt"}
-    /\ calls[i].att =< Root.eff.att
+    /\ ResultAdmitted(Root, calls[i].att)
     /\ CasNow(RecordResultHead(Root, calls[i].att, i))
     /\ UNCHANGED <<cl, wk, sw, calls, crashed, pol, acked>>
 
@@ -723,31 +749,35 @@ DispatchRequiresCommittedAuthorization ==
         /\ Root.eff.st \notin {"none", "intent"}
         /\ calls[i].att =< Root.eff.att
 
-\* Each attempt is dispatched at most once; under manual only the first
-\* attempt exists (no admin here), and no result lands for the client input
-\* while its effect is in doubt; under provider_idempotency the provider
-\* executes at most once.
+\* Outside provider_idempotency each attempt is dispatched at most once;
+\* under manual only the first attempt exists (no admin here), and no
+\* result lands for the client input while its effect is in doubt; under
+\* provider_idempotency only attempt 1 exists and the provider executes at
+\* most once.
 PolicyControlsRedispatch ==
-    /\ \A i, j \in 1..Len(calls) : i # j => calls[i].att # calls[j].att
+    /\ (RootUp /\ Root.eff.pol # "provider_idempotency") =>
+         \A i, j \in 1..Len(calls) : i # j => calls[i].att # calls[j].att
     /\ (RootUp /\ Root.eff.pol = "manual") =>
          /\ \A i \in 1..Len(calls) : calls[i].att = 1
          /\ Root.eff.att =< 1
-    /\ (RootUp /\ Root.eff.pol = "provider_idempotency") => Cardinality(PhysCalls) =< 1
+    /\ (RootUp /\ Root.eff.pol = "provider_idempotency") =>
+         /\ Root.eff.att =< 1
+         /\ \A i \in 1..Len(calls) : calls[i].att = 1
+         /\ Cardinality(PhysCalls) =< 1
     /\ (Wrote /\ LC.before.eff.st = "indoubt") =>
          \A r \in NewResults : r.seq \notin ClientSeq(LC.before)
 
 EffectResultFromExecution ==
     (RootUp /\ Root.eff.st = "completed") =>
         /\ Root.eff.rval \in PhysCalls
-        /\ calls[Root.eff.rval].att =< Root.eff.att
-        /\ 1 =< Root.eff.ratt /\ Root.eff.ratt =< Root.eff.att
-        /\ Root.eff.pol # "provider_idempotency" =>
-             calls[Root.eff.rval].att = Root.eff.ratt
+        /\ Root.eff.ratt = Root.eff.att
+        /\ calls[Root.eff.rval].att = Root.eff.ratt
 
 \* Both forms: a cancelled input ends cancelled; until it settles it is the
 \* active turn's input with the request recorded; once the request is on
 \* the root the owner journals no new step or intent and authorizes no new
-\* attempt; no write drops a cancel or rewrites a published result.
+\* attempt; once the client input is cancelled no write changes its
+\* effect; no write drops a cancel or rewrites a published result.
 CancellationRespected ==
     /\ RootUp =>
          LET h == Root
@@ -759,6 +789,7 @@ CancellationRespected ==
              a == LC.after
          IN /\ b.cancels \subseteq a.cancels
             /\ b.results \subseteq a.results
+            /\ InputCancelled(b) => a.eff = b.eff
             /\ \A s \in b.cancels \cap b.inbox :
                   s \in a.inbox => a.active.turn = b.active.turn
             /\ b.active.creq =>
@@ -770,10 +801,10 @@ CancellationRespected ==
 \* --- Liveness (conditional on Fairness) ------------------------------------
 
 \* Blocked terminals: the client effect is in doubt (no admin here), or the
-\* run spent the model's attempt bound on an ambiguous attempt.
+\* run spent the model's dispatch bound on an ambiguous attempt.
 EffectBlocked(h) ==
     \/ h.eff.st = "indoubt"
-    \/ h.eff.st = "authorized" /\ h.eff.att = MaxAttempt
+    \/ h.eff.st = "authorized" /\ ~DispatchBudgetLeft(h)
 
 Settled(s) == RootUp /\ \E r \in Root.results : r.seq = s
 
