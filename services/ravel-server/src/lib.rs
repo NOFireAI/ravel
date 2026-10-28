@@ -2840,7 +2840,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         agents::AgentsSettings::from_server_config(&config),
         agents_readiness.clone(),
         store.clone(),
-    ));
+    )
+    .with_clock(config.query_budgets.agents.clock.clone()));
     #[cfg(feature = "agents")]
     if config.query_budgets.agents.enabled {
         readiness_sources.push(agents_readiness.clone() as Arc<dyn health::IngestHealth>);

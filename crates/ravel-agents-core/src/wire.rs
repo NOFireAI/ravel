@@ -263,6 +263,58 @@ pub struct StateResponse {
     pub state_version: u64,
     pub content_type: String,
     pub state: Value,
+    /// The turn HEAD holds open, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<ActiveTurnBody>,
+    /// Accepted inputs not yet consumed, oldest first; the head of the list
+    /// is the active turn's input while one runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mailbox: Vec<MailboxEntryBody>,
+}
+
+/// The open turn of a [`StateResponse`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveTurnBody {
+    pub turn_id: String,
+    /// The accepted input the turn consumes.
+    pub accept_seq: u64,
+    pub handler: String,
+    /// The handler version the turn is bound to: only a worker serving this
+    /// version and digest can resume it.
+    pub handler_version: String,
+    pub handler_digest: String,
+    pub base_state_version: u64,
+    #[serde(with = "unix_ns")]
+    pub started_unix_ns: i64,
+    /// The owner's lease as last recorded in HEAD; a heartbeat may have
+    /// extended it since.
+    #[serde(with = "unix_ns")]
+    pub lease_hint_unix_ns: i64,
+    /// A cancel was requested and the turn has not yet observed it.
+    pub cancel_requested: bool,
+    /// A replay diverged from the journaled steps; the turn waits for an
+    /// operator.
+    pub non_deterministic_replay: bool,
+}
+
+/// Where an accepted input came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputSourceBody {
+    Message { request_id: String },
+    /// A fired timer: the id and the generation that fired.
+    Timer { timer: String, generation: u64 },
+}
+
+/// One accepted input of a [`StateResponse`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MailboxEntryBody {
+    pub accept_seq: u64,
+    pub handler: String,
+    pub source: InputSourceBody,
+    #[serde(with = "unix_ns")]
+    pub accepted_unix_ns: i64,
+    pub failed_attempts: u32,
 }
 
 /// `POST /api/v1/agents/events`: one bounded page after a durable cursor.

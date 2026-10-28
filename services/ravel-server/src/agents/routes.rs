@@ -18,21 +18,22 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, Request, StatusCode, Uri};
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{
-    EffectRecord, EffectStatus, EventEntry, Head, Lifecycle, StepRecord,
+    Cancellation, EffectRecord, EffectStatus, EventEntry, Head, InboxEntry, InputSource, Lifecycle,
+    StepRecord, TurnBlock,
 };
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest, CursorExpiredBody, CursorRestart, SafeIdsBody, CallResponse, CancelRequest, CreateAgentRequest,
+    ActiveTurnBody, AgentRef, AttemptState, InputSourceBody, MailboxEntryBody, CURSOR_EXPIRED_CODE, CallRequest, CursorExpiredBody, CursorRestart, SafeIdsBody, CallResponse, CancelRequest, CreateAgentRequest,
     EffectAttemptBody, EffectBody, EffectCompleteRequest, EffectCompleteResponse,
     EffectEvidenceBody, EffectFailRequest, EffectInspectResponse, EffectsResponse, ErrorBody,
     EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
-    ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse,
+    ReconcileDecision, ReconcileRequest, CancelTimerRequest, SweepResponse, TimerBody, TimerRequest, TimersResponse, ReconcileResponse, ResolveRequest, ResolveResponse,
     ResultBody, ResultResponse, SendRequest, StateResponse, StepBody, StepRecordRequest,
     StepRecordResponse, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
     WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
@@ -60,19 +61,40 @@ pub const MAX_EVENTS_PAGE: u32 = 1_000;
 /// retried past this many lists attempts starting above 1.
 pub const MAX_INSPECT_ATTEMPTS: u32 = 64;
 
+/// The inspector page, served as is.
+pub const INSPECTOR_HTML: &str = include_str!("inspector.html");
+/// The inspector page's `content-type`.
+pub const INSPECTOR_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+/// The inspector page's `content-security-policy`: inline script and style
+/// only, and requests to this origin only.
+pub const INSPECTOR_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; \
+     style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
+
 /// How often a waiting `result` re-reads HEAD when nothing in this process
 /// signalled a change, so a commit through another process is seen.
 const RESULT_RECHECK: Duration = Duration::from_secs(1);
 
 /// The capability a route requires (ADR-3331 decision 9).
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Capability {
-    /// Client routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Client routes and the inspector page.
     Agents,
     /// Worker routes.
     AgentsWorker,
-    /// Operator routes: reconcile.
+    /// Operator routes: reconcile and sweep.
     AgentsAdmin,
+}
+
+impl Capability {
+    /// The capability's name, as a 403 names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Capability::Agents => "agents",
+            Capability::AgentsWorker => "agents_worker",
+            Capability::AgentsAdmin => "agents_admin",
+        }
+    }
 }
 
 /// Router state: the process runtime, this listener's resolver and the
@@ -159,14 +181,15 @@ impl Api {
     ) -> Result<Admitted, Refusal> {
         let principal =
             authenticate_principal(self.resolver.as_ref(), headers).map_err(Refusal::Auth)?;
-        let (granted, name) = match capability {
-            Capability::Agents => (principal.agents, "agents"),
-            Capability::AgentsWorker => (principal.agents_worker, "agents_worker"),
-            Capability::AgentsAdmin => (principal.agents_admin, "agents_admin"),
+        let granted = match capability {
+            Capability::Agents => principal.agents,
+            Capability::AgentsWorker => principal.agents_worker,
+            Capability::AgentsAdmin => principal.agents_admin,
         };
         if !granted {
             return Err(Refusal::Auth(ServiceError::forbidden(format!(
-                "this route requires the {name} capability"
+                "this route requires the {} capability",
+                capability.name()
             ))));
         }
         let Some(permit) = self.runtime.admit(lane) else {
@@ -380,6 +403,19 @@ pub(super) async fn state(State(api): State<Api>, req: Request<Body>) -> Respons
             state_version: head.state_version,
             content_type: "application/json".to_string(),
             state,
+            active_turn: head.active_turn.as_ref().map(|turn| ActiveTurnBody {
+                turn_id: turn.turn_id.to_hex(),
+                accept_seq: turn.input_accept_seq,
+                handler: turn.handler.clone(),
+                handler_version: turn.handler_version.clone(),
+                handler_digest: turn.handler_digest.to_hex(),
+                base_state_version: turn.base_state_version,
+                started_unix_ns: turn.started_unix_ns,
+                lease_hint_unix_ns: head.owner_lease_hint_unix_ns,
+                cancel_requested: turn.cancellation == Cancellation::Requested,
+                non_deterministic_replay: turn.block == TurnBlock::NonDeterministicReplay,
+            }),
+            mailbox: head.inbox.iter().map(mailbox_entry).collect(),
         }))
     };
     run.await.into_response()
@@ -474,6 +510,99 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
         }))
     };
     run.await.into_response()
+}
+
+pub(super) async fn timer_schedule(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<TimerRequest>(req, Capability::Agents, Lane::Activation)
+            .await?;
+        let scheduled = call.tenant.coordinator.schedule_timer(&body).await?;
+        Ok::<_, Refusal>(Json(scheduled))
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn timer_cancel(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<CancelTimerRequest>(req, Capability::Agents, Lane::Activation)
+            .await?;
+        let cancelled = call.tenant.coordinator.cancel_timer(&body).await?;
+        Ok::<_, Refusal>(Json(cancelled))
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn timers(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let call = api.admit(req.headers(), Capability::Agents, Lane::Activation)?;
+        let q: StateQuery = query(req.uri())?;
+        let agent = parse_agent(&AgentRef {
+            kind: q.kind,
+            key: q.key,
+        })?;
+        let head = read_head(&call.tenant, &agent).await?;
+        Ok::<_, Refusal>(Json(TimersResponse {
+            timers: head
+                .timers
+                .iter()
+                .map(|t| TimerBody {
+                    timer: t.timer_id.to_hex(),
+                    timer_key: t.timer_key.clone(),
+                    generation: t.generation,
+                    due_unix_ns: t.due_unix_ns,
+                    handler: t.handler.clone(),
+                    status: t.status.into(),
+                })
+                .collect(),
+        }))
+    };
+    run.await.into_response()
+}
+
+/// One sweep pass over the caller's tenant, on demand: the same pass the
+/// interval task runs, under the same budgets and the same cursor.
+pub(super) async fn sweep(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let call = api.admit(req.headers(), Capability::AgentsAdmin, Lane::Activation)?;
+        let report = call
+            .tenant
+            .coordinator
+            .sweep_once(&call.principal.tenant.hash())
+            .await?;
+        Ok::<_, Refusal>(Json(SweepResponse {
+            wake_list_pages: report.wake_list_pages,
+            dir_list_pages: report.dir_list_pages,
+            head_gets: report.head_gets,
+            hints_read: report.hints_read,
+            hints_deleted: report.hints_deleted,
+            timers_fired: report.timers_fired,
+            agents_loaded: report.agents_loaded,
+            dir_entries_repaired: report.dir_entries_repaired,
+        }))
+    };
+    run.await.into_response()
+}
+
+/// The inspector page (ADR-3331 decision 11). It carries no tenant data: the
+/// page reads state, timers, effects and events through the routes above with
+/// the token its user enters. The policy forbids every origin but this one,
+/// so the page can load nothing external.
+pub(super) async fn inspector(State(api): State<Api>, req: Request<Body>) -> Response {
+    match api.admit(req.headers(), Capability::Agents, Lane::Activation) {
+        Err(refused) => refused.into_response(),
+        Ok(_call) => (
+            [
+                (header::CONTENT_TYPE, INSPECTOR_CONTENT_TYPE),
+                (header::CONTENT_SECURITY_POLICY, INSPECTOR_CSP),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            INSPECTOR_HTML,
+        )
+            .into_response(),
+    }
 }
 
 pub(super) async fn worker_register(State(api): State<Api>, req: Request<Body>) -> Response {
@@ -877,6 +1006,9 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
         call.tenant.changed.notify_waiters();
         let head = read_head(&call.tenant, &effect.agent).await?;
         let record = effect_record(&head, &effect)?;
+        if record.status != EffectStatus::InDoubt {
+            call.tenant.evidence.forget(effect.agent, effect.effect_id);
+        }
         Ok::<_, Refusal>(Json(ReconcileResponse {
             effect: body.effect,
             status: record.status.into(),
@@ -884,6 +1016,27 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
         }))
     };
     run.await.into_response()
+}
+
+fn mailbox_entry(entry: &InboxEntry) -> MailboxEntryBody {
+    MailboxEntryBody {
+        accept_seq: entry.accept_seq,
+        handler: entry.handler.clone(),
+        source: match &entry.source {
+            InputSource::Message { request_id, .. } => InputSourceBody::Message {
+                request_id: request_id.clone(),
+            },
+            InputSource::Timer {
+                timer_id,
+                generation,
+            } => InputSourceBody::Timer {
+                timer: timer_id.to_hex(),
+                generation: *generation,
+            },
+        },
+        accepted_unix_ns: entry.accepted_unix_ns,
+        failed_attempts: entry.failed_attempts,
+    }
 }
 
 fn step_body(step: &StepRecord, output: Option<Value>) -> StepBody {
