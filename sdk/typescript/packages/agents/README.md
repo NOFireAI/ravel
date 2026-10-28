@@ -218,6 +218,11 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   lease before journaling a step and derives ids from incarnation and
   accept_seq`, `refuses a step for a fenced lease without touching the
   journal`, `refuses a step for a turn it never polled`.
+- That per-step heartbeat is the only one in a turn: nothing is sent while a
+  tool runs. Test: `heartbeats once before each step and sends nothing while
+  a tool runs`.
+- A 401 or 403 in the server's plain body maps to `Forbidden` with its
+  status. Test: `maps the plain %i body to Forbidden with its status`.
 - The server polls an agent that has never committed with a null state and
   `base_state_version` 0; the turn starts from the agent's `initialState`.
   Test: `starts a never-committed agent's turn from initialState when the
@@ -298,15 +303,19 @@ provisionally on the SDK side:
   `agents_admin` route reconciles an effect. Until they land,
   `createHttpTransport` serves `recordStep`, `completeEffect` and
   `failEffect` from a `MemoryStepJournal`, which lives in one process and
-  is lost with it, and a polled lease's `steps` is always empty over HTTP.
-  This is why the end-to-end kill is an in-process abort. Tests:
-  `MemoryStepJournal` in `http.test.ts`.
+  is lost with it. This is why the end-to-end kill is an in-process abort.
+  Tests: `authorizes a new attempt at an unsettled at_least_once step and
+  replays a settled one`, `puts an unsettled manual step in doubt until a
+  reconcile records its result`, `hands a reconciled retry out exactly
+  once` (`http.test.ts`).
 - While an effect is in doubt the server still reports the operation as
   `running`, since no route tells it the operation is blocked (asserted in
-  `worker killed inside a manual step blocks as EffectInDoubt until
-  reconciled`, `e2e/recover.test.ts`).
-- `serveAgents` does not heartbeat the lease while a turn runs; a turn
-  longer than the 30 s lease loses it to another worker.
+  `worker killed inside a manual step blocks as EffectInDoubt in the
+  in-memory journal until reconciled there`, `e2e/recover.test.ts`).
+- Over `createHttpTransport` the lease is heartbeated only before each step
+  (see "HTTP transport" above), so a single tool run, or the handler code
+  between two steps, longer than the 30 s lease loses the turn to another
+  worker.
 - `agent.state()` answers `state: null` for an agent that has never
   committed, which its type `S` does not admit. The golden
   `worker_poll_response` fixture carries a non-null state at
@@ -348,22 +357,34 @@ The binary is `RAVEL_SERVER_BIN`, else
 `$CARGO_TARGET_DIR/debug/ravel-server`, else `target/debug/ravel-server`
 under the repository root. The store is `RAVEL_E2E_STORE`: `memory`
 (default, `MemoryStore`) or `rustfs` (the compose RustFS store, which
-needs `docker compose`). The run takes about 80 s, most of it two 40 s
-lease expiries.
+needs `docker compose`; the run stops the RustFS container afterwards
+only if it started it). Each test waits out one 30 s lease and its 10 s
+grace before worker B can take the turn over. Tests for the path and
+store choice, which need no server and run under `npm test`: `resolves
+the repository root to the directory holding the workspace Cargo.toml`,
+`looks for the server under the repository's target unless told
+otherwise`, `needs docker compose only for the rustfs store`
+(`e2e/plan.unit.test.ts`).
 
 Each test kills worker A inside a step, after the tool's side effect and
 before its result is recorded, resends under the same request id, and
-lets worker B take the turn over:
+lets worker B take the turn over. The server shows that the resend
+resolves to the same operation id, that a second worker takes the turn
+over, and that the turn commits once. Step replay, effect attempts and the
+`EffectInDoubt` block come from the SDK's in-memory step journal (see
+"Wire gaps"), and the test titles say so:
 
 - `worker killed inside an at_least_once step recovers the same operation
-  on restart`: the resend resolves to the same operation id, `kb.search`
-  runs once and is replayed, `kb.draft` runs twice under one effect id
-  (attempts 1 and 2), and the operation completes with the drafted answer.
-- `worker killed inside a manual step blocks as EffectInDoubt until
-  reconciled`: worker B abandons the turn with `EffectInDoubt` without
-  running `desk.ticket` again, and the operation completes with ticket
-  `T-1001` once the effect is reconciled with the ticket the killed run
-  filed.
+  on restart, replaying steps from the in-memory journal`: the resend
+  resolves to the same operation id, `kb.search` runs once and is
+  replayed, `kb.draft` runs twice under one effect id (attempts 1 and 2),
+  and the operation completes with the drafted answer.
+- `worker killed inside a manual step blocks as EffectInDoubt in the
+  in-memory journal until reconciled there`: worker B abandons the turn
+  with `EffectInDoubt` without running `desk.ticket` again, and the
+  operation completes with ticket `T-1001` once the journal's effect is
+  reconciled with the ticket the killed run filed. The reconcile goes
+  through the journal, not an `agents_admin` route.
 
 A missing prerequisite skips both tests and names it, both in a warning at
 the top of the run and in the suite title the verbose reporter prints:
@@ -373,7 +394,11 @@ e2e skipped: ravel-server binary not found at <path>; build it with `cargo build
 e2e skipped: RAVEL_E2E_STORE=rustfs needs `docker compose`, which is not installed or not running
 ```
 
-A skipped run exits 0.
+A skipped run exits 0. With `RAVEL_E2E_REQUIRE=1` a missing prerequisite
+fails the run instead, with the same reason, so a job that must exercise
+the server cannot pass with nothing run (test: `skips on a missing
+prerequisite, and fails instead under RAVEL_E2E_REQUIRE=1`, and test:
+`names the resolved binary path when it is missing`).
 
 ## Demo
 
@@ -382,8 +407,11 @@ compose RustFS store (or `MemoryStore` with
 `RAVEL_AGENTS_DEMO_STORE=memory`) and a built `ravel-server --agents`, runs
 the same two scenarios through `examples/assistant/kill-and-recover.ts`,
 asserts each printed figure against an exact value or a stated band, and
-exits 1 on any miss. It needs `npm ci` in `sdk/typescript/` and node 22.
-See `examples/assistant/README.md`.
+exits 1 on any miss. It needs `npm ci` in `sdk/typescript/` and node 22.15
+or later 22.x: the example's loader hook (`examples/ts-hooks.js`) uses
+`module.registerHooks`, added in Node 22.15.0, which is why the `engines`
+floor in `sdk/typescript/package.json` is 22.15.0. See
+`examples/assistant/README.md`.
 
 ## Checks
 
@@ -393,7 +421,8 @@ Run from `sdk/typescript/` after `npm ci`:
   rules.
 - `npm run typecheck`: `tsc` in strict mode over `src/`, `typetests/`,
   `e2e/` and `examples/`.
-- `npm test`: the vitest suites under `src/`.
+- `npm test`: the vitest suites under `src/`, and `e2e/*.unit.test.ts`,
+  which need no server.
 - `npm run test:e2e`: the end-to-end tests above.
 
 `typetests/` holds compile-time negative tests. Each `// @ts-expect-error`

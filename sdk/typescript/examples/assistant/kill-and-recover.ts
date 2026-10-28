@@ -37,6 +37,7 @@ const draftCalls = run.calls.filter((c) => c.tool === "kb.draft");
 const ticketCalls = run.calls.filter((c) => c.tool === "desk.ticket");
 const lines: Record<string, string | number> = {
   OPERATION_ID: run.operationId,
+  RETRIED_OPERATION_ID: run.retriedOperationId ?? "none",
   RETRIED_SAME_OPERATION: String(run.retriedOperationId === run.operationId),
   WORKERS_DIFFER: String(run.workerA !== run.workerB),
   SEARCH_RUNS: run.counts.search,
