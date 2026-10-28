@@ -1344,6 +1344,7 @@ async fn handed_over(
     Arc<Coordinator>,
     TurnAssignment,
     Dispatch,
+    Arc<TestClock>,
 ) {
     let clock = clock();
     let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
@@ -1362,7 +1363,20 @@ async fn handed_over(
             .await
             .expect("authorize")
     );
-    (fault, store, co, b, d)
+    (fault, store, co, b, d, clock)
+}
+
+/// How many HEAD reads [`handed_over`] makes, and how many the step that
+/// claims and dispatches the hand-over makes; the last one follows the
+/// claim.
+async fn hand_over_reads() -> (u64, u64) {
+    let (fault, _, co, b, _, _) = handed_over(head_reads()).await;
+    let setup = fault.sequence_progress(0);
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    dispatched(&co, &b, &s, &Hook::default()).await;
+    let reads = fault.sequence_progress(0) - setup;
+    assert!(reads > 1 && setup + reads < 100, "{setup} + {reads}");
+    (setup, reads)
 }
 
 fn head_reads() -> FaultPlan {
@@ -1377,14 +1391,14 @@ fn head_reads() -> FaultPlan {
 async fn concurrent_steps_dispatch_a_reconciled_attempt_once() {
     // The HEAD reads of the step that dispatches the hand-over; its last one
     // follows the claim.
-    let (fault, _, co, b, _) = handed_over(head_reads()).await;
+    let (fault, _, co, b, _, _) = handed_over(head_reads()).await;
     let before = fault.sequence_progress(0);
     let s = spec("wire-funds", RecoveryPolicy::Manual);
     dispatched(&co, &b, &s, &Hook::default()).await;
     let reads = fault.sequence_progress(0) - before;
     assert!(reads > 0 && reads < 100);
 
-    let (fault, store, co, b, d) = handed_over(FaultPlan::empty()).await;
+    let (fault, store, co, b, d, _) = handed_over(FaultPlan::empty()).await;
     let hook = Arc::new(Hook::default());
     let gate = fault.hold(Op::Get, Some("/head".to_string()), Occurrence::Nth(reads));
     let first = {
@@ -1469,6 +1483,143 @@ async fn a_hand_over_refused_after_its_claim_is_released_and_never_dispatched_tw
         .await
         .expect_err("the turn settled");
     assert_eq!(hook.calls(), 1, "attempt 2 was never dispatched");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_step_that_passed_the_open_check_before_the_claim_is_refused_after_it() {
+    let (_, reads) = hand_over_reads().await;
+    let (fault, store, co, b, d, _) = handed_over(FaultPlan::empty()).await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Arc::new(Hook::default());
+    // The second step's last HEAD read before its claim: its open-attempt
+    // check has already found the hand-over unclaimed.
+    let gate = fault.hold(
+        Op::Get,
+        Some("/head".to_string()),
+        Occurrence::Nth(reads - 1),
+    );
+    let second = {
+        let (co, hook, lease, s) = (co.clone(), hook.clone(), b.lease.clone(), s.clone());
+        tokio::spawn(async move { co.run_step(&lease, &s, hook.as_ref()).await })
+    };
+    gate.wait_until_held(1).await;
+
+    match co
+        .run_step(&b.lease, &s, hook.as_ref())
+        .await
+        .expect("first step")
+    {
+        StepProgress::Dispatched(d2) => assert_eq!((d2.effect, d2.attempt), (d.effect, 2)),
+        other => panic!("expected a dispatch, got {other:?}"),
+    }
+    assert_eq!(hook.calls(), 1);
+    for id in gate.held() {
+        assert!(gate.release(id), "the held read is released");
+    }
+    let err = second
+        .await
+        .expect("join")
+        .expect_err("the claimed attempt is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 1, "exactly one dispatch of attempt 2");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hand_over_whose_fresh_read_fails_is_dispatched_by_the_next_step() {
+    let (setup, reads) = hand_over_reads().await;
+    // The step's HEAD read after its claim fails on every one of its tries.
+    let tries = ravel_agents_store::publish::MAX_READ_ATTEMPTS;
+    let mut steps =
+        vec![SequenceStep::Passthrough; usize::try_from(setup + reads - 1).expect("fits")];
+    steps.extend(
+        (0..tries).map(|_| SequenceStep::Fault(ScriptedFault::Transient("blip".to_string()))),
+    );
+    let plan = FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Get)
+            .with_key_contains("/head")
+            .with_steps(steps),
+    );
+    let (fault, store, co, b, d, _) = handed_over(plan).await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+
+    co.run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("the read after the claim failed");
+    assert_eq!(
+        fault.fault_count(Op::Get, FaultKind::Transient),
+        u64::from(tries),
+        "the fault fired on the read after the claim"
+    );
+    assert_eq!(hook.calls(), 0);
+
+    let d2 = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!((d2.effect, d2.attempt), (d.effect, 2));
+    assert_eq!(hook.calls(), 1, "the next step dispatched attempt 2");
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("attempt 2 is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 1, "dispatched once");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hand_over_claimed_by_an_owner_that_lost_the_turn_goes_to_the_new_owner() {
+    let (_, reads) = hand_over_reads().await;
+    let (fault, store, co, b, d, clock) = handed_over(FaultPlan::empty()).await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Arc::new(Hook::default());
+    // B's HEAD read after its claim: B journaled the step under its own
+    // epoch and claimed attempt 2.
+    let gate = fault.hold(Op::Get, Some("/head".to_string()), Occurrence::Nth(reads));
+    let stale = {
+        let (co, hook, lease, s) = (co.clone(), hook.clone(), b.lease.clone(), s.clone());
+        tokio::spawn(async move { co.run_step(&lease, &s, hook.as_ref()).await })
+    };
+    gate.wait_until_held(1).await;
+
+    // B's lease expires before it dispatches; C takes the turn over.
+    let c = takeover(&co, &clock).await;
+    assert_ne!(c.lease.epoch, b.lease.epoch);
+    for id in gate.held() {
+        assert!(gate.release(id), "the held read is released");
+    }
+    let err = stale
+        .await
+        .expect("join")
+        .expect_err("B lost the turn before dispatching");
+    assert_eq!(err.kind, ErrorKind::OwnershipLost);
+    assert_eq!(
+        hook.calls(),
+        0,
+        "nothing went to the worker that lost the turn"
+    );
+
+    let d2 = dispatched(&co, &c, &s, hook.as_ref()).await;
+    assert_eq!((d2.effect, d2.attempt), (d.effect, 2));
+    assert_eq!(hook.calls(), 1, "the new owner dispatched attempt 2");
+    let err = co
+        .run_step(&c.lease, &s, hook.as_ref())
+        .await
+        .expect_err("attempt 2 is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 1, "dispatched once");
     let h = head(&store, "o-1").await;
     assert_eq!(
         (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
