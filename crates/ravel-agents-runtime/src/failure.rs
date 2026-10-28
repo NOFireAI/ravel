@@ -38,6 +38,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use ravel_agents_core::command::{Command, FailTurn};
+use ravel_agents_core::pages::{ListKind, Need};
 use ravel_agents_core::error::{AgentError, ErrorKind};
 use ravel_agents_core::head::ResultStatus;
 use ravel_agents_core::identity::{AgentId, request_hash};
@@ -210,11 +211,14 @@ impl Coordinator {
                 confirmed_lost_ack,
             });
         }
-        let (head, version) = match self.store.read_head(agent).await? {
+        let (mut head, version) = match self.store.read_head_shallow(agent).await? {
             HeadState::Present { head, version } => (*head, version),
             HeadState::Absent | HeadState::Unsupported { .. } => return Err(unknown),
         };
         let accept_seq = resolution.accept_seq;
+        self.store
+            .attach(agent, &mut head, &[(ListKind::Results, Need::Key(accept_seq))])
+            .await?;
         let Some(result) = head.results.iter().find(|r| r.accept_seq == accept_seq) else {
             return Err(unknown);
         };
