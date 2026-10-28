@@ -207,13 +207,18 @@ export type AttemptState = z.output<typeof AttemptState>;
 export const EffectAttemptBody = z.object({ attempt: U32, status: AttemptState });
 export type EffectAttemptBody = z.output<typeof EffectAttemptBody>;
 
-export const EffectEvidenceBody = z.object({ attempt: U32, result: Json });
+export const EffectEvidenceBody = z.object({
+  attempt: U32,
+  result: Json,
+  failure: z.string().optional(),
+});
 export type EffectEvidenceBody = z.output<typeof EffectEvidenceBody>;
 
 export const EffectInspectResponse = EffectBody.extend({
   step_key: z.string(),
   result_attempt: U32.nullable(),
   result: Json.nullable(),
+  failure: z.string().optional(),
   attempts: z.array(EffectAttemptBody),
   evidence: z.array(EffectEvidenceBody),
 });
@@ -471,6 +476,7 @@ export const WIRE_FIXTURES = {
   effect_complete_response: EffectCompleteResponse,
   effect_fail_request: EffectFailRequest,
   effect_inspect_response: EffectInspectResponse,
+  effect_inspect_response_failure: EffectInspectResponse,
   effects_response: EffectsResponse,
   error_body: ErrorBody,
   events_request: EventsRequest,

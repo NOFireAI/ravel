@@ -412,7 +412,8 @@ async fn reconcile_audit_records(store: &dyn ObjectStoreBackend) -> Vec<LogRecor
 /// commit 1. A's refused second step, A's late result and B's `BeginTurn`
 /// publish nothing. 11 in all.
 #[tokio::test]
-async fn completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn() {
+async fn completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn()
+ {
     let running = start_server(Arc::new(MemoryStore::new())).await;
     let api = Api::public(&running);
     let (operation, assigned_a) = begin(&api).await;
@@ -574,9 +575,9 @@ async fn provider_idempotency_redispatches_the_same_attempt_and_the_late_result_
 
 /// `manual`: B's replay is not authorized a new attempt. The effect latches
 /// in doubt, the step answers `effect_in_doubt`, the turn stays blocked and
-/// may not fail. Only an `agents_admin` reconcile unblocks it, once, with one
-/// audit record naming the caller; B's replay then reads the attached result
-/// and B commits once.
+/// may not fail, also under C after a takeover. Only an `agents_admin`
+/// reconcile unblocks it, once, with one audit record naming the caller; C's
+/// replay then reads the attached result and C commits once.
 #[tokio::test]
 async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -619,9 +620,13 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
     assert_eq!(refused["code"], json!("effect_in_doubt"), "{refused}");
     let op = operation_status(&api, &operation).await;
     assert_eq!(op["status"], json!("blocked"), "{op}");
-    // Blocked across a poll: no worker is handed the turn.
-    let worker_c = register(&api).await;
-    assert_eq!(poll(&api, &worker_c, 100).await, Value::Null);
+    // Blocked across a takeover: once B's lease and the grace passed, a poll
+    // hands the turn to C (a poll does not skip a blocked turn), and C's
+    // replay of the step is refused in doubt too.
+    let assigned_c = take_over(&api, &assigned_b).await;
+    let (status, refused) = step(&api, &assigned_c, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("effect_in_doubt"));
     let op = operation_status(&api, &operation).await;
     assert_eq!(op["status"], json!("blocked"), "{op}");
     assert_eq!(op["blocked_effect"], json!(effect), "{op}");
@@ -649,7 +654,7 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
     let again = api.ok(ADMIN, "reconcile", &reconcile).await;
     assert_eq!(again, reconciled);
 
-    let (status, replayed) = step(&api, &assigned_b, "manual").await;
+    let (status, replayed) = step(&api, &assigned_c, "manual").await;
     assert_eq!(status, StatusCode::OK, "{replayed}");
     assert_eq!(replayed["step"]["status"], json!("completed"));
     assert_eq!(replayed["step"]["output"], json!({"cents": 1500}));
@@ -657,7 +662,7 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
         .ok(
             WORKER,
             "worker/commit",
-            &commit_body(&assigned_b, json!({"total_cents": 1500})),
+            &commit_body(&assigned_c, json!({"total_cents": 1500})),
         )
         .await;
     assert_eq!(committed["status"], json!("completed"));
@@ -817,7 +822,11 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
         .await;
     assert_eq!(retried["status"], json!("accepted"), "{retried}");
     let op = operation_status(&api, &operation).await;
-    assert_eq!(op["status"], json!("accepted"), "the turn is queued again: {op}");
+    assert_eq!(
+        op["status"],
+        json!("accepted"),
+        "the turn is queued again: {op}"
+    );
     let worker_b = register(&api).await;
     let assigned_b = poll(&api, &worker_b, 2_000).await;
     assert_eq!(assigned_b["operation"], json!(operation), "{assigned_b}");
@@ -829,10 +838,17 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
         assigned_b["lease"]["turn_id"], assigned_a["lease"]["turn_id"],
         "the retry runs under a new turn id"
     );
-    assert_eq!(steps[0]["step_id"], a_step["step"]["step_id"], "{assigned_b}");
+    assert_eq!(
+        steps[0]["step_id"], a_step["step"]["step_id"],
+        "{assigned_b}"
+    );
     let (status, replayed) = step(&api, &assigned_b, "at_least_once").await;
     assert_eq!(status, StatusCode::OK, "{replayed}");
-    assert_eq!(replayed["effect"], json!(effect), "the retry reuses the effect");
+    assert_eq!(
+        replayed["effect"],
+        json!(effect),
+        "the retry reuses the effect"
+    );
     assert_eq!(replayed["attempt"], json!(1));
     assert_eq!(replayed["failure"], json!("out of stock"));
     assert_eq!(replayed["step"]["status"], json!("started"));
@@ -864,12 +880,10 @@ async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
     let running = start_server(store.clone()).await;
     let api = Api::public(&running);
     let (operation, assigned_a) = begin(&api).await;
-    let mut tool_runs = 0;
 
     let (status, a_step) = step(&api, &assigned_a, "manual").await;
     assert_eq!(status, StatusCode::OK, "{a_step}");
     assert_eq!(a_step["attempt"], json!(1));
-    tool_runs += 1;
     let effect = a_step["effect"].as_str().expect("effect").to_string();
 
     let assigned_b = take_over(&api, &assigned_a).await;
@@ -891,7 +905,13 @@ async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
     assert_eq!(handed["step"]["status"], json!("started"));
     assert_eq!(handed["step"]["output"], Value::Null);
     assert_eq!(handed["failure"], Value::Null);
-    tool_runs += 1;
+    assert_eq!(
+        inspect(&api, &effect).await["attempts"],
+        json!([
+            {"attempt": 1, "status": "superseded"},
+            {"attempt": 2, "status": "open"},
+        ])
+    );
 
     // Attempt 2 is open: a retry of it is refused, and a repeat of the step
     // is not handed attempt 2 a second time.
@@ -910,7 +930,6 @@ async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
     assert_eq!(replayed["step"]["status"], json!("completed"));
     assert_eq!(replayed["step"]["output"], json!({"cents": 1700}));
     assert_eq!(replayed["attempt"], json!(2));
-    assert_eq!(tool_runs, 2, "the tool ran once per authorized attempt");
 
     let committed = api
         .ok(
@@ -1008,5 +1027,60 @@ async fn a_conflicting_final_result_for_the_same_attempt_is_refused() {
     assert_eq!(refused["code"], json!("idempotency_conflict"));
     let inspected = inspect(&api, &effect).await;
     assert_eq!(inspected["result"], json!({"cents": 1100}));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The retry outlives B: B abandons the blocked turn, its lease expires after
+/// the reconcile, and the worker that takes the turn over is handed attempt 2
+/// by its first `worker/step` for the key, once.
+#[tokio::test]
+async fn a_reconcile_retry_is_handed_to_the_owner_after_a_takeover() {
+    let running = start_server(Arc::new(MemoryStore::new())).await;
+    let api = Api::public(&running);
+    let (_, assigned_a) = begin(&api).await;
+    let (status, a_step) = step(&api, &assigned_a, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let assigned_b = take_over(&api, &assigned_a).await;
+    let (status, refused) = step(&api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("effect_in_doubt"));
+
+    let retry = json!({"effect": effect, "attempt": 1, "decision": "retry"});
+    let reconciled = api.ok(ADMIN, "reconcile", &retry).await;
+    assert_eq!(reconciled["status"], json!("authorized"), "{reconciled}");
+    assert_eq!(reconciled["attempt"], json!(2), "{reconciled}");
+
+    let assigned_c = take_over(&api, &assigned_b).await;
+    let (status, handed) = step(&api, &assigned_c, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{handed}");
+    assert_eq!(handed["attempt"], json!(2), "{handed}");
+    assert_eq!(handed["effect"], json!(effect));
+    let (status, refused) = step(&api, &assigned_c, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("idempotency_conflict"));
+    let inspected = inspect(&api, &effect).await;
+    assert_eq!(inspected["status"], json!("authorized"), "{inspected}");
+    assert_eq!(
+        inspected["attempts"],
+        json!([
+            {"attempt": 1, "status": "superseded"},
+            {"attempt": 2, "status": "open"},
+        ])
+    );
+
+    let (status, recorded) = complete(&api, &effect, 2, json!({"cents": 1700})).await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    let (status, replayed) = step(&api, &assigned_c, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["step"]["output"], json!({"cents": 1700}));
+    let committed = api
+        .ok(
+            WORKER,
+            "worker/commit",
+            &commit_body(&assigned_c, json!({"total_cents": 1700})),
+        )
+        .await;
+    assert_eq!(committed["status"], json!("completed"));
     running.shutdown().await.expect("clean shutdown");
 }

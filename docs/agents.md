@@ -12,12 +12,16 @@ is described in [the MCP guide](guides/mcp-server.md).
 Status: the contracts (`ravel-agents-core`), the publication layer
 (`ravel-agents-store`) and the coordinator (`ravel-agents-runtime`) are on
 `main`, and `ravel-server --agents` serves them over HTTP: `create`, `send`,
-`call`, `operation`, `result`, `resolve`, `cancel`, `state` and `events` for
-clients, and `worker/register`, `worker/poll`, `worker/heartbeat` and
-`worker/commit` for workers, all under `/api/v1/agents/` (the
+`call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`,
+`effects` and `effects/{effect}` for clients (`agents`); `worker/register`,
+`worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`,
+`worker/effects/complete` and `worker/effects/fail` for workers
+(`agents_worker`); and `reconcile` for operators (`agents_admin`), all under
+`/api/v1/agents/` (the
 [HTTP API reference](reference/http-api.md#agents-routes) lists them).
-`services/ravel-server/tests/agents_e2e.rs` drives them through a real
-server. Timers, effects, reconciliation and the sweep have no route yet.
+`services/ravel-server/tests/agents_e2e.rs` and
+`services/ravel-server/tests/agents_effects_e2e.rs` drive them through a
+real server. Timers and the sweep have no route yet.
 Every claim below says which test pins it or which milestone delivers it;
 the [guarantee table](#guarantees-and-limitations) collects them.
 
@@ -297,7 +301,7 @@ tool input (`SafeIds`).
 | `AgentGone` | `agent_gone` | the agent does not exist, is tombstoned, or the handle names an earlier incarnation | `never` |
 | `IdempotencyConflict` | `idempotency_conflict` | a request id reused with a different request hash, or two different results for one attempt | `never` |
 | `OutcomeUnknown` | `outcome_unknown` | the command may or may not have been published | `resolve_operation`: resolve the handle, do not resubmit under a new id |
-| `OwnershipLost` | `ownership_lost` | the command's epoch, owner or active turn no longer matches HEAD | `never` |
+| `OwnershipLost` | `ownership_lost` | the command's epoch, owner or active turn no longer matches HEAD, or the effect state does not admit the command (a reconcile of an effect that is not in doubt: runtime `reconcile_is_idempotent_and_audited_once`, e2e `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`; a new attempt for an input being cancelled: runtime `a_new_attempt_for_a_cancelled_input_is_refused_and_the_completion_settles_cancelled`) | `never` |
 | `IncompatibleHandler` | `incompatible_handler` | the handler version or digest differs from the turn's pin, or the worker has no handler for the input | `never` |
 | `NonDeterministicReplay` | `non_deterministic_replay` | a step key reused with a different tool identity or input hash | `never` |
 | `EffectInDoubt` | `effect_in_doubt` | a `manual` effect had an ambiguous attempt | `reconcile`: an operator must reconcile first |
@@ -335,14 +339,34 @@ step under the polled lease with its `input_hash` and recovery policy,
 authorizes an attempt, and answers `StepRecordResponse` with the step, the
 effect handle and the attempt to run. The worker reports that attempt's
 result with `worker/effects/complete` or a tool failure with
-`worker/effects/fail`; a failure is stored as the result
-`{"error": <string>}` and comes back from a replayed step as `failure`,
-never as `output`, and `worker/poll` hands such a step out as `started`
-with no output. A result for an attempt another attempt's result already
-settled answers `late: true` and is kept only as evidence. `reconcile`
-(`agents_admin`) settles a `manual` effect in doubt, and
-`effects/{effect}` reads each attempt, the result and the evidence
-(`agents_effects_e2e`, one test per policy and refusal).
+`worker/effects/fail`. A failure is a typed result object, never read from
+an output's shape: it leaves the step `started`, a replayed step answers it
+as `failure` with no `output`, and `worker/poll` hands the step out as
+`started` with no output, so a retried turn replays the failure
+(`a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail`); an
+output of exactly `{"error": "x"}` replays as that output
+(`an_output_shaped_like_a_failure_replays_as_the_output`). A failure's
+result object is a NUL byte, the ASCII text `ravel-agents-tool-failure-v1`,
+a NUL byte, then the error as UTF-8 text (`FAILURE_RESULT_PREFIX` in
+`crates/ravel-agents-runtime/src/effects.rs`); any other result object is
+the output's JSON text, which never contains a NUL byte. ADR-3331 decision
+7 does not define a result object's bytes, so this document does. Nothing
+outside `ravel-agents-runtime` wrote result objects before failures were
+stored this way, so no older object is read as a failure. A result for an
+attempt another attempt's result already settled answers `late: true` and
+is kept only as evidence. `reconcile` (`agents_admin`) settles a `manual`
+effect in doubt. Its `retry` dispatches nothing: the next `worker/step`
+for the step is answered the authorized attempt to run, once, whether it
+comes from the owner the turn had at the reconcile or from a worker that
+took the turn over after that owner's lease expired
+(`a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`,
+`a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`). That
+hand-over is kept only in the memory of the server process that answered
+the reconcile. If that process restarts before the step, or the step is
+served by another server process, the attempt reads as lost and a `manual`
+effect is back in doubt: reconcile it again. `effects/{effect}` reads each attempt, the
+result and the evidence (all in `agents_effects_e2e`, one test per policy
+and refusal).
 
 Not found. An operation handle the agent never issued, one from an earlier
 incarnation, or one for a tombstoned agent answers `AgentGone` (404) with
@@ -382,8 +406,9 @@ Milestones are those of ADR-3331 decision 15. "In the crates" means the
 property holds in `ravel-agents-core`, `ravel-agents-store` or
 `ravel-agents-runtime` on `main` and
 is pinned by their own tests. "End to end" means a test in
-`services/ravel-server/tests/agents_e2e.rs` pins it through the HTTP routes
-of a running server.
+`services/ravel-server/tests/agents_e2e.rs` or
+`services/ravel-server/tests/agents_effects_e2e.rs` pins it through the HTTP
+routes of a running server.
 
 | Property | Status | Evidence |
 |---|---|---|
@@ -397,10 +422,10 @@ of a running server.
 | Mailbox and HEAD byte caps refuse with a typed error, never drop; the receipt cap refuses the same way in code but has no test yet (test debt for T14) | in the crates (M1) | kernel `logical_caps_and_the_byte_cap_are_typed`, store `a_full_mailbox_is_refused_before_any_write` |
 | A turn commit publishes state, result, events and intents in one write, and rebases over a concurrent send | in the crates (M1) | kernel `turn_commit_publishes_state_input_result_events_and_intents_together`, `a_commit_rebases_onto_a_root_that_moved_without_touching_the_turn` |
 | A stale owner cannot commit or heartbeat after a takeover | in the crates (kernel); end to end | kernel `a_commit_after_takeover_is_ownership_lost`, `every_fenced_command_refuses_a_stale_fence`; e2e `send_then_result_through_real_server_survives_worker_replacement` (the replaced worker's commit and heartbeat both answer 409 `ownership_lost`) |
-| Failed turns retry under a new turn id, then dead-letter | in the crates (kernel); end to end in M2 | kernel `failed_turns_retry_under_a_new_turn_id_then_dead_letter` |
-| A retry reuses the failed attempt's step and effect identities | in the crates (kernel); end to end in M3 | kernel `a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt` (ADR-3331 step identity amendment) |
-| A `manual` effect in doubt blocks the turn until reconciled | in the crates (kernel); end to end in M3 | kernel `a_manual_effect_goes_in_doubt_and_blocks_the_turn_until_reconciled` |
-| A step replayed with a different input blocks the turn | in the crates (kernel); end to end in M3 | kernel `a_step_replayed_with_another_input_blocks_the_turn` |
+| Failed turns retry under a new turn id, then dead-letter | in the crates (kernel); the retry end to end | kernel `failed_turns_retry_under_a_new_turn_id_then_dead_letter`; e2e `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` (a retryable failure is accepted and the turn runs again under a new turn id); no e2e test reaches the dead letter |
+| A retry reuses the failed attempt's step and effect identities | in the crates (kernel); end to end | kernel `a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt` (ADR-3331 step identity amendment); e2e `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` |
+| A `manual` effect in doubt blocks the turn until reconciled | in the crates (kernel); end to end | kernel `a_manual_effect_goes_in_doubt_and_blocks_the_turn_until_reconciled`; e2e `manual_blocks_until_reconciled_and_audits_the_decision_once` |
+| A step replayed with a different input blocks the turn | in the crates (kernel); end to end | kernel `a_step_replayed_with_another_input_blocks_the_turn`; e2e `a_drifted_replay_is_non_deterministic_and_blocks_the_turn` |
 | A timer fires once; a cancel after the firing reports `AlreadyFired` | in the crates (kernel); end to end in M4 | kernel `timers_fire_once_and_a_late_cancel_reports_already_fired` |
 | A timer fires without its wake hint | in the crates (runtime sweep); end to end in M4 | runtime `a_lost_hint_is_found_by_the_directory_half`, `a_schedule_whose_hint_was_never_written_still_fires_when_due`; the directory half reaches the agent within `ceil(agents / directory GETs per pass)` passes (`a_bounded_pass_walks_the_directory_in_list_order_across_passes`); every agent with a HEAD has a `_dir` entry because a create writes it first (store `a_create_whose_dir_entry_fails_writes_no_head`), a hint-reached agent whose entry went missing gets it back (`a_hint_reached_agent_gets_its_missing_dir_entry_back`), and a listing page of unaddressable keys still moves the cursor (`a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it`, `a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it`) |
 | Wake hints are deleted when no longer needed | in the crates (runtime sweep); end to end in M4 | runtime `fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation`, `duplicate_hints_for_one_generation_fire_it_once`; a hint is deleted only after a HEAD read in the same pass shows no timer armed in its bucket, and a premature one is kept (`a_premature_hint_fires_nothing_and_is_kept`) |
@@ -408,9 +433,11 @@ of a running server.
 | Kernel sequences keep the HEAD invariants | in the crates (M1) | kernel `kernel_sequences_keep_the_head_invariants` |
 | The production store and runtime are checked against the independent reference machine | M1 (simulation drivers, T13) | the reference machine exists in `ravel-agents-sim` and is tested on its own (`reference_machine_invariants_hold`); nothing drives the production crates through it yet |
 | HTTP routes for create, send, call, operation, result, resolve, cancel, state, events and the worker register, poll, heartbeat and commit | end to end | e2e `send_then_result_through_real_server_survives_worker_replacement`, `call_heartbeat_and_cancel_through_real_server`, `cancel_of_a_running_turn_settles_it_cancelled_at_commit`, `events_page_after_the_durable_cursor_without_duplicates`, `resolve_after_a_lost_send_ack_returns_the_same_operation`; mounting `agents_router_mounts_on_both_listeners_only_with_feature_and_flag` |
-| `agents` and `agents_worker` capabilities are checked on every route | end to end | e2e `capabilities_are_enforced_on_both_listeners` |
+| HTTP routes for steps, effect results, effect inspection and reconciliation (`worker/step`, `worker/effects/complete`, `worker/effects/fail`, `effects`, `effects/{effect}`, `reconcile`) | end to end | e2e `completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn`, `provider_idempotency_redispatches_the_same_attempt_and_the_late_result_counts`, `manual_blocks_until_reconciled_and_audits_the_decision_once`, `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`, `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` |
+| A reconcile `retry` is dispatched once by the next step for its key in the same server process, under the owner at the reconcile or one that took the turn over since; a restart of that process, or a step served by another one, loses it and a `manual` effect is in doubt again | end to end (the hand-over, with and without a takeover); in the crates (the takeover, a race of two steps, a refused step handing it back) | e2e `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`, `a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`; runtime `a_reconciled_attempt_survives_a_takeover_before_the_next_step` (the lease expires after the reconcile and the new owner's first step dispatches attempt 2 once, the effect reads authorized at attempt 2), `concurrent_steps_dispatch_a_reconciled_attempt_once`, `a_hand_over_refused_after_its_claim_is_released_and_never_dispatched_twice`. The loss on a restart is not tested: a restarted coordinator holds no record, and runtime `manual_latches_in_doubt_after_a_coordinator_restart_and_is_never_redispatched` shows what a `manual` attempt with no record does |
+| `agents`, `agents_worker` and `agents_admin` capabilities are checked on every route | end to end | e2e `capabilities_are_enforced_on_both_listeners`; `agents_admin` on `reconcile` in `manual_blocks_until_reconciled_and_audits_the_decision_once` |
 | A HEAD that cannot be read under an operation handle answers `outcome_unknown`, not `agent_gone` | end to end | e2e `a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone`; an unknown handle is `agent_gone` (`unknown_operation_handle_is_agent_gone_with_the_handle`) |
-| HTTP routes for timers, effects and reconciliation | M3 to M4 | ADR-3331 decision 9; no route yet |
+| HTTP routes for timers and the sweep | M4 | ADR-3331 decision 9; no route yet (`a_path_outside_the_route_table_is_404`) |
 | `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers` set the kernel caps | on main | the server passes them as the kernel limits of every tenant's store, and the kernel refuses past a cap with a typed error (`logical_caps_and_the_byte_cap_are_typed`); no e2e test sets one below its default |
 | `--agents-max-agents`, `--agents-max-state-bytes` and `--agents-memory-budget` are enforced | follow-up | The routes do not enforce these three flags: they are parsed and reported on `GET /api/v1/agents/health` and `/metrics` only (`agents_flags_parse_and_reach_query_budgets`, `health_reports_feature_mode_and_every_setting`). Enforcing them is left to a follow-up. |
 | Projection of history into logs and traces | M5 | ADR-3331 decision 12 |

@@ -676,7 +676,11 @@ async fn fail_effect_records_the_failure_so_the_turn_can_fail() {
         .iter()
         .find(|st| st.step_key == "send-email")
         .expect("step journaled");
-    assert_eq!(step.status, StepStatus::Started, "a failure completes no step");
+    assert_eq!(
+        step.status,
+        StepStatus::Started,
+        "a failure completes no step"
+    );
     assert!(step.output.is_none());
     assert_eq!(hook.calls(), 2);
     assert!(matches!(
@@ -711,11 +715,18 @@ async fn a_reconciled_attempt_is_dispatched_by_the_owners_next_step() {
     let hook = Hook::default();
     let d1 = dispatched(&co, &a, &s, &hook).await;
     let b = takeover(&co, &clock).await;
-    let err = co.run_step(&b.lease, &s, &hook).await.expect_err("in doubt");
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
     assert_eq!(err.kind, ErrorKind::EffectInDoubt);
     assert_eq!(hook.calls(), 1);
 
-    assert!(co.reconcile_authorize(&d1.effect, 2).await.expect("authorize"));
+    assert!(
+        co.reconcile_authorize(&d1.effect, 2)
+            .await
+            .expect("authorize")
+    );
     assert_eq!(hook.calls(), 1, "reconcile dispatches nothing");
     let d2 = dispatched(&co, &b, &s, &hook).await;
     assert_eq!((d2.effect, d2.attempt), (d1.effect, 2));
@@ -734,7 +745,10 @@ async fn a_reconciled_attempt_is_dispatched_by_the_owners_next_step() {
             .expect("result"),
         EffectSettled::Recorded
     );
-    assert_eq!(step_output(&co, &b, &s, &hook).await, json!({"cents": 1700}));
+    assert_eq!(
+        step_output(&co, &b, &s, &hook).await,
+        json!({"cents": 1700})
+    );
     assert_eq!(hook.calls(), 2);
 }
 
@@ -979,11 +993,7 @@ async fn a_reconcile_authorization_with_a_lost_ack_dispatches_once() {
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
 
     // A genuine repeat hands nothing over.
-    assert!(
-        !co.reconcile_authorize(&d.effect, 2)
-            .await
-            .expect("again")
-    );
+    assert!(!co.reconcile_authorize(&d.effect, 2).await.expect("again"));
     let err = co
         .run_step(&b.lease, &s, &hook)
         .await
@@ -1165,7 +1175,11 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     }
     let authorized_here = reconciling.await.expect("join").expect("this reconcile");
     assert!(!authorized_here, "the attempt is the other admin's");
-    assert_eq!(cas_since(&store, &before), 0, "this call makes no further CAS");
+    assert_eq!(
+        cas_since(&store, &before),
+        0,
+        "this call makes no further CAS"
+    );
     assert_eq!(co.metrics().outcome_unknown_resolved, resolved);
     let h = head(&store, "o-1").await;
     assert_eq!(h, landed);
@@ -1265,4 +1279,199 @@ async fn a_completed_turn_with_an_open_attempt_does_not_wedge_the_next_turn() {
         .map(|((_, effect_id), open)| (*effect_id, open.attempt))
         .collect();
     assert_eq!(open, vec![(e.effect.effect_id, 1)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconciled_attempt_survives_a_takeover_before_the_next_step() {
+    let (clock, store, co) = rig();
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let d1 = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
+    assert_eq!(err.kind, ErrorKind::EffectInDoubt);
+    assert!(
+        co.reconcile_authorize(&d1.effect, 2)
+            .await
+            .expect("authorize")
+    );
+
+    // B abandoned the blocked turn; its lease expires before its next step.
+    let c = takeover(&co, &clock).await;
+    assert_ne!(
+        (&c.lease.owner_id, c.lease.epoch),
+        (&b.lease.owner_id, b.lease.epoch)
+    );
+    let d2 = dispatched(&co, &c, &s, &hook).await;
+    assert_eq!((d2.effect, d2.attempt), (d1.effect, 2));
+    assert_eq!(hook.calls(), 2, "the new owner's step dispatched attempt 2");
+    let err = co
+        .run_step(&c.lease, &s, &hook)
+        .await
+        .expect_err("attempt 2 is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 2, "dispatched once");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d1).status, effect_of(&h, &d1).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+
+    assert_eq!(
+        co.complete_effect(&d2.effect, 2, &json!({"cents": 1700}))
+            .await
+            .expect("result"),
+        EffectSettled::Recorded
+    );
+    assert_eq!(
+        step_output(&co, &c, &s, &hook).await,
+        json!({"cents": 1700})
+    );
+    assert_eq!(hook.calls(), 2);
+}
+
+/// A manual effect latched in doubt under a takeover owner, with attempt 2
+/// handed over by a reconcile; HEAD reads counted by a pass-through sequence.
+async fn handed_over(
+    plan: FaultPlan,
+) -> (
+    Arc<FaultStore<MemoryStore>>,
+    Arc<AgentStore>,
+    Arc<Coordinator>,
+    TurnAssignment,
+    Dispatch,
+) {
+    let clock = clock();
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    co.run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
+    assert!(
+        co.reconcile_authorize(&d.effect, 2)
+            .await
+            .expect("authorize")
+    );
+    (fault, store, co, b, d)
+}
+
+fn head_reads() -> FaultPlan {
+    FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Get)
+            .with_key_contains("/head")
+            .with_steps(vec![SequenceStep::Passthrough; 100]),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_steps_dispatch_a_reconciled_attempt_once() {
+    // The HEAD reads of the step that dispatches the hand-over; its last one
+    // follows the claim.
+    let (fault, _, co, b, _) = handed_over(head_reads()).await;
+    let before = fault.sequence_progress(0);
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    dispatched(&co, &b, &s, &Hook::default()).await;
+    let reads = fault.sequence_progress(0) - before;
+    assert!(reads > 0 && reads < 100);
+
+    let (fault, store, co, b, d) = handed_over(FaultPlan::empty()).await;
+    let hook = Arc::new(Hook::default());
+    let gate = fault.hold(Op::Get, Some("/head".to_string()), Occurrence::Nth(reads));
+    let first = {
+        let (co, hook, lease, s) = (co.clone(), hook.clone(), b.lease.clone(), s.clone());
+        tokio::spawn(async move { co.run_step(&lease, &s, hook.as_ref()).await })
+    };
+    gate.wait_until_held(1).await;
+    let claimed = co
+        .open_attempts
+        .lock()
+        .get(&(d.effect.agent, d.effect.effect_id))
+        .map(|open| open.reconciled);
+    assert_eq!(claimed, Some(false), "the first step holds the claim");
+
+    let err = co
+        .run_step(&b.lease, &s, hook.as_ref())
+        .await
+        .expect_err("the claimed attempt is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 0);
+
+    for id in gate.held() {
+        assert!(gate.release(id), "the held read is released");
+    }
+    match first.await.expect("join").expect("first step") {
+        StepProgress::Dispatched(d2) => assert_eq!((d2.effect, d2.attempt), (d.effect, 2)),
+        other => panic!("expected a dispatch, got {other:?}"),
+    }
+    assert_eq!(hook.calls(), 1, "exactly one dispatch of attempt 2");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hand_over_refused_after_its_claim_is_released_and_never_dispatched_twice() {
+    let (clock, store, co) = rig();
+    let (a, operation) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    co.run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
+    assert!(
+        co.reconcile_authorize(&d.effect, 2)
+            .await
+            .expect("authorize")
+    );
+    co.cancel(&CancelRequest { operation })
+        .await
+        .expect("cancel");
+
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("the input is being cancelled");
+    assert_eq!(err.kind, ErrorKind::OwnershipLost);
+    assert_eq!(hook.calls(), 1);
+    let released = co
+        .open_attempts
+        .lock()
+        .get(&(d.effect.agent, d.effect.effect_id))
+        .map(|open| (open.reconciled, open.attempt));
+    assert_eq!(released, Some((true, 2)), "the claim was handed back");
+
+    let done = co
+        .commit(&completed(&b.lease, json!("ok")))
+        .await
+        .expect("commit");
+    assert_eq!(done.status, OperationStatus::Cancelled);
+    assert!(
+        !co.open_attempts
+            .lock()
+            .contains_key(&(d.effect.agent, d.effect.effect_id)),
+        "the settled input dropped the hand-over"
+    );
+    co.run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("the turn settled");
+    assert_eq!(hook.calls(), 1, "attempt 2 was never dispatched");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
+        (EffectStatus::Authorized, 2)
+    );
 }
