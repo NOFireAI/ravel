@@ -53,9 +53,11 @@
 #                    `docker inspect`, when docker is reachable; otherwise the
 #                    literal string "unavailable: docker not reachable".
 #                    `docker compose ps` reads docker-compose.yml and
-#                    ravel.yml together, with RAVEL_IMAGE set to a placeholder
-#                    when unset (ravel.yml requires it, and a listing pulls
-#                    no image), so the ravel-server container is found.
+#                    ravel.yml together, with RAVEL_IMAGE and S3S_FS_BIN set
+#                    to placeholders when unset (ravel.yml requires the one
+#                    and docker-compose.yml the other, and a listing pulls no
+#                    image and mounts nothing), so the ravel-server container
+#                    is found.
 #
 # A field that could not be fetched is {"unavailable": "<reason>"}; no field is
 # omitted or left empty, except under --no-ravel, where Ravel's entry is
@@ -341,11 +343,14 @@ def compose_containers():
     _, err = run_docker("info", "--format", "{{.ServerVersion}}")
     if err:
         return DOCKER_UNREACHABLE
-    # ravel.yml refuses interpolation without RAVEL_IMAGE; ps only reads
-    # container labels, so the placeholder names no image that is used.
+    # ravel.yml refuses interpolation without RAVEL_IMAGE and
+    # docker-compose.yml without S3S_FS_BIN; ps only reads container labels,
+    # so neither placeholder names an image or a file that is used.
     env = dict(os.environ)
     if not env.get("RAVEL_IMAGE"):
         env["RAVEL_IMAGE"] = "unset-placeholder-for-compose-ps"
+    if not env.get("S3S_FS_BIN"):
+        env["S3S_FS_BIN"] = "unset-placeholder-for-compose-ps"
     stdout, err = run_docker(
         "compose", "-f", compose_file, "-f", ravel_compose_file, "ps", "--format", "json", env=env
     )
