@@ -658,8 +658,9 @@ differences that remain, each with the property that rests on it:
   answer (a cancel on a delivered generation is not enabled); the receipt index as pages; the HEAD size cap and
   quotas; format versions and `UnsupportedFormat`; operation states other than
   pending and resolved.
-- `bands.tsv` uses a placeholder for the three unmeasured exhaustive rows
-  (see the claims section); T20 measures them.
+- `bands.tsv` uses a placeholder for the two unmeasured exhaustive rows,
+  and a third exhaustive config sits unenrolled under `unenrolled/` (see
+  the claims section); T20 measures all three.
 
 ## Exhaustive runs
 
