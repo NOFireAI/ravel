@@ -14,8 +14,10 @@
 # AgentIntegrated, 2 workers: smoke measured 427920 distinct at depth 44 in
 # 42 s; live (one worker, no timer, liveness on) measured 13617 distinct at
 # depth 35 in 8 s; positive/integrated-timer-race.cfg measured 1190621
-# distinct at depth 45 in 92 s. The exhaustive row is a placeholder, and no
-# run has finished it, so its 3000 s budget is unproven (T20, #3354).
+# distinct at depth 45 in 92 s. The exhaustive config is not enrolled: no
+# run has finished it, so its budget is unproven, and it sits under
+# unenrolled/ until T20 (#3354) measures it on the nightly runner and moves
+# it back with a row here.
 cfg	min_distinct	max_distinct	min_depth	max_depth	budget_s
 MCAgentProtocol.smoke.cfg	286000	292000	-	-
 MCAgentProtocol.exhaustive.cfg	0	999999999	-	-	3000
@@ -25,6 +27,5 @@ MCAgentEffects.smoke.cfg	219000	226000	-	-
 MCAgentEffects.exhaustive.cfg	0	999999999	-	-	3000
 MCAgentEffects.live.cfg	125500	130000	-	-
 MCAgentIntegrated.smoke.cfg	422000	434000	-	-
-MCAgentIntegrated.exhaustive.cfg	0	999999999	-	-	3000
 MCAgentIntegrated.live.cfg	13350	13900	-	-
 positive/integrated-timer-race.cfg	1170000	1210000	-	-
