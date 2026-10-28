@@ -10,8 +10,10 @@
   },
   "scripts": {
     "lint": "eslint --max-warnings 0 .",
-    "typecheck": "npm run typecheck --workspaces",
-    "test": "npm test --workspaces"
+    "typecheck": "npm run typecheck --workspaces && tsc -p examples",
+    "test": "npm test --workspaces",
+    "test:e2e": "npm run test:e2e --workspace @ravel/agents",
+    "example:assistant": "node --experimental-transform-types --disable-warning=ExperimentalWarning --import ./examples/ts-hooks.js examples/assistant/main.ts"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
