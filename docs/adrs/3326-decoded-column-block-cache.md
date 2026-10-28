@@ -181,10 +181,16 @@ Exclusions, each a property the implementation tests:
 - **Narrowed values never populate an entry.** No narrowed, survivor-only
   or Arrow value populates an entry, and nothing after step 2 reads from
   one.
-- **Erasure runs after the hit.** A block whose object has an erasure
-  pending is not decoded today (`log_fetcher.rs:599-601`), and erased rows
-  are filtered after decode. A cached column is filtered the same way, so
-  an erasure applies to a hit exactly as to a fresh decode.
+- **Blocks with an erasure pending bypass the cache.** The columnar path
+  decodes nothing while an erasure is pending (`log_fetcher.rs:599-601`).
+  Such blocks take the row path, where erased rows are filtered after
+  decode. The row path produces the same step-2 `DecodedBlock`, so it is
+  not cache-free by construction: it must neither read nor fill an entry,
+  and the implementation tests that (narrowed by the Stage 0 result
+  amendment below).
+- **Entries expire.** Every entry carries the fetch cache's maximum age
+  and is dropped at its first access or sweep after it (see the Stage 0
+  result amendment below).
 
 Entries of an object no longer referenced by any snapshot age out by
 eviction, as its raw bytes do in the fetch cache. Whether erasure
@@ -369,18 +375,18 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 
 | Stage 0 figure | Band | Miss | Basis |
 |---|---|---|---|
-| Simulation: try-3 hit share for statements whose set fits, chosen policy, 8 GB | at least 0.95 | under 0.80 | predicted |
-| Simulation: interactive working set retained through a scan larger than the cap, chosen policy | at least 0.90 | under 0.50 | predicted |
-| Branch at 8 GB, today's string layout: hot geomean, B/A | 0.76 to 0.88 | above 0.92 | predicted |
-| Branch at 8 GB: q04 (BulkScan) server CPU on try 3, B/A | 0.30 to 0.50 | above 0.70 | predicted |
-| Branch at 8 GB: q34 (modelled set 10.5 GB, larger than the cap) hot wall, B/A | 0.95 to 1.05 | above 1.10 | predicted |
-| Branch at 8 GB: any statement refused for memory or above 1.10 hot wall | none | any | predicted |
-| Branch at 8 GB, full entry run with the concurrent phase: QPS | at least 0.60 and at least main's on the same box minus 5% | under 0.60 | ADR-3217 standing bar (#3217 comment 6366582370) |
-| Branch at 8 GB, full entry run with the concurrent phase: error ratio | at most 0.058 | above 0.058 | ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
-| Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
+| Simulation: try-3 hit share for statements whose set fits, chosen policy, 8 GB | at least 0.95 | under 0.80 | predicted; met, measured 2026-10-27: 1.000, #3326 comment 6441843449 |
+| Simulation: interactive working set retained through a scan larger than the cap, chosen policy | at least 0.90 | under 0.50 | predicted; met, measured 2026-10-27: 1.000, #3326 comment 6441843449 |
+| Branch at 8 GB, today's string layout: hot geomean, B/A | 0.76 to 0.88 | above 0.92 | predicted; met, measured 2026-10-28: 0.7675, #3326 comment 6461898958 |
+| Branch at 8 GB: q04 (BulkScan) server CPU on try 3, B/A | 0.30 to 0.50 | above 0.70 | predicted; met, measured 2026-10-28: 0.309, #3326 comment 6461898958 |
+| Branch at 8 GB: q34 (modelled set 10.5 GB, larger than the cap) hot wall, B/A | 0.95 to 1.05 | above 1.10 | predicted; outside the band on the fast side, not a miss, measured 2026-10-28: 0.776, #3326 comment 6461898958 (the Stage 0 result amendment explains it) |
+| Branch at 8 GB: any statement refused for memory or above 1.10 hot wall | none | any | predicted; met, measured 2026-10-28: every statement answered, highest 1.013, #3326 comment 6461898958 |
+| Branch at 8 GB, full entry run with the concurrent phase: QPS | at least 0.60 and at least main's on the same box minus 5% | under 0.60 | ADR-3217 standing bar (#3217 comment 6366582370); met on the same box type, measured 2026-10-28: 0.817 against 0.777, #3326 comment 6462646965 |
+| Branch at 8 GB, full entry run with the concurrent phase: error ratio | at most 0.058 | above 0.058 | ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100`; met, measured 2026-10-28: 0.058, #3326 comment 6462646965 |
+| Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863; met, measured 2026-10-28: 0.9887 |
 | Simulation, q33 shape, without the margin (control): aggregate refusals at an 8 GB cap | at least one | none | met, measured 2026-10-27: 116, #3326 comment 6452444728 |
 | Simulation, q33 shape, with the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | met, measured 2026-10-27: 0 at each cap, #3326 comment 6452444728 |
-| Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | missed, measured 2026-10-27: 0 of 4, #3326 comment 6455179106 |
+| Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | missed, measured 2026-10-27: 0 of 4, #3326 comment 6455179106; superseded by the last row |
 | Simulation, q33 shape with racing checked reservations, evictor freeing the exact shortfall (control): aggregate refusals at an 8 GB cap | at least one | none | met, measured 2026-10-28: 75, #3326 comment 6459628404 |
 | Simulation, same shape, evictor freeing the shortfall plus the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | met, measured 2026-10-28: 0 at each cap, #3326 comment 6459628404 |
 | Branch at 8 GB, evictor slack added to margin build: q33 answers on every B run | yes | any B run refused | met, measured 2026-10-28: 4 of 4, #3326 comment 6461898958 |
@@ -397,7 +403,9 @@ work, and the readout names the step that missed.
    regression, since nothing copies before the cache exists.
 3. The cache with the cap defaulting to 0, the hook of decision 4 and
    its admission margin (see the admission-headroom amendment below), the
-   tests of decision 5 and the metrics.
+   evictor's slack, the entry age bound and the row-path exclusion (see
+   the Stage 0 result amendment below), the tests of decision 5 and the
+   metrics.
 4. The default cap, chosen from Stage 0 and the owner's decision 6, with a
    paired A/B on the reference box, bands pre-registered on #3326.
 
@@ -575,23 +583,47 @@ row of the Stage 0 table, pre-registered on #3326 before launch.
 
 ## Amendment (2026-10-28): Stage 0 result, the entry decision and the age bound
 
-<!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|Stage 0, before any code that merges|6. Whether the ClickBench entry runs with the cache is an owner decision" pointer="Stage 0 result amendment" -->
+<!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|Stage 0, before any code that merges|Delivery, after Stage 0 passes|6. Whether the ClickBench entry runs with the cache is an owner decision" pointer="Stage 0 result amendment" -->
 
-**Stage 0 passed on 2026-10-28.** Every row of the Stage 0 table is met.
+**Stage 0 passed on 2026-10-28.** Each row of the Stage 0 table now
+carries its measured figure. Every row is met, with two exceptions:
+- the margin-only re-run row is missed and superseded by the
+  evictor-slack re-run row below it;
+- the q34 row lands outside its band on the fast side, not past its miss
+  line.
 
 | Stage 0 step | Result | Basis |
 |---|---|---|
 | Admission simulation (Traces A and B) | try-3 hit share 1.000 for every fitting statement at 8 GB; the interactive set retained 1.000 through scans larger than the cap | #3326 comment 6441843449 |
 | q33-shape simulations (Traces C and D) | without the margin or with an exact-shortfall evictor: refused; with the margin and the evictor's slack: no refusal at 4, 8 or 12 GB | #3326 comments 6452444728 and 6459628404 |
-| Paired 8 GB run with the hook, the margin and the slack (`dc8s-20261028T0428Z`) | hot geomean 0.7675 over 43 statements; q04 try-3 CPU 0.309; q34 0.776; q33 answers 4 of 4; no refusal stood after the evictor | #3326 comment 6461898958 |
+| Paired 8 GB run with the hook, the margin and the slack (`dc8s-20261028T0428Z`) | hot geomean 0.7675 over 43 statements; q04 try-3 CPU 0.309; q34 0.776; every statement answered, q33 on 4 of 4 runs | #3326 comment 6461898958 |
 | Erasure check | no purge on erasure anywhere in main; see the age bound below | #3326 comment 6461939175 |
 | Full entry runs, one per arm (`qps-20261028T0558Z-A` and `-B`) | QPS 0.817 against main's 0.777; error ratio 0.058 against main's 0.064; cold sum 0.997 of main | #3326 comment 6462646965 |
 
-The full entry runs are the first measurement under the ClickBench
-protocol, which restarts the server before each statement. The hot
-geomean there was 0.719 of main and the hot sum 0.738. The two arms ran on
-separate boxes, so these figures carry box-to-box noise; the paired figure
-above is the banded one.
+Three of the paired run's figures need a reading beyond the table.
+
+- **q34 is faster than predicted.** q34 was banded at no change because
+  the model put its decoded set at 10.5 GB, over the 8 GB cap. On the
+  box it hit 39,699 of 39,705 column accesses, so its set fit. The model
+  costs each plain string row at about 40 B. The ADR named that string
+  bias as running high; this is a measured instance of it.
+- **Refusals happened inside q33 and were resolved.** The no-refusal row
+  asks that no statement be refused. None was: every statement answered,
+  q33 included. Across the run's four B rounds the server log records 38
+  pressure-eviction passes, each one a refused reservation that the hook
+  resolved before the refusal reached the statement. It has no
+  `reservation refused after the pressure evictor ran` line.
+- **QPS and the error ratio come from two boxes.** The full entry runs
+  ran one arm per box, on the same box type, launched together. The rows
+  are met on that same-box-type basis.
+  - QPS: B's 0.817 is above A's 0.777. The row fails only if box-to-box
+    noise exceeds about 10% in A's favour.
+  - Error ratio: an absolute bar, independent of A.
+
+The full entry runs are also the first measurement under the ClickBench
+protocol, which restarts the server before each statement. There the hot
+geomean was 0.719 of main and the hot sum 0.738. These carry the same
+box-to-box noise; the paired figure is the banded one.
 
 **Decision 1 gains an age bound.** Erasure completion purges no cache in
 main. The fetch cache bounds erased residue by age: 23 hours per entry
@@ -600,11 +632,18 @@ acceptance criterion, that a later query cannot return erased bytes from
 a cache, covers every tier (`docs/adrs/0064-selective-subject-erasure.md:101-104`).
 The decoded cache therefore carries the same maximum age, from the same
 constants, and drops an entry at its first access or sweep after that
-age. The other two protections already hold:
-- a rewritten part has a new content hash, so snapshots taken after the
-  rewrite never read the old entries;
-- a block with an erasure pending is decoded on the row path, which the
-  decoded cache neither reads nor fills.
+age. Two more protections complete the argument.
+- **New content hash after a rewrite.** This holds in main: a rewritten
+  part has a new content hash, so snapshots taken after the rewrite never
+  read the old entries.
+- **The row path never touches the cache.** This is a requirement on the
+  implementation, not a property of main. A block with an erasure pending
+  takes the row path, and the row path produces the same step-2
+  `DecodedBlock` the cache keys. Decision 1's exclusions now say so, and
+  Delivery step 3 tests it.
+
+Delivery step 3 now lists the age bound, the row-path exclusion and the
+evictor's slack beside the hook and the margin.
 
 ADR-0064's promise of tombstone-style invalidation for RAM-tier decoded
 structures is not implemented in main. That is filed as #3401 and is not
