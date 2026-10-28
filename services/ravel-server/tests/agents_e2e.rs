@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
@@ -295,6 +295,26 @@ fn value(scrape: &str, name: &str, label: &str) -> u64 {
         .expect("integer sample")
 }
 
+const ALL: &str = "mode=\"all\"";
+
+/// The process's `mode="all"` sample of `name`.
+async fn counter(api: &Api, name: &str) -> u64 {
+    value(&api.scrape().await, name, ALL)
+}
+
+/// Scrape until the `mode="all"` sample of `name` reaches `want`, so a test
+/// orders its next request after a state the server reports rather than
+/// after a sleep.
+async fn wait_for_counter(api: &Api, name: &str, want: u64) {
+    for _ in 0..2_000 {
+        if counter(api, name).await >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{name} never reached {want}");
+}
+
 /// The acceptance path. Worker A takes the turn and dies holding it; once
 /// its lease and the grace have passed, worker B polls and is handed the same
 /// turn id and input, A's late commit is refused on the lease's own fence,
@@ -358,23 +378,32 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["code"], json!("ownership_lost"));
+    // A's heartbeat on the same stale lease is refused the same way.
+    let (status, refused) = api
+        .post(
+            WORKER,
+            "worker/heartbeat",
+            &json!({"lease": assigned_a["lease"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("ownership_lost"));
 
-    // A result long-poll waiting across B's commit returns as soon as the
-    // commit lands, not at its wait.
+    // A result long-poll parked before B's commit is woken by the commit,
+    // not by its periodic HEAD re-read or its deadline.
     let waiter = {
         let api = api.clone();
         let operation = operation.clone();
         tokio::spawn(async move {
-            let (status, body) = api
-                .get(
-                    CLIENT,
-                    &format!("result?operation={operation}&wait_ms=15000"),
-                )
-                .await;
-            (status, body, Instant::now())
+            api.get(
+                CLIENT,
+                &format!("result?operation={operation}&wait_ms=15000"),
+            )
+            .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_counter(&api, "ravel_agents_result_waits_total", 1).await;
+    assert_eq!(counter(&api, "ravel_agents_result_wakes_total").await, 0);
 
     let committed = api
         .ok(
@@ -388,19 +417,18 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
             ),
         )
         .await;
-    let committed_at = Instant::now();
     assert_eq!(committed["operation"], json!(operation));
     assert_eq!(committed["status"], json!("completed"));
 
-    let (status, waited, answered_at) = waiter.await.expect("waiter joins");
-    assert_eq!(status, StatusCode::OK, "{waited}");
-    assert_eq!(waited["operation"], json!(operation));
-    assert_eq!(waited["result"]["status"], json!("completed"));
-    assert_eq!(waited["result"]["output"], json!({"total_cents": 1299}));
-    assert!(
-        answered_at.saturating_duration_since(committed_at) < Duration::from_millis(500),
-        "result answered {:?} after the commit",
-        answered_at.saturating_duration_since(committed_at)
+    let (status, answer) = waiter.await.expect("waiter joins");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["operation"], json!(operation));
+    assert_eq!(answer["result"]["status"], json!("completed"));
+    assert_eq!(answer["result"]["output"], json!({"total_cents": 1299}));
+    assert_eq!(counter(&api, "ravel_agents_result_wakes_total").await, 1);
+    assert_eq!(
+        counter(&api, "ravel_agents_result_wait_expiries_total").await,
+        0
     );
 
     // Completed once: a second read sees the same single result.
@@ -408,19 +436,19 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
         .get(CLIENT, &format!("result?operation={operation}"))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(again["result"], waited["result"]);
+    assert_eq!(again["result"], answer["result"]);
     let (status, state) = api.get(CLIENT, "state?kind=order&key=o-1").await;
     assert_eq!(status, StatusCode::OK, "{state}");
     assert_eq!(state["state"], json!({"by": "b"}));
     assert_eq!(state["state_version"], json!(1));
 
     let scrape = api.scrape().await;
-    let all = "mode=\"all\"";
+    let all = ALL;
     assert_eq!(value(&scrape, "ravel_agents_turns_committed_total", all), 1);
     assert_eq!(value(&scrape, "ravel_agents_takeovers_total", all), 2);
     assert_eq!(
         value(&scrape, "ravel_agents_ownership_lost_refusals_total", all),
-        1
+        2
     );
     let publish = "phase=\"publish\"";
     assert_eq!(value(&scrape, "ravel_agents_store_cas_total", publish), 5);
@@ -611,7 +639,7 @@ async fn events_page_after_the_durable_cursor_without_duplicates() {
     running.shutdown().await.expect("clean shutdown");
 }
 
-/// A `send` body over `--agents-max-body-bytes` is a 413 carrying the typed
+/// A `send` body over `AgentsConfig::max_body_bytes` is a 413 carrying the typed
 /// error body, and the store is never touched.
 #[tokio::test]
 async fn send_over_the_body_limit_is_413_with_a_typed_body() {
@@ -637,7 +665,7 @@ async fn send_over_the_body_limit_is_413_with_a_typed_body() {
 /// With one poll permit held by a waiting `worker/poll`, a second is refused
 /// with 503 `store_unavailable`, while a PromQL query under a query
 /// concurrency limit of one is still admitted: the agents route holds no
-/// query permit.
+/// query permit. The holder is released by a send, not by its deadline.
 #[tokio::test]
 async fn admission_refusal_is_503_and_takes_no_query_permit() {
     let running = start_server(
@@ -650,18 +678,21 @@ async fn admission_refusal_is_503_and_takes_no_query_permit() {
     )
     .await;
     let api = Api::public(&running);
+    api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
     let holder = {
         let api = api.clone();
         tokio::spawn(async move {
             api.post(
                 WORKER,
                 "worker/poll",
-                &json!({"worker_id": "w-1", "handlers": pins(), "wait_ms": 3_000}),
+                &json!({"worker_id": "w-1", "handlers": pins(), "wait_ms": 15_000}),
             )
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The coordinator counts a poll as waited only once it parks, and the
+    // route took the permit before calling it.
+    wait_for_counter(&api, "ravel_agents_polls_waited_total", 1).await;
 
     let (status, body) = api
         .post(
@@ -689,9 +720,10 @@ async fn admission_refusal_is_503_and_takes_no_query_permit() {
         query.text().await.unwrap_or_default()
     );
 
+    let sent = api.ok(CLIENT, "send", &send_body("req-1", json!({}))).await;
     let (status, held) = holder.await.expect("holder joins");
     assert_eq!(status, StatusCode::OK, "{held}");
-    assert_eq!(held["assignment"], Value::Null);
+    assert_eq!(held["assignment"]["operation"], sent["operation"], "{held}");
     running.shutdown().await.expect("clean shutdown");
 }
 
@@ -794,10 +826,11 @@ async fn unknown_operation_handle_is_agent_gone_with_the_handle() {
     running.shutdown().await.expect("clean shutdown");
 }
 
-/// `call` waits up to its `wait_ms` and answers the operation's status when
-/// nothing finished; `worker/heartbeat` renews the lease past the turn's
-/// start; a repeated `call` under the same request id answers the finished
-/// result at once; `cancel` stops an input no worker has started.
+/// `call` waits until its `wait_ms` deadline and answers the operation's
+/// status when nothing finished; `worker/heartbeat` moves the lease expiry
+/// forward on each renewal; a repeated `call` under the same request id
+/// answers the finished result without waiting; `cancel` stops an input no
+/// worker has started.
 #[tokio::test]
 async fn call_heartbeat_and_cancel_through_real_server() {
     let running = start_memory().await;
@@ -811,36 +844,30 @@ async fn call_heartbeat_and_cancel_through_real_server() {
         "wait_ms": 300,
     });
 
-    let started = Instant::now();
     let pending = api.ok(CLIENT, "call", &call).await;
-    let waited = started.elapsed();
     assert_eq!(pending["status"], json!("accepted"), "{pending}");
     assert_eq!(pending["result"], Value::Null);
-    assert!(
-        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
-        "{waited:?}"
+    // The call parked and was answered by its deadline firing.
+    assert_eq!(counter(&api, "ravel_agents_result_waits_total").await, 1);
+    assert_eq!(
+        counter(&api, "ravel_agents_result_wait_expiries_total").await,
+        1
     );
     let operation = pending["operation"].clone();
 
     let worker = register(&api).await;
     let assignment = poll(&api, &worker, 2_000).await;
     assert_eq!(assignment["operation"], operation);
-    let renewed = api
-        .ok(
-            WORKER,
-            "worker/heartbeat",
-            &json!({"lease": assignment["lease"]}),
-        )
-        .await;
-    let expires: i64 = renewed["lease_expires_unix_ns"]
-        .as_str()
-        .and_then(|v| v.parse().ok())
-        .expect("expiry");
-    let recorded: i64 = assignment["lease"]["recorded_unix_ns"]
-        .as_str()
-        .and_then(|v| v.parse().ok())
-        .expect("recorded");
-    assert!(expires > recorded, "{expires} <= {recorded}");
+    let expiry = |body: &Value| -> i64 {
+        body["lease_expires_unix_ns"]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .expect("expiry")
+    };
+    let lease = json!({"lease": assignment["lease"]});
+    let first = expiry(&api.ok(WORKER, "worker/heartbeat", &lease).await);
+    let second = expiry(&api.ok(WORKER, "worker/heartbeat", &lease).await);
+    assert!(second > first, "{second} <= {first}");
     api.ok(
         WORKER,
         "worker/commit",
@@ -850,9 +877,9 @@ async fn call_heartbeat_and_cancel_through_real_server() {
 
     let mut again = call.clone();
     again["wait_ms"] = json!(15_000);
-    let started = Instant::now();
     let done = api.ok(CLIENT, "call", &again).await;
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Terminal at the first read: no second wait was parked.
+    assert_eq!(counter(&api, "ravel_agents_result_waits_total").await, 1);
     assert_eq!(done["operation"], operation);
     assert_eq!(done["status"], json!("completed"));
     assert_eq!(done["result"]["output"], json!({"ok": true}));
@@ -873,5 +900,124 @@ async fn call_heartbeat_and_cancel_through_real_server() {
         .await;
     assert_eq!(status, StatusCode::OK, "{op}");
     assert_eq!(op["status"], json!("cancelled"), "{cancelled} {op}");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// `cancel` on an input a worker is running records the request and answers
+/// `running`; the parked `result` long poll stays parked through that
+/// non-terminal change, and the worker's commit then settles the input as
+/// cancelled without applying its state.
+#[tokio::test]
+async fn cancel_of_a_running_turn_settles_it_cancelled_at_commit() {
+    let running = start_memory().await;
+    let api = Api::public(&running);
+    api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
+    let sent = api
+        .ok(CLIENT, "send", &send_body("req-1", json!({"sku": "A-1"})))
+        .await;
+    let operation = sent["operation"].as_str().expect("operation").to_string();
+    let worker = register(&api).await;
+    let assignment = poll(&api, &worker, 2_000).await;
+    assert_eq!(assignment["operation"], json!(operation));
+
+    let waiter = {
+        let api = api.clone();
+        let operation = operation.clone();
+        tokio::spawn(async move {
+            api.get(
+                CLIENT,
+                &format!("result?operation={operation}&wait_ms=15000"),
+            )
+            .await
+        })
+    };
+    wait_for_counter(&api, "ravel_agents_result_waits_total", 1).await;
+
+    let cancelled = api
+        .ok(CLIENT, "cancel", &json!({"operation": operation}))
+        .await;
+    assert_eq!(cancelled["status"], json!("running"), "{cancelled}");
+    assert_eq!(cancelled["requested"], json!(true), "{cancelled}");
+    wait_for_counter(&api, "ravel_agents_result_wakes_total", 1).await;
+    let (status, op) = api
+        .get(CLIENT, &format!("operation?operation={operation}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{op}");
+    assert_eq!(op["status"], json!("running"), "{op}");
+
+    api.ok(
+        WORKER,
+        "worker/commit",
+        &commit_body(
+            &assignment,
+            json!({"placed": true}),
+            json!({"ok": true}),
+            json!([]),
+        ),
+    )
+    .await;
+    let (status, answer) = waiter.await.expect("waiter joins");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["result"]["status"], json!("cancelled"), "{answer}");
+    assert_eq!(
+        counter(&api, "ravel_agents_result_wait_expiries_total").await,
+        0
+    );
+    let (status, state) = api.get(CLIENT, "state?kind=order&key=o-1").await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    assert_eq!(state["state"], Value::Null, "{state}");
+    assert_eq!(state["state_version"], json!(0), "{state}");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A HEAD read that finds nothing while `result` holds an operation handle
+/// is a failed read, not a deleted agent, since a HEAD is never deleted:
+/// 500 `outcome_unknown` carrying the handle, and the next read answers.
+#[tokio::test]
+async fn a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone() {
+    let kind = ravel_agents_core::keys::AgentKind::new("order").expect("kind");
+    let key = ravel_agents_core::keys::AgentKey::new("o-1").expect("key");
+    let head = format!(
+        "{}/head",
+        ravel_agents_core::identity::agent_id(&kind, &key).to_hex()
+    );
+    // create's read and send's read pass; every attempt of result's read
+    // (the store confirms an absence over `MAX_READ_ATTEMPTS` reads) blips.
+    let blips = u64::from(ravel_agents_store::publish::MAX_READ_ATTEMPTS);
+    let mut sequence = Sequence::new(Op::Get)
+        .with_key_contains(head)
+        .then_passthrough()
+        .then_passthrough();
+    for _ in 0..blips {
+        sequence = sequence.then_fault(ScriptedFault::NotFoundBlip);
+    }
+    let plan = FaultPlan::empty().with_sequence(sequence);
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let running = start_server(
+        faults.clone(),
+        agents_config(),
+        ravel_query::QueryConcurrencyLimit::Unlimited,
+    )
+    .await;
+    let api = Api::public(&running);
+    api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
+    let sent = api.ok(CLIENT, "send", &send_body("req-1", json!({}))).await;
+    let operation = sent["operation"].as_str().expect("operation").to_string();
+
+    let (status, body) = api
+        .get(CLIENT, &format!("result?operation={operation}"))
+        .await;
+    assert_eq!(faults.fault_count(Op::Get, FaultKind::NotFoundBlip), blips);
+    assert_eq!(faults.sequence_progress(0), 2 + blips);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["code"], json!("outcome_unknown"), "{body}");
+    assert_eq!(body["retry"], json!("resolve_operation"), "{body}");
+    assert_eq!(body["ids"]["operation"], json!(operation), "{body}");
+
+    let (status, body) = api
+        .get(CLIENT, &format!("operation?operation={operation}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], json!("accepted"), "{body}");
     running.shutdown().await.expect("clean shutdown");
 }
