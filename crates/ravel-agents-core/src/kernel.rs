@@ -115,27 +115,67 @@ pub struct Limits {
     /// 6, last failed turn id 18, the entry's length prefix 1: 25 bytes) and
     /// then the result entry its terminal `FailTurn` or `Cancel` publishes
     /// (field tag 2, length prefix 2, accept seq 11, status 2, turn id 18,
-    /// dead-lettered flag 2, finish time 11, the error's tag and length 3:
-    /// 51 bytes plus the error). So this must be at least
-    /// `max_error_bytes + 76`: 332 at the defaults, which reserve 512. The
-    /// entry the terminal publish removes is not credited.
+    /// dead-lettered flag 2, finish time 11, the error's tag 1 and length
+    /// varint: 51 bytes plus the error at the defaults). Both length varints
+    /// widen with the error, so the floor is
+    /// [`result_entry_overhead_bytes`]`(max_error_bytes)` above the error:
+    /// 332 at the defaults, which reserve 512, and 16462 at a 16384-byte
+    /// error (`tests::the_result_floor_covers_the_varint_widths_of_a_wide_error`).
+    /// The entry the terminal publish removes is not credited.
     pub terminal_reserve_per_input_bytes: usize,
 }
 
 /// Bytes the growth guard leaves free for each journaled effect that is not
-/// `Completed`: a `Reconcile` authorization, an owner's retry authorization
-/// of an effect already `Authorized` or `InDoubt`, or a `RecordEffectResult`
-/// may still grow it, and all three are exempt. The attempt varint (6), the result
-/// reference (47), the result attempt varint (6), the record's length prefix
-/// (1) and a status change (2, though prost writes every status in one byte
-/// either way) come to 62.
-pub const PENDING_EFFECT_RESERVE_BYTES: usize = 64;
+/// `Completed`: an owner's retry authorization of an effect already
+/// `Authorized` or `InDoubt`, or a `RecordEffectResult`, may still grow it,
+/// and both are exempt. The attempt varint (6), the result reference (47),
+/// the result attempt varint (6), the record's length prefix (1) and a status
+/// change (2, though prost writes every status in one byte either way) come
+/// to 62. A result that settles an `InDoubt` effect also appends one audit
+/// event (see [`AUDIT_RECONCILE_RESULT`]): its entry at the widest sequence
+/// numbers and a `next_event_seq` varint one byte wider add 68, so 128 in all
+/// (`tests::the_reserves_cover_the_growth_they_stand_for`).
+pub const PENDING_EFFECT_RESERVE_BYTES: usize = 132;
+
+/// Event type of the audit event a result appends when it settles an
+/// `InDoubt` effect (`tests::reconciliation_is_audited_once_in_the_event_stream`).
+pub const AUDIT_RECONCILE_RESULT: &str = "audit.reconcile_result";
+
+/// Event type of the audit event a `Reconcile` authorization appends when it
+/// authorizes another attempt
+/// (`tests::reconciliation_is_audited_once_in_the_event_stream`).
+pub const AUDIT_RECONCILE_ATTEMPT: &str = "audit.reconcile_attempt";
 
 /// Bytes a terminal result entry costs beyond its error text, plus the
-/// retryable `FailTurn` growth that precedes it: the 51 plus 25 the `Limits`
-/// doc derives. `Kernel::new` keeps `terminal_reserve_per_input_bytes` at or
-/// above `max_error_bytes` plus this.
+/// retryable `FailTurn` growth that precedes it, at the default
+/// `max_error_bytes`: the 51 plus 25 the `Limits` doc derives. A wider error
+/// widens two length varints; [`result_entry_overhead_bytes`] is the general
+/// form.
 pub const RESULT_ENTRY_OVERHEAD_BYTES: usize = 76;
+
+/// Bytes a terminal result entry with a `max_error_bytes` error costs beyond
+/// the error text, plus the 25 bytes of retryable `FailTurn` growth before
+/// it. The entry body is 45 fixed bytes, the error's length varint and the
+/// error; the entry adds a 2-byte field tag and its own length varint.
+/// `Kernel::new` keeps `terminal_reserve_per_input_bytes` at or above
+/// `max_error_bytes` plus this
+/// (`tests::the_result_floor_covers_the_varint_widths_of_a_wide_error`).
+pub fn result_entry_overhead_bytes(max_error_bytes: usize) -> usize {
+    fn varint_len(v: usize) -> usize {
+        let mut n = 1;
+        let mut v = v >> 7;
+        while v > 0 {
+            n += 1;
+            v >>= 7;
+        }
+        n
+    }
+    let error_len = varint_len(max_error_bytes);
+    let body = 45usize
+        .saturating_add(error_len)
+        .saturating_add(max_error_bytes);
+    45 + error_len + 2 + varint_len(body) + 25
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -382,9 +422,19 @@ impl Transition {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// The limits are fixed by [`Kernel::new`], which raises the terminal
+/// reserve to its floor, and read through [`Kernel::limits`]; a caller
+/// cannot set a reserve below the floor by building the struct directly
+/// (`tests::a_reserve_below_the_result_floor_is_raised_to_it`).
+#[derive(Debug, Clone, Copy)]
 pub struct Kernel {
-    pub limits: Limits,
+    limits: Limits,
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Kernel::new(Limits::default())
+    }
 }
 
 type Outcome = Result<Transition, AgentError>;
@@ -422,18 +472,23 @@ fn intent_strings(intent: &IntentSpec) -> [&str; 3] {
 
 impl Kernel {
     /// `terminal_reserve_per_input_bytes` is raised to the floor the `Limits`
-    /// doc derives (`max_error_bytes + RESULT_ENTRY_OVERHEAD_BYTES`) when a
-    /// caller configures less, so the terminal guarantee does not depend on
+    /// doc derives (`max_error_bytes + result_entry_overhead_bytes(..)`) when
+    /// a caller configures less, so the terminal guarantee does not depend on
     /// the caller reading that doc
     /// (`tests::a_reserve_below_the_result_floor_is_raised_to_it`).
     pub fn new(mut limits: Limits) -> Kernel {
         let floor = limits
             .max_error_bytes
-            .saturating_add(RESULT_ENTRY_OVERHEAD_BYTES);
+            .saturating_add(result_entry_overhead_bytes(limits.max_error_bytes));
         if limits.terminal_reserve_per_input_bytes < floor {
             limits.terminal_reserve_per_input_bytes = floor;
         }
         Kernel { limits }
+    }
+
+    /// The limits in force, with the terminal reserve at or above its floor.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     pub fn apply(
@@ -646,12 +701,22 @@ fn identity_strings(command: &Command) -> (Vec<&str>, Vec<&str>) {
 }
 
 /// Whether the growth guard applies to a publish. Exempt are the terminal
-/// paths (`FailTurn`, `Cancel`), the commands that only move a turn or an
-/// owner along (`Takeover`, `BeginTurn`, `CancelTimer`, `Tombstone`,
-/// `Create`), the latches (a publish answering `Reply::Blocked`, which
-/// blocks the turn or marks an effect `InDoubt`), and what an effect needs
-/// to settle (`RecordEffectResult`, a `Reconcile` authorization). Refusing a
-/// latch would let the next `CompleteTurn` commit past it.
+/// paths (`FailTurn`, `Cancel`;
+/// `tests::terminal_commands_keep_a_path_through_the_byte_cap`), the
+/// commands that only move a turn or an owner along (`Takeover`,
+/// `BeginTurn`, `CancelTimer`, `Tombstone`, `Create`;
+/// `tests::the_lifecycle_commands_publish_at_the_byte_cap`,
+/// `tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`),
+/// the latches (a publish answering `Reply::Blocked`, which blocks the turn
+/// or marks an effect `InDoubt`; `tests::a_blocking_replay_is_recorded_inside_the_reserve`),
+/// and what an effect needs to settle (`RecordEffectResult`;
+/// `tests::pending_effects_settle_inside_the_reserve`). Refusing a latch would let the next
+/// `CompleteTurn` commit past it. A `Reconcile` authorization is guarded: it
+/// appends an audit event every time it publishes, and an effect can be
+/// latched and reconciled any number of times, so its growth has no bound a
+/// reserve could cover. An effect near the cap still settles through a
+/// reconciled result, which is exempt
+/// (`tests::a_manual_attempt_enters_in_doubt_inside_the_reserve`).
 fn guarded(observed: &Head, command: &Command, reply: &Reply) -> bool {
     if matches!(reply, Reply::Blocked(_)) {
         return false;
@@ -672,7 +737,7 @@ fn guarded(observed: &Head, command: &Command, reply: &Reply) -> bool {
         // the input could neither be retried nor failed
         // (`tests::an_owner_retry_authorization_is_answered_inside_the_reserve`).
         Command::AuthorizeAttempt(c) => match &c.authority {
-            Authority::Reconcile(_) => false,
+            Authority::Reconcile(_) => true,
             Authority::Owner(_) => !observed.effects.iter().any(|e| {
                 e.effect_id == c.effect_id
                     && matches!(e.status, EffectStatus::Authorized | EffectStatus::InDoubt)
@@ -1139,6 +1204,17 @@ impl Kernel {
     /// not while one is merely authorized without a result: a handler that
     /// completed awaited the attempt it authorized and knows its outcome, which
     /// a failing handler does not, so `FailTurn` refuses both.
+    ///
+    /// An intent listed in `intents` whose key the input already journaled
+    /// (by a `CommitIntent` during this or an earlier turn of the input) is
+    /// refused `IdempotencyConflict` when the spec is the same, since the
+    /// outbox would never dispatch it
+    /// (`tests::a_completion_relisting_a_mid_turn_intent_is_refused_typed`), and
+    /// blocks the turn `NonDeterministicReplay` when the spec differs, as two
+    /// differing intents under one key in the list do
+    /// (`tests::a_completion_with_a_conflicting_intent_key_blocks_the_turn`).
+    /// The input's step transcript is dropped, and no other input's
+    /// (`tests::a_terminal_turn_drops_only_its_own_input_steps`).
     fn complete_turn(&self, head: &Head, c: &CompleteTurn, now: i64) -> Outcome {
         let turn = match Self::check_turn(head, &c.fence)? {
             Ok(turn) => turn,
@@ -1160,10 +1236,28 @@ impl Kernel {
         }
         let accept_seq = turn.input_accept_seq;
         let turn_id = turn.turn_id;
+        if turn.cancellation != Cancellation::Requested {
+            for intent in &c.intents {
+                let effect_id =
+                    identity::effect_id(head.incarnation, accept_seq, &intent.intent_key);
+                let Some(existing) = head.effects.iter().find(|e| e.effect_id == effect_id) else {
+                    continue;
+                };
+                if !same_intent(existing, intent) {
+                    return self
+                        .block_turn(head, "intent key reused with a different tool or input");
+                }
+                return Err(fail(
+                    head,
+                    ErrorKind::IdempotencyConflict,
+                    "intent key already journaled by a CommitIntent of this input",
+                ));
+            }
+        }
         let mut new = head.clone();
         Self::take_input(head, &mut new, accept_seq)?;
         new.active_turn = None;
-        new.steps.clear();
+        drop_input_steps(&mut new, accept_seq);
         let mut effects = vec![Effect::OperationTerminal { accept_seq }];
         if turn.cancellation == Cancellation::Requested {
             new.results.push(ResultEntry {
@@ -1220,7 +1314,15 @@ impl Kernel {
             self.check_timer_cap(&new)?;
             let mut dispatched = Vec::new();
             for intent in &c.intents {
-                if let Some(effect_id) = add_intent(head, &mut new, accept_seq, turn_id, intent)? {
+                let added = match add_intent(head, &mut new, accept_seq, turn_id, intent) {
+                    Ok(added) => added,
+                    Err(e) if e.kind == ErrorKind::NonDeterministicReplay => {
+                        return self
+                            .block_turn(head, "intent key reused with a different tool or input");
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(effect_id) = added {
                     new.outbox.push(OutboxIntent {
                         effect_id,
                         intent_key: intent.intent_key.clone(),
@@ -1255,6 +1357,15 @@ impl Kernel {
         )
     }
 
+    /// A retry of the latest retryable failure is answered `TurnRetry` from the
+    /// inbox entry's `last_failed_turn_id`. Only the latest failed turn is
+    /// kept there, so a replay of an OLDER attempt's `FailTurn`, after a newer
+    /// attempt of the same input also failed, is refused `OwnershipLost`: its
+    /// turn is neither active nor the one the entry names, and that caller is
+    /// a superseded worker whose verdict was already overtaken
+    /// (`tests::an_older_attempts_fail_replay_after_a_newer_failure_is_ownership_lost`).
+    /// The terminal paths drop only this input's step transcript
+    /// (`tests::a_terminal_turn_drops_only_its_own_input_steps`).
     fn fail_turn(&self, head: &Head, c: &FailTurn, now: i64) -> Outcome {
         Self::check_owner(head, &c.fence.owner)?;
         // A retry of a retryable failure that already published: the input
@@ -1297,7 +1408,7 @@ impl Kernel {
             let mut new = head.clone();
             Self::take_input(head, &mut new, accept_seq)?;
             new.active_turn = None;
-            new.steps.clear();
+            drop_input_steps(&mut new, accept_seq);
             new.results.push(ResultEntry {
                 accept_seq,
                 status: ResultStatus::Cancelled,
@@ -1343,7 +1454,7 @@ impl Kernel {
         }
         let dead_lettered = !c.terminal;
         Self::take_input(head, &mut new, accept_seq)?;
-        new.steps.clear();
+        drop_input_steps(&mut new, accept_seq);
         new.results.push(ResultEntry {
             accept_seq,
             status: ResultStatus::Failed,
@@ -1582,6 +1693,19 @@ impl Kernel {
         )
     }
 
+    /// An `Owner` authorization that changes the effect needs the active turn
+    /// to be running the effect's own input: a late authorization after the
+    /// input's turn ended (a retryable `FailTurn`, a completion) is refused
+    /// `OwnershipLost`
+    /// (`tests::a_late_owner_authorization_after_a_retryable_failure_is_refused`).
+    /// While cancellation is requested an owner may not authorize a new
+    /// attempt; a manual effect's in-doubt latch is still recorded, since it
+    /// authorizes nothing
+    /// (`tests::a_new_attempt_for_a_cancelled_input_is_refused`). A
+    /// `Reconcile` authorization is an operator's and has neither check; each
+    /// one that publishes appends an [`AUDIT_RECONCILE_ATTEMPT`] event, and a
+    /// repeat of it answers without a publish, so it is audited once
+    /// (`tests::reconciliation_is_audited_once_in_the_event_stream`).
     fn authorize_attempt(&self, head: &Head, c: &AuthorizeAttempt) -> Outcome {
         let owner = match &c.authority {
             Authority::Owner(fence) => {
@@ -1616,6 +1740,27 @@ impl Kernel {
                 "attempt does not follow the journaled attempt",
             ));
         }
+        if owner {
+            let Some(turn) = head.active_turn.as_ref().filter(|t| {
+                identity::effect_id(head.incarnation, t.input_accept_seq, &effect.step_key)
+                    == effect.effect_id
+            }) else {
+                return Err(fail(
+                    head,
+                    ErrorKind::OwnershipLost,
+                    "EffectStateAdmits: the effect's input is not the active turn's",
+                ));
+            };
+            let latch = effect.status == EffectStatus::Authorized
+                && effect.policy == RecoveryPolicy::Manual;
+            if turn.cancellation == Cancellation::Requested && !latch {
+                return Err(fail(
+                    head,
+                    ErrorKind::OwnershipLost,
+                    "EffectStateAdmits: the effect's input is being cancelled",
+                ));
+            }
+        }
         let mut new = head.clone();
         let Some(slot) = new.effects.iter_mut().find(|e| e.effect_id == c.effect_id) else {
             return Err(fail(head, ErrorKind::AgentGone, "effect is not journaled"));
@@ -1642,6 +1787,9 @@ impl Kernel {
                 slot.attempt = c.attempt;
             }
         }
+        if !owner {
+            push_audit(&mut new, effect, AUDIT_RECONCILE_ATTEMPT);
+        }
         self.publish(
             Some(head),
             new,
@@ -1653,6 +1801,16 @@ impl Kernel {
         )
     }
 
+    /// Only the journaled attempt's result settles the effect. A result for an
+    /// earlier attempt (superseded by a retry authorization), a different
+    /// attempt's result after the effect completed, and any result for an
+    /// effect whose input ended cancelled are answered `LateResultIgnored`
+    /// without a publish: the caller keeps them as evidence
+    /// (`tests::superseded_and_cancelled_results_are_evidence`). A result that
+    /// settles an `InDoubt` effect is a reconciliation whoever supplied it and
+    /// appends one [`AUDIT_RECONCILE_RESULT`] event; its replay answers without
+    /// a publish
+    /// (`tests::reconciliation_is_audited_once_in_the_event_stream`).
     fn record_effect_result(&self, head: &Head, c: &RecordEffectResult) -> Outcome {
         Self::check_incarnation(head, &c.fence)?;
         let Some(effect) = head.effects.iter().find(|e| e.effect_id == c.effect_id) else {
@@ -1682,7 +1840,20 @@ impl Kernel {
                 effect_id: c.effect_id,
             });
         }
+        let input_cancelled = head.results.iter().any(|r| {
+            r.status == ResultStatus::Cancelled
+                && identity::effect_id(head.incarnation, r.accept_seq, &effect.step_key)
+                    == effect.effect_id
+        });
+        if c.attempt < effect.attempt || input_cancelled {
+            return unchanged(Reply::LateResultIgnored {
+                effect_id: c.effect_id,
+            });
+        }
         let mut new = head.clone();
+        if effect.status == EffectStatus::InDoubt {
+            push_audit(&mut new, effect, AUDIT_RECONCILE_RESULT);
+        }
         if let Some(slot) = new.effects.iter_mut().find(|e| e.effect_id == c.effect_id) {
             slot.status = EffectStatus::Completed;
             slot.result = Some(c.result);
@@ -1725,6 +1896,28 @@ fn same_intent(existing: &EffectRecord, intent: &IntentSpec) -> bool {
         && existing.tool_version == intent.tool_version
         && existing.input_hash == intent.input_hash
         && existing.policy == intent.policy
+}
+
+/// Append an audit event for `effect` to the stream of the turn that
+/// journaled it, under the effect's input.
+fn push_audit(new: &mut Head, effect: &EffectRecord, event_type: &str) {
+    let incarnation = new.incarnation;
+    let accept_seq = new
+        .active_turn
+        .iter()
+        .map(|t| t.input_accept_seq)
+        .chain(new.inbox.iter().map(|e| e.accept_seq))
+        .chain(new.results.iter().map(|r| r.accept_seq))
+        .find(|&seq| identity::effect_id(incarnation, seq, &effect.step_key) == effect.effect_id)
+        .unwrap_or(0);
+    new.events.push(EventEntry {
+        event_seq: new.next_event_seq,
+        accept_seq,
+        turn_id: effect.turn_id,
+        event_type: event_type.to_string(),
+        payload: None,
+    });
+    new.next_event_seq += 1;
 }
 
 /// The effects journaled for the input `accept_seq`, by any of its turns.

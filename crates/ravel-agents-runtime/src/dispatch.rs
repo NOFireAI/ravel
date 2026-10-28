@@ -9,8 +9,8 @@
 //! An agent whose HEAD records an active turn re-issues that turn: the same
 //! turn id, input and base state, under the poller's own ownership epoch
 //! (`tests::cold_restart_resumes_the_active_turn_from_head_alone`). The
-//! assignment also copies HEAD's recorded steps; no test here records one,
-//! and the step journal that writes them is task T14's.
+//! assignment also copies HEAD's recorded steps, which `effects` journals
+//! (`effects::tests::a_completed_step_replays_without_a_new_intent_or_attempt`).
 //!
 //! The takeover and the `BeginTurn` that follows each get one retry of
 //! their own, so losing a takeover race does not use up the settle of a
@@ -410,7 +410,7 @@ impl Coordinator {
     }
 
     /// An object decoded as JSON; no object is `null`.
-    async fn read_json(
+    pub(crate) async fn read_json(
         &self,
         agent: &AgentId,
         dep: Option<ObjectRef>,
