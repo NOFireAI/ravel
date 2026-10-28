@@ -946,7 +946,9 @@ async fn a_lost_takeover_write_that_did_not_apply_is_store_unavailable() {
     let h = head(&store, "o-1").await;
     assert_eq!((h.owner_id.as_str(), h.epoch), ("", 0));
     assert_eq!(co.metrics().outcome_unknown_resolved, 0);
-    let a = poll_now(&co, &w, "v1").await.expect("leased on the next poll");
+    let a = poll_now(&co, &w, "v1")
+        .await
+        .expect("leased on the next poll");
     assert_eq!(a.lease.epoch, 1);
 }
 
