@@ -502,7 +502,10 @@ pub(crate) async fn run_fold_warning_to(
         }
         MappingSection::Logs(logs) => logs,
     };
-    for warning in unknown_chunk_order_warnings(chunk_order, &mapping) {
+    for warning in unknown_chunk_order_warnings(chunk_order, &mapping)
+        .into_iter()
+        .chain(string_resource_chunk_order_warnings(chunk_order, &mapping))
+    {
         let _ = writeln!(warnings, "{warning}");
     }
     for warning in ruled_bytes_column_warnings(
@@ -1020,6 +1023,40 @@ pub(super) fn unknown_chunk_order_warnings(
         .filter(|name| !carried.contains(**name))
         .map(|name| {
             format!("warning: --chunk-order names {name}, which no mapped attribute carries")
+        })
+        .collect()
+}
+
+/// One warning per `--chunk-order` name that a logs `mapping` carries only as
+/// a string or bytes `[[resource_attribute]]` key, in the order given. The
+/// RLOG writer gives such a stream-level key a column only when it is one of
+/// the tenant's indexed fields, which the router reads from the store at flush
+/// time, so the load cannot tell here whether the name will be skipped. A key
+/// also mapped as an `[[attribute]]` is carried per record and gets a column.
+pub(super) fn string_resource_chunk_order_warnings(
+    chunk_order: RlogChunkOrder,
+    mapping: &Mapping,
+) -> Vec<String> {
+    let record_keys: std::collections::HashSet<&str> =
+        mapping.attributes.iter().map(|a| a.key.as_str()).collect();
+    chunk_order
+        .get()
+        .iter()
+        .filter(|name| !record_keys.contains(**name))
+        .filter_map(|name| {
+            let kind = mapping
+                .resource_attributes
+                .iter()
+                .find(|a| a.key == **name)
+                .and_then(|a| match a.value_type {
+                    ColType::Str => Some("string"),
+                    ColType::Bytes => Some("bytes"),
+                    ColType::I64 | ColType::F64 | ColType::Bool => None,
+                })?;
+            Some(format!(
+                "warning: --chunk-order names {name}, a {kind} resource attribute, which gets a \
+                 column only if it is an indexed field"
+            ))
         })
         .collect()
 }
