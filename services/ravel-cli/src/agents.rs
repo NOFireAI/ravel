@@ -17,14 +17,15 @@ use std::time::Duration;
 use ravel_agents_client::{AgentsClient, ClientError};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{
-    Cancellation, EffectRecord, EffectStatus, Head, Lifecycle, ObjectRef, TimerStatus, TurnBlock,
+    Cancellation, EffectRecord, EffectStatus, Head, InputSource, Lifecycle, ObjectRef, TimerStatus,
+    TurnBlock,
 };
 use ravel_agents_core::identity::{AgentId, effect_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind, dir_prefix};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    EffectBody, EffectsResponse, EventBody, EventsResponse, OperationResponse, ReconcileResponse,
-    StateResponse,
+    ActiveTurnBody, EffectBody, EffectsResponse, EventBody, EventsResponse, InputSourceBody,
+    MailboxEntryBody, OperationResponse, ReconcileResponse, StateResponse,
 };
 use ravel_agents_store::{AgentStore, HeadState, StoreLimits};
 use ravel_object_store::ObjectStoreBackend;
@@ -225,20 +226,7 @@ pub struct InspectOutput {
     pub epoch: u64,
     pub next_accept_seq: u64,
     pub mailbox_depth: usize,
-    pub active_turn: Option<ActiveTurnOutput>,
     pub timers: Vec<TimerOutput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ActiveTurnOutput {
-    pub turn_id: String,
-    pub input_accept_seq: u64,
-    pub base_state_version: u64,
-    pub handler: String,
-    pub handler_version: String,
-    pub started_unix_ns: String,
-    pub cancel_requested: bool,
-    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,16 +242,6 @@ pub struct TimerOutput {
 pub async fn inspect(store: &AgentStore, agent: AgentId) -> Result<InspectOutput, AgentsCliError> {
     let head = live_head(store, &agent).await?;
     let state = read_json(store, &agent, head.state).await?;
-    let active_turn = head.active_turn.as_ref().map(|turn| ActiveTurnOutput {
-        turn_id: turn.turn_id.to_hex(),
-        input_accept_seq: turn.input_accept_seq,
-        base_state_version: turn.base_state_version,
-        handler: turn.handler.clone(),
-        handler_version: turn.handler_version.clone(),
-        started_unix_ns: turn.started_unix_ns.to_string(),
-        cancel_requested: turn.cancellation == Cancellation::Requested,
-        blocked: turn.block != TurnBlock::None,
-    });
     let timers = head
         .timers
         .iter()
@@ -288,6 +266,40 @@ pub async fn inspect(store: &AgentStore, agent: AgentId) -> Result<InspectOutput
             state_version: head.state_version,
             content_type: "application/json".to_string(),
             state,
+            active_turn: head.active_turn.as_ref().map(|turn| ActiveTurnBody {
+                turn_id: turn.turn_id.to_hex(),
+                accept_seq: turn.input_accept_seq,
+                handler: turn.handler.clone(),
+                handler_version: turn.handler_version.clone(),
+                handler_digest: turn.handler_digest.to_hex(),
+                base_state_version: turn.base_state_version,
+                started_unix_ns: turn.started_unix_ns,
+                lease_hint_unix_ns: head.owner_lease_hint_unix_ns,
+                cancel_requested: turn.cancellation == Cancellation::Requested,
+                non_deterministic_replay: turn.block == TurnBlock::NonDeterministicReplay,
+            }),
+            mailbox: head
+                .inbox
+                .iter()
+                .map(|entry| MailboxEntryBody {
+                    accept_seq: entry.accept_seq,
+                    handler: entry.handler.clone(),
+                    source: match &entry.source {
+                        InputSource::Message { request_id, .. } => InputSourceBody::Message {
+                            request_id: request_id.clone(),
+                        },
+                        InputSource::Timer {
+                            timer_id,
+                            generation,
+                        } => InputSourceBody::Timer {
+                            timer: timer_id.to_hex(),
+                            generation: *generation,
+                        },
+                    },
+                    accepted_unix_ns: entry.accepted_unix_ns,
+                    failed_attempts: entry.failed_attempts,
+                })
+                .collect(),
         },
         kind: head.kind.as_str().to_string(),
         key: head.key.as_str().to_string(),
@@ -296,7 +308,6 @@ pub async fn inspect(store: &AgentStore, agent: AgentId) -> Result<InspectOutput
         epoch: head.epoch,
         next_accept_seq: head.next_accept_seq,
         mailbox_depth: head.inbox.len(),
-        active_turn,
         timers,
     })
 }
@@ -316,14 +327,14 @@ pub fn render_inspect(out: &InspectOutput) -> String {
         out.mailbox_depth,
         out.next_accept_seq,
     );
-    match &out.active_turn {
+    match &out.state.active_turn {
         None => text.push_str("active turn: none\n"),
         Some(turn) => text.push_str(&format!(
             "active turn: {} handler {}@{} input {} base state {} started {}{}{}\n",
             turn.turn_id,
             turn.handler,
             turn.handler_version,
-            turn.input_accept_seq,
+            turn.accept_seq,
             turn.base_state_version,
             turn.started_unix_ns,
             if turn.cancel_requested {
@@ -331,7 +342,11 @@ pub fn render_inspect(out: &InspectOutput) -> String {
             } else {
                 ""
             },
-            if turn.blocked { " blocked" } else { "" },
+            if turn.non_deterministic_replay {
+                " blocked: non-deterministic replay"
+            } else {
+                ""
+            },
         )),
     }
     text.push_str(&format!("timers: {}\n", out.timers.len()));
@@ -466,6 +481,7 @@ pub async fn events(
     Ok(EventsResponse {
         events: page,
         next_cursor: next.to_string(),
+        terminal: None,
     })
 }
 
