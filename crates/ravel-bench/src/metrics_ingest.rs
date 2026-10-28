@@ -929,6 +929,14 @@ pub struct SystemIngestResult {
     /// (`metricsbench_query::a_report_whose_readback_failed_does_not_bind`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readback_error: Option<String>,
+    /// The check this row failed after its replay, recorded only when an
+    /// earlier row had already failed: the bin keeps the row, skips its
+    /// read-back, and exits with the earlier failure's code
+    /// (`metricsbench_ingest_smoke::a_later_hard_failure_after_a_failed_readback_keeps_the_report`).
+    /// A report holding one is refused as a run result
+    /// (`metricsbench_query::a_row_failure_or_failed_replay_does_not_bind`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_failure: Option<RowFailure>,
     /// Diagnostic object-store accounting; see [`StorageAccounting`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageAccounting>,
@@ -966,6 +974,7 @@ impl SystemIngestResult {
             tenant: None,
             readback: None,
             readback_error: None,
+            row_failure: None,
             storage: Some(storage),
         }
     }
@@ -994,6 +1003,7 @@ impl SystemIngestResult {
             tenant: None,
             readback: None,
             readback_error: None,
+            row_failure: None,
             storage: None,
         }
     }
@@ -1031,6 +1041,7 @@ impl SystemIngestResult {
             tenant: None,
             readback: None,
             readback_error: None,
+            row_failure: None,
             storage: None,
         }
     }
@@ -1549,6 +1560,35 @@ pub struct MetricsIngestReport {
     /// as a run result (`metrics_query::BindError::Stalled`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalled: Vec<StalledRow>,
+    /// Rows whose replay failed other than by a stall after an earlier row
+    /// had already failed. Such a row has no closed ingest figures, so it is
+    /// kept here rather than in `systems`; a report holding one is refused
+    /// as a run result (`metrics_query::BindError::FailedReplay`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_replays: Vec<FailedReplay>,
+}
+
+/// A check a row in `systems` failed after its replay
+/// ([`SystemIngestResult::row_failure`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowFailure {
+    /// The ADR-0927 band the check belongs to, `None` for a check that is
+    /// not a numbered band.
+    pub band: Option<u32>,
+    /// The failure as the bin printed it.
+    pub error: String,
+}
+
+/// A row whose replay failed with an error other than a stall
+/// ([`MetricsIngestReport::failed_replays`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedReplay {
+    /// The row's system, as in [`SystemIngestResult::system`].
+    pub system: String,
+    /// The write endpoint the row sent to.
+    pub endpoint: String,
+    /// The replay error as the bin printed it.
+    pub error: String,
 }
 
 /// A row stopped by [`LaneError::IngestStalled`], with the figures the stall
@@ -1588,6 +1628,7 @@ impl MetricsIngestReport {
             systems,
             queries: Vec::new(),
             stalled: Vec::new(),
+            failed_replays: Vec::new(),
         }
     }
 
