@@ -15,9 +15,12 @@ use ravel_agents_runtime::SweepReport;
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 
+use rand::RngExt;
+
 use super::*;
 use crate::drive::{HANDLER, Refusal, T0_NS, TENANT, agent, json_bytes, status_of};
 use crate::reference::{ClientOp, Event, Reply};
+use crate::seeds::AgentSeeds;
 use crate::{sim_assert, sim_assert_eq};
 
 /// The timer every schedule here sets.
@@ -474,6 +477,29 @@ fn a_lost_hint_put_due_on_a_pass_fires_on_that_pass() {
     assert_eq!(lost_hint(2_000), 2);
 }
 
+/// Lost hints due at a time each seed draws from the first eight intervals:
+/// each fires on the first pass at or after its due time.
+#[test]
+fn lost_hint_puts_across_seeds() {
+    let mut runs = 0;
+    let mut passes = 0;
+    for seed in seeds() {
+        let due_ms = AgentSeeds::new(seed)
+            .schedule_rng()
+            .random_range(1..=8 * INTERVAL_MS);
+        let fired_at = lost_hint(due_ms);
+        assert_eq!(fired_at as u64, due_ms.div_ceil(INTERVAL_MS), "seed {seed}");
+        passes += fired_at;
+        runs += 1;
+    }
+    assert_eq!(runs, 64);
+    assert_eq!(passes, LOST_HINT_PASSES);
+}
+
+/// Sum over the batch of the pass index that fired, the delivery delay in
+/// whole intervals.
+const LOST_HINT_PASSES: usize = 286;
+
 /// A pass whose fire write fails fires nothing and is a `StoreUnavailable`
 /// refusal rather than a wake; the timer and its hint stay for a later pass.
 #[test]
@@ -504,7 +530,10 @@ fn a_sweep_whose_fire_write_fails_is_a_store_unavailable_refusal() {
     );
     assert_eq!(fires(&run), Vec::<Reply>::new());
     // The pass tries the fire once and does not retry it.
-    assert_eq!(all_fired(&faults), vec![((Op::Put, FaultKind::Throttled), 1)]);
+    assert_eq!(
+        all_fired(&faults),
+        vec![((Op::Put, FaultKind::Throttled), 1)]
+    );
     let report = reports(&swept);
     assert_eq!(report.len(), 1);
     assert_eq!(report[0].timers_fired, 0);
