@@ -555,14 +555,17 @@ Remaining differences, each also stated in its `traceability.md` row:
 input is not the active turn's (`crates/ravel-agents-core/src/kernel.rs:1752`)
 or is being cancelled (`kernel.rs:1764`), and refuses the owner on an effect in
 doubt (`kernel.rs:1777`); `Kernel::record_effect_result` answers
-`LateResultIgnored` without a publish for a result of an older attempt, for a
-different attempt's result after completion, and for any result once the input
-ended cancelled (`kernel.rs:1835`, `1851` and `1856`). Under
+`LateResultIgnored` without a publish for a different attempt's result after
+completion (`kernel.rs:1835`), and for a result of an older attempt or any
+result once the input ended cancelled (`kernel.rs:1851` and `1856`). Under
 `provider_idempotency` the models re-dispatch the journaled effect id and
 attempt with no HEAD write, as `Coordinator::run_step` does
-(`crates/ravel-agents-runtime/src/effects.rs:330`), and admin reconciliation
-acts only on an effect in doubt, as `Coordinator::reconcile_authorize` and
-`Coordinator::reconcile_attach` require (`effects.rs:456` and `409`). The
+(`crates/ravel-agents-runtime/src/effects.rs:330`). The models admit admin
+reconciliation only on an effect in doubt; the runtime also admits two paths
+that write nothing, a `reconcile_attach` on a completed effect
+(`effects.rs:409`, which re-submits the recorded attempt) and a
+`reconcile_authorize` that replays the same authorized attempt
+(`effects.rs:456`), as traceability rows 66 and 67 record. The
 differences that remain, each with the property that rests on it:
 
 - An owner that reads a cancel request on its turn journals no new step. The
