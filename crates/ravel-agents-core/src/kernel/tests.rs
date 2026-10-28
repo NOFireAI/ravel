@@ -5,6 +5,8 @@ use crate::keys::{AgentKey, AgentKind};
 use proptest::prelude::*;
 use ravel_types::TenantHash;
 
+mod pages;
+
 const SECOND: i64 = 1_000_000_000;
 
 fn blob(tag: &[u8]) -> ObjectRef {
@@ -2311,7 +2313,10 @@ fn latch_and_reconcile_cycles_are_bounded_by_the_byte_cap() {
     let encoded = sim.head().encode();
     assert!(encoded.len() <= limits.max_head_bytes);
     assert!(encoded.len() <= MAX_HEAD_BYTES);
-    assert_eq!(Head::decode(&encoded).expect("HEAD decodes").encode(), encoded);
+    assert_eq!(
+        Head::decode(&encoded).expect("HEAD decodes").encode(),
+        encoded
+    );
     // Every audit event lives in the one running turn's stream, far past
     // the per-turn event cap, which does not count them.
     let audits = sim.head().events.len() as u64;

@@ -542,9 +542,11 @@ impl Directory {
     /// Entries the list holds: those of the pages not in memory plus the
     /// `in_memory` ones.
     pub fn total(&self, in_memory: usize) -> u64 {
-        self.unloaded().into_iter().fold(in_memory as u64, |acc, i| {
-            acc.saturating_add(u64::from(self.pages[i].entries))
-        })
+        self.unloaded()
+            .into_iter()
+            .fold(in_memory as u64, |acc, i| {
+                acc.saturating_add(u64::from(self.pages[i].entries))
+            })
     }
 
     /// Marked entries in the pages not in memory.
@@ -556,9 +558,9 @@ impl Directory {
 
     /// Referenced bytes of the pages not in memory.
     pub fn unloaded_referenced_bytes(&self) -> u64 {
-        self.unloaded()
-            .into_iter()
-            .fold(0u64, |acc, i| acc.saturating_add(self.pages[i].referenced_bytes))
+        self.unloaded().into_iter().fold(0u64, |acc, i| {
+            acc.saturating_add(self.pages[i].referenced_bytes)
+        })
     }
 
     /// Whether the entry with `key` is encoded inline in HEAD.
@@ -795,7 +797,10 @@ impl Head {
             .iter()
             .filter(|t| t.status == TimerStatus::Scheduled)
             .count() as u64;
-        self.index.timers.unloaded_marked().saturating_add(in_memory)
+        self.index
+            .timers
+            .unloaded_marked()
+            .saturating_add(in_memory)
     }
 
     /// Whether the inbox holds an input, sealed pages included.
@@ -826,7 +831,11 @@ fn page_directory(dir: &Directory) -> pb::PageDirectory {
                 marked: p.marked,
                 min_due_unix_ns: p.min_due_unix_ns,
                 referenced_bytes: p.referenced_bytes,
-                fingerprints: p.fingerprints.iter().flat_map(|f| f.to_be_bytes()).collect(),
+                fingerprints: p
+                    .fingerprints
+                    .iter()
+                    .flat_map(|f| f.to_be_bytes())
+                    .collect(),
             })
             .collect(),
         tail_from: dir.tail_from,

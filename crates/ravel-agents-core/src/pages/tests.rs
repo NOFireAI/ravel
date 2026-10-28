@@ -57,8 +57,7 @@ fn a_full_page_refuses_the_next_append_typed() {
     // Exactly K entries stay open; the publish that adds the K+1st seals a
     // page of K and leaves the new entry as the open page.
     let full: Vec<InboxEntry> = (1..=K as u64).map(inbox_entry).collect();
-    let (dir, written) =
-        seal(&Directory::default(), &full, u64::MAX, bounds(K)).expect("seals");
+    let (dir, written) = seal(&Directory::default(), &full, u64::MAX, bounds(K)).expect("seals");
     assert!(dir.pages.is_empty());
     assert!(written.is_empty());
     let next: Vec<InboxEntry> = (1..=K as u64 + 1).map(inbox_entry).collect();
@@ -68,10 +67,7 @@ fn a_full_page_refuses_the_next_append_typed() {
     assert_eq!(dir.tail_from, K as u64 + 1);
     assert_eq!(written.len(), 1);
     assert_eq!(written[0].page, dir.pages[0].page);
-    assert_eq!(
-        InboxEntry::decode_page(&written[0].bytes),
-        Ok(full.clone())
-    );
+    assert_eq!(InboxEntry::decode_page(&written[0].bytes), Ok(full.clone()));
 }
 
 /// `Limits::max_index_pages` bounds a directory: the publish that would seal
@@ -312,8 +308,17 @@ fn directory() -> impl Strategy<Value = Directory> {
 /// A HEAD with a paged directory on every list and its inline entries
 /// outside every sealed range, as the decoder requires.
 fn paged_head() -> impl Strategy<Value = Head> {
-    (head(), [directory(), directory(), directory(), directory(), directory()]).prop_map(
-        |(mut h, [inbox, receipts, results, events, timers])| {
+    (
+        head(),
+        [
+            directory(),
+            directory(),
+            directory(),
+            directory(),
+            directory(),
+        ],
+    )
+        .prop_map(|(mut h, [inbox, receipts, results, events, timers])| {
             h.inbox.retain(|e| inbox.is_inline(e.accept_seq));
             h.receipts.retain(|e| receipts.is_inline(e.accept_seq));
             h.results.retain(|e| results.is_inline(e.accept_seq));
@@ -328,8 +333,7 @@ fn paged_head() -> impl Strategy<Value = Head> {
                 written: Vec::new(),
             };
             h
-        },
-    )
+        })
 }
 
 proptest! {

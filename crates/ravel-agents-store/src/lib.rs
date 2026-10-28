@@ -424,7 +424,11 @@ impl AgentStore {
     /// The scheduled timers due at `now`, earliest first. A sealed timer page
     /// never holds a scheduled timer, so this reads HEAD and no page
     /// (`tests::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`).
-    pub async fn due_timers(&self, agent: &AgentId, now: i64) -> Result<Vec<TimerEntry>, AgentError> {
+    pub async fn due_timers(
+        &self,
+        agent: &AgentId,
+        now: i64,
+    ) -> Result<Vec<TimerEntry>, AgentError> {
         let Some(head) = self.shallow_head(agent).await? else {
             return Ok(Vec::new());
         };

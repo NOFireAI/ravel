@@ -149,7 +149,11 @@ async fn send_receipt_lookup_and_wake_read_at_most_one_index_page_each() {
                 .iter()
                 .all(|w| matches!(w.list, ListKind::Inbox | ListKind::Receipts))
         );
-        assert_eq!(delta.store.put, 1 + written, "n={n}: the payload and the pages it sealed");
+        assert_eq!(
+            delta.store.put,
+            1 + written,
+            "n={n}: the payload and the pages it sealed"
+        );
         assert_eq!(delta.store.get, 0);
         assert_eq!(delta.publish.cas, 1);
 
@@ -157,7 +161,10 @@ async fn send_receipt_lookup_and_wake_read_at_most_one_index_page_each() {
         let again = again.expect("repeat");
         assert!(!again.published);
         assert_eq!(accept_seq(&again), 1);
-        assert_eq!(delta.resolve.get, 2, "n={n}: a repeated send reads one page");
+        assert_eq!(
+            delta.resolve.get, 2,
+            "n={n}: a repeated send reads one page"
+        );
         assert_eq!(delta.store.requests(), 0);
         assert_eq!(delta.publish.requests(), 0);
 
@@ -273,7 +280,10 @@ async fn events_are_read_by_seq_range() {
 
     // Past every sealed page: HEAD only.
     let before = store.counters();
-    let read = store.read_events(&agent(), events - 1, 10).await.expect("tail");
+    let read = store
+        .read_events(&agent(), events - 1, 10)
+        .await
+        .expect("tail");
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].event_seq, events);
     assert_eq!(store.counters().since(&before).resolve.get, 1);
@@ -419,7 +429,10 @@ async fn a_version_one_head_migrates_on_the_next_cas() {
             Representation::Paged
         );
     }
-    assert_eq!(sealed(&migrated, ListKind::Inbox), pages_for(3 * K as u64 + 1));
+    assert_eq!(
+        sealed(&migrated, ListKind::Inbox),
+        pages_for(3 * K as u64 + 1)
+    );
     assert_eq!(
         delta.store.put,
         1 + out.head.index.written.len() as u64,

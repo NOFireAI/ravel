@@ -9,11 +9,11 @@ use prost::Message as _;
 use ravel_proto::agents::v1 as pb;
 
 use crate::head::{
-    CodecError, EffectRecord, EventEntry, OBJECT_FORMAT_VERSION, InboxEntry, Receipt, ResultEntry, SEAL,
-    StepRecord, TimerEntry, check_format_version, check_seal, effect_from_proto, effect_to_proto,
-    event_from_proto, event_to_proto, inbox_from_proto, inbox_to_proto, peek_format_version,
-    receipt_from_proto, receipt_to_proto, result_from_proto, result_to_proto, step_from_proto,
-    step_to_proto, timer_from_proto, timer_to_proto,
+    CodecError, EffectRecord, EventEntry, InboxEntry, OBJECT_FORMAT_VERSION, Receipt, ResultEntry,
+    SEAL, StepRecord, TimerEntry, check_format_version, check_seal, effect_from_proto,
+    effect_to_proto, event_from_proto, event_to_proto, inbox_from_proto, inbox_to_proto,
+    peek_format_version, receipt_from_proto, receipt_to_proto, result_from_proto, result_to_proto,
+    step_from_proto, step_to_proto, timer_from_proto, timer_to_proto,
 };
 use crate::identity::Id128;
 

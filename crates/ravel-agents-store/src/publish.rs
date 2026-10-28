@@ -242,10 +242,12 @@ impl AgentStore {
                 self.load_pages(agent, head, &needed).await?;
             }
             let now = self.clock.now_unix_ns();
-            let transition = match self
-                .kernel
-                .apply(current.as_ref(), command, now, self.ids.as_ref())
-            {
+            let transition = match self.kernel.apply(
+                current.as_ref(),
+                command,
+                now,
+                self.ids.as_ref(),
+            ) {
                 Err(error) if error.reason == PAGE_NOT_LOADED => {
                     // `pages_needed` names every page a transition reads, so
                     // this is a planner miss: load the rest rather than fail.
@@ -399,7 +401,9 @@ impl AgentStore {
             let dep = meta.page;
             let key = object_key(&self.tenant, agent, &dep.hash)
                 .map_err(|_| unavailable(agent, "object key is not addressable"))?;
-            let bytes = self.read_object_in(Phase::Resolve, agent, &key, dep).await?;
+            let bytes = self
+                .read_object_in(Phase::Resolve, agent, &key, dep)
+                .await?;
             attach_page(head, list, page, &bytes).map_err(|e| codec_error(agent, &e))?;
         }
         Ok(())

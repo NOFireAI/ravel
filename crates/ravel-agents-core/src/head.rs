@@ -458,7 +458,12 @@ impl Head {
                 receipt_count: self.quota.receipt_count,
                 timer_count: self.quota.timer_count,
             }),
-            inbox: inline(&self.index.inbox, &self.inbox, |e| e.accept_seq, inbox_to_proto),
+            inbox: inline(
+                &self.index.inbox,
+                &self.inbox,
+                |e| e.accept_seq,
+                inbox_to_proto,
+            ),
             receipts: inline(
                 &self.index.receipts,
                 &self.receipts,
@@ -471,8 +476,18 @@ impl Head {
                 |r| r.accept_seq,
                 result_to_proto,
             ),
-            events: inline(&self.index.events, &self.events, |e| e.event_seq, event_to_proto),
-            timers: inline(&self.index.timers, &self.timers, |t| t.generation, timer_to_proto),
+            events: inline(
+                &self.index.events,
+                &self.events,
+                |e| e.event_seq,
+                event_to_proto,
+            ),
+            timers: inline(
+                &self.index.timers,
+                &self.timers,
+                |t| t.generation,
+                timer_to_proto,
+            ),
             steps: self.steps.iter().map(step_to_proto).collect(),
             effects: self.effects.iter().map(effect_to_proto).collect(),
             outbox_intents: self.outbox.iter().map(outbox_to_proto).collect(),
@@ -522,7 +537,11 @@ impl Head {
                 written: Vec::new(),
             }
         };
-        outside_pages(&index.inbox, raw.inbox.iter().map(|e| e.accept_seq), "inbox")?;
+        outside_pages(
+            &index.inbox,
+            raw.inbox.iter().map(|e| e.accept_seq),
+            "inbox",
+        )?;
         outside_pages(
             &index.receipts,
             raw.receipts.iter().map(|r| r.accept_seq),
@@ -533,8 +552,16 @@ impl Head {
             raw.results.iter().map(|r| r.accept_seq),
             "results",
         )?;
-        outside_pages(&index.events, raw.events.iter().map(|e| e.event_seq), "events")?;
-        outside_pages(&index.timers, raw.timers.iter().map(|t| t.generation), "timers")?;
+        outside_pages(
+            &index.events,
+            raw.events.iter().map(|e| e.event_seq),
+            "events",
+        )?;
+        outside_pages(
+            &index.timers,
+            raw.timers.iter().map(|t| t.generation),
+            "timers",
+        )?;
         for (field, page) in [
             ("inbox_page", &raw.inbox_page),
             ("receipt_index", &raw.receipt_index),

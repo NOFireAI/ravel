@@ -135,10 +135,10 @@ pub struct Limits {
     /// Most sealed pages one list's directory holds. A publish past it is
     /// refused `BudgetExceeded`; a guarded publish is refused earlier, while
     /// the pages an exempt publish may still seal would not fit
-    /// (`tests::a_guarded_publish_keeps_the_index_page_reserve`). The
+    /// (`tests::pages::a_guarded_publish_keeps_the_index_page_reserve`). The
     /// default holds every entry a version 1 HEAD at the byte cap can carry,
     /// so its migration is never refused for pages
-    /// (`tests::one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`).
+    /// (`tests::pages::one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`).
     pub max_index_pages: usize,
 }
 
@@ -319,7 +319,7 @@ impl Limits {
     /// Bytes the growth guard leaves free for index growth on the exempt
     /// paths: one widest page reference ([`max_page_ref_bytes`]) per page
     /// [`Limits::reserved_index_pages`] counts
-    /// (`tests::the_index_reserve_covers_the_exempt_page_growth`). An exempt
+    /// (`tests::pages::the_index_reserve_covers_the_exempt_page_growth`). An exempt
     /// `CancelTimer` rewrites no sealed page, since a sealed timer page never
     /// holds a scheduled timer ([`crate::pages::seal_index`]).
     pub fn index_reserve_bytes(&self, head: &Head) -> usize {
@@ -363,18 +363,16 @@ fn pending_effects(head: &Head) -> usize {
 /// input.
 pub fn page_needs(head: &Head, command: &Command) -> Vec<(ListKind, Need)> {
     let mut needs = Vec::new();
-    let turn = |needs: &mut Vec<(ListKind, Need)>, fence: &TurnFence| match head
-        .active_turn
-        .as_ref()
-    {
-        Some(t) if t.turn_id == fence.turn_id => {
-            needs.push((ListKind::Inbox, Need::Key(t.input_accept_seq)));
-        }
-        _ => needs.push((
-            ListKind::Results,
-            Need::Fingerprint(id_fingerprint(&fence.turn_id)),
-        )),
-    };
+    let turn =
+        |needs: &mut Vec<(ListKind, Need)>, fence: &TurnFence| match head.active_turn.as_ref() {
+            Some(t) if t.turn_id == fence.turn_id => {
+                needs.push((ListKind::Inbox, Need::Key(t.input_accept_seq)));
+            }
+            _ => needs.push((
+                ListKind::Results,
+                Need::Fingerprint(id_fingerprint(&fence.turn_id)),
+            )),
+        };
     let timer = |key: &str| {
         (
             ListKind::Timers,
