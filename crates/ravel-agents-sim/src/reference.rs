@@ -50,7 +50,8 @@
 //!   any result once the input ended cancelled are evidence and change
 //!   nothing. A second, different result for the attempt that settled it
 //!   is `IdempotencyConflict`; the same one again is recorded. An attempt
-//!   never authorized is `OwnershipLost`.
+//!   the effect never authorized is `OwnershipLost`; a step with no effect
+//!   record has no effect to settle and answers `AgentGone`.
 //! - Reconciliation (decision 7). An effect in doubt is settled by
 //!   attaching a result to its latest attempt (attaching again is
 //!   idempotent), or by authorizing the next attempt, which is dispatched
@@ -67,7 +68,11 @@
 //! failure, and leaves the state version unchanged; a handle naming an
 //! `accept_seq` this incarnation never accepted answers
 //! [`Reply::UnknownOperation`] on a client read, and a worker event on the
-//! same handle answers `OwnershipLost`; a `destroy` of an incarnation that
+//! same handle answers `OwnershipLost`, except an effect result, attach or
+//! authorization, which answers `AgentGone` on that handle and on a step
+//! key with no effect record, as the runtime does: it finds the effect by an
+//! id derived from incarnation, `accept_seq` and step key, and answers
+//! `AgentGone` when HEAD journals none; a `destroy` of an incarnation that
 //! is already tombstoned is idempotent and answers [`Reply::Destroyed`]
 //! with `already` set, as the kernel's `AlreadyTombstoned` does, while a
 //! `destroy` of an agent never created answers `AgentGone`. Retryable
@@ -941,7 +946,9 @@ impl ReferenceMachine {
     }
 
     /// The effect of step `step_key` of `operation`'s input, or the reply
-    /// refusing a call on it.
+    /// refusing a call on it. An unaccepted handle and a step with no
+    /// effect record both answer `AgentGone`, unlike `start` and `commit`:
+    /// see the choices paragraph in the module docs.
     fn effect_mut(
         &mut self,
         operation: &Handle,
@@ -1845,6 +1852,65 @@ mod tests {
             ),
         ]);
         assert_eq!(history(steps).check(m), Ok(()));
+    }
+
+    /// Each effect event on `operation`'s step `step_key`.
+    fn effect_events(operation: Handle, step_key: &str) -> [Event; 3] {
+        [
+            Event::EffectResult {
+                operation,
+                step_key: step_key.into(),
+                attempt: 1,
+                result: b"r".to_vec(),
+            },
+            Event::ReconcileAttach {
+                operation,
+                step_key: step_key.into(),
+                result: b"r".to_vec(),
+            },
+            Event::ReconcileAuthorize {
+                operation,
+                step_key: step_key.into(),
+                attempt: 2,
+            },
+        ]
+    }
+
+    /// Check `steps` followed by each effect event answering `AgentGone`,
+    /// and that answering `OwnershipLost` instead diverges.
+    fn effect_events_answer_agent_gone(steps: &[(Event, Reply)], events: [Event; 3]) {
+        for event in events {
+            let mut with = steps.to_vec();
+            with.push((event.clone(), refused(ErrorKind::AgentGone)));
+            assert_eq!(history(with).check(machine()), Ok(()), "{event:?}");
+            let mut wrong = steps.to_vec();
+            wrong.push((event.clone(), refused(ErrorKind::OwnershipLost)));
+            assert!(history(wrong).check(machine()).is_err(), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn an_effect_event_on_a_handle_never_accepted_is_agent_gone() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let mut steps = running(op);
+        steps.push((
+            step(op, RecoveryPolicy::Manual),
+            Reply::StepDispatched { attempt: 1 },
+        ));
+        effect_events_answer_agent_gone(&steps, effect_events(m.operation(1, 9), "lookup"));
+    }
+
+    #[test]
+    fn an_effect_event_on_a_step_with_no_effect_record_is_agent_gone() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let mut steps = running(op);
+        steps.push((
+            step(op, RecoveryPolicy::Manual),
+            Reply::StepDispatched { attempt: 1 },
+        ));
+        effect_events_answer_agent_gone(&steps, effect_events(op, "notify"));
     }
 
     #[test]

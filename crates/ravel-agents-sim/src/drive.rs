@@ -24,10 +24,13 @@
 //! orders calls by that number. A write is the point its effect became
 //! visible, and a call that wrote nothing answered from the last root it
 //! read. One exception: a step that journaled its start and then answered
-//! an error decided that error on a later read, so it takes that read's
-//! number when it follows the write
+//! `OwnershipLost` decided it on a later read, the cancel check before an
+//! authorization, so it takes that read's number when it follows the write
 //! (`schedules::effects::cancels_across_seeds`, where the cancel lands
-//! between the two). The numbers reach the call through a task-local cell
+//! between the two). A step refused with any other error keeps the rule:
+//! a manual latch in doubt and a replay block are decided by their own
+//! write, and the reload after the refusal is not that decision. The
+//! numbers reach the call through a task-local cell
 //! ([`tokio::task_local!`]); nothing in the store or the runtime spawns, so
 //! the bottom of the stack runs inside the recording task.
 //!
@@ -492,7 +495,10 @@ impl Recorder {
             let stamps = lock(&entry.cell).clone();
             let written = stamps.write.as_ref().map(|(s, _)| *s);
             let refused_step = matches!(entry.event, Some(Event::Step { .. }))
-                && matches!(entry.observed, Some(Observed::Modelled(Reply::Error(_))));
+                && matches!(
+                    entry.observed,
+                    Some(Observed::Modelled(Reply::Error(ErrorKind::OwnershipLost)))
+                );
             let stamp = match (written, stamps.read) {
                 (Some(w), Some(r)) if refused_step && r > w => Some(r),
                 _ => written.or(stamps.read),
@@ -627,7 +633,9 @@ struct Item {
 /// The event a step that applied a write and never answered stands for.
 /// `run_step` journals the step, then commits and authorizes an attempt,
 /// each its own HEAD write, so a crash between them leaves the step
-/// journaled with no attempt: [`Event::StepStarted`]. When the root it
+/// journaled with no attempt: [`Event::StepStarted`]. A root holding the
+/// committed intent at attempt 0 is that shape, since the reference has no
+/// intents; an intent at any other attempt is unmappable. When the root it
 /// wrote holds what [`Event::Step`] would leave, the step ran through.
 fn crashed_step(
     shadow: &ReferenceMachine,
@@ -640,16 +648,21 @@ fn crashed_step(
         return Err(format!("{operation:?} names no input"));
     };
     let id = effect_id(operation.incarnation, seq, &step.key);
-    let written = head
-        .effects
-        .iter()
-        .find(|e| e.effect_id == id)
-        .and_then(|e| {
-            phase_of(e.status).map(|phase| EffectView {
+    let written = match head.effects.iter().find(|e| e.effect_id == id) {
+        None => None,
+        Some(e) => match phase_of(e.status) {
+            Some(phase) => Some(EffectView {
                 phase,
                 attempt: e.attempt,
-            })
-        });
+            }),
+            None if e.attempt == 0 => None,
+            None => {
+                return Err(format!(
+                    "step journal shows an intent past attempt 0: {e:?}"
+                ));
+            }
+        },
+    };
     let completed = head
         .steps
         .iter()
@@ -1668,5 +1681,136 @@ mod tests {
         assert_eq!(last.event, run_step);
         assert_eq!(last.observed, Reply::Error(ErrorKind::EffectInDoubt));
         assert_eq!(run.check(), Ok(()));
+    }
+
+    /// Build the run of a step that crashed after writing a root whose
+    /// effect is an intent at `attempt`; answer it and the intent.
+    fn crashed_at_intent(attempt: u32) -> (Run, Event, EffectRecord) {
+        let rec = Recorder::default();
+        let mut reference = machine().expect("machine");
+        let op = accepted(&rec, &mut reference);
+        let step = StepCall {
+            key: "lookup".to_string(),
+            tool: "search".to_string(),
+            version: "v1".to_string(),
+            input: b"q".to_vec(),
+            policy: RecoveryPolicy::AtLeastOnce,
+        };
+        let run_step = Event::Step {
+            operation: op,
+            step: step.clone(),
+        };
+        answered(
+            &rec,
+            &mut reference,
+            Event::TurnStarted { operation: op },
+            3,
+        );
+        let rig = Rig::new(FaultPlan::empty());
+        rig.setup(|p| async move {
+            p.create().await.map_err(|e| format!("create: {e:?}"))?;
+            Ok(())
+        })
+        .expect("setup");
+        let mut head = rig.head().expect("head");
+        let intent = EffectRecord {
+            effect_id: effect_id(1, 1, &step.key),
+            step_key: step.key.clone(),
+            tool_name: step.tool.clone(),
+            tool_version: step.version.clone(),
+            input_hash: Hash256([0; 32]),
+            policy: HeadPolicy::AtLeastOnce,
+            status: EffectStatus::Intent,
+            attempt,
+            result: None,
+            result_attempt: 0,
+            turn_id: Id128([0; 16]),
+        };
+        head.effects.push(intent.clone());
+        crashed(&rec, run_step, 4, Bytes::from(head.encode()));
+        let started = Event::StepStarted {
+            operation: op,
+            step,
+        };
+        (rec.build().expect("build"), started, intent)
+    }
+
+    #[test]
+    fn a_crashed_step_whose_root_shows_an_intent_is_journaled_with_no_attempt() {
+        let (run, started, _) = crashed_at_intent(0);
+        assert_eq!(run.unmappable, Vec::<String>::new());
+        assert_eq!(run.inferred, vec![("w2".to_string(), started.clone())]);
+        let last = run.history.calls().last().expect("a call");
+        assert_eq!(last.event, started);
+        assert_eq!(run.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_crashed_step_whose_root_shows_an_intent_past_attempt_zero_is_unmappable() {
+        let (run, _, intent) = crashed_at_intent(1);
+        assert_eq!(
+            run.unmappable,
+            vec![format!(
+                "w2 step: step journal shows an intent past attempt 0: {intent:?}"
+            )]
+        );
+        assert_eq!(run.inferred, Vec::new());
+    }
+
+    /// Record a step that wrote at `write`, read at `read` and answered
+    /// `kind`, beside a state read at `between`; answer the order the
+    /// history places the two in.
+    fn refused_step_order(kind: ErrorKind, write: u64, between: u64, read: u64) -> Vec<Event> {
+        let rec = Recorder::default();
+        let mut reference = machine().expect("machine");
+        let op = accepted(&rec, &mut reference);
+        let step = Event::Step {
+            operation: op,
+            step: StepCall {
+                key: "lookup".to_string(),
+                tool: "search".to_string(),
+                version: "v1".to_string(),
+                input: b"q".to_vec(),
+                policy: RecoveryPolicy::AtLeastOnce,
+            },
+        };
+        let (index, cell) = rec.begin("w1", "run_step", Some(step));
+        {
+            let mut stamps = lock(&cell);
+            stamps.write = Some((write, Bytes::from_static(b"root")));
+            stamps.read = Some(read);
+        }
+        rec.finish(index, None, Observed::Modelled(Reply::Error(kind)));
+        answered(
+            &rec,
+            &mut reference,
+            Event::Client(ClientOp::State),
+            between,
+        );
+        let run = rec.build().expect("build");
+        run.history
+            .calls()
+            .iter()
+            .skip(2)
+            .map(|c| c.event.clone())
+            .collect()
+    }
+
+    #[test]
+    fn only_an_ownership_lost_step_takes_its_later_read_stamp() {
+        let state = Event::Client(ClientOp::State);
+        let lost = refused_step_order(ErrorKind::OwnershipLost, 3, 4, 5);
+        assert_eq!(lost.len(), 2);
+        assert_eq!(lost[0], state);
+        for kind in [
+            ErrorKind::EffectInDoubt,
+            ErrorKind::NonDeterministicReplay,
+            ErrorKind::IdempotencyConflict,
+            ErrorKind::AgentGone,
+        ] {
+            let order = refused_step_order(kind, 3, 4, 5);
+            assert_eq!(order.len(), 2, "{kind:?}");
+            assert_eq!(order[1], state, "{kind:?}");
+        }
     }
 }

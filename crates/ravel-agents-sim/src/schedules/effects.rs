@@ -1422,7 +1422,7 @@ fn concurrent_pollers(seed: u64) -> usize {
 /// 25 of the 64 batch seeds reach it with no fault at all; this is the
 /// first.
 #[test]
-#[ignore = "suspected defect: a takeover re-applied after a lost CAS fences a live turn"]
+#[ignore = "suspected defect #3415: a takeover re-applied after a lost CAS fences a live turn"]
 fn takeover_retried_on_fresh_head_fences_a_live_turn() {
     assert_eq!(concurrent_pollers(0x5eed_0001), 0);
 }
