@@ -1,0 +1,15 @@
+{
+  "events": [
+    {
+      "event_seq": 3,
+      "accept_seq": 1,
+      "turn_id": "d746246fc5bd6d52e210c7e1883ca81e",
+      "event_type": "order_shipped",
+      "payload": {
+        "carrier": "post"
+      }
+    }
+  ],
+  "next_cursor": "3",
+  "terminal": "completed"
+}

@@ -37,7 +37,7 @@ mod unix_ns {
 }
 
 use crate::error::{AgentError, SafeIds};
-use crate::head::{EffectStatus, RecoveryPolicy, ResultStatus, StepStatus};
+use crate::head::{EffectStatus, RecoveryPolicy, ResultStatus, StepStatus, TimerStatus};
 use crate::state::OperationState;
 
 /// The `(kind, key)` pair a client names an agent by.
@@ -272,6 +272,11 @@ pub struct EventsRequest {
     /// Opaque cursor from a previous page; absent reads from the start.
     pub cursor: Option<String>,
     pub limit: u32,
+    /// An operation handle of `agent`: the page holds only the events its
+    /// turns committed, and the page that drains them once the operation is
+    /// finished carries [`EventsResponse::terminal`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,8 +291,41 @@ pub struct EventBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventsResponse {
     pub events: Vec<EventBody>,
+    /// The cursor to send for the next page. A page with no events echoes
+    /// the cursor it was asked for.
     pub next_cursor: String,
+    /// Set only on a page for [`EventsRequest::operation`] that holds the
+    /// operation's last event and finds it finished: its final status. No
+    /// later page holds an event of that operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<OperationStatus>,
 }
+
+/// What a caller holding an expired events cursor does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorRestart {
+    /// Read again from [`CursorExpiredBody::oldest_cursor`]; the events
+    /// between the expired cursor and it are no longer retained.
+    RestartFromOldestCursor,
+}
+
+/// The `410 Gone` body of `events` for a cursor below the retained window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CursorExpiredBody {
+    /// Always `cursor_expired`.
+    pub code: String,
+    /// The cursor the request sent.
+    pub cursor: String,
+    /// The oldest cursor this agent's events are still served from.
+    pub oldest_cursor: String,
+    pub restart: CursorRestart,
+    pub reason: String,
+    pub ids: SafeIdsBody,
+}
+
+/// The `code` of every [`CursorExpiredBody`].
+pub const CURSOR_EXPIRED_CODE: &str = "cursor_expired";
 
 /// `POST /api/v1/agents/timers`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -306,7 +344,7 @@ pub struct TimerResponse {
     pub generation: u64,
 }
 
-/// `DELETE /api/v1/agents/timers`
+/// `POST /api/v1/agents/timers/cancel`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelTimerRequest {
     pub agent: AgentRef,
@@ -325,6 +363,60 @@ pub enum TimerCancelOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelTimerResponse {
     pub outcome: TimerCancelOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerState {
+    /// Armed: the sweep fires it once it is due.
+    Scheduled,
+    /// Fired: its message was enqueued by the firing CAS.
+    Delivered,
+    Cancelled,
+}
+
+impl From<TimerStatus> for TimerState {
+    fn from(status: TimerStatus) -> Self {
+        match status {
+            TimerStatus::Scheduled => TimerState::Scheduled,
+            TimerStatus::Delivered => TimerState::Delivered,
+            TimerStatus::Cancelled => TimerState::Cancelled,
+        }
+    }
+}
+
+/// One timer as HEAD holds it: the latest generation of its key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimerBody {
+    pub timer: String,
+    pub timer_key: String,
+    pub generation: u64,
+    #[serde(with = "unix_ns")]
+    pub due_unix_ns: i64,
+    pub handler: String,
+    pub status: TimerState,
+}
+
+/// `GET /api/v1/agents/timers?kind=<k>&key=<k>`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimersResponse {
+    pub timers: Vec<TimerBody>,
+}
+
+/// `POST /api/v1/agents/sweep`: what one sweep pass over the caller's
+/// tenant did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepResponse {
+    /// `_wake/` LIST pages.
+    pub wake_list_pages: u64,
+    /// `_dir/` LIST pages.
+    pub dir_list_pages: u64,
+    pub head_gets: u64,
+    pub hints_read: u64,
+    pub hints_deleted: u64,
+    pub timers_fired: u64,
+    pub agents_loaded: u64,
+    pub dir_entries_repaired: u64,
 }
 
 /// `GET /api/v1/agents/effects?kind=<k>&key=<k>`
