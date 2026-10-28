@@ -2833,6 +2833,14 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // the routes the flag promises are absent.
     #[cfg(feature = "agents")]
     let agents_readiness = Arc::new(agents::AgentsReadiness::new());
+    // Built in every `agents` build so `/metrics` reports the settings even
+    // without `--agents`; it touches the store only when a route is called.
+    #[cfg(feature = "agents")]
+    let agents_runtime = Arc::new(agents::AgentsRuntime::new(
+        agents::AgentsSettings::from_server_config(&config),
+        agents_readiness.clone(),
+        store.clone(),
+    ));
     #[cfg(feature = "agents")]
     if config.query_budgets.agents.enabled {
         readiness_sources.push(agents_readiness.clone() as Arc<dyn health::IngestHealth>);
@@ -3212,10 +3220,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         #[cfg(feature = "flight-sql")]
         sql_slice_tls_dials: None,
         #[cfg(feature = "agents")]
-        agents: Some(agents::AgentsMetricsSnapshot::new(
-            agents::AgentsSettings::from_server_config(&config),
-            agents_readiness.clone(),
-        )),
+        agents: Some(agents_runtime.clone()),
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
         normalize_reject_metrics: normalize_reject_metrics.clone(),
@@ -3764,7 +3769,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         #[cfg(feature = "agents")]
         if config.query_budgets.agents.enabled {
             http_router = http_router.merge(agents::router(
-                agents::AgentsSettings::from_server_config(&config),
+                agents_runtime.clone(),
+                config.tenant_resolver.clone(),
             ));
         }
         query_service_handle = Some(query_service);
@@ -3814,7 +3820,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             #[cfg(feature = "agents")]
             if config.query_budgets.agents.enabled {
                 mtls_router = mtls_router.merge(agents::router(
-                    agents::AgentsSettings::from_server_config(&config),
+                    agents_runtime.clone(),
+                    mtls.resolver.clone(),
                 ));
             }
             mtls_query_service_handle = Some(mtls_query_service);

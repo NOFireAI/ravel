@@ -9,7 +9,9 @@
       "base_state_version": 0,
       "handler_version": "1.0.0",
       "handler_digest": "3c20eb97686b101673103ee45ac9cb5f678f30cbee12933adc1f8b0a9868085f",
-      "observed_root_revision": 4
+      "observed_root_revision": 4,
+      "recorded_unix_ns": "1767225600000000000",
+      "random_seed": "8f8d1b06b1618bd08db0300dbba36423"
     },
     "agent": {
       "kind": "order",

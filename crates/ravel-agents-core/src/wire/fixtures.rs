@@ -336,25 +336,54 @@ fn samples() -> Vec<Sample> {
         sample(
             "worker_poll_response",
             WorkerPollResponse {
-                assignment: Some(TurnAssignment {
-                    lease: lease(),
-                    agent: agent(),
-                    operation: operation(),
-                    accept_seq: 1,
+                assignment: Some(
+                    TurnAssignment {
+                        lease: lease(),
+                        agent: agent(),
+                        operation: operation(),
+                        accept_seq: 1,
+                        handler: "place".to_string(),
+                        state: json!({"items": []}),
+                        payload: json!({"sku": "A-1", "qty": 2}),
+                        steps: vec![StepBody {
+                            step_id: identity::step_id(1, 1, "price").to_hex(),
+                            step_key: "price".to_string(),
+                            tool_name: "catalog.price".to_string(),
+                            tool_version: "1".to_string(),
+                            input_hash: identity::step_input_hash("catalog.price", "1", b"A-1")
+                                .to_hex(),
+                            status: StepState::Completed,
+                            output: Some(json!({"cents": 649})),
+                        }],
+                    }
+                    .polled(1_767_225_600_000_000_000),
+                ),
+            },
+        ),
+        sample(
+            "worker_register_request",
+            WorkerRegisterRequest {
+                handlers: vec![HandlerPinBody {
                     handler: "place".to_string(),
-                    state: json!({"items": []}),
-                    payload: json!({"sku": "A-1", "qty": 2}),
-                    steps: vec![StepBody {
-                        step_id: identity::step_id(1, 1, "price").to_hex(),
-                        step_key: "price".to_string(),
-                        tool_name: "catalog.price".to_string(),
-                        tool_version: "1".to_string(),
-                        input_hash: identity::step_input_hash("catalog.price", "1", b"A-1")
-                            .to_hex(),
-                        status: StepState::Completed,
-                        output: Some(json!({"cents": 649})),
-                    }],
-                }),
+                    version: "1.0.0".to_string(),
+                    digest: identity::request_hash("digest", b"order-handler").to_hex(),
+                }],
+            },
+        ),
+        sample(
+            "worker_register_response",
+            WorkerRegisterResponse {
+                worker_id: "w-00000000000000a1".to_string(),
+            },
+        ),
+        sample(
+            "worker_heartbeat_request",
+            WorkerHeartbeatRequest { lease: lease() },
+        ),
+        sample(
+            "worker_heartbeat_response",
+            WorkerHeartbeatResponse {
+                lease_expires_unix_ns: 1_767_225_630_000_000_000,
             },
         ),
         sample(
@@ -530,6 +559,9 @@ fn unix_ns_fields_are_decimal_strings() {
     })
     .expect("serialize");
     assert_eq!(change["due_unix_ns"], exact);
+    let polled =
+        serde_json::to_value(lease_assignment().polled(PRECISE_UNIX_NS)).expect("serialize");
+    assert_eq!(polled["lease"]["recorded_unix_ns"], exact);
     let decoded: TimerChangeBody = serde_json::from_value(change).expect("decode");
     assert!(matches!(
         decoded,
@@ -539,4 +571,46 @@ fn unix_ns_fields_are_decimal_strings() {
     let mut number = result;
     number["finished_unix_ns"] = json!(PRECISE_UNIX_NS);
     assert!(serde_json::from_value::<ResultBody>(number).is_err());
+}
+
+fn lease_assignment() -> TurnAssignment {
+    TurnAssignment {
+        lease: lease(),
+        agent: agent(),
+        operation: operation(),
+        accept_seq: 1,
+        handler: "place".to_string(),
+        state: json!(null),
+        payload: json!(null),
+        steps: Vec::new(),
+    }
+}
+
+/// The polled lease carries the seed the SDK derives on its own
+/// (`derive("random", [agent_id, u64le(incarnation), u64le(accept_seq)])`)
+/// and keeps every [`TurnLease`] field at the top level, so a commit that
+/// echoes the polled lease is read as the lease it extends.
+#[test]
+fn polled_lease_extends_the_lease_and_echoes_back_as_it() {
+    let polled = lease_assignment().polled(7);
+    assert_eq!(
+        polled.lease.random_seed,
+        turn_random_seed(&agent_id().to_hex(), 1, 1)
+    );
+    assert_eq!(polled.lease.random_seed.len(), 32);
+    assert_ne!(
+        polled.lease.random_seed,
+        turn_random_seed(&agent_id().to_hex(), 1, 2)
+    );
+    let mut commit = serde_json::to_value(WorkerCommitRequest {
+        lease: lease(),
+        outcome: TurnOutcome::Failed {
+            error: "e".to_string(),
+            terminal: true,
+        },
+    })
+    .expect("serialize");
+    commit["lease"] = serde_json::to_value(&polled.lease).expect("serialize");
+    let decoded: WorkerCommitRequest = serde_json::from_value(commit).expect("decode");
+    assert_eq!(decoded.lease, lease());
 }

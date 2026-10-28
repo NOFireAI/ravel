@@ -2,26 +2,52 @@
 //! `agents` cargo feature.
 //!
 //! `crate::start` mounts [`router`] on the public and the mTLS router from
-//! inside its query block when `--agents` is set, feeds an
-//! [`AgentsMetricsSnapshot`] to `/metrics`, and adds an [`AgentsReadiness`]
-//! to `/readyz`. The only route is `GET /api/v1/agents/health`, which reports
-//! the settings below; the coordinator, store and worker routes that act on
-//! them arrive in later tasks of epic #3331.
+//! inside its query block when `--agents` is set, feeds the
+//! [`AgentsRuntime`]'s counters to `/metrics`, and adds an
+//! [`AgentsReadiness`] to `/readyz`. The router serves
+//! `GET /api/v1/agents/health`, which reports the settings below, and the
+//! client and worker routes of milestones 1 and 2 over one
+//! [`ravel_agents_runtime::Coordinator`] per tenant. Timer, effect and
+//! reconcile routes are not mounted.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::State;
-use axum::routing::get;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use ravel_query::http::TenantResolver;
 use serde::Serialize;
 
 use crate::ServerConfig;
 use crate::config::Mode;
 use crate::health::IngestHealth;
 
-/// The one route this release serves.
+mod routes;
+mod runtime;
+
+pub use routes::MAX_EVENTS_PAGE;
+pub use runtime::{AgentsRuntime, LONG_POLL_CAP_MS, Lane, TenantAgents};
+
+/// The unauthenticated settings route.
 pub const HEALTH_PATH: &str = "/api/v1/agents/health";
+
+/// Every authenticated route, as `(method, path)`, in mount order.
+pub const ROUTES: &[(&str, &str)] = &[
+    ("POST", "/api/v1/agents/create"),
+    ("POST", "/api/v1/agents/send"),
+    ("POST", "/api/v1/agents/call"),
+    ("GET", "/api/v1/agents/operation"),
+    ("GET", "/api/v1/agents/result"),
+    ("POST", "/api/v1/agents/resolve"),
+    ("POST", "/api/v1/agents/cancel"),
+    ("GET", "/api/v1/agents/state"),
+    ("POST", "/api/v1/agents/events"),
+    ("POST", "/api/v1/agents/worker/register"),
+    ("POST", "/api/v1/agents/worker/poll"),
+    ("POST", "/api/v1/agents/worker/commit"),
+    ("POST", "/api/v1/agents/worker/heartbeat"),
+];
 
 /// The agents settings a process runs with: its mode and the resolved
 /// `--agents-*` values from [`crate::config::AgentsConfig`].
@@ -36,6 +62,9 @@ pub struct AgentsSettings {
     pub max_state_bytes: u64,
     pub max_receipts: u64,
     pub max_timers: u64,
+    pub max_body_bytes: usize,
+    pub lease_ms: u64,
+    pub heartbeat_grace_ms: u64,
 }
 
 impl AgentsSettings {
@@ -51,6 +80,9 @@ impl AgentsSettings {
             max_state_bytes: agents.max_state_bytes,
             max_receipts: agents.max_receipts,
             max_timers: agents.max_timers,
+            max_body_bytes: agents.max_body_bytes,
+            lease_ms: agents.lease_ms,
+            heartbeat_grace_ms: agents.heartbeat_grace_ms,
         }
     }
 }
@@ -80,25 +112,6 @@ impl AgentsReadiness {
 impl IngestHealth for AgentsReadiness {
     fn shards_ready(&self) -> bool {
         self.is_mounted()
-    }
-}
-
-/// What `/metrics` renders for the agents surface: the settings, and whether
-/// the router is mounted, read live from the same flag `/readyz` reads.
-#[derive(Debug, Clone)]
-pub struct AgentsMetricsSnapshot {
-    pub settings: AgentsSettings,
-    mounted: Arc<AgentsReadiness>,
-}
-
-impl AgentsMetricsSnapshot {
-    pub fn new(settings: AgentsSettings, mounted: Arc<AgentsReadiness>) -> Self {
-        Self { settings, mounted }
-    }
-
-    /// True once the agents router is mounted in this process.
-    pub fn enabled(&self) -> bool {
-        self.mounted.is_mounted()
     }
 }
 
@@ -140,18 +153,42 @@ impl HealthBody {
     }
 }
 
-/// `GET /api/v1/agents/health`. It reads no store and no tenant data, only
-/// operator settings `/metrics` also exposes, so it carries no authentication
-/// on either listener, including the mTLS one, where `/healthz` itself is not
-/// served (ADR-3331 decision 9 mounts it on both).
-pub fn router(settings: AgentsSettings) -> Router {
+/// The agents router for one listener. `GET /api/v1/agents/health` reads no
+/// store and no tenant data, only operator settings `/metrics` also exposes,
+/// so it carries no authentication on either listener, including the mTLS
+/// one, where `/healthz` itself is not served (ADR-3331 decision 9 mounts it
+/// on both). Every other route resolves its tenant through `resolver`, the
+/// listener's own.
+pub fn router(runtime: Arc<AgentsRuntime>, resolver: Arc<dyn TenantResolver>) -> Router {
+    let limit = runtime.settings.max_body_bytes;
+    let api = routes::Api { runtime, resolver };
     Router::new()
         .route(HEALTH_PATH, get(health))
-        .with_state(settings)
+        .route("/api/v1/agents/create", post(routes::create))
+        .route("/api/v1/agents/send", post(routes::send))
+        .route("/api/v1/agents/call", post(routes::call))
+        .route("/api/v1/agents/operation", get(routes::operation))
+        .route("/api/v1/agents/result", get(routes::result))
+        .route("/api/v1/agents/resolve", post(routes::resolve))
+        .route("/api/v1/agents/cancel", post(routes::cancel))
+        .route("/api/v1/agents/state", get(routes::state))
+        .route("/api/v1/agents/events", post(routes::events))
+        .route(
+            "/api/v1/agents/worker/register",
+            post(routes::worker_register),
+        )
+        .route("/api/v1/agents/worker/poll", post(routes::worker_poll))
+        .route("/api/v1/agents/worker/commit", post(routes::worker_commit))
+        .route(
+            "/api/v1/agents/worker/heartbeat",
+            post(routes::worker_heartbeat),
+        )
+        .layer(DefaultBodyLimit::max(limit))
+        .with_state(api)
 }
 
-async fn health(State(settings): State<AgentsSettings>) -> Json<HealthBody> {
-    Json(HealthBody::new(&settings))
+async fn health(State(api): State<routes::Api>) -> Json<HealthBody> {
+    Json(HealthBody::new(&api.runtime.settings))
 }
 
 #[cfg(test)]
@@ -174,7 +211,74 @@ mod tests {
             max_state_bytes: 17,
             max_receipts: 19,
             max_timers: 23,
+            max_body_bytes: 4096,
+            lease_ms: 30_000,
+            heartbeat_grace_ms: 10_000,
         }
+    }
+
+    const WORKER_TOKEN: &str = "worker-token";
+
+    fn test_router(settings: AgentsSettings) -> Router {
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert(
+            WORKER_TOKEN.to_string(),
+            ravel_tenant_resolve::Principal {
+                agents_worker: true,
+                ..ravel_tenant_resolve::Principal::tenant_only(ravel_types::TenantId::new("acme"))
+            },
+        );
+        let resolver: Arc<dyn TenantResolver> =
+            Arc::new(ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(tokens));
+        let runtime = Arc::new(AgentsRuntime::new(
+            settings,
+            Arc::new(AgentsReadiness::new()),
+            Arc::new(ravel_object_store::memory::MemoryStore::new()),
+        ));
+        router(runtime, resolver)
+    }
+
+    /// `worker/poll` asking for a 60 s wait answers with no assignment once
+    /// the 20 s cap elapses, on paused time, and not before it.
+    #[tokio::test(start_paused = true)]
+    async fn worker_poll_wait_is_capped_at_the_long_poll_cap() {
+        let app = test_router(settings());
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/agents/worker/poll")
+                    .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "worker_id": "w-unregistered",
+                            "handlers": [],
+                            "wait_ms": 60_000,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        let waited = started.elapsed();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body is JSON");
+        assert_eq!(body["assignment"], serde_json::Value::Null);
+        assert_eq!(
+            waited,
+            std::time::Duration::from_millis(LONG_POLL_CAP_MS),
+            "the wait ends at the cap, not at the 60 s asked for"
+        );
     }
 
     /// The per-agent quota defaults equal the kernel's own limits, so the
@@ -197,18 +301,22 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_enabled_follows_the_mount_flag() {
+    fn runtime_enabled_follows_the_mount_flag() {
         let mounted = Arc::new(AgentsReadiness::new());
-        let snapshot = AgentsMetricsSnapshot::new(settings(), mounted.clone());
-        assert!(!snapshot.enabled());
+        let runtime = AgentsRuntime::new(
+            settings(),
+            mounted.clone(),
+            Arc::new(ravel_object_store::memory::MemoryStore::new()),
+        );
+        assert!(!runtime.enabled());
         mounted.mark_mounted();
-        assert!(snapshot.enabled());
+        assert!(runtime.enabled());
     }
 
     /// The health route answers 200 with every setting under its own key.
     #[tokio::test]
     async fn health_reports_feature_mode_and_every_setting() {
-        let response = router(settings())
+        let response = test_router(settings())
             .oneshot(
                 Request::get(HEALTH_PATH)
                     .body(Body::empty())

@@ -298,6 +298,35 @@ tool input (`SafeIds`).
 The wire form carries the code and the retry hint
 (`wire::fixtures::tests::error_body_carries_the_code_and_retry_hint`).
 
+## Wire
+
+The request and response bodies are the `wire` types in
+`crates/ravel-agents-core/src/wire.rs`, served under `/api/v1/agents` and
+listed route by route in
+[the HTTP API reference](reference/http-api.md#agents-routes). Their JSON
+forms are pinned by the files in `sdk/fixtures/`, which
+`wire::fixtures::tests` regenerates and checks.
+
+Canonical step-input encoding. A step's `input_hash` is
+`identity::step_input_hash(tool_name, tool_version, input)` over the bytes of
+the input's canonical JSON: the SDK takes the input's JSON form (what
+`JSON.stringify` would encode: `toJSON` applied, `undefined` members dropped,
+`undefined` array items written as `null`), then writes it with object keys
+sorted at every depth and no whitespace, and hashes those bytes. Two equal
+inputs hash equal whatever their key order, and a value with no lossless JSON
+form (a `Date` before `toJSON`, a `Map`, a `bigint`, a non-finite number) is
+refused with `InvalidStepInput` rather than hashed (SDK `identity.test.ts`:
+"canonical JSON sorts keys at every depth", "step id and step input hash
+match the worker_poll_response fixture").
+
+Not found. An operation handle the agent never issued, one from an earlier
+incarnation, or one whose agent does not exist answers `AgentGone` (404) with
+the handle itself in the safe ids, beside the agent id, so a caller can tell
+which of its handles is gone without the server echoing any caller text
+(`agents_e2e::unknown_operation_handle_is_agent_gone_with_the_handle`). A
+token that does not decode as an operation handle is `AgentGone` with no
+ids, since its text is not known to be safe to echo.
+
 ## Clocks
 
 Safety never depends on a clock: every exclusion is a CAS on HEAD, fenced by
