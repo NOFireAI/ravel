@@ -28,6 +28,15 @@
 //! says `in_process_row: "skipped"`. Band 6 still runs across the portable
 //! rows (`check_band6_across_rows`).
 //!
+//! A portable row whose read-back fails (an error, a refusal or a mismatch)
+//! or that the stall ceiling stops does not stop the replay: the row is
+//! recorded (`readback_error` or `readback`, or an entry in `stalled`), the
+//! later rows are replayed, and once every row has run the bin prints the
+//! report and exits with the first failing row's code, 1
+//! (`metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`).
+//! Any other failure (band 4, a diverged stream, a transport error) still
+//! stops the run at that row with no report.
+//!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
 //! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
 #![allow(clippy::expect_used)]
@@ -41,9 +50,9 @@ use ravel_bench::harness::{
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, GeneratedStream,
-    HttpReplayConfig, IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, RavelReplayConfig,
+    HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport, PayloadClass, RavelReplayConfig,
     ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance, STALL_GRACE, STALL_RECHECK,
-    StallCeiling, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
+    StallCeiling, StalledRow, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
     SystemQueryResult, build_profile_record, check_anchor, check_expected_digests_agree,
     check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
     readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
@@ -524,10 +533,10 @@ fn check_scalar_expected(
     }
 }
 
-/// A failed run: the error, and the report of the rows replayed before it
-/// when the failure was a read-back, so their ingest figures are still
-/// printed
-/// (`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`).
+/// A failed run: the error, and, when the failure was a read-back or a
+/// stall, the report of every row, so their ingest figures are still printed
+/// (`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`,
+/// `metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`).
 struct RunFailure {
     error: RunError,
     report: Option<MetricsIngestReport>,
@@ -696,6 +705,10 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
     // Portable rows, only those a caller supplied an endpoint for. Their
     // `system` values are the names the query runner joins on.
     let mut portable = Vec::new();
+    let mut stalled = Vec::new();
+    // The first row whose read-back failed or that stalled: every row is
+    // still replayed, and the run exits with this one's code.
+    let mut first_failure: Option<RunError> = None;
     for (receiver, endpoint, query_url, bearer_token, tenant) in [
         (
             Receiver::Ravel,
@@ -753,12 +766,43 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
             }),
         };
         let mut stream = stream_from_anchor()?;
-        let outcome = replay_over_http_with_plan(&http_cfg, &mut stream)
-            .await
-            .map_err(|source| RunError::Http {
-                system: system.to_string(),
-                source,
-            })?;
+        let outcome = match replay_over_http_with_plan(&http_cfg, &mut stream).await {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                let error = RunError::Http {
+                    system: system.to_string(),
+                    source,
+                };
+                let RunError::Http {
+                    source:
+                        LaneError::IngestStalled {
+                            projected_secs,
+                            ceiling_secs,
+                            offered_points,
+                            stream_points,
+                            ..
+                        },
+                    ..
+                } = &error
+                else {
+                    return Err(RunFailure::from(error));
+                };
+                // A stalled row stops only itself (decision 7); the rows
+                // after it are still replayed.
+                stalled.push(StalledRow {
+                    system: system.to_string(),
+                    endpoint: endpoint.clone(),
+                    projected_secs: *projected_secs,
+                    ceiling_secs: *ceiling_secs,
+                    offered_points: *offered_points,
+                    stream_points: *stream_points,
+                    error: error.to_string(),
+                });
+                eprintln!("metricsbench_ingest: {error}; replaying the next row");
+                first_failure.get_or_insert(error);
+                continue;
+            }
+        };
         let mut row = outcome.result;
         let (report, _) = close_row(system, stream, &row)?;
         match &reference {
@@ -804,19 +848,24 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
         };
         portable.push(row);
         if let Some(error) = failed {
-            // The rows replayed so far are printed with the failed one marked,
-            // so their ingest figures survive the exit.
-            rows.extend(portable);
-            let report = context
-                .assemble(rows, reference.as_ref(), query, substrate)
-                .ok();
-            return Err(RunFailure { error, report });
+            // The row stays in the report marked failed, and the rows after
+            // it are still replayed; the run exits with the first failure.
+            eprintln!("metricsbench_ingest: {error}; replaying the next row");
+            first_failure.get_or_insert(error);
         }
     }
     let portable_refs: Vec<&SystemIngestResult> = portable.iter().collect();
     check_band6_across_rows(in_process_scalar.as_deref(), &portable_refs)?;
     rows.extend(portable);
-    Ok(context.assemble(rows, reference.as_ref(), query, substrate)?)
+    let mut report = context.assemble(rows, reference.as_ref(), query, substrate)?;
+    report.stalled = stalled;
+    match first_failure {
+        None => Ok(report),
+        Some(error) => Err(RunFailure {
+            error,
+            report: Some(report),
+        }),
+    }
 }
 
 #[tokio::main]
