@@ -559,12 +559,15 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         );
         rows.push(ravel.result);
     }
-    let in_process_scalar = rows.first().map(|r| {
-        r.ingest
-            .expected_digests
-            .get(PayloadClass::Scalar)
-            .to_string()
-    });
+    let in_process_scalar = rows
+        .iter()
+        .find(|r| r.system == IN_PROCESS_SYSTEM)
+        .map(|r| {
+            r.ingest
+                .expected_digests
+                .get(PayloadClass::Scalar)
+                .to_string()
+        });
 
     // Portable rows, only those a caller supplied an endpoint for. Their
     // `system` values are the names the query runner joins on.

@@ -4146,41 +4146,6 @@ mod tests {
     /// then share `Buffered`, `max_ack_p99_ms(&[IN_PROCESS_SYSTEM, "prometheus"])`
     /// returns `Ok` instead of the `AckConflation` error, and the
     /// `expect_err` below panics.
-    /// The report's `in_process_row` says whether [`IN_PROCESS_SYSTEM`] is
-    /// among its rows, and serializes as `present` or `skipped`; a report
-    /// with no such field reads as `present`.
-    #[test]
-    fn the_in_process_row_disclosure_follows_the_rows() {
-        let ravel = SystemIngestResult::ravel_row(
-            "in-process".to_string(),
-            ingest_phase(3.0),
-            vec!["tok-shard-0".to_string()],
-            storage_fixture(),
-        );
-        let prometheus = SystemIngestResult::buffered_http_row(
-            "prometheus",
-            "http://prom.example:9090/api/v1/write",
-            "reqwest RW1.0 sender",
-            ingest_phase(9.0),
-        );
-        let both = MetricsIngestReport::new(vec![ravel, prometheus.clone()]);
-        assert_eq!(both.in_process_row, InProcessRow::Present);
-        let portable = MetricsIngestReport::new(vec![prometheus]);
-        assert_eq!(portable.in_process_row, InProcessRow::Skipped);
-
-        let mut json = serde_json::to_value(&portable).expect("serialize");
-        assert_eq!(json["in_process_row"], "skipped");
-        assert_eq!(
-            serde_json::to_value(&both).expect("serialize")["in_process_row"],
-            "present"
-        );
-        json.as_object_mut()
-            .expect("object")
-            .remove("in_process_row");
-        let older: MetricsIngestReport = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(older.in_process_row, InProcessRow::Present);
-    }
-
     #[test]
     fn strict_ack_is_reported_separately_from_buffered() {
         let ravel = SystemIngestResult::ravel_row(
@@ -4269,6 +4234,41 @@ mod tests {
             ravel_ack, prom_ack,
             "the ack meanings must not collapse in JSON"
         );
+    }
+
+    /// The report's `in_process_row` says whether [`IN_PROCESS_SYSTEM`] is
+    /// among its rows, and serializes as `present` or `skipped`; a report
+    /// with no such field reads as `present`.
+    #[test]
+    fn the_in_process_row_disclosure_follows_the_rows() {
+        let ravel = SystemIngestResult::ravel_row(
+            "in-process".to_string(),
+            ingest_phase(3.0),
+            vec!["tok-shard-0".to_string()],
+            storage_fixture(),
+        );
+        let prometheus = SystemIngestResult::buffered_http_row(
+            "prometheus",
+            "http://prom.example:9090/api/v1/write",
+            "reqwest RW1.0 sender",
+            ingest_phase(9.0),
+        );
+        let both = MetricsIngestReport::new(vec![ravel, prometheus.clone()]);
+        assert_eq!(both.in_process_row, InProcessRow::Present);
+        let portable = MetricsIngestReport::new(vec![prometheus]);
+        assert_eq!(portable.in_process_row, InProcessRow::Skipped);
+
+        let mut json = serde_json::to_value(&portable).expect("serialize");
+        assert_eq!(json["in_process_row"], "skipped");
+        assert_eq!(
+            serde_json::to_value(&both).expect("serialize")["in_process_row"],
+            "present"
+        );
+        json.as_object_mut()
+            .expect("object")
+            .remove("in_process_row");
+        let older: MetricsIngestReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(older.in_process_row, InProcessRow::Present);
     }
 
     /// A base timestamp near now (milliseconds), so a strict write's samples sit
