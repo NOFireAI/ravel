@@ -212,7 +212,10 @@ jobs:
           # Provably irrelevant to every Rust lane: prose, the TLA+ models, and
           # the TLA+ harness (all three already handled above, and listed again
           # here so this test can be read on its own).
-          known_irrelevant='\.(md|svg)$|^formal/|^scripts/check-tla\.sh$'
+          # The TypeScript SDK tree and its runner reach no Rust lane (the sdk
+          # job covers them); sdk/fixtures stays out of this list because the
+          # ravel-agents-core fixture test reads it.
+          known_irrelevant='\.(md|svg)$|^formal/|^scripts/check-tla\.sh$|^sdk/typescript/|^scripts/gates-sdk\.sh$'
           # Any changed path that is neither in a named area list nor provably
           # irrelevant forces every area. The previous form asked this only of
           # paths under crates/ or services/, so a change to deny.toml, the
@@ -1517,7 +1520,11 @@ jobs:
   # the protect-main ruleset to the owner.
   features-agents:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.agents_area == 'true'
+    # Also on server_or_operator: ravel-server's lib.rs, config.rs,
+    # metrics.rs, tenant.rs and several integration tests carry
+    # `#[cfg(feature = "agents")]` code and struct literals this lane alone
+    # compiles, and those paths match the server area, not agents_area.
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.agents_area == 'true' || needs.changes.outputs.server_or_operator == 'true')
     runs-on: ubuntu-latest
     # 25m (provisional): copied from `features-otap`, which compiles, lints
     # (--all-targets) and tests a single ravel-server feature in the same shape
