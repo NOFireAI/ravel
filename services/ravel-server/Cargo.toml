@@ -208,6 +208,13 @@ ravel-mcp = { path = "../../crates/ravel-mcp", version = "0.27.0", optional = tr
 # the tool catalog's own rmcp types come through ravel-mcp.
 rmcp = { workspace = true, optional = true }
 
+# The Ravel Agents runtime crates (ADR-3331 decision 9), linked only by the
+# `agents` feature. Path dependencies pinned to a version for the same reason
+# ravel-mcp above is.
+ravel-agents-core = { path = "../../crates/ravel-agents-core", version = "0.27.0", optional = true }
+ravel-agents-store = { path = "../../crates/ravel-agents-store", version = "0.27.0", optional = true }
+ravel-agents-runtime = { path = "../../crates/ravel-agents-runtime", version = "0.27.0", optional = true }
+
 # Flight service codegen for the `flight-sql` feature: arrow 59's arrow-flight,
 # the same arrow major datafusion carries.
 arrow-flight = { workspace = true, optional = true }
@@ -263,6 +270,15 @@ mcp = [
     "dep:rmcp",
     "rmcp/transport-streamable-http-server",
     "rmcp/tower",
+]
+
+# The Ravel Agents surface under `/api/v1/agents` (ADR-3331 decision 9). Off by
+# default and not in the published image; `--agents` is a second, runtime
+# opt-in on top, and a build without this feature refuses that flag.
+agents = [
+    "dep:ravel-agents-core",
+    "dep:ravel-agents-store",
+    "dep:ravel-agents-runtime",
 ]
 
 # jemalloc heap profiling, for attributing live memory to allocation sites

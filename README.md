@@ -138,6 +138,7 @@ records the release that each surface first shipped in.
 | Flight SQL | the same five tables, with the same `samples` limit | `flight-sql` | yes |
 | ES&vert;QL over `POST /api/v1/esql` | logs, as `FROM logs` | `esql` | no |
 | Parquet tables over both SQL surfaces | Parquet files read in place from an S3, GCS or Azure location granted to the tenant (`ravel-cli tenant parquet-grant add`, `ravel-server --parquet-profiles`); described below the matrix | `sql` | yes |
+| Agents API under `/api/v1/agents/`, with `--agents` | none: durable agent state, not a telemetry signal; this release serves only `GET /api/v1/agents/health` | `agents` | no |
 
 <!-- END SUPPORT MATRIX -->
 
