@@ -39,11 +39,12 @@ The models check the protocol design under those bounds. Whether the Rust
 implementation conforms is a separate question: the traceability table argues
 it, and the Rust tests named there assert it.
 [`traceability.md`](traceability.md) maps each action and property to the
-kernel and store symbols and tests that implement it today; the runtime rows
-(lease takeover, worker dispatch, worker crash, the effect runner, wake hints
-and the sweep, and liveness) sit under its design heading, pending T9 (#3343),
-T14, T15 (#3348) and later tasks. Safety and liveness are stated separately
-below, and every liveness result carries its fairness assumptions. The object
+kernel, store and runtime symbols and tests that implement it today (the
+effect rows cite the coordinator in `ravel-agents-runtime`); the remaining
+runtime rows (lease takeover, worker dispatch, worker crash, wake hints and the
+sweep, and liveness) sit under its design heading, pending T9 (#3343), T15
+(#3348) and later tasks. Safety and liveness are stated separately below, and
+every liveness result carries its fairness assumptions. The object
 store's own conformance to its contract is an assumption, stated as such and
 not checked here.
 
@@ -58,11 +59,11 @@ pins a distinct-state band around the measured figure with depth waived by
 | `MCAgentProtocol.smoke.cfg` | 286000 to 292000 | 289101 |
 | `positive/stale-turn-rebase-unreachable.cfg` | 286000 to 292000 | 289101 |
 | `positive/two-generations.cfg` | 240000 to 246000 | 243171 |
-| `MCAgentEffects.smoke.cfg` | 325000 to 333000 | 328900 |
-| `MCAgentEffects.live.cfg` | 184000 to 191000 | 187421 |
-| `MCAgentIntegrated.smoke.cfg` | 612000 to 626000 | 618946 |
-| `MCAgentIntegrated.live.cfg` | 17800 to 18400 | 18057 |
-| `positive/integrated-timer-race.cfg` | 1485000 to 1515000 | 1499824 |
+| `MCAgentEffects.smoke.cfg` | 219000 to 226000 | 222513 |
+| `MCAgentEffects.live.cfg` | 125500 to 130000 | 127749 |
+| `MCAgentIntegrated.smoke.cfg` | 422000 to 434000 | 427920 |
+| `MCAgentIntegrated.live.cfg` | 13350 to 13900 | 13617 |
+| `positive/integrated-timer-race.cfg` | 1170000 to 1210000 | 1190621 |
 
 The three exhaustive rows set only `budget_s` (3000, ADR-3331 decision 13);
 their distinct band is the full `0`-`999999999` range and their depth cells
@@ -349,19 +350,23 @@ Safety (invariants), in `MCAgentEffects.smoke.cfg`,
 - `DispatchRequiresCommittedAuthorization`: every dispatch the provider saw is
   of an attempt the journal holds an authorization for.
 - `PolicyControlsRedispatch`: each authorized attempt is dispatched at most
-  once; under `manual` no attempt after the first is authorized or dispatched
-  without a reconcile audit object, and no turn result lands while the effect
-  is in doubt; under `provider_idempotency` the provider executes at most
-  once; `at_least_once` is unconstrained.
-- `EffectResultFromExecution`: a recorded result came from a physical
-  execution of an attempt the journal authorized. Under
-  `provider_idempotency` that execution may belong to another attempt than
-  the one the result is recorded for, since the provider answers a repeat of
-  the effect id with the first execution's result.
+  once, except under `provider_idempotency`, where an ambiguous attempt is
+  re-dispatched under the same effect id and attempt; under `manual` no
+  attempt after the first is authorized or dispatched without a reconcile
+  audit object, and no turn result lands while the effect is in doubt; under
+  `provider_idempotency` only attempt 1 is ever journaled or dispatched and
+  the provider executes at most once; `at_least_once` is otherwise
+  unconstrained.
+- `EffectResultFromExecution`: a recorded result is the journaled attempt's,
+  and came from a physical execution of that attempt. A result from an older
+  attempt leaves HEAD unchanged, as `Kernel::record_effect_result` answers
+  `LateResultIgnored` (`crates/ravel-agents-core/src/kernel.rs:1856`).
 - `CancellationRespected` (effects form): a commit on a turn with a cancel
   request publishes it cancelled; once the request is on the root the owner
   journals no new step or intent and authorizes no new attempt (only a
-  reconcile audit object admits one); nothing rewrites a published result.
+  reconcile audit object admits one); nothing rewrites a published result;
+  and once the input ended cancelled no write changes its effect, so a result
+  arriving after that is evidence only (`kernel.rs:1851` and `1856`).
 
 Liveness, in `MCAgentEffects.live.cfg` only, under `MCFairSpec`:
 `InputSettledOrEffectBlocked`, an input on the inbox eventually leaves it, or
@@ -402,14 +407,22 @@ Negative controls, each the smoke bounds with one switch on in
 | `step-input-drift` | `StepInputDrift` | `StepTranscriptCompatible` |
 | `late-result-overwrites` | `LateResultOverwrites` | `StepTranscriptCompatible` |
 | `authorize-ignores-cancel-request` | `AuthorizeIgnoresCancelRequest` | `CancellationRespected` |
+| `provider-reauthorizes` | `ProviderReauthorizes` | `PolicyControlsRedispatch` |
+| `older-result-recorded` | `OlderResultRecorded` | `EffectResultFromExecution` |
+| `cancelled-result-recorded` | `CancelledResultRecorded` | `CancellationRespected` |
 
 `ambiguous-manual-attempt-retried` and `commit-while-in-doubt` run with the
-`manual` policy only, `late-result-overwrites` with `at_least_once` only (the
-policy under which two executions of one effect are reachable), and
-`step-input-drift` with two input hashes. `authorize-ignores-cancel-request`
-breaks a runner rule the kernel does not enforce (see "Differences from the
-kernel"); its trace is in
-`negative/counterexamples/authorize-ignores-cancel-request.md`.
+`manual` policy only, `late-result-overwrites` and `older-result-recorded`
+with `at_least_once` only (the policy under which two executions of one
+effect are reachable), `provider-reauthorizes` with `provider_idempotency`
+only, and `step-input-drift` with two input hashes.
+`authorize-ignores-cancel-request` breaks the refusal at
+`crates/ravel-agents-core/src/kernel.rs:1764`, `late-result-overwrites` and
+`older-result-recorded` the `LateResultIgnored` answers at `kernel.rs:1835`
+and `1856`, `cancelled-result-recorded` the cancelled-input answer at
+`kernel.rs:1851`, and `provider-reauthorizes` the runner's same-attempt
+re-dispatch at `crates/ravel-agents-runtime/src/effects.rs:330`. Each trace
+is in `negative/counterexamples/<name>.md`.
 
 Reachability probes, every switch off, each violating its probe invariant
 (exit 12) unless noted: `duplicate-execution-reachable`
@@ -537,34 +550,59 @@ Remaining differences, each also stated in its `traceability.md` row:
 - The store keys a wake hint by its due bucket; the models key it by
   generation.
 
-`AgentEffects` and `AgentIntegrated` state some rules as guards on the owner,
-the dispatcher or the reconciler that the kernel does not enforce. Each is a
-rule the runner (task T14) must keep, and the property that rests on it is
-named:
+`AgentEffects` and `AgentIntegrated` follow the kernel's effect rules:
+`Kernel::authorize_attempt` refuses an owner authorization for an effect whose
+input is not the active turn's (`crates/ravel-agents-core/src/kernel.rs:1752`)
+or is being cancelled (`kernel.rs:1764`), and refuses the owner on an effect in
+doubt (`kernel.rs:1777`); `Kernel::record_effect_result` answers
+`LateResultIgnored` without a publish for a result of an older attempt, for a
+different attempt's result after completion, and for any result once the input
+ended cancelled (`kernel.rs:1835`, `1851` and `1856`). Under
+`provider_idempotency` the models re-dispatch the journaled effect id and
+attempt with no HEAD write, as `Coordinator::run_step` does
+(`crates/ravel-agents-runtime/src/effects.rs:330`), and admin reconciliation
+acts only on an effect in doubt, as `Coordinator::reconcile_authorize` and
+`Coordinator::reconcile_attach` require (`effects.rs:456` and `409`). The
+differences that remain, each with the property that rests on it:
 
-- An owner that reads a cancel request on its turn records no new step,
-  commits no new intent and authorizes no new attempt; it commits the turn
-  cancelled. `Kernel::authorize_attempt` does not read the request, and
-  neither does `Kernel::require_running`, which `Kernel::record_step` and
-  `Kernel::commit_intent` use. `CancellationRespected` (effects form) rests
-  on the runner here; the negative `authorize-ignores-cancel-request` shows it
-  fails without the rule.
-- An owner authorizes only on its own running, unblocked turn. The kernel's
-  owner authorization checks the owner fence only: no turn fence and no check
-  that the turn is running or unblocked.
+- An owner that reads a cancel request on its turn journals no new step. The
+  kernel's `Kernel::require_running` (`kernel.rs:1007`), which
+  `Kernel::record_step` and `Kernel::commit_intent` use, checks the turn fence
+  and the replay block but not the request, and the runtime journals the step
+  before `refuse_cancelled` runs (`effects.rs:196` and `657`). The runtime does
+  refuse the intent and every authorization under a request (the
+  `refuse_cancelled` calls in `run_step`). `CancellationRespected` (effects
+  form) states the stricter rule; the step half is test debt in its
+  `traceability.md` row.
+- An owner that reads a cancel request does not latch a `manual` attempt in
+  doubt. The kernel admits that latch under a request (`kernel.rs:1762`, the
+  `latch` exemption); the runtime calls `refuse_cancelled` before it
+  (`effects.rs:338`) and the model's `Reauthorize` requires a running turn
+  without a request.
+- An owner authorizes only on an unblocked turn. The kernel's owner
+  authorization checks the owner fence and that the effect's input is the
+  active turn's (`kernel.rs:1752`), not the replay block; the runtime never
+  reaches an authorization on a blocked turn, because `journal_step` goes
+  through `Kernel::record_step` first.
 - An attempt the reconciler authorized is dispatched by the reconciler alone,
-  and the owner leaves it alone. The root has no field naming the
-  reconciler as that attempt's dispatcher; the model reads its audit object.
+  and the owner leaves it alone. The runtime keeps that in memory (its open
+  attempts, `Coordinator::prune_open_attempts`, `effects.rs:641`); the root has
+  no field naming the reconciler as that attempt's dispatcher, so the model
+  reads its audit object.
 - `AdminAuthorize` and `AdminRecordResult` write an immutable audit object
-  before their CAS, and `PolicyControlsRedispatch` reads it. The kernel writes
-  no audit record.
+  before their CAS, and `PolicyControlsRedispatch` reads it. The kernel
+  appends the audit event to HEAD in the same publish
+  (`push_audit`, `kernel.rs:1799` for an attempt and `kernel.rs:1863` for a
+  result).
 - The owner writes the turn output only after its effect has a result.
-  `Kernel::complete_turn` refuses an effect in doubt but accepts one
-  authorized without a result, on the ground that a handler that completed
-  awaited its attempt; the model encodes that as an ordering on the owner.
+  `Kernel::complete_turn` refuses an effect in doubt (`kernel.rs:1242`) but
+  accepts one authorized without a result, on the ground that a handler that
+  completed awaited its attempt; the model encodes that as an ordering on the
+  owner.
 - A step is recorded completed in one CAS. The kernel also accepts a
-  `Started` record first and replaces it with the completed one; the module
-  header of `AgentEffects.tla` argues it adds no case.
+  `Started` record first and replaces it with the completed one
+  (`kernel.rs:1654`); the module header of `AgentEffects.tla` argues it adds no
+  case.
 
 ## Gaps
 
@@ -590,10 +628,10 @@ named:
   `Kernel::complete_turn` refuses, so the input waits for an admin. In
   `AgentIntegrated`, which has no admin, it waits forever, and its liveness
   property lists the in-doubt effect as a blocked terminal.
-- Under `provider_idempotency` the result recorded for an attempt may come
-  from another attempt's execution (the provider's deduplication answers with
-  the first result). `EffectResultFromExecution` allows that; it is an
-  assumption about the provider, not something the kernel can check.
+- Under `provider_idempotency` the provider is assumed to deduplicate on the
+  effect id, so a re-dispatch of attempt 1 executes nothing new and answers
+  with the first execution's result. That is an assumption about the
+  provider, not something the kernel or the runner can check.
 - `AgentEffects` holds one accepted input, one step and one intent per turn,
   at most two turns and two attempts; enqueue and timers are not in it.
   `AgentIntegrated` has one client request, no replay drift, no retry after a
@@ -617,17 +655,22 @@ named:
 ## Exhaustive runs
 
 Each exhaustive config was run once locally with 2 workers, outside the
-harness; the two T17 runs used `-Xmx4g` on an aarch64 host with 4 cores:
+harness; the T17 runs used `-Xmx4g` on an aarch64 host with 4 cores:
 
 - `MCAgentProtocol.exhaustive.cfg`: 362907 distinct states at depth 27, as
   recorded in the `bands.tsv` comments.
-- `MCAgentEffects.exhaustive.cfg` finished: 2807644 distinct states at depth
-  49 in 270 s, no violation.
+- `MCAgentEffects.exhaustive.cfg` finished: 1944775 distinct states at depth
+  48 in 188 s, no violation (re-run after the effects model was aligned with
+  the kernel's late-result and cancelled-input answers).
 - `MCAgentIntegrated.exhaustive.cfg` did not finish. It was stopped at 560 s
   with 6422545 distinct states at depth 27 and 1849641 still queued, and the
   queue was still growing; no violation was found in the states it reached.
-  Its invariants are checked to completion only at the smoke and timer race
-  bounds. Whether it fits the 3000 s budget is T20's measurement.
+  That run predates the alignment, which shrank every other integrated
+  config by about a fifth to a third, and it was not repeated. Its
+  invariants are checked to completion only at the smoke and timer race
+  bounds. The 3000 s budget in `bands.tsv` is therefore unproven: no run has
+  shown this config finishes inside it. Whether to keep the budget, raise it
+  or lower the bounds is T20's (#3354) decision, on the nightly runner.
 
 ## Running
 
