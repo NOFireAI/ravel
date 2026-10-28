@@ -14,12 +14,12 @@ use ravel_agents_core::error::ErrorKind;
 use ravel_agents_core::head::{EffectStatus, Head};
 use ravel_agents_core::identity::effect_id;
 use ravel_agents_core::state::Handle;
-use ravel_agents_core::wire::OperationStatus;
+use ravel_agents_core::wire::{HandlerPinBody, OperationStatus};
 use ravel_agents_runtime::StepProgress;
 use ravel_object_store::fault::{FaultPlan, Op};
 
 use super::*;
-use crate::drive::{PAST_LEASE_MS, PROVIDER_PREFIX, agent, json_bytes, turn_values};
+use crate::drive::{PAST_LEASE_MS, PROVIDER_PREFIX, agent, json_bytes, pin, turn_values};
 use crate::reference::{Event, RecoveryPolicy, Reply, StepCall};
 use crate::scheduler::{Action, FailureContext};
 use crate::{sim_assert, sim_assert_eq};
@@ -380,6 +380,398 @@ fn kill_point(policy: RecoveryPolicy, point: Point) -> Story {
         ends: ends.all(),
         effect: effect_of(&head, 1),
     }
+}
+
+/// Two inputs. `w1` dispatches op 1's step and is held before executing
+/// it while a client cancels op 1; `w1` then executes, commits with the
+/// attempt still open, and, when `late`, reports the result afterwards.
+/// `w1` then runs op 2's turn, whose step must dispatch.
+fn cancelled_with_open_attempt(late: bool) -> Story {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 2);
+    let ends = Ends::default();
+    let w1_ends = ends.clone();
+    let w1 = worker(&rig, "w1", 10, move |p| async move {
+        let a = p
+            .poll()
+            .await
+            .map_err(|e| format!("poll: {e:?}"))?
+            .ok_or("no assignment")?;
+        let Ok(StepProgress::Dispatched(d)) = p.step(&a, &call(ALO)).await else {
+            return Err("the first step did not dispatch".to_string());
+        };
+        let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
+        let (state, output) = turn_values(&a);
+        p.commit(&a, &state, &output)
+            .await
+            .map_err(|e| format!("commit: {e:?}"))?;
+        if late {
+            p.complete_effect(&op(1), &d, &result)
+                .await
+                .map_err(|e| format!("complete: {e:?}"))?;
+        }
+        w1_ends.push("w1", step_turn(&p, ALO).await?);
+        Ok(())
+    })
+    .with_gates(vec![gate(Op::Put, PROVIDER_PREFIX, 1)]);
+    let c = client(&rig, "c", 30, |p| async move {
+        p.cancel(&op(1)).await.map_err(|e| format!("cancel: {e:?}"))?;
+        Ok(())
+    })
+    .with_gates(vec![gate(Op::Get, "/head", 1)]);
+    let out = run(
+        &rig,
+        1,
+        ScheduleScript::new(vec![ScriptStep::Release(1), ScriptStep::Release(0)]),
+        vec![w1, c],
+    )
+    .expect("schedule");
+    let held: Vec<_> = out
+        .trace
+        .iter()
+        .map(|t| (t.name.as_str(), t.action, t.op))
+        .collect();
+    sim_assert_eq!(
+        out,
+        held,
+        vec![
+            ("c", Action::Released, Op::Get),
+            ("w1", Action::Released, Op::Put)
+        ]
+    );
+    let run = checked(&rig, &out);
+    sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
+    sim_assert!(out, run.inferred.is_empty(), "{:?}", run.inferred);
+    let head = rig.head().expect("head");
+    crate::drive::one_terminal_result_per_input(&head)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.failure_context()));
+    sim_assert_eq!(
+        out,
+        (
+            crate::drive::status_of(&head, 1),
+            crate::drive::status_of(&head, 2)
+        ),
+        (
+            Some(OperationStatus::Cancelled),
+            Some(OperationStatus::Completed)
+        )
+    );
+    sim_assert_eq!(
+        out,
+        effect_of(&head, 2),
+        Some((EffectStatus::Completed, 1, 1))
+    );
+    Story {
+        story: story(&run),
+        dispatched: rig
+            .dispatches
+            .lock()
+            .expect("dispatches")
+            .iter()
+            .map(|(name, d)| (name.clone(), d.attempt))
+            .collect(),
+        executions: executions(&rig, 2),
+        ends: ends.all(),
+        effect: effect_of(&head, 1),
+    }
+}
+
+/// The cancel wedge: a cancelled turn committed with its attempt still
+/// open, and the next turn's step dispatches rather than being refused
+/// for the earlier input's open attempt.
+#[test]
+fn cancelled_turn_with_open_attempt_does_not_wedge_the_next_step() {
+    assert_eq!(
+        cancelled_with_open_attempt(false),
+        expect(
+            &[
+                "start 1: started",
+                "step 1: dispatched a1",
+                "cancel 1: Running requested=true",
+                "commit 1: Cancelled",
+                "start 2: started",
+                "step 2: dispatched a1",
+                "result 2 a1: recorded",
+                "step 2: replayed",
+                "commit 2: Completed",
+            ],
+            &[("w1", 1), ("w1", 1)],
+            &[(1, 1), (2, 1)],
+            &[("w1", Ended::Committed)],
+            (EffectStatus::Authorized, 1, 0),
+        )
+    );
+}
+
+/// A result landing after its input settled cancelled is evidence, and
+/// the input stays cancelled.
+#[test]
+fn late_result_after_cancel_is_evidence() {
+    assert_eq!(
+        cancelled_with_open_attempt(true),
+        expect(
+            &[
+                "start 1: started",
+                "step 1: dispatched a1",
+                "cancel 1: Running requested=true",
+                "commit 1: Cancelled",
+                "result 1 a1: evidence",
+                "start 2: started",
+                "step 2: dispatched a1",
+                "result 2 a1: recorded",
+                "step 2: replayed",
+                "commit 2: Completed",
+            ],
+            &[("w1", 1), ("w1", 1)],
+            &[(1, 1), (2, 1)],
+            &[("w1", Ended::Committed)],
+            (EffectStatus::Authorized, 1, 0),
+        )
+    );
+}
+
+/// `w1` begins op 1 under `v1`, dispatches its step and is held before
+/// executing it. The deployment moves to `v2`: `w2`, presenting only `v2`,
+/// is refused the pinned turn. `w3`, still on `v1`, takes over, re-dispatches
+/// the same attempt and commits. `w1` then executes, reports the same
+/// result, and its commit is refused after `w3`'s.
+#[test]
+fn handler_version_change_while_a_turn_is_suspended() {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let ends = Ends::default();
+    let w1_ends = ends.clone();
+    let w1 = worker(&rig, "w1", 10, move |p| async move {
+        let a = p
+            .poll()
+            .await
+            .map_err(|e| format!("poll: {e:?}"))?
+            .ok_or("no assignment")?;
+        let Ok(StepProgress::Dispatched(d)) = p.step(&a, &call(PI)).await else {
+            return Err("the first step did not dispatch".to_string());
+        };
+        let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
+        p.complete_effect(&op(1), &d, &result)
+            .await
+            .map_err(|e| format!("complete: {e:?}"))?;
+        let (state, output) = turn_values(&a);
+        match p.commit(&a, &state, &output).await {
+            Err(e) if e.kind == ErrorKind::OwnershipLost => w1_ends.push("w1", Ended::Lost),
+            other => return Err(format!("commit: {other:?}")),
+        }
+        Ok(())
+    })
+    .with_gates(vec![gate(Op::Put, PROVIDER_PREFIX, 1)]);
+    let clock = rig.clock.clone();
+    let w2 = worker(&rig, "w2", 20, move |p| async move {
+        p.operation(&op(1))
+            .await
+            .map_err(|e| format!("operation: {e:?}"))?;
+        clock.advance_ms(PAST_LEASE_MS);
+        let v2 = HandlerPinBody {
+            version: "v2".to_string(),
+            ..pin()
+        };
+        match p.poll_with(vec![v2]).await {
+            Err(e) if e.kind == ErrorKind::IncompatibleHandler => Ok(()),
+            other => Err(format!("poll: {other:?}")),
+        }
+    })
+    .with_gates(vec![gate(Op::Get, "/head", 1)]);
+    let w3 = stepper(&rig, "w3", 30, PI, 1, &ends).with_gates(vec![gate(Op::List, "", 1)]);
+    let out = run(
+        &rig,
+        1,
+        ScheduleScript::new(vec![
+            ScriptStep::Release(1),
+            ScriptStep::Release(2),
+            ScriptStep::Release(0),
+        ]),
+        vec![w1, w2, w3],
+    )
+    .expect("schedule");
+    let held: Vec<_> = out
+        .trace
+        .iter()
+        .map(|t| (t.name.as_str(), t.action, t.op))
+        .collect();
+    sim_assert_eq!(
+        out,
+        held,
+        vec![
+            ("w2", Action::Released, Op::Get),
+            ("w3", Action::Released, Op::List),
+            ("w1", Action::Released, Op::Put)
+        ]
+    );
+    let run = checked(&rig, &out);
+    sim_assert_eq!(
+        out,
+        run.refusals,
+        vec![crate::drive::Refusal {
+            actor: "w2".to_string(),
+            call: "poll",
+            kind: ErrorKind::IncompatibleHandler,
+        }]
+    );
+    sim_assert!(out, run.inferred.is_empty(), "{:?}", run.inferred);
+    sim_assert_eq!(
+        out,
+        story(&run),
+        expect_story(&[
+            "start 1: started",
+            "step 1: dispatched a1",
+            "status 1: Running",
+            "start 1: started",
+            "step 1: dispatched a1",
+            "result 1 a1: recorded",
+            "step 1: replayed",
+            "commit 1: Completed",
+            "result 1 a1: recorded",
+            "commit 1: Error(OwnershipLost)",
+        ])
+    );
+    sim_assert_eq!(
+        out,
+        ends.all(),
+        vec![
+            ("w3".to_string(), Ended::Committed),
+            ("w1".to_string(), Ended::Lost)
+        ]
+    );
+    sim_assert_eq!(out, executions(&rig, 1), vec![(1, 0)]);
+    let metrics = |name: &str| rig.proc_named(name).expect("proc").co.metrics();
+    sim_assert_eq!(
+        out,
+        (
+            metrics("w1").ownership_lost_refusals,
+            metrics("w2").incompatible_handler_refusals,
+            metrics("w3").turns_committed
+        ),
+        (1, 1, 1)
+    );
+}
+
+/// Two different results reported for the same attempt: the first is the
+/// effect's, the second is refused `IdempotencyConflict`, and the step
+/// replays the first.
+#[test]
+fn conflicting_results_for_one_attempt_are_idempotency_conflict() {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let w1 = worker(&rig, "w1", 10, |p| async move {
+        let a = p
+            .poll()
+            .await
+            .map_err(|e| format!("poll: {e:?}"))?
+            .ok_or("no assignment")?;
+        let Ok(StepProgress::Dispatched(d)) = p.step(&a, &call(ALO)).await else {
+            return Err("the first step did not dispatch".to_string());
+        };
+        p.complete_effect(&op(1), &d, &json!({ "charged": 5 }))
+            .await
+            .map_err(|e| format!("first result: {e:?}"))?;
+        match p.complete_effect(&op(1), &d, &json!({ "charged": 6 })).await {
+            Err(e) if e.kind == ErrorKind::IdempotencyConflict => {}
+            other => return Err(format!("second result: {other:?}")),
+        }
+        let Ok(StepProgress::Completed { output }) = p.step(&a, &call(ALO)).await else {
+            return Err("the step did not replay".to_string());
+        };
+        if output != json!({ "charged": 5 }) {
+            return Err(format!("replayed {output}"));
+        }
+        let (state, out) = turn_values(&a);
+        p.commit(&a, &state, &out)
+            .await
+            .map_err(|e| format!("commit: {e:?}"))?;
+        Ok(())
+    });
+    let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![w1]).expect("schedule");
+    let run = checked(&rig, &out);
+    sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
+    sim_assert_eq!(
+        out,
+        story(&run),
+        expect_story(&[
+            "start 1: started",
+            "step 1: dispatched a1",
+            "result 1 a1: recorded",
+            "result 1 a1: Error(IdempotencyConflict)",
+            "step 1: replayed",
+            "commit 1: Completed",
+        ])
+    );
+    let head = rig.head().expect("head");
+    sim_assert_eq!(
+        out,
+        effect_of(&head, 1),
+        Some((EffectStatus::Completed, 1, 1))
+    );
+}
+
+/// A client asks after an operation handle naming no accepted input, and
+/// resolves a request id never sent.
+#[test]
+fn query_of_a_handle_with_no_input() {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let c = client(&rig, "c", 30, |p| async move {
+        let status = p
+            .operation(&op(99))
+            .await
+            .map_err(|e| format!("operation: {e:?}"))?;
+        let result = p
+            .result(&op(99))
+            .await
+            .map_err(|e| format!("result: {e:?}"))?;
+        let resolved = p
+            .resolve("never-sent")
+            .await
+            .map_err(|e| format!("resolve: {e:?}"))?;
+        let got = (status, result, resolved);
+        let want = (
+            Reply::UnknownOperation,
+            Reply::UnknownOperation,
+            Reply::Resolved(None),
+        );
+        if got != want {
+            return Err(format!("{got:?}"));
+        }
+        Ok(())
+    });
+    let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![c]).expect("schedule");
+    let run = checked(&rig, &out);
+    sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
+    let replies: Vec<Reply> = run
+        .history
+        .calls()
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.event,
+                Event::Client(
+                    crate::reference::ClientOp::Operation { .. }
+                        | crate::reference::ClientOp::Result { .. }
+                        | crate::reference::ClientOp::Resolve { .. }
+                )
+            )
+        })
+        .map(|c| c.observed.clone())
+        .collect();
+    sim_assert_eq!(
+        out,
+        replies,
+        vec![
+            Reply::UnknownOperation,
+            Reply::UnknownOperation,
+            Reply::Resolved(None)
+        ]
+    );
+}
+
+fn expect_story(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|s| s.to_string()).collect()
 }
 
 fn expect(
