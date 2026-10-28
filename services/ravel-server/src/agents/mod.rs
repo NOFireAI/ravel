@@ -435,7 +435,50 @@ mod tests {
             .await
             .expect("body reads");
         assert_eq!(&bytes[..], include_str!("inspector.html").as_bytes());
+        let page = std::str::from_utf8(&bytes).expect("utf-8 page");
+        for id in INSPECTOR_MARKER_IDS {
+            assert_eq!(
+                page.matches(&format!("id=\"{id}\"")).count(),
+                1,
+                "marker {id}"
+            );
+        }
+        for reason in [
+            "EffectInDoubt",
+            "NonDeterministicReplay",
+            "IncompatibleHandler",
+            "CancelPending",
+        ] {
+            assert!(
+                page.contains(&format!("\"data-reason\": \"{reason}\"")),
+                "{reason}"
+            );
+        }
+        assert!(page.contains("/api/v1/agents/reconcile"));
+        assert!(page.contains("[\"preview\"]"), "previews are labelled");
+        assert!(page.contains("el(\"details\""), "raw payloads sit in <details>");
+        assert!(page.contains("\"Authorization\": \"Bearer \""));
+        for external in ["<script src", "<link", "@import", "http://", "https://", "url("] {
+            assert!(!page.contains(external), "external asset: {external}");
+        }
     }
+
+    /// Every section and input of the inspector page, by element id.
+    const INSPECTOR_MARKER_IDS: [&str; 13] = [
+        "inspector-form",
+        "inspector-token",
+        "inspector-kind",
+        "inspector-key",
+        "inspector-error",
+        "inspector-blocked",
+        "inspector-state",
+        "inspector-active-turn",
+        "inspector-mailbox",
+        "inspector-timers",
+        "inspector-steps",
+        "inspector-effects",
+        "inspector-events",
+    ];
 
     /// `worker/poll` asking for a 60 s wait answers with no assignment once
     /// the 20 s cap elapses, on paused time, and not before it.

@@ -2391,10 +2391,10 @@ query incurred up to that point, not zeros:
 ### Ravel Agents settings (`ravel_agents_*`)
 
 Labels: `mode` on every sample. A process built with the `agents` feature
-renders all nine gauges on every scrape, with or without `--agents`; a build
+renders all ten gauges on every scrape, with or without `--agents`; a build
 without the feature omits them. One sample per family.
 
-Only the first gauge describes behaviour. The other eight repeat the
+Only the first gauge describes behaviour. The next eight repeat the
 `--agents-*` settings as parsed: in this release they are reported and not
 enforced (the flags reference says the same of each flag), so a scrape
 showing `ravel_agents_max_mailbox 256` says what the operator set, not what
@@ -2411,9 +2411,27 @@ the process refused.
 | `ravel_agents_max_state_bytes` | The `--agents-max-state-bytes` setting: most bytes of objects one agent's root may reference. |
 | `ravel_agents_max_receipts` | The `--agents-max-receipts` setting: most idempotency receipts one agent retains. |
 | `ravel_agents_max_timers` | The `--agents-max-timers` setting: most pending timers one agent may hold. |
+| `ravel_agents_sweep_interval_ms` | The `agents.sweep_interval_ms` setting: milliseconds between the interval sweeps of each tenant this process has served, 0 for none. Unlike the eight above, it is enforced. |
+
+The sweep counters below sum every tenant this process has served. Each is a
+counter with the `mode` label; `ravel_agents_sweep_list_pages_total` adds
+`phase`.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_agents_sweep_passes_total` | Sweep passes run, failed ones included: the interval sweep, worker polls and `POST /api/v1/agents/sweep` alike. |
+| `ravel_agents_sweep_list_pages_total{phase}` | LISTs the passes issued: `phase="wake"` over the `_wake/` hints, `phase="dir"` over the `_dir/` agent directory. |
+| `ravel_agents_sweep_head_gets_total` | HEAD reads the passes issued themselves. |
+| `ravel_agents_sweep_hints_read_total` | `_wake` hints in a due bucket the passes acted on. |
+| `ravel_agents_sweep_hints_deleted_total` | Hints deleted after HEAD showed their timer settled. |
+| `ravel_agents_sweep_timers_fired_total` | `TimerFired` replies published by the passes' `FireTimer` CASes. |
+| `ravel_agents_sweep_agents_loaded_total` | Agents with work a pass added to the dispatch set. |
+| `ravel_agents_sweep_dir_entries_repaired_total` | Missing `_dir` entries the passes wrote back. |
 
 Test: `metrics_scrape_reports_every_agents_family_once_with_the_mode_label`
-and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`.
+and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`; the
+sweep counters by `sweep_route_counts_match_the_store_and_needs_agents_admin`
+in `services/ravel-server/tests/agents_timers_e2e.rs`.
 
 ### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
 

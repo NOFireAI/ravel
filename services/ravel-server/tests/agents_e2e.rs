@@ -488,8 +488,8 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
     running.shutdown().await.expect("clean shutdown");
 }
 
-/// The nine settings gauges `agents_seam.rs` pins the values of.
-const SETTINGS_GAUGES: [&str; 9] = [
+/// The ten settings gauges `agents_seam.rs` pins the values of.
+const SETTINGS_GAUGES: [&str; 10] = [
     "ravel_agents_enabled",
     "ravel_agents_activation_concurrency_limit",
     "ravel_agents_poll_concurrency_limit",
@@ -499,6 +499,7 @@ const SETTINGS_GAUGES: [&str; 9] = [
     "ravel_agents_max_state_bytes",
     "ravel_agents_max_receipts",
     "ravel_agents_max_timers",
+    "ravel_agents_sweep_interval_ms",
 ];
 
 /// A client token without `agents` is refused on `send` and a token without

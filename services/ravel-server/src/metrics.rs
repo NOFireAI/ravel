@@ -461,6 +461,19 @@ pub enum Label {
     /// `phase` key with `DdlPhase`.
     #[cfg(feature = "agents")]
     AgentsStorePhase(ravel_agents_store::counters::Phase),
+    /// Which listing a `ravel_agents_sweep_list_pages_total` sample counts:
+    /// `wake` (the `_wake` hint buckets) or `dir` (the agent directory).
+    /// Shares the `phase` key with `AgentsStorePhase`.
+    #[cfg(feature = "agents")]
+    AgentsSweepList(AgentsSweepList),
+}
+
+/// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
+#[cfg(feature = "agents")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentsSweepList {
+    Wake,
+    Dir,
 }
 
 /// The closed `site` set of `ravel_memory_gate_refusals_total` and
@@ -700,6 +713,8 @@ impl Label {
             Label::WorkerRecordRejectReason(_) => "reason",
             #[cfg(feature = "agents")]
             Label::AgentsStorePhase(_) => "phase",
+            #[cfg(feature = "agents")]
+            Label::AgentsSweepList(_) => "phase",
         }
     }
 
@@ -756,6 +771,10 @@ impl Label {
             Label::WorkerRecordRejectReason(reason) => reason.reason().to_string(),
             #[cfg(feature = "agents")]
             Label::AgentsStorePhase(phase) => agents_store_phase_name(*phase).to_string(),
+            #[cfg(feature = "agents")]
+            Label::AgentsSweepList(AgentsSweepList::Wake) => "wake".to_string(),
+            #[cfg(feature = "agents")]
+            Label::AgentsSweepList(AgentsSweepList::Dir) => "dir".to_string(),
         }
     }
 
@@ -4395,6 +4414,11 @@ pub(crate) fn render_agents_families(
             "The --agents-max-timers setting: most pending timers one agent may hold, enforced by the agent kernel.",
             settings.max_timers,
         ),
+        (
+            "ravel_agents_sweep_interval_ms",
+            "The agents.sweep_interval_ms setting: milliseconds between one tenant's timer and directory sweeps in this process, 0 for none. A tenant is swept once this process has served it.",
+            settings.sweep_interval_ms,
+        ),
     ] {
         write_header(out, name, help, "gauge");
         write_sample(out, name, &[Label::Mode(mode)], value);
@@ -4484,6 +4508,66 @@ pub(crate) fn render_agents_families(
     ] {
         write_header(out, name, help, kind);
         write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+
+    let sweep = runtime.sweep_metrics();
+    for (name, help, value) in [
+        (
+            "ravel_agents_sweep_passes_total",
+            "Sweep passes this process ran, failed ones included: the interval sweep, worker polls and POST /api/v1/agents/sweep alike.",
+            sweep.passes,
+        ),
+        (
+            "ravel_agents_sweep_head_gets_total",
+            "HEAD reads sweep passes issued themselves; the store's own reads count under ravel_agents_store_gets_total.",
+            sweep.head_gets,
+        ),
+        (
+            "ravel_agents_sweep_hints_read_total",
+            "_wake hints in a due bucket that sweep passes acted on.",
+            sweep.hints_read,
+        ),
+        (
+            "ravel_agents_sweep_hints_deleted_total",
+            "_wake hints sweep passes deleted after HEAD showed their timer settled.",
+            sweep.hints_deleted,
+        ),
+        (
+            "ravel_agents_sweep_timers_fired_total",
+            "TimerFired replies published by the FireTimer CASes of sweep passes.",
+            sweep.timers_fired,
+        ),
+        (
+            "ravel_agents_sweep_agents_loaded_total",
+            "Agents with work that sweep passes added to the dispatch set.",
+            sweep.agents_loaded,
+        ),
+        (
+            "ravel_agents_sweep_dir_entries_repaired_total",
+            "Missing _dir entries sweep passes wrote back.",
+            sweep.dir_entries_repaired,
+        ),
+    ] {
+        write_header(out, name, help, "counter");
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+    let name = "ravel_agents_sweep_list_pages_total";
+    write_header(
+        out,
+        name,
+        "LISTs sweep passes issued, by listing: wake over _wake/ hints, dir over the _dir/ agent directory.",
+        "counter",
+    );
+    for (list, value) in [
+        (AgentsSweepList::Wake, sweep.wake_list_pages),
+        (AgentsSweepList::Dir, sweep.dir_list_pages),
+    ] {
+        write_sample(
+            out,
+            name,
+            &[Label::Mode(mode), Label::AgentsSweepList(list)],
+            value,
+        );
     }
 
     use ravel_agents_store::counters::{Phase, PhaseCounts};
@@ -10006,6 +10090,8 @@ mod tests {
                 Label::WorkerRecordRejectReason(_) => "reason",
                 #[cfg(feature = "agents")]
                 Label::AgentsStorePhase(_) => "phase",
+                #[cfg(feature = "agents")]
+                Label::AgentsSweepList(_) => "phase",
             })
             .collect();
         assert_eq!(
