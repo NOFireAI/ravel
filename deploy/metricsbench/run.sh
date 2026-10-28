@@ -66,7 +66,9 @@
 # Environment, for tests: METRICSBENCH_DOCKER (default docker),
 # METRICSBENCH_CAPTURE (default capture-effective-config.sh beside this
 # script), METRICSBENCH_SAMPLE_INTERVAL (default 5), METRICSBENCH_READY_TRIES
-# and METRICSBENCH_READY_INTERVAL (default 300 tries 2 s apart),
+# and METRICSBENCH_READY_INTERVAL (default 300 tries 2 s apart; a try that
+# reaches a port which does not answer also spends up to 5 s in curl, so the
+# bound per engine is tries x (interval + 5) s),
 # METRICSBENCH_IMDS (default http://169.254.169.254).
 set -uo pipefail
 
@@ -506,7 +508,9 @@ if [ "$diagnostic" -eq 1 ]; then
   # the limit, and a "success" would falsify nothing.
   entry_profiles="$(py corpus-entry-profiles "$CORPUS" "$FALSIFICATION_ENTRY")" ||
     refuse "the corpus has no entry ${FALSIFICATION_ENTRY}"
+  # An empty list means every profile, as promql_corpus::CorpusEntry reads it.
   case " ${entry_profiles} " in
+    "  ") ;;
     *" ${profile} "*) ;;
     *) refuse "--diagnostic-prometheus-max-samples sends ${FALSIFICATION_ENTRY}, which the corpus declares for '${entry_profiles}', not '${profile}'; on this profile it cannot reach the limit and falsifies nothing" ;;
   esac
@@ -815,7 +819,10 @@ run_diagnostic() {
   step_done ready
   start_sampler
 
-  run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" --store memory \
+  # Prometheus is the only row this run needs; an in-process row of the
+  # history profile would not fit in memory.
+  stamp_str in_process_row skipped
+  run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" --no-in-process-row \
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE"
 
   query="$(py corpus-query "$CORPUS" "$FALSIFICATION_ENTRY")" ||
@@ -867,8 +874,18 @@ run_full() {
   start_sampler
 
   export "${RAVEL_TOKEN_ENV}=${RAVEL_TOKEN_VALUE}"
-  run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" --store memory \
-    --tenant "$RAVEL_TENANT" \
+  # The in-process diagnostic row holds the whole stream in a memory store.
+  # That fits ci's 120,000 samples; cardinality and history do not fit beside
+  # four engine containers, and the stack's RustFS is the engines' own store,
+  # so every other profile runs on its portable rows alone.
+  if [ "$profile" = "ci" ]; then
+    in_process=(--store memory --tenant "$RAVEL_TENANT")
+    stamp_str in_process_row present
+  else
+    in_process=(--no-in-process-row)
+    stamp_str in_process_row skipped
+  fi
+  run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" "${in_process[@]}" \
     --ravel-endpoint "${RAVEL_BASE}/api/v1/write" --ravel-tenant "$RAVEL_TENANT" \
     --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE" \

@@ -492,7 +492,11 @@ Steps, in order, stopping at the first failure:
    their read-back query URLs, output `ingest.json`. Ravel's token reaches it
    only through `--ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN`, never on
    a command line (case a). A failing ingest exits 70 naming the step and the
-   stack is still torn down (case b).
+   stack is still torn down (case b). The `ci` profile keeps the ingest's
+   in-process diagnostic row on a memory store (case a); every other profile
+   passes `--no-in-process-row` (case l), since cardinality's and history's
+   streams do not fit in memory beside four engine containers and the
+   stack's RustFS is the engines' own store.
 7. `mimir-readiness`: the ingest row for Mimir read back exactly what it
    accepted; the line is stamped (case a).
 8. `capture`: `capture-effective-config.sh` into `effective-config.json`,
@@ -525,8 +529,8 @@ b).
 and `anchor_source`, `started_at` and `ended_at`, `store_kind: rustfs`,
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
-`mimir_readiness`, `steps_completed`, `failed_step`, `exit_code`, `status`
-and `teardown`.
+`mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
+f), `steps_completed`, `failed_step`, `exit_code`, `status` and `teardown`.
 
 ### The falsification run
 
