@@ -1154,7 +1154,10 @@ async fn pollers_woken_together_share_one_sweep_pass() {
     assert!(ra.expect("poll a").is_none());
     assert!(rb.expect("poll b").is_none());
     let delta = store.counters().since(&before);
-    assert_eq!(delta.resolve.list, 2, "one shared pass: a wake and a dir page");
+    assert_eq!(
+        delta.resolve.list, 2,
+        "one shared pass: a wake and a dir page"
+    );
     assert_eq!(delta.resolve.get, 3, "three dormant HEADs read once");
     assert_eq!(co.sweep_metrics().passes, 2);
 }
@@ -1204,7 +1207,11 @@ async fn a_poll_issues_no_unbounded_list() {
     clock.advance_ms(SWEEP_MS);
     assert!(poll_now(&co, &w, "v1").await.is_none());
     expect("next pass", store.counters().since(&before).resolve, 4, 4);
-    assert_eq!(co.sweep_metrics().head_gets, 8, "eight distinct agents read");
+    assert_eq!(
+        co.sweep_metrics().head_gets,
+        8,
+        "eight distinct agents read"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1223,7 +1230,10 @@ async fn a_poll_with_no_wait_runs_at_most_one_bounded_pass() {
     let w = worker(&co, "v1");
 
     let before = store.counters();
-    assert!(poll_now(&co, &w, "v1").await.is_some(), "the pass found work");
+    assert!(
+        poll_now(&co, &w, "v1").await.is_some(),
+        "the pass found work"
+    );
     assert_eq!(co.sweep_metrics().passes, 1);
     let first = store.counters().since(&before).resolve;
     assert_eq!(first.list, 2, "one wake page and one directory page");

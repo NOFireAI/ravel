@@ -882,4 +882,3 @@ fn lost_commit_ack_then_takeover_is_a_known_false_negative() {
     );
     sim_assert_eq!(out, (w2.takeovers, w2.turns_committed), (1, 1));
 }
-

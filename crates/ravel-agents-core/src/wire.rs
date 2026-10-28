@@ -301,9 +301,14 @@ pub struct ActiveTurnBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputSourceBody {
-    Message { request_id: String },
+    Message {
+        request_id: String,
+    },
     /// A fired timer: the id and the generation that fired.
-    Timer { timer: String, generation: u64 },
+    Timer {
+        timer: String,
+        generation: u64,
+    },
 }
 
 /// One accepted input of a [`StateResponse`].

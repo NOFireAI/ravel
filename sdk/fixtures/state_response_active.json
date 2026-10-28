@@ -1,0 +1,47 @@
+{
+  "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+  "incarnation": 1,
+  "state_version": 3,
+  "content_type": "application/json",
+  "state": {
+    "items": [
+      "A-1"
+    ],
+    "paid": false
+  },
+  "active_turn": {
+    "turn_id": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "accept_seq": 4,
+    "handler": "checkout",
+    "handler_version": "v2",
+    "handler_digest": "abababababababababababababababababababababababababababababababab",
+    "base_state_version": 3,
+    "started_unix_ns": "1767225600000000000",
+    "lease_hint_unix_ns": "1767225630000000000",
+    "cancel_requested": true,
+    "non_deterministic_replay": false
+  },
+  "mailbox": [
+    {
+      "accept_seq": 4,
+      "handler": "checkout",
+      "source": {
+        "kind": "message",
+        "request_id": "req-4"
+      },
+      "accepted_unix_ns": "1767225599000000000",
+      "failed_attempts": 1
+    },
+    {
+      "accept_seq": 5,
+      "handler": "remind",
+      "source": {
+        "kind": "timer",
+        "timer": "1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e",
+        "generation": 2
+      },
+      "accepted_unix_ns": "1767225601000000000",
+      "failed_attempts": 0
+    }
+  ]
+}
