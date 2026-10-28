@@ -84,6 +84,8 @@ fn valid_report() -> MetricsBenchReport {
         cases_expected: vec![],
         denominators: vec![],
         exclusions: vec![],
+        run_verdict: None,
+        failed_bands: vec![],
     }
 }
 
@@ -352,4 +354,62 @@ fn the_provenance_subcommand_stamps_a_block_a_report_accepts() {
         .expect("spawn");
     let p2: Provenance = serde_json::from_slice(&out2.stdout).expect("JSON");
     assert_ne!(p.corpus_digest, p2.corpus_digest);
+}
+
+/// A report that says `run_verdict: "failed"` is a diagnostic of a failed
+/// run, never a result: `validate` refuses it naming the verdict and every
+/// failed band, although the rest of it stands, and `render` prints that
+/// verdict and prints no table. A verdict without failed bands, or failed
+/// bands without the verdict, is refused as inconsistent.
+///
+/// TO SEE THIS FAIL: make `validate`'s `(Some(RunVerdict::Failed), false)`
+/// arm fall through to `validate_body`: the report then validates.
+#[test]
+fn validate_refuses_a_report_with_a_failed_run_verdict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut doc = valid_v3_json();
+    doc["run_verdict"] = serde_json::json!("failed");
+    doc["failed_bands"] = serde_json::json!([
+        {"band": 6, "check": "readback", "system": "mimir", "reason": "query samples.0 failed: 422"}
+    ]);
+    let out = run_validate(&dir, "failed_run.json", &doc);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("diagnostic of a failed run")
+            && stderr.contains("run_verdict: failed")
+            && stderr.contains("band 6 on mimir: query samples.0 failed: 422"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+
+    let report: MetricsBenchReport = serde_json::from_value(doc).expect("parses");
+    let out = render_report(&dir, "failed_run_render.json", &report);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run_verdict: failed") && stderr.contains("band 6 on mimir"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty(), "no table for a failed run");
+
+    // Either field without the other is refused as inconsistent.
+    let mut verdict_only = valid_v3_json();
+    verdict_only["run_verdict"] = serde_json::json!("failed");
+    let mut bands_only = valid_v3_json();
+    bands_only["failed_bands"] = serde_json::json!([
+        {"band": null, "check": "stall", "system": "mimir", "reason": "projected 9000 s"}
+    ]);
+    for (name, doc) in [
+        ("verdict_only.json", verdict_only),
+        ("bands_only.json", bands_only),
+    ] {
+        let out = run_validate(&dir, name, &doc);
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("run_verdict and failed_bands disagree"),
+            "{name}: {stderr}"
+        );
+    }
 }

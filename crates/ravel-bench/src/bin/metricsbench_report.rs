@@ -14,7 +14,11 @@
 //!   hand-maintained.
 //! - `validate <path>` runs only [`ravel_bench::report_schema::validate`]: exit
 //!   0 when the report stands under its schema version's rules, otherwise a
-//!   non-zero exit with the failing rule on stderr.
+//!   non-zero exit with the failing rule on stderr. A report carrying
+//!   `run_verdict: "failed"` is refused, and `render` refuses it the same way,
+//!   with its failed bands on stderr: it is a diagnostic of a failed run,
+//!   never a result (`validate_refuses_a_report_with_a_failed_run_verdict` in
+//!   `tests/metricsbench_report.rs`).
 //! - `provenance` gathers the reconciled provenance a producer stamps on a
 //!   report: the Ravel git commit, the toolchain, the hardware, the object-store
 //!   backend, and the content digests of the workload manifest and PromQL
