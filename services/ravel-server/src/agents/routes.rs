@@ -31,11 +31,11 @@ use ravel_agents_core::wire::{
     EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
     ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse,
     ResultBody, ResultResponse, SendRequest, StateResponse, StepBody, StepRecordRequest,
-    StepRecordResponse, StepState, WorkerCommitRequest, WorkerHeartbeatRequest,
+    StepRecordResponse, WorkerCommitRequest, WorkerHeartbeatRequest,
     WorkerHeartbeatResponse, WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest,
     WorkerRegisterResponse,
 };
-use ravel_agents_runtime::{EffectRef, EffectSettled, StepProgress, StepSpec};
+use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};
 use ravel_maintain::QueryAuditSink;
 use ravel_query::http::TenantResolver;
@@ -46,7 +46,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use super::audit::{ReconcileAction, agents_reconcile_audit_event};
 use super::runtime::{
-    AgentsRuntime, LONG_POLL_CAP_MS, Lane, RecordingDispatcher, ResultWaitCounters, TenantAgents,
+    AgentsRuntime, LONG_POLL_CAP_MS, Lane, WorkerDispatcher, ResultWaitCounters, TenantAgents,
 };
 use crate::service::{ServiceError, authenticate_principal};
 use ravel_tenant_resolve::Principal;
@@ -444,14 +444,8 @@ pub(super) async fn worker_poll(State(api): State<Api>, req: Request<Body>) -> R
         let deadline = deadline(u64::from(body.wait_ms));
         let assignment = match call.tenant.coordinator.poll(&body, deadline).await? {
             None => None,
-            Some(mut assignment) => {
+            Some(assignment) => {
                 let recorded = recorded_unix_ns(&call.tenant, &assignment.lease).await?;
-                for step in &mut assignment.steps {
-                    if step.output.as_ref().and_then(step_failure).is_some() {
-                        step.status = StepState::Started;
-                        step.output = None;
-                    }
-                }
                 Some(assignment.polled(recorded))
             }
         };
@@ -513,7 +507,7 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
             policy: body.policy.into(),
             input_hash,
         };
-        let dispatcher = RecordingDispatcher::default();
+        let dispatcher = WorkerDispatcher;
         let progress = call
             .tenant
             .coordinator
@@ -542,23 +536,18 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
         };
         let effect = effect_id(head.incarnation, seq, &spec.step_key);
         let handle = effect_handle(agent, head.incarnation, effect);
+        let result_attempt = || {
+            head.effects
+                .iter()
+                .find(|e| e.effect_id == effect)
+                .map_or(0, |e| e.result_attempt)
+        };
         let (step, attempt, failure) = match progress {
             StepProgress::Dispatched(dispatch) => (step_body(step, None), dispatch.attempt, None),
             StepProgress::Completed { output } => {
-                let attempt = head
-                    .effects
-                    .iter()
-                    .find(|e| e.effect_id == effect)
-                    .map_or(0, |e| e.result_attempt);
-                match step_failure(&output) {
-                    Some(error) => {
-                        let mut body = step_body(step, None);
-                        body.status = StepState::Started;
-                        (body, attempt, Some(error.to_string()))
-                    }
-                    None => (step_body(step, Some(output)), attempt, None),
-                }
+                (step_body(step, Some(output)), result_attempt(), None)
             }
+            StepProgress::Failed { error } => (step_body(step, None), result_attempt(), Some(error)),
         };
         Ok::<_, Refusal>(Json(StepRecordResponse {
             step,
@@ -669,21 +658,27 @@ pub(super) async fn effect_inspect(
             })
             .collect();
         let mut evidence = Vec::new();
-        for (attempt, result) in call.tenant.evidence.of(effect.agent, effect.effect_id) {
+        for (attempt, dep) in call.tenant.evidence.of(effect.agent, effect.effect_id) {
+            let (result, failure) = read_result(&call.tenant, &effect.agent, dep).await?;
             evidence.push(EffectEvidenceBody {
                 attempt,
-                result: read_json(&call.tenant, &effect.agent, Some(result)).await?,
+                result,
+                failure,
             });
         }
-        let result = match record.result {
-            Some(dep) => Some(read_json(&call.tenant, &effect.agent, Some(dep)).await?),
-            None => None,
+        let (result, failure) = match record.result {
+            Some(dep) => {
+                let (output, failure) = read_result(&call.tenant, &effect.agent, dep).await?;
+                (failure.is_none().then_some(output), failure)
+            }
+            None => (None, None),
         };
         Ok::<_, Refusal>(Json(EffectInspectResponse {
             effect: effect_body(effect.agent, head.incarnation, record),
             step_key: record.step_key.clone(),
             result_attempt: recorded,
             result,
+            failure,
             attempts,
             evidence,
         }))
@@ -757,6 +752,11 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
                 return Err(wrong_attempt());
             }
             (ReconcileDecision::Retry, EffectStatus::Authorized)
+                if body.attempt == record.attempt =>
+            {
+                return Err(not_in_doubt());
+            }
+            (ReconcileDecision::Retry, EffectStatus::Authorized)
                 if Some(record.attempt) != body.attempt.checked_add(1) =>
             {
                 return Err(wrong_attempt());
@@ -794,7 +794,7 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
                 let next = body.attempt.checked_add(1).ok_or_else(not_in_doubt)?;
                 call.tenant
                     .coordinator
-                    .reconcile_authorize(&effect, next, &RecordingDispatcher::default())
+                    .reconcile_authorize(&effect, next)
                     .await?;
             }
         }
@@ -808,16 +808,6 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
         }))
     };
     run.await.into_response()
-}
-
-/// The tool failure a step's output records: exactly `{"error": <string>}`,
-/// the shape `Coordinator::fail_effect` stores.
-fn step_failure(output: &Value) -> Option<&str> {
-    let object = output.as_object()?;
-    if object.len() != 1 {
-        return None;
-    }
-    object.get("error")?.as_str()
 }
 
 fn step_body(step: &StepRecord, output: Option<Value>) -> StepBody {
@@ -1048,6 +1038,19 @@ async fn read_json(
             "object is not a JSON value",
         )
     })
+}
+
+/// An effect's result object: its output, or null and the tool failure
+/// recorded through `effects/fail`.
+async fn read_result(
+    tenant: &TenantAgents,
+    agent: &AgentId,
+    dep: ravel_agents_core::head::ObjectRef,
+) -> Result<(Value, Option<String>), Refusal> {
+    match tenant.coordinator.read_result(agent, Some(dep)).await? {
+        EffectResult::Output(output) => Ok((output, None)),
+        EffectResult::Failure(error) => Ok((Value::Null, Some(error))),
+    }
 }
 
 /// The operation's result once terminal, re-read after every commit or

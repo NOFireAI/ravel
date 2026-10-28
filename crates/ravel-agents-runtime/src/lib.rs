@@ -56,8 +56,8 @@ mod ownership;
 mod unload;
 
 pub use effects::{
-    Dispatch, EffectDispatcher, EffectRef, EffectSettled, StepJournal, StepProgress, StepSpec,
-    UNKNOWN_OUTCOME_RETRIES,
+    Dispatch, EffectDispatcher, EffectRef, EffectResult, EffectSettled, FAILURE_RESULT_PREFIX,
+    StepJournal, StepProgress, StepSpec, UNKNOWN_OUTCOME_RETRIES,
 };
 pub use failure::FailOutcome;
 pub use metrics::AgentsMetricsSnapshot;

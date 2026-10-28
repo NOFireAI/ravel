@@ -2,9 +2,9 @@
 //! [`Coordinator`] per tenant over a tenant-scoped [`AgentStore`], built on
 //! first use, plus the router's own admission permits.
 //!
-//! The coordinator is handed a [`RecordingDispatcher`]: the worker that asked
+//! The coordinator is handed a [`WorkerDispatcher`]: the worker that asked
 //! for a step runs the tool itself, so dispatching an attempt here executes
-//! nothing and only keeps the attempt for the route's answer.
+//! nothing, and the route answers with the attempt `run_step` returns.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,22 +82,12 @@ impl EvidenceIndex {
 }
 
 /// The dispatcher hook the routes hand the coordinator. It executes nothing:
-/// it keeps each attempt it is handed so the route can answer with it.
+/// the worker that asked for the step runs the tool.
 #[derive(Debug, Default)]
-pub struct RecordingDispatcher {
-    dispatched: Mutex<Vec<Dispatch>>,
-}
+pub struct WorkerDispatcher;
 
-impl RecordingDispatcher {
-    pub fn dispatched(&self) -> Vec<Dispatch> {
-        self.dispatched.lock().clone()
-    }
-}
-
-impl EffectDispatcher for RecordingDispatcher {
-    fn dispatch(&self, dispatch: &Dispatch) {
-        self.dispatched.lock().push(dispatch.clone());
-    }
+impl EffectDispatcher for WorkerDispatcher {
+    fn dispatch(&self, _dispatch: &Dispatch) {}
 }
 
 /// Which admission pool a route draws from.

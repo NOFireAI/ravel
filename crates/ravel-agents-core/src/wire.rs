@@ -370,7 +370,11 @@ pub struct EffectAttemptBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectEvidenceBody {
     pub attempt: u32,
+    /// The reported output; null when the report was a failure.
     pub result: Value,
+    /// The reported tool failure, when the report was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 /// `GET /api/v1/agents/effects/{effect}`
@@ -381,7 +385,11 @@ pub struct EffectInspectResponse {
     pub step_key: String,
     /// The attempt whose result is recorded, once one is.
     pub result_attempt: Option<u32>,
+    /// The recorded output; null when the recorded result is a failure.
     pub result: Option<Value>,
+    /// The recorded tool failure, when the result is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
     pub attempts: Vec<EffectAttemptBody>,
     pub evidence: Vec<EffectEvidenceBody>,
 }
