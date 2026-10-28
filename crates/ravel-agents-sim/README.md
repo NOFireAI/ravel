@@ -147,9 +147,10 @@ Each of these is a test in the crate:
 - `workers::a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll`
   (ignored): a poll whose `BeginTurn` CAS lost its answer once and was
   retried, then lost the retry's answer too, hands `OutcomeUnknown` to the
-  worker instead of settling it. The runtime spends one retry flag on both
-  `OwnershipLost` and `OutcomeUnknown`. Seed 11000167 reaches it, and so do
-  17000075 and 19000231 in 512-seed windows; none of the default seeds does.
+  worker instead of settling it (issue #3425). The runtime spends one retry
+  flag on both `OwnershipLost` and `OutcomeUnknown`. Seed 11000167 reaches
+  it, and so do 17000075 and 19000231 in 512-seed windows; none of the
+  default seeds does.
   `drive::map_error` reports `OutcomeUnknown` as unmappable, and
   `workers::kills` counts this one shape (`escaped_unknown`, pinned 0 on the
   default batch, and 1 by

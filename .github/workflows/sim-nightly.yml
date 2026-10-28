@@ -99,7 +99,8 @@ jobs:
           INPUT_SEED: ${{ github.event.inputs.agents_seed }}
           INPUT_SEEDS: ${{ github.event.inputs.agents_seeds }}
         run: |
-          seed="${INPUT_SEED:-$(( $(date -u +%s) / 86400 * 1000000 ))}"
+          day="$(( $(date -u +%s) / 86400 ))"
+          seed="${INPUT_SEED:-$(( day * 1000000 ))}"
           seeds="${INPUT_SEEDS:-512}"
           echo "replay: RAVEL_SIM_SEED=$seed RAVEL_SIM_SEEDS=$seeds crates/ravel-agents-sim/nightly.sh"
           echo "replay: \`RAVEL_SIM_SEED=$seed RAVEL_SIM_SEEDS=$seeds crates/ravel-agents-sim/nightly.sh\`" >> "$GITHUB_STEP_SUMMARY"

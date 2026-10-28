@@ -52,7 +52,10 @@ for s in "${SCHEDULES[@]}"; do
     missing=1
   fi
 done
-extra="$(grep -vcE "^sim-batch ($(IFS='|'; echo "${SCHEDULES[*]}")) " <<<"$lines" || true)"
+extra=0
+if [[ -n "$lines" ]]; then
+  extra="$(grep -vcE "^sim-batch ($(IFS='|'; echo "${SCHEDULES[*]}")) " <<<"$lines" || true)"
+fi
 if [[ "$extra" != 0 ]]; then
   echo "UNKNOWN: $extra sim-batch lines name no listed schedule" >&2
   missing=1
