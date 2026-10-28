@@ -477,6 +477,27 @@ impl ReferenceMachine {
         &self.terminal_log
     }
 
+    /// The effect of step `step_key` of `operation`'s input in the live
+    /// incarnation, as a journal would read it.
+    pub fn effect_view(&self, operation: &Handle, step_key: &str) -> Option<EffectView> {
+        let (seq, _) = self.input(operation).ok()?;
+        let life = self.life.as_ref()?;
+        life.effects
+            .get(&(seq, step_key.to_string()))
+            .map(|e| EffectView {
+                phase: e.phase,
+                attempt: e.attempt,
+            })
+    }
+
+    /// Whether the running turn journals step `step_key` as completed.
+    pub fn step_completed(&self, step_key: &str) -> bool {
+        self.life
+            .as_ref()
+            .and_then(|life| life.steps.get(step_key))
+            .is_some_and(|s| s.completed.is_some())
+    }
+
     /// Apply one event and return the reply its caller should observe.
     pub fn apply(&mut self, event: &Event) -> Reply {
         match event {
