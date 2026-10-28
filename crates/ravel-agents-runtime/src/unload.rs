@@ -17,9 +17,8 @@ impl Coordinator {
     /// dropped.
     pub fn unload_idle(&self) -> usize {
         let now = self.now();
-        let idle_ns =
-            i64::try_from(self.config.idle_unload_after_ms.saturating_mul(1_000_000))
-                .unwrap_or(i64::MAX);
+        let idle_ns = i64::try_from(self.config.idle_unload_after_ms.saturating_mul(1_000_000))
+            .unwrap_or(i64::MAX);
         let dropped: Vec<_> = {
             let mut agents = self.agents.lock();
             let idle: Vec<_> = agents

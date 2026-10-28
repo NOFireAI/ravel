@@ -18,7 +18,9 @@ use ravel_agents_store::backoff::NoBackoff;
 use ravel_agents_store::counters::PhaseCounts;
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_types::TenantHash;
 use serde_json::{Value, json};
@@ -284,7 +286,10 @@ async fn competing_sends_dispatch_in_accept_seq_order() {
     let mut by_seq = BTreeMap::new();
     for task in tasks {
         for (seq, payload) in task.await.expect("join") {
-            assert!(by_seq.insert(seq, payload).is_none(), "accept_seq {seq} twice");
+            assert!(
+                by_seq.insert(seq, payload).is_none(),
+                "accept_seq {seq} twice"
+            );
         }
     }
     let expected: Vec<u64> = (1..=20).collect();
@@ -434,7 +439,10 @@ async fn incompatible_handler_is_refused_before_any_write() {
         .await
         .expect_err("v2 against a v1 turn");
     assert_eq!(refused.kind, ErrorKind::IncompatibleHandler);
-    assert_eq!(store.counters().since(&before).publish, PhaseCounts::default());
+    assert_eq!(
+        store.counters().since(&before).publish,
+        PhaseCounts::default()
+    );
     assert_eq!(co.metrics().incompatible_handler_refusals, 1);
     assert_eq!(co.metrics().takeovers, 1, "only w1's activation");
 }
@@ -576,7 +584,10 @@ async fn idle_unload_writes_nothing_and_send_reloads_from_head() {
     clock.advance_ms(IDLE_MS);
     let before = store.counters();
     assert_eq!(co.unload_idle(), 1);
-    assert_eq!(store.counters().since(&before).total(), PhaseCounts::default());
+    assert_eq!(
+        store.counters().since(&before).total(),
+        PhaseCounts::default()
+    );
     assert_eq!(co.metrics().agents_loaded, loaded - 1);
     assert!(co.cached(&id_of("o-1")).is_none());
 
@@ -601,8 +612,14 @@ async fn heartbeat_renews_inside_the_lease_and_is_refused_after_takeover() {
     clock.advance_ms(LEASE_MS / 2);
     let before = store.counters();
     let expires = co.heartbeat(&la.lease).await.expect("renewed");
-    assert_eq!(expires, clock.now_unix_ns() + i64::try_from(LEASE_MS).expect("ms") * MS);
-    assert_eq!(store.counters().since(&before).publish, PhaseCounts::default());
+    assert_eq!(
+        expires,
+        clock.now_unix_ns() + i64::try_from(LEASE_MS).expect("ms") * MS
+    );
+    assert_eq!(
+        store.counters().since(&before).publish,
+        PhaseCounts::default()
+    );
 
     // The renewal moved the takeover point: B is not leased before it.
     clock.advance_ms(LEASE_MS);
@@ -617,7 +634,10 @@ async fn heartbeat_renews_inside_the_lease_and_is_refused_after_takeover() {
         .await
         .expect_err("A after the takeover");
     assert_eq!(lost.kind, ErrorKind::OwnershipLost);
-    assert_eq!(store.counters().since(&before).publish, PhaseCounts::default());
+    assert_eq!(
+        store.counters().since(&before).publish,
+        PhaseCounts::default()
+    );
     assert_eq!(co.metrics().ownership_lost_refusals, 1);
     co.heartbeat(&lb.lease).await.expect("B renews");
 }
@@ -628,10 +648,13 @@ async fn a_waiting_poll_wakes_on_send_and_the_wait_is_capped() {
     create(&co, "o-1").await;
     let w = worker(&co, "v1");
     let req = poll_req(&w, "v1", 5_000);
-    let (polled, sent) = tokio::join!(co.poll(&req, Instant::now() + Duration::from_secs(60)), async {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        send(&co, "o-1", "r-1", json!(1)).await
-    });
+    let (polled, sent) = tokio::join!(
+        co.poll(&req, Instant::now() + Duration::from_secs(60)),
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            send(&co, "o-1", "r-1", json!(1)).await
+        }
+    );
     let polled = polled.expect("poll").expect("woken with work");
     assert_eq!(polled.accept_seq, sent.accept_seq);
     assert_eq!(co.metrics().polls_waited, 1);
@@ -641,7 +664,10 @@ async fn a_waiting_poll_wakes_on_send_and_the_wait_is_capped() {
         .expect("commit");
     let start = Instant::now();
     let none = co
-        .poll(&poll_req(&w, "v1", 60_000), start + Duration::from_secs(120))
+        .poll(
+            &poll_req(&w, "v1", 60_000),
+            start + Duration::from_secs(120),
+        )
         .await
         .expect("poll");
     assert!(none.is_none());
@@ -659,10 +685,18 @@ async fn activation_and_admin_takeover_are_one_cas_each() {
     let (_clock, store, co) = rig();
     create(&co, "o-1").await;
     let before = store.counters();
-    assert_eq!(co.activate(&agent_ref("o-1"), "w-a").await.expect("activate"), 1);
+    assert_eq!(
+        co.activate(&agent_ref("o-1"), "w-a")
+            .await
+            .expect("activate"),
+        1
+    );
     assert_eq!(store.counters().since(&before).publish.cas, 1);
     let before = store.counters();
-    assert_eq!(co.activate(&agent_ref("o-1"), "w-a").await.expect("again"), 1);
+    assert_eq!(
+        co.activate(&agent_ref("o-1"), "w-a").await.expect("again"),
+        1
+    );
     assert_eq!(store.counters().since(&before).publish.cas, 0);
     let before = store.counters();
     let epoch = co

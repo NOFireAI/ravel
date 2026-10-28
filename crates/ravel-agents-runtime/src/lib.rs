@@ -236,7 +236,9 @@ impl Coordinator {
             {
                 Ok(out) => break out,
                 Err(e) if e.kind == ErrorKind::OutcomeUnknown => {
-                    break self.settle_enqueue(&agent, incarnation, req, &payload, e).await?;
+                    break self
+                        .settle_enqueue(&agent, incarnation, req, &payload, e)
+                        .await?;
                 }
                 // A cached incarnation can be older than HEAD's.
                 Err(e) if e.kind == ErrorKind::AgentGone && !reloaded => {
@@ -342,23 +344,24 @@ impl Coordinator {
                         input: Some(input),
                     });
                 }
-                let command =
-                    ravel_agents_core::command::Command::CompleteTurn(CompleteTurn {
-                        fence: fence.clone(),
-                        observed_root_revision: req.lease.observed_root_revision,
-                        new_state,
-                        output,
-                        events: event_specs,
-                        timer_changes,
-                        intents: intent_specs,
-                    });
+                let command = ravel_agents_core::command::Command::CompleteTurn(CompleteTurn {
+                    fence: fence.clone(),
+                    observed_root_revision: req.lease.observed_root_revision,
+                    new_state,
+                    output,
+                    events: event_specs,
+                    timer_changes,
+                    intents: intent_specs,
+                });
                 let settled = self.publish_turn_command(&agent, &command, &deps).await?;
                 self.complete_response(&agent, &fence, settled)
             }
             TurnOutcome::Failed { error, terminal } => {
                 let verdict = self.fail(&req.lease, error, *terminal).await?;
                 let (accept_seq, status) = match verdict {
-                    FailOutcome::Retry { accept_seq, .. } => (accept_seq, OperationStatus::Accepted),
+                    FailOutcome::Retry { accept_seq, .. } => {
+                        (accept_seq, OperationStatus::Accepted)
+                    }
                     FailOutcome::Failed { accept_seq, .. } => (accept_seq, OperationStatus::Failed),
                     FailOutcome::Cancelled { accept_seq } => {
                         (accept_seq, OperationStatus::Cancelled)
@@ -399,9 +402,7 @@ impl Coordinator {
             // A retry of a commit that already published, or a lost
             // acknowledgement settled through `resolve`: the root's version
             // is the committed one or a later one.
-            Reply::AlreadyCommitted { accept_seq } => {
-                (accept_seq, out.head.state_version, false)
-            }
+            Reply::AlreadyCommitted { accept_seq } => (accept_seq, out.head.state_version, false),
             _ => {
                 return Err(refused(
                     agent,
@@ -628,8 +629,13 @@ pub(crate) fn fence_from_lease(lease: &TurnLease) -> Result<(AgentId, TurnFence)
             "lease agent id is malformed",
         )
     })?;
-    let turn_id = decode_id(&lease.turn_id)
-        .ok_or_else(|| refused(&agent, ErrorKind::OwnershipLost, "lease turn id is malformed"))?;
+    let turn_id = decode_id(&lease.turn_id).ok_or_else(|| {
+        refused(
+            &agent,
+            ErrorKind::OwnershipLost,
+            "lease turn id is malformed",
+        )
+    })?;
     let handler_digest = decode_hash(&lease.handler_digest).ok_or_else(|| {
         refused(
             &agent,

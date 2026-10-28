@@ -22,9 +22,7 @@ use ravel_agents_core::head::{ActiveTurn, Head, ObjectRef};
 use ravel_agents_core::identity::AgentId;
 use ravel_agents_core::kernel::Reply;
 use ravel_agents_core::state::Handle;
-use ravel_agents_core::wire::{
-    AgentRef, StepBody, TurnAssignment, TurnLease, WorkerPollRequest,
-};
+use ravel_agents_core::wire::{AgentRef, StepBody, TurnAssignment, TurnLease, WorkerPollRequest};
 use ravel_agents_store::HeadState;
 use serde_json::Value;
 
@@ -321,7 +319,11 @@ impl Coordinator {
     }
 
     /// An object decoded as JSON; no object is `null`.
-    async fn read_json(&self, agent: &AgentId, dep: Option<ObjectRef>) -> Result<Value, AgentError> {
+    async fn read_json(
+        &self,
+        agent: &AgentId,
+        dep: Option<ObjectRef>,
+    ) -> Result<Value, AgentError> {
         let Some(dep) = dep else {
             return Ok(Value::Null);
         };

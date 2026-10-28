@@ -107,9 +107,7 @@ impl Coordinator {
         }
         let lease = self.leases.current(agent, head);
         let grace = ms_to_ns(self.config.heartbeat_grace_ms);
-        if head.active_turn.is_none()
-            || self.now() > lease.expires_unix_ns.saturating_add(grace)
-        {
+        if head.active_turn.is_none() || self.now() > lease.expires_unix_ns.saturating_add(grace) {
             return Some(TakeoverReason::LeaseExpired);
         }
         None

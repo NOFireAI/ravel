@@ -36,9 +36,15 @@ use crate::{Coordinator, fence_from_lease, refused};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailOutcome {
     /// The input waits for another attempt.
-    Retry { accept_seq: u64, failed_attempts: u32 },
+    Retry {
+        accept_seq: u64,
+        failed_attempts: u32,
+    },
     /// The input ended failed.
-    Failed { accept_seq: u64, dead_lettered: bool },
+    Failed {
+        accept_seq: u64,
+        dead_lettered: bool,
+    },
     /// Cancellation was requested during the turn; the input ended
     /// cancelled.
     Cancelled { accept_seq: u64 },
