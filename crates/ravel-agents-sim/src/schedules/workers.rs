@@ -542,8 +542,7 @@ fn worker_kills_across_seeds() {
         totals.false_negatives += k.false_negatives;
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(totals, KILL_TOTALS);
+    pinned("worker_kills", runs, totals, KILL_TOTALS);
 }
 
 /// The seed of [`worker_kills_across_seeds`] whose first run diverged: no
@@ -659,8 +658,7 @@ fn suspended_worker_across_seeds() {
         }
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(taken_over, SUSPENDED_TAKEN_OVER);
+    pinned("suspended_worker", runs, taken_over, SUSPENDED_TAKEN_OVER);
 }
 
 /// Runs of the batch where `w2` took over before `w1`'s commit.
@@ -715,8 +713,7 @@ fn cold_restart_across_seeds() {
         turns += cold_restart_race(seed);
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(turns, COLD_RESTART_TURNS);
+    pinned("cold_restart", runs, turns, COLD_RESTART_TURNS);
 }
 
 /// `w-restarted`'s turns over the batch; the drain ran the rest of 128.

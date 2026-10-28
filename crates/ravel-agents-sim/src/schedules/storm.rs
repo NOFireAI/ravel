@@ -483,8 +483,7 @@ fn recovery_storms_across_seeds() {
         totals.longest_wait = totals.longest_wait.max(s.longest_wait());
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(totals, STORM_TOTALS);
+    pinned("recovery_storms", runs, totals, STORM_TOTALS);
 }
 
 /// The batch's totals. Every pass spends its whole budget, four LISTs and
