@@ -36,6 +36,10 @@ The SDK runs against the in-process fake coordinator in
 | `@ravel/agents/worker` | `defineAgent`, `message`, `serveAgents` and the step runner |
 | `@ravel/agents/tools` | `defineTool` |
 | `@ravel/agents/testing` | `createTestHarness`: in-process agents for tests |
+| `@ravel/agents/contract` | `generateContract`: client types from an agent's handler schemas |
+| `@ravel/agents/scaffold` | `scaffold`: write a starter project into an empty directory |
+
+The package's bin, `ravel-agents-scaffold <dir>`, runs `scaffold`.
 
 The client entry imports no server-only module: nothing under `worker/`,
 `tools/` or `testing/`, and none of `node:child_process`, `node:fs` or
@@ -90,6 +94,63 @@ await h.close();
 
 Against a server, the client side is the same with
 `createClient({ url, token }).agent<typeof order>("order", "o-1")`.
+
+## Scaffold and typed contract
+
+`ravel-agents-scaffold <dir>` (from `sdk/typescript/`, `node
+packages/agents/bin/ravel-agents-scaffold.js <dir>`) writes a starter project: one agent, `order`,
+whose `checkout` handler prices a line through the durable step `price`
+against a local price-list fixture (no network, no API key); the client
+types generated from its handler schemas; a client typed by them; a vitest
+suite against `@ravel/agents/testing`; and its `package.json`, `tsconfig.json`
+and README. `npm install && npm test` in the output passes with no server and
+no API key. The `ravel` CLI has no scaffold command yet; when one lands it
+is meant to run this bin.
+
+- The output typechecks and its own suite passes, run as a child process
+  with every `*_API_KEY` variable removed and again with poison values set,
+  and no generated file names an API key; the generated test and the files
+  it imports do not read `process.env`. The file list is exactly
+  `SCAFFOLD_FILES`. Test: `scaffold output typechecks and its tests pass
+  without an API key` (`src/scaffold/index.test.ts`).
+- A directory that is not empty, even one holding only an empty
+  subdirectory, is refused with `ScaffoldError` code `target_not_empty`
+  before anything is written, and a path that is a file with
+  `target_not_a_directory`; files are opened with `wx`, so none is
+  overwritten. Tests: `a second scaffold into the same directory is refused
+  and changes nothing`, `a directory holding any other file is refused and
+  nothing is written`, `a directory holding only an empty subdirectory is
+  refused`, `a path that is a file is refused`.
+- The bin exits 0 with the file list, 1 with `<code>: <message>` on stderr
+  for a refused directory, and 64 on bad usage. Test: `the bin writes a
+  project, exits 1 on a non-empty directory and 64 on bad usage`.
+- The project links `@ravel/agents` with a relative `file:` dependency and
+  pins zod, typescript, vitest and `@types/node` to the versions this
+  workspace pins. Test: `the generated package.json links this package and
+  pins the workspace's versions`.
+
+`generateContract(agent)` (`@ravel/agents/contract`) returns a TypeScript
+module of client types for one agent: `AGENT_KIND`, `AGENT_VERSION`,
+`HANDLER_NAMES`, `HandlerName`, and `InputOf<K>`, `OutputOf<K>` and
+`OperationOf<K>` for each handler. Inputs are the payload schemas' input side
+and outputs the result schemas' output side, as `PayloadOf` and `ResultOf`.
+
+- The contract generated from `examples/assistant` typechecks against the
+  agent's own `PayloadOf`, `ResultOf` and `OperationHandle` types, and a
+  contract that disagrees with the agent fails that check. Tests: `the
+  contract generated from the example assistant typechecks against the
+  agent's own types`, `a contract that disagrees with the agent fails that
+  typecheck` (`src/scaffold/contract.test.ts`).
+- The emitted text is pinned for a schema with an optional member, a
+  defaulted enum, a literal and a nullable member. Test: `emits handler
+  names, input and output types and the operation handle type`.
+- A `bigint`, a `Date`, a transform in a result schema or a recursive
+  schema is refused with `ContractError` code `unsupported_schema` naming
+  the handler side. Test: `a schema with no TypeScript form is refused with
+  a ContractError naming the handler side`.
+- The template's checked-in `contract.ts` is the generator's output. Test:
+  `the template's contract.ts is the generator's output for the template
+  agent`.
 
 ## Behaviour and the tests that pin it
 
@@ -322,22 +383,79 @@ that recorded the failure and on every retry that replays it; it carries
 the step key and the recorded error text (test: `P11 a tool failure is
 journaled as the step's result before the failed commit, and replayed`).
 
-## The test harness is not durable
+## The testing export (`@ravel/agents/testing`)
 
-`createTestHarness` runs a fake coordinator in process memory. It models the
-coordinator's protocol (leases, epochs, step journal, retries, dead letters,
-blocked operations), not its storage: every agent, operation, step and
-event is lost on `close()` or when the process exits. `crashWorker()`
-revokes the worker's leases and starts a fresh worker against the same
-fake; it simulates a worker crash, not a coordinator or store crash.
-`advanceTime(ms)` is the only thing that moves the fake's clock. The fake
-reads wall-clock time only to bound the long-poll waits in `poll` and
-`waitTerminal`, and `delayNext` holds a response back with a timer; none of
-these changes state. The fake refuses a failed commit while a step's
-attempt is authorized without a result, as the kernel does (test: `P11 the
-fake refuses FailTurn while a step's attempt is authorized without a
-result`, `review.test.ts`). A test that passes against the harness says the
-handler behaves under replay; it says nothing about what Ravel persists.
+`createTestHarness({ agents, tools })` returns a fake coordinator
+(`coordinator`), a client over it (`client`, and `agent(definition, key)`
+for a typed one), one worker serving `agents`, the list of turns its
+workers finished or abandoned (`turns`), and `advanceTime`, `crashWorker`
+and `close`. The fake models the coordinator's protocol, not its storage.
+Each statement below names the test that pins it; unless a file is named,
+the test is in `src/testing/harness.test.ts`.
+
+What the fake honours:
+
+- Leases: a polled lease carries the turn's recorded time and random seed,
+  a heartbeat extends a held lease to 30 s past the fake's clock, and a
+  heartbeat on a revoked lease fails `OwnershipLost`. Test: `leases carry
+  the recorded time and seed, and heartbeats extend a held lease only`
+  (`testing/transport.test.ts`).
+- Replay: after `crashWorker()`, the new worker replays completed steps from
+  the fake's journal without calling the tool again, and the turn commits
+  once. Test: `replay after crashWorker with two completed steps replays
+  both without calling run and commits once` (`worker/replay.test.ts`).
+- At-least-once retry: an `at_least_once` tool interrupted by a crash runs
+  again under the same effect id. Test: `an at_least_once tool interrupted
+  by a crash runs again under the same effect id`
+  (`worker/steps.test.ts`).
+- In-doubt: a `manual` tool interrupted by a crash blocks the operation with
+  `EffectInDoubt` and names the effect in `blockedEffect`. Test: `a manual
+  tool interrupted by a crash blocks the operation with EffectInDoubt`
+  (`worker/steps.test.ts`). The fake refuses a failed commit while a step's
+  attempt is authorized without a result, as the kernel does. Test: `P11
+  the fake refuses FailTurn while a step's attempt is authorized without a
+  result` (`worker/review.test.ts`).
+- Cancellation: `cancel` on a running operation is recorded and applied
+  when its turn commits, a cancelled operation rejects `result()` with
+  `OperationFailed`, and a second `cancel` answers `cancelled`. Test:
+  `cancel is idempotent and a cancelled operation rejects result()`
+  (`client/client.test.ts`).
+- Retries and dead letters: a failing handler publishes neither state nor
+  events and dead-letters after its attempts. Test: `a failing handler
+  publishes neither state nor events, and dead-letters after its attempts`
+  (`worker/steps.test.ts`).
+- Time: `advanceTime(ms)` moves the fake's clock, and the next lease
+  records the moved time. Test: `leases carry the recorded time and seed,
+  and heartbeats extend a held lease only` (`testing/transport.test.ts`).
+
+What it does not do:
+
+- Timers: the fake has none, and its clock never expires a lease. Advancing
+  the clock an hour past a lease's expiry neither takes the turn away nor
+  runs anything. Test: `advancing the fake's clock past a lease's expiry
+  neither takes the turn away nor runs anything`.
+- Reconciliation: the fake has no reconcile route, so an operation blocked
+  with `EffectInDoubt` stays blocked through a day of clock advance and a
+  further worker. Test: `an operation blocked with EffectInDoubt stays
+  blocked: no clock advance or new worker reconciles it`.
+- Durability: every agent, operation, step and event lives in the fake's
+  memory, and a new harness has never seen the agents of one that closed.
+  Test: `nothing outlives close: a new harness has never seen the first
+  one's agent`.
+
+Kill and recover: hold a tool's run open (a promise the test resolves),
+wait until it has started, call `crashWorker()`, then release it.
+`crashWorker()` revokes the current leases and starts a fresh worker
+(`harness-worker-2`) against the same fake; it simulates a worker crash,
+not a coordinator or store crash. The killed worker's turn is reported in
+`turns` as abandoned. Tests: `replay after crashWorker with two completed
+steps replays both without calling run and commits once`
+(`worker/replay.test.ts`), `an operation blocked with EffectInDoubt stays
+blocked: no clock advance or new worker reconciles it` (the abandoned
+turn), and in a scaffolded project `a worker killed
+inside the price step is replaced and the turn commits once`, which the
+scaffold acceptance test runs. A test that passes against the harness says
+the handler behaves under replay; it says nothing about what Ravel persists.
 
 ## Wire gaps
 
@@ -353,7 +471,8 @@ provisionally on the SDK side:
   Tests: `authorizes a new attempt at an unsettled at_least_once step and
   replays a settled one`, `puts an unsettled manual step in doubt until a
   reconcile records its result`, `hands a reconciled retry out exactly
-  once` (`http.test.ts`).
+  once` (`http.test.ts`). Pairing each step with its effect record on the
+  server, so the SDK can drop the in-memory journal, is tracked in #3416.
 - While an effect is in doubt the server still reports the operation as
   `running`, since no route tells it the operation is blocked (asserted in
   `worker killed inside a manual step blocks as EffectInDoubt in the
@@ -468,7 +587,9 @@ Run from `sdk/typescript/` after `npm ci`:
 - `npm run typecheck`: `tsc` in strict mode over `src/`, `typetests/`,
   `e2e/` and `examples/`.
 - `npm test`: the vitest suites under `src/`, and `e2e/*.unit.test.ts`,
-  which need no server.
+  which need no server. The scaffold template's own suite under
+  `src/scaffold/template/` is excluded here; the scaffold acceptance test
+  runs it inside a generated project.
 - `npm run test:e2e`: the end-to-end tests above.
 
 `typetests/` holds compile-time negative tests. Each `// @ts-expect-error`
