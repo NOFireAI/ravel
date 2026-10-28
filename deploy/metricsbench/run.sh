@@ -4,16 +4,32 @@
 # loudly (ADR-0927, epic #2821).
 #
 # Usage:
-#   run.sh --profile NAME --ravel-image REF@sha256:DIGEST
+#   run.sh --profile NAME
+#     (--ravel-image REF@sha256:DIGEST | --ravel-image REF --ravel-image-id sha256:ID)
 #     --ravel-source-commit SHA --bin-dir DIR --out-dir DIR
 #     [--anchor-ms N] [--passes N] [--reps N] [--keep]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
 #     [--diagnostic-prometheus-max-samples N]
 #
+# The Ravel image comes in one of two forms, and stamps.json says which ran
+# (ravel_image.kind):
+#
+#   published    --ravel-image REF@sha256:DIGEST, a registry image pinned by
+#                its digest. The only form a comparable run may use.
+#   local-build  --ravel-image REF --ravel-image-id sha256:ID, an image built
+#                on this host (it has no registry digest), named by a local
+#                tag and identified by its content: `docker image inspect
+#                REF` must report Id equal to ID. Accepted with --profile ci
+#                only, the nightly's non-comparable profile; a local-build
+#                run is never publishable.
+#
 # Steps, in order; the first failure stops the run:
 #
-#   (refusals)  a --ravel-image without an @sha256: digest, a bin missing from
-#               --bin-dir, an out-dir that already holds a run's output, a
+#   (refusals)  a --ravel-image without an @sha256: digest and no
+#               --ravel-image-id, a --ravel-image-id that is not sha256:<64
+#               hex>, given with a profile other than ci, or not the Id
+#               `docker image inspect` reports for --ravel-image, a bin
+#               missing from --bin-dir, an out-dir that already holds a run's output, a
 #               profile the workload does not declare, an off-grid anchor, or
 #               a metricsbench compose project (containers or volumes) left
 #               from an earlier run; nothing is started
@@ -22,8 +38,9 @@
 #   up          docker compose up -d of docker-compose.yml plus ravel.yml,
 #               RAVEL_IMAGE set
 #   qualify     the one-shots createbuckets and ravel-qualify exited 0
-#   image       the Ravel image's resolved digest (docker image inspect),
-#               which must include the digest the reference names
+#   image       the Ravel image as docker image inspect resolves it: a
+#               published image must list the digest the reference names, a
+#               local build must still have the Id --ravel-image-id names
 #   ready       every engine answers its readiness URL
 #   sampler     a background loop appends each compose container's memory use
 #               (docker stats --no-stream) to <out>/memory.jsonl, one sample
@@ -60,7 +77,9 @@
 #
 # Exit codes:
 #   0   every step passed
-#   64  usage error
+#   64  usage error, including --ravel-image-id with a digest-pinned
+#       --ravel-image (both forms) or with no --ravel-image, and no Ravel
+#       image at all on a run that starts Ravel (neither form)
 #   65  a refused input (see refusals above); nothing was started
 #   70  a step failed; its name is in the message and in stamps.json
 #       (failed_step)
@@ -112,7 +131,7 @@ say() {
 }
 
 usage() {
-  sed -n '7,11p' "$0" >&2
+  sed -n '7,12p' "$0" >&2
 }
 
 usage_error() {
@@ -211,6 +230,14 @@ elif op == "image-inspect":
            "digest_matches_reference": bool(want) and any(d.endswith("@" + want) for d in digests)}
     print(json.dumps(out))
     sys.exit(0 if out["digest_matches_reference"] else 3)
+elif op == "image-inspect-local":
+    ref, want = args
+    rows = json.load(sys.stdin)
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    out = {"reference": ref, "image_id": row.get("Id"), "repo_digests": row.get("RepoDigests") or [],
+           "id_matches": row.get("Id") == want}
+    print(json.dumps(out))
+    sys.exit(0 if out["id_matches"] else 3)
 elif op == "one-shot-exit":
     # docker inspect rows on stdin; prints "<status> <exit code>".
     rows = json.load(sys.stdin)
@@ -410,6 +437,7 @@ stamp_str() { py setstr "$STAMPS" "$1" "$2"; }
 
 profile=""
 ravel_image=""
+ravel_image_id=""
 ravel_source_commit=""
 bin_dir=""
 out_dir=""
@@ -433,7 +461,7 @@ while [ $# -gt 0 ]; do
       usage
       exit 0
       ;;
-    --profile | --ravel-image | --ravel-source-commit | --bin-dir | --out-dir | \
+    --profile | --ravel-image | --ravel-image-id | --ravel-source-commit | --bin-dir | --out-dir | \
       --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples)
       [ $# -ge 2 ] || usage_error "$1 needs a value"
       ;;
@@ -444,6 +472,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --profile) profile="$2" ;;
     --ravel-image) ravel_image="$2" ;;
+    --ravel-image-id) ravel_image_id="$2" ;;
     --ravel-source-commit) ravel_source_commit="$2" ;;
     --bin-dir) bin_dir="$2" ;;
     --out-dir) out_dir="$2" ;;
@@ -462,8 +491,15 @@ diagnostic=0
 [ -n "$profile" ] || usage_error "--profile is required"
 [ -n "$bin_dir" ] || usage_error "--bin-dir is required"
 [ -n "$out_dir" ] || usage_error "--out-dir is required"
+if [ -n "$ravel_image_id" ]; then
+  [ -n "$ravel_image" ] ||
+    usage_error "--ravel-image-id needs --ravel-image REF naming the local tag it identifies"
+  [[ "$ravel_image" != *@sha256:* ]] ||
+    usage_error "give either --ravel-image REF@sha256:DIGEST (published) or --ravel-image REF --ravel-image-id sha256:ID (local build), not both"
+fi
 if [ "$diagnostic" -eq 0 ]; then
-  [ -n "$ravel_image" ] || usage_error "--ravel-image is required"
+  [ -n "$ravel_image" ] ||
+    usage_error "a Ravel image is required: --ravel-image REF@sha256:DIGEST (published) or --ravel-image REF --ravel-image-id sha256:ID (local build)"
   [ -n "$ravel_source_commit" ] || usage_error "--ravel-source-commit is required"
 fi
 for pair in "--anchor-ms:$anchor_ms" "--passes:$passes" "--reps:$reps" \
@@ -491,8 +527,18 @@ command -v python3 >/dev/null 2>&1 || {
 
 # --- refusals ----------------------------------------------------------------
 
-if [ -n "$ravel_image" ] && ! [[ "$ravel_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
-  refuse "--ravel-image '$ravel_image' carries no @sha256: digest; a tag is a moving reference and the run could not say what it measured"
+ravel_image_kind=""
+if [ -n "$ravel_image_id" ]; then
+  ravel_image_kind="local-build"
+  [[ "$ravel_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    refuse "--ravel-image-id '$ravel_image_id' is not sha256:<64 hex>"
+  [ "$profile" = "ci" ] ||
+    refuse "--ravel-image-id with --profile $profile: a local build is for the nightly only (--profile ci); a comparable run needs a published --ravel-image REF@sha256:DIGEST"
+elif [ -n "$ravel_image" ]; then
+  ravel_image_kind="published"
+fi
+if [ "$ravel_image_kind" = "published" ] && ! [[ "$ravel_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  refuse "--ravel-image '$ravel_image' carries no @sha256: digest; a tag is a moving reference and the run could not say what it measured (a local build is named by --ravel-image-id sha256:ID instead)"
 fi
 if [ -n "$ravel_source_commit" ] && ! [[ "$ravel_source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   refuse "--ravel-source-commit '$ravel_source_commit' is not a full 40-character commit id"
@@ -553,6 +599,11 @@ else
   now_ms=$(($(date +%s) * 1000))
   anchor_ms=$(((now_ms - duration_secs * 1000 - 600000) / interval_ms * interval_ms))
   anchor_source="clock: the profile's window ending at least 10 minutes before the run started, on the scrape grid"
+fi
+
+if [ "$ravel_image_kind" = "local-build" ]; then
+  local_id="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null | py image-inspect-local "$ravel_image" "$ravel_image_id")" ||
+    refuse "docker image inspect $ravel_image does not report Id $ravel_image_id (got: ${local_id:-no such image}); the tag no longer names the build the run was given"
 fi
 
 if [ "$diagnostic" -eq 1 ]; then
@@ -618,7 +669,11 @@ stamp_set anchor_ms "$anchor_ms"
 stamp_str anchor_source "$anchor_source"
 stamp_str started_at "$(utc_now)"
 stamp_set ended_at null
+stamp_str ravel_image.kind "${ravel_image_kind:-not given: diagnostic run}"
 stamp_str ravel_image.reference "${ravel_image:-not given: diagnostic run}"
+if [ "$ravel_image_kind" = "local-build" ]; then
+  stamp_str ravel_image.image_id "$ravel_image_id"
+fi
 stamp_set ravel_image.resolved null
 stamp_str ravel_source_commit "${ravel_source_commit:-not given: diagnostic run}"
 stamp_str harness_commit "$(git_head "$bin_dir")"
@@ -908,10 +963,18 @@ run_full() {
   step_done qualify
 
   code=0
-  resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null | py image-inspect "$ravel_image")" || code=$?
-  [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
-  [ "$code" -eq 0 ] ||
-    fail_step image "docker image inspect of $ravel_image did not list the digest the reference names"
+  if [ "$ravel_image_kind" = "local-build" ]; then
+    resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null |
+      py image-inspect-local "$ravel_image" "$ravel_image_id")" || code=$?
+    [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
+    [ "$code" -eq 0 ] ||
+      fail_step image "docker image inspect of $ravel_image no longer reports Id $ravel_image_id"
+  else
+    resolved="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null | py image-inspect "$ravel_image")" || code=$?
+    [ -n "$resolved" ] && stamp_set ravel_image.resolved "$resolved"
+    [ "$code" -eq 0 ] ||
+      fail_step image "docker image inspect of $ravel_image did not list the digest the reference names"
+  fi
   step_done image
 
   wait_ready prometheus "${PROM_BASE}/-/ready"
@@ -976,6 +1039,8 @@ run_full() {
     --store-backend rustfs --region us-east-1 --endpoint http://rustfs:9000 \
     "${pins[@]}" \
     --config "ravel_image=${ravel_image}" \
+    --config "ravel_image_kind=${ravel_image_kind}" \
+    ${ravel_image_id:+--config "ravel_image_id=${ravel_image_id}"} \
     --config "ravel_source_commit=${ravel_source_commit}" \
     --config "harness_commit=$(py get "$STAMPS" harness_commit)" \
     --config "store_kind=rustfs" \

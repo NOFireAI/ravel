@@ -50,6 +50,14 @@
 #                                       success (a) and on failure (b); a
 #                                       failed copy is stamped and said, the
 #                                       exit code stays 0, still torn down
+#   p  local-build image           -> --ravel-image REF --ravel-image-id ID passes
+#                                       when docker image inspect reports Id ID;
+#                                       stamps and provenance say local-build
+#                                       with the Id; refused 65 before anything
+#                                       starts when the Id differs, and with a
+#                                       profile other than ci; both forms, or
+#                                       neither, or an id without
+#                                       --ravel-image, exit 64
 #   o  descriptor limits             -> prometheus, victoriametrics, rustfs,
 #                                       mimir (docker-compose.yml) and
 #                                       ravel-server (ravel.yml) each carry
@@ -179,7 +187,12 @@ JSON
     ;;
   image)
     ref="$3"
-    printf '[{"Id":"sha256:imageid","RepoDigests":["%s@%s"]}]\n' "${ref%%[:@]*}" "${ref#*@}"
+    if [[ "$ref" == *@* ]]; then
+      printf '[{"Id":"sha256:imageid","RepoDigests":["%s@%s"]}]\n' "${ref%%[:@]*}" "${ref#*@}"
+    else
+      # A locally built image: no registry digest, only its content Id.
+      printf '[{"Id":"%s","RepoDigests":[]}]\n' "${STUB_LOCAL_IMAGE_ID:-sha256:imageid}"
+    fi
     ;;
   volume)
     [ -z "${STUB_LEFTOVER_VOLUME:-}" ] || echo "${STUB_LEFTOVER_VOLUME}"
@@ -376,6 +389,9 @@ for f in stamps.json ingest.json effective-config.json provenance.json report.js
 done
 check "a: stamps status passed, exit 0" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["exit_code"] == 0'
 check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["up","qualify","image","ready","sampler","ingest","mimir-readiness","capture","provenance","fold-state","query","validate","memory"]'
+check "a: published image kind stamped, no image_id" 'j("stamps.json")["ravel_image"]["kind"] == "published" and "image_id" not in j("stamps.json")["ravel_image"]'
+expect_log "a: provenance says the image is published" "--config ravel_image_kind=published"
+expect_no_log "a: provenance carries no local image id" "ravel_image_id="
 check "a: image reference and resolved digest stamped" 'j("stamps.json")["ravel_image"]["reference"] == "'"${IMAGE}"'" and j("stamps.json")["ravel_image"]["resolved"]["digest_matches_reference"] is True'
 check "a: source commit, store kind, profile, anchor stamped" 'j("stamps.json")["ravel_source_commit"] == "'"${COMMIT}"'" and j("stamps.json")["store_kind"] == "rustfs" and j("stamps.json")["profile"] == "ci" and j("stamps.json")["anchor_ms"] == '"${ANCHOR}"' and j("stamps.json")["anchor_source"] == "flag"'
 check "a: harness commit stamped (unavailable outside git)" 'j("stamps.json")["harness_commit"].startswith("unavailable")'
@@ -564,6 +580,54 @@ expect_rc n 0
 check "n: stamps say the copy failed, run passed" 'j("stamps.json")["rustfs_logs"].startswith("copy failed (exit 1)") and j("stamps.json")["status"] == "passed"'
 expect_err "n: the failed copy is said" "copying RustFS's /logs failed (exit 1)"
 expect_log "n: still torn down" " down -v"
+
+# --- p: local-build image ------------------------------------------------------
+LOCAL_REF="ravel-server:nightly-${COMMIT}"
+LOCAL_ID="sha256:$(printf 'b%.0s' $(seq 64))"
+OTHER_ID="sha256:$(printf 'c%.0s' $(seq 64))"
+local_args() {
+  printf '%s\n' --profile "${2:-ci}" --ravel-image "${LOCAL_REF}" --ravel-image-id "${LOCAL_ID}" \
+    --ravel-source-commit "${COMMIT}" --bin-dir "${BIN}" --out-dir "$1" --anchor-ms "${ANCHOR}"
+}
+mapfile -t args < <(local_args "${TMP}/p1/out")
+STUB_LOCAL_IMAGE_ID="${LOCAL_ID}" run_case p1 "${args[@]}"
+expect_rc "p local build" 0
+check "p local build: stamps say local-build with the Id, reference and source commit" 'j("stamps.json")["ravel_image"]["kind"] == "local-build" and j("stamps.json")["ravel_image"]["image_id"] == "'"${LOCAL_ID}"'" and j("stamps.json")["ravel_image"]["reference"] == "'"${LOCAL_REF}"'" and j("stamps.json")["ravel_source_commit"] == "'"${COMMIT}"'"'
+check "p local build: image step resolved the same Id, no registry digest" 'j("stamps.json")["ravel_image"]["resolved"]["id_matches"] is True and j("stamps.json")["ravel_image"]["resolved"]["image_id"] == "'"${LOCAL_ID}"'" and j("stamps.json")["ravel_image"]["resolved"]["repo_digests"] == [] and "image" in j("stamps.json")["steps_completed"]'
+expect_log "p local build: provenance says local-build" "--config ravel_image_kind=local-build"
+expect_log "p local build: provenance carries the Id" "--config ravel_image_id=${LOCAL_ID}"
+expect_log "p local build: compose brought up" "ravel.yml up -d"
+
+mapfile -t args < <(local_args "${TMP}/p2/out")
+STUB_LOCAL_IMAGE_ID="${OTHER_ID}" run_case p2 "${args[@]}"
+expect_rc "p Id differs" 65
+expect_err "p Id differs: refusal names the Id" "does not report Id ${LOCAL_ID}"
+expect_no_log "p Id differs: nothing started" " up -d"
+expect_no_file p2 stamps.json
+
+mapfile -t args < <(local_args "${TMP}/p3/out" history)
+STUB_LOCAL_IMAGE_ID="${LOCAL_ID}" run_case p3 "${args[@]}"
+expect_rc "p local build on history" 65
+expect_err "p local build on history: refusal says nightly only" "a local build is for the nightly only"
+expect_no_log "p local build on history: nothing started" "compose -f"
+expect_no_file p3 stamps.json
+
+run_case p4 --profile ci --ravel-image "${IMAGE}" --ravel-image-id "${LOCAL_ID}" \
+  --ravel-source-commit "${COMMIT}" --bin-dir "${BIN}" --out-dir "${TMP}/p4/out" --anchor-ms "${ANCHOR}"
+expect_rc "p both forms" 64
+expect_err "p both forms: message says not both" "not both"
+expect_no_log "p both forms: nothing started" "compose -f"
+
+run_case p5 --profile ci --ravel-source-commit "${COMMIT}" --bin-dir "${BIN}" \
+  --out-dir "${TMP}/p5/out" --anchor-ms "${ANCHOR}"
+expect_rc "p neither form" 64
+expect_err "p neither form: message says an image is required" "a Ravel image is required"
+expect_no_log "p neither form: nothing started" "compose -f"
+
+run_case p6 --profile ci --ravel-image-id "${LOCAL_ID}" --ravel-source-commit "${COMMIT}" \
+  --bin-dir "${BIN}" --out-dir "${TMP}/p6/out" --anchor-ms "${ANCHOR}"
+expect_rc "p id without --ravel-image" 64
+expect_no_log "p id without --ravel-image: nothing started" "compose -f"
 
 # --- o: descriptor limits --------------------------------------------------------
 # A service's block runs from its two-space key to the next key at two spaces
