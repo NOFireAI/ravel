@@ -73,7 +73,8 @@ async function contractProject(
 }
 
 function tsc(dir: string): { code: number | null; output: string } {
-  const run = spawnSync(process.execPath, [TSC, "-p", dir], { encoding: "utf8" });
+  // tsc colours its diagnostics when FORCE_COLOR is set, which splits "error TS".
+  const run = spawnSync(process.execPath, [TSC, "--pretty", "false", "-p", dir], { encoding: "utf8" });
   return { code: run.status, output: `${run.stdout}${run.stderr}` };
 }
 
@@ -267,6 +268,43 @@ describe("generateContract", () => {
         message: `go.result: JSON Schema keyword ${keyword} in propertyNames is not supported`,
       });
     }
+  });
+
+  it("an object with named properties and a typed catchall is refused; a loose object keeps its members", async () => {
+    let thrown: unknown;
+    try {
+      generateContract(withResult(z.object({ a: z.string() }).catchall(z.number())));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ContractError);
+    expect(thrown).toMatchObject({
+      code: "unsupported_schema",
+      at: "go.result",
+      message: "go.result: an object with named properties and a catchall other than unknown is not supported",
+    });
+
+    // With no named properties a typed catchall is a plain record.
+    expect(generateContract(withResult(z.object({}).catchall(z.number())))).toContain(
+      "    readonly output: Record<string, number>;\n",
+    );
+
+    const loose = generateContract(withResult(z.object({ a: z.string() }).loose()));
+    expect(loose).toContain(["    readonly output: {", "      a: string;", "    } & Record<string, unknown>;"].join("\n"));
+    const check = [
+      'import type { OutputOf } from "./contract.js";',
+      'export const extra: OutputOf<"go"> = { a: "x", b: 1 };',
+      "// @ts-expect-error a named member keeps its own type",
+      'export const wrong: OutputOf<"go"> = { a: 1 };',
+      "",
+    ].join("\n");
+    const run = tsc(await contractProject(loose, check));
+    expect(run.output).toBe("");
+    expect(run.code).toBe(0);
+  }, 120_000);
+
+  it("an empty union is typed never", () => {
+    expect(generateContract(withResult(z.union([])))).toContain("    readonly output: never;\n");
   });
 
   it("a schema with no TypeScript form is refused with a ContractError naming the handler side", () => {

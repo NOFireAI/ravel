@@ -40,7 +40,8 @@ The SDK runs against the in-process fake coordinator in
 | `@ravel/agents/scaffold` | `scaffold`: write a starter project into an empty directory |
 
 The package's bin, `bin/ravel-agents-scaffold.js <dir>`, runs `scaffold`.
-Run it by path (see below), never by its bare name.
+Run it by its path, never by its bare name; [the SDK
+guide](../../../../docs/guides/agents-sdk.md#first-run) says why.
 
 The client entry imports no server-only module: nothing under `worker/`,
 `tools/` or `testing/`, and none of `node:child_process`, `node:fs` or
@@ -104,25 +105,25 @@ From `sdk/typescript/`, after `npm ci`:
 node packages/agents/bin/ravel-agents-scaffold.js <dir>
 ```
 
-Run the bin by its path. `npm ci` does not link it into
-`node_modules/.bin`, because the lockfile does not list a bin for this
-workspace package, and `npx ravel-agents-scaffold` would look the name up
-in the public npm registry instead, so never use the bare name.
+Run the bin by its path; [the SDK
+guide](../../../../docs/guides/agents-sdk.md#first-run) says why.
 
 It writes a starter project: one agent, `order`, whose `checkout` handler prices a line through the durable step `price`
 against a local price-list fixture (no network, no API key); the client
 types generated from its handler schemas; a client typed by them; a vitest
 suite against `@ravel/agents/testing`; and its `package.json`, `tsconfig.json`
-and README. `npm install && npm test` in the output passes with no server and
-no API key. The `ravel` CLI has no scaffold command yet; when one lands it
-is meant to run this bin.
+and README. Its suite needs no server and no API key. The `ravel` CLI has no
+scaffold command yet; when one lands it is meant to run this bin.
 
 - The output typechecks and its own suite passes, run as a child process
   with every `*_API_KEY` variable removed and again with poison values set,
   and no generated file names an API key; the generated test and the files
   it imports do not read `process.env`. The file list is exactly
   `SCAFFOLD_FILES`. Test: `scaffold output typechecks and its tests pass
-  without an API key` (`src/scaffold/index.test.ts`).
+  without an API key` (`src/scaffold/index.test.ts`). That test links the
+  SDK's own `node_modules` into the output instead of running
+  `npm install`, so npm resolving the generated `file:` dependency is not
+  under test.
 - A directory that is not empty, even one holding only an empty
   subdirectory, is refused with `ScaffoldError` code `target_not_empty`
   before anything is written, and a path that is a file with
@@ -169,6 +170,14 @@ and outputs the result schemas' output side, as `PayloadOf` and `ResultOf`.
   `Record<string, V>` would let a client send keys zod rejects. Test: `a
   record whose keys are constrained other than by an enum is refused naming
   the keyword`.
+- An object with named properties and a catchall typed other than
+  `unknown` is refused with `unsupported_schema`: intersecting the members
+  with `Record<string, V>` would type them as never, and an index signature
+  wide enough for them would accept extra keys zod rejects. A loose object
+  is typed as its members `& Record<string, unknown>`. Test: `an object
+  with named properties and a typed catchall is refused; a loose object
+  keeps its members`. An empty union (`z.union([])`) is typed `never`.
+  Test: `an empty union is typed never`.
 - The template's checked-in `contract.ts` is the generator's output. Test:
   `the template's contract.ts is the generator's output for the template
   agent`.
