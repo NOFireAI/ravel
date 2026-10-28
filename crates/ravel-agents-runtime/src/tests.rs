@@ -671,6 +671,8 @@ async fn a_waiting_poll_wakes_on_send_and_the_wait_is_capped() {
         .await
         .expect("poll");
     assert!(none.is_none());
+    // hygiene-allow: wall-clock -- `Instant` is tokio's paused clock, so this
+    // is the exact virtual wait, not real time.
     assert_eq!(
         start.elapsed(),
         Duration::from_millis(DEFAULT_POLL_WAIT_CAP_MS)
