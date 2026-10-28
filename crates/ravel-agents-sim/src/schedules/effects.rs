@@ -1289,6 +1289,27 @@ fn cancels(seed: u64) -> Totals {
     t
 }
 
+/// A seed outside the default batch where `w1` journals op 1's step start
+/// after the cancel and dies before its cancel check: the crashed step
+/// stands for `OwnershipLost`, and the drain commits op 1 cancelled.
+#[test]
+fn a_worker_dead_between_its_step_journal_and_its_cancel_check_is_fenced() {
+    assert_eq!(
+        cancels(7_000_441),
+        Totals {
+            runs: 1,
+            crashes: 1,
+            inferred: 1,
+            dispatches: 1,
+            distinct_dispatches: 1,
+            attempts: 1,
+            executions: 1,
+            cancelled: 1,
+            ..Totals::default()
+        }
+    );
+}
+
 #[test]
 fn cancels_across_seeds() {
     let mut totals = Totals::default();
