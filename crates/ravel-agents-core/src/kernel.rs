@@ -436,6 +436,17 @@ pub fn page_needs(head: &Head, command: &Command) -> Vec<(ListKind, Need)> {
         Command::Cancel(c) => {
             needs.push((ListKind::Results, Need::Key(c.accept_seq)));
             needs.push((ListKind::Inbox, Need::Key(c.accept_seq)));
+            // Cancelling the open page's last input pulls the last sealed
+            // page back into HEAD (`PageEntry::KEEP_TAIL`).
+            let dir = &head.index.inbox;
+            let open = head
+                .inbox
+                .iter()
+                .filter(|e| dir.is_inline(e.accept_seq))
+                .count();
+            if !dir.pages.is_empty() && dir.is_inline(c.accept_seq) && open <= 1 {
+                needs.push((ListKind::Inbox, Need::Key(dir.tail_from.saturating_sub(1))));
+            }
         }
         Command::ScheduleTimer(c) => needs.push(timer(&c.timer.timer_key)),
         Command::FireTimer(c) => needs.push((ListKind::Timers, Need::Key(c.generation))),

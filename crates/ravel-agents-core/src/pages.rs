@@ -235,6 +235,9 @@ pub enum Need {
 /// One list's entry type: its key, its lookup fingerprint and its page codec.
 pub trait PageEntry: Clone + PartialEq + Sized {
     const LIST: ListKind;
+    /// The open page never stays empty while a sealed page exists, so a
+    /// HEAD read without its pages still answers "is the list empty".
+    const KEEP_TAIL: bool = false;
     fn key(&self) -> u64;
     fn fingerprint(&self) -> Option<u32> {
         None
@@ -284,6 +287,7 @@ fn ref_bytes(r: &Option<ObjectRef>) -> u64 {
 
 impl PageEntry for InboxEntry {
     const LIST: ListKind = ListKind::Inbox;
+    const KEEP_TAIL: bool = true;
     fn key(&self) -> u64 {
         self.accept_seq
     }
@@ -638,17 +642,11 @@ pub fn seal<T: PageEntry>(
     seal_below: u64,
     bounds: PageBounds,
 ) -> Result<(Directory, Vec<PageObject>), PageError> {
-    let source = match dir.representation {
+    let mut source = match dir.representation {
         Representation::Inline => Directory::default(),
         Representation::Paged => dir.clone(),
     };
     let k = bounds.max_page_entries.max(1);
-    let mut out = Directory {
-        representation: Representation::Paged,
-        pages: Vec::new(),
-        tail_from: source.tail_from,
-        loaded: Vec::new(),
-    };
     let mut objects = Vec::new();
     let mut by_page: Vec<Vec<T>> = vec![Vec::new(); source.pages.len()];
     let mut open: Vec<T> = Vec::new();
@@ -658,6 +656,19 @@ pub fn seal<T: PageEntry>(
             None => open.push(entry.clone()),
         }
     }
+    let last = source.pages.len().checked_sub(1);
+    if let Some(last) = last.filter(|&i| T::KEEP_TAIL && open.is_empty() && source.is_loaded(i)) {
+        open = by_page.pop().unwrap_or_default();
+        let meta = source.pages.remove(last);
+        source.loaded.truncate(last);
+        source.tail_from = if last == 0 { 0 } else { meta.first_key };
+    }
+    let mut out = Directory {
+        representation: Representation::Paged,
+        pages: Vec::new(),
+        tail_from: source.tail_from,
+        loaded: Vec::new(),
+    };
     for (i, mut entries) in by_page.into_iter().enumerate() {
         let meta = &source.pages[i];
         if !source.is_loaded(i) {
@@ -745,6 +756,9 @@ fn seal_list<T: PageEntry>(
 /// still pending (in the inbox or the active turn), since a pending input's
 /// result is appended later under that key; a sealed first inbox page
 /// answers with its `first_key`, which is at or below every key it holds.
+/// Timers seal only below the lowest scheduled generation, so a sealed timer
+/// page never holds a scheduled timer and the scheduled set is always in
+/// HEAD itself (a rescheduled timer takes a new, highest generation).
 pub fn seal_index(head: &mut Head, bounds: PageBounds) -> Result<(), PageError> {
     let pending_floor = head
         .active_turn
@@ -759,7 +773,14 @@ pub fn seal_index(head: &mut Head, bounds: PageBounds) -> Result<(), PageError> 
     seal_list::<Receipt>(head, u64::MAX, bounds, &mut written)?;
     seal_list::<ResultEntry>(head, pending_floor, bounds, &mut written)?;
     seal_list::<EventEntry>(head, u64::MAX, bounds, &mut written)?;
-    seal_list::<TimerEntry>(head, u64::MAX, bounds, &mut written)?;
+    let first_scheduled = head
+        .timers
+        .iter()
+        .filter(|t| t.marked())
+        .map(|t| t.generation)
+        .min()
+        .unwrap_or(u64::MAX);
+    seal_list::<TimerEntry>(head, first_scheduled, bounds, &mut written)?;
     head.index.written = written;
     Ok(())
 }

@@ -34,10 +34,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ravel_agents_core::command::{Command, Create, Enqueue, IncarnationFence};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
-use ravel_agents_core::head::{Head, Lifecycle, ObjectRef, Receipt};
+use ravel_agents_core::head::{
+    EventEntry, Head, Lifecycle, ObjectRef, Receipt, TimerEntry, TimerStatus,
+};
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, request_hash};
 use ravel_agents_core::kernel::{DerivedIds, Effect, IdSource, Kernel, Limits, Reply};
 use ravel_agents_core::keys::{AgentKey, AgentKind, dir_prefix, object_key};
+use ravel_agents_core::pages::{ListKind, Need, receipt_fingerprint};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError, Version};
 use ravel_types::TenantHash;
@@ -325,9 +328,113 @@ impl AgentStore {
         self.read_object_at(agent, &key, dep).await
     }
 
-    /// Read HEAD without writing anything.
+    /// Read HEAD without writing anything, with every sealed index page
+    /// attached, so each list is whole: one GET for HEAD plus one per sealed
+    /// page. The narrower reads below ([`Self::find_receipt`],
+    /// [`Self::read_events`], [`Self::due_timers`], [`Self::resolve`]) read
+    /// at most the pages their answer is on.
     pub async fn read_head(&self, agent: &AgentId) -> Result<HeadState, AgentError> {
-        self.read_head_state(agent, true).await
+        let mut state = self.read_head_state(agent, true).await?;
+        if let HeadState::Present { head, .. } = &mut state {
+            self.load_all_pages(agent, head).await?;
+        }
+        Ok(state)
+    }
+
+    /// HEAD as stored, sealed pages not attached; `None` when the agent does
+    /// not exist.
+    async fn shallow_head(&self, agent: &AgentId) -> Result<Option<Head>, AgentError> {
+        match self.read_head_state(agent, true).await? {
+            HeadState::Present { head, .. } => Ok(Some(*head)),
+            HeadState::Absent => Ok(None),
+            HeadState::Unsupported { .. } => Err(AgentError::new(
+                ErrorKind::UnsupportedFormat,
+                ids_for(agent),
+                "HEAD format version is newer than this release",
+            )),
+        }
+    }
+
+    /// The receipt `(handler, request_id)` was accepted under, if any. Reads
+    /// HEAD and the sealed receipt pages whose fingerprint set lists the
+    /// pair's fingerprint: at most one page unless two pages share a 32-bit
+    /// fingerprint
+    /// (`tests::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`).
+    pub async fn find_receipt(
+        &self,
+        agent: &AgentId,
+        handler: &str,
+        request_id: &str,
+    ) -> Result<Option<Receipt>, AgentError> {
+        let Some(mut head) = self.shallow_head(agent).await? else {
+            return Ok(None);
+        };
+        let need = Need::Fingerprint(receipt_fingerprint(handler, request_id));
+        let pages: Vec<_> = head
+            .index
+            .receipts
+            .missing(need)
+            .into_iter()
+            .map(|page| (ListKind::Receipts, page))
+            .collect();
+        self.load_pages(agent, &mut head, &pages).await?;
+        Ok(head
+            .receipts
+            .into_iter()
+            .find(|r| r.handler == handler && r.request_id == request_id))
+    }
+
+    /// Up to `limit` events with `event_seq > after`, in order. Reads HEAD
+    /// and the sealed event pages from the one holding `after + 1` onward,
+    /// stopping once `limit` entries are in hand: `ceil(limit /
+    /// max_page_entries) + 1` pages at most, whatever the history's length
+    /// (`tests::events_are_read_by_seq_range`).
+    pub async fn read_events(
+        &self,
+        agent: &AgentId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<EventEntry>, AgentError> {
+        let Some(mut head) = self.shallow_head(agent).await? else {
+            return Ok(Vec::new());
+        };
+        let from = after.saturating_add(1);
+        let directory = &head.index.events;
+        if let Some(first) = directory.page_for(from) {
+            let count = directory.pages.len();
+            for page in first..count {
+                let held = head.events.iter().filter(|e| e.event_seq > after).count();
+                if held >= limit {
+                    break;
+                }
+                self.load_pages(agent, &mut head, &[(ListKind::Events, page)])
+                    .await?;
+            }
+        }
+        let mut events: Vec<EventEntry> = head
+            .events
+            .into_iter()
+            .filter(|e| e.event_seq > after)
+            .collect();
+        events.sort_by_key(|e| e.event_seq);
+        events.truncate(limit);
+        Ok(events)
+    }
+
+    /// The scheduled timers due at `now`, earliest first. A sealed timer page
+    /// never holds a scheduled timer, so this reads HEAD and no page
+    /// (`tests::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`).
+    pub async fn due_timers(&self, agent: &AgentId, now: i64) -> Result<Vec<TimerEntry>, AgentError> {
+        let Some(head) = self.shallow_head(agent).await? else {
+            return Ok(Vec::new());
+        };
+        let mut due: Vec<TimerEntry> = head
+            .timers
+            .into_iter()
+            .filter(|t| t.status == TimerStatus::Scheduled && t.due_unix_ns <= now)
+            .collect();
+        due.sort_by_key(|t| (t.due_unix_ns, t.generation));
+        Ok(due)
     }
 
     /// Re-read HEAD and report the operation an operation handle names,
@@ -343,7 +450,7 @@ impl AgentStore {
                 "handle does not name an operation",
             ));
         };
-        let head = match self.read_head_state(&agent, true).await? {
+        let mut head = match self.read_head_state(&agent, true).await? {
             HeadState::Present { head, .. } => *head,
             // A HEAD is never deleted (ADR-3331 decision 3), so a handle
             // proves the agent existed; a read that finds nothing is a read
@@ -373,6 +480,19 @@ impl AgentStore {
                 "handle names an incarnation that is not current",
             ));
         }
+        // The operation's entry in each list is on the page its key falls
+        // in: at most one page per list.
+        let pages: Vec<_> = [ListKind::Receipts, ListKind::Results, ListKind::Inbox]
+            .into_iter()
+            .flat_map(|list| {
+                head.index
+                    .directory(list)
+                    .missing(Need::Key(accept_seq))
+                    .into_iter()
+                    .map(move |page| (list, page))
+            })
+            .collect();
+        self.load_pages(&agent, &mut head, &pages).await?;
         Ok(Resolution {
             handle: *handle,
             accept_seq,
