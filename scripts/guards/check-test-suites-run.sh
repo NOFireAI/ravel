@@ -11,6 +11,14 @@
 #            filename finds nothing and proves nothing.
 #   Shell:   every suite is enumerated by hand in a workflow step. A new one
 #            runs nowhere until somebody remembers, and nothing says so.
+#   TypeScript: the `*.test.ts` suites under sdk/ are discovered by vitest by
+#            pattern, like the Python side, so one suite cannot be orphaned
+#            alone. Their single runner can: scripts/gates-sdk.sh runs them
+#            (`npm test --workspaces`), and if no workflow names it, every
+#            TypeScript suite runs nowhere at once. So for TypeScript this
+#            checks the runner, not each file: when any `sdk/**.test.ts` is
+#            tracked, scripts/gates-sdk.sh must be tracked and named on a
+#            non-comment, non-`name:` workflow line.
 #
 # That has now bitten three times, each time the same way: a suite that was
 # green locally, had never executed in CI, and sat beside a real defect. The
@@ -27,7 +35,8 @@
 #
 # Exit codes:
 #   0   every suite is run by a workflow, or knowingly excepted
-#   1   at least one suite runs nowhere
+#   1   at least one suite runs nowhere, or TypeScript suites exist and
+#       scripts/gates-sdk.sh is untracked or named in no workflow
 #   2   the check could not be performed (no workflows dir, git failed)
 set -uo pipefail
 
@@ -217,6 +226,38 @@ while IFS= read -r suite; do
   orphans=$((orphans + 1))
 done <<<"${suites}"
 
+# TypeScript suites: see the header. The runner's basename is matched with the
+# same boundaries as a shell suite's, on the same comment- and name:-stripped
+# text.
+sdk_runner="scripts/gates-sdk.sh"
+ts_suites="$(git ls-files -- 'sdk/*.test.ts' 2>/dev/null)" || {
+  echo "check-test-suites-run.sh: git ls-files failed for the TypeScript suites" >&2
+  exit 2
+}
+ts_total=0
+ts_orphaned=0
+if [[ -n "${ts_suites}" ]]; then
+  ts_total="$(grep -c . <<<"${ts_suites}")"
+  if ! git ls-files --error-unmatch -- "${sdk_runner}" >/dev/null 2>&1; then
+    printf 'ORPHAN    %d TypeScript suite(s) under sdk/: their runner %s is not tracked\n' "${ts_total}" "${sdk_runner}"
+    ts_orphaned=1
+  elif ! grep -qE -- '(^|[^A-Za-z0-9._-])gates-sdk\.sh([^A-Za-z0-9._-]|$)' <<<"${workflow_text}"; then
+    printf 'ORPHAN    %d TypeScript suite(s) under sdk/: their runner %s runs in no workflow\n' "${ts_total}" "${sdk_runner}"
+    ts_orphaned=1
+  elif ((list_all == 1)); then
+    while IFS= read -r suite; do
+      printf 'run       %s (via %s)\n' "${suite}" "${sdk_runner}"
+    done <<<"${ts_suites}"
+  fi
+fi
+
+if ((ts_orphaned == 1)); then
+  echo
+  echo "Every TypeScript suite runs nowhere until a workflow step runs ${sdk_runner}" >&2
+  echo "(the sdk job in ci.yml is where it lives)." >&2
+  ((orphans > 0)) || exit 1
+fi
+
 if ((orphans > 0)); then
   echo
   echo "${orphans} of ${total} shell test suite(s) run in no CI job." >&2
@@ -230,4 +271,7 @@ if ((excepted_count > 0)); then
   echo "check-test-suites-run.sh: ${total} shell test suite(s); $((total - excepted_count)) run by a workflow, ${excepted_count} excepted above."
 else
   echo "check-test-suites-run.sh: ${total} shell test suite(s), all run by a workflow."
+fi
+if ((ts_total > 0)); then
+  echo "check-test-suites-run.sh: ${ts_total} TypeScript test suite(s) under sdk/, run by ${sdk_runner}, which a workflow names."
 fi
