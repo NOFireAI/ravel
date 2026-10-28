@@ -871,9 +871,11 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
 
 /// `manual` retry through `reconcile`: the route authorizes attempt 2 and
 /// dispatches nothing; the owner's next `worker/step` for the key is handed
-/// attempt 2 and runs the tool once more. A second retry while attempt 2 is
-/// open is refused, and once attempt 2's result is recorded the turn commits
-/// once.
+/// attempt 2 and runs the tool once more. A retry naming attempt 0 while
+/// attempt 1 is open is refused `idempotency_conflict` and not audited, a
+/// repeated retry of attempt 1 answers `authorized`/2 again without a second
+/// audit record, a second retry while attempt 2 is open is refused, and once
+/// attempt 2's result is recorded the turn commits once.
 #[tokio::test]
 async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -885,16 +887,25 @@ async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
     assert_eq!(status, StatusCode::OK, "{a_step}");
     assert_eq!(a_step["attempt"], json!(1));
     let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let retry = |attempt: u64| json!({"effect": effect, "attempt": attempt, "decision": "retry"});
+
+    // Attempt 1 is open: a retry naming attempt 0, which never existed, is
+    // refused before the audit write.
+    let (status, refused) = api.post(ADMIN, "reconcile", &retry(0)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("idempotency_conflict"));
 
     let assigned_b = take_over(&api, &assigned_a).await;
     let (status, refused) = step(&api, &assigned_b, "manual").await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["code"], json!("effect_in_doubt"));
 
-    let retry = |attempt: u64| json!({"effect": effect, "attempt": attempt, "decision": "retry"});
     let reconciled = api.ok(ADMIN, "reconcile", &retry(1)).await;
     assert_eq!(reconciled["status"], json!("authorized"), "{reconciled}");
     assert_eq!(reconciled["attempt"], json!(2), "{reconciled}");
+    // The same retry again is a repeat: answered from HEAD, not audited.
+    let repeated = api.ok(ADMIN, "reconcile", &retry(1)).await;
+    assert_eq!(repeated, reconciled);
     let op = operation_status(&api, &operation).await;
     assert_eq!(op["status"], json!("running"), "{op}");
 
@@ -956,6 +967,7 @@ async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
             {"attempt": 2, "status": "result"},
         ])
     );
+    // One record: the refused retry(0) and the repeated retry(1) wrote none.
     let records = reconcile_audit_records(store.as_ref()).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(attr(&records[0], "agents.decision"), Some("retry"));
