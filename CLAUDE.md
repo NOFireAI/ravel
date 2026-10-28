@@ -112,7 +112,17 @@ cargo test   -p ravel-server --features esql
 (`-p CRATE`) scope is the reverse-dependency closure of the named crates:
 the `sql` lane runs when ravel-server is in it, the `flight-sql` lane
 when ravel-sql or ravel-server is, and the `esql` lane when ravel-esql,
-ravel-sql or ravel-server is, so `-p ravel-query` runs all three. A fleet
+ravel-sql or ravel-server is, so `-p ravel-query` runs all three. Two more
+ravel-server lanes run whenever ravel-server is in the closure: `agents`
+(clippy, the agents_seam binary and the lib tests, plus ravel-catalog's
+sys_proto_format_version_classification test) and `mcp` (clippy, the
+mcp_e2e and trace_by_id binaries and the lib tests), so `-p ravel-query`
+runs five lanes, and each of them builds into the same `target/` as the
+other four (the disk figures below predate these two lanes). An unscoped
+run also runs `scripts/gates-sdk.sh` (npm ci, lint, typecheck and test
+under sdk/typescript), which needs node 22 and refuses with exit 64
+without it; `RAVEL_GATES_SKIP_SDK=1` skips that step and leaves CI's
+`sdk` job as the gate for the SDK. A fleet
 executor's gate is `scripts/gates.sh -p <crate> [-p <crate2>]`, not a
 hand-listed workspace clippy, and the PreToolUse hook refuses `cargo
 clippy --workspace` in a fleet clone. gates.sh also runs a
@@ -234,10 +244,12 @@ connection, a pushed-but-broken main).
   args runs the full workspace gate; `-p CRATE` (repeatable) scopes
   clippy/test/doc to the named crates and every workspace crate that
   depends on them, transitively (the closure `affected-tests.sh -n`
-  prints). It also runs the `sql`, `flight-sql` and `esql` feature lanes,
-  always in workspace mode, and in scoped mode `sql` when `ravel-server`
-  is in the closure, `flight-sql` when `ravel-sql` or `ravel-server` is,
-  and `esql` when `ravel-esql`, `ravel-sql` or `ravel-server` is.
+  prints). It also runs the `sql`, `flight-sql`, `esql`, `agents` and
+  `mcp` feature lanes, always in workspace mode, and in scoped mode `sql`,
+  `agents` and `mcp` when `ravel-server` is in the closure, `flight-sql`
+  when `ravel-sql` or `ravel-server` is, and `esql` when `ravel-esql`,
+  `ravel-sql` or `ravel-server` is. In workspace mode it also runs
+  `scripts/gates-sdk.sh` (node 22; `RAVEL_GATES_SKIP_SDK=1` skips it).
   This is the executor's gate in fleet specs. A scoped run writes no
   gates-pass receipt. `--dry-run` prints the closure and every cargo
   command the same arguments would run, then exits 0 without building;
@@ -647,7 +659,10 @@ than passing for "no pull request open".
   ravel-server -p ravel-bench` gate filled its volume at 188 GB (144 GB of
   `debug/` from the feature lanes, 44 GB of `ci/` from the ci-profile main
   suite) and died at link before its flight-sql lane finished, so that
-  closure needs more than 188 GB.
+  closure needs more than 188 GB. Those figures predate the `agents` and
+  `mcp` lanes, which add two more ravel-server feature builds to the same
+  `target/`; a ravel-server closure now needs more than they say, by an
+  amount not yet measured.
 - A cold gate needs 54-70 GB of `target/` per worktree when its closure
   runs no feature lane, and from about 93 GB to more than 188 GB when it
   reaches the sql, flight-sql, esql and ravel-bench lanes, so this machine

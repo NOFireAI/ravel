@@ -17,10 +17,15 @@
 # skipped. What can be orphaned is this script itself, which is why
 # scripts/guards/check-test-suites-run.sh requires a workflow to name it.
 #
-# Node: the major version comes from sdk/typescript/.node-version, the file
-# CI's actions/setup-node reads, so the two cannot pin different majors. A
-# missing node or npm, or a different major, is refused with exit 64 before
-# any npm command runs.
+# Node: this script checks the major against sdk/typescript/.node-version,
+# the file CI's actions/setup-node reads. The binding floor is stricter and
+# lives in sdk/typescript/package.json's `engines` range, which `npm ci`
+# enforces because sdk/typescript/.npmrc sets engine-strict: a node of the
+# right major below that floor passes this check and fails at `npm ci` with
+# EBADENGINE. A missing node or npm, or a different major, is refused with
+# exit 64 before any npm command runs. A host without node 22 that needs an
+# unscoped scripts/gates.sh run sets RAVEL_GATES_SKIP_SDK=1 there, and CI's
+# `sdk` job stays the gate for sdk/typescript.
 #
 # Exit codes:
 #   0   all four steps passed
@@ -46,18 +51,18 @@ if [[ ! "${want_major}" =~ ^[0-9]+$ ]]; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "gates-sdk.sh: refused: node is not on PATH (need node ${want_major}, per sdk/typescript/.node-version)" >&2
+  echo "gates-sdk.sh: refused: node is not on PATH (need node ${want_major}, per sdk/typescript/.node-version); for an unscoped scripts/gates.sh run on this host set RAVEL_GATES_SKIP_SDK=1 and let CI's sdk job be the gate" >&2
   exit 64
 fi
 if ! command -v npm >/dev/null 2>&1; then
-  echo "gates-sdk.sh: refused: npm is not on PATH (need the npm that ships with node ${want_major})" >&2
+  echo "gates-sdk.sh: refused: npm is not on PATH (need the npm that ships with node ${want_major}); for an unscoped scripts/gates.sh run on this host set RAVEL_GATES_SKIP_SDK=1 and let CI's sdk job be the gate" >&2
   exit 64
 fi
 node_version="$(node --version 2>/dev/null)" || node_version=""
 have_major="${node_version#v}"
 have_major="${have_major%%.*}"
 if [[ "${have_major}" != "${want_major}" ]]; then
-  echo "gates-sdk.sh: refused: node ${node_version:-of unknown version} is on PATH, sdk/typescript/.node-version pins major ${want_major}" >&2
+  echo "gates-sdk.sh: refused: node ${node_version:-of unknown version} is on PATH, sdk/typescript/.node-version pins major ${want_major} (and npm ci enforces package.json's engines floor); for an unscoped scripts/gates.sh run on this host set RAVEL_GATES_SKIP_SDK=1 and let CI's sdk job be the gate" >&2
   exit 64
 fi
 

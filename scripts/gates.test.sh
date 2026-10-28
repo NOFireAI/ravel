@@ -122,12 +122,12 @@ agents_clippy='==> cargo clippy --locked -p ravel-server --features agents --all
 # The agents and mcp lanes select tests by binary: a test-name filter alone
 # (the *_name_filter forms) never runs a test whose path omits the keyword.
 agents_test='==> cargo nextest run --locked -p ravel-server --features agents --test agents_seam'
-agents_lib_test='==> cargo nextest run --locked -p ravel-server --features agents --lib agents'
+agents_lib_test='==> cargo nextest run --locked -p ravel-server --features agents --lib'
 agents_name_filter='==> cargo nextest run --locked -p ravel-server --features agents agents'
 agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification'
 mcp_clippy='==> cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings'
 mcp_test='==> cargo nextest run --locked -p ravel-server --features mcp --test mcp_e2e --test trace_by_id'
-mcp_lib_test='==> cargo nextest run --locked -p ravel-server --features mcp --lib mcp'
+mcp_lib_test='==> cargo nextest run --locked -p ravel-server --features mcp --lib'
 mcp_name_filter='==> cargo nextest run --locked -p ravel-server --features mcp mcp'
 sdk_gate_re='^==> .*/gates-sdk\.sh$'
 sdk_skip='==> SDK gate skipped (RAVEL_GATES_SKIP_SDK=1): CI'"'"'s sdk job is the gate for sdk/typescript'
@@ -340,7 +340,7 @@ check_eq "affected-tests -p ravel-query: esql tests" "1" \
 check_eq "affected-tests -p ravel-query: agents seam binary" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --test agents_seam')"
 check_eq "affected-tests -p ravel-query: agents lib tests" "1" \
-  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --lib agents')"
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --lib')"
 check_eq "affected-tests -p ravel-query: no bare agents name filter" "0" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents agents')"
 check_eq "affected-tests -p ravel-query: classification test" "1" \
@@ -348,7 +348,7 @@ check_eq "affected-tests -p ravel-query: classification test" "1" \
 check_eq "affected-tests -p ravel-query: mcp binaries" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id')"
 check_eq "affected-tests -p ravel-query: mcp lib tests" "1" \
-  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --lib mcp')"
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --lib')"
 check_eq "affected-tests -p ravel-query: no bare mcp name filter" "0" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp mcp')"
 
@@ -376,7 +376,7 @@ check_eq "affected-tests, esql run fails: sql still ran" "1" \
 CARGO_STUB_FAIL_ON="--features agents" run_stubbed at-agents-fail bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
 check_eq "affected-tests, agents run fails: exit 3" "3" "${rc}"
 check_eq "affected-tests, agents run fails: mcp still ran" "1" \
-  "$(count_matching "${tmp}/at-agents-fail.calls" '--features mcp --lib mcp$')"
+  "$(count_matching "${tmp}/at-agents-fail.calls" '--features mcp --lib$')"
 
 # A failing agents lib run fails the script though the seam binary passed.
 CARGO_STUB_FAIL_ON="--features agents --lib" run_stubbed at-agents-lib-fail \
