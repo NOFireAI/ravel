@@ -84,10 +84,40 @@ pub fn peek_format_version(bytes: &[u8]) -> Result<u32, CodecError> {
     check_format_version(version).map(|()| FORMAT_VERSION)
 }
 
+/// Gate every top-level occurrence of field 1 of a HEAD before it is
+/// decoded. Each occurrence is read as the raw 64-bit varint: prost
+/// truncates a `uint32` varint above `u32::MAX` to its low 32 bits, so a
+/// trailing `2^32 + 1` behind a leading 1 (the occurrence protobuf keeps)
+/// would otherwise decode as version 1 and pass [`check_format_version`].
+/// Such a value is refused as `UnsupportedFormat { found: u32::MAX }`
+/// (`tests::a_format_version_varint_above_u32_is_refused_before_decode`).
+fn gate_every_format_version(bytes: &[u8]) -> Result<(), CodecError> {
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+    let decode = |e: prost::DecodeError| CodecError::Decode(e.to_string());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (tag, wire_type) = decode_key(&mut rest).map_err(decode)?;
+        if tag != 1 {
+            skip_field(wire_type, tag, &mut rest, DecodeContext::default()).map_err(decode)?;
+            continue;
+        }
+        if wire_type != WireType::Varint {
+            return Err(CodecError::Decode(
+                "format_version is not a varint".to_string(),
+            ));
+        }
+        let raw = decode_varint(&mut rest).map_err(decode)?;
+        check_format_version(u32::try_from(raw).unwrap_or(u32::MAX))?;
+    }
+    Ok(())
+}
+
 /// Gate on the `format_version` a full decode settled on. Protobuf keeps the
 /// last occurrence of a repeated scalar field, so a record that writes field
 /// 1 twice passes [`peek_format_version`] on its first occurrence and only
-/// this check sees the value the decoded message carries.
+/// this check sees the value the decoded message carries. A HEAD is also
+/// gated occurrence by occurrence before decode, which this check cannot do
+/// for a value prost truncated.
 pub(crate) fn check_format_version(version: u32) -> Result<(), CodecError> {
     match version {
         0 => Err(CodecError::MissingFormatVersion),
@@ -332,6 +362,7 @@ impl Head {
 
     pub fn decode(bytes: &[u8]) -> Result<Head, CodecError> {
         peek_format_version(bytes)?;
+        gate_every_format_version(bytes)?;
         let raw = pb::AgentHead::decode(bytes).map_err(|e| CodecError::Decode(e.to_string()))?;
         check_format_version(raw.format_version)?;
         check_seal(raw.seal)?;
@@ -1353,6 +1384,44 @@ pub(crate) mod tests {
             Head::decode(&bytes),
             Err(CodecError::UnsupportedFormat { found: 2 })
         );
+    }
+
+    #[test]
+    fn a_format_version_varint_above_u32_is_refused_before_decode() {
+        // 2^32 + 1 as a varint: prost decodes a uint32 field by truncating
+        // the u64, so a full decode alone reads this as version 1.
+        let mut above = Vec::new();
+        prost::encoding::encode_varint((1u64 << 32) + 1, &mut above);
+        let truncated = {
+            let mut probe = vec![0x08];
+            probe.extend_from_slice(&above);
+            pb::AgentHead::decode(probe.as_slice())
+                .expect("prost accepts it")
+                .format_version
+        };
+        assert_eq!(truncated, 1, "prost truncates the varint");
+        let refused = CodecError::UnsupportedFormat { found: u32::MAX };
+        // The only occurrence, leading.
+        let mut lone = sample_head().encode();
+        lone.splice(0..2, [0x08].into_iter().chain(above.iter().copied()));
+        assert_eq!(peek_format_version(&lone), Err(refused.clone()));
+        assert_eq!(Head::decode(&lone), Err(refused.clone()));
+        // A later occurrence behind a leading 1, where it is the value
+        // protobuf keeps: the leading peek passes it, and the full gate
+        // refuses it before decode.
+        let mut repeated = sample_head().encode();
+        let seal = repeated.split_off(repeated.len() - 6);
+        repeated.push(0x08);
+        repeated.extend_from_slice(&above);
+        repeated.extend_from_slice(&seal);
+        assert_eq!(peek_format_version(&repeated), Ok(FORMAT_VERSION));
+        assert_eq!(gate_every_format_version(&repeated), Err(refused.clone()));
+        assert_eq!(Head::decode(&repeated), Err(refused));
+        // Field 1 under another wire type is corrupt, not a version.
+        assert!(matches!(
+            gate_every_format_version(&[0x0d, 1, 0, 0, 0]),
+            Err(CodecError::Decode(_))
+        ));
     }
 
     #[test]
