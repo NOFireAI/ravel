@@ -73,6 +73,16 @@ ravel-pqtable = { workspace = true }
 # encrypt|decrypt|set-policy` derive epoch keys and replace the marker. Was a
 # dev-dependency here; workspace pin, no new external crate.
 ravel-ipcrypt = { workspace = true, features = ["marker"] }
+# `agents` (ADR-3331, issue #3355): read commands decode HEAD straight from the
+# bucket through ravel-agents-store; write commands go through the server with
+# ravel-agents-client. Workspace pins, no new external crate.
+ravel-agents-core = { workspace = true }
+ravel-agents-store = { workspace = true }
+ravel-agents-client = { workspace = true }
+# `agents dev` probes the server's /readyz with reqwest and supervises the
+# server and docker compose as child processes (tokio's `process` feature).
+# Workspace pins, no new external crate.
+reqwest = { workspace = true }
 prost = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
@@ -87,7 +97,7 @@ thiserror = { workspace = true }
 # section 4, EC4), matching ravel-server's `--retention-*` duration convention.
 # Already a workspace pin (ravel-server uses it); adds no new external crate.
 humantime = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use ravel_cli::agents::AgentsCommand;
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::{
     catalog, hold, idem, maintain, now_ns, parse_max_flush_lifetime_ns, rlog_footprint, store,
@@ -189,6 +190,20 @@ fn command_hashes_tenant(command: &Command) -> bool {
             TenantCommand::Token { .. } => false,
             TenantCommand::ParquetGrant { .. } => true,
         },
+        // The read commands find HEAD and the agent directory under
+        // `t/<tenant_hash>/agents/` from `--tenant`. `dev` hands tenancy to
+        // the server it starts, `scaffold` touches no store, and `reconcile`
+        // goes through a running server, which hashes the tenant itself.
+        Command::Agents { command } => match command {
+            AgentsCommand::List { .. }
+            | AgentsCommand::Inspect { .. }
+            | AgentsCommand::Operation { .. }
+            | AgentsCommand::Events { .. }
+            | AgentsCommand::Effects { .. } => true,
+            AgentsCommand::Dev(_)
+            | AgentsCommand::Scaffold { .. }
+            | AgentsCommand::Reconcile { .. } => false,
+        },
     }
 }
 
@@ -336,6 +351,22 @@ fn command_is_write(command: &Command) -> bool {
         | Command::Cache { .. }
         // `inspect cstat` and `inspect kidx` only read the named object.
         | Command::Inspect { .. } => false,
+        Command::Agents { command } => match command {
+            // Decode HEAD and the agent directory; write nothing.
+            AgentsCommand::List { .. }
+            | AgentsCommand::Inspect { .. }
+            | AgentsCommand::Operation { .. }
+            | AgentsCommand::Events { .. }
+            | AgentsCommand::Effects { .. } => false,
+            // `dev` writes only `sys/qualification` through `store qualify`,
+            // a bucket-root object, for the same bootstrap reason as `store`;
+            // the server it starts runs its own tenancy checks. `scaffold`
+            // writes a local directory, and `reconcile`'s write is the
+            // server's, under the server's own tenancy.
+            AgentsCommand::Dev(_) | AgentsCommand::Scaffold { .. } | AgentsCommand::Reconcile { .. } => {
+                false
+            }
+        },
     }
 }
 
@@ -376,6 +407,12 @@ enum Command {
     Maintain {
         #[command(subcommand)]
         command: MaintainCommand,
+    },
+    /// Ravel Agents (ADR-3331): a local development server, the SDK example
+    /// scaffold, and read-only inspection of agents straight from the bucket.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
     /// Object store backend qualification (ADR-0050 section 6).
     Store {
@@ -2435,6 +2472,151 @@ fn run_ipcrypt_transform(
 
 /// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
 /// than stderr.
+/// `agents ...`. The read commands run after `run_logged` installed the
+/// bucket's tenant-hash scheme (see `command_hashes_tenant`).
+async fn run_agents(
+    command: AgentsCommand,
+    store_args: &store::StoreArgs,
+    tenancy: &TenancyArgs,
+) -> anyhow::Result<()> {
+    use ravel_cli::agents;
+    let out = &mut std::io::stdout().lock();
+    match command {
+        AgentsCommand::Dev(args) => {
+            // The memory store is refused inside `agents::dev`, before any
+            // store is built or any step runs.
+            let mut server_store_args = store_args.echo_flags(&|_| true);
+            match &tenancy.tenant_hash_key_file {
+                Some(path) => server_store_args.extend([
+                    "--tenant-hash-key-file".to_string(),
+                    path.display().to_string(),
+                ]),
+                None => server_store_args.push("--tenant-hash-unkeyed".to_string()),
+            }
+            let options = agents::DevOptions {
+                store_kind: store_args.store_kind(),
+                listen_http: args.listen_http,
+                listen_grpc: args.listen_grpc,
+                tenant: args.tenant,
+                server_store_args,
+                client_token: uuid::Uuid::new_v4().simple().to_string(),
+                worker_token: uuid::Uuid::new_v4().simple().to_string(),
+                json: args.json,
+            };
+            if options.store_kind == store::StoreKind::Memory {
+                return Err(agents::AgentsCliError::MemoryStore.into());
+            }
+            let built = store::build_store(store_args)?;
+            let server_env = [
+                ("RAVEL_S3_ACCESS_KEY", &store_args.s3_access_key),
+                ("RAVEL_S3_SECRET_KEY", &store_args.s3_secret_key),
+                ("RAVEL_S3_SESSION_TOKEN", &store_args.s3_session_token),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| value.clone().map(|v| (name.to_string(), v)))
+            .collect();
+            let page = ravel_object_store::s3::LIST_PAGE_SIZE;
+            let qualify_store = store::build_store_handle(store_args, Some(page))?;
+            let identity = store_args.backend_identity();
+            let qualify: agents::QualifyRun = Box::pin(async move {
+                ravel_cli::qualify::qualify_built(
+                    qualify_store,
+                    identity,
+                    &uuid::Uuid::new_v4().to_string(),
+                    page,
+                )
+                .await
+            });
+            let mut host = agents::SystemDevHost::new(
+                built,
+                args.compose_file,
+                args.server_bin,
+                server_env,
+                Duration::from_secs(args.ready_timeout_secs),
+                qualify,
+            );
+            agents::dev(&options, &mut host, out).await.map(|_| ())
+        }
+        AgentsCommand::Scaffold {
+            dir,
+            sdk_package,
+            json,
+        } => agents::scaffold(&dir, &sdk_package, json, out).map(|_| ()),
+        AgentsCommand::List {
+            tenant,
+            limit,
+            cursor,
+            json,
+        } => {
+            let built = store::build_store(store_args)?;
+            let tenant = TenantId::new(tenant).hash();
+            agents::list(built, tenant, limit, cursor.as_deref(), json, out)
+                .await
+                .map(|_| ())
+        }
+        AgentsCommand::Inspect {
+            tenant,
+            agent,
+            json,
+        } => {
+            let built = store::build_store(store_args)?;
+            let tenant = TenantId::new(tenant).hash();
+            agents::inspect(built, tenant, &agent, json, out)
+                .await
+                .map(|_| ())
+        }
+        AgentsCommand::Operation {
+            tenant,
+            handle,
+            json,
+        } => {
+            let built = store::build_store(store_args)?;
+            let tenant = TenantId::new(tenant).hash();
+            agents::operation(built, tenant, &handle, json, out)
+                .await
+                .map(|_| ())
+        }
+        AgentsCommand::Events {
+            tenant,
+            agent,
+            cursor,
+            limit,
+            json,
+        } => {
+            let built = store::build_store(store_args)?;
+            let tenant = TenantId::new(tenant).hash();
+            agents::events(built, tenant, &agent, cursor.as_deref(), limit, json, out)
+                .await
+                .map(|_| ())
+        }
+        AgentsCommand::Effects {
+            tenant,
+            agent,
+            json,
+        } => {
+            let built = store::build_store(store_args)?;
+            let tenant = TenantId::new(tenant).hash();
+            agents::effects(built, tenant, &agent, json, out)
+                .await
+                .map(|_| ())
+        }
+        AgentsCommand::Reconcile {
+            effect,
+            attempt,
+            retry: _,
+            result,
+            url,
+            token,
+            json,
+        } => {
+            let client = ravel_agents_client::AgentsClient::new(&url, Some(token))?;
+            agents::reconcile(&client, &effect, attempt, result.as_deref(), json, out)
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
 async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
     // Refused before the store is built: an unaudited query must not cost a
     // single request unless the operator acknowledged it.
@@ -2857,6 +3039,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             )
             .await
         }
+        Command::Agents { command } => run_agents(command, &cli.store, &cli.tenancy).await,
         Command::Store {
             command: StoreCommand::Qualify { list_page_size },
         } => {

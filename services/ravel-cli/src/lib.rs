@@ -5,6 +5,7 @@
 //! in-memory store, making a chained fold -> inspect -> verify scenario
 //! impossible to construct without a persistent S3 backend).
 
+pub mod agents;
 pub mod catalog;
 pub mod cli_profiling;
 pub mod erase;
