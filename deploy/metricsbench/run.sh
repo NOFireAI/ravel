@@ -54,7 +54,9 @@
 # are optional there, since no Ravel is started.
 #
 # The stack is always torn down with `docker compose ... down -v` (after its
-# logs are saved to <out>/compose.log) unless --keep is given.
+# logs are saved to <out>/compose.log and RustFS's /logs directory is copied
+# to <out>/rustfs-logs/) unless --keep is given. A failed copy is stamped
+# (rustfs_logs) and does not change the exit code.
 #
 # Exit codes:
 #   0   every step passed
@@ -513,6 +515,16 @@ case "$profile" in
   churn) max_ingest_secs=18000 ;;
   *) refuse "no ingest wall-time ceiling is set for profile '$profile'; add one to run.sh" ;;
 esac
+# Per-request timeout of every read-back query, the same for every engine.
+# The read-back's first query lists every series of the profile, which on
+# cardinality is 1,000,000 of them; the write timeout does not fit it.
+case "$profile" in
+  ci) readback_timeout_secs=30 ;;
+  cardinality) readback_timeout_secs=900 ;;
+  history) readback_timeout_secs=300 ;;
+  churn) readback_timeout_secs=900 ;;
+  *) refuse "no read-back timeout is set for profile '$profile'; add one to run.sh" ;;
+esac
 if [ "$diagnostic" -eq 1 ]; then
   # The falsification query only tests --query.max-samples on a profile whose
   # window the entry declares; elsewhere it loads a few samples, cannot reach
@@ -625,6 +637,7 @@ fi
 stamp_set comparator_images null
 stamp_set ravel_catalog_fold null
 stamp_set mimir_readiness null
+stamp_set rustfs_logs null
 stamp_set in_process_row null
 stamp_set steps_completed '[]'
 stamp_set failed_step null
@@ -687,6 +700,26 @@ memory_summary() {
   return "$code"
 }
 
+# save_rustfs_logs: copy RustFS's /logs out of its container into
+# <out>/rustfs-logs/, since `down -v` destroys the container and its own log
+# directory with it. A failed copy is stamped and said, and never changes the
+# run's exit code.
+save_rustfs_logs() {
+  local cp_code=0
+  if [ "$diagnostic" -eq 1 ]; then
+    stamp_str rustfs_logs "not applicable: diagnostic run starts no RustFS"
+    return 0
+  fi
+  compose cp rustfs:/logs "${out_dir}/rustfs-logs" >"${out_dir}/rustfs-logs-copy.log" 2>&1 || cp_code=$?
+  if [ "$cp_code" -eq 0 ]; then
+    stamp_str rustfs_logs "copied to rustfs-logs/"
+  else
+    stamp_str rustfs_logs "copy failed (exit ${cp_code}), see rustfs-logs-copy.log"
+    say "copying RustFS's /logs failed (exit ${cp_code}); see ${out_dir}/rustfs-logs-copy.log"
+  fi
+  return 0
+}
+
 on_exit() {
   local code=$? down_code=0
   trap - EXIT
@@ -698,6 +731,7 @@ on_exit() {
     fi
     stop_sampler
     compose logs --no-color >"${out_dir}/compose.log" 2>&1
+    save_rustfs_logs
     if [ "$keep" -eq 1 ]; then
       stamp_str teardown "kept (--keep)"
       say "--keep: the stack is still up"
@@ -835,7 +869,7 @@ run_diagnostic() {
   # history profile would not fit in memory.
   stamp_str in_process_row skipped
   run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" --no-in-process-row \
-    --max-ingest-secs "$max_ingest_secs" \
+    --max-ingest-secs "$max_ingest_secs" --readback-timeout-secs "$readback_timeout_secs" \
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE"
 
   query="$(py corpus-query "$CORPUS" "$FALSIFICATION_ENTRY")" ||
@@ -902,7 +936,7 @@ run_full() {
     stamp_str in_process_row skipped
   fi
   run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" "${in_process[@]}" \
-    --max-ingest-secs "$max_ingest_secs" \
+    --max-ingest-secs "$max_ingest_secs" --readback-timeout-secs "$readback_timeout_secs" \
     --ravel-endpoint "${RAVEL_BASE}/api/v1/write" --ravel-tenant "$RAVEL_TENANT" \
     --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE" \

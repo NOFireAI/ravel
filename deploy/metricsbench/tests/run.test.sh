@@ -41,7 +41,20 @@
 #                                       14400, history 72000, churn 18000), in
 #                                       diagnostic mode too; no shard or batch
 #                                       flag, so the bin's defaults of 50
-#                                       shards and 2000 points apply
+#                                       shards and 2000 points apply; and its
+#                                       --readback-timeout-secs (ci 30,
+#                                       cardinality 900, history 300, churn
+#                                       900)
+#   n  RustFS log copy               -> teardown copies rustfs:/logs into
+#                                       <out>/rustfs-logs before down -v, on
+#                                       success (a) and on failure (b); a
+#                                       failed copy is stamped and said, the
+#                                       exit code stays 0, still torn down
+#   o  descriptor limits             -> prometheus, victoriametrics, rustfs,
+#                                       mimir (docker-compose.yml) and
+#                                       ravel-server (ravel.yml) each carry
+#                                       ulimits nofile soft and hard 524288,
+#                                       read from the files' text
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -125,6 +138,13 @@ JSON
         ;;
       logs)
         echo "stub compose logs"
+        ;;
+      cp)
+        if [ "${STUB_CP_EXIT:-0}" -ne 0 ]; then
+          echo "stub: no such container path" >&2
+          exit "${STUB_CP_EXIT}"
+        fi
+        mkdir -p "$2" && echo "stub rustfs log" >"$2/rustfs.log"
         ;;
     esac
     ;;
@@ -334,6 +354,19 @@ expect_err() {
   if grep -qF -- "$2" "${ERR}"; then pass "$1"; else fail "$1 (no '$2' in stderr: $(cat "${ERR}"))"; fi
 }
 
+# expect_cp_before_down LABEL: teardown asked for RustFS's /logs, into the
+# out-dir, before the down -v that destroys the container.
+expect_cp_before_down() {
+  local cp_line down_line
+  cp_line="$(grep -nF -- "ravel.yml cp rustfs:/logs ${OUT}/rustfs-logs" "${LOG}" | head -n 1 | cut -d: -f1)"
+  down_line="$(grep -nF -- " down -v" "${LOG}" | head -n 1 | cut -d: -f1)"
+  if [ -n "${cp_line}" ] && [ -n "${down_line}" ] && [ "${cp_line}" -lt "${down_line}" ]; then
+    pass "$1: RustFS's /logs copied before down -v"
+  else
+    fail "$1: RustFS's /logs not copied before down -v (cp line '${cp_line}', down line '${down_line}')"
+  fi
+}
+
 # --- a: success --------------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/a/out")
 run_case a "${args[@]}" --rss-band ravel-server:1:1000000000
@@ -365,6 +398,9 @@ expect_log "a: provenance pins the comparators from the capture" "--comparator m
 expect_no_log "a: the token never on a command line" "metricsbench-token"
 expect_log "a: ci keeps the in-process row on a memory store" "--store memory --tenant metricsbench"
 check "a: stamps say the in-process row is present" 'j("stamps.json")["in_process_row"] == "present"'
+expect_cp_before_down a
+check "a: stamps say RustFS's logs were copied" 'j("stamps.json")["rustfs_logs"] == "copied to rustfs-logs/"'
+expect_file a rustfs-logs/rustfs.log
 
 # --- b: ingest fails ---------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/b/out")
@@ -375,6 +411,7 @@ check "b: stamps name step ingest, status failed" 'j("stamps.json")["failed_step
 expect_no_file b report.json
 expect_log "b: still torn down" " down -v"
 expect_file b memory-summary.json
+expect_cp_before_down b
 
 # --- c: image without a digest -----------------------------------------------
 run_case c --profile ci --ravel-image ghcr.io/nofireai/ravel-server:latest --ravel-source-commit "${COMMIT}" \
@@ -419,6 +456,8 @@ expect_no_log "f: no memory store" "--store memory"
 check "f: stamps say the in-process row is skipped" 'j("stamps.json")["in_process_row"] == "skipped"'
 expect_no_log "f: no query run" "metricsbench_query"
 expect_log "f: torn down" " down -v"
+expect_no_log "f: no RustFS log copy without RustFS" " cp rustfs:/logs"
+check "f: stamps say the RustFS log copy does not apply" 'j("stamps.json")["rustfs_logs"].startswith("not applicable")'
 
 # --- f2: diagnostic on a profile the entry is not declared for ---------------
 run_case f2 --profile ci --bin-dir "${BIN}" --out-dir "${TMP}/f2/out" --anchor-ms "${ANCHOR}" \
@@ -486,14 +525,17 @@ expect_no_log "l: no memory store" "--store memory"
 check "l: stamps say the in-process row is skipped" 'j("stamps.json")["in_process_row"] == "skipped"'
 
 # --- m: ingest wall-time ceilings ----------------------------------------------
-for pair in ci:600 cardinality:14400 history:72000 churn:18000; do
-  name="${pair%%:*}"
-  ceiling="${pair#*:}"
+for triple in ci:600:30 cardinality:14400:900 history:72000:300 churn:18000:900; do
+  name="${triple%%:*}"
+  ceiling="${triple#*:}"
+  readback="${ceiling#*:}"
+  ceiling="${ceiling%%:*}"
   run_case "m-${name}" --profile "${name}" --ravel-image "${IMAGE}" \
     --ravel-source-commit "${COMMIT}" --bin-dir "${BIN}" --out-dir "${TMP}/m-${name}/out" \
     --anchor-ms "${ANCHOR}"
   expect_rc "m-${name}" 0
   expect_log "m-${name}: ingest gets the ${ceiling} s ceiling" "--max-ingest-secs ${ceiling} "
+  expect_log "m-${name}: read-back gets the ${readback} s timeout" "--readback-timeout-secs ${readback} "
   expect_no_log "m-${name}: no shard count passed" "--http-shards"
   expect_no_log "m-${name}: no batch size passed" "--http-batch-size"
 done
@@ -501,6 +543,7 @@ run_case m-diagnostic --profile history --bin-dir "${BIN}" --out-dir "${TMP}/m-d
   --anchor-ms "${ANCHOR}" --diagnostic-prometheus-max-samples 1000
 expect_rc m-diagnostic 0
 expect_log "m-diagnostic: the diagnostic ingest gets the history ceiling" "--max-ingest-secs 72000 "
+expect_log "m-diagnostic: the diagnostic read-back gets the history timeout" "--readback-timeout-secs 300 "
 # The defaults run.sh relies on by passing neither flag.
 INGEST_SRC="${HERE}/../../../crates/ravel-bench/src/metrics_ingest.rs"
 if grep -qF 'pub const DEFAULT_HTTP_SHARDS: usize = 50;' "${INGEST_SRC}"; then
@@ -513,6 +556,42 @@ if grep -qF 'pub const DEFAULT_HTTP_BATCH_SIZE: usize = 2000;' "${INGEST_SRC}"; 
 else
   fail "m: DEFAULT_HTTP_BATCH_SIZE is not 2000 in ${INGEST_SRC}"
 fi
+
+# --- n: RustFS log copy fails ----------------------------------------------------
+mapfile -t args < <(full_args "${TMP}/n/out")
+STUB_CP_EXIT=1 run_case n "${args[@]}"
+expect_rc n 0
+check "n: stamps say the copy failed, run passed" 'j("stamps.json")["rustfs_logs"].startswith("copy failed (exit 1)") and j("stamps.json")["status"] == "passed"'
+expect_err "n: the failed copy is said" "copying RustFS's /logs failed (exit 1)"
+expect_log "n: still torn down" " down -v"
+
+# --- o: descriptor limits --------------------------------------------------------
+# A service's block runs from its two-space key to the next key at two spaces
+# or less; the four ulimits lines must appear in it, in order.
+for pair in docker-compose.yml:prometheus docker-compose.yml:victoriametrics \
+  docker-compose.yml:rustfs docker-compose.yml:mimir ravel.yml:ravel-server; do
+  file="${pair%%:*}"
+  svc="${pair#*:}"
+  if python3 -I - "${HERE}/../${file}" "${svc}" <<'PY'; then
+import re, sys
+path, svc = sys.argv[1], sys.argv[2]
+lines = open(path).read().splitlines()
+start = next((i for i, l in enumerate(lines) if l == "  " + svc + ":"), None)
+if start is None:
+    sys.exit(1)
+block = []
+for l in lines[start + 1:]:
+    if re.match(r"^ {0,2}[A-Za-z0-9_.-]+:", l):
+        break
+    block.append(l)
+want = ["    ulimits:", "      nofile:", "        soft: 524288", "        hard: 524288"]
+sys.exit(0 if any(block[i:i + 4] == want for i in range(len(block))) else 1)
+PY
+    pass "o: ${svc} in ${file} carries nofile 524288 soft and hard"
+  else
+    fail "o: ${svc} in ${file} lacks ulimits nofile soft and hard 524288"
+  fi
+done
 
 echo
 echo "${passes} passed, ${fails} failed"

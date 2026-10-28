@@ -220,6 +220,7 @@ scrape grid.
 | Ravel | `--max-samples` | `500000000` | `10000000` | Raised (#3306) to Prometheus' and Mimir's value. Ravel counts total materialized samples after dedup, where Prometheus counts peak resident samples, so the equal numbers are not equal semantics; the comparator counting the same quantity is VictoriaMetrics' `-search.maxSamplesPerQuery`, at twice this value. No corpus entry comes near either: the largest read is 96,000,000. The bytes behind them are bounded by `--memory-budget-bytes`, which refuses an oversized materialization `memory exhausted` first. The flag also sizes the range selector-cache cap (2 x max_samples x 16 bytes): 16,000,000,000 bytes here, against 320,000,000 at the default, so that cap is inert and the memory budget alone bounds a range query's cached selector copies. At the default, 5 history entries would be refused, the largest `mb_long_range_7d_avg` at about 40.3M | `--max-samples <N>  Cap on the total samples (summed across series, after cross-segment dedup) a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SAMPLES (10,000,000)` |
 | Ravel | points per range series | `11000` | `11000` (unchanged, no flag) | Kept, same as Prometheus and Mimir: history's grid is 289 points | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_RANGE_POINTS: usize = 11_000` |
 | Ravel | total evaluation points per query | `1000000` | `1000000` (unchanged, no flag) | Kept: `mb_long_range_subquery_max` (`[1d:5m]`, 289 points) over the 289-point grid is 83,521 | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000` |
+| All five: Prometheus, VictoriaMetrics, Mimir, Ravel, RustFS | `ulimits.nofile` (docker-compose.yml, ravel.yml) | `524288` soft and hard | Docker's container default: soft `1024`, hard `524288` | Equal descriptors for every long-running service, at Docker's hard default. The Go engines (Prometheus, VictoriaMetrics, Mimir) raise their soft limit to the hard limit themselves, so for them this changes nothing; ravel-server and RustFS do not (#3412), so without it they run at 1,024 descriptors | Default as recorded on #2821; each service's block is pinned by `tests/run.test.sh` case o |
 
 Limits the corpus does not reach, left at their defaults: VictoriaMetrics
 `-search.maxSamplesPerSeries` (default 30000000; history holds 172,800 samples
@@ -507,7 +508,12 @@ Steps, in order, stopping at the first failure:
    2000 points per request with one request in flight per shard; run.sh
    passes neither `--http-shards` nor `--http-batch-size` (case m). It passes
    `--max-ingest-secs` per profile: ci 600, cardinality 14400, history 72000,
-   churn 18000, the diagnostic mode's ingest included (case m). A row whose
+   churn 18000, the diagnostic mode's ingest included (case m), and
+   `--readback-timeout-secs`, the per-request timeout of each read-back
+   query with its body read, per profile: ci 30, cardinality 900, history
+   300, churn 900 (case m). `--http-timeout-secs` bounds writes only. Each
+   row's `readback.query_ms` records every read-back query's wall time in
+   milliseconds, and a failed query names its elapsed time. A row whose
    projected wall time passes its ceiling makes the bin exit 1, so the run
    exits 70 naming step ingest, like any failed ingest; a profile with no
    ceiling in run.sh is refused with exit 65 before anything starts.
@@ -536,7 +542,12 @@ Steps, in order, stopping at the first failure:
 Whatever the outcome, the compose logs go to `compose.log` and the stack is
 torn down with `docker compose ... down -v` unless `--keep` is given (cases
 a, b, d, f, i, k). On a failed step the memory summary is still written (case
-b).
+b). Before that teardown, `docker compose cp rustfs:/logs` copies RustFS's
+own log directory into `rustfs-logs/`, on success and on failure (cases a and
+b), since `down -v` destroys the container that holds it. A failed copy is
+stamped and written to `rustfs-logs-copy.log` and leaves the exit code as it
+was (case n); the diagnostic mode starts no RustFS and copies nothing (case
+f).
 
 `stamps.json` is written before the first step and completed at the end
 (case a). It holds `ravel_image.reference` and `ravel_image.resolved` (the
@@ -547,7 +558,8 @@ and `anchor_source`, `started_at` and `ended_at`, `store_kind: rustfs`,
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
 `mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
-f), `steps_completed`, `failed_step`, `exit_code`, `status` and `teardown`.
+f), `rustfs_logs` (cases a, f and n), `steps_completed`, `failed_step`,
+`exit_code`, `status` and `teardown`.
 
 ### The falsification run
 
