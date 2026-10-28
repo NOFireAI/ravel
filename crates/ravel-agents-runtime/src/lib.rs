@@ -175,7 +175,8 @@ pub struct Coordinator {
     pub(crate) wake: Notify,
     pub(crate) metrics: Metrics,
     /// The effect attempts this coordinator dispatched and has seen no
-    /// result for, by agent and effect id (see `effects`).
+    /// result for, by agent and effect id (see `effects`). An entry is
+    /// dropped once a root of a later epoch is seen or the agent unloads.
     pub(crate) open_attempts: Mutex<HashMap<(AgentId, Id128), effects::OpenAttempt>>,
 }
 
@@ -553,6 +554,7 @@ impl Coordinator {
 
     /// Record a root an operation returned, unless a newer one is loaded.
     pub(crate) fn observe(&self, agent: &AgentId, head: &Head) {
+        self.prune_open_attempts(agent, head);
         let now = self.now();
         let mut agents = self.agents.lock();
         match agents.get_mut(agent) {
@@ -579,6 +581,7 @@ impl Coordinator {
 
     /// Record a root read fresh from HEAD, whatever is loaded.
     pub(crate) fn replace(&self, agent: &AgentId, head: &Head) {
+        self.prune_open_attempts(agent, head);
         let now = self.now();
         let mut agents = self.agents.lock();
         let loaded = agents.entry(*agent).or_insert_with(|| Loaded {

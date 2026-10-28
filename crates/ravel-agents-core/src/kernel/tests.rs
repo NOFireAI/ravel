@@ -641,6 +641,42 @@ fn a_step_replayed_with_another_input_blocks_the_turn() {
 }
 
 #[test]
+fn a_step_replayed_under_another_tool_name_blocks_the_turn() {
+    let mut sim = Sim::started();
+    let input_hash = identity::step_input_hash("db", "1", b"a");
+    let step = |head: &Head, tool_name: &str| {
+        Command::RecordStep(RecordStep {
+            fence: turn_fence(head),
+            step_key: "lookup".to_string(),
+            tool_name: tool_name.to_string(),
+            tool_version: "1".to_string(),
+            input_hash,
+            status: StepStatus::Started,
+            output: None,
+        })
+    };
+    assert!(matches!(
+        sim.run(&step(sim.head(), "db")),
+        Reply::StepRecorded(_)
+    ));
+    assert!(matches!(
+        sim.run(&step(sim.head(), "db")),
+        Reply::StepReplayed(_)
+    ));
+    // Same key, version and input hash; only the tool name differs.
+    let Reply::Blocked(error) = sim.run(&step(sim.head(), "cache")) else {
+        panic!("a replay under another tool name must block");
+    };
+    assert_eq!(error.kind, ErrorKind::NonDeterministicReplay);
+    assert_eq!(
+        sim.head().active_turn.as_ref().map(|t| t.block),
+        Some(TurnBlock::NonDeterministicReplay)
+    );
+    assert_eq!(sim.head().steps.len(), 1);
+    assert_eq!(sim.head().steps[0].tool_name, "db");
+}
+
+#[test]
 fn a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation() {
     let mut sim = Sim::started();
     let old = sim.head().clone();
@@ -2210,6 +2246,106 @@ fn a_manual_attempt_enters_in_doubt_inside_the_reserve() {
     assert!(matches!(sim.run(&fail), Reply::TurnFailed { .. }));
 }
 
+/// Latch a manual effect in doubt, reconcile it by another attempt, and
+/// repeat `RECONCILES` times; then latch once more and attach a verified
+/// result. Cycle over new effects until a publish is refused.
+#[test]
+fn latch_and_reconcile_cycles_are_bounded_by_the_byte_cap() {
+    const RECONCILES: u32 = 8;
+    let limits = Limits::default();
+    let mut sim = Sim::with_limits(limits);
+    sim.run(&create_cmd());
+    sim.run(&takeover_cmd(sim.head(), "w1"));
+    sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
+    sim.run(&begin_cmd(sim.head()));
+
+    let mut settled = 0u32;
+    let (refused, refusal) = 'cycles: loop {
+        let commit = commit_intent_cmd(
+            sim.head(),
+            &format!("wire-{settled}"),
+            RecoveryPolicy::Manual,
+        );
+        let effect_id = match sim.step(&commit) {
+            Ok(t) => match t.reply() {
+                Reply::IntentCommitted { effect_id } => *effect_id,
+                other => panic!("intent answered {other:?}"),
+            },
+            Err(e) => break 'cycles ("commit intent", e),
+        };
+        let owner = Authority::Owner(owner_fence(sim.head()));
+        if let Err(e) = sim.step(&authorize_cmd(owner.clone(), effect_id, 1)) {
+            break 'cycles ("first authorization", e);
+        }
+        for attempt in 2..=RECONCILES + 1 {
+            assert!(matches!(
+                sim.run(&authorize_cmd(owner.clone(), effect_id, attempt)),
+                Reply::Blocked(_)
+            ));
+            let reconcile = Authority::Reconcile(inc_fence(sim.head()));
+            if let Err(e) = sim.step(&authorize_cmd(reconcile, effect_id, attempt)) {
+                break 'cycles ("reconcile authorization", e);
+            }
+        }
+        assert!(matches!(
+            sim.run(&authorize_cmd(owner, effect_id, RECONCILES + 2)),
+            Reply::Blocked(_)
+        ));
+        assert_eq!(
+            sim.run(&effect_result_cmd(sim.head(), effect_id, RECONCILES + 1)),
+            Reply::EffectResultRecorded { effect_id }
+        );
+        settled += 1;
+    };
+    assert_eq!(refusal.kind, ErrorKind::BudgetExceeded, "{refused}");
+    assert!(settled > 0);
+
+    let encoded = sim.head().encode();
+    assert!(encoded.len() <= limits.max_head_bytes);
+    assert!(encoded.len() <= MAX_HEAD_BYTES);
+    assert_eq!(&Head::decode(&encoded).expect("HEAD decodes"), sim.head());
+    // Every audit event lives in the one running turn's stream, far past
+    // the per-turn event cap, which does not count them.
+    let audits = sim.head().events.len() as u64;
+    assert_eq!(
+        audits,
+        u64::from(settled) * u64::from(RECONCILES + 1) + {
+            let pending = sim
+                .head()
+                .effects
+                .iter()
+                .find(|e| e.status != EffectStatus::Completed);
+            pending.map_or(0, |e| u64::from(e.attempt.saturating_sub(1)))
+        }
+    );
+    assert!(audits > limits.max_events_per_turn);
+    eprintln!(
+        "refused at {refused} after {settled} effects, {audits} audit events, {} bytes",
+        encoded.len()
+    );
+
+    // An effect left in doubt still settles inside the reserve.
+    if let Some(pending) = sim
+        .head()
+        .effects
+        .iter()
+        .find(|e| e.status == EffectStatus::InDoubt)
+        .cloned()
+    {
+        assert_eq!(
+            sim.run(&effect_result_cmd(
+                sim.head(),
+                pending.effect_id,
+                pending.attempt
+            )),
+            Reply::EffectResultRecorded {
+                effect_id: pending.effect_id
+            }
+        );
+        assert!(sim.head().encode().len() <= limits.max_head_bytes);
+    }
+}
+
 /// Fill under the guard at `limits`, apply the largest growth the guard
 /// exempts (a takeover by an `owner_len`-byte owner, then turns pinned to a
 /// `version_len`-byte handler version), and drain every input by a
@@ -2598,7 +2734,7 @@ fn the_reserves_cover_the_growth_they_stand_for() {
     // attempt and result, with the audit event of a reconciled result at the
     // widest sequence numbers and a `next_event_seq` one varint byte wider,
     // over step key sizes on both sides of the prefixes.
-    let mut effect = 0usize;
+    let (mut base, mut effect) = (0usize, 0usize);
     for len in (1..=200).chain([limits.max_string_bytes]) {
         let mut journaled = empty.clone();
         journaled.next_event_seq = 127;
@@ -2624,6 +2760,7 @@ fn the_reserves_cover_the_growth_they_stand_for() {
             ..blob(b"result")
         });
         slot.result_attempt = u32::MAX;
+        base = base.max(size(&settled) - size(&journaled));
         settled.next_event_seq = 128;
         settled.events.push(EventEntry {
             event_seq: u64::MAX,
@@ -2634,10 +2771,12 @@ fn the_reserves_cover_the_growth_they_stand_for() {
         });
         effect = effect.max(size(&settled) - size(&journaled));
     }
+    assert_eq!(base, 60);
     assert_eq!(effect, 128);
     assert!(effect <= PENDING_EFFECT_RESERVE_BYTES);
     eprintln!(
-        "slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {effect}"
+        "slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {base} + audit {} = {effect}",
+        effect - base
     );
 }
 

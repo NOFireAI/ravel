@@ -129,9 +129,9 @@ pub struct Limits {
 /// `Completed`: an owner's retry authorization of an effect already
 /// `Authorized` or `InDoubt`, or a `RecordEffectResult`, may still grow it,
 /// and both are exempt. The attempt varint (6), the result reference (47),
-/// the result attempt varint (6), the record's length prefix (1) and a status
-/// change (2, though prost writes every status in one byte either way) come
-/// to 62. A result that settles an `InDoubt` effect also appends one audit
+/// the result attempt varint (6) and the record's length prefix (1) come to
+/// 60; the status change costs nothing, since prost writes every status in
+/// one byte. A result that settles an `InDoubt` effect also appends one audit
 /// event (see [`AUDIT_RECONCILE_RESULT`]): its entry at the widest sequence
 /// numbers and a `next_event_seq` varint one byte wider add 68, so 128 in all
 /// (`tests::the_reserves_cover_the_growth_they_stand_for`).
@@ -717,6 +717,14 @@ fn identity_strings(command: &Command) -> (Vec<&str>, Vec<&str>) {
 /// reserve could cover. An effect near the cap still settles through a
 /// reconciled result, which is exempt
 /// (`tests::a_manual_attempt_enters_in_doubt_inside_the_reserve`).
+///
+/// Audit events are not counted against `Limits::max_events_per_turn`, which
+/// covers only the events a `CompleteTurn` carries; they are bounded by the
+/// byte cap alone. A reconciled result (an attach) is exempt and appends one
+/// inside the per-effect reserve; a `Reconcile` authorization is guarded and
+/// appends one only while the root stays outside the reserves, so
+/// a latch-and-reconcile loop ends in `BudgetExceeded` on a decodable root
+/// (`tests::latch_and_reconcile_cycles_are_bounded_by_the_byte_cap`).
 fn guarded(observed: &Head, command: &Command, reply: &Reply) -> bool {
     if matches!(reply, Reply::Blocked(_)) {
         return false;

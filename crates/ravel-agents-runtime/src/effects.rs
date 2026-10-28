@@ -385,7 +385,11 @@ impl Coordinator {
 
     /// Reconcile an effect in doubt by authorizing `attempt`, the one after
     /// its latest, and dispatching it. Idempotent: a repeat for an attempt
-    /// already authorized answers `false` and dispatches nothing.
+    /// already authorized answers `false` and dispatches nothing. When this
+    /// call's own write landed and only its acknowledgement was lost, the
+    /// retry finds the attempt authorized one past the effect's attempt this
+    /// call started from, and the attempt is dispatched
+    /// (`tests::a_reconcile_authorization_with_a_lost_ack_dispatches_once`).
     pub async fn reconcile_authorize(
         &self,
         effect: &EffectRef,
@@ -409,7 +413,9 @@ impl Coordinator {
             effect_id: effect.effect_id,
             attempt,
         });
-        let out = self.execute_effect(&effect.agent, &command, &[]).await?;
+        let (out, retried) = self
+            .execute_effect_counted(&effect.agent, &command, &[])
+            .await?;
         let Reply::AttemptAuthorized { attempt, .. } = out.reply else {
             return Err(refused(
                 &effect.agent,
@@ -417,7 +423,17 @@ impl Coordinator {
                 "reconciliation answered with something other than an attempt",
             ));
         };
-        if !out.published {
+        // The retry read HEAD after the unknown outcome; the attempt is this
+        // call's when the effect was in doubt before it and now holds the next
+        // attempt authorized.
+        let landed_unacknowledged = retried
+            && record.status == EffectStatus::InDoubt
+            && journaled(&out.head, effect).is_ok_and(|now| {
+                now.status == EffectStatus::Authorized
+                    && Some(now.attempt) == record.attempt.checked_add(1)
+                    && now.attempt == attempt
+            });
+        if !out.published && !landed_unacknowledged {
             return Ok(false);
         }
         self.open_attempts.lock().insert(
@@ -550,6 +566,16 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Drop the attempts recorded for `agent` under an epoch older than
+    /// `head`'s: no lease of that epoch can journal another step.
+    pub(crate) fn prune_open_attempts(&self, agent: &AgentId, head: &Head) {
+        let mut attempts = self.open_attempts.lock();
+        if attempts.is_empty() {
+            return;
+        }
+        attempts.retain(|(a, _), open| a != agent || open.epoch >= head.epoch);
+    }
+
     /// Refuse a dispatch while the loaded root shows the input being
     /// cancelled. The kernel refuses a new authorization then as well; this
     /// also covers a re-dispatch that needs none.
@@ -579,6 +605,17 @@ impl Coordinator {
         command: &Command,
         deps: &[Bytes],
     ) -> Result<Outcome, AgentError> {
+        Ok(self.execute_effect_counted(agent, command, deps).await?.0)
+    }
+
+    /// [`Coordinator::execute_effect`], also answering whether an unknown
+    /// outcome was run again.
+    async fn execute_effect_counted(
+        &self,
+        agent: &AgentId,
+        command: &Command,
+        deps: &[Bytes],
+    ) -> Result<(Outcome, bool), AgentError> {
         let mut retries = 0;
         loop {
             match self.store.execute_with(agent, command, deps).await {
@@ -589,7 +626,7 @@ impl Coordinator {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     self.after_outcome(&out);
-                    return Ok(out);
+                    return Ok((out, retries > 0));
                 }
                 Err(e)
                     if e.kind == ErrorKind::OutcomeUnknown && retries < UNKNOWN_OUTCOME_RETRIES =>
