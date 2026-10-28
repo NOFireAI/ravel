@@ -23,7 +23,8 @@
 #                only, the nightly's non-comparable profile; a local-build
 #                run is never publishable.
 #
-# Steps, in order; the first failure stops the run:
+# Steps, in order; the first failure stops the run, except a failed ingest
+# verification (see ingest):
 #
 #   (refusals)  a --ravel-image without an @sha256: digest and no
 #               --ravel-image-id, a --ravel-image-id that is not sha256:<64
@@ -56,8 +57,17 @@
 #               every SAMPLE_INTERVAL seconds after the previous one ends
 #   ingest      metricsbench_ingest into all four portable endpoints, read back
 #               through their query URLs, into <out>/ingest.json; Ravel's
-#               bearer token goes through --ravel-bearer-token-env
+#               bearer token goes through --ravel-bearer-token-env. When
+#               the bin exits non-zero and ingest.json still holds a row
+#               whose read-back failed or that stalled, ingest is stamped
+#               failed (failed_step) and the run goes on through every later
+#               step as a diagnostic: query gets
+#               --diagnostic-after-failed-ingest, validate must refuse the
+#               report it writes, a later step's failure is listed in
+#               failed_after_ingest, and the run exits 70 naming ingest.
+#               Any other ingest failure stops the run
 #   mimir-readiness  the ingest row for mimir read back what it accepted
+#               (after a failed ingest verification, stamped and not checked)
 #   capture     capture-effective-config.sh into <out>/effective-config.json
 #   provenance  metricsbench_report provenance into <out>/provenance.json
 #   fold-state  ravel_catalog_fold_last_success_timestamp_seconds from Ravel's
@@ -92,7 +102,8 @@
 #       sha256 is not the pinned one (step fetch-s3s-fs); nothing was
 #       started
 #   70  a step failed; its name is in the message and in stamps.json
-#       (failed_step)
+#       (failed_step). After a failed ingest verification this is ingest,
+#       even when a later step failed or the memory bands were violated
 #   75  a --rss-band was violated or a container was OOM-killed
 #
 # Environment, for tests: METRICSBENCH_DOCKER (default docker),
@@ -357,6 +368,28 @@ elif op == "mimir-readiness":
         sys.exit(3)
     print("the ingest report has no mimir row")
     sys.exit(3)
+elif op == "ingest-verification-failed":
+    # One line naming every row of an ingest report whose read-back failed or
+    # that stalled; exit 3 when the file is not such a report. metricsbench_ingest
+    # prints a report on a failed exit only for those two failures.
+    try:
+        doc = load(args[0])
+    except (OSError, ValueError):
+        sys.exit(3)
+    if not isinstance(doc, dict):
+        sys.exit(3)
+    failed = []
+    for row in doc.get("systems") or []:
+        rb = row.get("readback")
+        if row.get("readback_error"):
+            failed.append(f"{row.get('system')}: read-back failed ({row['readback_error']})")
+        elif isinstance(rb, dict) and rb.get("matches_expected") is False:
+            failed.append(f"{row.get('system')}: read-back did not match ({'; '.join(rb.get('mismatches') or [])})")
+    for st in doc.get("stalled") or []:
+        failed.append(f"{st.get('system')}: stalled ({st.get('error')})")
+    if not failed:
+        sys.exit(3)
+    print("; ".join(failed))
 elif op == "capture-images":
     # Each comparator's image block as the capture recorded it.
     comps = load(args[0]).get("comparators", {})
@@ -751,6 +784,7 @@ stamp_set mimir_readiness null
 stamp_set object_store null
 stamp_set in_process_row null
 stamp_set steps_completed '[]'
+stamp_set failed_after_ingest '[]'
 stamp_set failed_step null
 stamp_set exit_code null
 stamp_set teardown null
@@ -761,6 +795,12 @@ STACK_UP=0
 SAMPLER_PID=""
 MEMORY_DONE=0
 FAILED_STEP=""
+# Set by run_ingest in a full run whose ingest verification failed (a row's
+# read-back failed or a row stalled): the run goes on to query as a
+# diagnostic and exits 70 naming ingest at the end.
+INGEST_FAILED=0
+INGEST_FAILURE=""
+CONTINUE_AFTER_FAILED_VERIFICATION=0
 
 sample_once() {
   local ids ts
@@ -854,9 +894,23 @@ on_exit() {
 trap on_exit EXIT
 
 fail_step() {
+  if [ "$INGEST_FAILED" -eq 1 ]; then
+    say "step $1 failed: ${*:2}"
+    py append "$STAMPS" failed_after_ingest "$1"
+    fail_after_ingest
+  fi
   FAILED_STEP="$1"
   shift
   say "step $FAILED_STEP failed: $*"
+  exit "$EXIT_STEP"
+}
+
+# fail_after_ingest: end a run whose ingest verification failed. The exit
+# code and failed_step name ingest whatever later step failed or passed;
+# failed_after_ingest lists the later ones that failed.
+fail_after_ingest() {
+  FAILED_STEP="ingest"
+  say "step ingest failed: ${INGEST_FAILURE}; the run went on as a diagnostic, report.json is not a result"
   exit "$EXIT_STEP"
 }
 
@@ -909,6 +963,16 @@ run_ingest() {
   "${bin_dir}/metricsbench_ingest" "$@" >"${out_dir}/ingest.json" 2>"${out_dir}/ingest.log" || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/ingest.log"
+    local failed=""
+    if [ "$CONTINUE_AFTER_FAILED_VERIFICATION" -eq 1 ] &&
+      failed="$(py ingest-verification-failed "${out_dir}/ingest.json")"; then
+      INGEST_FAILED=1
+      INGEST_FAILURE="metricsbench_ingest exited $code: ${failed}"
+      FAILED_STEP="ingest"
+      stamp_str failed_step ingest
+      say "step ingest failed: ${INGEST_FAILURE}; going on to query as a diagnostic"
+      return 0
+    fi
     fail_step ingest "metricsbench_ingest exited $code; see ${out_dir}/ingest.log"
   fi
   step_done ingest
@@ -918,12 +982,17 @@ memory_step() {
   local code=0 verdict
   memory_summary || code=$?
   if [ "$code" -ne 0 ]; then
-    FAILED_STEP="memory"
     verdict="$(cat "${out_dir}/memory-verdict.txt" 2>/dev/null)"
     say "step memory failed: ${verdict//$'\n'/; }"
+    if [ "$INGEST_FAILED" -eq 1 ]; then
+      py append "$STAMPS" failed_after_ingest memory
+      fail_after_ingest
+    fi
+    FAILED_STEP="memory"
     exit "$EXIT_MEMORY"
   fi
   step_done memory
+  [ "$INGEST_FAILED" -eq 0 ] || fail_after_ingest
 }
 
 # sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
@@ -1085,6 +1154,7 @@ run_full() {
     in_process=(--no-in-process-row --tenant "$RAVEL_TENANT")
     stamp_str in_process_row skipped
   fi
+  CONTINUE_AFTER_FAILED_VERIFICATION=1
   run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" "${in_process[@]}" \
     --max-ingest-secs "$max_ingest_secs" --readback-timeout-secs "$readback_timeout_secs" \
     --ravel-endpoint "${RAVEL_BASE}/api/v1/write" --ravel-tenant "$RAVEL_TENANT" \
@@ -1093,10 +1163,17 @@ run_full() {
     --victoriametrics-endpoint "${VM_BASE}/api/v1/write" --victoriametrics-query-url "${VM_BASE}/prometheus" \
     --mimir-endpoint "${MIMIR_BASE}/api/v1/push" --mimir-query-url "${MIMIR_BASE}/prometheus"
 
-  line="$(py mimir-readiness "${out_dir}/ingest.json")" ||
-    fail_step mimir-readiness "$line"
-  stamp_str mimir_readiness "$line"
-  step_done mimir-readiness
+  code=0
+  line="$(py mimir-readiness "${out_dir}/ingest.json")" || code=$?
+  if [ "$code" -ne 0 ] && [ "$INGEST_FAILED" -eq 1 ]; then
+    # Already part of the ingest failure; the diagnostic queries regardless.
+    stamp_str mimir_readiness "$line"
+    say "mimir-readiness: $line"
+  else
+    [ "$code" -eq 0 ] || fail_step mimir-readiness "$line"
+    stamp_str mimir_readiness "$line"
+    step_done mimir-readiness
+  fi
 
   code=0
   "$CAPTURE" --out "${out_dir}/effective-config.json" >"${out_dir}/capture.log" 2>&1 || code=$?
@@ -1158,6 +1235,7 @@ run_full() {
     --out "${out_dir}/report.json")
   [ -z "$passes" ] || query_args+=(--passes "$passes")
   [ -z "$reps" ] || query_args+=(--reps-per-pass "$reps")
+  [ "$INGEST_FAILED" -eq 0 ] || query_args+=(--diagnostic-after-failed-ingest)
   code=0
   "${bin_dir}/metricsbench_query" "${query_args[@]}" >"${out_dir}/query.log" 2>&1 || code=$?
   if [ "$code" -ne 0 ]; then
@@ -1169,7 +1247,17 @@ run_full() {
 
   code=0
   "${bin_dir}/metricsbench_report" validate "${out_dir}/report.json" >"${out_dir}/validate.log" 2>&1 || code=$?
-  if [ "$code" -ne 0 ]; then
+  if [ "$INGEST_FAILED" -eq 1 ]; then
+    # The diagnostic report says run_verdict: failed, which validate refuses.
+    if [ "$code" -eq 0 ]; then
+      fail_step validate "metricsbench_report validate accepted a report written after a failed ingest"
+    fi
+    grep -qF "diagnostic of a failed run" "${out_dir}/validate.log" || {
+      show_log "${out_dir}/validate.log"
+      fail_step validate "metricsbench_report validate exited $code without naming the failed run"
+    }
+    say "step validate refused the diagnostic report, as it must"
+  elif [ "$code" -ne 0 ]; then
     show_log "${out_dir}/validate.log"
     fail_step validate "metricsbench_report validate exited $code"
   fi

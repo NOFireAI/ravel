@@ -416,9 +416,14 @@ responses drain, so it also covers a stream small enough to fit in the shard
 buffers
 (`metrics_ingest::tests::the_drain_stops_a_row_whose_whole_stream_is_already_offered`). A
 projection over `N` fails the row with an error naming the system, the
-projection, the ceiling and the points offered, and the bin exits 1, as it
-does for a band violation
-(`metricsbench_ingest::tests::a_stalled_row_exits_like_a_band_violation`).
+projection, the ceiling and the points offered. That row alone stops: it is
+listed under the report's `stalled` (`system`, `endpoint`, `projected_secs`,
+`ceiling_secs`, `offered_points`, `stream_points`, `error`;
+`metrics_ingest::StalledRow`), the rows after it are still replayed, and the
+bin prints the report and exits 1 after the last row, as it does for a band
+violation (`metricsbench_ingest::tests::a_stalled_row_exits_like_a_band_violation`;
+the `LaneError::IngestStalled` arm of the bin's row loop, which no test
+drives through the bin since the first check waits 60 s).
 The stream's point total is the generator report of the first row replayed
 when one exists (exact), else `active_series x steps` for the first row (one
 line per series per step; anomalies make the real count differ). Omitted, a
@@ -475,13 +480,17 @@ answer whose `status` is not `success`, or a body cut short, is refused
 The bin fails when `matches_expected` is false
 (`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`,
 `metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`)
-or a read-back query fails, and stops at that row. It still prints the report
-for the rows replayed so far, the failed one included with its mismatching
-`readback` or, when a query failed, its error in `readback_error`, and exits
-with the same code as before
-(`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`).
+or a read-back query fails, but does not stop at that row: the row is
+recorded with its mismatching `readback` or, when a query failed, its error
+in `readback_error`, and every later row is still replayed and read back.
+After the last row the bin prints the report of every row and exits with the
+code the first failing row gives, 1
+(`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`,
+`metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`).
 `metricsbench_query` refuses such a report as a run result
-(`metricsbench_query::a_report_whose_readback_failed_does_not_bind`).
+(`metricsbench_query::a_report_whose_readback_failed_does_not_bind`); with
+`--diagnostic-after-failed-ingest` it queries it as a diagnostic (see
+"Portable query run").
 
 #### Band 6: accepted digests per class
 
@@ -838,6 +847,22 @@ pass excluded for a recorded external cause is listed in `exclusions` with
 that cause (`a_pass_exclusion_needs_a_cause`). Version 3 drops the
 report-level `geomean_ms`: decision 6 rules out one figure across engines.
 
+**Failed run verdict.** A report `metricsbench_query` writes with
+`--diagnostic-after-failed-ingest` carries `run_verdict: "failed"` and a
+non-empty `failed_bands`, one entry per failed ingest row: `band` (6 for a
+read-back, the accepted-set check; `null` for a stall, which is not a
+numbered band), `check` (`readback` or `stall`), `system` and `reason`
+(`report_schema::FailedBand`). Such a report is a diagnostic of a failed
+run and never a result: `validate` refuses it with "report is a diagnostic
+of a failed run, never a result", followed by the verdict and every failed
+band, and `render` refuses it the same way, so the verdict and the failed
+bands are printed and no table is
+(`validate_refuses_a_report_with_a_failed_run_verdict`). A report that
+carries only one of the two fields is refused as inconsistent
+(`ValidationError::VerdictInconsistent`,
+`validate_refuses_a_report_with_a_failed_run_verdict`). Both are absent from every other
+report.
+
 ## Portable query run (`metricsbench_query`)
 
 `metricsbench_query` runs the query corpus over HTTP against every engine one
@@ -953,6 +978,19 @@ and, with five or more passes, `rel_mad_pct` (`only_ok_rows_carry_latency`).
 `cases_expected` is written from the corpus before any query. The assembled
 report goes through `report_schema::validate` before it is written; a report
 that fails is not written and the exit is 70.
+
+**Diagnostic after a failed ingest.** `--diagnostic-after-failed-ingest`,
+which `deploy/metricsbench/run.sh` passes only after an ingest whose
+read-back failed or that stalled, binds such an ingest report instead of
+refusing it (`metrics_query::bind_diagnostic`). A row whose read-back failed
+is queried, an engine whose row stalled is left out, and every failure is
+recorded in the report's `failed_bands` with `run_verdict: "failed"` (see
+"Failed run verdict" under "Report schema version 3"). The report is checked
+by `report_schema::validate_diagnostic`, which applies every rule `validate`
+does except the verdict. With the flag, an ingest report with no failed row
+is refused (`metrics_query::BindError::NoFailedRow`); without it, a failed
+row is refused with exit 65 and nothing written
+(`metricsbench_query::a_failed_readback_is_queried_as_a_diagnostic_only_with_the_flag`).
 
 **Diagnostics sidecar.** `--diagnostics <path>` writes a second JSON file
 after the report, holding figures pre-registered checks need that the

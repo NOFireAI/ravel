@@ -642,6 +642,68 @@ pub struct MetricsBenchReport {
     /// one was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclusions: Vec<PassExclusion>,
+    /// Set only on a diagnostic run after a failed ingest verification
+    /// (`metricsbench_query --diagnostic-after-failed-ingest`): the run
+    /// failed, and [`validate`] refuses the report
+    /// ([`ValidationError::FailedRun`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_verdict: Option<RunVerdict>,
+    /// Every ingest-row failure behind `run_verdict`, in row order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_bands: Vec<FailedBand>,
+}
+
+/// A report's run verdict. Only a failed run carries one; a report without
+/// it is an ordinary run result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunVerdict {
+    /// An ingest row failed its verification; the report is a diagnostic.
+    Failed,
+}
+
+/// Which ingest check a [`FailedBand`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedCheck {
+    /// The row's read-back failed, was refused, or did not match (band 6).
+    Readback,
+    /// The stall ceiling stopped the row (ADR-0927, 2026-10-28 amendment,
+    /// decision 7), which is no numbered band.
+    Stall,
+}
+
+/// One ingest-row failure of a failed run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedBand {
+    /// The ADR-0927 band, `None` for a check that is not a numbered band.
+    pub band: Option<u32>,
+    /// The check that failed.
+    pub check: FailedCheck,
+    /// The ingest row's system.
+    pub system: String,
+    /// The row's `readback_error`, read-back mismatches, or stall error.
+    pub reason: String,
+}
+
+impl std::fmt::Display for FailedBand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.band {
+            Some(band) => write!(f, "band {band}"),
+            None => write!(f, "stall ceiling"),
+        }?;
+        write!(f, " on {}: {}", self.system, self.reason)
+    }
+}
+
+/// `bands` joined for an error message.
+fn join_failed_bands(bands: &[FailedBand]) -> String {
+    bands
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Everything [`validate`] can reject, one variant per failure class the task
@@ -690,6 +752,24 @@ pub enum ValidationError {
     /// truth, and a report with none measures nothing.
     #[error("report carries no measurements; per-query results are the source of truth")]
     NoMeasurements,
+    /// The report says its run failed (`run_verdict: failed`). It is a
+    /// diagnostic of that run, never a result, so nothing may accept it.
+    #[error(
+        "report is a diagnostic of a failed run, never a result (run_verdict: failed; failed \
+         bands: {})",
+        join_failed_bands(.bands)
+    )]
+    FailedRun {
+        /// The failures the report names.
+        bands: Vec<FailedBand>,
+    },
+    /// `failed_bands` is set on a report whose `run_verdict` is not
+    /// `failed`, or a failed verdict names no failure.
+    #[error(
+        "run_verdict and failed_bands disagree: a failed run names at least one failed band, \
+         and only a failed run names any"
+    )]
+    VerdictInconsistent,
     /// Two measurements share an id. A later row silently overwriting an earlier
     /// one keeps the count correct while changing which figures are checked (the
     /// runbook's duplicate-id trap).
@@ -1300,6 +1380,31 @@ fn validate_measurement(m: &Measurement, label: &str) -> Result<(), ValidationEr
 /// rule set, versions 1 and 2 by the original one, which also refuses any
 /// version-3 field set on them.
 pub fn validate(report: &MetricsBenchReport) -> Result<(), ValidationError> {
+    match (report.run_verdict, report.failed_bands.is_empty()) {
+        (Some(RunVerdict::Failed), false) => {
+            return Err(ValidationError::FailedRun {
+                bands: report.failed_bands.clone(),
+            });
+        }
+        (None, true) => {}
+        _ => return Err(ValidationError::VerdictInconsistent),
+    }
+    validate_body(report)
+}
+
+/// Checks a diagnostic report of a failed run: it must say so (a failed
+/// `run_verdict` naming at least one failed band), and everything else in it
+/// must stand under [`validate`]'s rules. `metricsbench_query` writes a
+/// diagnostic only after this accepts it; [`validate`] still refuses it.
+pub fn validate_diagnostic(report: &MetricsBenchReport) -> Result<(), ValidationError> {
+    if report.run_verdict != Some(RunVerdict::Failed) || report.failed_bands.is_empty() {
+        return Err(ValidationError::VerdictInconsistent);
+    }
+    validate_body(report)
+}
+
+/// [`validate`]'s rules other than the run verdict.
+fn validate_body(report: &MetricsBenchReport) -> Result<(), ValidationError> {
     validate_provenance(&report.provenance)?;
     if report.provenance.schema_version >= 3 {
         return validate_v3(report);
@@ -2173,6 +2278,8 @@ mod tests {
             cases_expected: vec![],
             denominators: vec![],
             exclusions: vec![],
+            run_verdict: None,
+            failed_bands: vec![],
         }
     }
 
@@ -3287,6 +3394,8 @@ mod tests {
                 den(Engine::Mimir, 1, 0),
             ],
             exclusions: vec![],
+            run_verdict: None,
+            failed_bands: vec![],
         }
     }
 

@@ -51,8 +51,8 @@ use crate::metrics_ingest::{
 use crate::metrics_workload::{FamilyKind, Profile, WorkloadFile};
 use crate::promql_corpus::{CorpusEntry, EvalKind};
 use crate::report_schema::{
-    EngineDenominators, ExpectedCase, Figure, MIN_VARIANCE_PASSES, Measurement, ResultStatus,
-    rel_mad_pct, row_status,
+    EngineDenominators, ExpectedCase, FailedBand, FailedCheck, Figure, MIN_VARIANCE_PASSES,
+    Measurement, ResultStatus, rel_mad_pct, row_status,
 };
 
 /// The query parameter Ravel's HTTP API reads commit tokens from.
@@ -156,6 +156,16 @@ pub enum BindError {
          diagnosis and is not a run result"
     )]
     Readback { system: String, detail: String },
+    #[error(
+        "ingest row `{system}` was stopped by the stall ceiling ({detail}); the report is kept \
+         for diagnosis and is not a run result"
+    )]
+    Stalled { system: String, detail: String },
+    #[error(
+        "a diagnostic after a failed ingest needs an ingest report with a failed row, and this \
+         one has none"
+    )]
+    NoFailedRow,
     #[error(
         "Prometheus is the oracle and must be one of the engines (--engine name=prometheus,...)"
     )]
@@ -319,6 +329,38 @@ pub fn bind(
     specs: &[EngineSpec],
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Binding, BindError> {
+    bind_rows(ingest, workload_bytes, workload, specs, env, false).map(|(binding, _)| binding)
+}
+
+/// [`bind`] for a diagnostic of a failed ingest: a row whose read-back
+/// failed or that stalled is returned as a [`FailedBand`] instead of
+/// refusing the run. A row that failed its read-back is still queried; a
+/// stalled row has no ingest figures and its engine is left out of the
+/// binding. Refused when no row failed ([`BindError::NoFailedRow`]) and when
+/// the oracle stalled. Band 6 and accounting failures refuse as in [`bind`].
+pub fn bind_diagnostic(
+    ingest: &MetricsIngestReport,
+    workload_bytes: &[u8],
+    workload: &WorkloadFile,
+    specs: &[EngineSpec],
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(Binding, Vec<FailedBand>), BindError> {
+    let (binding, failed) = bind_rows(ingest, workload_bytes, workload, specs, env, true)?;
+    if failed.is_empty() {
+        return Err(BindError::NoFailedRow);
+    }
+    Ok((binding, failed))
+}
+
+fn bind_rows(
+    ingest: &MetricsIngestReport,
+    workload_bytes: &[u8],
+    workload: &WorkloadFile,
+    specs: &[EngineSpec],
+    env: impl Fn(&str) -> Option<String>,
+    diagnostic: bool,
+) -> Result<(Binding, Vec<FailedBand>), BindError> {
+    let mut failed = Vec::new();
     let profile_record = ingest
         .profile
         .as_ref()
@@ -388,12 +430,40 @@ pub fn bind(
             _ => None,
         };
         if let Some(detail) = failed_readback {
-            return Err(BindError::Readback {
+            if !diagnostic {
+                return Err(BindError::Readback {
+                    system: row.system.clone(),
+                    detail,
+                });
+            }
+            failed.push(FailedBand {
+                band: Some(6),
+                check: FailedCheck::Readback,
                 system: row.system.clone(),
-                detail,
+                reason: detail,
             });
         }
     }
+    for stalled in &ingest.stalled {
+        if !diagnostic || stalled.system == system_name(Engine::Prometheus) {
+            return Err(BindError::Stalled {
+                system: stalled.system.clone(),
+                detail: stalled.error.clone(),
+            });
+        }
+        failed.push(FailedBand {
+            band: None,
+            check: FailedCheck::Stall,
+            system: stalled.system.clone(),
+            reason: stalled.error.clone(),
+        });
+    }
+    let is_stalled = |engine: Engine| {
+        ingest
+            .stalled
+            .iter()
+            .any(|r| r.system == system_name(engine))
+    };
 
     let grid = QueryGrid::from_run(&run, profile)?;
 
@@ -405,6 +475,9 @@ pub fn bind(
     ordered.extend(specs.iter().filter(|s| s.engine != Engine::Prometheus));
     let mut engines: Vec<BoundEngine> = Vec::with_capacity(specs.len());
     for spec in ordered {
+        if is_stalled(spec.engine) {
+            continue;
+        }
         let system = system_name(spec.engine);
         if engines.iter().any(|e| e.engine == spec.engine) {
             return Err(BindError::DuplicateEngine(system));
@@ -462,7 +535,7 @@ pub fn bind(
                 .collect(),
         });
     }
-    Ok(Binding { run, grid, engines })
+    Ok((Binding { run, grid, engines }, failed))
 }
 
 /// Whether `entry` reads a native-histogram family of `workload`.
