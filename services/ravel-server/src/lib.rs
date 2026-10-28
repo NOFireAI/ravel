@@ -2843,8 +2843,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // parallel with `http_router` below, merging the same tenant-resolving
     // routes but constructed with `mtls.resolver` instead of
     // `config.tenant_resolver`. `None` unless `--mtls-listener` is
-    // configured. Deliberately serves no health or metrics routes - those
-    // carry no tenant identity and stay on the public listener only.
+    // configured. Serves no `/healthz` or `/metrics`: those carry no tenant
+    // identity and stay on the public listener only. The one exception is
+    // the agents health route, which ADR-3331 decision 9 mounts on both
+    // listeners when `--agents` is set; it reads operator settings only.
     let mut mtls_router = Router::new();
     // The per-listener query service layers, kept on `Running` so an
     // in-process transport takes the one belonging to the listener it serves
