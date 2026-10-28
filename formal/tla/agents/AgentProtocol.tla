@@ -58,7 +58,8 @@ CONSTANTS
     RequestIds,   \* client request ids
     Hashes,       \* payload hashes (content addresses of payload objects)
     MaxRevision,  \* bound on optional root writes (cancel, destroy,
-                  \* recreate): each is enabled only below this revision
+                  \* recreate, timer schedule and cancel): each is enabled
+                  \* only below this revision
     MaxEpoch,     \* bound on takeovers
     MaxTimerGen,  \* bound on timer generations
     NoC,          \* sentinels, each a model value: absent content,
@@ -516,12 +517,15 @@ CompleteTurnRebase(w) ==
 \* check_incarnation does: any caller holding the current incarnation may
 \* issue them, and a tombstoned HEAD or another incarnation answers
 \* AgentGone and writes nothing. With the read folded into the CAS that
-\* refusal is a stutter, so the fence is the ~h.tomb guard.
+\* refusal is a stutter, so the fence is the ~h.tomb guard. Scheduling an
+\* armed timer reschedules it under the next generation, which supersedes
+\* the armed one: a fire or hint for the old generation then finds it no
+\* longer armed.
 ScheduleTimer(ak) ==
     /\ HeadUp(ak)
     /\ LET h == Head(ak)
        IN /\ ~h.tomb
-          /\ h.timer.st # "armed"
+          /\ h.rev < MaxRevision
           /\ h.timer.gen < MaxTimerGen
           /\ CasNow(ak, [h EXCEPT !.rev = @ + 1,
                            !.timer = [gen |-> h.timer.gen + 1, st |-> "armed"]])
@@ -534,6 +538,7 @@ CancelTimer(ak) ==
     /\ HeadUp(ak)
     /\ LET h == Head(ak)
        IN /\ ~h.tomb
+          /\ h.rev < MaxRevision
           /\ h.timer.st = "armed"
           /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.timer.st = "cancelled"])
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
