@@ -276,16 +276,27 @@ export function canonicalBytes(value: unknown): Uint8Array {
 
 /**
  * The JSON form of a schema's output, as `JSON.stringify` would produce it:
- * every `toJSON` method applied (a `Date` becomes its ISO string). Anything
- * else is left in place for {@link canonicalJson} to accept or refuse.
+ * every `toJSON` method applied (a `Date` becomes its ISO string), an
+ * object member whose value is `undefined` dropped, and an `undefined`
+ * array item written as `null`, so `{ a: undefined }` and `{}` are the same
+ * input, as they are on the wire. Anything else is left in place for
+ * {@link canonicalJson} to accept or refuse; a top-level `undefined` stays
+ * refused there.
  */
 export function jsonForm(value: unknown, key = ""): unknown {
   if (typeof value !== "object" || value === null) return value;
   const toJSON = (value as { toJSON?: unknown }).toJSON;
   if (typeof toJSON === "function") return jsonForm((toJSON as (key: string) => unknown).call(value, key), key);
-  if (Array.isArray(value)) return value.map((v: unknown, i) => jsonForm(v, String(i)));
+  if (Array.isArray(value)) {
+    return value.map((v: unknown, i) => {
+      const item = jsonForm(v, String(i));
+      return item === undefined ? null : item;
+    });
+  }
   if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
   return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, jsonForm(v, k)]),
+    Object.entries(value as Record<string, unknown>)
+      .map(([k, v]) => [k, jsonForm(v, k)] as const)
+      .filter(([, v]) => v !== undefined),
   );
 }

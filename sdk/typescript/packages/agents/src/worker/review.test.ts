@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { createClient, OperationFailed } from "../client/index.js";
-import { AgentGone, EffectInDoubt } from "../errors.js";
+import { AgentGone, EffectInDoubt, NonDeterministicReplay } from "../errors.js";
 import { gate, until } from "../test-util.js";
 import { createTestHarness, FakeCoordinator, type TestHarness } from "../testing/index.js";
 import { defineTool } from "../tools/index.js";
-import { defineAgent, handlerDigest, StepFailed } from "./index.js";
+import { defineAgent, handlerDigest, serveAgents, StepFailed, type Transport, type TurnReport } from "./index.js";
 
 let harness: TestHarness | undefined;
 const cleanups: (() => void)[] = [];
@@ -152,6 +152,100 @@ describe("step runner review reproductions (#3340)", () => {
     await h.crashWorker();
     await until(() => h.turns.length === 2 || held === 2);
     expect(held).toBe(1);
+    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1]).toMatchObject({ outcome: "abandoned" });
+    expect((h.turns[1] as { error: unknown }).error).toBeInstanceOf(NonDeterministicReplay);
+    expect(h.coordinator.commits).toHaveLength(0);
+  });
+
+  it("P3b a journaled step whose tool version differs under the same input hash is refused by the runner itself", async () => {
+    // The input hash already covers the tool version, so P3 above would
+    // pass through the hash alone. This pins the explicit version check:
+    // the first worker journals and completes the step, then a second
+    // worker is handed that transcript with the entry's tool version
+    // changed and its input hash left as journaled, so only the version
+    // disagrees. Without the check the runner replays the record and the
+    // turn commits.
+    let runs = 0;
+    let held = 0;
+    const hold = gate();
+    cleanups.push(() => {
+      hold.open();
+    });
+    const tool = defineTool({
+      name: "t",
+      version: "1",
+      input: z.object({}),
+      output: z.object({ v: z.string() }),
+      recovery: "at_least_once",
+      run: () => {
+        runs += 1;
+        return Promise.resolve({ v: "1" });
+      },
+    });
+    const agent = defineAgent({
+      name: "v",
+      version: "1",
+      state: z.object({}),
+      initialState: {},
+      messages: (message) => ({
+        go: message({
+          payload: z.object({}),
+          result: z.string(),
+          handler: async (ctx) => {
+            const r = await ctx.step("k", tool, {});
+            held += 1;
+            await hold.wait;
+            return r.v;
+          },
+        }),
+      }),
+    });
+    const coordinator = new FakeCoordinator({ agents: [agent] });
+    cleanups.push(() => {
+      coordinator.close();
+    });
+    const client = createClient({ url: "http://fake.invalid", token: "t", fetch: coordinator.fetch });
+    const op = await client.agent<typeof agent>("v", "v-1").send("go", {});
+    const first = await serveAgents({ transport: coordinator, agents: [agent], tools: [tool], pollWaitMs: 50 });
+    await until(() => held === 1);
+    coordinator.revokeLeases();
+    await first.close();
+    expect(runs).toBe(1);
+
+    const reports: TurnReport[] = [];
+    const transport: Transport = {
+      poll: async (request, signal) => {
+        const polled = await coordinator.poll(request, signal);
+        if (polled === null) return null;
+        const steps = polled.assignment.steps.map((s) => (s.step_key === "k" ? { ...s, tool_version: "2" } : s));
+        return { ...polled, assignment: { ...polled.assignment, steps } };
+      },
+      recordStep: (request) => coordinator.recordStep(request),
+      failEffect: (request) => coordinator.failEffect(request),
+      commit: (request) => coordinator.commit(request),
+      completeEffect: (request) => coordinator.completeEffect(request),
+    };
+    const second = await serveAgents({
+      transport,
+      agents: [agent],
+      tools: [tool],
+      pollWaitMs: 50,
+      onTurn: (report) => reports.push(report),
+    });
+    try {
+      await until(() => reports.length === 1);
+      expect(reports[0]).toMatchObject({ outcome: "abandoned" });
+      expect((reports[0] as { error: unknown }).error).toBeInstanceOf(NonDeterministicReplay);
+      expect(runs).toBe(1);
+      expect(held).toBe(1);
+      expect(coordinator.commits).toHaveLength(0);
+      // The fake's own journal still agrees with the runner's request, so
+      // it does not block the operation; the runner refused on its own.
+      expect((await op.status()).status).toBe("running");
+    } finally {
+      await second.close();
+    }
   });
 
   it("P9 a tool that throws a typed RavelAgentsError does not wedge the operation", async () => {
@@ -229,6 +323,10 @@ describe("step runner review reproductions (#3340)", () => {
     await h.crashWorker();
     await until(() => h.turns.length === 2 || held === 2);
     expect(held).toBe(1);
+    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1]).toMatchObject({ outcome: "abandoned" });
+    expect((h.turns[1] as { error: unknown }).error).toBeInstanceOf(NonDeterministicReplay);
+    expect(h.coordinator.commits).toHaveLength(0);
   });
 
   it("P11 a tool failure is journaled as the step's result before the failed commit, and replayed", async () => {

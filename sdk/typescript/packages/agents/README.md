@@ -120,13 +120,17 @@ Worker and steps (`src/worker/`):
   Tests: `reused step key with a different input hash fails
   NonDeterministicReplay` (`replay.test.ts`), `P3 a tool version bump under
   a reused step key fails NonDeterministicReplay` (`review.test.ts`).
-- The input hash covers the input's JSON form (`toJSON` applied, as
-  `JSON.stringify` does), so a different `Date` is a different input. Any
-  value that has no plain JSON form (a `Map`, `Set`, `bigint`, `undefined`,
-  function, non-finite number or class instance) is refused with
-  `InvalidStepInput` before the tool runs. Tests: `P10 a different Date
-  under the same step key is detected` (`review.test.ts`), `canonical JSON
-  refuses %s` (`identity.test.ts`), `a step input that is not plain JSON is
+- The input hash covers the input's JSON form (`toJSON` applied, an
+  `undefined` member dropped and an `undefined` array item written as
+  `null`, as `JSON.stringify` does), so a different `Date` is a different
+  input and `{ cursor: undefined }` is the same input as `{}`. Any value
+  that has no plain JSON form (a `Map`, `Set`, `bigint`, function,
+  non-finite number or class instance, or `undefined` as the whole input)
+  is refused with `InvalidStepInput` before the tool runs. Tests: `P10 a
+  different Date under the same step key is detected` (`review.test.ts`),
+  `the JSON form drops undefined members and writes undefined items as
+  null, as JSON.stringify does` and `canonical JSON refuses %s`
+  (`identity.test.ts`), `a step input that is not plain JSON is
   refused with InvalidStepInput before its tool runs, and fails terminally
   uncaught`.
 - One step at a time per turn: a second `ctx.step` while one is in flight
