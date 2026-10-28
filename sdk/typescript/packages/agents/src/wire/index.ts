@@ -136,12 +136,43 @@ export const CancelResponse = z.object({
 });
 export type CancelResponse = z.output<typeof CancelResponse>;
 
+export const ActiveTurnBody = z.object({
+  turn_id: z.string(),
+  accept_seq: U64,
+  handler: z.string(),
+  handler_version: z.string(),
+  handler_digest: z.string(),
+  base_state_version: U64,
+  started_unix_ns: UnixNs,
+  lease_hint_unix_ns: UnixNs,
+  cancel_requested: z.boolean(),
+  non_deterministic_replay: z.boolean(),
+});
+export type ActiveTurnBody = z.output<typeof ActiveTurnBody>;
+
+export const InputSourceBody = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("message"), request_id: z.string() }),
+  z.object({ kind: z.literal("timer"), timer: z.string(), generation: U64 }),
+]);
+export type InputSourceBody = z.output<typeof InputSourceBody>;
+
+export const MailboxEntryBody = z.object({
+  accept_seq: U64,
+  handler: z.string(),
+  source: InputSourceBody,
+  accepted_unix_ns: UnixNs,
+  failed_attempts: U32,
+});
+export type MailboxEntryBody = z.output<typeof MailboxEntryBody>;
+
 export const StateResponse = z.object({
   agent_id: z.string(),
   incarnation: U64,
   state_version: U64,
   content_type: z.string(),
   state: Json,
+  active_turn: ActiveTurnBody.optional(),
+  mailbox: z.array(MailboxEntryBody).optional(),
 });
 export type StateResponse = z.output<typeof StateResponse>;
 
@@ -532,6 +563,7 @@ export const WIRE_FIXTURES = {
   send_request: SendRequest,
   send_response: SendResponse,
   state_response: StateResponse,
+  state_response_active: StateResponse,
   step_record_request: StepRecordRequest,
   step_record_response: StepRecordResponse,
   sweep_response: SweepResponse,

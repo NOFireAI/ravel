@@ -5,25 +5,33 @@
 //! The coordinator is handed a [`WorkerDispatcher`]: the worker that asked
 //! for a step runs the tool itself, so dispatching an attempt here executes
 //! nothing, and the route answers with the attempt `run_step` returns.
+//!
+//! Each tenant built while a tokio runtime is current also gets an interval
+//! sweep every `sweep_interval_ms`, which stops once the [`AgentsRuntime`]
+//! or the tenant is dropped. It is the authority that fires due timers; the
+//! `_wake` hints only make it cheap (ADR-3331 decision 8).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use ravel_agents_core::head::ObjectRef;
 use ravel_agents_core::identity::{AgentId, Id128};
-use ravel_agents_core::kernel::Limits;
+use ravel_agents_core::kernel::{DerivedIds, Limits};
 use ravel_agents_runtime::{
-    AgentsMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher, RuntimeConfig, SystemRng,
+    AgentsMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher, RuntimeConfig, SweepConfig,
+    SweepMetricsSnapshot, SystemRng,
 };
 use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
-use ravel_agents_store::{AgentStore, StoreLimits, SystemClock};
+use ravel_agents_store::{AgentStore, Clock, StoreLimits, SystemClock};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use super::{AgentsReadiness, AgentsSettings};
+use crate::config::AgentsClock;
 
 /// The long-poll cap of ADR-3331 decision 9, applied to `worker/poll`,
 /// `result` and `call` whatever `wait_ms` a caller asks for.
@@ -79,6 +87,33 @@ impl EvidenceIndex {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Drop what the index names for an effect that is no longer in doubt,
+    /// so its slot goes to an effect an operator still has to decide.
+    pub fn forget(&self, agent: AgentId, effect_id: Id128) {
+        self.entries.lock().remove(&(agent, effect_id));
+    }
+
+    /// Effects the index names.
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// [`AgentsClock`] as the store's and coordinator's [`Clock`].
+struct RuntimeClock(AgentsClock);
+
+impl Clock for RuntimeClock {
+    fn now_unix_ns(&self) -> i64 {
+        match &self.0.0 {
+            Some(now) => now(),
+            None => SystemClock.now_unix_ns(),
+        }
+    }
 }
 
 /// The dispatcher hook the routes hand the coordinator. It executes nothing:
@@ -109,6 +144,9 @@ pub struct AgentsRuntime {
     poll_permits: Arc<Semaphore>,
     activation_permits: Arc<Semaphore>,
     pub result_waits: ResultWaitCounters,
+    clock: AgentsClock,
+    /// Dropped with the runtime, which ends every tenant's interval sweep.
+    stop_sweeps: watch::Sender<()>,
 }
 
 /// What the `result` and `call` long polls in this process did while waiting
@@ -149,7 +187,16 @@ impl AgentsRuntime {
             poll_permits: Arc::new(Semaphore::new(settings.poll_concurrency)),
             activation_permits: Arc::new(Semaphore::new(settings.activation_concurrency)),
             result_waits: ResultWaitCounters::default(),
+            clock: AgentsClock::default(),
+            stop_sweeps: watch::channel(()).0,
         }
+    }
+
+    /// The same runtime reading `clock` instead of the host's wall clock.
+    /// Applies to tenants built after the call.
+    pub fn with_clock(mut self, clock: AgentsClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn runtime_config(&self) -> RuntimeConfig {
@@ -180,25 +227,67 @@ impl AgentsRuntime {
         tenants
             .entry(tenant)
             .or_insert_with(|| {
-                let store = Arc::new(AgentStore::with_system_clock(
+                let clock: Arc<dyn Clock> = Arc::new(RuntimeClock(self.clock.clone()));
+                let store = Arc::new(AgentStore::new(
                     self.object_store.clone(),
                     tenant,
                     self.store_limits(),
+                    clock.clone(),
+                    Arc::new(DerivedIds),
                 ));
                 let coordinator = Coordinator::new(
                     store.clone(),
                     self.runtime_config(),
-                    Arc::new(SystemClock),
+                    clock,
                     Arc::new(SystemRng::new()),
-                );
-                Arc::new(TenantAgents {
+                )
+                .with_sweep(SweepConfig {
+                    interval_ms: self.settings.sweep_interval_ms,
+                    ..SweepConfig::default()
+                });
+                let agents = Arc::new(TenantAgents {
                     store,
                     coordinator,
                     changed: Notify::new(),
                     evidence: EvidenceIndex::default(),
-                })
+                });
+                self.spawn_sweep(tenant, &agents);
+                agents
             })
             .clone()
+    }
+
+    /// Start the tenant's interval sweep, when the interval is not zero and
+    /// a tokio runtime is current. The first pass runs one interval after
+    /// the tenant is built; a pass that overruns delays the next one rather
+    /// than bunching them.
+    fn spawn_sweep(&self, tenant: TenantHash, agents: &Arc<TenantAgents>) {
+        let interval_ms = self.settings.sweep_interval_ms;
+        if interval_ms == 0 {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let agents: Weak<TenantAgents> = Arc::downgrade(agents);
+        let mut stop = self.stop_sweeps.subscribe();
+        let period = Duration::from_millis(interval_ms);
+        handle.spawn(async move {
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.changed() => return,
+                }
+                let Some(agents) = agents.upgrade() else {
+                    return;
+                };
+                if let Err(error) = agents.coordinator.sweep_once(&tenant).await {
+                    tracing::debug!(%error, "agents interval sweep did not complete");
+                }
+            }
+        });
     }
 
     /// A permit from the lane's pool, or `None` when the pool is exhausted.
@@ -223,6 +312,25 @@ impl AgentsRuntime {
             .iter()
             .map(|t| t.coordinator.metrics())
             .fold(empty_snapshot(), add_snapshots)
+    }
+
+    /// Every tenant coordinator's sweep counters, summed.
+    pub fn sweep_metrics(&self) -> SweepMetricsSnapshot {
+        let coordinators: Vec<Arc<TenantAgents>> = self.tenants.lock().values().cloned().collect();
+        coordinators
+            .iter()
+            .map(|t| t.coordinator.sweep_metrics())
+            .fold(SweepMetricsSnapshot::default(), |a, b| SweepMetricsSnapshot {
+                passes: a.passes + b.passes,
+                wake_list_pages: a.wake_list_pages + b.wake_list_pages,
+                dir_list_pages: a.dir_list_pages + b.dir_list_pages,
+                head_gets: a.head_gets + b.head_gets,
+                hints_read: a.hints_read + b.hints_read,
+                hints_deleted: a.hints_deleted + b.hints_deleted,
+                timers_fired: a.timers_fired + b.timers_fired,
+                agents_loaded: a.agents_loaded + b.agents_loaded,
+                dir_entries_repaired: a.dir_entries_repaired + b.dir_entries_repaired,
+            })
     }
 }
 
@@ -273,5 +381,44 @@ fn add_phase(a: PhaseCounts, b: PhaseCounts) -> PhaseCounts {
         conflict: a.conflict + b.conflict,
         bytes_in: a.bytes_in + b.bytes_in,
         bytes_out: a.bytes_out + b.bytes_out,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn agent(n: u8) -> AgentId {
+        AgentId([n; 16])
+    }
+
+    fn id(n: u128) -> Id128 {
+        Id128(n.to_be_bytes())
+    }
+
+    /// A full index takes no new effect until one it names leaves doubt and
+    /// is forgotten; then exactly one more fits.
+    #[test]
+    fn forgetting_an_effect_frees_its_slot_in_a_full_index() {
+        let index = EvidenceIndex::default();
+        let result = ObjectRef::of(b"late");
+        for n in 0..MAX_EVIDENCE_EFFECTS {
+            let id = id(n as u128 + 1);
+            index.record(agent(0), id, 1, result);
+        }
+        assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
+        let late = id(u128::MAX);
+        index.record(agent(1), late, 1, result);
+        assert!(index.of(agent(1), late).is_empty(), "a full index took a new effect");
+
+        index.forget(agent(0), id(1));
+        assert!(index.of(agent(0), id(1)).is_empty());
+        assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS - 1);
+        index.record(agent(1), late, 1, result);
+        assert_eq!(index.of(agent(1), late), vec![(1, result)]);
+        assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
+        index.record(agent(1), id(u128::MAX - 1), 1, result);
+        assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
     }
 }

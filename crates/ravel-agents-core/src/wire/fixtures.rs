@@ -231,6 +231,51 @@ fn samples() -> Vec<Sample> {
                 state_version: 3,
                 content_type: "application/json".to_string(),
                 state: json!({"items": ["A-1"], "paid": false}),
+                active_turn: None,
+                mailbox: Vec::new(),
+            },
+        ),
+        sample(
+            "state_response_active",
+            StateResponse {
+                agent_id: agent_id().to_hex(),
+                incarnation: 1,
+                state_version: 3,
+                content_type: "application/json".to_string(),
+                state: json!({"items": ["A-1"], "paid": false}),
+                active_turn: Some(ActiveTurnBody {
+                    turn_id: "0f".repeat(16),
+                    accept_seq: 4,
+                    handler: "checkout".to_string(),
+                    handler_version: "v2".to_string(),
+                    handler_digest: "ab".repeat(32),
+                    base_state_version: 3,
+                    started_unix_ns: 1_767_225_600_000_000_000,
+                    lease_hint_unix_ns: 1_767_225_630_000_000_000,
+                    cancel_requested: true,
+                    non_deterministic_replay: false,
+                }),
+                mailbox: vec![
+                    MailboxEntryBody {
+                        accept_seq: 4,
+                        handler: "checkout".to_string(),
+                        source: InputSourceBody::Message {
+                            request_id: "req-4".to_string(),
+                        },
+                        accepted_unix_ns: 1_767_225_599_000_000_000,
+                        failed_attempts: 1,
+                    },
+                    MailboxEntryBody {
+                        accept_seq: 5,
+                        handler: "remind".to_string(),
+                        source: InputSourceBody::Timer {
+                            timer: "1e".repeat(16),
+                            generation: 2,
+                        },
+                        accepted_unix_ns: 1_767_225_601_000_000_000,
+                        failed_attempts: 0,
+                    },
+                ],
             },
         ),
         sample(

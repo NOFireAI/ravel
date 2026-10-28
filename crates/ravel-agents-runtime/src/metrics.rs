@@ -66,8 +66,8 @@ pub(crate) struct Metrics {
 /// The timer and sweep counters, summed over every pass since the
 /// coordinator started: the [`crate::SweepReport`] fields plus the pass
 /// count. `ravel-server` renders them on `/metrics`, the LISTs under a
-/// `phase` label of `wake` or `dir`. Kept apart from [`AgentsMetricsSnapshot`], which `ravel-server` builds
-/// field by field.
+/// `phase` label of `wake` or `dir`. Kept apart from
+/// [`AgentsMetricsSnapshot`], which `ravel-server` builds field by field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepMetricsSnapshot {
     /// Passes run, from polls and from `sweep_once`, including failed ones.
