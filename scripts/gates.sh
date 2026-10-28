@@ -27,6 +27,13 @@
 # unscoped run so a verification host under that root still produces a
 # gates-pass receipt.
 #
+# A workspace run also runs the TypeScript SDK gate (scripts/gates-sdk.sh),
+# which refuses with exit 64 on a host without the pinned node major, before
+# any cargo work. RAVEL_GATES_SKIP_SDK=1 skips that step with one printed line,
+# for a full gate on a node-less host (verify-dispatch-gates.sh --with-gates,
+# or a run whose receipt FLEET_MERGE_SKIP_GATES=1 will reuse); CI's sdk job is
+# then the gate for sdk/typescript. Without it the refusal stands.
+#
 #   scripts/gates.sh --flag-doc-guard-only [FILE]
 #                                     # run only the ingest-memory flag-doc
 #                                     # overclaim guard, against FILE or the
@@ -275,18 +282,14 @@ run_feature_lane() {
   fi
 }
 
-# run_filtered_feature_lane <feature> <filter> <cargo args...>: the
-# feature lane above, with the tests narrowed to those whose path contains
-# <filter> (a positional test-name filter, which nextest and `cargo test` both
-# take). Clippy still lints every target under the feature.
-run_filtered_feature_lane() {
-  local feature="$1" filter="$2"
-  shift 2
-  run cargo clippy --locked "$@" --features "${feature}" --all-targets -- -D warnings
+# run_lane_tests <cargo args...>: one test run of a feature lane with an
+# explicit target selection (`--test NAME`, `--lib FILTER`), which nextest and
+# `cargo test` both spell the same way.
+run_lane_tests() {
   if [[ ${have_nextest} -eq 1 ]]; then
-    run cargo nextest run --locked "$@" --features "${feature}" "${filter}"
+    run cargo nextest run --locked "$@"
   else
-    run cargo test --locked "$@" --features "${feature}" "${filter}"
+    run cargo test --locked "$@"
   fi
 }
 
@@ -350,25 +353,30 @@ run_feature_lanes() {
     run_feature_lane sql -p ravel-server
   fi
   # ravel-server's `agents` feature (ADR-3331 decision 14): the agents router,
-  # flags and metric families compile only under it. The tests are selected
-  # by the name filter `agents` because `tests/cli_reference.rs` pins the
-  # flag page of a build with no optional features and fails by construction
-  # under any feature that adds a flag. The classification test stays in
-  # ravel-catalog and covers proto/ravel/agents.proto (ADR-3331 decision 3),
-  # so the lane names it and a scoped run that does not reach ravel-catalog
-  # still checks it.
+  # flags and metric families compile only under it. Its tests are selected by
+  # binary, not by a test-name filter (nextest and `cargo test` filter on the
+  # test path, never the binary, so a seam test whose name omits the keyword
+  # would run nowhere): the agents_seam binary whole, and the lib tests whose
+  # path contains `agents`. The whole crate does not run under the feature
+  # because `tests/cli_reference.rs` asserts the flag page of a build with the
+  # flags it has, and the feature adds flags; clippy still lints every target.
+  # The classification test stays in ravel-catalog and covers
+  # proto/ravel/agents.proto (ADR-3331 decision 3), so the lane names it and a
+  # scoped run that does not reach ravel-catalog still checks it.
   if [[ ${want_agents} -eq 1 ]]; then
-    run_filtered_feature_lane agents agents -p ravel-server
-    if [[ ${have_nextest} -eq 1 ]]; then
-      run cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification
-    else
-      run cargo test --locked -p ravel-catalog --test sys_proto_format_version_classification
-    fi
+    run cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings
+    run_lane_tests -p ravel-server --features agents --test agents_seam
+    run_lane_tests -p ravel-server --features agents --lib agents
+    run_lane_tests -p ravel-catalog --test sys_proto_format_version_classification
   fi
   # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
-  # compile only under it. Filtered by `mcp` for the same cli_reference reason.
+  # compile only under it. Selected by binary for the same reasons: mcp_e2e
+  # and trace_by_id (whose `with_mcp` module compiles only under the feature)
+  # whole, and the lib tests whose path contains `mcp`.
   if [[ ${want_mcp} -eq 1 ]]; then
-    run_filtered_feature_lane mcp mcp -p ravel-server
+    run cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
+    run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
+    run_lane_tests -p ravel-server --features mcp --lib mcp
   fi
   if [[ ${want_flight_sql} -eq 1 ]]; then
     run_feature_lane flight-sql -p ravel-server -p ravel-sql
@@ -427,13 +435,18 @@ run_feature_lanes() {
 # test under sdk/typescript). Workspace mode only: scoped mode selects cargo
 # packages and the SDK is not one, so no -p argument reaches it. It refuses
 # with exit 64 when node is absent or not the major sdk/typescript/.node-version
-# pins, which fails the workspace gate.
+# pins, which fails the workspace gate. RAVEL_GATES_SKIP_SDK=1 (see the header)
+# skips it on a host without that node and says so.
 want_sdk=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sdk=1
 fi
 run_sdk_gate() {
   if [[ ${want_sdk} -eq 1 ]]; then
+    if [[ "${RAVEL_GATES_SKIP_SDK:-0}" == "1" ]]; then
+      echo "==> SDK gate skipped (RAVEL_GATES_SKIP_SDK=1): CI's sdk job is the gate for sdk/typescript"
+      return 0
+    fi
     run "$(dirname "$0")/gates-sdk.sh"
   fi
 }
