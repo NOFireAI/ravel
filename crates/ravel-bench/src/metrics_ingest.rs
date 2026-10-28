@@ -1105,6 +1105,11 @@ pub struct Readback {
     /// one reported.
     #[serde(default)]
     pub settled_after_ms: u64,
+    /// Wall milliseconds of each query of the reported read-back, keyed by
+    /// [`READBACK_QUERY_SERIES`] and its siblings. Empty when no window was
+    /// queried, and in a report written before the field existed.
+    #[serde(default)]
+    pub query_ms: BTreeMap<String, u64>,
 }
 
 /// The read-your-write query phase of a system's replay. Recorded as its own
@@ -4339,6 +4344,19 @@ pub struct ReadbackConfig {
     pub settle_secs: u64,
 }
 
+/// The [`Readback::query_ms`] key of the `/api/v1/series` cardinality read.
+pub const READBACK_QUERY_SERIES: &str = "series";
+/// The [`Readback::query_ms`] key prefix of each float probe's
+/// `count_over_time`, suffixed `.0`, `.1`, ... in probe order.
+pub const READBACK_QUERY_SAMPLES: &str = "samples";
+/// The [`Readback::query_ms`] key of the native-histogram series read.
+pub const READBACK_QUERY_HISTOGRAM_SERIES: &str = "histogram_series";
+/// The [`Readback::query_ms`] key of the native-histogram probe's
+/// `count_over_time`.
+pub const READBACK_QUERY_HISTOGRAM_SAMPLES: &str = "histogram_samples";
+/// The [`Readback::query_ms`] key of the stale marker probe's instant query.
+pub const READBACK_QUERY_STALE_MARKER: &str = "stale_marker";
+
 /// Pause between two read-backs of a row that has not settled.
 const READBACK_SETTLE_POLL: Duration = Duration::from_millis(500);
 
@@ -4413,7 +4431,17 @@ async fn read_back_once(
     let window = [("start", seconds(min_ts)), ("end", seconds(max_ts))];
     let range_ms = max_ts - min_ts + 1;
 
-    let series_count = reader
+    let mut query_ms = BTreeMap::new();
+    // Each query's wall time goes into `query_ms` under `name`, and a failed
+    // query's detail says how long it ran before it failed.
+    let mut timed = |name: String, started: std::time::Instant, result: Result<u64, String>| {
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        query_ms.insert(name.clone(), ms);
+        result.map_err(|detail| fail(format!("query {name} failed after {ms} ms: {detail}")))
+    };
+
+    let started = std::time::Instant::now();
+    let result = reader
         .series_count(
             &format!(
                 "{{__name__=~\"{}\"}}",
@@ -4421,21 +4449,27 @@ async fn read_back_once(
             ),
             &window,
         )
-        .await
-        .map_err(fail)?;
+        .await;
+    let series_count = timed(READBACK_QUERY_SERIES.to_string(), started, result)?;
     let mut sample_count = 0u64;
-    for (probe, _) in plan.float_probes() {
-        sample_count += reader
+    for (index, (probe, _)) in plan.float_probes().into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        let result = reader
             .instant_count(
                 &format!("count_over_time({}[{range_ms}ms])", probe.selector),
                 max_ts,
             )
-            .await
-            .map_err(fail)?;
+            .await;
+        sample_count += timed(
+            format!("{READBACK_QUERY_SAMPLES}.{index}"),
+            started,
+            result,
+        )?;
     }
     let histogram_series_count = match expected.histogram_series_count {
-        Some(_) => Some(
-            reader
+        Some(_) => {
+            let started = std::time::Instant::now();
+            let result = reader
                 .series_count(
                     &format!(
                         "{{__name__=~\"{}\"}}",
@@ -4443,24 +4477,33 @@ async fn read_back_once(
                     ),
                     &window,
                 )
-                .await
-                .map_err(fail)?,
-        ),
+                .await;
+            Some(timed(
+                READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
+                started,
+                result,
+            )?)
+        }
         None => None,
     };
     let histogram_sample_count = match (
         expected.histogram_sample_count,
         plan.probes.get(&PayloadClass::NativeHistogram),
     ) {
-        (Some(_), Some(probe)) => Some(
-            reader
+        (Some(_), Some(probe)) => {
+            let started = std::time::Instant::now();
+            let result = reader
                 .instant_count(
                     &format!("count_over_time({}[{range_ms}ms])", probe.selector),
                     max_ts,
                 )
-                .await
-                .map_err(fail)?,
-        ),
+                .await;
+            Some(timed(
+                READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
+                started,
+                result,
+            )?)
+        }
         _ => None,
     };
     let stale_marker_honored = match (
@@ -4468,13 +4511,11 @@ async fn read_back_once(
         plan.stale_probe,
         plan.probes.get(&PayloadClass::StaleMarker),
     ) {
-        (Some(_), Some((marker_ts, _)), Some(probe)) => Some(
-            reader
-                .instant_series(&probe.selector, marker_ts)
-                .await
-                .map_err(fail)?
-                == 0,
-        ),
+        (Some(_), Some((marker_ts, _)), Some(probe)) => {
+            let started = std::time::Instant::now();
+            let result = reader.instant_series(&probe.selector, marker_ts).await;
+            Some(timed(READBACK_QUERY_STALE_MARKER.to_string(), started, result)? == 0)
+        }
         _ => None,
     };
 
@@ -4521,6 +4562,7 @@ async fn read_back_once(
         expected,
         attempts: 1,
         settled_after_ms: 0,
+        query_ms,
     })
 }
 
@@ -4547,6 +4589,7 @@ fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readb
         expected,
         attempts: 1,
         settled_after_ms: 0,
+        query_ms: BTreeMap::new(),
     }
 }
 

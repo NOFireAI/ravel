@@ -357,6 +357,7 @@ fn readback(query_url: &str) -> Readback {
         matches_expected: true,
         attempts: 1,
         settled_after_ms: 0,
+        query_ms: Default::default(),
     }
 }
 
