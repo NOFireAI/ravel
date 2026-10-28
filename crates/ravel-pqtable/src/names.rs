@@ -14,7 +14,7 @@ pub const RESERVED_TABLE_NAMES: [&str; 6] =
 /// across `/`, so a pattern such as `t/*/*/l0/*` also matches the manifests
 /// `t/<tenant_hash>/pq/t/l0/v/...` of a table named `l0`, handing them to a
 /// role that was never meant to read or write table definitions.
-pub const IAM_GRANT_SEGMENTS: [&str; 10] = [
+pub const IAM_GRANT_SEGMENTS: [&str; 11] = [
     "l0",
     "c",
     "l1",
@@ -25,6 +25,7 @@ pub const IAM_GRANT_SEGMENTS: [&str; 10] = [
     "catalog",
     "del",
     "a",
+    "ag",
 ];
 
 /// Longest table name, in bytes (one leading character plus up to 62 more).
