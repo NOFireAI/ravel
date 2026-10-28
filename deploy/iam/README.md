@@ -87,7 +87,7 @@ grants below are what remains deletable after that deny applies.
   that before applying these templates to another S3-compatible store. The
   read, write and list grants on `t/*/*/admission/*`
   and on other key segments (`c`, `l0`, `l1`, `idem`, `maint`, `u`,
-  `catalog`, `del` and `a`) keep the cross-`/` match, so they would reach the
+  `catalog`, `del`, `a` and `ag`) keep the cross-`/` match, so they would reach the
   manifests of a Parquet table with that name. No such table can exist:
   `validate_table` (`crates/ravel-pqtable/src/names.rs`) refuses each of those
   segments as a table name (ADR-2040's 2026-10-03 IAM segment amendment).
@@ -392,6 +392,31 @@ same three. Removing Gateway's catalog grants is a separate least-privilege
 decision recorded on issue #2382. Admin lists and reads the
 catalog through `t/*`. Maintain's two deletes are the unreferenced-catalog sweep
 (see "Delete grants per role" above).
+
+## Ravel Agents: `t/*/ag/*`
+
+Ravel Agents (ADR-3331, `docs/agents.md`) keeps every agent object under
+`t/<tenant_hash>/ag/`: one HEAD per agent (`CreateIfAbsent`, then
+`CasVersion`), immutable objects under `o/` (`CreateIfAbsent`), advisory wake
+hints under `_wake/` (`Overwrite`) and directory entries under `_dir/`
+(`CreateIfAbsent`). The runtime runs in a `query` or `all` process started
+with `--agents`, so the Query role writes the namespace; the Gateway role
+carries the same grants for an `all`-mode deployment under that credential.
+Maintain reads and lists it and writes nothing there. No role deletes an
+agent object: a HEAD is never deleted and live garbage collection of agent
+objects is not part of this release (ADR-3331 decision 2).
+
+| Key | Gateway | Query | Maintain | Admin |
+|---|---|---|---|---|
+| `t/*/ag/*` | list, get, put | list, get, put | list, get | list, get (through `t/*`) |
+
+`ag` is also a reserved Parquet table name, for the reason the "Delete grants
+per role" section gives for the other segments: `t/*/ag/*` would match the
+manifests of a table named `ag`. An existing table of that name stops
+resolving and `ravel-cli parquet repair --stray` reports its manifests as
+`ReservedName`. Pinned by
+`agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain`
+in `crates/ravel-commit/tests/iam_templates.rs`.
 
 ## Control-plane keys outside the data path
 
