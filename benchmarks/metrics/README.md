@@ -166,7 +166,8 @@ The bin streams the generator: it generates one scrape step at a time and
 replays it in `--batch-size` batches, so memory is bounded by the batch size
 and one step's width, not by the number of steps. Each comparator gets the
 same stream regenerated from the same anchor, and the bin fails if its digest
-differs from the Ravel row's.
+differs from the in-process row's, or, without one, from the first portable
+row's.
 
 Every line of the stream is classified as a scalar (float) sample, a native
 histogram, a staleness marker, or malformed, and every row's `ingest` block
@@ -310,8 +311,9 @@ Every row records its `tenant`. The in-process row writes under
 `--ravel-tenant`, the tenant the operator declares ravel-server resolves its
 requests to. It is declared, not observed: nothing on the wire carries it and
 a `CommitToken` holds no tenant (its fields, `crates/ravel-types/src/lib.rs`,
-are shard, writer, epoch, sequence and ingest hour). `--ravel-endpoint` requires it and it must
-equal `--tenant`, so both Ravel rows describe one tenant's data; the bin
+are shard, writer, epoch, sequence and ingest hour). `--ravel-endpoint` requires it and, unless
+`--no-in-process-row` is given, it must equal `--tenant`, so both Ravel rows
+describe one tenant's data; the bin
 exits 64 otherwise
 (`metricsbench_ingest_smoke::a_missing_or_mismatched_ravel_tenant_exits_64`),
 and exits 64 on `--ravel-tenant` given without `--ravel-endpoint`
@@ -373,6 +375,37 @@ in-process row's
 `metricsbench_ingest::tests::a_portable_scalar_digest_must_equal_the_in_process_one`,
 `metrics_ingest::tests::the_in_process_and_portable_rows_carry_equal_expected_digests`).
 
+#### Without the in-process row (`--no-in-process-row`)
+
+`--no-in-process-row` replays into the portable rows only. The bin builds no
+`ravel-in-process` row, opens no store, and runs no post-ingest query, so
+`--store` and `--tenant` are unused and `--ravel-tenant` is not compared with
+`--tenant`
+(`metricsbench_ingest::tests::without_the_in_process_row_the_ravel_tenant_stands_alone`).
+The report says so at the top level, `in_process_row: "skipped"` beside
+`profile`, and carries no `substrate` and no `queries`; every other run
+writes `in_process_row: "present"`, and a report written before the field
+existed reads as `present` (`MetricsIngestReport::new` derives it from the
+rows; `metrics_ingest::tests::the_in_process_row_disclosure_follows_the_rows`).
+The profile record and the stream-digest check take the first portable row's
+regeneration as the reference, and that row must accept a non-zero sample
+count. Given with no portable endpoint, the flag exits 64: a run with no rows
+measures nothing
+(`metricsbench_ingest_smoke::skipping_the_in_process_row_with_no_endpoint_exits_64`).
+
+Every check on a portable row still runs: band 4 and band 6 on each row, the
+read-back, and the cross-row check that every portable row carries the same
+expected digest for every class. Only the comparison of each portable row's
+expected scalar digest with the in-process row's is skipped, because there is
+none (`check_band6_across_rows` in `src/bin/metricsbench_ingest.rs`;
+`metricsbench_ingest::tests::portable_rows_still_cross_check_without_the_in_process_row`,
+`metricsbench_ingest_smoke::without_the_in_process_row_the_portable_rows_still_close_band_6`).
+
+The large profiles run with it. On `cardinality` (360,000,000 samples) and
+`history` (1,728,000,000 samples) a memory store does not fit beside four
+4 GB engine containers on a 32 GB host, and the stack's RustFS is the
+engines' own store, not a neutral place for a diagnostic row.
+
 A class a receiver acknowledges without storing is excluded from its band 6
 comparison and its read-back, and counted under `unsupported_samples` or
 `unsupported_histograms` instead of accepted; it is not a drop, so the drop
@@ -398,7 +431,7 @@ the only basis change is the generation now interleaved between segments,
 which the sum excludes, and a throughput figure is compared across the
 change only with that in mind.
 
-`substrate`:
+`substrate`, absent with `--no-in-process-row`:
 - `store_backend`: the `--store` kind (`memory` or `s3`).
 - `endpoint_host`: the configured S3 endpoint's host, when `--store s3` and
   `RAVEL_S3_ENDPOINT` is set; absent for `memory` regardless of the env var.
@@ -657,7 +690,9 @@ or the provenance's `generator_digest` is not the run's workload digest, and
 when any portable ingest row (every row but `ravel-in-process`) fails
 `check_row_band6` or `check_row_accounting`, before any query is sent (the
 digest checks are in `bind` and in the binary's `run_main`;
-`a_band6_failure_refuses_the_run`). An engine's query URL is its ingest
+`a_band6_failure_refuses_the_run`). `bind` reads no `ravel-in-process` row, so
+a report from a `--no-in-process-row` run binds
+(`an_ingest_report_without_the_in_process_row_binds`). An engine's query URL is its ingest
 row's `readback.query_url` when the row records one, else `url=`; an engine
 with neither, or with no ingest row, exits 65. An empty recorded URL counts
 as none. Ravel is queried with one `min_commit_token` per token, since the

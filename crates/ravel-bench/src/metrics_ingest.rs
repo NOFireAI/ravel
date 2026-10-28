@@ -1444,10 +1444,30 @@ pub struct Substrate {
     pub backend_bills_requests: bool,
 }
 
+/// Whether a run built its in-process row ([`IN_PROCESS_SYSTEM`]), recorded
+/// at the top of the report so a reader of a run without one can tell a skip
+/// from a lost row. [`MetricsIngestReport::new`] derives it from the rows
+/// (`tests::the_in_process_row_disclosure_follows_the_rows`); a report
+/// written before the field existed always had the row, so it reads as
+/// `present`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InProcessRow {
+    /// The run replayed into the in-process Ravel path.
+    #[default]
+    Present,
+    /// The run was given `--no-in-process-row`: portable rows only, no store
+    /// opened, and no post-ingest query phase.
+    Skipped,
+}
+
 /// The whole ingest-lane report: one row per participating system, plus the
 /// separately-recorded query-phase rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetricsIngestReport {
+    /// Whether [`IN_PROCESS_SYSTEM`] is among `systems`.
+    #[serde(default)]
+    pub in_process_row: InProcessRow,
     /// The profile this run replayed, and its ADR-0927 decision-11 figures.
     /// Absent only for the internal unit-test rows built directly from
     /// `SystemIngestResult`s with no profile context.
@@ -1466,9 +1486,16 @@ pub struct MetricsIngestReport {
 
 impl MetricsIngestReport {
     /// Assemble a report from its ingest rows, with no query phase, profile,
-    /// or substrate attached yet.
+    /// or substrate attached yet. `in_process_row` is `present` exactly when
+    /// a row is [`IN_PROCESS_SYSTEM`].
     pub fn new(systems: Vec<SystemIngestResult>) -> Self {
+        let in_process_row = if systems.iter().any(|r| r.system == IN_PROCESS_SYSTEM) {
+            InProcessRow::Present
+        } else {
+            InProcessRow::Skipped
+        };
         MetricsIngestReport {
+            in_process_row,
             profile: None,
             substrate: None,
             systems,
@@ -4207,6 +4234,41 @@ mod tests {
             ravel_ack, prom_ack,
             "the ack meanings must not collapse in JSON"
         );
+    }
+
+    /// The report's `in_process_row` says whether [`IN_PROCESS_SYSTEM`] is
+    /// among its rows, and serializes as `present` or `skipped`; a report
+    /// with no such field reads as `present`.
+    #[test]
+    fn the_in_process_row_disclosure_follows_the_rows() {
+        let ravel = SystemIngestResult::ravel_row(
+            "in-process".to_string(),
+            ingest_phase(3.0),
+            vec!["tok-shard-0".to_string()],
+            storage_fixture(),
+        );
+        let prometheus = SystemIngestResult::buffered_http_row(
+            "prometheus",
+            "http://prom.example:9090/api/v1/write",
+            "reqwest RW1.0 sender",
+            ingest_phase(9.0),
+        );
+        let both = MetricsIngestReport::new(vec![ravel, prometheus.clone()]);
+        assert_eq!(both.in_process_row, InProcessRow::Present);
+        let portable = MetricsIngestReport::new(vec![prometheus]);
+        assert_eq!(portable.in_process_row, InProcessRow::Skipped);
+
+        let mut json = serde_json::to_value(&portable).expect("serialize");
+        assert_eq!(json["in_process_row"], "skipped");
+        assert_eq!(
+            serde_json::to_value(&both).expect("serialize")["in_process_row"],
+            "present"
+        );
+        json.as_object_mut()
+            .expect("object")
+            .remove("in_process_row");
+        let older: MetricsIngestReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(older.in_process_row, InProcessRow::Present);
     }
 
     /// A base timestamp near now (milliseconds), so a strict write's samples sit
