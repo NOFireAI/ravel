@@ -789,8 +789,10 @@ mod with_mcp {
         );
 
         // The call the released permit admitted, which is the same query run
-        // to completion: it reached the two further requests the dropped one
-        // never issued, and only a completed plan carries an estimate.
+        // to completion: it reached one further request beyond the dropped
+        // call's three. The dropped call cached the HEAD's absence, so this
+        // call's HEAD lookup is a cache hit and issues no GET. Only a
+        // completed plan carries an estimate.
         let succeeded: Vec<_> = outcomes
             .iter()
             .filter(|row| row.status == QueryOutcomeStatus::Success)
@@ -800,10 +802,10 @@ mod with_mcp {
             succeeded[0].counters,
             ravel_server::metrics::QueryCostCounters {
                 queries: 1,
-                s3_requests: 5,
+                s3_requests: 4,
                 s3_bytes: 0,
-                cache_hits: 0,
-                cache_misses: 1,
+                cache_hits: 1,
+                cache_misses: 0,
                 decompressed_bytes: 0,
                 estimated_requests: 4,
                 estimated_store_bytes: 0,
