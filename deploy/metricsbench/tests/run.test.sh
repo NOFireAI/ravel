@@ -34,6 +34,8 @@
 #   j  no fold gauge on /metrics     -> stamps ravel_catalog_fold "absent"
 #   k  capture exits 1 (partial)     -> exit 70, step capture, no query run,
 #                                       torn down
+#   l  a profile other than ci       -> exit 0, ingest runs without the
+#                                       in-process row; stamps say skipped
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -354,6 +356,8 @@ expect_log "a: query given all four engines" "--engine name=mimir,url=http://127
 expect_log "a: report validated by path" "metricsbench_report validate ${OUT}/report.json"
 expect_log "a: provenance pins the comparators from the capture" "--comparator mimir=2.16.0=sha256:3333"
 expect_no_log "a: the token never on a command line" "metricsbench-token"
+expect_log "a: ci keeps the in-process row on a memory store" "--store memory --tenant metricsbench"
+check "a: stamps say the in-process row is present" 'j("stamps.json")["in_process_row"] == "present"'
 
 # --- b: ingest fails ---------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/b/out")
@@ -403,6 +407,9 @@ check "f: override sets --query.max-samples" '"--query.max-samples=1000" in j("p
 expect_log "f: Prometheus started alone with the override" "prometheus-max-samples.override.yml up -d prometheus"
 expect_log "f: ingest into Prometheus" "--prometheus-endpoint http://127.0.0.1:9090/api/v1/write"
 expect_no_log "f: no other endpoint" "--ravel-endpoint"
+expect_log "f: no in-process row" "--no-in-process-row"
+expect_no_log "f: no memory store" "--store memory"
+check "f: stamps say the in-process row is skipped" 'j("stamps.json")["in_process_row"] == "skipped"'
 expect_no_log "f: no query run" "metricsbench_query"
 expect_log "f: torn down" " down -v"
 
@@ -462,6 +469,14 @@ expect_rc k 70
 check "k: stamps name step capture" 'j("stamps.json")["failed_step"] == "capture"'
 expect_no_log "k: no query run" "metricsbench_query"
 expect_log "k: torn down" " down -v"
+
+# --- l: a profile other than ci ----------------------------------------------
+run_case l --profile history --ravel-image "${IMAGE}" --ravel-source-commit "${COMMIT}" \
+  --bin-dir "${BIN}" --out-dir "${TMP}/l/out" --anchor-ms "${ANCHOR}"
+expect_rc l 0
+expect_log "l: ingest skips the in-process row" "--no-in-process-row"
+expect_no_log "l: no memory store" "--store memory"
+check "l: stamps say the in-process row is skipped" 'j("stamps.json")["in_process_row"] == "skipped"'
 
 echo
 echo "${passes} passed, ${fails} failed"

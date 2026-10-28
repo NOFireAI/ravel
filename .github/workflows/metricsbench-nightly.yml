@@ -49,13 +49,16 @@ permissions:
 jobs:
   metricsbench-rustfs:
     runs-on: ubuntu-latest
-    # 60 minutes. A cold release build of the three bins takes most of the
-    # old 30-minute budget on its own; run.sh then pulls five images, waits
-    # for each of four engines in turn (METRICSBENCH_READY_TRIES below bounds
-    # each wait to 2.5 minutes, 10 in all), replays the ci profile (120,000
-    # samples) into four engines, and runs 20 corpus entries x 6 passes x 3
-    # reps against four engines, each query capped at 120 s.
-    timeout-minutes: 60
+    # 75 minutes. A cold release build of the three bins takes most of 30
+    # minutes on its own; run.sh then pulls five images and waits for each of
+    # four engines in turn. METRICSBENCH_READY_TRIES below gives each engine
+    # 75 tries: 2.5 minutes when a refused connection fails fast, and up to
+    # 8.75 minutes (75 x the 2 s interval plus curl's 5 s cap) when a port
+    # accepts and does not answer, so up to 35 minutes for four. Then it
+    # replays the ci profile (120,000 samples) into four engines and runs 20
+    # corpus entries x 6 passes x 3 reps against four engines, each query
+    # capped at 120 s. The budget leaves the out-dir upload room to run.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -80,9 +83,9 @@ jobs:
           # alongside it rather than trusting the binary's own version.
           RAVEL_IMAGE_REF: ghcr.io/nofireai/ravel-server:manual-0bf5fed@sha256:42116db1a8b2b0da52b5bc71219678d9b32d42aefb61ba46152ba9f9968d5ca7
           RAVEL_SOURCE_COMMIT: 0bf5fedb2834df7dc87f8086701dd289b049efb0
-          # 75 tries 2 s apart per engine. run.sh's default of 300 is per
-          # engine too, and four engines down would take 40 minutes, past the
-          # job timeout, which cancels the out-dir upload below.
+          # 75 tries per engine (the bound is in the timeout comment above).
+          # run.sh's default of 300 would let four stalled engines outlast
+          # the job timeout, which cancels the out-dir upload below.
           METRICSBENCH_READY_TRIES: "75"
         run: |
           # No --anchor-ms: run.sh derives the window from the clock, ending
