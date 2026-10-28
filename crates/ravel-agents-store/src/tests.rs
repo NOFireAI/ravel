@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use proptest::prelude::*;
@@ -20,8 +21,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, PutOptions};
 
 use super::*;
+use crate::backoff::{Backoff, JitteredBackoff, NoBackoff};
 use crate::counters::PhaseCounts;
-use crate::publish::MAX_CAS_ATTEMPTS;
+use crate::publish::{MAX_CAS_ATTEMPTS, reply_handle};
 
 const SECOND: i64 = 1_000_000_000;
 const T0: i64 = 1_800_000_000 * SECOND;
@@ -50,6 +52,26 @@ fn agent() -> AgentId {
     agent_id(&kind(), &key("o-1"))
 }
 
+/// Records every delay the store asks for and waits for none of them.
+#[derive(Default)]
+struct RecordingBackoff(Mutex<Vec<(u32, Option<u64>)>>);
+
+impl RecordingBackoff {
+    fn asked(&self) -> Vec<(u32, Option<u64>)> {
+        self.0.lock().expect("backoff lock").clone()
+    }
+}
+
+impl Backoff for RecordingBackoff {
+    fn delay(&self, attempt: u32, retry_after_ms: Option<u64>) -> Duration {
+        self.0
+            .lock()
+            .expect("backoff lock")
+            .push((attempt, retry_after_ms));
+        Duration::ZERO
+    }
+}
+
 fn store_with(backend: Arc<dyn ObjectStoreBackend>, limits: StoreLimits) -> AgentStore {
     AgentStore::new(
         backend,
@@ -58,6 +80,7 @@ fn store_with(backend: Arc<dyn ObjectStoreBackend>, limits: StoreLimits) -> Agen
         Arc::new(TestClock(AtomicI64::new(T0))),
         Arc::new(DerivedIds),
     )
+    .with_backoff(Arc::new(NoBackoff))
 }
 
 fn faulty(rules: Vec<Rule>) -> (Arc<FaultStore<MemoryStore>>, AgentStore) {
@@ -120,16 +143,22 @@ async fn create_is_idempotent_through_already_exists() {
     assert!(!second.published);
     assert_eq!(second.head, first.head);
     assert_eq!(second.version, first.version);
-    assert_eq!(delta.publish.put, 1, "one CreateIfAbsent on HEAD");
+    assert_eq!(
+        delta.publish.put, 2,
+        "one CreateIfAbsent on HEAD, then the dir entry the Exists path repairs"
+    );
     assert_eq!(delta.publish.conflict, 1, "refused with AlreadyExists");
     assert_eq!(delta.resolve.get, 2, "the blip, then the re-read");
 
-    // Without the blip a repeated create is one read and no write.
+    // Without the blip a repeated create is one read, no HEAD write and the
+    // advisory dir entry.
     let before = store.counters();
     let third = create(&store).await;
     let delta = store.counters().since(&before);
     assert_eq!(third.reply, Reply::Exists { incarnation: 1 });
-    assert_eq!(delta.total().put + delta.total().cas, 0);
+    assert_eq!(delta.total().cas, 0);
+    assert_eq!(delta.total().put, 1, "the dir entry");
+    assert_eq!(delta.resolve.get, 1);
 }
 
 #[tokio::test]
@@ -975,4 +1004,171 @@ async fn a_contended_cas_uses_the_version_of_its_own_re_read() {
     assert_eq!(ca.publish.conflict, 1, "a lost exactly one CAS to b");
     assert_eq!(ao.head.root_revision, bo.head.root_revision + 1);
     assert_eq!(ao.head.inbox.len(), 2, "both inputs survive the rebase");
+}
+
+// ---- review round 1 of the store pull request ----
+
+#[tokio::test]
+async fn an_unknown_outcome_on_any_operation_command_carries_its_handle() {
+    // Put 1 on the head key is the create, put 2 the enqueue's CAS, put 3
+    // the cancel's CAS: it applies and its acknowledgement is lost.
+    let (backend, store) = faulty(vec![head_rule(
+        Op::Put,
+        ScriptedFault::DuplicateDelivery,
+        3,
+    )]);
+    let created = create(&store).await;
+    let accepted = enqueue(&store, &created.head, "r1", b"p")
+        .await
+        .expect("enqueue");
+    let seq = accept_seq(&accepted);
+    let cancel = Command::Cancel(Cancel {
+        fence: IncarnationFence {
+            incarnation: accepted.head.incarnation,
+        },
+        accept_seq: seq,
+    });
+    let error = store
+        .execute(&agent(), &cancel)
+        .await
+        .expect_err("the cancel's CAS answer was lost");
+    assert_eq!(error.kind, ErrorKind::OutcomeUnknown);
+    let token = error
+        .ids
+        .operation
+        .expect("a cancel's unknown outcome carries the operation handle");
+    let handle = Handle::decode(&token).expect("handle");
+    assert_eq!(handle.item, HandleItem::Operation(seq));
+    let resolution = store.resolve(&handle).await.expect("resolve");
+    assert_eq!(resolution.accept_seq, seq);
+    assert_eq!(resolution.state, Some(OperationState::Cancelled));
+    assert_eq!(
+        backend.fault_count(Op::Put, FaultKind::DuplicateDelivery),
+        1
+    );
+
+    // Every reply that names an accept sequence yields a handle.
+    let named = [
+        Reply::TurnCommitted {
+            accept_seq: 4,
+            state_version: 1,
+            rebased: false,
+        },
+        Reply::AlreadyCommitted { accept_seq: 4 },
+        Reply::TurnRetry {
+            accept_seq: 4,
+            failed_attempts: 1,
+        },
+        Reply::TurnFailed {
+            accept_seq: 4,
+            dead_lettered: false,
+        },
+        Reply::CancelRequested { accept_seq: 4 },
+        Reply::Cancelled { accept_seq: 4 },
+        Reply::AlreadyTerminal {
+            accept_seq: 4,
+            status: ravel_agents_core::head::ResultStatus::Completed,
+        },
+        Reply::TimerFired { accept_seq: 4 },
+    ];
+    for reply in named {
+        assert_eq!(
+            reply_handle(&agent(), &created.head, &reply),
+            Some(Handle::operation(agent(), created.head.incarnation, 4)),
+            "{reply:?}"
+        );
+    }
+    for reply in [Reply::Idle, Reply::TimerNotDue, Reply::Tombstoned] {
+        assert_eq!(reply_handle(&agent(), &created.head, &reply), None);
+    }
+}
+
+#[tokio::test]
+async fn a_retry_waits_through_the_backoff_seam() {
+    // Get 2 on the head key (the enqueue's read) is throttled with a named
+    // wait; put 2 (the enqueue's CAS) is refused once.
+    let plan = FaultPlan::empty()
+        .with_rule(head_rule(
+            Op::Get,
+            ScriptedFault::Throttled { retry_after_ms: 7 },
+            2,
+        ))
+        .with_rule(head_rule(Op::Put, ScriptedFault::FailedConditionalWrite, 2));
+    let backend = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let backoff = Arc::new(RecordingBackoff::default());
+    let store = store_with(backend.clone(), StoreLimits::default()).with_backoff(backoff.clone());
+    let created = create(&store).await;
+    assert_eq!(
+        backoff.asked(),
+        Vec::new(),
+        "a clean create waits for nothing"
+    );
+    let accepted = enqueue(&store, &created.head, "r1", b"p")
+        .await
+        .expect("enqueue");
+    assert!(accepted.published);
+    assert_eq!(
+        backoff.asked(),
+        vec![(1, Some(7)), (1, None)],
+        "one wait after the throttled read with its floor, one after the refused CAS"
+    );
+    assert_eq!(backend.fault_count(Op::Get, FaultKind::Throttled), 1);
+    assert_eq!(
+        backend.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+        1
+    );
+}
+
+#[test]
+fn the_jittered_backoff_grows_to_its_cap_and_honours_retry_after() {
+    let backoff = JitteredBackoff::new(Duration::from_millis(20), Duration::from_millis(200));
+    for attempt in 1..=12 {
+        let ceiling = Duration::from_millis(20u64 << (attempt - 1)).min(Duration::from_millis(200));
+        for _ in 0..64 {
+            assert!(backoff.delay(attempt, None) <= ceiling, "attempt {attempt}");
+        }
+    }
+    for _ in 0..64 {
+        assert!(backoff.delay(1, Some(500)) >= Duration::from_millis(500));
+    }
+    let spread: std::collections::BTreeSet<Duration> =
+        (0..64).map(|_| backoff.delay(8, None)).collect();
+    assert!(
+        spread.len() > 1,
+        "the draws are jittered, not one fixed delay"
+    );
+}
+
+#[tokio::test]
+async fn a_create_that_finds_the_root_repairs_the_dir_entry() {
+    // The first create's dir entry write fails after its HEAD applied.
+    let refuse = Rule::new(Op::Put, ScriptedFault::Transient("down".to_string()))
+        .with_key_contains("/_dir/")
+        .with_occurrence(Occurrence::Nth(1));
+    let (backend, store) = faulty(vec![refuse]);
+    let first = create(&store).await;
+    assert_eq!(first.reply, Reply::Created { incarnation: 1 });
+    assert!(first.published);
+    assert!(
+        store
+            .list_agents(None)
+            .await
+            .expect("list")
+            .agents
+            .is_empty(),
+        "the agent is live but unlisted"
+    );
+
+    let before = store.counters();
+    let second = create(&store).await;
+    assert_eq!(second.reply, Reply::Exists { incarnation: 1 });
+    assert!(!second.published);
+    let delta = store.counters().since(&before);
+    assert_eq!(delta.publish.put, 1, "the dir entry, and no HEAD write");
+    assert_eq!(delta.publish.cas, 0);
+    assert_eq!(
+        store.list_agents(None).await.expect("list").agents,
+        vec![agent()]
+    );
+    assert_eq!(backend.fault_count(Op::Put, FaultKind::Transient), 1);
 }
