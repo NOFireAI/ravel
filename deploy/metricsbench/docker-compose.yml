@@ -110,6 +110,15 @@ services:
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
+    # DESCRIPTOR LIMIT (disclosed, equal on every long-running service):
+    # nofile 524288 soft and hard, the Docker hard default. The Go engines
+    # raise their soft limit to the hard limit themselves; ravel-server and
+    # RustFS do not (#3412), so without this they run at the 1,024 soft
+    # default. README "Frozen limits" carries the row.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
     deploy:
       resources:
         limits:
@@ -197,6 +206,11 @@ services:
       - "127.0.0.1:8428:8428"
     volumes:
       - victoriametrics-data:/victoria-metrics-data
+    # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
     deploy:
       resources:
         limits:
@@ -224,6 +238,11 @@ services:
       RUSTFS_SECRET_KEY: mimir-dev-secret
     volumes:
       - rustfs-data:/data
+    # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
     deploy:
       resources:
         limits:
@@ -320,6 +339,11 @@ services:
     volumes:
       - ./config/mimir.yaml:/etc/mimir/mimir.yaml:ro
       - mimir-data:/data
+    # DESCRIPTOR LIMIT: equal on every long-running service; see prometheus.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
     deploy:
       resources:
         limits:
