@@ -1070,6 +1070,44 @@ async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn pollers_woken_together_share_one_rescan() {
+    // Three dormant agents known only from the directory; two workers wait
+    // on long polls; one wake past the rescan interval releases both, and
+    // the directory is listed once, not once per poller.
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let other = coordinator(&store, &clock, 100);
+    let co = coordinator(&store, &clock, 200);
+    for key in ["o-1", "o-2", "o-3"] {
+        create(&other, key).await;
+    }
+    let wa = worker(&co, "v1");
+    let wb = worker(&co, "v1");
+    let before = store.counters();
+    let deadline = Instant::now() + Duration::from_millis(1_000);
+    let req_a = poll_req(&wa, "v1", 1_000);
+    let req_b = poll_req(&wb, "v1", 1_000);
+    let pa = co.poll(&req_a, deadline);
+    let pb = co.poll(&req_b, deadline);
+    let wake = async {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance_ms(RESCAN_MS);
+        co.wake.notify_waiters();
+    };
+    let (ra, rb, ()) = tokio::join!(pa, pb, wake);
+    assert!(ra.expect("poll a").is_none());
+    assert!(rb.expect("poll b").is_none());
+    let delta = store.counters().since(&before);
+    assert_eq!(
+        delta.resolve.list, 2,
+        "one scan at start, one shared rescan after the wake"
+    );
+    assert_eq!(delta.resolve.get, 6, "three dormant HEADs read per scan");
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_idle_poll_rescans_the_directory_at_most_once_per_interval() {
     // Three dormant agents created through another coordinator, so this
     // one knows them only from the directory, and no work: the first poll
