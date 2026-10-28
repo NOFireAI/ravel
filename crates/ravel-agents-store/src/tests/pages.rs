@@ -5,7 +5,7 @@
 use ravel_agents_core::command::{EventSpec, FireTimer};
 use ravel_agents_core::head::{FORMAT_VERSION, MAX_HEAD_BYTES, peek_format_version};
 use ravel_agents_core::identity::Id128;
-use ravel_agents_core::pages::{ListKind, Representation, receipt_fingerprint};
+use ravel_agents_core::pages::{ListKind, Need, Representation, receipt_fingerprint};
 use ravel_object_store::fault::{Sequence, SequenceStep};
 
 use crate::counters::CounterSnapshot;
@@ -230,7 +230,8 @@ async fn send_receipt_lookup_and_wake_read_at_most_one_index_page_each() {
 }
 
 /// Events are read by `event_seq` range: from the page holding `after + 1`
-/// until `limit` events are in hand, never the pages before it.
+/// until `limit` events are in hand, never the pages before it. A result
+/// the route layer reads by `accept_seq` costs the one page holding it.
 #[tokio::test]
 async fn events_are_read_by_seq_range() {
     let store = store_with(Arc::new(MemoryStore::new()), paged_limits());
@@ -287,6 +288,29 @@ async fn events_are_read_by_seq_range() {
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].event_seq, events);
     assert_eq!(store.counters().since(&before).resolve.get, 1);
+
+    // A result read by accept_seq: one GET for a sealed result, none for
+    // one still on the open page.
+    let mut head = shallow(&store).await;
+    assert_eq!(sealed(&head, ListKind::Results), pages_for(turns as u64));
+    let before = store.counters();
+    store
+        .attach(&agent(), &mut head, &[(ListKind::Results, Need::Key(1))])
+        .await
+        .expect("attach");
+    assert!(head.results.iter().any(|r| r.accept_seq == 1));
+    assert_eq!(store.counters().since(&before).resolve.get, 1);
+    let before = store.counters();
+    store
+        .attach(
+            &agent(),
+            &mut head,
+            &[(ListKind::Results, Need::Key(turns as u64))],
+        )
+        .await
+        .expect("attach");
+    assert!(head.results.iter().any(|r| r.accept_seq == turns as u64));
+    assert_eq!(store.counters().since(&before).total().requests(), 0);
 }
 
 /// A CAS refused once: the retry re-reads HEAD, re-runs the kernel, and seals
