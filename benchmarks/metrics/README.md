@@ -536,7 +536,7 @@ none (`check_band6_across_rows` in `src/bin/metricsbench_ingest.rs`;
 
 The large profiles run with it. On `cardinality` (360,000,000 samples) and
 `history` (1,728,000,000 samples) a memory store does not fit beside four
-4 GB engine containers on a 32 GB host, and the stack's RustFS is the
+4 GB engine containers on a 32 GB host, and the stack's s3s-fs is the
 engines' own store, not a neutral place for a diagnostic row.
 
 A class a receiver acknowledges without storing is excluded from its band 6
@@ -566,7 +566,7 @@ the write loop of a stream generated up front.
   `RAVEL_S3_ENDPOINT` is set; absent for `memory` regardless of the env var.
 - `backend_bills_requests`: true only for real S3 with no endpoint override
   (decision 10); false on `memory` and on any store behind a configured
-  endpoint, such as the nightly lane's local RustFS.
+  endpoint, such as the nightly lane's local s3s-fs.
 
 ## Determinism
 

@@ -32,11 +32,18 @@
 #               missing from --bin-dir, an out-dir that already holds a run's output, a
 #               profile the workload does not declare, an off-grid anchor, or
 #               a metricsbench compose project (containers or volumes) left
-#               from an earlier run; nothing is started
+#               from an earlier run, or a host arch (uname -m) other than
+#               x86_64 or aarch64; nothing is started
 #   stamps      <out>/stamps.json, written before the first step and completed
 #               at the end, whatever the outcome
+#   fetch-s3s-fs  the s3s-fs binary the s3s service runs (ADR-0927 amendment
+#               2026-10-29): the cached copy for this arch if its sha256
+#               equals the pinned constant below, else the release asset
+#               downloaded and checked against it; any other sha256 is
+#               refused with exit 65 before anything starts. Its path is
+#               exported as S3S_FS_BIN and stamped (object_store)
 #   up          docker compose up -d of docker-compose.yml plus ravel.yml,
-#               RAVEL_IMAGE set
+#               RAVEL_IMAGE and S3S_FS_BIN set
 #   qualify     the one-shots createbuckets and ravel-qualify exited 0
 #   image       the Ravel image as docker image inspect resolves it: a
 #               published image must list the digest the reference names, a
@@ -71,16 +78,17 @@
 # are optional there, since no Ravel is started.
 #
 # The stack is always torn down with `docker compose ... down -v` (after its
-# logs are saved to <out>/compose.log and RustFS's /logs directory is copied
-# to <out>/rustfs-logs/) unless --keep is given. A failed copy is stamped
-# (rustfs_logs) and does not change the exit code.
+# logs, s3s-fs's among them, are saved to <out>/compose.log) unless --keep is
+# given.
 #
 # Exit codes:
 #   0   every step passed
 #   64  usage error, including --ravel-image-id with a digest-pinned
 #       --ravel-image (both forms) or with no --ravel-image, and no Ravel
 #       image at all on a run that starts Ravel (neither form)
-#   65  a refused input (see refusals above); nothing was started
+#   65  a refused input (see refusals above), or an s3s-fs binary whose
+#       sha256 is not the pinned one (step fetch-s3s-fs); nothing was
+#       started
 #   70  a step failed; its name is in the message and in stamps.json
 #       (failed_step)
 #   75  a --rss-band was violated or a container was OOM-killed
@@ -91,7 +99,9 @@
 # and METRICSBENCH_READY_INTERVAL (default 300 tries 2 s apart; a try that
 # reaches a port which does not answer also spends up to 5 s in curl, so the
 # bound per engine is tries x (interval + 5) s),
-# METRICSBENCH_IMDS (default http://169.254.169.254).
+# METRICSBENCH_IMDS (default http://169.254.169.254),
+# METRICSBENCH_S3S_FS_CACHE (default ${XDG_CACHE_HOME:-~/.cache}/ravel-metricsbench,
+# where fetch-s3s-fs keeps the verified binary between runs).
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,6 +114,16 @@ READY_TRIES="${METRICSBENCH_READY_TRIES:-300}"
 READY_INTERVAL="${METRICSBENCH_READY_INTERVAL:-2}"
 IMDS="${METRICSBENCH_IMDS:-http://169.254.169.254}"
 PROJECT="${COMPOSE_PROJECT_NAME:-metricsbench}"
+S3S_FS_CACHE="${METRICSBENCH_S3S_FS_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/ravel-metricsbench}"
+
+# The s3s-fs build the s3s service runs, pinned by the sha256 of each arch's
+# release asset. fetch_s3s_fs refuses any binary, cached or downloaded, whose
+# sha256 differs; tests/every_comparator_pins_an_image_digest.sh (category 7)
+# fails if a constant or that comparison goes.
+S3S_FS_RELEASE="s3s-fs-0.17.0-ravel.1"
+S3S_FS_URL_BASE="https://github.com/NOFireAI/s3s/releases/download/${S3S_FS_RELEASE}"
+S3S_FS_SHA256_X86_64="0ac5480b51389c1913f9645d0e1ff2ff1dfdd3a44bb396a7cb74c5e91176c01f"
+S3S_FS_SHA256_AARCH64="6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717ad"
 
 WORKLOAD="${repo_root}/benchmarks/metrics/workload.json"
 CORPUS="${repo_root}/benchmarks/metrics/metrics.corpus.json"
@@ -601,6 +621,16 @@ else
   anchor_source="clock: the profile's window ending at least 10 minutes before the run started, on the scrape grid"
 fi
 
+host_arch="$(uname -m)"
+if [ "$diagnostic" -eq 0 ]; then
+  case "$host_arch" in
+    x86_64) s3s_fs_sha256="$S3S_FS_SHA256_X86_64" ;;
+    aarch64) s3s_fs_sha256="$S3S_FS_SHA256_AARCH64" ;;
+    *) refuse "no s3s-fs release asset is pinned for host arch '$host_arch' (uname -m); only x86_64 and aarch64 are" ;;
+  esac
+  s3s_fs_asset="s3s-fs-linux-${host_arch}"
+fi
+
 if [ "$ravel_image_kind" = "local-build" ]; then
   local_id="$("$DOCKER" image inspect "$ravel_image" 2>/dev/null | py image-inspect-local "$ravel_image" "$ravel_image_id")" ||
     refuse "docker image inspect $ravel_image does not report Id $ravel_image_id (got: ${local_id:-no such image}); the tag no longer names the build the run was given"
@@ -613,6 +643,9 @@ else
 fi
 # compose interpolates ravel.yml on every command, `ps` and `down` included.
 export RAVEL_IMAGE="${ravel_image:-unset-diagnostic-run-starts-no-ravel}"
+# The same for docker-compose.yml's S3S_FS_BIN, which fetch-s3s-fs replaces
+# with the verified binary before `up`; this path is never started.
+export S3S_FS_BIN="/nonexistent/s3s-fs-not-fetched"
 
 compose() {
   "$DOCKER" compose "${compose_files[@]}" "$@"
@@ -679,9 +712,9 @@ stamp_str ravel_source_commit "${ravel_source_commit:-not given: diagnostic run}
 stamp_str harness_commit "$(git_head "$bin_dir")"
 stamp_str run_script_commit "$(git_head "$here")"
 stamp_str bin_dir "$bin_dir"
-stamp_str store_kind rustfs
+stamp_str store_kind s3s-fs
 stamp_str instance_type "$host_instance_type"
-stamp_str host.arch "$(uname -m)"
+stamp_str host.arch "$host_arch"
 stamp_str host.kernel "$(uname -sr)"
 stamp_str passes "${passes:-default}"
 stamp_str reps_per_pass "${reps:-default}"
@@ -692,7 +725,7 @@ fi
 stamp_set comparator_images null
 stamp_set ravel_catalog_fold null
 stamp_set mimir_readiness null
-stamp_set rustfs_logs null
+stamp_set object_store null
 stamp_set in_process_row null
 stamp_set steps_completed '[]'
 stamp_set failed_step null
@@ -755,28 +788,6 @@ memory_summary() {
   return "$code"
 }
 
-# save_rustfs_logs: copy RustFS's /logs out of its container into
-# <out>/rustfs-logs/, since `down -v` destroys the container and its own log
-# directory with it. The image's entrypoint creates /logs and logs there, not
-# to stdout: a smoke-pass compose.log holds only its three startup lines,
-# "Initializing log directory: /logs" among them (#2821, comment 6465409125).
-# A failed copy is stamped and said, and never changes the run's exit code.
-save_rustfs_logs() {
-  local cp_code=0
-  if [ "$diagnostic" -eq 1 ]; then
-    stamp_str rustfs_logs "not applicable: diagnostic run starts no RustFS"
-    return 0
-  fi
-  compose cp rustfs:/logs "${out_dir}/rustfs-logs" >"${out_dir}/rustfs-logs-copy.log" 2>&1 || cp_code=$?
-  if [ "$cp_code" -eq 0 ]; then
-    stamp_str rustfs_logs "copied to rustfs-logs/"
-  else
-    stamp_str rustfs_logs "copy failed (exit ${cp_code}), see rustfs-logs-copy.log"
-    say "copying RustFS's /logs failed (exit ${cp_code}); see ${out_dir}/rustfs-logs-copy.log"
-  fi
-  return 0
-}
-
 on_exit() {
   local code=$? down_code=0
   trap - EXIT
@@ -788,7 +799,6 @@ on_exit() {
     fi
     stop_sampler
     compose logs --no-color >"${out_dir}/compose.log" 2>&1
-    save_rustfs_logs
     if [ "$keep" -eq 1 ]; then
       stamp_str teardown "kept (--keep)"
       say "--keep: the stack is still up"
@@ -893,6 +903,55 @@ memory_step() {
   step_done memory
 }
 
+# sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
+sha256_of() {
+  local out
+  out="$(sha256sum "$1")" || return 1
+  printf '%s\n' "${out%% *}"
+}
+
+# fetch_s3s_fs: S3S_FS_BIN for the s3s service. A cached binary is used only
+# if its sha256 is the pinned one; otherwise none is cached, and the release
+# asset is downloaded beside the cache entry, compared, and moved into it
+# only on a match. A mismatch on either path exits 65 and starts nothing.
+fetch_s3s_fs() {
+  local dir="${S3S_FS_CACHE}/${S3S_FS_RELEASE}" bin got from tmp code=0
+  local url="${S3S_FS_URL_BASE}/${s3s_fs_asset}"
+  bin="${dir}/${s3s_fs_asset}"
+  if [ -e "$bin" ]; then
+    got="$(sha256_of "$bin")" || fail_step fetch-s3s-fs "cannot hash the cached $bin"
+    if [ "$got" != "$s3s_fs_sha256" ]; then
+      FAILED_STEP="fetch-s3s-fs"
+      say "refused: the cached $bin has sha256 $got, not the pinned $s3s_fs_sha256 for $S3S_FS_RELEASE; delete it to download again"
+      exit "$EXIT_REFUSED"
+    fi
+    from="cache"
+  else
+    mkdir -p "$dir" || fail_step fetch-s3s-fs "cannot create the cache directory $dir"
+    tmp="${bin}.download.$$"
+    curl -fsSL --max-time 600 -o "$tmp" "$url" >"${out_dir}/s3s-fs-fetch.log" 2>&1 || code=$?
+    if [ "$code" -ne 0 ]; then
+      rm -f "$tmp"
+      show_log "${out_dir}/s3s-fs-fetch.log"
+      fail_step fetch-s3s-fs "downloading $url failed (curl exit $code)"
+    fi
+    got="$(sha256_of "$tmp")" || { rm -f "$tmp"; fail_step fetch-s3s-fs "cannot hash the download of $url"; }
+    if [ "$got" != "$s3s_fs_sha256" ]; then
+      rm -f "$tmp"
+      FAILED_STEP="fetch-s3s-fs"
+      say "refused: $url has sha256 $got, not the pinned $s3s_fs_sha256; nothing was cached"
+      exit "$EXIT_REFUSED"
+    fi
+    chmod 0755 "$tmp" && mv -f "$tmp" "$bin" ||
+      { rm -f "$tmp"; fail_step fetch-s3s-fs "cannot move the verified download into $bin"; }
+    from="download"
+  fi
+  export S3S_FS_BIN="$bin"
+  stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps(dict(zip(["implementation","release","arch","sha256","url","path","source"], sys.argv[1:]))))' \
+    s3s-fs "$S3S_FS_RELEASE" "$host_arch" "$got" "$url" "$bin" "$from")"
+  step_done fetch-s3s-fs
+}
+
 run_diagnostic() {
   local code=0 query at http
   compose_config="$("$DOCKER" compose -f "${here}/docker-compose.yml" config --format json 2>"${out_dir}/override.log")" ||
@@ -915,6 +974,7 @@ run_diagnostic() {
     stamp_set comparator_images "{\"prometheus\": $("$DOCKER" inspect "$pid" 2>/dev/null |
       python3 -I -c 'import json,sys; r=json.load(sys.stdin); print(json.dumps({"container_image": (r[0].get("Config") or {}).get("Image"), "image_id": r[0].get("Image")}))' 2>/dev/null || echo null)}"
   fi
+  stamp_str object_store "not applicable: diagnostic run starts no object store"
   stamp_str ravel_catalog_fold "not applicable: diagnostic run starts no Ravel"
   stamp_str mimir_readiness "not applicable: diagnostic run starts no Mimir"
 
@@ -950,6 +1010,8 @@ run_diagnostic() {
 
 run_full() {
   local code=0 resolved line fold
+  fetch_s3s_fs
+
   STACK_UP=1
   compose up -d >"${out_dir}/compose-up.log" 2>&1 || code=$?
   if [ "$code" -ne 0 ]; then
@@ -988,7 +1050,7 @@ run_full() {
   export "${RAVEL_TOKEN_ENV}=${RAVEL_TOKEN_VALUE}"
   # The in-process diagnostic row holds the whole stream in a memory store.
   # That fits ci's 120,000 samples; cardinality and history do not fit beside
-  # four engine containers, and the stack's RustFS is the engines' own store,
+  # four engine containers, and the stack's s3s-fs is the engines' own store,
   # so every other profile runs on its portable rows alone. Those runs lose
   # one check: the portable rows' scalar digests are no longer compared with
   # the in-process row's; they are still compared with each other.
@@ -1036,14 +1098,16 @@ run_full() {
   code=0
   "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
     --workload "$WORKLOAD" --corpus "$CORPUS" \
-    --store-backend rustfs --region us-east-1 --endpoint http://rustfs:9000 \
+    --store-backend s3s-fs --region us-east-1 --endpoint http://s3s:9000 \
     "${pins[@]}" \
     --config "ravel_image=${ravel_image}" \
     --config "ravel_image_kind=${ravel_image_kind}" \
     ${ravel_image_id:+--config "ravel_image_id=${ravel_image_id}"} \
     --config "ravel_source_commit=${ravel_source_commit}" \
     --config "harness_commit=$(py get "$STAMPS" harness_commit)" \
-    --config "store_kind=rustfs" \
+    --config "store_kind=s3s-fs" \
+    --config "store_release=${S3S_FS_RELEASE}" \
+    --config "store_sha256=${s3s_fs_sha256}" \
     >"${out_dir}/provenance.json" 2>>"${out_dir}/provenance.log" || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/provenance.log"

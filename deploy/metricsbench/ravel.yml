@@ -1,9 +1,10 @@
 # Ravel in the MetricsBench portable lane (ADR-0927 amendment 2026-10-26 A).
 #
 # An overlay on docker-compose.yml, not run on its own: it reuses that
-# file's RustFS and createbuckets one-shot, and its network. Bring the whole
-# set up, comparators and Ravel together, with:
+# file's s3s object store and createbuckets one-shot, and its network. Bring
+# the whole set up, comparators and Ravel together, with:
 #
+#   S3S_FS_BIN=/path/to/verified/s3s-fs \
 #   RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:<tag>@sha256:<digest> \
 #     docker compose -f deploy/metricsbench/docker-compose.yml \
 #       -f deploy/metricsbench/ravel.yml up -d
@@ -24,10 +25,10 @@
 # not pulled); capture-effective-config.sh records the resolved image id
 # either way. Both services use the same image: ravel-cli ships in it.
 #
-# DURABILITY: object storage (RustFS here, bucket ravel-metricsbench). Remote
+# DURABILITY: object storage (s3s-fs here, bucket ravel-metricsbench). Remote
 # Write is strict: a 2xx means the data object and the commit record are
 # durable in object storage before the ack (ADR-0927 decision 3), and no
-# state lives on local disk, so this service has no volume. RustFS removes
+# state lives on local disk, so this service has no volume. s3s-fs removes
 # per-request fees, so a result here is valid for correctness and CI only,
 # not a publishable performance or cost claim (ADR-0927 decision 10).
 #
@@ -35,9 +36,9 @@
 # development values of docker-compose.yml; the port binds loopback only.
 
 x-ravel-s3-env: &ravel-s3-env
-  # The metricsbench RustFS on the compose network. Same credentials as the
+  # The metricsbench s3s-fs on the compose network. Same credentials as the
   # createbuckets one-shot in docker-compose.yml.
-  RAVEL_S3_ENDPOINT: http://rustfs:9000
+  RAVEL_S3_ENDPOINT: http://s3s:9000
   # Plaintext S3: the endpoint above is http, which ravel refuses unless
   # allowed. Local network only.
   RAVEL_S3_ALLOW_HTTP: "true"
@@ -50,7 +51,7 @@ services:
   # --- Ravel store qualification (one-shot) -------------------------------
   # ravel-server refuses to start on an S3 store until sys/qualification
   # exists; `ravel-cli store qualify` probes the bucket and writes it. It is
-  # idempotent, so a rerun on the kept rustfs-data volume exits 0. The bucket
+  # idempotent, so a rerun on the kept s3s-data volume exits 0. The bucket
   # is a plain one (createbuckets in docker-compose.yml): Object Lock is
   # reported by qualify but not required without
   # --require-bucket-protection, and immutability is not what this lane

@@ -20,8 +20,9 @@
 #                                           unavailable, no crash
 #   h  --out not writable                -> exit 70, no document
 #   i  compose ps                        -> reads docker-compose.yml and
-#                                           ravel.yml; RAVEL_IMAGE placeholder
-#                                           when unset, passed on when set
+#                                           ravel.yml; RAVEL_IMAGE and
+#                                           S3S_FS_BIN placeholders when
+#                                           unset, passed on when set
 #   j  Ravel empty revision (every image)-> exit 0, version kept, revision
 #                                           recorded unavailable
 #   k  Ravel down / --no-ravel           -> exit 1 when Ravel is queried and
@@ -163,7 +164,7 @@ write "${TMP}/bin/docker-up" '#!/usr/bin/env bash
 case "$1 $2" in
   "info --format") echo 27.0.0 ;;
   "compose -f")
-    printf "%s\n" "$*" "RAVEL_IMAGE=${RAVEL_IMAGE-<unset>}" >"$(dirname "$0")/compose-call.log"
+    printf "%s\n" "$*" "RAVEL_IMAGE=${RAVEL_IMAGE-<unset>}" "S3S_FS_BIN=${S3S_FS_BIN-<unset>}" >"$(dirname "$0")/compose-call.log"
     echo "{\"ID\":\"c-prom\",\"Service\":\"prometheus\"}"
     echo "{\"ID\":\"c-vm\",\"Service\":\"victoriametrics\"}"
     echo "{\"ID\":\"c-mimir\",\"Service\":\"mimir\"}"
@@ -306,8 +307,9 @@ d["comparators"]["ravel"]["runtime_flags"]["source"] == "docker inspect .Config.
 EOF
 
 # --- i: compose ps reads ravel.yml, with RAVEL_IMAGE placeholder or passed on ---
-# ravel.yml refuses interpolation without RAVEL_IMAGE, so the listing would
-# fail for every service if the script left it unset.
+# ravel.yml refuses interpolation without RAVEL_IMAGE, and docker-compose.yml
+# without S3S_FS_BIN, so the listing would fail for every service if the
+# script left either unset.
 compose_log="${TMP}/bin/compose-call.log"
 if grep -q -- "-f .*/docker-compose.yml -f .*/ravel.yml ps --format json" "${compose_log}"; then
   pass "i compose ps reads both files"
@@ -319,8 +321,13 @@ if grep -qx "RAVEL_IMAGE=unset-placeholder-for-compose-ps" "${compose_log}"; the
 else
   fail "i placeholder RAVEL_IMAGE when unset: $(cat "${compose_log}")"
 fi
+if grep -qx "S3S_FS_BIN=unset-placeholder-for-compose-ps" "${compose_log}"; then
+  pass "i placeholder S3S_FS_BIN when unset"
+else
+  fail "i placeholder S3S_FS_BIN when unset: $(cat "${compose_log}")"
+fi
 code=0
-RAVEL_IMAGE="ghcr.io/nofireai/ravel-server:0.26.0@sha256:given" \
+RAVEL_IMAGE="ghcr.io/nofireai/ravel-server:0.26.0@sha256:given" S3S_FS_BIN="/cache/s3s-fs-given" \
   METRICSBENCH_DOCKER="${TMP}/bin/docker-up" "${SCRIPT}" --out "${TMP}/i.json" \
   --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir2_url}" \
   --ravel "${ravel_url}" \
@@ -330,6 +337,11 @@ if grep -qx "RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:0.26.0@sha256:given" "${c
   pass "i RAVEL_IMAGE passed on unchanged"
 else
   fail "i RAVEL_IMAGE passed on unchanged: $(cat "${compose_log}")"
+fi
+if grep -qx "S3S_FS_BIN=/cache/s3s-fs-given" "${compose_log}"; then
+  pass "i S3S_FS_BIN passed on unchanged"
+else
+  fail "i S3S_FS_BIN passed on unchanged: $(cat "${compose_log}")"
 fi
 
 # --- j: Ravel answers an empty revision, as every published image does ----------
