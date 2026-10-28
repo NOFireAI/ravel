@@ -237,6 +237,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         fold_loop: Default::default(),
         refold: Default::default(),
         heartbeat: ravel_server::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+        decoded_cache: None,
     });
 
     Surfaces {
@@ -664,6 +665,7 @@ mod flight {
             fold_loop: Default::default(),
             refold: Default::default(),
             heartbeat: ravel_server::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+            decoded_cache: None,
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

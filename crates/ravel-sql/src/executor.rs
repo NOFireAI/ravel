@@ -123,6 +123,7 @@ use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot};
+use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -710,6 +711,20 @@ pub(crate) struct StatementRequest {
     pub budgets: Option<RequestBudgets>,
 }
 
+/// One statement's decoded-column cache figures: the counters its scans moved
+/// and the cache's resident bytes when the statement finished.
+///
+/// `pressure` is the cache's process-wide pressure evictions between the
+/// statement's start and its end: the budget's evictor does not know which
+/// statement's reservation asked, so a concurrent statement's evictions land
+/// here too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodedCacheStats {
+    pub counters: DecodedCacheSnapshot,
+    pub resident_bytes: u64,
+    pub pressure: PressureSnapshot,
+}
+
 /// What the executor actually did, for tests and operator metrics.
 ///
 /// Not `Copy`: [`Self::window_predicate`] carries the applied predicate text,
@@ -839,6 +854,10 @@ pub struct SqlStats {
     /// the executor reads uncached, and on the Flight SQL and distributed
     /// paths, which do not classify.
     pub cache: Option<StatementCacheStats>,
+    /// The decoded-column cache's movement over the successful attempt
+    /// (ADR-3326). `None` when the executor's log fetcher
+    /// carries no decoded cache, which is the default.
+    pub decoded_cache: Option<DecodedCacheStats>,
     /// The successful attempt's `LogsScanExec` wall-clock timing, read off the
     /// same DataFusion metric set as the block counters. All zero for a plan
     /// with no logs scan.
@@ -1829,6 +1848,16 @@ impl SqlExecutor {
         self
     }
 
+    /// Installs the process decoded-column cache on the logs fetcher, which the
+    /// `logs`, `alerts` and `audit` scans read through (ADR-3326). With
+    /// one installed every statement's [`SqlStats::decoded_cache`] is `Some`.
+    pub fn set_decoded_cache(
+        &mut self,
+        cache: Arc<ravel_logseg::decoded_cache::DecodedColumnCache>,
+    ) {
+        self.log_fetcher = self.log_fetcher.clone().with_decoded_cache(cache);
+    }
+
     /// The `min_grace_ms` `execute_ddl` passes to
     /// `ravel_pqtable::writer::apply`: [`Self::with_ddl_min_grace_ms`]'s
     /// value, or [`crate::ddl::DEFAULT_MIN_GRACE_MS`] when none was set.
@@ -2259,6 +2288,11 @@ impl SqlExecutor {
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         let cache_mark = self.fetcher.cache_ram_metrics().map(CacheCounterMark::take);
+        let pressure_mark = self
+            .log_fetcher
+            .decoded_cache()
+            .map(|cache| cache.pressure_counters())
+            .unwrap_or_default();
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -2400,6 +2434,14 @@ impl SqlExecutor {
                     stats.cache = cache_mark
                         .as_ref()
                         .map(|mark| mark.since(phase_accounting.access_intent()));
+                    stats.decoded_cache =
+                        self.log_fetcher
+                            .decoded_cache()
+                            .map(|cache| DecodedCacheStats {
+                                counters: phase_accounting.decoded_cache_snapshot(),
+                                resident_bytes: cache.resident_bytes(),
+                                pressure: cache.pressure_counters().since(&pressure_mark),
+                            });
                     let phase_snapshot = phase_accounting.snapshot();
                     let accounting = phase_snapshot.pooled();
                     if let Some(key) = read_bytes_key {

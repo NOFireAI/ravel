@@ -5184,6 +5184,53 @@ oversights.
    `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
    fallback, not a failure.
 
+#### The decoded column-block cache (ADR-3326)
+
+`--decoded-cache-max-bytes` (default `0`, off) sizes a process-wide cache of
+decoded RLOG columns, `ravel_logseg::decoded_cache::DecodedColumnCache`. At
+`0` no cache is built and every response and counter is what it is without
+the flag.
+
+- Key: tenant hash, object content hash, block index, column id, and a layout
+  tag. A hit clones the entry's `Arc`s; no column data is copied.
+- Only the columnar path reads or fills it, and only from a whole-block
+  decode: a hit removes the column from the decode's wanted set, and the
+  columns the decode did produce are offered afterwards. The row path
+  (`next_block`, used by `fetch_block` and `next_block_on_gate`, and by every
+  scan with a pending erasure) neither reads nor fills it. A column deferred
+  for a `Contains` arm is never looked up or offered.
+- Admission: an `Interactive` statement admits on first decode. Every other
+  intent (`BulkScan`, `Maintenance`) admits on the second touch, through a
+  ghost list of keys spanning the cap in bytes. Eviction is CLOCK, weighted
+  by entry bytes.
+- Age: an entry older than `ravel-cache`'s `DEFAULT_MAX_ENTRY_AGE_NS` (23 h)
+  is dropped at its first access after expiry, and an hourly sweep
+  (`DEFAULT_SWEEP_INTERVAL_NS`) drops the rest. The clock is injected.
+- Memory: each entry holds a reservation on the process memory budget. The
+  reservation is taken by an atomic check-and-reserve that keeps
+  `max(1 GiB, 5% of the limit)` unreserved with the memory gate open, and it
+  lives inside the entry's `Arc`, so it is released when the last handle
+  drops, not when the index lets go of the entry. A scan holds the entries it
+  was served, and its own resident charge excludes them, so a cached column
+  is charged once. When the budget refuses a reservation, the cache's
+  registered evictor frees the shortfall plus the same margin from entries no
+  scan holds, and the reservation is retried once; `reserve_best_effort`
+  never evicts. Each pressure pass logs one INFO line, and a refusal that
+  stands logs WARN. The server warns at startup when the cap is nonzero and
+  the budget limit is below twice the margin, since admission then rarely
+  succeeds.
+- Known under-count: a dictionary column's entry is charged its share of the
+  dictionary but can keep the whole dictionary alive, and Arrow buffers
+  exported from an entry outlive it.
+
+When the cap is nonzero each SQL response's `stats` carries `decodedCache`
+exactly once: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
+`marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`.
+`/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes` and
+`_entries` as gauges and `_hits_total`, `_misses_total`, `_admissions_total`,
+`_ghost_hits_total`, `_margin_skips_total`, `_pressure_evictions_total` and
+`_expired_drops_total` as counters; none of these families appears at `0`.
+
 ## SQL over spans (the `spans` table, ADR-0045)
 
 `POST /api/v1/sql` serves `spans` (`Signal::Spans`) alongside `samples` and
