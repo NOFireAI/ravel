@@ -15,7 +15,7 @@ import {
 } from "../errors.js";
 import { effectId, stepId } from "../identity.js";
 import { defineTool } from "../tools/index.js";
-import { until } from "../test-util.js";
+import { gate, until } from "../test-util.js";
 import { decodeWire, heldLease, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
 import { defineAgent, handlerDigest, serveAgents, type TurnReport } from "../worker/index.js";
 import type { StepRecordRequest } from "../worker/transport.js";
@@ -452,5 +452,78 @@ describe("serveAgents over HttpTransport", () => {
     const decoded: TurnAssignment = decodeWire(WorkerPollResponse, { assignment }).assignment ?? fail();
     expect(seen).toEqual([{ effectId: effectId(decoded.lease.incarnation, decoded.accept_seq, "charge"), attempt: 1 }]);
     expect((await transport.journal.effects(decoded.operation)).map((e) => e.status)).toEqual(["completed"]);
+  });
+
+  it("heartbeats once before each step and sends nothing while a tool runs", async () => {
+    const held = gate();
+    let running = 0;
+    const tool = (name: string, hold: boolean) =>
+      defineTool({
+        name,
+        version: "1",
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        recovery: "at_least_once",
+        run: async () => {
+          running += 1;
+          if (hold) await held.wait;
+          return { ok: true };
+        },
+      });
+    const reserve = tool("stock.reserve", true);
+    const charge = tool("pay.charge", false);
+    const agent = defineAgent({
+      name: "order",
+      version: "1.0.0",
+      state: z.object({ items: z.array(z.unknown()) }),
+      initialState: { items: [] },
+      messages: (message) => ({
+        place: message({
+          payload: z.object({ qty: z.number(), sku: z.string() }),
+          result: z.object({ ok: z.boolean() }),
+          handler: async (ctx) => {
+            await ctx.step("reserve", reserve, {});
+            return ctx.step("charge", charge, {});
+          },
+        }),
+      }),
+    });
+    const lease = { ...pollFixture.assignment.lease, handler_digest: handlerDigest(agent, "place") };
+    const assignment = { ...pollFixture.assignment, lease, steps: [] };
+    let served = false;
+    const reports: TurnReport[] = [];
+    const { fetch, sent } = fakeFetch((route) => {
+      if (route === "poll") {
+        if (served) return { status: 200, body: { assignment: null } };
+        served = true;
+        return { status: 200, body: { assignment } };
+      }
+      if (route === "heartbeat") return { status: 200, body: { lease_expires_unix_ns: "1" } };
+      return {
+        status: 200,
+        body: { operation: pollFixture.assignment.operation, status: "completed", state_version: 1, rebased: false, effects: [] },
+      };
+    });
+    const routes = () => sent.map((s) => s.url.slice(s.url.lastIndexOf("/") + 1));
+    const worker = await serveAgents({
+      transport: createHttpTransport({ url: "http://ravel.test", token: "t", fetch }),
+      agents: [agent],
+      workerId: "w-explicit",
+      pollWaitMs: 1,
+      onTurn: (report) => reports.push(report),
+    });
+    try {
+      await until(() => running === 1);
+      const atStart = routes();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(atStart).toEqual(["poll", "heartbeat"]);
+      expect(routes()).toEqual(atStart);
+      held.open();
+      await until(() => reports.length === 1);
+    } finally {
+      await worker.close();
+    }
+    expect(reports[0]?.outcome).toBe("committed");
+    expect(routes().slice(0, 4)).toEqual(["poll", "heartbeat", "heartbeat", "commit"]);
   });
 });
