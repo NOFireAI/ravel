@@ -59,15 +59,23 @@ The related flags, all listed in the
 `--agents-activation-concurrency`, `--agents-poll-concurrency`,
 `--agents-memory-budget`, `--agents-max-agents`, `--agents-max-mailbox`,
 `--agents-max-receipts`, `--agents-max-state-bytes` and
-`--agents-max-timers`. In this release they are parsed and reported on
-`GET /api/v1/agents/health` and `/metrics`, and nothing enforces them yet.
+`--agents-max-timers`. All of them are reported on
+`GET /api/v1/agents/health` and `/metrics`. The two concurrency flags bound
+the routes' admission pools: a request past its pool answers 503
+`store_unavailable`. `--agents-max-mailbox`, `--agents-max-receipts` and
+`--agents-max-timers` are the caps every agent's mailbox, receipts and
+timers are held to. `--agents-max-agents`, `--agents-max-state-bytes` and
+`--agents-memory-budget` are reported only: no route enforces them in this
+release.
 
 Access is by three capabilities: `agents` for client operations,
 `agents_worker` for workers, and `agents_admin` for reconciliation. A
 static token grants them through its suffix (`--tenant-token
 'TOKEN=acme;agents'`), and OIDC through `--oidc-agents-claim`,
-`--oidc-agents-worker-claim` and `--oidc-agents-admin-claim`. No route
-checks them yet.
+`--oidc-agents-worker-claim` and `--oidc-agents-admin-claim`. Every client
+route requires `agents` and every `worker/` route requires `agents_worker`,
+answering 403 without it. No route needs `agents_admin` yet, because
+reconciliation has no route.
 
 The runtime stores objects under `t/<tenant>/ag/` in the bucket. The IAM
 templates in [deploy/iam](../../deploy/iam/README.md#ravel-agents-tag) grant
@@ -78,14 +86,22 @@ and `ravel-cli parquet repair --stray` reports its manifests.
 ## What works today
 
 Ravel Agents arrives in seven milestones. This release has the
-contracts and the storage layer; the server serves only a health route.
+contracts, the storage layer and the coordinator, served over HTTP under
+`/api/v1/agents/`. Clients use `create`, `send`, `call`, `operation`,
+`result`, `resolve`, `cancel`, `state` and `events`. Workers use
+`worker/register`, `worker/poll`, `worker/heartbeat` and `worker/commit`.
+The [HTTP API reference](../reference/http-api.md#agents-routes) gives each
+route's body and status codes. The server's `agents_e2e` tests run these
+routes against a real server, for example
+`send_then_result_through_real_server_survives_worker_replacement` and
+`call_heartbeat_and_cancel_through_real_server`.
 
 | Milestone | What it delivers | In this release |
 |---|---|---|
-| 0 Contracts | key layout, HEAD format, typed errors, the `agents` feature and `--agents` flag | yes; `GET /api/v1/agents/health` is the only route |
-| 1 Durable kernel | create, send, read, resolve, turn commit, receipts, quotas | in the storage crates and their tests; no route reaches them |
-| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | the SDK runs only against its in-process test harness |
-| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | in the transition kernel's tests only |
+| 0 Contracts | key layout, HEAD format, typed errors, the `agents` feature and `--agents` flag | yes |
+| 1 Durable kernel | create, send, read, resolve, turn commit, receipts, quotas | yes, over the client routes; the agent-count, state-size and memory quotas are reported but not enforced |
+| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | the worker routes, leases, heartbeats and takeover are served; the SDK has no HTTP worker transport yet and runs against its in-process test harness |
+| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | cancellation is served (`cancel`); the step journal, effect intents and recovery policies have no route and are in the transition kernel's tests only |
 | 4 Timers and discovery | timer firing, wake hints, the reconciliation sweep | timer firing in the kernel's tests only; no sweep |
 | 5 Developer experience | `ravel-cli agents`, inspector page, MCP tools, Rust client, projection into logs and traces | no |
 | 6 Release hardening | paged indexes, benchmarks, operator guide, the feature in the published image | no |
@@ -98,4 +114,4 @@ property with the test that pins it or the milestone that delivers it.
 The SDK lives in `sdk/typescript/packages/agents`; its
 [README](../../sdk/typescript/packages/agents/README.md) shows how to define
 an agent and a tool and drive them through the test harness. It is not
-published and has no live server to talk to until the agents routes land.
+published, and its worker has no HTTP transport for the agents routes yet.
