@@ -455,15 +455,39 @@ deploy/metricsbench/run.sh \
   --out-dir metricsbench-out
 ```
 
-This is the command `metricsbench-nightly.yml` runs. Every claim below names
-the case in `deploy/metricsbench/tests/run.test.sh` that proves it; the cases
-stub docker, curl, the three bins and the capture script, and run in CI's
-`doc-scripts` job.
+That is the published form, the only one a comparable run may use. The
+nightly (`metricsbench-nightly.yml`) runs the local-build form instead: it
+builds Ravel from the commit it checked out with `docker build --target
+server -t ravel-server:nightly-<sha> .`, reads the image's Id, and passes
+
+```sh
+deploy/metricsbench/run.sh \
+  --profile ci \
+  --ravel-image ravel-server:nightly-<sha> \
+  --ravel-image-id sha256:<the image's Id> \
+  --ravel-source-commit <sha> \
+  --bin-dir target/release \
+  --out-dir metricsbench-out
+```
+
+so every nightly measures the Ravel at the commit it checked out (`main`'s
+head on the schedule), not a frozen image. The image is never pushed
+(ADR-0037 decision 4 keeps publishing off plain `main` commits). A
+local-build run is non-comparable and never publishable: `run.sh` accepts
+`--ravel-image-id` with `--profile ci` only, and stamps
+`ravel_image.kind: "local-build"` in `stamps.json` and `ravel_image_kind`
+in the provenance it hands the report, so the run cannot be read as a
+published image's (case p).
+
+Every claim below names the case in `deploy/metricsbench/tests/run.test.sh`
+that proves it; the cases stub docker, curl, the three bins and the capture
+script, and run in CI's `doc-scripts` job.
 
 | Flag | Meaning |
 |---|---|
 | `--profile NAME` | A profile in `benchmarks/metrics/workload.json`. |
-| `--ravel-image REF@sha256:DIGEST` | The Ravel image, set as `RAVEL_IMAGE`. A reference without a digest is refused with exit 65 (case c). |
+| `--ravel-image REF@sha256:DIGEST` | The published form: a registry image pinned by its digest, set as `RAVEL_IMAGE`. A reference without a digest, and no `--ravel-image-id`, is refused with exit 65 (case c). Stamped `ravel_image.kind: "published"` (case a). |
+| `--ravel-image REF --ravel-image-id sha256:ID` | The local-build form: an image built on this host, which has no registry digest, named by the local tag `REF` and identified by its content. Refused with exit 65 before anything starts unless `docker image inspect REF` reports `Id` equal to `ID`, and with any profile other than `ci`, since a local build is for the nightly only. Stamped `ravel_image.kind: "local-build"` with `image_id` and `reference`, and passed to provenance as `ravel_image_kind` and `ravel_image_id` (case p). Exactly one form is required: an id with a digest-pinned `--ravel-image`, an id with no `--ravel-image`, or no image at all exits 64 (case p). |
 | `--ravel-source-commit SHA` | The full commit the image was built from, stamped as given (case a). |
 | `--bin-dir DIR` | Holds `metricsbench_ingest`, `metricsbench_query` and `metricsbench_report`. A missing one is refused with exit 65 (case h). |
 | `--out-dir DIR` | Created if absent. One that already holds `stamps.json`, `report.json`, `ingest.json` or `falsification.json` is refused with exit 65 (case h). |
@@ -483,7 +507,8 @@ Steps, in order, stopping at the first failure:
 2. `qualify`: `createbuckets` and `ravel-qualify` exited 0; otherwise exit
    70 naming the step (case i).
 3. `image`: `docker image inspect` of the Ravel image, which must list the
-   digest the reference names; the result is stamped (case a).
+   digest the reference names (case a), or, for a local build, still report
+   the Id `--ravel-image-id` names (case p); the result is stamped.
 4. `ready`: Prometheus `/-/ready`, VictoriaMetrics `/health`, Mimir
    `/ready` and Ravel `/api/v1/status/buildinfo` each answer 200 (case a).
 5. `sampler`: every 5 s after the previous sample, the memory use of every
@@ -563,8 +588,10 @@ was (case n); the diagnostic mode starts no RustFS and copies nothing (case
 f).
 
 `stamps.json` is written before the first step and completed at the end
-(case a). It holds `ravel_image.reference` and `ravel_image.resolved` (the
-`docker image inspect` digests), `ravel_source_commit`, `harness_commit`
+(case a). It holds `ravel_image.kind` (`published` or `local-build`, cases a
+and p), `ravel_image.reference`, `ravel_image.image_id` (local builds only,
+case p), `ravel_image.resolved` (the `docker image inspect` result),
+`ravel_source_commit`, `harness_commit`
 (`git rev-parse HEAD` of the checkout holding `--bin-dir`, or
 `unavailable: ...` outside one), `run_script_commit`, `profile`, `anchor_ms`
 and `anchor_source`, `started_at` and `ended_at`, `store_kind: rustfs`,
@@ -597,8 +624,8 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | Exit | Meaning |
 |---|---|
 | 0 | Every step passed (cases a, f, g). |
-| 64 | Usage error (case h). |
-| 65 | A refused input; nothing was started (cases c, h). |
+| 64 | Usage error (cases h, p). |
+| 65 | A refused input; nothing was started (cases c, h, p). |
 | 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
