@@ -33,8 +33,11 @@
 //!   name, tool version and input bytes; a key reused with any of them
 //!   different blocks the turn `NonDeterministicReplay`, and a blocked turn
 //!   cannot complete. A completed step replays its output. A step with no
-//!   effect authorizes attempt 1; a step whose effect completed replays the
-//!   effect's result; an effect in doubt answers `EffectInDoubt`. Steps are
+//!   effect authorizes attempt 1; a step whose effect completed with an
+//!   output replays it and journals the step completed, while one whose
+//!   effect recorded a tool failure answers that failure and leaves the step
+//!   started, so every later run of the step answers it again; an effect in
+//!   doubt answers `EffectInDoubt`. Steps are
 //!   sequential: a new step while this turn's own dispatched attempt has no
 //!   result is `IdempotencyConflict`. An attempt nobody in the current turn
 //!   dispatched is lost, and its policy decides the recovery:
@@ -44,18 +47,23 @@
 //!   effect in doubt cannot complete or fail, a turn cannot fail with an
 //!   attempt still waiting for its result, and an input running with an
 //!   effect in doubt or a blocked turn reads `blocked`.
-//! - Effect results (decision 7). Only the effect's latest attempt settles
+//! - Effect results (decision 7). A result is an output or a tool failure.
+//!   Only the effect's latest attempt settles
 //!   it, and only while its input has not ended cancelled; a result for an
 //!   earlier attempt, a different attempt's result after it settled, and
 //!   any result once the input ended cancelled are evidence and change
 //!   nothing. A second, different result for the attempt that settled it
-//!   is `IdempotencyConflict`; the same one again is recorded. An attempt
+//!   (a failure where an output settled it counts as different, whatever
+//!   the output holds) is `IdempotencyConflict`; the same one again is
+//!   recorded. An attempt
 //!   the effect never authorized is `OwnershipLost`; a step with no effect
 //!   record has no effect to settle and answers `AgentGone`.
 //! - Reconciliation (decision 7). An effect in doubt is settled by
 //!   attaching a result to its latest attempt (attaching again is
-//!   idempotent), or by authorizing the next attempt, which is dispatched
-//!   once; a repeat of that authorization dispatches nothing. Either needs
+//!   idempotent), or by authorizing the next attempt. The authorization
+//!   dispatches nothing: it hands the attempt over, and the next step of
+//!   that key dispatches it, once, whatever the policy; a repeat of the
+//!   authorization hands nothing over. Either needs
 //!   the effect in doubt (attach also accepts a settled one), else it is
 //!   `OwnershipLost`.
 //!
@@ -85,9 +93,19 @@
 //! Choices for steps and effects: an attempt is this turn's own, and so
 //! blocks the next step, when it was dispatched by a step after the input's
 //! latest [`Event::TurnStarted`]; every `TurnStarted`, a takeover's
-//! included, starts a new owner session, and an attempt authorized by
-//! [`Event::ReconcileAuthorize`] is an operator's and belongs to no
-//! session (the driver reconciles from a process that runs no turn). A
+//! included, starts a new owner session. An attempt authorized by
+//! [`Event::ReconcileAuthorize`] belongs to no session until a step
+//! dispatches it: the next [`Event::Step`] of its key, in whichever
+//! session, dispatches that same attempt and makes it the session's own,
+//! and until then a step of any other key of the same input is
+//! `IdempotencyConflict`, as production refuses it. Production holds that
+//! hand-over in the memory of the coordinator that authorized it, so only a
+//! step through the same process dispatches it; a step through another
+//! process, or after a restart, finds the attempt lost and its policy
+//! decides. That case is not modelled: the driver reconciles from the
+//! process that runs the next step. A tool failure is its own result,
+//! [`Event::EffectFailed`], never output bytes, and a step answers it
+//! [`Reply::StepFailed`]. A
 //! step whose input has a cancellation requested answers `OwnershipLost`
 //! before it authorizes or re-dispatches anything, after journaling the
 //! step. A cancel of a running input reports `running` even while the input
@@ -182,13 +200,21 @@ pub enum Event {
         operation: Handle,
         step: StepCall,
     },
-    /// A tool's result (or failure) for one attempt of the step `step_key`
-    /// of `operation`, from whoever reports it.
+    /// A tool's output for one attempt of the step `step_key` of
+    /// `operation`, from whoever reports it.
     EffectResult {
         operation: Handle,
         step_key: String,
         attempt: u32,
         result: Vec<u8>,
+    },
+    /// A tool's failure for one attempt, from whoever reports it: settled
+    /// like an output, and answered [`Reply::StepFailed`] by the step.
+    EffectFailed {
+        operation: Handle,
+        step_key: String,
+        attempt: u32,
+        error: String,
     },
     /// An operator attaches a verified result to an effect in doubt.
     ReconcileAttach {
@@ -196,8 +222,8 @@ pub enum Event {
         step_key: String,
         result: Vec<u8>,
     },
-    /// An operator authorizes and dispatches `attempt` of an effect in
-    /// doubt.
+    /// An operator authorizes `attempt` of an effect in doubt and hands it
+    /// over to the next step of its key, which dispatches it.
     ReconcileAuthorize {
         operation: Handle,
         step_key: String,
@@ -295,13 +321,18 @@ pub enum Reply {
     StepCompleted {
         output: Vec<u8>,
     },
+    /// The step's effect recorded a tool failure; the step stays started.
+    StepFailed {
+        error: String,
+    },
     /// The result is the effect's.
     EffectRecorded,
     /// The result is kept as evidence; nothing changed.
     EffectEvidence,
-    /// A reconcile authorization, `dispatched` when this call dispatched.
+    /// A reconcile authorization, `handed_over` when this call authorized
+    /// the attempt and handed it to the next step. It never dispatches.
     Reconciled {
-        dispatched: bool,
+        handed_over: bool,
     },
     Error(ErrorKind),
 }
@@ -340,10 +371,20 @@ struct EffectRec {
     phase: EffectPhase,
     attempt: u32,
     /// The attempt that settled it, and its result.
-    result: Option<(u32, Vec<u8>)>,
+    result: Option<(u32, Settled)>,
     /// The owner session that dispatched the latest attempt; `None` when an
-    /// operator authorized it.
+    /// operator authorized it and no step has dispatched it yet.
     dispatched_in: Option<u64>,
+    /// The latest attempt was authorized by a reconcile and waits for the
+    /// next step of its key to dispatch it.
+    handed_over: bool,
+}
+
+/// What settled an effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Settled {
+    Output(Vec<u8>),
+    Failure(String),
 }
 
 /// Everything that belongs to one incarnation and dies with it.
@@ -527,7 +568,23 @@ impl ReferenceMachine {
                 step_key,
                 attempt,
                 result,
-            } => self.effect_result(operation, step_key, *attempt, result),
+            } => self.effect_result(
+                operation,
+                step_key,
+                *attempt,
+                &Settled::Output(result.clone()),
+            ),
+            Event::EffectFailed {
+                operation,
+                step_key,
+                attempt,
+                error,
+            } => self.effect_result(
+                operation,
+                step_key,
+                *attempt,
+                &Settled::Failure(error.clone()),
+            ),
             Event::ReconcileAttach {
                 operation,
                 step_key,
@@ -860,9 +917,11 @@ impl ReferenceMachine {
             return Reply::Error(ErrorKind::OwnershipLost);
         }
         let session = life.session;
-        let open = life
-            .input_effects(seq)
-            .any(|e| e.phase == EffectPhase::Authorized && e.dispatched_in == Some(session));
+        let open = life.effects.iter().any(|((s, key), e)| {
+            *s == seq
+                && e.phase == EffectPhase::Authorized
+                && (e.dispatched_in == Some(session) || (e.handed_over && *key != call.key))
+        });
         if open {
             return Reply::Error(ErrorKind::IdempotencyConflict);
         }
@@ -909,20 +968,34 @@ impl ReferenceMachine {
                     attempt: 1,
                     result: None,
                     dispatched_in: Some(session),
+                    handed_over: false,
                 },
             );
             return Reply::StepDispatched { attempt: 1 };
         };
         match effect.phase {
-            EffectPhase::Completed => {
-                let output = effect.result.clone().map(|(_, r)| r).unwrap_or_default();
-                if let Some(step) = life.steps.get_mut(&call.key) {
-                    step.completed = Some(output.clone());
+            EffectPhase::Completed => match effect.result.clone().map(|(_, r)| r) {
+                Some(Settled::Failure(error)) => Reply::StepFailed { error },
+                settled => {
+                    let output = match settled {
+                        Some(Settled::Output(bytes)) => bytes,
+                        _ => Vec::new(),
+                    };
+                    if let Some(step) = life.steps.get_mut(&call.key) {
+                        step.completed = Some(output.clone());
+                    }
+                    Reply::StepCompleted { output }
                 }
-                Reply::StepCompleted { output }
-            }
+            },
             EffectPhase::InDoubt => Reply::Error(ErrorKind::EffectInDoubt),
             EffectPhase::Authorized if cancelling => Reply::Error(ErrorKind::OwnershipLost),
+            EffectPhase::Authorized if effect.handed_over => {
+                effect.handed_over = false;
+                effect.dispatched_in = Some(session);
+                Reply::StepDispatched {
+                    attempt: effect.attempt,
+                }
+            }
             EffectPhase::Authorized => match effect.policy {
                 RecoveryPolicy::ProviderIdempotency => {
                     effect.dispatched_in = Some(session);
@@ -975,7 +1048,7 @@ impl ReferenceMachine {
         operation: &Handle,
         step_key: &str,
         attempt: u32,
-        result: &[u8],
+        result: &Settled,
     ) -> Reply {
         let (_, cancelled, effect) = match self.effect_mut(operation, step_key) {
             Ok(found) => found,
@@ -987,7 +1060,7 @@ impl ReferenceMachine {
         if let Some((settled_by, recorded)) = &effect.result {
             return if *settled_by != attempt {
                 Reply::EffectEvidence
-            } else if recorded.as_slice() != result {
+            } else if recorded != result {
                 Reply::Error(ErrorKind::IdempotencyConflict)
             } else {
                 Reply::EffectRecorded
@@ -997,7 +1070,8 @@ impl ReferenceMachine {
             return Reply::EffectEvidence;
         }
         effect.phase = EffectPhase::Completed;
-        effect.result = Some((attempt, result.to_vec()));
+        effect.result = Some((attempt, result.clone()));
+        effect.handed_over = false;
         Reply::EffectRecorded
     }
 
@@ -1010,7 +1084,12 @@ impl ReferenceMachine {
             },
             Err(reply) => return reply,
         };
-        self.effect_result(operation, step_key, attempt, result)
+        self.effect_result(
+            operation,
+            step_key,
+            attempt,
+            &Settled::Output(result.to_vec()),
+        )
     }
 
     fn reconcile_authorize(&mut self, operation: &Handle, step_key: &str, attempt: u32) -> Reply {
@@ -1020,13 +1099,14 @@ impl ReferenceMachine {
         };
         match effect.phase {
             EffectPhase::Authorized if attempt == effect.attempt => {
-                Reply::Reconciled { dispatched: false }
+                Reply::Reconciled { handed_over: false }
             }
             EffectPhase::InDoubt if Some(attempt) == effect.attempt.checked_add(1) => {
                 effect.phase = EffectPhase::Authorized;
                 effect.attempt = attempt;
                 effect.dispatched_in = None;
-                Reply::Reconciled { dispatched: true }
+                effect.handed_over = true;
+                Reply::Reconciled { handed_over: true }
             }
             _ => Reply::Error(ErrorKind::OwnershipLost),
         }
@@ -1658,6 +1738,17 @@ mod tests {
         }
     }
 
+    /// A step of another key of the same turn.
+    fn other_step(operation: Handle, policy: RecoveryPolicy) -> Event {
+        Event::Step {
+            operation,
+            step: StepCall {
+                key: "notify".into(),
+                ..call(policy)
+            },
+        }
+    }
+
     fn result(operation: Handle, attempt: u32, bytes: &[u8]) -> Event {
         Event::EffectResult {
             operation,
@@ -1759,8 +1850,18 @@ mod tests {
             (step(op, manual), refused(ErrorKind::EffectInDoubt)),
             (step(op, manual), refused(ErrorKind::EffectInDoubt)),
             (authorize(3), refused(ErrorKind::OwnershipLost)),
-            (authorize(2), Reply::Reconciled { dispatched: true }),
-            (authorize(2), Reply::Reconciled { dispatched: false }),
+            (authorize(2), Reply::Reconciled { handed_over: true }),
+            (authorize(2), Reply::Reconciled { handed_over: false }),
+            // The hand-over survives a takeover, and refuses another step
+            // of the input until its own step dispatches it.
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (
+                other_step(op, manual),
+                refused(ErrorKind::IdempotencyConflict),
+            ),
+            (step(op, manual), Reply::StepDispatched { attempt: 2 }),
+            // Now it is this session's open attempt.
+            (step(op, manual), refused(ErrorKind::IdempotencyConflict)),
             (result(op, 1, b"late"), Reply::EffectEvidence),
             (result(op, 2, b"done"), Reply::EffectRecorded),
             (
@@ -1770,7 +1871,90 @@ mod tests {
                 },
             ),
         ]);
-        assert_eq!(history(steps).check(m), Ok(()));
+        assert_eq!(history(steps.clone()).check(m), Ok(()));
+        // The authorization dispatches nothing itself, and the step after it
+        // neither latches the effect in doubt nor authorizes another attempt.
+        let handed = steps
+            .iter()
+            .position(|(_, r)| *r == Reply::StepDispatched { attempt: 2 })
+            .expect("the hand-over's dispatch");
+        for wrong in [
+            refused(ErrorKind::EffectInDoubt),
+            Reply::StepDispatched { attempt: 3 },
+        ] {
+            let mut diverged = steps.clone();
+            diverged[handed].1 = wrong;
+            assert!(history(diverged).check(machine()).is_err());
+        }
+    }
+
+    #[test]
+    fn a_failed_attempt_answers_the_failure_and_leaves_the_step_started() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let alo = RecoveryPolicy::AtLeastOnce;
+        let failed = |error: &str| Event::EffectFailed {
+            operation: op,
+            step_key: "lookup".into(),
+            attempt: 1,
+            error: error.into(),
+        };
+        let journal = Event::StepStarted {
+            operation: op,
+            step: call(alo),
+        };
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, alo), Reply::StepDispatched { attempt: 1 }),
+            (failed("declined"), Reply::EffectRecorded),
+            (failed("declined"), Reply::EffectRecorded),
+            (failed("other"), refused(ErrorKind::IdempotencyConflict)),
+            // An output for the attempt a failure settled is a different
+            // result, whatever its bytes.
+            (
+                result(op, 1, b"declined"),
+                refused(ErrorKind::IdempotencyConflict),
+            ),
+            (
+                step(op, alo),
+                Reply::StepFailed {
+                    error: "declined".into(),
+                },
+            ),
+            (
+                journal.clone(),
+                Reply::StepJournaled {
+                    completed: false,
+                    effect: Some(EffectView {
+                        phase: EffectPhase::Completed,
+                        attempt: 1,
+                    }),
+                },
+            ),
+            (
+                step(op, alo),
+                Reply::StepFailed {
+                    error: "declined".into(),
+                },
+            ),
+        ]);
+        assert_eq!(history(steps.clone()).check(m), Ok(()));
+        let replay = steps.len() - 1;
+        let mut as_output = steps.clone();
+        as_output[replay].1 = Reply::StepCompleted {
+            output: b"declined".to_vec(),
+        };
+        assert!(history(as_output).check(machine()).is_err());
+        let journaled = steps.len() - 2;
+        let mut completed = steps;
+        completed[journaled].1 = Reply::StepJournaled {
+            completed: true,
+            effect: Some(EffectView {
+                phase: EffectPhase::Completed,
+                attempt: 1,
+            }),
+        };
+        assert!(history(completed).check(machine()).is_err());
     }
 
     #[test]

@@ -97,6 +97,8 @@ async fn step_turn_with(
     for _ in 0..2 {
         match p.step(&a, &step).await {
             Ok(StepProgress::Completed { .. }) => return commit().await,
+            // No turn here reports a failure, so a failed step is a defect.
+            Ok(StepProgress::Failed { error }) => return Err(format!("step failed: {error}")),
             Ok(StepProgress::Dispatched(d)) => {
                 let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
                 p.complete_effect(&operation, &d, &result)
@@ -167,6 +169,33 @@ fn stepper_with(
     })
 }
 
+/// A worker that first reconciles each `(seq, attempt, executed)` effect
+/// in doubt through its own process, as [`reconcile`] does, then runs
+/// [`step_turn`] up to `turns` times. An authorized attempt is held by
+/// that process's coordinator, so only this worker's next step of the
+/// effect dispatches it.
+fn finisher(
+    rig: &Rig,
+    name: &str,
+    id_seed: u64,
+    policy: RecoveryPolicy,
+    turns: usize,
+    pins: Vec<HandlerPinBody>,
+    doubts: Vec<(u64, u32, bool)>,
+) -> Actor {
+    worker(rig, name, id_seed, move |p| async move {
+        for (seq, attempt, executed) in doubts {
+            reconcile(&p, seq, attempt, executed).await?;
+        }
+        for _ in 0..turns {
+            if step_turn_with(&p, policy, pins.clone()).await? != Ended::Committed {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// The provider's executions as `(accept_seq, attempt)`, attempt 0 for an
 /// execution keyed by effect id alone.
 fn executions(rig: &Rig, inputs: u64) -> Vec<(u64, u32)> {
@@ -218,6 +247,9 @@ fn story(run: &Run) -> Vec<String> {
                 Event::EffectResult {
                     operation, attempt, ..
                 } => format!("result {} a{attempt}", seq_of(operation)),
+                Event::EffectFailed {
+                    operation, attempt, ..
+                } => format!("failure {} a{attempt}", seq_of(operation)),
                 Event::ReconcileAttach { operation, .. } => {
                     format!("attach {}", seq_of(operation))
                 }
@@ -239,7 +271,10 @@ fn story(run: &Run) -> Vec<String> {
                 Reply::StepCompleted { .. } => "replayed".to_string(),
                 Reply::EffectRecorded => "recorded".to_string(),
                 Reply::EffectEvidence => "evidence".to_string(),
-                Reply::Reconciled { dispatched } => format!("reconciled dispatched={dispatched}"),
+                Reply::StepFailed { error } => format!("failed {error}"),
+                Reply::Reconciled { handed_over } => {
+                    format!("reconciled handed_over={handed_over}")
+                }
                 Reply::Committed { status, .. } => format!("{status:?}"),
                 Reply::Status(status) => format!("{status:?}"),
                 Reply::Cancel { status, requested } => format!("{status:?} requested={requested}"),
@@ -284,9 +319,10 @@ struct Story {
 
 /// One input. `w1` dispatches its step's first attempt and stops at
 /// `point`; a replacement worker takes over. Under `manual`, an operator
-/// then reconciles the effect in doubt: attaching the result the provider
-/// shows executed, or authorizing the next attempt when it shows none, and
-/// a third worker finishes the turn.
+/// then reconciles the effect in doubt through a third worker's process:
+/// attaching the result the provider shows executed, or authorizing the
+/// next attempt when it shows none, which that worker's step dispatches.
+/// The third worker finishes the turn.
 fn kill_point(policy: RecoveryPolicy, point: Point) -> Story {
     let rig = Rig::new(FaultPlan::empty());
     create_with_inputs(&rig, 1);
@@ -359,31 +395,16 @@ fn kill_point(policy: RecoveryPolicy, point: Point) -> Story {
     };
     let head = rig.head().expect("head");
     let out = if effect_of(&head, 1).map(|e| e.0) == Some(EffectStatus::InDoubt) {
-        let attach = executions(&rig, 1).contains(&(1, 1));
-        let operator = client(&rig, "op", 40, move |p| async move {
-            p.operation(&op(1))
-                .await
-                .map_err(|e| format!("operation: {e:?}"))?;
-            if attach {
-                let result = json!({ "step": KEY, "attempt": 1 });
-                p.reconcile_attach(&op(1), KEY, &result)
-                    .await
-                    .map_err(|e| format!("attach: {e:?}"))?;
-            } else {
-                p.reconcile_authorize(&op(1), KEY, 2)
-                    .await
-                    .map_err(|e| format!("authorize: {e:?}"))?;
-                let d = p.last_dispatch().ok_or("authorize dispatched nothing")?;
-                let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
-                p.complete_effect(&op(1), &d, &result)
-                    .await
-                    .map_err(|e| format!("complete: {e:?}"))?;
-            }
+        let executed = executions(&rig, 1).contains(&(1, 1));
+        rig.clock.advance_ms(PAST_LEASE_MS);
+        let w3_ends = ends.clone();
+        // The operator reconciles through w3's process: an authorized
+        // attempt is held there for w3's next step, which dispatches it.
+        let w3 = worker(&rig, "w3", 30, move |p| async move {
+            reconcile(&p, 1, 1, executed).await?;
+            w3_ends.push("w3", step_turn(&p, policy).await?);
             Ok(())
         });
-        run(&rig, 3, ScheduleScript::new(Vec::new()), vec![operator]).expect("operator");
-        rig.clock.advance_ms(PAST_LEASE_MS);
-        let w3 = stepper(&rig, "w3", 30, policy, 1, &ends);
         run(&rig, 4, ScheduleScript::new(Vec::new()), vec![w3]).expect("finish")
     } else if head.active_turn.is_some() {
         rig.clock.advance_ms(PAST_LEASE_MS);
@@ -812,7 +833,8 @@ fn query_of_a_handle_with_no_input() {
 }
 
 /// A step journaled before it runs, an attempt that fails, and the journal
-/// read again: the failure is the effect's result and the step replays it.
+/// read again: the failure is the effect's result, the step stays started,
+/// and every run of it answers the failure, never an output.
 #[test]
 fn journaled_step_with_a_failed_attempt_replays_the_failure() {
     let rig = Rig::new(FaultPlan::empty());
@@ -835,11 +857,11 @@ fn journaled_step_with_a_failed_attempt_replays_the_failure() {
         p.record_step(&a, &call(ALO))
             .await
             .map_err(|e| format!("journal again: {e:?}"))?;
-        let Ok(StepProgress::Completed { output }) = p.step(&a, &call(ALO)).await else {
-            return Err("the step did not replay".to_string());
-        };
-        if output != json!({ "error": "declined" }) {
-            return Err(format!("replayed {output}"));
+        for run in ["first", "second"] {
+            match p.step(&a, &call(ALO)).await {
+                Ok(StepProgress::Failed { error }) if error == "declined" => {}
+                other => return Err(format!("{run} replay answered {other:?}")),
+            }
         }
         let (state, out) = turn_values(&a);
         p.commit(&a, &state, &out)
@@ -857,9 +879,10 @@ fn journaled_step_with_a_failed_attempt_replays_the_failure() {
             "start 1: started",
             "journal 1: StepJournaled { completed: false, effect: None }",
             "step 1: dispatched a1",
-            "result 1 a1: recorded",
+            "failure 1 a1: recorded",
             "journal 1: StepJournaled { completed: false, effect: Some(EffectView { phase: Completed, attempt: 1 }) }",
-            "step 1: replayed",
+            "step 1: failed declined",
+            "step 1: failed declined",
             "commit 1: Completed",
         ])
     );
@@ -873,7 +896,8 @@ struct Totals {
     /// Calls a crash left unanswered whose applied write the reference
     /// answered.
     inferred: usize,
-    /// Attempts handed to a dispatcher, by a step or a reconcile.
+    /// Attempts handed to a dispatcher, all by steps: a reconcile's attempt
+    /// is dispatched by the next step.
     dispatches: usize,
     /// Distinct (effect, attempt) pairs among them.
     distinct_dispatches: usize,
@@ -916,9 +940,10 @@ impl std::ops::AddAssign for Totals {
     }
 }
 
-/// An operator settles the effect of input `seq`, in doubt at `attempt`:
-/// it attaches that attempt's result when the provider shows it executed,
-/// else authorizes the next attempt, executes it and reports its result.
+/// An operator settles the effect of input `seq`, in doubt at `attempt`,
+/// through `p`: it attaches that attempt's result when the provider shows
+/// it executed, else authorizes the next attempt, which dispatches nothing
+/// and is handed to `p`'s next step of the effect.
 async fn reconcile(p: &Proc, seq: u64, attempt: u32, executed: bool) -> Result<(), String> {
     p.operation(&op(seq))
         .await
@@ -930,20 +955,20 @@ async fn reconcile(p: &Proc, seq: u64, attempt: u32, executed: bool) -> Result<(
             .map_err(|e| format!("attach: {e:?}"))?;
         return Ok(());
     }
-    p.reconcile_authorize(&op(seq), KEY, attempt + 1)
+    let handed_over = p
+        .reconcile_authorize(&op(seq), KEY, attempt + 1)
         .await
         .map_err(|e| format!("authorize: {e:?}"))?;
-    let d = p.last_dispatch().ok_or("authorize dispatched nothing")?;
-    let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
-    p.complete_effect(&op(seq), &d, &result)
-        .await
-        .map_err(|e| format!("complete: {e:?}"))?;
+    if !handed_over {
+        return Err(format!("authorize a{} handed nothing over", attempt + 1));
+    }
     Ok(())
 }
 
-/// Settle what a schedule left. Each round an operator reconciles every
-/// effect in doubt, then a fresh worker takes over and runs turns. Returns
-/// the reconciles made.
+/// Settle what a schedule left. Each round a fresh worker takes over: it
+/// reconciles every effect in doubt through its own process, the operator's
+/// calls reaching the process that runs the next step, then runs turns.
+/// Returns the reconciles made.
 fn finish(rig: &Rig, policy: RecoveryPolicy, seed: u64, inputs: u64) -> usize {
     finish_with(rig, policy, seed, inputs, vec![pin()])
 }
@@ -961,37 +986,25 @@ fn finish_with(
         if head.inbox.is_empty() && head.active_turn.is_none() {
             break;
         }
-        let doubts: Vec<(u64, u32)> = (1..=inputs)
+        let executed = executions(rig, inputs);
+        let doubts: Vec<(u64, u32, bool)> = (1..=inputs)
             .filter_map(|seq| match effect_of(&head, seq) {
-                Some((EffectStatus::InDoubt, attempt, _)) => Some((seq, attempt)),
+                Some((EffectStatus::InDoubt, attempt, _)) => {
+                    Some((seq, attempt, executed.contains(&(seq, attempt))))
+                }
                 _ => None,
             })
             .collect();
-        if !doubts.is_empty() {
-            let executed = executions(rig, inputs);
-            reconciled += doubts.len();
-            let operator = client(
-                rig,
-                &format!("op{round}"),
-                40 + round,
-                move |p| async move {
-                    for (seq, attempt) in doubts {
-                        reconcile(&p, seq, attempt, executed.contains(&(seq, attempt))).await?;
-                    }
-                    Ok(())
-                },
-            );
-            run(rig, seed, ScheduleScript::new(Vec::new()), vec![operator]).expect("operator");
-        }
+        reconciled += doubts.len();
         rig.clock.advance_ms(PAST_LEASE_MS);
-        let w = stepper_with(
+        let w = finisher(
             rig,
             &format!("fin{round}"),
             50 + round,
             policy,
             2 * inputs as usize,
-            &Ends::default(),
             pins.clone(),
+            doubts,
         );
         run(rig, seed, ScheduleScript::new(Vec::new()), vec![w]).expect("finish");
     }
@@ -1194,7 +1207,7 @@ fn at_least_once_duplicate_execution_is_reachable_and_manual_policy_never_redisp
 const PI_TOTALS: Totals = Totals {
     runs: 64,
     crashes: 114,
-    inferred: 27,
+    inferred: 29,
     dispatches: 144,
     distinct_dispatches: 128,
     attempts: 128,
@@ -1208,17 +1221,17 @@ const PI_TOTALS: Totals = Totals {
     incompatible: 0,
 };
 
-/// The same kills: each re-dispatch is a new attempt, and 13 of them
+/// The same kills: each re-dispatch is a new attempt, and 12 of them
 /// executed the tool a second time.
 const ALO_TOTALS: Totals = Totals {
     runs: 64,
     crashes: 114,
-    inferred: 27,
+    inferred: 29,
     dispatches: 144,
     distinct_dispatches: 144,
     attempts: 144,
-    executions: 141,
-    duplicates: 13,
+    executions: 140,
+    duplicates: 12,
     in_doubt: 0,
     reconciled: 0,
     evidence: 0,
@@ -1232,10 +1245,10 @@ const ALO_TOTALS: Totals = Totals {
 const MANUAL_TOTALS: Totals = Totals {
     runs: 64,
     crashes: 112,
-    inferred: 27,
-    dispatches: 131,
-    distinct_dispatches: 131,
-    attempts: 131,
+    inferred: 29,
+    dispatches: 132,
+    distinct_dispatches: 132,
+    attempts: 132,
     executions: 128,
     duplicates: 0,
     in_doubt: 15,
@@ -1297,8 +1310,8 @@ fn cancels_across_seeds() {
 
 const CANCEL_TOTALS: Totals = Totals {
     runs: 64,
-    crashes: 53,
-    inferred: 14,
+    crashes: 54,
+    inferred: 13,
     dispatches: 94,
     distinct_dispatches: 94,
     attempts: 94,
@@ -1438,9 +1451,9 @@ fn handler_version_changes_across_seeds() {
 
 const VERSION_TOTALS: Totals = Totals {
     runs: 64,
-    crashes: 136,
-    inferred: 21,
-    dispatches: 147,
+    crashes: 134,
+    inferred: 23,
+    dispatches: 146,
     distinct_dispatches: 128,
     attempts: 128,
     executions: 128,
@@ -1450,7 +1463,7 @@ const VERSION_TOTALS: Totals = Totals {
     evidence: 0,
     conflicts: 0,
     cancelled: 0,
-    incompatible: 37,
+    incompatible: 39,
 };
 
 fn expect_story(lines: &[&str]) -> Vec<String> {
@@ -1627,8 +1640,9 @@ fn at_least_once_late_result_after_takeover_is_evidence() {
 }
 
 /// The takeover finds the effect in doubt and dispatches nothing; the
-/// operation reads blocked until an operator authorizes attempt 2, which
-/// is dispatched once.
+/// operation reads blocked until an operator authorizes attempt 2. The
+/// authorization dispatches nothing itself: the next owner's step
+/// dispatches attempt 2, once.
 #[test]
 fn manual_killed_before_tool_call() {
     assert_eq!(
@@ -1640,13 +1654,14 @@ fn manual_killed_before_tool_call() {
                 "start 1: started",
                 "step 1: Error(EffectInDoubt)",
                 "status 1: Blocked",
-                "authorize 1 a2: reconciled dispatched=true",
-                "result 1 a2: recorded",
+                "authorize 1 a2: reconciled handed_over=true",
                 "start 1: started",
+                "step 1: dispatched a2",
+                "result 1 a2: recorded",
                 "step 1: replayed",
                 "commit 1: Completed",
             ],
-            &[("w1", 1), ("op", 2)],
+            &[("w1", 1), ("w3", 2)],
             &[(1, 2)],
             &[("w2", Ended::InDoubt), ("w3", Ended::Committed)],
             (EffectStatus::Completed, 2, 2),
