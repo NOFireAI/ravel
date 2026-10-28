@@ -556,7 +556,9 @@ pub fn runtime_config() -> RuntimeConfig {
     }
 }
 
-/// One store, one clock and one recorder for one simulated agent.
+/// One store, one clock and one recorder for one simulated agent. Clones
+/// share all of them.
+#[derive(Clone)]
 pub struct Rig {
     pub clock: Arc<SimClock>,
     pub memory: Arc<MemoryStore>,
@@ -564,6 +566,16 @@ pub struct Rig {
     pub rules: Arc<FaultStore<Arc<StampStore>>>,
     pub recorder: Arc<Recorder>,
     limits: StoreLimits,
+    procs: Arc<Mutex<Vec<ProcHandle>>>,
+}
+
+/// A process's store and coordinator, kept after its actor ends or crashes
+/// so a schedule can read its counters.
+#[derive(Clone)]
+pub struct ProcHandle {
+    pub name: String,
+    pub store: Arc<AgentStore>,
+    pub co: Arc<Coordinator>,
 }
 
 impl Rig {
@@ -583,6 +595,7 @@ impl Rig {
             rules,
             recorder: Arc::new(Recorder::default()),
             limits,
+            procs: Arc::default(),
         }
     }
 
@@ -613,6 +626,11 @@ impl Rig {
         let worker_id = co
             .register_worker(&[pin()])
             .unwrap_or_else(|_| format!("w-{seed}"));
+        lock(&self.procs).push(ProcHandle {
+            name: name.to_string(),
+            store: store.clone(),
+            co: co.clone(),
+        });
         Proc {
             name: name.to_string(),
             store,
@@ -653,6 +671,24 @@ impl Rig {
 
     pub fn build(&self) -> Result<Run, String> {
         self.recorder.build()
+    }
+
+    /// Every process the rig made, setup included, in creation order.
+    pub fn procs(&self) -> Vec<ProcHandle> {
+        lock(&self.procs).clone()
+    }
+
+    /// The process named `name`; the last one when the name repeats.
+    pub fn proc_named(&self, name: &str) -> Option<ProcHandle> {
+        lock(&self.procs).iter().rev().find(|p| p.name == name).cloned()
+    }
+
+    /// Head CAS attempts and conflicts summed over every process.
+    pub fn publish_totals(&self) -> (u64, u64) {
+        lock(&self.procs).iter().fold((0, 0), |(cas, conflict), p| {
+            let c = p.store.counters();
+            (cas + c.publish.cas, conflict + c.publish.conflict)
+        })
     }
 }
 
