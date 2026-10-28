@@ -201,6 +201,24 @@ export type EffectBody = z.output<typeof EffectBody>;
 export const EffectsResponse = z.object({ effects: z.array(EffectBody) });
 export type EffectsResponse = z.output<typeof EffectsResponse>;
 
+export const AttemptState = z.enum(["open", "in_doubt", "result", "superseded"]);
+export type AttemptState = z.output<typeof AttemptState>;
+
+export const EffectAttemptBody = z.object({ attempt: U32, status: AttemptState });
+export type EffectAttemptBody = z.output<typeof EffectAttemptBody>;
+
+export const EffectEvidenceBody = z.object({ attempt: U32, result: Json });
+export type EffectEvidenceBody = z.output<typeof EffectEvidenceBody>;
+
+export const EffectInspectResponse = EffectBody.extend({
+  step_key: z.string(),
+  result_attempt: U32.nullable(),
+  result: Json.nullable(),
+  attempts: z.array(EffectAttemptBody),
+  evidence: z.array(EffectEvidenceBody),
+});
+export type EffectInspectResponse = z.output<typeof EffectInspectResponse>;
+
 export const ReconcileRequest = z.discriminatedUnion("decision", [
   z.object({ effect: z.string(), attempt: U32, decision: z.literal("retry") }),
   z.object({
@@ -362,6 +380,28 @@ export const WorkerCommitResponse = z.object({
 });
 export type WorkerCommitResponse = z.output<typeof WorkerCommitResponse>;
 
+/**
+ * `input_hash` is `stepInputHash(tool_name, tool_version, canonicalBytes(input))`;
+ * `sdk/fixtures/identity/step_input_hash.json` pins the encoding.
+ */
+export const StepRecordRequest = z.object({
+  lease: TurnLease,
+  step_key: z.string(),
+  tool_name: z.string(),
+  tool_version: z.string(),
+  policy: Policy,
+  input_hash: z.string(),
+});
+export type StepRecordRequest = z.output<typeof StepRecordRequest>;
+
+export const StepRecordResponse = z.object({
+  step: StepBody,
+  effect: z.string(),
+  attempt: U32,
+  failure: z.string().nullable(),
+});
+export type StepRecordResponse = z.output<typeof StepRecordResponse>;
+
 export const EffectCompleteRequest = z.object({
   effect: z.string(),
   attempt: U32,
@@ -375,6 +415,13 @@ export const EffectCompleteResponse = z.object({
   late: z.boolean(),
 });
 export type EffectCompleteResponse = z.output<typeof EffectCompleteResponse>;
+
+export const EffectFailRequest = z.object({
+  effect: z.string(),
+  attempt: U32,
+  error: z.string(),
+});
+export type EffectFailRequest = z.output<typeof EffectFailRequest>;
 
 export const SafeIdsBody = z.object({
   agent_id: z.string().optional(),
@@ -422,6 +469,8 @@ export const WIRE_FIXTURES = {
   create_agent_response: CreateAgentResponse,
   effect_complete_request: EffectCompleteRequest,
   effect_complete_response: EffectCompleteResponse,
+  effect_fail_request: EffectFailRequest,
+  effect_inspect_response: EffectInspectResponse,
   effects_response: EffectsResponse,
   error_body: ErrorBody,
   events_request: EventsRequest,
@@ -436,6 +485,8 @@ export const WIRE_FIXTURES = {
   send_request: SendRequest,
   send_response: SendResponse,
   state_response: StateResponse,
+  step_record_request: StepRecordRequest,
+  step_record_response: StepRecordResponse,
   timer_request: TimerRequest,
   timer_response: TimerResponse,
   worker_commit_failed_request: WorkerCommitRequest,

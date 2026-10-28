@@ -121,7 +121,7 @@ ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets 
 agents_clippy='==> cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings'
 # The agents and mcp lanes select tests by binary: a test-name filter alone
 # (the *_name_filter forms) never runs a test whose path omits the keyword.
-agents_test='==> cargo nextest run --locked -p ravel-server --features agents --test agents_seam'
+agents_test='==> cargo nextest run --locked -p ravel-server --features agents --test agents_seam --test agents_effects_e2e'
 agents_lib_test='==> cargo nextest run --locked -p ravel-server --features agents --lib'
 agents_name_filter='==> cargo nextest run --locked -p ravel-server --features agents agents'
 agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification'
@@ -146,7 +146,7 @@ check_eq "gates -p ravel-query: flight-sql lane tests" "1" "$(count "${out}" "${
 check_eq "gates -p ravel-query: esql lane clippy" "1" "$(count "${out}" "${esql_clippy}")"
 check_eq "gates -p ravel-query: esql lane tests" "1" "$(count "${out}" "${esql_test}")"
 check_eq "gates -p ravel-query: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
-check_eq "gates -p ravel-query: agents lane seam binary" "1" "$(count "${out}" "${agents_test}")"
+check_eq "gates -p ravel-query: agents lane seam and effects binaries" "1" "$(count "${out}" "${agents_test}")"
 check_eq "gates -p ravel-query: agents lane lib tests" "1" "$(count "${out}" "${agents_lib_test}")"
 check_eq "gates -p ravel-query: agents lane has no bare name filter" "0" \
   "$(count "${out}" "${agents_name_filter}")"
@@ -272,7 +272,7 @@ check_eq "gates --dry-run: sql-explain lane" "1" "$(count "${out}" "${cli_explai
 check_eq "gates --dry-run: ravel-ingest shipping-features clippy" "1" \
   "$(count "${out}" "${ingest_shipping_clippy}")"
 check_eq "gates --dry-run: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
-check_eq "gates --dry-run: agents lane seam binary" "1" "$(count "${out}" "${agents_test}")"
+check_eq "gates --dry-run: agents lane seam and effects binaries" "1" "$(count "${out}" "${agents_test}")"
 check_eq "gates --dry-run: agents lane lib tests" "1" "$(count "${out}" "${agents_lib_test}")"
 check_eq "gates --dry-run: agents lane classification test" "1" \
   "$(count "${out}" "${agents_classification}")"
@@ -337,8 +337,8 @@ check_eq "affected-tests -p ravel-query: flight-sql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql')"
 check_eq "affected-tests -p ravel-query: esql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features esql')"
-check_eq "affected-tests -p ravel-query: agents seam binary" "1" \
-  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --test agents_seam')"
+check_eq "affected-tests -p ravel-query: agents seam and effects binaries" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --test agents_seam --test agents_effects_e2e')"
 check_eq "affected-tests -p ravel-query: agents lib tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --lib')"
 check_eq "affected-tests -p ravel-query: no bare agents name filter" "0" \

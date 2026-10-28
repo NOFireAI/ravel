@@ -1,14 +1,22 @@
 //! The per-process agents runtime the routes act on: one
 //! [`Coordinator`] per tenant over a tenant-scoped [`AgentStore`], built on
 //! first use, plus the router's own admission permits.
+//!
+//! The coordinator is handed a [`RecordingDispatcher`]: the worker that asked
+//! for a step runs the tool itself, so dispatching an attempt here executes
+//! nothing and only keeps the attempt for the route's answer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use ravel_agents_core::head::ObjectRef;
+use ravel_agents_core::identity::{AgentId, Id128};
 use ravel_agents_core::kernel::Limits;
-use ravel_agents_runtime::{AgentsMetricsSnapshot, Coordinator, RuntimeConfig, SystemRng};
+use ravel_agents_runtime::{
+    AgentsMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher, RuntimeConfig, SystemRng,
+};
 use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
 use ravel_agents_store::{AgentStore, StoreLimits, SystemClock};
 use ravel_object_store::ObjectStoreBackend;
@@ -28,6 +36,68 @@ pub struct TenantAgents {
     /// Fired after a commit or a cancel through this process, so a waiting
     /// `result` re-reads HEAD at once instead of at its next recheck.
     pub changed: Notify,
+    /// Late results reported through this process, by effect.
+    pub evidence: EvidenceIndex,
+}
+
+/// Most effects whose late results one tenant's [`EvidenceIndex`] names.
+pub const MAX_EVIDENCE_EFFECTS: usize = 4_096;
+/// Most late results the index names for one effect.
+pub const MAX_EVIDENCE_PER_EFFECT: usize = 16;
+
+/// Where the late results of each effect were stored, for
+/// `GET /api/v1/agents/effects/{effect}`. HEAD never references a late
+/// result (ADR-3331 decision 7), so nothing durable lists one: the objects
+/// themselves are in object storage, and this index is process-local and
+/// bounded. A result reported through another process, or before a restart,
+/// is not listed; once the index is full, results for effects it does not
+/// already name are not listed either.
+#[derive(Debug, Default)]
+pub struct EvidenceIndex {
+    entries: Mutex<HashMap<(AgentId, Id128), Vec<LateResult>>>,
+}
+
+/// One late result: the attempt that reported it and where it is stored.
+type LateResult = (u32, ObjectRef);
+
+impl EvidenceIndex {
+    pub fn record(&self, agent: AgentId, effect_id: Id128, attempt: u32, result: ObjectRef) {
+        let mut entries = self.entries.lock();
+        if !entries.contains_key(&(agent, effect_id)) && entries.len() >= MAX_EVIDENCE_EFFECTS {
+            return;
+        }
+        let kept = entries.entry((agent, effect_id)).or_default();
+        if kept.len() < MAX_EVIDENCE_PER_EFFECT && !kept.contains(&(attempt, result)) {
+            kept.push((attempt, result));
+        }
+    }
+
+    pub fn of(&self, agent: AgentId, effect_id: Id128) -> Vec<(u32, ObjectRef)> {
+        self.entries
+            .lock()
+            .get(&(agent, effect_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The dispatcher hook the routes hand the coordinator. It executes nothing:
+/// it keeps each attempt it is handed so the route can answer with it.
+#[derive(Debug, Default)]
+pub struct RecordingDispatcher {
+    dispatched: Mutex<Vec<Dispatch>>,
+}
+
+impl RecordingDispatcher {
+    pub fn dispatched(&self) -> Vec<Dispatch> {
+        self.dispatched.lock().clone()
+    }
+}
+
+impl EffectDispatcher for RecordingDispatcher {
+    fn dispatch(&self, dispatch: &Dispatch) {
+        self.dispatched.lock().push(dispatch.clone());
+    }
 }
 
 /// Which admission pool a route draws from.
@@ -135,6 +205,7 @@ impl AgentsRuntime {
                     store,
                     coordinator,
                     changed: Notify::new(),
+                    evidence: EvidenceIndex::default(),
                 })
             })
             .clone()
