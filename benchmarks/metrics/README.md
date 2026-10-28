@@ -353,8 +353,16 @@ the marker's timestamp returns no sample for its series), `expected` (the
 same figures from what was sent, for the classes the receiver stores),
 `mismatches` naming each figure that differs, and `matches_expected`. The
 Ravel row passes every token in `commit_tokens_by_shard` as
-`min_commit_token` on every query. The bin fails when `matches_expected` is
-false
+`min_commit_token` on every query. A read whose figures do not match what
+was sent is repeated every 500 ms until one matches or
+`--readback-settle-secs` (default 60, the same for every system) has passed
+since the first read began, since a receiver can acknowledge a write before
+it is queryable; `attempts` counts the reads, the reported one included, and
+`settled_after_ms` is the time from the start of the first read to the end
+of the reported one
+(`metrics_ingest::tests::readback_settles_on_a_lagging_receiver_within_the_window_only`).
+A query that fails, rather than reading short, is not repeated. The bin
+fails when `matches_expected` is false
 (`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`,
 `metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`).
 

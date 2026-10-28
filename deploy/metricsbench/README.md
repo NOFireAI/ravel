@@ -489,8 +489,8 @@ Steps, in order, stopping at the first failure:
    running compose container from `docker stats --no-stream` is appended to
    `memory.jsonl` (case a).
 6. `ingest`: `metricsbench_ingest` into all four portable endpoints with
-   their read-back query URLs, output `ingest.json`. A read-back that reads
-   less than was sent is repeated every 500 ms for up to
+   their read-back query URLs, output `ingest.json`. A read-back whose
+   figures do not match what was sent is repeated every 500 ms for up to
    `--readback-settle-secs` (default 60, the same for every engine), since
    VictoriaMetrics acknowledges a write before it is queryable; each row's
    `readback` records `attempts` and `settled_after_ms`. Ravel's token reaches it
