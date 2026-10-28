@@ -1,45 +1,80 @@
-# Agents TLA+ model
+# Agents TLA+ models
 
-A TLA+ model of the agent HEAD protocol in ADR-3331 (task T5 of epic #3331):
-enqueue with request identity and receipts, root publication, takeover, turn
-completion and rebase, cancellation, and timer delivery through wake hints. It
-is the `MCAgentProtocol` module that ADR-3331 decision 13 names; the other two
-modules that decision names are not here yet (see "Refinement" below).
+TLA+ models of the agent HEAD protocol in ADR-3331, as the three modules
+ADR-3331 decision 13 names:
 
-`AgentProtocol.tla` is the spec; `MCAgentProtocol.tla` is the model-checking
-entry point that extends it with the broken-behavior switches, the reachability
-probes, the state view and the worker symmetry. The spec instantiates the shared
-`RavelObjectStore.tla` (under `../common`) unchanged, so every payload PUT, turn
-output PUT, HEAD create, HEAD CAS, hint write and hint delete obeys the
-object-store contract rather than a hand-rolled map.
+- `AgentProtocol` (task T5 of epic #3331): enqueue with request identity and
+  receipts, root publication, takeover, turn completion and rebase,
+  cancellation, destroy and recreate, and timer delivery through wake hints.
+  A turn's handler is a black box that completes or fails.
+- `AgentEffects` (task T17): what happens inside one active turn. Durable
+  steps and effect intents journaled under keys that follow the input, attempt
+  authorization under the tool's recovery policy (`provider_idempotency`,
+  `at_least_once`, `manual`), the external provider with response loss,
+  result publication by the dispatcher or the result-completion endpoint,
+  replay and replay drift, admin reconciliation of a manual effect, takeover,
+  crash, retry after a failure, and cancellation of the running turn.
+- `AgentIntegrated` (task T17): one agent end to end. A client enqueue with
+  its payload PUT, lost responses and resolution, takeover, one tool step
+  under each policy, the turn output and the final commit, the client's
+  cancel, and a timer generation whose schedule, cancel, hint and sweep race
+  the client and the turn on the same HEAD.
 
-## What this model claims (ADR-1113 D12)
+Each `<Name>.tla` is a spec; each `MC<Name>.tla` is its model-checking entry
+point, which extends it with the broken-behavior switches, the reachability
+probes, the state view and the worker symmetry. Every spec instantiates the
+shared `RavelObjectStore.tla` (under `../common`) unchanged, so every payload
+PUT, turn output PUT, audit PUT, HEAD create, HEAD CAS, hint write and hint
+delete obeys the object-store contract rather than a hand-rolled map.
 
-TLC checked this finite model under the bounds and assumptions in each `.cfg`.
-This model checks the protocol design under those bounds; implementation conformance is argued
-in the traceability table and asserted by the named Rust tests, not proved.
+The sections whose heading starts "AgentProtocol:" describe `AgentProtocol`;
+"Refinement" states how the other two modules relate
+to it, and "AgentEffects" and "AgentIntegrated" describe those two.
+"Differences from the kernel", "Gaps" and "Exhaustive runs" cover all three.
+
+## What these models claim (ADR-1113 D12)
+
+TLC checked each finite model under the bounds and assumptions in its `.cfg`.
+The models check the protocol design under those bounds. Whether the Rust
+implementation conforms is a separate question: the traceability table argues
+it, and the Rust tests named there assert it.
 [`traceability.md`](traceability.md) maps each action and property to the
 kernel and store symbols and tests that implement it today; the runtime rows
-(lease takeover, worker dispatch, worker crash, wake hints and the sweep, and
-liveness) sit under its design heading, pending T9 (#3343) and later tasks. Safety
-and liveness are stated separately below, and every liveness result carries its
-fairness assumptions. The object store's own conformance to its contract is an
-assumption, stated as such and not checked here.
+(lease takeover, worker dispatch, worker crash, the effect runner, wake hints
+and the sweep, and liveness) sit under its design heading, pending T9 (#3343),
+T14, T15 (#3348) and later tasks. Safety and liveness are stated separately
+below, and every liveness result carries its fairness assumptions. The object
+store's own conformance to its contract is an assumption, stated as such and
+not checked here.
 
-No `results.md` exists yet: recorded figures are task T20. `bands.tsv`
-carries two rows. The `MCAgentProtocol.smoke.cfg` row pins the required lane
-at 286000 to 292000 distinct states (measured 289101 with 2 workers) with
-depth waived by `-`, so a change that narrows what the smoke run reaches fails
-that lane. The `MCAgentProtocol.exhaustive.cfg` row sets only `budget_s`
-(3000, ADR-3331 decision 13); its distinct band is the full `0`-`999999999`
-range and its depth cells are `-`, so the harness enforces nothing on it
-until T20 measures it on the nightly runner. The harness requires the distinct
-cells to be integers, so that range is the placeholder for an unmeasured row;
-`formal/tla/README.md` does not define an unmeasured form.
+No `results.md` exists yet: recorded figures are task T20. `bands.tsv` carries
+one row per smoke, live, exhaustive and positive config, and its header
+comments record each measurement (2 workers). A smoke, live or positive row
+pins a distinct-state band around the measured figure with depth waived by
+`-`, so a change that narrows what the run reaches fails that lane:
 
-## Scope
+| Config | Band (distinct) | Measured |
+|---|---|---|
+| `MCAgentProtocol.smoke.cfg` | 286000 to 292000 | 289101 |
+| `positive/stale-turn-rebase-unreachable.cfg` | 286000 to 292000 | 289101 |
+| `positive/two-generations.cfg` | 240000 to 246000 | 243171 |
+| `MCAgentEffects.smoke.cfg` | 325000 to 333000 | 328900 |
+| `MCAgentEffects.live.cfg` | 184000 to 191000 | 187421 |
+| `MCAgentIntegrated.smoke.cfg` | 612000 to 626000 | 618946 |
+| `MCAgentIntegrated.live.cfg` | 17800 to 18400 | 18057 |
+| `positive/integrated-timer-race.cfg` | 1485000 to 1515000 | 1499824 |
 
-Modelled, each as its own action unless "Folded steps" below says otherwise:
+The three exhaustive rows set only `budget_s` (3000, ADR-3331 decision 13);
+their distinct band is the full `0`-`999999999` range and their depth cells
+are `-`, so the harness enforces nothing on them until T20 measures them on
+the nightly runner. The harness requires the distinct cells to be integers, so
+that range is the placeholder for an unmeasured row; `formal/tla/README.md`
+does not define an unmeasured form. "Exhaustive runs" below gives what the
+local runs reached.
+
+## AgentProtocol: scope
+
+Modelled, each as its own action unless "AgentProtocol: folded steps" below says otherwise:
 
 - One mutable HEAD per agent key, written `CreateIfAbsent` once and
   `CasVersion` afterwards. `rev` (root_revision) rises by one on every write
@@ -70,20 +105,46 @@ Out of scope, by design (see "Refinement"): step intents, attempt
 authorization, external execution, replay and manual resolution; history
 paging; quotas and `BudgetExceeded`; format versions.
 
-## Refinement: AgentEffects and AgentIntegrated
+## Refinement
 
-ADR-3331 decision 13 names three modules for this area. `MCAgentEffects`
-(active turn, step intent, attempt authorization, external execution with
-response loss, result publication, replay, manual resolution) and
-`MCAgentIntegrated` (takeover, enqueue, one tool step, final completion, a
-timer and cancellation race) follow in task T17. This module treats a turn's
-handler as a black box that completes or fails, so `StepTranscriptCompatible`,
-`DispatchRequiresCommittedAuthorization` and `PolicyControlsRedispatch`, the
-dispatch-before-intent, ambiguous-manual-retry and step-input-drift negatives,
-and the duplicate-execution and blocked-effect probes all belong to those
-modules and are not here.
+`AgentProtocol` treats a turn's handler as a black box that completes or
+fails. `AgentEffects` opens that box for one accepted input, and
+`AgentIntegrated` joins the two for one agent. The relation between them is a
+correspondence argued here, not a refinement mapping TLC checks: no module
+instantiates another, and each is checked against its own properties.
 
-## Assumptions
+- `AgentEffects` takes the input as accepted before the first state and has no
+  enqueue, timers, tombstone or recreate; those stay `AgentProtocol`'s. Its
+  HEAD carries what `AgentProtocol`'s does for one input (owner, epoch, active
+  turn with its cancel request, results) plus the step transcript and the
+  effect journal. Its actors (`ac`) are the workers and the admin.
+- `AgentIntegrated` keeps the store variables of both, the client (`cl`) and
+  the answered handle (`acked`) of `AgentProtocol`, and a per-worker operation
+  (`wk`) that plays both `AgentProtocol`'s worker and `AgentEffects`'s owner;
+  `sw` is the sweep. It restricts both models: one tenant, one agent, one
+  incarnation, one client request, one step and one effect per client turn, a
+  timer input whose handler runs no step or effect, and no admin, so an effect in doubt stays in
+  doubt. Replay drift and the retry after a failure are `AgentEffects`'s only.
+- The protocol properties take `AgentProtocol`'s form for one agent and one
+  incarnation, and the effect properties take `AgentEffects`'s form; the
+  smoke, exhaustive and positive configs check all fourteen together (see
+  "AgentIntegrated").
+- Five steps `AgentProtocol` folds for its budget are separate actions in
+  `AgentIntegrated`: the client's answer (`Ack`), the payload PUT's lost
+  response (`PutPayloadLostResponse`), the re-read that resolves an unknown
+  enqueue outcome (`Resolve`), a crashed worker's restart (`Recover`), and the
+  sweep's read before its fire (`SweepRead`). Its negatives
+  `integrated-ack-before-cas`, `integrated-resolve-trusts-unknown` and
+  `integrated-sweep-overwrites-head` and its probes `integrated-resolved-reachable`
+  and `integrated-recovered-reachable` exercise those splits.
+- Three callers in `AgentIntegrated` still fold a read into their CAS, each
+  acting on the current version with nothing written in between: the client's
+  cancel, the timer schedule and cancel, and the result-completion endpoint
+  (`ResultCallback`). `AgentEffects` folds the cancel and the result endpoint
+  the same way. A CAS on a stale read fails with no effect and is retried, so a
+  separate read only adds stuttering states.
+
+## AgentProtocol: assumptions
 
 - The store honours its contract (`common/RavelObjectStore.tla`). Nothing
   else about the store is assumed.
@@ -96,7 +157,7 @@ modules and are not here.
 - A transient store failure applies nothing and leaves the caller free to
   retry, so it is a stuttering step.
 
-## Properties
+## AgentProtocol: properties
 
 Safety (invariants), all in `MCAgentProtocol.smoke.cfg` and
 `MCAgentProtocol.exhaustive.cfg`: `AcceptedImpliesRecoverable`,
@@ -126,7 +187,7 @@ which weak fairness on those actions already rules out. Contention is bounded
 because each client sends once and the optional root writes stop at
 `MaxRevision`.
 
-## Configs and bounds
+## AgentProtocol: configs and bounds
 
 Every config: one tenant, one agent, two workers, `MaxEpoch = 2`.
 
@@ -173,7 +234,7 @@ action, invariant or initial state names a particular worker. Both reductions
 are sound for invariants only, which is why the exhaustive config, the one
 with `PROPERTY` lines, uses neither.
 
-## Negative controls
+## AgentProtocol: negative controls
 
 Each switch in `MCAgentProtocol.tla` adds one broken action; each config in
 `negative/` turns exactly one on and pins the property it must violate in its
@@ -229,7 +290,7 @@ probes at smoke bounds the smoke run checks the eleven invariants on those
 states, and for `second-generation-reachable` only the stale-timer negative
 shares its bounds, with its mutant on.
 
-## Folded steps
+## AgentProtocol: folded steps
 
 ADR-3331 decision 13 asks for every read, immutable write, HEAD CAS,
 acknowledgement, crash, recovery and discovery to be its own action. To fit the
@@ -260,6 +321,185 @@ argued here, not checked.
   writes nothing, so it is a stutter with no action of its own (the comment
   on `FireTimer` says so); `early-hint-forgotten.cfg` checks that deleting
   it instead is caught.
+
+## AgentEffects
+
+Scope and assumptions are in the module header of `AgentEffects.tla`. In
+short: one HEAD holding one accepted input; turns bound to it by its owner and
+retried after a retryable failure under a new turn that keeps the step
+transcript and the effect journal; one durable step and one effect intent per
+turn; attempt authorization by the owner under the tool's policy; a provider
+that executes a dispatched attempt and whose response can be lost; result
+publication by the dispatcher (`RecordHeldResult`) or by the result-completion
+endpoint (`ResultCallback`); replay from the journal, and drift that blocks the
+turn; admin reconciliation of a manual effect (`AdminAuthorize`,
+`AdminRecordResult`), each behind an immutable audit object written before the
+CAS; takeover; worker crash and recovery; and the client's cancel. Every read,
+immutable write, HEAD CAS, crash, recovery, dispatch, provider response,
+response loss and result record is its own action, except the two folded reads
+named in "Refinement". The provider's own log (`calls`) is the witness for
+what executed.
+
+Safety (invariants), in `MCAgentEffects.smoke.cfg`,
+`MCAgentEffects.exhaustive.cfg` and `MCAgentEffects.live.cfg`:
+
+- `StepTranscriptCompatible`: a step or intent key keeps the tool identity and
+  input hash it was first journaled with, a recorded effect result is never
+  rewritten, and the journal never goes back to a lower attempt.
+- `DispatchRequiresCommittedAuthorization`: every dispatch the provider saw is
+  of an attempt the journal holds an authorization for.
+- `PolicyControlsRedispatch`: each authorized attempt is dispatched at most
+  once; under `manual` no attempt after the first is authorized or dispatched
+  without a reconcile audit object, and no turn result lands while the effect
+  is in doubt; under `provider_idempotency` the provider executes at most
+  once; `at_least_once` is unconstrained.
+- `EffectResultFromExecution`: a recorded result came from a physical
+  execution of an attempt the journal authorized. Under
+  `provider_idempotency` that execution may belong to another attempt than
+  the one the result is recorded for, since the provider answers a repeat of
+  the effect id with the first execution's result.
+- `CancellationRespected` (effects form): a commit on a turn with a cancel
+  request publishes it cancelled; once the request is on the root the owner
+  journals no new step or intent and authorizes no new attempt (only a
+  reconcile audit object admits one); nothing rewrites a published result.
+
+Liveness, in `MCAgentEffects.live.cfg` only, under `MCFairSpec`:
+`InputSettledOrEffectBlocked`, an input on the inbox eventually leaves it, or
+the effect reaches a blocked terminal: it awaits reconciliation (in doubt, or a
+reconcile attempt the admin has not settled), the run spent `MaxAttempt` on an
+ambiguous attempt, or the turn is blocked by replay drift while an attempt is
+authorized without a result (`BlockedWithPendingAttempt`, see "Gaps"). Fairness
+(`Fairness` in `AgentEffects.tla`): weak fairness on `CreateHead` and, per
+worker, on `Read`, `Takeover`, `BeginTurn`, `RecordStep`, `CommitIntent`,
+`AuthorizeFirst`, `Reauthorize`, `ResumeAuthorized`, `PutTurnOutput`,
+`CompleteTurn`, `CommitCancelled`, `FailTurn` on a blocked turn, `Dispatch`,
+`Respond`, `RecordHeldResult` and `Recover`. The admin, the client's cancel
+and the result endpoint are not fair: reconciliation is an operator's choice,
+so an in-doubt effect may wait forever, which is why the property names the
+blocked terminals. The probe `effect-in-doubt-blocks-input` shows the
+property without them (`InputEventuallySettled`) fails.
+
+| Config | Workers, epochs | Policies | Hashes | MaxTurns, MaxAttempt | Checks |
+|---|---|---|---|---|---|
+| `MCAgentEffects.smoke.cfg` | 2, 2 | all three | 1 | 2, 2 | the 5 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `MCAgentEffects.exhaustive.cfg` | 2, 2 | all three | 2 | 2, 2 | the 5 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `MCAgentEffects.live.cfg` | 1, 1 | all three | 2 | 2, 2 | the 5 invariants and `InputSettledOrEffectBlocked`, no VIEW or SYMMETRY |
+
+The smoke config has one input hash, so replay drift is reached only in the
+exhaustive and live configs (and in the `step-input-drift` negative, which
+adds the second hash). The live config runs at one worker and one epoch
+because liveness cannot use the view or the symmetry; the worker crashes and
+recovers instead of being taken over.
+
+Negative controls, each the smoke bounds with one switch on in
+`MCAgentEffects.tla` and its `.expect` naming the property:
+
+| Config | Switch | Violates |
+|---|---|---|
+| `dispatch-before-intent` | `DispatchBeforeIntent` | `DispatchRequiresCommittedAuthorization` |
+| `ambiguous-manual-attempt-retried` | `AmbiguousManualAttemptRetried` | `PolicyControlsRedispatch` |
+| `commit-while-in-doubt` | `CommitWhileInDoubt` | `PolicyControlsRedispatch` |
+| `step-input-drift` | `StepInputDrift` | `StepTranscriptCompatible` |
+| `late-result-overwrites` | `LateResultOverwrites` | `StepTranscriptCompatible` |
+| `authorize-ignores-cancel-request` | `AuthorizeIgnoresCancelRequest` | `CancellationRespected` |
+
+`ambiguous-manual-attempt-retried` and `commit-while-in-doubt` run with the
+`manual` policy only, `late-result-overwrites` with `at_least_once` only (the
+policy under which two executions of one effect are reachable), and
+`step-input-drift` with two input hashes. `authorize-ignores-cancel-request`
+breaks a runner rule the kernel does not enforce (see "Differences from the
+kernel"); its trace is in
+`negative/counterexamples/authorize-ignores-cancel-request.md`.
+
+Reachability probes, every switch off, each violating its probe invariant
+(exit 12) unless noted: `duplicate-execution-reachable`
+(`DuplicateExecutionUnreachable`, `at_least_once` only: a lost response and a
+second authorization execute the effect twice), `blocked-effect-reachable`
+(`BlockedEffectUnreachable`, `manual` only: the owner's next authorization
+puts the effect in doubt), `reconciled-effect-reachable`
+(`ReconciledEffectUnreachable`, `manual` only: an admin reconciles behind an
+audit object), `effect-worker-crash-reachable` (`CrashUnreachable`: a crash
+with an operation in flight or a provider response unrecorded), and the
+liveness probe `effect-in-doubt-blocks-input` (`InputEventuallySettled`, exit
+13, `manual` only, live bounds).
+
+## AgentIntegrated
+
+Scope and assumptions are in the module header of `AgentIntegrated.tla`, and
+its relation to the other two modules is in "Refinement". Safety
+(invariants), in `MCAgentIntegrated.smoke.cfg`,
+`MCAgentIntegrated.exhaustive.cfg`, `MCAgentIntegrated.live.cfg` and
+`positive/integrated-timer-race.cfg`: the nine protocol properties
+`AcceptedImpliesRecoverable`, `PublishedReferencesComplete`,
+`RequestIdentityStable`, `OneLogicalCompletion`, `TurnCommitAtomic`,
+`NoStaleOwnerCommit`, `NoLostConcurrentEnqueue`, `MonotonicIdentity` and
+`TimerGenerationDeliveredOnce` in `AgentProtocol`'s form for one agent and one
+incarnation, and the five effect properties `StepTranscriptCompatible`,
+`DispatchRequiresCommittedAuthorization`, `PolicyControlsRedispatch`,
+`EffectResultFromExecution` and `CancellationRespected` in `AgentEffects`'s
+form. `TenantIncarnationIsolation` is not here: one tenant, one agent and one
+incarnation leave it nothing to check.
+
+Liveness, in `MCAgentIntegrated.live.cfg` only, under `MCFairSpec`:
+
+- `InputSettledOrEffectBlocked`: every accepted input eventually has a
+  result, or the client's effect is blocked (in doubt, with no admin here, or
+  authorized at `MaxAttempt` without a result).
+- `EnqueueEventuallyAnswered`: the client is eventually answered with a
+  handle.
+
+Fairness (`Fairness` in `AgentIntegrated.tla`): weak fairness on
+`CreateHead`, `ClientRead`, `Resolve`, `Ack`, `WriteHint`, `SweepRead` and
+`SweepFire`, and per worker on `Read`, `Takeover`, `BeginTurn`, `RecordStep`,
+`CommitIntent`, `AuthorizeFirst`, `Reauthorize`, `PutTurnOutput`,
+`CompleteTurn`, `CommitCancelled`, `Dispatch`, `Respond`, `RecordHeldResult`
+and `Recover`; strong fairness on `PutPayload` and `EnqueueCas`, since a lost
+response sends the client back to the read and so disables them again; the
+client finishes the enqueue it started. The client's cancel, timer scheduling
+and cancelling, and the result endpoint are not fair.
+
+| Config | Workers, epochs | Policies | MaxTimerGen | Checks |
+|---|---|---|---|---|
+| `MCAgentIntegrated.smoke.cfg` | 2, 2 | all three | 0 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `positive/integrated-timer-race.cfg` | 1, 1 | `at_least_once`, `manual` | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `MCAgentIntegrated.exhaustive.cfg` | 2, 2 | all three | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `MCAgentIntegrated.live.cfg` | 1, 1 | all three | 0 | the 14 invariants and both liveness properties, no VIEW or SYMMETRY |
+
+Every config has one client and `MaxAttempt = 2`. The bounds are split the
+same way as `AgentProtocol`'s: two workers with the timer on is the exhaustive
+config, which did not finish locally (see "Exhaustive runs"), so the required
+lanes check takeover without the timer (smoke) and the timer race with one
+worker that crashes and restarts (`positive/integrated-timer-race.cfg`).
+
+Negative controls, each with one switch on in `MCAgentIntegrated.tla`:
+
+| Config | Switch | Bounds | Violates |
+|---|---|---|---|
+| `integrated-ack-before-cas` | `AckBeforeCas` | smoke | `AcceptedImpliesRecoverable` |
+| `integrated-resolve-trusts-unknown` | `ResolveTrustsUnknown` | timer race | `AcceptedImpliesRecoverable` |
+| `integrated-sweep-overwrites-head` | `SweepOverwritesHead` | timer race | `NoLostConcurrentEnqueue` |
+| `integrated-dispatch-before-intent` | `DispatchBeforeIntent` | smoke | `DispatchRequiresCommittedAuthorization` |
+| `integrated-complete-ignores-cancel` | `CompleteIgnoresCancel` | smoke | `CancellationRespected` |
+
+`integrated-resolve-trusts-unknown` needs the timer: at smoke bounds no other
+writer moves HEAD before the first enqueue, so the enqueue CAS cannot fail.
+Each negative's trace is in `negative/counterexamples/<name>.md`.
+
+Reachability probes, every switch off, each violating its probe invariant
+(exit 12) unless noted: `integrated-takeover-reachable`
+(`TakeoverUnreachable`, epoch 2), `integrated-resolved-reachable`
+(`ResolvedUnreachable`, a lost enqueue response answered by `Resolve`),
+`integrated-recovered-reachable` (`RecoveredUnreachable`, a crashed worker
+restarts), `integrated-tool-turn-completed-reachable`
+(`ToolTurnCompletedUnreachable`, the client turn commits completed with its
+effect result recorded), `integrated-duplicate-execution-reachable`
+(`DuplicateExecutionUnreachable`, `at_least_once` only),
+`integrated-blocked-effect-reachable` (`BlockedEffectUnreachable`, `manual`
+only), `integrated-timer-cancel-race-reachable` (`TimerCancelRaceUnreachable`,
+timer race bounds: the client's input settles cancelled on a HEAD that also
+delivered a timer generation), and the liveness probe
+`integrated-effect-in-doubt-blocks-input` (`InputEventuallySettled`, exit 13,
+`manual` only, live bounds).
 
 ## Differences from the kernel
 
@@ -294,23 +534,76 @@ Remaining differences, each also stated in its `traceability.md` row:
 
 - The model's `turns` counter names output objects and survives a recreate;
   the kernel derives turn ids and has no counter.
+- The store keys a wake hint by its due bucket; the models key it by
+  generation.
+
+`AgentEffects` and `AgentIntegrated` state some rules as guards on the owner,
+the dispatcher or the reconciler that the kernel does not enforce. Each is a
+rule the runner (task T14) must keep, and the property that rests on it is
+named:
+
+- An owner that reads a cancel request on its turn records no new step,
+  commits no new intent and authorizes no new attempt; it commits the turn
+  cancelled. `Kernel::authorize_attempt` does not read the request, and
+  neither does `Kernel::require_running`, which `Kernel::record_step` and
+  `Kernel::commit_intent` use. `CancellationRespected` (effects form) rests
+  on the runner here; the negative `authorize-ignores-cancel-request` shows it
+  fails without the rule.
+- An owner authorizes only on its own running, unblocked turn. The kernel's
+  owner authorization checks the owner fence only: no turn fence and no check
+  that the turn is running or unblocked.
+- An attempt the reconciler authorized is dispatched by the reconciler alone,
+  and the owner leaves it alone. The root has no field naming the
+  reconciler as that attempt's dispatcher; the model reads its audit object.
+- `AdminAuthorize` and `AdminRecordResult` write an immutable audit object
+  before their CAS, and `PolicyControlsRedispatch` reads it. The kernel writes
+  no audit record.
+- The owner writes the turn output only after its effect has a result.
+  `Kernel::complete_turn` refuses an effect in doubt but accepts one
+  authorized without a result, on the ground that a handler that completed
+  awaited its attempt; the model encodes that as an ordering on the owner.
+- A step is recorded completed in one CAS. The kernel also accepts a
+  `Started` record first and replaces it with the completed one; the module
+  header of `AgentEffects.tla` argues it adds no case.
 
 ## Gaps
 
 - The HEAD-listing half of the reconciliation sweep is not modelled. Timer
   discovery goes only through hints, so "fair discovery" in ADR-3331's
-  liveness condition is weak fairness on `WriteHint` and `FireTimer`.
+  liveness condition is weak fairness on `WriteHint` and `FireTimer` in
+  `AgentProtocol`, and on `WriteHint`, `SweepRead` and `SweepFire` in
+  `AgentIntegrated`.
 - A hint is written once per generation; duplicated hints are not modelled.
-- One tenant (`Tenants = {t1}`) and one agent in both configs.
-  `TenantIncarnationIsolation` is checked across incarnations, not across
-  tenants or agents.
-- Each worker crashes at most once, and only with a turn output written or a
-  completion outcome unknown.
+- One tenant (`Tenants = {t1}`) and one agent in every config of the three
+  modules. `TenantIncarnationIsolation` is checked in `AgentProtocol` across
+  incarnations, not across tenants or agents.
+- Each worker crashes at most once. In `AgentProtocol` it crashes only with a
+  turn output written or a completion outcome unknown.
+- `BlockedWithPendingAttempt` (a design gap, not a model bug): a turn blocked
+  by replay drift while its attempt is authorized without a result cannot be
+  failed (`Kernel::fail_turn` answers `NoAuthorizedAttemptPending`) and the
+  runner authorizes nothing on a blocked turn, so only the dispatcher's own
+  response or the result endpoint moves it. If neither arrives the input is
+  stuck; `InputSettledOrEffectBlocked` in `AgentEffects` lists the state as a
+  blocked terminal rather than claim it settles.
+- A cancel does not settle an input whose effect is in doubt:
+  `Kernel::complete_turn` refuses, so the input waits for an admin. In
+  `AgentIntegrated`, which has no admin, it waits forever, and its liveness
+  property lists the in-doubt effect as a blocked terminal.
+- Under `provider_idempotency` the result recorded for an attempt may come
+  from another attempt's execution (the provider's deduplication answers with
+  the first result). `EffectResultFromExecution` allows that; it is an
+  assumption about the provider, not something the kernel can check.
+- `AgentEffects` holds one accepted input, one step and one intent per turn,
+  at most two turns and two attempts; enqueue and timers are not in it.
+  `AgentIntegrated` has one client request, no replay drift, no retry after a
+  failure and no admin.
 - A transient store failure is a stutter, not an action.
 - The first client's agent, request id and payload are pinned in `Init`;
   every other choice is the same up to renaming.
 - Timers and liveness are not checked with two competing clients, and
-  competing senders are not checked with timers (see "Configs and bounds").
+  competing senders are not checked with timers in `AgentProtocol` (see
+  "AgentProtocol: configs and bounds").
 - Not modelled from ADR-3331 decisions 3 to 8: handler version and digest in
   the rebase check and `IncompatibleHandler`; events, effect intents and timer
   changes in the turn completion CAS (timers change only through their own
@@ -318,14 +611,34 @@ Remaining differences, each also stated in its `traceability.md` row:
   answer (a cancel on a delivered generation is not enabled); the receipt index as pages; the HEAD size cap and
   quotas; format versions and `UnsupportedFormat`; operation states other than
   pending and resolved.
-- `bands.tsv` uses a placeholder for the unmeasured exhaustive row (see the
-  claims section); T20 measures it.
+- `bands.tsv` uses a placeholder for the three unmeasured exhaustive rows
+  (see the claims section); T20 measures them.
+
+## Exhaustive runs
+
+Each exhaustive config was run once locally with 2 workers, outside the
+harness; the two T17 runs used `-Xmx4g` on an aarch64 host with 4 cores:
+
+- `MCAgentProtocol.exhaustive.cfg`: 362907 distinct states at depth 27, as
+  recorded in the `bands.tsv` comments.
+- `MCAgentEffects.exhaustive.cfg` finished: 2807644 distinct states at depth
+  49 in 270 s, no violation.
+- `MCAgentIntegrated.exhaustive.cfg` did not finish. It was stopped at 560 s
+  with 6422545 distinct states at depth 27 and 1849641 still queued, and the
+  queue was still growing; no violation was found in the states it reached.
+  Its invariants are checked to completion only at the smoke and timer race
+  bounds. Whether it fits the 3000 s budget is T20's measurement.
 
 ## Running
 
 ```sh
 scripts/check-tla.sh smoke -a agents
+scripts/check-tla.sh live -a agents
 scripts/check-tla.sh positive -a agents
 scripts/check-tla.sh negative -a agents
 scripts/check-tla.sh exhaustive -a agents
 ```
+
+The `live` lane runs `MCAgentEffects.live.cfg` and
+`MCAgentIntegrated.live.cfg` (`AgentProtocol` has no live config: its liveness
+runs in its exhaustive config).
