@@ -40,7 +40,8 @@ pub struct MemoryBudget {
     handoff_overlap: AtomicU64,
     gate: ResidentGate,
     refusals: RefusalCounts,
-    evictor: OnceLock<Box<Evictor>>,
+    /// The evictor and the slack it is asked for beyond each shortfall.
+    evictor: OnceLock<(Box<Evictor>, u64)>,
 }
 
 /// A pressure evictor: asked to free at least the given number of bytes held
@@ -154,20 +155,24 @@ impl MemoryBudget {
     ///
     /// Once registered, a `try_reserve` (and so a [`reserve`]) that its gate or
     /// ledger check would refuse first calls the evictor with the shortfall
-    /// and checks once more; the refusal stands, and is counted, only if that
-    /// second check refuses too. For a ledger refusal the shortfall is the
-    /// bytes over `limit`, and the second check is the ordinary one. For a
-    /// gate refusal it is the larger of the request plus the bytes the host
-    /// reading is below the floor and the ledger's own shortfall; when the
-    /// evictor freed at least that much, the second check waives the gate
-    /// (which only the sampler reopens) and applies the ledger alone.
+    /// plus `slack` and checks once more; the refusal stands, and is counted,
+    /// only if that second check refuses too. The slack covers reservations
+    /// other threads make between the eviction and the retry. For a ledger
+    /// refusal the shortfall is the bytes over `limit`, and the second check
+    /// is the ordinary one. For a gate refusal it is the larger of the request
+    /// plus the bytes the host reading is below the floor and the ledger's own
+    /// shortfall; when the evictor freed at least that much (slack not
+    /// included), the second check waives the gate (which only the sampler
+    /// reopens) and applies the ledger alone.
     /// [`reserve_best_effort`] never calls the evictor, and neither does a
     /// reservation made while this thread is already running one.
     ///
     /// [`reserve`]: MemoryBudget::reserve
     /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
-    pub fn register_evictor(&self, evictor: Box<Evictor>) -> Result<(), Box<Evictor>> {
-        self.evictor.set(evictor)
+    pub fn register_evictor(&self, evictor: Box<Evictor>, slack: u64) -> Result<(), Box<Evictor>> {
+        self.evictor
+            .set((evictor, slack))
+            .map_err(|(evictor, _)| evictor)
     }
 
     /// Records a host available-memory reading, the floor it was compared
@@ -326,7 +331,8 @@ impl MemoryBudget {
     /// bytes than it admitted).
     ///
     /// Eviction rule: with an evictor registered, either refusal first asks it
-    /// to free the shortfall and checks once more (see [`register_evictor`]).
+    /// to free the shortfall plus its slack and checks once more (see
+    /// [`register_evictor`]).
     ///
     /// [`accounted_refusals`]: MemoryBudget::accounted_refusals
     /// [`gate_refusals`]: MemoryBudget::gate_refusals
@@ -347,7 +353,7 @@ impl MemoryBudget {
     #[cold]
     #[inline(never)]
     fn evict_and_retry(&self, n: u64, refusal: MemoryExhausted) -> Result<(), MemoryExhausted> {
-        let Some(evictor) = self.evictor.get() else {
+        let Some((evictor, slack)) = self.evictor.get() else {
             return Err(refusal);
         };
         let Some(guard) = EvictingGuard::enter() else {
@@ -364,7 +370,7 @@ impl MemoryBudget {
                 .saturating_add(n)
                 .max(ledger_shortfall),
         };
-        let freed = evictor(shortfall, refusal.cause);
+        let freed = evictor(shortfall.saturating_add(*slack), refusal.cause);
         drop(guard);
         let retried = match refusal.cause {
             ExhaustionCause::HostMemory { .. } if freed >= shortfall => self.admit_ledger(n),
@@ -1302,7 +1308,7 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         assert!(
             budget
-                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)), 0)
                 .is_ok()
         );
         budget
@@ -1318,7 +1324,7 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         assert!(
             starved
-                .register_evictor(evictor_over(held, false, Arc::clone(&asked)))
+                .register_evictor(evictor_over(held, false, Arc::clone(&asked)), 0)
                 .is_ok()
         );
         let err = starved.try_reserve(30).expect_err("nothing freed");
@@ -1351,7 +1357,7 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         assert!(
             budget
-                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)), 0)
                 .is_ok()
         );
         budget.set_host_memory_gate(false, 300, 600);
@@ -1367,7 +1373,7 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         assert!(
             short
-                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)), 0)
                 .is_ok()
         );
         short.set_host_memory_gate(false, 300, 600);
@@ -1396,7 +1402,7 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         assert!(
             budget
-                .register_evictor(evictor_over(held, true, Arc::clone(&asked)))
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)), 0)
                 .is_ok()
         );
         budget
@@ -1424,18 +1430,133 @@ mod tests {
         let counted = Arc::clone(&calls);
         assert!(
             budget
-                .register_evictor(Box::new(move |_, _| {
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    if let Some(budget) = inner.upgrade() {
-                        budget.try_reserve(1).expect_err("nested: still full");
-                    }
+                .register_evictor(
+                    Box::new(move |_, _| {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        if let Some(budget) = inner.upgrade() {
+                            budget.try_reserve(1).expect_err("nested: still full");
+                        }
+                        0
+                    }),
                     0
-                }))
+                )
                 .is_ok()
         );
         budget.try_reserve(1).expect_err("nothing freed");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert!(budget.register_evictor(Box::new(|_, _| 0)).is_err());
+        assert!(budget.register_evictor(Box::new(|_, _| 0), 0).is_err());
+    }
+
+    /// A refused reservation asks the evictor for its shortfall plus the
+    /// slack it was registered with, for a ledger refusal and a gate refusal
+    /// alike; the gate is still waived on the shortfall alone.
+    ///
+    /// FLIP: pass `shortfall` alone to the evictor in `evict_and_retry` and
+    /// `asked` is `[30]`, then `[310]`.
+    #[test]
+    fn a_refusal_asks_the_evictor_for_the_shortfall_plus_the_slack() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        let held = budget.reserve(80).expect("80 of 100");
+        budget.try_reserve(20).expect("100 of 100");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            budget
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)), 25)
+                .is_ok()
+        );
+        budget.try_reserve(30).expect("the evictor frees 80");
+        assert_eq!(*asked.lock().expect("asked"), vec![30 + 25]);
+        assert_eq!(budget.reserved(), 50);
+
+        let gated = Arc::new(MemoryBudget::new(1_000));
+        let held = gated.reserve(320).expect("320 of 1000");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            gated
+                .register_evictor(evictor_over(held, true, Arc::clone(&asked)), 25)
+                .is_ok()
+        );
+        gated.set_host_memory_gate(false, 300, 600);
+        gated
+            .try_reserve(10)
+            .expect("320 freed covers the 310 shortfall, though not 335");
+        assert_eq!(*asked.lock().expect("asked"), vec![310 + 25]);
+        assert_eq!(gated.reserved(), 10);
+        assert_eq!(gated.gate_refusals(), 0);
+    }
+
+    /// The box race: holder threads keep the budget full, a reservation is
+    /// refused, and the evictor releases pooled 10-byte entries until it has
+    /// freed what it was asked. Before it returns, and so before the refused
+    /// caller's retry, it runs another thread's `try_reserve` of 50 bytes to
+    /// completion: more than the zero bytes an exact-shortfall eviction leaves
+    /// over, less than the 100-byte slack. Running that reservation on a
+    /// joined thread inside the evictor fixes the interleaving, so the test
+    /// is deterministic. Both reservations are admitted.
+    ///
+    /// FLIP: pass `shortfall` alone to the evictor in `evict_and_retry` and
+    /// the evictor frees 200, the other thread takes 50, and the retry is
+    /// refused with 150 free: the first `expect` fails.
+    #[test]
+    fn a_reservation_between_eviction_and_retry_leaves_the_retry_enough() {
+        const LIMIT: u64 = 1_000;
+        const SLACK: u64 = 100;
+        const BETWEEN: u64 = 50;
+        let budget = Arc::new(MemoryBudget::new(LIMIT));
+        let holders: Vec<Reservation> = (0..4)
+            .map(|_| {
+                let budget = Arc::clone(&budget);
+                thread::spawn(move || budget.reserve(150).expect("150 per holder"))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("holder"))
+            .collect();
+        let pool: Vec<Reservation> = (0..40)
+            .map(|_| budget.reserve(10).expect("pooled entry"))
+            .collect();
+        assert_eq!(budget.unreserved(), 0);
+
+        let pool = std::sync::Mutex::new(pool);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let between = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let weak = Arc::downgrade(&budget);
+        let (asked_in, between_in) = (Arc::clone(&asked), Arc::clone(&between));
+        assert!(
+            budget
+                .register_evictor(
+                    Box::new(move |want, _| {
+                        asked_in.lock().expect("asked").push(want);
+                        let mut freed = 0;
+                        let mut pool = pool.lock().expect("pool");
+                        while freed < want {
+                            let Some(entry) = pool.pop() else { break };
+                            freed += entry.size();
+                        }
+                        drop(pool);
+                        if let Some(budget) = weak.upgrade() {
+                            let other = thread::spawn(move || budget.reserve(BETWEEN))
+                                .join()
+                                .expect("other thread");
+                            between_in.lock().expect("between").push(other);
+                        }
+                        freed
+                    }),
+                    SLACK,
+                )
+                .is_ok()
+        );
+
+        let refused = budget
+            .reserve(200)
+            .expect("the retry finds the shortfall after the other thread's 50");
+        assert_eq!(*asked.lock().expect("asked"), vec![200 + SLACK]);
+        let between = std::mem::take(&mut *between.lock().expect("between"));
+        assert_eq!(between.len(), 1, "one reservation ran in between");
+        assert!(between[0].is_ok(), "the in-between reservation is admitted");
+        assert_eq!(budget.reserved(), LIMIT - 300 + BETWEEN + 200);
+        assert_eq!(budget.accounted_refusals(), 0);
+        drop((refused, between, holders));
     }
 
     /// A budget of `limit` with `limit - free` bytes already reserved.
