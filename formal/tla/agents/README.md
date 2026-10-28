@@ -65,10 +65,16 @@ pins a distinct-state band around the measured figure with depth waived by
 | `MCAgentIntegrated.live.cfg` | 13350 to 13900 | 13617 |
 | `positive/integrated-timer-race.cfg` | 1170000 to 1210000 | 1190621 |
 
-The three exhaustive rows set only `budget_s` (3000, ADR-3331 decision 13);
+The two exhaustive rows set only `budget_s` (3000, ADR-3331 decision 13);
 their distinct band is the full `0`-`999999999` range and their depth cells
 are `-`, so the harness enforces nothing on them until T20 measures them on
-the nightly runner. The harness requires the distinct cells to be integers, so
+the nightly runner. `MCAgentIntegrated.exhaustive.cfg` has no row and sits
+under `unenrolled/`, where the exhaustive lane does not find it, because no
+run has finished it (see "Exhaustive runs"); T20 enrols it once it is
+measured. The exhaustive lane is safety-only for `AgentEffects` and
+`AgentIntegrated`: their exhaustive configs carry no `PROPERTY` line, since
+`VIEW` and `SYMMETRY` are sound for invariants only, and their liveness runs
+in the `live` lane. The harness requires the distinct cells to be integers, so
 that range is the placeholder for an unmeasured row; `formal/tla/README.md`
 does not define an unmeasured form. "Exhaustive runs" below gives what the
 local runs reached.
@@ -441,8 +447,8 @@ liveness probe `effect-in-doubt-blocks-input` (`InputEventuallySettled`, exit
 Scope and assumptions are in the module header of `AgentIntegrated.tla`, and
 its relation to the other two modules is in "Refinement". Safety
 (invariants), in `MCAgentIntegrated.smoke.cfg`,
-`MCAgentIntegrated.exhaustive.cfg`, `MCAgentIntegrated.live.cfg` and
-`positive/integrated-timer-race.cfg`: the nine protocol properties
+`unenrolled/MCAgentIntegrated.exhaustive.cfg`, `MCAgentIntegrated.live.cfg`
+and `positive/integrated-timer-race.cfg`: the nine protocol properties
 `AcceptedImpliesRecoverable`, `PublishedReferencesComplete`,
 `RequestIdentityStable`, `OneLogicalCompletion`, `TurnCommitAtomic`,
 `NoStaleOwnerCommit`, `NoLostConcurrentEnqueue`, `MonotonicIdentity` and
@@ -475,7 +481,7 @@ and cancelling, and the result endpoint are not fair.
 |---|---|---|---|---|
 | `MCAgentIntegrated.smoke.cfg` | 2, 2 | all three | 0 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 | `positive/integrated-timer-race.cfg` | 1, 1 | `at_least_once`, `manual` | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
-| `MCAgentIntegrated.exhaustive.cfg` | 2, 2 | all three | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `unenrolled/MCAgentIntegrated.exhaustive.cfg` (not run by any lane until T20 enrols it) | 2, 2 | all three | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 | `MCAgentIntegrated.live.cfg` | 1, 1 | all three | 0 | the 14 invariants and both liveness properties, no VIEW or SYMMETRY |
 
 Every config has one client and `MaxAttempt = 2`. The bounds are split the
@@ -671,9 +677,12 @@ harness; the T17 runs used `-Xmx4g` on an aarch64 host with 4 cores:
   That run predates the alignment, which shrank every other integrated
   config by about a fifth to a third, and it was not repeated. Its
   invariants are checked to completion only at the smoke and timer race
-  bounds. The 3000 s budget in `bands.tsv` is therefore unproven: no run has
-  shown this config finishes inside it. Whether to keep the budget, raise it
-  or lower the bounds is T20's (#3354) decision, on the nightly runner.
+  bounds. No run has shown this config finishes inside a 3000 s budget, so
+  it is not enrolled: it sits under `unenrolled/`, which the exhaustive lane
+  does not read, and has no `bands.tsv` row. A lane that is expected to
+  time out would turn the nightly red every night. Whether to raise the
+  budget or lower the bounds, and then move the config back with a measured
+  row, is T20's (#3354) decision, on the nightly runner.
 
 ## Running
 

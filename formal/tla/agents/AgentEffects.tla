@@ -690,6 +690,10 @@ PolicyControlsRedispatch ==
     /\ (RootUp /\ Root.eff.pol = "provider_idempotency") =>
          /\ Root.eff.att =< 1
          /\ \A i \in 1..Len(calls) : calls[i].att = 1
+         \* True by construction: Dispatch marks a provider re-dispatch
+         \* phys = FALSE whenever PhysCalls is non-empty, and no switch
+         \* alters Dispatch, so the guarantee lives there and this conjunct
+         \* restates it with no negative control of its own.
          /\ Cardinality(PhysCalls) =< 1
     /\ (Wrote /\ LC.before.eff.st = "indoubt") => NewResults = {}
 
