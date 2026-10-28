@@ -6,10 +6,10 @@
 //! reaches the store. The scheduler lets the runtime settle until every live
 //! actor is either finished or parked on a held call, then performs one
 //! [`ScriptStep`]: release one actor's oldest held call, or crash an actor by
-//! aborting its task while it holds a gate. Store calls therefore reach the
-//! store one at a time, in the order the [`ScheduleScript`] names, and the
-//! script is derived from the run's seed so a failure replays from the seed
-//! alone.
+//! aborting its task while it holds a gate. With the default gates, which
+//! hold every call, store calls therefore reach the store one at a time, in
+//! the order the [`ScheduleScript`] names, and the script is derived from
+//! the run's seed so a failure replays from the seed alone.
 //!
 //! Determinism rests on the runtime: a `current_thread` runtime polls tasks
 //! in a fixed order and paused time advances only when every task is idle.
@@ -57,7 +57,6 @@ pub struct Actor {
     name: String,
     role: Role,
     gates: Vec<GateScript>,
-    plan: FaultPlan,
     body: Body,
 }
 
@@ -97,7 +96,6 @@ impl Actor {
             name: name.into(),
             role,
             gates: every_call(),
-            plan: FaultPlan::empty(),
             body: Box::new(move |store| body(store).boxed()),
         }
     }
@@ -106,12 +104,6 @@ impl Actor {
     /// through. The default holds every call.
     pub fn with_gates(mut self, gates: Vec<GateScript>) -> Actor {
         self.gates = gates;
-        self
-    }
-
-    /// Faults injected into this actor's calls after its gate releases them.
-    pub fn with_plan(mut self, plan: FaultPlan) -> Actor {
-        self.plan = plan;
         self
     }
 
@@ -403,7 +395,8 @@ impl Scheduler {
     ) -> Result<ScheduleOutcome, ScheduleError> {
         let mut running: Vec<Running> = Vec::with_capacity(actors.len());
         for actor in actors {
-            let fault: ActorStore = Arc::new(FaultStore::new(Arc::clone(&store), actor.plan));
+            let fault: ActorStore =
+                Arc::new(FaultStore::new(Arc::clone(&store), FaultPlan::empty()));
             let mut gate = None;
             for g in &actor.gates {
                 gate = Some(fault.hold(g.op, g.key_contains.clone(), g.occurrence));
@@ -727,6 +720,99 @@ mod tests {
             message.contains(&format!("{:?}", outcome.script)),
             "{message}"
         );
+
+        let caught = std::panic::catch_unwind(|| {
+            sim_assert!(outcome, outcome.trace.is_empty());
+        })
+        .expect_err("the assertion fails");
+        let message = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("a formatted panic message");
+        assert!(
+            message.contains("assertion failed: outcome.trace.is_empty()"),
+            "{message}"
+        );
+        assert!(message.contains("RAVEL_SIM_SEED=42"), "{message}");
+        assert!(message.contains("schedule: ScheduleScript {"), "{message}");
+    }
+
+    #[test]
+    fn a_release_of_a_finished_actor_moves_on_and_a_crash_of_one_is_skipped() {
+        use ScriptStep::{Crash, Release};
+        let script = ScheduleScript::new(vec![Release(0), Release(0), Crash(0), Release(0)]);
+        let (outcome, log) = run(4, script);
+        // After A finishes, Crash(0) does nothing, Release(0) moves on to B,
+        // and the exhausted script releases B's last call.
+        sim_assert_eq!(
+            outcome,
+            outcome.order(),
+            vec![
+                ("A".to_string(), Action::Released, Op::Get),
+                ("A".to_string(), Action::Released, Op::Put),
+                ("B".to_string(), Action::Released, Op::Get),
+                ("B".to_string(), Action::Released, Op::Put),
+            ]
+        );
+        sim_assert_eq!(outcome, log, vec!["A won", "B won"]);
+        sim_assert_eq!(
+            outcome,
+            outcome.ends,
+            vec![ActorEnd::Finished, ActorEnd::Finished]
+        );
+    }
+
+    #[test]
+    fn calls_no_gate_matches_pass_through() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let actors = cas_race(Arc::clone(&log))
+            .into_iter()
+            .map(|actor| {
+                actor.with_gates(vec![GateScript {
+                    op: Op::Put,
+                    key_contains: Some("/head".into()),
+                    occurrence: Occurrence::Always,
+                }])
+            })
+            .collect();
+        let script = ScheduleScript::new(vec![ScriptStep::Release(1), ScriptStep::Release(0)]);
+        let outcome = Scheduler::new(AgentSeeds::new(5), script)
+            .run(store_with_head(), actors)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Both GETs ran ungated before either PUT was released.
+        sim_assert_eq!(
+            outcome,
+            outcome.order(),
+            vec![
+                ("B".to_string(), Action::Released, Op::Put),
+                ("A".to_string(), Action::Released, Op::Put),
+            ]
+        );
+        sim_assert_eq!(
+            outcome,
+            log.lock().expect("log").clone(),
+            vec!["B won", "A lost"]
+        );
+    }
+
+    #[test]
+    fn a_run_past_max_steps_fails() {
+        let err = Scheduler::new(AgentSeeds::new(6), ScheduleScript::new(Vec::new()))
+            .with_max_steps(5)
+            .run(
+                store_with_head(),
+                vec![Actor::client("C", |store: ActorStore| async move {
+                    loop {
+                        store
+                            .get(HEAD, GetRange::Full)
+                            .await
+                            .map_err(|e| format!("get: {e}"))?;
+                    }
+                })],
+            )
+            .expect_err("never ends");
+        assert_eq!(err.reason, "no end after 5 steps", "{err}");
+        assert_eq!(err.trace.len(), 5, "{err}");
     }
 
     #[test]
@@ -747,6 +833,10 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("C failed: get:"), "{message}");
         assert!(message.contains("seed: 9"), "{message}");
+        assert!(
+            message.contains("replay: RAVEL_SIM_SEED=9 cargo test -p ravel-agents-sim"),
+            "{message}"
+        );
         assert!(message.contains(&format!("{script:?}")), "{message}");
     }
 

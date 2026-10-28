@@ -2,13 +2,13 @@
 //! [`ReferenceMachine`].
 //!
 //! A history is a sequence of [`Call`]s, each an [`Event`] and the reply the
-//! system under test was observed to give. The recorder appends calls in the
-//! order their effects were linearized by the store: a client call at the
-//! point its CAS or read returned, a turn event at its commit. The checker
-//! replays that sequence through a fresh machine and compares reply for
-//! reply, so a history passes exactly when it is sequentially consistent
-//! with the recorded order, and accept order is whatever order the
-//! accepting calls appear in.
+//! system under test was observed to give. A recorder must append calls in
+//! the order their effects were linearized by the store: a client call at
+//! the point its CAS or read returned, a turn event at its commit. The
+//! checker replays that sequence through the machine it is given and
+//! compares reply for reply, so a history passes exactly when it is
+//! sequentially consistent with the recorded order, and accept order is
+//! whatever order the accepting calls appear in.
 
 use std::fmt;
 

@@ -1055,6 +1055,77 @@ mod tests {
         assert_eq!(h.check(m), Ok(()));
     }
 
+    #[test]
+    fn choices_the_adr_leaves_open_behave_as_documented() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let h = history(vec![
+            (client(ClientOp::Create), created(1, true)),
+            (send("r1", b"hi"), accepted(op, false)),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (
+                client(ClientOp::Cancel { operation: op }),
+                Reply::Cancel {
+                    status: OperationStatus::Running,
+                    requested: true,
+                },
+            ),
+            // A failure committed after the cancel request also ends cancelled.
+            (
+                Event::TurnFailed {
+                    operation: op,
+                    error: "boom".into(),
+                },
+                committed(OperationStatus::Cancelled, 0),
+            ),
+            (
+                client(ClientOp::Operation {
+                    operation: m.operation(1, 9),
+                }),
+                Reply::UnknownOperation,
+            ),
+            (
+                client(ClientOp::SetTimer {
+                    timer_key: "nudge".into(),
+                    handler: "remind".into(),
+                    payload: Vec::new(),
+                }),
+                Reply::TimerSet {
+                    timer: m.timer(1, "nudge"),
+                    generation: FIRST_TIMER_GENERATION,
+                },
+            ),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed { incarnation: 1 },
+            ),
+            (client(ClientOp::Create), created(2, true)),
+            // A new incarnation keeps no timers and starts at state version 0.
+            (
+                client(ClientOp::CancelTimer {
+                    timer_key: "nudge".into(),
+                }),
+                Reply::TimerCancel(TimerCancelOutcome::Unknown),
+            ),
+            (
+                client(ClientOp::State),
+                Reply::State {
+                    incarnation: 2,
+                    state_version: 0,
+                },
+            ),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed { incarnation: 2 },
+            ),
+            (
+                client(ClientOp::Destroy),
+                Reply::Error(ErrorKind::AgentGone),
+            ),
+        ]);
+        assert_eq!(h.check(m), Ok(()));
+    }
+
     mod invariants {
         use super::*;
         use proptest::prelude::*;
