@@ -5344,6 +5344,61 @@ mod tests {
         }
     }
 
+    /// `agents` (issue #3355): the five read commands hash `--tenant` to find
+    /// `t/<tenant_hash>/agents/`; `dev`, `scaffold` and `reconcile` hash
+    /// nothing here. None of the eight writes through this process's
+    /// tenancy gate: `dev` writes only bucket-root `sys/qualification`, and
+    /// `reconcile`'s write is the server's.
+    #[test]
+    fn agents_commands_are_classified() {
+        let agent = "00112233445566778899aabbccddeeff";
+        let cases: &[(&[&str], bool)] = &[
+            (&["ravel", "agents", "list", "--tenant", "t"], true),
+            (&["ravel", "agents", "inspect", "--tenant", "t", agent], true),
+            (
+                &[
+                    "ravel", "agents", "inspect", "--tenant", "t", "--kind", "k", "--key", "x",
+                ],
+                true,
+            ),
+            (&["ravel", "agents", "operation", "--tenant", "t", "op_x"], true),
+            (&["ravel", "agents", "events", "--tenant", "t", agent], true),
+            (&["ravel", "agents", "effects", "--tenant", "t", agent], true),
+            (&["ravel", "agents", "dev"], false),
+            (&["ravel", "agents", "scaffold", "d"], false),
+            (
+                &[
+                    "ravel",
+                    "agents",
+                    "reconcile",
+                    "e",
+                    "--attempt",
+                    "1",
+                    "--retry",
+                    "--token",
+                    "x",
+                ],
+                false,
+            ),
+        ];
+        for (args, hashes) in cases {
+            let cli = Cli::try_parse_from(*args).expect("agents subcommand parses");
+            assert!(
+                matches!(cli.command, Command::Agents { .. }),
+                "{args:?} is an agents command"
+            );
+            assert_eq!(
+                super::command_hashes_tenant(&cli.command),
+                *hashes,
+                "command_hashes_tenant for {args:?}"
+            );
+            assert!(
+                !super::command_is_write(&cli.command),
+                "command_is_write for {args:?}"
+            );
+        }
+    }
+
     /// Issue #1184's classification: `load`, `typed-attr-column set`,
     /// `clustering-key set`/`clear`, `bloom-scope set`, `hold set`/`clear`,
     /// `erase submit`, `provision adopt`/`reshard`, `gc-config
