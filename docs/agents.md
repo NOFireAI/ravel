@@ -366,12 +366,25 @@ took the turn over after that owner's lease expired
 hand-over is kept only in the memory of the server process that answered
 the reconcile. If that process restarts before the step, or the step is
 served by another server process, the attempt reads as lost and a `manual`
-effect is back in doubt: reconcile it again. `effects/{effect}` reads each attempt, the
+effect is back in doubt: reconcile it again. A repeated `retry` is
+answered as applied only while that process still holds its hand-over
+unclaimed; a `retry` naming the attempt before one a worker's own step
+authorized, such as an `at_least_once` attempt raised after a takeover, is
+409 `ownership_lost` with no audit record and no hand-over
+(`a_reconcile_retry_of_an_attempt_a_takeover_raised_is_ownership_lost`).
+`effects/{effect}` reads each attempt, the
 result and the evidence (all in `agents_effects_e2e`, one test per policy
 and refusal), and lists at most the latest 64 attempts
 (`agents_timers_e2e::effect_inspect_lists_at_most_the_latest_64_attempts`).
 The serving process forgets an effect's evidence once a reconcile settles
 it out of doubt (`runtime::tests::forgetting_an_effect_frees_its_slot_in_a_full_index`).
+It names the evidence of at most 4096 effects per tenant. An effect that a
+reported result, an operation status read or an inspection showed settled
+(its result recorded, or its input finished or cancelled) stays listed
+until the index is full, then gives its slot to a new effect; an effect
+still in doubt keeps its slot
+(`runtime::tests::a_full_index_gives_only_a_settled_effects_slot_away`,
+`settled_effects_give_their_evidence_slot_to_an_effect_in_doubt`).
 
 Timers. `timers` (`TimerRequest`) arms the agent's timer `timer_key` at
 `due_unix_ns` and answers its id and generation (`TimerResponse`);
@@ -402,7 +415,13 @@ entries repaired. Those counts are the requests the store served for the
 pass and the deltas of the `ravel_agents_sweep_*` families on `/metrics`
 (`sweep_route_counts_match_the_store_and_needs_agents_admin`). The
 interval task covers the tenants this process has served since it
-started; a tenant no route has touched is swept by no one.
+started; a tenant no route has touched is swept by no one. It runs a pass
+each interval with no poll and no `sweep` call
+(`the_interval_sweep_runs_a_pass_per_interval_with_no_poll`). An idle
+worker poll also runs a pass, at most once per `sweep_interval_ms`, and at
+most once per 5000 ms of the agents clock when that is 0, so idle polls
+never sweep on every wake
+(`interval_zero_runs_no_periodic_pass_and_polls_sweep_at_the_floor`).
 
 Events cursor. `events` (`EventsRequest`) pages committed events strictly
 after `cursor`, the decimal committed event sequence, and `next_cursor`
@@ -463,6 +482,14 @@ decision 8). A wake hint is bucketed by minute and may be early or late; the
 runtime's sweep makes a due timer fire without its hint, judged by one HEAD
 read against the coordinator's injected clock, within the pass bound its
 module documents (`a_schedule_whose_hint_was_never_written_still_fires_when_due`).
+Work given to an agent through another server process reaches this
+process's workers the same way: a poll issues no listing of its own
+(`a_poll_issues_no_unbounded_list`), so the sweep's directory half finds
+the agent within `ceil(agents / directory GETs per pass)` passes (at
+least 32 directory GETs per pass by default, half of the pass's 64 HEAD
+reads plus whatever the wake half left;
+`a_bounded_pass_walks_the_directory_in_list_order_across_passes`), one pass
+per sweep interval.
 The owner lease hint in HEAD is advisory and revokes nothing; only an epoch
 advance does (ADR-3331 decision 6).
 

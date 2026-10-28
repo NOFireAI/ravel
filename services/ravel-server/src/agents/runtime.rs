@@ -17,8 +17,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use ravel_agents_core::head::ObjectRef;
-use ravel_agents_core::identity::{AgentId, Id128};
+use ravel_agents_core::head::{EffectStatus, Head, ObjectRef};
+use ravel_agents_core::identity::{AgentId, Id128, effect_id};
 use ravel_agents_core::kernel::{DerivedIds, Limits};
 use ravel_agents_runtime::{
     AgentsMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher, RuntimeConfig, SweepConfig,
@@ -48,33 +48,70 @@ pub struct TenantAgents {
     pub evidence: EvidenceIndex,
 }
 
-/// Most effects whose late results one tenant's [`EvidenceIndex`] names.
-pub const MAX_EVIDENCE_EFFECTS: usize = 4_096;
+/// Most effects whose late results one tenant's [`EvidenceIndex`] names,
+/// unless `agents.max_evidence_effects` says otherwise.
+pub const MAX_EVIDENCE_EFFECTS: usize = crate::config::DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS;
 /// Most late results the index names for one effect.
 pub const MAX_EVIDENCE_PER_EFFECT: usize = 16;
+
+/// The least time between two poll-driven sweep passes when
+/// `agents.sweep_interval_ms` is 0, so idle polls cannot sweep on every
+/// wake.
+pub const POLL_SWEEP_FLOOR_MS: u64 = ravel_agents_runtime::DEFAULT_SWEEP_INTERVAL_MS;
 
 /// Where the late results of each effect were stored, for
 /// `GET /api/v1/agents/effects/{effect}`. HEAD never references a late
 /// result (ADR-3331 decision 7), so nothing durable lists one: the objects
 /// themselves are in object storage, and this index is process-local and
 /// bounded. A result reported through another process, or before a restart,
-/// is not listed; once the index is full, results for effects it does not
-/// already name are not listed either.
-#[derive(Debug, Default)]
+/// is not listed. An effect a HEAD read through [`EvidenceIndex::note`]
+/// showed settled stays listed until the index is full, and then gives up
+/// its slot to an effect the index does not name yet; once the index is
+/// full of effects not known settled, results for new effects are not
+/// listed.
+#[derive(Debug)]
 pub struct EvidenceIndex {
-    entries: Mutex<HashMap<(AgentId, Id128), Vec<LateResult>>>,
+    max_effects: usize,
+    entries: Mutex<HashMap<(AgentId, Id128), Evidence>>,
+}
+
+#[derive(Debug, Default)]
+struct Evidence {
+    results: Vec<LateResult>,
+    /// No operator has to decide the effect any more: it left HEAD, has a
+    /// result, or its input settled.
+    settled: bool,
 }
 
 /// One late result: the attempt that reported it and where it is stored.
 type LateResult = (u32, ObjectRef);
 
+impl Default for EvidenceIndex {
+    fn default() -> Self {
+        EvidenceIndex::new(MAX_EVIDENCE_EFFECTS)
+    }
+}
+
 impl EvidenceIndex {
+    pub fn new(max_effects: usize) -> Self {
+        EvidenceIndex {
+            max_effects,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn record(&self, agent: AgentId, effect_id: Id128, attempt: u32, result: ObjectRef) {
         let mut entries = self.entries.lock();
-        if !entries.contains_key(&(agent, effect_id)) && entries.len() >= MAX_EVIDENCE_EFFECTS {
-            return;
+        if !entries.contains_key(&(agent, effect_id)) && entries.len() >= self.max_effects {
+            let settled = entries.iter().find(|(_, e)| e.settled).map(|(key, _)| *key);
+            match settled {
+                Some(key) => {
+                    entries.remove(&key);
+                }
+                None => return,
+            }
         }
-        let kept = entries.entry((agent, effect_id)).or_default();
+        let kept = &mut entries.entry((agent, effect_id)).or_default().results;
         if kept.len() < MAX_EVIDENCE_PER_EFFECT && !kept.contains(&(attempt, result)) {
             kept.push((attempt, result));
         }
@@ -84,8 +121,19 @@ impl EvidenceIndex {
         self.entries
             .lock()
             .get(&(agent, effect_id))
-            .cloned()
+            .map(|e| e.results.clone())
             .unwrap_or_default()
+    }
+
+    /// Mark every effect of `agent` the index names that `head` shows
+    /// settled, so a full index can give its slot away.
+    pub fn note(&self, agent: AgentId, head: &Head) {
+        let mut entries = self.entries.lock();
+        for ((a, id), evidence) in entries.iter_mut() {
+            if *a == agent && !evidence.settled {
+                evidence.settled = settled_in(head, *id);
+            }
+        }
     }
 
     /// Drop what the index names for an effect that is no longer in doubt,
@@ -102,6 +150,26 @@ impl EvidenceIndex {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Whether `head` shows `effect` past any operator decision: gone from
+/// HEAD, completed, or journaled for an input that is neither waiting nor
+/// the active turn's.
+fn settled_in(head: &Head, effect: Id128) -> bool {
+    let Some(record) = head.effects.iter().find(|e| e.effect_id == effect) else {
+        return true;
+    };
+    if record.status == EffectStatus::Completed {
+        return true;
+    }
+    let pending = head
+        .inbox
+        .iter()
+        .map(|entry| entry.accept_seq)
+        .chain(head.active_turn.as_ref().map(|turn| turn.input_accept_seq));
+    !pending
+        .into_iter()
+        .any(|seq| effect_id(head.incarnation, seq, &record.step_key) == effect)
 }
 
 /// [`AgentsClock`] as the store's and coordinator's [`Clock`].
@@ -242,19 +310,28 @@ impl AgentsRuntime {
                     Arc::new(SystemRng::new()),
                 )
                 .with_sweep(SweepConfig {
-                    interval_ms: self.settings.sweep_interval_ms,
+                    interval_ms: self.poll_sweep_interval_ms(),
                     ..SweepConfig::default()
                 });
                 let agents = Arc::new(TenantAgents {
                     store,
                     coordinator,
                     changed: Notify::new(),
-                    evidence: EvidenceIndex::default(),
+                    evidence: EvidenceIndex::new(self.settings.max_evidence_effects),
                 });
                 self.spawn_sweep(tenant, &agents);
                 agents
             })
             .clone()
+    }
+
+    /// The least time between two poll-driven passes: the periodic interval,
+    /// or [`POLL_SWEEP_FLOOR_MS`] when that is 0.
+    pub fn poll_sweep_interval_ms(&self) -> u64 {
+        match self.settings.sweep_interval_ms {
+            0 => POLL_SWEEP_FLOOR_MS,
+            interval_ms => interval_ms,
+        }
     }
 
     /// Start the tenant's interval sweep, when the interval is not zero and
@@ -386,10 +463,68 @@ fn add_phase(a: PhaseCounts, b: PhaseCounts) -> PhaseCounts {
     }
 }
 
+/// An active agent's HEAD with nothing in it, for unit tests over what HEAD
+/// shows.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn empty_head() -> Head {
+    use ravel_agents_core::head::{Lifecycle, Quota};
+    use ravel_agents_core::keys::{AgentKey, AgentKind};
+    Head {
+        tenant: TenantHash([7; 16]),
+        kind: AgentKind::new("order").expect("kind"),
+        key: AgentKey::new("o-1").expect("key"),
+        incarnation: 1,
+        root_revision: 1,
+        owner_id: String::new(),
+        epoch: 0,
+        owner_lease_hint_unix_ns: 0,
+        state_version: 0,
+        state: None,
+        next_accept_seq: 1,
+        active_turn: None,
+        timer_generation: 0,
+        next_event_seq: 1,
+        lifecycle: Lifecycle::Active,
+        quota: Quota::default(),
+        inbox: Vec::new(),
+        receipts: Vec::new(),
+        results: Vec::new(),
+        events: Vec::new(),
+        timers: Vec::new(),
+        steps: Vec::new(),
+        effects: Vec::new(),
+        outbox: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A full index takes a new effect only by dropping one a HEAD read
+    /// showed settled; an effect not known settled keeps its slot.
+    #[test]
+    fn a_full_index_gives_only_a_settled_effects_slot_away() {
+        let index = EvidenceIndex::new(2);
+        let result = ObjectRef::of(b"late");
+        index.record(agent(0), id(1), 1, result);
+        index.record(agent(1), id(2), 1, result);
+        index.record(agent(2), id(3), 1, result);
+        assert!(index.of(agent(2), id(3)).is_empty(), "no settled slot");
+
+        // Neither effect is in this HEAD any more; only agent 0's is noted.
+        index.note(agent(0), &empty_head());
+        index.record(agent(2), id(3), 1, result);
+        assert_eq!(index.of(agent(2), id(3)), vec![(1, result)]);
+        assert!(index.of(agent(0), id(1)).is_empty(), "the settled one went");
+        assert_eq!(index.of(agent(1), id(2)), vec![(1, result)]);
+        assert_eq!(index.len(), 2);
+
+        index.record(agent(3), id(4), 1, result);
+        assert!(index.of(agent(3), id(4)).is_empty(), "no settled slot left");
+    }
 
     fn agent(n: u8) -> AgentId {
         AgentId([n; 16])

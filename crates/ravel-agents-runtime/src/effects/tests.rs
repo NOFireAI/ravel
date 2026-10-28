@@ -598,6 +598,8 @@ async fn reconcile_is_idempotent_and_audited_once() {
     );
     assert!(!co.reconcile_authorize(&d.effect, 2).await.expect("again"));
     assert_eq!(hook.calls(), 1, "reconcile dispatches nothing");
+    assert!(co.holds_hand_over(&d.effect, 2));
+    assert!(!co.holds_hand_over(&d.effect, 1));
     let h = head(&store, "o-1").await;
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
     assert_eq!(effect_of(&h, &d).attempt, 2);
@@ -609,6 +611,7 @@ async fn reconcile_is_idempotent_and_audited_once() {
     let d2 = dispatched(&co, &b, &s, &hook).await;
     assert_eq!(d2.attempt, 2);
     assert_eq!(hook.calls(), 2, "the owner's step dispatched it once");
+    assert!(!co.holds_hand_over(&d.effect, 2), "the step claimed it");
 
     // The reconciled attempt is lost too; the effect latches again.
     let c = takeover(&co, &clock).await;
@@ -628,6 +631,22 @@ async fn reconcile_is_idempotent_and_audited_once() {
     assert_eq!(effect_of(&h, &d).result_attempt, 2);
     assert_eq!(hook.calls(), 2);
     assert_eq!(step_output(&co, &c, &s, &hook).await, json!("verified"));
+}
+
+/// An attempt a new owner's own step authorized is no hand-over: nothing a
+/// reconcile could be repeating.
+#[tokio::test(start_paused = true)]
+async fn an_attempt_a_new_owners_step_raised_is_not_a_hand_over() {
+    let (clock, _store, co) = rig();
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("send-email", RecoveryPolicy::AtLeastOnce);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    let raised = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!(raised.attempt, 2);
+    assert!(!co.holds_hand_over(&d.effect, 2));
+    assert!(!co.holds_hand_over(&d.effect, 1));
 }
 
 #[tokio::test(start_paused = true)]
