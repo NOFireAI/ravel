@@ -527,14 +527,6 @@ impl Directory {
         }
     }
 
-    /// The page holding the earliest-due scheduled timer, if a sealed page
-    /// holds a scheduled timer at all.
-    pub fn earliest_due_page(&self) -> Option<usize> {
-        (0..self.pages.len())
-            .filter(|&i| self.pages[i].marked > 0)
-            .min_by_key(|&i| (self.pages[i].min_due_unix_ns, i))
-    }
-
     /// The pages whose key ranges meet `[lo, hi]`.
     pub fn pages_in_range(&self, lo: u64, hi: u64) -> Vec<usize> {
         if self.pages.is_empty() || lo > hi || lo >= self.tail_from {

@@ -142,11 +142,6 @@ pub struct Limits {
     pub max_index_pages: usize,
 }
 
-/// Bytes the growth guard leaves free per sealed timer page holding a
-/// scheduled timer: an exempt `CancelTimer` rewrites the page, which can
-/// widen its `min_due_unix_ns` (10 bytes and a tag) and its size varint.
-pub const TIMER_PAGE_REWRITE_RESERVE_BYTES: usize = 16;
-
 /// Reason of the `StoreUnavailable` refusal for a command run on a HEAD
 /// without an index page it reads; the store loads the page and re-applies.
 pub const PAGE_NOT_LOADED: &str = "an index page the command reads is not loaded";
@@ -323,28 +318,20 @@ impl Limits {
 
     /// Bytes the growth guard leaves free for index growth on the exempt
     /// paths: one widest page reference ([`max_page_ref_bytes`]) per page
-    /// [`Limits::reserved_index_pages`] counts, and
-    /// [`TIMER_PAGE_REWRITE_RESERVE_BYTES`] per sealed timer page an exempt
-    /// `CancelTimer` may rewrite
-    /// (`tests::the_index_reserve_covers_the_exempt_page_growth`).
+    /// [`Limits::reserved_index_pages`] counts
+    /// (`tests::the_index_reserve_covers_the_exempt_page_growth`). An exempt
+    /// `CancelTimer` rewrites no sealed page, since a sealed timer page never
+    /// holds a scheduled timer ([`crate::pages::seal_index`]).
     pub fn index_reserve_bytes(&self, head: &Head) -> usize {
         let k = self.max_page_entries.max(1);
-        let pages = [ListKind::Results, ListKind::Events]
+        [ListKind::Results, ListKind::Events]
             .into_iter()
             .fold(0usize, |acc, list| {
                 acc.saturating_add(
                     self.reserved_index_pages(head, list)
                         .saturating_mul(max_page_ref_bytes(list, k)),
                 )
-            });
-        let timer_pages = head
-            .index
-            .timers
-            .pages
-            .iter()
-            .filter(|p| p.marked > 0)
-            .count();
-        pages.saturating_add(TIMER_PAGE_REWRITE_RESERVE_BYTES.saturating_mul(timer_pages))
+            })
     }
 
     fn page_bounds(&self) -> PageBounds {
