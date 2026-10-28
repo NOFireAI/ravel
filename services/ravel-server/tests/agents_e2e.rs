@@ -752,5 +752,95 @@ async fn unknown_operation_handle_is_agent_gone_with_the_handle() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["code"], json!("agent_gone"));
     assert_eq!(body["ids"]["operation"], json!(unknown));
+    assert_eq!(body["ids"]["agent_id"], json!(handle.agent.to_hex()));
+
+    // A token that is not a handle is not echoed back.
+    let (status, body) = api.get(CLIENT, "operation?operation=not-a-handle").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], json!("agent_gone"));
+    assert!(!body.to_string().contains("not-a-handle"), "{body}");
+    assert_eq!(body["ids"]["operation"], Value::Null);
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// `call` waits up to its `wait_ms` and answers the operation's status when
+/// nothing finished; `worker/heartbeat` renews the lease past the turn's
+/// start; a repeated `call` under the same request id answers the finished
+/// result at once; `cancel` stops an input no worker has started.
+#[tokio::test]
+async fn call_heartbeat_and_cancel_through_real_server() {
+    let running = start_memory().await;
+    let api = Api::public(&running);
+    api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
+    let call = json!({
+        "agent": agent(),
+        "handler": "place",
+        "request_id": "req-1",
+        "payload": {"sku": "A-1"},
+        "wait_ms": 300,
+    });
+
+    let started = Instant::now();
+    let pending = api.ok(CLIENT, "call", &call).await;
+    let waited = started.elapsed();
+    assert_eq!(pending["status"], json!("accepted"), "{pending}");
+    assert_eq!(pending["result"], Value::Null);
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+        "{waited:?}"
+    );
+    let operation = pending["operation"].clone();
+
+    let worker = register(&api).await;
+    let assignment = poll(&api, &worker, 2_000).await;
+    assert_eq!(assignment["operation"], operation);
+    let renewed = api
+        .ok(
+            WORKER,
+            "worker/heartbeat",
+            &json!({"lease": assignment["lease"]}),
+        )
+        .await;
+    let expires: i64 = renewed["lease_expires_unix_ns"]
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .expect("expiry");
+    let recorded: i64 = assignment["lease"]["recorded_unix_ns"]
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .expect("recorded");
+    assert!(expires > recorded, "{expires} <= {recorded}");
+    api.ok(
+        WORKER,
+        "worker/commit",
+        &commit_body(&assignment, json!({}), json!({"ok": true}), json!([])),
+    )
+    .await;
+
+    let mut again = call.clone();
+    again["wait_ms"] = json!(15_000);
+    let started = Instant::now();
+    let done = api.ok(CLIENT, "call", &again).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(done["operation"], operation);
+    assert_eq!(done["status"], json!("completed"));
+    assert_eq!(done["result"]["output"], json!({"ok": true}));
+
+    let sent = api.ok(CLIENT, "send", &send_body("req-2", json!({}))).await;
+    let cancelled = api
+        .ok(CLIENT, "cancel", &json!({"operation": sent["operation"]}))
+        .await;
+    assert_eq!(cancelled["operation"], sent["operation"]);
+    let (status, op) = api
+        .get(
+            CLIENT,
+            &format!(
+                "operation?operation={}",
+                sent["operation"].as_str().expect("operation")
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{op}");
+    assert_eq!(op["status"], json!("cancelled"), "{cancelled} {op}");
     running.shutdown().await.expect("clean shutdown");
 }

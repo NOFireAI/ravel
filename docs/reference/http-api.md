@@ -38,7 +38,9 @@ serves the same ingest and query routes with the mTLS resolver. It serves
 none of the four probe routes (`/healthz`, `/readyz`, `/-/healthy`,
 `/-/ready`) nor `/metrics`. The one exception is
 `GET /api/v1/agents/health`, which `--agents` mounts on both listeners; it
-is unauthenticated there too and reports operator settings only.
+is unauthenticated there too and reports operator settings only. The other
+`/api/v1/agents` routes are mounted on both listeners as well, each with
+that listener's resolver (see [Agents routes](#agents-routes)).
 
 ## Ingest routes
 
@@ -106,6 +108,19 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | GET | `/api/traces/{trace_id}` | path `trace_id`, plus optional `start`, `end`, `timeout`, `min_commit_token` (`<token>` or `spans:<token>`) | The `/api/v1/sql` response for every span of the trace: Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
 | POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
 | GET | `/api/v1/agents/health` | none | JSON: `feature`, `mode`, `activation_concurrency`, `poll_concurrency`, `memory_budget_bytes` and the five `quotas` as `--agents-*` set them | 200 | No | `all`, `query`, and only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/create` | JSON: `agent` (`kind`, `key`) | JSON: `agent_id`, `incarnation`, `created` | 200, 401, 403, 404, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/send` | JSON: `agent`, `handler`, `request_id`, `payload` | JSON: `operation`, `accept_seq`, `duplicate` | 200, 401, 403, 404, 409, 413, 422, 429, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/call` | JSON: the `send` body plus `wait_ms` | JSON: `operation`, `status`, `result` (null until terminal) | 200, 401, 403, 404, 409, 413, 422, 429, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/operation` | `operation` | JSON: `operation`, `status`, `accept_seq`, `blocked_effect` | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/result` | `operation`, optional `wait_ms` | JSON: `operation`, `result` (null until terminal) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/resolve` | JSON: `agent`, `handler`, `request_id` | JSON: `operation` and `status`, both null when no receipt matches | 200, 401, 403, 404, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/cancel` | JSON: `operation` | JSON: `operation`, `status`, `requested` | 200, 401, 403, 404, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/state` | `kind`, `key` | JSON: `agent_id`, `incarnation`, `state_version`, `content_type`, `state` | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/events` | JSON: `agent`, `cursor` (null for the start), `limit` | JSON: `events`, `next_cursor` | 200, 401, 403, 404, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/register` | JSON: `handlers` (each `handler`, `version`, `digest`) | JSON: `worker_id` | 200, 401, 403, 409, 413, 422, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/poll` | JSON: `worker_id`, `handlers`, `wait_ms` | JSON: `assignment` (`lease`, `agent`, `operation`, `accept_seq`, `handler`, `state`, `payload`, `steps`), null when nothing is due | 200, 401, 403, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/commit` | JSON: `lease` as polled, `outcome` (`completed` with `state`, `output`, `events`, `timers`, `intents`; or `failed` with `error`, `terminal`) | JSON: `operation`, `status`, `state_version`, `rebased`, `effects` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/heartbeat` | JSON: `lease` as polled | JSON: `lease_expires_unix_ns` | 200, 401, 403, 404, 409, 413, 422, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
 
@@ -357,6 +372,73 @@ before the JSON-RPC message is parsed.
 | An `Origin` outside `--mcp-allowed-origins` | 403 |
 | A body past `--mcp-max-body-bytes` | 413 |
 | On revision `2026-07-28`, a `Mcp-Method` or `Mcp-Name` header that disagrees with the body | 400 |
+
+### Agents routes
+
+The `/api/v1/agents` routes (ADR-3331, milestones 1 and 2) are behind the
+`agents` cargo feature and `--agents`. Both listeners mount them, each with
+its own tenant resolver, and the tenant always comes from the credential,
+never from the request (`agents_e2e::capabilities_are_enforced_on_both_listeners`).
+Client routes need the principal's `agents` capability and worker routes its
+`agents_worker` capability. A credential without it gets 403 with a body
+naming the capability, before any coordinator or store call. Timer, effect
+and reconcile routes are not mounted in this release.
+
+The router carries its own body limit and its own admission counter, one
+lane for the long polls (`result`, `worker/poll`) sized by
+`--agents-poll-concurrency` and one for every other route sized by
+`--agents-activation-concurrency`. It never takes a query permit, so a full
+agents lane leaves query routes serving
+(`agents_e2e::admission_refusal_is_503_and_takes_no_query_permit`).
+
+Every refusal after authentication is an `ErrorBody`: `code`, `retry`,
+`reason`, and `ids` holding only safe identifiers (agent id, incarnation,
+operation, turn, step, effect, timer). Payloads and state never appear in
+an error.
+
+| `code` | Status | `retry` |
+| --- | --- | --- |
+| `agent_gone`, including an unknown operation handle, whose `ids.operation` echoes the handle (`agents_e2e::unknown_operation_handle_is_agent_gone_with_the_handle`) | 404 | `never` |
+| `idempotency_conflict`, `ownership_lost`, `incompatible_handler`, `non_deterministic_replay` | 409 | `never` |
+| `effect_in_doubt` | 409 | `reconcile` |
+| `outcome_unknown`; resolve by `request_id` before resending (`agents_e2e::resolve_after_a_lost_send_ack_returns_the_same_operation`) | 500 | `resolve_operation` |
+| `mailbox_full` | 429 | `backoff` |
+| `budget_exceeded`, including a body past the router's limit (`agents_e2e::send_over_the_body_limit_is_413_with_a_typed_body`) | 413 | `never` |
+| `store_unavailable`, including the admission refusal `agents admission limit reached` | 503 | `backoff` |
+| `unsupported_format`, including a body or query string that does not parse | 422 | `never` |
+
+No credential is 401 and a missing capability is 403, both in the query
+routes' plain error shape.
+
+**Long polls.** `result` and `worker/poll` hold the request until there is
+something to return or `wait_ms` elapses, and `call` waits the same way
+after accepting. `wait_ms` is capped at 20 s on every one of them; a larger
+value waits 20 s. A long poll that ends empty answers 200 with a null
+`result` or `assignment`. A waiter answers as soon as the commit lands, not
+at the next poll interval
+(`agents_e2e::send_then_result_through_real_server_survives_worker_replacement`).
+
+**Event cursor.** `events` returns committed events strictly after
+`cursor`, in event sequence order, at most `limit` per page (clamped to
+1..=1000). The cursor is the decimal committed event sequence; null starts
+at the beginning. `next_cursor` is the last sequence returned, or the input
+cursor when the page is empty, so resuming from it never repeats or skips
+an event (`agents_e2e::events_page_after_the_durable_cursor_without_duplicates`).
+A cursor that is not a decimal sequence is 422.
+
+**Workers.** `worker/register` mints a fresh worker id per call, so a
+worker process registers once at start and a restarted process gets a new
+id; no two processes can share one. A worker polls with its id and handler
+pins, and `worker/commit` and `worker/heartbeat` echo the polled `lease`.
+The commit is fenced by that lease alone: once another worker has taken the
+agent over, the old lease's commit is 409 `ownership_lost` and changes
+nothing (`agents_e2e::send_then_result_through_real_server_survives_worker_replacement`).
+The polled lease also carries `recorded_unix_ns` and `random_seed`, fixed
+when the turn begins, so a replacement worker re-runs the turn with the
+same clock and randomness. `call`, `cancel` and `worker/heartbeat` are
+covered by `agents_e2e::call_heartbeat_and_cancel_through_real_server`.
+One coordinator per tenant per server process is assumed; several servers
+coordinating the same tenant is out of scope for this release.
 
 ### Query status codes
 
