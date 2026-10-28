@@ -331,7 +331,10 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
     assert_ne!(worker_a, worker_b, "register mints a fresh id per process");
     let assigned_b = poll(&api, &worker_b, 2_000).await;
     assert_eq!(assigned_b["lease"]["owner_id"], json!(worker_b));
-    assert_eq!(assigned_b["lease"]["turn_id"], assigned_a["lease"]["turn_id"]);
+    assert_eq!(
+        assigned_b["lease"]["turn_id"],
+        assigned_a["lease"]["turn_id"]
+    );
     assert_eq!(assigned_b["payload"], json!({"sku": "A-1"}));
     assert_eq!(assigned_b["payload"], assigned_a["payload"]);
     assert_eq!(assigned_b["operation"], json!(operation));
@@ -345,7 +348,12 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
         .post(
             WORKER,
             "worker/commit",
-            &commit_body(&assigned_a, json!({"by": "a"}), json!({"by": "a"}), json!([])),
+            &commit_body(
+                &assigned_a,
+                json!({"by": "a"}),
+                json!({"by": "a"}),
+                json!([]),
+            ),
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
@@ -416,9 +424,16 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
     );
     let publish = "phase=\"publish\"";
     assert_eq!(value(&scrape, "ravel_agents_store_cas_total", publish), 5);
-    assert_eq!(value(&scrape, "ravel_agents_store_conflicts_total", publish), 0);
+    assert_eq!(
+        value(&scrape, "ravel_agents_store_conflicts_total", publish),
+        0
+    );
     for name in SETTINGS_GAUGES {
-        assert_eq!(scrape.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+        assert_eq!(
+            scrape.matches(&format!("# HELP {name} ")).count(),
+            1,
+            "{name}"
+        );
         assert_eq!(
             scrape.matches(&format!("# TYPE {name} gauge\n")).count(),
             1,
@@ -430,7 +445,11 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
         "ravel_agents_turns_committed_total",
         "ravel_agents_takeovers_total",
     ] {
-        assert_eq!(scrape.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+        assert_eq!(
+            scrape.matches(&format!("# HELP {name} ")).count(),
+            1,
+            "{name}"
+        );
         assert_eq!(
             scrape.matches(&format!("# TYPE {name} counter\n")).count(),
             1,
@@ -525,9 +544,14 @@ async fn events_page_after_the_durable_cursor_without_duplicates() {
                 {"event_type": "priced", "payload": {"n": 2}},
             ]),
         ),
-        ("req-2", json!([{"event_type": "paid", "payload": {"n": 3}}])),
+        (
+            "req-2",
+            json!([{"event_type": "paid", "payload": {"n": 3}}]),
+        ),
     ] {
-        let sent = api.ok(CLIENT, "send", &send_body(request_id, json!({}))).await;
+        let sent = api
+            .ok(CLIENT, "send", &send_body(request_id, json!({})))
+            .await;
         let assignment = poll(&api, &worker, 2_000).await;
         assert_eq!(assignment["operation"], sent["operation"]);
         api.ok(
@@ -600,7 +624,11 @@ async fn send_over_the_body_limit_is_413_with_a_typed_body() {
     assert_eq!(body["retry"], json!("never"));
     let scrape = api.scrape().await;
     assert_eq!(
-        value(&scrape, "ravel_agents_store_gets_total", "phase=\"resolve\""),
+        value(
+            &scrape,
+            "ravel_agents_store_gets_total",
+            "phase=\"resolve\""
+        ),
         0
     );
     running.shutdown().await.expect("clean shutdown");
@@ -715,7 +743,10 @@ async fn resolve_after_a_lost_send_ack_returns_the_same_operation() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{lost}");
     assert_eq!(lost["code"], json!("outcome_unknown"));
     assert_eq!(lost["retry"], json!("resolve_operation"));
-    let operation = lost["ids"]["operation"].as_str().expect("handle").to_string();
+    let operation = lost["ids"]["operation"]
+        .as_str()
+        .expect("handle")
+        .to_string();
     assert_eq!(faults.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
     assert_eq!(faults.fault_count(Op::Get, FaultKind::NotFoundBlip), 3);
     assert_eq!(faults.sequence_progress(0), 2);
@@ -744,8 +775,8 @@ async fn unknown_operation_handle_is_agent_gone_with_the_handle() {
     let real = sent["operation"].as_str().expect("operation");
     // The same agent and incarnation at an accept_seq never issued.
     let handle = ravel_agents_core::state::Handle::decode(real).expect("handle decodes");
-    let unknown = ravel_agents_core::state::Handle::operation(handle.agent, handle.incarnation, 99)
-        .encode();
+    let unknown =
+        ravel_agents_core::state::Handle::operation(handle.agent, handle.incarnation, 99).encode();
     let (status, body) = api
         .get(CLIENT, &format!("operation?operation={unknown}"))
         .await;

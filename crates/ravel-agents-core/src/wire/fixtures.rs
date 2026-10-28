@@ -336,26 +336,28 @@ fn samples() -> Vec<Sample> {
         sample(
             "worker_poll_response",
             WorkerPollResponse {
-                assignment: Some(TurnAssignment {
-                    lease: lease(),
-                    agent: agent(),
-                    operation: operation(),
-                    accept_seq: 1,
-                    handler: "place".to_string(),
-                    state: json!({"items": []}),
-                    payload: json!({"sku": "A-1", "qty": 2}),
-                    steps: vec![StepBody {
-                        step_id: identity::step_id(1, 1, "price").to_hex(),
-                        step_key: "price".to_string(),
-                        tool_name: "catalog.price".to_string(),
-                        tool_version: "1".to_string(),
-                        input_hash: identity::step_input_hash("catalog.price", "1", b"A-1")
-                            .to_hex(),
-                        status: StepState::Completed,
-                        output: Some(json!({"cents": 649})),
-                    }],
-                }
-                .polled(1_767_225_600_000_000_000)),
+                assignment: Some(
+                    TurnAssignment {
+                        lease: lease(),
+                        agent: agent(),
+                        operation: operation(),
+                        accept_seq: 1,
+                        handler: "place".to_string(),
+                        state: json!({"items": []}),
+                        payload: json!({"sku": "A-1", "qty": 2}),
+                        steps: vec![StepBody {
+                            step_id: identity::step_id(1, 1, "price").to_hex(),
+                            step_key: "price".to_string(),
+                            tool_name: "catalog.price".to_string(),
+                            tool_version: "1".to_string(),
+                            input_hash: identity::step_input_hash("catalog.price", "1", b"A-1")
+                                .to_hex(),
+                            status: StepState::Completed,
+                            output: Some(json!({"cents": 649})),
+                        }],
+                    }
+                    .polled(1_767_225_600_000_000_000),
+                ),
             },
         ),
         sample(
@@ -557,7 +559,8 @@ fn unix_ns_fields_are_decimal_strings() {
     })
     .expect("serialize");
     assert_eq!(change["due_unix_ns"], exact);
-    let polled = serde_json::to_value(lease_assignment().polled(PRECISE_UNIX_NS)).expect("serialize");
+    let polled =
+        serde_json::to_value(lease_assignment().polled(PRECISE_UNIX_NS)).expect("serialize");
     assert_eq!(polled["lease"]["recorded_unix_ns"], exact);
     let decoded: TimerChangeBody = serde_json::from_value(change).expect("decode");
     assert!(matches!(

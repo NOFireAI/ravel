@@ -173,7 +173,10 @@ pub fn router(runtime: Arc<AgentsRuntime>, resolver: Arc<dyn TenantResolver>) ->
         .route("/api/v1/agents/cancel", post(routes::cancel))
         .route("/api/v1/agents/state", get(routes::state))
         .route("/api/v1/agents/events", post(routes::events))
-        .route("/api/v1/agents/worker/register", post(routes::worker_register))
+        .route(
+            "/api/v1/agents/worker/register",
+            post(routes::worker_register),
+        )
         .route("/api/v1/agents/worker/poll", post(routes::worker_poll))
         .route("/api/v1/agents/worker/commit", post(routes::worker_commit))
         .route(
@@ -222,14 +225,11 @@ mod tests {
             WORKER_TOKEN.to_string(),
             ravel_tenant_resolve::Principal {
                 agents_worker: true,
-                ..ravel_tenant_resolve::Principal::tenant_only(
-                    ravel_types::TenantId::new("acme"),
-                )
+                ..ravel_tenant_resolve::Principal::tenant_only(ravel_types::TenantId::new("acme"))
             },
         );
-        let resolver: Arc<dyn TenantResolver> = Arc::new(
-            ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(tokens),
-        );
+        let resolver: Arc<dyn TenantResolver> =
+            Arc::new(ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(tokens));
         let runtime = Arc::new(AgentsRuntime::new(
             settings,
             Arc::new(AgentsReadiness::new()),
@@ -266,7 +266,12 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body reads");
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body is JSON");
         assert_eq!(body["assignment"], serde_json::Value::Null);
         assert_eq!(

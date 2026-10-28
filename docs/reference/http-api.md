@@ -375,7 +375,7 @@ before the JSON-RPC message is parsed.
 
 ### Agents routes
 
-The `/api/v1/agents` routes (ADR-3331, milestones 1 and 2) are behind the
+The `/api/v1/agents` routes are behind the
 `agents` cargo feature and `--agents`. Both listeners mount them, each with
 its own tenant resolver, and the tenant always comes from the credential,
 never from the request (`agents_e2e::capabilities_are_enforced_on_both_listeners`).
@@ -385,7 +385,7 @@ naming the capability, before any coordinator or store call. Timer, effect
 and reconcile routes are not mounted in this release.
 
 The router carries its own body limit and its own admission counter, one
-lane for the long polls (`result`, `worker/poll`) sized by
+lane for the waiting routes (`call`, `result`, `worker/poll`) sized by
 `--agents-poll-concurrency` and one for every other route sized by
 `--agents-activation-concurrency`. It never takes a query permit, so a full
 agents lane leaves query routes serving

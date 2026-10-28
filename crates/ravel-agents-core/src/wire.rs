@@ -469,8 +469,11 @@ impl TurnAssignment {
     /// This assignment with its lease extended by the turn's recorded start
     /// time and its [`turn_random_seed`].
     pub fn polled(self, recorded_unix_ns: i64) -> PolledAssignment {
-        let random_seed =
-            turn_random_seed(&self.lease.agent_id, self.lease.incarnation, self.accept_seq);
+        let random_seed = turn_random_seed(
+            &self.lease.agent_id,
+            self.lease.incarnation,
+            self.accept_seq,
+        );
         TurnAssignment {
             lease: PolledLease {
                 lease: self.lease,

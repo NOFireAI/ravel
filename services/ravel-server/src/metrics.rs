@@ -4467,14 +4467,15 @@ pub(crate) fn render_agents_families(
         write_sample(out, name, &[Label::Mode(mode)], value);
     }
 
-    use ravel_agents_store::counters::{PhaseCounts, Phase};
+    use ravel_agents_store::counters::{Phase, PhaseCounts};
     let phases = [
         (Phase::Resolve, snapshot.store.resolve),
         (Phase::Build, snapshot.store.build),
         (Phase::Store, snapshot.store.store),
         (Phase::Publish, snapshot.store.publish),
     ];
-    let families: [(&str, &str, fn(&PhaseCounts) -> u64); 7] = [
+    type Family = (&'static str, &'static str, fn(&PhaseCounts) -> u64);
+    let families: [Family; 7] = [
         (
             "ravel_agents_store_gets_total",
             "Object-store GETs and head probes the agents store issued, by publication phase.",

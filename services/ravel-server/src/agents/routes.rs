@@ -22,11 +22,11 @@ use ravel_agents_core::identity::{AgentId, agent_id, effect_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, CallRequest, CallResponse, CancelRequest, CreateAgentRequest, ErrorBody,
-    EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
-    ResolveRequest, ResolveResponse, ResultBody, ResultResponse, SendRequest, StateResponse,
-    WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest,
-    WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
+    AgentRef, CallRequest, CallResponse, CancelRequest, CreateAgentRequest, ErrorBody, EventBody,
+    EventsRequest, EventsResponse, OperationResponse, OperationStatus, ResolveRequest,
+    ResolveResponse, ResultBody, ResultResponse, SendRequest, StateResponse, WorkerCommitRequest,
+    WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest, WorkerPollResponse,
+    WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_store::HeadState;
 use ravel_query::http::TenantResolver;
@@ -373,7 +373,12 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
         let head = read_head(&call.tenant, &agent).await?;
         let limit = usize::try_from(body.limit.clamp(1, MAX_EVENTS_PAGE)).unwrap_or(1);
         let mut events = Vec::new();
-        for event in head.events.iter().filter(|e| e.event_seq > after).take(limit) {
+        for event in head
+            .events
+            .iter()
+            .filter(|e| e.event_seq > after)
+            .take(limit)
+        {
             events.push(EventBody {
                 event_seq: event.event_seq,
                 accept_seq: event.accept_seq,
@@ -435,11 +440,7 @@ pub(super) async fn worker_commit(State(api): State<Api>, req: Request<Body>) ->
 pub(super) async fn worker_heartbeat(State(api): State<Api>, req: Request<Body>) -> Response {
     let run = async move {
         let (call, body) = api
-            .admit_body::<WorkerHeartbeatRequest>(
-                req,
-                Capability::AgentsWorker,
-                Lane::Activation,
-            )
+            .admit_body::<WorkerHeartbeatRequest>(req, Capability::AgentsWorker, Lane::Activation)
             .await?;
         let lease_expires_unix_ns = call.tenant.coordinator.heartbeat(&body.lease).await?;
         Ok::<_, Refusal>(Json(WorkerHeartbeatResponse {
@@ -522,10 +523,12 @@ async fn read_operation(
             "operation is not known to this agent",
         )
     };
-    let head = read_head(tenant, &handle.agent).await.map_err(|e| match e {
-        Refusal::Agent(error) if error.kind == ErrorKind::AgentGone => gone(),
-        other => other,
-    })?;
+    let head = read_head(tenant, &handle.agent)
+        .await
+        .map_err(|e| match e {
+            Refusal::Agent(error) if error.kind == ErrorKind::AgentGone => gone(),
+            other => other,
+        })?;
     if head.incarnation != handle.incarnation {
         return Err(gone());
     }
