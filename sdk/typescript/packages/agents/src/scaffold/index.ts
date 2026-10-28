@@ -223,10 +223,8 @@ directory; moving either one breaks the link, and editing that path in
 
 From the SDK checkout's \`sdk/typescript/\` directory, after \`npm ci\`, run
 \`node packages/agents/bin/ravel-agents-scaffold.js <dir>\`. Run the bin by
-its path: \`npm ci\` does not link it into \`node_modules/.bin\`, because the
-lockfile does not list a bin for that workspace package, and
-\`npx ravel-agents-scaffold\` would look the name up in the public npm
-registry instead, so never use the bare name.
+its path; \`docs/guides/agents-sdk.md\` in the Ravel repository, under
+"First run", says why.
 
 ## Changing the agent
 

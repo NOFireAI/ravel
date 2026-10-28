@@ -52,7 +52,9 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    client types matching the agent. Test: `scaffold output typechecks and
    its tests pass without an API key` (`scaffold/index.test.ts`), which
    typechecks a generated project and runs its suite with every `*_API_KEY`
-   variable removed.
+   variable removed. It links the SDK's own `node_modules` into the project
+   in place of `npm install`, so npm resolving the `file:` dependency is not
+   under test.
 
 3. Run it against a server. Turn the runtime on as
    [the Ravel Agents guide](agents.md#turning-it-on) describes, with one

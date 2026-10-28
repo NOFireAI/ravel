@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { generateContract } from "./contract.js";
 import { SCAFFOLD_FILES, scaffold, ScaffoldError } from "./index.js";
@@ -57,11 +58,29 @@ async function snapshot(dir: string): Promise<Map<string, string>> {
   return files;
 }
 
-/** The environment with every `*_API_KEY` variable and vitest's own variables removed. */
+/**
+ * The environment with every `*_API_KEY` variable and vitest's own variables
+ * removed, and colour off. vitest colours its output even into a pipe unless
+ * NO_COLOR is set or it detects a coding agent in the environment, so without
+ * this the summary line holds escape codes on a CI runner and not under an
+ * agent.
+ */
 function strippedEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => !name.endsWith("_API_KEY") && !name.startsWith("VITEST")),
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !name.endsWith("_API_KEY") && !name.startsWith("VITEST") && name !== "FORCE_COLOR",
+    ),
   );
+  return { ...env, NO_COLOR: "1" };
+}
+
+/** vitest's `Tests` summary line, whitespace collapsed, or null when there is not exactly one. */
+function testsLine(output: string): string | null {
+  const lines = stripVTControlCharacters(output)
+    .split("\n")
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .filter((line) => line.startsWith("Tests "));
+  return lines.length === 1 ? (lines[0] ?? null) : null;
 }
 
 function run(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv = strippedEnv()) {
@@ -102,21 +121,23 @@ describe("scaffold", () => {
     for (const file of closure) expect(files.get(file), file).not.toContain("process.env");
 
     // The SDK's own install stands in for `npm install`, so the test needs no
-    // network either.
+    // network either. It does not cover npm resolving the generated `file:`
+    // dependency: `npm install --offline` needs registry metadata that a cache
+    // filled by `npm ci` does not hold.
     await symlink(path.join(SDK_DIR, "node_modules"), path.join(dir, "node_modules"), "dir");
 
-    const typecheck = run([TSC, "-p", "tsconfig.json"], dir);
+    const typecheck = run([TSC, "--pretty", "false", "-p", "tsconfig.json"], dir);
     expect(typecheck.output).toBe("");
     expect(typecheck.code).toBe(0);
 
     const stripped = run([VITEST, "run"], dir);
-    expect(stripped.output).toMatch(/Tests\s+4 passed \(4\)/);
-    expect(stripped.code).toBe(0);
+    expect(stripped.code, stripped.output).toBe(0);
+    expect(testsLine(stripped.output), stripped.output).toBe("Tests 4 passed (4)");
 
     const poison = { ...strippedEnv(), OPENAI_API_KEY: "poison", ANTHROPIC_API_KEY: "poison", RAVEL_AGENTS_API_KEY: "poison" };
     const poisoned = run([VITEST, "run"], dir, poison);
-    expect(poisoned.output).toMatch(/Tests\s+4 passed \(4\)/);
-    expect(poisoned.code).toBe(0);
+    expect(poisoned.code, poisoned.output).toBe(0);
+    expect(testsLine(poisoned.output), poisoned.output).toBe("Tests 4 passed (4)");
   }, 300_000);
 
   it("a second scaffold into the same directory is refused and changes nothing", async () => {
@@ -186,9 +207,13 @@ describe("scaffold", () => {
     const dir = await tempDir();
     await scaffold(dir);
     const readme = (await readFile(path.join(dir, "README.md"), "utf8")).replace(/\s*\n\s*/g, " ");
-    expect(readme).toContain("run `node packages/agents/bin/ravel-agents-scaffold.js <dir>`. Run the bin by its path");
-    expect(readme).toContain("so never use the bare name.");
-    expect(readme.match(/ravel-agents-scaffold/g)).toHaveLength(2);
+    expect(readme).toContain(
+      "run `node packages/agents/bin/ravel-agents-scaffold.js <dir>`. Run the bin by its path; " +
+        '`docs/guides/agents-sdk.md` in the Ravel repository, under "First run", says why.',
+    );
+    // The one mention is the path; no line names the bin bare.
+    expect(readme.match(/ravel-agents-scaffold/g)).toHaveLength(1);
+    expect(readme).not.toMatch(/(?<!bin\/)ravel-agents-scaffold/);
   });
 
   it("the template's contract.ts is the generator's output for the template agent", async () => {

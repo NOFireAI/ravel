@@ -50,7 +50,7 @@ function literal(value: unknown, at: string): string {
 
 function union(members: readonly string[]): string {
   const unique = [...new Set(members)];
-  return unique.length === 1 ? (unique[0] ?? "never") : unique.join(" | ");
+  return unique.length === 0 ? "never" : unique.join(" | ");
 }
 
 const KEYWORDS_HANDLED = new Set([
@@ -180,8 +180,17 @@ function objectType(schema: JsonSchema, at: string, depth: number): string {
   });
   const shape = lines.length === 0 ? null : `{\n${lines.join("\n")}\n${"  ".repeat(depth)}}`;
   if (isSchema(extra)) {
-    const record = `Record<string, ${typeOf(extra, at, depth)}>`;
-    return shape === null ? record : `${shape} & ${record}`;
+    const value = typeOf(extra, at, depth);
+    const record = `Record<string, ${value}>`;
+    if (shape === null) return record;
+    // Intersecting named members with `Record<string, V>` types each member
+    // as itself & V, which is never for a member V does not cover; an index
+    // signature wide enough for the members would accept extra keys zod
+    // rejects. Only an unconstrained catchall has an exact form.
+    if (value !== "unknown") {
+      throw new ContractError(at, "an object with named properties and a catchall other than unknown is not supported");
+    }
+    return `${shape} & ${record}`;
   }
   // zod types an object schema with no members as `Record<string, never>`
   // on both its input and its output side.
@@ -220,7 +229,8 @@ function jsonSchema(schema: z.ZodType, io: "input" | "output", at: string): Json
  * but the definition, so regenerating an unchanged agent writes the same
  * bytes. Throws {@link ContractError} for a schema with no TypeScript form
  * (a `bigint`, a `Date`, a transform in a result schema, a recursive
- * schema, a record whose keys are constrained other than by an enum).
+ * schema, a record whose keys are constrained other than by an enum, an
+ * object with named properties and a catchall typed other than `unknown`).
  */
 export function generateContract(agent: AnyAgentDefinition): string {
   const handlers = Object.keys(agent.messages).sort();
