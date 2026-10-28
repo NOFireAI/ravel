@@ -70,16 +70,16 @@ impl History {
     /// Replay the history through `machine` and return the first divergence.
     /// `machine` is the agent's state before the first call, normally a
     /// fresh [`ReferenceMachine::new`].
-    pub fn check(&self, mut machine: ReferenceMachine) -> Result<(), Divergence> {
+    pub fn check(&self, mut machine: ReferenceMachine) -> Result<(), Box<Divergence>> {
         for (index, call) in self.calls.iter().enumerate() {
             let expected = machine.apply(&call.event);
             if expected != call.observed {
-                return Err(Divergence {
+                return Err(Box::new(Divergence {
                     index,
                     event: call.event.clone(),
                     expected,
                     observed: call.observed.clone(),
-                });
+                }));
             }
         }
         Ok(())

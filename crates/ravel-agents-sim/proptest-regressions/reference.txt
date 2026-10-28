@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4bb4f8c4e2876cd69ee6430b204bb2800a6e68ef54f4eae05d65d2165d7c7254 # shrinks to events = [Client(Create), Client(Send { handler: "reply", request_id: "r0", payload: [0] }), TurnStarted { operation: Handle { agent: AgentId([116, 97, 54, 97, 64, 44, 146, 47, 114, 107, 114, 118, 254, 123, 138, 187]), incarnation: 1, item: Operation(1) } }, TurnFailed { operation: Handle { agent: AgentId([116, 97, 54, 97, 64, 44, 146, 47, 114, 107, 114, 118, 254, 123, 138, 187]), incarnation: 1, item: Operation(1) }, error: "boom" }, TurnFailed { operation: Handle { agent: AgentId([116, 97, 54, 97, 64, 44, 146, 47, 114, 107, 114, 118, 254, 123, 138, 187]), incarnation: 1, item: Operation(1) }, error: "boom" }]

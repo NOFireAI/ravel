@@ -75,12 +75,7 @@ mod tests {
         "compactor-id",
         "faults",
     ];
-    const AGENT_DOMAINS: [&str; 4] = [
-        WORKLOAD_DOMAIN,
-        FAULTS_DOMAIN,
-        IDS_DOMAIN,
-        SCHEDULE_DOMAIN,
-    ];
+    const AGENT_DOMAINS: [&str; 4] = [WORKLOAD_DOMAIN, FAULTS_DOMAIN, IDS_DOMAIN, SCHEDULE_DOMAIN];
 
     #[test]
     fn agent_domains_draw_distinct_sub_seeds_from_each_other_and_from_ravel_sim() {

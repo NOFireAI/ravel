@@ -449,10 +449,7 @@ impl Scheduler {
                 ));
             }
             if trace.len() >= self.max_steps {
-                return Err(self.error(
-                    trace,
-                    format!("no end after {} steps", self.max_steps),
-                ));
+                return Err(self.error(trace, format!("no end after {} steps", self.max_steps)));
             }
             let (index, action) = match steps.next() {
                 Some(ScriptStep::Release(i)) => {
@@ -544,16 +541,12 @@ impl Scheduler {
             match settled {
                 Ok(Some(Ok(Ok(())))) => actor.phase = Phase::Finished,
                 Ok(Some(Ok(Err(reason)))) => {
-                    return Err(self.error(
-                        trace.to_vec(),
-                        format!("{} failed: {reason}", actor.name),
-                    ));
+                    return Err(
+                        self.error(trace.to_vec(), format!("{} failed: {reason}", actor.name))
+                    );
                 }
                 Ok(Some(Err(e))) => {
-                    return Err(self.error(
-                        trace.to_vec(),
-                        format!("{} panicked: {e}", actor.name),
-                    ));
+                    return Err(self.error(trace.to_vec(), format!("{} panicked: {e}", actor.name)));
                 }
                 Ok(None) | Err(_) => {}
             }
@@ -613,7 +606,11 @@ mod tests {
             .build()
             .expect("runtime");
         runtime
-            .block_on(store.put(HEAD, Bytes::from_static(b"0"), PutOptions::create_if_absent()))
+            .block_on(store.put(
+                HEAD,
+                Bytes::from_static(b"0"),
+                PutOptions::create_if_absent(),
+            ))
             .expect("seed head");
         store
     }
@@ -675,7 +672,11 @@ mod tests {
                         ("B".to_string(), Action::Released, Op::Put),
                     ]
                 );
-                sim_assert_eq!(outcome, outcome.ends, vec![ActorEnd::Crashed, ActorEnd::Finished]);
+                sim_assert_eq!(
+                    outcome,
+                    outcome.ends,
+                    vec![ActorEnd::Crashed, ActorEnd::Finished]
+                );
                 sim_assert_eq!(outcome, log, vec!["B won"]);
             },
         );

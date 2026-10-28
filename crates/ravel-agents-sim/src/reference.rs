@@ -94,13 +94,24 @@ pub enum ClientOp {
 pub enum Event {
     Client(ClientOp),
     /// A worker bound the input to a turn.
-    TurnStarted { operation: Handle },
+    TurnStarted {
+        operation: Handle,
+    },
     /// The turn's completion committed.
-    TurnCompleted { operation: Handle, output: Vec<u8> },
+    TurnCompleted {
+        operation: Handle,
+        output: Vec<u8>,
+    },
     /// The turn's terminal failure committed.
-    TurnFailed { operation: Handle, error: String },
+    TurnFailed {
+        operation: Handle,
+        error: String,
+    },
     /// A wake hint or the sweep found the timer generation due.
-    TimerDue { timer_key: String, generation: u64 },
+    TimerDue {
+        timer_key: String,
+        generation: u64,
+    },
 }
 
 /// A terminal result as a client reads it.
@@ -429,7 +440,8 @@ impl ReferenceMachine {
                     output: None,
                     error: None,
                 });
-                self.terminal_log.push((*operation, OperationStatus::Cancelled));
+                self.terminal_log
+                    .push((*operation, OperationStatus::Cancelled));
                 Reply::Cancel {
                     status: OperationStatus::Cancelled,
                     requested: false,
@@ -692,12 +704,12 @@ mod tests {
         ]);
         assert_eq!(
             same_incarnation.check(m.clone()),
-            Err(Divergence {
+            Err(Box::new(Divergence {
                 index: 5,
                 event: same_incarnation.calls()[5].event.clone(),
                 expected: Reply::Error(ErrorKind::OwnershipLost),
                 observed: committed(OperationStatus::Failed, 1),
-            })
+            }))
         );
 
         // Across a recreate: the completed input's handle from incarnation 1
@@ -714,13 +726,13 @@ mod tests {
                 },
                 committed(OperationStatus::Completed, 1),
             ),
-            (client(ClientOp::Destroy), Reply::Destroyed { incarnation: 1 }),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed { incarnation: 1 },
+            ),
             (client(ClientOp::Create), created(2, true)),
             (send("r1", b"hi"), accepted(new_op, false)),
-            (
-                Event::TurnStarted { operation: new_op },
-                Reply::TurnStarted,
-            ),
+            (Event::TurnStarted { operation: new_op }, Reply::TurnStarted),
             (
                 Event::TurnFailed {
                     operation: op,
@@ -731,12 +743,12 @@ mod tests {
         ]);
         assert_eq!(
             across_recreate.check(m),
-            Err(Divergence {
+            Err(Box::new(Divergence {
                 index: 8,
                 event: across_recreate.calls()[8].event.clone(),
                 expected: Reply::Error(ErrorKind::AgentGone),
                 observed: committed(OperationStatus::Failed, 0),
-            })
+            }))
         );
     }
 
@@ -767,7 +779,10 @@ mod tests {
         let h = history(vec![
             (client(ClientOp::Create), created(1, true)),
             (send("r1", b"hi"), accepted(op, false)),
-            (send("r1", b"bye"), Reply::Error(ErrorKind::IdempotencyConflict)),
+            (
+                send("r1", b"bye"),
+                Reply::Error(ErrorKind::IdempotencyConflict),
+            ),
             // The conflict allocated nothing: the next new id gets seq 2.
             (send("r2", b"bye"), accepted(m.operation(1, 2), false)),
             (send("r1", b"hi"), accepted(op, true)),
@@ -821,7 +836,10 @@ mod tests {
             (client(ClientOp::Create), created(1, true)),
             (send("r1", b"hi"), accepted(op, false)),
             (Event::TurnStarted { operation: op }, Reply::TurnStarted),
-            (client(ClientOp::Cancel { operation: op }), cancelled.clone()),
+            (
+                client(ClientOp::Cancel { operation: op }),
+                cancelled.clone(),
+            ),
             // Idempotent while the turn still runs.
             (client(ClientOp::Cancel { operation: op }), cancelled),
             (
@@ -1005,7 +1023,10 @@ mod tests {
             (client(ClientOp::Create), created(1, true)),
             (client(ClientOp::Create), created(1, false)),
             (send("r1", b"hi"), accepted(old, false)),
-            (client(ClientOp::Destroy), Reply::Destroyed { incarnation: 1 }),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed { incarnation: 1 },
+            ),
             (
                 client(ClientOp::Operation { operation: old }),
                 Reply::Error(ErrorKind::AgentGone),
@@ -1123,6 +1144,13 @@ mod tests {
                 for (index, event) in events.iter().enumerate() {
                     let incarnation = m.incarnation();
                     let reply = m.apply(event);
+
+                    // A handle from any other incarnation is refused.
+                    if let Some(handle) = subject(event)
+                        && Some(handle.incarnation) != incarnation
+                    {
+                        prop_assert_eq!(&reply, &Reply::Error(ErrorKind::AgentGone));
+                    }
 
                     // One terminal result per input: once any reply shows a
                     // terminal status for a handle, every later one agrees.
