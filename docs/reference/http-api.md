@@ -510,9 +510,14 @@ result is reported, a further step is 409 `idempotency_conflict` and a
 `retry` naming that attempt is 409 `ownership_lost`, since it is not in
 doubt
 (`agents_effects_e2e::a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`).
-The hand-over is held by the serving process: an owner replaced by a
-takeover, or a restart before its next step, finds the attempt lost, and a
-`manual` effect latches in doubt again. Before changing an effect in
+The next `worker/step` for the step gets the attempt whichever worker
+holds the turn by then, including one that took the turn over after the
+owner's lease expired
+(`agents_effects_e2e::a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`).
+The hand-over is kept only in the memory of the server process that
+answered the reconcile: if that process restarts before the step, or
+another server process serves the step, the attempt reads as lost and a
+`manual` effect is back in doubt, so reconcile it again. Before changing an effect in
 doubt the server submits one audit record with `kind` `agents_reconcile`
 to the audit pipeline, which writes it into the tenant's audit shard,
 naming the effect, attempt, decision and the caller's tenant and

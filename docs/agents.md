@@ -295,7 +295,7 @@ tool input (`SafeIds`).
 | `AgentGone` | `agent_gone` | the agent does not exist, is tombstoned, or the handle names an earlier incarnation | `never` |
 | `IdempotencyConflict` | `idempotency_conflict` | a request id reused with a different request hash, or two different results for one attempt | `never` |
 | `OutcomeUnknown` | `outcome_unknown` | the command may or may not have been published | `resolve_operation`: resolve the handle, do not resubmit under a new id |
-| `OwnershipLost` | `ownership_lost` | the command's epoch, owner or active turn no longer matches HEAD | `never` |
+| `OwnershipLost` | `ownership_lost` | the command's epoch, owner or active turn no longer matches HEAD, or the effect state does not admit the command (a reconcile of an effect that is not in doubt: runtime `reconcile_is_idempotent_and_audited_once`, e2e `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`; a new attempt for an input being cancelled: runtime `a_new_attempt_for_a_cancelled_input_is_refused_and_the_completion_settles_cancelled`) | `never` |
 | `IncompatibleHandler` | `incompatible_handler` | the handler version or digest differs from the turn's pin, or the worker has no handler for the input | `never` |
 | `NonDeterministicReplay` | `non_deterministic_replay` | a step key reused with a different tool identity or input hash | `never` |
 | `EffectInDoubt` | `effect_in_doubt` | a `manual` effect had an ambiguous attempt | `reconcile`: an operator must reconcile first |
@@ -339,15 +339,26 @@ as `failure` with no `output`, and `worker/poll` hands the step out as
 `started` with no output, so a retried turn replays the failure
 (`a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail`); an
 output of exactly `{"error": "x"}` replays as that output
-(`an_output_shaped_like_a_failure_replays_as_the_output`). A result for an
+(`an_output_shaped_like_a_failure_replays_as_the_output`). A failure's
+result object is a NUL byte, the ASCII text `ravel-agents-tool-failure-v1`,
+a NUL byte, then the error as UTF-8 text (`FAILURE_RESULT_PREFIX` in
+`crates/ravel-agents-runtime/src/effects.rs`); any other result object is
+the output's JSON text, which never contains a NUL byte. ADR-3331 decision
+7 does not define a result object's bytes, so this document does. Nothing
+outside `ravel-agents-runtime` wrote result objects before failures were
+stored this way, so no older object is read as a failure. A result for an
 attempt another attempt's result already settled answers `late: true` and
 is kept only as evidence. `reconcile` (`agents_admin`) settles a `manual`
-effect in doubt. Its `retry` dispatches nothing: the owner's next
-`worker/step` for the step is answered the authorized attempt to run
-(`a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`). That
-hand-over is held by the serving process, so an owner replaced by a
-takeover, or a restart in between, finds the attempt lost and a `manual`
-effect latches in doubt again. `effects/{effect}` reads each attempt, the
+effect in doubt. Its `retry` dispatches nothing: the next `worker/step`
+for the step is answered the authorized attempt to run, once, whether it
+comes from the owner the turn had at the reconcile or from a worker that
+took the turn over after that owner's lease expired
+(`a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`,
+`a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`). That
+hand-over is kept only in the memory of the server process that answered
+the reconcile. If that process restarts before the step, or the step is
+served by another server process, the attempt reads as lost and a `manual`
+effect is back in doubt: reconcile it again. `effects/{effect}` reads each attempt, the
 result and the evidence (all in `agents_effects_e2e`, one test per policy
 and refusal).
 
@@ -414,7 +425,7 @@ routes of a running server.
 | The production store and runtime are checked against the independent reference machine | M1 (simulation drivers, T13) | the reference machine exists in `ravel-agents-sim` and is tested on its own (`reference_machine_invariants_hold`); nothing drives the production crates through it yet |
 | HTTP routes for create, send, call, operation, result, resolve, cancel, state, events and the worker register, poll, heartbeat and commit | end to end | e2e `send_then_result_through_real_server_survives_worker_replacement`, `call_heartbeat_and_cancel_through_real_server`, `cancel_of_a_running_turn_settles_it_cancelled_at_commit`, `events_page_after_the_durable_cursor_without_duplicates`, `resolve_after_a_lost_send_ack_returns_the_same_operation`; mounting `agents_router_mounts_on_both_listeners_only_with_feature_and_flag` |
 | HTTP routes for steps, effect results, effect inspection and reconciliation (`worker/step`, `worker/effects/complete`, `worker/effects/fail`, `effects`, `effects/{effect}`, `reconcile`) | end to end | e2e `completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn`, `provider_idempotency_redispatches_the_same_attempt_and_the_late_result_counts`, `manual_blocks_until_reconciled_and_audits_the_decision_once`, `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`, `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` |
-| A reconcile `retry` is dispatched by the owner's next step in the same server process; after a takeover or a restart it latches in doubt again | end to end (the hand-over); in the crates (the limitation) | e2e `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`; runtime `a_reconciled_attempt_is_dispatched_by_the_owners_next_step`, `reconcile_is_idempotent_and_audited_once` |
+| A reconcile `retry` is dispatched once by the next step for its key in the same server process, under the owner at the reconcile or one that took the turn over since; a restart of that process, or a step served by another one, loses it and a `manual` effect is in doubt again | end to end (the hand-over, with and without a takeover); in the crates (the takeover, a race of two steps, a refused step handing it back) | e2e `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`, `a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`; runtime `a_reconciled_attempt_survives_a_takeover_before_the_next_step` (the lease expires after the reconcile and the new owner's first step dispatches attempt 2 once, the effect reads authorized at attempt 2), `concurrent_steps_dispatch_a_reconciled_attempt_once`, `a_hand_over_refused_after_its_claim_is_released_and_never_dispatched_twice`. The loss on a restart is not tested: a restarted coordinator holds no record, and runtime `manual_latches_in_doubt_after_a_coordinator_restart_and_is_never_redispatched` shows what a `manual` attempt with no record does |
 | `agents`, `agents_worker` and `agents_admin` capabilities are checked on every route | end to end | e2e `capabilities_are_enforced_on_both_listeners`; `agents_admin` on `reconcile` in `manual_blocks_until_reconciled_and_audits_the_decision_once` |
 | A HEAD that cannot be read under an operation handle answers `outcome_unknown`, not `agent_gone` | end to end | e2e `a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone`; an unknown handle is `agent_gone` (`unknown_operation_handle_is_agent_gone_with_the_handle`) |
 | HTTP routes for timers and the sweep | M4 | ADR-3331 decision 9; no route yet (`a_path_outside_the_route_table_is_404`) |

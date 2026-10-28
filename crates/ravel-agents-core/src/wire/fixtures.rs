@@ -337,6 +337,39 @@ fn samples() -> Vec<Sample> {
             },
         ),
         sample(
+            "effect_inspect_response_failure",
+            EffectInspectResponse {
+                effect: EffectBody {
+                    effect: effect(),
+                    turn_id: turn_id().to_hex(),
+                    tool_name: "payments.charge".to_string(),
+                    tool_version: "2".to_string(),
+                    policy: Policy::AtLeastOnce,
+                    status: EffectState::Completed,
+                    attempt: 2,
+                },
+                step_key: "charge".to_string(),
+                result_attempt: Some(2),
+                result: None,
+                failure: Some("card declined".to_string()),
+                attempts: vec![
+                    EffectAttemptBody {
+                        attempt: 1,
+                        status: AttemptState::Superseded,
+                    },
+                    EffectAttemptBody {
+                        attempt: 2,
+                        status: AttemptState::Result,
+                    },
+                ],
+                evidence: vec![EffectEvidenceBody {
+                    attempt: 1,
+                    result: json!(null),
+                    failure: Some("gateway timeout".to_string()),
+                }],
+            },
+        ),
+        sample(
             "reconcile_request",
             ReconcileRequest {
                 effect: effect(),
