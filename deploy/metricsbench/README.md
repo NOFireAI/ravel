@@ -489,7 +489,11 @@ Steps, in order, stopping at the first failure:
    running compose container from `docker stats --no-stream` is appended to
    `memory.jsonl` (case a).
 6. `ingest`: `metricsbench_ingest` into all four portable endpoints with
-   their read-back query URLs, output `ingest.json`. Ravel's token reaches it
+   their read-back query URLs, output `ingest.json`. A read-back that reads
+   less than was sent is repeated every 500 ms for up to
+   `--readback-settle-secs` (default 60, the same for every engine), since
+   VictoriaMetrics acknowledges a write before it is queryable; each row's
+   `readback` records `attempts` and `settled_after_ms`. Ravel's token reaches it
    only through `--ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN`, never on
    a command line (case a). A failing ingest exits 70 naming the step and the
    stack is still torn down (case b). The `ci` profile keeps the ingest's
