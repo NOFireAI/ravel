@@ -56,7 +56,7 @@ services:
   # --require-bucket-protection, and immutability is not what this lane
   # measures.
   ravel-qualify:
-    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned or a checked local tag}
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}
     depends_on:
       createbuckets:
         condition: service_completed_successfully
@@ -67,7 +67,7 @@ services:
 
   # --- Ravel ---------------------------------------------------------------
   ravel-server:
-    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned or a checked local tag}
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the ravel-server image under test, digest-pinned}
     depends_on:
       ravel-qualify:
         condition: service_completed_successfully
