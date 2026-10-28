@@ -671,6 +671,13 @@ pub enum FailedCheck {
     /// The stall ceiling stopped the row (ADR-0927, 2026-10-28 amendment,
     /// decision 7), which is no numbered band.
     Stall,
+    /// A check the row failed after its replay closed (band 4 or 6, a
+    /// diverged stream, or nothing accepted), recorded as its `row_failure`
+    /// because an earlier row had already failed.
+    Ingest,
+    /// The row's replay failed other than by a stall, after an earlier row
+    /// had already failed; no numbered band.
+    Replay,
 }
 
 /// One ingest-row failure of a failed run.
@@ -683,15 +690,18 @@ pub struct FailedBand {
     pub check: FailedCheck,
     /// The ingest row's system.
     pub system: String,
-    /// The row's `readback_error`, read-back mismatches, or stall error.
+    /// The row's `readback_error`, read-back mismatches, `row_failure`,
+    /// stall error, or failed replay error.
     pub reason: String,
 }
 
 impl std::fmt::Display for FailedBand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.band {
-            Some(band) => write!(f, "band {band}"),
-            None => write!(f, "stall ceiling"),
+        match (self.band, self.check) {
+            (Some(band), _) => write!(f, "band {band}"),
+            (None, FailedCheck::Stall) => write!(f, "stall ceiling"),
+            (None, FailedCheck::Replay) => write!(f, "replay"),
+            (None, FailedCheck::Readback | FailedCheck::Ingest) => write!(f, "ingest check"),
         }?;
         write!(f, " on {}: {}", self.system, self.reason)
     }
@@ -1468,6 +1478,12 @@ fn refuse_v3_fields(report: &MetricsBenchReport) -> Result<(), ValidationError> 
     }
     if !report.exclusions.is_empty() {
         return refuse("exclusions");
+    }
+    if report.run_verdict.is_some() {
+        return refuse("run_verdict");
+    }
+    if !report.failed_bands.is_empty() {
+        return refuse("failed_bands");
     }
     for m in &report.measurements {
         let set: [(&'static str, bool); 11] = [
@@ -3892,6 +3908,35 @@ mod tests {
             validate(&report).expect_err("a version-3 field on version 2 must fail"),
             ValidationError::FieldNotInVersion {
                 field: "engine",
+                version: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn a_run_verdict_or_failed_bands_on_a_v2_report_fail() {
+        let band = FailedBand {
+            band: Some(6),
+            check: FailedCheck::Readback,
+            system: "mimir".to_string(),
+            reason: "422".to_string(),
+        };
+        let mut report = valid_report();
+        report.run_verdict = Some(RunVerdict::Failed);
+        report.failed_bands = vec![band.clone()];
+        assert_eq!(
+            validate_diagnostic(&report).expect_err("run_verdict on version 2 must fail"),
+            ValidationError::FieldNotInVersion {
+                field: "run_verdict",
+                version: 2,
+            }
+        );
+        let mut report = valid_report();
+        report.failed_bands = vec![band];
+        assert_eq!(
+            refuse_v3_fields(&report).expect_err("failed_bands on version 2 must fail"),
+            ValidationError::FieldNotInVersion {
+                field: "failed_bands",
                 version: 2,
             }
         );

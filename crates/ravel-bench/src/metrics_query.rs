@@ -162,6 +162,16 @@ pub enum BindError {
     )]
     Stalled { system: String, detail: String },
     #[error(
+        "ingest row `{system}` failed a check after its replay ({detail}); the report is kept for \
+         diagnosis and is not a run result"
+    )]
+    RowFailed { system: String, detail: String },
+    #[error(
+        "ingest row `{system}` failed its replay ({detail}); the report is kept for diagnosis and \
+         is not a run result"
+    )]
+    FailedReplay { system: String, detail: String },
+    #[error(
         "a diagnostic after a failed ingest needs an ingest report with a failed row, and this \
          one has none"
     )]
@@ -333,11 +343,14 @@ pub fn bind(
 }
 
 /// [`bind`] for a diagnostic of a failed ingest: a row whose read-back
-/// failed or that stalled is returned as a [`FailedBand`] instead of
-/// refusing the run. A row that failed its read-back is still queried; a
-/// stalled row has no ingest figures and its engine is left out of the
-/// binding. Refused when no row failed ([`BindError::NoFailedRow`]) and when
-/// the oracle stalled. Band 6 and accounting failures refuse as in [`bind`].
+/// failed, that carries a `row_failure`, that stalled, or whose replay
+/// failed is returned as a [`FailedBand`] instead of refusing the run. A row
+/// that failed its read-back or carries a `row_failure` is still queried; a
+/// stalled row or a failed replay has no ingest figures and its engine is
+/// left out of the binding. Refused when no row failed
+/// ([`BindError::NoFailedRow`]) and when the oracle stalled or failed its
+/// replay. Band 6 and accounting failures on a row without a `row_failure`
+/// refuse as in [`bind`].
 pub fn bind_diagnostic(
     ingest: &MetricsIngestReport,
     workload_bytes: &[u8],
@@ -412,6 +425,23 @@ fn bind_rows(
         .iter()
         .filter(|r| r.system != IN_PROCESS_SYSTEM)
     {
+        if let Some(failure) = &row.row_failure {
+            if !diagnostic {
+                return Err(BindError::RowFailed {
+                    system: row.system.clone(),
+                    detail: failure.error.clone(),
+                });
+            }
+            // The row's band 4 or 6 check already failed and is recorded;
+            // running it again would refuse the diagnostic.
+            failed.push(FailedBand {
+                band: failure.band,
+                check: FailedCheck::Ingest,
+                system: row.system.clone(),
+                reason: failure.error.clone(),
+            });
+            continue;
+        }
         check_row_band6(row).map_err(|e| BindError::Band6 {
             system: row.system.clone(),
             detail: e.to_string(),
@@ -458,11 +488,28 @@ fn bind_rows(
             reason: stalled.error.clone(),
         });
     }
+    for replay in &ingest.failed_replays {
+        if !diagnostic || replay.system == system_name(Engine::Prometheus) {
+            return Err(BindError::FailedReplay {
+                system: replay.system.clone(),
+                detail: replay.error.clone(),
+            });
+        }
+        failed.push(FailedBand {
+            band: None,
+            check: FailedCheck::Replay,
+            system: replay.system.clone(),
+            reason: replay.error.clone(),
+        });
+    }
+    // A stalled row and a failed replay have no ingest figures to query.
     let is_stalled = |engine: Engine| {
         ingest
             .stalled
             .iter()
-            .any(|r| r.system == system_name(engine))
+            .map(|r| &r.system)
+            .chain(ingest.failed_replays.iter().map(|r| &r.system))
+            .any(|system| system == system_name(engine))
     };
 
     let grid = QueryGrid::from_run(&run, profile)?;

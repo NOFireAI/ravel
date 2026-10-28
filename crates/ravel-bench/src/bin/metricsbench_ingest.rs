@@ -1093,6 +1093,22 @@ mod tests {
     /// differ still fail band 6; only the comparison with an in-process
     /// scalar digest is skipped.
     #[test]
+    fn band6_across_rows_after_a_failure_is_recorded_on_the_named_row() {
+        let mut rows = vec![
+            portable_row("prometheus", "aa"),
+            portable_row("victoriametrics", "aa"),
+            portable_row("mimir", "ab"),
+        ];
+        let refs: Vec<&SystemIngestResult> = rows.iter().collect();
+        let err = check_band6_across_rows(None, &refs).expect_err("mimir's expected set differs");
+        record_across_rows_failure(&mut rows, &err);
+        let failure = rows[2].row_failure.as_ref().expect("mimir carries the failure");
+        assert_eq!(failure.band, Some(6));
+        assert_eq!(failure.error, err.to_string());
+        assert!(rows[..2].iter().all(|r| r.row_failure.is_none()));
+    }
+
+    #[test]
     fn portable_rows_still_cross_check_without_the_in_process_row() {
         let prometheus = portable_row("prometheus", "aa");
         let mimir = portable_row("mimir", "aa");
