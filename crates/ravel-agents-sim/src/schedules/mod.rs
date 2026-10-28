@@ -23,12 +23,22 @@ use crate::scheduler::{
 };
 use crate::seeds::AgentSeeds;
 
-/// Seeds every batch runs, `BASE..BASE + BATCH`.
+/// Seeds in one batch.
 pub(crate) const BATCH: u64 = 64;
+/// First seed of a batch when `RAVEL_SIM_SEED` is unset.
 pub(crate) const BASE: u64 = 0x5eed_0000;
 
+/// Seeds every batch runs: `BATCH` seeds from `RAVEL_SIM_SEED` when it is
+/// set and parses, else from `BASE`. A failure message's replay line sets
+/// the variable to the failing batch seed, so the replayed batch runs that
+/// seed first.
 pub(crate) fn seeds() -> impl Iterator<Item = u64> {
-    BASE..BASE + BATCH
+    seeds_from(AgentSeeds::from_env_or(BASE).seed())
+}
+
+/// `BATCH` consecutive seeds starting at `base`.
+pub(crate) fn seeds_from(base: u64) -> impl Iterator<Item = u64> {
+    (0..BATCH).map(move |i| base.wrapping_add(i))
 }
 
 /// A client actor whose body runs against its own process.
@@ -108,7 +118,31 @@ pub(crate) fn run(
     script: ScheduleScript,
     actors: Vec<Actor>,
 ) -> Result<ScheduleOutcome, ScheduleError> {
-    Scheduler::new(AgentSeeds::new(seed), script).run(rig.shared(), actors)
+    run_in_batch(rig, seed, seed, script, actors)
+}
+
+/// [`run`] on a seed derived from the batch seed `batch`, which failure
+/// messages replay from.
+pub(crate) fn run_in_batch(
+    rig: &Rig,
+    batch: u64,
+    seed: u64,
+    script: ScheduleScript,
+    actors: Vec<Actor>,
+) -> Result<ScheduleOutcome, ScheduleError> {
+    Scheduler::new(AgentSeeds::new(seed), script)
+        .with_batch_seed(batch)
+        .run(rig.shared(), actors)
+}
+
+#[test]
+fn seeds_from_counts_a_batch_up_from_its_base() {
+    let batch: Vec<u64> = seeds_from(7).collect();
+    assert_eq!(batch.len(), 64);
+    assert_eq!(batch.first(), Some(&7));
+    assert_eq!(batch.last(), Some(&70));
+    assert!(batch.windows(2).all(|w| w[1] == w[0] + 1));
+    assert_eq!(seeds_from(u64::MAX).nth(1), Some(0));
 }
 
 /// A script from `seed` over `actors` actors.

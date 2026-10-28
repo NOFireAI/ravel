@@ -363,6 +363,172 @@ fn past_known_divergences(run: &Run) -> Result<Known, String> {
     }
 }
 
+/// One call of a hand-built [`Run`]: its event, the reply recorded in
+/// place of the reference's (`None` records the reference's own), and
+/// whether it applied a HEAD write.
+struct Fed {
+    event: Event,
+    reply: Option<Reply>,
+    wrote: bool,
+}
+
+fn answered(event: Event) -> Fed {
+    Fed {
+        event,
+        reply: None,
+        wrote: true,
+    }
+}
+
+fn refused_lost(event: Event, wrote: bool) -> Fed {
+    Fed {
+        event,
+        reply: Some(Reply::Error(ErrorKind::OwnershipLost)),
+        wrote,
+    }
+}
+
+/// A run built by feeding `calls` to a fresh reference machine. A call with
+/// its own reply reaches the machine only when it wrote: a refusal that
+/// wrote nothing changed nothing.
+fn hand_run(calls: Vec<Fed>) -> Run {
+    let mut machine = crate::drive::machine().expect("machine");
+    let mut history = History::default();
+    let mut applied = Vec::new();
+    for call in calls {
+        let reply = match call.reply {
+            None => machine.apply(&call.event),
+            Some(reply) => {
+                if call.wrote {
+                    machine.apply(&call.event);
+                }
+                reply
+            }
+        };
+        history.record(call.event, reply);
+        applied.push(call.wrote);
+    }
+    Run {
+        history,
+        inferred: Vec::new(),
+        applied,
+        refusals: Vec::new(),
+        unmappable: Vec::new(),
+    }
+}
+
+/// Create the agent and accept input 1.
+fn accepted() -> Vec<Fed> {
+    vec![
+        answered(Event::Client(crate::reference::ClientOp::Create)),
+        answered(Event::Client(crate::reference::ClientOp::Send {
+            handler: crate::drive::HANDLER.to_string(),
+            request_id: "r1".to_string(),
+            payload: json_bytes(&payload(1)),
+        })),
+    ]
+}
+
+fn started(seq: u64) -> Fed {
+    answered(Event::TurnStarted { operation: op(seq) })
+}
+
+fn rejected(calls: Vec<Fed>) -> String {
+    past_known_divergences(&hand_run(calls)).expect_err("not a known shape")
+}
+
+#[test]
+fn a_fenced_commit_of_a_turn_begun_twice_then_committed_is_a_stale_owner() {
+    let mut calls = accepted();
+    calls.extend([
+        started(1),
+        started(1),
+        refused_lost(completed(1), false),
+        answered(completed(1)),
+    ]);
+    assert_eq!(
+        past_known_divergences(&hand_run(calls)),
+        Ok(Known {
+            stale_owner: 1,
+            false_negatives: 0,
+        })
+    );
+}
+
+#[test]
+fn a_fenced_commit_that_wrote_after_one_begin_is_the_false_negative() {
+    let mut calls = accepted();
+    calls.extend([started(1), refused_lost(completed(1), true)]);
+    assert_eq!(
+        past_known_divergences(&hand_run(calls)),
+        Ok(Known {
+            stale_owner: 0,
+            false_negatives: 1,
+        })
+    );
+}
+
+#[test]
+fn a_begin_after_the_fenced_commit_does_not_count_toward_a_stale_owner() {
+    let mut calls = accepted();
+    calls.extend([
+        started(1),
+        refused_lost(completed(1), false),
+        started(1),
+        answered(completed(1)),
+    ]);
+    let err = rejected(calls);
+    assert!(
+        err.contains("not a known shape: begun 1, wrote false, committed later true"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_fenced_commit_that_wrote_after_two_begins_is_not_a_stale_owner() {
+    let mut calls = accepted();
+    calls.extend([
+        started(1),
+        started(1),
+        refused_lost(completed(1), true),
+        Fed {
+            event: completed(1),
+            reply: Some(Reply::Committed {
+                status: ravel_agents_core::wire::OperationStatus::Completed,
+                state_version: 1,
+            }),
+            wrote: true,
+        },
+    ]);
+    let err = rejected(calls);
+    assert!(
+        err.contains("not a known shape: begun 2, wrote true, committed later true"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_fenced_commit_with_no_later_commit_is_not_a_stale_owner() {
+    let mut calls = accepted();
+    calls.extend([started(1), started(1), refused_lost(completed(1), false)]);
+    let err = rejected(calls);
+    assert!(
+        err.contains("not a known shape: begun 2, wrote false, committed later false"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_fenced_commit_that_wrote_nothing_after_one_begin_is_not_the_false_negative() {
+    let mut calls = accepted();
+    calls.extend([started(1), refused_lost(completed(1), false)]);
+    let err = rejected(calls);
+    assert!(
+        err.contains("not a known shape: begun 1, wrote false, committed later false"),
+        "{err}"
+    );
+}
+
 #[test]
 fn worker_kills_across_seeds() {
     let mut runs = 0;
