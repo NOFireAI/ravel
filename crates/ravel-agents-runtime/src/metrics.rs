@@ -31,7 +31,8 @@ pub struct AgentsMetricsSnapshot {
     pub incompatible_handler_refusals: u64,
     /// `OutcomeUnknown` errors settled into this caller's answer: through
     /// `AgentStore::resolve` for an input-scoped command, by re-reading HEAD
-    /// for `Takeover` and `BeginTurn`. Counted once the settle succeeds, not
+    /// for `Takeover`, `BeginTurn`, `ScheduleTimer` and `CancelTimer`.
+    /// Counted once the settle succeeds, not
     /// when the error is seen; a settle that ends in a refusal or another
     /// error is not counted.
     pub outcome_unknown_resolved: u64,
@@ -51,9 +52,66 @@ pub(crate) struct Metrics {
     pub(crate) incompatible_handler_refusals: AtomicU64,
     pub(crate) outcome_unknown_resolved: AtomicU64,
     pub(crate) polls_waited: AtomicU64,
+    pub(crate) timers_fired: AtomicU64,
+    pub(crate) sweep_passes: AtomicU64,
+    pub(crate) sweep_list_pages: AtomicU64,
+    pub(crate) sweep_head_gets: AtomicU64,
+    pub(crate) sweep_hints_read: AtomicU64,
+    pub(crate) sweep_hints_deleted: AtomicU64,
+    pub(crate) sweep_agents_loaded: AtomicU64,
+}
+
+/// The timer and sweep counters, summed over every pass since the
+/// coordinator started. Kept apart from [`AgentsMetricsSnapshot`], which
+/// `ravel-server` builds field by field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepMetricsSnapshot {
+    /// Passes run, from polls and from `sweep_once`, including failed ones.
+    pub passes: u64,
+    /// LISTs the passes issued over `_wake/` and `_dir/`.
+    pub list_pages: u64,
+    /// HEAD reads the passes issued themselves.
+    pub head_gets: u64,
+    /// Due hints acted on.
+    pub hints_read: u64,
+    /// Hints deleted after HEAD showed their timer settled.
+    pub hints_deleted: u64,
+    /// `TimerFired` replies published by a `FireTimer` CAS.
+    pub timers_fired: u64,
+    /// Agents with work a pass added to the dispatch set.
+    pub agents_loaded: u64,
 }
 
 impl Coordinator {
+    /// The timer and sweep counters.
+    pub fn sweep_metrics(&self) -> SweepMetricsSnapshot {
+        let m = &self.metrics;
+        SweepMetricsSnapshot {
+            passes: m.sweep_passes.load(Ordering::Relaxed),
+            list_pages: m.sweep_list_pages.load(Ordering::Relaxed),
+            head_gets: m.sweep_head_gets.load(Ordering::Relaxed),
+            hints_read: m.sweep_hints_read.load(Ordering::Relaxed),
+            hints_deleted: m.sweep_hints_deleted.load(Ordering::Relaxed),
+            timers_fired: m.timers_fired.load(Ordering::Relaxed),
+            agents_loaded: m.sweep_agents_loaded.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_sweep(&self, report: &crate::SweepReport) {
+        let m = &self.metrics;
+        m.sweep_passes.fetch_add(1, Ordering::Relaxed);
+        m.sweep_list_pages
+            .fetch_add(report.list_pages, Ordering::Relaxed);
+        m.sweep_head_gets
+            .fetch_add(report.head_gets, Ordering::Relaxed);
+        m.sweep_hints_read
+            .fetch_add(report.hints_read, Ordering::Relaxed);
+        m.sweep_hints_deleted
+            .fetch_add(report.hints_deleted, Ordering::Relaxed);
+        m.sweep_agents_loaded
+            .fetch_add(report.agents_loaded, Ordering::Relaxed);
+    }
+
     pub(crate) fn metrics_snapshot(&self) -> AgentsMetricsSnapshot {
         let (agents_loaded, turns_active) = {
             let agents = self.agents.lock();

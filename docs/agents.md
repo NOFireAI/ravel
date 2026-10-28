@@ -71,11 +71,11 @@ typed error (`keys::tests::negative_due_is_typed`). The listing prefixes are
 `tenant_prefix`, `agent_prefix`, `wake_prefix` and `dir_prefix`.
 
 ADR-3331 decision 2 says a wake hint is deleted once HEAD no longer needs
-it. Nothing deletes one in this release and no IAM template grants a delete
-under `ag/` (test
+it. The gateway and query IAM templates grant `s3:DeleteObject` on
+`t/*/ag/_wake/*` for the sweep's hint delete, and no role may delete any
+other key under `ag/` (test
 `agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain`
-in `crates/ravel-commit/tests/iam_templates.rs`); hint cleanup arrives with
-the sweep in milestone 4. Live garbage collection of agent objects is out of
+in `crates/ravel-commit/tests/iam_templates.rs`). Live garbage collection of agent objects is out of
 scope for this release (ADR-3331 decision 2).
 
 Because IAM's `*` matches `/`, the template grant `t/*/ag/*` also reaches
@@ -366,7 +366,7 @@ of a running server.
 |---|---|---|
 | All agent objects live under `t/<tenant>/ag/`; keys carry no caller text | in the crates (M0) | `keys::tests::layout_matches_the_adr_table`, `every_built_key_is_addressable` |
 | `ag` is a reserved Parquet table name | on main | `names::tests::every_segment_a_template_grants_after_a_wildcard_is_reserved` |
-| gateway and query roles may list, read and write `t/*/ag/*`; maintain may list and read; no role may delete | on main (templates) | `agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain` |
+| gateway and query roles may list, read and write `t/*/ag/*` and delete `t/*/ag/_wake/*` only; maintain may list and read; no other role may delete | on main (templates) | `agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain` |
 | A newer HEAD format is refused before any field is read and is never written | in the crates (M0, M1) | `head::tests::a_newer_format_version_is_refused_before_the_rest_is_read`, store `a_newer_head_format_is_unsupported_and_never_written` |
 | A command succeeds only when its HEAD CAS returned `Ok` | in the crates (M1) | `an_unknown_cas_outcome_is_never_retried` (an ambiguous CAS is not reported as success), `a_failed_conditional_write_re_reads_and_succeeds_on_retry` (a refused CAS is not) |
 | An ambiguous CAS returns `OutcomeUnknown` with a handle that resolves later | in the crates (M1) | `cas_applied_with_lost_response_is_resolved_by_operation_id_after_a_later_revision` |

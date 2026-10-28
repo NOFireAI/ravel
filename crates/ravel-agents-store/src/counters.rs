@@ -17,6 +17,12 @@
 //!   `put`; `CasVersion` otherwise, counted under `cas`) and the advisory
 //!   `_dir` and `_wake` writes after it (under `put`).
 //!
+//! DELETEs of `_wake` hints (`AgentStore::delete_wake_hint`) belong to no
+//! publication phase and [`PhaseCounts`] has no delete field, so they are
+//! counted apart, by [`Counters::deletes`]. The two cursor listings
+//! (`list_wake_hints`, `list_dir_after`) count under `resolve` `list`, like
+//! `list_agents`.
+//!
 //! `conflict` counts conditional writes the store refused: `PreconditionFailed`
 //! on a HEAD CAS and `AlreadyExists` on a HEAD create (publish phase), and
 //! `AlreadyExists` on a dependency PUT (store phase, the normal idempotent
@@ -81,6 +87,7 @@ pub struct Counters {
     build: PhaseCounters,
     store: PhaseCounters,
     publish: PhaseCounters,
+    deletes: AtomicU64,
 }
 
 impl Counters {
@@ -102,6 +109,15 @@ impl Counters {
             Request::List => &p.list,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn delete(&self) {
+        self.deletes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Wake hint DELETEs issued, every attempt counted.
+    pub fn deletes(&self) -> u64 {
+        self.deletes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn conflict(&self, phase: Phase) {

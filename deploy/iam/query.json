@@ -120,6 +120,12 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*"
     },
     {
+      "Sid": "QueryAgentsWakeDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/ag/_wake/*"
+    },
+    {
       "Sid": "QueryTenantKms",
       "Effect": "Allow",
       "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],

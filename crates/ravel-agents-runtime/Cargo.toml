@@ -9,6 +9,7 @@ description = "Ravel Agents coordinator: ownership epochs, turn dispatch, steps,
 [dependencies]
 ravel-agents-core = { workspace = true }
 ravel-agents-store = { workspace = true }
+ravel-types = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
@@ -18,7 +19,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ravel-object-store = { workspace = true }
-ravel-types = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

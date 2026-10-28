@@ -62,6 +62,7 @@ impl Coordinator {
             notified.as_mut().enable();
             self.unload_idle();
             self.discover().await?;
+            self.sweep_from_poll().await;
             match self.scan(&req.worker_id, &pins).await? {
                 Scan::Assigned(a) => return Ok(Some(*a)),
                 Scan::Refused(e) => return Err(e),
