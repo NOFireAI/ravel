@@ -9,10 +9,12 @@ never published (`"private": true` in `package.json`).
 The SDK runs end to end against the in-process fake coordinator in
 `@ravel/agents/testing`, and nowhere else yet:
 
-- No Ravel server serves the agents routes to this client. The HTTP routes
-  under `/api/v1/agents/` and the worker transport arrive with tasks T11
-  and T12b; until then `createClient` has nothing live to talk to, and
-  `serveAgents` has no HTTP `Transport` implementation, only the fake.
+- `ravel-server --agents` serves the client and worker routes under
+  `/api/v1/agents/`, and the wire schemas here match their bodies (the
+  golden fixtures in `sdk/fixtures/` are written by the Rust side). No test
+  runs this package against a live server yet, and `serveAgents` has no
+  HTTP `Transport` implementation, only the fake. `createClient` maps a 401
+  or 403 to `Forbidden`.
 - The only way in is the package's own exports; nothing in Ravel imports
   it.
 - No CI job runs it yet (task T2 adds the `sdk` job). Run the checks by
@@ -273,10 +275,13 @@ provisionally on the SDK side:
   name alone. Two agents at one version sharing a handler name are told
   apart only by the digest, which the fake coordinator matches on (test:
   `two agents at one version sharing a handler name are each leased their
-  own turn`, `steps.test.ts`); the server-side match is a wire gap for T11.
-- No recorded turn time or random seed travels on the wire. `ctx.now()`
-  reads the poll's `startedUnixNs`, local to the SDK, and `ctx.random()` is
-  seeded from the agent id, incarnation and accept sequence.
+  own turn`, `steps.test.ts`); whether the server matches on the digest
+  too is not pinned by any server test.
+- The polled lease carries the turn's `recorded_unix_ns` and `random_seed`.
+  `ctx.now()` reads the recorded time and `ctx.random()` is seeded from the
+  random seed, so a retried turn sees the same values (test: `turn random
+  seed matches the worker_poll_response fixture's lease`,
+  `identity.test.ts`).
 - The canonical encoding of step input is unspecified; the SDK hashes
   sorted-key JSON of the input's JSON form and refuses anything that is not
   plain JSON.
