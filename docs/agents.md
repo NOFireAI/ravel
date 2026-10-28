@@ -350,8 +350,10 @@ the retry jitter (`backoff.rs`) and decides nothing.
 Timer accuracy and takeover speed do depend on clocks. The assumption is
 monotonic local clocks and bounded skew between coordinators (ADR-3331
 decision 8). A wake hint is bucketed by minute and may be early or late; the
-sweep that makes timers fire without a hint arrives in milestone 4. The
-owner lease hint in HEAD is advisory and revokes nothing; only an epoch
+runtime's sweep makes a due timer fire without its hint, judged by one HEAD
+read against the coordinator's injected clock, within the pass bound its
+module documents (`a_schedule_whose_hint_was_never_written_still_fires_when_due`).
+The owner lease hint in HEAD is advisory and revokes nothing; only an epoch
 advance does (ADR-3331 decision 6).
 
 ## Guarantees and limitations
