@@ -4477,6 +4477,18 @@ dependencies = [
 [[package]]
 name = "ravel-agents-runtime"
 version = "0.27.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "parking_lot",
+ "ravel-agents-core",
+ "ravel-agents-store",
+ "ravel-object-store",
+ "ravel-types",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "ravel-agents-sim"
