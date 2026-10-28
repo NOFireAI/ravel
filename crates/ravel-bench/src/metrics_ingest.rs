@@ -3704,7 +3704,10 @@ impl HttpCollector {
         self.retries += retries;
         self.wire_bytes += wire_bytes;
         self.first_sent = Some(self.first_sent.map_or(sent_at, |t| t.min(sent_at)));
-        self.last_answered = Some(self.last_answered.map_or(answered_at, |t| t.max(answered_at)));
+        self.last_answered = Some(
+            self.last_answered
+                .map_or(answered_at, |t| t.max(answered_at)),
+        );
         let receiver = self.receiver;
         let tally = &mut self.tally;
         let dropped_before = tally.dropped();
@@ -3768,7 +3771,11 @@ fn stall_check_due(sending_for: Duration, since_last_check: Option<Duration>) ->
 /// `elapsed_secs` and offered `offered_points` of the `stream_points` its
 /// stream will offer: `elapsed_secs * stream_points / offered_points`. `None`
 /// before any point is offered, when nothing can be projected.
-pub fn project_ingest_secs(elapsed_secs: f64, offered_points: u64, stream_points: u64) -> Option<f64> {
+pub fn project_ingest_secs(
+    elapsed_secs: f64,
+    offered_points: u64,
+    stream_points: u64,
+) -> Option<f64> {
     (offered_points > 0).then(|| elapsed_secs * stream_points as f64 / offered_points as f64)
 }
 
@@ -4169,12 +4176,11 @@ fn record_commit_tokens(
             value: entry.to_string(),
         })?;
         if let Some(held_entry) = by_shard.get(&token.shard) {
-            let held = CommitToken::decode(held_entry).map_err(|_| {
-                LaneError::InvalidCommitToken {
+            let held =
+                CommitToken::decode(held_entry).map_err(|_| LaneError::InvalidCommitToken {
                     system: system.to_string(),
                     value: held_entry.clone(),
-                }
-            })?;
+                })?;
             if held.writer_id != token.writer_id {
                 return Err(LaneError::CommitTokenWriterConflict {
                     system: system.to_string(),
@@ -7870,7 +7876,13 @@ mod tests {
         // a different shard from point 0; and the series on distinct shards,
         // so the other two can finish while series 0's first point is held.
         let shards = (4..=16)
-            .find(|&n| stream_shards(SERIES, n).iter().collect::<BTreeSet<_>>().len() == SERIES)
+            .find(|&n| {
+                stream_shards(SERIES, n)
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == SERIES
+            })
             .expect("a shard count in 4..=16 that routes the 3 series apart");
 
         let samples = valid_stream(POINTS, SERIES);
@@ -7938,7 +7950,10 @@ mod tests {
         for (series, arrived) in &by_series {
             let mut offered = arrived.clone();
             offered.sort_unstable();
-            assert_eq!(arrived, &offered, "{series} reached the receiver out of order");
+            assert_eq!(
+                arrived, &offered,
+                "{series} reached the receiver out of order"
+            );
         }
     }
 
@@ -7967,7 +7982,8 @@ mod tests {
             let app = axum::Router::new().route(
                 "/api/v1/write",
                 axum::routing::post(move || {
-                    let (now, max, notify) = (Arc::clone(&now), Arc::clone(&max), Arc::clone(&notify));
+                    let (now, max, notify) =
+                        (Arc::clone(&now), Arc::clone(&max), Arc::clone(&notify));
                     async move {
                         use std::sync::atomic::Ordering;
                         let current = now.fetch_add(1, Ordering::SeqCst) + 1;
@@ -8015,7 +8031,9 @@ mod tests {
     }
 
     /// A shard sends its partial batch at stream end: 5 points of one series
-    /// at batch size 2 are 3 requests, the last holding one point.
+    /// at batch size 2 are 3 requests, the last holding one point. The row is
+    /// on the wall basis and its `client_behavior` discloses the shard model
+    /// and the backoff.
     #[tokio::test]
     async fn a_partial_batch_is_flushed_at_stream_end() {
         let sizes: Arc<std::sync::Mutex<Vec<usize>>> = Arc::default();
@@ -8025,7 +8043,9 @@ mod tests {
             axum::routing::post(move |body: axum::body::Bytes| {
                 let log = Arc::clone(&log);
                 async move {
-                    log.lock().expect("lock").push(decode_series_ts(&body).len());
+                    log.lock()
+                        .expect("lock")
+                        .push(decode_series_ts(&body).len());
                     axum::http::StatusCode::NO_CONTENT
                 }
             }),
@@ -8050,6 +8070,20 @@ mod tests {
         assert_eq!(*sizes.lock().expect("lock"), vec![2, 2, 1]);
         assert_eq!(row.ingest.accepted_samples, 5);
         assert_eq!(row.ingest.elapsed_basis, ELAPSED_BASIS_WALL_IN_FLIGHT);
+        for disclosed in [
+            "4 shards fixed for the whole replay (no resharding",
+            "BLAKE3 hash of its sorted labels",
+            "one request in flight per shard",
+            "at 2 logical points",
+            "backoff from 30 ms doubling to 5000 ms",
+            "429 is retried although Prometheus' default retry_on_http_429 is false",
+        ] {
+            assert!(
+                row.client_behavior.contains(disclosed),
+                "client_behavior lacks `{disclosed}`: {}",
+                row.client_behavior
+            );
+        }
     }
 
     /// Class digests are a multiset: the same points in another order give
@@ -8150,7 +8184,10 @@ mod tests {
             "{err:?}"
         );
         let message = err.to_string();
-        assert!(message.contains(&held) && message.contains(&new), "{message}");
+        assert!(
+            message.contains(&held) && message.contains(&new),
+            "{message}"
+        );
         assert_eq!(by_shard.get(&3), Some(&token_of(3, 1, 1, 1)));
     }
 
@@ -8159,10 +8196,7 @@ mod tests {
     #[test]
     fn retry_delay_doubles_from_30ms_and_caps_at_5s() {
         let ms: Vec<u128> = (0..10).map(|r| retry_delay(r).as_millis()).collect();
-        assert_eq!(
-            ms,
-            vec![30, 60, 120, 240, 480, 960, 1920, 3840, 5000, 5000]
-        );
+        assert_eq!(ms, vec![30, 60, 120, 240, 480, 960, 1920, 3840, 5000, 5000]);
         assert_eq!(retry_delay(63), Duration::from_secs(5));
         assert_eq!(retry_delay(64), Duration::from_secs(5));
         assert_eq!(retry_delay(u32::MAX), Duration::from_secs(5));
@@ -8180,7 +8214,11 @@ mod tests {
             max_ingest_secs: 600,
             stream_points: 1_000,
         };
-        assert_eq!(stall_projection_over(&ceiling, 60.0, 100), None, "exactly 600 s");
+        assert_eq!(
+            stall_projection_over(&ceiling, 60.0, 100),
+            None,
+            "exactly 600 s"
+        );
         assert_eq!(stall_projection_over(&ceiling, 60.0, 50), Some(1_200.0));
         assert_eq!(stall_projection_over(&ceiling, 60.0, 0), None);
     }

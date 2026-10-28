@@ -503,6 +503,14 @@ Steps, in order, stopping at the first failure:
    stack's RustFS is the engines' own store. Those runs lose one check: the
    portable rows' expected scalar digests are not compared with an
    in-process reference, only with each other (band 6 across rows).
+   Each HTTP row is sent on the bin's defaults, 50 series shards of up to
+   2000 points per request with one request in flight per shard; run.sh
+   passes neither `--http-shards` nor `--http-batch-size` (case m). It passes
+   `--max-ingest-secs` per profile: ci 600, cardinality 14400, history 7200,
+   churn 18000, the diagnostic mode's ingest included (case m). A row whose
+   projected wall time passes its ceiling makes the bin exit 1, so the run
+   exits 70 naming step ingest, like any failed ingest; a profile with no
+   ceiling in run.sh is refused with exit 65 before anything starts.
 7. `mimir-readiness`: the ingest row for Mimir read back exactly what it
    accepted; the line is stamped (case a).
 8. `capture`: `capture-effective-config.sh` into `effective-config.json`,

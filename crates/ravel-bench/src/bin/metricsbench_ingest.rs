@@ -41,12 +41,12 @@ use ravel_bench::harness::{
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, GeneratedStream,
-    HttpReplayConfig, IN_PROCESS_SYSTEM, StallCeiling,
-    MetricsIngestReport, PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver,
-    RowAccountingViolation, RunProvenance, StreamBandViolation, StreamCounts, Substrate,
-    SystemIngestResult, build_profile_record, check_anchor, check_expected_digests_agree,
-    check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
-    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
+    HttpReplayConfig, IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, RavelReplayConfig,
+    ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance, StallCeiling,
+    StreamBandViolation, StreamCounts, Substrate, SystemIngestResult, build_profile_record,
+    check_anchor, check_expected_digests_agree, check_row_accounting, check_row_band6,
+    check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
+    replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -227,9 +227,7 @@ enum RunError {
          rows measures nothing"
     )]
     NoRows,
-    #[error(
-        "--{flag} must be at least 1: an HTTP row with no {what} sends nothing"
-    )]
+    #[error("--{flag} must be at least 1: an HTTP row with no {what} sends nothing")]
     ZeroHttpSetting {
         flag: &'static str,
         what: &'static str,
@@ -666,10 +664,11 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
                 max_ingest_secs,
                 // The generator writes one line per active series per step
                 // less anomalies; once a row has run, its report is exact.
-                stream_points: reference.as_ref().map_or(
-                    profile.active_series.saturating_mul(steps),
-                    |report| report.emitted_samples,
-                ),
+                stream_points: reference
+                    .as_ref()
+                    .map_or(profile.active_series.saturating_mul(steps), |report| {
+                        report.emitted_samples
+                    }),
             }),
         };
         let mut stream = stream_from_anchor()?;
@@ -1047,7 +1046,10 @@ mod tests {
     #[test]
     fn zero_shards_or_batch_size_exits_64() {
         resolve_http_settings(&args(&[])).expect("defaults");
-        for (flag, name) in [("--http-shards", "http-shards"), ("--http-batch-size", "http-batch-size")] {
+        for (flag, name) in [
+            ("--http-shards", "http-shards"),
+            ("--http-batch-size", "http-batch-size"),
+        ] {
             let err = resolve_http_settings(&args(&[flag, "0"])).expect_err("zero");
             assert!(
                 matches!(err, RunError::ZeroHttpSetting { flag: f, .. } if f == name),
@@ -1073,7 +1075,8 @@ mod tests {
         assert_eq!(exit_code(&err), 1);
         let text = err.to_string();
         assert!(
-            text.contains("projected 1200 s") && text.contains("600 s ceiling")
+            text.contains("projected 1200 s")
+                && text.contains("600 s ceiling")
                 && text.contains("50 of 1000 points"),
             "{text}"
         );
