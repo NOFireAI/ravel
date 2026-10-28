@@ -209,7 +209,8 @@ use ravel_agents_core::error::{AgentError, ErrorKind};
 use ravel_agents_core::head::{EffectStatus, Head, InputSource, StepStatus};
 use ravel_agents_core::identity::{AgentId, agent_id, effect_id, step_input_hash, timer_id};
 use ravel_agents_core::kernel::DerivedIds;
-use ravel_agents_core::keys::{AgentKey, AgentKind, head_key};
+use ravel_agents_core::keys::{AgentKey, AgentKind, head_key, object_key};
+use ravel_agents_core::pages::attach_page;
 use ravel_agents_core::state::{Handle, HandleItem, operation_state};
 use ravel_agents_core::wire::{
     AgentRef, CancelRequest, CancelResponse, CancelTimerRequest, CancelTimerResponse,
@@ -271,6 +272,36 @@ pub fn machine() -> Result<ReferenceMachine, String> {
 }
 
 /// The HEAD key of the simulated agent.
+/// Environment variable that sets every rig's index page size, so the
+/// suite runs a second time with lists sealing every few entries.
+pub const PAGE_ENTRIES_ENV: &str = "RAVEL_AGENTS_PAGE_ENTRIES";
+
+/// The store limits a rig uses unless a schedule sets its own: the default,
+/// with `max_page_entries` from [`PAGE_ENTRIES_ENV`] when it is set.
+///
+/// # Panics
+///
+/// When the variable is set to something other than a positive integer, so
+/// a mistyped run does not pass at the default size.
+#[allow(clippy::expect_used)]
+pub fn sim_limits() -> StoreLimits {
+    let mut limits = StoreLimits::default();
+    if let Ok(text) = std::env::var(PAGE_ENTRIES_ENV) {
+        let entries: usize = text
+            .parse()
+            .ok()
+            .filter(|&n| n > 0)
+            .expect("RAVEL_AGENTS_PAGE_ENTRIES is a positive integer");
+        limits.kernel.max_page_entries = entries;
+    }
+    limits
+}
+
+/// The page size [`sim_limits`] applies.
+pub fn page_entries() -> usize {
+    sim_limits().kernel.max_page_entries
+}
+
 pub fn head_object_key() -> Result<String, String> {
     head_key(&TENANT, &agent()).map_err(|e| format!("head key: {e:?}"))
 }
@@ -980,7 +1011,7 @@ pub struct ProcHandle {
 impl Rig {
     /// A rig whose shared store applies `plan`.
     pub fn new(plan: FaultPlan) -> Rig {
-        Rig::with_limits(plan, StoreLimits::default())
+        Rig::with_limits(plan, sim_limits())
     }
 
     pub fn with_limits(plan: FaultPlan, limits: StoreLimits) -> Rig {
@@ -1081,8 +1112,8 @@ impl Rig {
         runtime.block_on(body(proc))
     }
 
-    /// Read the agent's HEAD straight from memory, bypassing every fault
-    /// and every recorder.
+    /// Read the agent's HEAD straight from memory, every sealed page
+    /// attached, bypassing every fault and every recorder.
     pub fn head(&self) -> Result<Head, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1091,7 +1122,18 @@ impl Rig {
         let got = runtime
             .block_on(self.memory.get(&key, GetRange::Full))
             .map_err(|e| format!("head read: {e}"))?;
-        Head::decode(&got.data).map_err(|e| format!("head decode: {e:?}"))
+        let mut head = Head::decode(&got.data).map_err(|e| format!("head decode: {e:?}"))?;
+        for (list, page) in head.index.unloaded() {
+            let dep = head.index.directory(list).pages[page].page;
+            let key = object_key(&TENANT, &agent(), &dep.hash)
+                .map_err(|e| format!("page key: {e:?}"))?;
+            let got = runtime
+                .block_on(self.memory.get(&key, GetRange::Full))
+                .map_err(|e| format!("page read: {e}"))?;
+            attach_page(&mut head, list, page, &got.data)
+                .map_err(|e| format!("page attach: {e:?}"))?;
+        }
+        Ok(head)
     }
 
     pub fn build(&self) -> Result<Run, String> {

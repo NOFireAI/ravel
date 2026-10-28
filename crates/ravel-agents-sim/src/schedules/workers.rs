@@ -9,10 +9,13 @@
 use ravel_agents_core::error::ErrorKind;
 use ravel_agents_core::head::{ObjectRef, ResultStatus};
 use ravel_agents_core::state::Handle;
+use ravel_agents_store::StoreLimits;
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 
 use super::*;
-use crate::drive::{agent, json_bytes, one_terminal_result_per_input, turn_values};
+use crate::drive::{
+    agent, json_bytes, one_terminal_result_per_input, sim_limits, turn_values,
+};
 use crate::history::History;
 use crate::reference::{Event, Reply};
 use crate::scheduler::{Action, FailureContext};
@@ -188,7 +191,17 @@ fn worker_killed_after_commit_cas() {
 /// at random and `w1`'s `k`-th HEAD write loses its answer. A replacement
 /// drains.
 fn kills(seed: u64) -> KillCounts {
-    let rig = Rig::new(FaultPlan::empty());
+    kills_at(seed, sim_limits())
+}
+
+/// [`kills`] at the default page size: a single seed names an interleaving
+/// found there, and a smaller page adds store calls that move it.
+fn kills_at_default_pages(seed: u64) -> KillCounts {
+    kills_at(seed, StoreLimits::default())
+}
+
+fn kills_at(seed: u64, limits: StoreLimits) -> KillCounts {
+    let rig = Rig::with_limits(FaultPlan::empty(), limits);
     create(&rig);
     let k = 1 + seed % 4;
     let (w1, faults) = faulty(
@@ -583,7 +596,13 @@ fn worker_kills_across_seeds() {
         totals.escaped_unknown += k.escaped_unknown;
         runs += 1;
     }
-    pinned("worker_kills", runs, totals, KILL_TOTALS);
+    pinned_by_page(
+        "worker_kills",
+        runs,
+        totals,
+        &KILL_TOTALS,
+        &SMALL_PAGE_KILL_TOTALS,
+    );
 }
 
 /// The seed of [`worker_kills_across_seeds`] whose first run diverged: no
@@ -594,7 +613,7 @@ fn worker_kills_across_seeds() {
 #[test]
 fn stale_owner_commit_after_takeover_is_fenced() {
     assert_eq!(
-        kills(0x5eed_0033),
+        kills_at_default_pages(0x5eed_0033),
         KillCounts {
             crashes: 0,
             fired: 1,
@@ -614,7 +633,7 @@ fn stale_owner_commit_after_takeover_is_fenced() {
 #[test]
 fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
     assert_eq!(
-        kills(9_000_272),
+        kills_at_default_pages(9_000_272),
         KillCounts {
             fired: 1,
             contended_sends: 1,
@@ -632,14 +651,14 @@ fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
 #[test]
 #[ignore = "suspected defect, issue #3425: poll returns OutcomeUnknown when a BeginTurn retry loses its answer"]
 fn a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll() {
-    assert_eq!(kills(11_000_167).escaped_unknown, 0);
+    assert_eq!(kills_at_default_pages(11_000_167).escaped_unknown, 0);
 }
 
 /// The same seed as counted today: the escape is the run's one divergence.
 #[test]
 fn a_lost_begin_turn_answer_after_a_spent_retry_escapes_the_poll_today() {
     assert_eq!(
-        kills(11_000_167),
+        kills_at_default_pages(11_000_167),
         KillCounts {
             fired: 1,
             escaped_unknown: 1,
@@ -659,6 +678,16 @@ const KILL_TOTALS: KillCounts = KillCounts {
     false_negatives: 0,
     contended_sends: 0,
     escaped_unknown: 0,
+};
+
+/// The same at [`SMALL_PAGE_ENTRIES`]. Crashes and lost-answer rule firings
+/// are unchanged; the page reads and writes move which call each scripted
+/// release lands on: one fewer run races a takeover into a fenced stale
+/// commit, and one more settles a lost answer by inference.
+const SMALL_PAGE_KILL_TOTALS: KillCounts = KillCounts {
+    inferred: 4,
+    stale_owner: 1,
+    ..KILL_TOTALS
 };
 
 /// `w1` begins op 1 and is held at its commit-time HEAD read. `w2`, on
@@ -799,11 +828,22 @@ fn cold_restart_across_seeds() {
         turns += cold_restart_race(seed);
         runs += 1;
     }
-    pinned("cold_restart", runs, turns, COLD_RESTART_TURNS);
+    pinned_by_page(
+        "cold_restart",
+        runs,
+        turns,
+        &COLD_RESTART_TURNS,
+        &SMALL_PAGE_COLD_RESTART_TURNS,
+    );
 }
 
 /// `w-restarted`'s turns over the batch; the drain ran the rest of 128.
 const COLD_RESTART_TURNS: u64 = 113;
+/// The same at [`SMALL_PAGE_ENTRIES`]: `c`'s send writes inbox and receipts
+/// pages and its result read loads a results page, so the 60-step script
+/// runs out sooner, and past it the scheduler releases the lowest actor,
+/// `c`, ahead of `w-restarted`, leaving more inputs to the drain.
+const SMALL_PAGE_COLD_RESTART_TURNS: u64 = 108;
 
 /// A worker completes op 1. Then every process restarts cold: a client on a
 /// new coordinator sends `r3` and reads `r1`, and a worker on another new

@@ -85,19 +85,33 @@ impl Batch {
         (0..self.count).map(move |i| base.wrapping_add(i))
     }
 
-    /// The line [`pinned`] prints for one schedule's batch.
-    fn line<T: std::fmt::Debug + PartialEq>(&self, schedule: &str, totals: &T, pins: &T) -> String {
-        let verdict = match (self.is_default(), totals == pins) {
+    /// The line [`pinned`] prints for one schedule's batch run at index page
+    /// size `pages`. `measured` says whether `pins` were measured on this
+    /// batch at this page size.
+    fn line<T: std::fmt::Debug + PartialEq>(
+        &self,
+        schedule: &str,
+        pages: usize,
+        totals: &T,
+        pins: &T,
+        measured: bool,
+    ) -> String {
+        let verdict = match (measured, totals == pins) {
             (true, true) => "match",
             (true, false) => "MISS",
             (false, _) => "unpinned",
         };
         format!(
-            "sim-batch {schedule} base={} seeds={} totals={totals:?} pinned={pins:?} {verdict}",
+            "sim-batch {schedule} base={} seeds={} pages={pages} totals={totals:?} pinned={pins:?} {verdict}",
             self.base, self.count
         )
     }
 }
+
+/// The second index page size the totals are pinned at, set through
+/// `crate::drive::PAGE_ENTRIES_ENV`. At this size every list seals every
+/// two entries, so the batches drive the sealed-page paths.
+pub(crate) const SMALL_PAGE_ENTRIES: usize = 2;
 
 /// Seeds every batch runs, from [`Batch::from_env`]. A failure message's
 /// replay line sets `RAVEL_SIM_SEED` to the failing batch seed, so the
@@ -113,21 +127,49 @@ pub(crate) fn seeds_from(base: u64) -> impl Iterator<Item = u64> {
 
 /// Close a batch: `runs` must be the batch's seed count, and one line goes
 /// to stdout naming the schedule, the seeds, the totals and the pins, which
-/// `nightly.sh` collects. On the default batch the totals must equal the
-/// pins; on any other the pins were never measured, so the line says
+/// `nightly.sh` collects. On the default batch, at the default page size or
+/// at [`SMALL_PAGE_ENTRIES`], the totals must equal the pins; on any other
+/// batch or page size the pins were never measured, so the line says
 /// `unpinned` and only the per-seed checks the schedule already made apply.
+/// The pins hold at both page sizes; [`pinned_by_page`] takes a second set
+/// for a schedule whose totals differ between them.
 pub(crate) fn pinned<T: std::fmt::Debug + PartialEq>(
     schedule: &str,
     runs: u64,
     totals: T,
     pins: T,
 ) {
+    pinned_by_page(schedule, runs, totals, &pins, &pins);
+}
+
+/// [`pinned`] with `small` pinned at [`SMALL_PAGE_ENTRIES`]. Every store
+/// call is a scheduler gate, and at the small size a command reads and
+/// writes sealed pages the default size never seals, so the same seed draws
+/// a different interleaving and the totals move.
+pub(crate) fn pinned_by_page<T: std::fmt::Debug + PartialEq>(
+    schedule: &str,
+    runs: u64,
+    totals: T,
+    pins: &T,
+    small: &T,
+) {
     let batch = Batch::from_env();
     assert_eq!(runs, batch.count, "{schedule}: runs against the batch size");
-    let line = batch.line(schedule, &totals, &pins);
+    let pages = crate::drive::page_entries();
+    let default_pages = ravel_agents_store::StoreLimits::default()
+        .kernel
+        .max_page_entries;
+    let (pins, measured) = if pages == default_pages {
+        (pins, batch.is_default())
+    } else if pages == SMALL_PAGE_ENTRIES {
+        (small, batch.is_default())
+    } else {
+        (pins, false)
+    };
+    let line = batch.line(schedule, pages, &totals, pins, measured);
     println!("{line}");
-    if batch.is_default() {
-        assert_eq!(totals, pins, "{line}");
+    if measured {
+        assert_eq!(&totals, pins, "{line}");
     }
 }
 
@@ -261,14 +303,15 @@ fn a_batch_line_names_its_verdict() {
         count: BATCH,
     };
     assert_eq!(
-        default.line("s", &3, &3),
-        "sim-batch s base=1592590336 seeds=64 totals=3 pinned=3 match"
+        default.line("s", 64, &3, &3, true),
+        "sim-batch s base=1592590336 seeds=64 pages=64 totals=3 pinned=3 match"
     );
-    assert!(default.line("s", &3, &4).ends_with(" MISS"));
+    assert!(default.line("s", 2, &3, &4, true).ends_with(" MISS"));
+    assert!(default.line("s", 5, &3, &4, false).ends_with(" unpinned"));
     let other = Batch { base: 1, count: 2 };
     assert_eq!(
-        other.line("s", &3, &4),
-        "sim-batch s base=1 seeds=2 totals=3 pinned=4 unpinned"
+        other.line("s", 64, &3, &4, false),
+        "sim-batch s base=1 seeds=2 pages=64 totals=3 pinned=4 unpinned"
     );
 }
 
