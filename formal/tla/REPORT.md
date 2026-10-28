@@ -15,6 +15,12 @@ that it is implemented). Every figure below is copied from the area's own
 no figure here was recomputed, rounded, or recalled from anything other than
 those files.
 
+Section 5 also carries an `agents` area (three modules, ADR-3331), added
+after the rest of this report at commit
+`8ee0bd2564ab9b5cb70ea27c76f41d11723c9c35` and copied from
+`agents/results.md` and `agents/bands.tsv` under the same rule. The other
+sections cover the six areas above and do not discuss it.
+
 ## 2. Method
 
 Each area's `results.md` records TLC's own output for every configuration it
@@ -268,6 +274,53 @@ Twelve negative controls, no figures tabulated (dashes throughout
 | negative/guarded-publish-ignores-claim.cfg | VIOLATED (exit 12) |
 | negative/diverge-overwrites-record.cfg | VIOLATED (exit 12) |
 | negative/missing-part-reports-converged.cfg | VIOLATED (exit 12) |
+
+### agents
+
+Three modules (ADR-3331 decision 13): `AgentProtocol`, `AgentEffects` and
+`AgentIntegrated`, at commit `8ee0bd2564ab9b5cb70ea27c76f41d11723c9c35`.
+Figures are copied from `agents/results.md` (rows R1 to R20 and the final-tree re-runs, `-workers 2`,
+`-Xmx4g`) and bands from `agents/bands.tsv`; every band row cites the
+`results.md` row it rests on.
+
+| Config | States generated | Distinct | Depth | Wall | Result | Band (distinct / depth) | Row |
+|---|---|---|---|---|---|---|---|
+| MCAgentProtocol.smoke.cfg | 1131064 | 289101 | 26 | 31s | PASS | 286000-292000 / - | R1 |
+| MCAgentEffects.smoke.cfg | 726839 | 222728 | 45 | 12s | PASS | 219000-226000 / - | R2 |
+| MCAgentIntegrated.smoke.cfg | 1455417 | 427920 | 44 | 23s | PASS | 422000-434000 / - | R3 |
+| positive/stale-turn-rebase-unreachable.cfg | 1131064 | 289101 | 26 | 32s | PASS | 286000-292000 / - | R4 |
+| positive/two-generations.cfg | 1155643 | 243171 | 31 | 26s | PASS | 240000-246000 / - | R5 |
+| positive/integrated-timer-race.cfg | 3641066 | 1190621 | 45 | 62s | PASS | 1170000-1210000 / - | R6 |
+| MCAgentEffects.live.cfg | 267170 | 127749 | 43 | 20s | PASS | 125500-130000 / - | R18 |
+| MCAgentIntegrated.live.cfg | 28110 | 13617 | 35 | 6s | PASS | 13350-13900 / - | R19 |
+| MCAgentProtocol.exhaustive.cfg (MaxTimerGen 1) | 4444815 | 1266296 | 27 | 1082s | PASS | 1253000-1280000 / - | R12 |
+| MCAgentEffects.exhaustive.cfg | 6873961 | 1942312 | 48 | 110s | PASS | 1925000-1965000 / - | R11 |
+
+Every figure lands inside its band. Depth is unbanded (`-`) on every agents
+row. The `AgentEffects` distinct counts move between repeat runs under
+`VIEW`, `SYMMETRY` and two workers (smoke 222504 to 222728 over R2, R7 to R9
+and R20, exhaustive 1942312 to 1944848 over R11, R16 and R17), and both bands
+cover that spread. All 42 negative controls violated their named property
+(R10).
+
+Exhaustive coverage: the nightly lane checks `AgentProtocol` at
+`MaxTimerGen = 1` with both liveness properties and `AgentEffects` (safety
+only); both finish inside their 3000 s `budget_s`. Three runs did not finish
+and are not banded:
+
+| Run | Distinct at stop | Queued at stop | BFS level | Stopped at | Row |
+|---|---|---|---|---|---|
+| MCAgentProtocol.exhaustive.cfg, MaxTimerGen 2 | 2879377 | 1058019 | 19 | 3000 s budget | R13 |
+| MCAgentIntegrated.exhaustive.cfg, MaxTimerGen 1 | 44348194 | 5350152 | 35 | 3000 s budget | R14 |
+| MCAgentIntegrated.exhaustive.cfg, MaxTimerGen 2 | 53745308 | 14786866 | 26 | 3000 s budget | R15 |
+
+`MCAgentIntegrated.exhaustive.cfg` therefore stays under
+`agents/unenrolled/` with no band row; `AgentIntegrated`'s invariants are
+checked to completion at the smoke bounds (no timer) and by the one-worker
+timer race (R6). Those figures are this executor's; the nightly runner's
+wall time for the two enrolled exhaustive configs has not been measured.
+`results.md` also records that `MCAgentProtocol.exhaustive.cfg`'s earlier
+figure of 362907 distinct states was not reproduced on this revision.
 
 ## 6. Counterexamples found
 
