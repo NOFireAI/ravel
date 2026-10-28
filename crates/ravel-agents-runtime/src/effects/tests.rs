@@ -592,17 +592,12 @@ async fn reconcile_is_idempotent_and_audited_once() {
         .await
         .expect_err("in doubt");
     assert!(
-        co.reconcile_authorize(&d.effect, 2, &hook)
+        co.reconcile_authorize(&d.effect, 2)
             .await
             .expect("authorize")
     );
-    assert_eq!(hook.calls(), 2);
-    assert!(
-        !co.reconcile_authorize(&d.effect, 2, &hook)
-            .await
-            .expect("again")
-    );
-    assert_eq!(hook.calls(), 2, "authorized once");
+    assert!(!co.reconcile_authorize(&d.effect, 2).await.expect("again"));
+    assert_eq!(hook.calls(), 1, "reconcile dispatches nothing");
     let h = head(&store, "o-1").await;
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
     assert_eq!(effect_of(&h, &d).attempt, 2);
@@ -611,6 +606,9 @@ async fn reconcile_is_idempotent_and_audited_once() {
         .await
         .expect_err("the reconciled attempt is open under this epoch");
     assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    let d2 = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!(d2.attempt, 2);
+    assert_eq!(hook.calls(), 2, "the owner's step dispatched it once");
 
     // The reconciled attempt is lost too; the effect latches again.
     let c = takeover(&co, &clock).await;
@@ -634,7 +632,7 @@ async fn reconcile_is_idempotent_and_audited_once() {
 
 #[tokio::test(start_paused = true)]
 async fn fail_effect_records_the_failure_so_the_turn_can_fail() {
-    let (clock, _, co) = rig();
+    let (clock, store, co) = rig();
     let (a, _) = leased(&co, "o-1").await;
     let s = spec("send-email", RecoveryPolicy::AtLeastOnce);
     let hook = Hook::default();
@@ -666,10 +664,78 @@ async fn fail_effect_records_the_failure_so_the_turn_can_fail() {
             .expect("failure"),
         EffectSettled::Recorded
     );
+    for _ in 0..2 {
+        match co.run_step(&b.lease, &s, &hook).await.expect("replay") {
+            StepProgress::Failed { error } => assert_eq!(error, "rejected"),
+            other => panic!("expected the step's failure, got {other:?}"),
+        }
+    }
+    let h = head(&store, "o-1").await;
+    let step = h
+        .steps
+        .iter()
+        .find(|st| st.step_key == "send-email")
+        .expect("step journaled");
+    assert_eq!(step.status, StepStatus::Started, "a failure completes no step");
+    assert!(step.output.is_none());
+    assert_eq!(hook.calls(), 2);
     assert!(matches!(
         co.fail(&b.lease, "boom", false).await.expect("fail"),
         FailOutcome::Retry { .. }
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_output_shaped_like_a_failure_replays_as_an_output() {
+    let (_, _, co) = rig();
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("lookup", RecoveryPolicy::AtLeastOnce);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    assert_eq!(
+        co.complete_effect(&d.effect, d.attempt, &json!({"error": "x"}))
+            .await
+            .expect("result"),
+        EffectSettled::Recorded
+    );
+    for _ in 0..2 {
+        assert_eq!(step_output(&co, &a, &s, &hook).await, json!({"error": "x"}));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconciled_attempt_is_dispatched_by_the_owners_next_step() {
+    let (clock, store, co) = rig();
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let d1 = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    let err = co.run_step(&b.lease, &s, &hook).await.expect_err("in doubt");
+    assert_eq!(err.kind, ErrorKind::EffectInDoubt);
+    assert_eq!(hook.calls(), 1);
+
+    assert!(co.reconcile_authorize(&d1.effect, 2).await.expect("authorize"));
+    assert_eq!(hook.calls(), 1, "reconcile dispatches nothing");
+    let d2 = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!((d2.effect, d2.attempt), (d1.effect, 2));
+    assert_eq!(hook.calls(), 2, "the owner's step dispatched attempt 2");
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("attempt 2 is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 2, "dispatched once");
+    assert_eq!(effect_of(&head(&store, "o-1").await, &d1).attempt, 2);
+
+    assert_eq!(
+        co.complete_effect(&d2.effect, 2, &json!({"cents": 1700}))
+            .await
+            .expect("result"),
+        EffectSettled::Recorded
+    );
+    assert_eq!(step_output(&co, &b, &s, &hook).await, json!({"cents": 1700}));
+    assert_eq!(hook.calls(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -893,7 +959,7 @@ async fn a_reconcile_authorization_with_a_lost_ack_dispatches_once() {
     let before = store.counters();
     let resolved = co.metrics().outcome_unknown_resolved;
     assert!(
-        co.reconcile_authorize(&d.effect, 2, &hook)
+        co.reconcile_authorize(&d.effect, 2)
             .await
             .expect("authorize"),
         "this call's attempt landed"
@@ -901,9 +967,10 @@ async fn a_reconcile_authorization_with_a_lost_ack_dispatches_once() {
     assert_eq!(fault.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
     assert_eq!(cas_since(&store, &before), 1);
     assert_eq!(co.metrics().outcome_unknown_resolved, resolved + 1);
-    assert_eq!(hook.calls(), 2);
-    let last = hook.0.lock().last().cloned().expect("a dispatch");
-    assert_eq!((last.effect, last.attempt), (d.effect, 2));
+    assert_eq!(hook.calls(), 1, "reconcile dispatches nothing");
+    let d2 = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!((d2.effect, d2.attempt), (d.effect, 2));
+    assert_eq!(hook.calls(), 2, "the owner's step dispatched it");
     let h = head(&store, "o-1").await;
     assert_eq!(
         (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
@@ -911,12 +978,17 @@ async fn a_reconcile_authorization_with_a_lost_ack_dispatches_once() {
     );
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
 
-    // A genuine repeat dispatches nothing.
+    // A genuine repeat hands nothing over.
     assert!(
-        !co.reconcile_authorize(&d.effect, 2, &hook)
+        !co.reconcile_authorize(&d.effect, 2)
             .await
             .expect("again")
     );
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("attempt 2 is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
     assert_eq!(hook.calls(), 2);
 }
 
@@ -1049,10 +1121,10 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     let co = coordinator(&store, &clock, 100);
     let (a, _) = leased(&co, "o-1").await;
     let s = spec("wire-funds", RecoveryPolicy::Manual);
-    let hook = Arc::new(Hook::default());
+    let hook = Hook::default();
     let d = dispatched(&co, &a, &s, &hook).await;
     let b = takeover(&co, &clock).await;
-    co.run_step(&b.lease, &s, hook.as_ref())
+    co.run_step(&b.lease, &s, &hook)
         .await
         .expect_err("in doubt");
     assert_eq!(hook.calls(), 1);
@@ -1061,9 +1133,8 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     let gate = fault.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
     let reconciling = {
         let co = co.clone();
-        let hook = hook.clone();
         let effect = d.effect;
-        tokio::spawn(async move { co.reconcile_authorize(&effect, 2, hook.as_ref()).await })
+        tokio::spawn(async move { co.reconcile_authorize(&effect, 2).await })
     };
     gate.wait_until_held(1).await;
 
@@ -1072,11 +1143,10 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     let other_hook = Hook::default();
     assert!(
         other
-            .reconcile_authorize(&d.effect, 2, &other_hook)
+            .reconcile_authorize(&d.effect, 2)
             .await
             .expect("the other reconcile")
     );
-    assert_eq!(other_hook.calls(), 1);
     let landed = head(&store, "o-1").await;
     assert_eq!(
         (
@@ -1093,14 +1163,20 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     for id in held {
         assert!(gate.release(id), "the held write is released");
     }
-    let dispatched_here = reconciling.await.expect("join").expect("this reconcile");
-    assert!(!dispatched_here, "the attempt is the other admin's");
-    assert_eq!(hook.calls(), 1, "this call dispatches nothing");
-    assert_eq!(cas_since(&store, &before), 0, "and makes no further CAS");
+    let authorized_here = reconciling.await.expect("join").expect("this reconcile");
+    assert!(!authorized_here, "the attempt is the other admin's");
+    assert_eq!(cas_since(&store, &before), 0, "this call makes no further CAS");
     assert_eq!(co.metrics().outcome_unknown_resolved, resolved);
     let h = head(&store, "o-1").await;
     assert_eq!(h, landed);
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
+
+    // The owner's step through the other admin's coordinator dispatches the
+    // attempt once.
+    let d2 = dispatched(&other, &b, &s, &other_hook).await;
+    assert_eq!((d2.effect, d2.attempt), (d.effect, 2));
+    assert_eq!(other_hook.calls(), 1);
+    assert_eq!(hook.calls(), 1, "this coordinator dispatched nothing");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1138,6 +1214,7 @@ async fn a_stale_open_attempt_of_a_settled_input_does_not_block_the_next_step() 
             incarnation: d.effect.incarnation,
             accept_seq: a.accept_seq,
             attempt: d.attempt,
+            reconciled: false,
         },
     );
     let next = spec("next", RecoveryPolicy::AtLeastOnce);
