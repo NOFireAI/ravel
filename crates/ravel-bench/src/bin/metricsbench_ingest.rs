@@ -166,10 +166,13 @@ struct Args {
     /// operation including the body read (ADR-0927 decision 6).
     #[arg(long, default_value_t = 30)]
     http_timeout_secs: u64,
-    /// How long, in seconds, a portable row's read-back is repeated while it
-    /// reads less than was sent, for a receiver that acknowledges a write
-    /// before it can be queried. The same window applies to every system,
-    /// and each row records `attempts` and `settled_after_ms`. 0 reads once.
+    /// How long, in seconds, a portable row's read-back is repeated while its
+    /// figures do not match what was sent, for a receiver that acknowledges
+    /// a write before it can be queried. The window bounds when the last
+    /// read may start, so a read begun just inside it can add up to five
+    /// `--http-timeout-secs` queries. The same window applies to every
+    /// system, and each row records `attempts` and `settled_after_ms`. 0
+    /// reads once.
     #[arg(long, default_value_t = 60)]
     readback_settle_secs: u64,
 }
