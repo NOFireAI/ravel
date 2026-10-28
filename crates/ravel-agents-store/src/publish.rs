@@ -2,14 +2,22 @@
 //! the crate runs goes through [`AgentStore::publish`]:
 //!
 //! 1. GET HEAD and keep `GetOutcome.version` as the CAS token
-//!    ([`AgentStore::read_head_state`]).
+//!    ([`AgentStore::read_head_state`]), then GET the sealed index pages the
+//!    command reads, as [`ravel_agents_core::kernel::Kernel::pages_needed`]
+//!    names them, and nothing else ([`AgentStore::load_pages`];
+//!    `tests::pages::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`).
+//!    A transition that still finds a page missing is a planner miss: it is
+//!    logged and every page is loaded before the command is applied again.
 //! 2. Resolve the command's operation id against the receipt index, and
 //! 3. validate its preconditions: both are the kernel's
 //!    ([`ravel_agents_core::kernel::Kernel::apply`]), run on the root just
 //!    read. A duplicate comes back `Unchanged` and nothing is written
 //!    (`tests::enqueue_with_the_same_request_id_and_hash_returns_the_same_handle`).
 //! 4. Build the dependencies: the objects the new root references that the
-//!    old one did not ([`new_dependencies`]).
+//!    old one did not ([`new_dependencies`]), the index pages the kernel
+//!    sealed into it (`Head::index.written`) among them, so every page is
+//!    written before the CAS that references it
+//!    (`tests::pages::pages_are_written_before_the_cas_that_references_them`).
 //! 5. PUT each with `CreateIfAbsent`; on `AlreadyExists` read it back and
 //!    compare the content hash ([`AgentStore::store_dependency`]).
 //! 6. CAS HEAD from the version read in step 1 to the new root, which the

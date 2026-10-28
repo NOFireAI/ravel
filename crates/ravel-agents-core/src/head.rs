@@ -6,7 +6,7 @@
 //! [`crate::pages`]) and refuses anything else as a typed [`CodecError`]
 //! before any field is trusted
 //! (`a_newer_format_version_is_refused_before_the_rest_is_read`,
-//! `paged_representation_and_page_refs_are_refused_by_version_one`,
+//! `a_representation_that_does_not_match_the_version_is_refused`,
 //! `a_repeated_format_version_field_is_gated_on_its_decoded_value`). It
 //! writes only version 2; a version 1 binary refuses that as
 //! `UnsupportedFormat` (`a_version_one_reader_refuses_a_version_two_head`).
@@ -1671,8 +1671,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unknown_field_within_version_1_is_dropped_on_re_encode() {
-        // A v1 reader accepts a field it does not know inside a v1 record and
+    fn an_unknown_field_within_version_2_is_dropped_on_re_encode() {
+        // A v2 reader accepts a field it does not know inside a v2 record and
         // drops it on re-encode, which is why every additive change to
         // AgentHead bumps format_version (ADR-0066 R1): only the version gate
         // keeps a CAS write from losing a newer writer's field.
