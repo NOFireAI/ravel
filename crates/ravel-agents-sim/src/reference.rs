@@ -400,7 +400,9 @@ impl Life {
         let in_doubt = self
             .input_effects(seq)
             .any(|e| e.phase == EffectPhase::InDoubt);
-        if status == OperationStatus::Running && (in_doubt || (self.blocked && self.running == Some(seq))) {
+        if status == OperationStatus::Running
+            && (in_doubt || (self.blocked && self.running == Some(seq)))
+        {
             OperationStatus::Blocked
         } else {
             status
@@ -853,18 +855,21 @@ impl ReferenceMachine {
             return Reply::Error(ErrorKind::OwnershipLost);
         }
         let session = life.session;
-        let open = life.input_effects(seq).any(|e| {
-            e.phase == EffectPhase::Authorized && e.dispatched_in == Some(session)
-        });
+        let open = life
+            .input_effects(seq)
+            .any(|e| e.phase == EffectPhase::Authorized && e.dispatched_in == Some(session));
         if open {
             return Reply::Error(ErrorKind::IdempotencyConflict);
         }
-        let journaled = life.steps.entry(call.key.clone()).or_insert_with(|| StepRec {
-            tool: call.tool.clone(),
-            version: call.version.clone(),
-            input: call.input.clone(),
-            completed: None,
-        });
+        let journaled = life
+            .steps
+            .entry(call.key.clone())
+            .or_insert_with(|| StepRec {
+                tool: call.tool.clone(),
+                version: call.version.clone(),
+                input: call.input.clone(),
+                completed: None,
+            });
         if journaled.tool != call.tool
             || journaled.version != call.version
             || journaled.input != call.input
@@ -937,7 +942,11 @@ impl ReferenceMachine {
 
     /// The effect of step `step_key` of `operation`'s input, or the reply
     /// refusing a call on it.
-    fn effect_mut(&mut self, operation: &Handle, step_key: &str) -> Result<(u64, bool, &mut EffectRec), Reply> {
+    fn effect_mut(
+        &mut self,
+        operation: &Handle,
+        step_key: &str,
+    ) -> Result<(u64, bool, &mut EffectRec), Reply> {
         let seq = match self.input(operation) {
             Ok((seq, _)) => seq,
             Err(Reply::UnknownOperation) => return Err(Reply::Error(ErrorKind::AgentGone)),
@@ -954,7 +963,13 @@ impl ReferenceMachine {
             .ok_or(Reply::Error(ErrorKind::AgentGone))
     }
 
-    fn effect_result(&mut self, operation: &Handle, step_key: &str, attempt: u32, result: &[u8]) -> Reply {
+    fn effect_result(
+        &mut self,
+        operation: &Handle,
+        step_key: &str,
+        attempt: u32,
+        result: &[u8],
+    ) -> Reply {
         let (_, cancelled, effect) = match self.effect_mut(operation, step_key) {
             Ok(found) => found,
             Err(reply) => return reply,

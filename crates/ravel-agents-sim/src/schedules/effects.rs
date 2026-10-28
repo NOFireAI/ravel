@@ -47,6 +47,8 @@ enum Ended {
     Committed,
     InDoubt,
     Lost,
+    /// The poll was refused `IncompatibleHandler`.
+    Incompatible,
 }
 
 /// What each actor reported, by actor name, in the order they ended.
@@ -55,10 +57,7 @@ struct Ends(Arc<Mutex<Vec<(String, Ended)>>>);
 
 impl Ends {
     fn push(&self, name: &str, ended: Ended) {
-        self.0
-            .lock()
-            .expect("ends")
-            .push((name.to_string(), ended));
+        self.0.lock().expect("ends").push((name.to_string(), ended));
     }
 
     fn all(&self) -> Vec<(String, Ended)> {
@@ -67,23 +66,37 @@ impl Ends {
 }
 
 /// Poll one turn and run its step until it replays: dispatch, execute,
-/// report, step again. Then commit.
+/// report, step again. Then commit. A step refused `OwnershipLost`, as a
+/// cancelled input's is, ends the handler early and it commits what it
+/// has, which settles a cancellation.
 async fn step_turn(p: &Proc, policy: RecoveryPolicy) -> Result<Ended, String> {
-    let Some(a) = p.poll().await.map_err(|e| format!("poll: {e:?}"))? else {
-        return Ok(Ended::NoWork);
+    step_turn_with(p, policy, vec![pin()]).await
+}
+
+async fn step_turn_with(
+    p: &Proc,
+    policy: RecoveryPolicy,
+    pins: Vec<HandlerPinBody>,
+) -> Result<Ended, String> {
+    let a = match p.poll_with(pins).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Ended::NoWork),
+        Err(e) if e.kind == ErrorKind::IncompatibleHandler => return Ok(Ended::Incompatible),
+        Err(e) => return Err(format!("poll: {e:?}")),
     };
     let operation = Handle::decode(&a.operation).map_err(|e| format!("handle: {e:?}"))?;
     let step = call(policy);
+    let commit = || async {
+        let (state, output) = turn_values(&a);
+        match p.commit(&a, &state, &output).await {
+            Ok(_) => Ok(Ended::Committed),
+            Err(e) if e.kind == ErrorKind::OwnershipLost => Ok(Ended::Lost),
+            Err(e) => Err(format!("commit: {e:?}")),
+        }
+    };
     for _ in 0..2 {
         match p.step(&a, &step).await {
-            Ok(StepProgress::Completed { .. }) => {
-                let (state, output) = turn_values(&a);
-                return match p.commit(&a, &state, &output).await {
-                    Ok(_) => Ok(Ended::Committed),
-                    Err(e) if e.kind == ErrorKind::OwnershipLost => Ok(Ended::Lost),
-                    Err(e) => Err(format!("commit: {e:?}")),
-                };
-            }
+            Ok(StepProgress::Completed { .. }) => return commit().await,
             Ok(StepProgress::Dispatched(d)) => {
                 let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
                 p.complete_effect(&operation, &d, &result)
@@ -91,7 +104,7 @@ async fn step_turn(p: &Proc, policy: RecoveryPolicy) -> Result<Ended, String> {
                     .map_err(|e| format!("complete: {e:?}"))?;
             }
             Err(e) if e.kind == ErrorKind::EffectInDoubt => return Ok(Ended::InDoubt),
-            Err(e) if e.kind == ErrorKind::OwnershipLost => return Ok(Ended::Lost),
+            Err(e) if e.kind == ErrorKind::OwnershipLost => return commit().await,
             Err(e) => return Err(format!("step: {e:?}")),
         }
     }
@@ -120,12 +133,31 @@ async fn first_attempt(p: &Proc, policy: RecoveryPolicy) -> Result<(), String> {
 
 /// A worker that runs [`step_turn`] up to `turns` times and reports each
 /// end.
-fn stepper(rig: &Rig, name: &str, id_seed: u64, policy: RecoveryPolicy, turns: usize, ends: &Ends) -> Actor {
+fn stepper(
+    rig: &Rig,
+    name: &str,
+    id_seed: u64,
+    policy: RecoveryPolicy,
+    turns: usize,
+    ends: &Ends,
+) -> Actor {
+    stepper_with(rig, name, id_seed, policy, turns, ends, vec![pin()])
+}
+
+fn stepper_with(
+    rig: &Rig,
+    name: &str,
+    id_seed: u64,
+    policy: RecoveryPolicy,
+    turns: usize,
+    ends: &Ends,
+    pins: Vec<HandlerPinBody>,
+) -> Actor {
     let ends = ends.clone();
     let owned = name.to_string();
     worker(rig, name, id_seed, move |p| async move {
         for _ in 0..turns {
-            let ended = step_turn(&p, policy).await?;
+            let ended = step_turn_with(&p, policy, pins.clone()).await?;
             ends.push(&owned, ended);
             if ended != Ended::Committed {
                 break;
@@ -274,7 +306,9 @@ fn kill_point(policy: RecoveryPolicy, point: Point) -> Story {
         let clock = rig.clock.clone();
         let w2_ends = ends.clone();
         let w2 = worker(&rig, "w2", 20, move |p| async move {
-            p.operation(&op(1)).await.map_err(|e| format!("operation: {e:?}"))?;
+            p.operation(&op(1))
+                .await
+                .map_err(|e| format!("operation: {e:?}"))?;
             clock.advance_ms(PAST_LEASE_MS);
             w2_ends.push("w2", step_turn(&p, policy).await?);
             Ok(())
@@ -327,7 +361,9 @@ fn kill_point(policy: RecoveryPolicy, point: Point) -> Story {
     let out = if effect_of(&head, 1).map(|e| e.0) == Some(EffectStatus::InDoubt) {
         let attach = executions(&rig, 1).contains(&(1, 1));
         let operator = client(&rig, "op", 40, move |p| async move {
-            p.operation(&op(1)).await.map_err(|e| format!("operation: {e:?}"))?;
+            p.operation(&op(1))
+                .await
+                .map_err(|e| format!("operation: {e:?}"))?;
             if attach {
                 let result = json!({ "step": KEY, "attempt": 1 });
                 p.reconcile_attach(&op(1), KEY, &result)
@@ -415,7 +451,9 @@ fn cancelled_with_open_attempt(late: bool) -> Story {
     })
     .with_gates(vec![gate(Op::Put, PROVIDER_PREFIX, 1)]);
     let c = client(&rig, "c", 30, |p| async move {
-        p.cancel(&op(1)).await.map_err(|e| format!("cancel: {e:?}"))?;
+        p.cancel(&op(1))
+            .await
+            .map_err(|e| format!("cancel: {e:?}"))?;
         Ok(())
     })
     .with_gates(vec![gate(Op::Get, "/head", 1)]);
@@ -671,7 +709,10 @@ fn conflicting_results_for_one_attempt_are_idempotency_conflict() {
         p.complete_effect(&op(1), &d, &json!({ "charged": 5 }))
             .await
             .map_err(|e| format!("first result: {e:?}"))?;
-        match p.complete_effect(&op(1), &d, &json!({ "charged": 6 })).await {
+        match p
+            .complete_effect(&op(1), &d, &json!({ "charged": 6 }))
+            .await
+        {
             Err(e) if e.kind == ErrorKind::IdempotencyConflict => {}
             other => return Err(format!("second result: {other:?}")),
         }
@@ -770,6 +811,560 @@ fn query_of_a_handle_with_no_input() {
     );
 }
 
+/// Counts a batch run ends with; summed over a batch's seeds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Totals {
+    runs: usize,
+    crashes: usize,
+    /// Calls a crash left unanswered whose applied write the reference
+    /// answered.
+    inferred: usize,
+    /// Attempts handed to a dispatcher, by a step or a reconcile.
+    dispatches: usize,
+    /// Distinct (effect, attempt) pairs among them.
+    distinct_dispatches: usize,
+    /// The latest attempt of every effect HEAD ends with, summed.
+    attempts: usize,
+    /// Physical executions at the provider.
+    executions: usize,
+    /// Executions beyond the first of an effect.
+    duplicates: usize,
+    /// Steps refused `EffectInDoubt`.
+    in_doubt: usize,
+    /// Effects an operator reconciled.
+    reconciled: usize,
+    /// Results kept as evidence.
+    evidence: usize,
+    /// Results refused `IdempotencyConflict`.
+    conflicts: usize,
+    /// Inputs that settled cancelled.
+    cancelled: usize,
+    /// Polls refused `IncompatibleHandler`.
+    incompatible: usize,
+}
+
+impl std::ops::AddAssign for Totals {
+    fn add_assign(&mut self, o: Totals) {
+        self.runs += o.runs;
+        self.crashes += o.crashes;
+        self.inferred += o.inferred;
+        self.dispatches += o.dispatches;
+        self.distinct_dispatches += o.distinct_dispatches;
+        self.attempts += o.attempts;
+        self.executions += o.executions;
+        self.duplicates += o.duplicates;
+        self.in_doubt += o.in_doubt;
+        self.reconciled += o.reconciled;
+        self.evidence += o.evidence;
+        self.conflicts += o.conflicts;
+        self.cancelled += o.cancelled;
+        self.incompatible += o.incompatible;
+    }
+}
+
+/// An operator settles the effect of input `seq`, in doubt at `attempt`:
+/// it attaches that attempt's result when the provider shows it executed,
+/// else authorizes the next attempt, executes it and reports its result.
+async fn reconcile(p: &Proc, seq: u64, attempt: u32, executed: bool) -> Result<(), String> {
+    p.operation(&op(seq))
+        .await
+        .map_err(|e| format!("operation: {e:?}"))?;
+    if executed {
+        let result = json!({ "step": KEY, "attempt": attempt });
+        p.reconcile_attach(&op(seq), KEY, &result)
+            .await
+            .map_err(|e| format!("attach: {e:?}"))?;
+        return Ok(());
+    }
+    p.reconcile_authorize(&op(seq), KEY, attempt + 1)
+        .await
+        .map_err(|e| format!("authorize: {e:?}"))?;
+    let d = p.last_dispatch().ok_or("authorize dispatched nothing")?;
+    let result = p.execute(&d).await.map_err(|e| format!("execute: {e:?}"))?;
+    p.complete_effect(&op(seq), &d, &result)
+        .await
+        .map_err(|e| format!("complete: {e:?}"))?;
+    Ok(())
+}
+
+/// Settle what a schedule left. Each round an operator reconciles every
+/// effect in doubt, then a fresh worker takes over and runs turns. Returns
+/// the reconciles made.
+fn finish(rig: &Rig, policy: RecoveryPolicy, seed: u64, inputs: u64) -> usize {
+    finish_with(rig, policy, seed, inputs, vec![pin()])
+}
+
+fn finish_with(
+    rig: &Rig,
+    policy: RecoveryPolicy,
+    seed: u64,
+    inputs: u64,
+    pins: Vec<HandlerPinBody>,
+) -> usize {
+    let mut reconciled = 0;
+    for round in 0..4u64 {
+        let head = rig.head().expect("head");
+        if head.inbox.is_empty() && head.active_turn.is_none() {
+            break;
+        }
+        let doubts: Vec<(u64, u32)> = (1..=inputs)
+            .filter_map(|seq| match effect_of(&head, seq) {
+                Some((EffectStatus::InDoubt, attempt, _)) => Some((seq, attempt)),
+                _ => None,
+            })
+            .collect();
+        if !doubts.is_empty() {
+            let executed = executions(rig, inputs);
+            reconciled += doubts.len();
+            let operator = client(
+                rig,
+                &format!("op{round}"),
+                40 + round,
+                move |p| async move {
+                    for (seq, attempt) in doubts {
+                        reconcile(&p, seq, attempt, executed.contains(&(seq, attempt))).await?;
+                    }
+                    Ok(())
+                },
+            );
+            run(rig, seed, ScheduleScript::new(Vec::new()), vec![operator]).expect("operator");
+        }
+        rig.clock.advance_ms(PAST_LEASE_MS);
+        let w = stepper_with(
+            rig,
+            &format!("fin{round}"),
+            50 + round,
+            policy,
+            2 * inputs as usize,
+            &Ends::default(),
+            pins.clone(),
+        );
+        run(rig, seed, ScheduleScript::new(Vec::new()), vec![w]).expect("finish");
+    }
+    reconciled
+}
+
+fn crashes(out: &ScheduleOutcome) -> usize {
+    out.trace
+        .iter()
+        .filter(|t| t.action == Action::Crashed)
+        .count()
+}
+
+/// Run each worker alone under its own seeded script, every lease past its
+/// grace before the next. Two workers polling at once can reach the
+/// takeover race [`takeover_retried_on_fresh_head_fences_a_live_turn`]
+/// pins, so the batches hand work over one worker at a time. Returns the
+/// last outcome and the crashes across all of them.
+fn relay(rig: &Rig, seed: u64, workers: Vec<Actor>) -> (ScheduleOutcome, usize) {
+    let mut last = None;
+    let mut crashed = 0;
+    for (i, w) in workers.into_iter().enumerate() {
+        if i > 0 {
+            rig.clock.advance_ms(PAST_LEASE_MS);
+        }
+        let s = seed ^ ((i as u64) << 32);
+        let out = run(rig, s, seeded(s, 1, 40, 80), vec![w]).expect("relay");
+        crashed += crashes(&out);
+        last = Some(out);
+    }
+    (last.expect("one worker"), crashed)
+}
+
+/// Check the whole run and count it. Every input reached one terminal
+/// result, and nothing was refused but an `IncompatibleHandler` poll.
+fn tally(rig: &Rig, out: &ScheduleOutcome, inputs: u64, reconciled: usize) -> Totals {
+    let run = checked(rig, out);
+    sim_assert!(
+        *out,
+        run.refusals
+            .iter()
+            .all(|r| r.call == "poll" && r.kind == ErrorKind::IncompatibleHandler),
+        "{:?}",
+        run.refusals
+    );
+    let head = rig.head().expect("head");
+    crate::drive::one_terminal_result_per_input(&head)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.failure_context()));
+    let dispatched: Vec<(ravel_agents_core::identity::Id128, u32)> = rig
+        .dispatches
+        .lock()
+        .expect("dispatches")
+        .iter()
+        .map(|(_, d)| (d.effect.effect_id, d.attempt))
+        .collect();
+    let mut distinct = dispatched.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let executed = executions(rig, inputs);
+    let mut executed_effects: Vec<u64> = executed.iter().map(|(seq, _)| *seq).collect();
+    executed_effects.dedup();
+    let observed = |reply: Reply| {
+        run.history
+            .calls()
+            .iter()
+            .filter(|c| c.observed == reply)
+            .count()
+    };
+    Totals {
+        runs: 1,
+        crashes: 0,
+        inferred: run.inferred.len(),
+        dispatches: dispatched.len(),
+        distinct_dispatches: distinct.len(),
+        attempts: head.effects.iter().map(|e| e.attempt as usize).sum(),
+        executions: executed.len(),
+        duplicates: executed.len() - executed_effects.len(),
+        in_doubt: observed(Reply::Error(ErrorKind::EffectInDoubt)),
+        reconciled,
+        evidence: observed(Reply::EffectEvidence),
+        conflicts: observed(Reply::Error(ErrorKind::IdempotencyConflict)),
+        cancelled: (1..=inputs)
+            .filter(|seq| crate::drive::status_of(&head, *seq) == Some(OperationStatus::Cancelled))
+            .count(),
+        incompatible: run.refusals.len(),
+    }
+}
+
+/// Two inputs, two workers in turn running step turns under `policy`,
+/// killed at random; then reconciliation and a replacement finish the work.
+fn kills(policy: RecoveryPolicy, seed: u64) -> Totals {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 2);
+    let ends = Ends::default();
+    let w1 = stepper(&rig, "w1", 10, policy, 2, &ends);
+    let w2 = stepper(&rig, "w2", 20, policy, 2, &ends);
+    let (out, crashed) = relay(&rig, seed, vec![w1, w2]);
+    let reconciled = finish(&rig, policy, seed, 2);
+    let mut t = tally(&rig, &out, 2, reconciled);
+    t.crashes = crashed;
+    let head = rig.head().expect("head");
+    sim_assert_eq!(
+        out,
+        (
+            crate::drive::status_of(&head, 1),
+            crate::drive::status_of(&head, 2)
+        ),
+        (
+            Some(OperationStatus::Completed),
+            Some(OperationStatus::Completed)
+        )
+    );
+    match policy {
+        RecoveryPolicy::ProviderIdempotency => {
+            sim_assert_eq!(out, (t.duplicates, t.distinct_dispatches), (0, 2));
+        }
+        RecoveryPolicy::AtLeastOnce => {
+            sim_assert_eq!(out, t.distinct_dispatches, t.dispatches);
+        }
+        RecoveryPolicy::Manual => {
+            sim_assert_eq!(
+                out,
+                (t.dispatches, t.distinct_dispatches),
+                (t.attempts, t.attempts)
+            );
+        }
+    }
+    t
+}
+
+fn kill_batch(policy: RecoveryPolicy) -> Totals {
+    let mut totals = Totals::default();
+    for seed in seeds() {
+        totals += kills(policy, seed);
+    }
+    totals
+}
+
+#[test]
+fn provider_idempotency_kills_across_seeds() {
+    assert_eq!(kill_batch(PI), PI_TOTALS);
+}
+
+/// The acceptance check for recovery policies. Under `at_least_once` a
+/// kill between execution and the result's publication re-executes the
+/// tool: the batch reaches that duplicate physical execution. Under
+/// `manual` no attempt is ever dispatched twice: every dispatch is a
+/// distinct attempt and their number is the attempts HEAD authorized.
+#[test]
+fn at_least_once_duplicate_execution_is_reachable_and_manual_policy_never_redispatches() {
+    let alo = kill_batch(ALO);
+    assert_eq!(alo, ALO_TOTALS);
+    assert!(alo.duplicates > 0, "{alo:?}");
+    let manual = kill_batch(MANUAL);
+    assert_eq!(manual, MANUAL_TOTALS);
+    assert_eq!(
+        (manual.dispatches, manual.distinct_dispatches),
+        (manual.attempts, manual.attempts)
+    );
+}
+
+/// Summed over each batch. Pinned: a scheduler or production change that
+/// moves where workers die moves them.
+/// A provider-idempotency attempt is dispatched again under the same
+/// attempt number, 16 times, and the provider executes each effect once.
+const PI_TOTALS: Totals = Totals {
+    runs: 64,
+    crashes: 114,
+    inferred: 27,
+    dispatches: 144,
+    distinct_dispatches: 128,
+    attempts: 128,
+    executions: 128,
+    duplicates: 0,
+    in_doubt: 0,
+    reconciled: 0,
+    evidence: 0,
+    conflicts: 0,
+    cancelled: 0,
+    incompatible: 0,
+};
+
+/// The same kills: each re-dispatch is a new attempt, and 13 of them
+/// executed the tool a second time.
+const ALO_TOTALS: Totals = Totals {
+    runs: 64,
+    crashes: 114,
+    inferred: 27,
+    dispatches: 144,
+    distinct_dispatches: 144,
+    attempts: 144,
+    executions: 141,
+    duplicates: 13,
+    in_doubt: 0,
+    reconciled: 0,
+    evidence: 0,
+    conflicts: 0,
+    cancelled: 0,
+    incompatible: 0,
+};
+
+/// The same kills: 15 attempts left in doubt, each reconciled by an
+/// operator, and no attempt dispatched twice.
+const MANUAL_TOTALS: Totals = Totals {
+    runs: 64,
+    crashes: 112,
+    inferred: 27,
+    dispatches: 131,
+    distinct_dispatches: 131,
+    attempts: 131,
+    executions: 128,
+    duplicates: 0,
+    in_doubt: 15,
+    reconciled: 15,
+    evidence: 0,
+    conflicts: 0,
+    cancelled: 0,
+    incompatible: 0,
+};
+
+/// Two inputs; a worker runs step turns under `at_least_once` while a
+/// client cancels op 1, the worker killed at random. One worker, for the
+/// reason [`relay`] gives.
+fn cancels(seed: u64) -> Totals {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 2);
+    let ends = Ends::default();
+    let w1 = stepper(&rig, "w1", 10, ALO, 2, &ends);
+    // A cancel of an accepted input answers `requested: true`, the suspected
+    // defect `races::cancel_of_an_accepted_input_reports_requested_false`
+    // pins, so `c` cancels only once op 1 has left `accepted`.
+    let c = client(&rig, "c", 30, |p| async move {
+        for _ in 0..64 {
+            let status = p
+                .operation(&op(1))
+                .await
+                .map_err(|e| format!("operation: {e:?}"))?;
+            if status != Reply::Status(OperationStatus::Accepted) {
+                p.cancel(&op(1))
+                    .await
+                    .map_err(|e| format!("cancel: {e:?}"))?;
+                break;
+            }
+        }
+        Ok(())
+    });
+    let script = crash_workers_only(seeded(seed, 2, 80, 80), &[1]);
+    let out = run(&rig, seed, script, vec![w1, c]).expect("schedule");
+    let reconciled = finish(&rig, ALO, seed, 2);
+    let mut t = tally(&rig, &out, 2, reconciled);
+    t.crashes = crashes(&out);
+    let head = rig.head().expect("head");
+    sim_assert_eq!(
+        out,
+        crate::drive::status_of(&head, 2),
+        Some(OperationStatus::Completed)
+    );
+    t
+}
+
+#[test]
+fn cancels_across_seeds() {
+    let mut totals = Totals::default();
+    for seed in seeds() {
+        totals += cancels(seed);
+    }
+    assert_eq!(totals, CANCEL_TOTALS);
+}
+
+const CANCEL_TOTALS: Totals = Totals {
+    runs: 64,
+    crashes: 53,
+    inferred: 14,
+    dispatches: 94,
+    distinct_dispatches: 94,
+    attempts: 94,
+    executions: 93,
+    duplicates: 2,
+    in_doubt: 0,
+    reconciled: 0,
+    evidence: 0,
+    conflicts: 0,
+    cancelled: 43,
+    incompatible: 0,
+};
+
+/// One input. `w1` dispatches the step's attempt; two reporters then race
+/// different results for it. One is recorded and the other refused, and
+/// the turn replays the recorded one.
+fn conflicts(seed: u64) -> Totals {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let slot: Arc<Mutex<Option<ravel_agents_runtime::Dispatch>>> = Arc::default();
+    let stash = slot.clone();
+    let w1 = worker(&rig, "w1", 10, move |p| async move {
+        let a = p
+            .poll()
+            .await
+            .map_err(|e| format!("poll: {e:?}"))?
+            .ok_or("no assignment")?;
+        let Ok(StepProgress::Dispatched(d)) = p.step(&a, &call(ALO)).await else {
+            return Err("the first step did not dispatch".to_string());
+        };
+        *stash.lock().expect("slot") = Some(d);
+        Ok(())
+    });
+    run(&rig, seed, ScheduleScript::new(Vec::new()), vec![w1]).expect("dispatch");
+    let d = slot.lock().expect("slot").clone().expect("dispatched");
+    let reporters = ["r1", "r2"].map(|name| {
+        let d = d.clone();
+        client(&rig, name, 60, move |p| async move {
+            match p.complete_effect(&op(1), &d, &json!({ "by": name })).await {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind == ErrorKind::IdempotencyConflict => Ok(()),
+                Err(e) => Err(format!("complete: {e:?}")),
+            }
+        })
+    });
+    let out = run(&rig, seed, seeded(seed, 2, 40, 0), reporters.into()).expect("schedule");
+    let reconciled = finish(&rig, ALO, seed, 1);
+    let t = tally(&rig, &out, 1, reconciled);
+    sim_assert_eq!(out, t.conflicts, 1);
+    t
+}
+
+#[test]
+fn conflicting_reporters_across_seeds() {
+    let mut totals = Totals::default();
+    for seed in seeds() {
+        totals += conflicts(seed);
+    }
+    assert_eq!(totals, CONFLICT_TOTALS);
+}
+
+const CONFLICT_TOTALS: Totals = Totals {
+    runs: 64,
+    crashes: 0,
+    inferred: 0,
+    dispatches: 64,
+    distinct_dispatches: 64,
+    attempts: 64,
+    executions: 0,
+    duplicates: 0,
+    in_doubt: 0,
+    reconciled: 0,
+    evidence: 0,
+    conflicts: 64,
+    cancelled: 0,
+    incompatible: 0,
+};
+
+/// Two inputs. `w1` on `v1`, `w2` on `v2` only and `w3` on `v1` run step
+/// turns in turn, each killed at random; a worker that finds a turn begun
+/// on the other version is refused. A replacement holding both finishes.
+fn versions(seed: u64) -> Totals {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 2);
+    let ends = Ends::default();
+    let v2 = HandlerPinBody {
+        version: "v2".to_string(),
+        ..pin()
+    };
+    let w1 = stepper(&rig, "w1", 10, PI, 2, &ends);
+    let w2 = stepper_with(&rig, "w2", 20, PI, 2, &ends, vec![v2.clone()]);
+    let w3 = stepper(&rig, "w3", 30, PI, 2, &ends);
+    let (out, crashed) = relay(&rig, seed, vec![w1, w2, w3]);
+    let reconciled = finish_with(&rig, PI, seed, 2, vec![pin(), v2]);
+    let mut t = tally(&rig, &out, 2, reconciled);
+    t.crashes = crashed;
+    t
+}
+
+/// Two inputs, two workers polling at once, nobody killed and the clock
+/// never moved, so no lease runs out. Returns the turns that ended fenced
+/// `OwnershipLost`.
+fn concurrent_pollers(seed: u64) -> usize {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 2);
+    let ends = Ends::default();
+    let w1 = stepper(&rig, "w1", 10, PI, 2, &ends);
+    let w2 = stepper(&rig, "w2", 20, PI, 2, &ends);
+    run(&rig, seed, seeded(seed, 2, 80, 0), vec![w1, w2]).expect("schedule");
+    ends.all().iter().filter(|(_, e)| *e == Ended::Lost).count()
+}
+
+/// Suspected defect in the runtime's takeover. `takeover_due` reads a HEAD
+/// whose owner holds no active turn; the owner then begins one, the
+/// takeover's CAS conflicts, and the store's publish loop applies
+/// `Takeover` again to the fresh HEAD. The kernel checks only the observed
+/// epoch, which `BeginTurn` does not move, so the takeover lands on a live
+/// turn whose lease never ran out and its owner is fenced `OwnershipLost`.
+/// `Coordinator::takeover_due` documents the takeover as allowed only
+/// while the owner holds no active turn or its lease and grace ran out.
+/// 25 of the 64 batch seeds reach it with no fault at all; this is the
+/// first.
+#[test]
+#[ignore = "suspected defect: a takeover re-applied after a lost CAS fences a live turn"]
+fn takeover_retried_on_fresh_head_fences_a_live_turn() {
+    assert_eq!(concurrent_pollers(0x5eed_0001), 0);
+}
+
+#[test]
+fn handler_version_changes_across_seeds() {
+    let mut totals = Totals::default();
+    for seed in seeds() {
+        totals += versions(seed);
+    }
+    assert_eq!(totals, VERSION_TOTALS);
+}
+
+const VERSION_TOTALS: Totals = Totals {
+    runs: 64,
+    crashes: 136,
+    inferred: 21,
+    dispatches: 147,
+    distinct_dispatches: 128,
+    attempts: 128,
+    executions: 128,
+    duplicates: 0,
+    in_doubt: 0,
+    reconciled: 0,
+    evidence: 0,
+    conflicts: 0,
+    cancelled: 0,
+    incompatible: 37,
+};
+
 fn expect_story(lines: &[&str]) -> Vec<String> {
     lines.iter().map(|s| s.to_string()).collect()
 }
@@ -783,7 +1378,10 @@ fn expect(
 ) -> Story {
     Story {
         story: story.iter().map(|s| s.to_string()).collect(),
-        dispatched: dispatched.iter().map(|(n, a)| (n.to_string(), *a)).collect(),
+        dispatched: dispatched
+            .iter()
+            .map(|(n, a)| (n.to_string(), *a))
+            .collect(),
         executions: executions.to_vec(),
         ends: ends.iter().map(|(n, e)| (n.to_string(), *e)).collect(),
         effect: Some(effect),

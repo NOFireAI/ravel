@@ -23,7 +23,11 @@
 //! applied, else of the last HEAD read it made, and [`Recorder::build`]
 //! orders calls by that number. A write is the point its effect became
 //! visible, and a call that wrote nothing answered from the last root it
-//! read. The numbers reach the call through a task-local cell
+//! read. One exception: a step that journaled its start and then answered
+//! an error decided that error on a later read, so it takes that read's
+//! number when it follows the write
+//! (`schedules::effects::cancels_across_seeds`, where the cancel lands
+//! between the two). The numbers reach the call through a task-local cell
 //! ([`tokio::task_local!`]); nothing in the store or the runtime spawns, so
 //! the bottom of the stack runs inside the recording task.
 //!
@@ -444,7 +448,13 @@ impl Recorder {
         let mut items: Vec<Item> = Vec::new();
         for (order, entry) in entries.iter().enumerate() {
             let stamps = lock(&entry.cell).clone();
-            let stamp = stamps.write.as_ref().map(|(s, _)| *s).or(stamps.read);
+            let written = stamps.write.as_ref().map(|(s, _)| *s);
+            let refused_step = matches!(entry.event, Some(Event::Step { .. }))
+                && matches!(entry.observed, Some(Observed::Modelled(Reply::Error(_))));
+            let stamp = match (written, stamps.read) {
+                (Some(w), Some(r)) if refused_step && r > w => Some(r),
+                _ => written.or(stamps.read),
+            };
             let applied = stamps.write.as_ref().map(|(_, body)| body.clone());
             if let Some(Observed::Refused(kind)) = &entry.observed {
                 refusals.push(Refusal {
@@ -608,7 +618,8 @@ fn crashed_step(
         step: step.clone(),
     };
     ran.apply(&event);
-    if ran.effect_view(operation, &step.key) == written && ran.step_completed(&step.key) == completed
+    if ran.effect_view(operation, &step.key) == written
+        && ran.step_completed(&step.key) == completed
     {
         Ok(event)
     } else {

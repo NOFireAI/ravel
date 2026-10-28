@@ -224,8 +224,8 @@ fn kills(seed: u64) -> KillCounts {
     drain(&rig, seed);
     let run = rig.build().expect("build");
     sim_assert!(out, run.unmappable.is_empty(), "{:?}", run.unmappable);
-    let known = past_known_divergences(&run)
-        .unwrap_or_else(|d| panic!("{d}\n{}", out.failure_context()));
+    let known =
+        past_known_divergences(&run).unwrap_or_else(|d| panic!("{d}\n{}", out.failure_context()));
     sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
     let head = rig.head().expect("head");
     sim_assert_eq!(out, head.next_accept_seq, 5);
@@ -250,7 +250,11 @@ fn kills(seed: u64) -> KillCounts {
     };
     sim_assert_eq!(out, all_fired(&faults), expected);
     // Only the one firing can produce the false negative.
-    sim_assert!(out, known.false_negatives <= fired, "{known:?}, fired {fired}");
+    sim_assert!(
+        out,
+        known.false_negatives <= fired,
+        "{known:?}, fired {fired}"
+    );
     let crashes = out
         .trace
         .iter()
