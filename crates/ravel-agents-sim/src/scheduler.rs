@@ -925,7 +925,9 @@ mod tests {
                             .get(HEAD, GetRange::Full)
                             .await
                             .map_err(|e| format!("get: {e}"))?;
-                        *seen.lock().map_err(|e| e.to_string())? = Some(start.elapsed());
+                        // Paused runtime: this is virtual time.
+                        let waited = start.elapsed();
+                        *seen.lock().map_err(|e| e.to_string())? = Some(waited);
                         Ok(())
                     }),
                 ],
