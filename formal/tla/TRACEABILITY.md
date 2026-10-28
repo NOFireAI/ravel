@@ -44,7 +44,7 @@ covers it.
 - `LostClaimNeverPublishesThroughGuardedPath` —
   `crates/ravel-fleet/src/claim.rs::renew` — same reason as `GuardedPublish`
 
-### agents (15 rows, test gap)
+### agents (14 rows, test gap)
 
 - `Destroy` — `crates/ravel-agents-core/src/kernel.rs::Kernel::tombstone` —
   the tombstone leaves a scheduled timer in HEAD and `check_active` refuses
@@ -97,4 +97,4 @@ covers it.
   (`kernel.rs:1856`), but no test records a step after a cancel request and
   asserts whether `require_running` refuses it
 
-Total test-debt rows: 19 (lifecycle 1, maintenance 3, agents 15).
+Total test-debt rows: 18 (lifecycle 1, maintenance 3, agents 14).
