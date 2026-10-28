@@ -261,11 +261,19 @@ handler behaves under replay; it says nothing about what Ravel persists.
 The wire contract this package was written against has gaps, filled
 provisionally on the SDK side:
 
-- No route records a step, so `Transport.recordStep` has no HTTP mapping.
-  Its answer carries a `failure` field, and `Transport.failEffect` records
-  a tool's failure; both are SDK-local shapes. The wire `StepState` has
-  only `started` and `completed`, so a failed step reads as `started` on
-  the wire.
+- No route records a step, so `Transport.recordStep` has no HTTP mapping;
+  one call fuses the kernel's `RecordStep`, `CommitIntent` and
+  `AuthorizeAttempt`, so the HTTP transport will map it to more than one
+  route. Its answer carries a `failure` field, and `Transport.failEffect`
+  records a tool's failure; both are SDK-local shapes. The wire `StepState`
+  has only `started` and `completed`, so a failed step reads as `started`
+  on the wire.
+- A handler pin on the wire (`HandlerPinBody`) names the handler, version
+  and digest but no agent kind, and the kernel matches a pin by handler
+  name alone. Two agents at one version sharing a handler name are told
+  apart only by the digest, which the fake coordinator matches on (test:
+  `two agents at one version sharing a handler name are each leased their
+  own turn`, `steps.test.ts`); the server-side match is a wire gap for T11.
 - No recorded turn time or random seed travels on the wire. `ctx.now()`
   reads the poll's `startedUnixNs`, local to the SDK, and `ctx.random()` is
   seeded from the agent id, incarnation and accept sequence.

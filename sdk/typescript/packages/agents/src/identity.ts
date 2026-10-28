@@ -185,10 +185,26 @@ export function stepId(incarnation: number, acceptSeq: number, stepKey: string):
   );
 }
 
-/** `identity::agent_id`: the domain, then kind and key each prefixed by its u16le length. */
+/** The kernel's cap on a kind or key, `keys::MAX_NAME_BYTES`. */
+export const MAX_NAME_BYTES = 256;
+
+/**
+ * `identity::agent_id`: the domain, then kind and key each prefixed by its
+ * u16le length. A kind or key over {@link MAX_NAME_BYTES} is refused with a
+ * `RangeError`: the server never derives an id for one, and the u16 prefix
+ * would otherwise wrap where the Rust side saturates.
+ */
 export function agentId(kind: string, key: string): string {
   const k = encoder.encode(kind);
   const v = encoder.encode(key);
+  for (const [what, bytes] of [
+    ["kind", k],
+    ["key", v],
+  ] as const) {
+    if (bytes.length > MAX_NAME_BYTES) {
+      throw new RangeError(`agent ${what} is ${String(bytes.length)} bytes, over the ${String(MAX_NAME_BYTES)}-byte cap`);
+    }
+  }
   const domain = encoder.encode(DOMAIN);
   const buf = new Uint8Array(domain.length + 4 + k.length + v.length);
   const view = new DataView(buf.buffer);
@@ -288,7 +304,9 @@ export function jsonForm(value: unknown, key = ""): unknown {
   const toJSON = (value as { toJSON?: unknown }).toJSON;
   if (typeof toJSON === "function") return jsonForm((toJSON as (key: string) => unknown).call(value, key), key);
   if (Array.isArray(value)) {
-    return value.map((v: unknown, i) => {
+    // Array.from visits holes as undefined, so a sparse array and an
+    // explicit undefined item both become null, as JSON.stringify writes them.
+    return Array.from(value as readonly unknown[], (v, i) => {
       const item = jsonForm(v, String(i));
       return item === undefined ? null : item;
     });

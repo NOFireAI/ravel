@@ -6,10 +6,13 @@
  *
  * `poll`, `commit` and `completeEffect` carry the wire bodies of
  * `crates/ravel-agents-core/src/wire.rs`. Three things the runner needs have no
- * wire body yet, so their shapes here are SDK-local and provisional: the
- * kernel's `RecordStep` command (journal a step as started before its tool
- * runs, or read back the record it already has), recording a tool's failure
- * as its attempt's result, and a recorded start time for the turn.
+ * wire body yet, so their shapes here are SDK-local and provisional:
+ * `recordStep`, which fuses three kernel commands into one call (`RecordStep`
+ * to journal the step or read back its record, `CommitIntent` for the effect,
+ * and `AuthorizeAttempt`, which is where the answer's `effect` and `attempt`
+ * come from; an HTTP transport maps it to more than one route), recording a
+ * tool's failure as its attempt's result, and a recorded start time for the
+ * turn.
  */
 import type {
   EffectCompleteRequest,

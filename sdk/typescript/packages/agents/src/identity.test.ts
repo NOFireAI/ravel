@@ -108,5 +108,14 @@ describe("identity", () => {
     expect(canonicalJson(jsonForm(value))).toBe(JSON.stringify({ keep: 1, list: [null, 2], nested: {} }));
     expect(canonicalJson(jsonForm({ cursor: undefined }))).toBe(canonicalJson(jsonForm({})));
     expect(() => canonicalJson(jsonForm(undefined))).toThrow(InvalidStepInput);
+    // eslint-disable-next-line no-sparse-arrays -- a hole is the case under test
+    expect(canonicalJson(jsonForm([, 1]))).toBe(JSON.stringify([, 1]));
+  });
+
+  it("agentId refuses a kind or key over the kernel's 256-byte cap instead of wrapping the length", () => {
+    const long = "k".repeat(257);
+    expect(() => agentId(long, "key")).toThrow(RangeError);
+    expect(() => agentId("kind", long)).toThrow(RangeError);
+    expect(() => agentId("k".repeat(256), "v".repeat(256))).not.toThrow();
   });
 });

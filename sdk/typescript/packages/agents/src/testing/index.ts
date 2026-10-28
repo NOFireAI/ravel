@@ -52,7 +52,7 @@ import {
   type WorkerCommitResponse,
   type WorkerPollRequest,
 } from "../wire/index.js";
-import { serveAgents, type TurnReport, type WorkerHandle } from "../worker/index.js";
+import { handlerDigest, serveAgents, type TurnReport, type WorkerHandle } from "../worker/index.js";
 import type {
   EffectFailRequest,
   PolledTurn,
@@ -359,9 +359,12 @@ export class FakeCoordinator implements Transport {
         .sort((a, b) => a.acceptSeq - b.acceptSeq)[0];
       if (next?.status !== "accepted") continue;
       const definition = this.definitions.get(agent.kind);
-      const pin = request.handlers.find(
-        (h) => h.handler === next.handler && h.version === definition?.version,
-      );
+      if (definition === undefined) continue;
+      // Match the pin by digest, which covers the agent name: two agents at
+      // one version can share a handler name, and a lease carrying the
+      // other agent's digest is refused by the worker and never retried.
+      const digest = handlerDigest(definition, next.handler);
+      const pin = request.handlers.find((h) => h.handler === next.handler && h.digest === digest);
       if (pin === undefined) continue;
       agent.epoch += 1;
       next.status = "running";
