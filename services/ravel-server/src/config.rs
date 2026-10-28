@@ -3475,7 +3475,7 @@ pub struct AgentsConfig {
     /// sweep pass: fires due timers, deletes settled wake hints and repairs
     /// missing directory entries (ADR-3331 decision 8). Zero runs no
     /// periodic pass; polls and `POST /api/v1/agents/sweep` still sweep,
-    /// polls at most once per [`DEFAULT_AGENTS_SWEEP_INTERVAL_MS`] then.
+    /// polls at most once per five seconds then (the poll floor).
     pub sweep_interval_ms: u64,
     /// Most effects whose late results each tenant's evidence index names.
     /// No flag sets it; tests lower it to fill the index.
