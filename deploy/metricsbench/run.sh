@@ -37,7 +37,8 @@
 #   fold-state  ravel_catalog_fold_last_success_timestamp_seconds from Ravel's
 #               /metrics, stamped
 #   query       metricsbench_query against all four engines into
-#               <out>/report.json
+#               <out>/report.json, with the per-entry ULP gaps and oracle
+#               retries in <out>/diagnostics.json
 #   validate    metricsbench_report validate <out>/report.json
 #   memory      the sampler stopped, <out>/memory-summary.json written (peak
 #               and final bytes per container, OOMKilled from docker inspect),
@@ -953,6 +954,7 @@ run_full() {
     --engine "name=ravel,url=${RAVEL_BASE},bearer_env=${RAVEL_TOKEN_ENV}"
     --engine "name=victoriametrics,url=${VM_BASE}/prometheus"
     --engine "name=mimir,url=${MIMIR_BASE}/prometheus"
+    --diagnostics "${out_dir}/diagnostics.json"
     --out "${out_dir}/report.json")
   [ -z "$passes" ] || query_args+=(--passes "$passes")
   [ -z "$reps" ] || query_args+=(--reps-per-pass "$reps")
