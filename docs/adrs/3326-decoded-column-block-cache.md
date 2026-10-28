@@ -281,7 +281,9 @@ anything is built (Measurement).
   (`crates/ravel-catalog/src/cache.rs:1173-1240`) is crate-private and is
   not wired in the server (`services/ravel-server/src/lib.rs:2930`).
   The hook alone does not keep a query admitted, so admission also keeps
-  a headroom margin (see the admission-headroom amendment below).
+  a headroom margin (see the admission-headroom amendment below), and the
+  pass frees the shortfall plus that margin, not the shortfall alone (see
+  the evictor-slack amendment below).
 - **Cap:** a `--decoded-cache-max-bytes` flag sets the cap, with a default
   expressed as a share of the memory budget. Stage 0 picks the default;
   until then it is 0, which disables the cache.
@@ -354,7 +356,9 @@ Every hot figure from a run with the cache on states the cap in its stamp.
    adds a simulation of q33's shape and an 8 GB re-run with the admission
    margin (see the admission-headroom amendment below). The last three
    rows of the table are theirs: the simulation's control arm, its margin
-   arm, and the re-run.
+   arm, and the re-run. Both ran on 2026-10-27. The simulation met its
+   rows. The re-run missed its row, which led to a second simulation and
+   re-run (see the evictor-slack amendment below); their rows follow.
 
 | Stage 0 figure | Band | Miss | Basis |
 |---|---|---|---|
@@ -367,9 +371,12 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 | Branch at 8 GB, full entry run with the concurrent phase: QPS | at least 0.60 and at least main's on the same box minus 5% | under 0.60 | ADR-3217 standing bar (#3217 comment 6366582370) |
 | Branch at 8 GB, full entry run with the concurrent phase: error ratio | at most 0.058 | above 0.058 | ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
-| Simulation, q33 shape, without the margin (control): aggregate refusals at an 8 GB cap | at least one | none | measured 2026-10-27: 116, #3326 comment 6452444728 |
-| Simulation, q33 shape, with the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | measured 2026-10-27: 0 at each cap, #3326 comment 6452444728 |
-| Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | #3326 comment 6448580460 |
+| Simulation, q33 shape, without the margin (control): aggregate refusals at an 8 GB cap | at least one | none | met, measured 2026-10-27: 116, #3326 comment 6452444728 |
+| Simulation, q33 shape, with the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | met, measured 2026-10-27: 0 at each cap, #3326 comment 6452444728 |
+| Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | missed, measured 2026-10-27: 0 of 4, #3326 comment 6455179106 |
+| Simulation, q33 shape with racing checked reservations, evictor freeing the exact shortfall (control): aggregate refusals at an 8 GB cap | at least one | none | met, measured 2026-10-28: 75, #3326 comment 6459628404 |
+| Simulation, same shape, evictor freeing the shortfall plus the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | met, measured 2026-10-28: 0 at each cap, #3326 comment 6459628404 |
+| Branch at 8 GB with the margin and the evictor's slack: q33 answers on every B run | yes | any B run refused | predicted (evictor-slack amendment) |
 
 The bands are copied to #3326 before launch. A miss on any row stops the
 work, and the readout names the step that missed.
@@ -483,4 +490,64 @@ the q33 shape comes first: 16 partitions interleave column admissions with
 aggregate growth against one budget. It checks that the aggregate is never
 refused with the margin and is refused without it. Then the 8 GB pair is
 re-run against the bands registered on #3326 (comment 6448580460), with
-the same rows.
+the same rows. Both ran on 2026-10-27; their results are in the
+evictor-slack amendment below.
+
+## Amendment (2026-10-28): the evictor frees the shortfall plus the margin
+
+<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries|Stage 0, before any code that merges" pointer="evictor-slack amendment" -->
+
+The admission-headroom amendment's simulation and re-run both ran on
+2026-10-27.
+
+- **Trace C met both of its rows** (#3326 comment 6452444728). Without the
+  margin, q33's aggregate was refused 116 times at an 8 GB cap. With the
+  margin it was refused none at 4, 8 and 12 GB.
+- **The 8 GB control is the informative one.** At 4 GB the evictor never
+  runs, because the budget never comes near its limit, so a 4 GB control
+  could not show a refusal. At 12 GB the second simulation below shows the
+  control refusing as well.
+- **The re-run missed** (`dc8m-20261027T2059Z`, #3326 comment 6455179106).
+  The hot geomean was 0.753 over 43 statements and 0.757 over 42, but q33
+  was refused on all 4 B runs.
+
+The server log now carries what the refused response cannot.
+
+- **The evictor made 312 passes, and 71 refusals stood after it ran.** In
+  each standing refusal the evictor freed close to the shortfall it was
+  asked for: `held_bytes` was near 0, so live scans were not the cause.
+  The caller was still short at its retry by 0.5 to 22 MB. Example:
+  requested 146,800,640, freed 146,457,106, unreserved at the retry
+  138,937,043.
+- **The margin did its part.** It stopped cache admissions from taking the
+  freed bytes: `marginSkips` was counted. What took them was q33's other
+  aggregate streams and scans, reserving through `try_reserve` between
+  one stream's eviction and its retry.
+- **The admission-headroom amendment's explanation was half right.** It
+  named admissions as the race. The race also includes the refused query's
+  own concurrent reservations, which no admission rule can hold back.
+
+A second simulation, Trace D (#3326 comment 6459628404), makes the racing
+step a checked 2 MB reservation by each other partition.
+
+- **Freeing the exact shortfall reproduces the miss:** 75 refusals at
+  8 GB and 132 at 12 GB, where the aggregate stalls at 7.0 GB.
+- **Freeing the shortfall plus the margin refuses none** at 4, 8 and
+  12 GB, and the aggregate reaches 10.1 GB at each.
+
+Decision 4 changes in one place. A pressure pass asks the cache to free
+the shortfall plus the admission margin, `max(1 GiB, 5% of the budget's
+limit)`, not the shortfall alone, then retries once. Admission and
+eviction use one definition of the margin.
+
+- **Concurrent reservers find room.** A refused caller's own sibling
+  streams can take up to the margin before its retry and still leave it
+  room, and the cache shrinks in steps of about the margin while a query
+  grows.
+- **The cost is a larger eviction per pass:** up to 1 GiB of cached
+  columns per refused reservation. The cache refills once the query
+  releases its memory and the admission margin is met again.
+
+Stage 0 continues with this change. A prototype adds it to the measurement
+branch, and the 8 GB pair is re-run against the same bands, with the last
+row of the Stage 0 table, pre-registered on #3326 before launch.
