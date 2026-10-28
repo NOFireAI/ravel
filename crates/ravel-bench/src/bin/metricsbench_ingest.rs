@@ -40,12 +40,13 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    AnchorError, Band6Violation, GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM,
-    MetricsIngestReport, PayloadClass, RavelReplayConfig, ReadbackConfig, Receiver,
-    RowAccountingViolation, RunProvenance, StreamBandViolation, StreamCounts, Substrate,
-    SystemIngestResult, build_profile_record, check_anchor, check_expected_digests_agree,
-    check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
-    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
+    AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, GeneratedStream,
+    HttpReplayConfig, IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, RavelReplayConfig,
+    ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance, StallCeiling,
+    StreamBandViolation, StreamCounts, Substrate, SystemIngestResult, build_profile_record,
+    check_anchor, check_expected_digests_agree, check_row_accounting, check_row_band6,
+    check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
+    replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -156,9 +157,19 @@ struct Args {
     /// Mimir push endpoint (Remote Write 1.0). Omitted, it is not replayed.
     #[arg(long)]
     mimir_endpoint: Option<String>,
-    /// Logical points per RW1.0 request to an HTTP receiver.
-    #[arg(long, default_value_t = 500)]
+    /// Logical points per RW1.0 request to an HTTP receiver: a shard sends
+    /// once it holds this many, or at stream end. Prometheus'
+    /// `max_samples_per_send`. Zero is refused.
+    #[arg(long, default_value_t = DEFAULT_HTTP_BATCH_SIZE)]
     http_batch_size: usize,
+    /// Series shards per HTTP row, each with one request in flight, fixed
+    /// for the whole replay. Prometheus' `max_shards`. Zero is refused.
+    #[arg(long, default_value_t = DEFAULT_HTTP_SHARDS)]
+    http_shards: usize,
+    /// Stop an HTTP row once, after 60 s of sending, its projected ingest
+    /// wall time exceeds this many seconds. Omitted, a row runs to its end.
+    #[arg(long)]
+    max_ingest_secs: Option<u64>,
     /// Retries on a 429/5xx before a comparator batch is dropped.
     #[arg(long, default_value_t = 3)]
     http_max_retries: u32,
@@ -216,6 +227,11 @@ enum RunError {
          rows measures nothing"
     )]
     NoRows,
+    #[error("--{flag} must be at least 1: an HTTP row with no {what} sends nothing")]
+    ZeroHttpSetting {
+        flag: &'static str,
+        what: &'static str,
+    },
     #[error("{0}")]
     Band6(#[from] Band6Violation),
     #[error(
@@ -386,6 +402,24 @@ fn resolve_rows(args: &Args) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Refuse a zero `--http-shards` or `--http-batch-size` before anything is
+/// generated.
+fn resolve_http_settings(args: &Args) -> Result<(), RunError> {
+    if args.http_shards == 0 {
+        return Err(RunError::ZeroHttpSetting {
+            flag: "http-shards",
+            what: "shards",
+        });
+    }
+    if args.http_batch_size == 0 {
+        return Err(RunError::ZeroHttpSetting {
+            flag: "http-batch-size",
+            what: "points per request",
+        });
+    }
+    Ok(())
+}
+
 /// The process exit code for a failed run.
 fn exit_code(err: &RunError) -> i32 {
     match err {
@@ -399,7 +433,8 @@ fn exit_code(err: &RunError) -> i32 {
         | RunError::TenantWithoutEndpoint
         | RunError::MissingQueryUrl { .. }
         | RunError::QueryUrlWithoutEndpoint { .. }
-        | RunError::NoRows => EXIT_USAGE,
+        | RunError::NoRows
+        | RunError::ZeroHttpSetting { .. } => EXIT_USAGE,
         _ => 1,
     }
 }
@@ -492,6 +527,7 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let ravel_tenant = resolve_ravel_tenant(args)?;
     resolve_query_urls(args)?;
     resolve_rows(args)?;
+    resolve_http_settings(args)?;
     // `load_workload` read the same file; a second read for the digest keeps
     // the loader's signature unchanged.
     let manifest_bytes = std::fs::read(&args.workload).map_err(|e| {
@@ -623,6 +659,17 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
             batch_size: args.http_batch_size,
             max_retries: args.http_max_retries,
             timeout_secs: args.http_timeout_secs,
+            shards: args.http_shards,
+            stall_ceiling: args.max_ingest_secs.map(|max_ingest_secs| StallCeiling {
+                max_ingest_secs,
+                // The generator writes one line per active series per step
+                // less anomalies; once a row has run, its report is exact.
+                stream_points: reference
+                    .as_ref()
+                    .map_or(profile.active_series.saturating_mul(steps), |report| {
+                        report.emitted_samples
+                    }),
+            }),
         };
         let mut stream = stream_from_anchor()?;
         let outcome = replay_over_http_with_plan(&http_cfg, &mut stream)
@@ -795,6 +842,8 @@ mod tests {
             retries: 0,
             elapsed_secs: 1.0,
             elapsed_basis: "test fixture".to_string(),
+            generation_secs: 0.0,
+            sender_bound: false,
             logical_points_per_sec: 10.0,
             wire_bytes: 100,
             wire_bytes_per_sec: 100.0,
@@ -978,5 +1027,58 @@ mod tests {
         assert!(matches!(err, RunError::TenantWithoutEndpoint), "{err}");
         assert_eq!(exit_code(&err), 64);
         assert_eq!(resolve_ravel_tenant(&args(&[])).expect("neither"), None);
+    }
+
+    /// The HTTP rows default to Prometheus' 50 shards and 2000 points per
+    /// request (ADR-0927, 2026-10-28 amendment, decision 1), with no stall
+    /// ceiling unless one is given.
+    #[test]
+    fn http_rows_default_to_50_shards_of_2000_points() {
+        let defaults = args(&[]);
+        assert_eq!(defaults.http_shards, 50);
+        assert_eq!(defaults.http_batch_size, 2000);
+        assert_eq!(defaults.max_ingest_secs, None);
+        let given = args(&["--max-ingest-secs", "600"]);
+        assert_eq!(given.max_ingest_secs, Some(600));
+    }
+
+    /// Zero shards or zero points per request is a usage error.
+    #[test]
+    fn zero_shards_or_batch_size_exits_64() {
+        resolve_http_settings(&args(&[])).expect("defaults");
+        for (flag, name) in [
+            ("--http-shards", "http-shards"),
+            ("--http-batch-size", "http-batch-size"),
+        ] {
+            let err = resolve_http_settings(&args(&[flag, "0"])).expect_err("zero");
+            assert!(
+                matches!(err, RunError::ZeroHttpSetting { flag: f, .. } if f == name),
+                "{err}"
+            );
+            assert_eq!(exit_code(&err), 64);
+        }
+    }
+
+    /// A stalled row exits 1, the code a band violation exits with.
+    #[test]
+    fn a_stalled_row_exits_like_a_band_violation() {
+        let err = RunError::Http {
+            system: "prometheus".to_string(),
+            source: ravel_bench::metrics_ingest::LaneError::IngestStalled {
+                system: "prometheus".to_string(),
+                projected_secs: 1_200.0,
+                ceiling_secs: 600,
+                offered_points: 50,
+                stream_points: 1_000,
+            },
+        };
+        assert_eq!(exit_code(&err), 1);
+        let text = err.to_string();
+        assert!(
+            text.contains("projected 1200 s")
+                && text.contains("600 s ceiling")
+                && text.contains("50 of 1000 points"),
+            "{text}"
+        );
     }
 }

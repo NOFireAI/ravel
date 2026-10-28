@@ -36,6 +36,12 @@
 #                                       torn down
 #   l  a profile other than ci       -> exit 0, ingest runs without the
 #                                       in-process row; stamps say skipped
+#   m  ingest wall-time ceilings     -> each profile passes its
+#                                       --max-ingest-secs (ci 600, cardinality
+#                                       14400, history 72000, churn 18000), in
+#                                       diagnostic mode too; no shard or batch
+#                                       flag, so the bin's defaults of 50
+#                                       shards and 2000 points apply
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -478,6 +484,35 @@ expect_rc l 0
 expect_log "l: ingest skips the in-process row" "--no-in-process-row"
 expect_no_log "l: no memory store" "--store memory"
 check "l: stamps say the in-process row is skipped" 'j("stamps.json")["in_process_row"] == "skipped"'
+
+# --- m: ingest wall-time ceilings ----------------------------------------------
+for pair in ci:600 cardinality:14400 history:72000 churn:18000; do
+  name="${pair%%:*}"
+  ceiling="${pair#*:}"
+  run_case "m-${name}" --profile "${name}" --ravel-image "${IMAGE}" \
+    --ravel-source-commit "${COMMIT}" --bin-dir "${BIN}" --out-dir "${TMP}/m-${name}/out" \
+    --anchor-ms "${ANCHOR}"
+  expect_rc "m-${name}" 0
+  expect_log "m-${name}: ingest gets the ${ceiling} s ceiling" "--max-ingest-secs ${ceiling} "
+  expect_no_log "m-${name}: no shard count passed" "--http-shards"
+  expect_no_log "m-${name}: no batch size passed" "--http-batch-size"
+done
+run_case m-diagnostic --profile history --bin-dir "${BIN}" --out-dir "${TMP}/m-diagnostic/out" \
+  --anchor-ms "${ANCHOR}" --diagnostic-prometheus-max-samples 1000
+expect_rc m-diagnostic 0
+expect_log "m-diagnostic: the diagnostic ingest gets the history ceiling" "--max-ingest-secs 72000 "
+# The defaults run.sh relies on by passing neither flag.
+INGEST_SRC="${HERE}/../../../crates/ravel-bench/src/metrics_ingest.rs"
+if grep -qF 'pub const DEFAULT_HTTP_SHARDS: usize = 50;' "${INGEST_SRC}"; then
+  pass "m: the bin defaults to 50 shards"
+else
+  fail "m: DEFAULT_HTTP_SHARDS is not 50 in ${INGEST_SRC}"
+fi
+if grep -qF 'pub const DEFAULT_HTTP_BATCH_SIZE: usize = 2000;' "${INGEST_SRC}"; then
+  pass "m: the bin defaults to 2000 points per request"
+else
+  fail "m: DEFAULT_HTTP_BATCH_SIZE is not 2000 in ${INGEST_SRC}"
+fi
 
 echo
 echo "${passes} passed, ${fails} failed"
