@@ -7,6 +7,13 @@
 //! caller as far as a [`Principal`] can: its tenant and the capabilities it
 //! holds. A principal carries no subject or token name, so two admins of one
 //! tenant are not told apart here either.
+//!
+//! The record is submitted before the reconcile changes HEAD, not after. In
+//! required audit mode a refused submission refuses the reconcile, so no
+//! change lands unaudited; the cost is a record for a decision whose HEAD
+//! write then failed, which names an intent that did not apply. Written
+//! after, a crash or a refused submission between the two would leave a
+//! changed effect with no record, which is the case the audit exists for.
 
 use ravel_logseg::{AttrValue, LogStreamId, stream_attrs_bytes};
 use ravel_maintain::AuditEvent;
