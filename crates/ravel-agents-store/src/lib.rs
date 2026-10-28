@@ -26,9 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ravel_agents_core::command::{Command, Create, Enqueue, IncarnationFence};
-use ravel_agents_core::error::{AgentError, ErrorKind};
+use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{Head, Lifecycle, ObjectRef, Receipt};
-use ravel_agents_core::identity::{AgentId, agent_id, request_hash};
+use ravel_agents_core::identity::{AgentId, Hash256, agent_id, request_hash};
 use ravel_agents_core::kernel::{DerivedIds, Effect, IdSource, Kernel, Limits, Reply};
 use ravel_agents_core::keys::{AgentKey, AgentKind, dir_prefix, object_key};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
@@ -133,13 +133,15 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    /// Whether the input at this handle is the request named, so a handle
-    /// predicted for a write that never applied is not mistaken for the
-    /// request a later writer was accepted under.
-    pub fn is_request(&self, request_id: &str, handler: &str) -> bool {
-        self.receipt
-            .as_ref()
-            .is_some_and(|r| r.request_id == request_id && r.handler == handler)
+    /// Whether the input at this handle is the request named, by id,
+    /// handler AND request hash (ADR-3331 decision 4 step 2), so a handle
+    /// predicted for a write that never applied is not mistaken for a later
+    /// writer accepted there under the same id with a different payload
+    /// (`tests::a_lost_write_is_not_mistaken_for_a_later_writer_with_the_same_id`).
+    pub fn is_request(&self, request_id: &str, handler: &str, request_hash: &Hash256) -> bool {
+        self.receipt.as_ref().is_some_and(|r| {
+            r.request_id == request_id && r.handler == handler && r.request_hash == *request_hash
+        })
     }
 }
 
@@ -312,11 +314,17 @@ impl AgentStore {
         };
         let head = match self.read_head_state(&agent, true).await? {
             HeadState::Present { head, .. } => *head,
+            // A HEAD is never deleted (ADR-3331 decision 3), so a handle
+            // proves the agent existed; a read that finds nothing is a read
+            // that failed, and the caller keeps its handle.
             HeadState::Absent => {
                 return Err(AgentError::new(
-                    ErrorKind::AgentGone,
-                    ids_for(&agent),
-                    "agent does not exist",
+                    ErrorKind::OutcomeUnknown,
+                    SafeIds {
+                        operation: Some(handle.encode()),
+                        ..ids_for(&agent)
+                    },
+                    "HEAD could not be read; resolve the operation again",
                 ));
             }
             HeadState::Unsupported { .. } => {

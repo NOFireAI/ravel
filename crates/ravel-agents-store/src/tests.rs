@@ -231,7 +231,8 @@ async fn cas_applied_with_lost_response_is_resolved_by_operation_id_after_a_late
     };
     assert_eq!(resolution.accept_seq, predicted);
     assert_eq!(resolution.state, Some(OperationState::Accepted));
-    assert!(resolution.is_request("r1", "h"));
+    assert!(resolution.is_request("r1", "h", &request_hash("h", b"first")));
+    assert!(!resolution.is_request("r1", "h", &request_hash("h", b"other")));
     let receipt = resolution.receipt.expect("receipt");
     assert_eq!(receipt.request_hash, request_hash("h", b"first"));
     assert_eq!(receipt.accept_seq, predicted);
@@ -885,4 +886,93 @@ proptest! {
         let steps: Vec<Step> = std::iter::once(Step::Create).chain(steps).collect();
         store_matches_kernel(&steps)?;
     }
+}
+
+#[tokio::test]
+async fn a_lost_write_is_not_mistaken_for_a_later_writer_with_the_same_id() {
+    // Put 2 (the first enqueue's CAS) is refused without applying and the
+    // caller sees a retryable error, so it holds a handle for a write that
+    // never landed. A later writer then takes that handle under the same
+    // request id with a different payload.
+    let (_backend, store) = faulty(vec![head_rule(
+        Op::Put,
+        ScriptedFault::Transient("lost".to_string()),
+        2,
+    )]);
+    let created = create(&store).await;
+    let lost = enqueue(&store, &created.head, "r1", b"first")
+        .await
+        .expect_err("the CAS answer was lost");
+    assert_eq!(lost.kind, ErrorKind::OutcomeUnknown);
+    let handle = Handle::decode(&lost.ids.operation.clone().expect("handle")).expect("handle");
+    let other = enqueue(&store, &created.head, "r1", b"other")
+        .await
+        .expect("the other writer is accepted");
+    assert_eq!(other.handle(), Some(handle));
+    let resolution = store.resolve(&handle).await.expect("resolve");
+    assert!(
+        !resolution.is_request("r1", "h", &request_hash("h", b"first")),
+        "the lost write must not be reported as accepted"
+    );
+    assert!(resolution.is_request("r1", "h", &request_hash("h", b"other")));
+}
+
+#[tokio::test]
+async fn resolve_keeps_the_handle_when_head_cannot_be_read() {
+    let (backend, store) = faulty(vec![head_rule(
+        Op::Put,
+        ScriptedFault::DuplicateDelivery,
+        2,
+    )]);
+    let created = create(&store).await;
+    let lost = enqueue(&store, &created.head, "r1", b"first")
+        .await
+        .expect_err("the CAS answer was lost");
+    let handle = Handle::decode(&lost.ids.operation.clone().expect("handle")).expect("handle");
+    // Every HEAD read now blips NotFound: the agent did not vanish, the read
+    // failed, so the caller keeps an unknown outcome and its handle.
+    let blips = Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+        .with_key_contains("/head")
+        .with_occurrence(Occurrence::Always);
+    let blipping = store_with(
+        Arc::new(FaultStore::new(
+            backend.clone(),
+            FaultPlan::empty().with_rule(blips),
+        )),
+        StoreLimits::default(),
+    );
+    let err = blipping.resolve(&handle).await.expect_err("unreadable");
+    assert_eq!(err.kind, ErrorKind::OutcomeUnknown);
+    assert_eq!(err.ids.operation.as_deref(), Some(handle.encode().as_str()));
+    let before = blipping.counters();
+    assert_eq!(before.total().put + before.total().cas, 0);
+}
+
+#[tokio::test]
+async fn a_contended_cas_uses_the_version_of_its_own_re_read() {
+    let mem = Arc::new(MemoryStore::new());
+    let seed = store_with(mem.clone(), StoreLimits::default());
+    let created = create(&seed).await;
+    let fa = Arc::new(FaultStore::new(mem.clone(), FaultPlan::empty()));
+    let gate = fa.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
+    let a = Arc::new(store_with(fa.clone(), StoreLimits::default()));
+    let b = store_with(mem.clone(), StoreLimits::default());
+    let a2 = a.clone();
+    let h = created.head.clone();
+    let task = tokio::spawn(async move { enqueue(&a2, &h, "ra", b"a").await });
+    gate.wait_until_held(1).await;
+    let bo = enqueue(&b, &created.head, "rb", b"b")
+        .await
+        .expect("b publishes first");
+    for id in gate.held() {
+        gate.release(id);
+    }
+    let ao = task
+        .await
+        .expect("join")
+        .expect("a publishes after one conflict");
+    let ca = a.counters();
+    assert_eq!(ca.publish.conflict, 1, "a lost exactly one CAS to b");
+    assert_eq!(ao.head.root_revision, bo.head.root_revision + 1);
+    assert_eq!(ao.head.inbox.len(), 2, "both inputs survive the rebase");
 }
