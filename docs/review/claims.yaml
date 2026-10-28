@@ -17,7 +17,7 @@
 
 - id: readme-mcp-ships
   doc: README.md
-  quote: "It ships behind the `mcp` cargo feature (`cargo build -p ravel-server --features mcp`) and the runtime `--mcp` flag, both off by default"
+  quote: "The MCP server ships behind the `mcp` cargo feature (`cargo build -p ravel-server --features mcp`) and the runtime `--mcp` flag, both off by default"
   kind: positive
   binds:
     - services/ravel-server/src/mcp/adapter.rs::MCP_PATH
