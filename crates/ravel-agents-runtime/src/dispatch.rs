@@ -117,6 +117,23 @@ impl Coordinator {
         if self.discovered.load(Ordering::Acquire) {
             return Ok(());
         }
+        // One scan at a time: a poller that arrives while another is inside
+        // the scan returns at once and finds the scan's results in the
+        // loaded set on its next pass
+        // (`tests::pollers_woken_together_share_one_rescan`).
+        if self
+            .scanning
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let result = self.scan_directory().await;
+        self.scanning.store(false, Ordering::Release);
+        result
+    }
+
+    async fn scan_directory(&self) -> Result<(), AgentError> {
         let mut page = None;
         loop {
             let listed = self.store.list_agents(page).await?;
