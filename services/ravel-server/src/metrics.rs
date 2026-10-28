@@ -4505,6 +4505,12 @@ pub(crate) fn render_agents_families(
             "counter",
             result_expired,
         ),
+        (
+            "ravel_agents_evidence_dropped_total",
+            "Late effect results the evidence index did not list, because every slot held an effect still in doubt or the effect already listed 16. The result is stored; GET /api/v1/agents/effects/{effect} does not name it.",
+            "counter",
+            runtime.evidence_dropped(),
+        ),
     ] {
         write_header(out, name, help, kind);
         write_sample(out, name, &[Label::Mode(mode)], value);
@@ -4547,10 +4553,28 @@ pub(crate) fn render_agents_families(
             "Missing _dir entries sweep passes wrote back.",
             sweep.dir_entries_repaired,
         ),
+        (
+            "ravel_agents_sweep_directory_cycles_total",
+            "Directory cycles sweep passes completed. One cycle walks _dir/ from its first entry to the end of the listing and reads every agent's HEAD once, which bounds how late a pass reaches an agent given work through another process.",
+            sweep.directory_cycles,
+        ),
     ] {
         write_header(out, name, help, "counter");
         write_sample(out, name, &[Label::Mode(mode)], value);
     }
+    let name = "ravel_agents_sweep_last_directory_cycle_ms";
+    write_header(
+        out,
+        name,
+        "Milliseconds the last full directory cycle took on the coordinator's clock, from the pass that started it to the pass that reached the end of _dir/, the largest over tenants; 0 before the first. One cycle reads every agent's HEAD once.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        name,
+        &[Label::Mode(mode)],
+        sweep.last_directory_cycle_ms,
+    );
     let name = "ravel_agents_sweep_list_pages_total";
     write_header(
         out,

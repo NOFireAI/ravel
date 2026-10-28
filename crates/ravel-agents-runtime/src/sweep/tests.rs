@@ -376,6 +376,8 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
             timers_fired: 1,
             agents_loaded: 2,
             dir_entries_repaired: 0,
+            directory_cycles: 1,
+            last_directory_cycle_ms: 0,
         }
     );
     let spent = r.store.counters().since(&store_before);
@@ -406,6 +408,8 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
             timers_fired: 1,
             agents_loaded: 2,
             dir_entries_repaired: 0,
+            directory_cycles: 2,
+            last_directory_cycle_ms: 0,
         }
     );
     assert_eq!(r.co.sweep_metrics(), SweepMetricsSnapshot::default());
@@ -584,4 +588,86 @@ async fn an_orphan_dir_entry_costs_one_read_and_is_skipped() {
     create(&r.co, "o-1").await;
     let listed = r.store.list_agents(None).await.expect("list").agents;
     assert_eq!(listed, vec![id_of("o-1")]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_directory_cycle_is_counted_and_timed_when_the_cursor_wraps() {
+    // Ten agents at four directory reads a pass: each cycle takes three
+    // passes, reading 4, 4 and 2 HEADs, and wraps on the third.
+    let r = rig_over(
+        Arc::new(MemoryStore::with_page_size(3)),
+        SweepConfig {
+            max_head_gets: 4,
+            ..SweepConfig::default()
+        },
+    );
+    for i in 0..10 {
+        create(&r.co, &format!("o-{i}")).await;
+    }
+    let mut gets = Vec::new();
+    let mut cycles = Vec::new();
+    let mut last_ms = Vec::new();
+    // The clock moves after each pass: the first cycle spans 7 + 5 s, the
+    // second, which starts one second after the first wrapped, 2 + 3 s.
+    for advance in [7, 5, 1, 2, 3, 0] {
+        let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+        let metrics = r.co.sweep_metrics();
+        gets.push(pass.head_gets);
+        cycles.push(metrics.directory_cycles);
+        last_ms.push(metrics.last_directory_cycle_ms);
+        r.now.advance(advance * SEC);
+    }
+    assert_eq!(gets, vec![4, 4, 2, 4, 4, 2]);
+    assert_eq!(cycles, vec![0, 0, 1, 1, 1, 2]);
+    assert_eq!(last_ms, vec![0, 0, 12_000, 12_000, 12_000, 5_000]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vanished_dir_entry_is_restored_once_the_directory_cursor_wraps() {
+    // The layout of
+    // `a_hint_reached_agent_outside_the_dir_slice_is_repaired_once_across_passes`:
+    // the directory half lists two entries a pass, the wake half reaches the
+    // hinted agent, last in LIST order, on every pass.
+    let r = rig_over(
+        Arc::new(MemoryStore::with_page_size(2)),
+        SweepConfig {
+            max_list_pages: 2,
+            ..SweepConfig::default()
+        },
+    );
+    let keys: Vec<String> = (0..8).map(|i| format!("o-{i}")).collect();
+    for key in &keys {
+        create(&r.co, key).await;
+    }
+    let mut order = keys.clone();
+    order.sort_by_key(|k| id_of(k).to_hex());
+    let hinted = order[7].clone();
+    schedule(&r.co, &hinted, "a", T0 + SEC).await;
+    schedule(&r.co, &hinted, "b", T0 + 50 * SEC).await;
+    r.now.advance(SEC);
+
+    // The first pass remembers the entry through an AlreadyExists PUT, and
+    // the entry is then removed by hand.
+    let before = r.store.counters();
+    r.co.sweep_once(&TENANT).await.expect("sweep");
+    assert_eq!(r.store.counters().since(&before).publish.put, 1);
+    let dir = dir_key(&TENANT, &id_of(&hinted)).expect("dir key");
+    r.backend.delete(&dir).await.expect("delete dir entry");
+
+    // Seven entries remain: the passes list two, two, then one and wrap.
+    let mut puts = Vec::new();
+    let mut repaired = Vec::new();
+    let mut cycles = Vec::new();
+    for _ in 0..3 {
+        let before = r.store.counters();
+        let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+        assert_eq!(pass.hints_read, 1, "the wake half reaches the agent");
+        puts.push(r.store.counters().since(&before).publish.put);
+        repaired.push(pass.dir_entries_repaired);
+        cycles.push(r.co.sweep_metrics().directory_cycles);
+    }
+    assert_eq!(cycles, vec![0, 0, 1]);
+    assert_eq!(puts, vec![0, 0, 1], "remembered until the wrap");
+    assert_eq!(repaired, vec![0, 0, 1]);
+    r.backend.head(&dir).await.expect("dir entry restored");
 }

@@ -1114,6 +1114,72 @@ async fn settled_effects_give_their_evidence_slot_to_an_effect_in_doubt() {
     running.shutdown().await.expect("clean shutdown");
 }
 
+/// A late result the full evidence index cannot list is counted on
+/// `/metrics`. With room for one effect and two `at_least_once` effects whose
+/// attempt 2 is open after a takeover, o-1's late result takes the slot and
+/// o-2's is dropped: o-1's effect is not settled, so its slot stays.
+#[tokio::test]
+async fn a_late_result_the_full_evidence_index_drops_is_counted() {
+    let running = start_server_with(
+        Arc::new(MemoryStore::new()),
+        AgentsConfig {
+            max_evidence_effects: 1,
+            ..agents_config()
+        },
+    )
+    .await;
+    let api = Api::public(&running);
+    let dropped = |scrape: &str| {
+        value(
+            scrape,
+            "ravel_agents_evidence_dropped_total",
+            "mode=\"all\"",
+        )
+    };
+
+    // Both turns are begun before one lease expiry, so the two takeover
+    // polls hand exactly these two turns to two new workers.
+    let mut effects = Vec::new();
+    for key in ["o-1", "o-2"] {
+        let (_, a) = begin_on(&api, key).await;
+        let (status, a_step) = step(&api, &a, "at_least_once").await;
+        assert_eq!(status, StatusCode::OK, "{a_step}");
+        assert_eq!(a_step["attempt"], json!(1), "{a_step}");
+        effects.push(a_step["effect"].as_str().expect("effect").to_string());
+    }
+    tokio::time::sleep(Duration::from_millis(2 * (LEASE_MS + GRACE_MS))).await;
+    let mut raised = Vec::new();
+    for _ in 0..2 {
+        let worker_b = register(&api).await;
+        let b = poll(&api, &worker_b, 2_000).await;
+        assert_eq!(b["lease"]["owner_id"], json!(worker_b), "{b}");
+        let (status, b_step) = step(&api, &b, "at_least_once").await;
+        assert_eq!(status, StatusCode::OK, "{b_step}");
+        assert_eq!(b_step["attempt"], json!(2), "{b_step}");
+        raised.push(b_step["effect"].as_str().expect("effect").to_string());
+    }
+    raised.sort();
+    let mut begun = effects.clone();
+    begun.sort();
+    assert_eq!(raised, begun, "B took over both turns");
+    let (e1, e2) = (&effects[0], &effects[1]);
+
+    let (_, late) = complete(&api, e1, 1, json!({"cents": 1100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    assert_eq!(dropped(&api.scrape().await), 0, "o-1's result is listed");
+
+    let (_, late) = complete(&api, e2, 1, json!({"cents": 2100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    assert_eq!(dropped(&api.scrape().await), 1, "o-2's result is dropped");
+    assert_eq!(inspect(&api, e2).await["evidence"], json!([]));
+    assert_eq!(
+        inspect(&api, e1).await["evidence"],
+        json!([{"attempt": 1, "result": {"cents": 1100}}]),
+        "the drop came from the cap, not from evicting o-1"
+    );
+    running.shutdown().await.expect("clean shutdown");
+}
+
 /// A tool output of exactly `{"error": <string>}` reported through
 /// `effects/complete` is an output like any other: the replayed step and the
 /// next poll return it as the output, never as a failure.

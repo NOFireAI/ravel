@@ -2415,7 +2415,8 @@ the process refused.
 
 The sweep counters below sum every tenant this process has served. Each is a
 counter with the `mode` label; `ravel_agents_sweep_list_pages_total` adds
-`phase`.
+`phase`. `ravel_agents_sweep_last_directory_cycle_ms` is a gauge with the
+`mode` label, the largest over those tenants.
 
 | Metric | Meaning |
 |---|---|
@@ -2427,11 +2428,22 @@ counter with the `mode` label; `ravel_agents_sweep_list_pages_total` adds
 | `ravel_agents_sweep_timers_fired_total` | `TimerFired` replies published by the passes' `FireTimer` CASes. |
 | `ravel_agents_sweep_agents_loaded_total` | Agents with work a pass added to the dispatch set. |
 | `ravel_agents_sweep_dir_entries_repaired_total` | Missing `_dir` entries the passes wrote back. |
+| `ravel_agents_sweep_directory_cycles_total` | Directory cycles the passes completed. One cycle is the directory half walking `_dir/` from its first entry to the end of the listing, which reads every agent's HEAD once; a tenant larger than one pass's directory GETs takes several passes per cycle. |
+| `ravel_agents_sweep_last_directory_cycle_ms` | How long the last full directory cycle took on the coordinator's clock, from the pass that started it to the pass that reached the end of the listing; 0 before the first. It bounds how late a pass reaches an agent given work through another server process (`docs/agents.md`, "Clocks"). |
+
+One more counter with the `mode` label reports the effect evidence index of
+each tenant this process has served (`docs/agents.md`, "Wire"):
+
+| Metric | Meaning |
+|---|---|
+| `ravel_agents_evidence_dropped_total` | Late effect results the evidence index could not list, because every slot held an effect still in doubt or the effect already listed 16. The result object is still stored; `GET /api/v1/agents/effects/{effect}` does not name it. |
 
 Test: `metrics_scrape_reports_every_agents_family_once_with_the_mode_label`
 and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`; the
 sweep counters by `sweep_route_counts_match_the_store_and_needs_agents_admin`
-in the `agents_timers_e2e` test binary.
+in the `agents_timers_e2e` test binary; the evidence counter by
+`a_late_result_the_full_evidence_index_drops_is_counted` in
+`agents_effects_e2e`.
 
 ### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
 

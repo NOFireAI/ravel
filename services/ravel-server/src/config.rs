@@ -3478,7 +3478,8 @@ pub struct AgentsConfig {
     /// polls at most once per five seconds then (the poll floor).
     pub sweep_interval_ms: u64,
     /// Most effects whose late results each tenant's evidence index names.
-    /// No flag sets it; tests lower it to fill the index.
+    /// No flag sets it; tests lower it to fill the index. At least 1:
+    /// [`AgentsConfig::check`] refuses 0 at startup.
     pub max_evidence_effects: usize,
     /// The clock every tenant coordinator and store reads: the host's wall
     /// clock unless a test injects one.
@@ -3514,6 +3515,28 @@ impl PartialEq for AgentsClock {
 }
 
 impl Eq for AgentsClock {}
+
+/// An [`AgentsConfig`] the server refuses to start with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AgentsConfigError {
+    /// An evidence index with no slot would list no late effect result.
+    #[error(
+        "agents.max_evidence_effects is 0: the evidence index would list no late effect result; \
+         set at least 1, or leave it at the default of {}",
+        DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS
+    )]
+    ZeroMaxEvidenceEffects,
+}
+
+impl AgentsConfig {
+    /// The settings no flag validates, checked before the server starts.
+    pub fn check(&self) -> Result<(), AgentsConfigError> {
+        if self.max_evidence_effects == 0 {
+            return Err(AgentsConfigError::ZeroMaxEvidenceEffects);
+        }
+        Ok(())
+    }
+}
 
 impl Default for AgentsConfig {
     fn default() -> Self {
@@ -17609,6 +17632,30 @@ mod tests {
                 clock: AgentsClock::default(),
             }
         );
+    }
+
+    /// An evidence index with no slot is refused with a typed error; one slot
+    /// and the default pass.
+    #[test]
+    fn agents_check_refuses_a_zero_evidence_index() {
+        let zero = AgentsConfig {
+            max_evidence_effects: 0,
+            ..AgentsConfig::default()
+        };
+        assert_eq!(zero.check(), Err(AgentsConfigError::ZeroMaxEvidenceEffects));
+        assert!(
+            zero.check()
+                .expect_err("refused")
+                .to_string()
+                .contains("agents.max_evidence_effects is 0")
+        );
+        for max_evidence_effects in [1, DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS] {
+            let config = AgentsConfig {
+                max_evidence_effects,
+                ..AgentsConfig::default()
+            };
+            assert_eq!(config.check(), Ok(()));
+        }
     }
 
     /// A non-numeric or negative value for each numeric agents flag is a parse

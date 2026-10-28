@@ -829,6 +829,11 @@ async fn sweep_route_counts_match_the_store_and_needs_agents_admin() {
     let scrape = api.scrape().await;
     assert_eq!(value(&scrape, "ravel_agents_sweep_interval_ms", "mode="), 0);
     let passes = value(&scrape, "ravel_agents_sweep_passes_total", "mode=");
+    let cycles = value(
+        &scrape,
+        "ravel_agents_sweep_directory_cycles_total",
+        "mode=",
+    );
     let before = fixture.requests.snapshot();
     let report = api.sweep().await;
     let after = fixture.requests.snapshot();
@@ -854,6 +859,15 @@ async fn sweep_route_counts_match_the_store_and_needs_agents_admin() {
     let scrape = api.scrape().await;
     let sample = |name: &str| value(&scrape, name, "mode=");
     assert_eq!(sample("ravel_agents_sweep_passes_total"), passes + 1);
+    // Both agents fit one pass, so the pass walked the whole directory and
+    // wrapped; the agents clock did not move during it.
+    assert_eq!(
+        sample("ravel_agents_sweep_directory_cycles_total"),
+        cycles + 1
+    );
+    assert_eq!(sample("ravel_agents_sweep_last_directory_cycle_ms"), 0);
+    assert!(scrape.contains("# TYPE ravel_agents_sweep_directory_cycles_total counter\n"));
+    assert!(scrape.contains("# TYPE ravel_agents_sweep_last_directory_cycle_ms gauge\n"));
     assert_eq!(
         json!(sample("ravel_agents_sweep_timers_fired_total")),
         report["timers_fired"]

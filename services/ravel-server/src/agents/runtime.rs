@@ -12,7 +12,7 @@
 //! `_wake` hints only make it cheap (ADR-3331 decision 8).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -68,11 +68,34 @@ pub const POLL_SWEEP_FLOOR_MS: u64 = ravel_agents_runtime::DEFAULT_SWEEP_INTERVA
 /// showed settled stays listed until the index is full, and then gives up
 /// its slot to an effect the index does not name yet; once the index is
 /// full of effects not known settled, results for new effects are not
-/// listed.
-#[derive(Debug)]
+/// listed. Every result not listed, for that reason or because its effect
+/// already names [`MAX_EVIDENCE_PER_EFFECT`], counts in
+/// [`EvidenceIndex::dropped`] and is logged at most once per
+/// [`DROP_WARNING_INTERVAL_NS`] of the index's clock.
 pub struct EvidenceIndex {
+    tenant: TenantHash,
     max_effects: usize,
+    clock: Arc<dyn Clock>,
     entries: Mutex<HashMap<(AgentId, Id128), Evidence>>,
+    dropped: AtomicU64,
+    /// When the last drop was logged, in the clock's nanoseconds; 0 before
+    /// the first.
+    last_drop_warning_unix_ns: AtomicI64,
+}
+
+/// The least time between two warnings about late results one tenant's
+/// [`EvidenceIndex`] did not list.
+pub const DROP_WARNING_INTERVAL_NS: i64 = 60 * 1_000_000_000;
+
+impl std::fmt::Debug for EvidenceIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvidenceIndex")
+            .field("tenant", &self.tenant)
+            .field("max_effects", &self.max_effects)
+            .field("entries", &self.entries)
+            .field("dropped", &self.dropped)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -86,35 +109,96 @@ struct Evidence {
 /// One late result: the attempt that reported it and where it is stored.
 type LateResult = (u32, ObjectRef);
 
-impl Default for EvidenceIndex {
-    fn default() -> Self {
-        EvidenceIndex::new(MAX_EVIDENCE_EFFECTS)
-    }
+/// Why [`EvidenceIndex::record`] did not list a late result.
+#[derive(Debug, Clone, Copy)]
+enum Dropped {
+    /// Every slot holds an effect not known settled.
+    IndexFull,
+    /// The effect already names [`MAX_EVIDENCE_PER_EFFECT`] results.
+    EffectFull,
 }
 
 impl EvidenceIndex {
-    pub fn new(max_effects: usize) -> Self {
+    /// The index of `tenant`, naming at most `max_effects` effects and
+    /// rate-limiting its drop warnings on `clock`.
+    pub fn new(tenant: TenantHash, max_effects: usize, clock: Arc<dyn Clock>) -> Self {
         EvidenceIndex {
+            tenant,
             max_effects,
+            clock,
             entries: Mutex::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
+            last_drop_warning_unix_ns: AtomicI64::new(0),
         }
     }
 
     pub fn record(&self, agent: AgentId, effect_id: Id128, attempt: u32, result: ObjectRef) {
-        let mut entries = self.entries.lock();
-        if !entries.contains_key(&(agent, effect_id)) && entries.len() >= self.max_effects {
-            let settled = entries.iter().find(|(_, e)| e.settled).map(|(key, _)| *key);
-            match settled {
-                Some(key) => {
-                    entries.remove(&key);
+        let dropped = {
+            let mut entries = self.entries.lock();
+            let mut room = true;
+            if !entries.contains_key(&(agent, effect_id)) && entries.len() >= self.max_effects {
+                let settled = entries.iter().find(|(_, e)| e.settled).map(|(key, _)| *key);
+                match settled {
+                    Some(key) => {
+                        entries.remove(&key);
+                    }
+                    None => room = false,
                 }
-                None => return,
             }
+            if room {
+                let kept = &mut entries.entry((agent, effect_id)).or_default().results;
+                if kept.contains(&(attempt, result)) {
+                    None
+                } else if kept.len() < MAX_EVIDENCE_PER_EFFECT {
+                    kept.push((attempt, result));
+                    None
+                } else {
+                    Some(Dropped::EffectFull)
+                }
+            } else {
+                Some(Dropped::IndexFull)
+            }
+        };
+        if let Some(reason) = dropped {
+            self.count_drop(effect_id, reason);
         }
-        let kept = &mut entries.entry((agent, effect_id)).or_default().results;
-        if kept.len() < MAX_EVIDENCE_PER_EFFECT && !kept.contains(&(attempt, result)) {
-            kept.push((attempt, result));
+    }
+
+    fn count_drop(&self, effect_id: Id128, reason: Dropped) {
+        let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        // 0 is the never-warned sentinel, so `now` is clamped above it.
+        let now = self.clock.now_unix_ns().max(1);
+        let last = self.last_drop_warning_unix_ns.load(Ordering::Relaxed);
+        let due = last == 0 || now.saturating_sub(last) >= DROP_WARNING_INTERVAL_NS;
+        if !due
+            || self
+                .last_drop_warning_unix_ns
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
         }
+        match reason {
+            Dropped::IndexFull => tracing::warn!(
+                tenant = %self.tenant.to_hex(),
+                effect = %effect_id.to_hex(),
+                cap = self.max_effects,
+                dropped = total,
+                "agents evidence index is full of effects in doubt; a late effect result is stored but not listed"
+            ),
+            Dropped::EffectFull => tracing::warn!(
+                tenant = %self.tenant.to_hex(),
+                effect = %effect_id.to_hex(),
+                cap = MAX_EVIDENCE_PER_EFFECT,
+                dropped = total,
+                "agents evidence index already lists the most late results one effect may name; a late effect result is stored but not listed"
+            ),
+        }
+    }
+
+    /// Late results this index did not list, since the process started.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn of(&self, agent: AgentId, effect_id: Id128) -> Vec<(u32, ObjectRef)> {
@@ -306,7 +390,7 @@ impl AgentsRuntime {
                 let coordinator = Coordinator::new(
                     store.clone(),
                     self.runtime_config(),
-                    clock,
+                    clock.clone(),
                     Arc::new(SystemRng::new()),
                 )
                 .with_sweep(SweepConfig {
@@ -317,7 +401,7 @@ impl AgentsRuntime {
                     store,
                     coordinator,
                     changed: Notify::new(),
-                    evidence: EvidenceIndex::new(self.settings.max_evidence_effects),
+                    evidence: EvidenceIndex::new(tenant, self.settings.max_evidence_effects, clock),
                 });
                 self.spawn_sweep(tenant, &agents);
                 agents
@@ -391,7 +475,14 @@ impl AgentsRuntime {
             .fold(empty_snapshot(), add_snapshots)
     }
 
-    /// Every tenant coordinator's sweep counters, summed.
+    /// Late results the evidence index of every tenant did not list, summed.
+    pub fn evidence_dropped(&self) -> u64 {
+        let tenants: Vec<Arc<TenantAgents>> = self.tenants.lock().values().cloned().collect();
+        tenants.iter().map(|t| t.evidence.dropped()).sum()
+    }
+
+    /// Every tenant coordinator's sweep counters, summed, except
+    /// `last_directory_cycle_ms`, which is the largest of them.
     pub fn sweep_metrics(&self) -> SweepMetricsSnapshot {
         let coordinators: Vec<Arc<TenantAgents>> = self.tenants.lock().values().cloned().collect();
         coordinators
@@ -408,6 +499,10 @@ impl AgentsRuntime {
                     timers_fired: a.timers_fired + b.timers_fired,
                     agents_loaded: a.agents_loaded + b.agents_loaded,
                     dir_entries_repaired: a.dir_entries_repaired + b.dir_entries_repaired,
+                    directory_cycles: a.directory_cycles + b.directory_cycles,
+                    last_directory_cycle_ms: a
+                        .last_directory_cycle_ms
+                        .max(b.last_directory_cycle_ms),
                 }
             })
     }
@@ -505,9 +600,13 @@ mod tests {
 
     /// A full index takes a new effect only by dropping one a HEAD read
     /// showed settled; an effect not known settled keeps its slot.
+    fn index(max_effects: usize) -> EvidenceIndex {
+        EvidenceIndex::new(TenantHash([7; 16]), max_effects, Arc::new(SystemClock))
+    }
+
     #[test]
     fn a_full_index_gives_only_a_settled_effects_slot_away() {
-        let index = EvidenceIndex::new(2);
+        let index = index(2);
         let result = ObjectRef::of(b"late");
         index.record(agent(0), id(1), 1, result);
         index.record(agent(1), id(2), 1, result);
@@ -538,7 +637,7 @@ mod tests {
     /// is forgotten; then exactly one more fits.
     #[test]
     fn forgetting_an_effect_frees_its_slot_in_a_full_index() {
-        let index = EvidenceIndex::default();
+        let index = index(MAX_EVIDENCE_EFFECTS);
         let result = ObjectRef::of(b"late");
         for n in 0..MAX_EVIDENCE_EFFECTS {
             let id = id(n as u128 + 1);
@@ -560,5 +659,32 @@ mod tests {
         assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
         index.record(agent(1), id(u128::MAX - 1), 1, result);
         assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
+    }
+
+    /// A result the index does not list counts once, whether the index is
+    /// full of effects in doubt or the effect already names
+    /// [`MAX_EVIDENCE_PER_EFFECT`] results; a listed result and a repeat of
+    /// one count nothing.
+    #[test]
+    fn every_late_result_the_index_cannot_list_is_counted() {
+        let index = index(1);
+        let result = |n: u32| ObjectRef::of(&n.to_be_bytes());
+        index.record(agent(0), id(1), 1, result(1));
+        index.record(agent(0), id(1), 1, result(1));
+        assert_eq!(index.dropped(), 0);
+
+        index.record(agent(1), id(2), 1, result(1));
+        assert!(index.of(agent(1), id(2)).is_empty());
+        assert_eq!(index.dropped(), 1, "full of an effect in doubt");
+
+        let per_effect = u32::try_from(MAX_EVIDENCE_PER_EFFECT).expect("small");
+        for attempt in 2..=per_effect {
+            index.record(agent(0), id(1), attempt, result(attempt));
+        }
+        assert_eq!(index.of(agent(0), id(1)).len(), MAX_EVIDENCE_PER_EFFECT);
+        assert_eq!(index.dropped(), 1);
+        index.record(agent(0), id(1), per_effect + 1, result(per_effect + 1));
+        assert_eq!(index.of(agent(0), id(1)).len(), MAX_EVIDENCE_PER_EFFECT);
+        assert_eq!(index.dropped(), 2, "the effect names its most results");
     }
 }
