@@ -358,10 +358,12 @@ The [HTTP API reference](docs/reference/http-api.md) lists every route. One
 of them, `POST /api/v1/admin/fold`, triggers a
 [catalog fold on demand](docs/architecture.md#on-demand-catalog-fold).
 
-## Agents (MCP)
+## MCP server for AI agents
 
-The MCP agent surface is documented in
-[docs/guides/agents.md](docs/guides/agents.md). It ships behind the `mcp`
+The MCP server, the query surface for an AI agent host, is documented in
+[docs/guides/mcp-server.md](docs/guides/mcp-server.md), and is distinct from
+[Ravel Agents](docs/guides/agents.md), the durable agent runtime. The MCP
+server ships behind the `mcp`
 cargo feature (`cargo build -p ravel-server --features mcp`) and the
 runtime `--mcp` flag, both off by default: build with the feature, then pass
 `--mcp` (and `--mcp-allowed-origins`, required whenever the MCP listener is
