@@ -271,13 +271,13 @@ AdminCas(ak, new) ==
     /\ CasNow(ak, new)
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
-\* Destroy sets the tombstone; an armed timer is cancelled with the agent.
+\* Destroy sets the tombstone and leaves an armed timer armed, as
+\* `Kernel::tombstone` does; FireTimer refuses to fire on a tombstoned root.
 Destroy(ak) ==
     /\ HeadUp(ak)
     /\ Head(ak).rev < MaxRevision
     /\ ~Head(ak).tomb
-    /\ AdminCas(ak, [Head(ak) EXCEPT !.rev = @ + 1, !.tomb = TRUE,
-                       !.timer.st = IF @ = "armed" THEN "cancelled" ELSE @])
+    /\ AdminCas(ak, [Head(ak) EXCEPT !.rev = @ + 1, !.tomb = TRUE])
 
 \* Recreate on a tombstoned HEAD bumps the incarnation in the same HEAD,
 \* clears the owner and starts an empty mailbox and timer generation 0, as
@@ -766,12 +766,15 @@ InputEventuallyResolved ==
     \A ak \in AKs, s \in 0..MaxInputs : PendingInput(ak, s) ~> InputSettled(ak, s)
 
 DueTimer(ak, g) ==
-    HeadUp(ak) /\ Head(ak).timer = [gen |-> g, st |-> "armed"] /\ due[ak] >= g
+    /\ HeadUp(ak) /\ ~Head(ak).tomb
+    /\ Head(ak).timer = [gen |-> g, st |-> "armed"] /\ due[ak] >= g
 
 \* A due, uncancelled timer generation is eventually delivered (or
-\* cancelled, or its agent destroyed: anything that disarms it).
+\* cancelled or replaced: anything that disarms it), or its agent destroyed.
+\* A destroyed agent's timer stays armed and never fires.
 DueTimerEventuallyDelivered ==
     \A ak \in AKs, g \in 1..MaxTimerGen :
-        DueTimer(ak, g) ~> (HeadUp(ak) /\ Head(ak).timer # [gen |-> g, st |-> "armed"])
+        DueTimer(ak, g) ~>
+            (HeadUp(ak) /\ (Head(ak).tomb \/ Head(ak).timer # [gen |-> g, st |-> "armed"]))
 
 =============================================================================

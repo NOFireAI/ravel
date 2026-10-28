@@ -255,6 +255,9 @@ intended behaviour and the model follows it:
   incarnation. `MonotonicIdentity` checks the timer generation only across
   writes within one incarnation, and checks no turn counter (the kernel has
   none).
+- Destroy leaves an armed timer armed, as `Kernel::tombstone` does, and
+  `FireTimer` refuses to fire on a tombstoned root. `DueTimerEventuallyDelivered`
+  counts a destroyed agent as settled for its timer.
 
 Remaining differences, each also stated in its `traceability.md` row:
 
