@@ -702,8 +702,10 @@ memory_summary() {
 
 # save_rustfs_logs: copy RustFS's /logs out of its container into
 # <out>/rustfs-logs/, since `down -v` destroys the container and its own log
-# directory with it. A failed copy is stamped and said, and never changes the
-# run's exit code.
+# directory with it. The image's entrypoint creates /logs and logs there, not
+# to stdout: a smoke-pass compose.log holds only its three startup lines,
+# "Initializing log directory: /logs" among them (#2821, comment 6465409125).
+# A failed copy is stamped and said, and never changes the run's exit code.
 save_rustfs_logs() {
   local cp_code=0
   if [ "$diagnostic" -eq 1 ]; then

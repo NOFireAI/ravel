@@ -511,7 +511,11 @@ Steps, in order, stopping at the first failure:
    churn 18000, the diagnostic mode's ingest included (case m), and
    `--readback-timeout-secs`, the per-request timeout of each read-back
    query with its body read, per profile: ci 30, cardinality 900, history
-   300, churn 900 (case m). `--http-timeout-secs` bounds writes only. Each
+   300, churn 900 (case m). A read-back that hangs on every query can hold
+   a row for the 60 s settle window plus one read's five or six queries at
+   that timeout, up to about 91 minutes on cardinality and churn, though
+   each engine's own 120 s query deadline normally ends a query first.
+   `--http-timeout-secs` bounds writes only. Each
    row's `readback.query_ms` records every read-back query's wall time in
    milliseconds, and a failed query names its elapsed time. A row whose
    projected wall time passes its ceiling makes the bin exit 1, so the run
