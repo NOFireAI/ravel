@@ -129,6 +129,12 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/?/admission/*"
     },
     {
+      "Sid": "GatewayAgentsWakeDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/ag/_wake/*"
+    },
+    {
       "Sid": "GatewayTenantKms",
       "Effect": "Allow",
       "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],

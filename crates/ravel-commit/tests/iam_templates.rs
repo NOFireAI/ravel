@@ -2377,15 +2377,21 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "s3:PutObject",
             "s3:PutObject",
         ],
-        deletes: &["t/????????????????????????????????/?/admission/*"],
-        delete_actions: &["s3:DeleteObject"],
+        // GatewayAdmissionDelete, then GatewayAgentsWakeDelete (the sweep's
+        // hint delete, agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain).
+        deletes: &[
+            "t/????????????????????????????????/?/admission/*",
+            AGENTS_WAKE_DELETE,
+        ],
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
         kms_resources: &[("GatewayTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
     // Query: reads every level, writes catalog-fold output, the query-audit
-    // prefix and its worker registration; deletes no durable object. A drained query
+    // prefix and its worker registration; deletes no durable object (the bucket
+    // probe and the advisory agents wake hints are not durable). A drained query
     // worker overwrites its own registration rather than deleting it, and the
     // maintain role reaps dead registrations (issue #1828). sys/auth is read
     // by the durable auth refresh (tenant_resolving_roles_read_the_auth_map).
@@ -2481,8 +2487,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "s3:PutObject",
             "s3:PutObject",
         ],
-        deletes: &["sys/pq-probe/*"],
-        delete_actions: &["s3:DeleteObject"],
+        // QueryProbeDelete, then QueryAgentsWakeDelete.
+        deletes: &["sys/pq-probe/*", AGENTS_WAKE_DELETE],
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
@@ -4672,9 +4679,10 @@ fn maintain_template_covers_every_query_worker_reap_call() {
         }
     }
 
-    // The query role deletes only the Parquet bucket probe's scratch object,
-    // never this record.
-    let query_deletes = delete_key_patterns(&load_policy("query"), "Allow");
+    // The query role deletes only the Parquet bucket probe's scratch object
+    // and agents wake hints, never this record.
+    let query_deletes =
+        without_agents_wake_delete(delete_key_patterns(&load_policy("query"), "Allow"));
     assert!(
         query_deletes.iter().all(|p| p.starts_with(PROBE_PREFIX))
             && !query_deletes.iter().any(|p| glob_matches(p, &record)),
@@ -5542,8 +5550,9 @@ fn query_template_covers_every_alert_evaluator_call() {
         );
     }
 
-    // Query's only delete is the Parquet bucket probe's scratch object.
-    let deletes = delete_key_patterns(&query, "Allow");
+    // Query's only deletes are the Parquet bucket probe's scratch object and
+    // agents wake hints.
+    let deletes = without_agents_wake_delete(delete_key_patterns(&query, "Allow"));
     assert!(
         deletes.iter().all(|p| p.starts_with(PROBE_PREFIX)),
         "query: the role must grant no delete outside {PROBE_PREFIX:?}; the \
@@ -5873,12 +5882,12 @@ fn query_template_covers_every_parquet_ddl_call() {
     );
     assert_reaches_nothing_outside("query", "s3:PutObject Allow", &puts, &probe, PROBE_PREFIX);
     assert_reaches_nothing_outside("query", "delete Allow", &deletes, &probe, PROBE_PREFIX);
-    for pattern in &deletes {
+    for pattern in &without_agents_wake_delete(deletes.clone()) {
         assert!(
             pattern.starts_with(PROBE_PREFIX),
             "query: delete Allow {pattern:?} lies outside the probe prefix \
-             {PROBE_PREFIX:?}; the bucket probe is the only thing the Query role \
-             deletes"
+             {PROBE_PREFIX:?}; besides agents wake hints, the bucket probe is \
+             the only thing the Query role deletes"
         );
     }
 }
@@ -7443,7 +7452,9 @@ fn every_reserved_table_name_has_a_manifest_witness_a_template_grant_reaches() {
 
 /// Every way `policy` departs from the Ravel Agents grant rule of ADR-3331
 /// decision 2: every role may list and GET each agents key family, only the
-/// gateway and query roles may PUT them, and no role may delete them.
+/// gateway and query roles may PUT them, and only those two may delete, and
+/// then only `_wake/` hints (decision 8: the sweep deletes a hint once HEAD
+/// shows its timer settled). No role deletes any other agents key.
 fn agents_namespace_defects(policy: &Policy) -> Vec<String> {
     let role = policy.role;
     let writes = matches!(role, "gateway" | "query");
@@ -7470,23 +7481,82 @@ fn agents_namespace_defects(policy: &Policy) -> Vec<String> {
                 writes
             ));
         }
-        if reaches(&deletes, &key) {
-            defects.push(format!("{role}: may delete {key}"));
+        let deletable = writes && key.contains("/ag/_wake/");
+        if reaches(&deletes, &key) != deletable {
+            defects.push(format!(
+                "{role}: DELETE on {key} is {}, expected {deletable}",
+                reaches(&deletes, &key)
+            ));
         }
+    }
+    let agents_deletes: Vec<&String> = deletes.iter().filter(|p| p.contains("/ag/")).collect();
+    let expected: Vec<&str> = if writes {
+        vec![AGENTS_WAKE_DELETE]
+    } else {
+        vec![]
+    };
+    if agents_deletes != expected {
+        defects.push(format!(
+            "{role}: agents delete grants are {agents_deletes:?}, expected {expected:?}"
+        ));
     }
     defects
 }
 
-/// ADR-3331 decision 2: the gateway and query roles GET, PUT and list every
-/// agents key family under `t/*/ag/*`, the maintain role only lists and GETs
-/// them, admin reads them through its tenant-wide `t/*` grants and writes none,
-/// and no role deletes one. The two mutants pin that the check is live: a
-/// maintain write grant and a grant narrowed to the HEAD alone each fail it.
+/// The one agents delete grant: the gateway and query roles delete `_wake/`
+/// hints (ADR-3331 decision 8).
+const AGENTS_WAKE_DELETE: &str = "t/*/ag/_wake/*";
+
+/// `patterns` less the agents wake delete, which
+/// `agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain`
+/// pins on its own, for a check about a role's other deletes.
+fn without_agents_wake_delete(patterns: Vec<String>) -> Vec<String> {
+    patterns
+        .into_iter()
+        .filter(|p| p != AGENTS_WAKE_DELETE)
+        .collect()
+}
+
+/// ADR-3331 decisions 2 and 8: the gateway and query roles GET, PUT and list
+/// every agents key family under `t/*/ag/*` and DELETE `t/*/ag/_wake/*` and
+/// nothing else under `ag/`, the maintain role only lists and GETs them, and
+/// admin reads them through its tenant-wide `t/*` grants and writes and
+/// deletes none. The mutants pin that the check is live: a maintain write
+/// grant, a grant narrowed to the HEAD alone, a wake delete widened to the
+/// whole namespace, and a role without the wake delete each fail it.
 #[test]
 fn agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain() {
     for role in ALL_ROLES {
         let defects = agents_namespace_defects(&load_policy(role));
         assert!(defects.is_empty(), "{defects:#?}");
+    }
+
+    for (role, sid) in [
+        ("gateway", "GatewayAgentsWakeDelete"),
+        ("query", "QueryAgentsWakeDelete"),
+    ] {
+        let widened = template_with_statement_edit(role, sid, |stmt| {
+            stmt["Resource"] = serde_json::json!(format!("{BUCKET_KEY_PREFIX}t/*/ag/*"));
+        });
+        let defects = agents_namespace_defects(&widened);
+        for family in ["/head", "/o/", "/_dir/"] {
+            assert!(
+                defects
+                    .iter()
+                    .any(|d| d.contains("DELETE on") && d.contains(family)),
+                "{role}: a delete widened to t/*/ag/* must reach {family}: {defects:#?}"
+            );
+        }
+        let without = template_with_statement_edit(role, sid, |stmt| {
+            stmt["Resource"] = serde_json::json!(format!("{BUCKET_KEY_PREFIX}t/*/ag/_none/*"));
+        });
+        let defects = agents_namespace_defects(&without);
+        assert!(
+            defects
+                .iter()
+                .any(|d| d.contains("DELETE on") && d.contains("/_wake/")),
+            "{role}: a role that cannot delete wake hints must fail: {defects:#?}"
+        );
     }
 
     let maintain_writes = template_with_statement_edit("maintain", "MaintainWrite", |stmt| {
@@ -7603,9 +7673,9 @@ fn gateway_template_covers_the_admission_snapshot_reap() {
          object. Grants: {deletes:?}"
     );
 
-    // Every gateway delete pattern is the admission reap's: the role deletes
-    // nothing else, immutable data included.
-    for pattern in &deletes {
+    // Every gateway delete pattern but the agents wake hints is the admission
+    // reap's: the role deletes nothing else, immutable data included.
+    for pattern in &without_agents_wake_delete(deletes.clone()) {
         assert!(
             ALL_SIGNALS
                 .iter()
