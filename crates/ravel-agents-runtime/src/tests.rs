@@ -236,7 +236,7 @@ pub(crate) async fn send(
 }
 
 pub(crate) async fn head(store: &AgentStore, key: &str) -> Head {
-    match store.read_head(&id_of(key)).await.expect("read head") {
+    match store.read_head_full(&id_of(key)).await.expect("read head") {
         HeadState::Present { head, .. } => *head,
         other => panic!("no head: {other:?}"),
     }

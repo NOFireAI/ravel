@@ -438,7 +438,7 @@ async fn a_version_one_head_migrates_on_the_next_cas() {
         1 + out.head.index.written.len() as u64,
         "the payload and every page the migration sealed"
     );
-    let full = match paged.read_head(&agent()).await.expect("read") {
+    let full = match paged.read_head_full(&agent()).await.expect("read") {
         HeadState::Present { head, .. } => *head,
         other => panic!("{other:?}"),
     };

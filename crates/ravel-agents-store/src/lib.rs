@@ -6,7 +6,8 @@
 //! kernel, uploads the immutable objects the new root references, and
 //! publishes the root with one conditional write. Every operation that
 //! writes HEAD goes through the one private skeleton in [`publish`]; read
-//! paths ([`AgentStore::read_head`], [`AgentStore::resolve`],
+//! paths ([`AgentStore::read_head_shallow`], [`AgentStore::attach`],
+//! [`AgentStore::read_head_full`], [`AgentStore::resolve`],
 //! [`AgentStore::list_agents`], [`AgentStore::list_wake_hints`],
 //! [`AgentStore::list_dir_after`]) never write, and the one delete,
 //! [`AgentStore::delete_wake_hint`], removes only an advisory hint. Time
@@ -173,6 +174,9 @@ pub struct AgentStore {
     pub(crate) ids: Arc<dyn IdSource + Send + Sync>,
     pub(crate) counters: Arc<Counters>,
     pub(crate) backoff: Arc<dyn Backoff>,
+    /// Whether a publish loads the pages `Kernel::pages_needed` names before
+    /// the transition. Always true outside this crate's tests.
+    pub(crate) plan_pages: bool,
 }
 
 impl AgentStore {
@@ -192,7 +196,16 @@ impl AgentStore {
             ids,
             counters: Arc::new(Counters::default()),
             backoff: Arc::new(JitteredBackoff::default()),
+            plan_pages: true,
         }
+    }
+
+    /// A store that loads no page before a transition, so any command that
+    /// reads a sealed page takes the planner-miss path.
+    #[cfg(test)]
+    pub(crate) fn without_page_plan(mut self) -> AgentStore {
+        self.plan_pages = false;
+        self
     }
 
     /// Replace the retry delay policy ([`JitteredBackoff`] by default).
@@ -328,17 +341,47 @@ impl AgentStore {
         self.read_object_at(agent, &key, dep).await
     }
 
-    /// Read HEAD without writing anything, with every sealed index page
-    /// attached, so each list is whole: one GET for HEAD plus one per sealed
-    /// page. The narrower reads below ([`Self::find_receipt`],
-    /// [`Self::read_events`], [`Self::due_timers`], [`Self::resolve`]) read
-    /// at most the pages their answer is on.
-    pub async fn read_head(&self, agent: &AgentId) -> Result<HeadState, AgentError> {
+    /// The full read: HEAD with every sealed index page attached, so each
+    /// list is whole, at one GET for HEAD plus one per sealed page, a cost
+    /// that grows with the agent's history. It is for the inspector, the
+    /// CLI and tests. Every hot path reads [`Self::read_head_shallow`] and
+    /// attaches only the pages it reads ([`Self::attach`]), or uses one of
+    /// the narrower reads below ([`Self::find_receipt`],
+    /// [`Self::read_events`], [`Self::due_timers`], [`Self::resolve`]).
+    pub async fn read_head_full(&self, agent: &AgentId) -> Result<HeadState, AgentError> {
         let mut state = self.read_head_state(agent, true).await?;
         if let HeadState::Present { head, .. } = &mut state {
             self.load_all_pages(agent, head).await?;
         }
         Ok(state)
+    }
+
+    /// HEAD as stored, in one GET: each list holds its open page only. What
+    /// is answerable from it without a page is listed on
+    /// [`ravel_agents_core::pages`]: the scheduled timers, the active turn,
+    /// whether the inbox is empty, and every singleton field.
+    pub async fn read_head_shallow(&self, agent: &AgentId) -> Result<HeadState, AgentError> {
+        self.read_head_state(agent, true).await
+    }
+
+    /// Attach to `head` every sealed page `needs` names that it does not
+    /// hold yet, one GET each. Pages are immutable, so `head` may be a root
+    /// read earlier, as long as it is the root the caller means to read.
+    pub async fn attach(
+        &self,
+        agent: &AgentId,
+        head: &mut Head,
+        needs: &[(ListKind, Need)],
+    ) -> Result<(), AgentError> {
+        let mut pages = Vec::new();
+        for &(list, need) in needs {
+            for page in head.index.directory(list).missing(need) {
+                if !pages.contains(&(list, page)) {
+                    pages.push((list, page));
+                }
+            }
+        }
+        self.load_pages(agent, head, &pages).await
     }
 
     /// HEAD as stored, sealed pages not attached; `None` when the agent does
@@ -395,9 +438,22 @@ impl AgentStore {
         after: u64,
         limit: usize,
     ) -> Result<Vec<EventEntry>, AgentError> {
-        let Some(mut head) = self.shallow_head(agent).await? else {
+        let Some(head) = self.shallow_head(agent).await? else {
             return Ok(Vec::new());
         };
+        self.events_in(agent, head, after, limit).await
+    }
+
+    /// [`Self::read_events`] over a root the caller already read, with the
+    /// same page bound, so a caller that checks the root first (an HTTP
+    /// route refusing a tombstoned agent) pays no second HEAD GET.
+    pub async fn events_in(
+        &self,
+        agent: &AgentId,
+        mut head: Head,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<EventEntry>, AgentError> {
         let from = after.saturating_add(1);
         let directory = &head.index.events;
         if let Some(first) = directory.page_for(from) {

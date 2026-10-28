@@ -28,6 +28,7 @@ use ravel_agents_core::error::{AgentError, ErrorKind};
 use ravel_agents_core::head::{ActiveTurn, Head, ObjectRef};
 use ravel_agents_core::identity::AgentId;
 use ravel_agents_core::kernel::Reply;
+use ravel_agents_core::pages::{ListKind, Need};
 use ravel_agents_core::state::Handle;
 use ravel_agents_core::wire::{AgentRef, StepBody, TurnAssignment, TurnLease, WorkerPollRequest};
 use ravel_agents_store::HeadState;
@@ -154,9 +155,11 @@ impl Coordinator {
                 if self.agents.lock().contains_key(&agent) {
                     continue;
                 }
-                match self.store.read_head(&agent).await? {
+                // HEAD alone answers whether there is work; the scan
+                // attaches the pages dispatch reads to the agents it offers.
+                match self.store.read_head_shallow(&agent).await? {
                     HeadState::Present { head, .. }
-                        if head.active_turn.is_some() || !head.inbox.is_empty() =>
+                        if head.active_turn.is_some() || head.has_inbox() =>
                     {
                         self.observe(&agent, &head);
                     }
@@ -192,10 +195,13 @@ impl Coordinator {
         let mut refusal = None;
         let agents = self.agents.lock();
         for (agent, loaded) in agents.iter() {
-            if loaded.dispatching {
+            let head = &loaded.head;
+            // The inbox entries read below are the ones `dispatch_needs`
+            // names; without their pages the first one in memory is not the
+            // first input.
+            if loaded.dispatching || !dispatch_ready(head) {
                 continue;
             }
-            let head = &loaded.head;
             let next = match &head.active_turn {
                 Some(turn) => {
                     if !pins.iter().any(|p| p.handler == turn.handler) {
@@ -231,7 +237,41 @@ impl Coordinator {
         (found.into_iter().map(|(_, a)| a).collect(), refusal)
     }
 
+    /// Attach the pages [`dispatch_needs`] names to every loaded root that
+    /// lacks one. A root an operation returned holds only the pages its
+    /// command read, and one found by a directory scan or a sweep holds
+    /// none; each costs one page GET here, once, until it is replaced. A
+    /// root whose page cannot be read is left as it is and is not offered
+    /// ([`Coordinator::candidates`]), so one agent cannot fail every poll.
+    async fn attach_dispatch_pages(&self) {
+        let lacking: Vec<(AgentId, Head)> = self
+            .agents
+            .lock()
+            .iter()
+            .filter(|(_, l)| !l.dispatching && !dispatch_ready(&l.head))
+            .map(|(a, l)| (*a, l.head.clone()))
+            .collect();
+        for (agent, mut head) in lacking {
+            if let Err(error) = self
+                .store
+                .attach(&agent, &mut head, &dispatch_needs(&head))
+                .await
+            {
+                tracing::debug!(agent = %agent.to_hex(), %error, "agents dispatch page not read");
+                continue;
+            }
+            let mut agents = self.agents.lock();
+            if let Some(loaded) = agents.get_mut(&agent)
+                && loaded.head.incarnation == head.incarnation
+                && loaded.head.root_revision == head.root_revision
+            {
+                loaded.head = head;
+            }
+        }
+    }
+
     async fn scan(&self, worker: &str, pins: &[HandlerPin]) -> Result<Scan, AgentError> {
+        self.attach_dispatch_pages().await;
         let (candidates, refusal) = self.candidates(worker, pins);
         for agent in candidates {
             if !self.claim(&agent) {
@@ -440,6 +480,24 @@ impl Coordinator {
             )
         })
     }
+}
+
+/// The inbox pages dispatch reads from a loaded root: the first input's,
+/// which `BeginTurn` binds and [`Coordinator::candidates`] orders by, and the
+/// active input's, which a resumed turn's assignment reads.
+pub(crate) fn dispatch_needs(head: &Head) -> Vec<(ListKind, Need)> {
+    let mut needs = vec![(ListKind::Inbox, Need::First)];
+    if let Some(turn) = &head.active_turn {
+        needs.push((ListKind::Inbox, Need::Key(turn.input_accept_seq)));
+    }
+    needs
+}
+
+/// Whether `head` holds every page [`dispatch_needs`] names.
+fn dispatch_ready(head: &Head) -> bool {
+    dispatch_needs(head)
+        .into_iter()
+        .all(|(list, need)| head.index.directory(list).missing(need).is_empty())
 }
 
 fn pinned(pin: &HandlerPin, turn: &ActiveTurn) -> bool {

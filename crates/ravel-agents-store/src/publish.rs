@@ -7,7 +7,13 @@
 //!    names them, and nothing else ([`AgentStore::load_pages`];
 //!    `tests::pages::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`).
 //!    A transition that still finds a page missing is a planner miss: it is
-//!    logged and every page is loaded before the command is applied again.
+//!    logged, counted (`CounterSnapshot::planner_misses`), and every page is
+//!    loaded before the command is applied again
+//!    (`tests::pages::a_planner_miss_loads_every_page_and_is_counted`). The
+//!    needs and the transition read the same root, so no interleaving of
+//!    writers causes one: a miss happens only when
+//!    `ravel_agents_core::kernel::page_needs` omits a page some transition
+//!    reads, a kernel defect the counter makes visible instead of a refusal.
 //! 2. Resolve the command's operation id against the receipt index, and
 //! 3. validate its preconditions: both are the kernel's
 //!    ([`ravel_agents_core::kernel::Kernel::apply`]), run on the root just
@@ -245,7 +251,9 @@ impl AgentStore {
                     ));
                 }
             };
-            if let Some(head) = current.as_mut() {
+            if let Some(head) = current.as_mut()
+                && self.plan_pages
+            {
                 let needed = self.kernel.pages_needed(Some(head), command);
                 self.load_pages(agent, head, &needed).await?;
             }
@@ -260,6 +268,7 @@ impl AgentStore {
                     // `pages_needed` names every page a transition reads, so
                     // this is a planner miss: load the rest rather than fail.
                     tracing::warn!(agent = %agent.to_hex(), "agents index page planner missed a page");
+                    self.counters.planner_miss();
                     if let Some(head) = current.as_mut() {
                         self.load_all_pages(agent, head).await?;
                     }
