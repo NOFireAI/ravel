@@ -325,12 +325,17 @@ refused with `InvalidStepInput` rather than hashed (SDK `identity.test.ts`:
 match the worker_poll_response fixture").
 
 Not found. An operation handle the agent never issued, one from an earlier
-incarnation, or one whose agent does not exist answers `AgentGone` (404) with
+incarnation, or one for a tombstoned agent answers `AgentGone` (404) with
 the handle itself in the safe ids, beside the agent id, so a caller can tell
 which of its handles is gone without the server echoing any caller text
 (`agents_e2e::unknown_operation_handle_is_agent_gone_with_the_handle`). A
 token that does not decode as an operation handle is `AgentGone` with no
-ids, since its text is not known to be safe to echo.
+ids, since its text is not known to be safe to echo. A HEAD that is still
+not found under a handle after the store's repeated reads answers
+`OutcomeUnknown` (500) with the handle and `retry` `resolve_operation`, not
+`AgentGone`: a HEAD is never deleted, so the server treats the miss as a
+failed read, whether or not the agent was ever created
+(`agents_e2e::a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone`).
 
 ## Clocks
 
