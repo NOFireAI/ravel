@@ -18,9 +18,11 @@
 //! - [`seeds`]: the agent seed domains split from one `MasterSeed`, and the
 //!   seeded `RngSource` for runtime ids.
 //!
-//! Task T13 (#3346) adds the drivers that run the production store and
-//! runtime crates through the scheduler and check their recorded histories
-//! here. Until then this crate's own tests are its only caller.
+//! - [`drive`]: runs the production store and runtime crates through the
+//!   scheduler and records their histories for the checker.
+//!
+//! The named schedules are this crate's own tests, its only caller; the
+//! crate README lists each with its pinned batch totals.
 
 pub mod drive;
 pub mod history;
