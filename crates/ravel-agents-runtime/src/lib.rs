@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -111,6 +111,11 @@ pub struct RuntimeConfig {
     pub idle_unload_after_ms: u64,
     /// Upper bound on one worker long-poll.
     pub poll_wait_cap_ms: u64,
+    /// Least time between two directory rescans triggered by a pass that
+    /// found nothing to dispatch. Bounds the LIST and per-agent HEAD reads
+    /// an idle coordinator spends looking for work that arrived through
+    /// another coordinator.
+    pub rescan_interval_ms: u64,
 }
 
 /// The long-poll cap of ADR-3331 decision 9.
@@ -124,6 +129,7 @@ impl Default for RuntimeConfig {
             max_turn_attempts: 3,
             idle_unload_after_ms: 300_000,
             poll_wait_cap_ms: DEFAULT_POLL_WAIT_CAP_MS,
+            rescan_interval_ms: 5_000,
         }
     }
 }
@@ -145,9 +151,14 @@ pub struct Coordinator {
     pub(crate) rng: Arc<dyn Rng>,
     pub(crate) agents: Mutex<HashMap<AgentId, Loaded>>,
     pub(crate) leases: LeaseTable,
-    /// Whether the agent directory was scanned since start or the last
-    /// unload.
+    /// Whether the agent directory needs no scan before the next dispatch
+    /// pass. Cleared at start, by an unload, and by a pass that found
+    /// nothing to dispatch once `rescan_interval_ms` has passed since the
+    /// last scan.
     pub(crate) discovered: AtomicBool,
+    /// When the directory was last scanned, in the injected clock's
+    /// nanoseconds; `i64::MIN` before the first scan.
+    pub(crate) last_scan_unix_ns: AtomicI64,
     pub(crate) wake: Notify,
     pub(crate) metrics: Metrics,
 }
@@ -167,6 +178,7 @@ impl Coordinator {
             agents: Mutex::new(HashMap::new()),
             leases: LeaseTable::default(),
             discovered: AtomicBool::new(false),
+            last_scan_unix_ns: AtomicI64::new(i64::MIN),
             wake: Notify::new(),
             metrics: Metrics::default(),
         }

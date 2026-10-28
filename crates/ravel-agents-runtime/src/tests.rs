@@ -34,6 +34,7 @@ const LEASE_MS: u64 = 1_000;
 const GRACE_MS: u64 = 500;
 const MAX_ATTEMPTS: u32 = 3;
 const IDLE_MS: u64 = 10_000;
+const RESCAN_MS: u64 = 2_000;
 
 struct TestClock(AtomicI64);
 
@@ -66,6 +67,7 @@ fn config() -> RuntimeConfig {
         max_turn_attempts: MAX_ATTEMPTS,
         idle_unload_after_ms: IDLE_MS,
         poll_wait_cap_ms: DEFAULT_POLL_WAIT_CAP_MS,
+        rescan_interval_ms: RESCAN_MS,
     }
 }
 
@@ -1057,6 +1059,7 @@ async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
 
     create(&c1, "o-1").await;
     let sent = send(&c1, "o-1", "r-1", json!(1)).await;
+    clock.advance_ms(RESCAN_MS);
     let leased = poll_now(&c2, &w, "v1")
         .await
         .expect("the second poll lists the directory again and finds the input");
@@ -1064,6 +1067,80 @@ async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
     assert_eq!(leased.lease.owner_id, w);
     assert_eq!(store.counters().resolve.list - lists_before, 1);
     assert_eq!(c2.metrics().agents_loaded, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_poll_rescans_the_directory_at_most_once_per_interval() {
+    // Three dormant agents created through another coordinator, so this
+    // one knows them only from the directory, and no work: the first poll
+    // scans (one LIST, one HEAD read per agent); polls inside the rescan
+    // interval read nothing; the first poll past it scans once more.
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let other = coordinator(&store, &clock, 100);
+    let co = coordinator(&store, &clock, 200);
+    for key in ["o-1", "o-2", "o-3"] {
+        create(&other, key).await;
+    }
+    let w = worker(&co, "v1");
+    let before = store.counters();
+    assert!(poll_now(&co, &w, "v1").await.is_none());
+    let first = store.counters().since(&before);
+    assert_eq!(first.resolve.list, 1);
+    assert_eq!(first.resolve.get, 3, "one HEAD read per dormant agent");
+
+    let before = store.counters();
+    clock.advance_ms(RESCAN_MS / 2);
+    for _ in 0..5 {
+        assert!(poll_now(&co, &w, "v1").await.is_none());
+    }
+    let inside = store.counters().since(&before);
+    assert_eq!(inside.resolve.list, 0, "no rescan inside the interval");
+    assert_eq!(inside.resolve.get, 0);
+
+    let before = store.counters();
+    clock.advance_ms(RESCAN_MS);
+    assert!(poll_now(&co, &w, "v1").await.is_none());
+    let after = store.counters().since(&before);
+    assert_eq!(after.resolve.list, 1, "one rescan once the interval passed");
+    assert_eq!(after.resolve.get, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_that_skips_an_incompatible_agent_but_assigns_another_counts_no_refusal() {
+    let (clock, store, co) = rig();
+    create(&co, "o-1").await;
+    create(&co, "o-2").await;
+    send(&co, "o-1", "r-1", json!(1)).await;
+    let w1 = worker(&co, "v1");
+    poll_now(&co, &w1, "v1").await.expect("o-1's turn at v1");
+    clock.advance_ms(past_lease_and_grace());
+    let sent = send(&co, "o-2", "r-2", json!(2)).await;
+    let w2 = worker(&co, "v2");
+    let before = store.counters();
+    let leased = poll_now(&co, &w2, "v2")
+        .await
+        .expect("o-2 is servable at v2 while o-1 holds a v1 turn");
+    assert_eq!(leased.accept_seq, sent.accept_seq);
+    assert_eq!(
+        co.metrics().incompatible_handler_refusals,
+        0,
+        "a pass that assigned another agent refused nothing"
+    );
+    assert_eq!(
+        store.counters().since(&before).publish.cas,
+        2,
+        "o-2's takeover and begin"
+    );
+    // A third worker at v2: o-2 is leased to w2 under a live lease, so the
+    // only candidate left is o-1's v1 turn, and that pass is a refusal.
+    let w3 = worker(&co, "v2");
+    let refused = co
+        .poll(&poll_req(&w3, "v2", 0), Instant::now())
+        .await
+        .expect_err("with o-2 leased only o-1 is left, and it is refused");
+    assert_eq!(refused.kind, ErrorKind::IncompatibleHandler);
+    assert_eq!(co.metrics().incompatible_handler_refusals, 1);
 }
 
 #[tokio::test(start_paused = true)]

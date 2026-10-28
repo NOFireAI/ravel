@@ -96,7 +96,7 @@ impl LeaseTable {
     }
 }
 
-fn ms_to_ns(ms: u64) -> i64 {
+pub(crate) fn ms_to_ns(ms: u64) -> i64 {
     i64::try_from(ms.saturating_mul(1_000_000)).unwrap_or(i64::MAX)
 }
 

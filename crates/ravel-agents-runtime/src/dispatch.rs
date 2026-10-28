@@ -33,6 +33,7 @@ use ravel_agents_core::wire::{AgentRef, StepBody, TurnAssignment, TurnLease, Wor
 use ravel_agents_store::HeadState;
 use serde_json::Value;
 
+use crate::ownership::ms_to_ns;
 use crate::{Coordinator, parse_pins, refused};
 
 /// What one pass over the loaded agents found.
@@ -52,6 +53,9 @@ impl Coordinator {
         let wait_ms = u64::from(req.wait_ms).min(self.config.poll_wait_cap_ms);
         let deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(wait_ms));
         let mut waited = false;
+        // At most one in-pass rescan per wake, so an interval of zero rescans
+        // every pass but never spins without reaching the wait below.
+        let mut rescanned = false;
         loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
@@ -63,9 +67,20 @@ impl Coordinator {
                 Scan::Refused(e) => return Err(e),
                 // Nothing loaded has work: an agent given work through
                 // another coordinator is only in the directory, so the next
-                // pass lists it again
-                // (`tests::a_poll_finds_an_agent_that_got_work_through_another_coordinator`).
-                Scan::Nothing => self.discovered.store(false, Ordering::Release),
+                // pass lists it again, at most once per rescan interval
+                // (`tests::a_poll_finds_an_agent_that_got_work_through_another_coordinator`,
+                // `tests::an_idle_poll_rescans_the_directory_at_most_once_per_interval`).
+                Scan::Nothing => {
+                    let interval = ms_to_ns(self.config.rescan_interval_ms);
+                    let last = self.last_scan_unix_ns.load(Ordering::Acquire);
+                    if !rescanned && self.now().saturating_sub(last) >= interval {
+                        // Rescan in this pass; a second empty pass falls
+                        // through to the wait.
+                        rescanned = true;
+                        self.discovered.store(false, Ordering::Release);
+                        continue;
+                    }
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(None);
@@ -77,13 +92,17 @@ impl Coordinator {
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return Ok(None);
             }
+            rescanned = false;
         }
     }
 
     /// Load every agent in the directory that has work. Runs once per
     /// start, after an unload, and after a pass that found nothing to
-    /// dispatch, so work that reached an agent through another coordinator
-    /// is picked up on the next pass.
+    /// dispatch once `rescan_interval_ms` has passed since the last scan,
+    /// so work that reached an agent through another coordinator is picked
+    /// up within one interval. An agent whose HEAD this release cannot read
+    /// is logged and skipped, so a rollback below an agent's format version
+    /// is visible in the log rather than as an input that never runs.
     async fn discover(&self) -> Result<(), AgentError> {
         if self.discovered.load(Ordering::Acquire) {
             return Ok(());
@@ -95,10 +114,20 @@ impl Coordinator {
                 if self.agents.lock().contains_key(&agent) {
                     continue;
                 }
-                if let HeadState::Present { head, .. } = self.store.read_head(&agent).await?
-                    && (head.active_turn.is_some() || !head.inbox.is_empty())
-                {
-                    self.observe(&agent, &head);
+                match self.store.read_head(&agent).await? {
+                    HeadState::Present { head, .. }
+                        if head.active_turn.is_some() || !head.inbox.is_empty() =>
+                    {
+                        self.observe(&agent, &head);
+                    }
+                    HeadState::Present { .. } | HeadState::Absent => {}
+                    HeadState::Unsupported { found } => {
+                        tracing::warn!(
+                            agent = %agent.to_hex(),
+                            format_version = found,
+                            "agents directory names an agent whose HEAD format this release cannot read; its inputs are not offered"
+                        );
+                    }
                 }
             }
             match listed.next {
@@ -106,6 +135,7 @@ impl Coordinator {
                 None => break,
             }
         }
+        self.last_scan_unix_ns.store(self.now(), Ordering::Release);
         self.discovered.store(true, Ordering::Release);
         Ok(())
     }
