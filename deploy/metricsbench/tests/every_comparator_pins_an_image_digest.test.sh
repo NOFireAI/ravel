@@ -2,11 +2,12 @@
 # Cases for every_comparator_pins_an_image_digest.sh, focused on the fourth
 # category issue #1720 added: deploy/docker-compose/ravel.yml AND
 # deploy/docker-compose/rustfs.yml pin enforcement (rustfs.yml is ravel.yml's
-# standalone RustFS-and-bucket mirror and must stay pinned in lockstep).
+# standalone RustFS-and-bucket mirror and must stay pinned in lockstep), and
+# on the seventh: the s3s-fs binary's sha256 pin in deploy/metricsbench/run.sh.
 #
 # The script resolves every path it reads (Dockerfile, Dockerfile.prebuilt,
 # .github/workflows, .github/actions, deploy/metricsbench/docker-compose.yml
-# and its ravel.yml overlay,
+# and its ravel.yml overlay, deploy/metricsbench/run.sh,
 # the two quickstart compose files, and deploy/k8s) from its own location, two
 # directories up. To exercise one category with a mutated file while the
 # other categories still see real, passing content, each case runs against a
@@ -61,6 +62,8 @@ new_tree() {
     "${dir}/deploy/metricsbench/docker-compose.yml"
   cp "${REPO_ROOT}/deploy/metricsbench/ravel.yml" \
     "${dir}/deploy/metricsbench/ravel.yml"
+  cp "${REPO_ROOT}/deploy/metricsbench/run.sh" \
+    "${dir}/deploy/metricsbench/run.sh"
   cp "${REPO_ROOT}/deploy/docker-compose/ravel.yml" \
     "${dir}/deploy/docker-compose/ravel.yml"
   cp "${REPO_ROOT}/deploy/docker-compose/rustfs.yml" \
@@ -113,8 +116,10 @@ check() {
 # the repository to be red cannot tell a fixed reference from a broken scan,
 # so each case below seeds its own bad input instead.
 d="$(new_tree committed)"
-check "the committed tree passes with all six categories pinned" \
+check "the committed tree passes with all seven categories pinned" \
   "${d}" 0 "RESULT: PASS"
+check "the committed tree reports both s3s-fs sha256 constants" \
+  "${d}" 0 "2 s3s-fs binary sha256s, all pinned"
 
 # --- the metricsbench Ravel overlay: exempt by exact match only -------------
 
@@ -335,6 +340,70 @@ check "removing a k8s manifest image line fails the k8s total-count assertion" \
   "${d}" 1 "found 5 k8s manifest image references, expected exactly 6"
 check "removing a k8s manifest image line also fails the k8s pin-required-count assertion" \
   "${d}" 1 "found 3 pin-required k8s manifest image references, expected exactly 4"
+
+# --- seventh category: the s3s-fs binary's sha256 pin in run.sh -------------
+
+# The download's comparison removed: fetch_s3s_fs would cache and export
+# whatever the release URL served.
+d="$(new_tree s3s_download_comparison_removed)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  '/sha256_of "\$tmp"/,$ s/if \[ "\$got" != "\$s3s_fs_sha256" \]; then/if false; then/'
+check "s3s_download_comparison_removed fails the comparison check" "${d}" 1 \
+  "fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+
+# The cached binary's comparison removed: any file in the cache would run.
+d="$(new_tree s3s_cache_comparison_removed)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  '/sha256_of "\$bin"/,/curl / s/if \[ "\$got" != "\$s3s_fs_sha256" \]; then/if false; then/'
+check "s3s_cache_comparison_removed fails the comparison check" "${d}" 1 \
+  "fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+
+# A mismatch that no longer refuses: the comparison is there but only warns.
+d="$(new_tree s3s_mismatch_not_refused)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  '/sha256_of "\$tmp"/,$ s/exit "\$EXIT_REFUSED"/true/'
+check "s3s_mismatch_not_refused fails the comparison check" "${d}" 1 \
+  "fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+
+# The verified download exported before its comparison.
+d="$(new_tree s3s_export_before_compare)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/^    got="\$(sha256_of "\$tmp")" || {/    export S3S_FS_BIN="$tmp"; got="$(sha256_of "$tmp")" || {/'
+check "s3s_export_before_compare fails the export check" "${d}" 1 \
+  "run.sh sets S3S_FS_BIN somewhere other than the placeholder"
+
+# A second download path beside the checked one.
+d="$(new_tree s3s_second_download)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/^  export S3S_FS_BIN="\$bin"$/  curl -fsSL -o "$bin" "$url"; export S3S_FS_BIN="$bin"/'
+check "s3s_second_download fails the single-download check" "${d}" 1 \
+  "fetch_s3s_fs downloads other than once"
+
+# A changed constant is not the pinned one.
+d="$(new_tree s3s_constant_changed)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/^S3S_FS_SHA256_AARCH64="6d5d/S3S_FS_SHA256_AARCH64="0000/'
+check "s3s_constant_changed fails naming the pin" "${d}" 1 \
+  "found 1 s3s-fs sha256 constants, expected exactly 2"
+
+# Both arches mapped to one constant.
+d="$(new_tree s3s_arch_mapped_wrong)"
+mutate "${d}/deploy/metricsbench/run.sh" \
+  's/aarch64) s3s_fs_sha256="\$S3S_FS_SHA256_AARCH64" ;;/aarch64) s3s_fs_sha256="$S3S_FS_SHA256_X86_64" ;;/'
+check "s3s_arch_mapped_wrong fails the arch mapping check" "${d}" 1 \
+  "run.sh does not map the arch to its pinned sha256 exactly once"
+
+# A compose default would start some other binary when run.sh is bypassed.
+d="$(new_tree s3s_compose_default)"
+mutate "${d}/deploy/metricsbench/docker-compose.yml" \
+  's/\${S3S_FS_BIN:?[^}]*}/${S3S_FS_BIN:-.\/s3s-fs}/'
+check "s3s_compose_default fails the compose mount check" "${d}" 1 \
+  "docker-compose.yml must take the s3s-fs binary from exactly one"
+
+# run.sh missing entirely.
+d="$(new_tree s3s_run_sh_missing)"
+rm "${d}/deploy/metricsbench/run.sh"
+check "s3s_run_sh_missing fails naming the path" "${d}" 1 "run.sh not found at"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

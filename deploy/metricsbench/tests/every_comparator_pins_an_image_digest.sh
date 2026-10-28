@@ -18,7 +18,9 @@
 # `docker pull`, and `docker create` inside workflow `run:` blocks. Issue
 # #1720's residual round added a sixth, scoped to the `image:` references in
 # deploy/k8s manifests that category 4's own scope note originally deferred.
-# It now scans six categories, each with its own exact-count assertion so a
+# ADR-0927 amendment 2026-10-29 added a seventh, for the s3s-fs binary the
+# MetricsBench stack runs from a release asset rather than an image.
+# It now scans seven categories, each with its own exact-count assertion so a
 # scan that finds nothing in a category fails rather than passing silently:
 #
 #   1. every `image:` reference in deploy/metricsbench/docker-compose.yml
@@ -73,6 +75,15 @@
 #      is pulled from a registry: both are built locally and loaded into the
 #      kind cluster with `kind load docker-image`, so there is no registry
 #      manifest to pin against.
+#   7. the s3s-fs binary deploy/metricsbench/run.sh fetches for the s3s
+#      service: run.sh must carry both arch sha256 constants (exact values
+#      below), map each arch to its own, and in fetch_s3s_fs compare the
+#      sha256 of the cached binary and of the download against the pinned
+#      one, each mismatch exiting 65, with the download moved into the cache
+#      and S3S_FS_BIN exported only after its comparison; S3S_FS_BIN is
+#      exported nowhere else but the never-started placeholder, there is one
+#      download, and docker-compose.yml takes the binary only from
+#      `${S3S_FS_BIN:?...}`, with no default.
 #
 # Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, 4,
 # 5, and 6) or a full 40-character commit SHA (category 3): a tag alone, a
@@ -96,6 +107,7 @@ DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # shellcheck disable=SC1007
 REPO_ROOT=$(CDPATH= cd -- "$DEPLOY_DIR/../.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
+RUN_SCRIPT="$DEPLOY_DIR/run.sh"
 METRICSBENCH_RAVEL_FILE="$DEPLOY_DIR/ravel.yml"
 RAVEL_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/ravel.yml"
 RUSTFS_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/rustfs.yml"
@@ -109,7 +121,7 @@ REQUIRED_COMPARATORS="prometheus victoriametrics mimir"
 
 # Exact number of `image:` references the committed deployment must contain,
 # across docker-compose.yml and its ravel.yml overlay: prometheus,
-# victoriametrics, rustfs, createbuckets, mimir, ravel-qualify, ravel-server.
+# victoriametrics, s3s, createbuckets, mimir, ravel-qualify, ravel-server.
 # Raised 5->7 when ravel.yml put Ravel in the portable lane (ADR-0927
 # amendment 2026-10-26 A): its two services both run the image under test. If
 # a service is added or removed, update this number deliberately in the same
@@ -843,6 +855,137 @@ else
   fi
 fi
 
+# --- 7. s3s-fs release binary pinned by sha256 in run.sh ---------------------
+# Line-exact on purpose: a rewording of any of these lines must update this
+# category deliberately, the same way a count change does.
+
+echo
+echo "== s3s-fs binary sha256 pin (deploy/metricsbench/run.sh) =="
+
+S3S_PIN_X86_64='S3S_FS_SHA256_X86_64="0ac5480b51389c1913f9645d0e1ff2ff1dfdd3a44bb396a7cb74c5e91176c01f"'
+S3S_PIN_AARCH64='S3S_FS_SHA256_AARCH64="6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717ad"'
+S3S_EXPECTED_PIN_COUNT=2
+
+# count_exact <file> <line>: lines of <file> equal to <line> after leading
+# whitespace is stripped.
+count_exact() {
+  sed -E 's/^[[:space:]]+//' "$1" | grep -cxF -- "$2"
+}
+
+# line_in_body <line>: the 1-based line number of <line> (leading whitespace
+# stripped) within fetch_s3s_fs's body, or empty. Only called after the line
+# is known to occur exactly once there.
+line_in_body() {
+  printf '%s\n' "$S3S_BODY" | sed -E 's/^[[:space:]]+//' | grep -nxF -- "$1" | cut -d: -f1
+}
+
+s3s_pin_count=0
+if [ ! -f "$RUN_SCRIPT" ]; then
+  echo "FAIL: run.sh not found at $RUN_SCRIPT"
+  fail=1
+else
+  for pin in "$S3S_PIN_X86_64" "$S3S_PIN_AARCH64"; do
+    n=$(count_exact "$RUN_SCRIPT" "$pin")
+    if [ "$n" -eq 1 ]; then
+      echo "  [pinned]   $pin"
+      s3s_pin_count=$((s3s_pin_count + 1))
+    else
+      echo "FAIL: run.sh carries '$pin' $n times, expected exactly once"
+      fail=1
+    fi
+  done
+  echo "  sha256 constants found: $s3s_pin_count (expected $S3S_EXPECTED_PIN_COUNT)"
+
+  for arm in 'x86_64) s3s_fs_sha256="$S3S_FS_SHA256_X86_64" ;;' \
+    'aarch64) s3s_fs_sha256="$S3S_FS_SHA256_AARCH64" ;;'; do
+    if [ "$(count_exact "$RUN_SCRIPT" "$arm")" -eq 1 ]; then
+      echo "  arch mapped: $arm"
+    else
+      echo "FAIL: run.sh does not map the arch to its pinned sha256 exactly once: '$arm'"
+      fail=1
+    fi
+  done
+  if [ "$(grep -c 's3s_fs_sha256=' "$RUN_SCRIPT")" -ne 2 ]; then
+    echo "FAIL: run.sh assigns s3s_fs_sha256 other than from the two pinned constants"
+    fail=1
+  fi
+
+  # Exactly two exports of S3S_FS_BIN: the never-started placeholder, and
+  # the verified path inside fetch_s3s_fs.
+  if [ "$(grep -c 'S3S_FS_BIN=' "$RUN_SCRIPT")" -ne 2 ] ||
+    [ "$(count_exact "$RUN_SCRIPT" 'export S3S_FS_BIN="/nonexistent/s3s-fs-not-fetched"')" -ne 1 ]; then
+    echo "FAIL: run.sh sets S3S_FS_BIN somewhere other than the placeholder and fetch_s3s_fs's verified path"
+    fail=1
+  fi
+  if [ "$(grep -c 'S3S_FS_URL_BASE' "$RUN_SCRIPT")" -ne 2 ]; then
+    echo "FAIL: run.sh uses the s3s-fs release URL outside fetch_s3s_fs"
+    fail=1
+  fi
+
+  S3S_BODY=$(sed -n '/^fetch_s3s_fs() {$/,/^}$/p' "$RUN_SCRIPT")
+  if [ -z "$S3S_BODY" ]; then
+    echo "FAIL: run.sh has no fetch_s3s_fs function"
+    fail=1
+  else
+    s3s_bad=0
+    for want in 'got="$(sha256_of "$bin")" || fail_step fetch-s3s-fs "cannot hash the cached $bin"' \
+      'got="$(sha256_of "$tmp")" || { rm -f "$tmp"; fail_step fetch-s3s-fs "cannot hash the download of $url"; }' \
+      'chmod 0755 "$tmp" && mv -f "$tmp" "$bin" ||' \
+      'export S3S_FS_BIN="$bin"'; do
+      if [ "$(printf '%s\n' "$S3S_BODY" | sed -E 's/^[[:space:]]+//' | grep -cxF -- "$want")" -ne 1 ]; then
+        echo "FAIL: fetch_s3s_fs lacks exactly one '$want'"
+        s3s_bad=1
+      fi
+    done
+    cmp_line='if [ "$got" != "$s3s_fs_sha256" ]; then'
+    if [ "$(printf '%s\n' "$S3S_BODY" | sed -E 's/^[[:space:]]+//' | grep -cxF -- "$cmp_line")" -ne 2 ] ||
+      [ "$(printf '%s\n' "$S3S_BODY" | grep -cF 'exit "$EXIT_REFUSED"')" -ne 2 ]; then
+      echo "FAIL: fetch_s3s_fs lacks its two sha256 comparisons, each exiting 65"
+      s3s_bad=1
+    fi
+    if [ "$(printf '%s\n' "$S3S_BODY" | grep -cE '^[[:space:]]*curl ')" -ne 1 ]; then
+      echo "FAIL: fetch_s3s_fs downloads other than once"
+      s3s_bad=1
+    fi
+    if [ "$s3s_bad" -eq 0 ]; then
+      hash_bin=$(line_in_body 'got="$(sha256_of "$bin")" || fail_step fetch-s3s-fs "cannot hash the cached $bin"')
+      hash_tmp=$(line_in_body 'got="$(sha256_of "$tmp")" || { rm -f "$tmp"; fail_step fetch-s3s-fs "cannot hash the download of $url"; }')
+      cmp1=$(line_in_body "$cmp_line" | sed -n 1p)
+      cmp2=$(line_in_body "$cmp_line" | sed -n 2p)
+      curl_at=$(printf '%s\n' "$S3S_BODY" | grep -nE '^[[:space:]]*curl ' | cut -d: -f1)
+      mv_at=$(line_in_body 'chmod 0755 "$tmp" && mv -f "$tmp" "$bin" ||')
+      export_at=$(line_in_body 'export S3S_FS_BIN="$bin"')
+      # cached: hash, then compare, before any download; downloaded: fetch,
+      # hash, compare, then cache, then export.
+      if [ "$hash_bin" -lt "$cmp1" ] && [ "$cmp1" -lt "$curl_at" ] &&
+        [ "$curl_at" -lt "$hash_tmp" ] && [ "$hash_tmp" -lt "$cmp2" ] &&
+        [ "$cmp2" -lt "$mv_at" ] && [ "$mv_at" -lt "$export_at" ]; then
+        echo "  fetch_s3s_fs compares the cached binary and the download before export"
+      else
+        echo "FAIL: fetch_s3s_fs does not hash and compare before it caches or exports (lines: cached hash $hash_bin, compare $cmp1, curl $curl_at, download hash $hash_tmp, compare $cmp2, mv $mv_at, export $export_at)"
+        s3s_bad=1
+      fi
+    fi
+    [ "$s3s_bad" -eq 0 ] || fail=1
+  fi
+fi
+
+if [ -f "$COMPOSE_FILE" ]; then
+  s3s_mounts=$(grep -c 'S3S_FS_BIN' "$COMPOSE_FILE")
+  s3s_required=$(grep -cE '^[[:space:]]*- \$\{S3S_FS_BIN:\?[^}]+\}:/usr/local/bin/s3s-fs:ro$' "$COMPOSE_FILE")
+  if [ "$s3s_required" -eq 1 ] && [ "$(grep -cE '\$\{S3S_FS_BIN[^}]*\}' "$COMPOSE_FILE")" -eq 1 ]; then
+    echo "  docker-compose.yml mounts only \${S3S_FS_BIN:?...} ($s3s_mounts mentions)"
+  else
+    echo "FAIL: docker-compose.yml must take the s3s-fs binary from exactly one \${S3S_FS_BIN:?...} mount, with no default"
+    fail=1
+  fi
+fi
+
+if [ "$s3s_pin_count" -ne "$S3S_EXPECTED_PIN_COUNT" ]; then
+  echo "FAIL: found $s3s_pin_count s3s-fs sha256 constants, expected exactly $S3S_EXPECTED_PIN_COUNT"
+  fail=1
+fi
+
 # --- Result -------------------------------------------------------------
 
 echo
@@ -851,5 +994,5 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, $k8s_count k8s manifest images, all pinned; comparators: $REQUIRED_COMPARATORS ravel-server)"
+echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, $k8s_count k8s manifest images, $s3s_pin_count s3s-fs binary sha256s, all pinned; comparators: $REQUIRED_COMPARATORS ravel-server)"
 exit 0
