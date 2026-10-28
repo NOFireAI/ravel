@@ -94,4 +94,9 @@ export interface Transport {
   failEffect(request: EffectFailRequest): Promise<EffectCompleteResponse>;
   /** A `failed` commit is refused with `EffectInDoubt` while an authorized attempt has no result. */
   commit(request: WorkerCommitRequest): Promise<WorkerCommitResponse>;
+  /**
+   * The runner is done with a polled turn, committed or abandoned; drop
+   * anything held for it. Called once per polled turn, after any commit.
+   */
+  release?(turnId: string): void;
 }

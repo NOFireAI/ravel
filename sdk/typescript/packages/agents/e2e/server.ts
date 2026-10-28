@@ -214,9 +214,10 @@ export async function startServer(binary: string, store: Store): Promise<Running
 
   const deadline = Date.now() + READY_TIMEOUT_MS;
   for (;;) {
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      const how = child.signalCode === null ? `exited ${String(child.exitCode)}` : `was killed by ${child.signalCode}`;
       await server.stop();
-      throw new Error(`ravel-server exited ${String(child.exitCode)} before ready:\n${server.output()}`);
+      throw new Error(`ravel-server ${how} before ready:\n${server.output()}`);
     }
     const ready = await fetch(`${url}/readyz`).then((r) => r.ok, () => false);
     if (ready) return server;

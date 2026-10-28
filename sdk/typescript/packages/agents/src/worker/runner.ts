@@ -329,8 +329,24 @@ class TerminalFailure extends Error {
   override readonly name = "TerminalFailure";
 }
 
-/** Run one leased turn to a commit, or to an abandonment that leaves it for the coordinator. */
+/**
+ * Run one leased turn to a commit, or to an abandonment that leaves it for the
+ * coordinator. Either way the turn is released from the transport.
+ */
 export async function runTurn(
+  polled: PolledTurn,
+  agents: ReadonlyMap<string, AnyAgentDefinition>,
+  transport: Transport,
+  signal: AbortSignal,
+): Promise<TurnReport> {
+  try {
+    return await runLeasedTurn(polled, agents, transport, signal);
+  } finally {
+    transport.release?.(polled.assignment.lease.turn_id);
+  }
+}
+
+async function runLeasedTurn(
   polled: PolledTurn,
   agents: ReadonlyMap<string, AnyAgentDefinition>,
   transport: Transport,
