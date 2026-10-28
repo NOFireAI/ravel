@@ -921,6 +921,14 @@ pub struct SystemIngestResult {
     /// row, whose read-your-write phase is its query row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readback: Option<Readback>,
+    /// Why this row's read-back failed, when a query failed or answered a
+    /// shape the lane cannot read. The bin keeps a row so marked in the
+    /// report it prints for diagnosis and still exits non-zero; a mismatch
+    /// is kept as its `readback` instead. A report holding either is refused
+    /// as a run result
+    /// (`metricsbench_query::a_report_whose_readback_failed_does_not_bind`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback_error: Option<String>,
     /// Diagnostic object-store accounting; see [`StorageAccounting`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageAccounting>,
@@ -957,6 +965,7 @@ impl SystemIngestResult {
             unsupported_classes: Vec::new(),
             tenant: None,
             readback: None,
+            readback_error: None,
             storage: Some(storage),
         }
     }
@@ -984,6 +993,7 @@ impl SystemIngestResult {
             unsupported_classes: Vec::new(),
             tenant: None,
             readback: None,
+            readback_error: None,
             storage: None,
         }
     }
@@ -1020,6 +1030,7 @@ impl SystemIngestResult {
             unsupported_classes: Vec::new(),
             tenant: None,
             readback: None,
+            readback_error: None,
             storage: None,
         }
     }
@@ -1110,6 +1121,12 @@ pub struct Readback {
     /// queried, and in a report written before the field existed.
     #[serde(default)]
     pub query_ms: BTreeMap<String, u64>,
+    /// How many [`READBACK_COUNT_WINDOW`] windows each `count_over_time`
+    /// read of the reported read-back summed, keyed as in `query_ms`; its
+    /// `query_ms` entry is the wall time of all of them. Empty when no
+    /// window was queried, and in a report written before the field existed.
+    #[serde(default)]
+    pub query_windows: BTreeMap<String, u32>,
 }
 
 /// The read-your-write query phase of a system's replay. Recorded as its own
@@ -4351,6 +4368,58 @@ pub const READBACK_QUERY_HISTOGRAM_SAMPLES: &str = "histogram_samples";
 /// The [`Readback::query_ms`] key of the stale marker probe's instant query.
 pub const READBACK_QUERY_STALE_MARKER: &str = "stale_marker";
 
+/// The longest range, in milliseconds (one day), of one read-back
+/// `count_over_time`. A read-back counts a probe's samples over the replay
+/// window as a sum over consecutive windows no longer than this
+/// ([`readback_count_windows`]), so the samples one query loads stay bounded
+/// as the replay grows: a 30-day replay's whole-window count on a 15 s probe
+/// is 172,800 samples, which Prometheus refuses under
+/// `--query.max-samples=100000`
+/// (`tests::a_two_day_readback_counts_by_day_windows_under_a_one_day_limit`).
+pub const READBACK_COUNT_WINDOW: i64 = 86_400_000;
+
+/// One `count_over_time` window of a read-back: the instant query at
+/// `end_ms` over `[range_ms ms]`, which covers `(end_ms - range_ms, end_ms]`
+/// (a PromQL range selector is open on the left).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountWindow {
+    /// The evaluation time of the instant query.
+    pub end_ms: i64,
+    /// The range selector's length.
+    pub range_ms: i64,
+}
+
+/// The windows that partition `[min_ts, max_ts]`, newest first: the first
+/// ends at `max_ts`, each next one ends where the previous one began, each
+/// reaches back at most `window_ms`, and the oldest reaches just past
+/// `min_ts` so `min_ts` is counted. A span of at most `window_ms`
+/// milliseconds (`max_ts - min_ts + 1`) is the one window ending at `max_ts`
+/// over the whole span. Empty when `max_ts < min_ts`; a `window_ms` below 1
+/// is taken as 1 (`tests::count_windows_partition_the_replay_window`).
+pub fn readback_count_windows(min_ts: i64, max_ts: i64, window_ms: i64) -> Vec<CountWindow> {
+    let window_ms = window_ms.max(1);
+    let mut windows = Vec::new();
+    if max_ts < min_ts {
+        return windows;
+    }
+    let mut end_ms = max_ts;
+    loop {
+        let reach = end_ms.saturating_sub(min_ts).saturating_add(1);
+        if reach <= window_ms {
+            windows.push(CountWindow {
+                end_ms,
+                range_ms: reach,
+            });
+            return windows;
+        }
+        windows.push(CountWindow {
+            end_ms,
+            range_ms: window_ms,
+        });
+        end_ms -= window_ms;
+    }
+}
+
 /// Pause between two read-backs of a row that has not settled.
 const READBACK_SETTLE_POLL: Duration = Duration::from_millis(500);
 
@@ -4423,7 +4492,9 @@ async fn read_back_once(
         return Ok(empty_window_readback(config.query_url.clone(), expected));
     };
     let window = [("start", seconds(min_ts)), ("end", seconds(max_ts))];
-    let range_ms = max_ts - min_ts + 1;
+    let count_windows = readback_count_windows(min_ts, max_ts, READBACK_COUNT_WINDOW);
+    let window_count = u32::try_from(count_windows.len()).unwrap_or(u32::MAX);
+    let mut query_windows = BTreeMap::new();
 
     let mut query_ms = BTreeMap::new();
     // Each query's wall time goes into `query_ms` under `name`, and a failed
@@ -4447,14 +4518,11 @@ async fn read_back_once(
     let series_count = timed(READBACK_QUERY_SERIES.to_string(), started, result)?;
     let mut sample_count = 0u64;
     for (index, (probe, _)) in plan.float_probes().into_iter().enumerate() {
+        let name = format!("{READBACK_QUERY_SAMPLES}.{index}");
+        query_windows.insert(name.clone(), window_count);
         let started = std::time::Instant::now();
-        let result = reader
-            .instant_count(
-                &format!("count_over_time({}[{range_ms}ms])", probe.selector),
-                max_ts,
-            )
-            .await;
-        sample_count += timed(format!("{READBACK_QUERY_SAMPLES}.{index}"), started, result)?;
+        let result = reader.windowed_count(&probe.selector, &count_windows).await;
+        sample_count += timed(name, started, result)?;
     }
     let histogram_series_count = match expected.histogram_series_count {
         Some(_) => {
@@ -4481,13 +4549,9 @@ async fn read_back_once(
         plan.probes.get(&PayloadClass::NativeHistogram),
     ) {
         (Some(_), Some(probe)) => {
+            query_windows.insert(READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(), window_count);
             let started = std::time::Instant::now();
-            let result = reader
-                .instant_count(
-                    &format!("count_over_time({}[{range_ms}ms])", probe.selector),
-                    max_ts,
-                )
-                .await;
+            let result = reader.windowed_count(&probe.selector, &count_windows).await;
             Some(timed(
                 READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
                 started,
@@ -4553,6 +4617,7 @@ async fn read_back_once(
         attempts: 1,
         settled_after_ms: 0,
         query_ms,
+        query_windows,
     })
 }
 
@@ -4580,6 +4645,7 @@ fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readb
         attempts: 1,
         settled_after_ms: 0,
         query_ms: BTreeMap::new(),
+        query_windows: BTreeMap::new(),
     }
 }
 
@@ -4696,6 +4762,28 @@ impl ApiReader<'_> {
                 .parse()
                 .map_err(|e| format!("query value {text} is not a number: {e}"))?;
             total += value as u64;
+        }
+        Ok(total)
+    }
+
+    /// `count_over_time` of `selector` summed over `windows`, one instant
+    /// query per window at its end; a failure names the window.
+    async fn windowed_count(&self, selector: &str, windows: &[CountWindow]) -> Result<u64, String> {
+        let mut total = 0u64;
+        for window in windows {
+            let count = self
+                .instant_count(
+                    &format!("count_over_time({selector}[{}ms])", window.range_ms),
+                    window.end_ms,
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "the window ending at {} ms over {} ms: {e}",
+                        window.end_ms, window.range_ms
+                    )
+                })?;
+            total = total.saturating_add(count);
         }
         Ok(total)
     }
@@ -7842,6 +7930,15 @@ mod tests {
                 ],
                 "{readback:?}"
             );
+            // A replay inside one day counts over one window.
+            assert_eq!(
+                readback.query_windows,
+                BTreeMap::from([
+                    (READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(), 1),
+                    ("samples.0".to_string(), 1),
+                ]),
+                "{readback:?}"
+            );
             if !matches {
                 assert_eq!(
                     readback.mismatches,
@@ -7873,6 +7970,322 @@ mod tests {
                 "the cardinality read names only the metrics sent"
             );
         }
+    }
+
+    /// The count windows partition `[min_ts, max_ts]`: newest first, each
+    /// ending where the next newer one began, none longer than the window,
+    /// the oldest reaching just past `min_ts`.
+    ///
+    /// TO SEE THIS FAIL: give each full window `range_ms: window_ms + 1`
+    /// (closed windows, so the sample on a shared boundary is counted
+    /// twice), or step `end_ms` back by `window_ms - 1` (overlapping
+    /// windows): the exact window list for the two-day case no longer
+    /// matches.
+    #[test]
+    fn count_windows_partition_the_replay_window() {
+        const DAY: i64 = READBACK_COUNT_WINDOW;
+        let min_ts = 1_760_000_010_000i64;
+        // Each point of `[min_ts, max_ts]` is covered by exactly one window,
+        // and no window reaches outside it.
+        let check = |max_ts: i64, windows: &[CountWindow]| {
+            assert_eq!(windows.first().map(|w| w.end_ms), Some(max_ts));
+            for pair in windows.windows(2) {
+                assert_eq!(
+                    pair[1].end_ms,
+                    pair[0].end_ms - pair[0].range_ms,
+                    "{windows:?}"
+                );
+            }
+            let oldest = windows.last().expect("a window");
+            assert_eq!(oldest.end_ms - oldest.range_ms, min_ts - 1, "{windows:?}");
+            assert!(windows.iter().all(|w| w.range_ms >= 1 && w.range_ms <= DAY));
+            for ts in [min_ts, min_ts + 1, max_ts - 1, max_ts] {
+                let covering = windows
+                    .iter()
+                    .filter(|w| w.end_ms - w.range_ms < ts && ts <= w.end_ms)
+                    .count();
+                assert_eq!(covering, 1, "ts {ts} in {windows:?}");
+            }
+        };
+
+        // The `ci` profile's 30 minutes: the one window of the whole-span
+        // query the read-back issued before windows existed.
+        let ci_max = min_ts + 1_800_000 - 15_000;
+        let windows = readback_count_windows(min_ts, ci_max, DAY);
+        assert_eq!(
+            windows,
+            [CountWindow {
+                end_ms: ci_max,
+                range_ms: ci_max - min_ts + 1,
+            }]
+        );
+        check(ci_max, &windows);
+
+        // A span of exactly two windows: two, meeting at `max_ts - DAY`.
+        let two_max = min_ts + 2 * DAY - 1;
+        let windows = readback_count_windows(min_ts, two_max, DAY);
+        assert_eq!(
+            windows,
+            [
+                CountWindow {
+                    end_ms: two_max,
+                    range_ms: DAY,
+                },
+                CountWindow {
+                    end_ms: two_max - DAY,
+                    range_ms: DAY,
+                },
+            ]
+        );
+        check(two_max, &windows);
+        // Every boundary point lands in one window only.
+        for ts in [two_max - DAY, two_max - DAY + 1] {
+            let covering = windows
+                .iter()
+                .filter(|w| w.end_ms - w.range_ms < ts && ts <= w.end_ms)
+                .count();
+            assert_eq!(covering, 1, "ts {ts}");
+        }
+
+        // 30 days plus 1 ms of span: thirty full windows and a 1 ms one
+        // holding `min_ts` alone.
+        let month_max = min_ts + 30 * DAY;
+        let windows = readback_count_windows(min_ts, month_max, DAY);
+        assert_eq!(windows.len(), 31);
+        assert_eq!(
+            windows.last(),
+            Some(&CountWindow {
+                end_ms: min_ts,
+                range_ms: 1,
+            })
+        );
+        check(month_max, &windows);
+
+        // One point; and no point at all.
+        assert_eq!(
+            readback_count_windows(min_ts, min_ts, DAY),
+            [CountWindow {
+                end_ms: min_ts,
+                range_ms: 1,
+            }]
+        );
+        assert_eq!(readback_count_windows(min_ts, min_ts - 1, DAY), []);
+    }
+
+    /// Every class over two days: series `a` and `b` each with a float at
+    /// `base`, one day later and 15 s before two days, two native histograms
+    /// on `mb_native{instance="a"}` at `base` and one day later, and `a`'s
+    /// stale marker at two days. The points one day in sit on the boundary
+    /// of two read-back windows.
+    fn two_day_mix(base: i64) -> Vec<LogicalPoint> {
+        let day = READBACK_COUNT_WINDOW;
+        let end = base + 2 * day;
+        vec![
+            scalar("a", base, 1.0),
+            scalar("b", base, 2.0),
+            LogicalPoint::Histogram(histogram(base, vec![1, 1])),
+            scalar("a", end - day, 1.5),
+            scalar("b", end - day, 2.5),
+            LogicalPoint::Histogram(histogram(end - day, vec![2, 1])),
+            scalar("a", end - 15_000, 1.75),
+            scalar("b", end - 15_000, 2.75),
+            scalar("a", end, f64::from_bits(STALE_MARKER_BITS)),
+        ]
+    }
+
+    /// A query stub over `points` that refuses, 422 as Prometheus does under
+    /// `--query.max-samples`, any `count_over_time` whose range passes one
+    /// day, counting each refusal in `refused`. Otherwise it counts the
+    /// non-marker points of the selector's series in `(time - range, time]`,
+    /// answers an instant selector with no sample, and `/api/v1/series` as
+    /// [`query_stub`] does.
+    fn day_limited_query_stub(
+        points: Vec<LogicalPoint>,
+        refused: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> axum::Router {
+        let pairs = |raw: &Option<String>| -> Vec<(String, String)> {
+            reqwest::Url::parse(&format!("http://stub/?{}", raw.clone().unwrap_or_default()))
+                .expect("query parses")
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        };
+        let points = Arc::new(points);
+        axum::Router::new()
+            .route(
+                "/api/v1/series",
+                axum::routing::get(
+                    move |axum::extract::RawQuery(raw): axum::extract::RawQuery| async move {
+                        let matcher = pairs(&raw)
+                            .into_iter()
+                            .find(|(k, _)| k == "match[]")
+                            .map(|(_, v)| v)
+                            .unwrap_or_default();
+                        let n = if matcher.contains("mb_native") && !matcher.contains('|') {
+                            1
+                        } else {
+                            3
+                        };
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": vec![serde_json::json!({}); n],
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/query",
+                axum::routing::get(
+                    move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                        let points = Arc::clone(&points);
+                        let refused = Arc::clone(&refused);
+                        async move {
+                            let params = pairs(&raw);
+                            let param = |name: &str| {
+                                params
+                                    .iter()
+                                    .find(|(k, _)| k == name)
+                                    .map(|(_, v)| v.clone())
+                                    .expect("query parameter")
+                            };
+                            let query = param("query");
+                            let time = param("time");
+                            let (secs, millis) = time.split_once('.').expect("decimal seconds");
+                            let at = secs.parse::<i64>().expect("seconds") * 1_000
+                                + millis.parse::<i64>().expect("millis");
+                            let Some((selector, range)) = query
+                                .strip_prefix("count_over_time(")
+                                .and_then(|q| q.strip_suffix("ms])"))
+                                .and_then(|q| q.rsplit_once('['))
+                            else {
+                                return (
+                                    axum::http::StatusCode::OK,
+                                    axum::Json(serde_json::json!({
+                                        "status": "success",
+                                        "data": {"resultType": "vector", "result": []},
+                                    })),
+                                );
+                            };
+                            let range: i64 = range.parse().expect("range ms");
+                            if range > READBACK_COUNT_WINDOW {
+                                refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return (
+                                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                                    axum::Json(serde_json::json!({
+                                        "status": "error",
+                                        "errorType": "execution",
+                                        "error": "query processing would load too many samples \
+                                                  into memory in query execution",
+                                    })),
+                                );
+                            }
+                            let count = points
+                                .iter()
+                                .filter(|p| {
+                                    let (metric, labels, ts, marker) = match p {
+                                        LogicalPoint::Sample(s) => {
+                                            (&s.metric, &s.labels, s.ts_ms, s.is_stale_marker())
+                                        }
+                                        LogicalPoint::Histogram(h) => {
+                                            (&h.metric, &h.labels, h.ts_ms, false)
+                                        }
+                                    };
+                                    promql_selector(metric, labels) == selector
+                                        && !marker
+                                        && at - range < ts
+                                        && ts <= at
+                                })
+                                .count();
+                            let result = if count == 0 {
+                                serde_json::json!([])
+                            } else {
+                                serde_json::json!([{"metric": {}, "value": [0, count.to_string()]}])
+                            };
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "status": "success",
+                                    "data": {"resultType": "vector", "result": result},
+                                })),
+                            )
+                        }
+                    },
+                ),
+            )
+    }
+
+    /// A two-day replay reads back and matches against a receiver that
+    /// refuses any `count_over_time` over more than one day, each count a
+    /// sum over day windows whose number `query_windows` records; the
+    /// samples one day in, on a window boundary, are counted once.
+    ///
+    /// TO SEE THIS FAIL: in `read_back_once`, count over one window spanning
+    /// the whole replay (`readback_count_windows(min_ts, max_ts, i64::MAX)`,
+    /// the query issued before windows existed): the first `count_over_time`
+    /// is refused with the 422 and the read-back fails. Closed windows
+    /// (`range_ms: window_ms + 1`) are refused the same way, since each full
+    /// window then reaches past one day.
+    #[tokio::test]
+    async fn a_two_day_readback_counts_by_day_windows_under_a_one_day_limit() {
+        let base = base_ts_ms() - 2 * READBACK_COUNT_WINDOW;
+        let points = two_day_mix(base);
+        let (addr, server) = serve(write_stub(vec![Canned::ok(None)])).await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Prometheus,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 3,
+            max_retries: 0,
+            timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        server.abort();
+        assert_eq!(outcome.plan.min_ts_ms, Some(base));
+        assert_eq!(
+            outcome.plan.max_ts_ms,
+            Some(base + 2 * READBACK_COUNT_WINDOW)
+        );
+
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (addr, server) =
+            serve(day_limited_query_stub(points.clone(), Arc::clone(&refused))).await;
+        let result = readback_over_http(
+            &ReadbackConfig {
+                query_url: format!("http://{addr}"),
+                bearer_token: None,
+                timeout_secs: 5,
+                settle_secs: 0,
+            },
+            &outcome.result,
+            &outcome.plan,
+        )
+        .await;
+        server.abort();
+        let readback = result.expect("a two-day read-back under a one-day limit");
+        assert_eq!(refused.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(readback.matches_expected, "{readback:?}");
+        assert_eq!(readback.expected.sample_count, readback.sample_count);
+        assert_eq!(readback.histogram_sample_count, Some(2));
+        assert_eq!(readback.stale_marker_honored, Some(true));
+        // Two days and 1 ms of span: three windows per count.
+        let counted: Vec<(&str, u32)> = readback
+            .query_windows
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        assert!(!counted.is_empty());
+        assert!(counted.iter().all(|(_, n)| *n == 3), "{counted:?}");
+        assert!(
+            counted
+                .iter()
+                .any(|(k, _)| *k == READBACK_QUERY_HISTOGRAM_SAMPLES),
+            "{counted:?}"
+        );
     }
 
     /// A receiver that acknowledges writes before it makes them queryable

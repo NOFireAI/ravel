@@ -152,6 +152,11 @@ pub enum BindError {
     #[error("ingest row `{system}` fails its accounting: {detail}")]
     Accounting { system: String, detail: String },
     #[error(
+        "ingest row `{system}` failed its read-back ({detail}); the report is kept for \
+         diagnosis and is not a run result"
+    )]
+    Readback { system: String, detail: String },
+    #[error(
         "Prometheus is the oracle and must be one of the engines (--engine name=prometheus,...)"
     )]
     NoOracle,
@@ -375,6 +380,19 @@ pub fn bind(
                 detail: e.to_string(),
             }
         })?;
+        let failed_readback = match (&row.readback_error, &row.readback) {
+            (Some(error), _) => Some(error.clone()),
+            (None, Some(readback)) if !readback.matches_expected => {
+                Some(format!("mismatches: {}", readback.mismatches.join("; ")))
+            }
+            _ => None,
+        };
+        if let Some(detail) = failed_readback {
+            return Err(BindError::Readback {
+                system: row.system.clone(),
+                detail,
+            });
+        }
     }
 
     let grid = QueryGrid::from_run(&run, profile)?;
