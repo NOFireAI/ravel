@@ -318,6 +318,8 @@ fn ingest_phase() -> IngestPhase {
         retries: 0,
         elapsed_secs: 1.0,
         elapsed_basis: "test fixture".to_string(),
+        generation_secs: 0.0,
+        sender_bound: false,
         logical_points_per_sec: 10.0,
         wire_bytes: 100,
         wire_bytes_per_sec: 100.0,

@@ -320,9 +320,18 @@ and exits 64 on `--ravel-tenant` given without `--ravel-endpoint`
 (`metricsbench_ingest::tests::a_ravel_tenant_without_the_ravel_endpoint_is_refused`).
 A comparator is sent no tenant and records none.
 
-The portable Ravel row records `commit_tokens_by_shard`, the latest
+The portable Ravel row records `commit_tokens_by_shard`, the newest
 `x-ravel-commit-token` value per shard over every acknowledged request (the
-server joins one token per shard a request touched with commas), and
+server joins one token per shard a request touched with commas). Newest is the
+highest `(epoch, seq)`, not the last to arrive: with requests in flight on
+several series shards, responses come back in any order, so a token for seq 5
+arriving after one for seq 7 leaves seq 7 in place
+(`metrics_ingest::tests::commit_tokens_keep_the_newest_epoch_and_seq_per_shard`).
+Two tokens for one Ravel shard from different writer ids fail the replay with
+an error naming the system, the shard and both writers, since neither can be
+called the newer
+(`metrics_ingest::tests::a_second_writer_on_one_shard_is_refused`). The row
+also records
 `last_commit_token`, those tokens joined with commas in shard order: a
 read-your-write fence over every shard the replay wrote, not only the shards
 the last request touched. The query API decodes each `min_commit_token`
@@ -337,6 +346,77 @@ stays `durable_on_ack` only when some response carried a token; otherwise the
 bin refuses it as unbacked durability
 (`metrics_ingest::tests::a_durable_row_without_any_commit_token_is_refused`).
 `commit_tokens` is absent on this row. A comparator row records none of them.
+
+#### HTTP sender
+
+Every HTTP row is sent the way Prometheus' remote-write queue sends it
+(ADR-0927, 2026-10-28 amendment):
+
+- `--http-shards` (default 50, Prometheus' `max_shards`) fixes the number of
+  shards for the whole replay; there is no resharding. Each series goes to
+  shard `h % shards`, `h` the first eight bytes, little-endian, of the BLAKE3
+  hash of its sorted labels, so every point of one series goes to one shard
+  on every run.
+- `--http-batch-size` (default 2000, Prometheus' `max_samples_per_send`) is
+  the points a shard sends per request. A shard sends when it holds that many,
+  and sends what it holds at stream end
+  (`metrics_ingest::tests::a_partial_batch_is_flushed_at_stream_end`).
+- Each shard keeps one request in flight and sends its next only once the
+  last has answered, so each series reaches the receiver in offered order
+  (`metrics_ingest::tests::sharded_replay_keeps_every_series_in_offered_order`)
+  and at most `min(shards, requests)` requests are in flight
+  (`metrics_ingest::tests::requests_in_flight_peak_at_min_of_shards_and_batches`).
+- One producer generates the stream, counts every point in offered order, and
+  routes it. A shard's queue holds one batch (`SHARD_QUEUE_BATCHES`); the
+  producer waits on a full queue, so a shard holds at most three batches at
+  once: one in flight, one queued and one filling. At the defaults that is
+  at most 50 x 3 x 2000 = 300,000 points buffered in the bench.
+- A 429, a 5xx or a transport error is retried after 30 ms, doubling per
+  retry up to 5 s (`retry_delay`,
+  `metrics_ingest::tests::retry_delay_doubles_from_30ms_and_caps_at_5s`), up
+  to `--http-max-retries` times, then the batch is dropped. 429 is retried
+  although Prometheus' default (`retry_on_http_429: false`) drops it, because
+  any dropped point fails the zero drop budget.
+- Both flags exit 64 on zero
+  (`metricsbench_ingest::tests::zero_shards_or_batch_size_exits_64`). Each
+  row's `client_behavior` states the shard count, batch size, routing and
+  backoff it ran with.
+
+An HTTP row's `elapsed_secs` is wall time, `elapsed_basis:
+"wall_in_flight"`: from the first request sent to the last response
+received, with requests overlapping on every shard and the stream generated
+between them. `generation_secs` is the part of the replay the producer spent
+generating and classifying the stream. `sender_bound` is true when
+`generation_secs` is at least 90% of `elapsed_secs` (`is_sender_bound`,
+`metrics_ingest::tests::sender_bound_needs_wall_basis_and_ninety_percent_generation`):
+the row measured the bench's generator, not the receiver, and its
+throughput is a floor on the receiver's. Every per-second figure divides by
+`elapsed_secs`. `ack_latency_ms` is per request, from its first send to its
+2xx, retries included, so it includes queueing inside the receiver.
+
+The in-process row keeps `elapsed_basis: "timed_segments"`: it is a
+sequential loop with no request in flight, so its `elapsed_secs` is the sum
+of the timed write segments (the `write_values` calls and the final flush),
+and generation, which runs between segments, is outside it. It records
+`generation_secs` too, and its `sender_bound` is always false, since the
+wall-time comparison does not apply to a sum that excludes generation.
+Reports written before these fields existed read them back as 0 and false.
+
+`--max-ingest-secs N` stops an HTTP row that would take longer than `N`
+seconds. Once the row has sent for 60 s, and then at most every 10 s, the bin
+projects its total wall time as elapsed x (stream points / points offered so
+far) (`project_ingest_secs`,
+`metrics_ingest::tests::stall_projection_scales_elapsed_by_the_stream_left`,
+`metrics_ingest::tests::stall_checks_wait_60s_then_recur_every_10s`). A
+projection over `N` fails the row with an error naming the system, the
+projection, the ceiling and the points offered, and the bin exits 1, as it
+does for a band violation
+(`metricsbench_ingest::tests::a_stalled_row_exits_like_a_band_violation`).
+The stream's point total is the generator report of the first row replayed
+when one exists (exact), else `active_series x steps` for the first row (one
+line per series per step; anomalies make the real count differ). Omitted, a
+row runs to its end. The ceiling applies to HTTP rows only; the in-process
+row has none.
 
 #### Read-back
 
@@ -368,9 +448,17 @@ fails when `matches_expected` is false
 
 #### Band 6: accepted digests per class
 
-Every row carries `expected_digests` and `accepted_digests`, one BLAKE3
-digest per class (`scalar`, `stale_marker`, `native_histogram`) over the
-points sent and the points accepted, in offered order. The bin fails a row
+Every row carries `expected_digests` and `accepted_digests`, one digest per
+class (`scalar`, `stale_marker`, `native_histogram`) over the points sent and
+the points accepted. Each class digest is a multiset digest: the sum, modulo
+2^256, of every point's BLAKE3 hash (the point encoded as `offered_digest`
+encodes it), written as the 32 little-endian bytes of the sum in hex. It does
+not depend on the order points were offered or acknowledged in, which a
+sharded sender does not preserve across series, and a point counted twice
+changes it (`metrics_ingest::tests::class_digests_ignore_order_and_count_duplicates`).
+No points give 64 zeros, and one point gives that point's own BLAKE3 hash.
+The in-process row uses the same scheme. `offered_digest` and the stream
+digest are unchanged: they are ordered hashes over the stream. The bin fails a row
 whose accepted digest differs from its expected digest for any class it
 stores; digests are compared, not counts, so a row that accepted as many
 points as it was sent, but not the same ones, fails
@@ -425,19 +513,15 @@ its citation, as `unsupported_classes`. The table has one entry
 |---|---|---|
 | VictoriaMetrics | native histogram | `lib/prompb/prompb.go` at v1.115.0: `TimeSeries.unmarshalProtobuf` reads only labels (field 1) and samples (field 2), so histograms (field 4) are skipped while the request is answered 2xx |
 
-Because generation runs inside the replay, `elapsed_secs` is the sum of the
-timed write segments (the `write_values` calls and the final flush for the
-Ravel row; each encode-and-POST for a comparator row) and never includes
-generating or classifying the stream, while `cpu_secs` covers the whole
-replay, generation included. Every `ingest` block carries
-`elapsed_basis: "timed_segments"` so a report written before this change can
-be told apart: its `elapsed_secs` was one wall-clock span over the write loop
-of a stream generated up front. For the Ravel row that span started after
-admission and after the RW1.0 encode; for a comparator row the encode was
-inside it, as it still is inside that row's timed segments. In both lanes
-the only basis change is the generation now interleaved between segments,
-which the sum excludes, and a throughput figure is compared across the
-change only with that in mind.
+Every `ingest` block carries `elapsed_basis`, so rows timed differently are
+never compared as if they were not (see "HTTP sender" above). The in-process
+row's is `timed_segments`, the sum of its write segments, while `cpu_secs`
+covers the whole replay, generation included. An HTTP row's is
+`wall_in_flight`. Before the 2026-10-28 amendment an HTTP row was also
+`timed_segments`, the sum of each sequential encode-and-POST, so its
+throughput is not comparable with a `wall_in_flight` row's. A report with no
+`elapsed_basis` predates both: its `elapsed_secs` was one wall-clock span over
+the write loop of a stream generated up front.
 
 `substrate`, absent with `--no-in-process-row`:
 - `store_backend`: the `--store` kind (`memory` or `s3`).
