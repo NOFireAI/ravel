@@ -102,6 +102,8 @@ enum Answer {
     /// The fixed series one ULP above the correct value at the first step
     /// and three above it at the second; an instant answer is one above.
     RampUlps,
+    /// The fixed series `n` ULPs above the correct value at every step.
+    UlpsAbove(u64),
     /// `success` with no series.
     Empty,
     /// HTTP 422, Mimir's chunk-limit refusal.
@@ -224,6 +226,7 @@ async fn answer(
             }
             axum::Json(json!({"status": "success", "data": data})).into_response()
         }
+        Answer::UlpsAbove(n) => axum::Json(json!({"status": "success", "data": series(&ulps_above_correct(n), kind, &params)})).into_response(),
         Answer::Empty => {
             let result_type = if kind == "instant" { "vector" } else { "matrix" };
             axum::Json(json!({"status": "success", "data": {"resultType": result_type, "result": []}})).into_response()
@@ -1104,6 +1107,80 @@ async fn an_entry_tolerance_reaches_the_comparator() {
     assert_eq!(status("mb_full_range_avg_over_time"), ResultStatus::Ok);
     assert_eq!(
         status("mb_full_range_avg_over_time_exact"),
+        ResultStatus::Incorrect
+    );
+}
+
+/// Runs one checked-in corpus entry with Ravel answering `ravel_answer` and
+/// the Prometheus oracle answering correctly, and returns Ravel's status.
+async fn ravel_status_on_checked_in_entry(id: &str, ravel_answer: Answer) -> ResultStatus {
+    use ravel_bench::metrics_query::{RunOptions, bind, parse_engine_spec, run};
+
+    let entry = ravel_bench::promql_corpus::load_corpus(
+        repo_root().join("benchmarks/metrics/metrics.corpus.json"),
+    )
+    .expect("checked-in corpus")
+    .into_iter()
+    .find(|e| e.id == id)
+    .unwrap_or_else(|| panic!("{id} in the checked-in corpus"));
+    let (_prometheus, p) = spawn_stub(&[], None).await;
+    let (_ravel, r) = spawn_stub(&[(&entry.promql, ravel_answer)], Some(RAVEL_TOKEN)).await;
+    let urls = Urls {
+        prometheus: p,
+        ravel: r.clone(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec(&format!("name=ravel,url={r},bearer_env={RAVEL_TOKEN_ENV}"))
+            .expect("spec"),
+    ];
+    let binding = bind(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| Some(RAVEL_TOKEN.to_string()),
+    )
+    .expect("bind");
+    let output = run(
+        &binding,
+        &[entry],
+        &workload,
+        RunOptions {
+            warmup_passes: 0,
+            passes: 1,
+            reps_per_pass: 1,
+            deadline: Duration::from_secs(5),
+            oracle_retries: 0,
+        },
+    )
+    .await
+    .expect("run");
+    output
+        .measurements
+        .iter()
+        .find(|m| m.engine == Some(Engine::Ravel) && m.id == id)
+        .unwrap_or_else(|| panic!("no ravel row for {id}"))
+        .status
+}
+
+/// Corpus version 4 gives `mb_fanout_total_rate` a summation-order tolerance
+/// of 2^20 ULPs, and the runner applies it: a one-ULP gap, the size measured
+/// on ci, classifies `ok`, while a gap of 2^40 ULPs, far below the smallest
+/// VictoriaMetrics gap measured on that entry (about 1.4e15), still
+/// classifies `incorrect`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_summation_tolerance_admits_last_bit_residue_and_not_a_semantic_gap() {
+    assert_eq!(
+        ravel_status_on_checked_in_entry("mb_fanout_total_rate", Answer::UlpsAbove(1)).await,
+        ResultStatus::Ok
+    );
+    assert_eq!(
+        ravel_status_on_checked_in_entry("mb_fanout_total_rate", Answer::UlpsAbove(1 << 40)).await,
         ResultStatus::Incorrect
     );
 }
