@@ -496,7 +496,9 @@ Steps, in order, stopping at the first failure:
    in-process diagnostic row on a memory store (case a); every other profile
    passes `--no-in-process-row` (case l), since cardinality's and history's
    streams do not fit in memory beside four engine containers and the
-   stack's RustFS is the engines' own store.
+   stack's RustFS is the engines' own store. Those runs lose one check: the
+   portable rows' expected scalar digests are not compared with an
+   in-process reference, only with each other (band 6 across rows).
 7. `mimir-readiness`: the ingest row for Mimir read back exactly what it
    accepted; the line is stamped (case a).
 8. `capture`: `capture-effective-config.sh` into `effective-config.json`,

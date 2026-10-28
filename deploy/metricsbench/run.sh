@@ -614,6 +614,7 @@ fi
 stamp_set comparator_images null
 stamp_set ravel_catalog_fold null
 stamp_set mimir_readiness null
+stamp_set in_process_row null
 stamp_set steps_completed '[]'
 stamp_set failed_step null
 stamp_set exit_code null
@@ -877,12 +878,15 @@ run_full() {
   # The in-process diagnostic row holds the whole stream in a memory store.
   # That fits ci's 120,000 samples; cardinality and history do not fit beside
   # four engine containers, and the stack's RustFS is the engines' own store,
-  # so every other profile runs on its portable rows alone.
+  # so every other profile runs on its portable rows alone. Those runs lose
+  # one check: the portable rows' scalar digests are no longer compared with
+  # the in-process row's; they are still compared with each other.
+  # --tenant is passed either way so --ravel-tenant always has its match.
   if [ "$profile" = "ci" ]; then
     in_process=(--store memory --tenant "$RAVEL_TENANT")
     stamp_str in_process_row present
   else
-    in_process=(--no-in-process-row)
+    in_process=(--no-in-process-row --tenant "$RAVEL_TENANT")
     stamp_str in_process_row skipped
   fi
   run_ingest --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" "${in_process[@]}" \
