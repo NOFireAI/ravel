@@ -9,27 +9,23 @@ Observed TLC line:
 
     Error: Temporal properties were violated.
 
-Trace (18 states then stuttering; 12988 distinct states, search complete):
+Trace (9 states then stuttering; 5076 distinct states found, 1769 left on
+the queue when TLC's liveness check found the cycle; 2 workers, `-Xmx4g`).
+TLC labels every step `MCNext`; the action names are read off the state.
+Where the liveness check runs depends on worker timing, so another run can
+report a longer path to the same cycle.
 
-    State 1: <Initial predicate>
-    State 2: <CreateHead in AgentProtocol>
-    State 3: <ReadHead in AgentProtocol>
-    State 4: <Destroy in AgentProtocol>
-    State 5: <CasHeadLostResponse in AgentProtocol>
-    State 6: <Recreate in AgentProtocol>
-    State 7: <ReadHead in AgentProtocol>
-    State 8: <CasHead in AgentProtocol>
-    State 9: <Takeover in AgentProtocol>
-    State 10: <BeginTurn in AgentProtocol>
-    State 11: <PutTurnOutput in AgentProtocol>
-    State 12: <WorkerCrash in AgentProtocol>
-    State 13: <ScheduleTimer in AgentProtocol>
-    State 14: <PutTurnOutput in AgentProtocol>
-    State 15: <WriteHint in AgentProtocol>
-    State 16: <FailTurn in AgentProtocol>
-    State 17: <BrokenEarlyHintForgotten in MCAgentProtocol>
-    State 18: <TimerDue in AgentProtocol>
-    State 19: Stuttering
+    State 1:  <Initial predicate>
+    State 2:  CreateHead
+    State 3:  ScheduleTimer (generation 1 armed)
+    State 4:  WriteHint (hint for generation 1 written)
+    State 5:  PutPayload(c1)
+    State 6:  Takeover(w1) (epoch 1)
+    State 7:  BrokenEarlyHintForgotten (hint for generation 1 deleted while
+              it is not yet due)
+    State 8:  TimerDue (generation 1 due)
+    State 9:  EnqueueCas(c1) fails on the moved version; the client re-reads
+    State 10: Stuttering
 
 ## What the switch breaks
 
@@ -39,13 +35,13 @@ The switch lets the sweep delete a hint it lists early.
 
 ## Why it is a real bug if it ever held
 
-Generation 1 is armed (state 13) and its hint written (state 15). The sweep
-deletes the hint while generation 1 is not yet due (state 17), and then it
-comes due (state 18). The root still has generation 1 armed, nothing will
+Generation 1 is armed (state 3) and its hint written (state 4). The sweep
+deletes the hint while generation 1 is not yet due (state 7), and then it
+comes due (state 8). The root still has generation 1 armed, nothing will
 write the hint again, and the sweep fires only from a present hint, so the
 behavior stutters forever with a due, armed timer. That is the response
 `DueTimerEventuallyDelivered` requires, and fairness on `FireTimer` does not
-help because `FireTimer` is never enabled. States 2 to 12 are an incidental
-path TLC found first (a destroy and recreate, a lost CAS response, a worker
-crash); none of them is needed for the violation. The correct model (switch
-FALSE) never deletes a hint whose generation is not yet due.
+help because `FireTimer` is never enabled. States 5, 6 and 9 are incidental
+client and worker steps; none of them is needed for the violation. The
+correct model (switch FALSE) never deletes a hint whose generation is not
+yet due.

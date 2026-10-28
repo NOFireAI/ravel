@@ -44,7 +44,7 @@ covers it.
 - `LostClaimNeverPublishesThroughGuardedPath` —
   `crates/ravel-fleet/src/claim.rs::renew` — same reason as `GuardedPublish`
 
-### agents (13 rows, test gap)
+### agents (15 rows, test gap)
 
 - `Destroy` — `crates/ravel-agents-core/src/kernel.rs::Kernel::tombstone` —
   the tombstone leaves a scheduled timer in HEAD and `check_active` refuses
@@ -74,9 +74,12 @@ covers it.
 - `ReplayIntentDrift` (`crates/ravel-agents-core/src/kernel.rs::Kernel::commit_intent`):
   no test recommits an intent key with a different input hash and asserts
   the turn is blocked with the intent unchanged
-- `AdminRecordResult` (`crates/ravel-agents-core/src/kernel.rs::Kernel::record_effect_result`):
-  no test records a result directly on an `InDoubt` effect; every manual
-  test authorizes a reconcile attempt first
+- `AdminAuthorize` (`crates/ravel-agents-runtime/src/effects.rs::Coordinator::reconcile_authorize`):
+  no test calls `reconcile_authorize` on an effect that is `Authorized` at
+  an earlier attempt and asserts it is refused with nothing dispatched
+- `AdminRecordResult` (`crates/ravel-agents-runtime/src/effects.rs::Coordinator::reconcile_attach`):
+  no test calls `reconcile_attach` on an effect `Authorized` without a
+  result and asserts it is refused with HEAD unchanged
 - `CommitCancelled` (`crates/ravel-agents-core/src/kernel.rs::Kernel::complete_turn`):
   no test requests a cancel while an effect of the turn is `InDoubt` and
   asserts the completion is refused until reconciliation
@@ -86,11 +89,12 @@ covers it.
 - `StepTranscriptCompatible` (`crates/ravel-agents-core/src/kernel.rs::Kernel::commit_intent`):
   the intent half, the same gap as `ReplayIntentDrift`
 - `DispatchRequiresCommittedAuthorization` (`crates/ravel-agents-core/src/kernel.rs::Kernel::authorize_attempt`):
-  no test asserts the refusal of an effect that is not journaled; the
-  dispatcher itself lands with T14
+  no test asserts the refusal of an effect that is not journaled
 - `CancellationRespected` (effects form,
-  `crates/ravel-agents-core/src/kernel.rs::Kernel::require_running`): the
-  kernel does not read the cancel request before a step, intent or
-  authorization; that rule and its test land with the runner in T14
+  `crates/ravel-agents-runtime/src/effects.rs::Coordinator::refuse_cancelled`):
+  the kernel refuses an owner authorization under a cancel request
+  (`kernel.rs:1764`) and ignores a result for a cancelled input
+  (`kernel.rs:1856`), but no test records a step after a cancel request and
+  asserts whether `require_running` refuses it
 
-Total test-debt rows: 17 (lifecycle 1, maintenance 3, agents 13).
+Total test-debt rows: 19 (lifecycle 1, maintenance 3, agents 15).
