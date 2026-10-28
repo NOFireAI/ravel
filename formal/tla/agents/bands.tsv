@@ -4,7 +4,11 @@
 # band is the full 0-999999999 range, so it only sets budget_s; a single local
 # run (2 workers) measured 362907 distinct at depth 27, and the row gets a real
 # band once the nightly lane has measured it on its own runner.
+# Positive rows, 2 workers: stale-turn-rebase-unreachable measured 289101
+# distinct (the smoke figure: its switch enables nothing); two-generations
+# measured 243171 distinct at depth 31 in 62 s.
 cfg	min_distinct	max_distinct	min_depth	max_depth	budget_s
 MCAgentProtocol.smoke.cfg	286000	292000	-	-
 MCAgentProtocol.exhaustive.cfg	0	999999999	-	-	3000
 positive/stale-turn-rebase-unreachable.cfg	286000	292000	-	-
+positive/two-generations.cfg	240000	246000	-	-
