@@ -2120,11 +2120,7 @@ mod tests {
             ] {
                 assert!(reason.contains(&claim), "{id}: no `{claim}` in {reason}");
             }
-            assert_eq!(
-                entry.tolerance_ulps.map(u64::from),
-                Some(tolerance),
-                "{id}"
-            );
+            assert_eq!(entry.tolerance_ulps.map(u64::from), Some(tolerance), "{id}");
             derived.push((id, per_engine, tolerance));
         }
         assert_eq!(
