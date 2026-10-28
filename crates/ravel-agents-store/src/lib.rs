@@ -7,7 +7,10 @@
 //! publishes the root with one conditional write. Every operation that
 //! writes HEAD goes through the one private skeleton in [`publish`]; read
 //! paths ([`AgentStore::read_head`], [`AgentStore::resolve`],
-//! [`AgentStore::list_agents`]) never write. Time and ids are injected
+//! [`AgentStore::list_agents`], [`AgentStore::list_wake_hints`],
+//! [`AgentStore::list_dir_after`]) never write, and the one delete,
+//! [`AgentStore::delete_wake_hint`], removes only an advisory hint. Time
+//! and ids are injected
 //! ([`Clock`], [`IdSource`]), and every store call is counted by phase in
 //! [`counters`].
 //!
@@ -18,6 +21,8 @@ pub mod backoff;
 pub mod counters;
 pub mod publish;
 mod wake;
+
+pub use wake::{CursorPage, DirEntry, WakeHint};
 
 #[cfg(test)]
 mod tests;
