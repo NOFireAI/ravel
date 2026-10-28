@@ -410,9 +410,20 @@ async fn completion_racing_an_enqueue_rebases_and_keeps_the_new_input() {
 
 #[tokio::test(start_paused = true)]
 async fn cold_restart_resumes_the_active_turn_from_head_alone() {
+    cold_restart_resumes_at(limits()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_restart_resumes_the_active_turn_at_two_entries_a_page() {
+    let mut small = limits();
+    small.kernel.max_page_entries = 2;
+    cold_restart_resumes_at(small).await;
+}
+
+async fn cold_restart_resumes_at(limits: StoreLimits) {
     let clock = clock();
     let backend = Arc::new(MemoryStore::new());
-    let store1 = store_over(backend.clone(), &clock);
+    let store1 = store_with(backend.clone(), &clock, limits);
     let co1 = coordinator(&store1, &clock, 100);
     create(&co1, "o-1").await;
     for i in 1..=3 {
@@ -426,10 +437,16 @@ async fn cold_restart_resumes_the_active_turn_from_head_alone() {
         .expect("commit 1");
     let active = poll_now(&co1, &w1, "v1").await.expect("second");
     assert_eq!(active.accept_seq, 2);
+    let before = head(&store1, "o-1").await;
+    assert_eq!(
+        before.index.inbox.page_for(active.accept_seq).is_some(),
+        limits.kernel.max_page_entries <= 2,
+        "the active input sits on a sealed page exactly when pages hold two entries"
+    );
     drop(co1);
     drop(store1);
 
-    let store2 = store_over(backend, &clock);
+    let store2 = store_with(backend, &clock, limits);
     let co2 = coordinator(&store2, &clock, 200);
     assert_eq!(co2.metrics().agents_loaded, 0);
     clock.advance_ms(past_lease_and_grace());
