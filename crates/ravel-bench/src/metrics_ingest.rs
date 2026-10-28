@@ -7808,4 +7808,400 @@ mod tests {
              not steps_declared"
         );
     }
+
+    /// The series and timestamp of every sample in one RW1.0 request body.
+    fn decode_series_ts(body: &[u8]) -> Vec<(String, i64)> {
+        let raw = snap::raw::Decoder::new()
+            .decompress_vec(body)
+            .expect("snappy");
+        let req = WriteRequest::decode(raw.as_slice()).expect("prost decode");
+        req.timeseries
+            .iter()
+            .flat_map(|ts| {
+                let instance = ts
+                    .labels
+                    .iter()
+                    .find(|l| l.name == "instance")
+                    .map(|l| l.value.clone())
+                    .unwrap_or_default();
+                ts.samples
+                    .iter()
+                    .map(move |s| (instance.clone(), s.timestamp))
+            })
+            .collect()
+    }
+
+    /// The shard each of `valid_stream`'s first `series` series routes to.
+    fn stream_shards(series: usize, shards: usize) -> Vec<usize> {
+        valid_stream(series, series)
+            .into_iter()
+            .map(|s| series_shard(&LogicalPoint::Sample(s), shards))
+            .collect()
+    }
+
+    /// Serve `app` on an ephemeral port.
+    async fn serve_stub(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, server)
+    }
+
+    /// With several shards in flight, every series still reaches the
+    /// receiver in offered order. The stub holds the first point of series
+    /// `mb-instance-0` until either a later point of that series arrives or
+    /// the other series' points the producer can send meanwhile have been
+    /// processed: series 0's shard takes one request in flight and
+    /// [`SHARD_QUEUE_BATCHES`] queued, after which the producer waits, so
+    /// each other series sends that many too. Routed by series, the later
+    /// point is queued behind the held one and cannot arrive; routed
+    /// round-robin by batch (each batch to the next shard), it is sent on
+    /// another shard while the first is held, is processed first, and the
+    /// order assertion fails.
+    #[tokio::test]
+    async fn sharded_replay_keeps_every_series_in_offered_order() {
+        const SERIES: usize = 3;
+        const POINTS: usize = 30;
+        // At least 4 shards, so round-robin puts point 3 (series 0 again) on
+        // a different shard from point 0; and the series on distinct shards,
+        // so the other two can finish while series 0's first point is held.
+        let shards = (4..=16)
+            .find(|&n| stream_shards(SERIES, n).iter().collect::<BTreeSet<_>>().len() == SERIES)
+            .expect("a shard count in 4..=16 that routes the 3 series apart");
+
+        let samples = valid_stream(POINTS, SERIES);
+        let held_ts = samples[0].ts_ms;
+        let others = (SERIES - 1) * (1 + SHARD_QUEUE_BATCHES);
+        let processed: Arc<std::sync::Mutex<Vec<(String, i64)>>> = Arc::default();
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let (log, notify) = (Arc::clone(&processed), Arc::clone(&changed));
+        let app = axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let (log, notify) = (Arc::clone(&log), Arc::clone(&notify));
+                async move {
+                    let points = decode_series_ts(&body);
+                    if points.iter().any(|(_, ts)| *ts == held_ts) {
+                        let release = || {
+                            let seen = log.lock().expect("lock");
+                            seen.iter().filter(|(s, _)| s != "mb-instance-0").count() >= others
+                                || seen.iter().any(|(s, _)| s == "mb-instance-0")
+                        };
+                        // A backstop only: a correct sender releases the hold
+                        // through `release` well before it.
+                        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let woken = notify.notified();
+                                if release() {
+                                    break;
+                                }
+                                woken.await;
+                            }
+                        })
+                        .await;
+                    }
+                    log.lock().expect("lock").extend(points);
+                    notify.notify_waiters();
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let (addr, server) = serve_stub(app).await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Prometheus,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 1,
+            max_retries: 0,
+            timeout_secs: 30,
+            shards,
+            stall_ceiling: None,
+        };
+        let row = replay_over_http(&config, &mut SliceSamples::new(&samples))
+            .await
+            .expect("replay");
+        server.abort();
+
+        assert_eq!(row.ingest.accepted_samples, POINTS as u64);
+        assert_eq!(row.ingest.batches, POINTS as u64);
+        let processed = processed.lock().expect("lock").clone();
+        assert_eq!(processed.len(), POINTS);
+        let mut by_series: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for (series, ts) in processed {
+            by_series.entry(series).or_default().push(ts);
+        }
+        for (series, arrived) in &by_series {
+            let mut offered = arrived.clone();
+            offered.sort_unstable();
+            assert_eq!(arrived, &offered, "{series} reached the receiver out of order");
+        }
+    }
+
+    /// At most one request per shard is in flight, and every shard with work
+    /// gets a request in flight at once: the peak is `min(shards, batches)`.
+    /// The stub holds each request until that many are in flight (a
+    /// backstop timeout aside), so the sequential sender this replaced, one
+    /// request at a time, peaks at 1 and fails the first assertion.
+    #[tokio::test]
+    async fn requests_in_flight_peak_at_min_of_shards_and_batches() {
+        for (series, shards, points) in [(2usize, 2usize, 8usize), (2, 8, 2)] {
+            let routed = stream_shards(series, shards);
+            assert!(
+                routed[0] != routed[1],
+                "precondition: the two series route to distinct shards, got {routed:?}"
+            );
+            let expected = shards.min(points);
+            let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let changed = Arc::new(tokio::sync::Notify::new());
+            let (now, max, notify) = (
+                Arc::clone(&in_flight),
+                Arc::clone(&peak),
+                Arc::clone(&changed),
+            );
+            let app = axum::Router::new().route(
+                "/api/v1/write",
+                axum::routing::post(move || {
+                    let (now, max, notify) = (Arc::clone(&now), Arc::clone(&max), Arc::clone(&notify));
+                    async move {
+                        use std::sync::atomic::Ordering;
+                        let current = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        max.fetch_max(current, Ordering::SeqCst);
+                        notify.notify_waiters();
+                        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let woken = notify.notified();
+                                if max.load(Ordering::SeqCst) >= expected {
+                                    break;
+                                }
+                                woken.await;
+                            }
+                        })
+                        .await;
+                        now.fetch_sub(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+            let (addr, server) = serve_stub(app).await;
+            let samples = valid_stream(points, series);
+            let config = HttpReplayConfig {
+                receiver: Receiver::Prometheus,
+                endpoint: format!("http://{addr}/api/v1/write"),
+                bearer_token: None,
+                tenant: None,
+                batch_size: 1,
+                max_retries: 0,
+                timeout_secs: 30,
+                shards,
+                stall_ceiling: None,
+            };
+            let row = replay_over_http(&config, &mut SliceSamples::new(&samples))
+                .await
+                .expect("replay");
+            server.abort();
+            assert_eq!(row.ingest.batches, points as u64);
+            assert_eq!(
+                peak.load(std::sync::atomic::Ordering::SeqCst),
+                expected,
+                "{shards} shards, {points} batches"
+            );
+        }
+    }
+
+    /// A shard sends its partial batch at stream end: 5 points of one series
+    /// at batch size 2 are 3 requests, the last holding one point.
+    #[tokio::test]
+    async fn a_partial_batch_is_flushed_at_stream_end() {
+        let sizes: Arc<std::sync::Mutex<Vec<usize>>> = Arc::default();
+        let log = Arc::clone(&sizes);
+        let app = axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let log = Arc::clone(&log);
+                async move {
+                    log.lock().expect("lock").push(decode_series_ts(&body).len());
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let (addr, server) = serve_stub(app).await;
+        let samples = valid_stream(5, 1);
+        let config = HttpReplayConfig {
+            receiver: Receiver::Prometheus,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 2,
+            max_retries: 0,
+            timeout_secs: 30,
+            shards: 4,
+            stall_ceiling: None,
+        };
+        let row = replay_over_http(&config, &mut SliceSamples::new(&samples))
+            .await
+            .expect("replay");
+        server.abort();
+        assert_eq!(*sizes.lock().expect("lock"), vec![2, 2, 1]);
+        assert_eq!(row.ingest.accepted_samples, 5);
+        assert_eq!(row.ingest.elapsed_basis, ELAPSED_BASIS_WALL_IN_FLIGHT);
+    }
+
+    /// Class digests are a multiset: the same points in another order give
+    /// the same digest, and a point counted twice changes it. An ordered
+    /// hasher fails the first assertion; an XOR of point hashes fails the
+    /// last two, where a duplicated pair cancels out.
+    #[test]
+    fn class_digests_ignore_order_and_count_duplicates() {
+        let points: Vec<LogicalPoint> = valid_stream(4, 2)
+            .into_iter()
+            .map(LogicalPoint::Sample)
+            .collect();
+        let digest = |p: &[&LogicalPoint]| {
+            let mut d = ClassDigester::default();
+            p.iter().for_each(|x| d.update(x));
+            d.finish().scalar
+        };
+        let [a, b, c, d] = [&points[0], &points[1], &points[2], &points[3]];
+        assert_eq!(digest(&[a, b, c, d]), digest(&[d, b, a, c]), "order");
+        assert_ne!(digest(&[a, b]), digest(&[a, b, b]), "a duplicate");
+        assert_ne!(digest(&[a]), digest(&[a, b, b]), "a duplicated pair");
+        assert_ne!(digest(&[]), digest(&[a, a]), "a point counted twice");
+        assert_eq!(digest(&[]), "0".repeat(64));
+
+        let mut single = OfferedDigest::new();
+        single.update_point(a);
+        assert_eq!(digest(&[a]), single.finish(), "one point is its own hash");
+    }
+
+    /// The modular sum carries across limbs and wraps at 2^256.
+    #[test]
+    fn multiset_digest_carries_and_wraps_mod_2_256() {
+        let mut d = MultisetDigest {
+            limbs: [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
+        };
+        let point = LogicalPoint::Sample(valid_stream(1, 1).remove(0));
+        let mut alone = MultisetDigest::new();
+        alone.add_point(&point);
+        d.add_point(&point);
+        // All-ones is -1 mod 2^256, so the sum is the point's hash minus one.
+        let mut expected = alone.limbs;
+        for limb in expected.iter_mut() {
+            let (v, borrow) = limb.overflowing_sub(1);
+            *limb = v;
+            if !borrow {
+                break;
+            }
+        }
+        assert_eq!(d.limbs, expected);
+    }
+
+    /// A commit token for `shard` at `(epoch, seq)` from `writer`.
+    fn token_of(shard: u32, writer: u128, epoch: u64, seq: u64) -> String {
+        CommitToken {
+            shard,
+            writer_id: uuid::Uuid::from_u128(writer),
+            epoch,
+            seq,
+            ingest_hour_bucket: 488_888,
+        }
+        .encode()
+    }
+
+    /// Responses from several shards arrive in any order, so an older token
+    /// arriving last does not replace a newer one: seq 7 then seq 5 keeps 7,
+    /// and a higher epoch wins over a higher seq. Overwriting with the latest
+    /// arrival, the rule this replaced, keeps 5.
+    #[test]
+    fn commit_tokens_keep_the_newest_epoch_and_seq_per_shard() {
+        let mut by_shard = BTreeMap::new();
+        record_commit_tokens("ravel", &token_of(0, 1, 1, 7), &mut by_shard).expect("seq 7");
+        record_commit_tokens("ravel", &token_of(0, 1, 1, 5), &mut by_shard).expect("seq 5");
+        assert_eq!(by_shard.get(&0), Some(&token_of(0, 1, 1, 7)));
+        record_commit_tokens("ravel", &token_of(0, 1, 2, 1), &mut by_shard).expect("epoch 2");
+        assert_eq!(by_shard.get(&0), Some(&token_of(0, 1, 2, 1)));
+        record_commit_tokens("ravel", &token_of(0, 1, 1, 9), &mut by_shard).expect("old epoch");
+        assert_eq!(by_shard.get(&0), Some(&token_of(0, 1, 2, 1)));
+    }
+
+    /// Two writers on one shard are refused, naming the system, the shard
+    /// and both writers.
+    #[test]
+    fn a_second_writer_on_one_shard_is_refused() {
+        let mut by_shard = BTreeMap::new();
+        record_commit_tokens("ravel", &token_of(3, 1, 1, 1), &mut by_shard).expect("first");
+        let err = record_commit_tokens("ravel", &token_of(3, 2, 1, 2), &mut by_shard)
+            .expect_err("a second writer");
+        let (held, new) = (
+            uuid::Uuid::from_u128(1).to_string(),
+            uuid::Uuid::from_u128(2).to_string(),
+        );
+        assert!(
+            matches!(
+                &err,
+                LaneError::CommitTokenWriterConflict { system, shard: 3, held_writer, new_writer }
+                    if system == "ravel" && *held_writer == held && *new_writer == new
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(&held) && message.contains(&new), "{message}");
+        assert_eq!(by_shard.get(&3), Some(&token_of(3, 1, 1, 1)));
+    }
+
+    /// 30 ms doubling per retry, capped at 5 s, and no overflow however many
+    /// retries.
+    #[test]
+    fn retry_delay_doubles_from_30ms_and_caps_at_5s() {
+        let ms: Vec<u128> = (0..10).map(|r| retry_delay(r).as_millis()).collect();
+        assert_eq!(
+            ms,
+            vec![30, 60, 120, 240, 480, 960, 1920, 3840, 5000, 5000]
+        );
+        assert_eq!(retry_delay(63), Duration::from_secs(5));
+        assert_eq!(retry_delay(64), Duration::from_secs(5));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(5));
+    }
+
+    /// The projection is elapsed time scaled by stream points over offered
+    /// points, and nothing is projected before a point is offered.
+    #[test]
+    fn stall_projection_scales_elapsed_by_the_stream_left() {
+        assert_eq!(project_ingest_secs(60.0, 0, 1_000), None);
+        assert_eq!(project_ingest_secs(60.0, 250, 1_000), Some(240.0));
+        assert_eq!(project_ingest_secs(60.0, 1_000, 1_000), Some(60.0));
+
+        let ceiling = StallCeiling {
+            max_ingest_secs: 600,
+            stream_points: 1_000,
+        };
+        assert_eq!(stall_projection_over(&ceiling, 60.0, 100), None, "exactly 600 s");
+        assert_eq!(stall_projection_over(&ceiling, 60.0, 50), Some(1_200.0));
+        assert_eq!(stall_projection_over(&ceiling, 60.0, 0), None);
+    }
+
+    /// The first check runs at 60 s of sending, later ones at most every 10 s.
+    #[test]
+    fn stall_checks_wait_60s_then_recur_every_10s() {
+        let s = Duration::from_secs;
+        assert!(!stall_check_due(s(59), None));
+        assert!(stall_check_due(s(60), None));
+        assert!(!stall_check_due(s(65), Some(s(5))));
+        assert!(stall_check_due(s(70), Some(s(10))));
+    }
+
+    /// A row is sender bound only on the wall basis, with generation at
+    /// least 90 % of its wall time.
+    #[test]
+    fn sender_bound_needs_wall_basis_and_ninety_percent_generation() {
+        assert!(is_sender_bound(ELAPSED_BASIS_WALL_IN_FLIGHT, 9.0, 10.0));
+        assert!(!is_sender_bound(ELAPSED_BASIS_WALL_IN_FLIGHT, 8.9, 10.0));
+        assert!(!is_sender_bound(ELAPSED_BASIS_TIMED_SEGMENTS, 9.5, 10.0));
+        assert!(!is_sender_bound(ELAPSED_BASIS_WALL_IN_FLIGHT, 0.0, 0.0));
+    }
 }
