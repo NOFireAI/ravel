@@ -4461,11 +4461,7 @@ async fn read_back_once(
                 max_ts,
             )
             .await;
-        sample_count += timed(
-            format!("{READBACK_QUERY_SAMPLES}.{index}"),
-            started,
-            result,
-        )?;
+        sample_count += timed(format!("{READBACK_QUERY_SAMPLES}.{index}"), started, result)?;
     }
     let histogram_series_count = match expected.histogram_series_count {
         Some(_) => {
@@ -4817,7 +4813,9 @@ impl<'de> Deserialize<'de> for SeriesBody {
                         "status" => body.status = map.next_value()?,
                         "errorType" => body.error_type = map.next_value()?,
                         "error" => body.error = map.next_value()?,
-                        "data" => body.count = map.next_value::<Option<ElementCount>>()?.map(|c| c.0),
+                        "data" => {
+                            body.count = map.next_value::<Option<ElementCount>>()?.map(|c| c.0)
+                        }
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                         }
@@ -7700,7 +7698,10 @@ mod tests {
         body.into_bytes()
     }
 
-    async fn stub_series_count(pieces: Vec<Vec<u8>>, declared: Option<usize>) -> Result<u64, String> {
+    async fn stub_series_count(
+        pieces: Vec<Vec<u8>>,
+        declared: Option<usize>,
+    ) -> Result<u64, String> {
         let (addr, server) = chunked_body_stub(pieces, declared).await;
         let client = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -7828,7 +7829,11 @@ mod tests {
             assert_eq!(readback.stale_marker_honored, Some(true));
             // One timing per query the stub saw (five, asserted below).
             assert_eq!(
-                readback.query_ms.keys().map(String::as_str).collect::<Vec<_>>(),
+                readback
+                    .query_ms
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
                 [
                     READBACK_QUERY_HISTOGRAM_SAMPLES,
                     READBACK_QUERY_HISTOGRAM_SERIES,
