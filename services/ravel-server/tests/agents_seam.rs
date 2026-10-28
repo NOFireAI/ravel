@@ -180,7 +180,7 @@ async fn agents_router_mounts_on_both_listeners_only_with_feature_and_flag() {
 
 /// Every `ravel_agents_*` family the scrape carries, with the value the
 /// settings above produce.
-const AGENTS_FAMILIES: [(&str, u64); 9] = [
+const AGENTS_FAMILIES: [(&str, u64); 10] = [
     ("ravel_agents_enabled", 1),
     ("ravel_agents_activation_concurrency_limit", 3),
     ("ravel_agents_poll_concurrency_limit", 5),
@@ -190,6 +190,7 @@ const AGENTS_FAMILIES: [(&str, u64); 9] = [
     ("ravel_agents_max_state_bytes", 17_000),
     ("ravel_agents_max_receipts", 19),
     ("ravel_agents_max_timers", 23),
+    ("ravel_agents_sweep_interval_ms", 5_000),
 ];
 
 /// A real `/metrics` scrape carries each agents family exactly once: one
