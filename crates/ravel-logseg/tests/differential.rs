@@ -15,7 +15,8 @@ use ravel_logseg::{
 
 const STREAMS: u8 = 6;
 const TS_MAX: i64 = 400;
-/// `arb_typed_attr`'s `I64` values lie in `-NARROW_I64..NARROW_I64`.
+/// `arb_typed_attr`'s `I64` values lie in `-NARROW_I64..=NARROW_I64 + 2`:
+/// `dur` in `-NARROW_I64..=NARROW_I64`, `code` up to `NARROW_I64 + 2` on stream 5.
 const NARROW_I64: i64 = 8;
 const NAMES: &[&str] = &["svc", "env", "code", "user", "path", "dur", "flag", "host"];
 const WORDS: &[&str] = &[
@@ -506,6 +507,58 @@ fn arb_chunk_order_case() -> impl Strategy<Value = ChunkOrderCase> {
     )
 }
 
+/// A chunk-order case ready to read: the content predicate composed with the
+/// content arms, the prune arms, and the corpus written in the default order
+/// and in the declared one.
+struct ChunkOrderReads {
+    corpus: Vec<LogRecord>,
+    pred: Predicate,
+    prune: Vec<Predicate>,
+    order: &'static [&'static str],
+    default_object: Vec<u8>,
+    ordered_object: Vec<u8>,
+}
+
+/// A generated case built for its reads, its arms from [`picked_arms`].
+fn chunk_order_reads(case: ChunkOrderCase) -> ChunkOrderReads {
+    let (corpus, pred, picks, order, indexed, columnar) = case;
+    let (content, prune) = picked_arms(&corpus, &picks);
+    chunk_order_reads_from_arms(
+        corpus,
+        pred,
+        content,
+        prune,
+        order.leak(),
+        &indexed,
+        columnar,
+    )
+}
+
+/// A case built for its reads from arms given directly, as a pinned case
+/// gives them: `Index` has no public constructor, so picks cannot be written
+/// as literals.
+fn chunk_order_reads_from_arms(
+    corpus: Vec<LogRecord>,
+    pred: Predicate,
+    content: Vec<Predicate>,
+    prune: Vec<Predicate>,
+    order: &'static [&'static str],
+    indexed: &[&str],
+    columnar: bool,
+) -> ChunkOrderReads {
+    let pred = Predicate::And(vec![pred, Predicate::And(content)]);
+    let default_object = write_object_ordered(&corpus, &[], indexed, columnar);
+    let ordered_object = write_object_ordered(&corpus, order, indexed, columnar);
+    ChunkOrderReads {
+        corpus,
+        pred,
+        prune,
+        order,
+        default_object,
+        ordered_object,
+    }
+}
+
 /// A numeric attribute value as a `NumRange` column type and bound bits; none
 /// for a non-numeric value or a NaN, which `NumRange` must not be given.
 fn num_bound(value: &AttrValue) -> Option<(FieldType, u64)> {
@@ -591,6 +644,8 @@ fn satisfies_prune_arm(rec: &LogRecord, arm: &Predicate) -> bool {
     }
 }
 
+/// The order `crates/ravel-logseg/src/skip_index.rs` folds `min_bits` and
+/// `max_bits` under: `i64` signed, `f64` by `total_cmp`, anything else unsigned.
 fn bits_cmp(ty: FieldType, a: u64, b: u64) -> std::cmp::Ordering {
     match ty {
         FieldType::F64 => f64::from_bits(a).total_cmp(&f64::from_bits(b)),
@@ -657,6 +712,63 @@ fn scan_projected(
     out
 }
 
+/// The assertions of [`chunk_order_reads_equal_the_default_order`], for a
+/// generated case and for a pinned one alike.
+fn check_chunk_order_reads(case: &ChunkOrderReads) -> Result<(), TestCaseError> {
+    let ChunkOrderReads {
+        corpus,
+        pred,
+        prune,
+        order,
+        default_object,
+        ordered_object,
+    } = case;
+    let cfg = RlogConfig::default();
+    let scan = |object: &[u8], prune: &[Predicate]| {
+        RlogReader::new(object, &cfg)
+            .expect("open")
+            .scan_pruned(pred, prune)
+            .expect("scan")
+            .0
+    };
+    let got = scan(ordered_object, &[]);
+    let matches = naive_eval(corpus, pred);
+    prop_assert_eq!(normalize(got.clone()), normalize(scan(default_object, &[])));
+    prop_assert_eq!(normalize(got), normalize(matches.clone()));
+    let pruned = normalize(scan(ordered_object, prune));
+    prop_assert_eq!(&pruned, &normalize(scan(default_object, prune)));
+    let must_keep = normalize(
+        matches
+            .iter()
+            .filter(|r| prune.iter().all(|arm| satisfies_prune_arm(r, arm)))
+            .cloned()
+            .collect(),
+    );
+    prop_assert!(
+        is_sub_multiset(&must_keep, &pruned),
+        "the prune channel dropped a content match that satisfies every prune arm: \
+         {} such rows, {} kept",
+        must_keep.len(),
+        pruned.len()
+    );
+    prop_assert!(
+        is_sub_multiset(&pruned, &normalize(matches)),
+        "the pruned read returned a row the content predicate does not match"
+    );
+
+    let mut columns = ColumnSelection::fixed_only()
+        .with_body()
+        .with_severity_text();
+    for name in order.iter().take(2) {
+        columns = columns.with_attr(*name);
+    }
+    prop_assert_eq!(
+        normalize(scan_projected(ordered_object, pred, prune, &columns)),
+        normalize(scan_projected(default_object, pred, prune, &columns))
+    );
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 200, ..ProptestConfig::default() })]
 
@@ -688,55 +800,83 @@ proptest! {
     /// that prune to the same wrong rows, or to nothing, do not pass as
     /// agreement.
     #[test]
-    fn chunk_order_reads_equal_the_default_order(
-        (corpus, pred, picks, order, indexed, columnar) in arb_chunk_order_case(),
-    ) {
-        let order: &'static [&'static str] = order.leak();
-        let (content, prune) = picked_arms(&corpus, &picks);
-        let pred = Predicate::And(vec![pred, Predicate::And(content)]);
-        let default_object = write_object_ordered(&corpus, &[], &indexed, columnar);
-        let ordered_object = write_object_ordered(&corpus, order, &indexed, columnar);
-        let cfg = RlogConfig::default();
-        let scan = |object: &[u8], prune: &[Predicate]| {
-            RlogReader::new(object, &cfg)
-                .expect("open")
-                .scan_pruned(&pred, prune)
-                .expect("scan")
-                .0
-        };
-        let got = scan(&ordered_object, &[]);
-        let matches = naive_eval(&corpus, &pred);
-        prop_assert_eq!(normalize(got.clone()), normalize(scan(&default_object, &[])));
-        prop_assert_eq!(normalize(got), normalize(matches.clone()));
-        let pruned = normalize(scan(&ordered_object, &prune));
-        prop_assert_eq!(&pruned, &normalize(scan(&default_object, &prune)));
-        let must_keep = normalize(
-            matches
-                .iter()
-                .filter(|r| prune.iter().all(|arm| satisfies_prune_arm(r, arm)))
-                .cloned()
-                .collect(),
-        );
-        prop_assert!(
-            is_sub_multiset(&must_keep, &pruned),
-            "the prune channel dropped a content match that satisfies every prune arm: \
-             {} such rows, {} kept",
-            must_keep.len(),
-            pruned.len()
-        );
-        prop_assert!(
-            is_sub_multiset(&pruned, &normalize(matches)),
-            "the pruned read returned a row the content predicate does not match"
-        );
+    fn chunk_order_reads_equal_the_default_order(case in arb_chunk_order_case()) {
+        check_chunk_order_reads(&chunk_order_reads(case))?;
+    }
+}
 
-        let mut columns = ColumnSelection::fixed_only().with_body().with_severity_text();
-        for name in order.iter().take(2) {
-            columns = columns.with_attr(*name);
-        }
-        prop_assert_eq!(
-            normalize(scan_projected(&ordered_object, &pred, &prune, &columns)),
-            normalize(scan_projected(&default_object, &pred, &prune, &columns))
+/// The stream attribute bytes both recorded shrinks of
+/// [`chunk_order_reads_equal_the_default_order`] carry, copied from their
+/// regressions file comments.
+const RECORDED_STREAM_ATTRS: [u8; 27] = [
+    1, 12, 115, 101, 114, 118, 105, 99, 101, 46, 110, 97, 109, 101, 1, 2, 115, 48, 5, 115, 99, 111,
+    112, 101, 1, 49, 0,
+];
+
+/// The one record of a recorded shrink: stream 0 at timestamp 0, severity 0
+/// ("INFO"), empty body, no trace or span id, flags 0, carrying `attrs`.
+fn recorded_record(attrs: Vec<(&'static str, AttrValue)>) -> LogRecord {
+    let rec = make_record(0, 0, String::new(), 0, attrs, None);
+    assert_eq!(rec.stream_attrs, RECORDED_STREAM_ATTRS);
+    rec
+}
+
+/// The shrink seed b662e1fd recorded for
+/// [`chunk_order_reads_equal_the_default_order`] before the typed corpus,
+/// the picks and the indexed names: `svc` and `code` hold the same word and
+/// `svc` is declared first. No arms and no indexed names, as recorded, on
+/// both writer paths.
+#[test]
+fn chunk_order_recorded_shrink_svc_and_code_same_word() {
+    for columnar in [false, true] {
+        let rec = recorded_record(vec![
+            ("svc", AttrValue::Str("timeout".to_string())),
+            ("code", AttrValue::Str("timeout".to_string())),
+        ]);
+        let case = chunk_order_reads_from_arms(
+            vec![rec],
+            Predicate::And(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+            &["svc"],
+            &[],
+            columnar,
         );
+        if let Err(e) = check_chunk_order_reads(&case) {
+            panic!("columnar {columnar}: {e}");
+        }
+    }
+}
+
+/// The shrink seed 9e19bfdc recorded for
+/// [`chunk_order_reads_equal_the_default_order`] under `Str` values on names
+/// the typed corpus no longer gives `Str`: the pick `(0, 0, ContentEquals)`
+/// as the content arm it builds, `flag = "fail"`, probing POSTINGS on the
+/// indexed `flag`, with a declared order naming no attribute the record
+/// carries. Both writer paths.
+#[test]
+fn chunk_order_recorded_shrink_indexed_flag_content_equals() {
+    for columnar in [false, true] {
+        let rec = recorded_record(vec![
+            ("flag", AttrValue::Str("fail".to_string())),
+            ("dur", AttrValue::Str("timeout".to_string())),
+        ]);
+        let content = vec![Predicate::Equals {
+            field: FieldSel::Attr("flag".to_string()),
+            value: AttrValue::Str("fail".to_string()),
+        }];
+        let case = chunk_order_reads_from_arms(
+            vec![rec],
+            Predicate::And(Vec::new()),
+            content,
+            Vec::new(),
+            &["host"],
+            &["dur", "flag"],
+            columnar,
+        );
+        if let Err(e) = check_chunk_order_reads(&case) {
+            panic!("columnar {columnar}: {e}");
+        }
     }
 }
 
@@ -745,7 +885,8 @@ const COVERAGE_SEED: [u8; 32] = [7; 32];
 const COVERAGE_CASES: usize = 200;
 // measured 2026-10-28: 69 of 200 partial, 11 no arm and 24 empty with seed
 // [7; 32]. The floor is two thirds of the partial count rounded down, each
-// ceiling one and a half times its count rounded up.
+// ceiling one and a half times its count rounded up. The counts follow
+// proptest 1.11.0's RNG streams: re-measure them on a proptest bump.
 const PARTIAL_FLOOR: usize = 46;
 const NOARM_CEIL: usize = 17;
 const EMPTY_CEIL: usize = 36;
@@ -766,14 +907,13 @@ fn chunk_order_prune_channel_prunes_partially() {
     let strategy = arb_chunk_order_case();
     let mut effects = Vec::with_capacity(COVERAGE_CASES);
     for _ in 0..COVERAGE_CASES {
-        let (corpus, pred, picks, _order, indexed, columnar) = strategy
-            .new_tree(&mut runner)
-            .expect("generate a case")
-            .current();
-        let (content, prune) = picked_arms(&corpus, &picks);
-        let pred = Predicate::And(vec![pred, Predicate::And(content)]);
-        let object = write_object_ordered(&corpus, &[], &indexed, columnar);
-        effects.push(prune_effect(&object, &pred, &prune));
+        let case = chunk_order_reads(
+            strategy
+                .new_tree(&mut runner)
+                .expect("generate a case")
+                .current(),
+        );
+        effects.push(prune_effect(&case.default_object, &case.pred, &case.prune));
     }
     let count = |e: PruneEffect| effects.iter().filter(|&&x| x == e).count();
     let summary = [
