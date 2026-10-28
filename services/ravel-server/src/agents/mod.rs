@@ -6,16 +6,17 @@
 //! [`AgentsRuntime`]'s counters to `/metrics`, and adds an
 //! [`AgentsReadiness`] to `/readyz`. The router serves
 //! `GET /api/v1/agents/health`, which reports the settings below, and the
-//! client and worker routes of milestones 1 and 2 over one
-//! [`ravel_agents_runtime::Coordinator`] per tenant. Timer, effect and
-//! reconcile routes are not mounted.
+//! client, worker and admin routes of milestones 1 to 3 over one
+//! [`ravel_agents_runtime::Coordinator`] per tenant. Timer routes are not
+//! mounted.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::{DefaultBodyLimit, State};
-use axum::routing::{get, post};
+use axum::extract::State;
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
+use ravel_maintain::QueryAuditSink;
 use ravel_query::http::TenantResolver;
 use serde::Serialize;
 
@@ -23,11 +24,16 @@ use crate::ServerConfig;
 use crate::config::Mode;
 use crate::health::IngestHealth;
 
+mod audit;
 mod routes;
 mod runtime;
 
+pub use audit::{KIND_AGENTS_RECONCILE, ReconcileAction, agents_reconcile_audit_event};
 pub use routes::MAX_EVENTS_PAGE;
-pub use runtime::{AgentsRuntime, LONG_POLL_CAP_MS, Lane, TenantAgents};
+pub use runtime::{
+    AgentsRuntime, EvidenceIndex, LONG_POLL_CAP_MS, Lane, MAX_EVIDENCE_EFFECTS,
+    MAX_EVIDENCE_PER_EFFECT, RecordingDispatcher, TenantAgents,
+};
 
 /// The unauthenticated settings route.
 pub const HEALTH_PATH: &str = "/api/v1/agents/health";
@@ -47,6 +53,12 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/agents/worker/poll"),
     ("POST", "/api/v1/agents/worker/commit"),
     ("POST", "/api/v1/agents/worker/heartbeat"),
+    ("POST", "/api/v1/agents/worker/step"),
+    ("POST", "/api/v1/agents/worker/effects/complete"),
+    ("POST", "/api/v1/agents/worker/effects/fail"),
+    ("GET", "/api/v1/agents/effects"),
+    ("GET", "/api/v1/agents/effects/{effect}"),
+    ("POST", "/api/v1/agents/reconcile"),
 ];
 
 /// The agents settings a process runs with: its mode and the resolved
@@ -158,33 +170,87 @@ impl HealthBody {
 /// so it carries no authentication on either listener, including the mTLS
 /// one, where `/healthz` itself is not served (ADR-3331 decision 9 mounts it
 /// on both). Every other route resolves its tenant through `resolver`, the
-/// listener's own.
-pub fn router(runtime: Arc<AgentsRuntime>, resolver: Arc<dyn TenantResolver>) -> Router {
-    let limit = runtime.settings.max_body_bytes;
-    let api = routes::Api { runtime, resolver };
-    Router::new()
-        .route(HEALTH_PATH, get(health))
-        .route("/api/v1/agents/create", post(routes::create))
-        .route("/api/v1/agents/send", post(routes::send))
-        .route("/api/v1/agents/call", post(routes::call))
-        .route("/api/v1/agents/operation", get(routes::operation))
-        .route("/api/v1/agents/result", get(routes::result))
-        .route("/api/v1/agents/resolve", post(routes::resolve))
-        .route("/api/v1/agents/cancel", post(routes::cancel))
-        .route("/api/v1/agents/state", get(routes::state))
-        .route("/api/v1/agents/events", post(routes::events))
-        .route(
+/// listener's own, and the reconcile route writes its audit record to
+/// `audit`.
+///
+/// Handlers read their own body under `max_body_bytes` after admission, so
+/// no body-limit layer is mounted: axum's applies only to its body
+/// extractors, which no handler uses.
+pub fn router(
+    runtime: Arc<AgentsRuntime>,
+    resolver: Arc<dyn TenantResolver>,
+    audit: Arc<dyn QueryAuditSink>,
+) -> Router {
+    let api = routes::Api {
+        runtime,
+        resolver,
+        audit,
+    };
+    mounted()
+        .into_iter()
+        .fold(
+            Router::new().route(HEALTH_PATH, get(health)),
+            |router, (_, path, handler)| router.route(path, handler),
+        )
+        .with_state(api)
+}
+
+/// Every authenticated route with its handler, in [`ROUTES`] order; the
+/// router mounts these and [`HEALTH_PATH`], nothing else.
+fn mounted() -> Vec<(&'static str, &'static str, MethodRouter<routes::Api>)> {
+    vec![
+        ("POST", "/api/v1/agents/create", post(routes::create)),
+        ("POST", "/api/v1/agents/send", post(routes::send)),
+        ("POST", "/api/v1/agents/call", post(routes::call)),
+        ("GET", "/api/v1/agents/operation", get(routes::operation)),
+        ("GET", "/api/v1/agents/result", get(routes::result)),
+        ("POST", "/api/v1/agents/resolve", post(routes::resolve)),
+        ("POST", "/api/v1/agents/cancel", post(routes::cancel)),
+        ("GET", "/api/v1/agents/state", get(routes::state)),
+        ("POST", "/api/v1/agents/events", post(routes::events)),
+        (
+            "POST",
             "/api/v1/agents/worker/register",
             post(routes::worker_register),
-        )
-        .route("/api/v1/agents/worker/poll", post(routes::worker_poll))
-        .route("/api/v1/agents/worker/commit", post(routes::worker_commit))
-        .route(
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/poll",
+            post(routes::worker_poll),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/commit",
+            post(routes::worker_commit),
+        ),
+        (
+            "POST",
             "/api/v1/agents/worker/heartbeat",
             post(routes::worker_heartbeat),
-        )
-        .layer(DefaultBodyLimit::max(limit))
-        .with_state(api)
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/step",
+            post(routes::worker_step),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/effects/complete",
+            post(routes::effect_complete),
+        ),
+        (
+            "POST",
+            "/api/v1/agents/worker/effects/fail",
+            post(routes::effect_fail),
+        ),
+        ("GET", "/api/v1/agents/effects", get(routes::effects)),
+        (
+            "GET",
+            "/api/v1/agents/effects/{effect}",
+            get(routes::effect_inspect),
+        ),
+        ("POST", "/api/v1/agents/reconcile", post(routes::reconcile)),
+    ]
 }
 
 async fn health(State(api): State<routes::Api>) -> Json<HealthBody> {
@@ -235,7 +301,47 @@ mod tests {
             Arc::new(AgentsReadiness::new()),
             Arc::new(ravel_object_store::memory::MemoryStore::new()),
         ));
-        router(runtime, resolver)
+        router(
+            runtime,
+            resolver,
+            Arc::new(ravel_maintain::NoopQueryAuditSink),
+        )
+    }
+
+    /// The router mounts exactly the [`ROUTES`] table: the handler list is
+    /// the table, entry for entry, and every entry answers its method
+    /// unauthenticated with 401, not 404 or 405.
+    #[tokio::test]
+    async fn every_route_in_the_table_is_mounted_and_nothing_else() {
+        let listed: Vec<(&str, &str)> = mounted().iter().map(|(m, p, _)| (*m, *p)).collect();
+        assert_eq!(listed, ROUTES.to_vec());
+        for (method, path) in ROUTES {
+            let uri = path.replace("{effect}", "not-a-handle");
+            let response = test_router(settings())
+                .oneshot(
+                    Request::builder()
+                        .method(*method)
+                        .uri(uri.as_str())
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router answers");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+        let unlisted = test_router(settings())
+            .oneshot(
+                Request::post("/api/v1/agents/timers")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(unlisted.status(), StatusCode::NOT_FOUND);
     }
 
     /// `worker/poll` asking for a 60 s wait answers with no assignment once

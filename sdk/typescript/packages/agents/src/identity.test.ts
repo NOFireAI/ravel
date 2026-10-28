@@ -61,6 +61,17 @@ describe("identity", () => {
     );
   });
 
+  it("canonical step input and its hash match the identity/step_input_hash fixture", () => {
+    // Written by wire::fixtures::step_input_hash_fixture_matches_the_canonical_encoding.
+    const fixture = JSON.parse(
+      readFileSync(resolve(fixtures, "identity/step_input_hash.json"), "utf8"),
+    ) as { tool_name: string; tool_version: string; input: unknown; canonical: string; input_hash: string };
+    expect(canonicalJson(jsonForm(fixture.input))).toBe(fixture.canonical);
+    expect(
+      stepInputHash(fixture.tool_name, fixture.tool_version, new TextEncoder().encode(fixture.canonical)),
+    ).toBe(fixture.input_hash);
+  });
+
   it("turn random seed matches the worker_poll_response fixture's lease", () => {
     // The Rust fixture writer fills the lease's random_seed with
     // wire::turn_random_seed(agent_id, incarnation, accept_seq).
