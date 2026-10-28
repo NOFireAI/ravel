@@ -18,7 +18,8 @@ CONSTANTS
     ReceiptDiscarded,            \* completion drops the consumed input's receipt
     StaleTimerGenerationFired,   \* fire a hint without the armed-generation check
     EarlyHintForgotten,          \* the sweep deletes a hint it sees early
-    StaleTurnRebase              \* rebase a completion whose turn is gone
+    StaleTurnRebase,             \* rebase a completion whose turn is gone
+    RebaseIgnoresCancelRequest   \* rebase completes a turn whose input was cancelled
 
 ASSUME AckBeforeCas \in BOOLEAN
 ASSUME HeadBeforeDependency \in BOOLEAN
@@ -30,6 +31,7 @@ ASSUME ReceiptDiscarded \in BOOLEAN
 ASSUME StaleTimerGenerationFired \in BOOLEAN
 ASSUME EarlyHintForgotten \in BOOLEAN
 ASSUME StaleTurnRebase \in BOOLEAN
+ASSUME RebaseIgnoresCancelRequest \in BOOLEAN
 
 \* --- Broken client steps --------------------------------------------------
 
@@ -114,6 +116,21 @@ BrokenStaleTurnRebase(w) ==
     /\ SetWk(w, WorkerIdle)
     /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
+\* Reapply the completion computed from the read root on the new root, so a
+\* cancellation requested between the two is lost.
+BrokenRebaseIgnoresCancelRequest(w) ==
+    /\ RebaseIgnoresCancelRequest
+    /\ wk[w].pc = "rebase"
+    /\ HeadUp(wk[w].ak)
+    /\ LET ak == wk[w].ak
+           h == Head(ak)
+       IN /\ ~OwnResult(w, h) /\ ~h.tomb /\ h.owner = w /\ h.epoch = wk[w].epoch
+          /\ h.active.turn = wk[w].turn /\ h.sv = wk[w].base
+          /\ h.active.creq
+          /\ CasNow(ak, CompleteHead([h EXCEPT !.active.creq = FALSE], wk[w], "completed", w))
+    /\ SetWk(w, WorkerIdle)
+    /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
+
 BrokenCursorWithoutResult(w) ==
     /\ CursorWithoutResult
     /\ wk[w].pc = "dep"
@@ -158,6 +175,7 @@ Broken ==
          \/ BrokenOverwriteStaleRoot(c) \/ BrokenRequestHashMismatchAccepted(c)
     \/ \E w \in Workers :
          \/ BrokenEpochCheckedOutsideCas(w) \/ BrokenStaleTurnRebase(w)
+         \/ BrokenRebaseIgnoresCancelRequest(w)
          \/ BrokenCursorWithoutResult(w) \/ BrokenReceiptDiscarded(w)
     \/ \E ak \in AKs :
          \/ \E g \in 1..MaxTimerGen :
