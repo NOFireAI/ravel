@@ -9,7 +9,12 @@ on.
 
 - Revision: `8ee0bd2564ab9b5cb70ea27c76f41d11723c9c35` (tree
   `4c08bec3441a1cc5e7e0584a427256b538c25b85`, the suffix of every
-  `check-tla.sh` run id below).
+  `check-tla.sh` run id below except R20's). R20 ran on tree
+  `e449059f413debc266750904096acf322662f99f`, this task's working tree late
+  in the task: it differs from `4c08bec` only in `REPORT.md`, this file, the
+  agents `README.md`, `bands.tsv` and the header comment of
+  `MCAgentProtocol.exhaustive.cfg`, so its `.tla` modules and every other
+  `.cfg` are the ones the other rows measured.
 - Tool: `tla2tools` 1.7.4 (TLC2 version 2.19), Java 21.0.13 (Temurin).
 - Host: fleet executor, x86_64, 16 cores, 30.6 GiB memory.
 - TLC settings on every run: `-workers 2`, `-Xmx4g`, `-XX:+UseParallelGC`,
@@ -23,6 +28,12 @@ on.
   ran beside each other and beside R4 to R12 and R16 to R19, at most four TLC
   processes at once with two workers each. Wall times are this host's under
   that load.
+- Runner settings: these bands were measured at two workers and a 4 GiB
+  heap. The nightly runner (`tla-nightly.yml`) runs with
+  `RAVEL_TLA_WORKERS: auto` and the harness's 2 GiB default heap, so the
+  first nightly after this change is the first check of the exhaustive bands
+  at the runner's settings. Pinning `RAVEL_TLA_XMX=4g` in `tla-nightly.yml`
+  is a recommended follow-up.
 
 ## Runs
 
@@ -63,7 +74,10 @@ moves between runs of the same config under two workers: 222504 to 222728
 for the smoke config (R2, R7 to R9, R20) and 1942312 to 1944848 for the
 exhaustive config (R11, R16, R17). The other configs gave the same distinct
 figure each time they were run (R1 and R4 share a state space). The bands are
-wide enough for that spread.
+wide enough for that spread. These ranges are what this host observed, not the
+full spread: a later smoke run on another host (macOS, Java 25, two workers,
+2 GiB heap) gave 222807 distinct for the smoke config, outside the recorded
+range and inside its band.
 
 `MCAgentProtocol.exhaustive.cfg` at MaxTimerGen 1 measured 1266296 distinct
 states (R12). Its header comment and the T17 notes gave 362907 from an
@@ -89,20 +103,27 @@ worker by `positive/integrated-timer-race.cfg` (R6).
 
 ## What each lane checks
 
-- smoke (ci.yml's TLA job): the three smoke configs to completion, each inside
-  its band (R1 to R3). It checks every invariant at the smoke bounds; it
-  checks no liveness and no timer in `AgentProtocol` or `AgentIntegrated`.
-- negative (ci.yml's TLA job): each of the 42 negative configs must violate
-  its named property (R10). It checks that each switch is caught; it pins no
-  state count, since TLC stops at the first counterexample.
-- positive: the three positive configs to completion inside their bands (R4 to
-  R6). It checks the second timer generation in `AgentProtocol` and the timer
-  race in `AgentIntegrated` with one worker; it checks no liveness.
-- live (tla-nightly): the two live configs to completion inside their bands
-  (R18, R19), safety and liveness at one worker and one epoch. It does not
-  check liveness with takeover, and `AgentProtocol` has no live config: its
-  liveness runs in its exhaustive config.
-- exhaustive (tla-nightly): `MCAgentProtocol.exhaustive.cfg` at MaxTimerGen 1
+Smoke, live, positive, negative and traceability run on every pull request
+that touches `formal/` through ci.yml's TLA job, `check-tla.sh ci -a <area>`
+(with `RAVEL_TLA_WORKERS: auto`). Only the exhaustive lane runs in
+`tla-nightly.yml`.
+
+- smoke (ci.yml, per pull request): the three smoke configs to completion,
+  each inside its band (R1 to R3). It checks every invariant at the smoke
+  bounds; it checks no liveness and no timer in `AgentProtocol` or
+  `AgentIntegrated`.
+- negative (ci.yml, per pull request): each of the 42 negative configs must
+  violate its named property (R10). It checks that each switch is caught; it
+  pins no state count, since TLC stops at the first counterexample.
+- positive (ci.yml, per pull request): the three positive configs to
+  completion inside their bands (R4 to R6). It checks the second timer
+  generation in `AgentProtocol` and the timer race in `AgentIntegrated` with
+  one worker; it checks no liveness.
+- live (ci.yml, per pull request): the two live configs to completion inside
+  their bands (R18, R19), safety and liveness at one worker and one epoch. It
+  does not check liveness with takeover, and `AgentProtocol` has no live
+  config: its liveness runs in its exhaustive config.
+- exhaustive (tla-nightly.yml, nightly): `MCAgentProtocol.exhaustive.cfg` at MaxTimerGen 1
   with both liveness properties (R12) and `MCAgentEffects.exhaustive.cfg`,
   safety only (R11), each inside its band and its 3000 s budget. It does not
   check `AgentProtocol` at a second timer generation, nor `AgentIntegrated`

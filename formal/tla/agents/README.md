@@ -667,7 +667,12 @@ Budgets and the nightly bound rest on the T20 runs in
 [`results.md`](results.md) (fleet executor, x86_64, 16 cores, `-workers 2`,
 `-Xmx4g`, revision `8ee0bd2`). Each exhaustive row's `budget_s` is 3000 s.
 The nightly runner's speed was not measured: these wall times are this
-host's.
+host's. The runner's settings differ too: the bands were measured at two
+workers and a 4 GiB heap, while `tla-nightly.yml` runs with
+`RAVEL_TLA_WORKERS: auto` and the harness's 2 GiB default heap, so the first
+nightly after T20 is the first check of the exhaustive bands at the runner's
+settings. Pinning `RAVEL_TLA_XMX=4g` in `tla-nightly.yml` is a recommended
+follow-up.
 
 - `MCAgentProtocol.exhaustive.cfg` at `MaxTimerGen = 1` finished: 1266296
   distinct states at depth 27 in 1082 s, both liveness properties checked
