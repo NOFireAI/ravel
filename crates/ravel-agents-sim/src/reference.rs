@@ -12,9 +12,11 @@
 //!   `destroy` bumps the incarnation, and every handle from an earlier
 //!   incarnation is refused as `AgentGone` (decision 3).
 //! - `send` is keyed by handler and request id within one incarnation: the
-//!   same id with the same request hash returns the recorded handle, a
-//!   different hash is `IdempotencyConflict`, and a new id takes the next
-//!   `accept_seq` (decision 5).
+//!   same id with the same payload bytes returns the recorded handle,
+//!   different bytes are `IdempotencyConflict`, and a new id takes the next
+//!   `accept_seq` (decision 5). The receipt holds the payload bytes rather
+//!   than the production `request_hash`, so the check does not share the
+//!   code under test.
 //! - Turns start one at a time in `accept_seq` order, and each input reaches
 //!   exactly one terminal result per incarnation (decisions 5 and 6).
 //! - `cancel` is idempotent. A terminal input reports its terminal status,
@@ -50,7 +52,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ravel_agents_core::error::ErrorKind;
-use ravel_agents_core::identity::{AgentId, Hash256, agent_id, request_hash, timer_id};
+use ravel_agents_core::identity::{AgentId, agent_id, timer_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind, KeyError};
 use ravel_agents_core::state::{Handle, HandleItem};
 use ravel_agents_core::wire::{OperationStatus, TimerCancelOutcome};
@@ -203,7 +205,10 @@ struct Life {
     tombstoned: bool,
     next_accept_seq: u64,
     inputs: BTreeMap<u64, Input>,
-    receipts: HashMap<(String, String), (Hash256, u64)>,
+    /// Receipts keyed by (handler, request id), holding the accepted payload
+    /// bytes, so idempotency is judged on the bytes and not on the
+    /// production `request_hash`.
+    receipts: HashMap<(String, String), (Vec<u8>, u64)>,
     state_version: u64,
     running: Option<u64>,
     timers: HashMap<String, Timer>,
@@ -418,10 +423,9 @@ impl ReferenceMachine {
             Ok(life) => life,
             Err(reply) => return reply,
         };
-        let hash = request_hash(handler, payload);
         let receipt = (handler.to_string(), request_id.to_string());
         if let Some((recorded, seq)) = life.receipts.get(&receipt) {
-            return if *recorded == hash {
+            return if recorded.as_slice() == payload {
                 Reply::Accepted {
                     operation: Handle::operation(agent, life.incarnation, *seq),
                     duplicate: true,
@@ -431,7 +435,7 @@ impl ReferenceMachine {
             };
         }
         let seq = life.accept();
-        life.receipts.insert(receipt, (hash, seq));
+        life.receipts.insert(receipt, (payload.to_vec(), seq));
         Reply::Accepted {
             operation: Handle::operation(agent, life.incarnation, seq),
             duplicate: false,
@@ -771,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_send_with_the_same_hash_returns_the_same_handle() {
+    fn duplicate_send_with_the_same_payload_returns_the_same_handle() {
         let m = machine();
         let op = m.operation(1, 1);
         let h = history(vec![
@@ -791,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_send_with_a_different_hash_conflicts() {
+    fn duplicate_send_with_a_different_payload_conflicts() {
         let m = machine();
         let op = m.operation(1, 1);
         let h = history(vec![
@@ -806,6 +810,34 @@ mod tests {
             (send("r1", b"hi"), accepted(op, true)),
         ]);
         assert_eq!(h.check(m), Ok(()));
+    }
+
+    #[test]
+    fn a_receipt_holds_the_payload_bytes_it_accepted() {
+        // Same id, payloads one trailing byte apart: the receipt compares
+        // the bytes, so the longer one conflicts and the original still
+        // dedupes after the conflict.
+        let m = machine();
+        let op = m.operation(1, 1);
+        let h = history(vec![
+            (client(ClientOp::Create), created(1, true)),
+            (send("r1", b"{\"n\":1}"), accepted(op, false)),
+            (
+                send("r1", b"{\"n\":1} "),
+                Reply::Error(ErrorKind::IdempotencyConflict),
+            ),
+            (send("r1", b"{\"n\":1}"), accepted(op, true)),
+        ]);
+        assert_eq!(h.check(m.clone()), Ok(()));
+
+        let mut probe = m;
+        probe.apply(&client(ClientOp::Create));
+        probe.apply(&send("r1", b"{\"n\":1}"));
+        let receipts = &probe.life.as_ref().expect("created").receipts;
+        assert_eq!(
+            receipts.get(&("reply".to_string(), "r1".to_string())),
+            Some(&(b"{\"n\":1}".to_vec(), 1))
+        );
     }
 
     #[test]

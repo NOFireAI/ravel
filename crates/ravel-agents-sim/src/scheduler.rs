@@ -210,8 +210,11 @@ pub struct ScheduleOutcome {
     pub ends: Vec<ActorEnd>,
     /// One entry per settle that hit the bound: the actor that neither
     /// finished nor reached a gate, and the trace length at that point.
-    /// Each such settle advanced paused time by the whole settle bound, so
-    /// a lease or timer deadline may have expired without a step asking
+    /// Entries recorded in one settle round share that round's deadline:
+    /// the round advanced paused time by one settle bound in total, however
+    /// many of its actors timed out
+    /// (`tests::timeouts_in_one_settle_round_share_one_deadline`). A lease
+    /// or timer deadline may therefore have expired without a step asking
     /// for it.
     pub settle_timeouts: Vec<(String, usize)>,
 }
@@ -894,6 +897,50 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         sim_assert_eq!(outcome, outcome.trace.len(), 1);
         sim_assert_eq!(outcome, outcome.settle_timeouts, vec![("P".to_string(), 0)]);
+    }
+
+    #[test]
+    fn timeouts_in_one_settle_round_share_one_deadline() {
+        // P1 and P2 both outlast the bound in the first settle round. W's
+        // read is released only after that round, and it sees one bound of
+        // virtual time gone, not two.
+        let released_at = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&released_at);
+        let sleeper = |name: &str| {
+            Actor::client(name, |_store: ActorStore| async move {
+                tokio::time::sleep(Duration::from_secs(100)).await;
+                Ok(())
+            })
+        };
+        let outcome = Scheduler::new(AgentSeeds::new(3), ScheduleScript::new(Vec::new()))
+            .with_settle_bound(Duration::from_secs(60))
+            .run(
+                store_with_head(),
+                vec![
+                    sleeper("P1"),
+                    sleeper("P2"),
+                    Actor::worker("W", move |store: ActorStore| async move {
+                        let start = tokio::time::Instant::now();
+                        store
+                            .get(HEAD, GetRange::Full)
+                            .await
+                            .map_err(|e| format!("get: {e}"))?;
+                        *seen.lock().map_err(|e| e.to_string())? = Some(start.elapsed());
+                        Ok(())
+                    }),
+                ],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        sim_assert_eq!(
+            outcome,
+            outcome.settle_timeouts,
+            vec![("P1".to_string(), 0), ("P2".to_string(), 0)]
+        );
+        sim_assert_eq!(
+            outcome,
+            *released_at.lock().expect("lock"),
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]

@@ -8,16 +8,22 @@ description = "Dev-only deterministic simulation of Ravel Agents (ADR-3331 decis
 
 [dependencies]
 ravel-agents-core = { workspace = true }
+ravel-agents-runtime = { workspace = true }
+ravel-agents-store = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-sim = { path = "../ravel-sim", version = "0.27.0" }
+ravel-types = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 rand = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "macros", "test-util"] }
 
 [dev-dependencies]
 ravel-test-support = { workspace = true }
-bytes = { workspace = true }
 proptest = { workspace = true }
 
 [lints]
