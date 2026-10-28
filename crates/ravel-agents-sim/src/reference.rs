@@ -1634,6 +1634,237 @@ mod tests {
         assert_eq!(h.check(m), Ok(()));
     }
 
+    fn call(policy: RecoveryPolicy) -> StepCall {
+        StepCall {
+            key: "lookup".into(),
+            tool: "crm".into(),
+            version: "v1".into(),
+            input: b"q".to_vec(),
+            policy,
+        }
+    }
+
+    fn step(operation: Handle, policy: RecoveryPolicy) -> Event {
+        Event::Step {
+            operation,
+            step: call(policy),
+        }
+    }
+
+    fn result(operation: Handle, attempt: u32, bytes: &[u8]) -> Event {
+        Event::EffectResult {
+            operation,
+            step_key: "lookup".into(),
+            attempt,
+            result: bytes.to_vec(),
+        }
+    }
+
+    fn refused(kind: ErrorKind) -> Reply {
+        Reply::Error(kind)
+    }
+
+    /// Create, send `r1` and start its turn.
+    fn running(op: Handle) -> Vec<(Event, Reply)> {
+        vec![
+            (client(ClientOp::Create), created(1, true)),
+            (send("r1", b"hi"), accepted(op, false)),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+        ]
+    }
+
+    #[test]
+    fn at_least_once_dispatches_once_per_session_and_records_one_result() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let alo = RecoveryPolicy::AtLeastOnce;
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, alo), Reply::StepDispatched { attempt: 1 }),
+            // The attempt is still open in this session.
+            (step(op, alo), refused(ErrorKind::IdempotencyConflict)),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (step(op, alo), Reply::StepDispatched { attempt: 2 }),
+            // A superseded attempt reporting first is evidence only.
+            (result(op, 1, b"old"), Reply::EffectEvidence),
+            (result(op, 3, b"new"), refused(ErrorKind::OwnershipLost)),
+            (result(op, 2, b"new"), Reply::EffectRecorded),
+            (result(op, 2, b"new"), Reply::EffectRecorded),
+            (result(op, 2, b"other"), refused(ErrorKind::IdempotencyConflict)),
+            (result(op, 1, b"old"), Reply::EffectEvidence),
+            (
+                step(op, alo),
+                Reply::StepCompleted {
+                    output: b"new".to_vec(),
+                },
+            ),
+            (
+                Event::StepStarted {
+                    operation: op,
+                    step: call(alo),
+                },
+                Reply::StepJournaled {
+                    completed: true,
+                    effect: Some(EffectView {
+                        phase: EffectPhase::Completed,
+                        attempt: 2,
+                    }),
+                },
+            ),
+        ]);
+        assert_eq!(history(steps).check(m), Ok(()));
+    }
+
+    #[test]
+    fn provider_idempotency_redispatches_the_same_attempt() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let pi = RecoveryPolicy::ProviderIdempotency;
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, pi), Reply::StepDispatched { attempt: 1 }),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (step(op, pi), Reply::StepDispatched { attempt: 1 }),
+        ]);
+        assert_eq!(history(steps.clone()).check(machine()), Ok(()));
+        let last = steps.len() - 1;
+        steps[last].1 = Reply::StepDispatched { attempt: 2 };
+        assert!(history(steps).check(m).is_err());
+    }
+
+    #[test]
+    fn manual_goes_in_doubt_until_an_operator_authorizes_the_next_attempt() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let manual = RecoveryPolicy::Manual;
+        let authorize = |attempt| Event::ReconcileAuthorize {
+            operation: op,
+            step_key: "lookup".into(),
+            attempt,
+        };
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, manual), Reply::StepDispatched { attempt: 1 }),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (step(op, manual), refused(ErrorKind::EffectInDoubt)),
+            (step(op, manual), refused(ErrorKind::EffectInDoubt)),
+            (authorize(3), refused(ErrorKind::OwnershipLost)),
+            (authorize(2), Reply::Reconciled { dispatched: true }),
+            (authorize(2), Reply::Reconciled { dispatched: false }),
+            (result(op, 1, b"late"), Reply::EffectEvidence),
+            (result(op, 2, b"done"), Reply::EffectRecorded),
+            (
+                step(op, manual),
+                Reply::StepCompleted {
+                    output: b"done".to_vec(),
+                },
+            ),
+        ]);
+        assert_eq!(history(steps).check(m), Ok(()));
+    }
+
+    #[test]
+    fn manual_redispatch_after_a_new_session_diverges() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let manual = RecoveryPolicy::Manual;
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, manual), Reply::StepDispatched { attempt: 1 }),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (step(op, manual), Reply::StepDispatched { attempt: 2 }),
+        ]);
+        assert!(history(steps).check(m).is_err());
+    }
+
+    #[test]
+    fn reconcile_attach_settles_an_effect_in_doubt() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let manual = RecoveryPolicy::Manual;
+        let attach = |bytes: &[u8]| Event::ReconcileAttach {
+            operation: op,
+            step_key: "lookup".into(),
+            result: bytes.to_vec(),
+        };
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, manual), Reply::StepDispatched { attempt: 1 }),
+            // Attach needs an effect in doubt or already settled.
+            (attach(b"v"), refused(ErrorKind::OwnershipLost)),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (step(op, manual), refused(ErrorKind::EffectInDoubt)),
+            (attach(b"v"), Reply::EffectRecorded),
+            (attach(b"v"), Reply::EffectRecorded),
+            (attach(b"w"), refused(ErrorKind::IdempotencyConflict)),
+            (
+                step(op, manual),
+                Reply::StepCompleted {
+                    output: b"v".to_vec(),
+                },
+            ),
+        ]);
+        assert_eq!(history(steps).check(m), Ok(()));
+    }
+
+    #[test]
+    fn a_requested_cancel_stops_new_dispatches() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let alo = RecoveryPolicy::AtLeastOnce;
+        let other = Event::Step {
+            operation: op,
+            step: StepCall {
+                key: "notify".into(),
+                ..call(alo)
+            },
+        };
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, alo), Reply::StepDispatched { attempt: 1 }),
+            (
+                client(ClientOp::Cancel { operation: op }),
+                Reply::Cancel {
+                    status: OperationStatus::Running,
+                    requested: true,
+                },
+            ),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (step(op, alo), refused(ErrorKind::OwnershipLost)),
+            (other, refused(ErrorKind::OwnershipLost)),
+            // The open attempt may still report.
+            (result(op, 1, b"r"), Reply::EffectRecorded),
+            (
+                step(op, alo),
+                Reply::StepCompleted {
+                    output: b"r".to_vec(),
+                },
+            ),
+        ]);
+        assert_eq!(history(steps).check(m), Ok(()));
+    }
+
+    #[test]
+    fn a_changed_step_call_blocks_the_agent() {
+        let m = machine();
+        let op = m.operation(1, 1);
+        let alo = RecoveryPolicy::AtLeastOnce;
+        let changed = Event::Step {
+            operation: op,
+            step: StepCall {
+                input: b"other".to_vec(),
+                ..call(alo)
+            },
+        };
+        let mut steps = running(op);
+        steps.extend([
+            (step(op, alo), Reply::StepDispatched { attempt: 1 }),
+            (Event::TurnStarted { operation: op }, Reply::TurnStarted),
+            (changed, refused(ErrorKind::NonDeterministicReplay)),
+        ]);
+        assert_eq!(history(steps).check(m), Ok(()));
+    }
+
     mod invariants {
         use super::*;
         use proptest::prelude::*;
