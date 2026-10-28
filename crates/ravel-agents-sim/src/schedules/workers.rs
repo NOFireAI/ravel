@@ -630,7 +630,7 @@ fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
 /// shared by `OwnershipLost` and `OutcomeUnknown`, so the second unknown
 /// escapes, where the runtime's failure module says `BeginTurn` is settled.
 #[test]
-#[ignore = "suspected defect: poll returns OutcomeUnknown when a BeginTurn retry loses its answer"]
+#[ignore = "suspected defect, issue #3425: poll returns OutcomeUnknown when a BeginTurn retry loses its answer"]
 fn a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll() {
     assert_eq!(kills(11_000_167).escaped_unknown, 0);
 }

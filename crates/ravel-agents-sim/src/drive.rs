@@ -159,6 +159,11 @@
 //!   in place of its wake
 //!   (`schedules::timers::a_sweep_whose_fire_write_fails_is_a_store_unavailable_refusal`).
 //!   A crashed pass keeps only its writes; no schedule crashes a pass.
+//!   A pass answered with an error the history cannot take
+//!   (`OutcomeUnknown`, or a modelled error such as `AgentGone`) is
+//!   unmappable
+//!   (`tests::a_sweep_answered_with_an_error_the_history_cannot_take_is_unmappable`);
+//!   no schedule reaches this.
 //!
 //! # Calls that never answered
 //!
@@ -188,7 +193,9 @@
 //! (`tests::a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost`,
 //! reached by
 //! `schedules::effects::a_worker_dead_between_its_step_journal_and_its_cancel_check_is_fenced`).
-//! `OwnershipLost` inferred for any other crashed write stays unmappable.
+//! `OwnershipLost` inferred for any other crashed write stays unmappable,
+//! including a step whose root holds no journaled start
+//! (`tests::a_step_crashed_past_a_cancel_with_no_journaled_start_is_unmappable`).
 //!
 //! Anything else the driver cannot map is listed in [`Run::unmappable`],
 //! and every schedule asserts that list is empty.
@@ -729,7 +736,8 @@ const SWEEP: &str = "sweep";
 /// for a pass that completed with no failed HEAD write, an [`Event::Wake`]
 /// at its last HEAD access answered with nothing left to fire. A pass with
 /// a failed HEAD write is a [`Refusal`] of `StoreUnavailable` instead of
-/// that wake. A crashed or refused pass keeps only its writes.
+/// that wake. A crashed or refused pass keeps only its writes; a pass
+/// answered with anything else is unmappable.
 fn sweep_items(
     entry: &Entry,
     order: usize,
@@ -755,8 +763,21 @@ fn sweep_items(
             Err(what) => unmappable.push(format!("{} sweep: {what}", entry.actor)),
         }
     }
-    if entry.observed != Some(Observed::Swept) {
-        return;
+    match &entry.observed {
+        Some(Observed::Swept) => {}
+        Some(Observed::Refused(_)) | None => return,
+        Some(Observed::Unmappable(what)) => {
+            unmappable.push(format!("{} sweep: {what}", entry.actor));
+            return;
+        }
+        Some(Observed::Modelled(reply)) => {
+            unmappable.push(format!("{} sweep: answered {reply:?}", entry.actor));
+            return;
+        }
+        Some(Observed::Skip) => {
+            unmappable.push(format!("{} sweep: answered with no event", entry.actor));
+            return;
+        }
     }
     if stamps.failed_puts > 0 {
         refusals.push(Refusal {
@@ -864,7 +885,8 @@ fn crashed_step(
         .steps
         .iter()
         .any(|s| s.step_key == step.key && s.status == StepStatus::Completed);
-    let start_only = written.is_none() && !completed;
+    let journaled = head.steps.iter().any(|s| s.step_key == step.key);
+    let start_only = journaled && written.is_none() && !completed;
     let mut ran = shadow.clone();
     let event = Event::Step {
         operation: *operation,
@@ -1906,8 +1928,8 @@ pub fn status_of(head: &Head, accept_seq: u64) -> Option<OperationStatus> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_agents_core::head::{EffectRecord, RecoveryPolicy as HeadPolicy};
-    use ravel_agents_core::identity::{Hash256, Id128};
+    use ravel_agents_core::head::{EffectRecord, RecoveryPolicy as HeadPolicy, StepRecord};
+    use ravel_agents_core::identity::{Hash256, Id128, step_id};
 
     use super::*;
 
@@ -2012,20 +2034,23 @@ mod tests {
         assert_eq!(run.check(), Ok(()));
     }
 
-    #[test]
-    fn a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost() {
+    /// Build the run of a step that crashed after a cancel, having written
+    /// a root that holds the step's journaled start when `journaled`, and
+    /// no trace of the step otherwise.
+    fn crashed_past_a_cancel(journaled: bool) -> (Run, Event) {
         let rec = Recorder::default();
         let mut reference = machine().expect("machine");
         let op = accepted(&rec, &mut reference);
+        let step = StepCall {
+            key: "lookup".to_string(),
+            tool: "search".to_string(),
+            version: "v1".to_string(),
+            input: b"q".to_vec(),
+            policy: RecoveryPolicy::AtLeastOnce,
+        };
         let run_step = Event::Step {
             operation: op,
-            step: StepCall {
-                key: "lookup".to_string(),
-                tool: "search".to_string(),
-                version: "v1".to_string(),
-                input: b"q".to_vec(),
-                policy: RecoveryPolicy::AtLeastOnce,
-            },
+            step: step.clone(),
         };
         answered(
             &rec,
@@ -2035,23 +2060,76 @@ mod tests {
         );
         let cancel = Event::Client(ClientOp::Cancel { operation: op });
         answered(&rec, &mut reference, cancel, 4);
-        // The step journaled its start, no attempt, then the process died
-        // before the cancel check that would have refused it.
         let rig = Rig::new(FaultPlan::empty());
         rig.setup(|p| async move {
             p.create().await.map_err(|e| format!("create: {e:?}"))?;
             Ok(())
         })
         .expect("setup");
-        let head = rig.head().expect("head");
+        let mut head = rig.head().expect("head");
+        if journaled {
+            head.steps.push(StepRecord {
+                step_id: step_id(1, 1, &step.key),
+                step_key: step.key.clone(),
+                tool_name: step.tool.clone(),
+                tool_version: step.version.clone(),
+                input_hash: Hash256([0; 32]),
+                status: StepStatus::Started,
+                output: None,
+            });
+        }
         crashed(&rec, run_step.clone(), 5, Bytes::from(head.encode()));
-        let run = rec.build().expect("build");
+        (rec.build().expect("build"), run_step)
+    }
+
+    #[test]
+    fn a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost() {
+        // The step journaled its start, no attempt, then the process died
+        // before the cancel check that would have refused it.
+        let (run, run_step) = crashed_past_a_cancel(true);
         assert_eq!(run.unmappable, Vec::<String>::new());
         assert_eq!(run.inferred, vec![("w2".to_string(), run_step.clone())]);
         let last = run.history.calls().last().expect("a call");
         assert_eq!(last.event, run_step);
         assert_eq!(last.observed, Reply::Error(ErrorKind::OwnershipLost));
         assert_eq!(run.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_step_crashed_past_a_cancel_with_no_journaled_start_is_unmappable() {
+        let (run, run_step) = crashed_past_a_cancel(false);
+        assert_eq!(
+            run.unmappable,
+            vec![format!(
+                "w2: applied a write the reference refuses OwnershipLost: {run_step:?}"
+            )]
+        );
+        assert_eq!(run.inferred, vec![("w2".to_string(), run_step)]);
+    }
+
+    #[test]
+    fn a_sweep_answered_with_an_error_the_history_cannot_take_is_unmappable() {
+        let rec = Recorder::default();
+        let wake = Event::Wake {
+            now_unix_ns: 10,
+            by: WakeSource::Sweep,
+        };
+        let (unknown, cell) = rec.begin("w1", SWEEP, Some(wake.clone()));
+        lock(&cell).read = Some(1);
+        rec.finish(unknown, None, map_error(ErrorKind::OutcomeUnknown));
+        let (gone, cell) = rec.begin("w2", SWEEP, Some(wake));
+        lock(&cell).read = Some(2);
+        rec.finish(gone, None, map_error(ErrorKind::AgentGone));
+        let run = rec.build().expect("build");
+        assert_eq!(
+            run.unmappable,
+            vec![
+                "w1 sweep: OutcomeUnknown reached the caller".to_string(),
+                "w2 sweep: answered Error(AgentGone)".to_string(),
+            ]
+        );
+        assert_eq!(run.history.calls().len(), 0);
+        assert_eq!(run.refusals, Vec::new());
     }
 
     /// Build the run of a step that crashed after writing a root whose

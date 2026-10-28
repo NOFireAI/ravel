@@ -173,8 +173,8 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # which no longer reached the build (#3146). Raised 109->115 when ci.yml
 # gained the features-agents and features-mcp jobs (a checkout and a
 # rust-cache each) and the sdk job (a checkout and a setup-node), epic
-# #3331 task T2. Raised 115->118 when sim-nightly.yml was added (a checkout,
-# a rust-cache and an upload-artifact), epic #3331 task T22.
+# #3331 task T2. Raised 115->118 when sim-nightly.yml gained the agents-sim
+# job (a checkout, a rust-cache and an upload-artifact), epic #3331 task T22.
 WORKFLOW_EXPECTED_ACTION_COUNT=118
 
 # Exact number of `image:` lines across the two quickstart compose files:
