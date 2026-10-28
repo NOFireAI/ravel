@@ -163,19 +163,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ravel_agents_core::error::{AgentError, ErrorKind};
-use ravel_agents_core::head::{EffectStatus, Head, StepStatus};
-use ravel_agents_core::identity::{AgentId, agent_id, effect_id, step_input_hash};
+use ravel_agents_core::head::{EffectStatus, Head, InputSource, StepStatus};
+use ravel_agents_core::identity::{AgentId, agent_id, effect_id, step_input_hash, timer_id};
 use ravel_agents_core::kernel::DerivedIds;
 use ravel_agents_core::keys::{AgentKey, AgentKind, head_key};
 use ravel_agents_core::state::{Handle, HandleItem, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, CancelRequest, CancelResponse, CreateAgentRequest, CreateAgentResponse,
-    HandlerPinBody, OperationStatus, SendRequest, SendResponse, TurnAssignment, TurnOutcome,
-    WorkerCommitRequest, WorkerCommitResponse, WorkerPollRequest,
+    AgentRef, CancelRequest, CancelResponse, CancelTimerRequest, CancelTimerResponse,
+    CreateAgentRequest, CreateAgentResponse, HandlerPinBody, OperationStatus, SendRequest,
+    SendResponse, TimerRequest, TimerResponse, TurnAssignment, TurnOutcome, WorkerCommitRequest,
+    WorkerCommitResponse, WorkerPollRequest,
 };
 use ravel_agents_runtime::{
     Coordinator, DEFAULT_POLL_WAIT_CAP_MS, Dispatch, EffectDispatcher, EffectRef, EffectSettled,
-    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec,
+    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec, SweepConfig, SweepReport,
 };
 use ravel_agents_store::backoff::NoBackoff;
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
@@ -191,7 +192,7 @@ use serde_json::Value;
 use crate::history::History;
 use crate::reference::{
     ClientOp, EffectPhase, EffectView, Event, Outcome, RecoveryPolicy, ReferenceMachine, Reply,
-    StepCall,
+    StepCall, WakeSource,
 };
 
 /// The tenant every rig's store serves.
@@ -279,8 +280,13 @@ impl Rng for CountingRng {
 struct Stamps {
     /// Sequence number and body of the last HEAD write it applied.
     write: Option<(u64, Bytes)>,
+    /// Every HEAD write it applied, in order.
+    writes: Vec<(u64, Bytes)>,
     /// Sequence number of the last HEAD read it made.
     read: Option<u64>,
+    /// HEAD writes its process saw fail with anything but a lost race,
+    /// counted at the process's own store boundary, above every fault.
+    failed_puts: u64,
 }
 
 type Cell = Arc<Mutex<Stamps>>;
@@ -298,6 +304,9 @@ pub struct StampStore {
     inner: Arc<dyn ObjectStoreBackend>,
     seq: AtomicU64,
     head_puts: AtomicU64,
+    /// A process's boundary layer: it stamps nothing and only counts the
+    /// HEAD writes that failed, as the process saw them.
+    boundary: bool,
 }
 
 impl StampStore {
@@ -306,6 +315,15 @@ impl StampStore {
             inner,
             seq: AtomicU64::new(0),
             head_puts: AtomicU64::new(0),
+            boundary: false,
+        }
+    }
+
+    /// The layer [`Rig::proc`] puts directly under a process's store.
+    fn boundary(inner: Arc<dyn ObjectStoreBackend>) -> StampStore {
+        StampStore {
+            boundary: true,
+            ..StampStore::new(inner)
         }
     }
 
@@ -335,20 +353,36 @@ impl ObjectStoreBackend for StampStore {
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
         let head = is_head(key);
+        if self.boundary {
+            let out = self.inner.put(key, data, opts).await;
+            if head
+                && let Err(e) = &out
+                && !matches!(
+                    e,
+                    StoreError::PreconditionFailed | StoreError::AlreadyExists
+                )
+            {
+                let _ = CALL.try_with(|cell| lock(cell).failed_puts += 1);
+            }
+            return out;
+        }
         if head {
             self.head_puts.fetch_add(1, Ordering::SeqCst);
         }
         let body = data.clone();
         let out = self.inner.put(key, data, opts).await;
         if head && out.is_ok() {
-            self.stamp(|s, seq| s.write = Some((seq, body)));
+            self.stamp(|s, seq| {
+                s.writes.push((seq, body.clone()));
+                s.write = Some((seq, body));
+            });
         }
         out
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         let out = self.inner.get(key, range).await;
-        if is_head(key) && out.is_ok() {
+        if !self.boundary && is_head(key) && out.is_ok() {
             self.stamp(|s, seq| s.read = Some(seq));
         }
         out
@@ -423,6 +457,9 @@ pub enum Observed {
     Unmappable(String),
     /// Not an event: a poll that found nothing.
     Skip,
+    /// A sweep pass that completed. Its events are read from what it wrote;
+    /// see [`Recorder::build`].
+    Swept,
 }
 
 /// A recorded call answered with an error the reference does not model.
@@ -522,11 +559,22 @@ impl Recorder {
                     kind: *kind,
                 });
             }
+            if entry.call == SWEEP {
+                sweep_items(
+                    entry,
+                    order,
+                    &stamps,
+                    &mut items,
+                    &mut unmappable,
+                    &mut refusals,
+                );
+                continue;
+            }
             match (&entry.observed, applied, stamp) {
                 (Some(Observed::Unmappable(what)), _, _) => {
                     unmappable.push(format!("{} {}: {what}", entry.actor, entry.call));
                 }
-                (Some(Observed::Skip), _, _) => {}
+                (Some(Observed::Skip | Observed::Swept), _, _) => {}
                 (Some(Observed::Modelled(reply)), applied, Some(stamp)) => match &entry.event {
                     Some(event) => items.push(Item {
                         stamp,
@@ -627,6 +675,97 @@ impl Recorder {
             unmappable,
         })
     }
+}
+
+/// The name a sweep pass is recorded under.
+const SWEEP: &str = "sweep";
+
+/// Place a sweep pass in the history: one [`Event::TimerDue`] per HEAD
+/// write it applied, answered with the input that write enqueued, then,
+/// for a pass that completed with no failed HEAD write, an [`Event::Wake`]
+/// at its last HEAD access answered with nothing left to fire. A pass with
+/// a failed HEAD write is a [`Refusal`] of `StoreUnavailable` instead of
+/// that wake. A crashed or refused pass keeps only its writes.
+fn sweep_items(
+    entry: &Entry,
+    order: usize,
+    stamps: &Stamps,
+    items: &mut Vec<Item>,
+    unmappable: &mut Vec<String>,
+    refusals: &mut Vec<Refusal>,
+) {
+    let Some(Event::Wake { now_unix_ns, by }) = &entry.event else {
+        unmappable.push(format!("{} sweep: recorded without its clock", entry.actor));
+        return;
+    };
+    for (seq, body) in &stamps.writes {
+        match fired_by(body, *now_unix_ns) {
+            Ok((event, reply)) => items.push(Item {
+                stamp: *seq,
+                order,
+                actor: entry.actor.clone(),
+                event,
+                observed: Some(reply),
+                applied: Some(body.clone()),
+            }),
+            Err(what) => unmappable.push(format!("{} sweep: {what}", entry.actor)),
+        }
+    }
+    if entry.observed != Some(Observed::Swept) {
+        return;
+    }
+    if stamps.failed_puts > 0 {
+        refusals.push(Refusal {
+            actor: entry.actor.clone(),
+            call: entry.call,
+            kind: ErrorKind::StoreUnavailable,
+        });
+        return;
+    }
+    let last = stamps.writes.last().map(|(seq, _)| *seq).max(stamps.read);
+    if let Some(stamp) = last {
+        items.push(Item {
+            stamp,
+            order,
+            actor: entry.actor.clone(),
+            event: Event::Wake {
+                now_unix_ns: *now_unix_ns,
+                by: *by,
+            },
+            observed: Some(Reply::Woken(Vec::new())),
+            applied: None,
+        });
+    }
+}
+
+/// The fire a sweep's HEAD write `body` applied: the newest inbox entry,
+/// which a `FireTimer` enqueues from a timer, and that timer's key.
+fn fired_by(body: &Bytes, now_unix_ns: i64) -> Result<(Event, Reply), String> {
+    let head = Head::decode(body).map_err(|e| format!("root does not decode: {e:?}"))?;
+    let newest = head.next_accept_seq.saturating_sub(1);
+    let Some(input) = head.inbox.iter().find(|e| e.accept_seq == newest) else {
+        return Err(format!("wrote a root whose inbox lacks input {newest}"));
+    };
+    let InputSource::Timer {
+        timer_id,
+        generation,
+    } = input.source
+    else {
+        return Err(format!("wrote input {newest} from {:?}", input.source));
+    };
+    let Some(timer) = head.timers.iter().find(|t| t.timer_id == timer_id) else {
+        return Err(format!(
+            "input {newest} names a timer the root does not hold"
+        ));
+    };
+    Ok((
+        Event::TimerDue {
+            timer_key: timer.timer_key.clone(),
+            generation,
+            now_unix_ns,
+        },
+        Reply::TimerFired(Some(Handle::operation(agent(), head.incarnation, newest))),
+    ))
 }
 
 /// One call placed in the history.
@@ -772,7 +911,12 @@ impl Rig {
     }
 
     pub fn with_limits(plan: FaultPlan, limits: StoreLimits) -> Rig {
-        let memory = Arc::new(MemoryStore::new());
+        Rig::over(MemoryStore::new(), plan, limits)
+    }
+
+    /// A rig over `memory`, for a store with its own page size.
+    pub fn over(memory: MemoryStore, plan: FaultPlan, limits: StoreLimits) -> Rig {
+        let memory = Arc::new(memory);
         let stamps = Arc::new(StampStore::new(memory.clone()));
         let rules = Arc::new(FaultStore::new(stamps.clone(), plan));
         Rig {
@@ -795,9 +939,21 @@ impl Rig {
     /// A process named `name` over `backend`, its coordinator's ids drawn
     /// from `seed`.
     pub fn proc(&self, name: &str, backend: Arc<dyn ObjectStoreBackend>, seed: u64) -> Proc {
+        self.proc_with(name, backend, seed, None)
+    }
+
+    /// [`Rig::proc`] whose coordinator sweeps with `sweep`, which also
+    /// starts passes from its idle polls.
+    pub fn proc_with(
+        &self,
+        name: &str,
+        backend: Arc<dyn ObjectStoreBackend>,
+        seed: u64,
+        sweep: Option<SweepConfig>,
+    ) -> Proc {
         let store = Arc::new(
             AgentStore::new(
-                backend.clone(),
+                Arc::new(StampStore::boundary(backend.clone())),
                 TENANT,
                 self.limits,
                 self.clock.clone(),
@@ -805,12 +961,16 @@ impl Rig {
             )
             .with_backoff(Arc::new(NoBackoff)),
         );
-        let co = Arc::new(Coordinator::new(
+        let co = Coordinator::new(
             store.clone(),
             runtime_config(),
             self.clock.clone(),
             Arc::new(CountingRng(AtomicU64::new(seed))),
-        ));
+        );
+        let co = Arc::new(match sweep {
+            Some(config) => co.with_sweep(config),
+            None => co,
+        });
         let worker_id = co
             .register_worker(&[pin()])
             .unwrap_or_else(|_| format!("w-{seed}"));
@@ -827,6 +987,7 @@ impl Rig {
             worker_id,
             backend,
             dispatches: self.dispatches.clone(),
+            clock: self.clock.clone(),
         }
     }
 
@@ -911,6 +1072,21 @@ impl Rig {
     }
 }
 
+/// Incarnations [`timer_handle`] searches.
+const MAX_INCARNATION: u64 = 16;
+
+/// The handle of timer `hex`, found as the id of `timer_key` in the
+/// incarnation that derives it.
+fn timer_handle(hex: &str, timer_key: &str) -> Option<Handle> {
+    (1..=MAX_INCARNATION)
+        .find(|&inc| timer_id(inc, timer_key).to_hex() == hex)
+        .map(|incarnation| Handle {
+            agent: agent(),
+            incarnation,
+            item: HandleItem::Timer(timer_id(incarnation, timer_key)),
+        })
+}
+
 /// Where the simulated tool provider records each execution.
 pub const PROVIDER_PREFIX: &str = "provider/";
 
@@ -974,6 +1150,7 @@ pub struct Proc {
     /// simulated tool provider writes through it.
     backend: Arc<dyn ObjectStoreBackend>,
     dispatches: Arc<Mutex<Vec<(String, Dispatch)>>>,
+    clock: Arc<SimClock>,
 }
 
 impl Proc {
@@ -1443,6 +1620,94 @@ impl Proc {
                     })
                 });
                 (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// Schedule `timer_key` due at `due_unix_ns` with an empty payload.
+    pub async fn schedule_timer(
+        &self,
+        timer_key: &str,
+        due_unix_ns: i64,
+    ) -> Result<TimerResponse, AgentError> {
+        let req = TimerRequest {
+            agent: agent_ref(),
+            timer_key: timer_key.to_string(),
+            due_unix_ns,
+            handler: HANDLER.to_string(),
+            payload: Value::Null,
+        };
+        let event = Event::Client(ClientOp::SetTimer {
+            timer_key: timer_key.to_string(),
+            due_unix_ns,
+            handler: HANDLER.to_string(),
+            payload: json_bytes(&Value::Null),
+        });
+        self.record(
+            "schedule_timer",
+            Some(event),
+            self.co.schedule_timer(&req),
+            |r| {
+                let observed = observe(r, |t| match timer_handle(&t.timer, timer_key) {
+                    Some(timer) => Observed::Modelled(Reply::TimerSet {
+                        timer,
+                        generation: t.generation,
+                    }),
+                    None => Observed::Unmappable(format!(
+                        "timer {} is {timer_key} in no incarnation up to {MAX_INCARNATION}",
+                        t.timer
+                    )),
+                });
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    pub async fn cancel_timer(&self, timer_key: &str) -> Result<CancelTimerResponse, AgentError> {
+        let req = CancelTimerRequest {
+            agent: agent_ref(),
+            timer_key: timer_key.to_string(),
+        };
+        let event = Event::Client(ClientOp::CancelTimer {
+            timer_key: timer_key.to_string(),
+        });
+        self.record(
+            "cancel_timer",
+            Some(event),
+            self.co.cancel_timer(&req),
+            |r| {
+                let observed = observe(r, |c| Observed::Modelled(Reply::TimerCancel(c.outcome)));
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// One sweep pass over the tenant: `Coordinator::sweep_once`. It is
+    /// recorded as a wake from a hint when the pass read a due hint, else
+    /// from the sweep; the reference answers both alike.
+    pub async fn sweep(&self) -> Result<SweepReport, AgentError> {
+        let now_unix_ns = self.clock.now_unix_ns();
+        let begun = Event::Wake {
+            now_unix_ns,
+            by: WakeSource::Sweep,
+        };
+        self.record(
+            SWEEP,
+            Some(begun),
+            self.co.sweep_once(&TENANT),
+            |r| match r {
+                Ok(report) => {
+                    let by = if report.hints_read > 0 {
+                        WakeSource::Hint
+                    } else {
+                        WakeSource::Sweep
+                    };
+                    (Some(Event::Wake { now_unix_ns, by }), Observed::Swept)
+                }
+                Err(e) => (None, map_error(e.kind)),
             },
         )
         .await
