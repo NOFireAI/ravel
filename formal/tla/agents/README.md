@@ -278,6 +278,10 @@ intended behaviour and the model follows it:
 - `ScheduleTimer` and `CancelTimer` are fenced by incarnation, as the
   kernel's `check_incarnation` fences them, so any caller of the current
   incarnation may issue them, with or without an owner.
+- `ScheduleTimer` is enabled while a generation is armed: it reschedules
+  under the next generation, which supersedes the armed one, as the kernel's
+  `schedule` does. Being environment writes now, timer schedule and cancel
+  are bounded by `MaxRevision` like the other optional root writes.
 
 Remaining differences, each also stated in its `traceability.md` row:
 
