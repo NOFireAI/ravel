@@ -128,12 +128,14 @@ because each client sends once and the optional root writes stop at
 
 ## Configs and bounds
 
-Both configs: one tenant, one agent, two workers, `MaxEpoch = 2`.
+Every config: one tenant, one agent, two workers, `MaxEpoch = 2`.
 
 | Config | Clients, inputs, request ids, hashes | MaxRevision | MaxTimerGen | Checks |
 |---|---|---|---|---|
 | `MCAgentProtocol.smoke.cfg` | 2 each | 6 | 0 | the 11 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 | `MCAgentProtocol.exhaustive.cfg` | 1 each | 4 | 1 | the 11 invariants and both liveness properties, no VIEW or SYMMETRY |
+| `positive/two-generations.cfg` | 1 each | 4 | 2 | the 11 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `positive/stale-turn-rebase-unreachable.cfg` | 2 each | 6 | 0 | the 11 invariants with `StaleTurnRebase` on, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 
 The bounds are split because the full product does not fit a budget. In
 local runs, two clients and two workers with one timer generation, even at
@@ -145,18 +147,23 @@ are checked without timers (smoke), and timers and liveness are checked with
 one sender and `MaxRevision = 4` (exhaustive). A second timer generation does
 not fit either: the exhaustive config at `MaxTimerGen = 2` passed 3.9 million
 distinct states with 1.4 million queued when the 3000 s budget ran out
-(2 workers, 2 GiB). So only the two configs that run at `MaxTimerGen = 2`
-reach a replaced generation: `stale-timer-generation-fired`, whose mutant TLC
-catches at the first stale fire, which a cancelled generation already
-produces at depth 10, and the `second-generation-reachable` probe, which
-asserts that a root carrying generation 2 is reached under those bounds. A
-`FireTimer` that ignored the generation passes every config at
-`MaxTimerGen = 1`. The probe lists only its own invariant. The config that
-checks the eleven invariants at those bounds is `stale-timer-generation-fired`,
-and it runs with its mutant switched on, so no shipped config checks the
-clean spec's invariants on a generation-2 state; a hand run of the exhaustive
-config at `MaxTimerGen = 2` is the only check of that today. Raising the
-exhaustive bound is T20's call once the nightly lane has measured it.
+(2 workers, 2 GiB; measured before timer schedule and cancel were bounded
+by `MaxRevision`). A `FireTimer` that ignored the generation passes every
+config at `MaxTimerGen = 1`, so the clean spec's invariants at a second
+generation are checked by the positive config `positive/two-generations.cfg`:
+every switch off, one client, one input, two workers, `MaxRevision = 4`,
+`MaxEpoch = 2`, `MaxTimerGen = 2`, the smoke config's view and symmetry, the
+eleven invariants and no liveness (243171 distinct states at depth 31, 62 s
+with 2 workers). Under those bounds a reschedule of an armed generation, a
+hint left behind for a superseded generation, and a delivered generation 2
+are each reached; a scratch probe invariant per case was violated by TLC
+(exit 12). A `FireTimer` whose generation check was replaced by
+`h.timer.st = "armed"` fails that config with `Error: Invariant
+TimerGenerationDeliveredOnce is violated.` (exit 12, a 7-state trace); that
+mutant was run on a scratch copy and is not shipped. The negative
+`stale-timer-generation-fired` and the `second-generation-reachable` probe
+run at the same timer bounds. Raising the exhaustive bound is T20's call once
+the nightly lane has measured it.
 
 `View` drops the store's version integers and keeps, for each held CAS token,
 only whether it equals the current HEAD version. Nothing reads a version
@@ -318,6 +325,7 @@ Remaining differences, each also stated in its `traceability.md` row:
 
 ```sh
 scripts/check-tla.sh smoke -a agents
+scripts/check-tla.sh positive -a agents
 scripts/check-tla.sh negative -a agents
 scripts/check-tla.sh exhaustive -a agents
 ```
