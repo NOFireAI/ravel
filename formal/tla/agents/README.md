@@ -28,7 +28,7 @@ assumption, stated as such and not checked here.
 
 No `results.md` exists yet: recorded figures are task T20. `bands.tsv`
 carries two rows. The `MCAgentProtocol.smoke.cfg` row pins the required lane
-at 275000 to 281000 distinct states (measured 278143 with 2 workers) with
+at 286000 to 292000 distinct states (measured 289101 with 2 workers) with
 depth waived by `-`, so a change that narrows what the smoke run reaches fails
 that lane. The `MCAgentProtocol.exhaustive.cfg` row sets only `budget_s`
 (3000, ADR-3331 decision 13); its distinct band is the full `0`-`999999999`
@@ -182,7 +182,7 @@ for each.
 | `cursor-without-result` | `CursorWithoutResult` | `TurnCommitAtomic` |
 | `request-hash-mismatch-accepted` | `RequestHashMismatchAccepted` | `RequestIdentityStable` |
 | `receipt-discarded` | `ReceiptDiscarded` | `RequestIdentityStable` |
-| `stale-turn-rebase` | `StaleTurnRebase` | `OneLogicalCompletion` |
+| `rebase-ignores-cancel-request` | `RebaseIgnoresCancelRequest` | `CancellationRespected` |
 | `stale-timer-generation-fired` | `StaleTimerGenerationFired` | `TimerGenerationDeliveredOnce` |
 | `early-hint-forgotten` | `EarlyHintForgotten` | `DueTimerEventuallyDelivered` (exit 13) |
 
@@ -192,11 +192,21 @@ uses the exhaustive bounds at `MaxTimerGen = 2` with the smoke config's view,
 symmetry and invariants; `early-hint-forgotten` is a liveness negative under `MCFairSpec`
 with one worker and `MaxEpoch = 1`, and no view or symmetry.
 
-`stale-turn-rebase` skips only the active-turn check in the rebase, and a
-cancelled input gains a second, completed result. The mutant breaks five
-invariants (`OneLogicalCompletion`, `TurnCommitAtomic`, `NoStaleOwnerCommit`,
-`CancellationRespected` and `TenantIncarnationIsolation`); the `.expect` names
-`OneLogicalCompletion` because it is the first of them in the config.
+`rebase-ignores-cancel-request` commits, on the re-read root, the result
+computed from the root read before the output PUT, so a cancellation
+requested in between is lost and the input completes. Its trace is in
+`negative/counterexamples/rebase-ignores-cancel-request.md`.
+
+`stale-turn-rebase` was a negative while a cancel cleared the active turn: a
+rebase that skipped only its active-turn check gave a cancelled input a
+second, completed result. Since a cancel only marks the active turn, the
+active turn moves only through the owner's own commit or through a takeover,
+which changes the epoch, so the rebase's owner and epoch checks already
+refuse every root on which the turn check would. TLC finds no violation with
+the switch on, and the config now runs in the positive lane as
+`positive/stale-turn-rebase-unreachable.cfg` (switch on, all eleven
+invariants, smoke bounds, 289101 distinct states as in smoke). In the model
+the turn check is defensive.
 
 Reachability probes, each a config with every switch off and one probe
 invariant that must be violated (exit 12): `crash-reachable`
@@ -258,6 +268,13 @@ intended behaviour and the model follows it:
 - Destroy leaves an armed timer armed, as `Kernel::tombstone` does, and
   `FireTimer` refuses to fire on a tombstoned root. `DueTimerEventuallyDelivered`
   counts a destroyed agent as settled for its timer.
+- Cancelling the active turn's input records the request on the turn
+  (`creq`) and leaves the input pending; the turn's next commit (complete,
+  fail or rebase) publishes a cancelled result and leaves the state version
+  alone, as `Kernel::complete_turn` and `Kernel::fail_turn` do with
+  `CancellationState::Requested`. A repeated request writes nothing.
+  `CancellationRespected` now allows a cancelled input to stay pending only
+  as the requested active turn's input.
 
 Remaining differences, each also stated in its `traceability.md` row:
 
