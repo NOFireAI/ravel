@@ -9,12 +9,17 @@ decision record; the [Ravel Agents guide](guides/agents.md) is the
 user-facing overview. Ravel Agents is not the MCP server: that read surface
 is described in [the MCP guide](guides/mcp-server.md).
 
-Status: the contracts (`ravel-agents-core`) and the publication skeleton
-(`ravel-agents-store`) are on `main`. No server route reaches them yet: the
-coordinator (`ravel-agents-runtime`) and the HTTP routes arrive with
-milestones 2 to 5 of ADR-3331 decision 15. Every claim below says which
-test pins it or which milestone delivers it; the
-[guarantee table](#guarantees-and-limitations) collects them.
+Status: the contracts (`ravel-agents-core`), the publication layer
+(`ravel-agents-store`) and the coordinator (`ravel-agents-runtime`) are on
+`main`, and `ravel-server --agents` serves them over HTTP: `create`, `send`,
+`call`, `operation`, `result`, `resolve`, `cancel`, `state` and `events` for
+clients, and `worker/register`, `worker/poll`, `worker/heartbeat` and
+`worker/commit` for workers, all under `/api/v1/agents/` (the
+[HTTP API reference](reference/http-api.md#agents-routes) lists them).
+`services/ravel-server/tests/agents_e2e.rs` drives them through a real
+server. Timers, effects, reconciliation and the sweep have no route yet.
+Every claim below says which test pins it or which milestone delivers it;
+the [guarantee table](#guarantees-and-limitations) collects them.
 
 ## Model
 
@@ -348,7 +353,9 @@ advance does (ADR-3331 decision 6).
 
 Milestones are those of ADR-3331 decision 15. "In the crates" means the
 property holds in `ravel-agents-core` or `ravel-agents-store` on `main` and
-no server route exposes it yet.
+is pinned by their own tests. "End to end" means a test in
+`services/ravel-server/tests/agents_e2e.rs` pins it through the HTTP routes
+of a running server.
 
 | Property | Status | Evidence |
 |---|---|---|
@@ -361,7 +368,7 @@ no server route exposes it yet.
 | Duplicate send with the same id and hash returns the same handle; a different hash conflicts | in the crates (M1) | store `enqueue_with_the_same_request_id_and_hash_returns_the_same_handle`, kernel `retries_are_idempotent_and_conflicts_are_typed` |
 | Mailbox and HEAD byte caps refuse with a typed error, never drop; the receipt cap refuses the same way in code but has no test yet (test debt for T14) | in the crates (M1) | kernel `logical_caps_and_the_byte_cap_are_typed`, store `a_full_mailbox_is_refused_before_any_write` |
 | A turn commit publishes state, result, events and intents in one write, and rebases over a concurrent send | in the crates (M1) | kernel `turn_commit_publishes_state_input_result_events_and_intents_together`, `a_commit_rebases_onto_a_root_that_moved_without_touching_the_turn` |
-| A stale owner cannot commit after a takeover | in the crates (kernel); end to end in M2 | kernel `a_commit_after_takeover_is_ownership_lost`, `every_fenced_command_refuses_a_stale_fence` |
+| A stale owner cannot commit or heartbeat after a takeover | in the crates (kernel); end to end | kernel `a_commit_after_takeover_is_ownership_lost`, `every_fenced_command_refuses_a_stale_fence`; e2e `send_then_result_through_real_server_survives_worker_replacement` (the replaced worker's commit and heartbeat both answer 409 `ownership_lost`) |
 | Failed turns retry under a new turn id, then dead-letter | in the crates (kernel); end to end in M2 | kernel `failed_turns_retry_under_a_new_turn_id_then_dead_letter` |
 | A retry reuses the failed attempt's step and effect identities | in the crates (kernel); end to end in M3 | kernel `a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt` (ADR-3331 step identity amendment) |
 | A `manual` effect in doubt blocks the turn until reconciled | in the crates (kernel); end to end in M3 | kernel `a_manual_effect_goes_in_doubt_and_blocks_the_turn_until_reconciled` |
@@ -372,8 +379,12 @@ no server route exposes it yet.
 | Destroy tombstones; recreate bumps the incarnation and refuses old handles | in the crates (M1) | kernel `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store `create_on_a_tombstoned_agent_bumps_the_incarnation` |
 | Kernel sequences keep the HEAD invariants | in the crates (M1) | kernel `kernel_sequences_keep_the_head_invariants` |
 | The production store and runtime are checked against the independent reference machine | M1 (simulation drivers, T13) | the reference machine exists in `ravel-agents-sim` and is tested on its own (`reference_machine_invariants_hold`); nothing drives the production crates through it yet |
-| HTTP routes for create, send, result, resolve, cancel | M2 to M5 (T11) | ADR-3331 decision 9; today only `GET /api/v1/agents/health` (`agents_router_mounts_on_both_listeners_only_with_feature_and_flag`) |
-| The `--agents-max-*` quota flags are enforced | with the routes (T11) | the flags parse and are reported only (`agents_flags_parse_and_reach_query_budgets`); the kernel enforces its own default caps (`logical_caps_and_the_byte_cap_are_typed`) |
+| HTTP routes for create, send, call, operation, result, resolve, cancel, state, events and the worker register, poll, heartbeat and commit | end to end | e2e `send_then_result_through_real_server_survives_worker_replacement`, `call_heartbeat_and_cancel_through_real_server`, `cancel_of_a_running_turn_settles_it_cancelled_at_commit`, `events_page_after_the_durable_cursor_without_duplicates`, `resolve_after_a_lost_send_ack_returns_the_same_operation`; mounting `agents_router_mounts_on_both_listeners_only_with_feature_and_flag` |
+| `agents` and `agents_worker` capabilities are checked on every route | end to end | e2e `capabilities_are_enforced_on_both_listeners` |
+| A HEAD that cannot be read under an operation handle answers `outcome_unknown`, not `agent_gone` | end to end | e2e `a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone`; an unknown handle is `agent_gone` (`unknown_operation_handle_is_agent_gone_with_the_handle`) |
+| HTTP routes for timers, effects and reconciliation | M3 to M4 | ADR-3331 decision 9; no route yet |
+| `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers` set the kernel caps | on main | the server passes them as the kernel limits of every tenant's store, and the kernel refuses past a cap with a typed error (`logical_caps_and_the_byte_cap_are_typed`); no e2e test sets one below its default |
+| `--agents-max-agents`, `--agents-max-state-bytes` and `--agents-memory-budget` are enforced | follow-up | The routes do not enforce these three flags: they are parsed and reported on `GET /api/v1/agents/health` and `/metrics` only (`agents_flags_parse_and_reach_query_budgets`, `health_reports_feature_mode_and_every_setting`). Enforcing them is left to a follow-up. |
 | Projection of history into logs and traces | M5 | ADR-3331 decision 12 |
 | Bounded paged indexes (format version 2) | M6 | ADR-3331 decision 3 |
 | Live garbage collection of agent objects | out of scope for this release | ADR-3331 decision 2 |
