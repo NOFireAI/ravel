@@ -224,14 +224,17 @@ fn kills(seed: u64) -> KillCounts {
     drain(&rig, seed);
     let run = rig.build().expect("build");
     sim_assert!(out, run.unmappable.is_empty(), "{:?}", run.unmappable);
-    let known = past_known_divergences(&run.history)
+    let known = past_known_divergences(&run)
         .unwrap_or_else(|d| panic!("{d}\n{}", out.failure_context()));
     sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
     let head = rig.head().expect("head");
     sim_assert_eq!(out, head.next_accept_seq, 5);
     one_terminal_result_per_input(&head)
         .unwrap_or_else(|e| panic!("{e}\n{}", out.failure_context()));
-    // The rule fires on w1's k-th HEAD write, if w1 lived to issue one.
+    // The rule fires on w1's k-th HEAD write, if w1 lived to issue one. It
+    // calls the store for real and answers Transient either way, so a
+    // firing is an applied write whose acknowledgement was lost or a
+    // conflicted CAS whose conflict was hidden.
     let w1_cas = rig
         .proc_named("w1")
         .expect("w1")
@@ -239,15 +242,15 @@ fn kills(seed: u64) -> KillCounts {
         .counters()
         .publish
         .cas;
-    let lost = usize::from(w1_cas >= k);
-    let expected = if lost == 1 {
+    let fired = usize::from(w1_cas >= k);
+    let expected = if fired == 1 {
         vec![((Op::Put, FaultKind::DuplicateDelivery), 1)]
     } else {
         vec![]
     };
     sim_assert_eq!(out, all_fired(&faults), expected);
-    // Only the one lost acknowledgement can produce the false negative.
-    sim_assert!(out, known.false_negatives <= lost, "{known:?}, lost {lost}");
+    // Only the one firing can produce the false negative.
+    sim_assert!(out, known.false_negatives <= fired, "{known:?}, fired {fired}");
     let crashes = out
         .trace
         .iter()
@@ -255,7 +258,7 @@ fn kills(seed: u64) -> KillCounts {
         .count();
     KillCounts {
         crashes,
-        lost,
+        fired,
         inferred: run.inferred.len(),
         stale_owner: known.stale_owner,
         false_negatives: known.false_negatives,
@@ -265,7 +268,10 @@ fn kills(seed: u64) -> KillCounts {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct KillCounts {
     crashes: usize,
-    lost: usize,
+    /// Runs where the `DuplicateDelivery` rule fired: a lost
+    /// acknowledgement of an applied write, or a conflicted CAS answered
+    /// `Transient`.
+    fired: usize,
     inferred: usize,
     stale_owner: usize,
     false_negatives: usize,
@@ -285,10 +291,24 @@ struct Known {
     false_negatives: usize,
 }
 
-/// Check `history`, answering past the two known divergences. Any other
-/// divergence is returned.
-fn past_known_divergences(history: &History) -> Result<Known, String> {
-    let mut patched = history.clone();
+/// Check the run's history, answering past the two known divergences. Any
+/// other divergence is returned.
+///
+/// A completion refused `OwnershipLost` where the reference expects
+/// `Committed` is a stale owner's when its operation began more than once
+/// before it, its call applied no HEAD write, and a later completion of
+/// the same operation committed. It is the false negative when the
+/// operation began once before it and its call applied a write.
+fn past_known_divergences(run: &Run) -> Result<Known, String> {
+    let mut patched = run.history.clone();
+    let mut applied = run.applied.clone();
+    if applied.len() != patched.len() {
+        return Err(format!(
+            "{} applied flags for {} calls",
+            applied.len(),
+            patched.len()
+        ));
+    }
     let mut known = Known::default();
     loop {
         let machine = crate::drive::machine()?;
@@ -303,22 +323,36 @@ fn past_known_divergences(history: &History) -> Result<Known, String> {
         {
             return Err(d.to_string());
         }
-        let begun = patched
-            .calls()
+        let calls = patched.calls();
+        let begun = calls[..d.index]
             .iter()
             .filter(|c| matches!(&c.event, Event::TurnStarted { operation: o } if o == operation))
             .count();
+        let wrote = applied[d.index];
+        let committed_later = calls[d.index + 1..].iter().any(|c| {
+            matches!(&c.event, Event::TurnCompleted { operation: o, .. } if o == operation)
+                && matches!(c.observed, Reply::Committed { .. })
+        });
+        let stale = begun >= 2 && !wrote && committed_later;
+        let false_negative = begun == 1 && wrote;
+        if !stale && !false_negative {
+            return Err(format!(
+                "{d}\nnot a known shape: begun {begun}, wrote {wrote}, committed later \
+                 {committed_later}"
+            ));
+        }
         let mut next = History::default();
-        for (i, call) in patched.calls().iter().enumerate() {
+        for (i, call) in calls.iter().enumerate() {
             if i != d.index {
                 next.record(call.event.clone(), call.observed.clone());
-            } else if begun < 2 {
+            } else if false_negative {
                 next.record(call.event.clone(), d.expected.clone());
             }
         }
-        if begun < 2 {
+        if false_negative {
             known.false_negatives += 1;
         } else {
+            applied.remove(d.index);
             known.stale_owner += 1;
         }
         patched = next;
@@ -332,7 +366,7 @@ fn worker_kills_across_seeds() {
     for seed in seeds() {
         let k = kills(seed);
         totals.crashes += k.crashes;
-        totals.lost += k.lost;
+        totals.fired += k.fired;
         totals.inferred += k.inferred;
         totals.stale_owner += k.stale_owner;
         totals.false_negatives += k.false_negatives;
@@ -353,7 +387,7 @@ fn stale_owner_commit_after_takeover_is_fenced() {
         kills(0x5eed_0033),
         KillCounts {
             crashes: 0,
-            lost: 1,
+            fired: 1,
             inferred: 0,
             stale_owner: 1,
             false_negatives: 0,
@@ -366,7 +400,7 @@ fn stale_owner_commit_after_takeover_is_fenced() {
 /// moves it.
 const KILL_TOTALS: KillCounts = KillCounts {
     crashes: 52,
-    lost: 30,
+    fired: 30,
     inferred: 3,
     stale_owner: 2,
     false_negatives: 0,
