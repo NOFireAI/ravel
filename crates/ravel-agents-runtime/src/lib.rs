@@ -21,8 +21,8 @@
 //! takeover, a failure's retry verdict) take and return crate types until
 //! T11 defines their bodies.
 
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -157,8 +157,13 @@ pub struct Coordinator {
     /// last scan.
     pub(crate) discovered: AtomicBool,
     /// When the directory was last scanned, in the injected clock's
-    /// nanoseconds; `i64::MIN` before the first scan.
+    /// nanoseconds; `i64::MIN` before the first scan. A poller that wants
+    /// a rescan claims this stamp with a compare-exchange first, so pollers
+    /// woken together share one scan.
     pub(crate) last_scan_unix_ns: AtomicI64,
+    /// Agents the scan has already reported as unreadable by this release,
+    /// so a rollback is logged once per agent, not once per rescan.
+    pub(crate) unsupported_reported: Mutex<HashSet<AgentId>>,
     pub(crate) wake: Notify,
     pub(crate) metrics: Metrics,
 }
@@ -179,6 +184,7 @@ impl Coordinator {
             leases: LeaseTable::default(),
             discovered: AtomicBool::new(false),
             last_scan_unix_ns: AtomicI64::new(i64::MIN),
+            unsupported_reported: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             metrics: Metrics::default(),
         }

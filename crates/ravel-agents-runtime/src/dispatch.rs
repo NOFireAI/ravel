@@ -73,9 +73,19 @@ impl Coordinator {
                 Scan::Nothing => {
                     let interval = ms_to_ns(self.config.rescan_interval_ms);
                     let last = self.last_scan_unix_ns.load(Ordering::Acquire);
-                    if !rescanned && self.now().saturating_sub(last) >= interval {
-                        // Rescan in this pass; a second empty pass falls
-                        // through to the wait.
+                    let now = self.now();
+                    // Claim the rescan slot before clearing the latch: every
+                    // poller a send wakes reads the same last-scan stamp, and
+                    // only the one whose compare-exchange wins rescans; the
+                    // rest fall through to the wait
+                    // (`tests::pollers_woken_together_share_one_rescan`).
+                    if !rescanned
+                        && now.saturating_sub(last) >= interval
+                        && self
+                            .last_scan_unix_ns
+                            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
                         rescanned = true;
                         self.discovered.store(false, Ordering::Release);
                         continue;
@@ -122,11 +132,15 @@ impl Coordinator {
                     }
                     HeadState::Present { .. } | HeadState::Absent => {}
                     HeadState::Unsupported { found } => {
-                        tracing::warn!(
-                            agent = %agent.to_hex(),
-                            format_version = found,
-                            "agents directory names an agent whose HEAD format this release cannot read; its inputs are not offered"
-                        );
+                        // Once per agent, not once per rescan: the condition
+                        // is static for the life of a rollback.
+                        if self.unsupported_reported.lock().insert(agent) {
+                            tracing::warn!(
+                                agent = %agent.to_hex(),
+                                format_version = found,
+                                "agents directory names an agent whose HEAD format this release cannot read; its inputs are not offered"
+                            );
+                        }
                     }
                 }
             }
