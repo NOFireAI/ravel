@@ -2111,19 +2111,25 @@ fn a_manual_attempt_enters_in_doubt_inside_the_reserve() {
         sim.refuse(&Command::CompleteTurn(complete_cmd(sim.head(), b"s"))),
         ErrorKind::EffectInDoubt
     );
-    // Reconciliation and its result are recorded inside the reserve too, and
-    // then the input can fail.
-    assert!(matches!(
-        sim.step(&authorize_cmd(
+    // Authorizing another attempt by reconciliation appends an audit event
+    // and is guarded; a reconciled result settles the effect inside the
+    // reserve, audit event included, and then the input can fail.
+    assert_eq!(
+        sim.refuse(&authorize_cmd(
             Authority::Reconcile(inc_fence(sim.head())),
             effect_id,
             2,
-        ))
-        .expect("a reconcile authorization is recorded inside the reserve")
-        .reply(),
-        Reply::AttemptAuthorized { attempt: 2, .. }
-    ));
-    sim.run(&effect_result_cmd(sim.head(), effect_id, 2));
+        )),
+        ErrorKind::BudgetExceeded
+    );
+    let events = sim.head().events.len();
+    assert_eq!(
+        sim.step(&effect_result_cmd(sim.head(), effect_id, 1))
+            .expect("a reconciled result is recorded inside the reserve")
+            .reply(),
+        &Reply::EffectResultRecorded { effect_id }
+    );
+    assert_eq!(sim.head().events.len(), events + 1);
     let error = "e".repeat(sim.kernel.limits().max_error_bytes);
     let fail = Command::FailTurn(FailTurn {
         fence: turn_fence(sim.head()),
@@ -2375,9 +2381,10 @@ fn an_owner_id_or_handler_version_over_its_cap_is_refused() {
 
 #[test]
 fn pending_effects_settle_inside_the_reserve() {
-    // Journal and authorize effects up to the guard, push the root into the
-    // reserve, then reconcile every effect and record its result (both
-    // exempt) and fail the input.
+    // Journal and authorize manual effects up to the guard, push the root
+    // into the reserve, then latch every effect in doubt and settle it with a
+    // reconciled result (both exempt, the result with its audit event) and
+    // fail the input.
     let mut sim = Sim::with_limits(Limits {
         max_intents_per_turn: 1_000,
         ..byte_capped(8 * 1024)
@@ -2387,21 +2394,28 @@ fn pending_effects_settle_inside_the_reserve() {
     sim.run(&enqueue_cmd(sim.head(), "r1", b"p1"));
     sim.run(&begin_cmd(sim.head()));
     let mut ids = Vec::new();
-    for n in 0.. {
-        match sim.step(&commit_intent_cmd(
+    'fill: for n in 0.. {
+        let effect_id = match sim.step(&commit_intent_cmd(
             sim.head(),
             &format!("k{n}"),
-            RecoveryPolicy::AtLeastOnce,
+            RecoveryPolicy::Manual,
         )) {
             Ok(t) => {
                 let Reply::IntentCommitted { effect_id } = t.reply() else {
                     panic!("{t:?}");
                 };
-                ids.push(*effect_id);
+                *effect_id
             }
             Err(e) => {
                 assert_eq!(e.kind, ErrorKind::BudgetExceeded);
-                break;
+                break 'fill;
+            }
+        };
+        match sim.step(&owner_authorize(&sim, effect_id, 1)) {
+            Ok(_) => ids.push(effect_id),
+            Err(e) => {
+                assert_eq!(e.kind, ErrorKind::BudgetExceeded);
+                break 'fill;
             }
         }
     }
@@ -2410,27 +2424,24 @@ fn pending_effects_settle_inside_the_reserve() {
         sim.head(),
         sim.kernel.limits().max_owner_bytes,
     ));
-    let reconcile = Authority::Reconcile(inc_fence(sim.head()));
+    let events = sim.head().events.len();
     for id in &ids {
-        for attempt in [1, u32::MAX] {
-            let cmd = authorize_cmd(reconcile.clone(), *id, attempt);
-            if attempt == u32::MAX {
-                // Jump the attempt varint to its widest through the journal.
-                if let Some(effect) = sim
-                    .head
-                    .as_mut()
-                    .and_then(|h| h.effects.iter_mut().find(|e| e.effect_id == *id))
-                {
-                    effect.attempt = u32::MAX - 1;
-                }
-            }
-            sim.step(&cmd)
-                .unwrap_or_else(|e| panic!("reconcile {attempt}: {e:?}"));
+        // Jump the attempt varint to its widest through the journal.
+        if let Some(effect) = sim
+            .head
+            .as_mut()
+            .and_then(|h| h.effects.iter_mut().find(|e| e.effect_id == *id))
+        {
+            effect.attempt = u32::MAX - 1;
         }
+        let latch = sim
+            .step(&owner_authorize(&sim, *id, u32::MAX))
+            .unwrap_or_else(|e| panic!("latch: {e:?}"));
+        assert!(matches!(latch.reply(), Reply::Blocked(_)), "{latch:?}");
         sim.step(&Command::RecordEffectResult(RecordEffectResult {
             fence: inc_fence(sim.head()),
             effect_id: *id,
-            attempt: u32::MAX,
+            attempt: u32::MAX - 1,
             result: ObjectRef {
                 size_bytes: u64::MAX / 2,
                 ..blob(b"result")
@@ -2438,6 +2449,7 @@ fn pending_effects_settle_inside_the_reserve() {
         }))
         .unwrap_or_else(|e| panic!("record result: {e:?}"));
     }
+    assert_eq!(sim.head().events.len(), events + ids.len());
     let fail = Command::FailTurn(FailTurn {
         fence: turn_fence(sim.head()),
         error: "e".repeat(sim.kernel.limits().max_error_bytes),
@@ -2513,10 +2525,13 @@ fn the_reserves_cover_the_growth_they_stand_for() {
     assert!(retry + result <= limits.terminal_reserve_per_input_bytes);
 
     // Per pending effect: from a fresh intent to completed at the widest
-    // attempt and result, over step key sizes on both sides of the prefixes.
+    // attempt and result, with the audit event of a reconciled result at the
+    // widest sequence numbers and a `next_event_seq` one varint byte wider,
+    // over step key sizes on both sides of the prefixes.
     let mut effect = 0usize;
     for len in (1..=200).chain([limits.max_string_bytes]) {
         let mut journaled = empty.clone();
+        journaled.next_event_seq = 127;
         journaled.effects.push(EffectRecord {
             effect_id: Id128([1; 16]),
             step_key: "k".repeat(len),
@@ -2539,9 +2554,17 @@ fn the_reserves_cover_the_growth_they_stand_for() {
             ..blob(b"result")
         });
         slot.result_attempt = u32::MAX;
+        settled.next_event_seq = 128;
+        settled.events.push(EventEntry {
+            event_seq: u64::MAX,
+            accept_seq: u64::MAX,
+            turn_id: Id128([u8::MAX; 16]),
+            event_type: AUDIT_RECONCILE_RESULT.to_string(),
+            payload: None,
+        });
         effect = effect.max(size(&settled) - size(&journaled));
     }
-    assert_eq!(effect, 60);
+    assert_eq!(effect, 128);
     assert!(effect <= PENDING_EFFECT_RESERVE_BYTES);
     eprintln!(
         "slack {slack} (takeover+turn grew {grown}), retry {retry}, result {result}, effect {effect}"
@@ -2983,4 +3006,66 @@ fn the_first_owner_authorization_of_an_intent_is_guarded() {
         max_attempts: 1,
     });
     assert!(matches!(sim.run(&fail), Reply::TurnFailed { .. }));
+}
+
+#[test]
+fn reconciliation_is_audited_once_in_the_event_stream() {
+    let mut sim = Sim::started();
+    let effect_id = committed_effect(&mut sim, "charge", RecoveryPolicy::Manual);
+    sim.run(&owner_authorize(&sim, effect_id, 1));
+    assert!(matches!(
+        sim.run(&owner_authorize(&sim, effect_id, 2)),
+        Reply::Blocked(_)
+    ));
+    let accept_seq = sim
+        .head()
+        .active_turn
+        .as_ref()
+        .map(|t| t.input_accept_seq)
+        .expect("active turn");
+    let journaled_by = sim.head().effects[0].turn_id;
+    let audits = |sim: &Sim| -> Vec<(String, u64, Id128)> {
+        sim.head()
+            .events
+            .iter()
+            .filter(|e| e.event_type.starts_with("audit."))
+            .map(|e| (e.event_type.clone(), e.accept_seq, e.turn_id))
+            .collect()
+    };
+    assert!(audits(&sim).is_empty());
+
+    // Authorizing another attempt twice publishes and audits once.
+    let reconcile = authorize_cmd(Authority::Reconcile(inc_fence(sim.head())), effect_id, 2);
+    sim.run(&reconcile);
+    assert!(matches!(
+        sim.step(&reconcile).expect("repeat"),
+        Transition::Unchanged {
+            reply: Reply::AttemptAuthorized { attempt: 2, .. }
+        }
+    ));
+    let attempt = (AUDIT_RECONCILE_ATTEMPT.to_string(), accept_seq, journaled_by);
+    assert_eq!(audits(&sim), vec![attempt.clone()]);
+
+    // The reconciled attempt is lost too; attaching its verified result twice
+    // publishes and audits once.
+    assert!(matches!(
+        sim.run(&owner_authorize(&sim, effect_id, 3)),
+        Reply::Blocked(_)
+    ));
+    let attach = effect_result_cmd(sim.head(), effect_id, 2);
+    sim.run(&attach);
+    assert!(matches!(
+        sim.step(&attach).expect("repeat"),
+        Transition::Unchanged {
+            reply: Reply::EffectResultRecorded { .. }
+        }
+    ));
+    let result = (AUDIT_RECONCILE_RESULT.to_string(), accept_seq, journaled_by);
+    assert_eq!(audits(&sim), vec![attempt.clone(), result.clone()]);
+
+    // A result for an attempt that was never in doubt is no reconciliation.
+    let other = committed_effect(&mut sim, "ship", RecoveryPolicy::AtLeastOnce);
+    sim.run(&owner_authorize(&sim, other, 1));
+    sim.run(&effect_result_cmd(sim.head(), other, 1));
+    assert_eq!(audits(&sim), vec![attempt, result]);
 }

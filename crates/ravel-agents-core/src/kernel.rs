@@ -126,13 +126,25 @@ pub struct Limits {
 }
 
 /// Bytes the growth guard leaves free for each journaled effect that is not
-/// `Completed`: a `Reconcile` authorization, an owner's retry authorization
-/// of an effect already `Authorized` or `InDoubt`, or a `RecordEffectResult`
-/// may still grow it, and all three are exempt. The attempt varint (6), the result
-/// reference (47), the result attempt varint (6), the record's length prefix
-/// (1) and a status change (2, though prost writes every status in one byte
-/// either way) come to 62.
-pub const PENDING_EFFECT_RESERVE_BYTES: usize = 64;
+/// `Completed`: an owner's retry authorization of an effect already
+/// `Authorized` or `InDoubt`, or a `RecordEffectResult`, may still grow it,
+/// and both are exempt. The attempt varint (6), the result reference (47),
+/// the result attempt varint (6), the record's length prefix (1) and a status
+/// change (2, though prost writes every status in one byte either way) come
+/// to 62. A result that settles an `InDoubt` effect also appends one audit
+/// event (see [`AUDIT_RECONCILE_RESULT`]): its entry at the widest sequence
+/// numbers and a `next_event_seq` varint one byte wider add 68, so 128 in all
+/// (`tests::the_reserves_cover_the_growth_they_stand_for`).
+pub const PENDING_EFFECT_RESERVE_BYTES: usize = 132;
+
+/// Event type of the audit event a result appends when it settles an
+/// `InDoubt` effect (`tests::reconciliation_is_audited_once_in_the_event_stream`).
+pub const AUDIT_RECONCILE_RESULT: &str = "audit.reconcile_result";
+
+/// Event type of the audit event a `Reconcile` authorization appends when it
+/// authorizes another attempt
+/// (`tests::reconciliation_is_audited_once_in_the_event_stream`).
+pub const AUDIT_RECONCILE_ATTEMPT: &str = "audit.reconcile_attempt";
 
 /// Bytes a terminal result entry costs beyond its error text, plus the
 /// retryable `FailTurn` growth that precedes it, at the default
@@ -693,8 +705,13 @@ fn identity_strings(command: &Command) -> (Vec<&str>, Vec<&str>) {
 /// owner along (`Takeover`, `BeginTurn`, `CancelTimer`, `Tombstone`,
 /// `Create`), the latches (a publish answering `Reply::Blocked`, which
 /// blocks the turn or marks an effect `InDoubt`), and what an effect needs
-/// to settle (`RecordEffectResult`, a `Reconcile` authorization). Refusing a
-/// latch would let the next `CompleteTurn` commit past it.
+/// to settle (`RecordEffectResult`). Refusing a latch would let the next
+/// `CompleteTurn` commit past it. A `Reconcile` authorization is guarded: it
+/// appends an audit event every time it publishes, and an effect can be
+/// latched and reconciled any number of times, so its growth has no bound a
+/// reserve could cover. An effect near the cap still settles through a
+/// reconciled result, which is exempt
+/// (`tests::a_manual_attempt_enters_in_doubt_inside_the_reserve`).
 fn guarded(observed: &Head, command: &Command, reply: &Reply) -> bool {
     if matches!(reply, Reply::Blocked(_)) {
         return false;
@@ -715,7 +732,7 @@ fn guarded(observed: &Head, command: &Command, reply: &Reply) -> bool {
         // the input could neither be retried nor failed
         // (`tests::an_owner_retry_authorization_is_answered_inside_the_reserve`).
         Command::AuthorizeAttempt(c) => match &c.authority {
-            Authority::Reconcile(_) => false,
+            Authority::Reconcile(_) => true,
             Authority::Owner(_) => !observed.effects.iter().any(|e| {
                 e.effect_id == c.effect_id
                     && matches!(e.status, EffectStatus::Authorized | EffectStatus::InDoubt)
@@ -1680,7 +1697,10 @@ impl Kernel {
     /// attempt; a manual effect's in-doubt latch is still recorded, since it
     /// authorizes nothing
     /// (`tests::a_new_attempt_for_a_cancelled_input_is_refused`). A
-    /// `Reconcile` authorization is an operator's and has neither check.
+    /// `Reconcile` authorization is an operator's and has neither check; each
+    /// one that publishes appends an [`AUDIT_RECONCILE_ATTEMPT`] event, and a
+    /// repeat of it answers without a publish, so it is audited once
+    /// (`tests::reconciliation_is_audited_once_in_the_event_stream`).
     fn authorize_attempt(&self, head: &Head, c: &AuthorizeAttempt) -> Outcome {
         let owner = match &c.authority {
             Authority::Owner(fence) => {
@@ -1762,6 +1782,9 @@ impl Kernel {
                 slot.attempt = c.attempt;
             }
         }
+        if !owner {
+            push_audit(&mut new, effect, AUDIT_RECONCILE_ATTEMPT);
+        }
         self.publish(
             Some(head),
             new,
@@ -1778,7 +1801,11 @@ impl Kernel {
     /// attempt's result after the effect completed, and any result for an
     /// effect whose input ended cancelled are answered `LateResultIgnored`
     /// without a publish: the caller keeps them as evidence
-    /// (`tests::superseded_and_cancelled_results_are_evidence`).
+    /// (`tests::superseded_and_cancelled_results_are_evidence`). A result that
+    /// settles an `InDoubt` effect is a reconciliation whoever supplied it and
+    /// appends one [`AUDIT_RECONCILE_RESULT`] event; its replay answers without
+    /// a publish
+    /// (`tests::reconciliation_is_audited_once_in_the_event_stream`).
     fn record_effect_result(&self, head: &Head, c: &RecordEffectResult) -> Outcome {
         Self::check_incarnation(head, &c.fence)?;
         let Some(effect) = head.effects.iter().find(|e| e.effect_id == c.effect_id) else {
@@ -1819,6 +1846,9 @@ impl Kernel {
             });
         }
         let mut new = head.clone();
+        if effect.status == EffectStatus::InDoubt {
+            push_audit(&mut new, effect, AUDIT_RECONCILE_RESULT);
+        }
         if let Some(slot) = new.effects.iter_mut().find(|e| e.effect_id == c.effect_id) {
             slot.status = EffectStatus::Completed;
             slot.result = Some(c.result);
@@ -1861,6 +1891,28 @@ fn same_intent(existing: &EffectRecord, intent: &IntentSpec) -> bool {
         && existing.tool_version == intent.tool_version
         && existing.input_hash == intent.input_hash
         && existing.policy == intent.policy
+}
+
+/// Append an audit event for `effect` to the stream of the turn that
+/// journaled it, under the effect's input.
+fn push_audit(new: &mut Head, effect: &EffectRecord, event_type: &str) {
+    let incarnation = new.incarnation;
+    let accept_seq = new
+        .active_turn
+        .iter()
+        .map(|t| t.input_accept_seq)
+        .chain(new.inbox.iter().map(|e| e.accept_seq))
+        .chain(new.results.iter().map(|r| r.accept_seq))
+        .find(|&seq| identity::effect_id(incarnation, seq, &effect.step_key) == effect.effect_id)
+        .unwrap_or(0);
+    new.events.push(EventEntry {
+        event_seq: new.next_event_seq,
+        accept_seq,
+        turn_id: effect.turn_id,
+        event_type: event_type.to_string(),
+        payload: None,
+    });
+    new.next_event_seq += 1;
 }
 
 /// The effects journaled for the input `accept_seq`, by any of its turns.
