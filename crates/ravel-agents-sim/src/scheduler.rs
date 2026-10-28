@@ -208,6 +208,12 @@ pub struct ScheduleOutcome {
     pub script: ScheduleScript,
     pub trace: Vec<TraceEntry>,
     pub ends: Vec<ActorEnd>,
+    /// One entry per settle that hit the bound: the actor that neither
+    /// finished nor reached a gate, and the trace length at that point.
+    /// Each such settle advanced paused time by the whole settle bound, so
+    /// a lease or timer deadline may have expired without a step asking
+    /// for it.
+    pub settle_timeouts: Vec<(String, usize)>,
 }
 
 impl ScheduleOutcome {
@@ -415,9 +421,11 @@ impl Scheduler {
         }
 
         let mut trace = Vec::new();
+        let mut settle_timeouts = Vec::new();
         let mut steps = self.script.steps.iter();
         loop {
-            self.settle(&mut running, &trace).await?;
+            self.settle(&mut running, &trace, &mut settle_timeouts)
+                .await?;
             let ready: Vec<usize> = running
                 .iter()
                 .enumerate()
@@ -507,15 +515,19 @@ impl Scheduler {
             script: self.script.clone(),
             trace,
             ends,
+            settle_timeouts,
         })
     }
 
     /// Let the runtime run until every live actor has finished or holds a
-    /// call, or until the settle bound of idle virtual time passes.
+    /// call, or until the settle bound of idle virtual time passes. An actor
+    /// still live at the bound is recorded in `settle_timeouts`
+    /// (`tests::an_actor_that_never_reaches_a_gate_is_recorded_when_the_settle_bound_passes`).
     async fn settle(
         &self,
         running: &mut [Running],
         trace: &[TraceEntry],
+        settle_timeouts: &mut Vec<(String, usize)>,
     ) -> Result<(), ScheduleError> {
         let deadline = tokio::time::Instant::now() + self.settle_bound;
         for actor in running.iter_mut() {
@@ -541,7 +553,8 @@ impl Scheduler {
                 Ok(Some(Err(e))) => {
                     return Err(self.error(trace.to_vec(), format!("{} panicked: {e}", actor.name)));
                 }
-                Ok(None) | Err(_) => {}
+                Ok(None) => {}
+                Err(_) => settle_timeouts.push((actor.name.clone(), trace.len())),
             }
         }
         Ok(())
@@ -610,7 +623,7 @@ mod tests {
 
     fn run(seed: u64, script: ScheduleScript) -> (ScheduleOutcome, Vec<String>) {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let outcome = Scheduler::new(AgentSeeds::from_env_or(seed), script.clone())
+        let outcome = Scheduler::new(AgentSeeds::new(seed), script.clone())
             .run(store_with_head(), cas_race(Arc::clone(&log)))
             .unwrap_or_else(|e| panic!("{e}"));
         let log = log.lock().expect("log").clone();
@@ -678,7 +691,7 @@ mod tests {
     fn seeded(seed: u64) -> (ScheduleOutcome, Vec<String>) {
         run(
             seed,
-            ScheduleScript::from_seed(&AgentSeeds::from_env_or(seed), 2, 8, 0),
+            ScheduleScript::from_seed(&AgentSeeds::new(seed), 2, 8, 0),
         )
     }
 
@@ -852,5 +865,46 @@ mod tests {
             )
             .expect_err("stuck");
         assert!(err.reason.starts_with("stuck: [\"C\"]"), "{err}");
+    }
+
+    #[test]
+    fn an_actor_that_never_reaches_a_gate_is_recorded_when_the_settle_bound_passes() {
+        // "P" parks on a timer the scheduler cannot see for longer than the
+        // settle bound; "W" does one gated read. The first settle waits the
+        // whole bound for P before W's call is released, and the outcome
+        // says so; P then finishes inside the second settle.
+        let outcome = Scheduler::new(AgentSeeds::new(3), ScheduleScript::new(Vec::new()))
+            .with_settle_bound(Duration::from_secs(60))
+            .run(
+                store_with_head(),
+                vec![
+                    Actor::client("P", |_store: ActorStore| async move {
+                        tokio::time::sleep(Duration::from_secs(100)).await;
+                        Ok(())
+                    }),
+                    Actor::worker("W", |store: ActorStore| async move {
+                        store
+                            .get(HEAD, GetRange::Full)
+                            .await
+                            .map_err(|e| format!("get: {e}"))?;
+                        Ok(())
+                    }),
+                ],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        sim_assert_eq!(outcome, outcome.trace.len(), 1);
+        sim_assert_eq!(outcome, outcome.settle_timeouts, vec![("P".to_string(), 0)]);
+    }
+
+    #[test]
+    fn the_env_override_does_not_reach_the_seeds_the_multi_seed_tests_compare() {
+        // The replay line sets RAVEL_SIM_SEED; a run built from an explicit
+        // seed must ignore it, or the seed comparison tests compare one
+        // seed with itself.
+        let (a, _) = seeded(5);
+        let (b, _) = seeded(6);
+        sim_assert_eq!(a, a.seed, 5);
+        sim_assert_eq!(b, b.seed, 6);
+        sim_assert_eq!(a, AgentSeeds::new(5).seed(), 5);
     }
 }

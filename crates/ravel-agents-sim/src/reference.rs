@@ -36,9 +36,16 @@
 //! that turn's next commit, whether the commit was a completion or a
 //! failure, and leaves the state version unchanged; a handle naming an
 //! `accept_seq` this incarnation never accepted answers
-//! [`Reply::UnknownOperation`]. Blocked effects, retryable failures, quotas
-//! and wait timeouts are not modelled: a [`Event::TurnFailed`] is the
-//! terminal failure after the handler's retry policy is spent.
+//! [`Reply::UnknownOperation`] on a client read, and a worker event on the
+//! same handle answers `OwnershipLost`; a `destroy` of an incarnation that
+//! is already tombstoned is idempotent and answers [`Reply::Destroyed`]
+//! with `already` set, as the kernel's `AlreadyTombstoned` does, while a
+//! `destroy` of an agent never created answers `AgentGone`. Blocked
+//! effects, retryable failures, quotas and wait timeouts are not modelled:
+//! a [`Event::TurnFailed`] is the terminal failure after the handler's
+//! retry policy is spent. The timer message's content is not modelled
+//! either: a firing enqueues an input known by its handle alone, and
+//! [`ClientOp::SetTimer`]'s handler and payload are not checked.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -52,7 +59,8 @@ use ravel_agents_core::wire::{OperationStatus, TimerCancelOutcome};
 pub const FIRST_INCARNATION: u64 = 1;
 /// `accept_seq` of the first input accepted in an incarnation.
 pub const FIRST_ACCEPT_SEQ: u64 = 1;
-/// Generation of a timer key's first `set`.
+/// Generation of an agent's first timer `set`; generations are counted per
+/// agent, so a second key's first `set` is already past it.
 pub const FIRST_TIMER_GENERATION: u64 = 1;
 
 /// A client call, named by what it asks rather than by its HTTP route.
@@ -130,8 +138,10 @@ pub enum Reply {
         incarnation: u64,
         created: bool,
     },
+    /// `already` when the incarnation was tombstoned before this call.
     Destroyed {
         incarnation: u64,
+        already: bool,
     },
     Accepted {
         operation: Handle,
@@ -308,14 +318,16 @@ impl ReferenceMachine {
     fn client(&mut self, op: &ClientOp) -> Reply {
         match op {
             ClientOp::Create => self.create(),
-            ClientOp::Destroy => match self.live_mut() {
-                Ok(life) => {
+            ClientOp::Destroy => match self.life.as_mut() {
+                Some(life) => {
+                    let already = life.tombstoned;
                     life.tombstoned = true;
                     Reply::Destroyed {
                         incarnation: life.incarnation,
+                        already,
                     }
                 }
-                Err(reply) => reply,
+                None => Reply::Error(ErrorKind::AgentGone),
             },
             ClientOp::Send {
                 handler,
@@ -731,7 +743,10 @@ mod tests {
             ),
             (
                 client(ClientOp::Destroy),
-                Reply::Destroyed { incarnation: 1 },
+                Reply::Destroyed {
+                    incarnation: 1,
+                    already: false,
+                },
             ),
             (client(ClientOp::Create), created(2, true)),
             (send("r1", b"hi"), accepted(new_op, false)),
@@ -1028,7 +1043,10 @@ mod tests {
             (send("r1", b"hi"), accepted(old, false)),
             (
                 client(ClientOp::Destroy),
-                Reply::Destroyed { incarnation: 1 },
+                Reply::Destroyed {
+                    incarnation: 1,
+                    already: false,
+                },
             ),
             (
                 client(ClientOp::Operation { operation: old }),
@@ -1056,6 +1074,34 @@ mod tests {
             ),
         ]);
         assert_eq!(h.check(m), Ok(()));
+    }
+
+    #[test]
+    fn destroy_before_any_create_is_agent_gone_and_a_repeat_is_idempotent() {
+        let h = history(vec![
+            (
+                client(ClientOp::Destroy),
+                Reply::Error(ErrorKind::AgentGone),
+            ),
+            (client(ClientOp::Create), created(1, true)),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed {
+                    incarnation: 1,
+                    already: false,
+                },
+            ),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed {
+                    incarnation: 1,
+                    already: true,
+                },
+            ),
+            (client(ClientOp::State), Reply::Error(ErrorKind::AgentGone)),
+            (client(ClientOp::Create), created(2, true)),
+        ]);
+        assert_eq!(h.check(machine()), Ok(()));
     }
 
     #[test]
@@ -1100,7 +1146,10 @@ mod tests {
             ),
             (
                 client(ClientOp::Destroy),
-                Reply::Destroyed { incarnation: 1 },
+                Reply::Destroyed {
+                    incarnation: 1,
+                    already: false,
+                },
             ),
             (client(ClientOp::Create), created(2, true)),
             // A new incarnation keeps no timers and starts at state version 0.
@@ -1119,11 +1168,17 @@ mod tests {
             ),
             (
                 client(ClientOp::Destroy),
-                Reply::Destroyed { incarnation: 2 },
+                Reply::Destroyed {
+                    incarnation: 2,
+                    already: false,
+                },
             ),
             (
                 client(ClientOp::Destroy),
-                Reply::Error(ErrorKind::AgentGone),
+                Reply::Destroyed {
+                    incarnation: 2,
+                    already: true,
+                },
             ),
         ]);
         assert_eq!(h.check(m), Ok(()));
@@ -1292,7 +1347,10 @@ mod tests {
                 ),
                 (
                     client(ClientOp::Destroy),
-                    Reply::Destroyed { incarnation: 1 },
+                    Reply::Destroyed {
+                        incarnation: 1,
+                        already: false,
+                    },
                 ),
                 (client(ClientOp::Create), created(2, true)),
                 (
