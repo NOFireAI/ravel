@@ -1052,3 +1052,205 @@ async fn a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone() {
     assert_eq!(body["status"], json!("accepted"), "{body}");
     running.shutdown().await.expect("clean shutdown");
 }
+
+/// A pass-through store that records the key of every GET under the agents
+/// prefix (`t/<tenant>/ag/`), so a test can pin what one route read.
+struct AgentGets {
+    inner: MemoryStore,
+    gets: std::sync::Mutex<Vec<String>>,
+}
+
+impl AgentGets {
+    /// The agents GETs recorded since the last call, emptied.
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.gets.lock().expect("spy mutex not poisoned"))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for AgentGets {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: ravel_object_store::PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        if key.contains("/ag/") {
+            self.gets
+                .lock()
+                .expect("spy mutex not poisoned")
+                .push(key.to_string());
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        ravel_object_store::Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// Turns run before the measured requests: one receipt, one result and one
+/// event each, so at the default 64 entries a page the receipts, results
+/// and events lists each hold 12 sealed pages.
+const DEEP_TURNS: u64 = 12 * 64 + 1;
+
+/// The bounded-read claim of the ADR-3331 index-page amendment through the
+/// real routes: against an agent with 12 sealed pages in each of its
+/// receipts, results and events lists, a result wait on its first operation,
+/// an events page from its first event and a worker poll each GET HEAD and
+/// at most one sealed page, never the history.
+#[tokio::test]
+async fn hot_routes_read_one_page_of_a_deep_history() {
+    let spy = Arc::new(AgentGets {
+        inner: MemoryStore::new(),
+        gets: std::sync::Mutex::new(Vec::new()),
+    });
+    let running = start_server(
+        spy.clone(),
+        agents_config(),
+        ravel_query::QueryConcurrencyLimit::Unlimited,
+    )
+    .await;
+    let api = Api::public(&running);
+    api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
+    let worker = register(&api).await;
+    let mut first = String::new();
+    for n in 0..DEEP_TURNS {
+        let sent = api
+            .ok(CLIENT, "send", &send_body(&format!("req-{n}"), json!({"n": n})))
+            .await;
+        if n == 0 {
+            first = sent["operation"].as_str().expect("operation").to_string();
+        }
+        let assignment = poll(&api, &worker, 2_000).await;
+        assert_eq!(assignment["operation"], sent["operation"]);
+        api.ok(
+            WORKER,
+            "worker/commit",
+            &commit_body(
+                &assignment,
+                json!({}),
+                json!({"n": n}),
+                json!([{"event_type": "done", "payload": {"n": n}}]),
+            ),
+        )
+        .await;
+    }
+
+    let head_key = {
+        let page = spy.inner.list("t/", None).await.expect("list");
+        page.objects
+            .iter()
+            .map(|o| o.key.clone())
+            .find(|k| k.contains("/ag/") && k.ends_with("/head"))
+            .expect("the agent's HEAD")
+    };
+    let stored = spy
+        .inner
+        .get(&head_key, ravel_object_store::GetRange::Full)
+        .await
+        .expect("HEAD");
+    let head = ravel_agents_core::head::Head::decode(&stored.data).expect("decode HEAD");
+    use ravel_agents_core::pages::ListKind;
+    for list in [ListKind::Receipts, ListKind::Results, ListKind::Events] {
+        assert_eq!(head.index.directory(list).pages.len(), 12, "{list:?}");
+    }
+    // Each GET named by what it read: HEAD, a sealed page of one list, or
+    // any other object (a payload or an output).
+    let mut pages = HashMap::new();
+    for list in ListKind::ALL {
+        for meta in &head.index.directory(list).pages {
+            pages.insert(meta.page.hash.to_hex(), format!("{list:?} page"));
+        }
+    }
+    let read = |gets: Vec<String>| -> Vec<String> {
+        gets.iter()
+            .map(|k| {
+                if *k == head_key {
+                    return "HEAD".to_string();
+                }
+                let hash = k.rsplit('/').next().unwrap_or_default();
+                pages
+                    .get(hash)
+                    .cloned()
+                    .unwrap_or_else(|| "object".to_string())
+            })
+            .collect()
+    };
+
+    // A result wait on the first operation, settled long ago: HEAD, the one
+    // results page holding it, and its output object.
+    spy.take();
+    let (status, body) = api
+        .get(CLIENT, &format!("result?operation={first}&wait_ms=0"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["status"], json!("completed"), "{body}");
+    assert_eq!(read(spy.take()), ["HEAD", "Results page", "object"]);
+
+    // The first page of events: HEAD, the first events page, and the
+    // payload object of each of the two events returned.
+    let page = api
+        .ok(
+            CLIENT,
+            "events",
+            &json!({"agent": agent(), "cursor": Value::Null, "limit": 2}),
+        )
+        .await;
+    assert_eq!(page["events"].as_array().map(Vec::len), Some(2), "{page}");
+    assert_eq!(
+        read(spy.take()),
+        ["HEAD", "Events page", "object", "object"]
+    );
+
+    // A poll that hands out a new input: `BeginTurn`'s HEAD read, the
+    // assignment's state and payload objects, and the route's HEAD read for
+    // the lease's recorded time. The runtime's root is already loaded and
+    // the input is on the open inbox page, so no sealed page is read.
+    let sent = api
+        .ok(CLIENT, "send", &send_body("req-last", json!({"n": "last"})))
+        .await;
+    spy.take();
+    let assignment = poll(&api, &worker, 2_000).await;
+    assert_eq!(assignment["operation"], sent["operation"]);
+    assert_eq!(read(spy.take()), ["HEAD", "object", "object", "HEAD"]);
+
+    running.shutdown().await.expect("clean shutdown");
+}
