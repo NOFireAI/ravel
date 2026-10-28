@@ -433,7 +433,7 @@ fn region_texts(batches: &[RecordBatch], column: usize) -> Vec<Option<String>> {
 /// over the fixture completes on the columnar path and returns the rows the
 /// row path returns (`SELECT region, attrs FROM logs`, which projects the
 /// `attrs` map and so drains the row path), every record's own value. Its
-/// peak is 659,920 bytes.
+/// peak is 659,568 bytes.
 ///
 /// Flipped: with the per-batch charge (`get_array_memory_size` summed in
 /// `hold_batches`, block keys sliced rather than copied) the same statement
@@ -457,7 +457,7 @@ async fn a_statement_the_per_batch_charge_refused_fits_the_ceiling() {
         Err(e) => panic!("query failed: {e:?}"),
     };
     let peak = columnar.accounting.peak_intermediate_bytes;
-    assert_eq!(peak, 659_920, "the statement's peak under the fixed charge");
+    assert_eq!(peak, 659_568, "the statement's peak under the fixed charge");
 
     let rows = executor(&store, SqlConfig::default().max_query_bytes)
         .execute(t.hash(), &request("SELECT region, attrs FROM logs"))
