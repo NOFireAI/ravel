@@ -1060,7 +1060,7 @@ The server registers both functions for a query only when all four hold:
 - the caller holds the `ipcrypt` capability: a token whose tenant is written
   `TENANT;ipcrypt` or `TENANT;ddl,ipcrypt`, or an OIDC token whose
   `--oidc-ipcrypt-claim` claim is `true`
-  ([capabilities](operations/configuration.md#the-ddl-and-ipcrypt-capabilities));
+  ([capabilities](operations/configuration.md#the-ddl-ipcrypt-and-agents-capabilities));
 - the server has a deployment key (`--tenant-hash-key-file`);
 - the query audit does not record query text in plaintext: `--audit-mode off`
   (the default), or `--audit-text redacted`. Under `--audit-text plaintext`
