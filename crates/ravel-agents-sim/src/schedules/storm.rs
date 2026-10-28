@@ -42,15 +42,12 @@ const STORM_SWEEP: SweepConfig = SweepConfig {
     max_head_gets: 8,
 };
 
-/// The recovering coordinator keeps the production idle unload and rescan
-/// intervals. The sim's zero intervals unload an agent on its commit, and an
-/// unload restarts the directory scan, so every takeover after the first
-/// would list the whole directory and the sweep would recover nothing.
+/// The recovering coordinator keeps the production idle unload interval, as
+/// a running server does; the sim's zero interval unloads an agent on its
+/// commit.
 fn storm_config() -> RuntimeConfig {
-    let defaults = RuntimeConfig::default();
     RuntimeConfig {
-        idle_unload_after_ms: defaults.idle_unload_after_ms,
-        rescan_interval_ms: defaults.rescan_interval_ms,
+        idle_unload_after_ms: RuntimeConfig::default().idle_unload_after_ms,
         ..runtime_config()
     }
 }
@@ -254,9 +251,9 @@ fn storm(sweep: SweepConfig, seed: Option<u64>) -> Storm {
     };
 
     runtime.block_on(async {
-        // The recovering coordinator was running before the storm: its start
-        // scan saw an empty directory, so it learns of the agents only
-        // through its sweep.
+        // The recovering coordinator was running before the storm. Its polls
+        // run no pass (`STORM_SWEEP`'s interval), so it learns of the agents
+        // only through `sweep_once`.
         let none = new
             .co
             .poll(&poll(new.worker_id.clone()), tokio::time::Instant::now())
@@ -395,7 +392,10 @@ const INGEST_WAIT_BAND: u64 = STORM_SWEEP.max_list_pages as u64 + STORM_SWEEP.ma
 fn assert_within_budget(s: &Storm) {
     for (n, (report, lists, gets)) in s.passes.iter().enumerate() {
         assert_eq!(
-            (report.list_pages, report.head_gets),
+            (
+                report.wake_list_pages + report.dir_list_pages,
+                report.head_gets
+            ),
             (*lists, *gets),
             "pass {n} reports what it issued"
         );

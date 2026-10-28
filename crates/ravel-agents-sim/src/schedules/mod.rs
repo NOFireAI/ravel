@@ -139,7 +139,9 @@ where
 {
     let rig = rig.clone();
     let owned = name.to_string();
-    Actor::client(name, move |store| body(rig.proc(&owned, store, id_seed)))
+    Actor::client(name, move |store| {
+        body(rig.client_proc(&owned, store, id_seed))
+    })
 }
 
 /// A worker actor whose body runs against its own process.
@@ -178,7 +180,10 @@ where
     let body = move |store: ActorStore| {
         let layer = Arc::new(FaultStore::new(store as Arc<dyn ObjectStoreBackend>, plan));
         let _ = cell.set(Arc::clone(&layer));
-        body(rig.proc(&owned, layer, id_seed))
+        body(match role {
+            Role::Client => rig.client_proc(&owned, layer, id_seed),
+            Role::Worker => rig.proc(&owned, layer, id_seed),
+        })
     };
     let actor = match role {
         Role::Client => Actor::client(name, body),

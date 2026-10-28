@@ -1,10 +1,12 @@
 //! Workers killed at each publication boundary, a suspended worker after a
 //! takeover, and a cold restart.
 //!
-//! One worker turn issues, in order: LIST, a discovery HEAD read, the
+//! One worker turn issues, in order: the LIST of `_dir/` and the HEAD read
+//! of the sweep pass its idle poll runs (`drive::poll_sweep`), the
 //! takeover's HEAD read and CAS, BeginTurn's HEAD read and CAS, the payload
 //! GET, then the commit's HEAD read, the state and output object PUTs and
-//! the commit CAS. The kill points gate on those ordinals.
+//! the commit CAS (`one_worker_turn_issues_the_documented_requests`). The
+//! kill points gate on those ordinals.
 
 use ravel_agents_core::error::ErrorKind;
 use ravel_agents_core::head::{ObjectRef, ResultStatus};
@@ -609,13 +611,16 @@ fn stale_owner_commit_after_takeover_is_fenced() {
 
 /// A seed outside the default batch where the scheduler holds `c0`'s send
 /// behind the workers' HEAD writes until its CAS bound runs out: the send
-/// is refused `StoreUnavailable`, and the retry lands it. No worker
-/// crashes; `w1`'s lost-answer rule fires.
+/// is refused `StoreUnavailable`, and the retry lands it. One worker
+/// crashes and `w1`'s lost-answer rule fires. No seed in the 512-seed
+/// windows of days 1 to 450 starves the send with no other event: this
+/// one also crashes a worker, and 392000268 also fences a stale owner.
 #[test]
 fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
     assert_eq!(
-        kills(9_000_272),
+        kills(20_000_471),
         KillCounts {
+            crashes: 1,
             fired: 1,
             contended_sends: 1,
             ..KillCounts::default()
@@ -632,19 +637,69 @@ fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
 #[test]
 #[ignore = "suspected defect, issue #3425: poll returns OutcomeUnknown when a BeginTurn retry loses its answer"]
 fn a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll() {
-    assert_eq!(kills(11_000_167).escaped_unknown, 0);
+    assert_eq!(kills(4_000_067).escaped_unknown, 0);
 }
 
 /// The same seed as counted today: the escape is the run's one divergence.
 #[test]
 fn a_lost_begin_turn_answer_after_a_spent_retry_escapes_the_poll_today() {
     assert_eq!(
-        kills(11_000_167),
+        kills(4_000_067),
         KillCounts {
             fired: 1,
             escaped_unknown: 1,
             ..KillCounts::default()
         }
+    );
+}
+
+/// The request order the module docs list, which the kill points' ordinals
+/// count on: one worker's turn on an agent another process created.
+#[test]
+fn one_worker_turn_issues_the_documented_requests() {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let w1 = worker(&rig, "w1", 10, |p| async move {
+        p.work(1).await;
+        Ok(())
+    });
+    let out = run(
+        &rig,
+        1,
+        ScheduleScript::new(vec![ScriptStep::Release(0); 40]),
+        vec![w1],
+    )
+    .expect("schedule");
+    let requests: Vec<(Op, &str)> = out
+        .trace
+        .iter()
+        .map(|t| {
+            let kind = if t.key.ends_with("/_dir/") {
+                "dir"
+            } else if t.key.ends_with("/head") {
+                "head"
+            } else {
+                "object"
+            };
+            (t.op, kind)
+        })
+        .collect();
+    sim_assert_eq!(
+        out,
+        requests,
+        vec![
+            (Op::List, "dir"),
+            (Op::Get, "head"),
+            (Op::Get, "head"),
+            (Op::Put, "head"),
+            (Op::Get, "head"),
+            (Op::Put, "head"),
+            (Op::Get, "object"),
+            (Op::Get, "head"),
+            (Op::Put, "object"),
+            (Op::Put, "object"),
+            (Op::Put, "head"),
+        ]
     );
 }
 

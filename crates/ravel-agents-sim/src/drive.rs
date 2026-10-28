@@ -1025,6 +1025,14 @@ impl Rig {
         self.proc_with(name, backend, seed, runtime_config(), Some(poll_sweep()))
     }
 
+    /// A client's process: [`Rig::proc`] with the runtime's default sweep, so
+    /// a pass it runs with [`Proc::sweep`] lists both halves. A client does
+    /// not poll, so [`poll_sweep`] would only take the wake half's LISTs
+    /// from those passes.
+    pub fn client_proc(&self, name: &str, backend: Arc<dyn ObjectStoreBackend>, seed: u64) -> Proc {
+        self.proc_with(name, backend, seed, runtime_config(), None)
+    }
+
     /// [`Rig::proc`] whose coordinator runs with `config` and sweeps with
     /// `sweep`, or with the runtime's default sweep when that is `None`. A
     /// coordinator's idle polls run passes on the sweep's interval.
@@ -1088,7 +1096,7 @@ impl Rig {
             .start_paused(true)
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
-        let proc = self.proc("setup", self.shared(), 1);
+        let proc = self.client_proc("setup", self.shared(), 1);
         runtime.block_on(body(proc))
     }
 
