@@ -386,7 +386,10 @@ An HTTP row's `elapsed_secs` is wall time, `elapsed_basis:
 "wall_in_flight"`: from the first request sent to the last response
 received, with requests overlapping on every shard and the stream generated
 between them. `generation_secs` is the part of the replay the producer spent
-generating and classifying the stream. `sender_bound` is true when
+generating and classifying the stream and routing each point to its shard
+(the read-back plan, the series hash and the buffer push), not counting time
+waiting on a full shard queue
+(`metrics_ingest::tests::a_producer_round_counts_routing_as_generation`). `sender_bound` is true when
 `generation_secs` is at least 90% of `elapsed_secs` (`is_sender_bound`,
 `metrics_ingest::tests::sender_bound_needs_wall_basis_and_ninety_percent_generation`):
 the row measured the bench's generator, not the receiver, and its
@@ -407,7 +410,11 @@ seconds. Once the row has sent for 60 s, and then at most every 10 s, the bin
 projects its total wall time as elapsed x (stream points / points offered so
 far) (`project_ingest_secs`,
 `metrics_ingest::tests::stall_projection_scales_elapsed_by_the_stream_left`,
-`metrics_ingest::tests::stall_checks_wait_60s_then_recur_every_10s`). A
+`metrics_ingest::tests::stall_checks_wait_60s_then_recur_every_10s`). The
+check keeps running after the whole stream is offered, while the last
+responses drain, so it also covers a stream small enough to fit in the shard
+buffers
+(`metrics_ingest::tests::the_drain_stops_a_row_whose_whole_stream_is_already_offered`). A
 projection over `N` fails the row with an error naming the system, the
 projection, the ceiling and the points offered, and the bin exits 1, as it
 does for a band violation
