@@ -61,7 +61,7 @@ Modelled, each as its own action unless "Folded steps" below says otherwise:
 - Cancellation as a HEAD command; destroy (tombstone) and recreate with an
   incarnation bump.
 - One timer per agent with a generation; scheduling and cancelling it are
-  owner CASes. One advisory hint per armed generation; the sweep fires a due
+  HEAD CASes fenced by incarnation, not by owner. One advisory hint per armed generation; the sweep fires a due
   hint with one CAS that marks the generation delivered and enqueues the timer
   message, and deletes a hint whose generation is no longer armed. A hint may
   be absent (never written yet), stale, or listed early.
@@ -275,6 +275,9 @@ intended behaviour and the model follows it:
   `CancellationState::Requested`. A repeated request writes nothing.
   `CancellationRespected` now allows a cancelled input to stay pending only
   as the requested active turn's input.
+- `ScheduleTimer` and `CancelTimer` are fenced by incarnation, as the
+  kernel's `check_incarnation` fences them, so any caller of the current
+  incarnation may issue them, with or without an owner.
 
 Remaining differences, each also stated in its `traceability.md` row:
 
@@ -300,7 +303,7 @@ Remaining differences, each also stated in its `traceability.md` row:
 - Not modelled from ADR-3331 decisions 3 to 8: handler version and digest in
   the rebase check and `IncompatibleHandler`; events, effect intents and timer
   changes in the turn completion CAS (timers change only through their own
-  owner CAS); the handler retry policy and dead-letter; the `AlreadyFired`
+  CAS); the handler retry policy and dead-letter; the `AlreadyFired`
   answer (a cancel on a delivered generation is not enabled); the receipt index as pages; the HEAD size cap and
   quotas; format versions and `UnsupportedFormat`; operation states other than
   pending and resolved.
