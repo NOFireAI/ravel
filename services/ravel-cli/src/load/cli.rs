@@ -114,50 +114,25 @@ pub fn dynamic_column_warnings(
     Vec::new()
 }
 
-/// Warning for a load whose `--target-bytes` above [`PER_BATCH_TARGET_BYTES`] laid
-/// the objects out exactly as `1` would have (issue #971). `None` when the
-/// target was `1`, when some buffer did span several writes, or when no
-/// shard ever received two writes to accumulate in the first place.
+/// Warning for a load whose target above [`PER_BATCH_TARGET_BYTES`], given by
+/// the flag or derived from [`DEFAULT_OBJECT_ROWS`], laid the objects out
+/// exactly as `1` would have (issue #971). `None` when the target was `1`,
+/// when some buffer did span several writes, or when no shard ever received
+/// two writes to accumulate in the first place. Every signal's loader computes
+/// it once the load finished and stores it on its report. A derived target
+/// clamped to [`MAX_TARGET_BYTES`] is named as clamped, as the geometry line
+/// names it.
 ///
-/// Why a target of a few MiB is a no-op on a wide corpus. The value reaches
-/// `IngestConfig::target_bytes` unmodified and the shard actor does consult it,
-/// but against the buffer's estimated *uncompressed object content*
-/// (`est_record_object_bytes`/`est_columnar_object_bytes` in
-/// crates/ravel-ingest/src/log_shard.rs): body, severity text, stream
-/// attributes, attribute names and values, and fixed per-row fields. Stored
-/// objects are compressed, so a target read off an observed object size is
-/// several times below the content of the rows that object holds. On top of
-/// that the comparison runs once per write, after a whole batch's per-shard
-/// slice has merged, so at an even split any target at or below one slice's
-/// content (`--batch-rows / --shards` rows' worth) is already exceeded by the
-/// first write into an empty buffer and flushes it, exactly as `1` does. A
-/// shard whose real slice sits under that can accumulate across batches.
-///
-/// The loader cannot compute that footprint before it runs, so this reports the
-/// outcome from figures [`LoadReport`] already carries. `tokens` holds one entry
-/// per (batch, shard) Strict ack, and a flush that answered several batches
-/// repeats its own token once per batch, so `objects_written() == tokens.len()`
-/// means no buffer ever spanned two writes. That is evidence about the target
-/// only if some shard took at least two writes, which is the second condition.
-pub fn target_bytes_no_effect_warning(
-    target_bytes: usize,
-    report: &LoadReport,
-    batch_rows: usize,
-    shards: u32,
-) -> Option<String> {
-    let geometry = LoadGeometry {
-        target_bytes,
-        target_source: TargetSource::Flag,
-        ..LoadGeometry::default()
-    };
-    layout_no_effect_warning(&geometry, &report.tokens, batch_rows, shards)
-}
-
-/// [`target_bytes_no_effect_warning`] over any signal's ack tokens, for a
-/// target given by the flag or derived from [`DEFAULT_OBJECT_ROWS`]. Every
-/// signal's loader computes it once the load finished and stores it on its
-/// report. A derived target clamped to [`MAX_TARGET_BYTES`] is named as
-/// clamped, as the geometry line names it.
+/// The target is compared against a shard buffer's estimated uncompressed
+/// object content, not the stored object size, and why a target at or below
+/// one batch's per-shard slice reproduces the `1` layout is explained on
+/// [`PER_BATCH_TARGET_BYTES`]. The loader cannot compute that footprint
+/// before it runs, so this reports the outcome from the ack `tokens`: one
+/// entry per (batch, shard) Strict ack, and a flush that answered several
+/// batches repeats its own token once per batch, so as many distinct tokens
+/// as entries means no buffer ever spanned two writes. That is evidence about
+/// the target only if some shard took at least two writes, which is the
+/// second condition.
 pub fn layout_no_effect_warning(
     geometry: &LoadGeometry,
     tokens: &[CommitToken],
@@ -190,7 +165,7 @@ pub fn layout_no_effect_warning(
     }
     let target = match geometry.target_source {
         TargetSource::Flag => format!("--target-bytes {target_bytes}"),
-        TargetSource::Derived if geometry.target_clamped() => format!(
+        TargetSource::Derived if geometry.target_clamped => format!(
             "the derived flush target of {target_bytes} bytes ({DEFAULT_OBJECT_ROWS} rows at the \
              first batch's estimated {} bytes per row, clamped to the {MAX_TARGET_BYTES} maximum)",
             geometry.est_bytes_per_row
@@ -211,10 +186,10 @@ pub fn layout_no_effect_warning(
          depth and write cadence before changing the target. Separately, the target is compared \
          against the buffer's estimated UNCOMPRESSED object content, not the stored object \
          size, and the check runs once per write after a whole batch has merged. So at an even \
-         split a target at or below one batch's per-shard slice (about {slice} rows here, at --batch-rows \
-         {batch_rows} over {shards} shards) is already exceeded by the first write into an empty \
-         buffer and flushes it. For objects that span several batches, raise --target-bytes \
-         above that slice's estimated content, or lower --batch-rows.",
+         split a target at or below one batch's per-shard slice (about {slice} rows here, at \
+         --batch-rows {batch_rows} over {shards} shards) is already exceeded by the first write \
+         into an empty buffer and flushes it. For objects that span several batches, raise \
+         --target-bytes above that slice's estimated content, or lower --batch-rows.",
         slice = batch_rows / (shards.max(1) as usize),
     ))
 }

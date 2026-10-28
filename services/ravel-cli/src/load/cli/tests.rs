@@ -277,7 +277,7 @@ const FLAG_4096_NO_EFFECT_WARNING: &str = "warning: --target-bytes 4096 did not 
 /// per-row wording.
 ///
 /// Prove-the-test: drop the `TargetSource::Derived if
-/// geometry.target_clamped()` arm in `layout_no_effect_warning` and the
+/// geometry.target_clamped` arm in `layout_no_effect_warning` and the
 /// clamped case fails (the warning reads "(250000 rows at the first batch's
 /// estimated bytes per row)"); print the clamp note for every derived target
 /// and the at-bound case fails; drop the per-row explanation from the
@@ -329,17 +329,17 @@ fn the_no_effect_warning_names_a_clamped_derived_target_as_clamped() {
     );
 }
 
-/// [`target_bytes_no_effect_warning`]'s three preconditions, each pinned by
-/// the case that would misfire without it. `writes` is
-/// `LoadReport::tokens`, one entry per (batch, shard) ack, so a flush that
-/// answered several batches shows up as a repeated token.
+/// [`layout_no_effect_warning`]'s three preconditions, each pinned by the
+/// case that would misfire without it. The tokens are one entry per
+/// (batch, shard) ack, so a flush that answered several batches shows up as
+/// a repeated token.
 ///
 /// Prove-the-test: delete the `objects < writes` early return and the
 /// accumulating case starts warning (its `is_none` assertion fails at
 /// "a repeated token is a flush that answered two batches"); delete the
 /// `< 2` writes-per-shard guard and the one-write-per-shard case starts
 /// warning; change the `target_bytes <= PER_BATCH_TARGET_BYTES` guard to `<`
-/// and the default-target case starts warning.
+/// and the `--target-bytes 1` case starts warning.
 #[test]
 fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
     let token = |shard: u32, seq: u64| CommitToken {
@@ -349,35 +349,39 @@ fn the_no_effect_warning_fires_only_when_the_target_is_what_did_nothing() {
         seq,
         ingest_hour_bucket: 7,
     };
-    let report = |tokens: Vec<CommitToken>| LoadReport {
-        tokens,
-        ..LoadReport::default()
+    let warning_for = |target_bytes: usize, tokens: &[CommitToken]| {
+        let geometry = LoadGeometry {
+            target_bytes,
+            target_source: TargetSource::Flag,
+            ..LoadGeometry::default()
+        };
+        layout_no_effect_warning(&geometry, tokens, 16, 4)
     };
 
     // Two writes on one shard, two distinct objects: nothing accumulated.
-    let inert = report(vec![token(0, 1), token(0, 2)]);
-    let warning = target_bytes_no_effect_warning(4096, &inert, 16, 4)
+    let inert = [token(0, 1), token(0, 2)];
+    let warning = warning_for(4096, &inert)
         .expect("two writes, two objects, one shard: the target did nothing");
     assert_eq!(warning, FLAG_4096_NO_EFFECT_WARNING);
 
     assert!(
-        target_bytes_no_effect_warning(PER_BATCH_TARGET_BYTES, &inert, 16, 4).is_none(),
-        "the default target is not a no-op, it is the documented per-batch layout"
+        warning_for(PER_BATCH_TARGET_BYTES, &inert).is_none(),
+        "--target-bytes 1 is not a no-op, it is the documented per-batch layout"
     );
 
     // Two writes answered by one flush: the same token repeats, so the
     // target held a buffer open.
-    let accumulating = report(vec![token(0, 1), token(0, 1)]);
+    let accumulating = [token(0, 1), token(0, 1)];
     assert!(
-        target_bytes_no_effect_warning(4096, &accumulating, 16, 4).is_none(),
+        warning_for(4096, &accumulating).is_none(),
         "a repeated token is a flush that answered two batches: the target worked"
     );
 
     // One write per shard: no buffer could have spanned two writes at any
     // target, so the target is not what to blame.
-    let single = report(vec![token(0, 1), token(1, 1), token(2, 1), token(3, 1)]);
+    let single = [token(0, 1), token(1, 1), token(2, 1), token(3, 1)];
     assert!(
-        target_bytes_no_effect_warning(4096, &single, 16, 4).is_none(),
+        warning_for(4096, &single).is_none(),
         "no shard was written twice, so nothing could have accumulated"
     );
 }

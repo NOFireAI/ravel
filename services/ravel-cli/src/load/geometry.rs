@@ -33,7 +33,7 @@ pub const DEFAULT_MAX_FLUSH_DELAY: Duration = Duration::from_secs(60);
 /// the same layout: the size check runs once per write, after the whole slice
 /// has merged, so the first write into an empty buffer already exceeds it. A
 /// shard whose real slice sits under that estimate can still accumulate
-/// across batches. See [`target_bytes_no_effect_warning`].
+/// across batches. See [`layout_no_effect_warning`].
 pub const PER_BATCH_TARGET_BYTES: usize = 1;
 
 /// The largest pipeline depth a load derives. A depth is a count of writes
@@ -185,6 +185,12 @@ pub struct LoadGeometry {
     /// [`Self::with_ack_deadline`].
     #[serde(default)]
     pub ack_deadline: Duration,
+    /// Whether [`resolve_geometry`] clamped a derived target to
+    /// [`MAX_TARGET_BYTES`]: its [`unclamped_derived_target`] exceeded the
+    /// bound. False for a given target and for a derived one exactly at the
+    /// bound.
+    #[serde(default)]
+    pub target_clamped: bool,
 }
 
 impl LoadGeometry {
@@ -193,17 +199,6 @@ impl LoadGeometry {
     /// or below it every write already flushes its own buffer.
     pub fn depth_flush_enabled(&self) -> bool {
         depth_flush_runs(self.target_bytes)
-    }
-
-    /// Whether this is a derived target [`resolve_geometry`] clamped to
-    /// [`MAX_TARGET_BYTES`]: [`DEFAULT_OBJECT_ROWS`] times the rounded-up
-    /// per-row estimate exceeds the bound. A derived target exactly at the
-    /// bound is not clamped.
-    pub fn target_clamped(&self) -> bool {
-        self.target_source == TargetSource::Derived
-            && self.target_bytes as u64 == MAX_TARGET_BYTES
-            && (DEFAULT_OBJECT_ROWS as u128).saturating_mul(u128::from(self.est_bytes_per_row))
-                > u128::from(MAX_TARGET_BYTES)
     }
 
     /// The depth the rows bound derives for this load: [`Self::rows_depth`],
@@ -229,11 +224,19 @@ impl LoadGeometry {
     }
 }
 
+/// The target a load derives from a first batch of `first_rows` rows
+/// estimated at `first_est_bytes`, before the clamp to [`MAX_TARGET_BYTES`]:
+/// [`DEFAULT_OBJECT_ROWS`] times the unrounded per-row estimate, rounded down.
+fn unclamped_derived_target(first_rows: usize, first_est_bytes: usize) -> u128 {
+    (DEFAULT_OBJECT_ROWS as u128).saturating_mul(first_est_bytes as u128)
+        / first_rows.max(1) as u128
+}
+
 /// Resolve the target and depth for a load once its first non-empty batch is
 /// decoded: `first_rows` rows of the object (log records, spans or metric
-/// points) that the router estimates at `first_est_bytes`. An explicit value is kept as given; a missing one is
-/// derived as the [`DEFAULT_OBJECT_ROWS`] geometry describes, clamped to
-/// [`MAX_TARGET_BYTES`].
+/// points) that the router estimates at `first_est_bytes`. An explicit value
+/// is kept as given; a missing one is derived as the [`DEFAULT_OBJECT_ROWS`]
+/// geometry describes, clamped to [`MAX_TARGET_BYTES`].
 pub fn resolve_geometry(
     target_bytes: Option<usize>,
     pipeline_depth: Option<usize>,
@@ -243,19 +246,19 @@ pub fn resolve_geometry(
     first_est_bytes: usize,
     memory_budget: Option<u64>,
 ) -> LoadGeometry {
-    let first_rows = first_rows.max(1) as u128;
-    let est = first_est_bytes as u128;
-    let est_bytes_per_row = u64::try_from(est.div_ceil(first_rows))
-        .unwrap_or(u64::MAX)
-        .max(1);
-    let (target_bytes, target_source) = match target_bytes {
-        Some(t) => (t, TargetSource::Flag),
+    let est_bytes_per_row =
+        u64::try_from((first_est_bytes as u128).div_ceil(first_rows.max(1) as u128))
+            .unwrap_or(u64::MAX)
+            .max(1);
+    let (target_bytes, target_source, target_clamped) = match target_bytes {
+        Some(t) => (t, TargetSource::Flag, false),
         None => {
-            let derived = ((DEFAULT_OBJECT_ROWS as u128).saturating_mul(est) / first_rows)
-                .min(u128::from(MAX_TARGET_BYTES));
+            let unclamped = unclamped_derived_target(first_rows, first_est_bytes);
+            let derived = unclamped.min(u128::from(MAX_TARGET_BYTES));
             (
                 usize::try_from(derived).unwrap_or(usize::MAX).max(1),
                 TargetSource::Derived,
+                unclamped > u128::from(MAX_TARGET_BYTES),
             )
         }
     };
@@ -297,6 +300,7 @@ pub fn resolve_geometry(
         memory_depth,
         slice_est_bytes,
         ack_deadline: write_ack_deadline(None, None, target_bytes),
+        target_clamped,
     }
 }
 
@@ -656,7 +660,7 @@ fn target_source_text(g: &LoadGeometry) -> String {
         TargetSource::Flag => "--target-bytes".to_string(),
         TargetSource::Derived => {
             let rows = DEFAULT_OBJECT_ROWS;
-            if g.target_clamped() {
+            if g.target_clamped {
                 return format!(
                     "derived: {rows} rows x {} estimated bytes per row, clamped to the \
                      {MAX_TARGET_BYTES} maximum",
@@ -1068,6 +1072,69 @@ mod tests {
                 .contains("(derived: 250000 rows x 1440000 estimated bytes per row),"),
             "{}",
             render_geometry_line("logs", &g)
+        );
+    }
+
+    /// The clamp and the clamp report read one value,
+    /// [`unclamped_derived_target`], so they agree at the bound. A per-row
+    /// estimate whose unclamped product lands exactly on [`MAX_TARGET_BYTES`]
+    /// is not reported clamped, and one byte per row more is, both for a
+    /// whole per-row estimate (1 row at 1,440,000 bytes) and for one just
+    /// over a whole number of bytes (250,001 rows at 1,440,000 + 1/250,001
+    /// bytes each), whose product rounds down onto the bound while its
+    /// rounded-up per-row figure, 1,440,001, times 250,000 is above it. The
+    /// flag reaches the JSON load report.
+    ///
+    /// Prove-the-test: compare with `>=` instead of `>` and the 1,440,000
+    /// case fails at its `!g.target_clamped`; report the clamp off the
+    /// rounded-up `est_bytes_per_row`, as `target_clamped()` did before,
+    /// and the 250,001-row case fails at its `!g.target_clamped`.
+    #[test]
+    fn the_clamp_report_agrees_with_the_clamp_at_the_bound() {
+        let at_bound = |first_rows: usize, first_est_bytes: usize| {
+            let g = resolve_geometry(None, None, 1, 1, first_rows, first_est_bytes, None);
+            assert_eq!(g.target_bytes as u64, MAX_TARGET_BYTES);
+            g
+        };
+
+        let g = at_bound(1, 1_440_000);
+        assert_eq!(unclamped_derived_target(1, 1_440_000), 360_000_000_000);
+        assert!(!g.target_clamped, "exactly at the bound is not clamped");
+        let g = at_bound(1, 1_440_001);
+        assert_eq!(unclamped_derived_target(1, 1_440_001), 360_000_250_000);
+        assert!(g.target_clamped, "one byte per row over is clamped");
+
+        let rows = 250_001;
+        let est = 1_440_000 * rows + 1;
+        let g = at_bound(rows, est);
+        assert_eq!(unclamped_derived_target(rows, est), 360_000_000_000);
+        assert_eq!(g.est_bytes_per_row, 1_440_001);
+        assert!(
+            !g.target_clamped,
+            "a product that rounds down onto the bound is not clamped"
+        );
+        assert!(
+            render_geometry_line("logs", &g).contains(
+                "(derived: 250000 rows x 1440000 estimated bytes per row), pipeline depth"
+            ),
+            "{}",
+            render_geometry_line("logs", &g)
+        );
+        let g = at_bound(rows, est + rows);
+        assert!(g.target_clamped, "one byte per row over is clamped");
+
+        let report = |geometry| LoadLayoutReport {
+            geometry: Some(geometry),
+            ..LoadLayoutReport::default()
+        };
+        assert!(
+            render_layout_summary(&report(g)).contains("\"target_clamped\":true"),
+            "{}",
+            render_layout_summary(&report(g))
+        );
+        assert!(
+            render_layout_summary(&report(at_bound(1, 1_440_000)))
+                .contains("\"target_clamped\":false")
         );
     }
 

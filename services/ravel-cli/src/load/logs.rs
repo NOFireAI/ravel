@@ -212,7 +212,7 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 /// The target is measured in the router's estimated buffered footprint and is
 /// tested once per write, so at an even split a value at or below one batch's
 /// per-shard slice lays the objects out as `1` does ([`PER_BATCH_TARGET_BYTES`]
-/// covers a skewed split); [`target_bytes_no_effect_warning`] is what reports
+/// covers a skewed split); [`layout_no_effect_warning`] is what reports
 /// that outcome to the operator.
 ///
 /// `max_flush_delay` is the `--max-flush-delay` lever (`None` = the
