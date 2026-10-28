@@ -41,6 +41,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ravel_logseg::decoded_cache::DecodedCacheCounters;
 use ravel_object_store::get_latency::GetPhase;
 use ravel_types::accounting::{AccessIntent, QueryAccounting, QueryAccountingSnapshot};
 
@@ -284,6 +285,9 @@ pub struct PhaseAccounting {
     /// correct without the caller having to remember which constructor built
     /// this handle.
     shared: bool,
+    /// This attempt's decoded-column cache counters (ADR-3326), shared by
+    /// every scan the attempt opens.
+    decoded_cache: Arc<DecodedCacheCounters>,
 }
 
 impl PhaseAccounting {
@@ -322,7 +326,13 @@ impl PhaseAccounting {
             scan: accounting.clone(),
             key_index: accounting.clone(),
             shared: true,
+            decoded_cache: Arc::default(),
         }
+    }
+
+    /// This attempt's decoded-column cache counters.
+    pub fn decoded_cache(&self) -> &Arc<DecodedCacheCounters> {
+        &self.decoded_cache
     }
 
     /// Set the [`AccessIntent`] on all five phase handles, so every cache read

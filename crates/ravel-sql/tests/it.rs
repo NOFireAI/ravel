@@ -78,6 +78,8 @@ mod logs_count_from_stats;
 mod logs_declared_columns;
 #[path = "logs_declared_minmax_from_stamps.rs"]
 mod logs_declared_minmax_from_stamps;
+#[path = "logs_decoded_cache.rs"]
+mod logs_decoded_cache;
 #[path = "logs_differential.rs"]
 mod logs_differential;
 #[path = "logs_fast_path_projection_routing.rs"]

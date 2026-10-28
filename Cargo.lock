@@ -4912,7 +4912,9 @@ dependencies = [
  "memchr",
  "proptest",
  "prost",
+ "ravel-cache",
  "ravel-codec",
+ "ravel-memory",
  "ravel-proto",
  "ravel-types",
  "stats_alloc",
@@ -4979,6 +4981,7 @@ name = "ravel-memory"
 version = "0.27.0"
 dependencies = [
  "criterion",
+ "tracing",
 ]
 
 [[package]]

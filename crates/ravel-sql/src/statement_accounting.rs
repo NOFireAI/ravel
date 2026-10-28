@@ -13,6 +13,7 @@
 //! the Parquet handle, which equals the total there: the statement handle
 //! holds only the pool peak.
 
+use ravel_logseg::decoded_cache::DecodedCacheSnapshot;
 use ravel_query::{PhaseAccounting, PhaseAccountingSnapshot};
 use ravel_types::accounting::{AccessIntent, QueryAccountingSnapshot};
 
@@ -135,6 +136,25 @@ impl StatementAccounting {
                 .chain([parquet, statement])
                 .for_each(|handle| handle.set_access_intent(intent)),
             StatementAccounting::One(handle) => handle.set_access_intent(intent),
+        }
+    }
+
+    /// The decoded-column cache's counters summed over every handle: what this
+    /// statement's scans hit, missed, admitted and evicted (ADR-3326).
+    pub(crate) fn decoded_cache_snapshot(&self) -> DecodedCacheSnapshot {
+        match self {
+            StatementAccounting::Split {
+                lanes,
+                parquet,
+                statement,
+            } => lanes
+                .iter()
+                .chain([parquet, statement])
+                .map(|handle| handle.decoded_cache().snapshot())
+                .fold(DecodedCacheSnapshot::default(), |sum, next| {
+                    sum.saturating_add(&next)
+                }),
+            StatementAccounting::One(handle) => handle.decoded_cache().snapshot(),
         }
     }
 

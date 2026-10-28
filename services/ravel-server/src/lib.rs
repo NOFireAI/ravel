@@ -2400,6 +2400,26 @@ pub async fn start_with_heartbeat(
     .await
 }
 
+/// Drops the decoded column-block cache's expired entries every
+/// `ravel_cache::DEFAULT_SWEEP_INTERVAL_NS` (ADR-3326 decision 2). The task
+/// holds a `Weak`, so it ends once the cache is gone.
+#[cfg(feature = "sql")]
+fn spawn_decoded_cache_sweeper(cache: &Arc<ravel_logseg::decoded_cache::DecodedColumnCache>) {
+    let weak = Arc::downgrade(cache);
+    let period = Duration::from_nanos(ravel_cache::DEFAULT_SWEEP_INTERVAL_NS.max(1));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(cache) = weak.upgrade() else {
+                break;
+            };
+            let _ = tokio::task::spawn_blocking(move || cache.sweep_expired()).await;
+        }
+    });
+}
+
 /// [`start_with_heartbeat`] under an IPCrypt policy: the entry point the
 /// binary uses, and the one every other `start` variant delegates to.
 ///
@@ -3248,6 +3268,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         fold_loop: fold_loop_metrics.clone(),
         refold: refold_queue.clone(),
         heartbeat,
+        decoded_cache: None,
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -3540,6 +3561,59 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 ),
                 bulk_scan_min_bytes.value,
             )?;
+            // ADR-3326: `--decoded-cache-max-bytes` above zero installs one
+            // process-wide decoded-column cache on the logs fetcher, its
+            // entries charged to the process memory budget. Zero builds none.
+            let mut state = state;
+            let decoded_cache_max_bytes = config.query_budgets.decoded_cache_max_bytes;
+            if decoded_cache_max_bytes > 0 {
+                let cache = Arc::new(ravel_logseg::decoded_cache::DecodedColumnCache::new(
+                    decoded_cache_max_bytes,
+                    Some(process_memory_budget.clone()),
+                ));
+                let limit = process_memory_budget.limit();
+                let margin = ravel_logseg::decoded_cache::admission_margin(limit);
+                if limit < margin.saturating_mul(2) {
+                    tracing::warn!(
+                        decoded_cache_max_bytes,
+                        memory_budget_bytes = limit,
+                        admission_margin_bytes = margin,
+                        "the decoded column-block cache keeps its admission margin unreserved, \
+                         and this memory budget is below twice that margin: the cache will \
+                         admit little or nothing"
+                    );
+                }
+                // A refused reservation from any other consumer evicts unheld
+                // entries first (ADR-3326 decision 4). Weak, because the cache
+                // already holds the budget. The evictor is asked for the
+                // shortfall plus the admission margin, so reservations other
+                // streams make before the refused caller retries do not take
+                // the bytes it was freed.
+                let evictee = Arc::downgrade(&cache);
+                if process_memory_budget
+                    .register_evictor(
+                        Box::new(move |want, cause| {
+                            evictee
+                                .upgrade()
+                                .map_or(0, |cache| cache.evict_for_pressure(want, margin, cause))
+                        }),
+                        margin,
+                    )
+                    .is_err()
+                {
+                    anyhow::bail!("process memory budget already has an evictor");
+                }
+                let Some(executor) = Arc::get_mut(&mut state.executor) else {
+                    anyhow::bail!("SQL executor shared before the decoded cache was installed");
+                };
+                executor.set_decoded_cache(cache.clone());
+                spawn_decoded_cache_sweeper(&cache);
+                metrics_state.decoded_cache = Some(cache);
+                tracing::info!(
+                    decoded_cache_max_bytes,
+                    "decoded column-block cache enabled"
+                );
+            }
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).
             // `mtls_sql_query_state` below is built from `state.clone()` after

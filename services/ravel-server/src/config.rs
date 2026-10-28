@@ -2736,6 +2736,16 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES", value_parser = parse_cache_bulk_scan_min_bytes)]
     pub cache_bulk_scan_min_bytes: Option<u64>,
 
+    /// Ceiling in bytes for the process-wide decoded column-block cache
+    /// (ADR-3326). The SQL `logs` scan's
+    /// columnar path serves decoded columns from it and skips their page
+    /// read and decode; each entry is charged to the process memory budget.
+    /// `0`, the default, disables it, and then every response and counter is
+    /// what it is without the flag. When nonzero each SQL response's `stats`
+    /// carries `decodedCache`.
+    #[arg(long, value_name = "BYTES", default_value_t = 0)]
+    pub decoded_cache_max_bytes: u64,
+
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
     /// both the query fetcher cache (`store::build_cache`) and the catalog byte
@@ -3700,6 +3710,9 @@ pub struct QueryBudgets {
     /// `--sql-spill` and the memory budget a `--cache-dir`-derived spill
     /// ceiling is capped against (ADR-0954, amended by issue #2416).
     pub sql_spill: SqlSpillSettings,
+    /// `--decoded-cache-max-bytes` (ADR-3326). `0` builds no decoded
+    /// column-block cache.
+    pub decoded_cache_max_bytes: u64,
 }
 
 impl Default for QueryBudgets {
@@ -3728,6 +3741,7 @@ impl Default for QueryBudgets {
             agents: AgentsConfig::default(),
             fold_lag_interval: None,
             sql_spill: SqlSpillSettings::default(),
+            decoded_cache_max_bytes: 0,
         }
     }
 }
@@ -7365,6 +7379,7 @@ impl Cli {
                         .saturating_add(resolved.catalog_cache_max_bytes)
                 },
             },
+            decoded_cache_max_bytes: self.decoded_cache_max_bytes,
         })
     }
 

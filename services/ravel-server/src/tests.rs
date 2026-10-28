@@ -237,6 +237,7 @@ fn harness(
         fold_loop: Default::default(),
         refold: Default::default(),
         heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+        decoded_cache: None,
     });
 
     Harness {
@@ -476,6 +477,7 @@ fn promql_harness_on(
         fold_loop: Default::default(),
         refold: Default::default(),
         heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+        decoded_cache: None,
     });
 
     (state, promql, metrics)
@@ -1700,6 +1702,7 @@ fn sql_budget_harness(
         fold_loop: Default::default(),
         refold: Default::default(),
         heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+        decoded_cache: None,
     });
 
     (executor, sql, metrics)

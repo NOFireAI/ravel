@@ -368,6 +368,28 @@ async fn run_scan(
     content: Vec<Predicate>,
     erasure_reqs: Vec<ravel_proto::commit::v1::ErasureRequest>,
 ) -> ScanRun {
+    run_scan_on(
+        LogSegmentFetcher::new(store),
+        PhaseAccounting::new(),
+        segments,
+        declared,
+        projection,
+        content,
+        erasure_reqs,
+    )
+    .await
+}
+
+/// [`run_scan`] through a caller-built fetcher and accounting handle.
+async fn run_scan_on(
+    fetcher: LogSegmentFetcher,
+    phase_accounting: PhaseAccounting,
+    segments: Vec<SegmentRef>,
+    declared: Vec<DeclaredColumn>,
+    projection: Option<Vec<usize>>,
+    content: Vec<Predicate>,
+    erasure_reqs: Vec<ravel_proto::commit::v1::ErasureRequest>,
+) -> ScanRun {
     let full_schema = logs_schema_with_declared(&declared);
     let erasure = snapshot_pending_erasure_predicates(&Snapshot {
         segments: segments.clone(),
@@ -376,7 +398,7 @@ async fn run_scan(
     });
     let scan = LogsScanExec::new(
         TENANT,
-        LogSegmentFetcher::new(store),
+        fetcher,
         &segments,
         1,
         i64::MIN,
@@ -385,7 +407,7 @@ async fn run_scan(
         Arc::new(Vec::new()),
         Arc::new(erasure),
         projection.as_ref(),
-        PhaseAccounting::new(),
+        phase_accounting,
         full_schema,
         Arc::new(declared),
     )
@@ -769,6 +791,78 @@ async fn pending_erasure_forces_the_row_path() {
     assert_eq!(got.len(), 1, "the erased record must be dropped");
     assert_eq!(got[0][0], Cell::Ts(2));
     assert_eq!(got[0][1], Cell::Str("keep me".to_string()));
+}
+
+/// The row path neither reads nor fills the decoded column-block cache
+/// (ADR-3326 decision 1): a columnar scan fills it, then the same scan under a
+/// pending erasure, which forces the row path, records zero hits and zero
+/// admissions, and the cache's process counters do not move.
+#[tokio::test]
+async fn pending_erasure_row_path_neither_reads_nor_fills_the_decoded_cache() {
+    use ravel_logseg::decoded_cache::DecodedColumnCache;
+
+    let declared = declared_columns();
+    let resource = vec![("service.name".to_string(), AttrValue::Str("worker".into()))];
+    let records: Vec<LogRecord> = (0..9)
+        .map(|ts| LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("body {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .collect();
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/decoded-cache.rlog", &records, small_blocks()).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store)).with_decoded_cache(Arc::clone(&cache));
+
+    let fill = PhaseAccounting::new();
+    let filled = run_scan_on(
+        fetcher.clone(),
+        fill.clone(),
+        vec![seg.clone()],
+        declared.clone(),
+        Some(vec![0, 4]),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        filled.columnar_batches > 0,
+        "the fill run takes the columnar path"
+    );
+    let fill_counters = fill.decoded_cache().snapshot();
+    assert!(
+        fill_counters.admissions > 0,
+        "the columnar run fills the cache"
+    );
+    let before = cache.process_counters();
+
+    let erased = PhaseAccounting::new();
+    let run = run_scan_on(
+        fetcher,
+        erased.clone(),
+        vec![seg],
+        declared,
+        Some(vec![0, 4]),
+        Vec::new(),
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(run.columnar_batches, 0, "erasure forces the row path");
+    assert!(run.rowpath_batches > 0);
+    let s = erased.decoded_cache().snapshot();
+    assert_eq!((s.hits, s.admissions), (0, 0));
+    assert_eq!(s, Default::default());
+    assert_eq!(cache.process_counters(), before);
 }
 
 /// A block WITH an `attrs_raw` spill and a query projecting a declared column

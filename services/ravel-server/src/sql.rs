@@ -318,6 +318,14 @@ pub(crate) fn stats_json(
             ravel_sql::stats_json::cache_json(cache),
         );
     }
+    if let (serde_json::Value::Object(map), Some(decoded)) =
+        (&mut stats, &outcome.stats.decoded_cache)
+    {
+        map.insert(
+            "decodedCache".to_string(),
+            ravel_sql::stats_json::decoded_cache_json(decoded),
+        );
+    }
     stats
 }
 
