@@ -312,6 +312,12 @@ pub(super) async fn operation(State(api): State<Api>, req: Request<Body>) -> Res
         let q: OperationQuery = query(req.uri())?;
         let handle = decode_operation(&q.operation)?;
         let (head, state) = read_operation(&call.tenant, &handle).await?;
+        if matches!(
+            state,
+            OperationState::Completed | OperationState::Failed | OperationState::Cancelled
+        ) {
+            call.tenant.evidence.note(handle.agent, &head);
+        }
         Ok::<_, Refusal>(Json(OperationResponse {
             operation: q.operation,
             status: state.into(),
@@ -718,29 +724,18 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
         };
         let effect = effect_id(head.incarnation, seq, &spec.step_key);
         let handle = effect_handle(agent, head.incarnation, effect);
-        // A settled step whose effect record HEAD no longer holds cannot say
-        // which attempt settled it, and this worker no longer owns it.
-        let result_attempt = || {
-            head.effects
-                .iter()
-                .find(|e| e.effect_id == effect)
-                .map(|e| e.result_attempt)
-                .ok_or_else(|| {
-                    refusal(
-                        ErrorKind::OwnershipLost,
-                        ids_for(&agent),
-                        "the effect record is no longer in HEAD",
-                    )
-                })
-        };
         let (step, attempt, failure) = match progress {
             StepProgress::Dispatched(dispatch) => (step_body(step, None), dispatch.attempt, None),
-            StepProgress::Completed { output } => {
-                (step_body(step, Some(output)), result_attempt()?, None)
-            }
-            StepProgress::Failed { error } => {
-                (step_body(step, None), result_attempt()?, Some(error))
-            }
+            StepProgress::Completed { output } => (
+                step_body(step, Some(output)),
+                result_attempt(&head, &agent, effect)?,
+                None,
+            ),
+            StepProgress::Failed { error } => (
+                step_body(step, None),
+                result_attempt(&head, &agent, effect)?,
+                Some(error),
+            ),
         };
         Ok::<_, Refusal>(Json(StepRecordResponse {
             step,
@@ -750,6 +745,27 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
         }))
     };
     run.await.into_response()
+}
+
+/// The attempt whose result settled `effect`. A settled step whose effect
+/// record HEAD no longer holds cannot say which attempt settled it, and the
+/// worker asking no longer owns it.
+fn result_attempt(
+    head: &Head,
+    agent: &AgentId,
+    effect: ravel_agents_core::identity::Id128,
+) -> Result<u32, Refusal> {
+    head.effects
+        .iter()
+        .find(|e| e.effect_id == effect)
+        .map(|e| e.result_attempt)
+        .ok_or_else(|| {
+            refusal(
+                ErrorKind::OwnershipLost,
+                ids_for(agent),
+                "the effect record is no longer in HEAD",
+            )
+        })
 }
 
 pub(super) async fn effect_complete(State(api): State<Api>, req: Request<Body>) -> Response {
@@ -805,6 +821,7 @@ async fn settle(
     };
     tenant.changed.notify_waiters();
     let head = read_head(tenant, &effect.agent).await?;
+    tenant.evidence.note(effect.agent, &head);
     let record = effect_record(&head, effect)?;
     Ok(Json(EffectCompleteResponse {
         effect: handle,
@@ -842,6 +859,7 @@ pub(super) async fn effect_inspect(
         let call = api.admit(req.headers(), Capability::Agents, Lane::Activation)?;
         let effect = decode_effect(&token)?;
         let head = read_head(&call.tenant, &effect.agent).await?;
+        call.tenant.evidence.note(effect.agent, &head);
         let record = effect_record(&head, &effect)?;
         let recorded = record.result.is_some().then_some(record.result_attempt);
         let first = record
@@ -958,13 +976,27 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
             {
                 return Err(wrong_attempt());
             }
+            // Only a repeat of this process's own reconcile is answered as
+            // applied; an attempt a step authorized was never handed over.
+            (ReconcileDecision::Retry, EffectStatus::Authorized)
+                if !call
+                    .tenant
+                    .coordinator
+                    .holds_hand_over(&effect, record.attempt) =>
+            {
+                return Err(refusal(
+                    ErrorKind::OwnershipLost,
+                    ids(),
+                    "the effect's latest attempt is not an unclaimed hand-over from a reconcile",
+                ));
+            }
             (ReconcileDecision::Retry, EffectStatus::InDoubt)
             | (ReconcileDecision::Retry, EffectStatus::Authorized) => {}
             _ => return Err(not_in_doubt()),
         }
-        // A retry of an attempt already superseded by the authorized one after
-        // it is a repeat: it is answered from HEAD as it stands, with no
-        // write, no hand-over and no audit record.
+        // A retry of the attempt before an unclaimed hand-over is a repeat:
+        // it is answered from HEAD as it stands, with no write, no new
+        // hand-over and no audit record.
         if matches!(body.decision, ReconcileDecision::Retry) && !in_doubt {
             return Ok(Json(ReconcileResponse {
                 effect: body.effect,
@@ -1359,5 +1391,45 @@ async fn recorded_unix_ns(
     match &head.active_turn {
         Some(turn) if turn.turn_id.to_hex() == lease.turn_id => Ok(turn.started_unix_ns),
         _ => Err(moved(&agent)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_agents_core::head::RecoveryPolicy;
+    use ravel_agents_core::identity::Id128;
+
+    use super::super::runtime::empty_head;
+    use super::*;
+
+    /// A settled step's answer names the attempt whose result settled it,
+    /// and an effect record gone from HEAD is 409 `ownership_lost`.
+    #[test]
+    fn result_attempt_is_ownership_lost_once_the_effect_left_head() {
+        let agent = AgentId([1; 16]);
+        let effect = Id128([2; 16]);
+        let mut head = empty_head();
+        let Err(Refusal::Agent(error)) = result_attempt(&head, &agent, effect) else {
+            panic!("an effect missing from HEAD answered an attempt");
+        };
+        assert_eq!(error.kind, ErrorKind::OwnershipLost);
+        assert_eq!(error.reason, "the effect record is no longer in HEAD");
+        assert_eq!(agent_error(&error).status(), StatusCode::CONFLICT);
+
+        head.effects.push(EffectRecord {
+            effect_id: effect,
+            step_key: "price".to_string(),
+            tool_name: "catalog.price".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: Hash256([0; 32]),
+            policy: RecoveryPolicy::AtLeastOnce,
+            status: EffectStatus::Completed,
+            attempt: 3,
+            result: None,
+            result_attempt: 2,
+            turn_id: Id128([3; 16]),
+        });
+        assert!(matches!(result_attempt(&head, &agent, effect), Ok(2)));
     }
 }

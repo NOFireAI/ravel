@@ -484,6 +484,11 @@ loaded and `_dir` entries repaired. The counts are the requests the store
 served for that pass, and the `ravel_agents_sweep_*` families on
 `/metrics` move by the same amounts
 (`agents_timers_e2e::sweep_route_counts_match_the_store_and_needs_agents_admin`).
+The periodic pass needs no poll and no `sweep` call
+(`agents_timers_e2e::the_interval_sweep_runs_a_pass_per_interval_with_no_poll`).
+An idle worker poll runs a pass at most once per `sweep_interval_ms`, or
+once per 5000 ms when it is 0, so idle polls never sweep on every wake
+(`agents_timers_e2e::interval_zero_runs_no_periodic_pass_and_polls_sweep_at_the_floor`).
 `GET /api/v1/agents/health` reports `sweep_interval_ms`.
 
 **Inspector.** `GET inspector` serves one embedded HTML page with no
@@ -559,6 +564,10 @@ kept as evidence
 (`agents_timers_e2e::effect_inspect_lists_at_most_the_latest_64_attempts`).
 Evidence is held by the serving process and is not durable; a restart
 forgets it, and so does a reconcile that settles the effect out of doubt.
+A process names the evidence of at most 4096 effects per tenant; when that
+is full, an effect whose result was recorded or whose input finished gives
+its slot to a new one, and an effect still in doubt keeps it
+(`agents_effects_e2e::settled_effects_give_their_evidence_slot_to_an_effect_in_doubt`).
 
 **Reconcile.** `reconcile` settles an effect in doubt: `record_result`
 attaches an operator-verified result, and `retry` authorizes one more
@@ -579,7 +588,13 @@ owner's lease expired
 The hand-over is kept only in the memory of the server process that
 answered the reconcile: if that process restarts before the step, or
 another server process serves the step, the attempt reads as lost and a
-`manual` effect is back in doubt, so reconcile it again. Before changing an effect in
+`manual` effect is back in doubt, so reconcile it again. For the same
+reason a repeated `retry` is answered as applied only while that process
+holds the hand-over unclaimed. A `retry` naming the attempt before one a
+worker's own step authorized, such as an `at_least_once` attempt raised
+after a takeover, is 409 `ownership_lost` and writes no audit record
+(`agents_effects_e2e::a_reconcile_retry_of_an_attempt_a_takeover_raised_is_ownership_lost`).
+Before changing an effect in
 doubt the server submits one audit record with `kind` `agents_reconcile`
 to the audit pipeline, which writes it into the tenant's audit shard,
 naming the effect, attempt, decision and the caller's tenant and

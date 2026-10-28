@@ -3474,8 +3474,12 @@ pub struct AgentsConfig {
     /// How often each tenant's coordinator in this process runs one bounded
     /// sweep pass: fires due timers, deletes settled wake hints and repairs
     /// missing directory entries (ADR-3331 decision 8). Zero runs no
-    /// periodic pass; polls and `POST /api/v1/agents/sweep` still sweep.
+    /// periodic pass; polls and `POST /api/v1/agents/sweep` still sweep,
+    /// polls at most once per [`DEFAULT_AGENTS_SWEEP_INTERVAL_MS`] then.
     pub sweep_interval_ms: u64,
+    /// Most effects whose late results each tenant's evidence index names.
+    /// No flag sets it; tests lower it to fill the index.
+    pub max_evidence_effects: usize,
     /// The clock every tenant coordinator and store reads: the host's wall
     /// clock unless a test injects one.
     pub clock: AgentsClock,
@@ -3527,6 +3531,7 @@ impl Default for AgentsConfig {
             lease_ms: DEFAULT_AGENTS_LEASE_MS,
             heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
             sweep_interval_ms: DEFAULT_AGENTS_SWEEP_INTERVAL_MS,
+            max_evidence_effects: DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS,
             clock: AgentsClock::default(),
         }
     }
@@ -3558,6 +3563,8 @@ pub const DEFAULT_AGENTS_LEASE_MS: u64 = 30_000;
 pub const DEFAULT_AGENTS_HEARTBEAT_GRACE_MS: u64 = 10_000;
 /// [`AgentsConfig::sweep_interval_ms`] default.
 pub const DEFAULT_AGENTS_SWEEP_INTERVAL_MS: u64 = 5_000;
+/// [`AgentsConfig::max_evidence_effects`] default.
+pub const DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
@@ -7320,6 +7327,7 @@ impl Cli {
                 lease_ms: DEFAULT_AGENTS_LEASE_MS,
                 heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
                 sweep_interval_ms: DEFAULT_AGENTS_SWEEP_INTERVAL_MS,
+                max_evidence_effects: DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS,
                 clock: AgentsClock::default(),
             },
             fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
@@ -17597,6 +17605,7 @@ mod tests {
                 lease_ms: 30_000,
                 heartbeat_grace_ms: 10_000,
                 sweep_interval_ms: 5_000,
+                max_evidence_effects: 4_096,
                 clock: AgentsClock::default(),
             }
         );
