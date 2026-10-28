@@ -7,6 +7,7 @@ mod effects;
 mod errors;
 mod races;
 mod senders;
+mod storm;
 mod timers;
 mod workers;
 

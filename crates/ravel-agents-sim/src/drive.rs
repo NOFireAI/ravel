@@ -939,16 +939,17 @@ impl Rig {
     /// A process named `name` over `backend`, its coordinator's ids drawn
     /// from `seed`.
     pub fn proc(&self, name: &str, backend: Arc<dyn ObjectStoreBackend>, seed: u64) -> Proc {
-        self.proc_with(name, backend, seed, None)
+        self.proc_with(name, backend, seed, runtime_config(), None)
     }
 
-    /// [`Rig::proc`] whose coordinator sweeps with `sweep`, which also
-    /// starts passes from its idle polls.
+    /// [`Rig::proc`] whose coordinator runs with `config` and sweeps with
+    /// `sweep`, which also starts passes from its idle polls.
     pub fn proc_with(
         &self,
         name: &str,
         backend: Arc<dyn ObjectStoreBackend>,
         seed: u64,
+        config: RuntimeConfig,
         sweep: Option<SweepConfig>,
     ) -> Proc {
         let store = Arc::new(
@@ -963,7 +964,7 @@ impl Rig {
         );
         let co = Coordinator::new(
             store.clone(),
-            runtime_config(),
+            config,
             self.clock.clone(),
             Arc::new(CountingRng(AtomicU64::new(seed))),
         );
