@@ -923,6 +923,8 @@ fn without_the_in_process_row_the_portable_rows_still_close_band_6() {
             "s3",
             "--http-batch-size",
             "4096",
+            "--readback-timeout-secs",
+            "45",
             "--prometheus-endpoint",
             &prometheus_write,
             "--prometheus-query-url",
@@ -968,6 +970,13 @@ fn without_the_in_process_row_the_portable_rows_still_close_band_6() {
         assert_eq!(row["readback"]["matches_expected"], true, "{row}");
         assert_eq!(row["readback"]["attempts"], 1, "{row}");
         assert!(row["readback"]["settled_after_ms"].is_u64(), "{row}");
+        // Each read-back query's wall time, the series read first among them.
+        let query_ms = row["readback"]["query_ms"]
+            .as_object()
+            .expect("readback.query_ms is an object");
+        assert!(query_ms["series"].is_u64(), "{row}");
+        assert!(query_ms.len() >= 2, "{row}");
+        assert!(query_ms.values().all(serde_json::Value::is_u64), "{row}");
     }
     assert_eq!(
         systems[0]["ingest"]["expected_digests"],

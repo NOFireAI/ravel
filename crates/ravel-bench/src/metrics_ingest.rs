@@ -4336,7 +4336,8 @@ pub struct ReadbackConfig {
     pub query_url: String,
     /// Sent as `Authorization: Bearer` when set.
     pub bearer_token: Option<String>,
-    /// Per-request timeout in seconds.
+    /// Per-request timeout in seconds for each read-back query, the body
+    /// read included (`metricsbench_ingest --readback-timeout-secs`).
     pub timeout_secs: u64,
     /// How long, in seconds, to keep re-reading a row whose figures do not
     /// yet match what was sent before reporting the mismatch. Zero reads
@@ -7825,6 +7826,18 @@ mod tests {
             assert_eq!(readback.histogram_series_count, Some(1));
             assert_eq!(readback.histogram_sample_count, Some(2));
             assert_eq!(readback.stale_marker_honored, Some(true));
+            // One timing per query the stub saw (five, asserted below).
+            assert_eq!(
+                readback.query_ms.keys().map(String::as_str).collect::<Vec<_>>(),
+                [
+                    READBACK_QUERY_HISTOGRAM_SAMPLES,
+                    READBACK_QUERY_HISTOGRAM_SERIES,
+                    "samples.0",
+                    READBACK_QUERY_SERIES,
+                    READBACK_QUERY_STALE_MARKER,
+                ],
+                "{readback:?}"
+            );
             if !matches {
                 assert_eq!(
                     readback.mismatches,
