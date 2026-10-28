@@ -70,6 +70,13 @@ jobs:
       # harness skips every compiling job yet must still run the tla lane, so it
       # is computed even on the docs/formal-only branch rather than forced false.
       formal_area: ${{ steps.check.outputs.formal_area }}
+      # agents_area gates features-agents and sdk_area gates sdk (ADR-3331
+      # decision 14). Both are forced true on the full-run branches below, as
+      # the four Rust area flags are; agents_area is also forced by the
+      # unlisted-path catch-all, sdk_area only by its own list, since nothing
+      # outside sdk/ and scripts/gates-sdk.sh changes what the sdk job runs.
+      agents_area: ${{ steps.check.outputs.agents_area }}
+      sdk_area: ${{ steps.check.outputs.sdk_area }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -77,10 +84,10 @@ jobs:
           persist-credentials: false
       - id: check
         run: |
-          # Emit all six outputs from a single point so no code path forgets
+          # Emit all eight outputs from a single point so no code path forgets
           # one. $1 is docs_only; $2..$5 are the four Rust area flags in output
           # order (server_or_operator, sql_area, promql_area, object_store_area);
-          # $6 is formal_area.
+          # $6 is formal_area; $7 is agents_area; $8 is sdk_area.
           emit() {
             {
               echo "docs_only=$1"
@@ -89,6 +96,8 @@ jobs:
               echo "promql_area=$4"
               echo "object_store_area=$5"
               echo "formal_area=$6"
+              echo "agents_area=$7"
+              echo "sdk_area=$8"
             } >> "$GITHUB_OUTPUT"
           }
           # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
@@ -100,7 +109,7 @@ jobs:
           # if it were docs-only or a narrow single-area change.
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             echo "::notice::merge_group event, running full CI"
-            emit false true true true true true
+            emit false true true true true true true true
             exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -110,7 +119,7 @@ jobs:
           fi
           if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
             echo "::notice::no usable base commit, running full CI"
-            emit false true true true true true
+            emit false true true true true true true true
             exit 0
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
@@ -121,7 +130,7 @@ jobs:
             # irrelevant, so run everything, matching the pre-D4 docs_only=false
             # default.
             echo "::notice::no changed files, running full CI"
-            emit false true true true true true
+            emit false true true true true true true true
             exit 0
           fi
           # formal_area (ADR-1113 D10): the TLA+ models, their harness, the
@@ -141,7 +150,7 @@ jobs:
           # runs; the tla lane still runs when formal_area is true.
           if ! echo "$changed" | grep -qvE '\.(md|svg)$|^formal/|^scripts/check-tla\.sh$'; then
             echo "::notice::docs/formal-only change, skipping compiling jobs"
-            emit true false false false false "$formal_area"
+            emit true false false false false "$formal_area" false false
             exit 0
           fi
           # Workspace-level paths change the build for every crate, so they
@@ -150,7 +159,7 @@ jobs:
           # under proto/ (regenerates types every crate can depend on).
           if echo "$changed" | grep -qE '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)$|^\.github/|^proto/'; then
             echo "::notice::workspace-level change, running every area"
-            emit false true true true true true
+            emit false true true true true true true true
             exit 0
           fi
           # Per-area path lists (conservative supersets; ravel-server and
@@ -160,6 +169,8 @@ jobs:
           sql_area=false
           promql_area=false
           object_store_area=false
+          agents_area=false
+          sdk_area=false
           if echo "$changed" | grep -qE '^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$'; then
             server_or_operator=true
           fi
@@ -171,6 +182,19 @@ jobs:
           fi
           if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^scripts/ci-create-bucket\.sh$|^scripts/ci-verify-protection-cases\.sh$'; then
             object_store_area=true
+          fi
+          # agents_area (ADR-3331 decision 14): the agents crates, the server's
+          # agents module and seam test, the server manifest that declares the
+          # `agents` feature, the two scripts that define the lane, and this
+          # workflow. Not an area_paths entry below: it narrows only
+          # features-agents and leaves the catch-all's view of the Rust lanes
+          # unchanged.
+          if echo "$changed" | grep -qE '^crates/ravel-agents-|^services/ravel-server/src/agents/|^services/ravel-server/tests/agents_seam\.rs$|^services/ravel-server/Cargo\.toml$|^scripts/gates\.sh$|^scripts/affected-tests\.sh$|^\.github/workflows/ci\.yml$'; then
+            agents_area=true
+          fi
+          # sdk_area: the SDK tree and the script the sdk job runs.
+          if echo "$changed" | grep -qE '^sdk/|^scripts/gates-sdk\.sh$'; then
+            sdk_area=true
           fi
           # Catch-all: the four lists above are conservative allowlists, not a
           # conservative superset of every workspace member -- a crate that
@@ -202,9 +226,10 @@ jobs:
             sql_area=true
             promql_area=true
             object_store_area=true
+            agents_area=true
           fi
-          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area formal=$formal_area"
-          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area" "$formal_area"
+          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area formal=$formal_area agents=$agents_area sdk=$sdk_area"
+          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area" "$formal_area" "$agents_area" "$sdk_area"
 
   # Cheap, build-free guards wired in from ADR-0053 D6:
   #   - scripts/check-doc-drift.sh recomputes the derived counts in
@@ -1479,6 +1504,136 @@ jobs:
         uses: ./.github/actions/disk-usage
         with:
           phase: report
+
+  # ravel-server's `agents` feature (ADR-3331 decision 14), the same shape as
+  # `features-otap`: its own job-scoped rust-cache key and the disk steps.
+  # Mirrors scripts/gates.sh's agents lane: `cargo clippy -p ravel-server
+  # --features agents --all-targets`, the server tests whose path contains
+  # `agents` (`cargo test ... --features agents agents`), and ravel-catalog's
+  # sys_proto_format_version_classification test, which covers
+  # proto/ravel/agents.proto (ADR-3331 decision 3). Gated on agents_area.
+  #
+  # NOTE: not yet a required check; ADR-3331 decision 14 leaves adding it to
+  # the protect-main ruleset to the owner.
+  features-agents:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.agents_area == 'true'
+    runs-on: ubuntu-latest
+    # 25m (provisional): copied from `features-otap`, which compiles, lints
+    # (--all-targets) and tests a single ravel-server feature in the same shape
+    # and carries that figure as a starting point rather than a measurement.
+    # This job's own duration has not been measured; tighten or loosen 25m
+    # once a run of it supplies one.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
+      - uses: ./.github/actions/free-disk-space
+        with:
+          background: "true"
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main, as in `features-otap`
+          # (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Names the cargo profile, as in `sql` above.
+          key: ci-profile
+      - name: Clippy ravel-server --features agents
+        run: cargo clippy --locked --profile ci -p ravel-server --features agents --all-targets -- -D warnings
+        # Filtered by name, not the whole test set: `tests/cli_reference.rs`
+        # pins the flag page of a build with NO optional features, and
+        # `--features agents` adds flags, so that test fails by construction.
+        # `--all-targets` on the clippy step above still compiles it.
+      - name: Test ravel-server --features agents (tests named agents)
+        run: cargo test --locked --profile ci -p ravel-server --features agents agents
+      - name: Test the sys proto format_version classification
+        run: cargo test --locked --profile ci -p ravel-catalog --test sys_proto_format_version_classification
+      - name: Report the lowest free space the job reached
+        if: always()
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
+
+  # ravel-server's `mcp` feature (ADR-1374), the same shape as
+  # `features-agents` above. Mirrors scripts/gates.sh's mcp lane: `cargo
+  # clippy -p ravel-server --features mcp --all-targets` and the server tests
+  # whose path contains `mcp` (`cargo test ... --features mcp mcp`). Gated on
+  # server_or_operator, since the feature lives entirely in ravel-server and
+  # ravel-mcp, and any unlisted path forces server_or_operator true.
+  #
+  # NOTE: not a required check.
+  features-mcp:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
+    runs-on: ubuntu-latest
+    # 25m (provisional): copied from `features-otap` for the same reason as
+    # `features-agents` above; not a measurement of this job.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
+      - uses: ./.github/actions/free-disk-space
+        with:
+          background: "true"
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main, as in `features-otap`
+          # (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Names the cargo profile, as in `sql` above.
+          key: ci-profile
+      - name: Clippy ravel-server --features mcp
+        run: cargo clippy --locked --profile ci -p ravel-server --features mcp --all-targets -- -D warnings
+        # Filtered by name for the cli_reference reason given in
+        # `features-agents` above.
+      - name: Test ravel-server --features mcp (tests named mcp)
+        run: cargo test --locked --profile ci -p ravel-server --features mcp mcp
+      - name: Report the lowest free space the job reached
+        if: always()
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
+
+  # The TypeScript SDK (ADR-3331 decision 14): scripts/gates-sdk.sh runs `npm
+  # ci`, `npm run lint`, `npm run typecheck` and `npm test` from
+  # sdk/typescript, the same script scripts/gates.sh runs in workspace mode, so
+  # CI and a local gate execute one definition. Node comes from
+  # sdk/typescript/.node-version, which gates-sdk.sh also reads and refuses
+  # (exit 64) on a different major. No cargo, so no docs_only gate beyond
+  # sdk_area, which the docs-only branch emits false.
+  #
+  # NOTE: not yet a required check; ADR-3331 decision 14 leaves adding it to
+  # the protect-main ruleset to the owner.
+  sdk:
+    needs: changes
+    if: needs.changes.outputs.sdk_area == 'true'
+    runs-on: ubuntu-latest
+    # 15m (provisional): not a measurement; tighten or loosen once this job
+    # reports its own duration.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: sdk/typescript/.node-version
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: SDK gates (npm ci, lint, typecheck, test)
+        run: scripts/gates-sdk.sh
 
   # The whole workspace with every feature of every member on at once (issue
   # #1925). Each lane above builds one feature set; none builds their union, so
