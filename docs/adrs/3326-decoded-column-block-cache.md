@@ -354,11 +354,12 @@ Every hot figure from a run with the cache on states the cap in its stamp.
    decoded cache the same way.
 4. **q33 simulation and re-run.** After the first paired runs, Stage 0
    adds a simulation of q33's shape and an 8 GB re-run with the admission
-   margin (see the admission-headroom amendment below). The last three
-   rows of the table are theirs: the simulation's control arm, its margin
-   arm, and the re-run. Both ran on 2026-10-27. The simulation met its
-   rows. The re-run missed its row, which led to a second simulation and
-   re-run (see the evictor-slack amendment below); their rows follow.
+   margin (see the admission-headroom amendment below). Their rows are
+   the three whose figure names "with the margin" or "without the margin":
+   the simulation's control arm, its margin arm, and the re-run. Both ran
+   on 2026-10-27. The simulation met its rows. The re-run missed its row,
+   which led to a second simulation and re-run (see the evictor-slack
+   amendment below). Their rows are the last three of the table.
 
 | Stage 0 figure | Band | Miss | Basis |
 |---|---|---|---|
@@ -376,7 +377,7 @@ Every hot figure from a run with the cache on states the cap in its stamp.
 | Branch at 8 GB with the margin: q33 answers on every B run | yes | any B run refused | missed, measured 2026-10-27: 0 of 4, #3326 comment 6455179106 |
 | Simulation, q33 shape with racing checked reservations, evictor freeing the exact shortfall (control): aggregate refusals at an 8 GB cap | at least one | none | met, measured 2026-10-28: 75, #3326 comment 6459628404 |
 | Simulation, same shape, evictor freeing the shortfall plus the margin: aggregate refusals at caps of 4, 8 and 12 GB | none | any | met, measured 2026-10-28: 0 at each cap, #3326 comment 6459628404 |
-| Branch at 8 GB with the margin and the evictor's slack: q33 answers on every B run | yes | any B run refused | predicted (evictor-slack amendment) |
+| Branch at 8 GB, evictor slack added to margin build: q33 answers on every B run | yes | any B run refused | predicted (evictor-slack amendment) |
 
 The bands are copied to #3326 before launch. A miss on any row stops the
 work, and the readout names the step that missed.
@@ -400,14 +401,18 @@ work, and the readout names the step that missed.
   fit. Cold runs are unchanged, because the cache starts empty after the
   restart.
 - The process holds decoded data that the fetch cache already holds in
-  compressed form, up to the cap. The budget hook and the admission
-  margin together keep queries ahead of the cache; the hook alone did not
-  (see the admission-headroom amendment below). RSS can be higher between
+  compressed form, up to the cap. Three rules together are meant to keep
+  queries ahead of the cache: the budget hook, the admission margin (see
+  the admission-headroom amendment below), and the hook freeing the
+  shortfall plus that margin (see the evictor-slack amendment below).
+  Stage 0 measured the hook alone and the hook with the margin, and both
+  left q33 refused. RSS can be higher between
   statements than today; the
   jemalloc purge thread (`services/ravel-server/src/main.rs:769-774`)
   returns freed pages.
 - A pressure eviction adds latency to the reservation that triggers it,
-  bounded by the bytes it frees.
+  bounded by the bytes it frees: the shortfall plus the margin (see the
+  evictor-slack amendment below).
 - Contains-tested columns gain nothing from this ADR. Their share of q21
   to q24 stays.
 - The `MemoryBudget` hook is new shared machinery and needs its own
@@ -495,12 +500,13 @@ evictor-slack amendment below.
 
 ## Amendment (2026-10-28): the evictor frees the shortfall plus the margin
 
-<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries|Stage 0, before any code that merges" pointer="evictor-slack amendment" -->
+<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries|Stage 0, before any code that merges|Consequences" pointer="evictor-slack amendment" -->
 
 The admission-headroom amendment's simulation and re-run both ran on
 2026-10-27.
 
-- **Trace C met both of its rows** (#3326 comment 6452444728). Without the
+- **The admission-headroom amendment's q33-shape simulation (Trace C)
+  met both of its rows** (#3326 comment 6452444728). Without the
   margin, q33's aggregate was refused 116 times at an 8 GB cap. With the
   margin it was refused none at 4, 8 and 12 GB.
 - **The 8 GB control is the informative one.** At 4 GB the evictor never
@@ -537,15 +543,23 @@ step a checked 2 MB reservation by each other partition.
 
 Decision 4 changes in one place. A pressure pass asks the cache to free
 the shortfall plus the admission margin, `max(1 GiB, 5% of the budget's
-limit)`, not the shortfall alone, then retries once. Admission and
-eviction use one definition of the margin.
+limit)`, not the shortfall alone, then retries once. The request is best
+effort: the retry runs on whatever the pass freed, so a reservation that
+fits after freeing only the shortfall is still admitted, and decision 4's
+rule stands that the refusal holds only if evicting every unreferenced
+entry would not make room. Admission and eviction use one definition of
+the margin.
 
 - **Concurrent reservers find room.** A refused caller's own sibling
   streams can take up to the margin before its retry and still leave it
   room, and the cache shrinks in steps of about the margin while a query
   grows.
-- **The cost is a larger eviction per pass:** up to 1 GiB of cached
-  columns per refused reservation. The cache refills once the query
+- **The cost is a larger eviction per pass:** the shortfall plus
+  `max(1 GiB, 5% of the limit)` of cached columns per refused
+  reservation. On the reference box the margin is the 1 GiB floor (its
+  remainder is 18.9 GB, so 5% is 0.95 GB), and at the shortfalls Stage 0
+  saw (132 to 147 MB) a pass evicts about 1.2 GB. On a budget above about
+  21.5 GB the 5% term is larger. The cache refills once the query
   releases its memory and the admission margin is met again.
 
 Stage 0 continues with this change. A prototype adds it to the measurement
