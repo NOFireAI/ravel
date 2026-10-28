@@ -7,6 +7,8 @@ mod effects;
 mod errors;
 mod races;
 mod senders;
+mod storm;
+mod timers;
 mod workers;
 
 use std::future::Future;
@@ -23,22 +25,110 @@ use crate::scheduler::{
 };
 use crate::seeds::AgentSeeds;
 
-/// Seeds in one batch.
+/// Seeds in the default batch.
 pub(crate) const BATCH: u64 = 64;
-/// First seed of a batch when `RAVEL_SIM_SEED` is unset.
+/// First seed of the default batch.
 pub(crate) const BASE: u64 = 0x5eed_0000;
+/// First seed of a batch, in decimal.
+pub(crate) const SEED_ENV: &str = "RAVEL_SIM_SEED";
+/// Seeds in a batch, in decimal.
+pub(crate) const SEEDS_ENV: &str = "RAVEL_SIM_SEEDS";
 
-/// Seeds every batch runs: `BATCH` seeds from `RAVEL_SIM_SEED` when it is
-/// set and parses, else from `BASE`. A failure message's replay line sets
-/// the variable to the failing batch seed, so the replayed batch runs that
-/// seed first.
+/// The seeds every batch runs: `count` consecutive seeds from `base`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Batch {
+    pub(crate) base: u64,
+    pub(crate) count: u64,
+}
+
+impl Batch {
+    /// `RAVEL_SIM_SEED` and `RAVEL_SIM_SEEDS`, each defaulting to the
+    /// default batch's when unset. A value that does not parse, or a count
+    /// of zero, panics rather than running a batch nobody asked for.
+    pub(crate) fn from_env() -> Batch {
+        Batch::parse(
+            std::env::var(SEED_ENV).ok().as_deref(),
+            std::env::var(SEEDS_ENV).ok().as_deref(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn parse(base: Option<&str>, count: Option<&str>) -> Result<Batch, String> {
+        let read = |name: &str, raw: Option<&str>, default: u64| match raw {
+            None => Ok(default),
+            Some(v) => v
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| format!("{name}={v:?} is not a decimal u64: {e}")),
+        };
+        let batch = Batch {
+            base: read(SEED_ENV, base, BASE)?,
+            count: read(SEEDS_ENV, count, BATCH)?,
+        };
+        if batch.count == 0 {
+            return Err(format!("{SEEDS_ENV}=0 runs no seed"));
+        }
+        Ok(batch)
+    }
+
+    /// Whether this is the batch the pinned totals were measured on.
+    pub(crate) fn is_default(&self) -> bool {
+        *self
+            == Batch {
+                base: BASE,
+                count: BATCH,
+            }
+    }
+
+    pub(crate) fn seeds(&self) -> impl Iterator<Item = u64> + use<> {
+        let base = self.base;
+        (0..self.count).map(move |i| base.wrapping_add(i))
+    }
+
+    /// The line [`pinned`] prints for one schedule's batch.
+    fn line<T: std::fmt::Debug + PartialEq>(&self, schedule: &str, totals: &T, pins: &T) -> String {
+        let verdict = match (self.is_default(), totals == pins) {
+            (true, true) => "match",
+            (true, false) => "MISS",
+            (false, _) => "unpinned",
+        };
+        format!(
+            "sim-batch {schedule} base={} seeds={} totals={totals:?} pinned={pins:?} {verdict}",
+            self.base, self.count
+        )
+    }
+}
+
+/// Seeds every batch runs, from [`Batch::from_env`]. A failure message's
+/// replay line sets `RAVEL_SIM_SEED` to the failing batch seed, so the
+/// replayed batch runs that seed first.
 pub(crate) fn seeds() -> impl Iterator<Item = u64> {
-    seeds_from(AgentSeeds::from_env_or(BASE).seed())
+    Batch::from_env().seeds()
 }
 
 /// `BATCH` consecutive seeds starting at `base`.
 pub(crate) fn seeds_from(base: u64) -> impl Iterator<Item = u64> {
-    (0..BATCH).map(move |i| base.wrapping_add(i))
+    Batch { base, count: BATCH }.seeds()
+}
+
+/// Close a batch: `runs` must be the batch's seed count, and one line goes
+/// to stdout naming the schedule, the seeds, the totals and the pins, which
+/// `nightly.sh` collects. On the default batch the totals must equal the
+/// pins; on any other the pins were never measured, so the line says
+/// `unpinned` and only the per-seed checks the schedule already made apply.
+pub(crate) fn pinned<T: std::fmt::Debug + PartialEq>(
+    schedule: &str,
+    runs: u64,
+    totals: T,
+    pins: T,
+) {
+    let batch = Batch::from_env();
+    assert_eq!(runs, batch.count, "{schedule}: runs against the batch size");
+    let line = batch.line(schedule, &totals, &pins);
+    println!("{line}");
+    if batch.is_default() {
+        assert_eq!(totals, pins, "{line}");
+    }
 }
 
 /// A client actor whose body runs against its own process.
@@ -143,6 +233,43 @@ fn seeds_from_counts_a_batch_up_from_its_base() {
     assert_eq!(batch.last(), Some(&70));
     assert!(batch.windows(2).all(|w| w[1] == w[0] + 1));
     assert_eq!(seeds_from(u64::MAX).nth(1), Some(0));
+}
+
+#[test]
+fn a_batch_reads_its_base_and_count_and_refuses_what_does_not_parse() {
+    assert_eq!(
+        Batch::parse(None, None),
+        Ok(Batch {
+            base: BASE,
+            count: BATCH
+        })
+    );
+    assert!(Batch::parse(None, None).is_ok_and(|b| b.is_default()));
+    let custom = Batch::parse(Some(" 7 "), Some("3")).expect("parses");
+    assert_eq!(custom, Batch { base: 7, count: 3 });
+    assert_eq!(custom.seeds().collect::<Vec<_>>(), vec![7, 8, 9]);
+    assert!(!custom.is_default());
+    assert!(Batch::parse(Some("0x5eed"), None).is_err());
+    assert!(Batch::parse(None, Some("many")).is_err());
+    assert!(Batch::parse(None, Some("0")).is_err());
+}
+
+#[test]
+fn a_batch_line_names_its_verdict() {
+    let default = Batch {
+        base: BASE,
+        count: BATCH,
+    };
+    assert_eq!(
+        default.line("s", &3, &3),
+        "sim-batch s base=1592590336 seeds=64 totals=3 pinned=3 match"
+    );
+    assert!(default.line("s", &3, &4).ends_with(" MISS"));
+    let other = Batch { base: 1, count: 2 };
+    assert_eq!(
+        other.line("s", &3, &4),
+        "sim-batch s base=1 seeds=2 totals=3 pinned=4 unpinned"
+    );
 }
 
 /// A script from `seed` over `actors` actors.

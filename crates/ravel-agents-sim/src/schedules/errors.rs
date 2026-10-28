@@ -416,8 +416,12 @@ fn contended_refusals_across_seeds() {
         conflicts += c;
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!((a_accepts, conflicts), CONTENDED_REFUSALS);
+    pinned(
+        "contended_refusals",
+        runs,
+        (a_accepts, conflicts),
+        CONTENDED_REFUSALS,
+    );
 }
 
 /// `a`'s accepts and the HEAD conflicts, summed over the batch.
