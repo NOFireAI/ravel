@@ -439,7 +439,7 @@ Fetch and decode an idempotency marker by its exact object key (`t/<tenant_hash>
 
 ## agents
 
-Ravel Agents (ADR-3331 decision 11): read agent state straight from the bucket, settle an effect through the server, start a development server, and scaffold the TypeScript example
+Ravel Agents (ADR-3331 decision 11): read agent state straight from the bucket, settle an effect through the server, start a development server, and scaffold a TypeScript starter project. Timer commands are not in this release
 
 _No flags._
 
@@ -457,12 +457,14 @@ Start a development server on the compose RustFS store: bring RustFS up when the
 
 ### agents scaffold
 
-Write the TypeScript assistant example into DIR. Refuses a DIR that exists and is not empty
+Write a TypeScript starter project into DIR by running the SDK's generator with node: one agent, a local tool fixture, generated client types and tests that need no API key. Refuses a DIR that exists and is not empty before running anything
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--json` |  |  | Print the files written as JSON |
-| `<DIR>` |  |  | Directory to create or fill |
+| `--json` |  |  | Print the directory and the generator's output as JSON |
+| `--node` | `RAVEL_NODE` | `node` | The node binary that runs the generator (node 22) |
+| `--scaffold-bin` | `RAVEL_SCAFFOLD_BIN` | `sdk/typescript/packages/agents/bin/ravel-agents-scaffold.js` | The generator script to run |
+| `<DIR>` |  |  | Directory to create or fill; passed to the generator as given |
 
 ### agents list
 
