@@ -60,7 +60,7 @@ and is checked per seed only
 | Effect kill points, at least once and manual | `effects::at_least_once_{killed_before_tool_call,killed_after_execution,late_result_after_takeover_is_evidence}`, `effects::manual_{killed_before_tool_call,killed_after_execution,suspended_before_result_publication}` | `effects::at_least_once_duplicate_execution_is_reachable_and_manual_policy_never_redispatches`: at least once 140 executions with 12 duplicates; manual 0 duplicates, 15 in doubt, 15 reconciled, each authorized attempt dispatched by the next step of the process that reconciled it |
 | Cancel with an open attempt | `effects::cancelled_turn_with_open_attempt_does_not_wedge_the_next_step`, `effects::late_result_after_cancel_is_evidence` | `effects::cancels_across_seeds`: 54 crashes, 43 cancelled, 2 duplicates |
 | Worker dead between its step journal and its cancel check | `effects::a_worker_dead_between_its_step_journal_and_its_cancel_check_is_fenced` (seed 7000441): 1 crash, 1 inferred `OwnershipLost`, 1 cancelled | covered by `effects::cancels_across_seeds` |
-| Client send starved past the store's CAS bound | `workers::a_send_starved_past_the_cas_bound_is_refused_and_retried` (seed 9000272): 1 `StoreUnavailable` send, retried | covered by `workers::worker_kills_across_seeds` |
+| Client send starved past the store's CAS bound | `workers::a_send_starved_past_the_cas_bound_is_refused_and_retried` (seed 20000471): 1 crash, 1 `StoreUnavailable` send, retried | covered by `workers::worker_kills_across_seeds` |
 | Timer fire racing a cancel | `timers::a_cancel_{before_the_fire_wins_and_the_sweep_fires_nothing,at_the_fire_that_lands_first_wins,at_the_fire_that_lands_second_is_already_fired,after_the_fire_is_already_fired}` | `timers::fire_cancel_race_across_seeds`: cancel won 43, already fired 21 |
 | Duplicate hint delivery | `timers::a_premature_hint_fires_nothing_and_is_kept`, `timers::a_hint_in_a_later_bucket_is_not_listed`, `timers::a_duplicate_hint_fires_its_generation_once`, `timers::two_sweepers_on_one_hint_fire_it_once` | `timers::duplicate_hint_delivery_across_seeds`: 128 HEAD reads, 125 hints deleted |
 | Lost hint PUT | `timers::a_lost_hint_put_is_delivered_by_the_sweep_within_its_interval`, `timers::a_lost_hint_put_due_on_a_pass_fires_on_that_pass`, `timers::a_sweep_whose_fire_write_fails_is_a_store_unavailable_refusal` | `timers::lost_hint_puts_across_seeds`: firing pass indexes sum to 286 |
@@ -77,7 +77,14 @@ fewer store calls. Fewer calls are fewer points where the scheduler
 interleaves processes, so the scripted crashes and lost acknowledgements
 land at other calls, and fewer of them land at all. The same shift moved
 the batch's one stale-owner run out of the 64 seeds; it is pinned from
-seed `0x5eed00db` instead.
+seed `0x5eed00db` instead. It moved two single-seed pins found under the
+old poll as well: the starved send is pinned from seed 20000471, which
+also crashes a worker (no seed in the 512-seed windows of days 1 to 450
+starves the send with no other event; 392000268 also fences a stale
+owner), and the escaped `OutcomeUnknown` from seed 4000067. Each worker process sweeps on every idle poll with one LIST a
+pass (`drive::poll_sweep`), which goes to the directory half; a client
+process sweeps with the runtime's default caps (`Rig::client_proc`), so a
+pass a timer schedule runs lists both halves.
 
 The "after" kill points use `DuplicateDelivery` to lose the answer to a
 write that applied. Each kill test then runs a replacement worker
@@ -159,8 +166,8 @@ Each of these is a test in the crate:
   (ignored): a poll whose `BeginTurn` CAS lost its answer once and was
   retried, then lost the retry's answer too, hands `OutcomeUnknown` to the
   worker instead of settling it (issue #3425). The runtime spends one retry
-  flag on both `OwnershipLost` and `OutcomeUnknown`. Seed 11000167 reaches
-  it, and so do 17000075 and 19000231 in 512-seed windows; none of the
+  flag on both `OwnershipLost` and `OutcomeUnknown`. Seed 4000067 reaches
+  it, and so do 12000370 and 16000166 in 512-seed windows; none of the
   default seeds does.
   `drive::map_error` reports `OutcomeUnknown` as unmappable, and
   `workers::kills` counts this one shape (`escaped_unknown`, pinned 0 on the
