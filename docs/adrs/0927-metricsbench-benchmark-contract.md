@@ -872,3 +872,105 @@ Consequences. A Ravel image for the portable lane must carry both flags
 (main after #3306, or a release after 0.27.0). Neither flag has a
 limits-file key: per-tenant query limits are not enforced today, and a key
 there would disclose a per-tenant bound that does not exist.
+
+## Amendment (2026-10-28): the portable replay keeps requests in flight the way a Prometheus sender does
+
+<!-- amendment-applies: none reason="adds the portable replay's sending model, which no earlier decision states; band 6 is already defined over each row's accepted set, so an order-independent digest of that set retires no earlier wording" -->
+
+Context. The first smoke pass on a dedicated box (#2821, comment 6460233909)
+replayed `ci` on all four portable rows and then stalled in `cardinality`'s
+ingest. The lane sends one Remote Write request, waits for its response, and
+only then sends the next. Ravel answers once the points are durable
+(decision 3), which happens when the tenant buffer ages past the 2 s flush
+delay, so each request took about 2.1 s: 1,054 requests in 37 minutes,
+measured from ravel-server's `ravel_cpu_gate_inline_total{site="remote_write_snappy"}`.
+At 500 points a request that is about 240 points per second, and
+cardinality's 360,000,000 samples would take about 420 hours. `ci` sends
+120,000 samples, 240 requests that take about 8 minutes on the Ravel row at
+that rate, inside the nightly's timeout, and no ingest figure was banded to
+catch it. A real sender does not wait on
+one request at a time: Prometheus' remote-write queue manager spreads series
+over shards, and each shard keeps its own request in flight. No earlier
+decision says how many requests the replay keeps in flight, so the lane's
+sequential loop was an unstated choice, and on a durable-on-ack receiver it
+measured the flush delay rather than ingest.
+
+Decision:
+
+1. **Shards and batch size come from Prometheus' own defaults.** The
+   replay keeps `S` shard queues and sends at most `B` points per request.
+   `S` is 50 and `B` is 2,000, the `queue_config` defaults of the pinned
+   Prometheus v3.13.1 (`docs/configuration/configuration.md` at tag
+   v3.13.1: `[ max_shards: <int> | default = 50 ]` and
+   `[ max_samples_per_send: <int> | default = 2000]`). Every portable row
+   uses the same `S` and `B`. Prometheus scales its shard count between
+   `min_shards` and `max_shards` as it goes; the replay does not model that
+   and holds `S` fixed, which is disclosed in the row's `client_behavior`.
+2. **A series always goes to the same shard, and a shard has one request
+   in flight.** The shard is a stable hash of the point's canonical series
+   identity modulo `S`. Each shard sends its next request only once the
+   previous one has answered, so every series reaches every receiver in
+   offered order, the out-of-order sample of the 2026-10-26 amendment,
+   section B, included, and at most `S` requests are in flight at once.
+   A shard sends when it holds `B` points or the stream has ended.
+3. **Retries back off the way Prometheus does.** A 429 or 5xx response, or
+   a transport error, is retried after a delay that starts at 30 ms and
+   doubles up to 5 s (`[ min_backoff: <duration> | default = 30ms ]`,
+   `[ max_backoff: <duration> | default = 5s ]`), up to the row's retry
+   limit, and the batch is then dropped as before. Prometheus by default
+   does not retry a 429 (`[ retry_on_http_429: <boolean> | default = false ]`);
+   the replay does, because a dropped point fails band 4 and the zero drop
+   budget, and the row's `client_behavior` says so.
+4. **Ingest figures are measured over wall time.** `elapsed_secs` becomes
+   the wall time from the first request sent to the last response
+   received, marked `elapsed_basis: "wall_in_flight"`, because with `S`
+   requests in flight a sum of per-request times counts the same second up
+   to `S` times. Generating the stream runs concurrently with sending, and
+   its busy time is reported as `generation_secs`; a row whose
+   `generation_secs` is at least 90% of its `elapsed_secs` is marked
+   `sender_bound: true`, since its throughput then says more about the
+   generator than about the receiver. `ack_latency_ms` stays per request,
+   from send to response, and now includes queueing inside the receiver
+   behind the other requests in flight. A durable-on-ack receiver's ack
+   latency still cannot fall below its flush interval, whatever `S` is.
+   Ingest figures from before this amendment carry
+   `elapsed_basis: "timed_segments"` and are not compared with figures
+   measured after it.
+5. **The digests do not depend on arrival order.** With `S` requests in
+   flight, responses arrive in no fixed order, so each class's expected and
+   accepted digest is the sum, modulo 2^256, of the BLAKE3 hash of each
+   point's encoding, the one the offered digest already uses: series,
+   timestamp and value bits for a sample, and every encoded field for a
+   native histogram. Band 6 already
+   compares sets, so its rule does not change. The sum is a multiset
+   digest: a point accepted twice changes it. Every lane computes it the
+   same way, the in-process row included, so the cross-row comparison
+   still holds.
+6. **A Ravel row keeps the newest commit token per shard.** Responses for
+   one Ravel shard can arrive out of order, so the row keeps, for each
+   shard, the token with the highest `(epoch, seq)`. Tokens on one shard
+   from two different writer ids cannot be ordered against each other, and
+   the row is refused when that happens; the portable deployment runs one
+   ravel-server.
+7. **A replay that cannot finish says so early.** Each HTTP row takes a
+   ceiling on its ingest wall time; the in-process row sends no requests
+   and takes none. Once a row has been sending for 60 s,
+   the replay projects its total wall time from the points offered so far
+   and the points the stream will offer, and stops with a typed error
+   naming the row, the projection and the ceiling when the projection is
+   over. `deploy/metricsbench/run.sh` passes a ceiling per profile, stated
+   next to the profile's pre-registration. The stall this amendment answers
+   was found by hand, an hour into a run whose `ingest.log` stays empty
+   until the step ends.
+
+Consequences. Band 4's identities are sums, so they hold under any arrival
+order and are unchanged. Every row's `client_behavior` describes the shard
+model, the backoff and the fixed `S`. Predicted, not measured: with 50
+shards of 2,000 points each answered about every 2.1 s, Ravel's row offers
+about 47,600 points per second. At that rate the Ravel row takes about
+2.1 hours for `cardinality` (360,000,000 samples), 2.5 hours for `churn`
+(432,000,000) and 10.1 hours for `history` (1,728,000,000). The per-profile
+ceilings are about twice those: 14,400 s, 18,000 s and 72,000 s, and 600 s
+for `ci`. A `history` run therefore needs a box that stays up longer than
+ten hours. The smoke pass that follows this amendment pre-registers each
+profile's figures on #2821 before it runs.
