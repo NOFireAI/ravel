@@ -18,10 +18,15 @@
 //! (`tests::a_completed_step_replays_without_a_new_intent_or_attempt`).
 //!
 //! Steps are sequential: while an attempt this coordinator dispatched under
-//! the caller's ownership epoch has no result, another `record_step` under
-//! that epoch is refused `IdempotencyConflict`
+//! the caller's ownership epoch for the active turn's input has no result,
+//! another `record_step` under that epoch is refused `IdempotencyConflict`
 //! (`tests::a_second_step_while_an_attempt_is_open_is_refused_typed`). That
-//! record is kept in memory only. An authorized attempt this coordinator did
+//! record is kept in memory only, and is dropped when HEAD shows its input
+//! settled. A turn whose input was cancelled settles with its attempt still
+//! open; HEAD keeps that attempt `Authorized`, as evidence that the tool was
+//! dispatched, its late result is stored as evidence without changing HEAD,
+//! and the next input's steps run under the same epoch
+//! (`tests::a_cancelled_turn_with_an_open_attempt_does_not_wedge_the_next_turn`). An authorized attempt this coordinator did
 //! not dispatch under the caller's epoch (a takeover, or a coordinator
 //! restart) is a lost attempt, and the step's recovery policy decides:
 //!
@@ -151,11 +156,14 @@ pub enum EffectSettled {
     Evidence { result: ObjectRef },
 }
 
-/// The attempt this coordinator dispatched under one ownership epoch.
+/// The attempt this coordinator dispatched under one ownership epoch, for
+/// the input `accept_seq` of `incarnation`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenAttempt {
     owner_id: String,
     epoch: u64,
+    incarnation: u64,
+    accept_seq: u64,
     attempt: u32,
 }
 
@@ -170,6 +178,16 @@ impl Coordinator {
         lease: &TurnLease,
         spec: &StepSpec,
     ) -> Result<StepJournal, AgentError> {
+        Ok(self.journal_step(lease, spec).await?.0)
+    }
+
+    /// [`Coordinator::record_step`], also answering the input the step
+    /// belongs to.
+    async fn journal_step(
+        &self,
+        lease: &TurnLease,
+        spec: &StepSpec,
+    ) -> Result<(StepJournal, u64), AgentError> {
         let (agent, fence) = fence_from_lease(lease)?;
         self.refuse_open_attempt(&agent, &fence).await?;
         let command = Command::RecordStep(RecordStep {
@@ -192,8 +210,15 @@ impl Coordinator {
                 ));
             }
         };
+        let Some(accept_seq) = out.head.active_turn.as_ref().map(|t| t.input_accept_seq) else {
+            return Err(refused(
+                &agent,
+                ErrorKind::OwnershipLost,
+                "the step's turn is no longer active",
+            ));
+        };
         let effect = step_effect(&out.head, &spec.step_key).cloned();
-        Ok(StepJournal { step, effect })
+        Ok((StepJournal { step, effect }, accept_seq))
     }
 
     /// Commit the step's intent; answers the effect id.
@@ -261,7 +286,7 @@ impl Coordinator {
         dispatcher: &dyn EffectDispatcher,
     ) -> Result<StepProgress, AgentError> {
         let (agent, fence) = fence_from_lease(lease)?;
-        let journal = self.record_step(lease, spec).await?;
+        let (journal, accept_seq) = self.journal_step(lease, spec).await?;
         if journal.step.status == StepStatus::Completed {
             let output = self.read_json(&agent, journal.step.output).await?;
             return Ok(StepProgress::Completed { output });
@@ -328,6 +353,8 @@ impl Coordinator {
             OpenAttempt {
                 owner_id: fence.owner.owner_id.clone(),
                 epoch: fence.owner.epoch,
+                incarnation: fence.owner.incarnation,
+                accept_seq,
                 attempt,
             },
         );
@@ -436,14 +463,18 @@ impl Coordinator {
         if !out.published && !landed_unacknowledged {
             return Ok(false);
         }
-        self.open_attempts.lock().insert(
-            (effect.agent, effect.effect_id),
-            OpenAttempt {
-                owner_id: out.head.owner_id.clone(),
-                epoch: out.head.epoch,
-                attempt,
-            },
-        );
+        if let Some(accept_seq) = effect_input(&out.head, &record) {
+            self.open_attempts.lock().insert(
+                (effect.agent, effect.effect_id),
+                OpenAttempt {
+                    owner_id: out.head.owner_id.clone(),
+                    epoch: out.head.epoch,
+                    incarnation: out.head.incarnation,
+                    accept_seq,
+                    attempt,
+                },
+            );
+        }
         dispatcher.dispatch(&Dispatch {
             effect: *effect,
             attempt,
@@ -520,14 +551,18 @@ impl Coordinator {
     }
 
     /// Refuse a new step while an attempt this coordinator dispatched under
-    /// the fence's epoch has no result. The record is dropped once HEAD no
+    /// the fence's epoch, for the active turn's input, has no result. An
+    /// attempt of another input does not race this step: that input settled
+    /// (a cancelled input settles with its attempt still authorized), and its
+    /// record is dropped by [`Coordinator::prune_open_attempts`] once HEAD
+    /// shows the input's result. The record is also dropped once HEAD no
     /// longer shows that attempt open.
     async fn refuse_open_attempt(
         &self,
         agent: &AgentId,
         fence: &TurnFence,
     ) -> Result<(), AgentError> {
-        let mine: Vec<(Id128, u32)> = self
+        let mine: Vec<(Id128, u64, u32)> = self
             .open_attempts
             .lock()
             .iter()
@@ -536,15 +571,21 @@ impl Coordinator {
                     && open.owner_id == fence.owner.owner_id
                     && open.epoch == fence.owner.epoch
             })
-            .map(|((_, effect_id), open)| (*effect_id, open.attempt))
+            .map(|((_, effect_id), open)| (*effect_id, open.accept_seq, open.attempt))
             .collect();
         if mine.is_empty() {
             return Ok(());
         }
         let head = self.reload(agent).await?;
+        let Some(active) = head.active_turn.as_ref().map(|t| t.input_accept_seq) else {
+            return Ok(());
+        };
         let mut still_open = false;
         let mut attempts = self.open_attempts.lock();
-        for (effect_id, attempt) in mine {
+        for (effect_id, accept_seq, attempt) in mine {
+            if accept_seq != active {
+                continue;
+            }
             let open = head.effects.iter().any(|e| {
                 e.effect_id == effect_id
                     && e.status == EffectStatus::Authorized
@@ -567,13 +608,20 @@ impl Coordinator {
     }
 
     /// Drop the attempts recorded for `agent` under an epoch older than
-    /// `head`'s: no lease of that epoch can journal another step.
+    /// `head`'s, since no lease of that epoch can journal another step, and
+    /// those whose input `head` shows settled, since no step of that input
+    /// follows.
     pub(crate) fn prune_open_attempts(&self, agent: &AgentId, head: &Head) {
         let mut attempts = self.open_attempts.lock();
         if attempts.is_empty() {
             return;
         }
-        attempts.retain(|(a, _), open| a != agent || open.epoch >= head.epoch);
+        attempts.retain(|(a, _), open| {
+            a != agent
+                || (open.epoch >= head.epoch
+                    && !(open.incarnation == head.incarnation
+                        && head.results.iter().any(|r| r.accept_seq == open.accept_seq)))
+        });
     }
 
     /// Refuse a dispatch while the loaded root shows the input being
@@ -660,6 +708,15 @@ fn step_effect<'a>(head: &'a Head, step_key: &str) -> Option<&'a EffectRecord> {
     let turn = head.active_turn.as_ref()?;
     let id = effect_id(head.incarnation, turn.input_accept_seq, step_key);
     head.effects.iter().find(|e| e.effect_id == id)
+}
+
+/// The input whose turn journaled `record`, among those HEAD still holds.
+fn effect_input(head: &Head, record: &EffectRecord) -> Option<u64> {
+    head.inbox
+        .iter()
+        .map(|i| i.accept_seq)
+        .chain(head.results.iter().map(|r| r.accept_seq))
+        .find(|seq| effect_id(head.incarnation, *seq, &record.step_key) == record.effect_id)
 }
 
 fn journaled<'a>(head: &'a Head, effect: &EffectRef) -> Result<&'a EffectRecord, AgentError> {
