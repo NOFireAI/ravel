@@ -86,21 +86,31 @@
 //!   An effect showing an intent with no attempt is unmappable; no schedule
 //!   reaches this.
 //! - `Coordinator::run_step` is [`Event::Step`], answered
-//!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher or
-//!   [`Reply::StepCompleted`] with the output's bytes
+//!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher,
+//!   [`Reply::StepCompleted`] with the output's bytes, or, for
+//!   `StepProgress::Failed`, [`Reply::StepFailed`] with the error
 //!   (`schedules::effects::at_least_once_killed_after_execution`, where the
-//!   second dispatch is attempt 2).
-//! - `Coordinator::complete_effect` and `fail_effect` are
-//!   [`Event::EffectResult`]; a failure's result is the bytes of
-//!   `{"error": error}`, as production records it. Both answer
+//!   second dispatch is attempt 2;
+//!   `schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`
+//!   for the failure).
+//! - `Coordinator::complete_effect` is [`Event::EffectResult`] with the
+//!   output's bytes, and `fail_effect` is [`Event::EffectFailed`] with the
+//!   error: production stores a failure as a typed result object, which
+//!   the reference keeps as a failure rather than as bytes. Both answer
 //!   [`Reply::EffectRecorded`] or [`Reply::EffectEvidence`]
 //!   (`schedules::effects::at_least_once_late_result_after_takeover_is_evidence`,
 //!   `schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
 //! - `Coordinator::reconcile_attach` is [`Event::ReconcileAttach`], answered
 //!   like a result, and `reconcile_authorize` is
 //!   [`Event::ReconcileAuthorize`], answered [`Reply::Reconciled`] with its
-//!   `dispatched` flag (`schedules::effects::manual_killed_after_execution`,
-//!   `schedules::effects::manual_killed_before_tool_call`).
+//!   `handed_over` flag (`schedules::effects::manual_killed_after_execution`,
+//!   `schedules::effects::manual_killed_before_tool_call`). The
+//!   authorization dispatches nothing: the coordinator that ran it holds the
+//!   attempt, and the next `run_step` of the effect's step through that
+//!   coordinator dispatches it and answers [`Reply::StepDispatched`] with
+//!   it. So the schedules authorize from the process that runs the next
+//!   step; a step through another process would find the attempt lost,
+//!   which the reference does not model.
 //! - The error kinds the reference models, `OwnershipLost`, `AgentGone`,
 //!   `IdempotencyConflict`, `EffectInDoubt` and `NonDeterministicReplay`,
 //!   answer [`Reply::Error`]
@@ -1318,6 +1328,9 @@ impl Proc {
                         StepProgress::Completed { output } => Reply::StepCompleted {
                             output: json_bytes(output),
                         },
+                        StepProgress::Failed { error } => Reply::StepFailed {
+                            error: error.clone(),
+                        },
                         StepProgress::Dispatched(d) => Reply::StepDispatched { attempt: d.attempt },
                     })
                 });
@@ -1349,19 +1362,18 @@ impl Proc {
         .await
     }
 
-    /// Report a failed attempt; production records `{"error": error}` as
-    /// its result, and so does the event.
+    /// Report a failed attempt: [`Event::EffectFailed`] with the error.
     pub async fn fail_effect(
         &self,
         operation: &Handle,
         d: &Dispatch,
         error: &str,
     ) -> Result<EffectSettled, AgentError> {
-        let event = Event::EffectResult {
+        let event = Event::EffectFailed {
             operation: *operation,
             step_key: d.step_key.clone(),
             attempt: d.attempt,
-            result: json_bytes(&serde_json::json!({ "error": error })),
+            error: error.to_string(),
         };
         self.record(
             "fail_effect",
@@ -1403,7 +1415,9 @@ impl Proc {
         .await
     }
 
-    /// Authorize `attempt` of an effect in doubt, as an operator.
+    /// Authorize `attempt` of an effect in doubt, as an operator. Nothing
+    /// is dispatched: this process's coordinator holds the attempt for the
+    /// next [`Proc::step`] of the effect's step through this same process.
     pub async fn reconcile_authorize(
         &self,
         operation: &Handle,
@@ -1416,18 +1430,14 @@ impl Proc {
             attempt,
         };
         let effect = Proc::effect_of(operation, step_key);
-        let dispatcher = LogDispatcher {
-            proc: &self.name,
-            log: &self.dispatches,
-        };
         self.record(
             "reconcile_authorize",
             Some(event),
-            self.co.reconcile_authorize(&effect, attempt, &dispatcher),
+            self.co.reconcile_authorize(&effect, attempt),
             |r| {
-                let observed = observe(r, |dispatched| {
+                let observed = observe(r, |handed_over| {
                     Observed::Modelled(Reply::Reconciled {
-                        dispatched: *dispatched,
+                        handed_over: *handed_over,
                     })
                 });
                 (None, observed)
