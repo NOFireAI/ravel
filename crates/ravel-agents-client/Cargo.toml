@@ -6,5 +6,23 @@ license.workspace = true
 rust-version.workspace = true
 description = "Rust HTTP client for the Ravel Agents API (ADR-3331)."
 
+[dependencies]
+# The wire types and error codes the server renders; the client decodes into
+# them rather than restating them.
+ravel-agents-core = { workspace = true }
+# The workspace pin ravel-object-store and ravel-server already link.
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The hand-rolled loopback test server; the workspace carries no mock-HTTP
+# crate.
+axum = { workspace = true }
+tokio = { workspace = true }
+# Pins the client's long-poll clamp to the coordinator's cap.
+ravel-agents-runtime = { workspace = true }
+
 [lints]
 workspace = true
