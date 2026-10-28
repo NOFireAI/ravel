@@ -6,7 +6,7 @@ gated by code rather than read by hand:
 | File | What it is | Loader and gate |
 |---|---|---|
 | `workload.json` | The workload manifest (format version 2): seed, generator configuration, metric families, label distributions, and the four profiles with their range-evaluation grids | `ravel_bench::metrics_workload::load_workload` |
-| `metrics.corpus.json` | The PromQL query corpus (format version 3): 24 queries, each with stable id, typed cost class, the registry constructs it exercises, and whether its answer is intended to be empty | `ravel_bench::promql_corpus::load_corpus`, then `ravel_bench::promql_corpus::gate_corpus_against_workload` |
+| `metrics.corpus.json` | The PromQL query corpus (format version 4): 24 queries, each with stable id, typed cost class, the registry constructs it exercises, whether its answer is intended to be empty, and any ULP tolerance its comparison allows | `ravel_bench::promql_corpus::load_corpus`, then `ravel_bench::promql_corpus::gate_corpus_against_workload` |
 
 Both gates run before the first sample is generated:
 
@@ -35,8 +35,8 @@ number. There is no compatibility path. The stream changed with the
 out-of-order shift (see "Determinism"), so a version-1 stream is reproduced
 from the version-1 files in git history, not by this build.
 
-Since then the two version independently. The corpus is at version 3 (see
-"Corpus version 3" below) and the workload manifest stays at version 2; a
+Since then the two version independently. The corpus is at version 4 (see
+"Corpus version 4" below) and the workload manifest stays at version 2; a
 corpus change does not alter the stream.
 
 `--profile` has no default. The profile selects which data the run touches and
@@ -609,8 +609,10 @@ was unavailable and no engine's answer could be compared. The new answer is
 one series of 121 points. The entry keeps its id, its `full_range` class
 (decision 5 classifies by physical work), range evaluation and profiles
 (`promql_corpus::tests::the_full_range_entry_collapses_its_answer_and_says_why`).
-A version-3 loader refuses a version-2 corpus
-(`promql_corpus::tests::a_version_2_corpus_is_refused_after_the_full_range_rewrite`).
+The version-4 loader refuses a version-2 corpus
+(`promql_corpus::tests::a_version_2_corpus_is_refused_after_the_full_range_rewrite`)
+and a version-3 one
+(`promql_corpus::tests::a_version_3_corpus_is_refused_after_the_summation_tolerances`).
 
 An entry may carry `tolerance_ulps`, the ULP tolerance the difftest comparator
 applies to its sample values. Absent means bit-exact, as before; the runner
@@ -623,8 +625,8 @@ tolerance on an entry that is not flagged modified with a reason
 The gate does not check that the reason explains the tolerance; the entry's
 own reason has to.
 
-`mb_full_range_avg_over_time` is the only entry with a tolerance
-(`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`):
+`mb_full_range_avg_over_time` was the first entry with a tolerance, and until
+corpus version 4 the only one:
 `1048576`, 2^20. After the collapse each step's answer is one mean over every
 selected gauge series, and an engine that sums them in another order, or with
 compensated summation, differs in the last bits while every per-series answer
@@ -642,6 +644,66 @@ cardinality's gauge series would exceed it. The gap is predicted, not
 measured: ADR-0025 pairs every tolerance with a measured gap, and the first
 comparable run under #2821 is pre-registered to measure this one and record
 the figure in the entry's reason.
+
+Corpus version 4 gives a tolerance to every other entry whose answer sums
+floats across series. The nightly ci run measured Ravel and Mimir 1 to 4 ULPs
+off the Prometheus oracle on these entries (#2821 comment 6459784933), and
+under bit-exact comparison each such answer read as `incorrect`. No query
+changes; each entry is flagged modified because the gate requires a tolerance
+to be disclosed there, and its reason carries the derivation. The bound, per
+engine: a sum of n non-negative values errs by at most n-1 ULPs of the sum.
+Every summed value here is non-negative: gauges are drawn from [0, 100)
+(`unit_scaled(h, 100, 10)`, `crates/ravel-bench/src/metrics_gen.rs:799`) and
+counters only grow (`crates/ravel-bench/src/metrics_gen.rs:815`), so their
+rates and increases are non-negative too. n is the largest series count the
+entry's selector matches on any profile it runs under, which is cardinality in
+every case. An inner `rate` adds at most 30 roundings, each at most one ULP of
+the result: 20 in the delta over the at most 20 samples a left-open 5-minute
+window holds at a 15-second scrape (one subtraction and up to 19 counter-reset
+corrections) and 10 in extrapolation (three timestamp-to-seconds conversions,
+a multiplication and a division for the zero-point clamp, two additions for
+the extrapolated interval, the factor division, the multiplication by the
+factor, and the division by the range). An inner 30-minute `increase` adds 129
+the same way: 120 in the delta and 9 in extrapolation, with no division by the
+range. Each division adds one. The comparator sees two engines that may err in
+opposite directions, so the bound is doubled, then rounded up to a power of
+two. `promql_corpus::tests::every_summation_tolerance_equals_the_bound_its_reason_derives`
+recomputes every figure below from the generator's own series counts and
+fails when a tolerance, a series count, or the arithmetic in a reason
+disagrees with the others.
+
+| Entry | Tolerance (per engine x 2) | Series summed on cardinality | ci gap: ravel | ci gap: mimir | ci gap: victoriametrics |
+|---|---|---|---|---|---|
+| `mb_selective_job_rate_sum` | 2^18 (75,029 x 2 = 150,058) | 75,000 counter series with `job="metricsbench-api"` | 1 | 1 | 2,339,342,372,231,417 |
+| `mb_selective_region_avg` | 2^19 (133,336 x 2 = 266,672) | 133,336 gauge series with `region="eu-west-1"` | 4 | none listed | none listed |
+| `mb_selective_error_ratio` | 2^20 (300,059 x 2 = 600,118) | 74,992 with `status="500"` over 225,008 without | 2 | 2 | 1,877,575,138,056,483 |
+| `mb_fanout_total_rate` | 2^20 (300,029 x 2 = 600,058) | 300,000 counter series | 1 | 1 | 1,395,624,456,039,935 |
+| `mb_full_range_avg_over_time` | 2^20 (400,119 x 2 = 800,238) | 400,000 gauge series | not run on ci | not run on ci | not run on ci |
+| `mb_full_range_counter_increase` | 2^20 (300,128 x 2 = 600,256) | 300,000 counter series | none listed | none listed | 484,832,405,549,241 |
+
+Sources: each bound and series count is the entry's own `modified` reason; each
+gap is the largest ULP gap to the oracle in nightly run 40623286253 on the ci
+profile, from that run's `diagnostics.json` `ulp_gaps` as posted on #2821
+comment 6459784933, where "none listed" means the comment names no gap for that
+engine and entry. The checked-in set of tolerances is pinned by
+`metricsbench_artifacts::the_modified_entries_say_why_and_no_entry_is_intended_empty`.
+The runner applies them: Ravel one ULP off on `mb_fanout_total_rate`
+classifies `ok`, and 2^40 ULPs off still classifies `incorrect`
+(`metricsbench_query::a_summation_tolerance_admits_last_bit_residue_and_not_a_semantic_gap`).
+The largest tolerance, 2^20 ULPs, is a relative difference of about 2.3e-10;
+the smallest VictoriaMetrics gap above, about 4.8e14 ULPs (2^48.8), is more
+than 2^28 times wider, so its different `rate` and `increase` algorithms still
+read as `incorrect`. Each gap is checked again by the next cardinality run.
+
+Every other entry stays bit-exact. `mb_single_counter_rate` (one series; the
+ADR-0025 `rate` residue, Ravel 1 ULP where Mimir is exact) and
+`mb_histogram_native_p95` (`histogram_quantile` over native buckets, Ravel 3
+ULPs) sum nothing across series. `mb_histogram_classic_p99` sums bucket rates
+across series, but `histogram_quantile` then interpolates on differences of
+those sums and picks its bucket by comparing them, so a last-bit change in a
+sum is not bounded relative to the answer. `mb_long_range_subquery_max` takes
+the maximum of cross-series sums, but runs only under history and has no
+measured gap yet, and ADR-0025 pairs each tolerance with one.
 
 An entry may carry `expected: {"intended_empty": true, "reason": "..."}`; the
 gate refuses the flag without a non-blank reason. An empty oracle answer on an
