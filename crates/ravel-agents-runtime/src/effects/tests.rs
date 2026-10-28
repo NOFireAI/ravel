@@ -953,3 +953,90 @@ async fn a_step_key_reused_under_another_tool_name_blocks_the_turn_before_dispat
     );
     assert_eq!(h.effects.len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_turn_with_an_open_attempt_does_not_wedge_the_next_turn() {
+    let (_clock, store, co) = rig();
+    create(&co, "o-1").await;
+    let sent = send(&co, "o-1", "r-1", json!({"n": 1})).await;
+    let w = worker(&co, "v1");
+    let a = poll_now(&co, &w, "v1").await.expect("leased");
+    let s = spec("send-email", RecoveryPolicy::AtLeastOnce);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    co.cancel(&CancelRequest {
+        operation: sent.operation,
+    })
+    .await
+    .expect("cancel");
+    let done = co
+        .commit(&completed(&a.lease, json!("ok")))
+        .await
+        .expect("commit");
+    assert_eq!(done.status, OperationStatus::Cancelled);
+
+    // The next turn runs under the same owner and epoch.
+    send(&co, "o-1", "r-2", json!({"n": 2})).await;
+    let b = poll_now(&co, &w, "v1").await.expect("next turn");
+    assert_eq!(
+        (&b.lease.owner_id, b.lease.epoch),
+        (&a.lease.owner_id, a.lease.epoch)
+    );
+    assert_ne!(b.accept_seq, a.accept_seq);
+    let next = spec("next", RecoveryPolicy::AtLeastOnce);
+    let e = dispatched(&co, &b, &next, &hook).await;
+    assert_eq!(hook.calls(), 2, "the next turn's step is dispatched");
+    assert_ne!(e.effect, d.effect);
+    assert_eq!(e.attempt, 1);
+    assert!(
+        !co.open_attempts
+            .lock()
+            .contains_key(&(d.effect.agent, d.effect.effect_id)),
+        "the commit that settled the input dropped its attempt"
+    );
+
+    // The cancelled input's attempt reports late: evidence, HEAD unchanged.
+    let base = head(&store, "o-1").await;
+    let before = store.counters();
+    let EffectSettled::Evidence { result } = co
+        .complete_effect(&d.effect, d.attempt, &json!("late"))
+        .await
+        .expect("late")
+    else {
+        panic!("a result for a cancelled input is evidence");
+    };
+    assert_eq!(cas_since(&store, &before), 0);
+    let h = head(&store, "o-1").await;
+    assert_eq!(h, base);
+    let kept = store
+        .read_object(&id_of("o-1"), result)
+        .await
+        .expect("evidence kept");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&kept).expect("json"),
+        json!("late")
+    );
+    let orphan = effect_of(&h, &d);
+    assert_eq!(
+        (orphan.status, orphan.attempt, orphan.result),
+        (EffectStatus::Authorized, 1, None),
+        "the cancelled input's attempt stays authorized, as evidence of a dispatched tool"
+    );
+    let current = effect_of(&h, &e);
+    assert_eq!(
+        (current.status, current.attempt),
+        (EffectStatus::Authorized, 1)
+    );
+    assert_eq!(hook.calls(), 2);
+    let open: Vec<_> = co
+        .open_attempts
+        .lock()
+        .iter()
+        .map(|((_, effect_id), open)| (*effect_id, open.attempt))
+        .collect();
+    assert_eq!(
+        open,
+        vec![(e.effect.effect_id, 1)],
+        "only the next turn's attempt is open"
+    );
+}
