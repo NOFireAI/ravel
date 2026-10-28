@@ -7,6 +7,7 @@ mod effects;
 mod errors;
 mod races;
 mod senders;
+mod timers;
 mod workers;
 
 use std::future::Future;
