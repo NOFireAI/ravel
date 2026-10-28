@@ -47,8 +47,13 @@
 //! (`tests::late_results_after_takeover_and_after_cancel_are_evidence`). A
 //! second, different result for the same attempt is `IdempotencyConflict`
 //! (same test). [`Coordinator::fail_effect`] records a failure as the
-//! attempt's result, so the turn can then fail
-//! (`tests::fail_effect_records_the_failure_so_the_turn_can_fail`).
+//! attempt's result, so the turn can then fail: the step stays started, and
+//! its replay answers [`StepProgress::Failed`]
+//! (`tests::fail_effect_records_the_failure_so_the_turn_can_fail`). A failure
+//! is typed by its result object, which starts with
+//! [`FAILURE_RESULT_PREFIX`]; a JSON output never does, so an output of any
+//! shape replays as an output
+//! (`tests::an_output_shaped_like_a_failure_replays_as_an_output`).
 //!
 //! While the input is being cancelled no attempt is dispatched, and a
 //! completion settles the input cancelled
@@ -56,17 +61,23 @@
 //!
 //! Reconciliation of an effect in doubt is [`Coordinator::reconcile_attach`]
 //! (attach a verified result) or [`Coordinator::reconcile_authorize`]
-//! (authorize another attempt and dispatch it). Each is idempotent, and the
-//! kernel appends one audit event to the effect's turn's event stream for
-//! each one that changes HEAD (`tests::reconcile_is_idempotent_and_audited_once`).
-//! One race is not covered: when another admin's `reconcile_authorize` for
-//! the same attempt lands between this call's read of HEAD and its write, and
-//! this call's write comes back with an unknown outcome, the retry cannot
-//! tell the other admin's authorization from its own and dispatches the
-//! attempt a second time. Telling them apart needs a caller identity in
+//! (authorize another attempt and hand it to the owner). Neither dispatches:
+//! an authorized attempt is dispatched by the owner's next `run_step` for
+//! the effect's step, which is not refused for that attempt being open
+//! (`tests::a_reconciled_attempt_is_dispatched_by_the_owners_next_step`). The
+//! hand-over is held in this coordinator's memory, so an owner whose step
+//! reaches another coordinator, or a new owner after a takeover, finds the
+//! attempt lost and the policy decides (a `manual` effect latches in doubt
+//! again). Each is idempotent, and the kernel appends one audit event to the
+//! effect's turn's event stream for each one that changes HEAD
+//! (`tests::reconcile_is_idempotent_and_audited_once`). One race is not
+//! covered: when another admin's `reconcile_authorize` for the same attempt
+//! lands between this call's read of HEAD and its write, and this call's
+//! write comes back with an unknown outcome, the retry cannot tell the other
+//! admin's authorization from its own. The owner still dispatches the
+//! attempt once. Telling them apart needs a caller identity in
 //! `Authority::Reconcile` or in the audit event, a format change tracked on
-//! issue #3408. Without an unknown outcome the other admin's attempt is
-//! never dispatched again
+//! issue #3408
 //! (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
 //! The `agents_admin` capability check belongs to the route that calls them.
 //!
@@ -75,9 +86,8 @@
 //! without a write when it already applied
 //! (`tests::an_effect_result_with_a_lost_ack_lands_once`).
 //!
-//! Reachability: nothing outside this crate calls this module yet. The SDK
-//! runner reaches it through the worker routes of T16; until then the
-//! callers are this module's tests and the simulation schedules of T18.
+//! Reachability: `ravel-server`'s worker, effect and reconcile routes call
+//! this module; so do this module's tests.
 
 use std::sync::atomic::Ordering;
 
@@ -152,8 +162,47 @@ pub struct StepJournal {
 pub enum StepProgress {
     /// The step completed; replay its output.
     Completed { output: Value },
+    /// The step's effect recorded a tool failure through
+    /// [`Coordinator::fail_effect`]; replay the failure. The step stays
+    /// journaled started, so a retried turn replays the failure again.
+    Failed { error: String },
     /// An attempt was handed to the dispatcher by this call.
     Dispatched(Dispatch),
+}
+
+/// The bytes an effect result object starts with when it records a tool
+/// failure, followed by the error as UTF-8. A result reported through
+/// [`Coordinator::complete_effect`] is JSON text, which never contains a NUL
+/// byte, so no output can be read back as a failure.
+pub const FAILURE_RESULT_PREFIX: &[u8] = b"\0ravel-agents-tool-failure-v1\0";
+
+/// An effect result object, decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffectResult {
+    /// What the tool returned, through [`Coordinator::complete_effect`] or a
+    /// reconcile.
+    Output(Value),
+    /// The tool failure [`Coordinator::fail_effect`] recorded.
+    Failure(String),
+}
+
+impl EffectResult {
+    /// Decode a stored result; `None` for bytes that are neither form.
+    pub fn decode(bytes: &[u8]) -> Option<EffectResult> {
+        match bytes.strip_prefix(FAILURE_RESULT_PREFIX) {
+            Some(error) => std::str::from_utf8(error)
+                .ok()
+                .map(|e| EffectResult::Failure(e.to_string())),
+            None => serde_json::from_slice(bytes).ok().map(EffectResult::Output),
+        }
+    }
+
+    fn failure_bytes(error: &str) -> Bytes {
+        let mut bytes = Vec::with_capacity(FAILURE_RESULT_PREFIX.len() + error.len());
+        bytes.extend_from_slice(FAILURE_RESULT_PREFIX);
+        bytes.extend_from_slice(error.as_bytes());
+        Bytes::from(bytes)
+    }
 }
 
 /// The answer to a result.
@@ -175,6 +224,10 @@ pub(crate) struct OpenAttempt {
     incarnation: u64,
     accept_seq: u64,
     attempt: u32,
+    /// Authorized by [`Coordinator::reconcile_authorize`] and not yet handed
+    /// to the owner: the owner's next `run_step` for the effect's step
+    /// dispatches it.
+    reconciled: bool,
 }
 
 impl Coordinator {
@@ -199,7 +252,8 @@ impl Coordinator {
         spec: &StepSpec,
     ) -> Result<(StepJournal, u64), AgentError> {
         let (agent, fence) = fence_from_lease(lease)?;
-        self.refuse_open_attempt(&agent, &fence).await?;
+        self.refuse_open_attempt(&agent, &fence, &spec.step_key)
+            .await?;
         let command = Command::RecordStep(RecordStep {
             fence,
             step_key: spec.step_key.clone(),
@@ -301,7 +355,18 @@ impl Coordinator {
             let output = self.read_json(&agent, journal.step.output).await?;
             return Ok(StepProgress::Completed { output });
         }
+        let reconciled = match &journal.effect {
+            Some(effect) => self.claim_reconciled(&agent, &fence, effect)?,
+            None => false,
+        };
         let attempt = match &journal.effect {
+            Some(effect) if reconciled => {
+                if let Err(err) = self.refuse_cancelled(&agent).await {
+                    self.release_reconciled(&agent, effect.effect_id);
+                    return Err(err);
+                }
+                (effect.effect_id, effect.attempt)
+            }
             None => {
                 self.refuse_cancelled(&agent).await?;
                 let effect_id = self.commit_intent(lease, spec).await?;
@@ -310,6 +375,11 @@ impl Coordinator {
             }
             Some(effect) => match (effect.status, effect.policy) {
                 (EffectStatus::Completed, _) => {
+                    if let EffectResult::Failure(error) =
+                        self.read_result(&agent, effect.result).await?
+                    {
+                        return Ok(StepProgress::Failed { error });
+                    }
                     return self.complete_step(lease, spec, effect).await;
                 }
                 (EffectStatus::InDoubt, _) => {
@@ -366,6 +436,7 @@ impl Coordinator {
                 incarnation: fence.owner.incarnation,
                 accept_seq,
                 attempt,
+                reconciled: false,
             },
         );
         dispatcher.dispatch(&dispatch);
@@ -384,16 +455,39 @@ impl Coordinator {
         self.record_result(effect, attempt, bytes).await
     }
 
-    /// Record a failed attempt: `error` becomes the attempt's result, so the
-    /// effect is settled and the turn may fail.
+    /// Record a failed attempt: `error` becomes the attempt's result, stored
+    /// under [`FAILURE_RESULT_PREFIX`], so the effect is settled and the turn
+    /// may fail. The step replays it as [`StepProgress::Failed`], never as an
+    /// output (`tests::fail_effect_records_the_failure_so_the_turn_can_fail`,
+    /// `tests::an_output_shaped_like_a_failure_replays_as_an_output`).
     pub async fn fail_effect(
         &self,
         effect: &EffectRef,
         attempt: u32,
         error: &str,
     ) -> Result<EffectSettled, AgentError> {
-        let failure = serde_json::json!({ "error": error });
-        self.complete_effect(effect, attempt, &failure).await
+        self.record_result(effect, attempt, EffectResult::failure_bytes(error))
+            .await
+    }
+
+    /// The effect result object `dep` names, decoded; no object is a `null`
+    /// output.
+    pub async fn read_result(
+        &self,
+        agent: &AgentId,
+        dep: Option<ObjectRef>,
+    ) -> Result<EffectResult, AgentError> {
+        let Some(dep) = dep else {
+            return Ok(EffectResult::Output(Value::Null));
+        };
+        let bytes = self.store.read_object(agent, dep).await?;
+        EffectResult::decode(&bytes).ok_or_else(|| {
+            refused(
+                agent,
+                ErrorKind::UnsupportedFormat,
+                "effect result is neither a JSON value nor a recorded failure",
+            )
+        })
     }
 
     /// Reconcile an effect in doubt by attaching a verified result to its
@@ -421,34 +515,44 @@ impl Coordinator {
     }
 
     /// Reconcile an effect in doubt by authorizing `attempt`, the one after
-    /// its latest, and dispatching it. Idempotent: a repeat for an attempt
-    /// already authorized answers `false` and dispatches nothing. When this
-    /// call's own write landed and only its acknowledgement was lost, the
-    /// retry finds the attempt authorized one past the effect's attempt this
-    /// call started from, and the attempt is dispatched
+    /// its latest, and handing it to the owner. Nothing is dispatched here:
+    /// the attempt is recorded open under HEAD's owner and epoch, and that
+    /// owner's next [`Coordinator::run_step`] for the effect's step
+    /// dispatches it through its own dispatcher, once
+    /// (`tests::reconcile_is_idempotent_and_audited_once`). Answers `true`
+    /// when this call authorized the attempt. Idempotent: a repeat for an
+    /// attempt already authorized answers `false` and hands nothing over.
+    /// When this call's own write landed and only its acknowledgement was
+    /// lost, the retry finds the attempt authorized one past the effect's
+    /// attempt this call started from, and the attempt is handed over
     /// (`tests::a_reconcile_authorization_with_a_lost_ack_dispatches_once`).
     /// When another admin's reconcile of the same attempt landed first and
     /// this call's write lost the race with a known outcome, this call
-    /// answers `false` and dispatches nothing
+    /// answers `false` and hands nothing over
     /// (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
+    ///
+    /// The hand-over is held by this coordinator in memory. An owner whose
+    /// next step reaches another coordinator, an owner replaced by a
+    /// takeover, or a restart in between finds the attempt authorized with
+    /// no record, takes it as lost, and the step's policy decides (a
+    /// `manual` effect latches in doubt again).
     ///
     /// Not idempotent across admins in one case: when another admin's
     /// reconcile lands between this call's reload and its write, and this
     /// call's write comes back `OutcomeUnknown`, the retry reads the other
-    /// admin's attempt as this call's and dispatches it a second time. The
-    /// fix needs a caller identity in `Authority::Reconcile` or in the audit
-    /// event, a format change tracked on issue #3408.
+    /// admin's attempt as this call's and hands it over too; the owner still
+    /// dispatches it once. Telling the two apart needs a caller identity in
+    /// `Authority::Reconcile` or in the audit event, a format change tracked
+    /// on issue #3408.
     ///
     /// When all [`UNKNOWN_OUTCOME_RETRIES`] retries also come back unknown,
-    /// the error is returned and nothing is dispatched, even if a write
-    /// landed: HEAD may then hold the attempt authorized with no dispatch,
-    /// and it stays undispatched until the owner's next `run_step` finds it
-    /// lost and relatches it (a `manual` effect latches in doubt again).
+    /// the error is returned and nothing is handed over, even if a write
+    /// landed: HEAD may then hold the attempt authorized with no record, and
+    /// the owner's next `run_step` finds it lost as above.
     pub async fn reconcile_authorize(
         &self,
         effect: &EffectRef,
         attempt: u32,
-        dispatcher: &dyn EffectDispatcher,
     ) -> Result<bool, AgentError> {
         let head = self.reload(&effect.agent).await?;
         let record = journaled(&head, effect)?.clone();
@@ -499,19 +603,55 @@ impl Coordinator {
                     incarnation: out.head.incarnation,
                     accept_seq,
                     attempt,
+                    reconciled: true,
                 },
             );
         }
-        dispatcher.dispatch(&Dispatch {
-            effect: *effect,
-            attempt,
-            step_key: record.step_key,
-            tool_name: record.tool_name,
-            tool_version: record.tool_version,
-            policy: record.policy,
-            input_hash: record.input_hash,
-        });
         Ok(true)
+    }
+
+    /// Claim the attempt of `effect` a reconcile handed to the fence's owner,
+    /// if it holds one not yet dispatched: `true` once, for the one
+    /// `run_step` that dispatches it. A concurrent step that finds the
+    /// attempt already claimed is refused `IdempotencyConflict`, since that
+    /// attempt is open.
+    fn claim_reconciled(
+        &self,
+        agent: &AgentId,
+        fence: &TurnFence,
+        effect: &EffectRecord,
+    ) -> Result<bool, AgentError> {
+        if effect.status != EffectStatus::Authorized {
+            return Ok(false);
+        }
+        let mut attempts = self.open_attempts.lock();
+        let Some(open) = attempts.get_mut(&(*agent, effect.effect_id)) else {
+            return Ok(false);
+        };
+        if open.owner_id != fence.owner.owner_id
+            || open.epoch != fence.owner.epoch
+            || open.incarnation != fence.owner.incarnation
+            || open.attempt != effect.attempt
+        {
+            return Ok(false);
+        }
+        if !open.reconciled {
+            return Err(refused(
+                agent,
+                ErrorKind::IdempotencyConflict,
+                "a step's attempt is still open; steps are sequential",
+            ));
+        }
+        open.reconciled = false;
+        Ok(true)
+    }
+
+    /// Hand a claimed reconciled attempt back when its step was refused
+    /// before dispatching it.
+    fn release_reconciled(&self, agent: &AgentId, effect_id: Id128) {
+        if let Some(open) = self.open_attempts.lock().get_mut(&(*agent, effect_id)) {
+            open.reconciled = true;
+        }
     }
 
     async fn record_result(
@@ -583,13 +723,16 @@ impl Coordinator {
     /// (a cancelled input settles with its attempt still authorized), and its
     /// record is dropped by [`Coordinator::prune_open_attempts`] once HEAD
     /// shows the input's result. The record is also dropped once HEAD no
-    /// longer shows that attempt open.
+    /// longer shows that attempt open. An attempt a reconcile handed over and
+    /// not yet dispatched does not refuse `step_key`'s own step, which is the
+    /// one that dispatches it; it refuses every other step.
     async fn refuse_open_attempt(
         &self,
         agent: &AgentId,
         fence: &TurnFence,
+        step_key: &str,
     ) -> Result<(), AgentError> {
-        let mine: Vec<(Id128, u64, u32)> = self
+        let mine: Vec<(Id128, u64, u32, bool)> = self
             .open_attempts
             .lock()
             .iter()
@@ -598,7 +741,9 @@ impl Coordinator {
                     && open.owner_id == fence.owner.owner_id
                     && open.epoch == fence.owner.epoch
             })
-            .map(|((_, effect_id), open)| (*effect_id, open.accept_seq, open.attempt))
+            .map(|((_, effect_id), open)| {
+                (*effect_id, open.accept_seq, open.attempt, open.reconciled)
+            })
             .collect();
         if mine.is_empty() {
             return Ok(());
@@ -607,21 +752,22 @@ impl Coordinator {
         let Some(active) = head.active_turn.as_ref().map(|t| t.input_accept_seq) else {
             return Ok(());
         };
+        let own_effect = effect_id(fence.owner.incarnation, active, step_key);
         let mut still_open = false;
         let mut attempts = self.open_attempts.lock();
-        for (effect_id, accept_seq, attempt) in mine {
-            if accept_seq != active {
+        for (id, accept_seq, attempt, reconciled) in mine {
+            if accept_seq != active || (reconciled && id == own_effect) {
                 continue;
             }
             let open = head.effects.iter().any(|e| {
-                e.effect_id == effect_id
+                e.effect_id == id
                     && e.status == EffectStatus::Authorized
                     && e.attempt == attempt
             });
             if open {
                 still_open = true;
             } else {
-                attempts.remove(&(*agent, effect_id));
+                attempts.remove(&(*agent, id));
             }
         }
         if still_open {
