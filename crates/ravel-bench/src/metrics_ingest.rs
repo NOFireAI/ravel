@@ -3153,13 +3153,20 @@ pub struct StallCeiling {
     /// The logical points the whole stream offers, the projection's
     /// denominator.
     pub stream_points: u64,
+    /// How long the row sends before its first stall check ([`STALL_GRACE`]
+    /// in the bin).
+    pub grace: Duration,
+    /// The shortest gap between two stall checks, and the longest the drain
+    /// waits for a response before checking again ([`STALL_RECHECK`] in the
+    /// bin).
+    pub recheck: Duration,
 }
 
-/// How long a row sends before its first stall check.
-const STALL_GRACE: Duration = Duration::from_secs(60);
+/// How long the bin lets a row send before its first stall check.
+pub const STALL_GRACE: Duration = Duration::from_secs(60);
 
-/// The shortest gap between two stall checks.
-const STALL_RECHECK: Duration = Duration::from_secs(10);
+/// The shortest gap the bin leaves between two stall checks.
+pub const STALL_RECHECK: Duration = Duration::from_secs(10);
 
 /// The first retry's backoff (Prometheus' `min_backoff`).
 const HTTP_MIN_BACKOFF: Duration = Duration::from_millis(30);
@@ -3762,9 +3769,116 @@ impl HttpCollector {
 }
 
 /// When a row's stall check next runs: once it has been sending for
-/// [`STALL_GRACE`], then at most every [`STALL_RECHECK`].
-fn stall_check_due(sending_for: Duration, since_last_check: Option<Duration>) -> bool {
-    sending_for >= STALL_GRACE && since_last_check.is_none_or(|d| d >= STALL_RECHECK)
+/// `ceiling.grace`, then at most every `ceiling.recheck`.
+fn stall_check_due(
+    ceiling: &StallCeiling,
+    sending_for: Duration,
+    since_last_check: Option<Duration>,
+) -> bool {
+    sending_for >= ceiling.grace && since_last_check.is_none_or(|d| d >= ceiling.recheck)
+}
+
+/// The stall check both the producer and the drain run: when one is due
+/// ([`stall_check_due`]) and the projection over `offered_points` exceeds
+/// the ceiling ([`stall_projection_over`]), [`LaneError::IngestStalled`].
+/// Nothing is checked before the first request is sent.
+fn check_stall(
+    system: &str,
+    ceiling: Option<&StallCeiling>,
+    sending_since: Option<std::time::Instant>,
+    last_check: &mut Option<std::time::Instant>,
+    offered_points: u64,
+) -> Result<(), LaneError> {
+    let (Some(ceiling), Some(since)) = (ceiling, sending_since) else {
+        return Ok(());
+    };
+    let now = std::time::Instant::now();
+    let sending_for = now.duration_since(since);
+    if !stall_check_due(
+        ceiling,
+        sending_for,
+        last_check.map(|t| now.duration_since(t)),
+    ) {
+        return Ok(());
+    }
+    *last_check = Some(now);
+    match stall_projection_over(ceiling, sending_for.as_secs_f64(), offered_points) {
+        Some(projected_secs) => Err(LaneError::IngestStalled {
+            system: system.to_string(),
+            projected_secs,
+            ceiling_secs: ceiling.max_ingest_secs,
+            offered_points,
+            stream_points: ceiling.stream_points,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The producer's state across rounds: the points pulled but not yet routed,
+/// each shard's filling batch, the offer tally, the read-back plan, and the
+/// time spent generating and routing.
+struct Producer {
+    batch_size: usize,
+    pending: Vec<LogicalPoint>,
+    buffers: Vec<Vec<LogicalPoint>>,
+    offer: OfferTally,
+    plan: ReadbackPlan,
+    generation: Duration,
+}
+
+impl Producer {
+    fn new(receiver: Receiver, shards: usize, batch_size: usize) -> Self {
+        Self {
+            batch_size,
+            pending: Vec::new(),
+            buffers: vec![Vec::new(); shards],
+            offer: OfferTally::default(),
+            plan: ReadbackPlan::new(receiver),
+            generation: Duration::ZERO,
+        }
+    }
+
+    /// One round: pull up to `batch_size` valid points, observe each into the
+    /// plan and route it to shard `shard_of(point)`, and return every shard
+    /// batch that filled, in the order it filled; `None` once the stream has
+    /// ended. The whole round, pulling and routing, is added to `generation`
+    /// as read on `now`; sending the returned batches is not. A round routes
+    /// at most `batch_size` points, so it fills at most one batch per shard.
+    fn round<S, R, N>(
+        &mut self,
+        source: &mut S,
+        mut shard_of: R,
+        now: N,
+    ) -> Result<Option<Vec<(usize, Vec<LogicalPoint>)>>, LaneError>
+    where
+        S: SampleBatches + ?Sized,
+        R: FnMut(&LogicalPoint) -> usize,
+        N: Fn() -> Duration,
+    {
+        let start = now();
+        fill_valid(
+            source,
+            self.batch_size,
+            &mut self.pending,
+            &mut self.offer,
+            Ok,
+        )?;
+        if self.pending.is_empty() {
+            self.generation += now().saturating_sub(start);
+            return Ok(None);
+        }
+        let mut full = Vec::new();
+        for point in self.pending.drain(..) {
+            self.plan.observe(&point);
+            let shard = shard_of(&point);
+            self.buffers[shard].push(point);
+            if self.buffers[shard].len() >= self.batch_size {
+                full.push((shard, std::mem::take(&mut self.buffers[shard])));
+            }
+        }
+        self.generation += now().saturating_sub(start);
+        Ok(Some(full))
+    }
 }
 
 /// The projected total ingest wall time of a row that has sent for
@@ -3861,62 +3975,38 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
     }
     drop(results_tx);
 
-    let mut pending: Vec<LogicalPoint> = Vec::new();
-    let mut buffers: Vec<Vec<LogicalPoint>> = vec![Vec::new(); shards];
-    let mut offer = OfferTally::default();
-    let mut plan = ReadbackPlan::new(receiver);
+    let mut producer = Producer::new(receiver, shards, batch_size);
     let mut collector = HttpCollector::new(receiver);
-    let mut generation = Duration::ZERO;
+    let ceiling = config.stall_ceiling.as_ref();
+    let clock_origin = std::time::Instant::now();
+    let now = || clock_origin.elapsed();
     let mut sending_since: Option<std::time::Instant> = None;
     let mut last_stall_check: Option<std::time::Instant> = None;
 
     let produced: Result<(), LaneError> = async {
-        loop {
-            let generation_start = std::time::Instant::now();
-            fill_valid(source, batch_size, &mut pending, &mut offer, Ok)?;
-            generation += generation_start.elapsed();
-            if pending.is_empty() {
-                break;
-            }
-            for point in pending.drain(..) {
-                plan.observe(&point);
-                let shard = series_shard(&point, shards);
-                buffers[shard].push(point);
-                if buffers[shard].len() >= batch_size {
-                    let chunk = std::mem::take(&mut buffers[shard]);
-                    sending_since.get_or_insert_with(std::time::Instant::now);
-                    queue_batch(&system, &queues[shard], shard, chunk).await?;
-                }
+        while let Some(full) =
+            producer.round(source, |point| series_shard(point, shards), now)?
+        {
+            for (shard, chunk) in full {
+                sending_since.get_or_insert_with(std::time::Instant::now);
+                queue_batch(&system, &queues[shard], shard, chunk).await?;
             }
             while let Ok(sent) = results_rx.try_recv() {
                 collector.record(sent?)?;
             }
-            if let (Some(ceiling), Some(since)) = (&config.stall_ceiling, sending_since) {
-                let now = std::time::Instant::now();
-                if stall_check_due(
-                    now.duration_since(since),
-                    last_stall_check.map(|t| now.duration_since(t)),
-                ) {
-                    last_stall_check = Some(now);
-                    let offered_points = offer.samples + offer.histograms;
-                    let elapsed = now.duration_since(since).as_secs_f64();
-                    if let Some(projected_secs) =
-                        stall_projection_over(ceiling, elapsed, offered_points)
-                    {
-                        return Err(LaneError::IngestStalled {
-                            system: system.clone(),
-                            projected_secs,
-                            ceiling_secs: ceiling.max_ingest_secs,
-                            offered_points,
-                            stream_points: ceiling.stream_points,
-                        });
-                    }
-                }
-            }
+            let offered_points = producer.offer.samples + producer.offer.histograms;
+            check_stall(
+                &system,
+                ceiling,
+                sending_since,
+                &mut last_stall_check,
+                offered_points,
+            )?;
         }
-        for (shard, buffer) in buffers.iter_mut().enumerate() {
+        for (shard, buffer) in producer.buffers.iter_mut().enumerate() {
             if !buffer.is_empty() {
                 let chunk = std::mem::take(buffer);
+                sending_since.get_or_insert_with(std::time::Instant::now);
                 queue_batch(&system, &queues[shard], shard, chunk).await?;
             }
         }
@@ -3933,11 +4023,38 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
         }
         return Err(err);
     }
-    while let Some(sent) = results_rx.recv().await {
-        collector.record(sent?)?;
+    // The whole stream is offered; the drain still runs the stall check, on
+    // every response and at least every `recheck` while none arrives.
+    let offered_points = producer.offer.samples + producer.offer.histograms;
+    loop {
+        let next = match ceiling {
+            Some(ceiling) => {
+                let wait = ceiling.recheck.max(Duration::from_millis(1));
+                tokio::time::timeout(wait, results_rx.recv()).await.ok()
+            }
+            None => Some(results_rx.recv().await),
+        };
+        match next {
+            Some(Some(sent)) => collector.record(sent?)?,
+            Some(None) => break,
+            None => {}
+        }
+        check_stall(
+            &system,
+            ceiling,
+            sending_since,
+            &mut last_stall_check,
+            offered_points,
+        )?;
     }
     while senders.join_next().await.is_some() {}
 
+    let Producer {
+        offer,
+        plan,
+        generation,
+        ..
+    } = producer;
     let elapsed_secs = collector.elapsed_secs();
     let generation_secs = generation.as_secs_f64();
     let stream_counts = source.stream_counts();
@@ -8213,6 +8330,8 @@ mod tests {
         let ceiling = StallCeiling {
             max_ingest_secs: 600,
             stream_points: 1_000,
+            grace: STALL_GRACE,
+            recheck: STALL_RECHECK,
         };
         assert_eq!(
             stall_projection_over(&ceiling, 60.0, 100),
@@ -8227,10 +8346,16 @@ mod tests {
     #[test]
     fn stall_checks_wait_60s_then_recur_every_10s() {
         let s = Duration::from_secs;
-        assert!(!stall_check_due(s(59), None));
-        assert!(stall_check_due(s(60), None));
-        assert!(!stall_check_due(s(65), Some(s(5))));
-        assert!(stall_check_due(s(70), Some(s(10))));
+        let ceiling = StallCeiling {
+            max_ingest_secs: 600,
+            stream_points: 1_000,
+            grace: STALL_GRACE,
+            recheck: STALL_RECHECK,
+        };
+        assert!(!stall_check_due(&ceiling, s(59), None));
+        assert!(stall_check_due(&ceiling, s(60), None));
+        assert!(!stall_check_due(&ceiling, s(65), Some(s(5))));
+        assert!(stall_check_due(&ceiling, s(70), Some(s(10))));
     }
 
     /// A row is sender bound only on the wall basis, with generation at

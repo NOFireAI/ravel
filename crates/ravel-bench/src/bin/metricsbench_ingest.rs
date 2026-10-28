@@ -42,7 +42,8 @@ use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, GeneratedStream,
     HttpReplayConfig, IN_PROCESS_SYSTEM, MetricsIngestReport, PayloadClass, RavelReplayConfig,
-    ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance, StallCeiling,
+    ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance, STALL_GRACE, STALL_RECHECK,
+    StallCeiling,
     StreamBandViolation, StreamCounts, Substrate, SystemIngestResult, build_profile_record,
     check_anchor, check_expected_digests_agree, check_row_accounting, check_row_band6,
     check_stream_band, query_after_replay, readback_over_http, replay_into_ravel,
@@ -669,6 +670,8 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
                     .map_or(profile.active_series.saturating_mul(steps), |report| {
                         report.emitted_samples
                     }),
+                grace: STALL_GRACE,
+                recheck: STALL_RECHECK,
             }),
         };
         let mut stream = stream_from_anchor()?;
