@@ -104,7 +104,7 @@ fn derive(purpose: &str, parts: &[&[u8]]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn derive_128(purpose: &str, parts: &[&[u8]]) -> Id128 {
+pub(crate) fn derive_128(purpose: &str, parts: &[&[u8]]) -> Id128 {
     let full = derive(purpose, parts);
     let mut out = [0u8; 16];
     out.copy_from_slice(&full[..16]);

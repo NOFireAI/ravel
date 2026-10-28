@@ -304,6 +304,37 @@ fn samples() -> Vec<Sample> {
             },
         ),
         sample(
+            "effect_inspect_response",
+            EffectInspectResponse {
+                effect: EffectBody {
+                    effect: effect(),
+                    turn_id: turn_id().to_hex(),
+                    tool_name: "payments.charge".to_string(),
+                    tool_version: "2".to_string(),
+                    policy: Policy::AtLeastOnce,
+                    status: EffectState::Completed,
+                    attempt: 2,
+                },
+                step_key: "charge".to_string(),
+                result_attempt: Some(2),
+                result: Some(json!({"charge_id": "ch_2"})),
+                attempts: vec![
+                    EffectAttemptBody {
+                        attempt: 1,
+                        status: AttemptState::Superseded,
+                    },
+                    EffectAttemptBody {
+                        attempt: 2,
+                        status: AttemptState::Result,
+                    },
+                ],
+                evidence: vec![EffectEvidenceBody {
+                    attempt: 1,
+                    result: json!({"charge_id": "ch_1"}),
+                }],
+            },
+        ),
+        sample(
             "reconcile_request",
             ReconcileRequest {
                 effect: effect(),
@@ -439,6 +470,39 @@ fn samples() -> Vec<Sample> {
             },
         ),
         sample(
+            "step_record_request",
+            StepRecordRequest {
+                lease: lease(),
+                step_key: "price".to_string(),
+                tool_name: "catalog.price".to_string(),
+                tool_version: "1".to_string(),
+                policy: Policy::AtLeastOnce,
+                input_hash: identity::step_input_hash("catalog.price", "1", b"A-1").to_hex(),
+            },
+        ),
+        sample(
+            "step_record_response",
+            StepRecordResponse {
+                step: StepBody {
+                    step_id: identity::step_id(1, 1, "price").to_hex(),
+                    step_key: "price".to_string(),
+                    tool_name: "catalog.price".to_string(),
+                    tool_version: "1".to_string(),
+                    input_hash: identity::step_input_hash("catalog.price", "1", b"A-1").to_hex(),
+                    status: StepState::Started,
+                    output: None,
+                },
+                effect: Handle {
+                    agent: agent_id(),
+                    incarnation: 1,
+                    item: HandleItem::Effect(identity::effect_id(1, 1, "price")),
+                }
+                .encode(),
+                attempt: 1,
+                failure: None,
+            },
+        ),
+        sample(
             "effect_complete_request",
             EffectCompleteRequest {
                 effect: effect(),
@@ -452,6 +516,14 @@ fn samples() -> Vec<Sample> {
                 effect: effect(),
                 status: EffectState::Completed,
                 late: false,
+            },
+        ),
+        sample(
+            "effect_fail_request",
+            EffectFailRequest {
+                effect: effect(),
+                attempt: 1,
+                error: "mailbox unavailable".to_string(),
             },
         ),
         sample("error_body", ErrorBody::from(&error)),
@@ -501,6 +573,100 @@ fn fixtures_match_the_wire_types() {
         .filter(|name| name.ends_with(".json"))
         .collect();
     assert_eq!(present, names, "sdk/fixtures holds a file no sample names");
+}
+
+/// The canonical step-input encoding [`StepRecordRequest::input_hash`]
+/// documents, for the hash fixture only: object keys sorted by UTF-16 code
+/// unit at every depth, no whitespace, serde_json's string escaping (equal to
+/// `JSON.stringify` for the text the fixture holds) and numbers as written.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+            let inner: Vec<String> = entries
+                .into_iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).expect("key"),
+                        canonical_json(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        other => serde_json::to_string(other).expect("scalar"),
+    }
+}
+
+/// One step input, its canonical text and its hash, written to
+/// `sdk/fixtures/identity/step_input_hash.json` and checked by the SDK's
+/// identity test against its own `canonicalJson` and `stepInputHash`. The
+/// keys `"\u{ff5e}"` and `"\u{1f600}"` sort one way by UTF-16 code unit and
+/// the other way by UTF-8 byte, so a byte-order encoder fails it.
+#[test]
+fn step_input_hash_fixture_matches_the_canonical_encoding() {
+    let input = json!({
+        "sku": "A-1",
+        "qty": 2,
+        "price": {"currency": "EUR", "cents": 649},
+        "tags": ["gift", {"z": 1, "a": 2}],
+        "note": "Gr\u{fc}\u{df}e\n\"quoted\"",
+        "ratio": 12.5,
+        "neg": -3,
+        "none": null,
+        "Z": true,
+        "a": false,
+        "\u{c4}": 1,
+        "\u{ff5e}": "fullwidth tilde",
+        "\u{1f600}": "astral",
+    });
+    let canonical = canonical_json(&input);
+    let hash = identity::step_input_hash("catalog.price", "1", canonical.as_bytes()).to_hex();
+    let fixture = json!({
+        "tool_name": "catalog.price",
+        "tool_version": "1",
+        "input": input,
+        "canonical": canonical,
+        "input_hash": hash,
+    });
+    let mut text = serde_json::to_string_pretty(&fixture).expect("serialize");
+    text.push('\n');
+    let dir = fixtures_dir().join("identity");
+    let path = dir.join("step_input_hash.json");
+    if std::env::var(UPDATE_VAR).as_deref() == Ok("1") {
+        std::fs::create_dir_all(&dir).expect("create sdk/fixtures/identity");
+        std::fs::write(&path, &text).expect("write fixture");
+    }
+    let on_disk = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}; rerun with {UPDATE_VAR}=1 to write it",
+            path.display()
+        )
+    });
+    assert_eq!(
+        on_disk, text,
+        "step_input_hash.json is stale; rerun with {UPDATE_VAR}=1"
+    );
+    let tilde = canonical.find("\u{ff5e}").expect("tilde key");
+    let astral = canonical.find("\u{1f600}").expect("astral key");
+    assert!(astral < tilde, "UTF-16 order puts the surrogate pair first");
+    assert!(canonical.starts_with("{\"Z\":true,\"a\":false,"));
+}
+
+/// The seed every existing fixture carries survives the move onto
+/// `identity::derive_128`.
+#[test]
+fn turn_random_seed_is_unchanged() {
+    assert_eq!(
+        turn_random_seed(&agent_id().to_hex(), 1, 1),
+        "8f8d1b06b1618bd08db0300dbba36423"
+    );
 }
 
 #[test]

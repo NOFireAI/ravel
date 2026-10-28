@@ -330,6 +330,20 @@ refused with `InvalidStepInput` rather than hashed (SDK `identity.test.ts`:
 "canonical JSON sorts keys at every depth", "step id and step input hash
 match the worker_poll_response fixture").
 
+Steps. `worker/step` is the route that records a step: it journals the
+step under the polled lease with its `input_hash` and recovery policy,
+authorizes an attempt, and answers `StepRecordResponse` with the step, the
+effect handle and the attempt to run. The worker reports that attempt's
+result with `worker/effects/complete` or a tool failure with
+`worker/effects/fail`; a failure is stored as the result
+`{"error": <string>}` and comes back from a replayed step as `failure`,
+never as `output`, and `worker/poll` hands such a step out as `started`
+with no output. A result for an attempt another attempt's result already
+settled answers `late: true` and is kept only as evidence. `reconcile`
+(`agents_admin`) settles a `manual` effect in doubt, and
+`effects/{effect}` reads each attempt, the result and the evidence
+(`agents_effects_e2e`, one test per policy and refusal).
+
 Not found. An operation handle the agent never issued, one from an earlier
 incarnation, or one for a tombstoned agent answers `AgentGone` (404) with
 the handle itself in the safe ids, beside the agent id, so a caller can tell

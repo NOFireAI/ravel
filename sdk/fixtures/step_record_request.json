@@ -1,0 +1,18 @@
+{
+  "lease": {
+    "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+    "incarnation": 1,
+    "owner_id": "worker-a",
+    "epoch": 1,
+    "turn_id": "d746246fc5bd6d52e210c7e1883ca81e",
+    "base_state_version": 0,
+    "handler_version": "1.0.0",
+    "handler_digest": "3c20eb97686b101673103ee45ac9cb5f678f30cbee12933adc1f8b0a9868085f",
+    "observed_root_revision": 4
+  },
+  "step_key": "price",
+  "tool_name": "catalog.price",
+  "tool_version": "1",
+  "policy": "at_least_once",
+  "input_hash": "5892e7a2b7b5a3aa11b9984ec594f8eb935e25f2f1a69ce17c2387d2bb1c74f0"
+}
