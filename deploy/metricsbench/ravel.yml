@@ -195,6 +195,13 @@ services:
       - "127.0.0.1:4318:4318"
     volumes:
       - ./config/ravel-limits.toml:/etc/ravel/limits.toml:ro
+    # DESCRIPTOR LIMIT (disclosed): the nofile 524288 soft and hard every
+    # long-running service in docker-compose.yml carries. ravel-server does
+    # not raise its own soft limit (#3412).
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
     deploy:
       resources:
         limits:

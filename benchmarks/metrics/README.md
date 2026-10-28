@@ -448,8 +448,19 @@ it is queryable; `attempts` counts the reads, the reported one included, and
 `settled_after_ms` is the time from the start of the first read to the end
 of the reported one
 (`metrics_ingest::tests::readback_settles_on_a_lagging_receiver_within_the_window_only`).
-A query that fails, rather than reading short, is not repeated. The bin
-fails when `matches_expected` is false
+A query that fails, rather than reading short, is not repeated; its error
+names the query and how long it ran. Each query, body read included, has
+`--readback-timeout-secs` (default 30), separate from the write timeout
+`--http-timeout-secs`. `query_ms` records each query's wall time in
+milliseconds, keyed `series`, `samples.0` and on per probe,
+`histogram_series`, `histogram_samples` and `stale_marker` (the last read's;
+`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`).
+The `/api/v1/series` answer is counted as it streams, so a 1,000,000-series
+answer is never held whole in memory
+(`metrics_ingest::tests::series_count_streams_a_200000_series_answer`); an
+answer whose `status` is not `success`, or a body cut short, is refused
+(`metrics_ingest::tests::series_count_refuses_an_error_answer_and_a_truncated_body`).
+The bin fails when `matches_expected` is false
 (`metrics_ingest::tests::readback_matches_what_was_stored_and_fails_one_series_off`,
 `metrics_ingest::tests::readback_expectations_follow_what_was_sent_and_what_the_receiver_stores`).
 

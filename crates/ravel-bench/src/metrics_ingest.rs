@@ -1105,6 +1105,11 @@ pub struct Readback {
     /// one reported.
     #[serde(default)]
     pub settled_after_ms: u64,
+    /// Wall milliseconds of each query of the reported read-back, keyed by
+    /// [`READBACK_QUERY_SERIES`] and its siblings. Empty when no window was
+    /// queried, and in a report written before the field existed.
+    #[serde(default)]
+    pub query_ms: BTreeMap<String, u64>,
 }
 
 /// The read-your-write query phase of a system's replay. Recorded as its own
@@ -4331,13 +4336,27 @@ pub struct ReadbackConfig {
     pub query_url: String,
     /// Sent as `Authorization: Bearer` when set.
     pub bearer_token: Option<String>,
-    /// Per-request timeout in seconds.
+    /// Per-request timeout in seconds for each read-back query, the body
+    /// read included (`metricsbench_ingest --readback-timeout-secs`).
     pub timeout_secs: u64,
     /// How long, in seconds, to keep re-reading a row whose figures do not
     /// yet match what was sent before reporting the mismatch. Zero reads
     /// once. The same window applies to every system.
     pub settle_secs: u64,
 }
+
+/// The [`Readback::query_ms`] key of the `/api/v1/series` cardinality read.
+pub const READBACK_QUERY_SERIES: &str = "series";
+/// The [`Readback::query_ms`] key prefix of each float probe's
+/// `count_over_time`, suffixed `.0`, `.1`, ... in probe order.
+pub const READBACK_QUERY_SAMPLES: &str = "samples";
+/// The [`Readback::query_ms`] key of the native-histogram series read.
+pub const READBACK_QUERY_HISTOGRAM_SERIES: &str = "histogram_series";
+/// The [`Readback::query_ms`] key of the native-histogram probe's
+/// `count_over_time`.
+pub const READBACK_QUERY_HISTOGRAM_SAMPLES: &str = "histogram_samples";
+/// The [`Readback::query_ms`] key of the stale marker probe's instant query.
+pub const READBACK_QUERY_STALE_MARKER: &str = "stale_marker";
 
 /// Pause between two read-backs of a row that has not settled.
 const READBACK_SETTLE_POLL: Duration = Duration::from_millis(500);
@@ -4413,7 +4432,17 @@ async fn read_back_once(
     let window = [("start", seconds(min_ts)), ("end", seconds(max_ts))];
     let range_ms = max_ts - min_ts + 1;
 
-    let series_count = reader
+    let mut query_ms = BTreeMap::new();
+    // Each query's wall time goes into `query_ms` under `name`, and a failed
+    // query's detail says how long it ran before it failed.
+    let mut timed = |name: String, started: std::time::Instant, result: Result<u64, String>| {
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        query_ms.insert(name.clone(), ms);
+        result.map_err(|detail| fail(format!("query {name} failed after {ms} ms: {detail}")))
+    };
+
+    let started = std::time::Instant::now();
+    let result = reader
         .series_count(
             &format!(
                 "{{__name__=~\"{}\"}}",
@@ -4421,21 +4450,23 @@ async fn read_back_once(
             ),
             &window,
         )
-        .await
-        .map_err(fail)?;
+        .await;
+    let series_count = timed(READBACK_QUERY_SERIES.to_string(), started, result)?;
     let mut sample_count = 0u64;
-    for (probe, _) in plan.float_probes() {
-        sample_count += reader
+    for (index, (probe, _)) in plan.float_probes().into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        let result = reader
             .instant_count(
                 &format!("count_over_time({}[{range_ms}ms])", probe.selector),
                 max_ts,
             )
-            .await
-            .map_err(fail)?;
+            .await;
+        sample_count += timed(format!("{READBACK_QUERY_SAMPLES}.{index}"), started, result)?;
     }
     let histogram_series_count = match expected.histogram_series_count {
-        Some(_) => Some(
-            reader
+        Some(_) => {
+            let started = std::time::Instant::now();
+            let result = reader
                 .series_count(
                     &format!(
                         "{{__name__=~\"{}\"}}",
@@ -4443,24 +4474,33 @@ async fn read_back_once(
                     ),
                     &window,
                 )
-                .await
-                .map_err(fail)?,
-        ),
+                .await;
+            Some(timed(
+                READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
+                started,
+                result,
+            )?)
+        }
         None => None,
     };
     let histogram_sample_count = match (
         expected.histogram_sample_count,
         plan.probes.get(&PayloadClass::NativeHistogram),
     ) {
-        (Some(_), Some(probe)) => Some(
-            reader
+        (Some(_), Some(probe)) => {
+            let started = std::time::Instant::now();
+            let result = reader
                 .instant_count(
                     &format!("count_over_time({}[{range_ms}ms])", probe.selector),
                     max_ts,
                 )
-                .await
-                .map_err(fail)?,
-        ),
+                .await;
+            Some(timed(
+                READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
+                started,
+                result,
+            )?)
+        }
         _ => None,
     };
     let stale_marker_honored = match (
@@ -4468,13 +4508,11 @@ async fn read_back_once(
         plan.stale_probe,
         plan.probes.get(&PayloadClass::StaleMarker),
     ) {
-        (Some(_), Some((marker_ts, _)), Some(probe)) => Some(
-            reader
-                .instant_series(&probe.selector, marker_ts)
-                .await
-                .map_err(fail)?
-                == 0,
-        ),
+        (Some(_), Some((marker_ts, _)), Some(probe)) => {
+            let started = std::time::Instant::now();
+            let result = reader.instant_series(&probe.selector, marker_ts).await;
+            Some(timed(READBACK_QUERY_STALE_MARKER.to_string(), started, result)? == 0)
+        }
         _ => None,
     };
 
@@ -4521,6 +4559,7 @@ async fn read_back_once(
         expected,
         attempts: 1,
         settled_after_ms: 0,
+        query_ms,
     })
 }
 
@@ -4547,6 +4586,7 @@ fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readb
         expected,
         attempts: 1,
         settled_after_ms: 0,
+        query_ms: BTreeMap::new(),
     }
 }
 
@@ -4567,11 +4607,13 @@ struct ApiReader<'a> {
 }
 
 impl ApiReader<'_> {
-    async fn get(
+    /// GET `path` with `params` and the commit-token fence; a non-2xx answer
+    /// is an error carrying its body.
+    async fn send(
         &self,
         path: &str,
         params: &[(&str, String)],
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<reqwest::Response, String> {
         let mut url = reqwest::Url::parse(&format!("{}{path}", self.base))
             .map_err(|e| format!("query URL {}{path} does not parse: {e}", self.base))?;
         {
@@ -4592,13 +4634,27 @@ impl ApiReader<'_> {
             .await
             .map_err(|e| format!("GET {path} failed: {e}"))?;
         let code = response.status();
-        let body = response
+        if !code.is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|e| format!("GET {path} body read failed: {e}"))?;
+            return Err(format!("GET {path} answered {code}: {body}"));
+        }
+        Ok(response)
+    }
+
+    async fn get(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<serde_json::Value, String> {
+        let body = self
+            .send(path, params)
+            .await?
             .text()
             .await
             .map_err(|e| format!("GET {path} body read failed: {e}"))?;
-        if !code.is_success() {
-            return Err(format!("GET {path} answered {code}: {body}"));
-        }
         let value: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("GET {path} answered non-JSON: {e}"))?;
         if value.get("status").and_then(|s| s.as_str()) != Some("success") {
@@ -4613,10 +4669,9 @@ impl ApiReader<'_> {
     async fn series_count(&self, matcher: &str, window: &[(&str, String)]) -> Result<u64, String> {
         let mut params = vec![("match[]", matcher.to_string())];
         params.extend(window.iter().cloned());
-        let data = self.get("/api/v1/series", &params).await?;
-        data.as_array()
-            .map(|a| a.len() as u64)
-            .ok_or_else(|| "series data is not an array".to_string())
+        let path = "/api/v1/series";
+        let response = self.send(path, &params).await?;
+        count_series_body(path, response).await
     }
 
     /// The instant vector of `query` at `ts_ms`.
@@ -4655,6 +4710,147 @@ impl ApiReader<'_> {
     /// How many series an instant query of `selector` at `ts_ms` returns.
     async fn instant_series(&self, selector: &str, ts_ms: i64) -> Result<u64, String> {
         Ok(self.instant(selector, ts_ms).await?.len() as u64)
+    }
+}
+
+/// Body chunks in flight between the network and the series counter.
+const SERIES_BODY_CHUNKS_IN_FLIGHT: usize = 4;
+
+/// Count the elements of the `data` array of a `/api/v1/series` answer as
+/// its body streams in, refusing a `status` other than `"success"`. The body
+/// is never held whole: chunks pass through a channel of
+/// [`SERIES_BODY_CHUNKS_IN_FLIGHT`] to a parser that discards each element
+/// as [`serde::de::IgnoredAny`] once counted, so a 1,000,000-series answer
+/// costs a few chunks and one element, not the body
+/// (`tests::series_count_streams_a_200000_series_answer`).
+async fn count_series_body(path: &str, mut response: reqwest::Response) -> Result<u64, String> {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, String>>(SERIES_BODY_CHUNKS_IN_FLIGHT);
+    let parser = tokio::task::spawn_blocking(move || {
+        let reader = std::io::BufReader::new(ChunkReader {
+            rx,
+            current: bytes::Bytes::new(),
+        });
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        let body = SeriesBody::deserialize(&mut de)?;
+        de.end()?;
+        Ok::<_, serde_json::Error>(body)
+    });
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => Ok(chunk),
+            Ok(None) => break,
+            Err(e) => Err(format!("GET {path} body read failed: {e}")),
+        };
+        let failed = chunk.is_err();
+        // A closed channel means the parser already stopped; its error is
+        // the one reported.
+        if tx.send(chunk).await.is_err() || failed {
+            break;
+        }
+    }
+    drop(tx);
+    let body = parser
+        .await
+        .map_err(|e| format!("GET {path} body parse task failed: {e}"))?
+        .map_err(|e| format!("GET {path} answered a body that is not a series answer: {e}"))?;
+    if body.status.as_deref() != Some("success") {
+        return Err(format!(
+            "GET {path} answered a non-success body: status {:?}, errorType {:?}, error {:?}",
+            body.status, body.error_type, body.error
+        ));
+    }
+    body.count
+        .ok_or_else(|| format!("GET {path} answered no data"))
+}
+
+/// A blocking [`std::io::Read`] over body chunks sent from the async side.
+struct ChunkReader {
+    rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, String>>,
+    current: bytes::Bytes,
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            match self.rx.blocking_recv() {
+                Some(Ok(chunk)) => self.current = chunk,
+                Some(Err(detail)) => return Err(std::io::Error::other(detail)),
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current.split_to(n));
+        Ok(n)
+    }
+}
+
+/// The fields of a `/api/v1/series` answer the read-back uses, with `data`
+/// reduced to its element count.
+#[derive(Default)]
+struct SeriesBody {
+    status: Option<String>,
+    error_type: Option<String>,
+    error: Option<String>,
+    count: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for SeriesBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BodyVisitor;
+        impl<'de> serde::de::Visitor<'de> for BodyVisitor {
+            type Value = SeriesBody;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Prometheus API answer object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<SeriesBody, A::Error> {
+                let mut body = SeriesBody::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "status" => body.status = map.next_value()?,
+                        "errorType" => body.error_type = map.next_value()?,
+                        "error" => body.error = map.next_value()?,
+                        "data" => {
+                            body.count = map.next_value::<Option<ElementCount>>()?.map(|c| c.0)
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(body)
+            }
+        }
+        deserializer.deserialize_map(BodyVisitor)
+    }
+}
+
+/// The length of a JSON array, read without keeping its elements.
+struct ElementCount(u64);
+
+impl<'de> Deserialize<'de> for ElementCount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CountVisitor;
+        impl<'de> serde::de::Visitor<'de> for CountVisitor {
+            type Value = ElementCount;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the series array")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ElementCount, A::Error> {
+                let mut n = 0u64;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    n += 1;
+                }
+                Ok(ElementCount(n))
+            }
+        }
+        deserializer.deserialize_seq(CountVisitor)
     }
 }
 
@@ -7444,6 +7640,129 @@ mod tests {
             )
     }
 
+    /// A one-connection HTTP stub that answers any request 200 with a
+    /// `Content-Length` of `declared` (the pieces' total when `None`) and
+    /// writes `pieces` 20 ms apart, so the client reads them as separate
+    /// chunks, then closes.
+    async fn chunked_body_stub(
+        pieces: Vec<Vec<u8>>,
+        declared: Option<usize>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.expect("read request");
+                assert!(n > 0, "the client closed before sending a request");
+                request.extend_from_slice(&buf[..n]);
+            }
+            let len = declared.unwrap_or_else(|| pieces.iter().map(Vec::len).sum());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(head.as_bytes()).await.expect("head");
+            for piece in pieces {
+                socket.write_all(&piece).await.expect("piece");
+                socket.flush().await.expect("flush");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        (addr, server)
+    }
+
+    /// `body` cut into `n` pieces at even byte offsets, which land inside
+    /// elements and strings.
+    fn pieces_of(body: &[u8], n: usize) -> Vec<Vec<u8>> {
+        body.chunks(body.len().div_ceil(n))
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    fn series_answer(n: usize) -> Vec<u8> {
+        let mut body = String::from(r#"{"status":"success","data":["#);
+        for i in 0..n {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                r#"{{"__name__":"mb_cardinality","instance":"host-{i}","job":"j[{{,}}]\"q"}}"#
+            ));
+        }
+        body.push_str("]}");
+        body.into_bytes()
+    }
+
+    async fn stub_series_count(
+        pieces: Vec<Vec<u8>>,
+        declared: Option<usize>,
+    ) -> Result<u64, String> {
+        let (addr, server) = chunked_body_stub(pieces, declared).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let reader = ApiReader {
+            client: &client,
+            base: &base,
+            bearer: None,
+            tokens: &[],
+        };
+        let result = reader
+            .series_count("{__name__=~\"mb_cardinality\"}", &[])
+            .await;
+        server.abort();
+        result
+    }
+
+    /// A 200,000-series answer delivered in eight pieces 20 ms apart counts
+    /// 200,000. Each element carries braces, brackets, a comma and an
+    /// escaped quote inside a string, and the cuts fall mid-element.
+    ///
+    /// TO SEE THIS FAIL: make `count_series_body` stop after the first
+    /// `response.chunk()` (count only the first chunk): the first piece is
+    /// an unterminated array, so the count is refused as not a series
+    /// answer, and a count of whole elements in it would read about 25,000.
+    #[tokio::test]
+    async fn series_count_streams_a_200000_series_answer() {
+        let body = series_answer(200_000);
+        let pieces = pieces_of(&body, 8);
+        assert_eq!(pieces.len(), 8);
+        assert_eq!(stub_series_count(pieces, None).await, Ok(200_000));
+    }
+
+    /// A `status: error` answer is refused with its errorType and error,
+    /// and so is a body cut short, whether the cut is inside the JSON or
+    /// the connection closes before the declared length.
+    #[tokio::test]
+    async fn series_count_refuses_an_error_answer_and_a_truncated_body() {
+        let error = br#"{"status":"error","errorType":"execution","error":"too many series"}"#;
+        let refused = stub_series_count(vec![error.to_vec()], None)
+            .await
+            .expect_err("a status error answer is refused");
+        assert!(
+            refused.contains("non-success")
+                && refused.contains("\"execution\"")
+                && refused.contains("too many series"),
+            "{refused}"
+        );
+
+        let body = series_answer(1_000);
+        let cut = body[..body.len() / 2].to_vec();
+        let refused = stub_series_count(pieces_of(&cut, 3), None)
+            .await
+            .expect_err("a body cut inside the JSON is refused");
+        assert!(refused.contains("not a series answer"), "{refused}");
+
+        let refused = stub_series_count(pieces_of(&cut, 3), Some(body.len()))
+            .await
+            .expect_err("a connection closed before the declared length is refused");
+        assert!(refused.contains("/api/v1/series"), "{refused}");
+    }
+
     /// The read-back of the portable Ravel row matches a receiver that
     /// stored what was sent, fences every query with every shard's token,
     /// and fails when the series count is off by one.
@@ -7508,6 +7827,22 @@ mod tests {
             assert_eq!(readback.histogram_series_count, Some(1));
             assert_eq!(readback.histogram_sample_count, Some(2));
             assert_eq!(readback.stale_marker_honored, Some(true));
+            // One timing per query the stub saw (five, asserted below).
+            assert_eq!(
+                readback
+                    .query_ms
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [
+                    READBACK_QUERY_HISTOGRAM_SAMPLES,
+                    READBACK_QUERY_HISTOGRAM_SERIES,
+                    "samples.0",
+                    READBACK_QUERY_SERIES,
+                    READBACK_QUERY_STALE_MARKER,
+                ],
+                "{readback:?}"
+            );
             if !matches {
                 assert_eq!(
                     readback.mismatches,
