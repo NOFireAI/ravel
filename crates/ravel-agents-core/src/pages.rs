@@ -791,7 +791,16 @@ impl Head {
     }
 }
 
-pub(crate) fn directory_to_proto(dir: &Directory) -> pb::PageDirectory {
+/// A version 2 list with no sealed page encodes no directory, so a small HEAD
+/// pays nothing for the paged representation.
+pub(crate) fn directory_to_proto(dir: &Directory) -> Option<pb::PageDirectory> {
+    if dir.pages.is_empty() {
+        return None;
+    }
+    Some(page_directory(dir))
+}
+
+fn page_directory(dir: &Directory) -> pb::PageDirectory {
     pb::PageDirectory {
         representation: pb::IndexRepresentation::Paged as i32,
         pages: dir
@@ -813,12 +822,18 @@ pub(crate) fn directory_to_proto(dir: &Directory) -> pb::PageDirectory {
 
 /// Decode and validate one version 2 directory: `PAGED`, `first_key`s
 /// strictly ascending and below `tail_from`, every page reference present,
-/// fingerprints whole 4-byte values in ascending order.
+/// fingerprints whole 4-byte values in ascending order. An absent directory
+/// is a paged list with no sealed page; a present one holds at least one.
 pub(crate) fn directory_from_proto(
     dir: Option<pb::PageDirectory>,
     field: &'static str,
 ) -> Result<Directory, CodecError> {
-    let dir = dir.ok_or(invalid(field))?;
+    let Some(dir) = dir else {
+        return Ok(Directory::default());
+    };
+    if dir.pages.is_empty() {
+        return Err(invalid(field));
+    }
     if dir.representation != pb::IndexRepresentation::Paged as i32 {
         return Err(CodecError::UnsupportedRepresentation {
             found: dir.representation,
@@ -887,16 +902,11 @@ pub fn max_page_ref_bytes(list: ListKind, max_page_entries: usize) -> usize {
         tail_from: u64::MAX,
         ..Directory::default()
     };
-    let none = Directory {
-        tail_from: u64::MAX,
-        ..Directory::default()
-    };
-    // Wrapped in its AgentHead field: tag and length prefix included.
-    let wrapped = |d: &Directory| {
-        let len = directory_to_proto(d).encoded_len();
-        len + prost::encoding::encoded_len_varint(len as u64) + 2
-    };
-    wrapped(&one).saturating_sub(wrapped(&none))
+    // A whole one-page directory in its AgentHead field, tag and length prefix
+    // included, so the first page of a list (which also adds the directory)
+    // is covered as well as every later one.
+    let len = page_directory(&one).encoded_len();
+    len + prost::encoding::encoded_len_varint(len as u64) + 2
 }
 
 #[cfg(test)]

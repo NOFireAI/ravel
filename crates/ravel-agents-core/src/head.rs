@@ -476,11 +476,11 @@ impl Head {
             steps: self.steps.iter().map(step_to_proto).collect(),
             effects: self.effects.iter().map(effect_to_proto).collect(),
             outbox_intents: self.outbox.iter().map(outbox_to_proto).collect(),
-            inbox_pages: Some(directory_to_proto(&self.index.inbox)),
-            receipt_pages: Some(directory_to_proto(&self.index.receipts)),
-            result_pages: Some(directory_to_proto(&self.index.results)),
-            event_pages: Some(directory_to_proto(&self.index.events)),
-            timer_pages: Some(directory_to_proto(&self.index.timers)),
+            inbox_pages: directory_to_proto(&self.index.inbox),
+            receipt_pages: directory_to_proto(&self.index.receipts),
+            result_pages: directory_to_proto(&self.index.results),
+            event_pages: directory_to_proto(&self.index.events),
+            timer_pages: directory_to_proto(&self.index.timers),
             seal: SEAL,
         }
     }
@@ -1466,18 +1466,41 @@ pub(crate) mod tests {
     #[test]
     fn a_newer_format_version_is_refused_before_the_rest_is_read() {
         let mut raw = sample_head().to_proto();
-        raw.format_version = 2;
+        raw.format_version = 3;
         let mut bytes = raw.encode_to_vec();
         assert_eq!(
             Head::decode(&bytes),
-            Err(CodecError::UnsupportedFormat { found: 2 })
+            Err(CodecError::UnsupportedFormat { found: 3 })
         );
         // Garbage after field 1 does not mask the version verdict.
         bytes.truncate(2);
         bytes.extend_from_slice(&[0xff, 0xff, 0xff]);
         assert_eq!(
             Head::decode(&bytes),
+            Err(CodecError::UnsupportedFormat { found: 3 })
+        );
+        assert_eq!(
+            CodecError::UnsupportedFormat { found: 3 }.kind(),
+            Some(ErrorKind::UnsupportedFormat)
+        );
+    }
+
+    /// A pre-amendment reader gates a HEAD the way [`check_format_version`]
+    /// gates an object: version 1 only. It refuses every root this release
+    /// writes as `UnsupportedFormat` before reading a list, so it never reads
+    /// a paged list as an empty inline one.
+    #[test]
+    fn a_version_one_reader_refuses_a_version_two_head() {
+        let version_one_gate =
+            |bytes: &[u8]| peek_format_version(bytes).and_then(check_format_version);
+        let written = sample_head().encode();
+        assert_eq!(
+            version_one_gate(&written),
             Err(CodecError::UnsupportedFormat { found: 2 })
+        );
+        assert_eq!(
+            version_one_gate(&sample_head().encode_version_one()),
+            Ok(())
         );
         assert_eq!(
             CodecError::UnsupportedFormat { found: 2 }.kind(),
@@ -1485,22 +1508,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// This release reads a version 1 root: every list inline, nothing paged.
+    /// Re-encoding it writes version 2.
     #[test]
-    fn paged_representation_and_page_refs_are_refused_by_version_one() {
+    fn a_version_one_head_decodes_with_every_list_inline() {
+        let head = sample_head();
+        let decoded = Head::decode(&head.encode_version_one()).expect("version 1 decodes");
+        for list in ListKind::ALL {
+            assert!(decoded.index.directory(list).pages.is_empty());
+        }
+        assert!(decoded.index.any_inline());
+        assert_eq!(decoded.inbox, head.inbox);
+        assert_eq!(decoded.results, head.results);
+        let rewritten = decoded.encode();
+        assert_eq!(peek_format_version(&rewritten), Ok(FORMAT_VERSION));
+        assert_eq!(Head::decode(&rewritten).expect("version 2 decodes"), head);
+    }
+
+    #[test]
+    fn a_representation_that_does_not_match_the_version_is_refused() {
+        let paged = pb::IndexRepresentation::Paged as i32;
+        let inline = pb::IndexRepresentation::Inline as i32;
         let mut raw = sample_head().to_proto();
-        raw.representation = pb::IndexRepresentation::Paged as i32;
+        raw.format_version = INLINE_FORMAT_VERSION;
+        raw.representation = paged;
         assert_eq!(
             Head::decode(&raw.encode_to_vec()),
-            Err(CodecError::UnsupportedRepresentation { found: 2 })
+            Err(CodecError::UnsupportedRepresentation { found: paged })
         );
         let mut raw = sample_head().to_proto();
-        raw.inbox_page = Some(ref_to_proto(ObjectRef::of(b"page")));
+        raw.representation = inline;
         assert_eq!(
             Head::decode(&raw.encode_to_vec()),
-            Err(CodecError::Invalid {
-                field: "inbox_page"
-            })
+            Err(CodecError::UnsupportedRepresentation { found: inline })
         );
+        // A version 1 record carrying a page directory.
+        let mut raw = sample_head().to_proto();
+        raw.format_version = INLINE_FORMAT_VERSION;
+        raw.representation = inline;
+        raw.event_pages = Some(pb::PageDirectory {
+            representation: paged,
+            pages: Vec::new(),
+            tail_from: 0,
+        });
+        assert_eq!(
+            Head::decode(&raw.encode_to_vec()),
+            Err(CodecError::UnsupportedRepresentation { found: paged })
+        );
+        // The pre-paging single-page fields stay refused in both versions.
+        for version in [INLINE_FORMAT_VERSION, FORMAT_VERSION] {
+            let mut raw = sample_head().to_proto();
+            raw.format_version = version;
+            raw.representation = if version == FORMAT_VERSION {
+                paged
+            } else {
+                inline
+            };
+            raw.inbox_page = Some(ref_to_proto(ObjectRef::of(b"page")));
+            assert_eq!(
+                Head::decode(&raw.encode_to_vec()),
+                Err(CodecError::Invalid {
+                    field: "inbox_page"
+                })
+            );
+        }
     }
 
     #[test]
@@ -1521,16 +1592,16 @@ pub(crate) mod tests {
 
     #[test]
     fn a_repeated_format_version_field_is_gated_on_its_decoded_value() {
-        // Field 1 written twice: the leading 1 passes the peek, and protobuf
-        // keeps the last value, 2.
+        // Field 1 written twice: the leading 2 passes the peek, and protobuf
+        // keeps the last value, 3.
         let mut bytes = sample_head().encode();
         let seal = bytes.split_off(bytes.len() - 6);
-        bytes.extend_from_slice(&[0x08, 0x02]);
+        bytes.extend_from_slice(&[0x08, 0x03]);
         bytes.extend_from_slice(&seal);
         assert_eq!(peek_format_version(&bytes), Ok(FORMAT_VERSION));
         assert_eq!(
             Head::decode(&bytes),
-            Err(CodecError::UnsupportedFormat { found: 2 })
+            Err(CodecError::UnsupportedFormat { found: 3 })
         );
     }
 
@@ -1552,7 +1623,7 @@ pub(crate) mod tests {
         // The only occurrence, leading.
         let mut lone = sample_head().encode();
         lone.splice(0..2, [0x08].into_iter().chain(above.iter().copied()));
-        assert_eq!(peek_format_version(&lone), Err(refused.clone()));
+        assert_eq!(peek_format_version(&lone), Ok(u32::MAX));
         assert_eq!(Head::decode(&lone), Err(refused.clone()));
         // A later occurrence behind a leading 1, where it is the value
         // protobuf keeps: the leading peek passes it, and the full gate

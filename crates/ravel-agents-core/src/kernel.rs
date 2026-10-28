@@ -292,11 +292,12 @@ impl Limits {
     }
 
     /// Sealed pages the exempt publishes still open to `head` may add to
-    /// `list`: a result page per `max_page_entries` results the outstanding
-    /// inputs' terminal publishes append to the inline ones, and an event
-    /// page per `max_page_entries` audit events the pending effects'
-    /// reconciled results append, each plus one for the partly filled open
-    /// page. No exempt publish appends to the other lists.
+    /// `list`. The open page seals `max_page_entries` entries only while more
+    /// than that many stay inline, so `n` inline entries seal at most
+    /// `(n - 1) / max_page_entries` pages; `n` counts the inline results plus
+    /// one per outstanding input's terminal result, and the inline events
+    /// plus one audit event per pending effect's reconciled result. No exempt
+    /// publish appends to the other lists.
     pub fn reserved_index_pages(&self, head: &Head, list: ListKind) -> usize {
         let k = self.max_page_entries.max(1);
         let inputs = usize::try_from(head.inbox_depth()).unwrap_or(usize::MAX);
@@ -317,7 +318,7 @@ impl Limits {
             ),
             ListKind::Inbox | ListKind::Receipts | ListKind::Timers => return 0,
         };
-        inline.saturating_add(appended).div_ceil(k).saturating_add(1)
+        inline.saturating_add(appended).saturating_sub(1) / k
     }
 
     /// Bytes the growth guard leaves free for index growth on the exempt

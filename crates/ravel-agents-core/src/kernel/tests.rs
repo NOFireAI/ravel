@@ -2067,6 +2067,9 @@ fn byte_capped(max_head_bytes: usize) -> Limits {
         max_mailbox_depth: 100_000,
         max_receipts: 100_000,
         max_timers: 100_000,
+        // Sealed pages leave HEAD, so the page count rather than the byte cap
+        // ends a fill of the lists the per-input reserve does not cover.
+        max_index_pages: 8,
         ..Limits::default()
     }
 }
@@ -2248,11 +2251,16 @@ fn a_manual_attempt_enters_in_doubt_inside_the_reserve() {
 
 /// Latch a manual effect in doubt, reconcile it by another attempt, and
 /// repeat `RECONCILES` times; then latch once more and attach a verified
-/// result. Cycle over new effects until a publish is refused.
+/// result. Cycle over new effects until a publish is refused. Sealed event
+/// pages carry the audit events out of HEAD, so the refusal comes from the
+/// byte cap or from `Limits::max_index_pages`, both `BudgetExceeded`.
 #[test]
 fn latch_and_reconcile_cycles_are_bounded_by_the_byte_cap() {
     const RECONCILES: u32 = 8;
-    let limits = Limits::default();
+    let limits = Limits {
+        max_index_pages: 8,
+        ..Limits::default()
+    };
     let mut sim = Sim::with_limits(limits);
     sim.run(&create_cmd());
     sim.run(&takeover_cmd(sim.head(), "w1"));
@@ -2303,7 +2311,7 @@ fn latch_and_reconcile_cycles_are_bounded_by_the_byte_cap() {
     let encoded = sim.head().encode();
     assert!(encoded.len() <= limits.max_head_bytes);
     assert!(encoded.len() <= MAX_HEAD_BYTES);
-    assert_eq!(&Head::decode(&encoded).expect("HEAD decodes"), sim.head());
+    assert_eq!(Head::decode(&encoded).expect("HEAD decodes").encode(), encoded);
     // Every audit event lives in the one running turn's stream, far past
     // the per-turn event cap, which does not count them.
     let audits = sim.head().events.len() as u64;
