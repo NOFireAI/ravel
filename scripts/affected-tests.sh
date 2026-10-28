@@ -17,7 +17,12 @@
 # test them with the feature selected on its own. When ravel-server is in the
 # closure this also runs `-p ravel-server --features sql` and `-p ravel-server
 # --features esql`, and when ravel-sql or ravel-server is, `-p ravel-server -p
-# ravel-sql --features flight-sql`, all on the `ci` profile.
+# ravel-sql --features flight-sql`, all on the `ci` profile. With ravel-server
+# in the closure it also runs `-p ravel-server --features agents agents` plus
+# ravel-catalog's sys_proto_format_version_classification test, and `-p
+# ravel-server --features mcp mcp`: the trailing word is a test-name filter,
+# because tests/cli_reference.rs fails by construction under any feature that
+# adds a flag. scripts/gates.sh's agents and mcp lanes run the same tests.
 # The exit code is the first failing run's, after every run has finished.
 #
 # scripts/gates.sh reads its scoped closure from `-n`, so `-n` prints the
@@ -126,6 +131,17 @@ case "$affected" in
     ;;
 esac
 
+agents_rc=0
+classification_rc=0
+mcp_rc=0
+case "$affected" in
+  *" ravel-server "*)
+    run_tests -p ravel-server --features agents agents || agents_rc=$?
+    run_tests -p ravel-catalog --test sys_proto_format_version_classification || classification_rc=$?
+    run_tests -p ravel-server --features mcp mcp || mcp_rc=$?
+    ;;
+esac
+
 flight_rc=0
 case "$affected" in
   *" ravel-server "* | *" ravel-sql "*)
@@ -140,7 +156,7 @@ case "$affected" in
     ;;
 esac
 
-for code in "$rc" "$doc_rc" "$sql_rc" "$flight_rc" "$esql_rc"; do
+for code in "$rc" "$doc_rc" "$sql_rc" "$agents_rc" "$classification_rc" "$mcp_rc" "$flight_rc" "$esql_rc"; do
   if [ "$code" -ne 0 ]; then
     exit "$code"
   fi
