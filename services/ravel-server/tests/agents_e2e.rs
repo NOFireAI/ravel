@@ -488,8 +488,8 @@ async fn send_then_result_through_real_server_survives_worker_replacement() {
     running.shutdown().await.expect("clean shutdown");
 }
 
-/// The nine settings gauges `agents_seam.rs` pins the values of.
-const SETTINGS_GAUGES: [&str; 9] = [
+/// The ten settings gauges `agents_seam.rs` pins the values of.
+const SETTINGS_GAUGES: [&str; 10] = [
     "ravel_agents_enabled",
     "ravel_agents_activation_concurrency_limit",
     "ravel_agents_poll_concurrency_limit",
@@ -499,6 +499,7 @@ const SETTINGS_GAUGES: [&str; 9] = [
     "ravel_agents_max_state_bytes",
     "ravel_agents_max_receipts",
     "ravel_agents_max_timers",
+    "ravel_agents_sweep_interval_ms",
 ];
 
 /// A client token without `agents` is refused on `send` and a token without
@@ -650,8 +651,8 @@ async fn events_page_after_the_durable_cursor_without_duplicates() {
     running.shutdown().await.expect("clean shutdown");
 }
 
-/// A path under `/api/v1/agents` outside the route table is 404, a timer
-/// route included, on both listeners, and with a capable credential.
+/// A path under `/api/v1/agents` outside the route table is 404, an unmounted
+/// timer path included, on both listeners, and with a capable credential.
 #[tokio::test]
 async fn a_path_outside_the_route_table_is_404() {
     let running = start_memory().await;
@@ -659,7 +660,7 @@ async fn a_path_outside_the_route_table_is_404() {
         (Api::public(&running), CLIENT),
         (Api::mtls(&running), MTLS_CLIENT),
     ] {
-        for path in ["timers", "timers/schedule", "sweep", "no-such-route"] {
+        for path in ["timers/schedule", "timers/fire", "no-such-route"] {
             let (status, body) = api.post(client, path, &json!({})).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "POST {path}: {body}");
             let (status, body) = api.get(client, path).await;

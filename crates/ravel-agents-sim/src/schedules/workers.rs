@@ -586,15 +586,15 @@ fn worker_kills_across_seeds() {
     pinned("worker_kills", runs, totals, KILL_TOTALS);
 }
 
-/// The seed of [`worker_kills_across_seeds`] whose first run diverged: no
-/// worker crashed, `w1` lost the answer to a HEAD write, and its later
-/// commit of a turn `w2` had begun again after a takeover was fenced
-/// `OwnershipLost` where the reference, which has no worker identity,
-/// expected `Committed`.
+/// A seed past the batch of [`worker_kills_across_seeds`], which no longer
+/// reaches this shape: no worker crashed, `w1` lost the answer to a HEAD
+/// write, and its later commit of a turn `w2` had begun again after a
+/// takeover was fenced `OwnershipLost` where the reference, which has no
+/// worker identity, expected `Committed`.
 #[test]
 fn stale_owner_commit_after_takeover_is_fenced() {
     assert_eq!(
-        kills(0x5eed_0033),
+        kills(0x5eed_00db),
         KillCounts {
             crashes: 0,
             fired: 1,
@@ -652,10 +652,10 @@ fn a_lost_begin_turn_answer_after_a_spent_retry_escapes_the_poll_today() {
 /// moves where workers die, or how often a fenced commit races a takeover,
 /// moves it.
 const KILL_TOTALS: KillCounts = KillCounts {
-    crashes: 52,
-    fired: 30,
-    inferred: 3,
-    stale_owner: 2,
+    crashes: 28,
+    fired: 19,
+    inferred: 2,
+    stale_owner: 0,
     false_negatives: 0,
     contended_sends: 0,
     escaped_unknown: 0,
@@ -803,7 +803,7 @@ fn cold_restart_across_seeds() {
 }
 
 /// `w-restarted`'s turns over the batch; the drain ran the rest of 128.
-const COLD_RESTART_TURNS: u64 = 113;
+const COLD_RESTART_TURNS: u64 = 112;
 
 /// A worker completes op 1. Then every process restarts cold: a client on a
 /// new coordinator sends `r3` and reads `r1`, and a worker on another new

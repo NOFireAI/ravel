@@ -1,0 +1,11 @@
+{
+  "code": "cursor_expired",
+  "cursor": "2",
+  "oldest_cursor": "40",
+  "restart": "restart_from_oldest_cursor",
+  "reason": "events after cursor 2 are no longer retained",
+  "ids": {
+    "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+    "incarnation": 1
+  }
+}

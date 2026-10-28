@@ -136,12 +136,43 @@ export const CancelResponse = z.object({
 });
 export type CancelResponse = z.output<typeof CancelResponse>;
 
+export const ActiveTurnBody = z.object({
+  turn_id: z.string(),
+  accept_seq: U64,
+  handler: z.string(),
+  handler_version: z.string(),
+  handler_digest: z.string(),
+  base_state_version: U64,
+  started_unix_ns: UnixNs,
+  lease_hint_unix_ns: UnixNs,
+  cancel_requested: z.boolean(),
+  non_deterministic_replay: z.boolean(),
+});
+export type ActiveTurnBody = z.output<typeof ActiveTurnBody>;
+
+export const InputSourceBody = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("message"), request_id: z.string() }),
+  z.object({ kind: z.literal("timer"), timer: z.string(), generation: U64 }),
+]);
+export type InputSourceBody = z.output<typeof InputSourceBody>;
+
+export const MailboxEntryBody = z.object({
+  accept_seq: U64,
+  handler: z.string(),
+  source: InputSourceBody,
+  accepted_unix_ns: UnixNs,
+  failed_attempts: U32,
+});
+export type MailboxEntryBody = z.output<typeof MailboxEntryBody>;
+
 export const StateResponse = z.object({
   agent_id: z.string(),
   incarnation: U64,
   state_version: U64,
   content_type: z.string(),
   state: Json,
+  active_turn: ActiveTurnBody.optional(),
+  mailbox: z.array(MailboxEntryBody).optional(),
 });
 export type StateResponse = z.output<typeof StateResponse>;
 
@@ -149,6 +180,7 @@ export const EventsRequest = z.object({
   agent: AgentRef,
   cursor: z.string().nullable(),
   limit: U32,
+  operation: z.string().optional(),
 });
 export type EventsRequest = z.output<typeof EventsRequest>;
 
@@ -164,6 +196,7 @@ export type EventBody = z.output<typeof EventBody>;
 export const EventsResponse = z.object({
   events: z.array(EventBody),
   next_cursor: z.string(),
+  terminal: OperationStatus.optional(),
 });
 export type EventsResponse = z.output<typeof EventsResponse>;
 
@@ -186,6 +219,31 @@ export const CancelTimerResponse = z.object({
   outcome: z.enum(["cancelled", "already_fired", "unknown"]),
 });
 export type CancelTimerResponse = z.output<typeof CancelTimerResponse>;
+
+export const TimerBody = z.object({
+  timer: z.string(),
+  timer_key: z.string(),
+  generation: U64,
+  due_unix_ns: UnixNs,
+  handler: z.string(),
+  status: z.enum(["scheduled", "delivered", "cancelled"]),
+});
+export type TimerBody = z.output<typeof TimerBody>;
+
+export const TimersResponse = z.object({ timers: z.array(TimerBody) });
+export type TimersResponse = z.output<typeof TimersResponse>;
+
+export const SweepResponse = z.object({
+  wake_list_pages: U64,
+  dir_list_pages: U64,
+  head_gets: U64,
+  hints_read: U64,
+  hints_deleted: U64,
+  timers_fired: U64,
+  agents_loaded: U64,
+  dir_entries_repaired: U64,
+});
+export type SweepResponse = z.output<typeof SweepResponse>;
 
 export const EffectBody = z.object({
   effect: z.string(),
@@ -447,6 +505,17 @@ export const ErrorBody = z.object({
 });
 export type ErrorBody = z.output<typeof ErrorBody>;
 
+/** The `410` body of `events` for a cursor below the retained window. */
+export const CursorExpiredBody = z.object({
+  code: z.literal("cursor_expired"),
+  cursor: z.string(),
+  oldest_cursor: z.string(),
+  restart: z.enum(["restart_from_oldest_cursor"]),
+  reason: z.string(),
+  ids: SafeIdsBody,
+});
+export type CursorExpiredBody = z.output<typeof CursorExpiredBody>;
+
 /**
  * The server-wide body of a 401 or 403, which the agents routes share with
  * every other route rather than answering with an {@link ErrorBody}.
@@ -472,6 +541,7 @@ export const WIRE_FIXTURES = {
   cancel_timer_response: CancelTimerResponse,
   create_agent_request: CreateAgentRequest,
   create_agent_response: CreateAgentResponse,
+  cursor_expired: CursorExpiredBody,
   effect_complete_request: EffectCompleteRequest,
   effect_complete_response: EffectCompleteResponse,
   effect_fail_request: EffectFailRequest,
@@ -480,7 +550,9 @@ export const WIRE_FIXTURES = {
   effects_response: EffectsResponse,
   error_body: ErrorBody,
   events_request: EventsRequest,
+  events_request_operation: EventsRequest,
   events_response: EventsResponse,
+  events_response_terminal: EventsResponse,
   operation_response: OperationResponse,
   reconcile_request: ReconcileRequest,
   reconcile_response: ReconcileResponse,
@@ -491,10 +563,13 @@ export const WIRE_FIXTURES = {
   send_request: SendRequest,
   send_response: SendResponse,
   state_response: StateResponse,
+  state_response_active: StateResponse,
   step_record_request: StepRecordRequest,
   step_record_response: StepRecordResponse,
+  sweep_response: SweepResponse,
   timer_request: TimerRequest,
   timer_response: TimerResponse,
+  timers_response: TimersResponse,
   worker_commit_failed_request: WorkerCommitRequest,
   worker_commit_request: WorkerCommitRequest,
   worker_commit_response: WorkerCommitResponse,

@@ -1,0 +1,12 @@
+{
+  "timers": [
+    {
+      "timer": "djE6dGltZXI6MTljZDBlNjg3Njk5MTMxNGMxYjZkYmQ4YmQxMjkyOTc6MTo1ZGJjNGEzZjc1MDFkZWRhNzA0M2FhZTJhZDg1Mjk0Yw",
+      "timer_key": "payment-reminder",
+      "generation": 2,
+      "due_unix_ns": "1767229200000000000",
+      "handler": "remind",
+      "status": "delivered"
+    }
+  ]
+}

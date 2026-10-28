@@ -8,7 +8,8 @@
 //! Every step and effect command goes through the coordinator's effects
 //! methods, never a kernel command built here.
 //! Every refusal after authentication leaves through [`agent_error`], the one
-//! mapping from an [`AgentError`] to a status and an [`ErrorBody`].
+//! mapping from an [`AgentError`] to a status and an [`ErrorBody`], except an
+//! expired `events` cursor, which is `410` with a [`CursorExpiredBody`].
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,22 +18,27 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, Request, StatusCode, Uri};
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
-use ravel_agents_core::head::{EffectRecord, EffectStatus, Head, Lifecycle, StepRecord};
+use ravel_agents_core::head::{
+    Cancellation, EffectRecord, EffectStatus, EventEntry, Head, InboxEntry, InputSource, Lifecycle,
+    StepRecord, TurnBlock,
+};
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, AttemptState, CallRequest, CallResponse, CancelRequest, CreateAgentRequest,
+    ActiveTurnBody, AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest, CallResponse,
+    CancelRequest, CancelTimerRequest, CreateAgentRequest, CursorExpiredBody, CursorRestart,
     EffectAttemptBody, EffectBody, EffectCompleteRequest, EffectCompleteResponse,
     EffectEvidenceBody, EffectFailRequest, EffectInspectResponse, EffectsResponse, ErrorBody,
-    EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
-    ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse,
-    ResultBody, ResultResponse, SendRequest, StateResponse, StepBody, StepRecordRequest,
-    StepRecordResponse, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
-    WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
+    EventBody, EventsRequest, EventsResponse, InputSourceBody, MailboxEntryBody, OperationResponse,
+    OperationStatus, ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest,
+    ResolveResponse, ResultBody, ResultResponse, SafeIdsBody, SendRequest, StateResponse, StepBody,
+    StepRecordRequest, StepRecordResponse, SweepResponse, TimerBody, TimerRequest, TimersResponse,
+    WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest,
+    WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};
@@ -53,19 +59,44 @@ use ravel_tenant_resolve::Principal;
 /// Most events one `events` page returns, whatever `limit` asks for.
 pub const MAX_EVENTS_PAGE: u32 = 1_000;
 
+/// Most attempts `GET effects/{effect}` lists: the latest ones, so an effect
+/// retried past this many lists attempts starting above 1.
+pub const MAX_INSPECT_ATTEMPTS: u32 = 64;
+
+/// The inspector page, served as is.
+pub const INSPECTOR_HTML: &str = include_str!("inspector.html");
+/// The inspector page's `content-type`.
+pub const INSPECTOR_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+/// The inspector page's `content-security-policy`: inline script and style
+/// only, and requests to this origin only.
+pub const INSPECTOR_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; \
+     style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
+
 /// How often a waiting `result` re-reads HEAD when nothing in this process
 /// signalled a change, so a commit through another process is seen.
 const RESULT_RECHECK: Duration = Duration::from_secs(1);
 
 /// The capability a route requires (ADR-3331 decision 9).
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Capability {
-    /// Client routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Client routes and the inspector page.
     Agents,
     /// Worker routes.
     AgentsWorker,
-    /// Operator routes: reconcile.
+    /// Operator routes: reconcile and sweep.
     AgentsAdmin,
+}
+
+impl Capability {
+    /// The capability's name, as a 403 names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Capability::Agents => "agents",
+            Capability::AgentsWorker => "agents_worker",
+            Capability::AgentsAdmin => "agents_admin",
+        }
+    }
 }
 
 /// Router state: the process runtime, this listener's resolver and the
@@ -83,6 +114,8 @@ pub(super) enum Refusal {
     /// shared error shape: no agent error kind describes either.
     Auth(ServiceError),
     Agent(AgentError),
+    /// An `events` cursor below the retained window (410).
+    CursorExpired(Box<CursorExpiredBody>),
 }
 
 impl From<AgentError> for Refusal {
@@ -96,6 +129,7 @@ impl IntoResponse for Refusal {
         match self {
             Refusal::Auth(error) => error.into_response(),
             Refusal::Agent(error) => agent_error(&error),
+            Refusal::CursorExpired(body) => (StatusCode::GONE, Json(*body)).into_response(),
         }
     }
 }
@@ -149,14 +183,15 @@ impl Api {
     ) -> Result<Admitted, Refusal> {
         let principal =
             authenticate_principal(self.resolver.as_ref(), headers).map_err(Refusal::Auth)?;
-        let (granted, name) = match capability {
-            Capability::Agents => (principal.agents, "agents"),
-            Capability::AgentsWorker => (principal.agents_worker, "agents_worker"),
-            Capability::AgentsAdmin => (principal.agents_admin, "agents_admin"),
+        let granted = match capability {
+            Capability::Agents => principal.agents,
+            Capability::AgentsWorker => principal.agents_worker,
+            Capability::AgentsAdmin => principal.agents_admin,
         };
         if !granted {
             return Err(Refusal::Auth(ServiceError::forbidden(format!(
-                "this route requires the {name} capability"
+                "this route requires the {} capability",
+                capability.name()
             ))));
         }
         let Some(permit) = self.runtime.admit(lane) else {
@@ -370,6 +405,19 @@ pub(super) async fn state(State(api): State<Api>, req: Request<Body>) -> Respons
             state_version: head.state_version,
             content_type: "application/json".to_string(),
             state,
+            active_turn: head.active_turn.as_ref().map(|turn| ActiveTurnBody {
+                turn_id: turn.turn_id.to_hex(),
+                accept_seq: turn.input_accept_seq,
+                handler: turn.handler.clone(),
+                handler_version: turn.handler_version.clone(),
+                handler_digest: turn.handler_digest.to_hex(),
+                base_state_version: turn.base_state_version,
+                started_unix_ns: turn.started_unix_ns,
+                lease_hint_unix_ns: head.owner_lease_hint_unix_ns,
+                cancel_requested: turn.cancellation == Cancellation::Requested,
+                non_deterministic_replay: turn.block == TurnBlock::NonDeterministicReplay,
+            }),
+            mailbox: head.inbox.iter().map(mailbox_entry).collect(),
         }))
     };
     run.await.into_response()
@@ -382,14 +430,14 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             .await?;
         let agent = parse_agent(&body.agent)?;
         let after = match body.cursor.as_deref() {
-            None => 0,
-            Some(text) => text.parse::<u64>().map_err(|_| {
+            None => None,
+            Some(text) => Some(text.parse::<u64>().map_err(|_| {
                 refusal(
                     ErrorKind::UnsupportedFormat,
                     ids_for(&agent),
                     "events cursor is not one this server issued",
                 )
-            })?,
+            })?),
         };
         if body.limit == 0 {
             return Err(refusal(
@@ -398,15 +446,44 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
                 "events limit must be at least 1",
             ));
         }
-        let head = read_head(&call.tenant, &agent).await?;
+        let (head, operation) = match body.operation.as_deref() {
+            None => (read_head(&call.tenant, &agent).await?, None),
+            Some(token) => {
+                let handle = decode_operation(token)?;
+                if handle.agent != agent {
+                    return Err(refusal(
+                        ErrorKind::AgentGone,
+                        ids_for(&agent),
+                        "operation is not one of this agent's",
+                    ));
+                }
+                let (head, state) = read_operation(&call.tenant, &handle).await?;
+                (head, Some((operation_seq(&handle), state)))
+            }
+        };
+        let oldest = head
+            .events
+            .first()
+            .map_or(head.next_event_seq, |e| e.event_seq);
+        if let Some(cursor) = after
+            && cursor.saturating_add(1) < oldest
+        {
+            return Err(Refusal::CursorExpired(Box::new(CursorExpiredBody {
+                code: CURSOR_EXPIRED_CODE.to_string(),
+                cursor: cursor.to_string(),
+                oldest_cursor: oldest.saturating_sub(1).to_string(),
+                restart: CursorRestart::RestartFromOldestCursor,
+                reason: "events below this cursor are no longer retained".to_string(),
+                ids: SafeIdsBody::from(&ids_for(&agent)),
+            })));
+        }
+        let after = after.unwrap_or(0);
+        let wanted = |e: &&EventEntry| {
+            e.event_seq > after && operation.is_none_or(|(seq, _)| e.accept_seq == seq)
+        };
         let limit = usize::try_from(body.limit.min(MAX_EVENTS_PAGE)).unwrap_or(1);
         let mut events = Vec::new();
-        for event in head
-            .events
-            .iter()
-            .filter(|e| e.event_seq > after)
-            .take(limit)
-        {
+        for event in head.events.iter().filter(wanted).take(limit) {
             events.push(EventBody {
                 event_seq: event.event_seq,
                 accept_seq: event.accept_seq,
@@ -416,12 +493,118 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             });
         }
         let next = events.last().map_or(after, |e| e.event_seq);
+        let terminal = match operation {
+            Some((seq, state))
+                if state.is_terminal()
+                    && !head
+                        .events
+                        .iter()
+                        .any(|e| e.event_seq > next && e.accept_seq == seq) =>
+            {
+                Some(state.into())
+            }
+            _ => None,
+        };
         Ok::<_, Refusal>(Json(EventsResponse {
             events,
             next_cursor: next.to_string(),
+            terminal,
         }))
     };
     run.await.into_response()
+}
+
+pub(super) async fn timer_schedule(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<TimerRequest>(req, Capability::Agents, Lane::Activation)
+            .await?;
+        let scheduled = call.tenant.coordinator.schedule_timer(&body).await?;
+        Ok::<_, Refusal>(Json(scheduled))
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn timer_cancel(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<CancelTimerRequest>(req, Capability::Agents, Lane::Activation)
+            .await?;
+        let cancelled = call.tenant.coordinator.cancel_timer(&body).await?;
+        Ok::<_, Refusal>(Json(cancelled))
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn timers(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let call = api.admit(req.headers(), Capability::Agents, Lane::Activation)?;
+        let q: StateQuery = query(req.uri())?;
+        let agent = parse_agent(&AgentRef {
+            kind: q.kind,
+            key: q.key,
+        })?;
+        let head = read_head(&call.tenant, &agent).await?;
+        Ok::<_, Refusal>(Json(TimersResponse {
+            timers: head
+                .timers
+                .iter()
+                .map(|t| TimerBody {
+                    timer: t.timer_id.to_hex(),
+                    timer_key: t.timer_key.clone(),
+                    generation: t.generation,
+                    due_unix_ns: t.due_unix_ns,
+                    handler: t.handler.clone(),
+                    status: t.status.into(),
+                })
+                .collect(),
+        }))
+    };
+    run.await.into_response()
+}
+
+/// One sweep pass over the caller's tenant, on demand: the same pass the
+/// interval task runs, under the same budgets and the same cursor.
+pub(super) async fn sweep(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let call = api.admit(req.headers(), Capability::AgentsAdmin, Lane::Activation)?;
+        let report = call
+            .tenant
+            .coordinator
+            .sweep_once(&call.principal.tenant.hash())
+            .await?;
+        Ok::<_, Refusal>(Json(SweepResponse {
+            wake_list_pages: report.wake_list_pages,
+            dir_list_pages: report.dir_list_pages,
+            head_gets: report.head_gets,
+            hints_read: report.hints_read,
+            hints_deleted: report.hints_deleted,
+            timers_fired: report.timers_fired,
+            agents_loaded: report.agents_loaded,
+            dir_entries_repaired: report.dir_entries_repaired,
+        }))
+    };
+    run.await.into_response()
+}
+
+/// The inspector page (ADR-3331 decision 11). It carries no tenant data: the
+/// page reads state, timers, effects and events through the routes above with
+/// the token its user enters. The policy forbids every origin but this one,
+/// so the page can load nothing external.
+pub(super) async fn inspector(State(api): State<Api>, req: Request<Body>) -> Response {
+    match api.admit(req.headers(), Capability::Agents, Lane::Activation) {
+        Err(refused) => refused.into_response(),
+        Ok(_call) => (
+            [
+                (header::CONTENT_TYPE, INSPECTOR_CONTENT_TYPE),
+                (header::CONTENT_SECURITY_POLICY, INSPECTOR_CSP),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            INSPECTOR_HTML,
+        )
+            .into_response(),
+    }
 }
 
 pub(super) async fn worker_register(State(api): State<Api>, req: Request<Body>) -> Response {
@@ -535,19 +718,28 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
         };
         let effect = effect_id(head.incarnation, seq, &spec.step_key);
         let handle = effect_handle(agent, head.incarnation, effect);
+        // A settled step whose effect record HEAD no longer holds cannot say
+        // which attempt settled it, and this worker no longer owns it.
         let result_attempt = || {
             head.effects
                 .iter()
                 .find(|e| e.effect_id == effect)
-                .map_or(0, |e| e.result_attempt)
+                .map(|e| e.result_attempt)
+                .ok_or_else(|| {
+                    refusal(
+                        ErrorKind::OwnershipLost,
+                        ids_for(&agent),
+                        "the effect record is no longer in HEAD",
+                    )
+                })
         };
         let (step, attempt, failure) = match progress {
             StepProgress::Dispatched(dispatch) => (step_body(step, None), dispatch.attempt, None),
             StepProgress::Completed { output } => {
-                (step_body(step, Some(output)), result_attempt(), None)
+                (step_body(step, Some(output)), result_attempt()?, None)
             }
             StepProgress::Failed { error } => {
-                (step_body(step, None), result_attempt(), Some(error))
+                (step_body(step, None), result_attempt()?, Some(error))
             }
         };
         Ok::<_, Refusal>(Json(StepRecordResponse {
@@ -652,7 +844,11 @@ pub(super) async fn effect_inspect(
         let head = read_head(&call.tenant, &effect.agent).await?;
         let record = effect_record(&head, &effect)?;
         let recorded = record.result.is_some().then_some(record.result_attempt);
-        let attempts = (1..=record.attempt)
+        let first = record
+            .attempt
+            .saturating_sub(MAX_INSPECT_ATTEMPTS - 1)
+            .max(1);
+        let attempts = (first..=record.attempt)
             .map(|attempt| EffectAttemptBody {
                 attempt,
                 status: attempt_state(record, recorded, attempt),
@@ -758,13 +954,23 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
                 return Err(not_in_doubt());
             }
             (ReconcileDecision::Retry, EffectStatus::Authorized)
-                if Some(record.attempt) != body.attempt.checked_add(1) =>
+                if body.attempt == 0 || Some(record.attempt) != body.attempt.checked_add(1) =>
             {
                 return Err(wrong_attempt());
             }
             (ReconcileDecision::Retry, EffectStatus::InDoubt)
             | (ReconcileDecision::Retry, EffectStatus::Authorized) => {}
             _ => return Err(not_in_doubt()),
+        }
+        // A retry of an attempt already superseded by the authorized one after
+        // it is a repeat: it is answered from HEAD as it stands, with no
+        // write, no hand-over and no audit record.
+        if matches!(body.decision, ReconcileDecision::Retry) && !in_doubt {
+            return Ok(Json(ReconcileResponse {
+                effect: body.effect,
+                status: record.status.into(),
+                attempt: record.attempt,
+            }));
         }
         if in_doubt {
             let event = agents_reconcile_audit_event(
@@ -802,6 +1008,9 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
         call.tenant.changed.notify_waiters();
         let head = read_head(&call.tenant, &effect.agent).await?;
         let record = effect_record(&head, &effect)?;
+        if record.status != EffectStatus::InDoubt {
+            call.tenant.evidence.forget(effect.agent, effect.effect_id);
+        }
         Ok::<_, Refusal>(Json(ReconcileResponse {
             effect: body.effect,
             status: record.status.into(),
@@ -809,6 +1018,27 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
         }))
     };
     run.await.into_response()
+}
+
+fn mailbox_entry(entry: &InboxEntry) -> MailboxEntryBody {
+    MailboxEntryBody {
+        accept_seq: entry.accept_seq,
+        handler: entry.handler.clone(),
+        source: match &entry.source {
+            InputSource::Message { request_id, .. } => InputSourceBody::Message {
+                request_id: request_id.clone(),
+            },
+            InputSource::Timer {
+                timer_id,
+                generation,
+            } => InputSourceBody::Timer {
+                timer: timer_id.to_hex(),
+                generation: *generation,
+            },
+        },
+        accepted_unix_ns: entry.accepted_unix_ns,
+        failed_attempts: entry.failed_attempts,
+    }
 }
 
 fn step_body(step: &StepRecord, output: Option<Value>) -> StepBody {

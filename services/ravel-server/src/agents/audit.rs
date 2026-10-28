@@ -47,13 +47,23 @@ impl ReconcileAction {
 }
 
 /// The capabilities `principal` holds, comma separated, in a fixed order.
+/// Destructured without `..`, so a capability added to [`Principal`] fails to
+/// build here until it is listed.
 fn capabilities(principal: &Principal) -> String {
+    let Principal {
+        tenant: _,
+        ddl,
+        ipcrypt,
+        agents,
+        agents_worker,
+        agents_admin,
+    } = principal;
     [
-        (principal.agents, "agents"),
-        (principal.agents_worker, "agents_worker"),
-        (principal.agents_admin, "agents_admin"),
-        (principal.ddl, "ddl"),
-        (principal.ipcrypt, "ipcrypt"),
+        (*agents, "agents"),
+        (*agents_worker, "agents_worker"),
+        (*agents_admin, "agents_admin"),
+        (*ddl, "ddl"),
+        (*ipcrypt, "ipcrypt"),
     ]
     .iter()
     .filter(|(held, _)| *held)

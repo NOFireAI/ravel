@@ -13,15 +13,17 @@ Status: the contracts (`ravel-agents-core`), the publication layer
 (`ravel-agents-store`) and the coordinator (`ravel-agents-runtime`) are on
 `main`, and `ravel-server --agents` serves them over HTTP: `create`, `send`,
 `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`,
-`effects` and `effects/{effect}` for clients (`agents`); `worker/register`,
+`timers`, `timers/cancel`, `GET timers`, `effects`, `effects/{effect}` and
+the `inspector` page for clients (`agents`); `worker/register`,
 `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`,
 `worker/effects/complete` and `worker/effects/fail` for workers
-(`agents_worker`); and `reconcile` for operators (`agents_admin`), all under
+(`agents_worker`); and `reconcile` and `sweep` for operators (`agents_admin`), all under
 `/api/v1/agents/` (the
 [HTTP API reference](reference/http-api.md#agents-routes) lists them).
 `services/ravel-server/tests/agents_e2e.rs` and
 `services/ravel-server/tests/agents_effects_e2e.rs` drive them through a
-real server. Timers and the sweep have no route yet.
+real server, and `services/ravel-server/tests/agents_timers_e2e.rs` drives
+the timer routes, `sweep` (`agents_admin`) and the inspector page.
 Every claim below says which test pins it or which milestone delivers it;
 the [guarantee table](#guarantees-and-limitations) collects them.
 
@@ -366,7 +368,71 @@ the reconcile. If that process restarts before the step, or the step is
 served by another server process, the attempt reads as lost and a `manual`
 effect is back in doubt: reconcile it again. `effects/{effect}` reads each attempt, the
 result and the evidence (all in `agents_effects_e2e`, one test per policy
-and refusal).
+and refusal), and lists at most the latest 64 attempts
+(`agents_timers_e2e::effect_inspect_lists_at_most_the_latest_64_attempts`).
+The serving process forgets an effect's evidence once a reconcile settles
+it out of doubt (`runtime::tests::forgetting_an_effect_frees_its_slot_in_a_full_index`).
+
+Timers. `timers` (`TimerRequest`) arms the agent's timer `timer_key` at
+`due_unix_ns` and answers its id and generation (`TimerResponse`);
+scheduling a key again bumps the generation and supersedes the earlier
+one, so only the new generation fires, once
+(`a_reschedule_supersedes_the_earlier_generation`). `timers/cancel`
+(`CancelTimerRequest`) answers `CancelTimerResponse` with `outcome`
+`cancelled` when it lands before the firing, `already_fired` when the
+firing committed first and its input is already in the mailbox, and
+`unknown` for a key never scheduled
+(`cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`).
+`GET timers` (`TimersResponse`) lists the latest generation of each key as
+`scheduled`, `delivered` or `cancelled`. A fired timer is an input like a
+message: `GET state` lists it in `mailbox` with `source` `{"kind": "timer",
+"timer", "generation"}`. Timer commands reach HEAD only through the
+coordinator, and `FireTimer` only from its sweep. The sweep is the
+authority: a `_wake` hint whose PUT failed costs nothing but latency, since
+the directory half of a pass finds the agent and fires the timer once,
+also in a process started after the one that scheduled it
+(`due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint`).
+
+Sweep. Each served tenant's coordinator runs a pass every
+`agents.sweep_interval_ms` (0 runs none; worker polls and `sweep` still
+do), and `sweep` (`agents_admin`) runs one pass over the caller's tenant
+on demand and answers `SweepResponse`: the `_wake/` and `_dir/` LIST pages,
+HEAD reads, hints read and deleted, timers fired, agents loaded and `_dir`
+entries repaired. Those counts are the requests the store served for the
+pass and the deltas of the `ravel_agents_sweep_*` families on `/metrics`
+(`sweep_route_counts_match_the_store_and_needs_agents_admin`). The
+interval task covers the tenants this process has served since it
+started; a tenant no route has touched is swept by no one.
+
+Events cursor. `events` (`EventsRequest`) pages committed events strictly
+after `cursor`, the decimal committed event sequence, and `next_cursor`
+resumes without a repeat or a gap. With `operation` set the page holds
+only that operation's events, and the page that drains them once the
+operation is finished carries `terminal` with its final status. A cursor
+below the retained window is 410 with `CursorExpiredBody`: `code`
+`cursor_expired`, `oldest_cursor` and `restart`
+`restart_from_oldest_cursor`. A `limit` of 0 is 422
+(`events_resume_from_a_cursor_to_terminal_and_expire_below_the_window`).
+Nothing trims events from HEAD in this release, so the 410 is reachable
+only once a later release retains a window.
+
+Inspector. `GET inspector` (`agents`) serves one embedded HTML page with
+no external asset, under a content security policy that allows no origin
+but this one. The page asks for the caller's token and reads `state`,
+`timers`, `effects`, `effects/{effect}` and `events` with it. It shows the
+state version, the active turn, the mailbox, the timers, the effect-backed
+steps, the effects with their status, and the events page by page, with
+hashes and raw payloads folded under `<details>` and each payload preview
+labelled "preview". A blocked agent shows its reason and the action that
+unblocks it: `EffectInDoubt` (the `reconcile` bodies), a
+`NonDeterministicReplay` or `IncompatibleHandler` turn (the handler version
+and digest to deploy), or a cancel pending (wait for the worker). Its
+marker ids and content type are pinned by
+`inspector_is_served_to_agents_tokens_with_every_section` and
+`agents::tests::inspector_serves_the_embedded_page_as_html`. Journaled
+steps with no effect have no client route, so the page omits them. A
+plain browser navigation sends no bearer token and is 401: open the page
+from a client that sets `Authorization`.
 
 Not found. An operation handle the agent never issued, one from an earlier
 incarnation, or one for a tombstoned agent answers `AgentGone` (404) with
@@ -426,8 +492,8 @@ routes of a running server.
 | A retry reuses the failed attempt's step and effect identities | in the crates (kernel); end to end | kernel `a_retry_reuses_the_effect_and_step_identities_of_the_failed_attempt` (ADR-3331 step identity amendment); e2e `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` |
 | A `manual` effect in doubt blocks the turn until reconciled | in the crates (kernel); end to end | kernel `a_manual_effect_goes_in_doubt_and_blocks_the_turn_until_reconciled`; e2e `manual_blocks_until_reconciled_and_audits_the_decision_once` |
 | A step replayed with a different input blocks the turn | in the crates (kernel); end to end | kernel `a_step_replayed_with_another_input_blocks_the_turn`; e2e `a_drifted_replay_is_non_deterministic_and_blocks_the_turn` |
-| A timer fires once; a cancel after the firing reports `AlreadyFired` | in the crates (kernel); end to end in M4 | kernel `timers_fire_once_and_a_late_cancel_reports_already_fired` |
-| A timer fires without its wake hint | in the crates (runtime sweep); end to end in M4 | runtime `a_lost_hint_is_found_by_the_directory_half`, `a_schedule_whose_hint_was_never_written_still_fires_when_due`; the directory half reaches the agent within `ceil(agents / directory GETs per pass)` passes (`a_bounded_pass_walks_the_directory_in_list_order_across_passes`); every agent with a HEAD has a `_dir` entry because a create writes it first (store `a_create_whose_dir_entry_fails_writes_no_head`), a hint-reached agent whose entry went missing gets it back (`a_hint_reached_agent_gets_its_missing_dir_entry_back`), and a listing page of unaddressable keys still moves the cursor (`a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it`, `a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it`) |
+| A timer fires once; a cancel after the firing reports `AlreadyFired` | in the crates (kernel); end to end | kernel `timers_fire_once_and_a_late_cancel_reports_already_fired`; e2e `cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`, `a_reschedule_supersedes_the_earlier_generation` |
+| A timer fires without its wake hint | in the crates (runtime sweep); end to end | e2e `due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint` (every hint PUT refused, the scheduling process shut down, a fresh process over the same store fires it once); runtime `a_lost_hint_is_found_by_the_directory_half`, `a_schedule_whose_hint_was_never_written_still_fires_when_due`; the directory half reaches the agent within `ceil(agents / directory GETs per pass)` passes (`a_bounded_pass_walks_the_directory_in_list_order_across_passes`); every agent with a HEAD has a `_dir` entry because a create writes it first (store `a_create_whose_dir_entry_fails_writes_no_head`), a hint-reached agent whose entry went missing gets it back (`a_hint_reached_agent_gets_its_missing_dir_entry_back`), and a listing page of unaddressable keys still moves the cursor (`a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it`, `a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it`) |
 | Wake hints are deleted when no longer needed | in the crates (runtime sweep); end to end in M4 | runtime `fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation`, `duplicate_hints_for_one_generation_fire_it_once`; a hint is deleted only after a HEAD read in the same pass shows no timer armed in its bucket, and a premature one is kept (`a_premature_hint_fires_nothing_and_is_kept`) |
 | Destroy tombstones; recreate bumps the incarnation and refuses old handles | in the crates (M1) | kernel `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store `create_on_a_tombstoned_agent_bumps_the_incarnation` |
 | Kernel sequences keep the HEAD invariants | in the crates (M1) | kernel `kernel_sequences_keep_the_head_invariants` |
@@ -435,9 +501,9 @@ routes of a running server.
 | HTTP routes for create, send, call, operation, result, resolve, cancel, state, events and the worker register, poll, heartbeat and commit | end to end | e2e `send_then_result_through_real_server_survives_worker_replacement`, `call_heartbeat_and_cancel_through_real_server`, `cancel_of_a_running_turn_settles_it_cancelled_at_commit`, `events_page_after_the_durable_cursor_without_duplicates`, `resolve_after_a_lost_send_ack_returns_the_same_operation`; mounting `agents_router_mounts_on_both_listeners_only_with_feature_and_flag` |
 | HTTP routes for steps, effect results, effect inspection and reconciliation (`worker/step`, `worker/effects/complete`, `worker/effects/fail`, `effects`, `effects/{effect}`, `reconcile`) | end to end | e2e `completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn`, `provider_idempotency_redispatches_the_same_attempt_and_the_late_result_counts`, `manual_blocks_until_reconciled_and_audits_the_decision_once`, `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`, `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` |
 | A reconcile `retry` is dispatched once by the next step for its key in the same server process, under the owner at the reconcile or one that took the turn over since; a restart of that process, or a step served by another one, loses it and a `manual` effect is in doubt again | end to end (the hand-over, with and without a takeover); in the crates (the takeover, a race of two steps, a refused step handing it back) | e2e `a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`, `a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`; runtime `a_reconciled_attempt_survives_a_takeover_before_the_next_step` (the lease expires after the reconcile and the new owner's first step dispatches attempt 2 once, the effect reads authorized at attempt 2), `concurrent_steps_dispatch_a_reconciled_attempt_once`, `a_hand_over_refused_after_its_claim_is_released_and_never_dispatched_twice`. The loss on a restart is not tested: a restarted coordinator holds no record, and runtime `manual_latches_in_doubt_after_a_coordinator_restart_and_is_never_redispatched` shows what a `manual` attempt with no record does |
-| `agents` on `send`, `agents_worker` on `worker/poll` and `agents_admin` on `reconcile` are checked end to end; every other handler passes its capability to the same admission prologue, pinned by reading, not by a test | end to end (the three routes named); in the crates (the prologue) | e2e `capabilities_are_enforced_on_both_listeners`; `agents_admin` on `reconcile` in `manual_blocks_until_reconciled_and_audits_the_decision_once`; the per-route table test is T19 |
+| Every route refuses a token lacking its capability with 403, naming the capability | in the server (every route); end to end (the routes named) | server `every_route_refuses_a_token_lacking_its_capability` sends every route in the `ROUTES` table, whose third column is the route's capability, a token holding every capability but that one and expects 403; e2e `capabilities_are_enforced_on_both_listeners` (`agents`, `agents_worker`), `manual_blocks_until_reconciled_and_audits_the_decision_once` (`agents_admin` on `reconcile`), `sweep_route_counts_match_the_store_and_needs_agents_admin` (`agents_admin` on `sweep`), `inspector_is_served_to_agents_tokens_with_every_section` (`agents` on `inspector`) |
 | A HEAD that cannot be read under an operation handle answers `outcome_unknown`, not `agent_gone` | end to end | e2e `a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone`; an unknown handle is `agent_gone` (`unknown_operation_handle_is_agent_gone_with_the_handle`) |
-| HTTP routes for timers and the sweep | M4 | ADR-3331 decision 9; no route yet (`a_path_outside_the_route_table_is_404`) |
+| HTTP routes for timers and the sweep | end to end | e2e `due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint`, `cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`, `a_reschedule_supersedes_the_earlier_generation`, `sweep_route_counts_match_the_store_and_needs_agents_admin` |
 | `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers` set the kernel caps | on main | the server passes them as the kernel limits of every tenant's store, and the kernel refuses past a cap with a typed error (`logical_caps_and_the_byte_cap_are_typed`); no e2e test sets one below its default |
 | `--agents-max-agents`, `--agents-max-state-bytes` and `--agents-memory-budget` are enforced | follow-up | The routes do not enforce these three flags: they are parsed and reported on `GET /api/v1/agents/health` and `/metrics` only (`agents_flags_parse_and_reach_query_budgets`, `health_reports_feature_mode_and_every_setting`). Enforcing them is left to a follow-up. |
 | Projection of history into logs and traces | M5 | ADR-3331 decision 12 |
