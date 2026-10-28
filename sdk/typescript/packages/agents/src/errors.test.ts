@@ -16,6 +16,9 @@ const EXPECTED: Record<string, RetryHint> = {
   UnsupportedFormat: "never",
 };
 
+/** Raised by the step runner and never carried on the wire. */
+const SDK_LOCAL = ["ConcurrentStepError", "InvalidStepInput"];
+
 type ErrorClass = new (message: string, options?: errors.RavelAgentsErrorOptions) => RavelAgentsError;
 
 function errorClasses(): [string, ErrorClass][] {
@@ -27,8 +30,20 @@ function errorClasses(): [string, ErrorClass][] {
 }
 
 describe("typed errors", () => {
-  it("exports exactly the eleven ADR-3331 errors", () => {
-    expect(errorClasses().map(([name]) => name).sort()).toEqual(Object.keys(EXPECTED).sort());
+  it("exports exactly the eleven ADR-3331 errors and the two SDK-local ones", () => {
+    expect(errorClasses().map(([name]) => name).sort()).toEqual([...Object.keys(EXPECTED), ...SDK_LOCAL].sort());
+  });
+
+  it("the SDK-local errors are typed and never retried", () => {
+    const concurrent = new errors.ConcurrentStepError("b", "a", { ids: { operationId: "op-1" } });
+    const invalid = new errors.InvalidStepInput("value.at is a Date, not plain JSON");
+    for (const err of [concurrent, invalid]) {
+      expect(err).toBeInstanceOf(RavelAgentsError);
+      expect(err.retry).toBe("never");
+    }
+    expect(concurrent.code).toBe("ConcurrentStep");
+    expect(concurrent.ids).toEqual({ operationId: "op-1", stepKey: "b" });
+    expect(invalid.code).toBe("InvalidStepInput");
   });
 
   it.each(Object.entries(EXPECTED))("%s carries its code, retry hint and safe ids", (name, retry) => {
