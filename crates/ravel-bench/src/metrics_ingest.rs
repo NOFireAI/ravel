@@ -4629,6 +4629,8 @@ mod tests {
             retries: 0,
             elapsed_secs: 1.0,
             elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
+            generation_secs: 0.0,
+            sender_bound: false,
             logical_points_per_sec: 1.0,
             wire_bytes: 10,
             wire_bytes_per_sec: 10.0,
@@ -6343,6 +6345,8 @@ mod tests {
             batch_size: 1,
             max_retries: 2,
             timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
         };
         let row = replay_over_http(&config, &mut SliceSamples::new(&samples))
             .await
@@ -6468,6 +6472,8 @@ mod tests {
             batch_size: 2,
             max_retries: 0,
             timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
         };
         let row = replay_over_http(&config, &mut SlicePoints::new(&points))
             .await
@@ -6538,6 +6544,8 @@ mod tests {
             batch_size: 2,
             max_retries: 0,
             timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
         };
         let err = replay_over_http(&config, &mut SlicePoints::new(&points))
             .await
@@ -6692,6 +6700,8 @@ mod tests {
             batch_size,
             max_retries: 0,
             timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
         };
         let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(points)).await;
         server.abort();
@@ -7328,6 +7338,8 @@ mod tests {
             batch_size: 3,
             max_retries: 0,
             timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
         };
         let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
             .await
@@ -7427,6 +7439,8 @@ mod tests {
             batch_size: 3,
             max_retries: 0,
             timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: None,
         };
         let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
             .await
