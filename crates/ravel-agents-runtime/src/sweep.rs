@@ -15,7 +15,7 @@
 //!   advanced by this pass's fires, holds no scheduled timer in its bucket,
 //!   which covers a generation delivered, cancelled or superseded. No key
 //!   is deleted that the pass did not list
-//!   (`tests::a_lost_hint_is_found_by_the_directory_half_within_one_pass`)
+//!   (`tests::a_lost_hint_is_found_by_the_directory_half`)
 //!   (`timers::tests::fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation`).
 //!
 //! A hint for a bucket the clock has not reached yet is not listed, and a
@@ -23,10 +23,35 @@
 //! (`tests::a_premature_hint_fires_nothing_and_is_kept`). Two hints for one
 //! generation fire it once: the second is answered from the root the first
 //! one's fire published (`tests::duplicate_hints_for_one_generation_fire_it_once`).
+//!
 //! A hint whose PUT was lost is not needed: the directory half reaches the
-//! agent within one pass (`tests::a_lost_hint_is_found_by_the_directory_half_within_one_pass`).
+//! agent within one pass when the directory fits the pass's directory GET
+//! budget (`tests::a_lost_hint_is_found_by_the_directory_half`), else within
+//! `ceil(agents / directory GETs per pass)` passes, where a pass gives the
+//! directory half at least `max_head_gets - max_head_gets / 2` reads
+//! (`sweep_pass`; ten agents at four reads a pass take three passes in
+//! `tests::a_bounded_pass_walks_the_directory_in_list_order_across_passes`).
 //! A hint delete can race a schedule into the same bucket made after the
-//! HEAD read; the directory half is the backstop for that timer as well.
+//! HEAD read: the DELETE in `sweep_wake` is unconditional, so it can remove
+//! the new hint, and `sweep_dir` skips an agent this pass already read. The
+//! timer then waits for the directory half's next visit, a latency within
+//! the same bound. It is never fired twice, since a fire is the fenced CAS
+//! `timers::Coordinator::fire_due` issues on the generation HEAD holds.
+//!
+//! The directory half lists `_dir/` entries (`AgentStore::list_dir_after`),
+//! not HEADs. A `_dir` entry is written only by a create
+//! (`Effect::WriteDirEntry` from the kernel's `create_new` and `create`; the
+//! store repeats the PUT when a create finds the agent exists), and a failed
+//! PUT of it is logged and not repaired (`write_dir_entry` in
+//! `ravel-agents-store`).
+//! An agent without one is reached only through its hints: the directory
+//! half reads nothing for it
+//! (`tests::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`,
+//! where no entry is written). A due timer on such an agent whose hint was
+//! lost or deleted by the race above stays unfired until a later schedule
+//! writes a new hint or a create rewrites the entry. ADR-3331 decision 8
+//! has the sweep list HEADs; this listing of the advisory index is where
+//! the code departs from it.
 //!
 //! # Bounds and fairness
 //!
@@ -36,8 +61,10 @@
 //! the rest plus whatever the wake half left. Each half resumes strictly
 //! after the last key the previous pass processed, so a budget smaller than
 //! the tenant walks it over several passes in LIST order, and no agent is
-//! read twice before every agent was read once
-//! (`tests::a_bounded_pass_walks_the_directory_in_list_order_across_passes`).
+//! read twice before every agent was read once: for the directory half in
+//! `tests::a_bounded_pass_walks_the_directory_in_list_order_across_passes`,
+//! for the wake half, which reads exactly its share of the cap, in
+//! `tests::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`.
 //! The wake cursor goes back to the start once it reaches a bucket past the
 //! clock, the directory cursor once it reaches the end of the listing; a
 //! pass never wraps. Within one pass an agent's HEAD is read at most once.

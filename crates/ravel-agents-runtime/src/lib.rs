@@ -21,9 +21,10 @@
 //! directly.
 //!
 //! The bodies are the `ravel_agents_core::wire` types wherever one exists.
-//! Calls with no wire type yet (worker registration, heartbeat, activation,
-//! takeover, a failure's retry verdict) take and return crate types until
-//! T11 defines their bodies.
+//! Worker registration, heartbeat, activation, takeover and a failure's
+//! retry verdict take and return crate types; where `ravel-server`'s agents
+//! routes (`services/ravel-server/src/agents/routes.rs`, T11 #3345) expose
+//! one, the route maps its wire body onto them.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
