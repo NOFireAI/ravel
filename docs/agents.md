@@ -187,9 +187,9 @@ skeleton (`publish.rs`). Steps 2 and 3 are the pure kernel,
 `Kernel::apply(head, command, now_unix_ns, ids)`, which does no I/O. The
 bounds:
 
-- At most `MAX_CAS_ATTEMPTS` = 8 runs from step 1 after a refused
-  conditional write, then `StoreUnavailable`
-  (`a_contended_head_gives_up_after_the_cas_bound`).
+- At most `MAX_CAS_ATTEMPTS` = 8 conditional writes in total for one
+  command, each refusal re-running from step 1, then `StoreUnavailable`
+  (`a_contended_head_gives_up_after_the_cas_bound` pins eight CAS calls).
 - At most `MAX_READ_ATTEMPTS` = 3 attempts at one read or one dependency
   write that failed retryably. The test
   `a_head_not_found_blip_is_retried_as_a_transient_read` pins the retry; no
@@ -226,22 +226,27 @@ What the store tests pin about the rule:
   (`a_corrupt_dependency_write_is_a_typed_error`,
   `a_corrupt_dependency_read_is_a_typed_error`).
 - The `_dir` entry and the `_wake` hint are written after the HEAD write;
-  a failure to write either is logged and the command still reports what
-  its CAS published (`a_failed_wake_hint_does_not_fail_the_command`). A
-  create that finds the agent already active rewrites the `_dir` entry
-  (`a_create_that_finds_the_root_repairs_the_dir_entry`).
+  a failure to write either does not fail the command, which still reports
+  what its CAS published (`a_failed_wake_hint_does_not_fail_the_command`);
+  the failure is logged, which no test asserts. A create that finds the
+  agent already active re-creates a missing `_dir` entry with
+  `CreateIfAbsent` (`a_create_that_finds_the_root_repairs_the_dir_entry`).
 
 The store counts GET, PUT, CAS, LIST and conflicts per phase (resolve,
-build, store, publish) in its own counters (`counters.rs`); the tests above
-assert those counts.
+build, store, publish) in its own counters (`counters.rs`); the store tests
+that name a count (the CAS, conflict and read counts above) assert it
+exactly.
 
 ## Operation states
 
 An accepted input is an operation. `operation_state` in
 `crates/ravel-agents-core/src/state.rs` derives its state from HEAD
-(ADR-3331 decision 5). `AgentStore::resolve` reports it; no test asserts the
-mapping state by state yet, so the table below describes the code, not a
-pinned behaviour:
+(ADR-3331 decision 5). `AgentStore::resolve` reports it; the store tests
+assert the `Accepted` and `Cancelled` rows
+(`cas_applied_with_lost_response_is_resolved_by_operation_id_after_a_later_revision`,
+`an_unknown_outcome_on_any_operation_command_carries_its_handle`), and
+no test asserts `Running` or `Blocked` yet, so those two rows describe the
+code, not a pinned behaviour:
 
 | State | Code | When | Terminal |
 |---|---|---|---|
@@ -252,10 +257,13 @@ pinned behaviour:
 | Failed | `failed` | a result entry with status `Failed` exists | yes |
 | Cancelled | `cancelled` | a result entry with status `Cancelled` exists | yes |
 
-Receipts and results are kept for the agent's lifetime in this release; an
-agent at its receipt or mailbox cap refuses new sends rather than dropping
-anything (ADR-3331 decision 5; kernel test
-`logical_caps_and_the_byte_cap_are_typed`).
+Receipts and results are kept for the agent's lifetime in this release
+(nothing in the kernel removes them; paged indexes are milestone 6). An
+agent at its mailbox cap refuses new sends rather than dropping anything
+(ADR-3331 decision 5; kernel test `logical_caps_and_the_byte_cap_are_typed`).
+The receipt cap refuses the same way in `Kernel::enqueue` (`BudgetExceeded`),
+but no test asserts that refusal yet; it is test debt for the steps and
+effects task (T14 of the epic).
 
 A client holds an operation by an opaque handle: base64url without padding
 over `v1:<kind>:<agent_id>:<incarnation>:<item>`, where the kind is `op`,
@@ -295,9 +303,10 @@ The wire form carries the code and the retry hint
 Safety never depends on a clock: every exclusion is a CAS on HEAD, fenced by
 incarnation, epoch, active turn and base state version (ADR-3331 decisions
 6 and 8; kernel tests `every_fenced_command_refuses_a_stale_fence`,
-`a_commit_after_takeover_is_ownership_lost`). Library code reads time only
-through an injected `Clock` (`now_unix_ns`); the kernel takes the time as a
-parameter.
+`a_commit_after_takeover_is_ownership_lost`). Every time that enters a
+decision comes through an injected `Clock` (`now_unix_ns`); the kernel
+takes the time as a parameter. The one wall-clock read in the store seeds
+the retry jitter (`backoff.rs`) and decides nothing.
 
 Timer accuracy and takeover speed do depend on clocks. The assumption is
 monotonic local clocks and bounded skew between coordinators (ADR-3331
@@ -318,10 +327,10 @@ no server route exposes it yet.
 | `ag` is a reserved Parquet table name | on main | `names::tests::every_segment_a_template_grants_after_a_wildcard_is_reserved` |
 | gateway and query roles may list, read and write `t/*/ag/*`; maintain may list and read; no role may delete | on main (templates) | `agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain` |
 | A newer HEAD format is refused before any field is read and is never written | in the crates (M0, M1) | `head::tests::a_newer_format_version_is_refused_before_the_rest_is_read`, store `a_newer_head_format_is_unsupported_and_never_written` |
-| A command succeeds only when its HEAD CAS returned `Ok` | in the crates (M1) | `an_unknown_cas_outcome_is_never_retried` |
+| A command succeeds only when its HEAD CAS returned `Ok` | in the crates (M1) | `an_unknown_cas_outcome_is_never_retried` (an ambiguous CAS is not reported as success), `a_failed_conditional_write_re_reads_and_succeeds_on_retry` (a refused CAS is not) |
 | An ambiguous CAS returns `OutcomeUnknown` with a handle that resolves later | in the crates (M1) | `cas_applied_with_lost_response_is_resolved_by_operation_id_after_a_later_revision` |
 | Duplicate send with the same id and hash returns the same handle; a different hash conflicts | in the crates (M1) | store `enqueue_with_the_same_request_id_and_hash_returns_the_same_handle`, kernel `retries_are_idempotent_and_conflicts_are_typed` |
-| Mailbox, receipt and HEAD byte caps refuse with a typed error, never drop | in the crates (M1) | kernel `logical_caps_and_the_byte_cap_are_typed`, store `a_full_mailbox_is_refused_before_any_write` |
+| Mailbox and HEAD byte caps refuse with a typed error, never drop; the receipt cap refuses the same way in code but has no test yet (test debt for T14) | in the crates (M1) | kernel `logical_caps_and_the_byte_cap_are_typed`, store `a_full_mailbox_is_refused_before_any_write` |
 | A turn commit publishes state, result, events and intents in one write, and rebases over a concurrent send | in the crates (M1) | kernel `turn_commit_publishes_state_input_result_events_and_intents_together`, `a_commit_rebases_onto_a_root_that_moved_without_touching_the_turn` |
 | A stale owner cannot commit after a takeover | in the crates (kernel); end to end in M2 | kernel `a_commit_after_takeover_is_ownership_lost`, `every_fenced_command_refuses_a_stale_fence` |
 | Failed turns retry under a new turn id, then dead-letter | in the crates (kernel); end to end in M2 | kernel `failed_turns_retry_under_a_new_turn_id_then_dead_letter` |
