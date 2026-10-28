@@ -26,9 +26,10 @@
 //! open; HEAD keeps that attempt `Authorized`, as evidence that the tool was
 //! dispatched, its late result is stored as evidence without changing HEAD,
 //! and the next input's steps run under the same epoch
-//! (`tests::a_cancelled_turn_with_an_open_attempt_does_not_wedge_the_next_turn`). An authorized attempt this coordinator did
-//! not dispatch under the caller's epoch (a takeover, or a coordinator
-//! restart) is a lost attempt, and the step's recovery policy decides:
+//! (`tests::a_cancelled_turn_with_an_open_attempt_does_not_wedge_the_next_turn`).
+//! An authorized attempt this coordinator did not dispatch under the
+//! caller's epoch (a takeover, or a coordinator restart) is a lost attempt,
+//! and the step's recovery policy decides:
 //!
 //! | Policy | First dispatch | After a lost attempt | Result of the lost attempt |
 //! |---|---|---|---|
