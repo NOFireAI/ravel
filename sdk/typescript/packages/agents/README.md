@@ -155,21 +155,36 @@ Worker and steps (`src/worker/`):
   leased handler version abandons the turn with IncompatibleHandler`, `a
   worker whose handler digest differs from the leased one abandons the turn
   with IncompatibleHandler`.
-- After a turn abandoned with `EffectInDoubt`, which the coordinator hands
-  straight back until someone reconciles the effect, the worker pauses
-  before polling again, doubling from `abandonDelayMs` (250 ms) up to
-  `maxBackoffMs` (30 s); a committed turn resets the pause, and any other
-  abandonment pauses the fixed `abandonDelayMs`. Tests: `doubles the pause
-  after each EffectInDoubt abandonment up to the cap and resets it on a
-  commit`, `a Backoff doubles from its start to its cap and starts over on
-  reset` (`serve.test.ts`).
-- A poll error whose `retry` is `never` stops the worker: it goes to
-  `onError`, or without one rejects the handle's `done`. Any other poll
-  error goes to `onError` and is retried after a pause doubling from 50 ms.
-  Tests: `a Forbidden poll stops the worker and rejects done with it`, `a
-  Forbidden poll goes to onError, stops the worker and fulfils done`, `a
-  transient OutcomeUnknown poll is retried after a doubling pause and the
-  next poll runs its turn` (`serve.test.ts`).
+- A turn still leased to the worker is handed straight back to it, so
+  after a turn abandoned with an error whose `retry` is `reconcile`
+  (`EffectInDoubt`), `backoff` (`StoreUnavailable`, `MailboxFull`) or
+  `resolve` (`OutcomeUnknown`) the worker pauses before polling again,
+  doubling from `abandonDelayMs` (250 ms) up to `maxBackoffMs` (30 s). An
+  abandonment whose `retry` is `never`, such as `IncompatibleHandler`,
+  pauses the fixed `abandonDelayMs`. The doubling delay is kept per
+  operation: an operation's commit resets its own delay, and another
+  operation's abandonment starts at `abandonDelayMs` whatever the first
+  one's delay is. The pause still holds the whole poll loop, not only the
+  operation. The worker keeps a delay for at most 1024 operations and
+  forgets the least recently used past that. Tests: `doubles one
+  operation's pause after each EffectInDoubt abandonment up to the cap and
+  resets it on its commit`, `doubles the pause after each StoreUnavailable
+  heartbeat abandonment, and an IncompatibleHandler abandonment keeps the
+  fixed pause`, `an operation at the backoff cap does not raise an
+  unrelated operation's pause, and the unrelated commit does not reset
+  it`, `OperationBackoffs keeps one delay per operation and forgets the
+  least recently used past its capacity`, `a Backoff doubles from its
+  start to its cap and starts over on reset` (`serve.test.ts`).
+- Only a `Forbidden` poll error, a refused token, stops the worker: it goes
+  to `onError`, or without one rejects the handle's `done`. Any other poll
+  error, `UnsupportedFormat` included, goes to `onError` and is retried
+  after a pause doubling from 50 ms, since a proxy can answer one poll with
+  a page the SDK does not read and the next with a turn. Tests: `a
+  Forbidden poll stops the worker and rejects done with it`, `a Forbidden
+  poll goes to onError, stops the worker and fulfils done`, `a poll
+  answered with UnsupportedFormat is retried and the next poll runs its
+  turn`, `a transient OutcomeUnknown poll is retried after a doubling pause
+  and the next poll runs its turn` (`serve.test.ts`).
 
 Unless a test file is named, the tests above are in `steps.test.ts`.
 
@@ -280,10 +295,12 @@ typed error` (`client.test.ts`) asserts the wire mapping.
 `Forbidden` has no wire code: the server refuses a credential with HTTP 401
 or 403 and a plain body, which the client and the worker transport map to
 `Forbidden` with `retry` `never`. A worker whose poll is refused stops
-instead of retrying, while a transient poll failure is retried. Tests: `a
-Forbidden poll stops the worker and rejects done with it`, `a transient
-OutcomeUnknown poll is retried after a doubling pause and the next poll
-runs its turn` (`serve.test.ts`).
+instead of retrying. Every other poll failure is retried, including an
+`UnsupportedFormat` answer, although its `retry` is also `never`. Tests:
+`a Forbidden poll stops the worker and rejects done with it`, `a poll
+answered with UnsupportedFormat is retried and the next poll runs its
+turn`, `a transient OutcomeUnknown poll is retried after a doubling pause
+and the next poll runs its turn` (`serve.test.ts`).
 
 An unknown code, or a 2xx body that does not match its schema, reads as
 `UnsupportedFormat` (test: `an unknown error code or an off-schema response

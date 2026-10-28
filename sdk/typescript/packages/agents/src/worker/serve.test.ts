@@ -3,10 +3,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { EffectInDoubt, Forbidden, OutcomeUnknown } from "../errors.js";
+import { EffectInDoubt, Forbidden, OutcomeUnknown, StoreUnavailable, UnsupportedFormat } from "../errors.js";
 import { defineTool } from "../tools/index.js";
 import { decodeWire, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
-import { Backoff } from "./backoff.js";
+import { Backoff, OperationBackoffs } from "./backoff.js";
 import { defineAgent, handlerDigest, serveAgents, type Transport, type TurnReport } from "./index.js";
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../fixtures");
@@ -38,15 +38,21 @@ const agent = defineAgent({
   }),
 });
 
-/** `block` abandons with EffectInDoubt, `pass` commits, `incompatible` abandons with IncompatibleHandler. */
-type Script = "block" | "pass" | "incompatible" | Error;
+/**
+ * `block` abandons with the transport's step error (EffectInDoubt unless
+ * set), `pass` commits, `incompatible` abandons with IncompatibleHandler. A
+ * bare kind runs under the fixture's operation id.
+ */
+type Kind = "block" | "pass" | "incompatible";
+type Script = Kind | { readonly kind: Kind; readonly operation: string } | Error;
 
-function assignment(kind: "block" | "pass" | "incompatible"): TurnAssignment {
+function assignment(kind: Kind, operation?: string): TurnAssignment {
   const handler = kind === "incompatible" ? "pass" : kind;
   const digest = kind === "incompatible" ? "00".repeat(32) : handlerDigest(agent, handler);
   const body = {
     assignment: {
       ...pollFixture.assignment,
+      ...(operation === undefined ? {} : { operation }),
       handler,
       lease: { ...pollFixture.assignment.lease, handler_digest: digest },
       steps: [],
@@ -59,9 +65,13 @@ function assignment(kind: "block" | "pass" | "incompatible"): TurnAssignment {
 
 /**
  * A transport that answers each poll with the next scripted turn or error,
- * stamping the fake clock, and then waits for the worker to close.
+ * stamping the fake clock, and then waits for the worker to close. Every
+ * step record rejects with `stepError()`.
  */
-function scriptedTransport(script: Script[]) {
+function scriptedTransport(
+  script: Script[],
+  stepError: () => Error = () => new EffectInDoubt("the ticket's attempt has no result"),
+) {
   const polledAt: number[] = [];
   const transport: Transport = {
     register: () => Promise.resolve({ worker_id: "w-0000000000000001" }),
@@ -77,9 +87,10 @@ function scriptedTransport(script: Script[]) {
         });
       }
       if (next instanceof Error) return Promise.reject(next);
-      return Promise.resolve({ assignment: assignment(next) });
+      if (typeof next === "string") return Promise.resolve({ assignment: assignment(next) });
+      return Promise.resolve({ assignment: assignment(next.kind, next.operation) });
     },
-    recordStep: () => Promise.reject(new EffectInDoubt("the ticket's attempt has no result")),
+    recordStep: () => Promise.reject(stepError()),
     completeEffect: () => Promise.reject(new Error("unused")),
     failEffect: () => Promise.reject(new Error("unused")),
     commit: (request) =>
@@ -113,7 +124,21 @@ describe("worker backoff", () => {
     expect(backoff.next()).toBe(250);
   });
 
-  it("doubles the pause after each EffectInDoubt abandonment up to the cap and resets it on a commit", async () => {
+  it("OperationBackoffs keeps one delay per operation and forgets the least recently used past its capacity", () => {
+    const delays = new OperationBackoffs(250, 1_000, 2);
+    expect([delays.next("a"), delays.next("a"), delays.next("b"), delays.next("a")]).toEqual([250, 500, 250, 1_000]);
+    delays.forget("a");
+    expect(delays.next("a")).toBe(250);
+    // "b" (next delay 500) is now the least recently used, so a third
+    // operation evicts it and "b" starts over at 250, evicting "a" in turn.
+    expect(delays.next("c")).toBe(250);
+    expect(delays.size).toBe(2);
+    expect(delays.next("b")).toBe(250);
+    expect(delays.next("c")).toBe(500);
+    expect(delays.next("a")).toBe(250);
+  });
+
+  it("doubles one operation's pause after each EffectInDoubt abandonment up to the cap and resets it on its commit", async () => {
     await withFakeClock(async () => {
       const { transport, polledAt } = scriptedTransport([
         "block",
@@ -150,6 +175,68 @@ describe("worker backoff", () => {
       expect(polledAt).toEqual([0, 250, 750, 1_000, 2_000, 3_000, 3_000, 3_250]);
     });
   });
+
+  it("doubles the pause after each StoreUnavailable heartbeat abandonment, and an IncompatibleHandler abandonment keeps the fixed pause", async () => {
+    await withFakeClock(async () => {
+      const { transport, polledAt } = scriptedTransport(
+        ["block", "block", "block", "incompatible", "block"],
+        () => new StoreUnavailable("step/record: object store unavailable"),
+      );
+      const reports: TurnReport[] = [];
+      const worker = await serveAgents({
+        transport,
+        agents: [agent],
+        workerId: "w-0000000000000001",
+        abandonDelayMs: 250,
+        maxBackoffMs: 1_000,
+        onTurn: (report) => reports.push(report),
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await worker.close();
+      expect(reports.map((r) => (r.outcome === "committed" ? "committed" : (r.error as Error).name))).toEqual([
+        "StoreUnavailable",
+        "StoreUnavailable",
+        "StoreUnavailable",
+        "IncompatibleHandler",
+        "StoreUnavailable",
+      ]);
+      // Pauses 250, 500, 1000 for the store outage, the fixed 250 for the
+      // handler mismatch, then 1000 at the cap.
+      expect(polledAt).toEqual([0, 250, 750, 1_750, 2_000, 3_000]);
+    });
+  });
+
+  it("an operation at the backoff cap does not raise an unrelated operation's pause, and the unrelated commit does not reset it", async () => {
+    await withFakeClock(async () => {
+      const a = { kind: "block", operation: "op-a" } as const;
+      const b = { kind: "block", operation: "op-b" } as const;
+      const { transport, polledAt } = scriptedTransport([a, a, a, b, a, { kind: "pass", operation: "op-b" }, a]);
+      const reports: TurnReport[] = [];
+      const worker = await serveAgents({
+        transport,
+        agents: [agent],
+        workerId: "w-0000000000000001",
+        abandonDelayMs: 250,
+        maxBackoffMs: 1_000,
+        onTurn: (report) => reports.push(report),
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await worker.close();
+      expect(reports.map((r) => `${r.operation}:${r.outcome}`)).toEqual([
+        "op-a:abandoned",
+        "op-a:abandoned",
+        "op-a:abandoned",
+        "op-b:abandoned",
+        "op-a:abandoned",
+        "op-b:committed",
+        "op-a:abandoned",
+      ]);
+      // op-a pauses 250, 500, then 1000; op-b's abandonment pauses the base
+      // 250; op-a stays at 1000; op-b's commit pauses nothing and leaves
+      // op-a at the cap.
+      expect(polledAt).toEqual([0, 250, 750, 1_750, 2_000, 3_000, 3_000, 4_000]);
+    });
+  });
 });
 
 describe("worker poll errors", () => {
@@ -180,6 +267,34 @@ describe("worker poll errors", () => {
     expect(errors).toEqual([refused]);
     expect(polledAt).toHaveLength(1);
     await worker.close();
+  });
+
+  it("a poll answered with UnsupportedFormat is retried and the next poll runs its turn", async () => {
+    await withFakeClock(async () => {
+      const unreadable = new UnsupportedFormat("worker/poll: HTTP 404 answer does not match the wire schema");
+      const { transport, polledAt } = scriptedTransport([unreadable, "pass"]);
+      const errors: unknown[] = [];
+      const reports: TurnReport[] = [];
+      const worker = await serveAgents({
+        transport,
+        agents: [agent],
+        workerId: "w-0000000000000001",
+        onError: (error) => errors.push(error),
+        onTurn: (report) => reports.push(report),
+      });
+      let settled = false;
+      void worker.done.finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(settled).toBe(false);
+      await worker.close();
+      expect(errors).toEqual([unreadable]);
+      expect(reports.map((r) => r.outcome)).toEqual(["committed"]);
+      // One 50 ms pause after the unreadable answer, then the turn, then the
+      // poll that waits for close.
+      expect(polledAt).toEqual([0, 50, 50]);
+    });
   });
 
   it("a transient OutcomeUnknown poll is retried after a doubling pause and the next poll runs its turn", async () => {
