@@ -24,7 +24,18 @@
     "./testing": {
       "types": "./src/testing/index.ts",
       "default": "./src/testing/index.ts"
+    },
+    "./contract": {
+      "types": "./src/scaffold/contract.ts",
+      "default": "./src/scaffold/contract.ts"
+    },
+    "./scaffold": {
+      "types": "./src/scaffold/index.ts",
+      "default": "./src/scaffold/index.ts"
     }
+  },
+  "bin": {
+    "ravel-agents-scaffold": "./bin/ravel-agents-scaffold.js"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
