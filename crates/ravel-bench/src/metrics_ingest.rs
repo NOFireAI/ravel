@@ -1783,13 +1783,6 @@ fn write_request_from_points(points: &[LogicalPoint]) -> WriteRequest {
     }
 }
 
-/// Group logical samples into `prometheus.TimeSeries` by canonical identity.
-#[cfg(test)]
-fn write_request_from(samples: &[LogicalSample]) -> WriteRequest {
-    let points: Vec<LogicalPoint> = samples.iter().cloned().map(LogicalPoint::Sample).collect();
-    write_request_from_points(&points)
-}
-
 fn snappy(req: &WriteRequest) -> Result<Vec<u8>, LaneError> {
     snap::raw::Encoder::new()
         .compress_vec(&req.encode_to_vec())
@@ -4910,6 +4903,12 @@ mod tests {
     use super::*;
 
     use ravel_object_store::memory::MemoryStore;
+
+    /// Group logical samples into `prometheus.TimeSeries` by canonical identity.
+    fn write_request_from(samples: &[LogicalSample]) -> WriteRequest {
+        let points: Vec<LogicalPoint> = samples.iter().cloned().map(LogicalPoint::Sample).collect();
+        write_request_from_points(&points)
+    }
 
     /// A latency report with a chosen p99, so a report fixture is a number a
     /// reader can check by hand.
