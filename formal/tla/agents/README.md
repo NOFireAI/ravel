@@ -18,8 +18,10 @@ object-store contract rather than a hand-rolled map.
 TLC checked this finite model under the bounds and assumptions in each `.cfg`.
 This model checks the protocol design under those bounds; implementation conformance is argued
 in the traceability table and asserted by the named Rust tests, not proved.
-That table does not exist yet: `traceability.md` lands with the kernel symbols
-it names (task T10), and the agents crates it would cite are not built. Safety
+[`traceability.md`](traceability.md) maps each action and property to the
+kernel and store symbols and tests that implement it today; the runtime rows
+(lease takeover, worker dispatch, worker crash, wake hints and the sweep, and
+liveness) sit under its design heading, pending T9 (#3343) and later tasks. Safety
 and liveness are stated separately below, and every liveness result carries its
 fairness assumptions. The object store's own conformance to its contract is an
 assumption, stated as such and not checked here.
