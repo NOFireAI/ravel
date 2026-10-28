@@ -1637,3 +1637,121 @@ fn a_stalled_row_binds_only_as_a_diagnostic_and_leaves_its_engine_out() {
     .expect_err("no failed row, no diagnostic");
     assert!(matches!(err, BindError::NoFailedRow), "{err}");
 }
+
+/// A row that carries a `row_failure`, and a row whose replay failed, bind
+/// only as a diagnostic. `bind` refuses each naming the row.
+/// `bind_diagnostic` keeps a `row_failure` row's engine in the binding even
+/// though the row's own band 6 check fails, and names the failure with its
+/// band; it leaves a failed replay's engine out and names it with no band. A
+/// failed replay of the oracle refuses even as a diagnostic.
+///
+/// TO SEE THIS FAIL: drop the `row_failure` branch in `bind_rows`' row loop:
+/// both binds then refuse with `BindError::Band6` on mimir.
+#[test]
+fn a_row_failure_or_failed_replay_does_not_bind() {
+    use ravel_bench::metrics_ingest::{FailedReplay, RowFailure};
+    use ravel_bench::metrics_query::{
+        BindError, bind, bind_diagnostic, endpoints, parse_engine_spec,
+    };
+    use ravel_bench::report_schema::FailedCheck;
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec("name=mimir,url=http://127.0.0.1:9").expect("spec"),
+    ];
+
+    let mut row_failed = ingest_report(&urls);
+    let row = row_failed
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "mimir")
+        .expect("mimir row");
+    row.ingest.accepted_digests.scalar = "not-the-expected-set".to_string();
+    row.row_failure = Some(RowFailure {
+        band: Some(6),
+        error: "mimir: the accepted scalar set is not the expected set".to_string(),
+    });
+    let err = bind(&row_failed, &workload_bytes, &workload, &specs, |_| None)
+        .map(|_| ())
+        .expect_err("bind refuses a row_failure");
+    assert!(
+        matches!(&err, BindError::RowFailed { system, detail }
+            if system == "mimir" && detail.contains("accepted scalar set")),
+        "{err}"
+    );
+    let (binding, failed) =
+        bind_diagnostic(&row_failed, &workload_bytes, &workload, &specs, |_| None)
+            .expect("a row_failure binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["mimir", "prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, Some(6));
+    assert_eq!(failed[0].check, FailedCheck::Ingest);
+    assert_eq!(failed[0].system, "mimir");
+
+    let replay_failed = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest.systems.retain(|r| r.system != system);
+        ingest.failed_replays = vec![FailedReplay {
+            system: system.to_string(),
+            endpoint: "http://127.0.0.1:9/api/v1/push".to_string(),
+            error: "sender for shard 0 stopped early".to_string(),
+        }];
+        ingest
+    };
+    let err = bind(
+        &replay_failed("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("bind refuses a failed replay");
+    assert!(
+        matches!(&err, BindError::FailedReplay { system, .. } if system == "mimir"),
+        "{err}"
+    );
+    let (binding, failed) = bind_diagnostic(
+        &replay_failed("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a failed comparator replay binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, None);
+    assert_eq!(failed[0].check, FailedCheck::Replay);
+    assert_eq!(
+        failed[0].to_string(),
+        format!("replay on mimir: {}", failed[0].reason)
+    );
+    let err = bind_diagnostic(
+        &replay_failed("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a failed oracle replay refuses");
+    assert!(
+        matches!(&err, BindError::FailedReplay { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+}

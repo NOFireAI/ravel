@@ -99,8 +99,8 @@ struct Args {
     #[arg(long)]
     diagnostics: Option<PathBuf>,
     /// Query a run whose ingest verification failed, as a diagnostic: a row
-    /// whose read-back failed is queried, a stalled row's engine is left out,
-    /// and the report says `run_verdict: "failed"` with every failure in
+    /// whose read-back failed or that carries a `row_failure` is queried, a
+    /// stalled row's or failed replay's engine is left out, and the report says `run_verdict: "failed"` with every failure in
     /// `failed_bands`, so `metricsbench_report validate` refuses it.
     /// Without this flag such an ingest report is refused (exit 65); with it,
     /// an ingest report with no failed row is refused.

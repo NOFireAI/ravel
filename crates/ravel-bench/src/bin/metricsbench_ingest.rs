@@ -34,8 +34,12 @@
 //! later rows are replayed, and once every row has run the bin prints the
 //! report and exits with the first failing row's code, 1
 //! (`metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`).
-//! Any other failure (band 4, a diverged stream, a transport error) still
-//! stops the run at that row with no report.
+//! Any other failure (band 4, a diverged stream, a transport error) on a row
+//! before the first failing one still stops the run at that row with no
+//! report. Once a row has failed, a later row's failure is recorded instead
+//! (`row_failure` on a row with figures, an entry in `failed_replays` on one
+//! without) and the report is still printed
+//! (`metricsbench_ingest_smoke::a_later_hard_failure_after_a_failed_readback_keeps_the_report`).
 //!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
 //! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
@@ -49,14 +53,14 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
-    AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, GeneratedStream,
-    HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport, PayloadClass,
-    RavelReplayConfig, ReadbackConfig, Receiver, RowAccountingViolation, RunProvenance,
-    STALL_GRACE, STALL_RECHECK, StallCeiling, StalledRow, StreamBandViolation, StreamCounts,
-    Substrate, SystemIngestResult, SystemQueryResult, build_profile_record, check_anchor,
-    check_expected_digests_agree, check_row_accounting, check_row_band6, check_stream_band,
-    query_after_replay, readback_over_http, replay_into_ravel, replay_over_http_with_plan,
-    workload_digest,
+    AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, FailedReplay,
+    GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport,
+    PayloadClass, ProfileRecord, RavelReplayConfig, ReadbackConfig, Receiver,
+    RowAccountingViolation, RowFailure, RunProvenance, STALL_GRACE, STALL_RECHECK, StallCeiling,
+    StalledRow, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
+    SystemQueryResult, build_profile_record, check_anchor, check_expected_digests_agree,
+    check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
+    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{Profile, WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -318,6 +322,31 @@ enum RunError {
     Query(String),
 }
 
+impl RunError {
+    /// The ADR-0927 band a row check belongs to, `None` for a failure that
+    /// is not a numbered band.
+    fn band(&self) -> Option<u32> {
+        match self {
+            RunError::StreamBand { .. } | RunError::AccountingMismatch { .. } => Some(4),
+            RunError::Band6(_) | RunError::ScalarExpectedDiverged { .. } => Some(6),
+            _ => None,
+        }
+    }
+
+    /// The row a band 6 across rows failure names: the second of the two
+    /// rows that disagree.
+    fn implicated_system(&self) -> Option<&str> {
+        match self {
+            RunError::ScalarExpectedDiverged { system, .. } => Some(system),
+            RunError::Band6(Band6Violation::ExpectedDiverged { second_system, .. }) => {
+                Some(second_system)
+            }
+            RunError::Band6(Band6Violation::AcceptedDiffers { system, .. }) => Some(system),
+            _ => None,
+        }
+    }
+}
+
 /// Steps to generate: the flag if set, else the profile's full
 /// `samples_per_series`.
 fn resolve_steps(args: &Args, workload: &WorkloadFile) -> Result<u64, RunError> {
@@ -497,6 +526,29 @@ fn close_row(
     Ok((report, counts))
 }
 
+/// Close a portable row: [`close_row`], then its regeneration against the
+/// run's reference stream, or, for the first row to close, a non-empty
+/// accepted set. Returns the row's generator report.
+fn close_portable_row(
+    system: &str,
+    stream: GeneratedStream<'_>,
+    row: &SystemIngestResult,
+    reference: Option<&GenerationReport>,
+) -> Result<GenerationReport, RunError> {
+    let (report, _) = close_row(system, stream, row)?;
+    match reference {
+        Some(expected) if report.digest != expected.digest => Err(RunError::StreamDiverged {
+            system: system.to_string(),
+            expected: expected.digest.clone(),
+            got: report.digest,
+        }),
+        None if row.ingest.accepted_samples == 0 => Err(RunError::NothingIngested {
+            system: system.to_string(),
+        }),
+        _ => Ok(report),
+    }
+}
+
 /// Band 6 across rows: every portable row carries the same expected digest
 /// for every class, and, when the run has an in-process row, the same scalar
 /// expected digest as that row's `in_process_scalar`. Without an in-process
@@ -561,17 +613,15 @@ struct ReportContext<'a> {
 }
 
 impl ReportContext<'_> {
-    /// The report over `rows`, with the profile record built from the
-    /// reference stream's generator report.
-    fn assemble(
+    /// The profile record, built from the reference stream's generator
+    /// report.
+    fn profile_record(
         &self,
-        rows: Vec<SystemIngestResult>,
         reference: Option<&GenerationReport>,
-        query: Option<SystemQueryResult>,
-        substrate: Option<Substrate>,
-    ) -> Result<MetricsIngestReport, RunError> {
-        // `resolve_rows` refused a run with neither an in-process nor a portable
-        // row before anything was generated, so one of them set the reference.
+    ) -> Result<ProfileRecord, RunError> {
+        // A run with no failed row has a reference: `resolve_rows` refused a
+        // run with neither an in-process nor a portable row before anything
+        // was generated, and every row that closed set or matched it.
         let gen_report = reference
             .ok_or_else(|| RunError::Generate("no row replayed the stream".to_string()))?;
 
@@ -579,7 +629,7 @@ impl ReportContext<'_> {
         // generator's exact counts for the figures that are not directly declared
         // (total series created, logical input bytes) -- never derived from the
         // offered sample count.
-        let profile_record = build_profile_record(
+        build_profile_record(
             self.workload,
             self.profile,
             self.steps,
@@ -587,17 +637,29 @@ impl ReportContext<'_> {
             gen_report,
             self.provenance.clone(),
         )
-        .map_err(|e| RunError::Generate(e.to_string()))?;
-
-        let mut report = MetricsIngestReport::new(rows).with_profile(profile_record);
-        if let Some(query) = query {
-            report = report.with_query(query);
-        }
-        if let Some(substrate) = substrate {
-            report = report.with_substrate(substrate);
-        }
-        Ok(report)
+        .map_err(|e| RunError::Generate(e.to_string()))
     }
+}
+
+/// The report over `rows`, with whichever of the profile record, the query
+/// phase and the substrate the run produced.
+fn assemble(
+    rows: Vec<SystemIngestResult>,
+    profile: Option<ProfileRecord>,
+    query: Option<SystemQueryResult>,
+    substrate: Option<Substrate>,
+) -> MetricsIngestReport {
+    let mut report = MetricsIngestReport::new(rows);
+    if let Some(profile) = profile {
+        report = report.with_profile(profile);
+    }
+    if let Some(query) = query {
+        report = report.with_query(query);
+    }
+    if let Some(substrate) = substrate {
+        report = report.with_substrate(substrate);
+    }
+    report
 }
 
 async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
@@ -707,8 +769,10 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
     // `system` values are the names the query runner joins on.
     let mut portable = Vec::new();
     let mut stalled = Vec::new();
+    let mut failed_replays = Vec::new();
     // The first row whose read-back failed or that stalled: every row is
-    // still replayed, and the run exits with this one's code.
+    // still replayed, and the run exits with this one's code. Once it is
+    // set, a later row's failure is recorded rather than returned.
     let mut first_failure: Option<RunError> = None;
     for (receiver, endpoint, query_url, bearer_token, tenant) in [
         (
@@ -786,7 +850,16 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
                     ..
                 } = &error
                 else {
-                    return Err(RunFailure::from(error));
+                    if first_failure.is_none() {
+                        return Err(RunFailure::from(error));
+                    }
+                    eprintln!("metricsbench_ingest: {error}; replaying the next row");
+                    failed_replays.push(FailedReplay {
+                        system: system.to_string(),
+                        endpoint: endpoint.clone(),
+                        error: error.to_string(),
+                    });
+                    continue;
                 };
                 // A stalled row stops only itself (decision 7); the rows
                 // after it are still replayed.
@@ -805,23 +878,20 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
             }
         };
         let mut row = outcome.result;
-        let (report, _) = close_row(system, stream, &row)?;
-        match &reference {
-            Some(expected) if report.digest != expected.digest => {
-                return Err(RunFailure::from(RunError::StreamDiverged {
-                    system: system.to_string(),
-                    expected: expected.digest.clone(),
-                    got: report.digest,
-                }));
+        match close_portable_row(system, stream, &row, reference.as_ref()) {
+            Ok(report) => {
+                reference.get_or_insert(report);
             }
-            Some(_) => {}
-            None => {
-                if row.ingest.accepted_samples == 0 {
-                    return Err(RunFailure::from(RunError::NothingIngested {
-                        system: system.to_string(),
-                    }));
-                }
-                reference = Some(report);
+            Err(error) if first_failure.is_none() => return Err(RunFailure::from(error)),
+            Err(error) => {
+                // A row that failed to close is not read back.
+                eprintln!("metricsbench_ingest: {error}; replaying the next row");
+                row.row_failure = Some(RowFailure {
+                    band: error.band(),
+                    error: error.to_string(),
+                });
+                portable.push(row);
+                continue;
             }
         }
         let readback_cfg = ReadbackConfig {
@@ -855,17 +925,54 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
             first_failure.get_or_insert(error);
         }
     }
-    let portable_refs: Vec<&SystemIngestResult> = portable.iter().collect();
-    check_band6_across_rows(in_process_scalar.as_deref(), &portable_refs)?;
+    // A row that failed to close is left out: its failure is already
+    // recorded, and its stream need not be the reference's.
+    let closed: Vec<&SystemIngestResult> = portable
+        .iter()
+        .filter(|r| r.row_failure.is_none())
+        .collect();
+    if let Err(error) = check_band6_across_rows(in_process_scalar.as_deref(), &closed) {
+        if first_failure.is_none() {
+            return Err(RunFailure::from(error));
+        }
+        record_across_rows_failure(&mut portable, &error);
+    }
     rows.extend(portable);
-    let mut report = context.assemble(rows, reference.as_ref(), query, substrate)?;
+    let profile = match context.profile_record(reference.as_ref()) {
+        Ok(profile) => Some(profile),
+        Err(error) if first_failure.is_none() => return Err(RunFailure::from(error)),
+        Err(error) => {
+            eprintln!("metricsbench_ingest: {error}; printing the report without a profile");
+            None
+        }
+    };
+    let mut report = assemble(rows, profile, query, substrate);
     report.stalled = stalled;
+    report.failed_replays = failed_replays;
     match first_failure {
         None => Ok(report),
         Some(error) => Err(RunFailure {
             error,
             report: Some(report),
         }),
+    }
+}
+
+/// Records a band 6 across rows failure that follows an earlier row's
+/// failure as `row_failure` on the row it names, so the report is still
+/// printed
+/// (`tests::band6_across_rows_after_a_failure_is_recorded_on_the_named_row`).
+fn record_across_rows_failure(portable: &mut [SystemIngestResult], error: &RunError) {
+    eprintln!("metricsbench_ingest: {error}");
+    let named = error.implicated_system();
+    if let Some(row) = portable
+        .iter_mut()
+        .find(|r| Some(r.system.as_str()) == named)
+    {
+        row.row_failure.get_or_insert(RowFailure {
+            band: error.band(),
+            error: error.to_string(),
+        });
     }
 }
 
@@ -985,6 +1092,25 @@ mod tests {
     /// Without an in-process row, two portable rows whose expected digests
     /// differ still fail band 6; only the comparison with an in-process
     /// scalar digest is skipped.
+    #[test]
+    fn band6_across_rows_after_a_failure_is_recorded_on_the_named_row() {
+        let mut rows = vec![
+            portable_row("prometheus", "aa"),
+            portable_row("victoriametrics", "aa"),
+            portable_row("mimir", "ab"),
+        ];
+        let refs: Vec<&SystemIngestResult> = rows.iter().collect();
+        let err = check_band6_across_rows(None, &refs).expect_err("mimir's expected set differs");
+        record_across_rows_failure(&mut rows, &err);
+        let failure = rows[2]
+            .row_failure
+            .as_ref()
+            .expect("mimir carries the failure");
+        assert_eq!(failure.band, Some(6));
+        assert_eq!(failure.error, err.to_string());
+        assert!(rows[..2].iter().all(|r| r.row_failure.is_none()));
+    }
+
     #[test]
     fn portable_rows_still_cross_check_without_the_in_process_row() {
         let prometheus = portable_row("prometheus", "aa");

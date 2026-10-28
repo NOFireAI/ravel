@@ -487,6 +487,15 @@ After the last row the bin prints the report of every row and exits with the
 code the first failing row gives, 1
 (`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`,
 `metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`).
+Once a row has failed, a later row's own failure is recorded too rather than
+discarding the report: a row that fails band 4 or 6 or its stream check after
+its replay carries `row_failure` (`band`, `error`) and is not read back, and a
+row whose replay fails outright is listed under `failed_replays`; the exit
+code stays the first failure's
+(`metricsbench_ingest_smoke::a_later_hard_failure_after_a_failed_readback_keeps_the_report`).
+Band 6 across rows then runs over the rows without a `row_failure`, and its
+failure is recorded as `row_failure` on the row it names
+(`metricsbench_ingest::tests::band6_across_rows_after_a_failure_is_recorded_on_the_named_row`).
 `metricsbench_query` refuses such a report as a run result
 (`metricsbench_query::a_report_whose_readback_failed_does_not_bind`); with
 `--diagnostic-after-failed-ingest` it queries it as a diagnostic (see
@@ -983,7 +992,9 @@ that fails is not written and the exit is 70.
 which `deploy/metricsbench/run.sh` passes only after an ingest whose
 read-back failed or that stalled, binds such an ingest report instead of
 refusing it (`metrics_query::bind_diagnostic`). A row whose read-back failed
-is queried, an engine whose row stalled is left out, and every failure is
+is queried, and so is a row carrying a `row_failure`; an engine whose row
+stalled or is listed under `failed_replays` is left out
+(`metricsbench_query::a_row_failure_or_failed_replay_does_not_bind`), and every failure is
 recorded in the report's `failed_bands` with `run_verdict: "failed"` (see
 "Failed run verdict" under "Report schema version 3"). The report is checked
 by `report_schema::validate_diagnostic`, which applies every rule `validate`
