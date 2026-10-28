@@ -83,8 +83,9 @@
 //!   [`Reply::StepJournaled`] with the step's completed flag and its
 //!   effect's phase and attempt
 //!   (`schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
-//!   An effect showing an intent with no attempt is unmappable; no schedule
-//!   reaches this.
+//!   An effect showing an intent at attempt 0 is no effect yet, as
+//!   `crashed_step` reads it; an intent past attempt 0 is unmappable, and no
+//!   schedule reaches this.
 //! - `Coordinator::run_step` is [`Event::Step`], answered
 //!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher or
 //!   [`Reply::StepCompleted`] with the output's bytes
@@ -1273,9 +1274,10 @@ impl Proc {
                                 phase,
                                 attempt: e.attempt,
                             }),
+                            None if e.attempt == 0 => None,
                             None => {
                                 return Observed::Unmappable(format!(
-                                    "step journal shows an intent with no attempt: {e:?}"
+                                    "step journal shows an intent past attempt 0: {e:?}"
                                 ));
                             }
                         },
