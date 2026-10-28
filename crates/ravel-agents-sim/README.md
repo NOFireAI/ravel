@@ -22,7 +22,7 @@ clock wait.
 line of the form
 
 ```text
-sim-batch <schedule> base=<first seed> seeds=<count> totals=<...> pinned=<...> match|unpinned
+sim-batch <schedule> base=<first seed> seeds=<count> pages=<max page entries> totals=<...> pinned=<...> match|unpinned
 ```
 
 It exits 1 when the tests fail or a schedule's line is missing, doubled or
@@ -44,6 +44,28 @@ batch it then asserts exact totals, so a scheduler or production change that
 moves any total fails it; any other batch prints its totals as `unpinned`
 and is checked per seed only
 (`schedules::tests::a_batch_line_names_its_verdict`).
+
+`RAVEL_AGENTS_PAGE_ENTRIES` sets the store's `max_page_entries` for every
+rig (`drive::sim_limits`; default 64, the production default). At 2 every
+paged list seals after two entries, so the batches exercise sealed inbox,
+receipts, results and timers pages and `Rig::head` loads them before a
+check. The pins in the table below are for the default page size; at 2 each
+batch asserts its own pin set (`schedules::pinned_by_page`), and any other
+size prints `unpinned`. Every page GET and PUT is a scheduler gate, so a
+smaller page moves where the seeded script runs out, and past it the
+scheduler releases the lowest actor first. Four totals move at 2 for that
+reason, no invariant changes:
+
+| Batch | Default | At 2 | Why it moves |
+|---|---|---|---|
+| `races::enqueue_racing_completion_across_seeds` | 42 conflicts | 31 | each send writes an inbox and a receipts page before its CAS, so `w`'s commit lands unraced more often |
+| `senders::lost_cas_response_across_seeds` | 45 conflicts | 40 | the same extra page writes per send; the 40/13/11 landing positions do not move |
+| `workers::worker_kills_across_seeds` | 3 inferred, 2 stale-owner fences | 4 inferred, 1 stale-owner fence | one run that raced a takeover into a fenced stale commit settles a lost answer by inference instead |
+| `workers::cold_restart_across_seeds` | 113 turns | 108 | `c`'s page writes and result-page reads release `c` ahead of `w-restarted` past the script, leaving more inputs to the drain |
+
+The single-seed reproductions in `workers.rs` (seeds 0x5eed0033, 9000272
+and 11000167) run at the default page size whatever the variable says,
+since each names an interleaving found there.
 
 | Schedule | Fixed test | Batch test and pinned total |
 |---|---|---|

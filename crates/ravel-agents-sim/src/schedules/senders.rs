@@ -535,14 +535,19 @@ fn lost_cas_response_across_seeds() {
     }
     // How often a's lost write landed first, second or third.
     let landed = |n| accepted_seqs.iter().filter(|s| **s == n).count();
-    pinned(
+    pinned_by_page(
         "lost_cas_response",
         runs,
         ((landed(1), landed(2), landed(3)), a_conflicts),
-        (LOST_ACK_POSITIONS, LOST_ACK_CONFLICTS),
+        &(LOST_ACK_POSITIONS, LOST_ACK_CONFLICTS),
+        &(LOST_ACK_POSITIONS, SMALL_PAGE_LOST_ACK_CONFLICTS),
     );
 }
 
 const LOST_ACK_POSITIONS: (usize, usize, usize) = (44, 11, 9);
 /// Conflicts a's faulted CASes took, summed over the batch.
 const LOST_ACK_CONFLICTS: u64 = 28;
+/// The same at [`SMALL_PAGE_ENTRIES`]. Where a's write lands is unchanged;
+/// the page writes ahead of each CAS spend more of the script on calls
+/// that cannot conflict, so fewer of a's retries meet a moved HEAD.
+const SMALL_PAGE_LOST_ACK_CONFLICTS: u64 = 40;
