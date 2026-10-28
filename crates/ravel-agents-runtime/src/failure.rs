@@ -38,11 +38,11 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use ravel_agents_core::command::{Command, FailTurn};
-use ravel_agents_core::pages::{ListKind, Need};
 use ravel_agents_core::error::{AgentError, ErrorKind};
 use ravel_agents_core::head::ResultStatus;
 use ravel_agents_core::identity::{AgentId, request_hash};
 use ravel_agents_core::kernel::Reply;
+use ravel_agents_core::pages::{ListKind, Need};
 use ravel_agents_core::state::{Handle, OperationState};
 use ravel_agents_core::wire::{SendRequest, TurnLease};
 use ravel_agents_store::{HeadState, Outcome};
@@ -217,7 +217,11 @@ impl Coordinator {
         };
         let accept_seq = resolution.accept_seq;
         self.store
-            .attach(agent, &mut head, &[(ListKind::Results, Need::Key(accept_seq))])
+            .attach(
+                agent,
+                &mut head,
+                &[(ListKind::Results, Need::Key(accept_seq))],
+            )
             .await?;
         let Some(result) = head.results.iter().find(|r| r.accept_seq == accept_seq) else {
             return Err(unknown);

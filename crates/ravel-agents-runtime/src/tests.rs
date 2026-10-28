@@ -520,11 +520,7 @@ async fn a_takeover_resumes_a_turn_whose_input_is_on_a_sealed_inbox_page() {
     assert_eq!(active.accept_seq, 1);
     let sealed = head(&store1, "o-1").await;
     assert!(
-        sealed
-            .index
-            .inbox
-            .page_for(active.accept_seq)
-            .is_some(),
+        sealed.index.inbox.page_for(active.accept_seq).is_some(),
         "the active input sits on a sealed page"
     );
     drop(co1);

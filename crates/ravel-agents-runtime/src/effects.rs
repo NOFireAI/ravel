@@ -842,8 +842,7 @@ impl Coordinator {
             let current = open.epoch >= head.epoch
                 || (open.reconciled && open.incarnation == head.incarnation);
             a != agent
-                || (current
-                    && !(open.incarnation == head.incarnation && settled(open.accept_seq)))
+                || (current && !(open.incarnation == head.incarnation && settled(open.accept_seq)))
         });
     }
 

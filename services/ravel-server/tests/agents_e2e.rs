@@ -1154,7 +1154,11 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
     let mut first = String::new();
     for n in 0..DEEP_TURNS {
         let sent = api
-            .ok(CLIENT, "send", &send_body(&format!("req-{n}"), json!({"n": n})))
+            .ok(
+                CLIENT,
+                "send",
+                &send_body(&format!("req-{n}"), json!({"n": n})),
+            )
             .await;
         if n == 0 {
             first = sent["operation"].as_str().expect("operation").to_string();

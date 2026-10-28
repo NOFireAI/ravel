@@ -15,9 +15,7 @@ use ravel_agents_store::StoreLimits;
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 
 use super::*;
-use crate::drive::{
-    agent, json_bytes, one_terminal_result_per_input, sim_limits, turn_values,
-};
+use crate::drive::{agent, json_bytes, one_terminal_result_per_input, sim_limits, turn_values};
 use crate::history::History;
 use crate::reference::{Event, Reply};
 use crate::scheduler::{Action, FailureContext};

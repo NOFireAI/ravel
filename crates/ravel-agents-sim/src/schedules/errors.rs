@@ -16,9 +16,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_types::TenantHash;
 
 use super::*;
-use crate::drive::{
-    HANDLER, Refusal, TENANT, agent, head_object_key, json_bytes, pin, sim_limits,
-};
+use crate::drive::{HANDLER, Refusal, TENANT, agent, head_object_key, json_bytes, pin, sim_limits};
 use crate::reference::Event;
 use crate::{sim_assert, sim_assert_eq};
 

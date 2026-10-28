@@ -436,7 +436,11 @@ async fn colliding_receipt_fingerprints_resolve_to_their_own_receipts() {
         2,
         "one page lists the fingerprint twice"
     );
-    let open: Vec<&str> = head.receipts.iter().map(|r| r.request_id.as_str()).collect();
+    let open: Vec<&str> = head
+        .receipts
+        .iter()
+        .map(|r| r.request_id.as_str())
+        .collect();
     assert_eq!(open, vec!["f2"], "both colliding receipts are sealed");
 
     for (rid, seq) in COLLIDING.iter().zip([1, 2]) {

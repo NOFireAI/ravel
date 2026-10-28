@@ -164,8 +164,7 @@ impl Coordinator {
             .collect();
         for (agent, mut head) in lacking {
             let needs = dispatch_needs(&head);
-            if let Err(error) = self.store.attach(&agent, &mut head, &needs).await
-            {
+            if let Err(error) = self.store.attach(&agent, &mut head, &needs).await {
                 tracing::debug!(agent = %agent.to_hex(), %error, "agents dispatch page not read");
                 continue;
             }
