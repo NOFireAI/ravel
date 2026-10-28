@@ -812,18 +812,25 @@ impl Coordinator {
     /// those whose input `head` shows settled, since no step of that input
     /// follows. An unclaimed hand-over outlives its epoch: whichever owner
     /// runs the step next dispatches it.
+    ///
+    /// Reads no page: an input is settled when its result is in the open
+    /// results page or below `results.tail_from`, since results seal only
+    /// below the pending floor, which never falls.
     pub(crate) fn prune_open_attempts(&self, agent: &AgentId, head: &Head) {
         let mut attempts = self.open_attempts.lock();
         if attempts.is_empty() {
             return;
         }
+        let settled = |seq: u64| {
+            head.index.results.page_for(seq).is_some()
+                || head.results.iter().any(|r| r.accept_seq == seq)
+        };
         attempts.retain(|(a, _), open| {
             let current = open.epoch >= head.epoch
                 || (open.reconciled && open.incarnation == head.incarnation);
             a != agent
                 || (current
-                    && !(open.incarnation == head.incarnation
-                        && head.results.iter().any(|r| r.accept_seq == open.accept_seq)))
+                    && !(open.incarnation == head.incarnation && settled(open.accept_seq)))
         });
     }
 
@@ -945,10 +952,15 @@ fn step_effect<'a>(head: &'a Head, step_key: &str) -> Option<&'a EffectRecord> {
 }
 
 /// The input whose turn journaled `record`, among those HEAD still holds.
+/// The active turn's input is read from the turn itself; any other input's
+/// pages are in `head` because a reconciling `AuthorizeAttempt` loads every
+/// inbox and results page for an effect outside the active turn
+/// (`kernel::page_needs`).
 fn effect_input(head: &Head, record: &EffectRecord) -> Option<u64> {
-    head.inbox
+    head.active_turn
         .iter()
-        .map(|i| i.accept_seq)
+        .map(|t| t.input_accept_seq)
+        .chain(head.inbox.iter().map(|i| i.accept_seq))
         .chain(head.results.iter().map(|r| r.accept_seq))
         .find(|seq| effect_id(head.incarnation, *seq, &record.step_key) == record.effect_id)
 }
