@@ -397,11 +397,12 @@ pub fn page_needs(head: &Head, command: &Command) -> Vec<(ListKind, Need)> {
             ListKind::Receipts,
             Need::Fingerprint(receipt_fingerprint(&c.handler, &c.request_id)),
         )),
-        Command::BeginTurn(_) => {
-            if head.active_turn.is_none() {
-                needs.push((ListKind::Inbox, Need::First));
-            }
-        }
+        // A resumed turn's reply carries the root its assignment reads the
+        // input from, so the active input's page is loaded as well.
+        Command::BeginTurn(_) => needs.push(match &head.active_turn {
+            Some(t) => (ListKind::Inbox, Need::Key(t.input_accept_seq)),
+            None => (ListKind::Inbox, Need::First),
+        }),
         Command::CompleteTurn(c) => {
             turn(&mut needs, &c.fence);
             for change in &c.timer_changes {
