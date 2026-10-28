@@ -205,11 +205,20 @@ impl EventCursor {
 }
 
 /// A client for one server and one bearer token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentsClient {
     http: reqwest::Client,
     base: Url,
     token: String,
+}
+
+impl std::fmt::Debug for AgentsClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentsClient")
+            .field("base", &self.base.as_str())
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AgentsClient {
@@ -911,5 +920,14 @@ mod tests {
             AgentsClient::new("not a url", "tok"),
             Err(ClientError::BaseUrl { .. })
         ));
+    }
+
+    #[test]
+    fn debug_output_redacts_the_bearer_token() {
+        let token = "secret-bearer-4f1c";
+        let client = AgentsClient::new("http://127.0.0.1:4318", token).expect("client");
+        let printed = format!("{client:?}");
+        assert!(!printed.contains(token), "{printed}");
+        assert!(printed.contains("127.0.0.1:4318"), "{printed}");
     }
 }

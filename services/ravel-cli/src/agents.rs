@@ -6,7 +6,7 @@
 //! through the server's HTTP API with [`AgentsClient`], because settling an
 //! effect is a server-side decision that needs an `agents_admin` token.
 //! `dev` starts a development server on the compose RustFS store, and
-//! `scaffold` writes the TypeScript assistant example into a new directory.
+//! `scaffold` runs the TypeScript SDK's generator to write a starter project.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -62,33 +62,11 @@ const DEV_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the store probe waits before calling the store down.
 const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The TypeScript assistant example, as `scaffold` writes it.
-pub const SCAFFOLD_FILES: [(&str, &str); 6] = [
-    (
-        "README.md",
-        include_str!("../../../sdk/typescript/examples/assistant/README.md"),
-    ),
-    (
-        "assistant.ts",
-        include_str!("../../../sdk/typescript/examples/assistant/assistant.ts"),
-    ),
-    (
-        "fixture.ts",
-        include_str!("../../../sdk/typescript/examples/assistant/fixture.ts"),
-    ),
-    (
-        "kill-and-recover.ts",
-        include_str!("../../../sdk/typescript/examples/assistant/kill-and-recover.ts"),
-    ),
-    (
-        "main.ts",
-        include_str!("../../../sdk/typescript/examples/assistant/main.ts"),
-    ),
-    (
-        "scenario.ts",
-        include_str!("../../../sdk/typescript/examples/assistant/scenario.ts"),
-    ),
-];
+/// The SDK's scaffold generator, relative to the repository root.
+pub const SCAFFOLD_BIN: &str = "sdk/typescript/packages/agents/bin/ravel-agents-scaffold.js";
+
+/// The command `agents dev` prints for starting a project against it.
+pub const DEV_SCAFFOLD_COMMAND: &str = "ravel-cli agents scaffold my-agent";
 
 /// Every refusal `ravel-cli agents` makes before or instead of doing work.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +90,24 @@ pub enum AgentsCliError {
     LimitZero,
     #[error("{} exists and is not empty; scaffold writes only into a new or empty directory", dir.display())]
     ScaffoldDirNotEmpty { dir: PathBuf },
+    #[error(
+        "scaffold generator {} not found; run from the repository root or pass --scaffold-bin",
+        bin.display()
+    )]
+    ScaffoldBinMissing { bin: PathBuf },
+    #[error("{} could not start: {reason}", node.display())]
+    ScaffoldSpawn { node: PathBuf, reason: String },
+    #[error(
+        "scaffold generator {} exited with {}: {}",
+        bin.display(),
+        match code { Some(c) => format!("code {c}"), None => "a signal".to_string() },
+        stderr.trim_end()
+    )]
+    ScaffoldFailed {
+        bin: PathBuf,
+        code: Option<i32>,
+        stderr: String,
+    },
     #[error("agent id {0:?} is not 32 hex characters")]
     InvalidAgentId(String),
     #[error("agent kind or key is not valid")]
@@ -761,27 +757,48 @@ pub fn emit<T: Serialize>(
     Ok(())
 }
 
-/// `agents scaffold <dir>`: write the assistant example into `dir`, which
-/// must not exist or be empty. Returns the files written.
-pub fn scaffold(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
-    if dir.exists() {
-        let mut entries = std::fs::read_dir(dir)?;
-        if entries.next().is_some() {
-            return Err(AgentsCliError::ScaffoldDirNotEmpty {
-                dir: dir.to_path_buf(),
-            }
-            .into());
-        }
-    } else {
-        std::fs::create_dir_all(dir)?;
+/// `agents scaffold <dir>`: run the SDK generator as `node <bin> <dir>`.
+/// A `dir` that exists and is not empty is refused before anything is
+/// spawned. Returns the generator's stdout.
+pub fn scaffold(node: &Path, bin: &Path, dir: &Path) -> Result<String, AgentsCliError> {
+    if let Ok(mut entries) = std::fs::read_dir(dir)
+        && entries.next().is_some()
+    {
+        return Err(AgentsCliError::ScaffoldDirNotEmpty {
+            dir: dir.to_path_buf(),
+        });
     }
-    let mut written = Vec::with_capacity(SCAFFOLD_FILES.len());
-    for (name, body) in SCAFFOLD_FILES {
-        let file = dir.join(name);
-        std::fs::write(&file, body)?;
-        written.push(file);
+    if !bin.is_file() {
+        return Err(AgentsCliError::ScaffoldBinMissing {
+            bin: bin.to_path_buf(),
+        });
     }
-    Ok(written)
+    let output = std::process::Command::new(node)
+        .arg(bin)
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| AgentsCliError::ScaffoldSpawn {
+            node: node.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(AgentsCliError::ScaffoldFailed {
+            bin: bin.to_path_buf(),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    std::io::stderr().write_all(&output.stderr).ok();
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// What `agents scaffold --json` prints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaffoldOutput {
+    pub dir: String,
+    /// The generator's stdout: the files it wrote and the next command.
+    pub output: String,
 }
 
 /// The settings `agents dev` runs with.
@@ -836,17 +853,21 @@ pub struct DevReady {
     pub tenant: String,
     pub token: String,
     pub capabilities: Vec<String>,
+    /// The command that writes a starter project to run against the server.
+    pub scaffold: String,
 }
 
 pub fn render_dev_ready(ready: &DevReady) -> String {
     format!(
         "agents dev server ready (tenant {}, capabilities {}); stop it with Ctrl-C\n\
-         RAVEL_URL={}\nRAVEL_AGENTS_TOKEN={}\nRAVEL_WORKER_TOKEN={}\n",
+         RAVEL_URL={}\nRAVEL_AGENTS_TOKEN={}\nRAVEL_WORKER_TOKEN={}\n\
+         start a project with: {}\n",
         ready.tenant,
         ready.capabilities.join(","),
         ready.url,
         ready.token,
-        ready.token
+        ready.token,
+        ready.scaffold
     )
 }
 
@@ -874,6 +895,7 @@ pub async fn run_dev<H: DevHost>(
             .split(',')
             .map(str::to_string)
             .collect(),
+        scaffold: DEV_SCAFFOLD_COMMAND.to_string(),
     };
     emit(out, json, &ready, render_dev_ready)?;
     out.flush()?;

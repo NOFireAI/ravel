@@ -352,9 +352,9 @@ fn command_is_write(command: &Command) -> bool {
         // `inspect cstat` and `inspect kidx` only read the named object.
         | Command::Inspect { .. } => false,
         // The agents reads only read. `reconcile` writes through the server,
-        // which owns the bucket's write gate; `scaffold` writes local files;
-        // `dev` writes only through its `store qualify` child, which clears
-        // the gate itself.
+        // which owns the bucket's write gate; `scaffold` writes local files.
+        // `dev` writes nothing to the bucket itself: `store qualify` runs in
+        // a child process, and the server it starts owns its own writes.
         Command::Agents { command } => match command {
             AgentsCommand::List { .. }
             | AgentsCommand::Inspect { .. }
@@ -439,7 +439,8 @@ enum Command {
     },
     /// Ravel Agents (ADR-3331 decision 11): read agent state straight from
     /// the bucket, settle an effect through the server, start a development
-    /// server, and scaffold the TypeScript example.
+    /// server, and scaffold a TypeScript starter project. Timer commands are
+    /// not in this release.
     Agents {
         #[command(subcommand)]
         command: AgentsCommand,
@@ -1850,12 +1851,25 @@ enum AgentsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Write the TypeScript assistant example into DIR. Refuses a DIR that
-    /// exists and is not empty.
+    /// Write a TypeScript starter project into DIR by running the SDK's
+    /// generator with node: one agent, a local tool fixture, generated client
+    /// types and tests that need no API key. Refuses a DIR that exists and is
+    /// not empty before running anything.
     Scaffold {
-        /// Directory to create or fill.
+        /// Directory to create or fill; passed to the generator as given.
         dir: std::path::PathBuf,
-        /// Print the files written as JSON.
+        /// The generator script to run.
+        #[arg(
+            long,
+            value_name = "FILE",
+            env = "RAVEL_SCAFFOLD_BIN",
+            default_value = ravel_cli::agents::SCAFFOLD_BIN
+        )]
+        scaffold_bin: std::path::PathBuf,
+        /// The node binary that runs the generator (node 22).
+        #[arg(long, value_name = "PATH", env = "RAVEL_NODE", default_value = "node")]
+        node: std::path::PathBuf,
+        /// Print the directory and the generator's output as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -2698,17 +2712,18 @@ async fn run_agents(
             let token = uuid::Uuid::new_v4().simple().to_string();
             agents::run_dev(&options, &mut host, &token, stdout, json).await
         }
-        AgentsCommand::Scaffold { dir, json } => {
-            let written = agents::scaffold(&dir)?;
-            let names: Vec<String> = written.iter().map(|p| p.display().to_string()).collect();
-            agents::emit(stdout, json, &names, |names| {
-                let mut text: String = names.iter().map(|n| format!("{n}\n")).collect();
-                text.push_str(&format!(
-                    "wrote the assistant example to {}; see its README.md to run it\n",
-                    dir.display()
-                ));
-                text
-            })
+        AgentsCommand::Scaffold {
+            dir,
+            scaffold_bin,
+            node,
+            json,
+        } => {
+            let output = agents::scaffold(&node, &scaffold_bin, &dir)?;
+            let out = agents::ScaffoldOutput {
+                dir: dir.display().to_string(),
+                output,
+            };
+            agents::emit(stdout, json, &out, |out| out.output.clone())
         }
         AgentsCommand::List {
             tenant,
