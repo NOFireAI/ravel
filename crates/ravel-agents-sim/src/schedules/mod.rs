@@ -149,6 +149,34 @@ pub(crate) fn create(rig: &Rig) {
     .expect("setup create");
 }
 
+/// Create the agent and send `r1..=rn` outside any schedule.
+pub(crate) fn create_with_inputs(rig: &Rig, n: u64) {
+    rig.setup(|p| async move {
+        p.create().await.map_err(|e| format!("create: {e:?}"))?;
+        for i in 1..=n {
+            p.send(&format!("r{i}"), &payload(i))
+                .await
+                .map_err(|e| format!("send r{i}: {e:?}"))?;
+        }
+        Ok(())
+    })
+    .expect("setup inputs");
+}
+
+/// Name of the replacement worker [`drain`] runs.
+pub(crate) const DRAIN: &str = "drain";
+
+/// Put every lease past its grace, then run a fresh worker on its own
+/// coordinator until it finds no work.
+pub(crate) fn drain(rig: &Rig, seed: u64) -> ScheduleOutcome {
+    rig.clock.advance_ms(crate::drive::PAST_LEASE_MS);
+    let w = worker(rig, DRAIN, 99, |p| async move {
+        p.work(16).await;
+        Ok(())
+    });
+    run(rig, seed, ScheduleScript::new(Vec::new()), vec![w]).expect("drain")
+}
+
 pub(crate) fn payload(n: u64) -> Value {
     json!({ "n": n })
 }
