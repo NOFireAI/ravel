@@ -16,7 +16,15 @@
 //! decides only WHEN a takeover is attempted. It never decides whether a
 //! commit is valid: a commit carries the lease's own fence and the kernel
 //! checks that fence against HEAD. Renewals are in memory only; another
-//! coordinator sees the lease hint the takeover wrote into HEAD.
+//! coordinator sees the lease hint the takeover wrote into HEAD, which no
+//! heartbeat advances, so with two coordinators a turn that runs longer than
+//! `lease_ms + heartbeat_grace_ms` is taken over by a worker polling the
+//! other one and the first worker's commit is then refused. That bound
+//! holds until a renewal reaches HEAD (a kernel command under the owner
+//! fence; T11 #3345 and T15 #3348 own that design). The same table also
+//! lets a takeover at every turn boundary: `takeover_due` fires whenever the
+//! owner holds no active turn, so with several workers on one agent each
+//! boundary costs one `Takeover` CAS.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -197,9 +205,10 @@ impl Coordinator {
         })
     }
 
-    /// Activate an agent for `owner_id`: a takeover when it has no owner or
-    /// its owner's lease and grace ran out, nothing when `owner_id` already
-    /// owns it. Returns the owner's epoch.
+    /// Activate an agent for `owner_id`: a takeover when it has no owner,
+    /// when its owner holds no active turn, or when the owner's lease and
+    /// grace ran out; nothing when `owner_id` already owns it. Returns the
+    /// owner's epoch.
     pub async fn activate(&self, agent: &AgentRef, owner_id: &str) -> Result<u64, AgentError> {
         let (kind, key) = parse_agent(agent)?;
         let agent = agent_id(&kind, &key);
@@ -234,9 +243,13 @@ impl Coordinator {
         Ok(self.take_over(&agent, &head, owner_id, reason).await?.epoch)
     }
 
-    /// Renew a lease. Reads HEAD (one GET, never a write) and renews only
-    /// when HEAD still names the lease's owner, epoch and turn; otherwise
-    /// the worker has lost the turn. Returns the new expiry.
+    /// Renew a lease in this coordinator's table. Reads HEAD (one GET,
+    /// never a write) and renews only when HEAD still names the lease's
+    /// owner, epoch and turn; otherwise the worker has lost the turn.
+    /// Returns the new expiry. The renewal is visible to this coordinator
+    /// only: HEAD's lease hint is not advanced, so another coordinator still
+    /// takes the agent over `lease_ms + heartbeat_grace_ms` after the
+    /// takeover that granted the lease (see the module doc).
     pub async fn heartbeat(&self, lease: &TurnLease) -> Result<i64, AgentError> {
         let (agent, fence) = fence_from_lease(lease)?;
         let head = self.reload(&agent).await?;
