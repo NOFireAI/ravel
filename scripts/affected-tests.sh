@@ -18,10 +18,10 @@
 # closure this also runs `-p ravel-server --features sql` and `-p ravel-server
 # --features esql`, and when ravel-sql or ravel-server is, `-p ravel-server -p
 # ravel-sql --features flight-sql`, all on the `ci` profile. With ravel-server
-# in the closure it also runs, under `--features agents`, the agents_seam and
-# agents_effects_e2e binaries and the lib tests whole, plus ravel-catalog's
-# sys_proto_format_version_classification test, and under `--features mcp` the
-# mcp_e2e and trace_by_id binaries and the lib tests whole. Tests are selected
+# in the closure it also runs, under `--features agents`, the agents_seam,
+# agents_effects_e2e and agents_e2e binaries and the lib tests whole, plus
+# ravel-catalog's sys_proto_format_version_classification test, and under
+# `--features mcp` the mcp_e2e and trace_by_id binaries and the lib tests whole. Tests are selected
 # by binary, never by a test-name filter; scripts/gates.sh's run_feature_lanes
 # states why, and why the other integration binaries are left out. Its agents
 # and mcp lanes run the same tests.
@@ -138,7 +138,7 @@ classification_rc=0
 mcp_rc=0
 case "$affected" in
   *" ravel-server "*)
-    run_tests -p ravel-server --features agents --test agents_seam --test agents_effects_e2e || agents_rc=$?
+    run_tests -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e || agents_rc=$?
     agents_lib_rc=0
     run_tests -p ravel-server --features agents --lib || agents_lib_rc=$?
     [ "$agents_rc" -ne 0 ] || agents_rc=$agents_lib_rc
