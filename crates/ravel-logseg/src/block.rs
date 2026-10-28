@@ -783,10 +783,11 @@ pub fn write_block_columnar(
 /// keys instead of materializing one owned `Vec<u8>` per row; a plain page keeps
 /// the per-row values in one buffer plus offsets (ADR-3326 decision 2). Both are
 /// addressed by block row position and carry presence separately: an absent row
-/// reads `None` either way.
+/// reads `None` either way. A clone shares every buffer with the original.
+#[derive(Clone)]
 pub(crate) enum StrColumn {
     /// Per-row values in one buffer. What a plain page decodes to.
-    Plain(PlainColumn),
+    Plain(Arc<PlainColumn>),
     /// A shared dictionary plus one key per block row.
     Dict(DictColumn),
 }
@@ -798,8 +799,8 @@ pub(crate) enum StrColumn {
 /// decode; an absent row's key is 0 and is never read.
 pub(crate) struct DictColumn {
     values: Arc<DictValues>,
-    keys: Vec<i32>,
-    present: Validity,
+    keys: Arc<[i32]>,
+    present: Arc<Validity>,
     /// Whether `values` is a row group dictionary. Its legacy view narrows it
     /// to the entries the block uses, the dictionary a tag 7 page over the
     /// block's values would have.
@@ -828,11 +829,13 @@ impl DictColumn {
         ids: Vec<u32>,
         narrow: bool,
     ) -> Result<Self, LogSegError> {
-        let mut keys = Vec::with_capacity(present.len());
+        let mut keys: Arc<[i32]> = std::iter::repeat_n(0i32, present.len()).collect();
+        let out = Arc::get_mut(&mut keys)
+            .ok_or_else(|| LogSegError::Corrupted("key buffer is shared before decode".into()))?;
         let mut bits = Validity::unset(present.len());
         let mut used = Validity::unset(if narrow { values.len() } else { 0 });
         let mut it = ids.into_iter();
-        for (row, &p) in present.iter().enumerate() {
+        for ((row, &p), slot) in present.iter().enumerate().zip(out.iter_mut()) {
             if p {
                 let id = it.next().ok_or_else(|| {
                     LogSegError::Corrupted("presence/value count mismatch".into())
@@ -846,11 +849,9 @@ impl DictColumn {
                             values.len()
                         ))
                     })?;
-                keys.push(key);
+                *slot = key;
                 bits.set(row);
                 used.set(key as usize);
-            } else {
-                keys.push(0);
             }
         }
         if it.next().is_some() {
@@ -866,7 +867,7 @@ impl DictColumn {
         Ok(DictColumn {
             values,
             keys,
-            present: bits,
+            present: Arc::new(bits),
             narrow,
             legacy: OnceCell::new(),
             values_charge,
@@ -908,7 +909,8 @@ impl DictColumn {
     /// every other row becomes absent. `values` is the column's dictionary
     /// built for those rows alone ([`EntryTexts::build`]), the same length as
     /// the one it replaces, and belongs to this block, so it is charged in
-    /// full.
+    /// full. The keys are rewritten through [`Arc::make_mut`], so a holder
+    /// sharing them with this column keeps its own view.
     ///
     /// [`EntryTexts::build`]: crate::dict_values::EntryTexts::build
     pub(crate) fn restrict_to(&mut self, values: Arc<DictValues>, rows: &[usize]) {
@@ -918,12 +920,12 @@ impl DictColumn {
                 present.set(r);
             }
         }
-        for (r, key) in self.keys.iter_mut().enumerate() {
+        for (r, key) in Arc::make_mut(&mut self.keys).iter_mut().enumerate() {
             if !present.get(r) {
                 *key = 0;
             }
         }
-        self.present = present;
+        self.present = Arc::new(present);
         self.values_charge = values.heap_bytes();
         self.values = values;
         self.narrow = true;
@@ -969,15 +971,30 @@ impl DictColumn {
     /// pay for an entry once per block that reads it. A per-block dictionary
     /// page's dictionary belongs to the block alone and is charged in full.
     fn heap_bytes(&self) -> usize {
-        self.keys.capacity() * std::mem::size_of::<i32>()
+        self.keys.len() * std::mem::size_of::<i32>()
             + self.present.heap_bytes()
             + self.values_charge
     }
 }
 
+/// Shares the dictionary, keys and presence with the original. The legacy view
+/// is a derived cache and is rebuilt on first use rather than copied.
+impl Clone for DictColumn {
+    fn clone(&self) -> Self {
+        DictColumn {
+            values: Arc::clone(&self.values),
+            keys: Arc::clone(&self.keys),
+            present: Arc::clone(&self.present),
+            narrow: self.narrow,
+            legacy: OnceCell::new(),
+            values_charge: self.values_charge,
+        }
+    }
+}
+
 /// The most value bytes one [`PlainColumn`] holds: the largest `u32` offset,
-/// one byte short of 4 GiB.
-const PLAIN_VALUES_MAX: usize = u32::MAX as usize;
+/// the same bound a columnar batch's byte column has.
+const PLAIN_VALUES_MAX: usize = crate::columnar_batch::VAR_BYTES_MAX;
 
 /// The plain form of a string column (ADR-3326 decision 2): every present
 /// row's bytes concatenated in row order, `rows + 1` `u32` offsets into them,
@@ -1350,10 +1367,10 @@ impl<'a> BytesColRef<'a> {
 pub struct DecodedBlock {
     record_count: usize,
     i64_cols: ColMap<I64Column>,
-    f64_cols: ColMap<Vec<Option<u64>>>,
-    bool_cols: ColMap<Vec<Option<bool>>>,
+    f64_cols: ColMap<Arc<Vec<Option<u64>>>>,
+    bool_cols: ColMap<Arc<Vec<Option<bool>>>>,
     str_cols: ColMap<StrColumn>,
-    fixed_cols: ColMap<Vec<Option<Vec<u8>>>>,
+    fixed_cols: ColMap<Arc<Vec<Option<Vec<u8>>>>>,
     /// Count of column resolutions by id (`i64_col`, `bytes_col`, ... ), for
     /// tests that pin the scan does O(columns) resolutions per block, not
     /// O(rows x columns) (#875). A per-cell accessor bumps it once per cell; a
@@ -1466,7 +1483,8 @@ impl DecodedBlock {
     /// Capacity, not length, because capacity is what is allocated. The
     /// per-kind `HashMap` spines are not counted: they hold one entry per
     /// decoded column, bounded by the scan's column selection and negligible
-    /// against the cells.
+    /// against the cells. Nor is each column's `Arc` header (its two counts and
+    /// the vector or struct it wraps), for the same reason.
     pub fn decoded_heap_bytes(&self) -> usize {
         let mut total = 0usize;
         // The slot vectors themselves, before the columns they hold.
@@ -1533,11 +1551,11 @@ impl DecodedBlock {
     }
     pub fn f64_col(&self, column_id: u32) -> Option<&[Option<u64>]> {
         self.bump_lookup();
-        self.f64_cols.get(column_id).map(Vec::as_slice)
+        self.f64_cols.get(column_id).map(|v| v.as_slice())
     }
     pub fn bool_col(&self, column_id: u32) -> Option<&[Option<bool>]> {
         self.bump_lookup();
-        self.bool_cols.get(column_id).map(Vec::as_slice)
+        self.bool_cols.get(column_id).map(|v| v.as_slice())
     }
 
     /// The bytes of string column `column_id` at block row `row`, or `None` when
@@ -1618,7 +1636,7 @@ impl DecodedBlock {
 
     pub fn fixed_col(&self, column_id: u32) -> Option<&[Option<Vec<u8>>]> {
         self.bump_lookup();
-        self.fixed_cols.get(column_id).map(Vec::as_slice)
+        self.fixed_cols.get(column_id).map(|v| v.as_slice())
     }
 
     /// Test-only fused view of a string column, `None` when the column is absent.
@@ -1949,7 +1967,8 @@ fn decode_columns(
             ColKind::F64 => {
                 let present = present_rows(presence, record_count)?;
                 let vals = decode_f64(enc, encoded, present_count)?;
-                out.f64_cols.insert(column_id, scatter(&present, vals)?);
+                out.f64_cols
+                    .insert(column_id, Arc::new(scatter(&present, vals)?));
             }
             ColKind::Bool => {
                 if enc != Enc::Bitmap {
@@ -1959,7 +1978,8 @@ fn decode_columns(
                 }
                 let present = present_rows(presence, record_count)?;
                 let vals = decode_bitmap(encoded, present_count)?;
-                out.bool_cols.insert(column_id, scatter(&present, vals)?);
+                out.bool_cols
+                    .insert(column_id, Arc::new(scatter(&present, vals)?));
             }
             ColKind::Str => {
                 let present = present_rows(presence, record_count)?;
@@ -1981,38 +2001,42 @@ fn decode_columns(
                     let ids = decode_dict_ids(encoded, present_count, dict.len())?;
                     StrColumn::Dict(DictColumn::new(Arc::clone(dict), &present, ids, true)?)
                 } else if enc == Enc::Plain {
-                    StrColumn::Plain(PlainColumn::decode(
+                    StrColumn::Plain(Arc::new(PlainColumn::decode(
                         encoded,
                         &present,
                         present_count,
                         PLAIN_VALUES_MAX,
-                    )?)
+                    )?))
+                } else if enc == Enc::Dict {
+                    // The codec decodes an `Enc::Dict` page to the dictionary
+                    // form only.
+                    let DecodedStrings::Dict { dict, ids } =
+                        decode_strings_columnar(enc, encoded, present_count)?
+                    else {
+                        return Err(LogSegError::Corrupted(
+                            "a dictionary string page decoded as plain".into(),
+                        ));
+                    };
+                    let values = if deferred.contains(&column_id) {
+                        Arc::new(DictValues::unvalidated(&dict)?)
+                    } else {
+                        out.str_cells_validated += dict.len() as u64;
+                        Arc::new(DictValues::from_entries(&dict)?)
+                    };
+                    StrColumn::Dict(DictColumn::new(values, &present, ids, false)?)
                 } else {
-                    match decode_strings_columnar(enc, encoded, present_count)? {
-                        // Only an `Enc::Plain` page, handled above, decodes
-                        // to the plain form.
-                        DecodedStrings::Plain(_) => {
-                            return Err(LogSegError::Corrupted(format!(
-                                "enc {enc:?} decoded as a plain string page"
-                            )));
-                        }
-                        DecodedStrings::Dict { dict, ids } => {
-                            let values = if deferred.contains(&column_id) {
-                                Arc::new(DictValues::unvalidated(&dict)?)
-                            } else {
-                                out.str_cells_validated += dict.len() as u64;
-                                Arc::new(DictValues::from_entries(&dict)?)
-                            };
-                            StrColumn::Dict(DictColumn::new(values, &present, ids, false)?)
-                        }
-                    }
+                    // The same refusal the codec gives any other enc.
+                    return Err(LogSegError::Corrupted(format!(
+                        "enc {enc:?} is not a string codec"
+                    )));
                 };
                 out.str_cols.insert(column_id, col);
             }
             ColKind::Fixed(width) => {
                 let present = present_rows(presence, record_count)?;
                 let vals = decode_fixed(enc, encoded, present_count, width)?;
-                out.fixed_cols.insert(column_id, scatter(&present, vals)?);
+                out.fixed_cols
+                    .insert(column_id, Arc::new(scatter(&present, vals)?));
             }
         }
     }
@@ -3380,6 +3404,241 @@ mod tests {
                     }
                 }
                 assert_eq!(block.int_values_buffers(), 2, "{enc:?}");
+            }
+        }
+    }
+
+    /// A block of 50 rows carrying an f64 column (11, every other row), a bool
+    /// column (12, every third row) and the fixed-width trace id (even rows).
+    fn scalar_fixture() -> (BlockWriteOut, Vec<ColumnPlan>) {
+        let plans = vec![
+            ColumnPlan {
+                column_id: 11,
+                ty: FieldType::F64,
+            },
+            ColumnPlan {
+                column_id: 12,
+                ty: FieldType::Bool,
+            },
+        ];
+        let rows: Vec<ResolvedRow> = (0..50i64)
+            .map(|i| {
+                let mut r = row(0, i);
+                if i % 2 == 0 {
+                    r.trace_id = Some([i as u8; 16]);
+                    put(&mut r, 11, ColumnValue::F64((i as f64 * 0.5).to_bits()));
+                }
+                if i % 3 == 0 {
+                    put(&mut r, 12, ColumnValue::Bool(i % 2 == 0));
+                }
+                r
+            })
+            .collect();
+        let out = write_block(&rows, &plans, 3).expect("write");
+        (out, plans)
+    }
+
+    /// The f64, bool and fixed-width columns are charged their per-row vectors
+    /// at capacity plus each present fixed cell's own buffer; the slot vectors
+    /// hold one `Arc` pointer per column id up to the largest.
+    #[test]
+    fn scalar_decoded_heap_bytes_counts_each_buffer_at_capacity() {
+        let (out, plans) = scalar_fixture();
+        let keep = ColumnIdSet::from_iter([11, 12, COL_TRACE_ID]);
+        let dec = decode_out(&out, &plans, Some(&keep)).expect("read");
+
+        let f64_buf = 50 * std::mem::size_of::<Option<u64>>();
+        let bool_buf = 50 * std::mem::size_of::<Option<bool>>();
+        let fixed_buf = 50 * std::mem::size_of::<Option<Vec<u8>>>() + 25 * 16;
+        assert_eq!((f64_buf, bool_buf, fixed_buf), (800, 50, 1600));
+        let slot = std::mem::size_of::<Option<Arc<Vec<Option<u64>>>>>();
+        assert_eq!(slot, 8);
+        // f64 slots 0..=11, bool 0..=12, fixed 0..=6.
+        let slots = (12 + 13 + 7) * slot;
+        assert_eq!(
+            dec.decoded_heap_bytes(),
+            f64_buf + bool_buf + fixed_buf + slots
+        );
+        assert_eq!(dec.decoded_heap_bytes(), 2706);
+    }
+
+    /// The plain fixture's figure: 1140 bytes of buffer, offsets and presence
+    /// plus 11 string slots of 96 bytes each.
+    #[test]
+    fn plain_fixture_decoded_heap_bytes_is_pinned() {
+        let (_, out, plans) = plain_fixture();
+        let keep = ColumnIdSet::from_iter([10]);
+        let dec = decode_out(&out, &plans, Some(&keep)).expect("read");
+        assert_eq!(std::mem::size_of::<Option<StrColumn>>(), 96);
+        assert_eq!(dec.decoded_heap_bytes(), 1140 + 11 * 96);
+        assert_eq!(dec.decoded_heap_bytes(), 2196);
+    }
+
+    /// A clone of a decoded column of every kind shares its buffers with the
+    /// original, so handing one out copies no data.
+    #[test]
+    fn cloned_i64_column_shares_its_buffer() {
+        let (out, plans) = scalar_fixture();
+        let dec = decode_out(&out, &plans, None).expect("read");
+        let col = dec.i64_cols.get(COL_TS).expect("ts");
+        let held = col.clone();
+        assert!(held.shares_buffer_with(col));
+        assert_eq!(held.values().as_ptr(), col.values().as_ptr());
+    }
+
+    #[test]
+    fn cloned_f64_column_shares_its_buffer() {
+        let (out, plans) = scalar_fixture();
+        let dec = decode_out(&out, &plans, None).expect("read");
+        let col = dec.f64_cols.get(11).expect("f64");
+        let held = Arc::clone(col);
+        assert!(Arc::ptr_eq(&held, col));
+        assert_eq!(held.as_ptr(), dec.f64_col(11).expect("f64").as_ptr());
+    }
+
+    #[test]
+    fn cloned_bool_column_shares_its_buffer() {
+        let (out, plans) = scalar_fixture();
+        let dec = decode_out(&out, &plans, None).expect("read");
+        let col = dec.bool_cols.get(12).expect("bool");
+        let held = Arc::clone(col);
+        assert!(Arc::ptr_eq(&held, col));
+        assert_eq!(held.as_ptr(), dec.bool_col(12).expect("bool").as_ptr());
+    }
+
+    #[test]
+    fn cloned_fixed_column_shares_its_buffer() {
+        let (out, plans) = scalar_fixture();
+        let dec = decode_out(&out, &plans, None).expect("read");
+        let col = dec.fixed_cols.get(COL_TRACE_ID).expect("trace");
+        let held = Arc::clone(col);
+        assert!(Arc::ptr_eq(&held, col));
+        assert_eq!(
+            held.as_ptr(),
+            dec.fixed_col(COL_TRACE_ID).expect("trace").as_ptr()
+        );
+    }
+
+    #[test]
+    fn cloned_plain_column_shares_its_buffers() {
+        let (_, out, plans) = plain_fixture();
+        let dec = decode_out(&out, &plans, None).expect("read");
+        let col = dec.str_cols.get(10).expect("plain");
+        let held = col.clone();
+        let (StrColumn::Plain(a), StrColumn::Plain(b)) = (col, &held) else {
+            panic!("column 10 is a plain page");
+        };
+        assert!(Arc::ptr_eq(a, b));
+        assert_eq!(a.values.as_ptr(), b.values.as_ptr());
+        assert_eq!(a.offsets.as_ptr(), b.offsets.as_ptr());
+    }
+
+    /// Three entries, six rows, row 2 absent; every present row's key is
+    /// non-zero so a key zeroed in the wrong holder reads a different entry.
+    fn shared_dict_fixture() -> (Vec<Vec<u8>>, DictColumn) {
+        let entries: Vec<Vec<u8>> = vec![b"zero".to_vec(), b"one".to_vec(), b"two".to_vec()];
+        let values = Arc::new(DictValues::unvalidated(&entries).expect("dict"));
+        let present = [true, true, false, true, true, true];
+        let col = DictColumn::new(values, &present, vec![1, 2, 1, 2, 1], false).expect("col");
+        (entries, col)
+    }
+
+    fn dict_cells(col: &DictColumn) -> Vec<Option<Vec<u8>>> {
+        (0..col.rows())
+            .map(|r| col.cell(r).map(<[u8]>::to_vec))
+            .collect()
+    }
+
+    /// The stored key of every row, absent rows included.
+    fn raw_keys(col: &DictColumn) -> Vec<i32> {
+        col.keys.to_vec()
+    }
+
+    #[test]
+    fn cloned_dict_column_shares_its_buffers() {
+        let (_, col) = shared_dict_fixture();
+        let col = StrColumn::Dict(col);
+        let held = col.clone();
+        let (StrColumn::Dict(a), StrColumn::Dict(b)) = (&col, &held) else {
+            panic!("both are dictionary columns");
+        };
+        assert!(Arc::ptr_eq(&a.values, &b.values));
+        assert!(Arc::ptr_eq(&a.keys, &b.keys));
+        assert!(Arc::ptr_eq(&a.present, &b.present));
+        assert_eq!(a.heap_bytes(), b.heap_bytes());
+    }
+
+    /// Narrowing a column another holder shares rewrites a private copy of
+    /// the keys: the other holder still reads every row it read before.
+    #[test]
+    fn restrict_to_on_a_shared_column_leaves_the_other_holder_unchanged() {
+        let (entries, mut col) = shared_dict_fixture();
+        let other = col.clone();
+        let before = dict_cells(&other);
+        let one = Some(b"one".to_vec());
+        let two = Some(b"two".to_vec());
+        assert_eq!(
+            before,
+            [
+                one.clone(),
+                two.clone(),
+                None,
+                one.clone(),
+                two.clone(),
+                one
+            ]
+        );
+
+        let narrowed = Arc::new(DictValues::from_entries(&entries).expect("dict"));
+        col.restrict_to(narrowed, &[1, 4]);
+
+        assert_eq!(dict_cells(&other), before);
+        assert_eq!(raw_keys(&other), [1, 2, 0, 1, 2, 1]);
+        assert_eq!(dict_cells(&col), [None, two.clone(), None, None, two, None]);
+        assert!(!Arc::ptr_eq(&col.keys, &other.keys));
+        assert!(!Arc::ptr_eq(&col.present, &other.present));
+    }
+
+    /// With no other holder the keys are rewritten where they are.
+    #[test]
+    fn restrict_to_on_an_unshared_column_rewrites_the_keys_in_place() {
+        let (entries, mut col) = shared_dict_fixture();
+        let at = Arc::as_ptr(&col.keys);
+        let narrowed = Arc::new(DictValues::from_entries(&entries).expect("dict"));
+        col.restrict_to(narrowed, &[1, 4]);
+        assert_eq!(Arc::as_ptr(&col.keys), at);
+        assert_eq!(raw_keys(&col), [0, 2, 0, 0, 2, 0]);
+    }
+
+    /// A string column whose value page carries an enc that is neither a
+    /// string codec nor a dictionary id page is refused, as the codec refuses
+    /// it.
+    #[test]
+    fn string_column_with_a_non_string_enc_errors() {
+        let (_, out, plans) = plain_fixture();
+        for enc in [
+            Enc::Constant,
+            Enc::Rle,
+            Enc::Bitmap,
+            Enc::FixedWidth,
+            Enc::GcdI64,
+            Enc::ColumnRef,
+            Enc::DictPage,
+        ] {
+            let mut bad = out.clone();
+            let value = bad
+                .descs
+                .iter_mut()
+                .rev()
+                .find(|d| d.column_id == 10)
+                .expect("value page");
+            value.enc = enc;
+            match decode_out(&bad, &plans, None) {
+                Err(LogSegError::Corrupted(msg)) => {
+                    assert_eq!(msg, format!("enc {enc:?} is not a string codec"));
+                }
+                Err(other) => panic!("{enc:?}: {other:?}"),
+                Ok(_) => panic!("{enc:?} decoded as a string column"),
             }
         }
     }

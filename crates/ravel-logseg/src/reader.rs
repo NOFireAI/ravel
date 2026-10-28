@@ -9367,9 +9367,11 @@ mod tests {
                                 }
                             })
                             .collect::<Vec<_>>();
-                        *b.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") = StrColumn::Plain(
-                            crate::block::PlainColumn::from_cells(&cells).expect("plain column"),
-                        );
+                        *b.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") =
+                            StrColumn::Plain(Arc::new(
+                                crate::block::PlainColumn::from_cells(&cells)
+                                    .expect("plain column"),
+                            ));
                         b
                     };
 
@@ -9627,9 +9629,10 @@ mod tests {
                             }
                         })
                         .collect::<Vec<_>>();
-                    *block.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") = StrColumn::Plain(
-                        crate::block::PlainColumn::from_cells(&cells).expect("plain column"),
-                    );
+                    *block.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") =
+                        StrColumn::Plain(Arc::new(
+                            crate::block::PlainColumn::from_cells(&cells).expect("plain column"),
+                        ));
                     let pred = contains("s", "ab", false);
                     let run = |rows: &[usize]| {
                         arm_on_rows(&reader, &short.stream_dir, &pred, &block, rows)

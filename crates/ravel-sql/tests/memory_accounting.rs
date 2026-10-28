@@ -723,20 +723,21 @@ async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
     }
 }
 
-/// How far below the row path's peak the columnar path's peak may sit for the
-/// same data before this test calls it an undercharge.
+/// The band, in tenths, that the row path's peak divided by the columnar
+/// path's peak must fall in for the same data.
 ///
-/// The two paths hold different things, so their peaks are not equal and pinning
-/// a ratio exactly would be a change detector: the row path holds a
-/// `Vec<LogRecord>` (a per-record struct, a cloned STREAM_DIR blob and an owned
-/// `String` per record), the columnar path holds the decoded block plus the
-/// Arrow batches built from it. Since plain string columns decode into one
-/// values buffer plus offsets (ADR-3326 decision 2), the columnar peak on this
-/// fixture is 697,534 bytes against the row path's 2,104,634, about a third.
-/// A factor of 4 admits that while still failing the defect it exists to
-/// catch: charging the batches alone put the columnar peak at under a quarter
-/// of the row path's.
-const MAX_COLUMNAR_UNDERCHARGE: usize = 4;
+/// The two paths hold different things, so their peaks are not equal: the row
+/// path holds a `Vec<LogRecord>` (a per-record struct, a cloned STREAM_DIR blob
+/// and an owned `String` per record), the columnar path holds the decoded block
+/// plus the Arrow batches built from it. Measured with every decoded column
+/// form behind an `Arc` (ADR-3326 decision 1) over the plain string layout
+/// (decision 2), the columnar peak on this fixture is 697,342 bytes against the
+/// row path's 2,104,634, a ratio of 3.02. The band is 2.6 to 3.5, about 15%
+/// either side. Its upper edge fails the defect the test exists to catch:
+/// charging the batches alone put the columnar peak at 24% of the row path's,
+/// a ratio of about 4.2. Its lower edge fails a columnar charge grown by more
+/// than about a sixth, such as the decoded block charged twice.
+const COLUMNAR_RATIO_BAND_TENTHS: (usize, usize) = (26, 35);
 
 /// The columnar path's pool charge must be the same order of magnitude as the
 /// row path's for the same data, because it holds the same data.
@@ -813,13 +814,23 @@ async fn the_columnar_path_charges_the_same_order_of_bytes_as_the_row_path() {
     assert_eq!(fast.rows, ONE_BLOCK_RECORDS);
     assert!(fast.peak > 0 && row.peak > 0);
 
+    let (low, high) = COLUMNAR_RATIO_BAND_TENTHS;
     assert!(
-        fast.peak * MAX_COLUMNAR_UNDERCHARGE >= row.peak,
-        "the columnar path's peak charge ({} bytes) is more than \
-         {MAX_COLUMNAR_UNDERCHARGE}x below the row path's ({} bytes) for the \
-         identical block and projection, so the pool is not bounding what the \
-         scan actually holds (ADR-0087 decision 2). The decoded block stays \
-         resident behind the view while its batches drain; charge it.",
+        row.peak * 10 <= fast.peak * high,
+        "the columnar path's peak charge ({} bytes) is more than {high}/10 \
+         below the row path's ({} bytes) for the identical block and \
+         projection, so the pool is not bounding what the scan actually holds \
+         (ADR-0087 decision 2). The decoded block stays resident behind the \
+         view while its batches drain; charge it.",
+        fast.peak,
+        row.peak
+    );
+    assert!(
+        row.peak * 10 >= fast.peak * low,
+        "the columnar path's peak charge ({} bytes) is within {low}/10 of the \
+         row path's ({} bytes) for the identical block and projection: it has \
+         grown past the measured ratio of 3.02, so something is charged that \
+         the scan does not hold.",
         fast.peak,
         row.peak
     );
