@@ -62,10 +62,11 @@
 //! - [`Proc::operation`] reads through `AgentStore::resolve` and answers
 //!   [`Reply::Status`] (`schedules::senders::competing_senders_take_distinct_accept_seqs`),
 //!   or [`Reply::UnknownOperation`] when the root has no input under the
-//!   handle. No schedule queries a handle with no input yet, so the
-//!   `UnknownOperation` answers of [`Proc::operation`] and [`Proc::result`]
-//!   and the `Resolved(None)` answer of [`Proc::resolve`] are mappings no
-//!   test has reached; the milestone 3 schedules add one.
+//!   handle (`schedules::effects::query_of_a_handle_with_no_input`, which
+//!   also reaches the `UnknownOperation` answer of [`Proc::result`] and the
+//!   `Resolved(None)` answer of [`Proc::resolve`]).
+//! - [`Proc::result`] and [`Proc::resolve`] are the driver's own reads of
+//!   HEAD: the `Coordinator` has no result or resolve call.
 //! - [`Proc::result`] reads HEAD once and answers [`Reply::Result`]: `None`
 //!   while the input is not terminal, else its status, the output object's
 //!   bytes, and the error string with `""` read as no error
@@ -74,10 +75,36 @@
 //!   the receipt matching both handler and request id
 //!   (`schedules::senders::same_id_different_payload_conflicts`). A receipt
 //!   whose input has no state is unmappable.
-//! - The error kinds the reference models, `OwnershipLost`, `AgentGone` and
-//!   `IdempotencyConflict`, answer [`Reply::Error`]
+//! - `Coordinator::record_step` is [`Event::StepStarted`], answered
+//!   [`Reply::StepJournaled`] with the step's completed flag and its
+//!   effect's phase and attempt; an effect showing an intent with no attempt
+//!   is unmappable
+//!   (`schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
+//! - `Coordinator::run_step` is [`Event::Step`], answered
+//!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher or
+//!   [`Reply::StepCompleted`] with the output's bytes
+//!   (`schedules::effects::at_least_once_killed_after_execution`, where the
+//!   second dispatch is attempt 2).
+//! - `Coordinator::complete_effect` and `fail_effect` are
+//!   [`Event::EffectResult`]; a failure's result is the bytes of
+//!   `{"error": error}`, as production records it. Both answer
+//!   [`Reply::EffectRecorded`] or [`Reply::EffectEvidence`]
+//!   (`schedules::effects::at_least_once_late_result_after_takeover_is_evidence`,
+//!   `schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
+//! - `Coordinator::reconcile_attach` is [`Event::ReconcileAttach`], answered
+//!   like a result, and `reconcile_authorize` is
+//!   [`Event::ReconcileAuthorize`], answered [`Reply::Reconciled`] with its
+//!   `dispatched` flag (`schedules::effects::manual_killed_after_execution`,
+//!   `schedules::effects::manual_killed_before_tool_call`).
+//! - The error kinds the reference models, `OwnershipLost`, `AgentGone`,
+//!   `IdempotencyConflict`, `EffectInDoubt` and `NonDeterministicReplay`,
+//!   answer [`Reply::Error`]
 //!   (`schedules::workers::suspended_worker_commit_is_refused_after_takeover`,
-//!   `schedules::senders::same_id_different_payload_conflicts`).
+//!   `schedules::senders::same_id_different_payload_conflicts`,
+//!   `schedules::effects::manual_killed_before_tool_call`). No schedule
+//!   changes a step's call between runs, so `NonDeterministicReplay` is
+//!   reached only by the reference's own
+//!   `a_changed_step_call_blocks_the_agent`.
 //! - The kinds it does not model (`StoreUnavailable`, `MailboxFull`,
 //!   `BudgetExceeded`, `UnsupportedFormat`, `IncompatibleHandler`, and any
 //!   other) are not fed to the reference. They are collected as

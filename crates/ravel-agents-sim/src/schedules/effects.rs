@@ -811,6 +811,60 @@ fn query_of_a_handle_with_no_input() {
     );
 }
 
+/// A step journaled before it runs, an attempt that fails, and the journal
+/// read again: the failure is the effect's result and the step replays it.
+#[test]
+fn journaled_step_with_a_failed_attempt_replays_the_failure() {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let w1 = worker(&rig, "w1", 10, |p| async move {
+        let a = p
+            .poll()
+            .await
+            .map_err(|e| format!("poll: {e:?}"))?
+            .ok_or("no assignment")?;
+        p.record_step(&a, &call(ALO))
+            .await
+            .map_err(|e| format!("journal: {e:?}"))?;
+        let Ok(StepProgress::Dispatched(d)) = p.step(&a, &call(ALO)).await else {
+            return Err("the first step did not dispatch".to_string());
+        };
+        p.fail_effect(&op(1), &d, "declined")
+            .await
+            .map_err(|e| format!("fail: {e:?}"))?;
+        p.record_step(&a, &call(ALO))
+            .await
+            .map_err(|e| format!("journal again: {e:?}"))?;
+        let Ok(StepProgress::Completed { output }) = p.step(&a, &call(ALO)).await else {
+            return Err("the step did not replay".to_string());
+        };
+        if output != json!({ "error": "declined" }) {
+            return Err(format!("replayed {output}"));
+        }
+        let (state, out) = turn_values(&a);
+        p.commit(&a, &state, &out)
+            .await
+            .map_err(|e| format!("commit: {e:?}"))?;
+        Ok(())
+    });
+    let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![w1]).expect("schedule");
+    let run = checked(&rig, &out);
+    sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
+    sim_assert_eq!(
+        out,
+        story(&run),
+        expect_story(&[
+            "start 1: started",
+            "journal 1: StepJournaled { completed: false, effect: None }",
+            "step 1: dispatched a1",
+            "result 1 a1: recorded",
+            "journal 1: StepJournaled { completed: false, effect: Some(EffectView { phase: Completed, attempt: 1 }) }",
+            "step 1: replayed",
+            "commit 1: Completed",
+        ])
+    );
+}
+
 /// Counts a batch run ends with; summed over a batch's seeds.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Totals {

@@ -1690,7 +1690,10 @@ mod tests {
             (result(op, 3, b"new"), refused(ErrorKind::OwnershipLost)),
             (result(op, 2, b"new"), Reply::EffectRecorded),
             (result(op, 2, b"new"), Reply::EffectRecorded),
-            (result(op, 2, b"other"), refused(ErrorKind::IdempotencyConflict)),
+            (
+                result(op, 2, b"other"),
+                refused(ErrorKind::IdempotencyConflict),
+            ),
             (result(op, 1, b"old"), Reply::EffectEvidence),
             (
                 step(op, alo),
