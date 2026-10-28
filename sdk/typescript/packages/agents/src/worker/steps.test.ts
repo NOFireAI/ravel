@@ -513,4 +513,63 @@ describe("turns", () => {
     const matching = await turn(handlerDigest(counter, "boom"));
     expect(matching.outcome === "abandoned" ? matching.error : undefined).not.toBeInstanceOf(IncompatibleHandler);
   });
+
+  it("two agents at one version sharing a handler name are each leased their own turn", async () => {
+    // The lease pin must be matched by digest: by name and version alone the
+    // fake can hand agent a's turn with agent b's digest, the worker refuses
+    // it as IncompatibleHandler, and the fake never leases that agent again.
+    const twin = (name: string) =>
+      defineAgent({
+        name,
+        version: "1",
+        state: z.object({}),
+        initialState: {},
+        messages: {
+          go: message({
+            payload: z.object({}),
+            result: z.string(),
+            handler: () => Promise.resolve(name),
+          }),
+        },
+      });
+    const a = twin("a");
+    const b = twin("b");
+    const h = (harness = createTestHarness({ agents: [a, b] }));
+    const results = await Promise.all(
+      [a, b].flatMap((agent) =>
+        [1, 2].map(async (i) => {
+          const op = await h.agent(agent, `${agent.name}-${String(i)}`).send("go", {});
+          return op.result({ deadlineMs: 2_000 });
+        }),
+      ),
+    );
+    expect(results).toEqual(["a", "a", "b", "b"]);
+    expect(h.turns.filter((t) => t.outcome === "abandoned")).toHaveLength(0);
+  });
+
+  it("a poll that answers null before its wait elapses is backed off, not spun", async () => {
+    let polls = 0;
+    const transport: Transport = {
+      poll: async () => {
+        polls += 1;
+        // Yield a macrotask so a spinning worker still lets timers run and
+        // the test fails by count rather than by starving the event loop.
+        await new Promise((resolve) => setImmediate(resolve));
+        return null;
+      },
+      recordStep: () => Promise.reject(new Error("unused")),
+      failEffect: () => Promise.reject(new Error("unused")),
+      commit: () => Promise.reject(new Error("unused")),
+      completeEffect: () => Promise.reject(new Error("unused")),
+    };
+    const worker = await serveAgents({ transport, agents: [], pollWaitMs: 20_000 });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      // Four or five polls at a 50 ms backoff; a spinning loop makes thousands.
+      expect(polls).toBeGreaterThan(1);
+      expect(polls).toBeLessThan(10);
+    } finally {
+      await worker.close();
+    }
+  });
 });

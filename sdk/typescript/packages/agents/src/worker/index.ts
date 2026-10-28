@@ -143,6 +143,7 @@ export function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
   const loop = (async () => {
     while (!stopped()) {
       let polled;
+      const askedAt = Date.now();
       try {
         polled = await options.transport.poll(
           { worker_id: workerId, handlers, wait_ms: waitMs },
@@ -153,7 +154,15 @@ export function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
         await new Promise((resolve) => setTimeout(resolve, 50));
         continue;
       }
-      if (polled === null) continue;
+      if (polled === null) {
+        // An empty answer that came back before the wait elapsed is a
+        // transport that is not long-polling (or a closed fake): back off
+        // rather than spin.
+        if (Date.now() - askedAt < Math.min(waitMs, 50) && !stopped()) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        continue;
+      }
       const report = await runTurn(polled, agents, options.transport, controller.signal);
       options.onTurn?.(report);
     }
