@@ -1522,9 +1522,8 @@ jobs:
   # `features-otap`: its own job-scoped rust-cache key and the disk steps.
   # Mirrors scripts/gates.sh's agents lane: `cargo clippy -p ravel-server
   # --features agents --all-targets`, the agents_seam, agents_effects_e2e and
-  # agents_e2e test binaries and the lib tests whose path contains `agents`, and
-  # ravel-catalog's
-  # sys_proto_format_version_classification test, which covers
+  # agents_e2e test binaries, the lib tests whole (no path filter), and
+  # ravel-catalog's sys_proto_format_version_classification test, which covers
   # proto/ravel/agents.proto (ADR-3331 decision 3). Gated on agents_area.
   #
   # NOTE: not yet a required check; ADR-3331 decision 14 leaves adding it to
