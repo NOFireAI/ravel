@@ -54,7 +54,7 @@ below, with the ticket that builds each.
 | `WriteHint` (store half) | after a schedule CAS the store writes the advisory `_wake` hint with `Overwrite`; a failed hint write is logged and does not fail the command. Model difference: the store keys the hint by due bucket, the model by generation; the reader and sweep side is a design row below | `crates/ravel-agents-store/src/wake.rs::write_wake_hint` `crates/ravel-agents-store/src/publish.rs::AgentStore::after_publish` | `crates/ravel-agents-store/src/tests.rs::a_scheduled_timer_writes_its_wake_hint` `crates/ravel-agents-store/src/tests.rs::a_failed_wake_hint_does_not_fail_the_command` | none |
 | `TimerDue` | a timer is due when the store clock reaches its recorded due time; the runtime fires only timers HEAD holds as scheduled with `due_unix_ns <= now`, and the kernel refuses an early fire with `TimerNotDue` | `crates/ravel-agents-runtime/src/timers.rs::due_timers` `crates/ravel-agents-runtime/src/timers.rs::Coordinator::fire_due` | `crates/ravel-agents-runtime/src/timers/tests.rs::a_timer_fires_at_its_recorded_due_time_and_not_a_nanosecond_before` | none |
 | `HintObservedEarly` | a `_wake` hint is advisory: the sweep reads HEAD before acting on one, so a hint listed before its bucket is due, or one whose timer was cancelled or rescheduled, fires nothing, and a hint is deleted only after a HEAD read in the same pass shows no timer still armed in its bucket. Model difference: the store keys the hint by due bucket, the model by generation, so the stale-generation case is the cancelled and superseded timers the cited tests use | `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_wake` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::visit` `crates/ravel-agents-runtime/src/timers.rs::armed_in` | `crates/ravel-agents-runtime/src/timers/tests.rs::fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_premature_hint_fires_nothing_and_is_kept` `crates/ravel-agents-runtime/src/sweep/tests.rs::duplicate_hints_for_one_generation_fire_it_once` | none |
-| `FireTimer` (sweep half) | the sweep that drives `FireTimer` in production: each pass reads HEAD and fires the generation HEAD holds, never one named by a hint; the directory half reaches an agent whose hint was never written or was lost, and a pass is bounded by list pages and HEAD GETs with a cursor that resumes in list order | `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_dir` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_from_poll` | `crates/ravel-agents-runtime/src/timers/tests.rs::a_schedule_whose_hint_was_never_written_still_fires_when_due` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_lost_hint_is_found_by_the_directory_half_within_one_pass` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_bounded_pass_walks_the_directory_in_list_order_across_passes` | none |
+| `FireTimer` (sweep half) | the sweep that drives `FireTimer` in production: each pass reads HEAD and fires the generation HEAD holds, never one named by a hint; the directory half reaches an agent whose hint was never written or was lost, and a pass is bounded by list pages and HEAD GETs with a cursor that resumes in list order | `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_dir` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_from_poll` | `crates/ravel-agents-runtime/src/timers/tests.rs::a_schedule_whose_hint_was_never_written_still_fires_when_due` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_lost_hint_is_found_by_the_directory_half` `crates/ravel-agents-runtime/src/sweep/tests.rs::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_bounded_pass_walks_the_directory_in_list_order_across_passes` | none |
 
 ## Design rows (not yet built)
 
@@ -74,6 +74,17 @@ table above in the task that builds its symbol.
   citing the coordinator's lease expiry and takeover path, and the end-to-end
   crash test is T13 (#3346) in `ravel-agents-sim`.
 - Liveness: `InputEventuallyResolved` and `DueTimerEventuallyDelivered` hold
-  only under the coordinator's fairness (dispatch, retry and the sweep), so
-  their tests land with T13 (#3346) and T15 (#3348), citing the simulation
-  schedules for a resolved input and a delivered timer.
+  only under the coordinator's fairness (dispatch, retry and the sweep). The
+  sweep has landed (`crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once`):
+  a bounded pass resumes from a cursor, so every agent it can list is read
+  within a bounded number of passes
+  (`crates/ravel-agents-runtime/src/sweep/tests.rs::a_bounded_pass_walks_the_directory_in_list_order_across_passes`,
+  `crates/ravel-agents-runtime/src/sweep/tests.rs::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`).
+  The rows wait for simulation schedules that drive a resolved input and a
+  delivered timer through the production crates; the T13 (#3346) drivers
+  schedule no timers yet. Model difference: the model reaches a timer only
+  through its hint and assumes the hint write under `Fairness` (the
+  HEAD-listing half of the sweep is not modelled). The code's backstop for
+  a lost hint is the `_dir` listing, not a HEAD listing, so an agent with
+  neither (its create-time `_dir` PUT failed and its hint was lost) is not
+  reached; the `sweep` module docs state the bound and the gap.

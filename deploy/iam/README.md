@@ -69,8 +69,11 @@ template also carries the shared `DenyDeleteProtected` deny listed above; the
 grants below are what remains deletable after that deny applies.
 
 - **Gateway** (`gateway.json`): `GatewayAdmissionDelete` grants
-  `s3:DeleteObject` on `t/????????????????????????????????/?/admission/*`
-  only, and the gateway deletes no durable object. Each ingest process
+  `s3:DeleteObject` on `t/????????????????????????????????/?/admission/*`,
+  and `GatewayAgentsWakeDelete` grants `s3:DeleteObject` on
+  `t/*/ag/_wake/*`, the advisory Ravel Agents wake hints (see "Ravel Agents"
+  below). Those are its only deletes, and the gateway deletes no durable
+  object. Each ingest process
   overwrites its own per-signal admission snapshot
   `t/<tenant_hash>/<signal>/admission/<process_id>.snapshot`, and the
   admission reconcile (`reap_keys`, `crates/ravel-ingest/src/reconcile.rs`)
@@ -92,9 +95,11 @@ grants below are what remains deletable after that deny applies.
   `validate_table` (`crates/ravel-pqtable/src/names.rs`) refuses each of those
   segments as a table name (ADR-2040's 2026-10-03 IAM segment amendment).
 - **Query** (`query.json`): `QueryProbeDelete` grants `s3:DeleteObject` on
-  `sys/pq-probe/*` only, the scratch object the Parquet bucket probe writes
+  `sys/pq-probe/*`, the scratch object the Parquet bucket probe writes
   and deletes before it returns when HTTP DDL runs a `CREATE EXTERNAL TABLE`
-  (see "Parquet table DDL" below). The query path deletes nothing else. A
+  (see "Parquet table DDL" below), and `QueryAgentsWakeDelete` grants
+  `s3:DeleteObject` on `t/*/ag/_wake/*`, the advisory Ravel Agents wake
+  hints (see "Ravel Agents" below). The query path deletes nothing else. A
   draining query worker overwrites its own
   `sys/query/workers/` record with a stamp no reader accepts as live, and the
   maintain role reaps dead records (issue #1828).
@@ -402,21 +407,31 @@ hints under `_wake/` (`Overwrite`) and directory entries under `_dir/`
 (`CreateIfAbsent`). The runtime runs in a `query` or `all` process started
 with `--agents`, so the Query role writes the namespace; the Gateway role
 carries the same grants for an `all`-mode deployment under that credential.
-Maintain reads and lists it and writes nothing there. No role deletes an
-agent object: a HEAD is never deleted and live garbage collection of agent
-objects is not part of this release (ADR-3331 decision 2).
+Maintain reads and lists it and writes nothing there. The one delete under
+`ag/` is the wake hint: the Gateway and Query roles grant `s3:DeleteObject`
+on `t/*/ag/_wake/*` (`GatewayAgentsWakeDelete`, `QueryAgentsWakeDelete`) for
+the runtime's reconciliation sweep, which deletes a hint once a HEAD read
+shows no timer still armed in its bucket (ADR-3331 decision 8). No role
+deletes a HEAD, an `o/` object or a `_dir/` entry: a HEAD is never deleted
+and live garbage collection of agent objects is not part of this release
+(ADR-3331 decision 2). The `*` after `t/` crosses `/`, but no Parquet
+manifest key holds `/ag/_wake/`, since `ag` is a reserved table name and a
+manifest's next segment is `v`.
 
 | Key | Gateway | Query | Maintain | Admin |
 |---|---|---|---|---|
 | `t/*/ag/*` | list, get, put | list, get, put | list, get | list, get (through `t/*`) |
+| `t/*/ag/_wake/*` | delete | delete | none | none |
 
 `ag` is also a reserved Parquet table name, for the reason the "Delete grants
 per role" section gives for the other segments: `t/*/ag/*` would match the
 manifests of a table named `ag`. An existing table of that name stops
 resolving and `ravel-cli parquet repair --stray` reports its manifests as
-`ReservedName`. Pinned by
+`ReservedName`. The table above, the wake delete and its scope included,
+is pinned by
 `agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain`
-in `crates/ravel-commit/tests/iam_templates.rs`.
+in `crates/ravel-commit/tests/iam_templates.rs`: a wake delete widened to
+`t/*/ag/*`, or a Gateway or Query role without it, fails that test.
 
 ## Control-plane keys outside the data path
 

@@ -14,8 +14,9 @@
 //! ([`Clock`], [`IdSource`]), and every store call is counted by phase in
 //! [`counters`].
 //!
-//! The runtime crate (T9, #3343) drives this store; nothing in ravel-server
-//! reaches it until T11.
+//! The runtime crate (T9, #3343) drives this store, and `ravel-server`
+//! builds one per tenant for its agents routes
+//! (`services/ravel-server/src/agents/runtime.rs`, T11 #3345).
 
 pub mod backoff;
 pub mod counters;

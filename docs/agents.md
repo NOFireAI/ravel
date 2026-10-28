@@ -357,7 +357,8 @@ advance does (ADR-3331 decision 6).
 ## Guarantees and limitations
 
 Milestones are those of ADR-3331 decision 15. "In the crates" means the
-property holds in `ravel-agents-core` or `ravel-agents-store` on `main` and
+property holds in `ravel-agents-core`, `ravel-agents-store` or
+`ravel-agents-runtime` on `main` and
 is pinned by their own tests. "End to end" means a test in
 `services/ravel-server/tests/agents_e2e.rs` pins it through the HTTP routes
 of a running server.
@@ -379,8 +380,8 @@ of a running server.
 | A `manual` effect in doubt blocks the turn until reconciled | in the crates (kernel); end to end in M3 | kernel `a_manual_effect_goes_in_doubt_and_blocks_the_turn_until_reconciled` |
 | A step replayed with a different input blocks the turn | in the crates (kernel); end to end in M3 | kernel `a_step_replayed_with_another_input_blocks_the_turn` |
 | A timer fires once; a cancel after the firing reports `AlreadyFired` | in the crates (kernel); end to end in M4 | kernel `timers_fire_once_and_a_late_cancel_reports_already_fired` |
-| A timer fires without its wake hint | M4 (the sweep) | ADR-3331 decision 8 |
-| Wake hints are deleted when no longer needed | M4 | ADR-3331 decision 2 |
+| A timer fires without its wake hint | in the crates (runtime sweep); end to end in M4 | runtime `a_lost_hint_is_found_by_the_directory_half`, `a_schedule_whose_hint_was_never_written_still_fires_when_due`; the directory half reaches the agent within `ceil(agents / directory GETs per pass)` passes (`a_bounded_pass_walks_the_directory_in_list_order_across_passes`), and an agent with neither a hint nor a `_dir` entry is not reached (`sweep` module docs) |
+| Wake hints are deleted when no longer needed | in the crates (runtime sweep); end to end in M4 | runtime `fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation`, `duplicate_hints_for_one_generation_fire_it_once`; a hint is deleted only after a HEAD read in the same pass shows no timer armed in its bucket, and a premature one is kept (`a_premature_hint_fires_nothing_and_is_kept`) |
 | Destroy tombstones; recreate bumps the incarnation and refuses old handles | in the crates (M1) | kernel `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store `create_on_a_tombstoned_agent_bumps_the_incarnation` |
 | Kernel sequences keep the HEAD invariants | in the crates (M1) | kernel `kernel_sequences_keep_the_head_invariants` |
 | The production store and runtime are checked against the independent reference machine | M1 (simulation drivers, T13) | the reference machine exists in `ravel-agents-sim` and is tested on its own (`reference_machine_invariants_hold`); nothing drives the production crates through it yet |
