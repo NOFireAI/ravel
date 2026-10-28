@@ -418,7 +418,7 @@ SetWk(w, f) == wk' = [wk EXCEPT ![w] = f]
 
 \* Owner commands are validated against the epoch, owner and turn of the root
 \* they read, because their CAS pins that root's version. Takeover,
-\* BeginTurn, ScheduleTimer, CancelTimer and the rebase read and CAS in one
+\* BeginTurn and the rebase read and CAS in one
 \* step (CasNow). A turn's completion is two steps: its output object is
 \* written between the read and the CAS, and WorkerCas is that CAS on the
 \* version read before the output PUT.
@@ -512,12 +512,15 @@ CompleteTurnRebase(w) ==
     /\ SetWk(w, WorkerIdle)
     /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
-ScheduleTimer(w, ak) ==
-    /\ wk[w].pc = "idle"
+\* Timer commands are fenced by incarnation, not by owner, as the kernel's
+\* check_incarnation does: any caller holding the current incarnation may
+\* issue them, and a tombstoned HEAD or another incarnation answers
+\* AgentGone and writes nothing. With the read folded into the CAS that
+\* refusal is a stutter, so the fence is the ~h.tomb guard.
+ScheduleTimer(ak) ==
     /\ HeadUp(ak)
     /\ LET h == Head(ak)
        IN /\ ~h.tomb
-          /\ h.owner = w
           /\ h.timer.st # "armed"
           /\ h.timer.gen < MaxTimerGen
           /\ CasNow(ak, [h EXCEPT !.rev = @ + 1,
@@ -527,12 +530,10 @@ ScheduleTimer(w, ak) ==
 \* Cancel an armed generation. CancelTimer is enabled only while the timer is
 \* armed, so the AlreadyFired outcome of ADR-3331 decision 8 is not modelled
 \* here (the README lists it under what is not modelled).
-CancelTimer(w, ak) ==
-    /\ wk[w].pc = "idle"
+CancelTimer(ak) ==
     /\ HeadUp(ak)
     /\ LET h == Head(ak)
        IN /\ ~h.tomb
-          /\ h.owner = w
           /\ h.timer.st = "armed"
           /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.timer.st = "cancelled"])
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
@@ -605,8 +606,8 @@ Step ==
          \/ FailTurn(w) \/ WorkerCrash(w)
          \/ \E ak \in AKs :
               \/ Takeover(w, ak) \/ BeginTurn(w, ak) \/ PutTurnOutput(w, ak)
-              \/ ScheduleTimer(w, ak) \/ CancelTimer(w, ak)
     \/ \E ak \in AKs :
+         \/ ScheduleTimer(ak) \/ CancelTimer(ak)
          \/ WriteHint(ak) \/ TimerDue(ak)
          \/ \E g \in 1..MaxTimerGen : FireTimer(ak, g)
 
