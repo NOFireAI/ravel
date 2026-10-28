@@ -166,6 +166,12 @@ struct Args {
     /// operation including the body read (ADR-0927 decision 6).
     #[arg(long, default_value_t = 30)]
     http_timeout_secs: u64,
+    /// How long, in seconds, a portable row's read-back is repeated while it
+    /// reads less than was sent, for a receiver that acknowledges a write
+    /// before it can be queried. The same window applies to every system,
+    /// and each row records `attempts` and `settled_after_ms`. 0 reads once.
+    #[arg(long, default_value_t = 60)]
+    readback_settle_secs: u64,
 }
 
 /// A band violation: the run measured something outside what was pre-registered
@@ -646,6 +652,7 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
             query_url: query_url.clone(),
             bearer_token,
             timeout_secs: args.http_timeout_secs,
+            settle_secs: args.readback_settle_secs,
         };
         let readback = readback_over_http(&readback_cfg, &row, &outcome.plan)
             .await

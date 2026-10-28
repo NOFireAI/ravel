@@ -966,6 +966,8 @@ fn without_the_in_process_row_the_portable_rows_still_close_band_6() {
             row["system"]
         );
         assert_eq!(row["readback"]["matches_expected"], true, "{row}");
+        assert_eq!(row["readback"]["attempts"], 1, "{row}");
+        assert!(row["readback"]["settled_after_ms"].is_u64(), "{row}");
     }
     assert_eq!(
         systems[0]["ingest"]["expected_digests"],

@@ -350,6 +350,8 @@ fn readback(query_url: &str) -> Readback {
         },
         mismatches: Vec::new(),
         matches_expected: true,
+        attempts: 1,
+        settled_after_ms: 0,
     }
 }
 

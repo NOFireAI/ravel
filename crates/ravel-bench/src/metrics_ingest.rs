@@ -1066,6 +1066,15 @@ pub struct Readback {
     pub mismatches: Vec<String>,
     /// `mismatches` is empty.
     pub matches_expected: bool,
+    /// Read-backs taken, the reported one included: 1 when the first
+    /// matched or no settle window was given. 0 in a report written before
+    /// the field existed.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Milliseconds from the start of the first read-back to the end of the
+    /// one reported.
+    #[serde(default)]
+    pub settled_after_ms: u64,
 }
 
 /// The read-your-write query phase of a system's replay. Recorded as its own
@@ -3724,7 +3733,14 @@ pub struct ReadbackConfig {
     pub bearer_token: Option<String>,
     /// Per-request timeout in seconds.
     pub timeout_secs: u64,
+    /// How long, in seconds, to keep re-reading a row whose figures do not
+    /// yet match what was sent before reporting the mismatch. Zero reads
+    /// once. The same window applies to every system.
+    pub settle_secs: u64,
 }
+
+/// Pause between two read-backs of a row that has not settled.
+const READBACK_SETTLE_POLL: Duration = Duration::from_millis(500);
 
 /// Read `row` back from its receiver's query API and compare with what
 /// `plan` says was sent: `/api/v1/series` cardinality over the replay window,
@@ -3732,9 +3748,40 @@ pub struct ReadbackConfig {
 /// series count and the histogram probe's sample count, and that the stale
 /// marker probe ended its series. A Ravel row passes every token in
 /// `commit_tokens_by_shard` as `min_commit_token`, so the read observes
-/// every shard written. Returns the figures with `matches_expected` set;
-/// a mismatch is data, not an error.
+/// every shard written. A receiver that acknowledges a write before it
+/// makes the write queryable reads short at first, so a read that does not
+/// match is repeated every 500 ms until one matches or `settle_secs` has
+/// passed since the first; `attempts` and `settled_after_ms` record which
+/// read is reported. Returns the figures with `matches_expected` set; a
+/// mismatch is data, not an error.
 pub async fn readback_over_http(
+    config: &ReadbackConfig,
+    row: &SystemIngestResult,
+    plan: &ReadbackPlan,
+) -> Result<Readback, LaneError> {
+    // A plan with no window reads nothing, so a repeat cannot change it.
+    let settle = match (plan.min_ts_ms, plan.max_ts_ms) {
+        (Some(_), Some(_)) => Duration::from_secs(config.settle_secs),
+        _ => Duration::ZERO,
+    };
+    let started = std::time::Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let mut readback = read_back_once(config, row, plan).await?;
+        let elapsed = started.elapsed();
+        if readback.matches_expected || elapsed >= settle {
+            readback.attempts = attempts;
+            readback.settled_after_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            return Ok(readback);
+        }
+        tokio::time::sleep(READBACK_SETTLE_POLL.min(settle - elapsed)).await;
+    }
+}
+
+/// One read-back of `row`, as [`readback_over_http`] describes it, with
+/// `attempts` 1 and `settled_after_ms` 0.
+async fn read_back_once(
     config: &ReadbackConfig,
     row: &SystemIngestResult,
     plan: &ReadbackPlan,
@@ -3872,6 +3919,8 @@ pub async fn readback_over_http(
         matches_expected: mismatches.is_empty(),
         mismatches,
         expected,
+        attempts: 1,
+        settled_after_ms: 0,
     })
 }
 
@@ -3896,6 +3945,8 @@ fn empty_window_readback(query_url: String, expected: ReadbackExpected) -> Readb
         matches_expected: mismatches.is_empty(),
         mismatches,
         expected,
+        attempts: 1,
+        settled_after_ms: 0,
     }
 }
 
@@ -6698,7 +6749,13 @@ mod tests {
     /// A query stub answering the series and query endpoints as a receiver
     /// that stored `class_mix` would, with `extra_series` added to the
     /// all-series cardinality; it records every query string it receives.
-    fn query_stub(extra_series: usize, seen: Arc<std::sync::Mutex<Vec<String>>>) -> axum::Router {
+    /// Its first `hidden` requests, over both endpoints, answer as a receiver
+    /// that has acknowledged the writes but not yet made them queryable.
+    fn query_stub(
+        extra_series: usize,
+        hidden: usize,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> axum::Router {
         let pairs = |raw: &Option<String>| -> Vec<(String, String)> {
             reqwest::Url::parse(&format!("http://stub/?{}", raw.clone().unwrap_or_default()))
                 .expect("query parses")
@@ -6714,9 +6771,11 @@ mod tests {
                     move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
                         let seen = Arc::clone(&seen_series);
                         async move {
-                            seen.lock()
-                                .expect("lock")
-                                .push(raw.clone().unwrap_or_default());
+                            let lagging = {
+                                let mut seen = seen.lock().expect("lock");
+                                seen.push(raw.clone().unwrap_or_default());
+                                seen.len() <= hidden
+                            };
                             let matcher = pairs(&raw)
                                 .into_iter()
                                 .find(|(k, _)| k == "match[]")
@@ -6724,7 +6783,9 @@ mod tests {
                                 .unwrap_or_default();
                             // The histogram probe names only `mb_native`;
                             // the cardinality read names every metric sent.
-                            let n = if matcher.contains("mb_native") && !matcher.contains('|') {
+                            let n = if lagging {
+                                0
+                            } else if matcher.contains("mb_native") && !matcher.contains('|') {
                                 1
                             } else {
                                 3 + extra_series
@@ -6743,15 +6804,17 @@ mod tests {
                     move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
                         let seen = Arc::clone(&seen);
                         async move {
-                            seen.lock()
-                                .expect("lock")
-                                .push(raw.clone().unwrap_or_default());
+                            let lagging = {
+                                let mut seen = seen.lock().expect("lock");
+                                seen.push(raw.clone().unwrap_or_default());
+                                seen.len() <= hidden
+                            };
                             let query = pairs(&raw)
                                 .into_iter()
                                 .find(|(k, _)| k == "query")
                                 .map(|(_, v)| v)
                                 .unwrap_or_default();
-                            let result = if !query.starts_with("count_over_time(") {
+                            let result = if lagging || !query.starts_with("count_over_time(") {
                                 serde_json::json!([])
                             } else {
                                 let n = if query.contains("mb_native") {
@@ -6812,12 +6875,13 @@ mod tests {
 
         for (extra, matches) in [(0usize, true), (1, false)] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (addr, server) = serve(query_stub(extra, Arc::clone(&seen))).await;
+            let (addr, server) = serve(query_stub(extra, 0, Arc::clone(&seen))).await;
             let readback = readback_over_http(
                 &ReadbackConfig {
                     query_url: format!("http://{addr}"),
                     bearer_token: None,
                     timeout_secs: 5,
+                    settle_secs: 0,
                 },
                 &outcome.result,
                 &outcome.plan,
@@ -6826,6 +6890,7 @@ mod tests {
             .expect("read back");
             server.abort();
             assert_eq!(readback.matches_expected, matches, "{readback:?}");
+            assert_eq!(readback.attempts, 1);
             assert_eq!(readback.series_count, 3 + extra as u64);
             assert_eq!(readback.sample_count, 3);
             assert_eq!(readback.histogram_series_count, Some(1));
@@ -6861,6 +6926,91 @@ mod tests {
                 ],
                 "the cardinality read names only the metrics sent"
             );
+        }
+    }
+
+    /// A receiver that acknowledges writes before it makes them queryable
+    /// reads short at first. The read-back repeats until a read matches
+    /// inside the settle window; a receiver that never catches up is
+    /// reported short once the window has passed; with no window the first
+    /// read is the one reported.
+    ///
+    /// TO SEE THIS FAIL: return after the first read in
+    /// `readback_over_http` (the lagging receiver reports a mismatch on
+    /// attempt 1), drop its `elapsed >= settle` exit (the receiver that
+    /// never catches up runs into the 20 s timeout), or ignore
+    /// `settle_secs` in favour of a fixed window (the zero-window case
+    /// reads more than once).
+    #[tokio::test]
+    async fn readback_settles_on_a_lagging_receiver_within_the_window_only() {
+        let points = class_mix(base_ts_ms());
+        let (addr, server) = serve(write_stub(vec![
+            Canned::ok(Some(ravel_stub_header(1))),
+            Canned::ok(Some(ravel_stub_header(2))),
+            Canned::ok(Some(ravel_stub_header(3))),
+        ]))
+        .await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Ravel,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 3,
+            max_retries: 0,
+            timeout_secs: 5,
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points))
+            .await
+            .expect("replay");
+        server.abort();
+
+        // One read-back is five requests, so `hidden` 5 hides exactly the
+        // first read.
+        for (hidden, settle_secs) in [(5usize, 30u64), (usize::MAX, 1), (5, 0)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (addr, server) = serve(query_stub(0, hidden, Arc::clone(&seen))).await;
+            let readback = tokio::time::timeout(
+                Duration::from_secs(20),
+                readback_over_http(
+                    &ReadbackConfig {
+                        query_url: format!("http://{addr}"),
+                        bearer_token: None,
+                        timeout_secs: 5,
+                        settle_secs,
+                    },
+                    &outcome.result,
+                    &outcome.plan,
+                ),
+            )
+            .await
+            .expect("the settle window bounds the read-back")
+            .expect("read back");
+            server.abort();
+            let requests = seen.lock().expect("lock").len();
+            match (hidden, settle_secs) {
+                (5, 30) => {
+                    assert!(readback.matches_expected, "{readback:?}");
+                    assert_eq!(readback.attempts, 2);
+                    assert_eq!(requests, 10);
+                    assert!(readback.settled_after_ms >= 500, "{readback:?}");
+                    assert!(readback.settled_after_ms < 30_000, "{readback:?}");
+                }
+                (_, 1) => {
+                    assert!(!readback.matches_expected, "{readback:?}");
+                    assert!(readback.attempts >= 2, "{readback:?}");
+                    assert_eq!(requests, 5 * readback.attempts as usize);
+                    assert!(readback.settled_after_ms >= 1_000, "{readback:?}");
+                    assert_eq!(
+                        readback.mismatches.first().map(String::as_str),
+                        Some("series_count: read 0, expected 3")
+                    );
+                }
+                _ => {
+                    assert!(!readback.matches_expected, "{readback:?}");
+                    assert_eq!(readback.attempts, 1);
+                    assert_eq!(requests, 5);
+                }
+            }
         }
     }
 
