@@ -18,6 +18,15 @@
 //! whose entries did not change keeps its hash, and the open page seals
 //! through [`PageWriter`], whose bound check refuses the entry past
 //! `Limits::max_page_entries`.
+//!
+//! [`seal_index`] keeps three facts answerable from HEAD alone, with no page
+//! loaded. Scheduled timers are never sealed: timers seal only below the
+//! first scheduled generation. Whether the inbox holds an input is the
+//! directory's entry count plus the open page ([`Head::has_inbox`]), and the
+//! open inbox page is never empty while a sealed one exists
+//! ([`PageEntry::KEEP_TAIL`]). A result key below `results.tail_from` is
+//! settled: results seal only below the pending floor, the oldest input
+//! still in the inbox or running, which never moves down.
 
 use prost::Message as _;
 use ravel_proto::agents::v1 as pb;

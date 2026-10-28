@@ -1856,7 +1856,7 @@ impl Proc {
                 reason,
             )
         };
-        match self.store.read_head(&agent()).await? {
+        match self.store.read_head_full(&agent()).await? {
             HeadState::Present { head, .. } => {
                 if (incarnation != 0 && head.incarnation != incarnation)
                     || head.lifecycle == ravel_agents_core::head::Lifecycle::Tombstoned

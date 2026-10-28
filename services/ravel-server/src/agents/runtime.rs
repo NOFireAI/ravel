@@ -542,6 +542,7 @@ fn add_snapshots(a: AgentsMetricsSnapshot, b: AgentsMetricsSnapshot) -> AgentsMe
             build: add_phase(a.store.build, b.store.build),
             store: add_phase(a.store.store, b.store.store),
             publish: add_phase(a.store.publish, b.store.publish),
+            planner_misses: a.store.planner_misses + b.store.planner_misses,
         },
     }
 }
