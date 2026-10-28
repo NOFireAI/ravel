@@ -182,6 +182,15 @@ describe("scaffold", () => {
     });
   });
 
+  it("the generated README runs the scaffold bin by its path, never by its bare name", async () => {
+    const dir = await tempDir();
+    await scaffold(dir);
+    const readme = (await readFile(path.join(dir, "README.md"), "utf8")).replace(/\s*\n\s*/g, " ");
+    expect(readme).toContain("run `node packages/agents/bin/ravel-agents-scaffold.js <dir>`. Run the bin by its path");
+    expect(readme).toContain("so never use the bare name.");
+    expect(readme.match(/ravel-agents-scaffold/g)).toHaveLength(2);
+  });
+
   it("the template's contract.ts is the generator's output for the template agent", async () => {
     const checkedIn = await readFile(path.join(HERE, "template", "contract.ts"), "utf8");
     expect(checkedIn).toBe(generateContract(createOrderAgent(new PriceList()).order));

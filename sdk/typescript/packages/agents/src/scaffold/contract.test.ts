@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { createAssistant } from "../../../../examples/assistant/assistant.js";
 import { AssistantFixture } from "../../../../examples/assistant/fixture.js";
+import type { AnyAgentDefinition } from "../types.js";
 import { defineAgent } from "../worker/index.js";
 import { ContractError, generateContract } from "./contract.js";
 
@@ -24,30 +25,42 @@ afterEach(async () => {
  * which fails to compile unless the contract's types equal the ones the
  * client derives from the agent definition itself.
  */
-async function contractProject(contract: string): Promise<string> {
+/** `check.ts` comparing a contract's types for `handler` with `agentType`'s, imported from `from`. */
+function sameTypesCheck(from: string, agentType: string, handler: string): string {
+  return [
+    `import type { ${agentType} } from ${JSON.stringify(from)};`,
+    'import type { OperationHandle, PayloadOf, ResultOf } from "@ravel/agents/client";',
+    'import type { HandlerName, InputOf, OperationOf, OutputOf } from "./contract.js";',
+    "",
+    "type Same<X, Y> = [X] extends [Y] ? ([Y] extends [X] ? true : false) : false;",
+    "",
+    "export const checks: [",
+    `  Same<HandlerName, ${JSON.stringify(handler)}>,`,
+    `  Same<InputOf<${JSON.stringify(handler)}>, PayloadOf<${agentType}, ${JSON.stringify(handler)}>>,`,
+    `  Same<OutputOf<${JSON.stringify(handler)}>, ResultOf<${agentType}, ${JSON.stringify(handler)}>>,`,
+    `  Same<OperationOf<${JSON.stringify(handler)}>, OperationHandle<ResultOf<${agentType}, ${JSON.stringify(handler)}>>>,`,
+    "] = [true, true, true, true];",
+    "",
+  ].join("\n");
+}
+
+/** An empty module project resolving packages from the SDK's install. */
+async function tempProject(): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "ravel-contract-"));
   dirs.push(dir);
   await symlink(path.join(SDK_DIR, "node_modules"), path.join(dir, "node_modules"), "dir");
   await writeFile(path.join(dir, "package.json"), JSON.stringify({ type: "module" }));
+  return dir;
+}
+
+async function contractProject(
+  contract: string,
+  check = sameTypesCheck(ASSISTANT, "Assistant", "ask"),
+  dir?: string,
+): Promise<string> {
+  dir ??= await tempProject();
   await writeFile(path.join(dir, "contract.ts"), contract);
-  await writeFile(
-    path.join(dir, "check.ts"),
-    [
-      `import type { Assistant } from ${JSON.stringify(ASSISTANT)};`,
-      'import type { OperationHandle, PayloadOf, ResultOf } from "@ravel/agents/client";',
-      'import type { HandlerName, InputOf, OperationOf, OutputOf } from "./contract.js";',
-      "",
-      "type Same<X, Y> = [X] extends [Y] ? ([Y] extends [X] ? true : false) : false;",
-      "",
-      "export const checks: [",
-      '  Same<HandlerName, "ask">,',
-      '  Same<InputOf<"ask">, PayloadOf<Assistant, "ask">>,',
-      '  Same<OutputOf<"ask">, ResultOf<Assistant, "ask">>,',
-      '  Same<OperationOf<"ask">, OperationHandle<ResultOf<Assistant, "ask">>>,',
-      "] = [true, true, true, true];",
-      "",
-    ].join("\n"),
-  );
+  await writeFile(path.join(dir, "check.ts"), check);
   await writeFile(
     path.join(dir, "tsconfig.json"),
     JSON.stringify({
@@ -86,6 +99,34 @@ const notes = defineAgent({
     }),
   }),
 });
+
+/** An agent module with every record key form, written into a temp project and imported from there. */
+const RECORDS_AGENT = `import { defineAgent } from "@ravel/agents/worker";
+import { z } from "zod";
+
+const keys = z.enum(["x", "y"]);
+
+export const records = defineAgent({
+  name: "records",
+  version: "1",
+  state: z.object({}),
+  initialState: {},
+  messages: (message) => ({
+    go: message({
+      payload: z.object({
+        limits: z.record(keys, z.number()),
+        caps: z.partialRecord(keys, z.number()),
+        one: z.record(z.literal("x"), z.string()),
+        free: z.record(z.string(), z.number()),
+      }),
+      result: z.record(keys, z.boolean()),
+      handler: () => Promise.resolve({ x: true, y: false }),
+    }),
+  }),
+});
+
+export type Records = typeof records;
+`;
 
 function withResult(result: z.ZodType) {
   return defineAgent({
@@ -163,6 +204,69 @@ describe("generateContract", () => {
         "",
       ].join("\n"),
     );
+  });
+
+  it("an enum-keyed record is typed by its key union and typechecks against the agent's own types", async () => {
+    const dir = await tempProject();
+    await writeFile(path.join(dir, "records.ts"), RECORDS_AGENT);
+    const { records } = (await import(path.join(dir, "records.ts"))) as { records: AnyAgentDefinition };
+    const contract = generateContract(records);
+    expect(contract).toContain(
+      [
+        "    readonly input: {",
+        '      limits: Record<"x" | "y", number>;',
+        '      caps: Partial<Record<"x" | "y", number>>;',
+        '      one: Record<"x", string>;',
+        "      free: Record<string, number>;",
+        "    };",
+      ].join("\n"),
+    );
+    // TypeScript relates `Record<string, V>` to `Record<"x" | "y", V>` both
+    // ways, so the Same checks alone cannot see a widened key type; the
+    // payloads below can.
+    const check = [
+      sameTypesCheck("./records.js", "Records", "go"),
+      'export const full: InputOf<"go">["limits"] = { x: 1, y: 2 };',
+      "// @ts-expect-error a record missing an enum key is refused, as zod refuses it",
+      'export const short: InputOf<"go">["limits"] = { x: 1 };',
+      'export const some: InputOf<"go">["caps"] = { x: 1 };',
+      "// @ts-expect-error a key outside the enum is refused",
+      'export const stray: InputOf<"go">["caps"] = { z: 1 };',
+      "",
+    ].join("\n");
+    const run = tsc(await contractProject(contract, check, dir));
+    expect(run.output).toBe("");
+    expect(run.code).toBe(0);
+
+    // The string-keyed form the generator wrote before the key union fails
+    // the same check.
+    const widened = contract.replace('limits: Record<"x" | "y", number>;', "limits: Record<string, number>;");
+    expect(widened).not.toBe(contract);
+    const wide = tsc(await contractProject(widened, check, dir));
+    expect(wide.code).not.toBe(0);
+    const errors = wide.output.split("\n").filter((line) => line.includes("error TS"));
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/check\.ts\(\d+,\d+\): error TS2578: Unused '@ts-expect-error' directive\./);
+  }, 120_000);
+
+  it("a record whose keys are constrained other than by an enum is refused naming the keyword", () => {
+    for (const [result, keyword] of [
+      [z.record(z.string().regex(/^a/), z.number()), "pattern"],
+      [z.record(z.string().min(2), z.number()), "minLength"],
+    ] as const) {
+      let thrown: unknown;
+      try {
+        generateContract(withResult(result));
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ContractError);
+      expect(thrown).toMatchObject({
+        code: "unsupported_schema",
+        at: "go.result",
+        message: `go.result: JSON Schema keyword ${keyword} in propertyNames is not supported`,
+      });
+    }
   });
 
   it("a schema with no TypeScript form is refused with a ContractError naming the handler side", () => {

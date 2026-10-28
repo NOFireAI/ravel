@@ -136,7 +136,34 @@ function arrayType(schema: JsonSchema, at: string, depth: number): string {
   return `Array<${typeOf(items, at, depth)}>`;
 }
 
+/**
+ * The keys a record's `propertyNames` allows: every string, or the finite set
+ * an `enum` or `const` lists. Any other constraint on the keys is refused,
+ * since a wider key type would let a client send a payload zod rejects.
+ */
+function recordKeys(schema: JsonSchema, at: string): readonly string[] | null {
+  const names = schema.propertyNames;
+  if (names === undefined) return null;
+  if (!isSchema(names)) throw new ContractError(at, "propertyNames is not a schema");
+  for (const key of Object.keys(names)) {
+    if (key !== "type" && key !== "enum" && key !== "const") {
+      throw new ContractError(at, `JSON Schema keyword ${key} in propertyNames is not supported`);
+    }
+  }
+  if (names.type !== undefined && names.type !== "string") {
+    throw new ContractError(at, `propertyNames type ${JSON.stringify(names.type)} is not supported`);
+  }
+  const listed: unknown = "const" in names ? [names.const] : names.enum;
+  if (listed === undefined) return null;
+  if (!Array.isArray(listed) || listed.length === 0 || !listed.every((key) => typeof key === "string")) {
+    throw new ContractError(at, "propertyNames enum is not a list of strings");
+  }
+  return listed;
+}
+
 function objectType(schema: JsonSchema, at: string, depth: number): string {
+  const keys = recordKeys(schema, at);
+  if (keys !== null) return enumRecordType(schema, keys, at, depth);
   const properties = schema.properties ?? {};
   if (!isSchema(properties)) throw new ContractError(at, "object properties is not a map");
   const required = new Set(Array.isArray(schema.required) ? schema.required : []);
@@ -161,6 +188,24 @@ function objectType(schema: JsonSchema, at: string, depth: number): string {
   return shape ?? "Record<string, never>";
 }
 
+/**
+ * A record keyed by a finite key set: `Record<K, V>` when every key is
+ * required (`z.record`), `Partial<Record<K, V>>` when none is
+ * (`z.partialRecord`), as zod types them.
+ */
+function enumRecordType(schema: JsonSchema, keys: readonly string[], at: string, depth: number): string {
+  const extra = schema.additionalProperties;
+  if (schema.properties !== undefined || !isSchema(extra)) {
+    throw new ContractError(at, "propertyNames with an enum is supported only on a record");
+  }
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const record = `Record<${union(keys.map((key) => JSON.stringify(key)))}, ${typeOf(extra, at, depth)}>`;
+  const listed = keys.filter((key) => required.has(key)).length;
+  if (listed === keys.length) return record;
+  if (listed === 0) return `Partial<${record}>`;
+  throw new ContractError(at, "a record requiring only some of its enum keys is not supported");
+}
+
 function jsonSchema(schema: z.ZodType, io: "input" | "output", at: string): JsonSchema {
   try {
     return z.toJSONSchema(schema, { io, unrepresentable: "throw", cycles: "throw" });
@@ -175,7 +220,7 @@ function jsonSchema(schema: z.ZodType, io: "input" | "output", at: string): Json
  * but the definition, so regenerating an unchanged agent writes the same
  * bytes. Throws {@link ContractError} for a schema with no TypeScript form
  * (a `bigint`, a `Date`, a transform in a result schema, a recursive
- * schema).
+ * schema, a record whose keys are constrained other than by an enum).
  */
 export function generateContract(agent: AnyAgentDefinition): string {
   const handlers = Object.keys(agent.messages).sort();

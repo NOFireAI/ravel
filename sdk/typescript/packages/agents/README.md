@@ -39,7 +39,8 @@ The SDK runs against the in-process fake coordinator in
 | `@ravel/agents/contract` | `generateContract`: client types from an agent's handler schemas |
 | `@ravel/agents/scaffold` | `scaffold`: write a starter project into an empty directory |
 
-The package's bin, `ravel-agents-scaffold <dir>`, runs `scaffold`.
+The package's bin, `bin/ravel-agents-scaffold.js <dir>`, runs `scaffold`.
+Run it by path (see below), never by its bare name.
 
 The client entry imports no server-only module: nothing under `worker/`,
 `tools/` or `testing/`, and none of `node:child_process`, `node:fs` or
@@ -97,9 +98,18 @@ Against a server, the client side is the same with
 
 ## Scaffold and typed contract
 
-`ravel-agents-scaffold <dir>` (from `sdk/typescript/`, `node
-packages/agents/bin/ravel-agents-scaffold.js <dir>`) writes a starter project: one agent, `order`,
-whose `checkout` handler prices a line through the durable step `price`
+From `sdk/typescript/`, after `npm ci`:
+
+```sh
+node packages/agents/bin/ravel-agents-scaffold.js <dir>
+```
+
+Run the bin by its path. `npm ci` does not link it into
+`node_modules/.bin`, because the lockfile does not list a bin for this
+workspace package, and `npx ravel-agents-scaffold` would look the name up
+in the public npm registry instead, so never use the bare name.
+
+It writes a starter project: one agent, `order`, whose `checkout` handler prices a line through the durable step `price`
 against a local price-list fixture (no network, no API key); the client
 types generated from its handler schemas; a client typed by them; a vitest
 suite against `@ravel/agents/testing`; and its `package.json`, `tsconfig.json`
@@ -148,6 +158,17 @@ and outputs the result schemas' output side, as `PayloadOf` and `ResultOf`.
   schema is refused with `ContractError` code `unsupported_schema` naming
   the handler side. Test: `a schema with no TypeScript form is refused with
   a ContractError naming the handler side`.
+- A record keyed by an enum or a literal is typed by its key union:
+  `Record<"x" | "y", V>` for `z.record`, `Partial<Record<"x" | "y", V>>`
+  for `z.partialRecord`. A payload missing a key, or holding a key outside
+  the enum, fails to typecheck as zod fails to parse it. Test: `an
+  enum-keyed record is typed by its key union and typechecks against the
+  agent's own types`.
+- A record whose keys carry any other constraint (a pattern, a length) is
+  refused with `unsupported_schema` naming the keyword, since a
+  `Record<string, V>` would let a client send keys zod rejects. Test: `a
+  record whose keys are constrained other than by an enum is refused naming
+  the keyword`.
 - The template's checked-in `contract.ts` is the generator's output. Test:
   `the template's contract.ts is the generator's output for the template
   agent`.

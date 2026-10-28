@@ -23,6 +23,11 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    node packages/agents/bin/ravel-agents-scaffold.js ../../../my-agent
    ```
 
+   Run the bin by its path. `npm ci` does not link it into
+   `node_modules/.bin`, because the lockfile does not list a bin for this
+   workspace package, and `npx ravel-agents-scaffold` would look the name
+   up in the public npm registry instead, so never use the bare name.
+
    The project holds one agent, `order`, whose `checkout` handler prices a
    line through a durable step against a local price-list fixture, the
    client types generated from its handler schemas, a client typed by them,
@@ -174,9 +179,11 @@ server. Its tests are in `transport/http.test.ts`.
 - The poll wait is clamped to 20 s. Test: `clamps the poll wait to 20 s and
   leaves a shorter one alone`.
 - The lease is heartbeated once before each step and never while a tool
-  runs, so one tool run, or handler code between two steps, longer than the
-  30 s lease loses the turn to another worker. Test: `heartbeats once
-  before each step and sends nothing while a tool runs`.
+  runs. Test: `heartbeats once before each step and sends nothing while a
+  tool runs`. So one tool run, or handler code between two steps, that
+  outlasts the server's lease loses the turn to another worker. The lease
+  is 30 s by default: the agents runtime's `RuntimeConfig::default` sets
+  `lease_ms` to 30000.
 - The server serves no step or effect route yet, so steps are journaled in
   the worker's own memory and lost with its process. Test: `authorizes a
   new attempt at an unsettled at_least_once step and replays a settled
@@ -191,9 +198,9 @@ server. Its tests are in `transport/http.test.ts`.
 
 ## What the SDK does not do yet
 
-- `ravel-cli` has no scaffold command; the package's bin,
-  `ravel-agents-scaffold`, is the entry point. Test: `the bin writes a project, exits 1 on a non-empty
-  directory and 64 on bad usage`.
+- `ravel-cli` has no scaffold command; the package's bin, run by its path
+  as in the first run above, is the entry point. Test: `the bin writes a
+  project, exits 1 on a non-empty directory and 64 on bad usage`.
 - Steps and effects are not stored on the server, so a worker restart
   loses the step journal and a kill across processes cannot replay a step.
   Test: `authorizes a new attempt at an unsettled at_least_once step and
