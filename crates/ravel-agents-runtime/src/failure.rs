@@ -8,15 +8,25 @@
 //! unless the worker called the failure terminal
 //! (`tests::failing_max_attempts_dead_letters_the_input`).
 //!
-//! `OutcomeUnknown` from any command is settled in one place,
-//! [`Coordinator::settle_unknown`] (and its enqueue form): the operation
-//! handle the error carries is resolved through `AgentStore::resolve` before
-//! anything is retried. A command whose input is already terminal is
-//! answered from HEAD without running it again, so a lost acknowledgement
-//! never produces a second commit
-//! (`tests::lost_acknowledgement_is_resolved_without_a_second_cas`). A
-//! command whose input is not terminal runs once more; the kernel answers a
-//! retry of a published retryable failure or enqueue without a write.
+//! `OutcomeUnknown` is settled at three sites. An input-scoped command goes
+//! through [`Coordinator::settle_unknown`] (and its enqueue form,
+//! [`Coordinator::settle_enqueue`]): the operation handle the error carries
+//! is resolved through `AgentStore::resolve` before anything is retried.
+//! `Takeover` is settled by re-reading HEAD in `ownership.rs`, and
+//! `BeginTurn` by reloading HEAD and running it once more in `dispatch.rs`;
+//! neither has an operation handle.
+//!
+//! A command whose input is already terminal is answered from HEAD without
+//! running it again, so a lost acknowledgement never produces a second
+//! commit (`tests::lost_acknowledgement_is_resolved_without_a_second_cas`).
+//! A terminal input is this caller's only when HEAD's result names the
+//! fence's turn AND HEAD still names the fence's owner and epoch: a turn id
+//! survives a takeover, so a result the new owner published under the same
+//! turn is answered `OwnershipLost`
+//! (`tests::a_lost_commit_ack_after_a_takeover_is_ownership_lost_not_committed`).
+//! A command whose input is not terminal runs once more; the kernel answers a
+//! retry of a published retryable failure or enqueue without a write
+//! (`tests::an_enqueue_with_a_lost_ack_is_settled_through_the_receipt_index`).
 
 use std::sync::atomic::Ordering;
 
@@ -160,7 +170,9 @@ impl Coordinator {
 
     /// Settle `OutcomeUnknown` from `command`: resolve the handle the error
     /// carries, then answer a terminal input from HEAD, or run the command
-    /// once more when the input is not terminal.
+    /// once more when the input is not terminal. A turn command's terminal
+    /// input is answered as its own only under the fence's turn, owner and
+    /// epoch; otherwise it is `OwnershipLost`.
     pub(crate) async fn settle_unknown(
         &self,
         agent: &AgentId,
@@ -177,15 +189,15 @@ impl Coordinator {
             return Err(unknown);
         };
         let resolution = self.store.resolve(&handle).await?;
-        self.metrics
-            .outcome_unknown_resolved
-            .fetch_add(1, Ordering::Relaxed);
         let terminal = matches!(
             resolution.state,
             Some(OperationState::Completed | OperationState::Failed | OperationState::Cancelled)
         );
         if !terminal {
             let outcome = self.store.execute_with(agent, command, deps).await?;
+            self.metrics
+                .outcome_unknown_resolved
+                .fetch_add(1, Ordering::Relaxed);
             let confirmed_lost_ack = !outcome.published;
             return Ok(Settled {
                 outcome,
@@ -200,16 +212,24 @@ impl Coordinator {
         let Some(result) = head.results.iter().find(|r| r.accept_seq == accept_seq) else {
             return Err(unknown);
         };
-        let turn_id = match command {
-            Command::CompleteTurn(c) => Some(c.fence.turn_id),
-            Command::FailTurn(c) => Some(c.fence.turn_id),
+        let fence = match command {
+            Command::CompleteTurn(c) => Some(&c.fence),
+            Command::FailTurn(c) => Some(&c.fence),
             _ => None,
         };
-        if turn_id.is_some() && result.turn_id != turn_id {
+        if let Some(fence) = fence
+            && (result.turn_id != Some(fence.turn_id)
+                || head.epoch != fence.owner.epoch
+                || head.owner_id != fence.owner.owner_id)
+        {
+            self.metrics
+                .ownership_lost_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            self.observe(agent, &head);
             return Err(refused(
                 agent,
                 ErrorKind::OwnershipLost,
-                "the input ended under another turn",
+                "the input ended under another turn or owner",
             ));
         }
         let reply = match (command, result.status) {
@@ -232,6 +252,9 @@ impl Coordinator {
                 ));
             }
         };
+        self.metrics
+            .outcome_unknown_resolved
+            .fetch_add(1, Ordering::Relaxed);
         Ok(Settled {
             outcome: Outcome {
                 agent: *agent,
@@ -267,9 +290,6 @@ impl Coordinator {
             return Err(unknown);
         };
         let resolution = self.store.resolve(&handle).await?;
-        self.metrics
-            .outcome_unknown_resolved
-            .fetch_add(1, Ordering::Relaxed);
         let own = resolution.is_request(
             &req.request_id,
             &req.handler,
@@ -285,6 +305,9 @@ impl Coordinator {
                 payload.clone(),
             )
             .await?;
+        self.metrics
+            .outcome_unknown_resolved
+            .fetch_add(1, Ordering::Relaxed);
         if own && let Reply::Accepted { duplicate, .. } = &mut outcome.reply {
             *duplicate = false;
         }

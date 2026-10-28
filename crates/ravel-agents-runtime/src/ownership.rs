@@ -3,7 +3,13 @@
 //! Activation and takeover are each one kernel `Takeover` command through
 //! the store: one HEAD CAS that advances the epoch and names the new owner
 //! (`tests::worker_paused_past_lease_cannot_commit_after_takeover_epoch_advanced`
-//! asserts the CAS count). The owner id is the worker id.
+//! asserts the CAS count). The owner id is the worker id. A takeover whose
+//! acknowledgement was lost and whose HEAD shows another owner past the
+//! observed epoch is `OwnershipLost`, never the raw `OutcomeUnknown`
+//! (`tests::a_lost_takeover_ack_with_another_owner_in_head_is_ownership_lost`).
+//! The kernel accepts a takeover by the current owner too: it advances the
+//! epoch and keeps the active turn, so the owner's own older lease is
+//! refused (`tests::a_stale_lease_of_the_same_owner_cannot_commit_after_an_admin_takeover`).
 //!
 //! The lease table maps an agent to the owner, epoch and expiry this
 //! coordinator last granted or renewed. Expiry plus `heartbeat_grace_ms`
@@ -146,14 +152,31 @@ impl Coordinator {
                 return Err(e);
             }
             // A takeover has no operation handle to resolve; HEAD settles it:
-            // this owner at the next epoch means the lost write landed.
+            // this owner at the next epoch means the lost write landed, the
+            // observed epoch still standing means it did not, and anything
+            // else means another writer moved the agent on.
             Err(e) if e.kind == ErrorKind::OutcomeUnknown => {
                 let fresh = self.reload(agent).await?;
-                if fresh.owner_id != owner_id
-                    || fresh.incarnation != head.incarnation
-                    || fresh.epoch != head.epoch.saturating_add(1)
-                {
-                    return Err(e);
+                let landed = fresh.owner_id == owner_id
+                    && fresh.incarnation == head.incarnation
+                    && fresh.epoch == head.epoch.saturating_add(1);
+                if !landed {
+                    let unchanged = fresh.incarnation == head.incarnation
+                        && fresh.epoch == head.epoch
+                        && fresh.owner_id == head.owner_id;
+                    return Err(if unchanged {
+                        refused(
+                            agent,
+                            ErrorKind::StoreUnavailable,
+                            "takeover write did not apply",
+                        )
+                    } else {
+                        refused(
+                            agent,
+                            ErrorKind::OwnershipLost,
+                            "another writer advanced the epoch",
+                        )
+                    });
                 }
                 self.metrics
                     .outcome_unknown_resolved

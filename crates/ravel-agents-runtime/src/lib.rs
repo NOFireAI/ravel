@@ -8,7 +8,7 @@
 //! the lease carries, and drops idle agents from memory.
 //!
 //! Every durable fact lives in the agent's HEAD. The coordinator's own maps
-//! (loaded roots, the lease table, registered workers) are caches: a fresh
+//! (loaded roots, the lease table) are caches: a fresh
 //! coordinator over an existing store resumes every agent from HEAD alone
 //! (`tests::cold_restart_resumes_the_active_turn_from_head_alone`).
 //!
@@ -145,7 +145,6 @@ pub struct Coordinator {
     pub(crate) rng: Arc<dyn Rng>,
     pub(crate) agents: Mutex<HashMap<AgentId, Loaded>>,
     pub(crate) leases: LeaseTable,
-    pub(crate) workers: Mutex<HashMap<String, Vec<HandlerPin>>>,
     /// Whether the agent directory was scanned since start or the last
     /// unload.
     pub(crate) discovered: AtomicBool,
@@ -167,7 +166,6 @@ impl Coordinator {
             rng,
             agents: Mutex::new(HashMap::new()),
             leases: LeaseTable::default(),
-            workers: Mutex::new(HashMap::new()),
             discovered: AtomicBool::new(false),
             wake: Notify::new(),
             metrics: Metrics::default(),
@@ -182,14 +180,15 @@ impl Coordinator {
         self.clock.now_unix_ns()
     }
 
-    /// Register a worker and the handler pins it serves. Returns the worker
-    /// id the worker names in every later poll; it is also the owner id the
-    /// agents it takes over record.
+    /// Mint a worker id after checking that `handlers` parse. Records
+    /// nothing: a poll is served on the pins it carries, so a worker keeps
+    /// working against a restarted or a different coordinator that never
+    /// saw this call (`tests::a_poll_needs_no_registration_on_this_coordinator`).
+    /// The id is the one the worker names in every later poll, and the owner
+    /// id the agents it takes over record.
     pub fn register_worker(&self, handlers: &[HandlerPinBody]) -> Result<String, AgentError> {
-        let pins = parse_pins(handlers)?;
-        let worker_id = format!("w-{:016x}", self.rng.next_u64());
-        self.workers.lock().insert(worker_id.clone(), pins);
-        Ok(worker_id)
+        parse_pins(handlers)?;
+        Ok(format!("w-{:016x}", self.rng.next_u64()))
     }
 
     /// Create the agent, or report the existing one.

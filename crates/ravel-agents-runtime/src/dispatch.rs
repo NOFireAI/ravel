@@ -7,8 +7,15 @@
 //! earliest, ties broken by agent id.
 //!
 //! An agent whose HEAD records an active turn re-issues that turn: the same
-//! turn id, input and recorded step transcript, under the poller's own
-//! ownership epoch (`tests::cold_restart_resumes_the_active_turn_from_head_alone`).
+//! turn id, input and base state, under the poller's own ownership epoch
+//! (`tests::cold_restart_resumes_the_active_turn_from_head_alone`). The
+//! assignment also copies HEAD's recorded steps; no test here records one,
+//! and the step journal that writes them is task T14's.
+//!
+//! The takeover and the `BeginTurn` that follows each get one retry of
+//! their own, so losing a takeover race does not use up the settle of a
+//! `BeginTurn` whose acknowledgement was lost
+//! (`tests::a_takeover_race_does_not_consume_the_begin_turn_settle`).
 //! A poller whose pins do not exactly match an active turn's handler name,
 //! version and digest is refused `IncompatibleHandler` before any write
 //! (`tests::incompatible_handler_is_refused_before_any_write`).
@@ -197,7 +204,9 @@ impl Coordinator {
         worker: &str,
         pins: &[HandlerPin],
     ) -> Result<Option<TurnAssignment>, AgentError> {
-        let mut retried = false;
+        let mut takeover_retried = false;
+        let mut begin_retried = false;
+        let mut begin_unknown = false;
         loop {
             let Some(head) = self.cached(agent) else {
                 return Ok(None);
@@ -214,8 +223,8 @@ impl Coordinator {
                 };
                 match self.take_over(agent, &head, worker, reason).await {
                     Ok(fence) => fence,
-                    Err(e) if e.kind == ErrorKind::OwnershipLost && !retried => {
-                        retried = true;
+                    Err(e) if e.kind == ErrorKind::OwnershipLost && !takeover_retried => {
+                        takeover_retried = true;
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -231,14 +240,10 @@ impl Coordinator {
                 // `BeginTurn` landed without its acknowledgement.
                 Err(e)
                     if matches!(e.kind, ErrorKind::OwnershipLost | ErrorKind::OutcomeUnknown)
-                        && !retried =>
+                        && !begin_retried =>
                 {
-                    if e.kind == ErrorKind::OutcomeUnknown {
-                        self.metrics
-                            .outcome_unknown_resolved
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    retried = true;
+                    begin_unknown = e.kind == ErrorKind::OutcomeUnknown;
+                    begin_retried = true;
                     self.reload(agent).await?;
                     continue;
                 }
@@ -251,6 +256,11 @@ impl Coordinator {
                     return Err(e);
                 }
             };
+            if begin_unknown {
+                self.metrics
+                    .outcome_unknown_resolved
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.after_outcome(&out);
             let turn = match &out.reply {
                 Reply::TurnStarted(turn) | Reply::TurnResumed(turn) => turn.clone(),

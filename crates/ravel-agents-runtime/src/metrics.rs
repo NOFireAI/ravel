@@ -27,9 +27,11 @@ pub struct AgentsMetricsSnapshot {
     pub ownership_lost_refusals: u64,
     /// Polls and commands refused for a handler pin mismatch.
     pub incompatible_handler_refusals: u64,
-    /// `OutcomeUnknown` errors settled: through `AgentStore::resolve` for an
-    /// input-scoped command, by re-reading HEAD for `Takeover` and
-    /// `BeginTurn`.
+    /// `OutcomeUnknown` errors settled into this caller's answer: through
+    /// `AgentStore::resolve` for an input-scoped command, by re-reading HEAD
+    /// for `Takeover` and `BeginTurn`. Counted once the settle succeeds, not
+    /// when the error is seen; a settle that ends in a refusal or another
+    /// error is not counted.
     pub outcome_unknown_resolved: u64,
     /// Polls that found no work at first and waited.
     pub polls_waited: u64,
