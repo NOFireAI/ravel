@@ -412,7 +412,8 @@ async fn reconcile_audit_records(store: &dyn ObjectStoreBackend) -> Vec<LogRecor
 /// commit 1. A's refused second step, A's late result and B's `BeginTurn`
 /// publish nothing. 11 in all.
 #[tokio::test]
-async fn completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn() {
+async fn completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn()
+ {
     let running = start_server(Arc::new(MemoryStore::new())).await;
     let api = Api::public(&running);
     let (operation, assigned_a) = begin(&api).await;
@@ -817,7 +818,11 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
         .await;
     assert_eq!(retried["status"], json!("accepted"), "{retried}");
     let op = operation_status(&api, &operation).await;
-    assert_eq!(op["status"], json!("accepted"), "the turn is queued again: {op}");
+    assert_eq!(
+        op["status"],
+        json!("accepted"),
+        "the turn is queued again: {op}"
+    );
     let worker_b = register(&api).await;
     let assigned_b = poll(&api, &worker_b, 2_000).await;
     assert_eq!(assigned_b["operation"], json!(operation), "{assigned_b}");
@@ -829,10 +834,17 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
         assigned_b["lease"]["turn_id"], assigned_a["lease"]["turn_id"],
         "the retry runs under a new turn id"
     );
-    assert_eq!(steps[0]["step_id"], a_step["step"]["step_id"], "{assigned_b}");
+    assert_eq!(
+        steps[0]["step_id"], a_step["step"]["step_id"],
+        "{assigned_b}"
+    );
     let (status, replayed) = step(&api, &assigned_b, "at_least_once").await;
     assert_eq!(status, StatusCode::OK, "{replayed}");
-    assert_eq!(replayed["effect"], json!(effect), "the retry reuses the effect");
+    assert_eq!(
+        replayed["effect"],
+        json!(effect),
+        "the retry reuses the effect"
+    );
     assert_eq!(replayed["attempt"], json!(1));
     assert_eq!(replayed["failure"], json!("out of stock"));
     assert_eq!(replayed["step"]["status"], json!("started"));

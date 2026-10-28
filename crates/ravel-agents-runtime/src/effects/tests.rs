@@ -676,7 +676,11 @@ async fn fail_effect_records_the_failure_so_the_turn_can_fail() {
         .iter()
         .find(|st| st.step_key == "send-email")
         .expect("step journaled");
-    assert_eq!(step.status, StepStatus::Started, "a failure completes no step");
+    assert_eq!(
+        step.status,
+        StepStatus::Started,
+        "a failure completes no step"
+    );
     assert!(step.output.is_none());
     assert_eq!(hook.calls(), 2);
     assert!(matches!(
@@ -711,11 +715,18 @@ async fn a_reconciled_attempt_is_dispatched_by_the_owners_next_step() {
     let hook = Hook::default();
     let d1 = dispatched(&co, &a, &s, &hook).await;
     let b = takeover(&co, &clock).await;
-    let err = co.run_step(&b.lease, &s, &hook).await.expect_err("in doubt");
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
     assert_eq!(err.kind, ErrorKind::EffectInDoubt);
     assert_eq!(hook.calls(), 1);
 
-    assert!(co.reconcile_authorize(&d1.effect, 2).await.expect("authorize"));
+    assert!(
+        co.reconcile_authorize(&d1.effect, 2)
+            .await
+            .expect("authorize")
+    );
     assert_eq!(hook.calls(), 1, "reconcile dispatches nothing");
     let d2 = dispatched(&co, &b, &s, &hook).await;
     assert_eq!((d2.effect, d2.attempt), (d1.effect, 2));
@@ -734,7 +745,10 @@ async fn a_reconciled_attempt_is_dispatched_by_the_owners_next_step() {
             .expect("result"),
         EffectSettled::Recorded
     );
-    assert_eq!(step_output(&co, &b, &s, &hook).await, json!({"cents": 1700}));
+    assert_eq!(
+        step_output(&co, &b, &s, &hook).await,
+        json!({"cents": 1700})
+    );
     assert_eq!(hook.calls(), 2);
 }
 
@@ -979,11 +993,7 @@ async fn a_reconcile_authorization_with_a_lost_ack_dispatches_once() {
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
 
     // A genuine repeat hands nothing over.
-    assert!(
-        !co.reconcile_authorize(&d.effect, 2)
-            .await
-            .expect("again")
-    );
+    assert!(!co.reconcile_authorize(&d.effect, 2).await.expect("again"));
     let err = co
         .run_step(&b.lease, &s, &hook)
         .await
@@ -1165,7 +1175,11 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     }
     let authorized_here = reconciling.await.expect("join").expect("this reconcile");
     assert!(!authorized_here, "the attempt is the other admin's");
-    assert_eq!(cas_since(&store, &before), 0, "this call makes no further CAS");
+    assert_eq!(
+        cas_since(&store, &before),
+        0,
+        "this call makes no further CAS"
+    );
     assert_eq!(co.metrics().outcome_unknown_resolved, resolved);
     let h = head(&store, "o-1").await;
     assert_eq!(h, landed);
