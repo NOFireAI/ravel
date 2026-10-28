@@ -73,8 +73,7 @@ describe("order agent", () => {
     await until(() => prices.lookups.length === 1);
 
     // Kill the worker while its lookup is in flight; the fresh worker runs the
-    // at_least_once step again, and the first lookup's late answer is kept
-    // as evidence only.
+    // at_least_once step again and commits the turn.
     prices.hold = undefined;
     await h.crashWorker();
     expect(await handle.result()).toMatchObject({ lineCents: 1200, totalCents: 1200 });
@@ -83,6 +82,7 @@ describe("order agent", () => {
     expect(prices.lookups).toEqual(["B-2", "B-2"]);
     expect(h.coordinator.commits).toHaveLength(1);
     expect(h.coordinator.commits[0]?.lease.owner_id).toBe("harness-worker-2");
+    expect(await orderClient(h.client, "o-3").call("summary", {})).toEqual({ totalCents: 1200, lines: 1 });
   });
 
   it("contract.ts is the generator's output for the agent", () => {
