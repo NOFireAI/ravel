@@ -4715,6 +4715,7 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.10.2",
+ "ravel-agents-core",
  "ravel-fleet",
  "ravel-object-store",
  "ravel-proto",

@@ -8,7 +8,7 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["t/", "t/*/*/c/*", "t/*/*/l0/*", "t/*/*/l1/*", "t/*/catalog/*/*", "admission/query/*", "sys/query/workers/*", "t/*/pq/t/*"]
+          "s3:prefix": ["t/", "t/*/*/c/*", "t/*/*/l0/*", "t/*/*/l1/*", "t/*/catalog/*/*", "admission/query/*", "sys/query/workers/*", "t/*/pq/t/*", "t/*/ag/*"]
         }
       }
     },
@@ -56,7 +56,8 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/a/state/latest",
         "arn:aws:s3:::my-ravel-bucket/t/*/m/meta",
         "arn:aws:s3:::my-ravel-bucket/t/*/pq/grants",
-        "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/ag/*"
       ]
     },
     {
@@ -75,7 +76,8 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/a/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/a/alert-lease",
         "arn:aws:s3:::my-ravel-bucket/t/*/a/state/latest",
-        "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*"
+        "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/ag/*"
       ]
     },
     {

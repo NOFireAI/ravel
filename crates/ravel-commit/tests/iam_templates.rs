@@ -17,6 +17,11 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use ravel_agents_core::identity::{AgentId, ObjectHash, agent_id};
+use ravel_agents_core::keys::{
+    AgentKey, AgentKind, DueBucket, agent_prefix, dir_key, dir_prefix, head_key, object_key,
+    tenant_prefix as agents_tenant_prefix, wake_key, wake_prefix,
+};
 use ravel_commit::keys::{
     commit_key, commit_shard_hour_prefix, commit_shard_prefix, compaction_record_key, data_key,
     del_prefix, erasure_completion_key, erasure_request_key, ingest_hour_string, l1_part_key,
@@ -430,6 +435,42 @@ fn parquet_and_admission_witness_keys() -> Vec<String> {
     keys
 }
 
+/// The witness agent the Ravel Agents keys below are built for.
+fn agents_witness_agent() -> AgentId {
+    agent_id(
+        &AgentKind::new("witness").expect("kind"),
+        &AgentKey::new("one").expect("key"),
+    )
+}
+
+/// One key of each Ravel Agents family (ADR-3331 decision 2): the HEAD, an
+/// immutable object, a wake hint and a directory entry, built with
+/// `ravel-agents-core`'s own key constructors.
+fn agents_witness_keys() -> Vec<String> {
+    let tenant = test_tenant();
+    let agent = agents_witness_agent();
+    vec![
+        head_key(&tenant, &agent).expect("head_key"),
+        object_key(&tenant, &agent, &ObjectHash::of(b"witness")).expect("object_key"),
+        wake_key(&tenant, DueBucket::for_due(0).expect("due bucket"), &agent).expect("wake_key"),
+        dir_key(&tenant, &agent).expect("dir_key"),
+    ]
+}
+
+/// The listing prefixes the agents store and sweep issue under
+/// `t/<tenant_hash>/ag/`: the tenant's whole namespace, one agent, the wake
+/// hints and the directory.
+fn agents_witness_prefixes() -> Vec<String> {
+    let tenant = test_tenant();
+    let agent = agents_witness_agent();
+    vec![
+        agents_tenant_prefix(&tenant).expect("tenant_prefix"),
+        agent_prefix(&tenant, &agent).expect("agent_prefix"),
+        wake_prefix(&tenant).expect("wake_prefix"),
+        dir_prefix(&tenant).expect("dir_prefix"),
+    ]
+}
+
 /// The key domain the value-level checks in this file evaluate a pattern
 /// against: every key `ravel-commit`'s constructors can produce, plus one
 /// witness per non-tenant keyspace the templates name, plus one per
@@ -445,6 +486,7 @@ fn key_domain() -> &'static [String] {
         keys.extend(constructor_free_tenant_witness_keys());
         keys.extend(quarantine_witness_keys());
         keys.extend(parquet_and_admission_witness_keys());
+        keys.extend(agents_witness_keys());
         keys
     })
 }
@@ -2265,6 +2307,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/admission/*",
             "t/*/catalog/*/*",
+            "t/*/ag/*",
             // GatewayListBootstrapKeys and GatewayListTenantBootstrapKeys
             // (bootstrap_list_grants_carry_exactly_the_expected_conditions);
             // the last two are the keyed-ingest marker probe
@@ -2299,6 +2342,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/enc",
             "t/*/m/meta",
+            "t/*/ag/*",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2312,6 +2356,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/t/*",
             "t/*/m/meta",
+            "t/*/ag/*",
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
@@ -2367,6 +2412,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "admission/query/*",
             "sys/query/workers/*",
             "t/*/pq/t/*",
+            "t/*/ag/*",
             // QueryListBootstrapKeys and QueryListTenantBootstrapKeys
             // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
             "sys/tenancy",
@@ -2405,6 +2451,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/m/meta",
             "t/*/pq/grants",
             "t/*/pq/t/*",
+            "t/*/ag/*",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -2420,6 +2467,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/alert-lease",
             "t/*/a/state/latest",
             "sys/pq-probe/*",
+            "t/*/ag/*",
             "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
             KEY_EPOCH_PATTERN,
             KEY_EPOCH_PATTERN,
@@ -2558,6 +2606,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/",
             "quarantine/t/*/a/",
             "t/*/pq/t/*",
+            "t/*/ag/*",
             // MaintainListBootstrapKeys and MaintainListTenantBootstrapKeys
             // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
             "sys/tenancy",
@@ -2594,6 +2643,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/config",
             "t/*/enc",
             "t/*/a/state/latest",
+            "t/*/ag/*",
         ],
         get_actions: &["s3:GetObject"],
         puts: &[
@@ -6743,6 +6793,7 @@ fn query_template_admits_the_startup_commit_listing_and_lists_the_data_prefixes(
                 "admission/query/*",
                 "sys/query/workers/*",
                 "t/*/pq/t/*",
+                "t/*/ag/*",
             ]}},
         }),
         "query/QueryList: the statement is not exactly the expected list grant"
@@ -7269,7 +7320,7 @@ fn maintain_template_covers_every_parquet_sweep_call() {
 /// The table names `crates/ravel-pqtable/src/names.rs` refuses because a
 /// shipped template grants that key segment after a wildcard (ADR-2040's
 /// 2026-10-03 IAM segment amendment).
-const RESERVED_IAM_TABLE_NAMES: [&str; 10] = [
+const RESERVED_IAM_TABLE_NAMES: [&str; 11] = [
     "l0",
     "c",
     "l1",
@@ -7280,6 +7331,7 @@ const RESERVED_IAM_TABLE_NAMES: [&str; 10] = [
     "catalog",
     "del",
     "a",
+    "ag",
 ];
 
 /// The string literals of `IAM_GRANT_SEGMENTS` as written in
@@ -7386,6 +7438,81 @@ fn every_reserved_table_name_has_a_manifest_witness_a_template_grant_reaches() {
              so {word:?} has no reason to be a reserved table name: un-reserve it \
              in names.rs deliberately, or restore the grant"
         );
+    }
+}
+
+/// Every way `policy` departs from the Ravel Agents grant rule of ADR-3331
+/// decision 2: every role may list and GET each agents key family, only the
+/// gateway and query roles may PUT them, and no role may delete them.
+fn agents_namespace_defects(policy: &Policy) -> Vec<String> {
+    let role = policy.role;
+    let writes = matches!(role, "gateway" | "query");
+    let lists = list_prefix_patterns(policy, Some("Allow"));
+    let gets = key_patterns_for(policy, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(policy, &["s3:PutObject"], Some("Allow"));
+    let deletes = key_patterns_for(policy, &S3_DELETE_OPERATIONS, Some("Allow"));
+    let reaches = |patterns: &[String], key: &str| patterns.iter().any(|p| glob_matches(p, key));
+
+    let mut defects = Vec::new();
+    for prefix in agents_witness_prefixes() {
+        if !reaches(&lists, &prefix) {
+            defects.push(format!("{role}: cannot list {prefix}"));
+        }
+    }
+    for key in agents_witness_keys() {
+        if !reaches(&gets, &key) {
+            defects.push(format!("{role}: cannot GET {key}"));
+        }
+        if reaches(&puts, &key) != writes {
+            defects.push(format!(
+                "{role}: PUT on {key} is {}, expected {}",
+                reaches(&puts, &key),
+                writes
+            ));
+        }
+        if reaches(&deletes, &key) {
+            defects.push(format!("{role}: may delete {key}"));
+        }
+    }
+    defects
+}
+
+/// ADR-3331 decision 2: the gateway and query roles GET, PUT and list every
+/// agents key family under `t/*/ag/*`, the maintain role only lists and GETs
+/// them, admin reads them through its tenant-wide `t/*` grants and writes none,
+/// and no role deletes one. The two mutants pin that the check is live: a
+/// maintain write grant and a grant narrowed to the HEAD alone each fail it.
+#[test]
+fn agents_namespace_is_granted_to_gateway_and_query_roles_and_read_only_to_maintain() {
+    for role in ALL_ROLES {
+        let defects = agents_namespace_defects(&load_policy(role));
+        assert!(defects.is_empty(), "{defects:#?}");
+    }
+
+    let maintain_writes = template_with_statement_edit("maintain", "MaintainWrite", |stmt| {
+        stmt["Resource"]
+            .as_array_mut()
+            .expect("MaintainWrite resources")
+            .push(serde_json::json!(format!("{BUCKET_KEY_PREFIX}t/*/ag/*")));
+    });
+    let defects = agents_namespace_defects(&maintain_writes);
+    assert_eq!(defects.len(), agents_witness_keys().len(), "{defects:#?}");
+    assert!(defects.iter().all(|d| d.contains("PUT")), "{defects:#?}");
+
+    for role in ["gateway", "query"] {
+        let text = std::fs::read_to_string(policy_json_path(role)).expect("read template");
+        let narrowed = text.replace("t/*/ag/*\"", "t/*/ag/*/head\"");
+        assert_ne!(narrowed, text, "{role}.json grants no t/*/ag/* pattern");
+        let json: serde_json::Value = serde_json::from_str(&narrowed).expect("parse template");
+        let defects = agents_namespace_defects(&build_policy(role, "head-only fixture", &json));
+        for family in ["/o/", "/_wake/", "/_dir/"] {
+            assert!(
+                defects
+                    .iter()
+                    .any(|d| d.contains("cannot GET") && d.contains(family)),
+                "{role}: a head-only grant must miss {family}: {defects:#?}"
+            );
+        }
     }
 }
 
@@ -9033,6 +9160,7 @@ fn every_in_scope_policy_pattern_matches_a_real_key_shape() {
     // other pattern instead of passing unexamined.
     let mut keys = representative_keys();
     keys.extend(quarantine_witness_keys());
+    keys.extend(agents_witness_keys());
     for role in ALL_ROLES {
         let policy = load_policy(role);
         // None: this is a shape check (does every pattern name a real key?), not

@@ -31,6 +31,9 @@ regex = { workspace = true }
 # constructors are the ground truth those tests build witnesses from, and
 # ravel-fleet does not depend on ravel-commit, so this direction is acyclic.
 ravel-fleet = { workspace = true }
+# The same, for the Ravel Agents key constructors (ADR-3331 decision 2);
+# ravel-agents-core does not depend on ravel-commit either.
+ravel-agents-core = { workspace = true }
 
 [lints]
 workspace = true
