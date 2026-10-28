@@ -156,6 +156,9 @@ pub struct Coordinator {
     /// nothing to dispatch once `rescan_interval_ms` has passed since the
     /// last scan.
     pub(crate) discovered: AtomicBool,
+    /// Set while one poller is inside the directory scan; a second poller
+    /// arriving then skips the scan rather than running its own.
+    pub(crate) scanning: AtomicBool,
     /// When the directory was last scanned, in the injected clock's
     /// nanoseconds; `i64::MIN` before the first scan. A poller that wants
     /// a rescan claims this stamp with a compare-exchange first, so pollers
@@ -183,6 +186,7 @@ impl Coordinator {
             agents: Mutex::new(HashMap::new()),
             leases: LeaseTable::default(),
             discovered: AtomicBool::new(false),
+            scanning: AtomicBool::new(false),
             last_scan_unix_ns: AtomicI64::new(i64::MIN),
             unsupported_reported: Mutex::new(HashSet::new()),
             wake: Notify::new(),

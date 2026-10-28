@@ -1072,10 +1072,13 @@ async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
 #[tokio::test(start_paused = true)]
 async fn pollers_woken_together_share_one_rescan() {
     // Three dormant agents known only from the directory; two workers wait
-    // on long polls; one wake past the rescan interval releases both, and
-    // the directory is listed once, not once per poller.
+    // on long polls; one wake past the rescan interval releases both. The
+    // rescan's LIST is held at a gate so the second poller runs its whole
+    // pass while the first is inside the scan: it must neither clear the
+    // latch again nor start a scan of its own.
     let clock = clock();
-    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let fa = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store = store_over(fa.clone(), &clock);
     let other = coordinator(&store, &clock, 100);
     let co = coordinator(&store, &clock, 200);
     for key in ["o-1", "o-2", "o-3"] {
@@ -1083,6 +1086,9 @@ async fn pollers_woken_together_share_one_rescan() {
     }
     let wa = worker(&co, "v1");
     let wb = worker(&co, "v1");
+    assert!(poll_now(&co, &wa, "v1").await.is_none(), "the start scan");
+    // The next LIST is the rescan; hold it (occurrences count from the hold).
+    let gate = fa.hold(Op::List, None, Occurrence::Nth(1));
     let before = store.counters();
     let deadline = Instant::now() + Duration::from_millis(1_000);
     let req_a = poll_req(&wa, "v1", 1_000);
@@ -1095,16 +1101,21 @@ async fn pollers_woken_together_share_one_rescan() {
         }
         clock.advance_ms(RESCAN_MS);
         co.wake.notify_waiters();
+        gate.wait_until_held(1).await;
+        // The other poller runs its pass against the held scan.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        for id in gate.held() {
+            gate.release(id);
+        }
     };
     let (ra, rb, ()) = tokio::join!(pa, pb, wake);
     assert!(ra.expect("poll a").is_none());
     assert!(rb.expect("poll b").is_none());
     let delta = store.counters().since(&before);
-    assert_eq!(
-        delta.resolve.list, 2,
-        "one scan at start, one shared rescan after the wake"
-    );
-    assert_eq!(delta.resolve.get, 6, "three dormant HEADs read per scan");
+    assert_eq!(delta.resolve.list, 1, "one shared rescan after the wake");
+    assert_eq!(delta.resolve.get, 3, "three dormant HEADs read once");
 }
 
 #[tokio::test(start_paused = true)]
