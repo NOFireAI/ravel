@@ -63,9 +63,13 @@ Come back to one lane when you have a specific question.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples that read segments, commit records and catalog listings
   from the bucket, to show what is stored.
-- [guides/agents.md](guides/agents.md): the MCP surface for an AI agent
-  host. How to connect, the nine tools grouped by task, the result envelope
-  field by field, budgets and cursors, and what an empty result means.
+- [guides/mcp-server.md](guides/mcp-server.md): the MCP server for an AI
+  agent host. How to connect, the nine tools grouped by task, the result
+  envelope field by field, budgets and cursors, and what an empty result
+  means.
+- [guides/agents.md](guides/agents.md): Ravel Agents, the durable agent
+  runtime. What an agent is, how to turn the runtime on, and what works in
+  this release milestone by milestone.
 
 ## Operate
 
@@ -149,6 +153,9 @@ protocol or byte layout, or when you are changing the code.
 
 - [catalog-and-mvcc.md](catalog-and-mvcc.md): the object key layout, the
   commit protocol, commit tokens, catalog folds and snapshot resolution.
+- [agents.md](agents.md): Ravel Agents storage: the key layout under
+  `t/<tenant>/ag/`, the HEAD record, the publication rule, operation states,
+  the typed errors, and each guarantee with its test or milestone.
 - [segment-format.md](segment-format.md): RSEG, the segment format for
   metrics. One supported version.
 - [log-segment-format.md](log-segment-format.md): RLOG, the segment format

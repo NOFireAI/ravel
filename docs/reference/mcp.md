@@ -12,7 +12,7 @@
 
 The tools use the Model Context Protocol over `POST /mcp`. Each tool lists
 what it takes, what it returns, its bounds, and the failure classes that it
-can produce. See [the agents guide](../guides/agents.md) for the tool
+can produce. See [the MCP server guide](../guides/mcp-server.md) for the tool
 grouping, the envelope fields, and the empty-result checklist.
 
 ## Tools
@@ -79,7 +79,7 @@ cap is on the page.
 ## The envelope
 
 Every tool result carries this shape, on success and on failure. See
-[the agents guide](../guides/agents.md#the-result-envelope) for the meaning
+[the MCP server guide](../guides/mcp-server.md#the-result-envelope) for the meaning
 of each field.
 
 ```json

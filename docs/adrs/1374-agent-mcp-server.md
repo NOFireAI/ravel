@@ -527,7 +527,8 @@ dependency is `rmcp` 3.2 with `rmcp-macros`. No persistent format changes.
 The HTTP `/api/v1/sql` behavior is unchanged unless a client sends the new
 optional body fields.
 
-Documentation: `docs/guides/agents.md`, `docs/reference/mcp.md` rendered from
+Documentation: `docs/guides/mcp-server.md` (renamed from
+`docs/guides/agents.md` by ADR-3331 decision 1), `docs/reference/mcp.md` rendered from
 the catalog by a drift test, a README section, the `/mcp` row in
 `docs/reference/http-api.md`, and one transport line in
 `docs/architecture.md`.
