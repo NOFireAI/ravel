@@ -323,11 +323,15 @@ fn commit_body(assigned: &Value, output: Value) -> Value {
 }
 
 fn failed_body(assigned: &Value, error: &str) -> Value {
+    failed_body_with(assigned, error, true)
+}
+
+fn failed_body_with(assigned: &Value, error: &str, terminal: bool) -> Value {
     json!({
         "lease": assigned["lease"],
         "outcome": "failed",
         "error": error,
-        "terminal": true,
+        "terminal": terminal,
     })
 }
 
@@ -408,7 +412,7 @@ async fn reconcile_audit_records(store: &dyn ObjectStoreBackend) -> Vec<LogRecor
 /// commit 1. A's refused second step, A's late result and B's `BeginTurn`
 /// publish nothing. 11 in all.
 #[tokio::test]
-async fn at_least_once_replays_a_new_attempt_and_keeps_the_late_result_as_evidence() {
+async fn completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn() {
     let running = start_server(Arc::new(MemoryStore::new())).await;
     let api = Api::public(&running);
     let (operation, assigned_a) = begin(&api).await;
@@ -593,11 +597,13 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
     }
     let inspected = inspect(&api, &effect).await;
     assert_eq!(inspected["status"], json!("in_doubt"));
-    let attempt = inspected["attempt"].as_u64().expect("attempt");
+    assert_eq!(inspected["attempt"], json!(1), "{inspected}");
     assert_eq!(
-        inspected["attempts"][attempt as usize - 1]["status"],
-        json!("in_doubt")
+        inspected["attempts"],
+        json!([{"attempt": 1, "status": "in_doubt"}]),
+        "{inspected}"
     );
+    let attempt = 1;
 
     let (status, refused) = api
         .post(
@@ -607,8 +613,15 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("effect_in_doubt"), "{refused}");
     let op = operation_status(&api, &operation).await;
     assert_eq!(op["status"], json!("blocked"), "{op}");
+    // Blocked across a poll: no worker is handed the turn.
+    let worker_c = register(&api).await;
+    assert_eq!(poll(&api, &worker_c, 100).await, Value::Null);
+    let op = operation_status(&api, &operation).await;
+    assert_eq!(op["status"], json!("blocked"), "{op}");
+    assert_eq!(op["blocked_effect"], json!(effect), "{op}");
 
     let reconcile = json!({
         "effect": effect,
@@ -781,11 +794,39 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
         assert_eq!(replayed["attempt"], json!(1));
     }
 
+    let inspected = inspect(&api, &effect).await;
+    assert_eq!(inspected["failure"], json!("out of stock"), "{inspected}");
+    assert_eq!(inspected["result"], Value::Null, "{inspected}");
+
+    // A retryable failure is accepted; the retried turn replays the failure.
+    let retried = api
+        .ok(
+            WORKER,
+            "worker/commit",
+            &failed_body_with(&assigned_a, "out of stock", false),
+        )
+        .await;
+    assert_eq!(retried["status"], json!("accepted"), "{retried}");
+    let op = operation_status(&api, &operation).await;
+    assert_eq!(op["status"], json!("accepted"), "the turn is queued again: {op}");
+    let worker_b = register(&api).await;
+    let assigned_b = poll(&api, &worker_b, 2_000).await;
+    assert_eq!(assigned_b["operation"], json!(operation), "{assigned_b}");
+    let steps = assigned_b["steps"].as_array().expect("steps");
+    assert_eq!(steps.len(), 1, "{assigned_b}");
+    assert_eq!(steps[0]["status"], json!("started"), "{assigned_b}");
+    assert_eq!(steps[0]["output"], Value::Null, "{assigned_b}");
+    let (status, replayed) = step(&api, &assigned_b, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["failure"], json!("out of stock"));
+    assert_eq!(replayed["step"]["status"], json!("started"));
+    assert_eq!(replayed["step"]["output"], Value::Null);
+
     let committed = api
         .ok(
             WORKER,
             "worker/commit",
-            &failed_body(&assigned_a, "out of stock"),
+            &failed_body(&assigned_b, "out of stock"),
         )
         .await;
     assert_eq!(committed["status"], json!("failed"), "{committed}");
@@ -793,6 +834,140 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
         .ok_get(CLIENT, &format!("result?operation={operation}"))
         .await;
     assert_eq!(result["result"]["error"], json!("out of stock"), "{result}");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// `manual` retry through `reconcile`: the route authorizes attempt 2 and
+/// dispatches nothing; the owner's next `worker/step` for the key is handed
+/// attempt 2 and runs the tool once more. A second retry while attempt 2 is
+/// open is refused, and once attempt 2's result is recorded the turn commits
+/// once.
+#[tokio::test]
+async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let (operation, assigned_a) = begin(&api).await;
+    let mut tool_runs = 0;
+
+    let (status, a_step) = step(&api, &assigned_a, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    assert_eq!(a_step["attempt"], json!(1));
+    tool_runs += 1;
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+
+    let assigned_b = take_over(&api, &assigned_a).await;
+    let (status, refused) = step(&api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("effect_in_doubt"));
+
+    let retry = |attempt: u64| json!({"effect": effect, "attempt": attempt, "decision": "retry"});
+    let reconciled = api.ok(ADMIN, "reconcile", &retry(1)).await;
+    assert_eq!(reconciled["status"], json!("authorized"), "{reconciled}");
+    assert_eq!(reconciled["attempt"], json!(2), "{reconciled}");
+    let op = operation_status(&api, &operation).await;
+    assert_eq!(op["status"], json!("running"), "{op}");
+
+    let (status, handed) = step(&api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{handed}");
+    assert_eq!(handed["attempt"], json!(2), "{handed}");
+    assert_eq!(handed["effect"], json!(effect));
+    assert_eq!(handed["step"]["status"], json!("started"));
+    assert_eq!(handed["step"]["output"], Value::Null);
+    assert_eq!(handed["failure"], Value::Null);
+    tool_runs += 1;
+
+    // Attempt 2 is open: a retry of it is refused, and a repeat of the step
+    // is not handed attempt 2 a second time.
+    let (status, refused) = api.post(ADMIN, "reconcile", &retry(2)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("ownership_lost"));
+    let (status, refused) = step(&api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("idempotency_conflict"));
+
+    let (status, recorded) = complete(&api, &effect, 2, json!({"cents": 1700})).await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["late"], json!(false));
+    let (status, replayed) = step(&api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["step"]["status"], json!("completed"));
+    assert_eq!(replayed["step"]["output"], json!({"cents": 1700}));
+    assert_eq!(replayed["attempt"], json!(2));
+    assert_eq!(tool_runs, 2, "the tool ran once per authorized attempt");
+
+    let committed = api
+        .ok(
+            WORKER,
+            "worker/commit",
+            &commit_body(&assigned_b, json!({"total_cents": 1700})),
+        )
+        .await;
+    assert_eq!(committed["status"], json!("completed"));
+    let scrape = api.scrape().await;
+    assert_eq!(
+        value(
+            &scrape,
+            "ravel_agents_turns_committed_total",
+            "mode=\"all\""
+        ),
+        1
+    );
+    let inspected = inspect(&api, &effect).await;
+    assert_eq!(
+        inspected["attempts"],
+        json!([
+            {"attempt": 1, "status": "superseded"},
+            {"attempt": 2, "status": "result"},
+        ])
+    );
+    let records = reconcile_audit_records(store.as_ref()).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(attr(&records[0], "agents.decision"), Some("retry"));
+    assert_eq!(attr(&records[0], "agents.attempt"), Some("1"));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A tool output of exactly `{"error": <string>}` reported through
+/// `effects/complete` is an output like any other: the replayed step and the
+/// next poll return it as the output, never as a failure.
+#[tokio::test]
+async fn an_output_shaped_like_a_failure_replays_as_the_output() {
+    let running = start_server(Arc::new(MemoryStore::new())).await;
+    let api = Api::public(&running);
+    let (operation, assigned_a) = begin(&api).await;
+
+    let (status, a_step) = step(&api, &assigned_a, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let (status, recorded) = complete(&api, &effect, 1, json!({"error": "x"})).await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, replayed) = step(&api, &assigned_a, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["failure"], Value::Null, "{replayed}");
+    assert_eq!(replayed["step"]["status"], json!("completed"));
+    assert_eq!(replayed["step"]["output"], json!({"error": "x"}));
+
+    let assigned_b = take_over(&api, &assigned_a).await;
+    assert_eq!(assigned_b["steps"][0]["status"], json!("completed"));
+    assert_eq!(assigned_b["steps"][0]["output"], json!({"error": "x"}));
+    let (status, replayed) = step(&api, &assigned_b, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["failure"], Value::Null, "{replayed}");
+    assert_eq!(replayed["step"]["output"], json!({"error": "x"}));
+    let inspected = inspect(&api, &effect).await;
+    assert_eq!(inspected["result"], json!({"error": "x"}));
+    assert_eq!(inspected["failure"], Value::Null);
+
+    api.ok(
+        WORKER,
+        "worker/commit",
+        &commit_body(&assigned_b, json!({"ok": true})),
+    )
+    .await;
+    let op = operation_status(&api, &operation).await;
+    assert_eq!(op["status"], json!("completed"), "{op}");
     running.shutdown().await.expect("clean shutdown");
 }
 
