@@ -665,6 +665,19 @@ impl Coordinator {
         Ok(None)
     }
 
+    /// Whether this coordinator holds `attempt` of `effect` as a hand-over
+    /// from [`Coordinator::reconcile_authorize`] that no step has claimed
+    /// yet. An attempt authorized by an owner's own step, or a hand-over
+    /// already dispatched, answers `false`.
+    pub fn holds_hand_over(&self, effect: &EffectRef, attempt: u32) -> bool {
+        self.open_attempts
+            .lock()
+            .get(&(effect.agent, effect.effect_id))
+            .is_some_and(|open| {
+                open.reconciled && open.incarnation == effect.incarnation && open.attempt == attempt
+            })
+    }
+
     /// Hand a claimed reconciled attempt back, unclaimed, when its step was
     /// refused before dispatching it. A takeover in between may have pruned
     /// the claimed record as its epoch's, so a missing record is put back;

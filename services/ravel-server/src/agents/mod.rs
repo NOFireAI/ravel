@@ -117,6 +117,7 @@ pub struct AgentsSettings {
     pub lease_ms: u64,
     pub heartbeat_grace_ms: u64,
     pub sweep_interval_ms: u64,
+    pub max_evidence_effects: usize,
 }
 
 impl AgentsSettings {
@@ -136,6 +137,7 @@ impl AgentsSettings {
             lease_ms: agents.lease_ms,
             heartbeat_grace_ms: agents.heartbeat_grace_ms,
             sweep_interval_ms: agents.sweep_interval_ms,
+            max_evidence_effects: agents.max_evidence_effects,
         }
     }
 }
@@ -337,6 +339,7 @@ mod tests {
             lease_ms: 30_000,
             heartbeat_grace_ms: 10_000,
             sweep_interval_ms: 29,
+            max_evidence_effects: 31,
         }
     }
 
