@@ -252,11 +252,18 @@ impl fmt::Display for ScheduleError {
 
 impl std::error::Error for ScheduleError {}
 
-/// The lines every failure message carries: the seed, how to replay it, and
-/// the schedule.
+/// The lines every failure message carries: the seed, the test, how to
+/// replay that test from that seed, and the schedule. The test is named
+/// from the thread libtest runs it on.
 pub fn failure_context(seed: u64, script: &ScheduleScript) -> String {
+    let current = std::thread::current();
+    let test = current
+        .name()
+        .filter(|name| *name != "main")
+        .unwrap_or("<test name>");
     format!(
-        "seed: {seed}\nreplay: RAVEL_SIM_SEED={seed} cargo test -p ravel-agents-sim\nschedule: {script:?}"
+        "seed: {seed} ({seed:#x})\ntest: {test}\nreplay: RAVEL_SIM_SEED={seed} cargo test -p \
+         ravel-agents-sim -- --exact {test}\nschedule: {script:?}"
     )
 }
 
@@ -729,8 +736,14 @@ mod tests {
             .downcast_ref::<String>()
             .cloned()
             .expect("a formatted panic message");
-        assert!(message.contains("seed: 42"), "{message}");
-        assert!(message.contains("RAVEL_SIM_SEED=42"), "{message}");
+        assert!(message.contains("seed: 42 (0x2a)\n"), "{message}");
+        assert!(
+            message.contains(
+                "replay: RAVEL_SIM_SEED=42 cargo test -p ravel-agents-sim -- --exact \
+                 scheduler::tests::a_failed_assertion_names_the_seed_and_the_script\n"
+            ),
+            "{message}"
+        );
         assert!(message.contains("schedule: ScheduleScript {"), "{message}");
         assert!(
             message.contains(&format!("{:?}", outcome.script)),
@@ -849,8 +862,12 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("C failed: get:"), "{message}");
         assert!(message.contains("seed: 9"), "{message}");
+        let test = "scheduler::tests::a_failing_actor_reports_the_seed_and_the_script";
+        assert!(message.contains(&format!("test: {test}\n")), "{message}");
         assert!(
-            message.contains("replay: RAVEL_SIM_SEED=9 cargo test -p ravel-agents-sim"),
+            message.contains(&format!(
+                "replay: RAVEL_SIM_SEED=9 cargo test -p ravel-agents-sim -- --exact {test}\n"
+            )),
             "{message}"
         );
         assert!(message.contains(&format!("{script:?}")), "{message}");
