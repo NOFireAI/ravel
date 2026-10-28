@@ -795,8 +795,12 @@ pub struct IngestPhase {
     #[serde(default)]
     pub elapsed_basis: String,
     /// Seconds the replay spent pulling points from the stream (generating,
-    /// classifying and admitting them, inside `fill_valid`). Zero in an
-    /// artifact written before it existed.
+    /// classifying and admitting them, inside `fill_valid`) and, on an HTTP
+    /// row, routing them: observing each into the read-back plan, hashing
+    /// its series to a shard and buffering it (`Producer::round`,
+    /// `tests::a_producer_round_counts_routing_as_generation`). Waiting on a
+    /// full shard queue is not counted. Zero in an artifact written before
+    /// it existed.
     #[serde(default)]
     pub generation_secs: f64,
     /// On a [`ELAPSED_BASIS_WALL_IN_FLIGHT`] row, true when `generation_secs`
@@ -3938,8 +3942,11 @@ pub fn stall_projection_over(
 /// [`LaneError::InvalidCommitToken`].
 ///
 /// With a [`StallCeiling`], the row stops with [`LaneError::IngestStalled`]
-/// once its projected wall time exceeds the ceiling ([`stall_check_due`],
-/// [`stall_projection_over`]).
+/// once its projected wall time exceeds the ceiling ([`check_stall`]). The
+/// check runs while the producer offers the stream and again while the last
+/// responses drain, waking at least every `recheck` while none arrives, so a
+/// row whose whole stream fits in the shard buffers is still stopped
+/// (`tests::the_drain_stops_a_row_whose_whole_stream_is_already_offered`).
 ///
 /// The receiver's object store is not the bench's, so this row carries no
 /// [`StorageAccounting`], and its CPU/RSS are the remote process's, so they are
@@ -3984,9 +3991,7 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
     let mut last_stall_check: Option<std::time::Instant> = None;
 
     let produced: Result<(), LaneError> = async {
-        while let Some(full) =
-            producer.round(source, |point| series_shard(point, shards), now)?
-        {
+        while let Some(full) = producer.round(source, |point| series_shard(point, shards), now)? {
             for (shard, chunk) in full {
                 sending_since.get_or_insert_with(std::time::Instant::now);
                 queue_batch(&system, &queues[shard], shard, chunk).await?;
@@ -8446,6 +8451,7 @@ mod tests {
         assert!(valid > 0);
         assert_eq!(routed.get(), valid);
         assert_eq!(producer.buffers[0].len() as u64, valid);
+        // hygiene-allow: wall-clock -- `generation` is read on the fake clock above, not the wall
         assert_eq!(producer.generation, Duration::from_secs(valid));
         assert!(
             producer
