@@ -21,10 +21,21 @@
 //! at most [`MAX_CAS_ATTEMPTS`] times, so the kernel revalidates the command
 //! against the root another writer published
 //! (`tests::a_failed_conditional_write_re_reads_and_succeeds_on_retry`).
+//! Every retry, of the CAS or of a read or dependency write that failed
+//! retryably, first waits for the delay the injected
+//! [`crate::backoff::Backoff`] gives it, with a `Throttled` answer's
+//! `retry_after_ms` as the floor (`tests::a_retry_waits_through_the_backoff_seam`).
+//!
+//! A create that finds the root already active (`Reply::Exists`) writes no
+//! HEAD but still writes the `_dir` entry: the create that minted the root
+//! may have lost its acknowledgement before it got there, and nothing later
+//! would repair the listing
+//! (`tests::a_create_that_finds_the_root_repairs_the_dir_entry`).
 //!
 //! `Transient`, `Timeout` or `Throttled` from the HEAD write is an unknown
 //! outcome: the write may have applied. The command returns `OutcomeUnknown`
-//! carrying the operation handle the kernel assigned, never a success and
+//! carrying the handle of the operation its reply names, whichever command
+//! it was ([`reply_handle`]), never a success and
 //! never a retry under a fresh id; the caller resolves that handle through
 //! [`AgentStore::resolve`], which reads the receipt index
 //! (`tests::cas_applied_with_lost_response_is_resolved_by_operation_id_after_a_later_revision`).
@@ -102,14 +113,24 @@ fn checksum(bytes: &[u8]) -> UploadChecksum {
     UploadChecksum::Crc32c(crc32c::crc32c(bytes))
 }
 
-/// The handle of the operation a reply names, if it names one.
+/// The handle of the operation a reply names, if it names one. Every reply
+/// that carries an `accept_seq` names one, so an unknown outcome on any
+/// command that moves an operation can be resolved
+/// (`tests::an_unknown_outcome_on_any_operation_command_carries_its_handle`).
 pub(crate) fn reply_handle(agent: &AgentId, head: &Head, reply: &Reply) -> Option<Handle> {
-    match reply {
-        Reply::Accepted { accept_seq, .. } => {
-            Some(Handle::operation(*agent, head.incarnation, *accept_seq))
-        }
-        _ => None,
-    }
+    let accept_seq = match reply {
+        Reply::Accepted { accept_seq, .. }
+        | Reply::TurnCommitted { accept_seq, .. }
+        | Reply::AlreadyCommitted { accept_seq }
+        | Reply::TurnRetry { accept_seq, .. }
+        | Reply::TurnFailed { accept_seq, .. }
+        | Reply::CancelRequested { accept_seq }
+        | Reply::Cancelled { accept_seq }
+        | Reply::AlreadyTerminal { accept_seq, .. }
+        | Reply::TimerFired { accept_seq } => *accept_seq,
+        _ => return None,
+    };
+    Some(Handle::operation(*agent, head.incarnation, accept_seq))
 }
 
 impl AgentStore {
@@ -133,11 +154,13 @@ impl AgentStore {
                     self.counters.bytes_in(Phase::Resolve, got.data.len());
                     return self.decode_head(agent, &got.data, got.version);
                 }
-                Err(StoreError::NotFound) if confirm_absence && !last => continue,
+                Err(error @ StoreError::NotFound) if confirm_absence && !last => {
+                    self.pause(attempt, Some(&error)).await;
+                }
                 Err(StoreError::NotFound) => return Ok(HeadState::Absent),
                 Err(error) if error.is_retryable() && !last => {
                     tracing::debug!(agent = %agent.to_hex(), %error, "agents HEAD read retried");
-                    continue;
+                    self.pause(attempt, Some(&error)).await;
                 }
                 Err(error) => {
                     tracing::warn!(agent = %agent.to_hex(), %error, "agents HEAD read failed");
@@ -214,6 +237,9 @@ impl AgentStore {
                     let (Some(head), Some(version)) = (current, version) else {
                         return Err(unavailable(agent, "kernel left an absent root unchanged"));
                     };
+                    if is_create {
+                        self.after_publish(agent, &[Effect::WriteDirEntry]).await;
+                    }
                     return Ok(Outcome {
                         agent: *agent,
                         reply,
@@ -291,6 +317,7 @@ impl AgentStore {
                             "HEAD stayed contended past the CAS bound",
                         ));
                     }
+                    self.pause(attempt, None).await;
                 }
                 Err(error) if error.is_retryable() => {
                     tracing::warn!(agent = %agent.to_hex(), %error, "agents HEAD write outcome unknown");
@@ -349,6 +376,7 @@ impl AgentStore {
                 }
                 Err(error) if error.is_retryable() && attempt < MAX_READ_ATTEMPTS => {
                     tracing::debug!(agent = %agent.to_hex(), %error, "agents object write retried");
+                    self.pause(attempt, Some(&error)).await;
                 }
                 Err(error) => {
                     tracing::warn!(agent = %agent.to_hex(), %error, "agents object write failed");
@@ -384,6 +412,7 @@ impl AgentStore {
                 }
                 Err(error) if error.is_retryable() && attempt < MAX_READ_ATTEMPTS => {
                     tracing::debug!(agent = %agent.to_hex(), %error, "agents object read retried");
+                    self.pause(attempt, Some(&error)).await;
                 }
                 Err(StoreError::NotFound) => {
                     return Err(unavailable(agent, "referenced object is not in the store"));
@@ -420,7 +449,10 @@ impl AgentStore {
                 }
                 Err(error)
                     if (error.is_retryable() || matches!(error, StoreError::NotFound))
-                        && attempt < MAX_READ_ATTEMPTS => {}
+                        && attempt < MAX_READ_ATTEMPTS =>
+                {
+                    self.pause(attempt, Some(&error)).await;
+                }
                 Err(StoreError::NotFound) => {
                     return Err(unavailable(agent, "referenced object is not in the store"));
                 }

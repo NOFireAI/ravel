@@ -14,6 +14,7 @@
 //! The runtime crate (T9, #3343) drives this store; nothing in ravel-server
 //! reaches it until T11.
 
+pub mod backoff;
 pub mod counters;
 pub mod publish;
 mod wake;
@@ -32,9 +33,10 @@ use ravel_agents_core::identity::{AgentId, Hash256, agent_id, request_hash};
 use ravel_agents_core::kernel::{DerivedIds, Effect, IdSource, Kernel, Limits, Reply};
 use ravel_agents_core::keys::{AgentKey, AgentKind, dir_prefix, object_key};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
-use ravel_object_store::{ObjectStoreBackend, PageToken, Version};
+use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError, Version};
 use ravel_types::TenantHash;
 
+use crate::backoff::{Backoff, JitteredBackoff};
 use crate::counters::{CounterSnapshot, Counters, Phase, Request};
 use crate::publish::{ids_for, reply_handle, unavailable};
 
@@ -161,6 +163,7 @@ pub struct AgentStore {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) ids: Arc<dyn IdSource + Send + Sync>,
     pub(crate) counters: Arc<Counters>,
+    pub(crate) backoff: Arc<dyn Backoff>,
 }
 
 impl AgentStore {
@@ -179,6 +182,28 @@ impl AgentStore {
             clock,
             ids,
             counters: Arc::new(Counters::default()),
+            backoff: Arc::new(JitteredBackoff::default()),
+        }
+    }
+
+    /// Replace the retry delay policy ([`JitteredBackoff`] by default).
+    #[must_use]
+    pub fn with_backoff(mut self, backoff: Arc<dyn Backoff>) -> AgentStore {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Wait before the attempt after `attempt`, for the delay the policy
+    /// gives the failure that ended it. A refused conditional write passes
+    /// no error.
+    pub(crate) async fn pause(&self, attempt: u32, error: Option<&StoreError>) {
+        let retry_after_ms = match error {
+            Some(StoreError::Throttled { retry_after_ms }) => Some(*retry_after_ms),
+            _ => None,
+        };
+        let delay = self.backoff.delay(attempt, retry_after_ms);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -358,9 +383,13 @@ impl AgentStore {
     /// One page of the tenant's `_dir` entries: one LIST call, bounded by the
     /// backend's page size. Pass the returned `next` to continue.
     pub async fn list_agents(&self, page: Option<PageToken>) -> Result<AgentPage, AgentError> {
-        let none = AgentId([0; 16]);
-        let prefix = dir_prefix(&self.tenant)
-            .map_err(|_| unavailable(&none, "tenant prefix is not addressable"))?;
+        let prefix = dir_prefix(&self.tenant).map_err(|_| {
+            AgentError::new(
+                ErrorKind::StoreUnavailable,
+                Default::default(),
+                "tenant prefix is not addressable",
+            )
+        })?;
         self.counters.request(Phase::Resolve, Request::List);
         let listed = self.store.list(&prefix, page).await.map_err(|error| {
             tracing::warn!(%error, "agents dir listing failed");

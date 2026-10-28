@@ -12,11 +12,11 @@ ravel-object-store = { workspace = true }
 ravel-types = { workspace = true }
 bytes = { workspace = true }
 crc32c = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tokio = { workspace = true }
 
 [lints]
 workspace = true
