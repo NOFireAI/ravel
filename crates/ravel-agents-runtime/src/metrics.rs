@@ -59,11 +59,15 @@ pub(crate) struct Metrics {
     pub(crate) sweep_hints_read: AtomicU64,
     pub(crate) sweep_hints_deleted: AtomicU64,
     pub(crate) sweep_agents_loaded: AtomicU64,
+    pub(crate) sweep_dir_entries_repaired: AtomicU64,
 }
 
 /// The timer and sweep counters, summed over every pass since the
-/// coordinator started. Kept apart from [`AgentsMetricsSnapshot`], which
-/// `ravel-server` builds field by field.
+/// coordinator started: the [`crate::SweepReport`] fields, a flat set of
+/// counters with no per-phase split, plus the pass count. Exported here for
+/// `ravel-server` to render; nothing renders them until T19 (#3353) does.
+/// Kept apart from [`AgentsMetricsSnapshot`], which `ravel-server` builds
+/// field by field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepMetricsSnapshot {
     /// Passes run, from polls and from `sweep_once`, including failed ones.
@@ -80,10 +84,13 @@ pub struct SweepMetricsSnapshot {
     pub timers_fired: u64,
     /// Agents with work a pass added to the dispatch set.
     pub agents_loaded: u64,
+    /// Missing `_dir` entries a pass wrote back.
+    pub dir_entries_repaired: u64,
 }
 
 impl Coordinator {
-    /// The timer and sweep counters.
+    /// The timer and sweep counters. Read by this crate's tests only until
+    /// `ravel-server` renders them (T19, #3353).
     pub fn sweep_metrics(&self) -> SweepMetricsSnapshot {
         let m = &self.metrics;
         SweepMetricsSnapshot {
@@ -94,6 +101,7 @@ impl Coordinator {
             hints_deleted: m.sweep_hints_deleted.load(Ordering::Relaxed),
             timers_fired: m.timers_fired.load(Ordering::Relaxed),
             agents_loaded: m.sweep_agents_loaded.load(Ordering::Relaxed),
+            dir_entries_repaired: m.sweep_dir_entries_repaired.load(Ordering::Relaxed),
         }
     }
 
@@ -110,6 +118,8 @@ impl Coordinator {
             .fetch_add(report.hints_deleted, Ordering::Relaxed);
         m.sweep_agents_loaded
             .fetch_add(report.agents_loaded, Ordering::Relaxed);
+        m.sweep_dir_entries_repaired
+            .fetch_add(report.dir_entries_repaired, Ordering::Relaxed);
     }
 
     pub(crate) fn metrics_snapshot(&self) -> AgentsMetricsSnapshot {

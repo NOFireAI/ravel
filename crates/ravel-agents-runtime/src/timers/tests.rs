@@ -246,8 +246,16 @@ async fn a_timer_fires_at_its_recorded_due_time_and_not_a_nanosecond_before() {
     schedule(&r.co, "o-1", "t", due).await;
 
     r.now.advance(due - 1 - r.now.get());
+    let before = r.store.counters();
     let early = r.co.sweep_once(&TENANT).await.expect("sweep");
     assert_eq!((early.timers_fired, early.hints_deleted), (0, 0));
+    // The runtime's own predicate holds the timer back: no fire is
+    // attempted, so neither the skeleton's HEAD read nor its CAS is issued.
+    // The kernel would refuse an early fire too, so only these two counts
+    // tell a runtime that asks too early from one that does not.
+    let spent = r.store.counters().since(&before);
+    assert_eq!(spent.publish.cas, 0);
+    assert_eq!(spent.resolve.get, 1, "the sweep's own HEAD read only");
     assert_eq!(
         status(&head(&r.store, "o-1").await, "t"),
         TimerStatus::Scheduled

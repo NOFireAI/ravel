@@ -56,13 +56,16 @@ impl Coordinator {
         // At most one in-pass rescan per wake, so an interval of zero rescans
         // every pass but never spins without reaching the wait below.
         let mut rescanned = false;
+        // At most one sweep pass per wake, run only once the scan found
+        // nothing, so a ready assignment never waits for one
+        // (`sweep::tests::a_poll_with_a_ready_turn_runs_no_sweep_pass`).
+        let mut swept = false;
         loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             self.unload_idle();
             self.discover().await?;
-            self.sweep_from_poll().await;
             match self.scan(&req.worker_id, &pins).await? {
                 Scan::Assigned(a) => return Ok(Some(*a)),
                 Scan::Refused(e) => return Err(e),
@@ -72,6 +75,14 @@ impl Coordinator {
                 // (`tests::a_poll_finds_an_agent_that_got_work_through_another_coordinator`,
                 // `tests::an_idle_poll_rescans_the_directory_at_most_once_per_interval`).
                 Scan::Nothing => {
+                    // A pass that fired a timer or loaded an agent may have
+                    // made work this poll can take, so scan again first.
+                    if !swept {
+                        swept = true;
+                        if self.sweep_from_poll().await {
+                            continue;
+                        }
+                    }
                     let interval = ms_to_ns(self.config.rescan_interval_ms);
                     let last = self.last_scan_unix_ns.load(Ordering::Acquire);
                     let now = self.now();
@@ -104,6 +115,7 @@ impl Coordinator {
                 return Ok(None);
             }
             rescanned = false;
+            swept = false;
         }
     }
 

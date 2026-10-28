@@ -145,7 +145,8 @@ async fn create_is_idempotent_through_already_exists() {
     assert_eq!(second.version, first.version);
     assert_eq!(
         delta.publish.put, 2,
-        "one CreateIfAbsent on HEAD, then the dir entry the Exists path repairs"
+        "the dir entry ahead of the HEAD write, then one CreateIfAbsent on HEAD; \
+         the Exists path does not repeat the entry this command already wrote"
     );
     assert_eq!(delta.publish.conflict, 1, "refused with AlreadyExists");
     assert_eq!(delta.resolve.get, 2, "the blip, then the re-read");
@@ -363,7 +364,11 @@ async fn a_contended_head_gives_up_after_the_cas_bound() {
         .expect_err("every create is refused");
     let delta = store.counters();
     assert_eq!(error.kind, ErrorKind::StoreUnavailable);
-    assert_eq!(delta.publish.put, u64::from(MAX_CAS_ATTEMPTS));
+    assert_eq!(
+        delta.publish.put,
+        u64::from(MAX_CAS_ATTEMPTS) + 1,
+        "the dir entry once, then every HEAD create"
+    );
     assert_eq!(delta.publish.conflict, u64::from(MAX_CAS_ATTEMPTS));
 }
 
@@ -1286,15 +1291,56 @@ fn the_jittered_backoff_grows_to_its_cap_and_honours_retry_after() {
 }
 
 #[tokio::test]
-async fn a_create_that_finds_the_root_repairs_the_dir_entry() {
-    // The first create's dir entry write fails after its HEAD applied.
-    let refuse = Rule::new(Op::Put, ScriptedFault::Transient("down".to_string()))
+async fn a_create_whose_dir_entry_fails_writes_no_head() {
+    let refuse = Rule::new(Op::Put, ScriptedFault::Permanent("down".to_string()))
         .with_key_contains("/_dir/")
-        .with_occurrence(Occurrence::Nth(1));
+        .with_occurrence(Occurrence::Always);
     let (backend, store) = faulty(vec![refuse]);
+    let before = store.counters();
+    let refused = store
+        .create(kind(), key("o-1"))
+        .await
+        .expect_err("a create without its directory entry is refused");
+    assert_eq!(refused.kind, ErrorKind::StoreUnavailable);
+    assert_eq!(backend.fault_count(Op::Put, FaultKind::Permanent), 1);
+    let delta = store.counters().since(&before);
+    assert_eq!(delta.publish.put, 1, "the refused dir entry, and no HEAD");
+    assert_eq!(delta.publish.cas, 0);
+    let head = head_key(&tenant(), &agent()).expect("head key");
+    assert!(matches!(
+        backend.inner().head(&head).await,
+        Err(StoreError::NotFound)
+    ));
+
+    // A retryable failure is retried, and the create then succeeds with
+    // its entry written first.
+    let (backend, store) = faulty(vec![
+        Rule::new(Op::Put, ScriptedFault::Transient("blip".to_string()))
+            .with_key_contains("/_dir/")
+            .with_occurrence(Occurrence::Nth(1)),
+    ]);
+    let created = create(&store).await;
+    assert_eq!(created.reply, Reply::Created { incarnation: 1 });
+    assert_eq!(backend.fault_count(Op::Put, FaultKind::Transient), 1);
+    assert_eq!(
+        store.list_agents(None).await.expect("list").agents,
+        vec![agent()]
+    );
+}
+
+#[tokio::test]
+async fn a_create_that_finds_the_root_repairs_the_dir_entry() {
+    // An agent whose entry went missing after its create, as one removed
+    // from the store by hand.
+    let backend = Arc::new(MemoryStore::new());
+    let store = store_with(backend.clone(), StoreLimits::default());
     let first = create(&store).await;
     assert_eq!(first.reply, Reply::Created { incarnation: 1 });
     assert!(first.published);
+    backend
+        .delete(&dir_key(&tenant(), &agent()).expect("dir key"))
+        .await
+        .expect("delete dir entry");
     assert!(
         store
             .list_agents(None)
@@ -1316,5 +1362,25 @@ async fn a_create_that_finds_the_root_repairs_the_dir_entry() {
         store.list_agents(None).await.expect("list").agents,
         vec![agent()]
     );
-    assert_eq!(backend.fault_count(Op::Put, FaultKind::Transient), 1);
+}
+
+#[tokio::test]
+async fn ensure_dir_entry_writes_only_a_missing_entry() {
+    let backend = Arc::new(MemoryStore::new());
+    let store = store_with(backend.clone(), StoreLimits::default());
+    create(&store).await;
+    let before = store.counters();
+    assert!(!store.ensure_dir_entry(&agent()).await.expect("present"));
+    backend
+        .delete(&dir_key(&tenant(), &agent()).expect("dir key"))
+        .await
+        .expect("delete dir entry");
+    assert!(store.ensure_dir_entry(&agent()).await.expect("missing"));
+    let delta = store.counters().since(&before);
+    assert_eq!(delta.publish.put, 2);
+    assert_eq!(delta.total().requests(), 2);
+    assert_eq!(
+        store.list_agents(None).await.expect("list").agents,
+        vec![agent()]
+    );
 }

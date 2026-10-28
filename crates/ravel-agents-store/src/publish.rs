@@ -26,10 +26,17 @@
 //! [`crate::backoff::Backoff`] gives it, with a `Throttled` answer's
 //! `retry_after_ms` as the floor (`tests::a_retry_waits_through_the_backoff_seam`).
 //!
+//! A create whose kernel transition asks for `Effect::WriteDirEntry` writes
+//! the `_dir` entry between steps 5 and 6, once per command, and fails with
+//! `StoreUnavailable` without writing HEAD when that write fails
+//! (`tests::a_create_whose_dir_entry_fails_writes_no_head`). So every agent
+//! with a HEAD has a directory entry, which the runtime's sweep relies on
+//! (ADR-3331, the directory amendment to decision 8).
+//!
 //! A create that finds the root already active (`Reply::Exists`) writes no
-//! HEAD but still writes the `_dir` entry: the create that minted the root
-//! may have lost its acknowledgement before it got there, and nothing later
-//! would repair the listing
+//! HEAD but still writes the `_dir` entry, logging a failure: an entry that
+//! went missing some other way, such as by hand, is restored by the next
+//! create
 //! (`tests::a_create_that_finds_the_root_repairs_the_dir_entry`).
 //!
 //! `Transient`, `Timeout` or `Throttled` from the HEAD write is an unknown
@@ -214,6 +221,7 @@ impl AgentStore {
         let key = head_key(&self.tenant, agent)
             .map_err(|_| unavailable(agent, "agent key is not addressable"))?;
         let is_create = matches!(command, Command::Create(_));
+        let mut dir_written = false;
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -237,8 +245,14 @@ impl AgentStore {
                     let (Some(head), Some(version)) = (current, version) else {
                         return Err(unavailable(agent, "kernel left an absent root unchanged"));
                     };
-                    if is_create {
-                        self.after_publish(agent, &[Effect::WriteDirEntry]).await;
+                    if is_create && !dir_written {
+                        wake::write_dir_entry(
+                            self.store.as_ref(),
+                            &self.counters,
+                            &self.tenant,
+                            agent,
+                        )
+                        .await;
                     }
                     return Ok(Outcome {
                         agent: *agent,
@@ -278,6 +292,13 @@ impl AgentStore {
 
             for dep in new_deps {
                 self.store_dependency(agent, dep, deps).await?;
+            }
+
+            // The directory entry goes first, so no HEAD is ever published
+            // without one; a CAS retry does not repeat it.
+            if !dir_written && effects.contains(&Effect::WriteDirEntry) {
+                self.ensure_dir_entry(agent).await?;
+                dir_written = true;
             }
 
             let mode = match &version {
@@ -464,15 +485,12 @@ impl AgentStore {
         }
     }
 
-    /// The advisory writes a successful CAS asks for. The rest of the
-    /// effects are the runtime's and are returned in the [`Outcome`].
+    /// The advisory writes a successful CAS asks for. `WriteDirEntry` was
+    /// already done before the HEAD write. The rest of the effects are the
+    /// runtime's and are returned in the [`Outcome`].
     async fn after_publish(&self, agent: &AgentId, effects: &[Effect]) {
         for effect in effects {
             match effect {
-                Effect::WriteDirEntry => {
-                    wake::write_dir_entry(self.store.as_ref(), &self.counters, &self.tenant, agent)
-                        .await;
-                }
                 Effect::WriteWakeHint { due_unix_ns } => {
                     wake::write_wake_hint(
                         self.store.as_ref(),
@@ -483,7 +501,8 @@ impl AgentStore {
                     )
                     .await;
                 }
-                Effect::WakeWorker
+                Effect::WriteDirEntry
+                | Effect::WakeWorker
                 | Effect::DispatchIntents { .. }
                 | Effect::OperationTerminal { .. } => {}
             }
