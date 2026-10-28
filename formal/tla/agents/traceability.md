@@ -81,9 +81,9 @@ below, with the ticket that builds each.
 
 ## Design rows (not yet built)
 
-These model actions and properties describe the coordinator in
-`ravel-agents-runtime`, which is an empty skeleton today. Each row joins the
-table above in the task that builds its symbol.
+These model actions and properties describe parts of the coordinator in
+`ravel-agents-runtime` that are not built yet. Each row joins the table
+above in the task that builds its symbol.
 
 - `Takeover` and `BeginTurn` as the runtime drives them: activation through the
   runtime lease table and the worker protocol that issues the kernel's
