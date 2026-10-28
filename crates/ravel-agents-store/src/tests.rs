@@ -25,6 +25,8 @@ use crate::backoff::{Backoff, JitteredBackoff, NoBackoff};
 use crate::counters::PhaseCounts;
 use crate::publish::{MAX_CAS_ATTEMPTS, reply_handle};
 
+mod pages;
+
 const SECOND: i64 = 1_000_000_000;
 const T0: i64 = 1_800_000_000 * SECOND;
 
