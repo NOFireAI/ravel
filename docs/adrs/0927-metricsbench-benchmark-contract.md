@@ -974,3 +974,34 @@ ceilings are about twice those: 14,400 s, 18,000 s and 72,000 s, and 600 s
 for `ci`. A `history` run therefore needs a box that stays up longer than
 ten hours. The smoke pass that follows this amendment pre-registers each
 profile's figures on #2821 before it runs.
+
+## Amendment (2026-10-29): the portable stack's local object store is s3s-fs
+
+<!-- amendment-applies: none reason="records which local S3 server the portable stack runs; decision 10 still limits any local store to correctness, CI and diagnostics, and no earlier text names the server" -->
+
+Context. The portable stack in `deploy/metricsbench` runs one local
+S3-compatible server that both Ravel and Mimir write to. It has been RustFS,
+capped at one CPU and 2 GiB. Experiment E1 on #2821 (comment 6481431272,
+then the mid-run reading) replayed the `cardinality` stream into Ravel under
+`--strict-flush-policy arrival`. RustFS sat at 99.86% of its one CPU while
+ravel-server sat at 0.42%, about 74 PUTs per second. The same stream fed to
+Prometheus from the same sender reached about 188,000 points per second, so
+the store, not the sender or Ravel, bounded the Ravel row. On the ClickBench
+entry, ADR-3217 measured RustFS reading a whole 1 MiB erasure block for each
+small ranged GET, and the same main's cold sum at 342.7 s on RustFS against
+157.7 s on s3s-fs.
+
+Decision: the portable stack's local object store is s3s-fs, the
+file-system backend of the s3s project. The binary is the
+`s3s-fs-0.17.0-ravel.1` release of the `NOFireAI/s3s` fork, checked against
+that release's SHA256SUMS, the same build the ClickBench entry runs. It keeps
+RustFS's resource envelope, one CPU and 2 GiB, so the store implementation is
+the only thing that changes, and both Ravel and Mimir use it. The envelope
+and the binary's checksum are disclosed beside the other frozen settings.
+
+Consequences. Decision 10 is unchanged: s3s-fs, like RustFS or MinIO before
+it, is valid for correctness, CI and diagnostic runs, and only the real-S3
+lane produces publishable Ravel performance and cost figures. Figures
+measured on RustFS are not compared with figures measured on s3s-fs; each
+run's provenance records the store. Raising the store's envelope, if a run
+shows it still binds, is a separate disclosed change.
