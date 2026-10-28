@@ -31,9 +31,8 @@ use ravel_agents_core::wire::{
     EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
     ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse,
     ResultBody, ResultResponse, SendRequest, StateResponse, StepBody, StepRecordRequest,
-    StepRecordResponse, WorkerCommitRequest, WorkerHeartbeatRequest,
-    WorkerHeartbeatResponse, WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest,
-    WorkerRegisterResponse,
+    StepRecordResponse, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};
@@ -46,7 +45,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use super::audit::{ReconcileAction, agents_reconcile_audit_event};
 use super::runtime::{
-    AgentsRuntime, LONG_POLL_CAP_MS, Lane, WorkerDispatcher, ResultWaitCounters, TenantAgents,
+    AgentsRuntime, LONG_POLL_CAP_MS, Lane, ResultWaitCounters, TenantAgents, WorkerDispatcher,
 };
 use crate::service::{ServiceError, authenticate_principal};
 use ravel_tenant_resolve::Principal;
@@ -547,7 +546,9 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
             StepProgress::Completed { output } => {
                 (step_body(step, Some(output)), result_attempt(), None)
             }
-            StepProgress::Failed { error } => (step_body(step, None), result_attempt(), Some(error)),
+            StepProgress::Failed { error } => {
+                (step_body(step, None), result_attempt(), Some(error))
+            }
         };
         Ok::<_, Refusal>(Json(StepRecordResponse {
             step,

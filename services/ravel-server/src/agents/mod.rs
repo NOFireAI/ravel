@@ -32,7 +32,7 @@ pub use audit::{KIND_AGENTS_RECONCILE, ReconcileAction, agents_reconcile_audit_e
 pub use routes::MAX_EVENTS_PAGE;
 pub use runtime::{
     AgentsRuntime, EvidenceIndex, LONG_POLL_CAP_MS, Lane, MAX_EVIDENCE_EFFECTS,
-    MAX_EVIDENCE_PER_EFFECT, WorkerDispatcher, TenantAgents,
+    MAX_EVIDENCE_PER_EFFECT, TenantAgents, WorkerDispatcher,
 };
 
 /// The unauthenticated settings route.

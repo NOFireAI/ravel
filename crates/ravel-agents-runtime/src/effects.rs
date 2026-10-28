@@ -760,9 +760,7 @@ impl Coordinator {
                 continue;
             }
             let open = head.effects.iter().any(|e| {
-                e.effect_id == id
-                    && e.status == EffectStatus::Authorized
-                    && e.attempt == attempt
+                e.effect_id == id && e.status == EffectStatus::Authorized && e.attempt == attempt
             });
             if open {
                 still_open = true;
