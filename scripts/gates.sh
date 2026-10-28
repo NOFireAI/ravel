@@ -371,7 +371,7 @@ run_feature_lanes() {
   # scoped run that does not reach ravel-catalog still checks it.
   if [[ ${want_agents} -eq 1 ]]; then
     run cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings
-    run_lane_tests -p ravel-server --features agents --test agents_seam --test agents_effects_e2e
+    run_lane_tests -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e
     run_lane_tests -p ravel-server --features agents --lib
     run_lane_tests -p ravel-catalog --test sys_proto_format_version_classification
   fi
