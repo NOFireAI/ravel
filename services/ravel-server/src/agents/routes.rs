@@ -9,6 +9,7 @@
 //! mapping from an [`AgentError`] to a status and an [`ErrorBody`].
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::Json;
@@ -35,7 +36,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::runtime::{AgentsRuntime, LONG_POLL_CAP_MS, Lane, TenantAgents};
+use super::runtime::{AgentsRuntime, LONG_POLL_CAP_MS, Lane, ResultWaitCounters, TenantAgents};
 use crate::service::{ServiceError, authenticate_principal};
 
 /// Most events one `events` page returns, whatever `limit` asks for.
@@ -236,7 +237,8 @@ pub(super) async fn call(State(api): State<Api>, req: Request<Body>) -> Response
             })
             .await?;
         let handle = decode_operation(&sent.operation)?;
-        let (status, result) = wait_result(&call.tenant, &handle, deadline).await?;
+        let (status, result) =
+            wait_result(&call.tenant, &api.runtime.result_waits, &handle, deadline).await?;
         Ok::<_, Refusal>(Json(CallResponse {
             operation: sent.operation,
             status,
@@ -280,7 +282,8 @@ pub(super) async fn result(State(api): State<Api>, req: Request<Body>) -> Respon
         let q: ResultQuery = query(req.uri())?;
         let deadline = deadline(q.wait_ms);
         let handle = decode_operation(&q.operation)?;
-        let (_, result) = wait_result(&call.tenant, &handle, deadline).await?;
+        let (_, result) =
+            wait_result(&call.tenant, &api.runtime.result_waits, &handle, deadline).await?;
         Ok::<_, Refusal>(Json(ResultResponse {
             operation: q.operation,
             result,
@@ -508,27 +511,42 @@ async fn read_head(tenant: &TenantAgents, agent: &AgentId) -> Result<Head, Refus
 
 /// HEAD and the state of the operation `handle` names. A handle this tenant
 /// never issued, from an earlier incarnation, or for an input no longer
-/// retained, is `AgentGone` carrying the handle.
+/// retained, is `AgentGone` carrying the handle. A HEAD read that finds no
+/// object is `OutcomeUnknown` carrying the handle, as in
+/// `AgentStore::resolve`: a HEAD is never deleted, so the read failed.
 async fn read_operation(
     tenant: &TenantAgents,
     handle: &Handle,
 ) -> Result<(Head, OperationState), Refusal> {
+    let handle_ids = || SafeIds {
+        operation: Some(handle.encode()),
+        ..ids_for(&handle.agent)
+    };
     let gone = || {
         refusal(
             ErrorKind::AgentGone,
-            SafeIds {
-                operation: Some(handle.encode()),
-                ..ids_for(&handle.agent)
-            },
+            handle_ids(),
             "operation is not known to this agent",
         )
     };
-    let head = read_head(tenant, &handle.agent)
-        .await
-        .map_err(|e| match e {
-            Refusal::Agent(error) if error.kind == ErrorKind::AgentGone => gone(),
-            other => other,
-        })?;
+    let head = match tenant.store.read_head(&handle.agent).await? {
+        HeadState::Present { head, .. } if head.lifecycle != Lifecycle::Tombstoned => *head,
+        HeadState::Present { .. } => return Err(gone()),
+        HeadState::Absent => {
+            return Err(refusal(
+                ErrorKind::OutcomeUnknown,
+                handle_ids(),
+                "HEAD could not be read; resolve the operation again",
+            ));
+        }
+        HeadState::Unsupported { .. } => {
+            return Err(refusal(
+                ErrorKind::UnsupportedFormat,
+                ids_for(&handle.agent),
+                "HEAD format version is newer than this release",
+            ));
+        }
+    };
     if head.incarnation != handle.incarnation {
         return Err(gone());
     }
@@ -580,9 +598,11 @@ async fn read_json(
 /// `deadline`. Returns the last state read and the result, if terminal.
 async fn wait_result(
     tenant: &TenantAgents,
+    counters: &ResultWaitCounters,
     handle: &Handle,
     deadline: tokio::time::Instant,
 ) -> Result<(OperationStatus, Option<ResultBody>), Refusal> {
+    let mut parked = false;
     loop {
         let changed = tenant.changed.notified();
         tokio::pin!(changed);
@@ -610,11 +630,18 @@ async fn wait_result(
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
+            counters.expired.fetch_add(1, Ordering::Relaxed);
             return Ok((state.into(), None));
+        }
+        if !parked {
+            parked = true;
+            counters.parked.fetch_add(1, Ordering::Relaxed);
         }
         let recheck = (now + RESULT_RECHECK).min(deadline);
         tokio::select! {
-            () = &mut changed => {}
+            () = &mut changed => {
+                counters.notified.fetch_add(1, Ordering::Relaxed);
+            }
             () = tokio::time::sleep_until(recheck) => {}
         }
     }
