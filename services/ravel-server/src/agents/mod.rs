@@ -274,6 +274,9 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body is JSON");
         assert_eq!(body["assignment"], serde_json::Value::Null);
+        // hygiene-allow: wall-clock -- `started` is tokio's Instant on a
+        // start_paused runtime, so `waited` is virtual time advanced only by
+        // the poll's own timer, exact on any machine.
         assert_eq!(
             waited,
             std::time::Duration::from_millis(LONG_POLL_CAP_MS),

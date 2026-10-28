@@ -4401,6 +4401,7 @@ pub(crate) fn render_agents_families(
     }
 
     let snapshot = runtime.metrics();
+    let (result_parked, result_notified, result_expired) = runtime.result_waits.snapshot();
     for (name, help, kind, value) in [
         (
             "ravel_agents_loaded",
@@ -4461,6 +4462,24 @@ pub(crate) fn render_agents_families(
             "Worker polls that found no work at first and waited.",
             "counter",
             snapshot.polls_waited,
+        ),
+        (
+            "ravel_agents_result_waits_total",
+            "result and call long polls that found their operation not yet terminal and waited.",
+            "counter",
+            result_parked,
+        ),
+        (
+            "ravel_agents_result_wakes_total",
+            "Waiting result and call long polls woken by a commit or cancel through this process, rather than by their periodic HEAD re-read.",
+            "counter",
+            result_notified,
+        ),
+        (
+            "ravel_agents_result_wait_expiries_total",
+            "result and call long polls that reached their wait deadline with the operation not terminal.",
+            "counter",
+            result_expired,
         ),
     ] {
         write_header(out, name, help, kind);

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use ravel_agents_core::kernel::Limits;
@@ -47,6 +48,31 @@ pub struct AgentsRuntime {
     tenants: Mutex<HashMap<TenantHash, Arc<TenantAgents>>>,
     poll_permits: Arc<Semaphore>,
     activation_permits: Arc<Semaphore>,
+    pub result_waits: ResultWaitCounters,
+}
+
+/// What the `result` and `call` long polls in this process did while waiting
+/// for an operation to finish.
+#[derive(Debug, Default)]
+pub struct ResultWaitCounters {
+    /// Long polls that found the operation not yet terminal and parked.
+    pub parked: AtomicU64,
+    /// Parked long polls woken by a commit or cancel through this process.
+    pub notified: AtomicU64,
+    /// Long polls that reached their deadline with the operation not
+    /// terminal.
+    pub expired: AtomicU64,
+}
+
+impl ResultWaitCounters {
+    /// `(parked, notified, expired)`.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.parked.load(Ordering::Relaxed),
+            self.notified.load(Ordering::Relaxed),
+            self.expired.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl AgentsRuntime {
@@ -62,6 +88,7 @@ impl AgentsRuntime {
             tenants: Mutex::new(HashMap::new()),
             poll_permits: Arc::new(Semaphore::new(settings.poll_concurrency)),
             activation_permits: Arc::new(Semaphore::new(settings.activation_concurrency)),
+            result_waits: ResultWaitCounters::default(),
         }
     }
 
