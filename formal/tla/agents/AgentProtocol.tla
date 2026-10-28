@@ -480,6 +480,7 @@ OwnResult(w, h) ==
 \* match; anything else is OwnershipLost.
 CompleteTurnRebase(w) ==
     /\ wk[w].pc = "rebase"
+    /\ HeadUp(wk[w].ak)
     /\ LET ak == wk[w].ak
            h == Head(ak)
        IN IF ~OwnResult(w, h) /\ ~h.tomb /\ h.owner = w /\ h.epoch = wk[w].epoch
