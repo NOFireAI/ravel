@@ -174,7 +174,8 @@ function jsonSchema(schema: z.ZodType, io: "input" | "output", at: string): Json
  * The contract module's source for `agent`. The output depends on nothing
  * but the definition, so regenerating an unchanged agent writes the same
  * bytes. Throws {@link ContractError} for a schema with no TypeScript form
- * (a `bigint`, a `Date`, a transform, a recursive schema).
+ * (a `bigint`, a `Date`, a transform in a result schema, a recursive
+ * schema).
  */
 export function generateContract(agent: AnyAgentDefinition): string {
   const handlers = Object.keys(agent.messages).sort();
