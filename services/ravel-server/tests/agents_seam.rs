@@ -30,6 +30,7 @@ fn agents_config() -> AgentsConfig {
         max_state_bytes: 17_000,
         max_receipts: 19,
         max_timers: 23,
+        ..AgentsConfig::default()
     }
 }
 

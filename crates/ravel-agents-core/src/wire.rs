@@ -409,9 +409,49 @@ pub struct StepBody {
     pub output: Option<Value>,
 }
 
+/// The lease `worker/poll` hands out: [`TurnLease`] plus two facts a worker
+/// needs to replay the turn deterministically. Both are fixed when the turn
+/// begins and carried across takeovers, so a replacement worker sees the
+/// values the first one did. A commit or heartbeat that echoes the whole
+/// object is read as its [`TurnLease`]; the two extra fields are ignored there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TurnAssignment {
+pub struct PolledLease {
+    #[serde(flatten)]
     pub lease: TurnLease,
+    /// When the coordinator began the turn, recorded in HEAD; the handler's
+    /// clock reads this, never the worker's own.
+    #[serde(with = "unix_ns")]
+    pub recorded_unix_ns: i64,
+    /// The turn's 128-bit randomness seed, lowercase hex
+    /// ([`turn_random_seed`]).
+    pub random_seed: String,
+}
+
+/// The seed of a turn's deterministic randomness: the first 16 bytes of the
+/// identity hash with purpose `random` over the agent id's hex text, the
+/// incarnation and the input's accept_seq (both u64 little-endian), as
+/// lowercase hex. Every attempt at one input derives the same seed.
+pub fn turn_random_seed(agent_id_hex: &str, incarnation: u64, accept_seq: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(crate::identity::DOMAIN);
+    let parts: [&[u8]; 4] = [
+        b"random",
+        agent_id_hex.as_bytes(),
+        &incarnation.to_le_bytes(),
+        &accept_seq.to_le_bytes(),
+    ];
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hex::encode(&hasher.finalize().as_bytes()[..16])
+}
+
+/// One leased turn. `worker/poll` delivers it with a [`PolledLease`]
+/// ([`PolledAssignment`]); the coordinator builds it with a [`TurnLease`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnAssignment<L = TurnLease> {
+    pub lease: L,
     pub agent: AgentRef,
     pub operation: String,
     pub accept_seq: u64,
@@ -422,10 +462,62 @@ pub struct TurnAssignment {
     pub steps: Vec<StepBody>,
 }
 
+/// A [`TurnAssignment`] as `worker/poll` delivers it.
+pub type PolledAssignment = TurnAssignment<PolledLease>;
+
+impl TurnAssignment {
+    /// This assignment with its lease extended by the turn's recorded start
+    /// time and its [`turn_random_seed`].
+    pub fn polled(self, recorded_unix_ns: i64) -> PolledAssignment {
+        let random_seed =
+            turn_random_seed(&self.lease.agent_id, self.lease.incarnation, self.accept_seq);
+        TurnAssignment {
+            lease: PolledLease {
+                lease: self.lease,
+                recorded_unix_ns,
+                random_seed,
+            },
+            agent: self.agent,
+            operation: self.operation,
+            accept_seq: self.accept_seq,
+            handler: self.handler,
+            state: self.state,
+            payload: self.payload,
+            steps: self.steps,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerPollResponse {
     /// Absent when the wait elapsed with no work.
-    pub assignment: Option<TurnAssignment>,
+    pub assignment: Option<PolledAssignment>,
+}
+
+/// `POST /api/v1/agents/worker/register`: the handler pins a worker process
+/// serves. Answered with the worker id the process names in every poll.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRegisterRequest {
+    pub handlers: Vec<HandlerPinBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRegisterResponse {
+    /// Minted for this call; never reused by another registration.
+    pub worker_id: String,
+}
+
+/// `POST /api/v1/agents/worker/heartbeat`: extend a running turn's lease.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerHeartbeatRequest {
+    pub lease: TurnLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerHeartbeatResponse {
+    /// When the extended lease expires.
+    #[serde(with = "unix_ns")]
+    pub lease_expires_unix_ns: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

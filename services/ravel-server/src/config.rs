@@ -3433,10 +3433,12 @@ pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// `--agents` and the `--agents-*` budget and quota flags.
 ///
 /// Like [`McpConfig`], these ride on [`QueryBudgets`] because the agents
-/// routes mount on the query router. Only `enabled` changes behaviour in this
-/// release: it mounts `GET /api/v1/agents/health`. The budgets and quotas are
-/// parsed, validated and reported on that route and on `/metrics`; the
-/// coordinator and store that enforce them land in later tasks of epic #3331.
+/// routes mount on the query router. `enabled` mounts the `/api/v1/agents`
+/// routes (`crate::agents`). The two concurrency settings bound the agents
+/// router's own admission, the mailbox, receipt and timer quotas are the
+/// store's kernel limits, and the body, lease and grace settings configure the
+/// router and the coordinator; `memory_budget_bytes`, `max_agents` and
+/// `max_state_bytes` are reported on the health route and `/metrics` only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsConfig {
     /// Whether the agents routes are mounted at all. Off unless `--agents`
@@ -3459,6 +3461,13 @@ pub struct AgentsConfig {
     pub max_receipts: u64,
     /// Most pending timers one agent may hold.
     pub max_timers: u64,
+    /// Largest request body the agents router reads; a larger one is refused
+    /// with 413 before any handler runs.
+    pub max_body_bytes: usize,
+    /// How long a worker's turn lease runs from its grant or last heartbeat.
+    pub lease_ms: u64,
+    /// How long past lease expiry another worker waits before taking over.
+    pub heartbeat_grace_ms: u64,
 }
 
 impl Default for AgentsConfig {
@@ -3473,6 +3482,9 @@ impl Default for AgentsConfig {
             max_state_bytes: DEFAULT_AGENTS_MAX_STATE_BYTES,
             max_receipts: DEFAULT_AGENTS_MAX_RECEIPTS,
             max_timers: DEFAULT_AGENTS_MAX_TIMERS,
+            max_body_bytes: DEFAULT_AGENTS_MAX_BODY_BYTES,
+            lease_ms: DEFAULT_AGENTS_LEASE_MS,
+            heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
         }
     }
 }
@@ -3495,6 +3507,12 @@ pub const DEFAULT_AGENTS_MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_AGENTS_MAX_RECEIPTS: u64 = 1024;
 /// `--agents-max-timers` default, equal to the kernel's `Limits::max_timers`.
 pub const DEFAULT_AGENTS_MAX_TIMERS: u64 = 64;
+/// Agents request body cap: 5 MiB, one 4 MiB store object plus its envelope.
+pub const DEFAULT_AGENTS_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+/// Agents turn lease: 30 s, the coordinator's own default.
+pub const DEFAULT_AGENTS_LEASE_MS: u64 = 30_000;
+/// Agents takeover grace past lease expiry: 10 s, the coordinator's default.
+pub const DEFAULT_AGENTS_HEARTBEAT_GRACE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
@@ -7253,6 +7271,9 @@ impl Cli {
                 max_state_bytes: self.agents_max_state_bytes,
                 max_receipts: self.agents_max_receipts,
                 max_timers: self.agents_max_timers,
+                max_body_bytes: DEFAULT_AGENTS_MAX_BODY_BYTES,
+                lease_ms: DEFAULT_AGENTS_LEASE_MS,
+                heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
             },
             fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
             sql_spill: SqlSpillSettings {
@@ -17498,6 +17519,7 @@ mod tests {
                 max_state_bytes: 17000,
                 max_receipts: 19,
                 max_timers: 23,
+                ..AgentsConfig::default()
             }
         );
     }
@@ -17524,6 +17546,9 @@ mod tests {
                 max_state_bytes: 64 * 1024 * 1024,
                 max_receipts: 1024,
                 max_timers: 64,
+                max_body_bytes: 5 * 1024 * 1024,
+                lease_ms: 30_000,
+                heartbeat_grace_ms: 10_000,
             }
         );
     }
