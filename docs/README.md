@@ -70,6 +70,10 @@ Come back to one lane when you have a specific question.
 - [guides/agents.md](guides/agents.md): Ravel Agents, the durable agent
   runtime. What an agent is, how to turn the runtime on, and what works in
   this release milestone by milestone.
+- [guides/agents-sdk.md](guides/agents-sdk.md): the TypeScript SDK for Ravel
+  Agents. Scaffolding a first project, its tests and a run against a server,
+  the typed errors, the testing export, the HTTP transport's limits, and
+  what the SDK does not do yet.
 
 ## Operate
 

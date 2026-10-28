@@ -115,3 +115,5 @@ The SDK lives in `sdk/typescript/packages/agents`; its
 [README](../../sdk/typescript/packages/agents/README.md) shows how to define
 an agent and a tool and drive them through the test harness. It is not
 published, and its worker has no HTTP transport for the agents routes yet.
+[The SDK guide](agents-sdk.md) takes a first project from a scaffold to a
+run against a server.
