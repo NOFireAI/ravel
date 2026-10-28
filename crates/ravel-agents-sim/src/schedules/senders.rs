@@ -118,8 +118,7 @@ fn competing_senders_across_seeds() {
         conflicts += competing(seed, seeded(seed, 3, 40, 0));
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(conflicts, COMPETING_CONFLICTS);
+    pinned("competing_senders", runs, conflicts, COMPETING_CONFLICTS);
 }
 
 /// Head CAS conflicts summed over `competing_senders_across_seeds`. Pinned:
@@ -250,10 +249,14 @@ fn duplicate_and_conflict_across_seeds() {
         conflicts += c;
         runs += 1;
     }
-    assert_eq!(runs, 64);
     // A payload-1 win gives one duplicate and one conflict, a payload-2 win
     // two conflicts: payload 1 won 36 of the 64 runs.
-    assert_eq!((dups, conflicts), DUP_AND_CONFLICT);
+    pinned(
+        "duplicate_and_conflict",
+        runs,
+        (dups, conflicts),
+        DUP_AND_CONFLICT,
+    );
 }
 
 const DUP_AND_CONFLICT: (usize, usize) = (36, 92);
@@ -530,11 +533,14 @@ fn lost_cas_response_across_seeds() {
         }
         runs += 1;
     }
-    assert_eq!(runs, 64);
     // How often a's lost write landed first, second or third.
     let landed = |n| accepted_seqs.iter().filter(|s| **s == n).count();
-    assert_eq!((landed(1), landed(2), landed(3)), LOST_ACK_POSITIONS);
-    assert_eq!(a_conflicts, LOST_ACK_CONFLICTS);
+    pinned(
+        "lost_cas_response",
+        runs,
+        ((landed(1), landed(2), landed(3)), a_conflicts),
+        (LOST_ACK_POSITIONS, LOST_ACK_CONFLICTS),
+    );
 }
 
 const LOST_ACK_POSITIONS: (usize, usize, usize) = (40, 13, 11);

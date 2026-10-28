@@ -108,8 +108,12 @@ fn enqueue_racing_completion_across_seeds() {
         conflicts += enqueue_race(seed, seeded(seed, 2, 60, 0), false);
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(conflicts, ENQUEUE_RACE_CONFLICTS);
+    pinned(
+        "enqueue_racing_completion",
+        runs,
+        conflicts,
+        ENQUEUE_RACE_CONFLICTS,
+    );
 }
 
 /// `w`'s HEAD conflicts summed over the batch.
@@ -223,8 +227,7 @@ fn cancel_racing_completion_across_seeds() {
         }
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(cancels_won, CANCELS_WON);
+    pinned("cancel_racing_completion", runs, cancels_won, CANCELS_WON);
 }
 
 /// Runs of the batch the cancel won; the completion won the rest.

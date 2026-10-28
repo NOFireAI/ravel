@@ -1179,7 +1179,8 @@ fn kill_batch(policy: RecoveryPolicy) -> Totals {
 
 #[test]
 fn provider_idempotency_kills_across_seeds() {
-    assert_eq!(kill_batch(PI), PI_TOTALS);
+    let pi = kill_batch(PI);
+    pinned("provider_idempotency_kills", pi.runs as u64, pi, PI_TOTALS);
 }
 
 /// The acceptance check for recovery policies. Under `at_least_once` a
@@ -1190,10 +1191,12 @@ fn provider_idempotency_kills_across_seeds() {
 #[test]
 fn at_least_once_duplicate_execution_is_reachable_and_manual_policy_never_redispatches() {
     let alo = kill_batch(ALO);
-    assert_eq!(alo, ALO_TOTALS);
-    assert!(alo.duplicates > 0, "{alo:?}");
+    pinned("at_least_once_kills", alo.runs as u64, alo, ALO_TOTALS);
+    if Batch::from_env().is_default() {
+        assert!(alo.duplicates > 0, "{alo:?}");
+    }
     let manual = kill_batch(MANUAL);
-    assert_eq!(manual, MANUAL_TOTALS);
+    pinned("manual_kills", manual.runs as u64, manual, MANUAL_TOTALS);
     assert_eq!(
         (manual.dispatches, manual.distinct_dispatches),
         (manual.attempts, manual.attempts)
@@ -1305,7 +1308,7 @@ fn cancels_across_seeds() {
     for seed in seeds() {
         totals += cancels(seed);
     }
-    assert_eq!(totals, CANCEL_TOTALS);
+    pinned("cancels", totals.runs as u64, totals, CANCEL_TOTALS);
 }
 
 const CANCEL_TOTALS: Totals = Totals {
@@ -1370,7 +1373,12 @@ fn conflicting_reporters_across_seeds() {
     for seed in seeds() {
         totals += conflicts(seed);
     }
-    assert_eq!(totals, CONFLICT_TOTALS);
+    pinned(
+        "conflicting_reporters",
+        totals.runs as u64,
+        totals,
+        CONFLICT_TOTALS,
+    );
 }
 
 const CONFLICT_TOTALS: Totals = Totals {
@@ -1446,7 +1454,12 @@ fn handler_version_changes_across_seeds() {
     for seed in seeds() {
         totals += versions(seed);
     }
-    assert_eq!(totals, VERSION_TOTALS);
+    pinned(
+        "handler_version_changes",
+        totals.runs as u64,
+        totals,
+        VERSION_TOTALS,
+    );
 }
 
 const VERSION_TOTALS: Totals = Totals {

@@ -231,8 +231,7 @@ fn fire_cancel_race_across_seeds() {
         }
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(tally, FIRE_CANCEL_TALLY);
+    pinned("fire_cancel_race", runs, tally, FIRE_CANCEL_TALLY);
 }
 
 /// How the batch's races resolved.
@@ -395,8 +394,12 @@ fn duplicate_hint_delivery_across_seeds() {
         deleted += d;
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!((gets, deleted), DUPLICATE_DELIVERY_TOTALS);
+    pinned(
+        "duplicate_hint_delivery",
+        runs,
+        (gets, deleted),
+        DUPLICATE_DELIVERY_TOTALS,
+    );
 }
 
 /// Summed `(head_gets, hints_deleted)` over the batch. Every pass reads
@@ -492,8 +495,7 @@ fn lost_hint_puts_across_seeds() {
         passes += fired_at;
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(passes, LOST_HINT_PASSES);
+    pinned("lost_hint_puts", runs, passes, LOST_HINT_PASSES);
 }
 
 /// Sum over the batch of the pass index that fired, the delivery delay in
@@ -624,8 +626,7 @@ fn crashes_around_the_hint_write_across_seeds() {
         tally[crash as usize] += 1;
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(tally, CRASH_TALLY);
+    pinned("crashes_around_the_hint_write", runs, tally, CRASH_TALLY);
 }
 
 /// Runs per [`Crash`] over the batch, in declaration order.
