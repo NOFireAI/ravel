@@ -61,14 +61,21 @@
 //!
 //! Reconciliation of an effect in doubt is [`Coordinator::reconcile_attach`]
 //! (attach a verified result) or [`Coordinator::reconcile_authorize`]
-//! (authorize another attempt and hand it to the owner). Neither dispatches:
-//! an authorized attempt is dispatched by the owner's next `run_step` for
-//! the effect's step, which is not refused for that attempt being open
-//! (`tests::a_reconciled_attempt_is_dispatched_by_the_owners_next_step`). The
-//! hand-over is held in this coordinator's memory, so an owner whose step
-//! reaches another coordinator, or a new owner after a takeover, finds the
-//! attempt lost and the policy decides (a `manual` effect latches in doubt
-//! again). Each is idempotent, and the kernel appends one audit event to the
+//! (authorize another attempt and hand it over). Neither dispatches: an
+//! authorized attempt is dispatched once by the next `run_step` for the
+//! effect's step through this coordinator, which is not refused for that
+//! attempt being open
+//! (`tests::a_reconciled_attempt_is_dispatched_by_the_owners_next_step`),
+//! whichever owner runs it, so a takeover in between does not lose it
+//! (`tests::a_reconciled_attempt_survives_a_takeover_before_the_next_step`).
+//! Two steps racing for it dispatch it once
+//! (`tests::concurrent_steps_dispatch_a_reconciled_attempt_once`), and a step
+//! refused after claiming it hands it back
+//! (`tests::a_hand_over_refused_after_its_claim_is_released_and_never_dispatched_twice`).
+//! The hand-over is held in this coordinator's memory, so a step that
+//! reaches another coordinator, or one after a restart, finds the attempt
+//! lost and the policy decides (a `manual` effect latches in doubt again).
+//! Each is idempotent, and the kernel appends one audit event to the
 //! effect's turn's event stream for each one that changes HEAD
 //! (`tests::reconcile_is_idempotent_and_audited_once`). One race is not
 //! covered: when another admin's `reconcile_authorize` for the same attempt
@@ -515,11 +522,13 @@ impl Coordinator {
     }
 
     /// Reconcile an effect in doubt by authorizing `attempt`, the one after
-    /// its latest, and handing it to the owner. Nothing is dispatched here:
-    /// the attempt is recorded open under HEAD's owner and epoch, and that
-    /// owner's next [`Coordinator::run_step`] for the effect's step
+    /// its latest, and handing it over. Nothing is dispatched here: the
+    /// attempt is recorded open and unclaimed for the effect's incarnation,
+    /// and the next [`Coordinator::run_step`] for the effect's step through
+    /// this coordinator, under whichever owner holds the turn by then,
     /// dispatches it through its own dispatcher, once
-    /// (`tests::reconcile_is_idempotent_and_audited_once`). Answers `true`
+    /// (`tests::reconcile_is_idempotent_and_audited_once`,
+    /// `tests::a_reconciled_attempt_survives_a_takeover_before_the_next_step`). Answers `true`
     /// when this call authorized the attempt. Idempotent: a repeat for an
     /// attempt already authorized answers `false` and hands nothing over.
     /// When this call's own write landed and only its acknowledgement was
@@ -531,11 +540,10 @@ impl Coordinator {
     /// answers `false` and hands nothing over
     /// (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
     ///
-    /// The hand-over is held by this coordinator in memory. An owner whose
-    /// next step reaches another coordinator, an owner replaced by a
-    /// takeover, or a restart in between finds the attempt authorized with
-    /// no record, takes it as lost, and the step's policy decides (a
-    /// `manual` effect latches in doubt again).
+    /// The hand-over is held by this coordinator in memory. A next step
+    /// that reaches another coordinator, or a restart in between, finds the
+    /// attempt authorized with no record, takes it as lost, and the step's
+    /// policy decides (a `manual` effect latches in doubt again).
     ///
     /// Not idempotent across admins in one case: when another admin's
     /// reconcile lands between this call's reload and its write, and this
