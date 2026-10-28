@@ -117,7 +117,9 @@ HeadRecs ==
      active: [turn: Nat, seq: Nat, base: Nat, inc: Nat], turns: Nat,
      cancels: SUBSET Nat, timer: [gen: Nat, st: TimerStates]]
 
-HintContents == {<<"hint", g>> : g \in 1..MaxTimerGen}
+\* A hint names the incarnation and generation it was written for; the key
+\* names only the generation, so a later incarnation's hint overwrites it.
+HintContents == {<<"hint", i, g>> : i \in Nat, g \in 1..MaxTimerGen}
 
 AgentContent == {NoC} \cup ObjIds \cup HintContents \cup HeadRecs
 
@@ -125,7 +127,8 @@ VARIABLES
     store, lastModified, versionCounter, uploads, listState,  \* the store
     cl,           \* [Clients -> client operation in flight]
     wk,           \* [Workers -> worker operation in flight]
-    co,           \* [AKs -> highest timer generation the scheduler hinted]
+    co,           \* [AKs -> highest timer generation the scheduler hinted
+                  \*         in the current incarnation]
     crashedOnce,  \* SUBSET Workers: model bound, each worker crashes once
     due,          \* [AKs -> highest due timer generation] (environment)
     acked,        \* [Clients -> handle returned to the client, or NoHandle]
@@ -143,6 +146,7 @@ Min(S) == CHOOSE x \in S : \A y \in S : x =< y
 
 Head(ak)  == Store!ContentOf(HeadKey(ak))
 HeadUp(ak) == Store!Present(HeadKey(ak))
+HintInc(ak, g) == Store!ContentOf(HintKey(ak, g))[2]
 
 FreshHead(ak, inc, rev, owner, epoch, turns, gen) ==
     [tenant |-> ak[1], agent |-> ak[2], inc |-> inc, tomb |-> FALSE,
@@ -275,15 +279,22 @@ Destroy(ak) ==
     /\ AdminCas(ak, [Head(ak) EXCEPT !.rev = @ + 1, !.tomb = TRUE,
                        !.timer.st = IF @ = "armed" THEN "cancelled" ELSE @])
 
-\* Recreate on a tombstoned HEAD bumps the incarnation in the same HEAD and
-\* starts an empty mailbox; epoch, turn and timer counters never go back.
+\* Recreate on a tombstoned HEAD bumps the incarnation in the same HEAD,
+\* clears the owner and starts an empty mailbox and timer generation 0, as
+\* `Kernel::create` does. The epoch is kept, so an owner of the old
+\* incarnation stays fenced. Timer generations restart because a timer's
+\* identity carries its incarnation; the scheduler's and the environment's
+\* per-agent generation counters restart with them. `turns` only names
+\* output objects and is kept so a new incarnation never reuses one.
 Recreate(ak) ==
     /\ HeadUp(ak)
     /\ Head(ak).rev < MaxRevision
     /\ Head(ak).tomb
     /\ LET h == Head(ak)
-       IN AdminCas(ak, FreshHead(ak, h.inc + 1, h.rev + 1, h.owner, h.epoch,
-                                 h.turns, h.timer.gen))
+       IN /\ CasNow(ak, FreshHead(ak, h.inc + 1, h.rev + 1, NoWorker, h.epoch, h.turns, 0))
+          /\ co' = [co EXCEPT ![ak] = 0]
+          /\ due' = [due EXCEPT ![ak] = 0]
+    /\ UNCHANGED <<cl, wk, crashedOnce, acked>>
 
 \* --- Client: enqueue ------------------------------------------------------
 
@@ -533,7 +544,8 @@ WriteHint(ak) ==
     /\ HeadUp(ak)
     /\ Head(ak).timer.st = "armed"
     /\ co[ak] < Head(ak).timer.gen
-    /\ Store!PutOverwrite(HintKey(ak, Head(ak).timer.gen), <<"hint", Head(ak).timer.gen>>)
+    /\ Store!PutOverwrite(HintKey(ak, Head(ak).timer.gen),
+                          <<"hint", Head(ak).inc, Head(ak).timer.gen>>)
     /\ co' = [co EXCEPT ![ak] = Head(ak).timer.gen]
     /\ UNCHANGED <<cl, wk, crashedOnce, due, acked>>
 
@@ -546,11 +558,13 @@ TimerDue(ak) ==
     /\ UNCHANGED <<sVars, cl, wk, co, crashedOnce, acked>>
 
 \* The sweep serves a due hint: it reads the HEAD the hint names and, when
-\* that root has the hint's generation armed, fires it with one CAS that
-\* marks the generation delivered and enqueues the timer message (read and
-\* CAS are one step, see CasNow). A hint for a generation the root no longer
-\* has armed fires nothing and is deleted; generations never re-arm, so that
-\* root never needs the hint again. A sweep pass that lists a hint whose
+\* that root has the hint's incarnation and generation armed, fires it with
+\* one CAS that marks the generation delivered and enqueues the timer
+\* message (read and CAS are one step, see CasNow). A hint for a generation
+\* the root no longer has armed, or for another incarnation, fires nothing
+\* and is deleted; within an incarnation generations never re-arm, and a
+\* later incarnation writes its own hint, so nothing needs the deleted one
+\* again. A sweep pass that lists a hint whose
 \* generation is not yet due keeps it and changes nothing, so it is a
 \* stutter and has no action; the EarlyHintForgotten negative shows that
 \* deleting it instead loses the timer.
@@ -559,7 +573,7 @@ FireTimer(ak, g) ==
     /\ g =< due[ak]
     /\ HeadUp(ak)
     /\ LET h == Head(ak)
-       IN IF h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb
+       IN IF h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb /\ HintInc(ak, g) = h.inc
             THEN CasNow(ak, FireHead(h, g))
             ELSE Store!Delete(HintKey(ak, g))
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
@@ -692,7 +706,9 @@ NoLostConcurrentEnqueue ==
                s \in LC.after.inbox \/ \E r \in LC.after.results : r.seq = s
 
 \* root_revision rises by exactly one per write and the store version rises
-\* with it; incarnation, epoch, turn and timer counters never go back.
+\* with it; incarnation and epoch never go back, and within an incarnation
+\* the timer generation never goes back (a recreate restarts it at 0, as
+\* the kernel does). The kernel keeps no turn counter, so none is checked.
 MonotonicIdentity ==
     LC # NoCas =>
         /\ LC.va > LC.vb
@@ -701,8 +717,7 @@ MonotonicIdentity ==
              /\ LC.after.rev = LC.before.rev + 1
              /\ LC.after.inc >= LC.before.inc
              /\ LC.after.epoch >= LC.before.epoch
-             /\ LC.after.turns >= LC.before.turns
-             /\ LC.after.timer.gen >= LC.before.timer.gen
+        /\ SameInc => LC.after.timer.gen >= LC.before.timer.gen
 
 \* A timer generation enqueues at most one message, only from a root where
 \* that generation was armed, and a delivered generation stays delivered.
