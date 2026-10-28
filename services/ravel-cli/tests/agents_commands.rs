@@ -30,8 +30,7 @@ use ravel_agents_core::wire::{
 };
 use ravel_agents_store::{AgentStore, Clock, StoreLimits};
 use ravel_cli::agents::{
-    self, AgentsCliError, DevHost, DevOptions, InspectOutput, LIST_LIMIT_CAP, ListOutput,
-    ReconcileChoice,
+    self, AgentsCliError, DevHost, DevOptions, InspectOutput, ListOutput, ReconcileChoice,
 };
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_object_store::ObjectStoreBackend;
@@ -369,6 +368,12 @@ async fn dev_runs_its_steps_in_order_once_the_store_is_not_memory() {
             ready.capabilities,
             vec!["agents", "agents_worker", "agents_admin"]
         );
+        assert_eq!(ready.scaffold, "ravel-cli agents scaffold my-agent");
+        let text = agents::render_dev_ready(&ready);
+        assert!(
+            text.ends_with("start a project with: ravel-cli agents scaffold my-agent\n"),
+            "{text}"
+        );
     }
 }
 
@@ -388,6 +393,29 @@ async fn dev_refuses_a_listener_off_loopback_before_starting_anything() {
         "{err}"
     );
     assert!(host.calls.is_empty());
+}
+
+#[tokio::test]
+async fn dev_refuses_a_grpc_listener_off_loopback_before_starting_anything() {
+    let mut options = dev_options(StoreSelection::explicit(StoreKind::S3));
+    options.listen_grpc = "0.0.0.0:4317".parse().expect("addr");
+    let mut host = RecordingHost::default();
+    let mut out = Vec::new();
+    let err = agents::run_dev(&options, &mut host, "tok", &mut out, false)
+        .await
+        .expect_err("non-loopback gRPC listener");
+    assert!(
+        matches!(
+            err.downcast_ref::<AgentsCliError>(),
+            Some(AgentsCliError::ListenNotLoopback {
+                flag: "listen-grpc",
+                ..
+            })
+        ),
+        "{err}"
+    );
+    assert!(host.calls.is_empty(), "started {:?}", host.calls);
+    assert!(out.is_empty(), "a refused dev printed a ready line");
 }
 
 #[test]
@@ -477,7 +505,8 @@ async fn list_pages_are_bounded_and_resume_at_the_cursor() {
     expected.dedup();
     assert_eq!(seen, expected);
 
-    for (limit, refusal) in [(0, "LimitZero"), (LIST_LIMIT_CAP + 1, "LimitOverCap")] {
+    // `--help` says "above 1000 is refused", so the bound is the literal.
+    for (limit, refusal) in [(0, "LimitZero"), (1001, "LimitOverCap")] {
         let before = list_requests(&reader);
         let err = agents::list(&reader, &TENANT, None, limit)
             .await
@@ -485,6 +514,10 @@ async fn list_pages_are_bounded_and_resume_at_the_cursor() {
         assert!(format!("{err:?}").starts_with(refusal), "{err:?}");
         assert_eq!(list_requests(&reader), before, "a refused list listed");
     }
+    let page = agents::list(&reader, &TENANT, None, 1000)
+        .await
+        .expect("a limit of 1000 is accepted");
+    assert_eq!(page.agents.len(), 5);
     let err = agents::list(&reader, &TENANT, Some("a/b"), 2)
         .await
         .expect_err("cursor with a slash");
@@ -546,15 +579,15 @@ async fn operation_events_and_effects_print_the_wire_types() {
         .expect("events at the end");
     assert!(end.events.is_empty());
     assert_eq!(end.next_cursor, "3");
-    for (cursor, limit) in [
-        (None, 0),
-        (None, agents::EVENTS_LIMIT_CAP + 1),
-        (Some("x"), 2),
-    ] {
+    for (cursor, limit) in [(None, 0), (None, 1001), (Some("x"), 2)] {
         agents::events(&reader, seeded.agent, cursor, limit)
             .await
             .expect_err("bad events page");
     }
+    let all = agents::events(&reader, seeded.agent, None, 1000)
+        .await
+        .expect("a limit of 1000 is accepted");
+    assert_eq!(all.events.len(), 3);
 
     let effects = agents::effects(&reader, seeded.agent)
         .await
@@ -588,23 +621,101 @@ async fn reads_of_an_unknown_agent_are_agent_gone() {
     assert_eq!(by_key, absent);
 }
 
-#[test]
-fn scaffold_writes_the_example_and_refuses_a_non_empty_dir() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let dir = root.path().join("my-agent");
-    let written = agents::scaffold(&dir).expect("scaffold");
-    assert_eq!(written.len(), agents::SCAFFOLD_FILES.len());
-    for (name, body) in agents::SCAFFOLD_FILES {
-        assert_eq!(std::fs::read_to_string(dir.join(name)).expect("read"), body);
+/// Writes an executable shell script standing in for `node`.
+fn fake_node(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    let file = dir.join("fake-node");
+    std::fs::write(&file, format!("#!/bin/sh\n{body}")).expect("write fake node");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
-    let err = agents::scaffold(&dir).expect_err("non-empty dir");
-    assert!(
-        matches!(
-            err.downcast_ref::<AgentsCliError>(),
-            Some(AgentsCliError::ScaffoldDirNotEmpty { .. })
+    file
+}
+
+fn run_scaffold(
+    node: &std::path::Path,
+    bin: &std::path::Path,
+    dir: &std::path::Path,
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+        .env("RAVEL_NODE", node)
+        .env("RAVEL_SCAFFOLD_BIN", bin)
+        .args(["agents", "scaffold"])
+        .arg(dir)
+        .output()
+        .expect("run ravel-cli")
+}
+
+/// `agents scaffold DIR` runs the SDK generator as `node BIN DIR` and writes
+/// nothing itself; a non-empty DIR spawns nothing, and a generator failure
+/// comes back with its exit code and stderr.
+#[test]
+fn scaffold_runs_the_sdk_generator_and_refuses_a_non_empty_dir_before_spawning() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let argv = root.path().join("argv");
+    let node = fake_node(
+        root.path(),
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}'\necho \"wrote 12 files to $2:\"\n",
+            argv.display()
         ),
-        "{err}"
     );
+    let bin = root.path().join("ravel-agents-scaffold.js");
+    std::fs::write(&bin, "// stand-in\n").expect("write bin");
+    let dir = root.path().join("my-agent");
+
+    let output = run_scaffold(&node, &bin, &dir);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let recorded = std::fs::read_to_string(&argv).expect("the generator was not run");
+    assert_eq!(
+        recorded,
+        format!("{}\n{}\n", bin.display(), dir.display()),
+        "argv"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("wrote 12 files to {}:", dir.display())),
+        "{stdout}"
+    );
+    assert!(!dir.exists(), "ravel-cli wrote into DIR itself");
+
+    std::fs::remove_file(&argv).expect("rm argv");
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::write(dir.join("keep.txt"), "x").expect("write");
+    let output = run_scaffold(&node, &bin, &dir);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is not empty"), "{stderr}");
+    assert!(!argv.exists(), "a non-empty DIR spawned the generator");
+    assert_eq!(
+        std::fs::read_dir(&dir).expect("read dir").count(),
+        1,
+        "a refused scaffold wrote into DIR"
+    );
+
+    let failing = root.path().join("failing");
+    std::fs::create_dir(&failing).expect("mkdir");
+    let node = fake_node(
+        &failing,
+        "echo 'target_not_a_directory: nope' >&2\nexit 3\n",
+    );
+    let output = run_scaffold(&node, &bin, &root.path().join("other"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exited with code 3"), "{stderr}");
+    assert!(stderr.contains("target_not_a_directory: nope"), "{stderr}");
+
+    let output = run_scaffold(
+        &node,
+        &root.path().join("absent.js"),
+        &root.path().join("other"),
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("absent.js"), "{stderr}");
+    assert!(stderr.contains("--scaffold-bin"), "{stderr}");
 }
 
 type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;

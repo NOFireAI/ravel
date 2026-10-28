@@ -112,8 +112,9 @@ It writes a starter project: one agent, `order`, whose `checkout` handler prices
 against a local price-list fixture (no network, no API key); the client
 types generated from its handler schemas; a client typed by them; a vitest
 suite against `@ravel/agents/testing`; and its `package.json`, `tsconfig.json`
-and README. Its suite needs no server and no API key. The `ravel` CLI has no
-scaffold command yet; when one lands it is meant to run this bin.
+and README. Its suite needs no server and no API key. From the repository
+root, `ravel-cli agents scaffold <dir>` runs this bin with node and passes
+`<dir>` through; the by-path form above needs no Rust build.
 
 - The output typechecks and its own suite passes, run as a child process
   with every `*_API_KEY` variable removed and again with poison values set,

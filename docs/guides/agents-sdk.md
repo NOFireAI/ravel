@@ -28,6 +28,15 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    workspace package, and `npx ravel-agents-scaffold` would look the name
    up in the public npm registry instead, so never use the bare name.
 
+   With `ravel-cli` built, `ravel-cli agents scaffold DIR` runs the same
+   bin with node: from the repository root it finds the bin at its path in
+   the checkout (`--scaffold-bin` names another, `--node` another node),
+   passes DIR through as given, refuses a DIR that exists and is not empty
+   before starting node, and reports the bin's exit code and stderr when it
+   fails. `agents dev` prints this command once its server is ready. Test:
+   `scaffold_runs_the_sdk_generator_and_refuses_a_non_empty_dir_before_spawning`
+   (`services/ravel-cli/tests/agents_commands.rs`).
+
    The project holds one agent, `order`, whose `checkout` handler prices a
    line through a durable step against a local price-list fixture, the
    client types generated from its handler schemas, a client typed by them,
@@ -200,9 +209,6 @@ server. Its tests are in `transport/http.test.ts`.
 
 ## What the SDK does not do yet
 
-- `ravel-cli` has no scaffold command; the package's bin, run by its path
-  as in the first run above, is the entry point. Test: `the bin writes a
-  project, exits 1 on a non-empty directory and 64 on bad usage`.
 - Steps and effects are not stored on the server, so a worker restart
   loses the step journal and a kill across processes cannot replay a step.
   Test: `authorizes a new attempt at an unsettled at_least_once step and
