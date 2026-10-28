@@ -37,7 +37,6 @@ BrokenAckBeforeCas(c) ==
     /\ AckBeforeCas
     /\ cl[c].pc = "dep"
     /\ AckWith(c, [ak |-> cl[c].ak, rcpt |-> NewReceipt(cl[c].obs, cl[c].rid, Hc(c))])
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<sVars, wk, co, crashedOnce, due>>
 
 \* The enqueue CAS straight after the read, without the payload PUT.
@@ -70,7 +69,6 @@ BrokenOverwriteStaleRoot(c) ==
           /\ cur.owner = h.owner /\ cur.timer = h.timer
           /\ cur.results = h.results /\ cur.active = h.active
           /\ Store!PutOverwrite(CK(c), EnqueueHead(h, cl[c].rid, Hc(c)))
-          /\ RecordCas(ak)
           /\ AckWith(c, [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))])
     /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
@@ -86,7 +84,6 @@ BrokenRequestHashMismatchAccepted(c) ==
           /\ \E r \in SameRid(c, h) : r.hash # Hc(c)
           /\ Store!PutCreateIfAbsent(ObjKey(ak, Hc(c)), Hc(c))
           /\ SetCl(c, [cl[c] EXCEPT !.pc = "dep", !.ver = Store!VersionOf(CK(c)), !.obs = h])
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<wk, co, crashedOnce, due, acked>>
 
 \* --- Broken worker steps --------------------------------------------------
@@ -153,7 +150,6 @@ BrokenEarlyHintForgotten(ak, g) ==
     /\ Store!Present(HintKey(ak, g))
     /\ due[ak] < g
     /\ Store!Delete(HintKey(ak, g))
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 Broken ==
@@ -167,7 +163,7 @@ Broken ==
          \/ \E g \in 1..MaxTimerGen :
               BrokenStaleTimerGenerationFired(ak, g) \/ BrokenEarlyHintForgotten(ak, g)
 
-MCNext == Next \/ Broken
+MCNext == (Step \/ Broken) /\ CasWitness
 
 MCSpec == Init /\ [][MCNext]_vars
 
