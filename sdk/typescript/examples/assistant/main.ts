@@ -35,20 +35,19 @@ const question = process.argv.slice(2).join(" ") || "How does a worker recover a
 
 const fixture = new AssistantFixture();
 const { assistant, tools } = createAssistant(fixture);
+const workerStopped = (error: unknown): never => {
+  console.error(`worker stopped: ${oneLine(error)}`);
+  process.exit(1);
+};
+// A token refused at register rejects serveAgents itself.
 const worker = await serveAgents({
   transport: createHttpTransport({ url, token: workerToken }),
   agents: [assistant],
   tools,
-});
+}).catch(workerStopped);
 // A refused poll (a revoked worker token, say) stops the worker and rejects
 // `done`: end the run there rather than wait out the result's deadline.
-const stopped = worker.done.then(
-  () => undefined,
-  (error: unknown) => {
-    console.error(`worker stopped: ${oneLine(error)}`);
-    process.exit(1);
-  },
-);
+const stopped = worker.done.then(() => undefined, workerStopped);
 try {
   const agent = createClient({ url, token: clientToken }).agent<Assistant>("assistant", `example-${randomUUID()}`);
   await agent.create();
