@@ -30,6 +30,12 @@
 # reads to skip its own second full build. Without this flag, behavior is
 # byte-for-byte unchanged from before it existed.
 #
+# An unscoped gates.sh run also runs scripts/gates-sdk.sh, which needs node
+# 22 and refuses with exit 64 without it, before any cargo command and
+# before the receipt is written. On a host without node 22, run this with
+# RAVEL_GATES_SKIP_SDK=1 in the environment (it passes through to gates.sh);
+# CI's `sdk` job stays the gate for sdk/typescript.
+#
 # GATES_SH overrides the path to gates.sh (default: the worktree's own
 # scripts/gates.sh, so a branch that edits gates.sh is verified against
 # its own edit). Test-only escape hatch for substituting a stub.

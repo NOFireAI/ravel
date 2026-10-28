@@ -353,30 +353,36 @@ run_feature_lanes() {
     run_feature_lane sql -p ravel-server
   fi
   # ravel-server's `agents` feature (ADR-3331 decision 14): the agents router,
-  # flags and metric families compile only under it. Its tests are selected by
-  # binary, not by a test-name filter (nextest and `cargo test` filter on the
-  # test path, never the binary, so a seam test whose name omits the keyword
-  # would run nowhere): the agents_seam binary whole, and the lib tests whose
-  # path contains `agents`. The whole crate does not run under the feature
-  # because `tests/cli_reference.rs` asserts the flag page of a build with the
-  # flags it has, and the feature adds flags; clippy still lints every target.
+  # routes and metric families compile only under it. The lane has the shape
+  # of CI's features-otap job: the lib tests whole, plus the integration
+  # binaries that exist only under the feature. Tests are selected by binary,
+  # never by a test-name filter: nextest and `cargo test` filter on the test
+  # path and never on the binary, so a filtered run skips any test whose
+  # name omits the keyword, and a filter that matches nothing exits 0. The
+  # other integration binaries are left out for cost, not correctness:
+  # `--agents` and `--mcp` are declared in every build
+  # (services/ravel-server/src/config.rs), so `tests/cli_reference.rs`
+  # passes under either feature, and the binaries that do not mention the
+  # feature already run in the main suite without it. This is the one
+  # statement of that reason; scripts/affected-tests.sh and ci.yml's
+  # features-agents and features-mcp jobs point here.
   # The classification test stays in ravel-catalog and covers
   # proto/ravel/agents.proto (ADR-3331 decision 3), so the lane names it and a
   # scoped run that does not reach ravel-catalog still checks it.
   if [[ ${want_agents} -eq 1 ]]; then
     run cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings
     run_lane_tests -p ravel-server --features agents --test agents_seam
-    run_lane_tests -p ravel-server --features agents --lib agents
+    run_lane_tests -p ravel-server --features agents --lib
     run_lane_tests -p ravel-catalog --test sys_proto_format_version_classification
   fi
   # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
-  # compile only under it. Selected by binary for the same reasons: mcp_e2e
-  # and trace_by_id (whose `with_mcp` module compiles only under the feature)
-  # whole, and the lib tests whose path contains `mcp`.
+  # compile only under it. Same shape as the agents lane above: mcp_e2e and
+  # trace_by_id (whose `with_mcp` module compiles only under the feature)
+  # whole, and the lib tests whole.
   if [[ ${want_mcp} -eq 1 ]]; then
     run cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
     run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
-    run_lane_tests -p ravel-server --features mcp --lib mcp
+    run_lane_tests -p ravel-server --features mcp --lib
   fi
   if [[ ${want_flight_sql} -eq 1 ]]; then
     run_feature_lane flight-sql -p ravel-server -p ravel-sql

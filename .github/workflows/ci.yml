@@ -1563,16 +1563,16 @@ jobs:
           key: ci-profile
       - name: Clippy ravel-server --features agents
         run: cargo clippy --locked --profile ci -p ravel-server --features agents --all-targets -- -D warnings
-        # Selected by binary, not by a test-name filter, which matches the test
-        # path and never the binary, so a seam test whose name omits `agents`
-        # would run nowhere. Not the whole crate either: `tests/cli_reference.rs`
-        # asserts the flag page of a build with the flags it has, and
-        # `--features agents` adds flags. `--all-targets` on the clippy step
-        # above still compiles every target.
+        # The lib tests whole and the agents_seam binary, the shape of
+        # `features-otap` above. Selected by binary, never by a test-name
+        # filter, and not the whole crate: scripts/gates.sh's
+        # run_feature_lanes states both reasons, and its agents lane runs
+        # these same tests. `--all-targets` on the clippy step above still
+        # compiles every target.
       - name: Test ravel-server --features agents (agents_seam binary)
         run: cargo test --locked --profile ci -p ravel-server --features agents --test agents_seam
-      - name: Test ravel-server --features agents (lib tests named agents)
-        run: cargo test --locked --profile ci -p ravel-server --features agents --lib agents
+      - name: Test ravel-server --features agents (lib tests)
+        run: cargo test --locked --profile ci -p ravel-server --features agents --lib
       - name: Test the sys proto format_version classification
         run: cargo test --locked --profile ci -p ravel-catalog --test sys_proto_format_version_classification
       - name: Report the lowest free space the job reached
@@ -1617,13 +1617,14 @@ jobs:
           key: ci-profile
       - name: Clippy ravel-server --features mcp
         run: cargo clippy --locked --profile ci -p ravel-server --features mcp --all-targets -- -D warnings
-        # Selected by binary for the reasons given in `features-agents` above:
-        # mcp_e2e and trace_by_id (whose `with_mcp` module compiles only under
-        # the feature) whole, and the lib tests whose path contains `mcp`.
+        # Same shape as `features-agents` above, with the reasons in
+        # scripts/gates.sh's run_feature_lanes: mcp_e2e and trace_by_id
+        # (whose `with_mcp` module compiles only under the feature) whole,
+        # and the lib tests whole.
       - name: Test ravel-server --features mcp (mcp_e2e and trace_by_id binaries)
         run: cargo test --locked --profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
-      - name: Test ravel-server --features mcp (lib tests named mcp)
-        run: cargo test --locked --profile ci -p ravel-server --features mcp --lib mcp
+      - name: Test ravel-server --features mcp (lib tests)
+        run: cargo test --locked --profile ci -p ravel-server --features mcp --lib
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
