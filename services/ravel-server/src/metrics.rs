@@ -455,6 +455,12 @@ pub enum Label {
     /// label spelling and shares it between the two registries. Shares the
     /// `reason` key with the other reason variants.
     WorkerRecordRejectReason(ravel_fleet::record_auth::RecordReject),
+    /// Which publication phase a `ravel_agents_store_*` sample counts:
+    /// `resolve`, `build`, `store` or `publish`. A closed enum owned by
+    /// `ravel_agents_store`; present only in an `agents` build. Shares the
+    /// `phase` key with `DdlPhase`.
+    #[cfg(feature = "agents")]
+    AgentsStorePhase(ravel_agents_store::counters::Phase),
 }
 
 /// The closed `site` set of `ravel_memory_gate_refusals_total` and
@@ -692,6 +698,8 @@ impl Label {
             Label::IpcryptVariant(_) => "variant",
             Label::IpcryptOutcome(_) => "outcome",
             Label::WorkerRecordRejectReason(_) => "reason",
+            #[cfg(feature = "agents")]
+            Label::AgentsStorePhase(_) => "phase",
         }
     }
 
@@ -746,6 +754,8 @@ impl Label {
             Label::IpcryptVariant(variant) => ipcrypt_variant_name(*variant).to_string(),
             Label::IpcryptOutcome(outcome) => ipcrypt_outcome_name(*outcome).to_string(),
             Label::WorkerRecordRejectReason(reason) => reason.reason().to_string(),
+            #[cfg(feature = "agents")]
+            Label::AgentsStorePhase(phase) => agents_store_phase_name(*phase).to_string(),
         }
     }
 
@@ -4315,31 +4325,44 @@ fn render_shutdown_family(out: &mut String, mode: Mode, drain_overrun_total: u64
     );
 }
 
-/// The Ravel Agents settings (ADR-3331 decision 9), one gauge per budget and
-/// quota flag plus whether the agents router is mounted. Exists only in an
-/// `agents` build; the budgets and quotas are reported, not yet enforced.
+#[cfg(feature = "agents")]
+fn agents_store_phase_name(phase: ravel_agents_store::counters::Phase) -> &'static str {
+    use ravel_agents_store::counters::Phase;
+    match phase {
+        Phase::Resolve => "resolve",
+        Phase::Build => "build",
+        Phase::Store => "store",
+        Phase::Publish => "publish",
+    }
+}
+
+/// The Ravel Agents families (ADR-3331 decision 9): one gauge per budget and
+/// quota flag plus whether the agents router is mounted, then the
+/// coordinators' turn counters and their store requests by publication phase,
+/// summed over every tenant this process served. Exists only in an `agents`
+/// build.
 #[cfg(feature = "agents")]
 pub(crate) fn render_agents_families(
     out: &mut String,
     mode: Mode,
-    snapshot: &crate::agents::AgentsMetricsSnapshot,
+    runtime: &crate::agents::AgentsRuntime,
 ) {
-    let settings = &snapshot.settings;
+    let settings = &runtime.settings;
     let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     for (name, help, value) in [
         (
             "ravel_agents_enabled",
             "Whether this process mounted the Ravel Agents routes (1) or not (0): 1 only with --agents in --mode all or --mode query.",
-            u64::from(snapshot.enabled()),
+            u64::from(runtime.enabled()),
         ),
         (
             "ravel_agents_activation_concurrency_limit",
-            "The --agents-activation-concurrency setting: most agent turns this process activates at once. Reported only; not enforced in this release.",
+            "The --agents-activation-concurrency setting: most agents requests outside the long-poll routes this process serves at once; one more is refused with 503.",
             as_u64(settings.activation_concurrency),
         ),
         (
             "ravel_agents_poll_concurrency_limit",
-            "The --agents-poll-concurrency setting: most worker long-polls this process holds open at once. Reported only; not enforced in this release.",
+            "The --agents-poll-concurrency setting: most worker/poll, result and call requests this process holds open at once; one more is refused with 503.",
             as_u64(settings.poll_concurrency),
         ),
         (
@@ -4354,7 +4377,7 @@ pub(crate) fn render_agents_families(
         ),
         (
             "ravel_agents_max_mailbox",
-            "The --agents-max-mailbox setting: most accepted inputs one agent's mailbox may hold. Reported only; not enforced in this release.",
+            "The --agents-max-mailbox setting: most accepted inputs one agent's mailbox may hold; a send past it is refused mailbox_full.",
             settings.max_mailbox,
         ),
         (
@@ -4364,17 +4387,141 @@ pub(crate) fn render_agents_families(
         ),
         (
             "ravel_agents_max_receipts",
-            "The --agents-max-receipts setting: most idempotency receipts one agent retains. Reported only; not enforced in this release.",
+            "The --agents-max-receipts setting: most idempotency receipts one agent retains, enforced by the agent kernel.",
             settings.max_receipts,
         ),
         (
             "ravel_agents_max_timers",
-            "The --agents-max-timers setting: most pending timers one agent may hold. Reported only; not enforced in this release.",
+            "The --agents-max-timers setting: most pending timers one agent may hold, enforced by the agent kernel.",
             settings.max_timers,
         ),
     ] {
         write_header(out, name, help, "gauge");
         write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+
+    let snapshot = runtime.metrics();
+    for (name, help, kind, value) in [
+        (
+            "ravel_agents_loaded",
+            "Agents whose root a coordinator in this process holds loaded in memory.",
+            "gauge",
+            snapshot.agents_loaded,
+        ),
+        (
+            "ravel_agents_turns_active",
+            "Loaded agents whose root records an active turn.",
+            "gauge",
+            snapshot.turns_active,
+        ),
+        (
+            "ravel_agents_turns_committed_total",
+            "Turn completions this process published, including a lost acknowledgement confirmed by re-reading HEAD.",
+            "counter",
+            snapshot.turns_committed,
+        ),
+        (
+            "ravel_agents_turns_failed_total",
+            "FailTurn publications this process made, retryable or final.",
+            "counter",
+            snapshot.turns_failed,
+        ),
+        (
+            "ravel_agents_turns_dead_lettered_total",
+            "Inputs this process dead-lettered after their last attempt.",
+            "counter",
+            snapshot.turns_dead_lettered,
+        ),
+        (
+            "ravel_agents_takeovers_total",
+            "Takeover commands this process published.",
+            "counter",
+            snapshot.takeovers,
+        ),
+        (
+            "ravel_agents_ownership_lost_refusals_total",
+            "Commits, failures, heartbeats and activations refused ownership_lost because the caller's ownership moved on.",
+            "counter",
+            snapshot.ownership_lost_refusals,
+        ),
+        (
+            "ravel_agents_incompatible_handler_refusals_total",
+            "Polls and commands refused incompatible_handler for a handler pin mismatch.",
+            "counter",
+            snapshot.incompatible_handler_refusals,
+        ),
+        (
+            "ravel_agents_outcome_unknown_resolved_total",
+            "outcome_unknown errors the coordinator settled into the caller's answer, counted once the settle succeeds.",
+            "counter",
+            snapshot.outcome_unknown_resolved,
+        ),
+        (
+            "ravel_agents_polls_waited_total",
+            "Worker polls that found no work at first and waited.",
+            "counter",
+            snapshot.polls_waited,
+        ),
+    ] {
+        write_header(out, name, help, kind);
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+
+    use ravel_agents_store::counters::{Phase, PhaseCounts};
+    let phases = [
+        (Phase::Resolve, snapshot.store.resolve),
+        (Phase::Build, snapshot.store.build),
+        (Phase::Store, snapshot.store.store),
+        (Phase::Publish, snapshot.store.publish),
+    ];
+    type Family = (&'static str, &'static str, fn(&PhaseCounts) -> u64);
+    let families: [Family; 7] = [
+        (
+            "ravel_agents_store_gets_total",
+            "Object-store GETs and head probes the agents store issued, by publication phase.",
+            |c| c.get,
+        ),
+        (
+            "ravel_agents_store_puts_total",
+            "Create-if-absent and advisory object-store PUTs the agents store issued, by publication phase; HEAD creation counts here under publish.",
+            |c| c.put,
+        ),
+        (
+            "ravel_agents_store_cas_total",
+            "Compare-and-swap HEAD writes the agents store issued, by publication phase, refused ones included.",
+            |c| c.cas,
+        ),
+        (
+            "ravel_agents_store_lists_total",
+            "Object-store LIST calls the agents store issued, by publication phase.",
+            |c| c.list,
+        ),
+        (
+            "ravel_agents_store_conflicts_total",
+            "Conditional writes the object store refused, by publication phase: a moved HEAD under publish, an already-written dependency under store.",
+            |c| c.conflict,
+        ),
+        (
+            "ravel_agents_store_bytes_in_total",
+            "GET body bytes the agents store received, by publication phase: object bodies as the store backend returned them, every retry included, no wire overhead.",
+            |c| c.bytes_in,
+        ),
+        (
+            "ravel_agents_store_bytes_out_total",
+            "PUT and CAS body bytes the agents store sent, by publication phase: object bodies as handed to the store backend, every retry included, no wire overhead.",
+            |c| c.bytes_out,
+        ),
+    ];
+    for (name, help, field) in families {
+        write_header(out, name, help, "counter");
+        for (phase, counts) in &phases {
+            write_sample(
+                out,
+                name,
+                &[Label::Mode(mode), Label::AgentsStorePhase(*phase)],
+                field(counts),
+            );
+        }
     }
 }
 
@@ -8933,7 +9080,7 @@ pub struct MetricsState {
     /// the `ravel_agents_*` families. `crate::start` always sets it in an
     /// `agents` build; `None` leaves the families off the exposition.
     #[cfg(feature = "agents")]
-    pub agents: Option<crate::agents::AgentsMetricsSnapshot>,
+    pub agents: Option<Arc<crate::agents::AgentsRuntime>>,
     /// The durable `sys/auth` background-refresh state (ADR-0066 decision 6),
     /// read at scrape time for its three refresh-loop counters. `Some` only
     /// when `--deployment-key` is set in a request-serving mode
@@ -9838,6 +9985,8 @@ mod tests {
                 Label::IpcryptVariant(_) => "variant",
                 Label::IpcryptOutcome(_) => "outcome",
                 Label::WorkerRecordRejectReason(_) => "reason",
+                #[cfg(feature = "agents")]
+                Label::AgentsStorePhase(_) => "phase",
             })
             .collect();
         assert_eq!(
