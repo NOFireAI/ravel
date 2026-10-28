@@ -42,20 +42,25 @@ on.
 | R12 | `20261028T135202Z-4c08bec` | exhaustive | `MCAgentProtocol.exhaustive.cfg` | 1 | 4444815 | 1266296 | 27 | 1082 s | PASS |
 | R13 | direct `20261028T134701Z` P2 | exhaustive (scratch) | `MCAgentProtocol.exhaustive.cfg` | 2 | 7807396 | 2879377 | 19 | 3001 s | NOT FINISHED: stopped at the 3000 s budget, 1058019 states queued |
 | R14 | direct `20261028T134701Z` I1 | exhaustive (scratch) | `unenrolled/MCAgentIntegrated.exhaustive.cfg` | 1 | 184332281 | 44348194 | 35 | 3001 s | NOT FINISHED: stopped at the 3000 s budget, 5350152 states queued |
-| R15 | direct `20261028T141116Z` I2 | exhaustive (scratch) | `unenrolled/MCAgentIntegrated.exhaustive.cfg` | 2 | R15_STATES | R15_DISTINCT | R15_DEPTH | R15_WALL | R15_RESULT |
+| R15 | direct `20261028T141116Z` I2 | exhaustive (scratch) | `unenrolled/MCAgentIntegrated.exhaustive.cfg` | 2 | 201468006 | 53745308 | 26 | 3000 s | NOT FINISHED: stopped at the 3000 s budget, 14786866 states queued |
 | R16 | direct `20261028T141254Z` Eexh1 | exhaustive (repeat) | `MCAgentEffects.exhaustive.cfg` | - | 6874592 | 1942586 | 48 | 150 s | PASS |
 | R17 | direct `20261028T141524Z` Eexh2 | exhaustive (repeat) | `MCAgentEffects.exhaustive.cfg` | - | 6883160 | 1944848 | 48 | 117 s | PASS |
 | R18 | `20261028T134958Z-4c08bec` | live | `MCAgentEffects.live.cfg` | - | 267170 | 127749 | 43 | 20 s | PASS |
 | R19 | `20261028T134958Z-4c08bec` | live | `MCAgentIntegrated.live.cfg` | 0 | 28110 | 13617 | 35 | 6 s | PASS |
+| R20 | `20261028T150259Z-e449059` | smoke (final tree) | `MCAgentEffects.smoke.cfg` | - | 726016 | 222504 | 45 | 12 s | PASS |
 
 MaxTimerGen is `-` for `AgentEffects`, which has no timers. For an unfinished
 run, the states, distinct and queued figures are TLC's last progress line
 before the stop and the depth is the BFS level that line reports; they are
-not totals. R13 and R14 found no violation in the states they reached.
+not totals. R13, R14 and R15 found no violation in the states they reached.
+A first launch of R15 at 13:47 UTC failed before exploring any state (TLC
+exit 150, a module-table lookup failure while three TLC processes started
+side by side on the same module directory); it was relaunched unchanged as
+R15.
 
 `AgentEffects` configs use `VIEW` and `SYMMETRY` and their distinct count
-moves between runs of the same config under two workers: 222626 to 222728
-for the smoke config (R2, R7 to R9) and 1942312 to 1944848 for the
+moves between runs of the same config under two workers: 222504 to 222728
+for the smoke config (R2, R7 to R9, R20) and 1942312 to 1944848 for the
 exhaustive config (R11, R16, R17). The other configs gave the same distinct
 figure each time they were run (R1 and R4 share a state space). The bands are
 wide enough for that spread.
@@ -70,7 +75,7 @@ R12.
 | Module | MaxTimerGen 1 | MaxTimerGen 2 | Exhaustive lane checks |
 |---|---|---|---|
 | `AgentProtocol` | finished, 1082 s (R12) | not finished in 3000 s (R13) | MaxTimerGen 1 |
-| `AgentIntegrated` | not finished in 3000 s (R14) | R15_SUMMARY (R15) | nothing: the config stays under `unenrolled/` |
+| `AgentIntegrated` | not finished in 3000 s (R14) | not finished in 3000 s (R15) | nothing: the config stays under `unenrolled/` |
 | `AgentEffects` | no timers | no timers | its exhaustive config (R11) |
 
 The exhaustive row for `AgentProtocol` stays at MaxTimerGen 1, the largest

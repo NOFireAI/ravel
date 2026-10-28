@@ -279,7 +279,7 @@ Twelve negative controls, no figures tabulated (dashes throughout
 
 Three modules (ADR-3331 decision 13): `AgentProtocol`, `AgentEffects` and
 `AgentIntegrated`, at commit `8ee0bd2564ab9b5cb70ea27c76f41d11723c9c35`.
-Figures are copied from `agents/results.md` (rows R1 to R19, `-workers 2`,
+Figures are copied from `agents/results.md` (rows R1 to R20 and the final-tree re-runs, `-workers 2`,
 `-Xmx4g`) and bands from `agents/bands.tsv`; every band row cites the
 `results.md` row it rests on.
 
@@ -298,8 +298,8 @@ Figures are copied from `agents/results.md` (rows R1 to R19, `-workers 2`,
 
 Every figure lands inside its band. Depth is unbanded (`-`) on every agents
 row. The `AgentEffects` distinct counts move between repeat runs under
-`VIEW`, `SYMMETRY` and two workers (smoke 222626 to 222728 over R2 and R7 to
-R9, exhaustive 1942312 to 1944848 over R11, R16 and R17), and both bands
+`VIEW`, `SYMMETRY` and two workers (smoke 222504 to 222728 over R2, R7 to R9
+and R20, exhaustive 1942312 to 1944848 over R11, R16 and R17), and both bands
 cover that spread. All 42 negative controls violated their named property
 (R10).
 
@@ -312,7 +312,7 @@ and are not banded:
 |---|---|---|---|---|---|
 | MCAgentProtocol.exhaustive.cfg, MaxTimerGen 2 | 2879377 | 1058019 | 19 | 3000 s budget | R13 |
 | MCAgentIntegrated.exhaustive.cfg, MaxTimerGen 1 | 44348194 | 5350152 | 35 | 3000 s budget | R14 |
-| MCAgentIntegrated.exhaustive.cfg, MaxTimerGen 2 | R15_DISTINCT | R15_QUEUED | R15_DEPTH | 3000 s budget | R15 |
+| MCAgentIntegrated.exhaustive.cfg, MaxTimerGen 2 | 53745308 | 14786866 | 26 | 3000 s budget | R15 |
 
 `MCAgentIntegrated.exhaustive.cfg` therefore stays under
 `agents/unenrolled/` with no band row; `AgentIntegrated`'s invariants are

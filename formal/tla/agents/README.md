@@ -61,7 +61,7 @@ change that narrows what the run reaches fails that lane:
 | `MCAgentProtocol.exhaustive.cfg` (MaxTimerGen 1) | 1253000 to 1280000 | 1266296 | R12 |
 | `positive/stale-turn-rebase-unreachable.cfg` | 286000 to 292000 | 289101 | R4 |
 | `positive/two-generations.cfg` | 240000 to 246000 | 243171 | R5 |
-| `MCAgentEffects.smoke.cfg` | 219000 to 226000 | 222626 to 222728 | R2, R7 to R9 |
+| `MCAgentEffects.smoke.cfg` | 219000 to 226000 | 222504 to 222728 | R2, R7 to R9, R20 |
 | `MCAgentEffects.exhaustive.cfg` | 1925000 to 1965000 | 1942312 to 1944848 | R11, R16, R17 |
 | `MCAgentEffects.live.cfg` | 125500 to 130000 | 127749 | R18 |
 | `MCAgentIntegrated.smoke.cfg` | 422000 to 434000 | 427920 | R3 |
@@ -680,7 +680,8 @@ host's.
 - `MCAgentIntegrated.exhaustive.cfg` did not finish at `MaxTimerGen = 1`:
   stopped at the 3000 s budget with 44348194 distinct states at BFS level 35
   and 5350152 queued (row R14). At `MaxTimerGen = 2` (a scratch copy):
-  R15_README (row R15). No violation was found in the states either run
+  stopped at the 3000 s budget with 53745308 distinct states at BFS level 26
+  and 14786866 queued (row R15). No violation was found in the states either run
   reached. It stays under `unenrolled/`, which the exhaustive lane does not
   read, with no `bands.tsv` row: a lane expected to time out would turn the
   nightly red every night. Its invariants are checked to completion at the

@@ -11,7 +11,7 @@
 # MaxTimerGen 1.
 # positive/stale-turn-rebase-unreachable.cfg: R4, 289101 distinct.
 # positive/two-generations.cfg: R5, 243171 distinct.
-# MCAgentEffects.smoke.cfg: R2, R7-R9, 222626 to 222728 distinct.
+# MCAgentEffects.smoke.cfg: R2, R7-R9, R20, 222504 to 222728 distinct.
 # MCAgentEffects.exhaustive.cfg: R11, R16, R17, 1942312 to 1944848 distinct.
 # MCAgentEffects.live.cfg: R18, 127749 distinct.
 # MCAgentIntegrated.smoke.cfg: R3, 427920 distinct.
