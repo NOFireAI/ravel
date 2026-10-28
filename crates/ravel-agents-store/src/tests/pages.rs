@@ -5,7 +5,7 @@
 use ravel_agents_core::command::{EventSpec, FireTimer};
 use ravel_agents_core::head::{FORMAT_VERSION, MAX_HEAD_BYTES, peek_format_version};
 use ravel_agents_core::identity::Id128;
-use ravel_agents_core::pages::{ListKind, Representation};
+use ravel_agents_core::pages::{ListKind, Representation, receipt_fingerprint};
 use ravel_object_store::fault::{Sequence, SequenceStep};
 
 use crate::counters::CounterSnapshot;
@@ -385,6 +385,79 @@ async fn pages_are_written_before_the_cas_that_references_them() {
         let bytes = store.read_object(&agent(), page.page).await.expect("page");
         assert_eq!(bytes.as_ref(), page.bytes.as_slice());
     }
+}
+
+/// Two request ids whose receipt fingerprints collide, found by search over
+/// `c0, c1, ...` for handler `h`.
+const COLLIDING: [&str; 2] = ["c24337", "c53026"];
+
+/// A fingerprint names candidate pages, not an entry: two receipts sealed
+/// into one page under the same fingerprint are each found by their own
+/// `(handler, request_id)`, at one page read each, and a repeated send of
+/// the second resolves to its own operation.
+#[tokio::test]
+async fn colliding_receipt_fingerprints_resolve_to_their_own_receipts() {
+    let fp = receipt_fingerprint("h", COLLIDING[0]);
+    assert_eq!(fp, receipt_fingerprint("h", COLLIDING[1]));
+    let store = store_with(Arc::new(MemoryStore::new()), paged_limits());
+    create(&store).await;
+    for rid in COLLIDING.iter().copied().chain(["f0", "f1", "f2"]) {
+        send(&store, rid).await.expect("send");
+    }
+    let head = shallow(&store).await;
+    let pages = &head.index.receipts.pages;
+    assert_eq!(pages.len(), 1);
+    assert_eq!(
+        pages[0].fingerprints.iter().filter(|&&f| f == fp).count(),
+        2,
+        "one page lists the fingerprint twice"
+    );
+    let open: Vec<&str> = head.receipts.iter().map(|r| r.request_id.as_str()).collect();
+    assert_eq!(open, vec!["f2"], "both colliding receipts are sealed");
+
+    for (rid, seq) in COLLIDING.iter().zip([1, 2]) {
+        let before = store.counters();
+        let receipt = store
+            .find_receipt(&agent(), "h", rid)
+            .await
+            .expect("lookup")
+            .expect("sent");
+        assert_eq!(receipt.request_id, *rid);
+        assert_eq!(receipt.accept_seq, seq);
+        assert_eq!(store.counters().since(&before).resolve.get, 2, "{rid}");
+    }
+
+    let again = send(&store, COLLIDING[1]).await.expect("repeat");
+    assert!(!again.published);
+    assert_eq!(accept_seq(&again), 2);
+}
+
+/// A store that plans no page (`AgentStore::without_page_plan`) stands in
+/// for a planner that omits one: a repeated send whose receipt is sealed
+/// finds the page missing, the miss is counted once, every page is loaded,
+/// and the reply is the one the planned path gives.
+#[tokio::test]
+async fn a_planner_miss_loads_every_page_and_is_counted() {
+    let backend = Arc::new(MemoryStore::new());
+    let planned = store_with(backend.clone(), paged_limits());
+    let head = grow(&planned, 3 * K + 1).await;
+    let pages = head.index.page_refs().count() as u64;
+
+    let (out, delta) = measured_send(&planned, "r0").await;
+    let out = out.expect("planned repeat");
+    assert_eq!(delta.planner_misses, 0);
+    assert_eq!(delta.resolve.get, 2);
+    let planned_reply = out.reply;
+
+    let blind = store_with(backend.clone(), paged_limits()).without_page_plan();
+    let (out, delta) = measured_send(&blind, "r0").await;
+    let out = out.expect("repeat after a miss");
+    assert_eq!(delta.planner_misses, 1);
+    assert_eq!(delta.resolve.get, 1 + pages, "HEAD, then every page");
+    assert!(!out.published);
+    assert_eq!(accept_seq(&out), 1);
+    assert_eq!(out.reply, planned_reply);
+    assert_eq!(delta.publish.requests(), 0);
 }
 
 /// A version 1 HEAD, every list inline and longer than one page, moves to
