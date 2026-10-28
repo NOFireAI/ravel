@@ -24,6 +24,12 @@
 //! survives a takeover, so a result the new owner published under the same
 //! turn is answered `OwnershipLost`
 //! (`tests::a_lost_commit_ack_after_a_takeover_is_ownership_lost_not_committed`).
+//! The same answer is given when this caller's commit did land and a
+//! takeover followed before the settle read HEAD: the result entry records
+//! no owner or epoch, so HEAD cannot tell the two apart, and the safe
+//! direction is to refuse. The commit is durable either way; only this
+//! coordinator's `turns_committed` misses it. No test pins that case yet
+//! (the simulation schedules of T13, #3346, are where it fits).
 //! A command whose input is not terminal runs once more; the kernel answers a
 //! retry of a published retryable failure or enqueue without a write
 //! (`tests::an_enqueue_with_a_lost_ack_is_settled_through_the_receipt_index`).
