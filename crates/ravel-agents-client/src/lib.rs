@@ -629,11 +629,8 @@ mod tests {
     #[tokio::test]
     async fn every_error_code_maps_to_its_typed_kind_and_hint() {
         for kind in ErrorKind::ALL {
-            let server = TestServer::start(vec![(
-                409,
-                error_body(kind.code(), kind.retry().code()),
-            )])
-            .await;
+            let server =
+                TestServer::start(vec![(409, error_body(kind.code(), kind.retry().code()))]).await;
             let err = server
                 .client()
                 .operation("op")
@@ -693,11 +690,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_bare_404_is_not_served_and_other_bodies_are_http() {
-        let server = TestServer::start_raw(vec![
-            (404, String::new()),
-            (502, "bad gateway".to_string()),
-        ])
-        .await;
+        let server =
+            TestServer::start_raw(vec![(404, String::new()), (502, "bad gateway".to_string())])
+                .await;
         let client = server.client();
         let timer = TimerRequest {
             agent: agent(),
@@ -811,11 +806,12 @@ mod tests {
 
     #[tokio::test]
     async fn event_cursor_resumes_from_next_cursor_and_holds_on_an_empty_page() {
-        let event = |seq: u64| {
-            json!({"event_seq": seq, "accept_seq": 0, "turn_id": "t", "event_type": "e", "payload": null})
-        };
+        let event = |seq: u64| json!({"event_seq": seq, "accept_seq": 0, "turn_id": "t", "event_type": "e", "payload": null});
         let server = TestServer::start(vec![
-            (200, json!({"events": [event(3), event(4)], "next_cursor": "4"})),
+            (
+                200,
+                json!({"events": [event(3), event(4)], "next_cursor": "4"}),
+            ),
             (200, json!({"events": [], "next_cursor": "4"})),
             (200, json!({"events": [event(5)], "next_cursor": "5"})),
         ])
@@ -903,10 +899,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_base_url_with_a_path_prefix_keeps_it() {
-        let server =
-            TestServer::start(vec![(200, json!({"effects": []}))]).await;
-        let client =
-            AgentsClient::new(&format!("{}/prefix", server.base), "tok").expect("client");
+        let server = TestServer::start(vec![(200, json!({"effects": []}))]).await;
+        let client = AgentsClient::new(&format!("{}/prefix", server.base), "tok").expect("client");
         client.effects(&agent()).await.expect("effects");
         assert_eq!(server.seen()[0].path, "/prefix/api/v1/agents/effects");
     }

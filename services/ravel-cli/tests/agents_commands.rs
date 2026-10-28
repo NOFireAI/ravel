@@ -383,10 +383,7 @@ async fn dev_refuses_a_listener_off_loopback_before_starting_anything() {
     assert!(
         matches!(
             err.downcast_ref::<AgentsCliError>(),
-            Some(AgentsCliError::ListenNotLoopback {
-                flag: "listen",
-                ..
-            })
+            Some(AgentsCliError::ListenNotLoopback { flag: "listen", .. })
         ),
         "{err}"
     );
@@ -549,7 +546,11 @@ async fn operation_events_and_effects_print_the_wire_types() {
         .expect("events at the end");
     assert!(end.events.is_empty());
     assert_eq!(end.next_cursor, "3");
-    for (cursor, limit) in [(None, 0), (None, agents::EVENTS_LIMIT_CAP + 1), (Some("x"), 2)] {
+    for (cursor, limit) in [
+        (None, 0),
+        (None, agents::EVENTS_LIMIT_CAP + 1),
+        (Some("x"), 2),
+    ] {
         agents::events(&reader, seeded.agent, cursor, limit)
             .await
             .expect_err("bad events page");
@@ -594,10 +595,7 @@ fn scaffold_writes_the_example_and_refuses_a_non_empty_dir() {
     let written = agents::scaffold(&dir).expect("scaffold");
     assert_eq!(written.len(), agents::SCAFFOLD_FILES.len());
     for (name, body) in agents::SCAFFOLD_FILES {
-        assert_eq!(
-            std::fs::read_to_string(dir.join(name)).expect("read"),
-            body
-        );
+        assert_eq!(std::fs::read_to_string(dir.join(name)).expect("read"), body);
     }
     let err = agents::scaffold(&dir).expect_err("non-empty dir");
     assert!(

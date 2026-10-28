@@ -102,7 +102,10 @@ pub enum AgentsCliError {
     )]
     DevRefusesMemoryStore { defaulted: bool },
     #[error("--{flag} {addr} is not a loopback address; agents dev binds loopback only")]
-    ListenNotLoopback { flag: &'static str, addr: SocketAddr },
+    ListenNotLoopback {
+        flag: &'static str,
+        addr: SocketAddr,
+    },
     #[error("--limit {limit} is above the cap of {cap}")]
     LimitOverCap { limit: usize, cap: usize },
     #[error("--limit must be at least 1")]
@@ -155,7 +158,8 @@ impl AgentSelector {
                 AgentId::from_hex(id).ok_or_else(|| AgentsCliError::InvalidAgentId(id.clone()))
             }
             AgentSelector::KindKey { kind, key } => {
-                let kind = AgentKind::new(kind.as_str()).map_err(|_| AgentsCliError::InvalidAgent)?;
+                let kind =
+                    AgentKind::new(kind.as_str()).map_err(|_| AgentsCliError::InvalidAgent)?;
                 let key = AgentKey::new(key.as_str()).map_err(|_| AgentsCliError::InvalidAgent)?;
                 Ok(ravel_agents_core::identity::agent_id(&kind, &key))
             }
@@ -179,12 +183,12 @@ fn ids_for(agent: &AgentId) -> SafeIds {
 async fn live_head(store: &AgentStore, agent: &AgentId) -> Result<Head, AgentsCliError> {
     match store.read_head(agent).await? {
         HeadState::Present { head, .. } if head.lifecycle != Lifecycle::Tombstoned => Ok(*head),
-        HeadState::Present { .. } | HeadState::Absent => Err(AgentError::new(
-            ErrorKind::AgentGone,
-            ids_for(agent),
-            "agent does not exist",
-        )
-        .into()),
+        HeadState::Present { .. } | HeadState::Absent => {
+            Err(
+                AgentError::new(ErrorKind::AgentGone, ids_for(agent), "agent does not exist")
+                    .into(),
+            )
+        }
         HeadState::Unsupported { .. } => Err(AgentError::new(
             ErrorKind::UnsupportedFormat,
             ids_for(agent),
@@ -495,7 +499,10 @@ fn effect_handle(agent: AgentId, incarnation: u64, record: &EffectRecord) -> Str
 }
 
 /// `agents effects`: every effect HEAD journals.
-pub async fn effects(store: &AgentStore, agent: AgentId) -> Result<EffectsResponse, AgentsCliError> {
+pub async fn effects(
+    store: &AgentStore,
+    agent: AgentId,
+) -> Result<EffectsResponse, AgentsCliError> {
     let head = live_head(store, &agent).await?;
     Ok(EffectsResponse {
         effects: head
@@ -963,9 +970,7 @@ impl DevHost for ProcessDevHost {
 
     async fn qualify(&mut self) -> anyhow::Result<()> {
         let mut command = std::process::Command::new(std::env::current_exe()?);
-        command
-            .args(&self.store_flags)
-            .args(["store", "qualify"]);
+        command.args(&self.store_flags).args(["store", "qualify"]);
         self.run_to_stderr(command, "ravel-cli store qualify")
     }
 

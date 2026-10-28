@@ -1825,7 +1825,12 @@ enum AgentsCommand {
         compose_file: std::path::PathBuf,
         /// The `ravel-server` binary to start; it must be built with the
         /// `agents` feature.
-        #[arg(long, value_name = "PATH", env = "RAVEL_SERVER_BIN", default_value = "ravel-server")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            env = "RAVEL_SERVER_BIN",
+            default_value = "ravel-server"
+        )]
         server_bin: std::path::PathBuf,
         /// HTTP listener for the server; refused unless loopback.
         #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:4318")]
@@ -1925,7 +1930,12 @@ enum AgentsCommand {
         #[arg(long)]
         attempt: u32,
         /// The confirmed result, as JSON.
-        #[arg(long, value_name = "JSON", conflicts_with = "authorize_attempt", required_unless_present = "authorize_attempt")]
+        #[arg(
+            long,
+            value_name = "JSON",
+            conflicts_with = "authorize_attempt",
+            required_unless_present = "authorize_attempt"
+        )]
         attach_result: Option<String>,
         /// Authorize the next attempt instead.
         #[arg(long)]
@@ -5919,7 +5929,9 @@ mod tests {
         let cases: &[(&[&str], bool, bool)] = &[
             (&["ravel", "agents", "list", "--tenant", "t"], true, false),
             (
-                &["ravel", "agents", "inspect", "--tenant", "t", "--kind", "k", "--key", "a"],
+                &[
+                    "ravel", "agents", "inspect", "--tenant", "t", "--kind", "k", "--key", "a",
+                ],
                 true,
                 false,
             ),
@@ -5929,12 +5941,21 @@ mod tests {
                 false,
             ),
             (
-                &["ravel", "agents", "events", "--tenant", "t", "00112233445566778899aabbccddeeff"],
+                &[
+                    "ravel",
+                    "agents",
+                    "events",
+                    "--tenant",
+                    "t",
+                    "00112233445566778899aabbccddeeff",
+                ],
                 true,
                 false,
             ),
             (
-                &["ravel", "agents", "effects", "--tenant", "t", "--kind", "k", "--key", "a"],
+                &[
+                    "ravel", "agents", "effects", "--tenant", "t", "--kind", "k", "--key", "a",
+                ],
                 true,
                 false,
             ),
@@ -5960,7 +5981,11 @@ mod tests {
         for (args, hashes, writes) in cases {
             let cli =
                 Cli::try_parse_from(*args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
-            assert_eq!(super::command_hashes_tenant(&cli.command), *hashes, "{args:?}");
+            assert_eq!(
+                super::command_hashes_tenant(&cli.command),
+                *hashes,
+                "{args:?}"
+            );
             assert_eq!(super::command_is_write(&cli.command), *writes, "{args:?}");
         }
     }
