@@ -1370,6 +1370,15 @@ impl Proc {
         .await
     }
 
+    /// The last attempt this process handed to its dispatcher.
+    pub fn last_dispatch(&self) -> Option<Dispatch> {
+        lock(&self.dispatches)
+            .iter()
+            .rev()
+            .find(|(name, _)| *name == self.name)
+            .map(|(_, d)| d.clone())
+    }
+
     /// The simulated tool provider executes `d` through this process's
     /// store view and answers the tool's result. Under
     /// `provider_idempotency` it keys the execution by effect id, so a

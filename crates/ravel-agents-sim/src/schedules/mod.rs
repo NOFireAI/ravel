@@ -3,6 +3,7 @@
 
 #![allow(clippy::expect_used)]
 
+mod effects;
 mod errors;
 mod races;
 mod senders;
