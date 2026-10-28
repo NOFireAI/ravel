@@ -23,7 +23,11 @@
 //! applied, else of the last HEAD read it made, and [`Recorder::build`]
 //! orders calls by that number. A write is the point its effect became
 //! visible, and a call that wrote nothing answered from the last root it
-//! read. The numbers reach the call through a task-local cell
+//! read. One exception: a step that journaled its start and then answered
+//! an error decided that error on a later read, so it takes that read's
+//! number when it follows the write
+//! (`schedules::effects::cancels_across_seeds`, where the cancel lands
+//! between the two). The numbers reach the call through a task-local cell
 //! ([`tokio::task_local!`]); nothing in the store or the runtime spawns, so
 //! the bottom of the stack runs inside the recording task.
 //!
@@ -58,10 +62,11 @@
 //! - [`Proc::operation`] reads through `AgentStore::resolve` and answers
 //!   [`Reply::Status`] (`schedules::senders::competing_senders_take_distinct_accept_seqs`),
 //!   or [`Reply::UnknownOperation`] when the root has no input under the
-//!   handle. No schedule queries a handle with no input yet, so the
-//!   `UnknownOperation` answers of [`Proc::operation`] and [`Proc::result`]
-//!   and the `Resolved(None)` answer of [`Proc::resolve`] are mappings no
-//!   test has reached; the milestone 3 schedules add one.
+//!   handle (`schedules::effects::query_of_a_handle_with_no_input`, which
+//!   also reaches the `UnknownOperation` answer of [`Proc::result`] and the
+//!   `Resolved(None)` answer of [`Proc::resolve`]).
+//! - [`Proc::result`] and [`Proc::resolve`] are the driver's own reads of
+//!   HEAD: the `Coordinator` has no result or resolve call.
 //! - [`Proc::result`] reads HEAD once and answers [`Reply::Result`]: `None`
 //!   while the input is not terminal, else its status, the output object's
 //!   bytes, and the error string with `""` read as no error
@@ -70,10 +75,36 @@
 //!   the receipt matching both handler and request id
 //!   (`schedules::senders::same_id_different_payload_conflicts`). A receipt
 //!   whose input has no state is unmappable.
-//! - The error kinds the reference models, `OwnershipLost`, `AgentGone` and
-//!   `IdempotencyConflict`, answer [`Reply::Error`]
+//! - `Coordinator::record_step` is [`Event::StepStarted`], answered
+//!   [`Reply::StepJournaled`] with the step's completed flag and its
+//!   effect's phase and attempt; an effect showing an intent with no attempt
+//!   is unmappable
+//!   (`schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
+//! - `Coordinator::run_step` is [`Event::Step`], answered
+//!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher or
+//!   [`Reply::StepCompleted`] with the output's bytes
+//!   (`schedules::effects::at_least_once_killed_after_execution`, where the
+//!   second dispatch is attempt 2).
+//! - `Coordinator::complete_effect` and `fail_effect` are
+//!   [`Event::EffectResult`]; a failure's result is the bytes of
+//!   `{"error": error}`, as production records it. Both answer
+//!   [`Reply::EffectRecorded`] or [`Reply::EffectEvidence`]
+//!   (`schedules::effects::at_least_once_late_result_after_takeover_is_evidence`,
+//!   `schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
+//! - `Coordinator::reconcile_attach` is [`Event::ReconcileAttach`], answered
+//!   like a result, and `reconcile_authorize` is
+//!   [`Event::ReconcileAuthorize`], answered [`Reply::Reconciled`] with its
+//!   `dispatched` flag (`schedules::effects::manual_killed_after_execution`,
+//!   `schedules::effects::manual_killed_before_tool_call`).
+//! - The error kinds the reference models, `OwnershipLost`, `AgentGone`,
+//!   `IdempotencyConflict`, `EffectInDoubt` and `NonDeterministicReplay`,
+//!   answer [`Reply::Error`]
 //!   (`schedules::workers::suspended_worker_commit_is_refused_after_takeover`,
-//!   `schedules::senders::same_id_different_payload_conflicts`).
+//!   `schedules::senders::same_id_different_payload_conflicts`,
+//!   `schedules::effects::manual_killed_before_tool_call`). No schedule
+//!   changes a step's call between runs, so `NonDeterministicReplay` is
+//!   reached only by the reference's own
+//!   `a_changed_step_call_blocks_the_agent`.
 //! - The kinds it does not model (`StoreUnavailable`, `MailboxFull`,
 //!   `BudgetExceeded`, `UnsupportedFormat`, `IncompatibleHandler`, and any
 //!   other) are not fed to the reference. They are collected as
@@ -103,8 +134,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ravel_agents_core::error::{AgentError, ErrorKind};
-use ravel_agents_core::head::Head;
-use ravel_agents_core::identity::{AgentId, agent_id};
+use ravel_agents_core::head::{EffectStatus, Head, StepStatus};
+use ravel_agents_core::identity::{AgentId, agent_id, effect_id, step_input_hash};
 use ravel_agents_core::kernel::DerivedIds;
 use ravel_agents_core::keys::{AgentKey, AgentKind, head_key};
 use ravel_agents_core::state::{Handle, HandleItem, operation_state};
@@ -113,7 +144,10 @@ use ravel_agents_core::wire::{
     HandlerPinBody, OperationStatus, SendRequest, SendResponse, TurnAssignment, TurnOutcome,
     WorkerCommitRequest, WorkerCommitResponse, WorkerPollRequest,
 };
-use ravel_agents_runtime::{Coordinator, DEFAULT_POLL_WAIT_CAP_MS, Rng, RuntimeConfig};
+use ravel_agents_runtime::{
+    Coordinator, DEFAULT_POLL_WAIT_CAP_MS, Dispatch, EffectDispatcher, EffectRef, EffectSettled,
+    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec,
+};
 use ravel_agents_store::backoff::NoBackoff;
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
 use ravel_object_store::fault::{FaultPlan, FaultStore};
@@ -126,7 +160,10 @@ use ravel_types::TenantHash;
 use serde_json::Value;
 
 use crate::history::History;
-use crate::reference::{ClientOp, Event, Outcome, ReferenceMachine, Reply};
+use crate::reference::{
+    ClientOp, EffectPhase, EffectView, Event, Outcome, RecoveryPolicy, ReferenceMachine, Reply,
+    StepCall,
+};
 
 /// The tenant every rig's store serves.
 pub const TENANT: TenantHash = TenantHash([7; 16]);
@@ -391,6 +428,9 @@ pub struct Run {
     /// because the call applied a write and never answered a modelled
     /// reply.
     pub inferred: Vec<(String, Event)>,
+    /// Parallel to the history's entries: whether each call applied a HEAD
+    /// write.
+    pub applied: Vec<bool>,
     pub refusals: Vec<Refusal>,
     pub unmappable: Vec<String>,
 }
@@ -432,11 +472,16 @@ impl Recorder {
         let entries = lock(&self.entries);
         let mut unmappable = Vec::new();
         let mut refusals = Vec::new();
-        // (stamp, begin order, actor, event, observed reply or None to infer)
-        let mut items: Vec<(u64, usize, String, Event, Option<Reply>)> = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
         for (order, entry) in entries.iter().enumerate() {
             let stamps = lock(&entry.cell).clone();
-            let stamp = stamps.write.as_ref().map(|(s, _)| *s).or(stamps.read);
+            let written = stamps.write.as_ref().map(|(s, _)| *s);
+            let refused_step = matches!(entry.event, Some(Event::Step { .. }))
+                && matches!(entry.observed, Some(Observed::Modelled(Reply::Error(_))));
+            let stamp = match (written, stamps.read) {
+                (Some(w), Some(r)) if refused_step && r > w => Some(r),
+                _ => written.or(stamps.read),
+            };
             let applied = stamps.write.as_ref().map(|(_, body)| body.clone());
             if let Some(Observed::Refused(kind)) = &entry.observed {
                 refusals.push(Refusal {
@@ -450,14 +495,15 @@ impl Recorder {
                     unmappable.push(format!("{} {}: {what}", entry.actor, entry.call));
                 }
                 (Some(Observed::Skip), _, _) => {}
-                (Some(Observed::Modelled(reply)), _, Some(stamp)) => match &entry.event {
-                    Some(event) => items.push((
+                (Some(Observed::Modelled(reply)), applied, Some(stamp)) => match &entry.event {
+                    Some(event) => items.push(Item {
                         stamp,
                         order,
-                        entry.actor.clone(),
-                        event.clone(),
-                        Some(reply.clone()),
-                    )),
+                        actor: entry.actor.clone(),
+                        event: event.clone(),
+                        observed: Some(reply.clone()),
+                        applied,
+                    }),
                     None => unmappable.push(format!(
                         "{} {}: answered {reply:?} with no event",
                         entry.actor, entry.call
@@ -488,32 +534,125 @@ impl Recorder {
                         },
                     };
                     if let Some(event) = event {
-                        items.push((stamp, order, entry.actor.clone(), event, None));
+                        items.push(Item {
+                            stamp,
+                            order,
+                            actor: entry.actor.clone(),
+                            event,
+                            observed: None,
+                            applied: Some(body),
+                        });
                     }
                 }
                 (Some(Observed::Refused(_)) | None, _, _) => {}
             }
         }
-        items.sort_by_key(|(stamp, order, ..)| (*stamp, *order));
+        items.sort_by_key(|item| (item.stamp, item.order));
         let mut shadow = machine()?;
         let mut history = History::default();
         let mut inferred = Vec::new();
-        for (_, _, actor, event, observed) in items {
+        let mut applied = Vec::new();
+        for item in items {
+            let event = match (&item.observed, &item.event, &item.applied) {
+                (None, Event::Step { operation, step }, Some(body)) => {
+                    match crashed_step(&shadow, operation, step, body) {
+                        Ok(event) => event,
+                        Err(what) => {
+                            unmappable.push(format!("{} step: {what}", item.actor));
+                            continue;
+                        }
+                    }
+                }
+                _ => item.event,
+            };
             let expected = shadow.apply(&event);
-            let reply = match observed {
+            let reply = match item.observed {
                 Some(reply) => reply,
                 None => {
-                    inferred.push((actor, event.clone()));
+                    if let Reply::Error(kind) = expected
+                        && !matches!(
+                            kind,
+                            ErrorKind::EffectInDoubt | ErrorKind::NonDeterministicReplay
+                        )
+                    {
+                        unmappable.push(format!(
+                            "{}: applied a write the reference refuses {kind:?}: {event:?}",
+                            item.actor
+                        ));
+                    }
+                    inferred.push((item.actor, event.clone()));
                     expected
                 }
             };
             history.record(event, reply);
+            applied.push(item.applied.is_some());
         }
         Ok(Run {
             history,
             inferred,
+            applied,
             refusals,
             unmappable,
+        })
+    }
+}
+
+/// One call placed in the history.
+struct Item {
+    stamp: u64,
+    order: usize,
+    actor: String,
+    event: Event,
+    /// The reply it answered, or `None` to take the reference's.
+    observed: Option<Reply>,
+    /// The body of the last HEAD write it applied.
+    applied: Option<Bytes>,
+}
+
+/// The event a step that applied a write and never answered stands for.
+/// `run_step` journals the step, then commits and authorizes an attempt,
+/// each its own HEAD write, so a crash between them leaves the step
+/// journaled with no attempt: [`Event::StepStarted`]. When the root it
+/// wrote holds what [`Event::Step`] would leave, the step ran through.
+fn crashed_step(
+    shadow: &ReferenceMachine,
+    operation: &Handle,
+    step: &StepCall,
+    body: &Bytes,
+) -> Result<Event, String> {
+    let head = Head::decode(body).map_err(|e| format!("root does not decode: {e:?}"))?;
+    let HandleItem::Operation(seq) = operation.item else {
+        return Err(format!("{operation:?} names no input"));
+    };
+    let id = effect_id(operation.incarnation, seq, &step.key);
+    let written = head
+        .effects
+        .iter()
+        .find(|e| e.effect_id == id)
+        .and_then(|e| {
+            phase_of(e.status).map(|phase| EffectView {
+                phase,
+                attempt: e.attempt,
+            })
+        });
+    let completed = head
+        .steps
+        .iter()
+        .any(|s| s.step_key == step.key && s.status == StepStatus::Completed);
+    let mut ran = shadow.clone();
+    let event = Event::Step {
+        operation: *operation,
+        step: step.clone(),
+    };
+    ran.apply(&event);
+    if ran.effect_view(operation, &step.key) == written
+        && ran.step_completed(&step.key) == completed
+    {
+        Ok(event)
+    } else {
+        Ok(Event::StepStarted {
+            operation: *operation,
+            step: step.clone(),
         })
     }
 }
@@ -521,9 +660,11 @@ impl Recorder {
 /// Map an error to what the history records.
 pub fn map_error(kind: ErrorKind) -> Observed {
     match kind {
-        ErrorKind::OwnershipLost | ErrorKind::AgentGone | ErrorKind::IdempotencyConflict => {
-            Observed::Modelled(Reply::Error(kind))
-        }
+        ErrorKind::OwnershipLost
+        | ErrorKind::AgentGone
+        | ErrorKind::IdempotencyConflict
+        | ErrorKind::EffectInDoubt
+        | ErrorKind::NonDeterministicReplay => Observed::Modelled(Reply::Error(kind)),
         ErrorKind::OutcomeUnknown => {
             Observed::Unmappable("OutcomeUnknown reached the caller".to_string())
         }
@@ -570,6 +711,8 @@ pub struct Rig {
     pub stamps: Arc<StampStore>,
     pub rules: Arc<FaultStore<Arc<StampStore>>>,
     pub recorder: Arc<Recorder>,
+    /// Every attempt any process handed to its dispatcher, in order.
+    pub dispatches: Arc<Mutex<Vec<(String, Dispatch)>>>,
     limits: StoreLimits,
     procs: Arc<Mutex<Vec<ProcHandle>>>,
 }
@@ -599,6 +742,7 @@ impl Rig {
             stamps,
             rules,
             recorder: Arc::new(Recorder::default()),
+            dispatches: Arc::default(),
             limits,
             procs: Arc::default(),
         }
@@ -614,7 +758,7 @@ impl Rig {
     pub fn proc(&self, name: &str, backend: Arc<dyn ObjectStoreBackend>, seed: u64) -> Proc {
         let store = Arc::new(
             AgentStore::new(
-                backend,
+                backend.clone(),
                 TENANT,
                 self.limits,
                 self.clock.clone(),
@@ -642,6 +786,8 @@ impl Rig {
             co,
             recorder: self.recorder.clone(),
             worker_id,
+            backend,
+            dispatches: self.dispatches.clone(),
         }
     }
 
@@ -694,6 +840,87 @@ impl Rig {
             (cas + c.publish.cas, conflict + c.publish.conflict)
         })
     }
+
+    /// Every physical tool execution the simulated provider performed: the
+    /// keys it wrote under [`PROVIDER_PREFIX`], read straight from memory.
+    pub fn executions(&self) -> Result<Vec<String>, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let mut keys = Vec::new();
+        let mut page = None;
+        loop {
+            let listed = runtime
+                .block_on(self.memory.list(PROVIDER_PREFIX, page))
+                .map_err(|e| format!("provider list: {e}"))?;
+            keys.extend(listed.objects.into_iter().map(|o| o.key));
+            match listed.next {
+                Some(next) => page = Some(next),
+                None => break,
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// The attempts handed to a dispatcher, as (step key, attempt).
+    pub fn dispatched(&self) -> Vec<(String, u32)> {
+        lock(&self.dispatches)
+            .iter()
+            .map(|(_, d)| (d.step_key.clone(), d.attempt))
+            .collect()
+    }
+}
+
+/// Where the simulated tool provider records each execution.
+pub const PROVIDER_PREFIX: &str = "provider/";
+
+/// The production step spec for `call`.
+pub fn step_spec(call: &StepCall) -> StepSpec {
+    StepSpec {
+        step_key: call.key.clone(),
+        tool_name: call.tool.clone(),
+        tool_version: call.version.clone(),
+        policy: call.policy,
+        input_hash: step_input_hash(&call.tool, &call.version, &call.input),
+    }
+}
+
+/// The effect of step `step_key` of input `accept_seq` in `incarnation`.
+pub fn effect_ref(incarnation: u64, accept_seq: u64, step_key: &str) -> EffectRef {
+    EffectRef {
+        agent: agent(),
+        incarnation,
+        effect_id: effect_id(incarnation, accept_seq, step_key),
+    }
+}
+
+/// Hands each attempt to the rig's log.
+struct LogDispatcher<'a> {
+    proc: &'a str,
+    log: &'a Mutex<Vec<(String, Dispatch)>>,
+}
+
+impl EffectDispatcher for LogDispatcher<'_> {
+    fn dispatch(&self, dispatch: &Dispatch) {
+        lock(self.log).push((self.proc.to_string(), dispatch.clone()));
+    }
+}
+
+fn phase_of(status: EffectStatus) -> Option<EffectPhase> {
+    match status {
+        EffectStatus::Authorized => Some(EffectPhase::Authorized),
+        EffectStatus::InDoubt => Some(EffectPhase::InDoubt),
+        EffectStatus::Completed => Some(EffectPhase::Completed),
+        EffectStatus::Intent => None,
+    }
+}
+
+fn settled(s: &EffectSettled) -> Observed {
+    Observed::Modelled(match s {
+        EffectSettled::Recorded => Reply::EffectRecorded,
+        EffectSettled::Evidence { .. } => Reply::EffectEvidence,
+    })
 }
 
 /// One simulated process: a store and a coordinator over one actor's view
@@ -704,6 +931,10 @@ pub struct Proc {
     pub co: Arc<Coordinator>,
     recorder: Arc<Recorder>,
     pub worker_id: String,
+    /// The actor's own view of the shared store, under its gates; the
+    /// simulated tool provider writes through it.
+    backend: Arc<dyn ObjectStoreBackend>,
+    dispatches: Arc<Mutex<Vec<(String, Dispatch)>>>,
 }
 
 impl Proc {
@@ -967,6 +1198,252 @@ impl Proc {
         match out {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => Ok(Reply::Resolved(None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The operation of `assignment`; a handle that does not decode is
+    /// recorded as unmappable and refused.
+    fn assigned(&self, call: &'static str, a: &TurnAssignment) -> Result<Handle, AgentError> {
+        Handle::decode(&a.operation).map_err(|_| {
+            let (index, _) = self.recorder.begin(&self.name, call, None);
+            self.recorder.finish(
+                index,
+                None,
+                Observed::Unmappable(format!("bad handle {}", a.operation)),
+            );
+            AgentError::new(
+                ErrorKind::OwnershipLost,
+                ravel_agents_core::error::SafeIds::default(),
+                "assignment handle does not decode",
+            )
+        })
+    }
+
+    /// Journal a step without running it: `Coordinator::record_step`.
+    pub async fn record_step(
+        &self,
+        a: &TurnAssignment,
+        call: &StepCall,
+    ) -> Result<StepJournal, AgentError> {
+        let operation = self.assigned("record_step", a)?;
+        let event = Event::StepStarted {
+            operation,
+            step: call.clone(),
+        };
+        let spec = step_spec(call);
+        self.record(
+            "record_step",
+            Some(event),
+            self.co.record_step(&a.lease, &spec),
+            |r| {
+                let observed = observe(r, |j| {
+                    let effect = match &j.effect {
+                        None => None,
+                        Some(e) => match phase_of(e.status) {
+                            Some(phase) => Some(EffectView {
+                                phase,
+                                attempt: e.attempt,
+                            }),
+                            None => {
+                                return Observed::Unmappable(format!(
+                                    "step journal shows an intent with no attempt: {e:?}"
+                                ));
+                            }
+                        },
+                    };
+                    Observed::Modelled(Reply::StepJournaled {
+                        completed: j.step.status == StepStatus::Completed,
+                        effect,
+                    })
+                });
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// Run a step: `Coordinator::run_step`, its attempt handed to the rig's
+    /// dispatch log.
+    pub async fn step(
+        &self,
+        a: &TurnAssignment,
+        call: &StepCall,
+    ) -> Result<StepProgress, AgentError> {
+        let operation = self.assigned("step", a)?;
+        let event = Event::Step {
+            operation,
+            step: call.clone(),
+        };
+        let spec = step_spec(call);
+        let dispatcher = LogDispatcher {
+            proc: &self.name,
+            log: &self.dispatches,
+        };
+        self.record(
+            "step",
+            Some(event),
+            self.co.run_step(&a.lease, &spec, &dispatcher),
+            |r| {
+                let observed = observe(r, |p| {
+                    Observed::Modelled(match p {
+                        StepProgress::Completed { output } => Reply::StepCompleted {
+                            output: json_bytes(output),
+                        },
+                        StepProgress::Dispatched(d) => Reply::StepDispatched { attempt: d.attempt },
+                    })
+                });
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// Report `result` for the attempt `d` of a step of `operation`.
+    pub async fn complete_effect(
+        &self,
+        operation: &Handle,
+        d: &Dispatch,
+        result: &Value,
+    ) -> Result<EffectSettled, AgentError> {
+        let event = Event::EffectResult {
+            operation: *operation,
+            step_key: d.step_key.clone(),
+            attempt: d.attempt,
+            result: json_bytes(result),
+        };
+        self.record(
+            "complete_effect",
+            Some(event),
+            self.co.complete_effect(&d.effect, d.attempt, result),
+            |r| (None, observe(r, settled)),
+        )
+        .await
+    }
+
+    /// Report a failed attempt; production records `{"error": error}` as
+    /// its result, and so does the event.
+    pub async fn fail_effect(
+        &self,
+        operation: &Handle,
+        d: &Dispatch,
+        error: &str,
+    ) -> Result<EffectSettled, AgentError> {
+        let event = Event::EffectResult {
+            operation: *operation,
+            step_key: d.step_key.clone(),
+            attempt: d.attempt,
+            result: json_bytes(&serde_json::json!({ "error": error })),
+        };
+        self.record(
+            "fail_effect",
+            Some(event),
+            self.co.fail_effect(&d.effect, d.attempt, error),
+            |r| (None, observe(r, settled)),
+        )
+        .await
+    }
+
+    /// The effect of step `step_key` of `operation`'s input.
+    pub fn effect_of(operation: &Handle, step_key: &str) -> EffectRef {
+        let seq = match operation.item {
+            HandleItem::Operation(seq) => seq,
+            _ => 0,
+        };
+        effect_ref(operation.incarnation, seq, step_key)
+    }
+
+    /// Attach a verified result to an effect in doubt.
+    pub async fn reconcile_attach(
+        &self,
+        operation: &Handle,
+        step_key: &str,
+        result: &Value,
+    ) -> Result<EffectSettled, AgentError> {
+        let event = Event::ReconcileAttach {
+            operation: *operation,
+            step_key: step_key.to_string(),
+            result: json_bytes(result),
+        };
+        let effect = Proc::effect_of(operation, step_key);
+        self.record(
+            "reconcile_attach",
+            Some(event),
+            self.co.reconcile_attach(&effect, result),
+            |r| (None, observe(r, settled)),
+        )
+        .await
+    }
+
+    /// Authorize `attempt` of an effect in doubt, as an operator.
+    pub async fn reconcile_authorize(
+        &self,
+        operation: &Handle,
+        step_key: &str,
+        attempt: u32,
+    ) -> Result<bool, AgentError> {
+        let event = Event::ReconcileAuthorize {
+            operation: *operation,
+            step_key: step_key.to_string(),
+            attempt,
+        };
+        let effect = Proc::effect_of(operation, step_key);
+        let dispatcher = LogDispatcher {
+            proc: &self.name,
+            log: &self.dispatches,
+        };
+        self.record(
+            "reconcile_authorize",
+            Some(event),
+            self.co.reconcile_authorize(&effect, attempt, &dispatcher),
+            |r| {
+                let observed = observe(r, |dispatched| {
+                    Observed::Modelled(Reply::Reconciled {
+                        dispatched: *dispatched,
+                    })
+                });
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// The last attempt this process handed to its dispatcher.
+    pub fn last_dispatch(&self) -> Option<Dispatch> {
+        lock(&self.dispatches)
+            .iter()
+            .rev()
+            .find(|(name, _)| *name == self.name)
+            .map(|(_, d)| d.clone())
+    }
+
+    /// The simulated tool provider executes `d` through this process's
+    /// store view and answers the tool's result. Under
+    /// `provider_idempotency` it keys the execution by effect id, so a
+    /// re-dispatch of the same effect executes nothing new; otherwise every
+    /// attempt is a new execution.
+    pub async fn execute(&self, d: &Dispatch) -> Result<Value, StoreError> {
+        let id = d.effect.effect_id.to_hex();
+        let (key, result) = match d.policy {
+            RecoveryPolicy::ProviderIdempotency => (
+                format!("{PROVIDER_PREFIX}{id}"),
+                serde_json::json!({ "step": d.step_key }),
+            ),
+            _ => (
+                format!("{PROVIDER_PREFIX}{id}/a{}", d.attempt),
+                serde_json::json!({ "step": d.step_key, "attempt": d.attempt }),
+            ),
+        };
+        match self
+            .backend
+            .put(
+                &key,
+                Bytes::from(json_bytes(&result)),
+                PutOptions::create_if_absent(),
+            )
+            .await
+        {
+            Ok(_) | Err(StoreError::AlreadyExists) => Ok(result),
             Err(e) => Err(e),
         }
     }
