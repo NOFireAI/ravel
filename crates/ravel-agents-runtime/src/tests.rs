@@ -19,7 +19,7 @@ use ravel_agents_store::counters::PhaseCounts;
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
-    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_types::TenantHash;
@@ -754,4 +754,357 @@ async fn activation_and_admin_takeover_are_one_cas_each() {
     assert_eq!(co.metrics().takeovers, 2);
     let h = head(&store, "o-1").await;
     assert_eq!((h.owner_id.as_str(), h.epoch), ("w-b", 2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stale_lease_of_the_same_owner_cannot_commit_after_an_admin_takeover() {
+    let (_clock, store, co) = rig();
+    create(&co, "o-1").await;
+    let sent = send(&co, "o-1", "r-1", json!(1)).await;
+    let w = worker(&co, "v1");
+    let l1 = poll_now(&co, &w, "v1").await.expect("leased");
+    let base = head(&store, "o-1").await;
+
+    let before = store.counters();
+    let epoch = co
+        .takeover(&agent_ref("o-1"), &w, TakeoverReason::Admin)
+        .await
+        .expect("takeover by the current owner");
+    assert_eq!(epoch, l1.lease.epoch + 1);
+    let refused = co
+        .commit(&completed(&l1.lease, json!("stale")))
+        .await
+        .expect_err("the lease from the older epoch");
+    assert_eq!(refused.kind, ErrorKind::OwnershipLost);
+    let moved = store.counters().since(&before);
+    assert_eq!(moved.publish.cas, 1, "only the takeover's CAS");
+    assert_eq!(moved.publish.put, 0);
+    let mid = head(&store, "o-1").await;
+    assert_eq!(mid.state_version, base.state_version);
+    assert_eq!((mid.owner_id.as_str(), mid.epoch), (w.as_str(), epoch));
+    assert_eq!(
+        mid.active_turn.expect("turn kept").turn_id.to_hex(),
+        l1.lease.turn_id
+    );
+    assert_eq!(co.metrics().turns_committed, 0);
+    assert_eq!(co.metrics().ownership_lost_refusals, 1);
+
+    let l2 = poll_now(&co, &w, "v1").await.expect("re-leased");
+    assert_eq!(l2.lease.epoch, epoch);
+    assert_eq!(l2.lease.turn_id, l1.lease.turn_id);
+    assert_eq!(l2.accept_seq, sent.accept_seq);
+    let committed = co
+        .commit(&completed(&l2.lease, json!("fresh")))
+        .await
+        .expect("commit under the new epoch");
+    assert_eq!(committed.status, OperationStatus::Completed);
+    assert_eq!(committed.state_version, base.state_version + 1);
+    assert_eq!(co.metrics().turns_committed, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_commit_ack_after_a_takeover_is_ownership_lost_not_committed() {
+    let clock = clock();
+    // HEAD writes in the order the plan sees them: create 1, enqueue 2, W1's
+    // takeover 3, W1's begin 4, W2's takeover 5, W2's commit 6, then W1's
+    // commit 7, held past W2's and released into a Transient that does not
+    // apply.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::Transient("ack lost".to_string()))
+            .with_key_contains("/head")
+            .with_occurrence(Occurrence::Nth(7)),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator(&store, &clock, 200);
+    create(&c1, "o-1").await;
+    let sent = send(&c1, "o-1", "r-1", json!(1)).await;
+    let w1 = worker(&c1, "v1");
+    let w2 = worker(&c2, "v1");
+    let l1 = poll_now(&c1, &w1, "v1").await.expect("W1 leased");
+
+    let gate = fault.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
+    let committing = {
+        let c1 = c1.clone();
+        let lease = l1.lease.clone();
+        tokio::spawn(async move { c1.commit(&completed(&lease, json!({"by": "w1"}))).await })
+    };
+    gate.wait_until_held(1).await;
+    clock.advance_ms(past_lease_and_grace());
+    let l2 = poll_now(&c2, &w2, "v1").await.expect("W2 leased");
+    assert_eq!(l2.lease.turn_id, l1.lease.turn_id);
+    assert_eq!(l2.lease.epoch, l1.lease.epoch + 1);
+    c2.commit(&completed(&l2.lease, json!({"by": "w2"})))
+        .await
+        .expect("W2 commits");
+    for id in gate.held() {
+        gate.release(id);
+    }
+    let lost = committing
+        .await
+        .expect("join")
+        .expect_err("W1's commit after W2's");
+    assert_eq!(lost.kind, ErrorKind::OwnershipLost);
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Transient), 1);
+    let m1 = c1.metrics();
+    assert_eq!(m1.turns_committed, 0);
+    assert_eq!(m1.ownership_lost_refusals, 1);
+    assert_eq!(m1.outcome_unknown_resolved, 0);
+    assert_eq!(m1.turns_committed + c2.metrics().turns_committed, 1);
+
+    let after = head(&store, "o-1").await;
+    assert_eq!(
+        (after.owner_id.as_str(), after.epoch),
+        (w2.as_str(), l2.lease.epoch)
+    );
+    let results: Vec<_> = after
+        .results
+        .iter()
+        .filter(|r| r.accept_seq == sent.accept_seq)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, ResultStatus::Completed);
+    let state = store
+        .read_object(&id_of("o-1"), after.state.expect("state"))
+        .await
+        .expect("state object");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&state).expect("json"),
+        json!({"by": "w2"})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_takeover_ack_with_another_owner_in_head_is_ownership_lost() {
+    let clock = clock();
+    // HEAD writes in the order the plan sees them: create 1, enqueue 2, W2's
+    // takeover 3, W2's begin 4, then W1's takeover 5, held past W2's and
+    // released into a Transient that does not apply.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::Transient("ack lost".to_string()))
+            .with_key_contains("/head")
+            .with_occurrence(Occurrence::Nth(5)),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator(&store, &clock, 200);
+    create(&c1, "o-1").await;
+    send(&c1, "o-1", "r-1", json!(1)).await;
+    let w1 = worker(&c1, "v1");
+    let w2 = worker(&c2, "v1");
+
+    let gate = fault.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
+    let polling = {
+        let c1 = c1.clone();
+        let w1 = w1.clone();
+        tokio::spawn(async move { c1.poll(&poll_req(&w1, "v1", 0), Instant::now()).await })
+    };
+    gate.wait_until_held(1).await;
+    let l2 = poll_now(&c2, &w2, "v1").await.expect("W2 leased");
+    for id in gate.held() {
+        gate.release(id);
+    }
+    let polled = polling.await.expect("join");
+    assert!(
+        matches!(polled, Ok(None)),
+        "W1's poll after losing the takeover: {polled:?}"
+    );
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Transient), 1);
+    let m1 = c1.metrics();
+    assert_eq!(m1.takeovers, 0);
+    assert_eq!(m1.outcome_unknown_resolved, 0);
+    let after = head(&store, "o-1").await;
+    assert_eq!(
+        (after.owner_id.as_str(), after.epoch),
+        (w2.as_str(), l2.lease.epoch)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_takeover_write_that_did_not_apply_is_store_unavailable() {
+    let clock = clock();
+    // HEAD writes: create 1, enqueue 2, takeover 3.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::Transient("ack lost".to_string()))
+            .with_key_contains("/head")
+            .with_occurrence(Occurrence::Nth(3)),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    create(&co, "o-1").await;
+    send(&co, "o-1", "r-1", json!(1)).await;
+    let w = worker(&co, "v1");
+    let refused = co
+        .poll(&poll_req(&w, "v1", 0), Instant::now())
+        .await
+        .expect_err("the takeover write did not apply");
+    assert_eq!(refused.kind, ErrorKind::StoreUnavailable);
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Transient), 1);
+    let h = head(&store, "o-1").await;
+    assert_eq!((h.owner_id.as_str(), h.epoch), ("", 0));
+    assert_eq!(co.metrics().outcome_unknown_resolved, 0);
+    let a = poll_now(&co, &w, "v1").await.expect("leased on the next poll");
+    assert_eq!(a.lease.epoch, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_takeover_race_does_not_consume_the_begin_turn_settle() {
+    let clock = clock();
+    // HEAD writes in the order the plan sees them: create, enqueue, W2's
+    // activation, W1's first takeover (held past W2's, then a Transient that
+    // does not apply), W1's second takeover, W1's begin (applied, ack lost).
+    let plan = FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Put)
+            .with_key_contains("/head")
+            .then_passthrough()
+            .then_passthrough()
+            .then_passthrough()
+            .then_fault(ScriptedFault::Transient("ack lost".to_string()))
+            .then_passthrough()
+            .then_fault(ScriptedFault::DuplicateDelivery),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator(&store, &clock, 200);
+    create(&c1, "o-1").await;
+    let sent = send(&c1, "o-1", "r-1", json!(1)).await;
+    let w1 = worker(&c1, "v1");
+
+    let gate = fault.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
+    let polling = {
+        let c1 = c1.clone();
+        let w1 = w1.clone();
+        tokio::spawn(async move { c1.poll(&poll_req(&w1, "v1", 0), Instant::now()).await })
+    };
+    gate.wait_until_held(1).await;
+    assert_eq!(
+        c2.activate(&agent_ref("o-1"), "w-other")
+            .await
+            .expect("activate"),
+        1
+    );
+    for id in gate.held() {
+        gate.release(id);
+    }
+    let leased = polling
+        .await
+        .expect("join")
+        .expect("poll")
+        .expect("W1 leased after both settles");
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Transient), 1);
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+    assert_eq!(leased.accept_seq, sent.accept_seq);
+    assert_eq!(
+        (leased.lease.owner_id.as_str(), leased.lease.epoch),
+        (w1.as_str(), 2)
+    );
+    let m1 = c1.metrics();
+    assert_eq!(m1.takeovers, 1);
+    assert_eq!(m1.outcome_unknown_resolved, 1, "only the BeginTurn settle");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        h.active_turn.expect("active turn").turn_id.to_hex(),
+        leased.lease.turn_id
+    );
+    c1.commit(&completed(&leased.lease, json!("ok")))
+        .await
+        .expect("commit under the settled lease");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_needs_no_registration_on_this_coordinator() {
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator(&store, &clock, 200);
+    create(&c1, "o-1").await;
+    let sent = send(&c1, "o-1", "r-1", json!(1)).await;
+    let w = worker(&c1, "v1");
+    let leased = poll_now(&c2, &w, "v1")
+        .await
+        .expect("served on the poll's own pins");
+    assert_eq!(leased.accept_seq, sent.accept_seq);
+    assert_eq!(leased.lease.owner_id, w);
+
+    let malformed = HandlerPinBody {
+        digest: "not hex".to_string(),
+        ..pin("v1")
+    };
+    let refused = c1
+        .register_worker(&[malformed])
+        .expect_err("a malformed pin");
+    assert_eq!(refused.kind, ErrorKind::IncompatibleHandler);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_pending_input_ends_it_cancelled_and_commits_nothing() {
+    let (_clock, store, co) = rig();
+    create(&co, "o-1").await;
+    let sent = send(&co, "o-1", "r-1", json!(1)).await;
+    let req = CancelRequest {
+        operation: sent.operation.clone(),
+    };
+    let before = store.counters();
+    let r = co.cancel(&req).await.expect("cancel");
+    assert_eq!(r.operation, sent.operation);
+    assert_eq!(r.status, OperationStatus::Cancelled);
+    assert!(r.requested);
+    assert_eq!(store.counters().since(&before).publish.cas, 1);
+    let after = head(&store, "o-1").await;
+    assert!(after.inbox.is_empty());
+    let result = after
+        .results
+        .iter()
+        .find(|r| r.accept_seq == sent.accept_seq)
+        .expect("result");
+    assert_eq!(result.status, ResultStatus::Cancelled);
+    let m = co.metrics();
+    assert_eq!(m.turns_committed, 0);
+    assert_eq!(m.turns_failed, 0);
+    let w = worker(&co, "v1");
+    assert!(poll_now(&co, &w, "v1").await.is_none());
+
+    let before = store.counters();
+    let again = co.cancel(&req).await.expect("cancel again");
+    assert_eq!(again.status, OperationStatus::Cancelled);
+    assert!(!again.requested);
+    assert_eq!(store.counters().since(&before).publish.cas, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_enqueue_with_a_lost_ack_is_settled_through_the_receipt_index() {
+    let clock = clock();
+    // HEAD writes: create 1, enqueue 2.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)
+            .with_key_contains("/head")
+            .with_occurrence(Occurrence::Nth(2)),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    create(&co, "o-1").await;
+    let incarnation = head(&store, "o-1").await.incarnation;
+    let before = store.counters();
+    let sent = send(&co, "o-1", "r-1", json!(1)).await;
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+    assert_eq!(store.counters().since(&before).publish.cas, 1);
+    assert!(!sent.duplicate);
+    assert_eq!(sent.accept_seq, 1);
+    assert_eq!(
+        sent.operation,
+        Handle::operation(id_of("o-1"), incarnation, 1).encode()
+    );
+    assert_eq!(co.metrics().outcome_unknown_resolved, 1);
+
+    let before = store.counters();
+    let retried = send(&co, "o-1", "r-1", json!(1)).await;
+    assert!(retried.duplicate);
+    assert_eq!(retried.operation, sent.operation);
+    assert_eq!(store.counters().since(&before).publish.cas, 0);
+    assert_eq!(head(&store, "o-1").await.inbox.len(), 1);
 }
