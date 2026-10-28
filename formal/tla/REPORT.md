@@ -279,7 +279,7 @@ Twelve negative controls, no figures tabulated (dashes throughout
 
 Three modules (ADR-3331 decision 13): `AgentProtocol`, `AgentEffects` and
 `AgentIntegrated`, at commit `8ee0bd2564ab9b5cb70ea27c76f41d11723c9c35`.
-Figures are copied from `agents/results.md` (rows R1 to R20 and the final-tree re-runs, `-workers 2`,
+Figures are copied from `agents/results.md` (rows R1 to R20 (R20 is the final-tree re-run), `-workers 2`,
 `-Xmx4g`) and bands from `agents/bands.tsv`; every band row cites the
 `results.md` row it rests on.
 
