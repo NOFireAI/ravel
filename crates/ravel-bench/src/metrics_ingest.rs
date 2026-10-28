@@ -7641,6 +7641,126 @@ mod tests {
             )
     }
 
+    /// A one-connection HTTP stub that answers any request 200 with a
+    /// `Content-Length` of `declared` (the pieces' total when `None`) and
+    /// writes `pieces` 20 ms apart, so the client reads them as separate
+    /// chunks, then closes.
+    async fn chunked_body_stub(
+        pieces: Vec<Vec<u8>>,
+        declared: Option<usize>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.expect("read request");
+                assert!(n > 0, "the client closed before sending a request");
+                request.extend_from_slice(&buf[..n]);
+            }
+            let len = declared.unwrap_or_else(|| pieces.iter().map(Vec::len).sum());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(head.as_bytes()).await.expect("head");
+            for piece in pieces {
+                socket.write_all(&piece).await.expect("piece");
+                socket.flush().await.expect("flush");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        (addr, server)
+    }
+
+    /// `body` cut into `n` pieces at even byte offsets, which land inside
+    /// elements and strings.
+    fn pieces_of(body: &[u8], n: usize) -> Vec<Vec<u8>> {
+        body.chunks(body.len().div_ceil(n))
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    fn series_answer(n: usize) -> Vec<u8> {
+        let mut body = String::from(r#"{"status":"success","data":["#);
+        for i in 0..n {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                r#"{{"__name__":"mb_cardinality","instance":"host-{i}","job":"j[{{,}}]\"q"}}"#
+            ));
+        }
+        body.push_str("]}");
+        body.into_bytes()
+    }
+
+    async fn stub_series_count(pieces: Vec<Vec<u8>>, declared: Option<usize>) -> Result<u64, String> {
+        let (addr, server) = chunked_body_stub(pieces, declared).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let reader = ApiReader {
+            client: &client,
+            base: &base,
+            bearer: None,
+            tokens: &[],
+        };
+        let result = reader
+            .series_count("{__name__=~\"mb_cardinality\"}", &[])
+            .await;
+        server.abort();
+        result
+    }
+
+    /// A 200,000-series answer delivered in eight pieces 20 ms apart counts
+    /// 200,000. Each element carries braces, brackets, a comma and an
+    /// escaped quote inside a string, and the cuts fall mid-element.
+    ///
+    /// TO SEE THIS FAIL: make `count_series_body` stop after the first
+    /// `response.chunk()` (count only the first chunk): the first piece is
+    /// an unterminated array, so the count is refused as not a series
+    /// answer, and a count of whole elements in it would read about 25,000.
+    #[tokio::test]
+    async fn series_count_streams_a_200000_series_answer() {
+        let body = series_answer(200_000);
+        let pieces = pieces_of(&body, 8);
+        assert_eq!(pieces.len(), 8);
+        assert_eq!(stub_series_count(pieces, None).await, Ok(200_000));
+    }
+
+    /// A `status: error` answer is refused with its errorType and error,
+    /// and so is a body cut short, whether the cut is inside the JSON or
+    /// the connection closes before the declared length.
+    #[tokio::test]
+    async fn series_count_refuses_an_error_answer_and_a_truncated_body() {
+        let error = br#"{"status":"error","errorType":"execution","error":"too many series"}"#;
+        let refused = stub_series_count(vec![error.to_vec()], None)
+            .await
+            .expect_err("a status error answer is refused");
+        assert!(
+            refused.contains("non-success")
+                && refused.contains("\"execution\"")
+                && refused.contains("too many series"),
+            "{refused}"
+        );
+
+        let body = series_answer(1_000);
+        let cut = body[..body.len() / 2].to_vec();
+        let refused = stub_series_count(pieces_of(&cut, 3), None)
+            .await
+            .expect_err("a body cut inside the JSON is refused");
+        assert!(refused.contains("not a series answer"), "{refused}");
+
+        let refused = stub_series_count(pieces_of(&cut, 3), Some(body.len()))
+            .await
+            .expect_err("a connection closed before the declared length is refused");
+        assert!(refused.contains("/api/v1/series"), "{refused}");
+    }
+
     /// The read-back of the portable Ravel row matches a receiver that
     /// stored what was sent, fences every query with every shard's token,
     /// and fails when the series count is off by one.
