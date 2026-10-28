@@ -14,7 +14,9 @@ use ravel_agents_core::kernel::{AUDIT_RECONCILE_ATTEMPT, AUDIT_RECONCILE_RESULT}
 use ravel_agents_core::wire::{CancelRequest, OperationStatus, StepState, TurnAssignment};
 use ravel_agents_store::AgentStore;
 use ravel_object_store::fault::ScriptedFault;
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, Sequence, SequenceStep,
+};
 use ravel_object_store::memory::MemoryStore;
 use serde_json::{Value, json};
 
@@ -139,6 +141,11 @@ fn effect_of<'a>(h: &'a Head, d: &Dispatch) -> &'a ravel_agents_core::head::Effe
 
 fn cas_since(store: &AgentStore, before: &ravel_agents_store::counters::CounterSnapshot) -> u64 {
     store.counters().since(before).publish.cas
+}
+
+/// The epochs of the attempts this coordinator holds open.
+fn open_epochs(co: &Coordinator) -> Vec<u64> {
+    co.open_attempts.lock().values().map(|o| o.epoch).collect()
 }
 
 fn audits(h: &Head, event_type: &str) -> usize {
@@ -308,7 +315,12 @@ async fn at_least_once_authorizes_a_new_attempt_at_every_crash_point() {
             Crash::BeforeResultPublication => Some(provider.execute(&d1)),
         };
 
+        assert_eq!(open_epochs(&co), vec![a.lease.epoch]);
         let b = takeover(&co, &clock).await;
+        assert!(
+            open_epochs(&co).is_empty(),
+            "{crash:?}: the takeover drops the old epoch's attempt"
+        );
         let before = store.counters();
         let d2 = dispatched(&co, &b, &s, &hook).await;
         assert_eq!(
@@ -316,6 +328,7 @@ async fn at_least_once_authorizes_a_new_attempt_at_every_crash_point() {
             1,
             "{crash:?}: one authorization"
         );
+        assert_eq!(open_epochs(&co), vec![b.lease.epoch]);
         assert_eq!((d2.effect, d2.attempt), (d1.effect, 2), "{crash:?}");
         assert_eq!(hook.calls(), 2);
         let r2 = provider.execute(&d2);
@@ -704,4 +717,239 @@ async fn an_effect_result_with_a_lost_ack_lands_once() {
             .await
             .expect("commit");
     }
+}
+
+/// A coordinator and its store over `backend`, as a restarted process builds
+/// them: nothing in memory, a different rng seed and so different worker ids.
+fn restarted(
+    backend: Arc<MemoryStore>,
+    clock: &Arc<TestClock>,
+) -> (Arc<AgentStore>, Arc<Coordinator>) {
+    let store = store_over(backend, clock);
+    let co = coordinator(&store, clock, 200);
+    (store, co)
+}
+
+/// The first coordinator dispatches attempt 1 of `spec` and is dropped
+/// before any result; a second one over the same `MemoryStore` takes over.
+async fn dispatched_then_restarted(
+    spec: &StepSpec,
+    hook: &Hook,
+) -> (
+    Arc<TestClock>,
+    Arc<AgentStore>,
+    Arc<Coordinator>,
+    TurnAssignment,
+    Dispatch,
+) {
+    let clock = clock();
+    let backend = Arc::new(MemoryStore::new());
+    let store1 = store_over(backend.clone(), &clock);
+    let co1 = coordinator(&store1, &clock, 100);
+    let (a, _) = leased(&co1, "o-1").await;
+    let d1 = dispatched(&co1, &a, spec, hook).await;
+    assert_eq!(d1.attempt, 1);
+    drop(co1);
+    drop(store1);
+    let (store, co) = restarted(backend, &clock);
+    (clock, store, co, a, d1)
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_idempotency_redispatches_the_same_effect_after_a_coordinator_restart() {
+    let s = spec("charge-card", RecoveryPolicy::ProviderIdempotency);
+    let hook = Hook::default();
+    let (clock, store, co, a, d1) = dispatched_then_restarted(&s, &hook).await;
+
+    // Under the same lease.
+    let before = store.counters();
+    let d2 = dispatched(&co, &a, &s, &hook).await;
+    assert_eq!(cas_since(&store, &before), 0, "no write");
+    assert_eq!((d2.effect, d2.attempt), (d1.effect, 1));
+    assert_eq!(hook.calls(), 2);
+
+    // After a takeover by the restarted coordinator's worker.
+    let b = takeover(&co, &clock).await;
+    assert!(b.lease.epoch > a.lease.epoch);
+    assert_ne!(b.lease.owner_id, a.lease.owner_id);
+    let before = store.counters();
+    let d3 = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!(cas_since(&store, &before), 0, "no write");
+    assert_eq!((d3.effect, d3.attempt), (d1.effect, 1));
+    assert_eq!(hook.calls(), 3);
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d1).status, effect_of(&h, &d1).attempt),
+        (EffectStatus::Authorized, 1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_least_once_authorizes_a_new_attempt_after_a_coordinator_restart() {
+    let s = spec("send-email", RecoveryPolicy::AtLeastOnce);
+    let hook = Hook::default();
+    let (clock, store, co, a, d1) = dispatched_then_restarted(&s, &hook).await;
+
+    let before = store.counters();
+    let d2 = dispatched(&co, &a, &s, &hook).await;
+    assert_eq!(cas_since(&store, &before), 1, "one authorization");
+    assert_eq!((d2.effect, d2.attempt), (d1.effect, 2));
+    assert_eq!(hook.calls(), 2);
+
+    let b = takeover(&co, &clock).await;
+    assert!(b.lease.epoch > a.lease.epoch);
+    let before = store.counters();
+    let d3 = dispatched(&co, &b, &s, &hook).await;
+    assert_eq!(cas_since(&store, &before), 1, "one authorization");
+    assert_eq!((d3.effect, d3.attempt), (d1.effect, 3));
+    assert_eq!(hook.calls(), 3);
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d1).status, effect_of(&h, &d1).attempt),
+        (EffectStatus::Authorized, 3)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn manual_latches_in_doubt_after_a_coordinator_restart_and_is_never_redispatched() {
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let (clock, store, co, a, d1) = dispatched_then_restarted(&s, &hook).await;
+
+    let before = store.counters();
+    let err = co
+        .run_step(&a.lease, &s, &hook)
+        .await
+        .expect_err("a lost manual attempt is in doubt");
+    assert_eq!(err.kind, ErrorKind::EffectInDoubt);
+    assert_eq!(cas_since(&store, &before), 1, "the latch");
+    assert_eq!(hook.calls(), 1, "nothing dispatched after the restart");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d1).status, effect_of(&h, &d1).attempt),
+        (EffectStatus::InDoubt, 1)
+    );
+
+    let b = takeover(&co, &clock).await;
+    assert!(b.lease.epoch > a.lease.epoch);
+    let before = store.counters();
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("still in doubt after a takeover");
+    assert_eq!(err.kind, ErrorKind::EffectInDoubt);
+    assert_eq!(cas_since(&store, &before), 0);
+    assert_eq!(hook.calls(), 1, "nothing dispatched after the takeover");
+    assert_eq!(effect_of(&head(&store, "o-1").await, &d1).attempt, 1);
+}
+
+/// HEAD writes up to the reconcile authorization of a latched manual effect,
+/// counted by a sequence of pass-through steps.
+async fn head_writes_before_reconcile() -> u64 {
+    let clock = clock();
+    let plan = FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Put)
+            .with_key_contains("/head")
+            .with_steps(vec![SequenceStep::Passthrough; 100]),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    co.run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
+    let writes = fault.sequence_progress(0);
+    assert!(writes < 100);
+    writes
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconcile_authorization_with_a_lost_ack_dispatches_once() {
+    let nth = head_writes_before_reconcile().await + 1;
+    let clock = clock();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)
+            .with_key_contains("/head")
+            .with_occurrence(Occurrence::Nth(nth)),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    co.run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::DuplicateDelivery), 0);
+
+    let before = store.counters();
+    let resolved = co.metrics().outcome_unknown_resolved;
+    assert!(
+        co.reconcile_authorize(&d.effect, 2, &hook)
+            .await
+            .expect("authorize"),
+        "this call's attempt landed"
+    );
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+    assert_eq!(cas_since(&store, &before), 1);
+    assert_eq!(co.metrics().outcome_unknown_resolved, resolved + 1);
+    assert_eq!(hook.calls(), 2);
+    let last = hook.0.lock().last().cloned().expect("a dispatch");
+    assert_eq!((last.effect, last.attempt), (d.effect, 2));
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d).status, effect_of(&h, &d).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+    assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
+
+    // A genuine repeat dispatches nothing.
+    assert!(
+        !co.reconcile_authorize(&d.effect, 2, &hook)
+            .await
+            .expect("again")
+    );
+    assert_eq!(hook.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_step_key_reused_under_another_tool_name_blocks_the_turn_before_dispatch() {
+    let (_, store, co) = rig();
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("charge-card", RecoveryPolicy::AtLeastOnce);
+    let hook = Hook::default();
+    let d = dispatched(&co, &a, &s, &hook).await;
+    co.complete_effect(&d.effect, d.attempt, &json!("paid"))
+        .await
+        .expect("result");
+    assert_eq!(step_output(&co, &a, &s, &hook).await, json!("paid"));
+
+    let renamed = StepSpec {
+        tool_name: "refund".to_string(),
+        ..s.clone()
+    };
+    assert_eq!(
+        (&renamed.tool_version, renamed.input_hash),
+        (&s.tool_version, s.input_hash)
+    );
+    let err = co
+        .run_step(&a.lease, &renamed, &hook)
+        .await
+        .expect_err("drift");
+    assert_eq!(err.kind, ErrorKind::NonDeterministicReplay);
+    assert_eq!(hook.calls(), 1, "nothing dispatched");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        h.active_turn.expect("turn").block,
+        TurnBlock::NonDeterministicReplay
+    );
+    assert_eq!(h.effects.len(), 1);
 }

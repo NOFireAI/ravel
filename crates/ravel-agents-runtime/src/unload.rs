@@ -36,6 +36,11 @@ impl Coordinator {
             }
             idle
         };
+        if !dropped.is_empty() {
+            self.open_attempts
+                .lock()
+                .retain(|(a, _), _| !dropped.contains(a));
+        }
         forget_all(&self.leases, &dropped);
         if !dropped.is_empty() {
             self.discovered.store(false, Ordering::Release);
