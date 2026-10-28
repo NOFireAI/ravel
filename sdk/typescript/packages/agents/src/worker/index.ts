@@ -32,6 +32,17 @@ export type {
   StepRecordResponse,
   Transport,
 } from "./transport.js";
+export {
+  createHttpTransport,
+  HttpTransport,
+  type HttpTransportOptions,
+  type JournalLateResult,
+  type JournalStepRequest,
+  MAX_POLL_WAIT_MS,
+  MemoryStepJournal,
+  type StepJournal,
+  type StepScope,
+} from "../transport/http.js";
 
 export interface MessageOptions<P extends Schema, R extends Schema, S> {
   readonly payload: P;
@@ -105,10 +116,16 @@ export interface ServeOptions {
   readonly agents: readonly AnyAgentDefinition[];
   /** The tools handlers may run; listed for registration, not required by the runner. */
   readonly tools?: readonly AnyToolDefinition[];
-  /** Defaults to a random id. */
+  /** Defaults to the id `transport.register` mints for this worker's handlers. */
   readonly workerId?: string;
   /** Long-poll wait per poll; the wire caps it at 20 s. */
   readonly pollWaitMs?: number;
+  /**
+   * Pause after an abandoned turn before polling again, so a turn the
+   * coordinator hands straight back to its owner (one blocked on an effect in
+   * doubt) is not re-run in a tight loop. Default 250 ms.
+   */
+  readonly abandonDelayMs?: number;
   /** Observes every turn the worker finishes or abandons. */
   readonly onTurn?: (report: TurnReport) => void;
 }
@@ -119,15 +136,29 @@ export interface WorkerHandle {
   close(): Promise<void>;
 }
 
-function randomId(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
 }
 
-/** Poll `transport` for turns of `agents` and run each to a commit until closed. */
-export function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
-  const workerId = options.workerId ?? `worker-${randomId()}`;
+/**
+ * Poll `transport` for turns of `agents` and run each to a commit until
+ * closed. Without `workerId` it registers first and polls under the id the
+ * coordinator minted.
+ */
+export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
   const agents = new Map(options.agents.map((a) => [a.name, a]));
   const handlers = options.agents.flatMap((agent) =>
     Object.keys(agent.messages).map((handler) => ({
@@ -136,8 +167,10 @@ export function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
       digest: handlerDigest(agent, handler),
     })),
   );
+  const workerId = options.workerId ?? (await options.transport.register({ handlers })).worker_id;
   const controller = new AbortController();
   const waitMs = Math.min(options.pollWaitMs ?? 20_000, 20_000);
+  const abandonDelayMs = options.abandonDelayMs ?? 250;
 
   const stopped = (): boolean => controller.signal.aborted;
   const loop = (async () => {
@@ -165,14 +198,15 @@ export function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
       }
       const report = await runTurn(polled, agents, options.transport, controller.signal);
       options.onTurn?.(report);
+      if (report.outcome === "abandoned") await pause(abandonDelayMs, controller.signal);
     }
   })();
 
-  return Promise.resolve({
+  return {
     ownerId: workerId,
     close: async () => {
       controller.abort(new Error("worker closed"));
       await loop;
     },
-  });
+  };
 }

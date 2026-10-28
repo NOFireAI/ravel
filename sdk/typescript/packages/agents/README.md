@@ -6,19 +6,26 @@ never published (`"private": true` in `package.json`).
 
 ## Status and reachability
 
-The SDK runs end to end against the in-process fake coordinator in
-`@ravel/agents/testing`, and nowhere else yet:
+The SDK runs against the in-process fake coordinator in
+`@ravel/agents/testing` and against a live `ravel-server --agents`:
 
 - `ravel-server --agents` serves the client and worker routes under
   `/api/v1/agents/`, and the wire schemas here match their bodies (the
-  golden fixtures in `sdk/fixtures/` are written by the Rust side). No test
-  runs this package against a live server yet, and `serveAgents` has no
-  HTTP `Transport` implementation, only the fake. `createClient` maps a 401
-  or 403 to `Forbidden`.
+  golden fixtures in `sdk/fixtures/` are written by the Rust side).
+  `createClient` maps a 401 or 403 to `Forbidden`.
+- `createHttpTransport` (`@ravel/agents/worker`) is the `Transport` that
+  `serveAgents` uses against a server. The server mounts no step or effect
+  route yet, so steps go to an in-memory step journal (see "Wire gaps").
+  Its behaviour is pinned under "HTTP transport" below.
+- The end-to-end tests in `e2e/` start a built `ravel-server` and kill a
+  worker inside a step (see "End-to-end tests").
 - The only way in is the package's own exports; nothing in Ravel imports
   it.
-- No CI job runs it yet (task T2 adds the `sdk` job). Run the checks by
-  hand with `make test-sdk` and `make lint-sdk` from the repository root.
+- CI's `sdk` job (`scripts/gates-sdk.sh`) runs `npm ci`, `npm run lint`,
+  `npm run typecheck` and `npm test`, and nothing else: it builds no
+  server, so `npm run test:e2e` runs locally only. No nightly workflow runs
+  it either. `make test-sdk` and `make lint-sdk` from the repository root
+  run the unit checks.
 
 ## Entry points
 
@@ -193,6 +200,29 @@ Client (`src/client/`):
   terminal operation's events end at the first page past it, not at an
   empty page`.
 
+HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
+
+- Each worker route is posted with the worker's bearer token, and the poll
+  wait is clamped to 20 s. Tests: `posts each worker route with the bearer
+  token`, `clamps the poll wait to 20 s and leaves a shorter one alone`.
+- An `ErrorBody` maps to the class its code names, a typed 503 to
+  `StoreUnavailable`, an untyped 5xx or a request with no answer to
+  `OutcomeUnknown`, and an off-schema 2xx or an untyped 4xx to
+  `UnsupportedFormat`. Tests: `maps an ErrorBody to the class its code
+  names, with its safe ids`, `maps a typed 503 to StoreUnavailable rather
+  than OutcomeUnknown`, `maps an untyped 5xx and a request with no answer
+  to OutcomeUnknown`, `maps an off-schema 2xx and an untyped 4xx to
+  UnsupportedFormat`.
+- A step heartbeats the lease before it is journaled, and is refused for a
+  fenced lease or a turn the transport never polled. Tests: `heartbeats the
+  lease before journaling a step and derives ids from incarnation and
+  accept_seq`, `refuses a step for a fenced lease without touching the
+  journal`, `refuses a step for a turn it never polled`.
+- The server polls an agent that has never committed with a null state and
+  `base_state_version` 0; the turn starts from the agent's `initialState`.
+  Test: `starts a never-committed agent's turn from initialState when the
+  server polls a null state`.
+
 Wire (`src/wire/`): every golden fixture under `sdk/fixtures/` decodes and
 re-encodes to the same bytes, and every body schema has a fixture
 (`wire.test.ts`). The identity derivations match the fixtures and the
@@ -263,13 +293,27 @@ handler behaves under replay; it says nothing about what Ravel persists.
 The wire contract this package was written against has gaps, filled
 provisionally on the SDK side:
 
-- No route records a step, so `Transport.recordStep` has no HTTP mapping;
-  one call fuses the kernel's `RecordStep`, `CommitIntent` and
-  `AuthorizeAttempt`, so the HTTP transport will map it to more than one
-  route. Its answer carries a `failure` field, and `Transport.failEffect`
-  records a tool's failure; both are SDK-local shapes. The wire `StepState`
-  has only `started` and `completed`, so a failed step reads as `started`
-  on the wire.
+- Pending routes (task T16): the server mounts no step, effect complete,
+  effect fail, effect list or reconcile route, and no client or
+  `agents_admin` route reconciles an effect. Until they land,
+  `createHttpTransport` serves `recordStep`, `completeEffect` and
+  `failEffect` from a `MemoryStepJournal`, which lives in one process and
+  is lost with it, and a polled lease's `steps` is always empty over HTTP.
+  This is why the end-to-end kill is an in-process abort. Tests:
+  `MemoryStepJournal` in `http.test.ts`.
+- While an effect is in doubt the server still reports the operation as
+  `running`, since no route tells it the operation is blocked (asserted in
+  `worker killed inside a manual step blocks as EffectInDoubt until
+  reconciled`, `e2e/recover.test.ts`).
+- `serveAgents` does not heartbeat the lease while a turn runs; a turn
+  longer than the 30 s lease loses it to another worker.
+- `agent.state()` answers `state: null` for an agent that has never
+  committed, which its type `S` does not admit. The golden
+  `worker_poll_response` fixture carries a non-null state at
+  `base_state_version` 0, while the server polls such an agent with a null
+  one.
+- The wire `StepState` has only `started` and `completed`, so a failed step
+  would read as `started` on the wire.
 - A handler pin on the wire (`HandlerPinBody`) names the handler, version
   and digest but no agent kind, and the kernel matches a pin by handler
   name alone. Two agents at one version sharing a handler name are told
@@ -290,14 +334,67 @@ provisionally on the SDK side:
   not rounded`). Nanosecond timestamps are strings refused outside the i64
   range (test: `a timestamp outside i64 is refused on decode and encode`).
 
+## End-to-end tests
+
+`npm run test:e2e` (from `sdk/typescript/`) runs `e2e/recover.test.ts`
+against a `ravel-server` it starts itself, with `--agents` on free local
+ports. `npm test` never runs it. Build the server first:
+
+```sh
+cargo build --locked -p ravel-server --features agents
+```
+
+The binary is `RAVEL_SERVER_BIN`, else
+`$CARGO_TARGET_DIR/debug/ravel-server`, else `target/debug/ravel-server`
+under the repository root. The store is `RAVEL_E2E_STORE`: `memory`
+(default, `MemoryStore`) or `rustfs` (the compose RustFS store, which
+needs `docker compose`). The run takes about 80 s, most of it two 40 s
+lease expiries.
+
+Each test kills worker A inside a step, after the tool's side effect and
+before its result is recorded, resends under the same request id, and
+lets worker B take the turn over:
+
+- `worker killed inside an at_least_once step recovers the same operation
+  on restart`: the resend resolves to the same operation id, `kb.search`
+  runs once and is replayed, `kb.draft` runs twice under one effect id
+  (attempts 1 and 2), and the operation completes with the drafted answer.
+- `worker killed inside a manual step blocks as EffectInDoubt until
+  reconciled`: worker B abandons the turn with `EffectInDoubt` without
+  running `desk.ticket` again, and the operation completes with ticket
+  `T-1001` once the effect is reconciled with the ticket the killed run
+  filed.
+
+A missing prerequisite skips both tests and names it, both in a warning at
+the top of the run and in the suite title the verbose reporter prints:
+
+```
+e2e skipped: ravel-server binary not found at <path>; build it with `cargo build --locked -p ravel-server --features agents` or set RAVEL_SERVER_BIN
+e2e skipped: RAVEL_E2E_STORE=rustfs needs `docker compose`, which is not installed or not running
+```
+
+A skipped run exits 0.
+
+## Demo
+
+`demo/agents-kill-and-recover.sh`, from the repository root, starts the
+compose RustFS store (or `MemoryStore` with
+`RAVEL_AGENTS_DEMO_STORE=memory`) and a built `ravel-server --agents`, runs
+the same two scenarios through `examples/assistant/kill-and-recover.ts`,
+asserts each printed figure against an exact value or a stated band, and
+exits 1 on any miss. It needs `npm ci` in `sdk/typescript/` and node 22.
+See `examples/assistant/README.md`.
+
 ## Checks
 
 Run from `sdk/typescript/` after `npm ci`:
 
 - `npm run lint`: ESLint with the `typescript-eslint` strict type-checked
   rules.
-- `npm run typecheck`: `tsc` in strict mode over `src/` and `typetests/`.
+- `npm run typecheck`: `tsc` in strict mode over `src/`, `typetests/`,
+  `e2e/` and `examples/`.
 - `npm test`: the vitest suites under `src/`.
+- `npm run test:e2e`: the end-to-end tests above.
 
 `typetests/` holds compile-time negative tests. Each `// @ts-expect-error`
 case (an invalid handler signature, an invalid payload type, a step input

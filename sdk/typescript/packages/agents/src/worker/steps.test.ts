@@ -561,7 +561,7 @@ describe("turns", () => {
         await new Promise((resolve) => setImmediate(resolve));
         return null;
       },
-      register: () => Promise.reject(new Error("unused")),
+      register: () => Promise.resolve({ worker_id: "w-0000000000000001" }),
       heartbeat: () => Promise.reject(new Error("unused")),
       recordStep: () => Promise.reject(new Error("unused")),
       failEffect: () => Promise.reject(new Error("unused")),
