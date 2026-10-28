@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { OperationFailed } from "../client/index.js";
-import { EffectInDoubt, IncompatibleHandler } from "../errors.js";
+import { createClient, OperationFailed } from "../client/index.js";
+import { EffectInDoubt, IncompatibleHandler, InvalidStepInput } from "../errors.js";
 import { effectId } from "../identity.js";
 import { gate, until } from "../test-util.js";
-import { createTestHarness, type TestHarness } from "../testing/index.js";
+import { createTestHarness, FakeCoordinator, type TestHarness } from "../testing/index.js";
 import { defineTool } from "../tools/index.js";
 import type { ToolContext } from "../types.js";
-import { ConcurrentStepError, defineAgent, message } from "./index.js";
+import { ConcurrentStepError, defineAgent, message, serveAgents, type Transport } from "./index.js";
 
 let harness: TestHarness | undefined;
 
@@ -240,6 +240,122 @@ describe("steps", () => {
     expect(info.blockedEffect).toBe(effectId(1, 1, "transfer"));
     hang.open();
   });
+
+  it("a late tool result is kept as evidence and the step returns the journal's result", async () => {
+    const agent = defineAgent({
+      name: "late",
+      version: "1",
+      state: z.object({}),
+      initialState: {},
+      messages: {
+        go: message({
+          payload: z.object({ n: z.number() }),
+          result: z.number(),
+          handler: async (ctx, payload) => (await ctx.step("a", echo, { n: payload.n })).n,
+        }),
+      },
+    });
+    const coordinator = new FakeCoordinator({ agents: [agent] });
+    // Another attempt's result reaches the journal first.
+    const transport: Transport = {
+      poll: (request, signal) => coordinator.poll(request, signal),
+      recordStep: (request) => coordinator.recordStep(request),
+      failEffect: (request) => coordinator.failEffect(request),
+      commit: (request) => coordinator.commit(request),
+      completeEffect: async (request) => {
+        await coordinator.completeEffect({ ...request, result: { n: 99 } });
+        return coordinator.completeEffect(request);
+      },
+    };
+    const worker = await serveAgents({ transport, agents: [agent], tools: [echo], pollWaitMs: 50 });
+    try {
+      const client = createClient({ url: "http://fake.invalid", token: "t", fetch: coordinator.fetch });
+      const op = await client.agent<typeof agent>("late", "l-1").send("go", { n: 2 });
+      expect(await op.result()).toBe(99);
+      expect(coordinator.evidence).toEqual([
+        { effect: effectId(1, 1, "a"), attempt: 1, result: { output: { n: 2 } } },
+      ]);
+      expect(coordinator.steps(op.operationId ?? "")).toMatchObject([{ status: "completed", output: { n: 99 } }]);
+    } finally {
+      await worker.close();
+      coordinator.close();
+    }
+  });
+
+  it("an uncaught ConcurrentStepError fails the operation terminally, without retries", async () => {
+    const agent = defineAgent({
+      name: "both",
+      version: "1",
+      state: z.object({}),
+      initialState: {},
+      messages: {
+        go: message({
+          payload: z.object({}),
+          result: z.number(),
+          handler: async (ctx) => {
+            const [a, b] = await Promise.all([ctx.step("a", echo, { n: 1 }), ctx.step("b", echo, { n: 2 })]);
+            return a.n + b.n;
+          },
+        }),
+      },
+    });
+    harness = createTestHarness({ agents: [agent], tools: [echo], maxAttempts: 3 });
+    const op = await harness.agent(agent, "b-1").send("go", {});
+    const error: unknown = await op.result().catch((e: unknown) => e);
+    expect(error).toMatchObject({ status: "failed", deadLettered: false });
+    expect(harness.coordinator.commits.map((c) => (c.outcome === "failed" ? c.terminal : null))).toEqual([true]);
+  });
+
+  it("a step input that is not plain JSON is refused with InvalidStepInput before its tool runs, and fails terminally uncaught", async () => {
+    let runs = 0;
+    const tally = defineTool({
+      name: "tally",
+      version: "1",
+      input: z.object({ counts: z.map(z.string(), z.number()) }),
+      output: z.object({}),
+      recovery: "at_least_once",
+      run: () => {
+        runs += 1;
+        return Promise.resolve({});
+      },
+    });
+    const agent = defineAgent({
+      name: "mapper",
+      version: "1",
+      state: z.object({}),
+      initialState: {},
+      messages: {
+        go: message({
+          payload: z.object({}),
+          result: z.string(),
+          handler: async (ctx) => {
+            const refused = await ctx.step("t", tally, { counts: new Map([["a", 1]]) }).then(
+              () => "ran",
+              (e: unknown) => (e instanceof InvalidStepInput ? e.message : "other"),
+            );
+            return refused;
+          },
+        }),
+        uncaught: message({
+          payload: z.object({}),
+          result: z.null(),
+          handler: async (ctx) => {
+            await ctx.step("t", tally, { counts: new Map([["a", 1]]) });
+            return null;
+          },
+        }),
+      },
+    });
+    harness = createTestHarness({ agents: [agent], tools: [tally], maxAttempts: 3 });
+    const op = await harness.agent(agent, "p-1").send("go", {});
+    expect(await op.result()).toBe("value.counts is a Map, not plain JSON");
+    expect(harness.coordinator.steps(op.operationId ?? "")).toEqual([]);
+    const failed = await harness.agent(agent, "p-2").send("uncaught", {});
+    const error: unknown = await failed.result().catch((e: unknown) => e);
+    expect(error).toMatchObject({ status: "failed", deadLettered: false });
+    expect(harness.coordinator.commits.filter((c) => c.outcome === "failed")).toHaveLength(1);
+    expect(runs).toBe(0);
+  });
 });
 
 describe("turns", () => {
@@ -356,5 +472,45 @@ describe("turns", () => {
     );
     expect(report.outcome).toBe("abandoned");
     expect(report.outcome === "abandoned" ? report.error : undefined).toBeInstanceOf(IncompatibleHandler);
+  });
+
+  it("a worker whose handler digest differs from the leased one abandons the turn with IncompatibleHandler", async () => {
+    const { handlerDigest, runTurn } = await import("./runner.js");
+    const { coordinator } = (harness = createTestHarness({ agents: [] }));
+    const turn = (digest: string) =>
+      runTurn(
+        {
+          startedUnixNs: 0n,
+          assignment: {
+            lease: {
+              agent_id: "a",
+              incarnation: 1,
+              owner_id: "w",
+              epoch: 1,
+              turn_id: "t",
+              base_state_version: 0,
+              handler_version: counter.version,
+              handler_digest: digest,
+              observed_root_revision: 0,
+            },
+            agent: { kind: "counter", key: "c-1" },
+            operation: "op-1",
+            accept_seq: 1,
+            handler: "boom",
+            state: { total: 0 },
+            payload: { by: 1 },
+            steps: [],
+          },
+        },
+        new Map([["counter", counter]]),
+        coordinator,
+        new AbortController().signal,
+      );
+    const report = await turn("d");
+    expect(report.outcome).toBe("abandoned");
+    expect(report.outcome === "abandoned" ? report.error : undefined).toBeInstanceOf(IncompatibleHandler);
+    // With the matching digest the same turn runs its handler and reaches the commit.
+    const matching = await turn(handlerDigest(counter, "boom"));
+    expect(matching.outcome === "abandoned" ? matching.error : undefined).not.toBeInstanceOf(IncompatibleHandler);
   });
 });

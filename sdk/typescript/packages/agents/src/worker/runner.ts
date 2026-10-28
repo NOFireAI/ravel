@@ -4,12 +4,14 @@
  */
 import type { z } from "zod";
 import {
+  ConcurrentStepError,
+  EffectInDoubt,
   IncompatibleHandler,
+  InvalidStepInput,
   NonDeterministicReplay,
-  RavelAgentsError,
   type SafeIds,
 } from "../errors.js";
-import { canonicalBytes, derive, stepInputHash, toHex } from "../identity.js";
+import { canonicalBytes, derive, jsonForm, stepInputHash, toHex } from "../identity.js";
 import type {
   AnyAgentDefinition,
   AnyMessageDefinition,
@@ -18,18 +20,22 @@ import type {
   ToolDefinition,
 } from "../types.js";
 import type { EventSpecBody, OperationStatus, StepBody, TurnAssignment } from "../wire/index.js";
-import type { PolledTurn, Transport } from "./transport.js";
+import type { PolledTurn, StepRecordRequest, StepRecordResponse, Transport } from "./transport.js";
 
-/** A second `ctx.step` started while one is still in flight. */
-export class ConcurrentStepError extends Error {
-  override readonly name = "ConcurrentStepError";
-  readonly code = "ConcurrentStep";
+/**
+ * A step's tool failed, and the failure is the step's recorded result: a
+ * retry of the turn replays it rather than running the tool again. `cause`
+ * holds the tool's own error on the run that recorded it.
+ */
+export class StepFailed extends Error {
+  override readonly name = "StepFailed";
 
   constructor(
     readonly stepKey: string,
-    readonly inFlightKey: string,
+    readonly error: string,
+    options: { cause?: unknown } = {},
   ) {
-    super(`step ${stepKey} started while step ${inFlightKey} is in flight; steps are sequential`);
+    super(error, options);
   }
 }
 
@@ -79,9 +85,8 @@ function u64le(value: number): Uint8Array {
   return out;
 }
 
-/** A protocol outcome that ends the turn without a commit. */
-function isBlocking(error: unknown): error is RavelAgentsError {
-  return error instanceof RavelAgentsError && error.retry !== "backoff";
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 class Turn<S> {
@@ -90,8 +95,12 @@ class Turn<S> {
   private draft: S;
   private inFlight: string | undefined;
   private pending: Promise<unknown> = Promise.resolve();
-  /** The first blocking outcome a step met; once set the turn never commits. */
-  blocked: RavelAgentsError | undefined;
+  /**
+   * The first outcome that ends the turn without a commit: a coordinator
+   * refusal or a replay drift the runner detected. A tool's own error never
+   * sets it.
+   */
+  blocked: { readonly error: unknown } | undefined;
   readonly random: () => number;
 
   constructor(
@@ -157,18 +166,63 @@ class Turn<S> {
     tool: ToolDefinition<I, O>,
     input: z.input<I>,
   ): Promise<z.output<O>> {
-    if (this.inFlight !== undefined) throw new ConcurrentStepError(key, this.inFlight);
+    if (this.inFlight !== undefined) {
+      throw new ConcurrentStepError(key, this.inFlight, { ids: this.ids() });
+    }
     this.inFlight = key;
     const run = this.runStep(key, tool, input);
     this.pending = run.catch(() => undefined);
     try {
       return await run;
-    } catch (error) {
-      if (isBlocking(error)) this.blocked ??= error;
-      throw error;
     } finally {
       this.inFlight = undefined;
     }
+  }
+
+  /** End the turn without a commit; every later step rejects with `error`. */
+  private block(error: unknown): never {
+    this.blocked ??= { error };
+    throw error;
+  }
+
+  /** A coordinator call; its rejection is a refusal and blocks the turn. */
+  private async coordinator<T>(call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (error) {
+      return this.block(error);
+    }
+  }
+
+  /** The recorded result `record` carries, if it has one. */
+  private replay<O extends Schema>(
+    key: string,
+    tool: ToolDefinition<Schema, O>,
+    record: StepRecordResponse,
+  ): { readonly output: z.output<O> } | undefined {
+    if (record.step.status === "completed") return { output: tool.output.parse(record.step.output) };
+    if (record.failure !== null) throw new StepFailed(key, record.failure);
+    return undefined;
+  }
+
+  /** The journal's result for a step whose own result arrived late. */
+  private async journaled<O extends Schema>(
+    key: string,
+    tool: ToolDefinition<Schema, O>,
+    request: StepRecordRequest,
+    effect: string,
+    status: string,
+  ): Promise<z.output<O>> {
+    if (status === "completed") {
+      const current = await this.coordinator(() => this.transport.recordStep(request));
+      const replayed = this.replay(key, tool, current);
+      if (replayed !== undefined) return replayed.output;
+    }
+    return this.block(
+      new EffectInDoubt(`effect ${effect} of step ${key} has a late result and no journaled one`, {
+        ids: this.ids({ stepKey: key, effectId: effect }),
+      }),
+    );
   }
 
   private async runStep<I extends Schema, O extends Schema>(
@@ -176,12 +230,11 @@ class Turn<S> {
     tool: ToolDefinition<I, O>,
     input: z.input<I>,
   ): Promise<z.output<O>> {
-    if (this.blocked !== undefined) throw this.blocked;
+    if (this.blocked !== undefined) throw this.blocked.error;
     const parsed = tool.input.parse(input);
-    const inputHash = stepInputHash(tool.name, tool.version, canonicalBytes(parsed));
-    const lease = this.assignment.lease;
-    const request = {
-      lease,
+    const inputHash = stepInputHash(tool.name, tool.version, canonicalBytes(jsonForm(parsed)));
+    const request: StepRecordRequest = {
+      lease: this.assignment.lease,
       step_key: key,
       tool_name: tool.name,
       tool_version: tool.version,
@@ -204,23 +257,33 @@ class Turn<S> {
         // The coordinator holds the journal and blocks the operation on the
         // same check; the runner refuses locally whatever it answers.
         await this.transport.recordStep(request).catch(() => undefined);
-        throw error;
+        this.block(error);
       }
       if (recorded.status === "completed") return tool.output.parse(recorded.output);
     }
-    const started = await this.transport.recordStep(request);
-    const output = tool.output.parse(
-      await tool.run(parsed, {
-        effectId: started.effect,
-        attempt: started.attempt,
-        signal: this.signal,
-      }),
+    // A `started` entry may have gained a result since the turn was leased,
+    // so the coordinator's current record decides whether the tool runs.
+    const started = await this.coordinator(() => this.transport.recordStep(request));
+    const replayed = this.replay(key, tool, started);
+    if (replayed !== undefined) return replayed.output;
+    const effect = { effect: started.effect, attempt: started.attempt };
+    let output: z.output<O>;
+    try {
+      output = tool.output.parse(
+        await tool.run(parsed, { effectId: started.effect, attempt: started.attempt, signal: this.signal }),
+      );
+    } catch (error) {
+      // An aborted worker's tool error says nothing about the effect.
+      if (this.signal.aborted) throw error;
+      const text = errorText(error);
+      const failed = await this.coordinator(() => this.transport.failEffect({ ...effect, error: text }));
+      if (failed.late) return this.journaled(key, tool, request, started.effect, failed.status);
+      throw new StepFailed(key, text, { cause: error });
+    }
+    const done = await this.coordinator(() =>
+      this.transport.completeEffect({ ...effect, result: output as StepBody["output"] & {} }),
     );
-    await this.transport.completeEffect({
-      effect: started.effect,
-      attempt: started.attempt,
-      result: output as StepBody["output"] & {},
-    });
+    if (done.late) return this.journaled(key, tool, request, started.effect, done.status);
     this.transcript.set(key, { ...started.step, status: "completed", output: output as StepBody["output"] });
     return output;
   }
@@ -275,9 +338,15 @@ export async function runTurn(
   const base = { operation: a.operation, turnId: a.lease.turn_id };
   const agent = agents.get(a.agent.kind);
   const message: AnyMessageDefinition | undefined = agent?.messages[a.handler];
-  if (agent === undefined || message === undefined || a.lease.handler_version !== agent.version) {
+  if (
+    agent === undefined ||
+    message === undefined ||
+    a.lease.handler_version !== agent.version ||
+    a.lease.handler_digest !== handlerDigest(agent, a.handler)
+  ) {
     const error = new IncompatibleHandler(
-      `no handler ${a.agent.kind}.${a.handler}@${a.lease.handler_version} on this worker`,
+      `no handler ${a.agent.kind}.${a.handler}@${a.lease.handler_version} ` +
+        `with digest ${a.lease.handler_digest} on this worker`,
       { ids: { agentId: a.lease.agent_id, operationId: a.operation, turnId: a.lease.turn_id } },
     );
     return { outcome: "abandoned", ...base, error };
@@ -299,13 +368,16 @@ export async function runTurn(
     completed = { output: result.data };
   } catch (error) {
     failure = {
-      error: error instanceof Error ? error.message : String(error),
-      terminal: error instanceof TerminalFailure,
+      error: errorText(error),
+      terminal:
+        error instanceof TerminalFailure ||
+        error instanceof ConcurrentStepError ||
+        error instanceof InvalidStepInput,
     };
   }
   if (signal.aborted) return { outcome: "abandoned", ...base, error: signal.reason };
   await turn.settled();
-  if (turn.blocked !== undefined) return { outcome: "abandoned", ...base, error: turn.blocked };
+  if (turn.blocked !== undefined) return { outcome: "abandoned", ...base, error: turn.blocked.error };
 
   try {
     if (completed !== undefined) {

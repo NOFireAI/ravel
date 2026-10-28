@@ -23,8 +23,10 @@ export type {
   HandlerContext,
   MessageDefinition,
 } from "../types.js";
-export { ConcurrentStepError, handlerDigest, runTurn, type TurnReport } from "./runner.js";
+export { ConcurrentStepError, InvalidStepInput } from "../errors.js";
+export { handlerDigest, runTurn, StepFailed, type TurnReport } from "./runner.js";
 export type {
+  EffectFailRequest,
   PolledTurn,
   StepRecordRequest,
   StepRecordResponse,

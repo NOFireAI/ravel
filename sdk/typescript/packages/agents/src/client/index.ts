@@ -219,21 +219,20 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function encodeCursor(wire: string | null, skip: number): string {
-  return btoa(JSON.stringify({ c: wire, n: skip }))
+/** An events cursor: the seq of the last event delivered, whatever page size carried it. */
+function encodeCursor(eventSeq: number): string {
+  return btoa(JSON.stringify({ s: eventSeq }))
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
 }
 
-function decodeCursor(cursor: string): { wire: string | null; skip: number } {
+function decodeCursor(cursor: string): number {
   try {
     const parsed: unknown = JSON.parse(atob(cursor.replaceAll("-", "+").replaceAll("_", "/")));
-    if (typeof parsed === "object" && parsed !== null && "c" in parsed && "n" in parsed) {
-      const { c, n } = parsed;
-      if ((typeof c === "string" || c === null) && typeof n === "number" && Number.isInteger(n) && n >= 0) {
-        return { wire: c, skip: n };
-      }
+    if (typeof parsed === "object" && parsed !== null && "s" in parsed) {
+      const { s } = parsed;
+      if (typeof s === "number" && Number.isSafeInteger(s) && s >= 0) return s;
     }
   } catch {
     // reported below
@@ -415,8 +414,9 @@ export function createClient(options: ClientOptions): RavelAgentsClient {
       const signal = eventsOptions.signal ?? new AbortController().signal;
       const pageSize = eventsOptions.pageSize ?? 100;
       const pollMs = eventsOptions.pollIntervalMs ?? 50;
-      let { wire, skip } =
-        eventsOptions.after === undefined ? { wire: null, skip: 0 } : decodeCursor(eventsOptions.after);
+      // The wire cursor is a committed event seq: the page holds the events after it.
+      let delivered = eventsOptions.after === undefined ? 0 : decodeCursor(eventsOptions.after);
+      let wire: string | null = delivered === 0 ? null : String(delivered);
       for (;;) {
         // Status before the page: a terminal status read here means every
         // event of the operation is already committed and in what follows.
@@ -424,24 +424,29 @@ export function createClient(options: ClientOptions): RavelAgentsClient {
         const terminal = TERMINAL_STATUSES.includes(info.status);
         const body = JSON.stringify(encodeWire(EventsRequest, { agent: ref, cursor: wire, limit: pageSize }));
         const page = await exchange("POST", "events", undefined, body, EventsResponse, signal);
-        for (let i = skip; i < page.events.length; i += 1) {
-          const event = page.events[i];
-          if (event === undefined || event.accept_seq !== info.acceptSeq) continue;
+        // Events are committed in accept order, so a later operation's event
+        // means this one's are all behind it.
+        let passed = false;
+        for (const event of page.events) {
+          if (event.accept_seq > info.acceptSeq) passed = true;
+          if (event.event_seq <= delivered || event.accept_seq !== info.acceptSeq) continue;
+          delivered = event.event_seq;
           yield {
             eventSeq: event.event_seq,
             acceptSeq: event.accept_seq,
             turnId: event.turn_id,
             eventType: event.event_type,
             payload: event.payload,
-            cursor: i + 1 === page.events.length ? encodeCursor(page.next_cursor, 0) : encodeCursor(wire, i + 1),
+            cursor: encodeCursor(delivered),
           };
         }
+        // A short page is not an end: the wire does not promise the server
+        // fills a page to `limit`.
+        if (terminal && (passed || page.events.length === 0)) return;
         if (page.events.length > 0) {
           wire = page.next_cursor;
-          skip = 0;
           continue;
         }
-        if (terminal) return;
         await sleep(pollMs, signal);
       }
     }

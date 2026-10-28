@@ -71,10 +71,10 @@ describe("operation events", () => {
     const all = await collect(op.events({ pageSize: 3 }));
     expect(all.map((e) => e.eventSeq)).toEqual([1, 2, 3, 4]);
 
-    // After the first event: the cursor points inside the first page.
+    // After the first event: mid-page.
     const afterFirst = await collect(op.events({ pageSize: 3, after: all[0]?.cursor ?? "" }));
     expect(afterFirst.map((e) => e.eventSeq)).toEqual([2, 3, 4]);
-    // After the third: the cursor is the page's own next cursor.
+    // After the third: the last event of the first page.
     const afterThird = await collect(op.events({ pageSize: 3, after: all[2]?.cursor ?? "" }));
     expect(afterThird.map((e) => e.eventSeq)).toEqual([4]);
     // After the last: nothing left, and the iterator still ends.
@@ -92,5 +92,37 @@ describe("operation events", () => {
     }
     const rest = await collect(op.events({ after: cursor }));
     expect(rest.map((e) => e.payload)).toEqual([{ i: 2 }, { i: 3 }]);
+  });
+
+  it("a cursor is the last delivered event seq, so a different page size resumes without duplicates", async () => {
+    const h = start();
+    const op = await h.agent(ticker, "t-1").send("tick", { n: 5, wait: false });
+    await op.result();
+    const seen: number[] = [];
+    let cursor = "";
+    for await (const event of op.events({ pageSize: 5 })) {
+      seen.push(event.eventSeq);
+      cursor = event.cursor;
+      if (seen.length === 3) break;
+    }
+    for await (const event of op.events({ pageSize: 2, after: cursor })) seen.push(event.eventSeq);
+    expect(seen).toEqual([1, 2, 3, 4, 5]);
+    const events = h.coordinator.received.filter((r) => r.route === "events");
+    // The resumed read asks the coordinator for the events after seq 3.
+    expect(events.map((r) => (r.body as { cursor: string | null }).cursor)).toEqual([null, "3", "5"]);
+  });
+
+  it("a terminal operation's events end at the first page past it, not at an empty page", async () => {
+    const h = start();
+    const agent = h.agent(ticker, "t-1");
+    const first = await agent.send("tick", { n: 2, wait: false });
+    const second = await agent.send("tick", { n: 3, wait: false });
+    await first.result();
+    await second.result();
+    const events = await collect(first.events({ pageSize: 2 }));
+    expect(events.map((e) => e.eventSeq)).toEqual([1, 2]);
+    // Page one holds events 1 and 2; page two opens on the second operation's
+    // event 3, which ends the read. Reading on to an empty page takes four.
+    expect(h.coordinator.received.filter((r) => r.route === "events")).toHaveLength(2);
   });
 });

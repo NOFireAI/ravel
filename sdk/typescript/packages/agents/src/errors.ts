@@ -1,6 +1,8 @@
 /**
- * The typed errors of ADR-3331 decision 11. Every surface of the SDK reports
- * a protocol outcome as one of these classes, never as a bare Error.
+ * The typed errors of ADR-3331 decision 11, plus two the SDK raises locally
+ * before any request leaves the process (`ConcurrentStepError`,
+ * `InvalidStepInput`). Every surface of the SDK reports a protocol outcome as
+ * one of these classes, never as a bare Error.
  */
 
 /**
@@ -43,7 +45,10 @@ export type RavelAgentsErrorCode =
   | "MailboxFull"
   | "BudgetExceeded"
   | "StoreUnavailable"
-  | "UnsupportedFormat";
+  | "UnsupportedFormat"
+  // SDK-local: raised by the step runner, never carried on the wire.
+  | "ConcurrentStep"
+  | "InvalidStepInput";
 
 export interface RavelAgentsErrorOptions {
   readonly ids?: SafeIds;
@@ -150,5 +155,39 @@ export class StoreUnavailable extends RavelAgentsError {
 export class UnsupportedFormat extends RavelAgentsError {
   override readonly name = "UnsupportedFormat";
   readonly code = "UnsupportedFormat";
+  readonly retry = "never";
+}
+
+/**
+ * A second `ctx.step` started while one is still in flight; steps are
+ * sequential. A programming error in the handler: a turn that fails with it is
+ * failed terminally, not retried.
+ */
+export class ConcurrentStepError extends RavelAgentsError {
+  override readonly name = "ConcurrentStepError";
+  readonly code = "ConcurrentStep";
+  readonly retry = "never";
+
+  constructor(
+    readonly stepKey: string,
+    readonly inFlightKey: string,
+    options: RavelAgentsErrorOptions = {},
+  ) {
+    super(`step ${stepKey} started while step ${inFlightKey} is in flight; steps are sequential`, {
+      ...options,
+      ids: { ...options.ids, stepKey },
+    });
+  }
+}
+
+/**
+ * A step input whose parsed value is not plain JSON (a `Map`, `Set`, `bigint`,
+ * function, non-finite number, `undefined` or class instance inside it), so it
+ * has no canonical bytes to hash. A turn that fails with it is failed
+ * terminally, not retried.
+ */
+export class InvalidStepInput extends RavelAgentsError {
+  override readonly name = "InvalidStepInput";
+  readonly code = "InvalidStepInput";
   readonly retry = "never";
 }

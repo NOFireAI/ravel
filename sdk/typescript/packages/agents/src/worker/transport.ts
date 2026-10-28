@@ -5,10 +5,11 @@
  * server exists, and both drive the same runner.
  *
  * `poll`, `commit` and `completeEffect` carry the wire bodies of
- * `crates/ravel-agents-core/src/wire.rs`. Two things the runner needs have no
+ * `crates/ravel-agents-core/src/wire.rs`. Three things the runner needs have no
  * wire body yet, so their shapes here are SDK-local and provisional: the
  * kernel's `RecordStep` command (journal a step as started before its tool
- * runs), and a recorded start time for the turn.
+ * runs, or read back the record it already has), recording a tool's failure
+ * as its attempt's result, and a recorded start time for the turn.
  */
 import type {
   EffectCompleteRequest,
@@ -39,12 +40,26 @@ export interface StepRecordRequest {
   readonly input_hash: string;
 }
 
+/**
+ * The step's current record. A step with a recorded result comes back as it
+ * is: `step.status` `completed` with its output, or `failure` set. Otherwise
+ * `attempt` is an attempt the caller is authorized to run.
+ */
 export interface StepRecordResponse {
   /** The journaled step; its `step_id` is minted by the coordinator. */
   readonly step: StepBody;
   /** The effect handle the tool's result is completed under. */
   readonly effect: string;
   readonly attempt: number;
+  /** The tool failure recorded as the step's result, or `null`. */
+  readonly failure: string | null;
+}
+
+/** Record a tool's failure as its attempt's result. */
+export interface EffectFailRequest {
+  readonly effect: string;
+  readonly attempt: number;
+  readonly error: string;
 }
 
 /**
@@ -55,7 +70,16 @@ export interface StepRecordResponse {
 export interface Transport {
   /** Long-poll for a turn; resolves `null` when the wait elapses with no work. */
   poll(request: WorkerPollRequest, signal: AbortSignal): Promise<PolledTurn | null>;
+  /**
+   * Journal a step, or answer with the record it already has. A step with no
+   * result is authorized a new attempt under `at_least_once` and
+   * `provider_idempotency`; under `manual` it rejects with `EffectInDoubt`.
+   */
   recordStep(request: StepRecordRequest): Promise<StepRecordResponse>;
+  /** Record an attempt's result. A `late` result is kept as evidence and changes no journal entry. */
   completeEffect(request: EffectCompleteRequest): Promise<EffectCompleteResponse>;
+  /** Record an attempt's failure, under the same `late` rule as {@link completeEffect}. */
+  failEffect(request: EffectFailRequest): Promise<EffectCompleteResponse>;
+  /** A `failed` commit is refused with `EffectInDoubt` while an authorized attempt has no result. */
   commit(request: WorkerCommitRequest): Promise<WorkerCommitResponse>;
 }
