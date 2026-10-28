@@ -358,6 +358,7 @@ fn readback(query_url: &str) -> Readback {
         attempts: 1,
         settled_after_ms: 0,
         query_ms: Default::default(),
+        query_windows: Default::default(),
     }
 }
 
@@ -1403,5 +1404,58 @@ async fn the_diagnostics_sidecar_records_the_largest_ulp_gap() {
     assert!(
         diverged["max_ulps"].as_u64().expect("aligned") > 1 << 40,
         "{diverged}"
+    );
+}
+
+/// An ingest report whose row failed its read-back binds no query run: the
+/// bin prints such a report for diagnosis, and a `readback_error` or a
+/// `readback` that did not match refuses the bind naming the row.
+///
+/// TO SEE THIS FAIL: drop the read-back check from `bind`'s row loop: both
+/// marked reports then bind.
+#[test]
+fn a_report_whose_readback_failed_does_not_bind() {
+    use ravel_bench::metrics_query::{BindError, bind, parse_engine_spec};
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec")];
+    let bind_report = |report: &MetricsIngestReport| {
+        bind(report, &workload_bytes, &workload, &specs, |_| None).map(|_| ())
+    };
+    bind_report(&ingest_report(&urls)).expect("a report whose read-backs matched binds");
+
+    let mut errored = ingest_report(&urls);
+    let row = errored
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "mimir")
+        .expect("mimir row");
+    row.readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+    let err = bind_report(&errored).expect_err("a readback_error refuses the bind");
+    assert!(
+        matches!(&err, BindError::Readback { system, detail }
+            if system == "mimir" && detail.contains("422")),
+        "{err}"
+    );
+
+    let mut mismatched = ingest_report(&urls);
+    let readback = mismatched.systems[0]
+        .readback
+        .as_mut()
+        .expect("prometheus readback");
+    readback.mismatches = vec!["sample_count: read 7, expected 8".to_string()];
+    readback.matches_expected = false;
+    let err = bind_report(&mismatched).expect_err("a mismatched readback refuses the bind");
+    assert!(
+        matches!(&err, BindError::Readback { system, detail }
+            if system == "prometheus" && detail.contains("sample_count: read 7")),
+        "{err}"
     );
 }

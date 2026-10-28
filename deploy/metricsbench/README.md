@@ -497,7 +497,11 @@ Steps, in order, stopping at the first failure:
    `readback` records `attempts` and `settled_after_ms`. Ravel's token reaches it
    only through `--ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN`, never on
    a command line (case a). A failing ingest exits 70 naming the step and the
-   stack is still torn down (case b). The `ci` profile keeps the ingest's
+   stack is still torn down (case b). When the failure is a read-back,
+   `ingest.json` still holds the rows replayed so far, the failed row with
+   its mismatching `readback` or its `readback_error`, for diagnosis only
+   (`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`).
+   The `ci` profile keeps the ingest's
    in-process diagnostic row on a memory store (case a); every other profile
    passes `--no-in-process-row` (case l), since cardinality's and history's
    streams do not fit in memory beside four engine containers and the
