@@ -1227,3 +1227,140 @@ fn a_failed_readback_does_not_stop_the_later_rows() {
     }
     assert!(report.get("stalled").is_none(), "{report}");
 }
+
+/// A row that fails a hard check after an earlier row's read-back failed
+/// does not discard the report: three stub receivers in row order,
+/// Prometheus answering 422 to every read-back query, VictoriaMetrics
+/// answering 400 to every write (its accepted set is then empty, so
+/// `close_row`'s band 6 check fails: an error, not a counted drop), and Mimir
+/// storing and reading back what it is sent. `ingest.json` holds all three
+/// rows with their ingest figures, Prometheus carrying `readback_error`,
+/// VictoriaMetrics carrying `row_failure` for band 6, and Mimir a matching
+/// read-back; the bin exits 1, the read-back failure's code.
+///
+/// TO SEE THIS FAIL: in `run`, return `close_row`'s error with no report
+/// once `first_failure` is set: `ingest.json` is then empty.
+#[test]
+fn a_later_hard_failure_after_a_failed_readback_keeps_the_report() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let refuse = || async {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "query refused",
+        )
+    };
+    let refusing_reads = axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route("/api/v1/series", axum::routing::get(refuse))
+        .route("/api/v1/query", axum::routing::get(refuse));
+    let refusing_writes = axum::Router::new().route(
+        "/api/v1/write",
+        axum::routing::post(|| async { (axum::http::StatusCode::BAD_REQUEST, "bad write") }),
+    );
+    let mut urls = Vec::new();
+    for app in [
+        refusing_reads,
+        refusing_writes,
+        stub_receiver(StubTsdb::default()),
+    ] {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        urls.push(format!("http://{addr}"));
+    }
+    let writes: Vec<String> = urls.iter().map(|u| format!("{u}/api/v1/write")).collect();
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    let stdout = std::fs::File::create(&ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "2",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "5",
+            "--prometheus-endpoint",
+            &writes[0],
+            "--prometheus-query-url",
+            &urls[0],
+            "--victoriametrics-endpoint",
+            &writes[1],
+            "--victoriametrics-query-url",
+            &urls[1],
+            "--mimir-endpoint",
+            &writes[2],
+            "--mimir-query-url",
+            &urls[2],
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("metricsbench_ingest: reading prometheus back failed"),
+        "the run exits with the first failure: {stderr}"
+    );
+
+    let text = std::fs::read_to_string(&ingest_json).expect("read ingest.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&text).expect("ingest.json is a JSON report");
+    let systems = report["systems"].as_array().expect("systems");
+    let names: Vec<&str> = systems
+        .iter()
+        .map(|r| r["system"].as_str().expect("system"))
+        .collect();
+    assert_eq!(
+        names,
+        ["prometheus", "victoriametrics", "mimir"],
+        "{report}"
+    );
+    for row in systems {
+        let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
+        assert!(offered > 0, "{row}");
+    }
+    let error = systems[0]["readback_error"]
+        .as_str()
+        .expect("readback_error");
+    assert!(error.contains("422"), "{error}");
+
+    let vm = &systems[1];
+    assert_eq!(vm["ingest"]["accepted_samples"], 0, "{vm}");
+    assert_eq!(vm["row_failure"]["band"], 6, "{vm}");
+    let failure = vm["row_failure"]["error"].as_str().expect("row_failure");
+    assert!(failure.contains("victoriametrics"), "{failure}");
+    assert!(vm.get("readback").is_none(), "{vm}");
+    assert!(vm.get("readback_error").is_none(), "{vm}");
+
+    let mimir = &systems[2];
+    assert_eq!(
+        mimir["ingest"]["accepted_samples"],
+        mimir["ingest"]["offered_samples"],
+        "{mimir}"
+    );
+    assert!(mimir.get("row_failure").is_none(), "{mimir}");
+    assert!(mimir.get("readback_error").is_none(), "{mimir}");
+    assert_eq!(mimir["readback"]["matches_expected"], true, "{mimir}");
+    assert!(report.get("stalled").is_none(), "{report}");
+    assert!(report.get("failed_replays").is_none(), "{report}");
+}
