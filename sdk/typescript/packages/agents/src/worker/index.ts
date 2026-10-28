@@ -4,7 +4,7 @@
  * entry never imports it.
  */
 import type { z } from "zod";
-import { EffectInDoubt, RavelAgentsError } from "../errors.js";
+import { Forbidden, RavelAgentsError } from "../errors.js";
 import type {
   AgentDefinition,
   AnyAgentDefinition,
@@ -14,7 +14,7 @@ import type {
   MessageDefinition,
   Schema,
 } from "../types.js";
-import { Backoff } from "./backoff.js";
+import { Backoff, OperationBackoffs } from "./backoff.js";
 import { handlerDigest, runTurn, type TurnReport } from "./runner.js";
 import type { Transport } from "./transport.js";
 
@@ -123,23 +123,31 @@ export interface ServeOptions {
   /** Long-poll wait per poll; the wire caps it at 20 s. */
   readonly pollWaitMs?: number;
   /**
-   * Pause after an abandoned turn before polling again. A turn abandoned with
-   * `EffectInDoubt` is handed straight back to its owner until someone
-   * reconciles the effect, so each consecutive one doubles the pause, up to
-   * `maxBackoffMs`, and a committed turn resets it. Default 250 ms.
+   * Pause after an abandoned turn before polling again. A turn still leased
+   * to this worker is handed straight back to it, so an abandonment whose
+   * error hints `reconcile` (`EffectInDoubt`), `backoff` (`StoreUnavailable`,
+   * `MailboxFull`) or `resolve` (`OutcomeUnknown`, a lost answer) doubles the
+   * pause for its operation, up to `maxBackoffMs`, and that operation's next
+   * commit resets it. Each operation keeps its own delay, so another
+   * operation's abandonment starts at this one; the pause still holds the
+   * whole poll loop. An abandonment hinted `never`, or with no hint, pauses
+   * this fixed delay. Default 250 ms.
    */
   readonly abandonDelayMs?: number;
-  /** Cap on the doubling pauses after in-doubt abandonments and failed polls. Default 30 s. */
+  /** Cap on the doubling pauses after abandoned turns and failed polls. Default 30 s. */
   readonly maxBackoffMs?: number;
   /** Observes every turn the worker finishes or abandons. */
   readonly onTurn?: (report: TurnReport) => void;
   /**
-   * Called with every error a poll rejects with. An error whose `retry` is
-   * `never` (such as `Forbidden` for a refused token) stops the worker; any
-   * other is retried after a pause that doubles from 50 ms up to
-   * `maxBackoffMs` and resets on the next poll that answers. Without
-   * `onError`, a stopping error rejects {@link WorkerHandle.done}; an
-   * `onError` that throws stops the worker with what it threw.
+   * Called with every error a poll rejects with. Only `Forbidden`, a refused
+   * token, stops the worker: a retry with the same token cannot succeed.
+   * Every other error is retried after a pause that doubles from 50 ms up to
+   * `maxBackoffMs` and resets on the next poll that answers, including
+   * `UnsupportedFormat` and other errors hinted `never`, since a proxy can
+   * answer one poll with a page the SDK does not read and the next with a
+   * turn. Without `onError`, a stopping error rejects
+   * {@link WorkerHandle.done}; an `onError` that throws stops the worker with
+   * what it threw.
    */
   readonly onError?: (error: unknown) => void;
 }
@@ -195,11 +203,15 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
   const waitMs = Math.min(options.pollWaitMs ?? 20_000, 20_000);
   const abandonDelayMs = options.abandonDelayMs ?? 250;
   const maxBackoffMs = options.maxBackoffMs ?? 30_000;
-  const inDoubtDelay = new Backoff(abandonDelayMs, maxBackoffMs);
+  const abandonDelays = new OperationBackoffs(abandonDelayMs, maxBackoffMs);
   const pollRetryDelay = new Backoff(POLL_RETRY_MS, maxBackoffMs);
+  const abandonPause = (report: Extract<TurnReport, { outcome: "abandoned" }>): number =>
+    report.error instanceof RavelAgentsError && report.error.retry !== "never"
+      ? abandonDelays.next(report.operation)
+      : abandonDelayMs;
 
   const stopped = (): boolean => controller.signal.aborted;
-  const loop = (async () => {
+  const serve = async (): Promise<void> => {
     while (!stopped()) {
       let polled;
       const askedAt = Date.now();
@@ -210,7 +222,7 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
         );
       } catch (error) {
         if (stopped()) return;
-        if (error instanceof RavelAgentsError && error.retry === "never") {
+        if (error instanceof Forbidden) {
           if (options.onError === undefined) throw error;
           options.onError(error);
           return;
@@ -232,12 +244,17 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
       const report = await runTurn(polled, agents, options.transport, controller.signal);
       options.onTurn?.(report);
       if (report.outcome === "committed") {
-        inDoubtDelay.reset();
-      } else if (report.error instanceof EffectInDoubt) {
-        await pause(inDoubtDelay.next(), controller.signal);
+        abandonDelays.forget(report.operation);
       } else {
-        await pause(abandonDelayMs, controller.signal);
+        await pause(abandonPause(report), controller.signal);
       }
+    }
+  };
+  const loop = (async () => {
+    try {
+      await serve();
+    } finally {
+      abandonDelays.clear();
     }
   })();
 
