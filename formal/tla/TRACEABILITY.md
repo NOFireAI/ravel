@@ -13,8 +13,9 @@ named in every area table and fails when one no longer exists.
 | lifecycle | `lifecycle/LifecycleGC.tla` | 18 | ravel-maintain, ravel-commit, ravel-query, ravel-catalog | [lifecycle/traceability.md](lifecycle/traceability.md) |
 | resharding | `resharding/OnlineResharding.tla` | 19 | ravel-ingest, ravel-catalog, ravel-commit, ravel-types, services/ravel-cli | [resharding/traceability.md](resharding/traceability.md) |
 | maintenance | `maintenance/MaintenanceOwnership.tla`, `maintenance/CompactionClaims.tla` | 45 | ravel-fleet, ravel-maintain, services/ravel-cli, services/ravel-server | [maintenance/traceability.md](maintenance/traceability.md) |
+| agents | `agents/AgentProtocol.tla` | 30 | ravel-agents-core, ravel-agents-store | [agents/traceability.md](agents/traceability.md) |
 
-Total: 137 traceability rows across the suite.
+Total: 167 traceability rows across the suite.
 
 ## Test debt
 
@@ -43,4 +44,15 @@ covers it.
 - `LostClaimNeverPublishesThroughGuardedPath` —
   `crates/ravel-fleet/src/claim.rs::renew` — same reason as `GuardedPublish`
 
-Total test-debt rows: 4 (lifecycle 1, maintenance 3).
+### agents (2 rows, test gap)
+
+- `Destroy` — `crates/ravel-agents-core/src/kernel.rs::Kernel::tombstone` —
+  the tombstone leaves a scheduled timer in HEAD and `check_active` refuses
+  its fire, but no test schedules a timer, tombstones the agent and asserts
+  `FireTimer` is `AgentGone` and the recreated HEAD holds no scheduled timer;
+  the property test's refused fire is skipped, not asserted
+- `MonotonicIdentity` — `crates/ravel-agents-core/src/kernel.rs::Kernel::publish`
+  — `kernel_sequences_keep_the_head_invariants` asserts `root_revision`,
+  `incarnation` and epoch but no clause on `timer_generation`
+
+Total test-debt rows: 6 (lifecycle 1, maintenance 3, agents 2).
