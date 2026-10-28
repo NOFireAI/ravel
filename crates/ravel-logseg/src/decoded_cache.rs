@@ -189,8 +189,9 @@ impl DecodedColumnCache {
     /// order, entries no live scan holds until `want` bytes are freed or none
     /// remains, releasing each one's reservation, and returns the bytes
     /// freed. An entry a scan still holds stays and counts for nothing.
-    /// Each pass logs one INFO line; `cause` is the refusal it answers.
-    pub fn evict_for_pressure(&self, want: u64, cause: ExhaustionCause) -> u64 {
+    /// Each pass logs one INFO line; `slack` is the part of `want` beyond the
+    /// refusal's shortfall and `cause` is the refusal it answers.
+    pub fn evict_for_pressure(&self, want: u64, slack: u64, cause: ExhaustionCause) -> u64 {
         let mut evicted = Vec::new();
         let mut freed = 0u64;
         let mut held = 0u64;
@@ -232,6 +233,7 @@ impl DecodedColumnCache {
         tracing::info!(
             target: "ravel_logseg::decoded_cache",
             asked_bytes = want,
+            slack_bytes = slack,
             freed_bytes = freed,
             resident_bytes_after = resident_after,
             held_bytes = held,
@@ -570,7 +572,7 @@ mod tests {
         drop(idle);
         assert_eq!(budget.reserved(), 2 * bytes);
 
-        let freed = cache.evict_for_pressure(u64::MAX, ExhaustionCause::Accounted);
+        let freed = cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
         assert_eq!(freed, bytes, "only the unheld entry frees");
         assert_eq!(budget.reserved(), bytes, "its reservation is released");
         assert_eq!(cache.entry_bytes(&key(0, 1)), Some(bytes), "held stays");
@@ -585,14 +587,14 @@ mod tests {
 
         drop(held);
         assert_eq!(
-            cache.evict_for_pressure(1, ExhaustionCause::Accounted),
+            cache.evict_for_pressure(1, 0, ExhaustionCause::Accounted),
             bytes,
             "unheld now"
         );
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), 0);
         assert_eq!(
-            cache.evict_for_pressure(1, ExhaustionCause::Accounted),
+            cache.evict_for_pressure(1, 0, ExhaustionCause::Accounted),
             0,
             "nothing left"
         );
@@ -708,15 +710,18 @@ mod tests {
         let (between, counted) = (Arc::clone(&c), Arc::clone(&offered));
         assert!(
             budget
-                .register_evictor(Box::new(move |want, cause| {
-                    let Some(cache) = evictee.upgrade() else {
-                        return 0;
-                    };
-                    let freed = cache.evict_for_pressure(want, cause);
-                    cache.offer(key(1, 1), &col(8), AccessIntent::Interactive, &between);
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    freed
-                }))
+                .register_evictor(
+                    Box::new(move |want, slack, cause| {
+                        let Some(cache) = evictee.upgrade() else {
+                            return 0;
+                        };
+                        let freed = cache.evict_for_pressure(want, slack, cause);
+                        cache.offer(key(1, 1), &col(8), AccessIntent::Interactive, &between);
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        freed
+                    }),
+                    admission_margin(LIMIT),
+                )
                 .is_ok()
         );
 

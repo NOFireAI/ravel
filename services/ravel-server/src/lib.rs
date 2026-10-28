@@ -3501,14 +3501,21 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 ));
                 // A refused reservation from any other consumer evicts unheld
                 // entries first (ADR-3326 decision 4). Weak, because the cache
-                // already holds the budget.
+                // already holds the budget. It is asked for the admission
+                // margin beyond each shortfall, so a concurrent reservation
+                // landing before the refused caller's retry finds room too.
                 let evictee = Arc::downgrade(&cache);
+                let slack =
+                    ravel_logseg::decoded_cache::admission_margin(process_memory_budget.limit());
                 if process_memory_budget
-                    .register_evictor(Box::new(move |want, cause| {
-                        evictee
-                            .upgrade()
-                            .map_or(0, |cache| cache.evict_for_pressure(want, cause))
-                    }))
+                    .register_evictor(
+                        Box::new(move |want, slack, cause| {
+                            evictee
+                                .upgrade()
+                                .map_or(0, |cache| cache.evict_for_pressure(want, slack, cause))
+                        }),
+                        slack,
+                    )
                     .is_err()
                 {
                     anyhow::bail!("process memory budget already has an evictor");
