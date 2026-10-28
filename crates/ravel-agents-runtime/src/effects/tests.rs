@@ -1040,3 +1040,63 @@ async fn a_cancelled_turn_with_an_open_attempt_does_not_wedge_the_next_turn() {
         "only the next turn's attempt is open"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
+    let clock = clock();
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Arc::new(Hook::default());
+    let d = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    co.run_step(&b.lease, &s, hook.as_ref())
+        .await
+        .expect_err("in doubt");
+    assert_eq!(hook.calls(), 1);
+
+    // This call reads the effect in doubt; its HEAD write is held.
+    let gate = fault.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
+    let reconciling = {
+        let co = co.clone();
+        let hook = hook.clone();
+        let effect = d.effect;
+        tokio::spawn(async move { co.reconcile_authorize(&effect, 2, hook.as_ref()).await })
+    };
+    gate.wait_until_held(1).await;
+
+    // Another admin's reconcile lands in between, with no unknown outcome.
+    let other = coordinator(&store, &clock, 200);
+    let other_hook = Hook::default();
+    assert!(
+        other
+            .reconcile_authorize(&d.effect, 2, &other_hook)
+            .await
+            .expect("the other reconcile")
+    );
+    assert_eq!(other_hook.calls(), 1);
+    let landed = head(&store, "o-1").await;
+    assert_eq!(
+        (
+            effect_of(&landed, &d).status,
+            effect_of(&landed, &d).attempt
+        ),
+        (EffectStatus::Authorized, 2)
+    );
+
+    let before = store.counters();
+    let resolved = co.metrics().outcome_unknown_resolved;
+    for id in gate.held() {
+        gate.release(id);
+    }
+    let dispatched_here = reconciling.await.expect("join").expect("this reconcile");
+    assert!(!dispatched_here, "the attempt is the other admin's");
+    assert_eq!(hook.calls(), 1, "this call dispatches nothing");
+    assert_eq!(cas_since(&store, &before), 0, "and makes no further CAS");
+    assert_eq!(co.metrics().outcome_unknown_resolved, resolved);
+    let h = head(&store, "o-1").await;
+    assert_eq!(h, landed);
+    assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
+}
