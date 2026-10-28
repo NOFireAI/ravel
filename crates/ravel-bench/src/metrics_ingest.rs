@@ -367,8 +367,11 @@ pub struct UnsupportedClassRecord {
     pub source: String,
 }
 
-/// One BLAKE3 digest (hex) per payload class, each over that class's points
-/// in offered order, encoded as [`OfferedDigest`] encodes them.
+/// One [`MultisetDigest`] (hex) per payload class over that class's points,
+/// each point encoded as [`OfferedDigest`] encodes it. The digest is the sum
+/// of per-point hashes, so it does not depend on the order the points were
+/// offered or acknowledged in, and a point counted twice changes it
+/// (`tests::class_digests_ignore_order_and_count_duplicates`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassDigests {
     pub scalar: String,
@@ -387,20 +390,20 @@ impl ClassDigests {
     }
 }
 
-/// Builds a [`ClassDigests`], one [`OfferedDigest`] per class.
+/// Builds a [`ClassDigests`], one [`MultisetDigest`] per class.
 #[derive(Clone, Debug, Default)]
 struct ClassDigester {
-    scalar: OfferedDigest,
-    stale_marker: OfferedDigest,
-    native_histogram: OfferedDigest,
+    scalar: MultisetDigest,
+    stale_marker: MultisetDigest,
+    native_histogram: MultisetDigest,
 }
 
 impl ClassDigester {
     fn update(&mut self, point: &LogicalPoint) {
         match PayloadClass::of(point) {
-            PayloadClass::Scalar => self.scalar.update_point(point),
-            PayloadClass::StaleMarker => self.stale_marker.update_point(point),
-            PayloadClass::NativeHistogram => self.native_histogram.update_point(point),
+            PayloadClass::Scalar => self.scalar.add_point(point),
+            PayloadClass::StaleMarker => self.stale_marker.add_point(point),
+            PayloadClass::NativeHistogram => self.native_histogram.add_point(point),
         }
     }
 
@@ -633,9 +636,20 @@ impl LatencyReport {
     }
 }
 
-/// The one value [`IngestPhase::elapsed_basis`] takes today: `elapsed_secs`
-/// is the sum of the timed write segments, never the replay's wall time.
+/// [`IngestPhase::elapsed_basis`] of the in-process row, and of every HTTP row
+/// written before the 2026-10-28 amendment to ADR-0927: `elapsed_secs` is the
+/// sum of the timed write segments, never the replay's wall time.
 pub const ELAPSED_BASIS_TIMED_SEGMENTS: &str = "timed_segments";
+
+/// [`IngestPhase::elapsed_basis`] of an HTTP row (ADR-0927, 2026-10-28
+/// amendment, decision 4): `elapsed_secs` is the wall time from the first
+/// request sent to the last response received, with up to one request in
+/// flight per shard.
+pub const ELAPSED_BASIS_WALL_IN_FLIGHT: &str = "wall_in_flight";
+
+/// A row is sender-bound when generating its stream took at least this
+/// fraction of its `elapsed_secs` ([`IngestPhase::sender_bound`]).
+pub const SENDER_BOUND_FRACTION: f64 = 0.9;
 
 /// The ingest phase of one system's replay. Ingest and query phases are
 /// recorded separately (ADR-0927 decision 9); this lane owns ingest, the query
@@ -759,29 +773,39 @@ pub struct IngestPhase {
     /// Transport retries: object-store PUT retries below `InstrumentedStore`
     /// for Ravel, HTTP 429/5xx retries for a comparator.
     pub retries: u64,
-    /// Time of the ingest phase, summed over the timed segments only: the
-    /// stream is generated batch by batch during the replay, and generating it
-    /// is never inside a segment. The two lanes time DIFFERENT work, so a
-    /// throughput comparison must account for it: the Ravel segments are the
-    /// in-process `write_values` calls and the final `flush_all` (the RW1.0
-    /// encode that yields `wire_bytes` runs OUTSIDE them, since the in-process
-    /// path never serializes an RW1.0 body to ingest), while an HTTP
-    /// comparator's segments are its genuine per-batch encode and POST, which
-    /// is real client work for that lane.
+    /// Time of the ingest phase, on the basis `elapsed_basis` names. On an
+    /// HTTP row ([`ELAPSED_BASIS_WALL_IN_FLIGHT`]) it is the wall time from
+    /// the first request sent to the last response received; the stream is
+    /// generated concurrently with sending, and that generation time is
+    /// `generation_secs`. On the in-process row
+    /// ([`ELAPSED_BASIS_TIMED_SEGMENTS`]) it is the sum of the in-process
+    /// `write_values` calls and the final `flush_all`, with generation and
+    /// the RW1.0 encode that yields `wire_bytes` outside it. The two bases
+    /// time different work, so a throughput comparison across them must
+    /// account for it.
     pub elapsed_secs: f64,
     /// What `elapsed_secs` measures, so two artifacts can be told apart
-    /// before their throughput figures are compared: always
-    /// [`ELAPSED_BASIS_TIMED_SEGMENTS`] for a report this code writes.
-    /// Reports written before this field existed carry no marker and read
-    /// back as the empty string, meaning wall time, unmarked; their
-    /// `elapsed_secs` was one wall-clock span over the write loop of a
-    /// stream generated up front. For the Ravel row that span started after
-    /// admission and the RW1.0 encode; for a comparator row the encode was
-    /// inside it, as it is inside that row's timed segments now. In both
-    /// lanes the only basis change is the generation now interleaved between
-    /// segments, which the sum excludes.
+    /// before their throughput figures are compared:
+    /// [`ELAPSED_BASIS_WALL_IN_FLIGHT`] on an HTTP row this code writes,
+    /// [`ELAPSED_BASIS_TIMED_SEGMENTS`] on the in-process row and on an HTTP
+    /// row written before the 2026-10-28 amendment to ADR-0927, whose figures
+    /// are not compared with wall-time ones. Reports written before this
+    /// field existed carry no marker and read back as the empty string,
+    /// meaning wall time, unmarked, over a stream generated up front.
     #[serde(default)]
     pub elapsed_basis: String,
+    /// Seconds the replay spent pulling points from the stream (generating,
+    /// classifying and admitting them, inside `fill_valid`). Zero in an
+    /// artifact written before it existed.
+    #[serde(default)]
+    pub generation_secs: f64,
+    /// On a [`ELAPSED_BASIS_WALL_IN_FLIGHT`] row, true when `generation_secs`
+    /// is at least [`SENDER_BOUND_FRACTION`] of `elapsed_secs`: the row's
+    /// throughput then says more about the generator than the receiver.
+    /// Always false on a [`ELAPSED_BASIS_TIMED_SEGMENTS`] row, whose
+    /// `elapsed_secs` excludes generation ([`is_sender_bound`]).
+    #[serde(default)]
+    pub sender_bound: bool,
     /// Accepted logical points (scalar samples plus native histograms) per
     /// second.
     pub logical_points_per_sec: f64,
@@ -790,9 +814,11 @@ pub struct IngestPhase {
     pub wire_bytes: u64,
     /// Wire bytes per second over the ingest wall time.
     pub wire_bytes_per_sec: f64,
-    /// Acknowledgement latency percentiles, per batch. Its meaning depends on
-    /// the row's [`AckSemantics`]: for a durable-on-ack row this is time to
-    /// durability, for a buffered row time to buffer-accept.
+    /// Acknowledgement latency percentiles, per batch, from its first send to
+    /// its 2xx response, retries included. Its meaning depends on the row's
+    /// [`AckSemantics`]: for a durable-on-ack row this is time to durability,
+    /// for a buffered row time to buffer-accept. On an HTTP row it includes
+    /// queueing inside the receiver behind the other requests in flight.
     pub ack_latency_ms: LatencyReport,
     /// Peak resident set of the bench process during the run, or `None` where
     /// the harness cannot read it (non-Linux, or a remote comparator whose
@@ -1631,6 +1657,40 @@ pub enum LaneError {
         /// The entry, verbatim.
         value: String,
     },
+    /// Two commit tokens for one shard named different writers, so the
+    /// shard's newest token cannot be chosen by `(epoch, seq)`.
+    #[error(
+        "{system} returned commit tokens from two writers on shard {shard}: \
+         {held_writer} and {new_writer}"
+    )]
+    CommitTokenWriterConflict {
+        /// The row's system.
+        system: String,
+        /// The shard both tokens fence.
+        shard: u32,
+        /// The writer of the token already held.
+        held_writer: String,
+        /// The writer of the token that conflicted.
+        new_writer: String,
+    },
+    /// The row's projected ingest wall time exceeded its ceiling
+    /// ([`StallCeiling`]), so it was stopped rather than left to run.
+    #[error(
+        "{system} ingest stalled: projected {projected_secs:.0} s for the stream exceeds the \
+         {ceiling_secs} s ceiling after offering {offered_points} of {stream_points} points"
+    )]
+    IngestStalled {
+        /// The row's system.
+        system: String,
+        /// The projected total wall time.
+        projected_secs: f64,
+        /// The ceiling it exceeded.
+        ceiling_secs: u64,
+        /// Points offered when the check ran.
+        offered_points: u64,
+        /// Points the whole stream offers.
+        stream_points: u64,
+    },
     /// A read-back query failed or answered a shape the lane cannot read.
     #[error("the read-back over {system}'s query API failed: {detail}")]
     Readback {
@@ -2346,6 +2406,50 @@ impl OfferedDigest {
     }
 }
 
+/// An order-independent digest of a multiset of points (ADR-0927, 2026-10-28
+/// amendment, decision 5): the sum, modulo 2^256, of BLAKE3 over each point's
+/// [`OfferedDigest`] encoding, each hash read as a little-endian integer. It
+/// renders as the 32 little-endian bytes of the sum in lowercase hex, so the
+/// digest of one point is that point's BLAKE3 hex, and of no points is 64
+/// zeros. A sum, unlike XOR, does not cancel a point added twice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MultisetDigest {
+    /// The sum as four little-endian 64-bit limbs.
+    limbs: [u64; 4],
+}
+
+impl MultisetDigest {
+    /// An empty digest.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one point.
+    pub fn add_point(&mut self, point: &LogicalPoint) {
+        let mut one = OfferedDigest::new();
+        one.update_point(point);
+        let hash = one.hasher.finalize();
+        let mut carry = false;
+        for (limb, chunk) in self.limbs.iter_mut().zip(hash.as_bytes().chunks_exact(8)) {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            let (sum, c1) = limb.overflowing_add(u64::from_le_bytes(word));
+            let (sum, c2) = sum.overflowing_add(u64::from(carry));
+            *limb = sum;
+            carry = c1 || c2;
+        }
+    }
+
+    /// The sum as 64 lowercase hex characters.
+    pub fn finish(&self) -> String {
+        self.limbs
+            .iter()
+            .flat_map(|limb| limb.to_le_bytes())
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
 /// A source of points a replay pulls in batches, in stream order, so a
 /// replay holds one batch at a time rather than the whole history.
 pub trait SampleBatches {
@@ -2744,6 +2848,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
 
     let cpu_before = process_cpu_secs();
     let mut timed = Duration::ZERO;
+    let mut generation = Duration::ZERO;
 
     let mut pending: Vec<(IngestPoint, LogicalPoint)> = Vec::with_capacity(batch_size);
     let mut offer = OfferTally::default();
@@ -2764,6 +2869,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
     loop {
         // Client-side admission: valid points (carrying their logical point
         // for the wire encoding) and exact rejections.
+        let generation_start = std::time::Instant::now();
         fill_valid(source, batch_size, &mut pending, &mut offer, |logical| {
             let point = ingest_point(&config.tenant, &logical)?;
             let ts_ms = logical.ts_ms();
@@ -2775,6 +2881,7 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
             }
             Ok((point, logical))
         })?;
+        generation += generation_start.elapsed();
         if pending.is_empty() {
             break;
         }
@@ -2879,6 +2986,12 @@ pub async fn replay_into_ravel<S: SampleBatches + ?Sized>(
         retries: snapshot.put.attempts.saturating_sub(snapshot.put.calls),
         elapsed_secs,
         elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
+        generation_secs: generation.as_secs_f64(),
+        sender_bound: is_sender_bound(
+            ELAPSED_BASIS_TIMED_SEGMENTS,
+            generation.as_secs_f64(),
+            elapsed_secs,
+        ),
         logical_points_per_sec: (accepted_samples + accepted_histograms) as f64 / elapsed_secs,
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
@@ -3010,12 +3123,72 @@ pub struct HttpReplayConfig {
     /// read (ADR-0927 decision 6: a client that bounds only the request records
     /// an expiry as a generic transport failure).
     pub timeout_secs: u64,
+    /// Fixed number of series shards, each with one request in flight
+    /// (ADR-0927, 2026-10-28 amendment). Never resharded during a replay.
+    pub shards: usize,
+    /// Stops the row once its projected wall time exceeds a ceiling. `None`
+    /// runs the replay to its end however long it takes.
+    pub stall_ceiling: Option<StallCeiling>,
 }
 
-/// The fixed backoff between RW1.0 retries. A constant rather than a computed
-/// estimate: `WriteError`/an HTTP response carries no per-error hint here, the
-/// same choice `remote_write.rs` makes with its fixed `RETRY_AFTER_SECONDS`.
-const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+/// Default [`HttpReplayConfig::shards`]: Prometheus' `max_shards` (ADR-0927,
+/// 2026-10-28 amendment, decision 1).
+pub const DEFAULT_HTTP_SHARDS: usize = 50;
+
+/// Default [`HttpReplayConfig::batch_size`]: Prometheus'
+/// `max_samples_per_send` (ADR-0927, 2026-10-28 amendment, decision 1).
+pub const DEFAULT_HTTP_BATCH_SIZE: usize = 2000;
+
+/// Batches a shard's queue holds while its request is in flight. The
+/// producer waits on a full queue, so each shard holds at most this many
+/// queued batches, one in flight, and one filling.
+const SHARD_QUEUE_BATCHES: usize = 1;
+
+/// A wall-time ceiling for one HTTP row (ADR-0927, 2026-10-28 amendment,
+/// decision 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StallCeiling {
+    /// The most wall time the row may be projected to take.
+    pub max_ingest_secs: u64,
+    /// The logical points the whole stream offers, the projection's
+    /// denominator.
+    pub stream_points: u64,
+}
+
+/// How long a row sends before its first stall check.
+const STALL_GRACE: Duration = Duration::from_secs(60);
+
+/// The shortest gap between two stall checks.
+const STALL_RECHECK: Duration = Duration::from_secs(10);
+
+/// The first retry's backoff (Prometheus' `min_backoff`).
+const HTTP_MIN_BACKOFF: Duration = Duration::from_millis(30);
+
+/// The longest backoff (Prometheus' `max_backoff`).
+const HTTP_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The backoff before retry `retry` (0-based): [`HTTP_MIN_BACKOFF`] doubled
+/// per earlier retry, capped at [`HTTP_MAX_BACKOFF`], as Prometheus'
+/// remote-write queue backs off (`tests::retry_delay_doubles_from_30ms_and_caps_at_5s`).
+pub fn retry_delay(retry: u32) -> Duration {
+    let min_ms = HTTP_MIN_BACKOFF.as_millis() as u64;
+    let max_ms = HTTP_MAX_BACKOFF.as_millis() as u64;
+    let ms = 1u64
+        .checked_shl(retry)
+        .and_then(|factor| min_ms.checked_mul(factor))
+        .map_or(max_ms, |ms| ms.min(max_ms));
+    Duration::from_millis(ms)
+}
+
+/// Whether a row was bound by its own sender rather than by the receiver:
+/// true only for a [`ELAPSED_BASIS_WALL_IN_FLIGHT`] row whose generation
+/// time is at least [`SENDER_BOUND_FRACTION`] of its wall time
+/// (`tests::sender_bound_needs_wall_basis_and_ninety_percent_generation`).
+pub fn is_sender_bound(basis: &str, generation_secs: f64, elapsed_secs: f64) -> bool {
+    basis == ELAPSED_BASIS_WALL_IN_FLIGHT
+        && elapsed_secs > 0.0
+        && generation_secs >= SENDER_BOUND_FRACTION * elapsed_secs
+}
 
 /// The response header `ravel-server` puts the strict write's commit tokens
 /// in (`services/ravel-server/src/remote_write.rs`).
@@ -3368,81 +3541,61 @@ pub async fn replay_over_http<S: SampleBatches + ?Sized>(
         .map(|outcome| outcome.result)
 }
 
-/// Replay `source` into a receiver over Remote Write 1.0, pulling one batch
-/// at a time as [`replay_into_ravel`] does. Valid points are batched in
-/// stream order, encoded as snappy protobuf, and POSTed to the configured
-/// endpoint (with `Authorization: Bearer` when `bearer_token` is set).
-///
-/// Each batch's points are accounted by the receiver's response:
-/// - a 2xx accepts every point, except a point of a class the receiver
-///   cannot store ([`UNSUPPORTED_CLASSES`]), which is counted under
-///   `unsupported_*`;
-/// - a Mimir 400 rejects only the points its body names
-///   ([`mimir_sample_needle`]) and accepts the rest; a Mimir 400 naming none
-///   of the batch's points rejects them all;
-/// - any other non-retryable non-2xx rejects the whole batch under
-///   `rejected_by_status`, keyed by that status;
-/// - a 429/5xx or a transport error is retried up to `max_retries`, then the
-///   batch is dropped under `retry_exhausted_*`, keyed by its last status in
-///   `retry_exhausted_by_status`.
-///
-/// A comparator row is [`AckSemantics::Buffered`]: a Remote Write 2xx from a
-/// comparator means accepted-into-a-buffer, a durability the client cannot
-/// observe, so it is never placed in a pooled column with Ravel's durable
-/// ack. The portable Ravel row keeps the latest `x-ravel-commit-token` entry
-/// per shard; an entry that does not decode is [`LaneError::InvalidCommitToken`].
-///
-/// The receiver's object store is not the bench's, so this row carries no
-/// [`StorageAccounting`], and its CPU/RSS are the remote process's, so they are
-/// `None`: absent, never a zero.
-pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
-    config: &HttpReplayConfig,
-    source: &mut S,
-) -> Result<HttpReplayOutcome, LaneError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs.max(1)))
-        .build()
-        .map_err(|e| transport_setup_error(format!("building the HTTP client failed: {e}")))?;
+/// The shard a point's series is sent on: BLAKE3 over the point's canonical
+/// series (sorted label pairs, `__name__` included), encoded as
+/// [`OfferedDigest`] encodes a series, its first eight bytes read as a
+/// little-endian integer, modulo `shards`. A fixed function of the series,
+/// so every point of one series goes to one shard on every run.
+fn series_shard(point: &LogicalPoint, shards: usize) -> usize {
+    let (metric, labels) = match point {
+        LogicalPoint::Sample(s) => (&s.metric, &s.labels),
+        LogicalPoint::Histogram(h) => (&h.metric, &h.labels),
+    };
+    let mut digest = OfferedDigest::new();
+    digest.update_series(&canonical_labels(metric, labels));
+    let hash = digest.hasher.finalize();
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&hash.as_bytes()[..8]);
+    (u64::from_le_bytes(word) % shards.max(1) as u64) as usize
+}
 
-    let receiver = config.receiver;
-    let system = receiver.system().to_string();
-    let mut pending: Vec<LogicalPoint> = Vec::new();
-    let mut offer = OfferTally::default();
-    let mut plan = ReadbackPlan::new(receiver);
-    let mut timed = Duration::ZERO;
+/// What one shard sends with: the client and everything a request needs.
+struct ShardSender {
+    client: reqwest::Client,
+    endpoint: String,
+    bearer_token: Option<String>,
+    receiver: Receiver,
+    max_retries: u32,
+}
 
-    let batch_size = config.batch_size.max(1);
-    let mut ack_latencies_ns: Vec<u64> = Vec::new();
-    let mut tally = HttpTally::default();
-    let mut dropped_batches: u64 = 0;
-    let mut batches: u64 = 0;
-    let mut retries: u64 = 0;
-    let mut wire_bytes: u64 = 0;
-    let mut tokens_by_shard: BTreeMap<u32, String> = BTreeMap::new();
+/// One request a shard finished: its points, how it ended, and when.
+struct SentBatch {
+    chunk: Vec<LogicalPoint>,
+    outcome: BatchOutcome,
+    retries: u64,
+    wire_bytes: u64,
+    /// The first attempt's send.
+    sent_at: std::time::Instant,
+    /// The last attempt's response, or its transport error.
+    answered_at: std::time::Instant,
+}
 
-    loop {
-        fill_valid(source, batch_size, &mut pending, &mut offer, Ok)?;
-        if pending.is_empty() {
-            break;
-        }
-        let chunk = std::mem::take(&mut pending);
-        for point in &chunk {
-            plan.observe(point);
-        }
-        let segment_start = std::time::Instant::now();
-        batches += 1;
+impl ShardSender {
+    /// Encode and POST one batch, retrying a 429, a 5xx or a transport error
+    /// after [`retry_delay`] up to `max_retries` times.
+    async fn send(&self, chunk: Vec<LogicalPoint>) -> Result<SentBatch, LaneError> {
         let body = encode_rw1_points(&chunk)?;
-        wire_bytes += body.len() as u64;
-
-        let start = std::time::Instant::now();
+        let wire_bytes = body.len() as u64;
+        let sent_at = std::time::Instant::now();
         let mut attempt = 0u32;
         let outcome = loop {
-            let mut request = client
-                .post(&config.endpoint)
+            let mut request = self
+                .client
+                .post(&self.endpoint)
                 .header("Content-Type", "application/x-protobuf")
                 .header("Content-Encoding", "snappy")
                 .header("X-Prometheus-Remote-Write-Version", "0.1.0");
-            if let Some(token) = &config.bearer_token {
+            if let Some(token) = &self.bearer_token {
                 request = request.bearer_auth(token);
             }
             let sent = request.body(body.clone()).send().await;
@@ -3455,38 +3608,115 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
                             .map(str::to_string),
                     );
                 }
-                Ok(resp) if is_retryable(resp.status()) && attempt < config.max_retries => {
+                Ok(resp) if is_retryable(resp.status()) && attempt < self.max_retries => {
+                    tokio::time::sleep(retry_delay(attempt)).await;
                     attempt += 1;
-                    retries += 1;
-                    tokio::time::sleep(HTTP_RETRY_BACKOFF).await;
                 }
                 Ok(resp) if is_retryable(resp.status()) => {
                     break BatchOutcome::RetriesExhausted(Some(resp.status().as_u16()));
                 }
                 Ok(resp)
-                    if receiver.soft_rejects_samples()
+                    if self.receiver.soft_rejects_samples()
                         && resp.status() == reqwest::StatusCode::BAD_REQUEST =>
                 {
                     break BatchOutcome::SoftRejected(resp.text().await.unwrap_or_default());
                 }
                 Ok(resp) => break BatchOutcome::Rejected(resp.status().as_u16()),
-                Err(_) if attempt < config.max_retries => {
+                Err(_) if attempt < self.max_retries => {
+                    tokio::time::sleep(retry_delay(attempt)).await;
                     attempt += 1;
-                    retries += 1;
-                    tokio::time::sleep(HTTP_RETRY_BACKOFF).await;
                 }
                 Err(_) => break BatchOutcome::RetriesExhausted(None),
             }
         };
+        Ok(SentBatch {
+            chunk,
+            outcome,
+            retries: u64::from(attempt),
+            wire_bytes,
+            sent_at,
+            answered_at: std::time::Instant::now(),
+        })
+    }
+}
+
+/// One shard's sender: it takes the shard's batches in the order the producer
+/// queued them and sends each only once the previous one has answered, so a
+/// series reaches the receiver in offered order. It stops after the first
+/// error it reports.
+async fn run_shard(
+    sender: Arc<ShardSender>,
+    mut batches: tokio::sync::mpsc::Receiver<Vec<LogicalPoint>>,
+    results: tokio::sync::mpsc::UnboundedSender<Result<SentBatch, LaneError>>,
+) {
+    while let Some(chunk) = batches.recv().await {
+        let sent = sender.send(chunk).await;
+        let failed = sent.is_err();
+        if results.send(sent).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// The one place an HTTP replay's per-request outcomes are accounted.
+struct HttpCollector {
+    receiver: Receiver,
+    system: String,
+    tally: HttpTally,
+    ack_latencies_ns: Vec<u64>,
+    dropped_batches: u64,
+    batches: u64,
+    retries: u64,
+    wire_bytes: u64,
+    tokens_by_shard: BTreeMap<u32, String>,
+    first_sent: Option<std::time::Instant>,
+    last_answered: Option<std::time::Instant>,
+}
+
+impl HttpCollector {
+    fn new(receiver: Receiver) -> Self {
+        HttpCollector {
+            receiver,
+            system: receiver.system().to_string(),
+            tally: HttpTally::default(),
+            ack_latencies_ns: Vec::new(),
+            dropped_batches: 0,
+            batches: 0,
+            retries: 0,
+            wire_bytes: 0,
+            tokens_by_shard: BTreeMap::new(),
+            first_sent: None,
+            last_answered: None,
+        }
+    }
+
+    /// Account one finished request.
+    fn record(&mut self, sent: SentBatch) -> Result<(), LaneError> {
+        let SentBatch {
+            chunk,
+            outcome,
+            retries,
+            wire_bytes,
+            sent_at,
+            answered_at,
+        } = sent;
+        self.batches += 1;
+        self.retries += retries;
+        self.wire_bytes += wire_bytes;
+        self.first_sent = Some(self.first_sent.map_or(sent_at, |t| t.min(sent_at)));
+        self.last_answered = Some(self.last_answered.map_or(answered_at, |t| t.max(answered_at)));
+        let receiver = self.receiver;
+        let tally = &mut self.tally;
         let dropped_before = tally.dropped();
         match outcome {
             BatchOutcome::Acknowledged(token) => {
-                ack_latencies_ns.push(start.elapsed().as_nanos() as u64);
+                self.ack_latencies_ns
+                    .push(answered_at.duration_since(sent_at).as_nanos() as u64);
                 for point in &chunk {
                     tally.accept(receiver, point);
                 }
                 if let Some(header) = token {
-                    record_commit_tokens(&system, &header, &mut tokens_by_shard)?;
+                    record_commit_tokens(&self.system, &header, &mut self.tokens_by_shard)?;
                 }
             }
             BatchOutcome::SoftRejected(body) => {
@@ -3513,13 +3743,207 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
             }
         }
         if tally.dropped() > dropped_before {
-            dropped_batches += 1;
+            self.dropped_batches += 1;
         }
-        timed += segment_start.elapsed();
+        Ok(())
     }
 
-    let elapsed_secs = timed.as_secs_f64().max(1e-9);
+    /// Wall time from the first request sent to the last response received,
+    /// floored at a nanosecond so a rate never divides by zero.
+    fn elapsed_secs(&self) -> f64 {
+        match (self.first_sent, self.last_answered) {
+            (Some(first), Some(last)) => last.duration_since(first).as_secs_f64().max(1e-9),
+            _ => 1e-9,
+        }
+    }
+}
+
+/// When a row's stall check next runs: once it has been sending for
+/// [`STALL_GRACE`], then at most every [`STALL_RECHECK`].
+fn stall_check_due(sending_for: Duration, since_last_check: Option<Duration>) -> bool {
+    sending_for >= STALL_GRACE && since_last_check.is_none_or(|d| d >= STALL_RECHECK)
+}
+
+/// The projected total ingest wall time of a row that has sent for
+/// `elapsed_secs` and offered `offered_points` of the `stream_points` its
+/// stream will offer: `elapsed_secs * stream_points / offered_points`. `None`
+/// before any point is offered, when nothing can be projected.
+pub fn project_ingest_secs(elapsed_secs: f64, offered_points: u64, stream_points: u64) -> Option<f64> {
+    (offered_points > 0).then(|| elapsed_secs * stream_points as f64 / offered_points as f64)
+}
+
+/// The stall verdict for one check: `Some(projection)` when the projected
+/// total wall time exceeds `ceiling.max_ingest_secs`, else `None`.
+pub fn stall_projection_over(
+    ceiling: &StallCeiling,
+    elapsed_secs: f64,
+    offered_points: u64,
+) -> Option<f64> {
+    project_ingest_secs(elapsed_secs, offered_points, ceiling.stream_points)
+        .filter(|projected| *projected > ceiling.max_ingest_secs as f64)
+}
+
+/// Replay `source` into a receiver over Remote Write 1.0 the way a Prometheus
+/// sender does (ADR-0927, 2026-10-28 amendment). One producer pulls the
+/// stream batch by batch as [`replay_into_ravel`] does, counts every point
+/// into the offer tally and the read-back plan in offered order, and routes
+/// each valid point to shard [`series_shard`] of `shards`. A shard sends a
+/// request when it holds `batch_size` points or the stream has ended, and
+/// keeps one request in flight, so at most `shards` requests are in flight
+/// and every series arrives in offered order. Each shard's queue holds
+/// [`SHARD_QUEUE_BATCHES`] batch, and the producer waits on a full queue, so
+/// memory stays bounded by a few batches per shard. Every request is encoded
+/// as snappy protobuf and POSTed to the configured endpoint (with
+/// `Authorization: Bearer` when `bearer_token` is set).
+///
+/// Each batch's points are accounted by the receiver's response:
+/// - a 2xx accepts every point, except a point of a class the receiver
+///   cannot store ([`UNSUPPORTED_CLASSES`]), which is counted under
+///   `unsupported_*`;
+/// - a Mimir 400 rejects only the points its body names
+///   ([`mimir_sample_needle`]) and accepts the rest; a Mimir 400 naming none
+///   of the batch's points rejects them all;
+/// - any other non-retryable non-2xx rejects the whole batch under
+///   `rejected_by_status`, keyed by that status;
+/// - a 429/5xx or a transport error is retried after [`retry_delay`] up to
+///   `max_retries`, then the batch is dropped under `retry_exhausted_*`,
+///   keyed by its last status in `retry_exhausted_by_status`.
+///
+/// A comparator row is [`AckSemantics::Buffered`]: a Remote Write 2xx from a
+/// comparator means accepted-into-a-buffer, a durability the client cannot
+/// observe, so it is never placed in a pooled column with Ravel's durable
+/// ack. The portable Ravel row keeps the newest `x-ravel-commit-token` entry
+/// per shard ([`record_commit_tokens`]); an entry that does not decode is
+/// [`LaneError::InvalidCommitToken`].
+///
+/// With a [`StallCeiling`], the row stops with [`LaneError::IngestStalled`]
+/// once its projected wall time exceeds the ceiling ([`stall_check_due`],
+/// [`stall_projection_over`]).
+///
+/// The receiver's object store is not the bench's, so this row carries no
+/// [`StorageAccounting`], and its CPU/RSS are the remote process's, so they are
+/// `None`: absent, never a zero.
+pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
+    config: &HttpReplayConfig,
+    source: &mut S,
+) -> Result<HttpReplayOutcome, LaneError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.timeout_secs.max(1)))
+        .build()
+        .map_err(|e| transport_setup_error(format!("building the HTTP client failed: {e}")))?;
+
+    let receiver = config.receiver;
+    let system = receiver.system().to_string();
+    let shards = config.shards.max(1);
+    let batch_size = config.batch_size.max(1);
+    let sender = Arc::new(ShardSender {
+        client,
+        endpoint: config.endpoint.clone(),
+        bearer_token: config.bearer_token.clone(),
+        receiver,
+        max_retries: config.max_retries,
+    });
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Dropping the set aborts every sender, so an early return stops them.
+    let mut senders = tokio::task::JoinSet::new();
+    let mut queues = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        let (tx, rx) = tokio::sync::mpsc::channel(SHARD_QUEUE_BATCHES);
+        senders.spawn(run_shard(Arc::clone(&sender), rx, results_tx.clone()));
+        queues.push(tx);
+    }
+    drop(results_tx);
+
+    let mut pending: Vec<LogicalPoint> = Vec::new();
+    let mut buffers: Vec<Vec<LogicalPoint>> = vec![Vec::new(); shards];
+    let mut offer = OfferTally::default();
+    let mut plan = ReadbackPlan::new(receiver);
+    let mut collector = HttpCollector::new(receiver);
+    let mut generation = Duration::ZERO;
+    let mut sending_since: Option<std::time::Instant> = None;
+    let mut last_stall_check: Option<std::time::Instant> = None;
+
+    let produced: Result<(), LaneError> = async {
+        loop {
+            let generation_start = std::time::Instant::now();
+            fill_valid(source, batch_size, &mut pending, &mut offer, Ok)?;
+            generation += generation_start.elapsed();
+            if pending.is_empty() {
+                break;
+            }
+            for point in pending.drain(..) {
+                plan.observe(&point);
+                let shard = series_shard(&point, shards);
+                buffers[shard].push(point);
+                if buffers[shard].len() >= batch_size {
+                    let chunk = std::mem::take(&mut buffers[shard]);
+                    sending_since.get_or_insert_with(std::time::Instant::now);
+                    queue_batch(&system, &queues[shard], shard, chunk).await?;
+                }
+            }
+            while let Ok(sent) = results_rx.try_recv() {
+                collector.record(sent?)?;
+            }
+            if let (Some(ceiling), Some(since)) = (&config.stall_ceiling, sending_since) {
+                let now = std::time::Instant::now();
+                if stall_check_due(
+                    now.duration_since(since),
+                    last_stall_check.map(|t| now.duration_since(t)),
+                ) {
+                    last_stall_check = Some(now);
+                    let offered_points = offer.samples + offer.histograms;
+                    let elapsed = now.duration_since(since).as_secs_f64();
+                    if let Some(projected_secs) =
+                        stall_projection_over(ceiling, elapsed, offered_points)
+                    {
+                        return Err(LaneError::IngestStalled {
+                            system: system.clone(),
+                            projected_secs,
+                            ceiling_secs: ceiling.max_ingest_secs,
+                            offered_points,
+                            stream_points: ceiling.stream_points,
+                        });
+                    }
+                }
+            }
+        }
+        for (shard, buffer) in buffers.iter_mut().enumerate() {
+            if !buffer.is_empty() {
+                let chunk = std::mem::take(buffer);
+                queue_batch(&system, &queues[shard], shard, chunk).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    // Closing the queues lets every sender finish its last batch and exit.
+    drop(queues);
+    if let Err(err) = produced {
+        // A shard that stopped on its own error closed its queue, and that
+        // error, already sent, is the cause.
+        while let Ok(sent) = results_rx.try_recv() {
+            sent?;
+        }
+        return Err(err);
+    }
+    while let Some(sent) = results_rx.recv().await {
+        collector.record(sent?)?;
+    }
+    while senders.join_next().await.is_some() {}
+
+    let elapsed_secs = collector.elapsed_secs();
+    let generation_secs = generation.as_secs_f64();
     let stream_counts = source.stream_counts();
+    let HttpCollector {
+        tally,
+        ack_latencies_ns,
+        dropped_batches,
+        batches,
+        retries,
+        wire_bytes,
+        tokens_by_shard,
+        ..
+    } = collector;
     let HttpTally {
         accepted_samples,
         accepted_histograms,
@@ -3562,7 +3986,9 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
         batches,
         retries,
         elapsed_secs,
-        elapsed_basis: ELAPSED_BASIS_TIMED_SEGMENTS.to_string(),
+        elapsed_basis: ELAPSED_BASIS_WALL_IN_FLIGHT.to_string(),
+        generation_secs,
+        sender_bound: is_sender_bound(ELAPSED_BASIS_WALL_IN_FLIGHT, generation_secs, elapsed_secs),
         logical_points_per_sec: (accepted_samples + accepted_histograms) as f64 / elapsed_secs,
         wire_bytes,
         wire_bytes_per_sec: wire_bytes as f64 / elapsed_secs,
@@ -3573,12 +3999,16 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
         cpu_secs: None,
     };
     let client_behavior = format!(
-        "reqwest RW1.0 sender: snappy protobuf, {batch} logical points (samples and native \
-         histograms)/request sent sequentially (backpressure by awaiting each POST), {auth}, \
-         retry on 429/5xx up to {retries} times with a fixed {backoff_ms} ms backoff then drop the \
-         batch; {timeout} s per-request timeout bounds the complete operation including the body \
-         read; accepted_* counts points by the receiver's acceptance rule, since an RW1.0 \
-         response carries no written count",
+        "reqwest RW1.0 sender modelled on Prometheus' remote-write queue: snappy protobuf, \
+         {shards} shards fixed for the whole replay (no resharding between min_shards and \
+         max_shards), each series routed to one shard by a BLAKE3 hash of its sorted labels, \
+         one request in flight per shard, a request sent at {batch} logical points (samples and \
+         native histograms) or at stream end, {auth}; 429, 5xx and transport errors retried up \
+         to {retries} times with backoff from {min_ms} ms doubling to {max_ms} ms, then the batch \
+         is dropped (429 is retried although Prometheus' default retry_on_http_429 is false, \
+         since a dropped point fails the zero drop budget); {timeout} s per-request timeout \
+         bounds the complete operation including the body read; accepted_* counts points by the \
+         receiver's acceptance rule, since an RW1.0 response carries no written count",
         batch = batch_size,
         auth = if config.bearer_token.is_some() {
             "bearer auth"
@@ -3586,7 +4016,8 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
             "no auth header"
         },
         retries = config.max_retries,
-        backoff_ms = HTTP_RETRY_BACKOFF.as_millis(),
+        min_ms = HTTP_MIN_BACKOFF.as_millis(),
+        max_ms = HTTP_MAX_BACKOFF.as_millis(),
         timeout = config.timeout_secs.max(1),
     );
     let acknowledged = accepted_samples + accepted_histograms;
@@ -3619,6 +4050,19 @@ pub async fn replay_over_http_with_plan<S: SampleBatches + ?Sized>(
     result.unsupported_classes = receiver.unsupported_classes();
     result.tenant = config.tenant.clone();
     Ok(HttpReplayOutcome { result, plan })
+}
+
+/// Hand a full (or final) batch to its shard's sender, waiting while the
+/// shard's queue is full.
+async fn queue_batch(
+    system: &str,
+    queue: &tokio::sync::mpsc::Sender<Vec<LogicalPoint>>,
+    shard: usize,
+    chunk: Vec<LogicalPoint>,
+) -> Result<(), LaneError> {
+    queue.send(chunk).await.map_err(|_| {
+        LaneError::Transport(format!("{system}'s sender for shard {shard} stopped early"))
+    })
 }
 
 /// How a comparator batch ended.
@@ -3706,8 +4150,14 @@ impl HttpTally {
 }
 
 /// Fold one `x-ravel-commit-token` header (comma-joined encoded tokens, one
-/// per shard the request wrote) into `by_shard`, a later token replacing an
-/// earlier one of the same shard.
+/// per shard the request wrote) into `by_shard`, keeping per shard the token
+/// with the highest `(epoch, seq)`: with requests in flight on several
+/// series shards, responses arrive in any order, and an older token arriving
+/// last must not replace a newer one
+/// (`tests::commit_tokens_keep_the_newest_epoch_and_seq_per_shard`). A token
+/// from a different writer than the one already held for its shard is
+/// [`LaneError::CommitTokenWriterConflict`]
+/// (`tests::a_second_writer_on_one_shard_is_refused`).
 fn record_commit_tokens(
     system: &str,
     header: &str,
@@ -3718,6 +4168,25 @@ fn record_commit_tokens(
             system: system.to_string(),
             value: entry.to_string(),
         })?;
+        if let Some(held_entry) = by_shard.get(&token.shard) {
+            let held = CommitToken::decode(held_entry).map_err(|_| {
+                LaneError::InvalidCommitToken {
+                    system: system.to_string(),
+                    value: held_entry.clone(),
+                }
+            })?;
+            if held.writer_id != token.writer_id {
+                return Err(LaneError::CommitTokenWriterConflict {
+                    system: system.to_string(),
+                    shard: token.shard,
+                    held_writer: held.writer_id.to_string(),
+                    new_writer: token.writer_id.to_string(),
+                });
+            }
+            if (token.epoch, token.seq) <= (held.epoch, held.seq) {
+                continue;
+            }
+        }
         by_shard.insert(token.shard, entry.to_string());
     }
     Ok(())
