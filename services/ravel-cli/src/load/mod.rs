@@ -285,9 +285,9 @@ pub(crate) fn write_ack_deadline(
 }
 
 /// Reject a `--target-bytes` of zero, which cannot express a target, and one
-/// above [`MAX_TARGET_BYTES`], whose encode allowance would exceed an hour.
-/// The bound holds whether or not `--ack-margin` is given. Every signal's
-/// loader calls this before its first read.
+/// above [`MAX_TARGET_BYTES`], an absolute bound that holds whether or not
+/// `--ack-margin` is given. Every signal's loader calls this before its first
+/// read.
 pub(crate) fn validate_target_bytes(target_bytes: Option<usize>) -> Result<(), LoadError> {
     match target_bytes {
         Some(0) => Err(LoadError::Setup(
@@ -422,7 +422,7 @@ pub struct LoadReport {
     /// The flush target and pipeline depth the load ran with. `None` when the
     /// load decoded no rows, so nothing was resolved.
     pub geometry: Option<LoadGeometry>,
-    /// The target-no-effect warning ([`target_bytes_no_effect_warning`]),
+    /// The target-no-effect warning ([`layout_no_effect_warning`]),
     /// computed once the load finished.
     pub target_bytes_no_effect_warning: Option<String>,
     /// How many times the depth window gave up realigning on size flushes
