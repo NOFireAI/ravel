@@ -45,7 +45,7 @@
 //!
 //! ```json
 //! {
-//!   "version": 3,
+//!   "version": 4,
 //!   "entries": [
 //!     {
 //!       "id": "mb_fanout_total_rate",
@@ -80,7 +80,7 @@ use crate::metrics_workload::{FamilyKind, Profile, WorkloadFile};
 /// The corpus format version this module reads and writes. A file declaring any
 /// other version is rejected rather than parsed optimistically: the field exists
 /// so a future format change is a loud error, not a silently misread document.
-pub const CORPUS_FORMAT_VERSION: u32 = 3;
+pub const CORPUS_FORMAT_VERSION: u32 = 4;
 
 /// Whether a query was rewritten in a way that changes what it computes.
 ///
@@ -1636,7 +1636,7 @@ mod tests {
         // otherwise parse as a corpus with zero entries, and a zero-entry
         // corpus passes all five checks vacuously.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_corpus(&dir, "typo.json", r#"{"version": 3, "entires": []}"#);
+        let path = write_corpus(&dir, "typo.json", r#"{"version": 4, "entires": []}"#);
         let err = load_corpus(&path).expect_err("a misspelled `entries` key must fail");
         assert!(matches!(&err, CorpusError::Parse { .. }), "{err:?}");
         assert!(err.to_string().contains("entires"), "{err}");
@@ -1686,7 +1686,7 @@ mod tests {
                 err,
                 CorpusError::UnsupportedVersion {
                     found: 7,
-                    expected: 3,
+                    expected: 4,
                     ..
                 }
             ),
@@ -1698,7 +1698,6 @@ mod tests {
     fn a_version_2_corpus_is_refused_after_the_full_range_rewrite() {
         // Version 3 changed what `mb_full_range_avg_over_time` computes, so a
         // version-2 file is a different corpus and must not load as this one.
-        assert_eq!(CORPUS_FORMAT_VERSION, 3);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_corpus(&dir, "corpus.json", r#"{"version": 2, "entries": []}"#);
         let err = load_corpus(&path).expect_err("a version-2 corpus must fail");
@@ -1707,7 +1706,28 @@ mod tests {
                 err,
                 CorpusError::UnsupportedVersion {
                     found: 2,
-                    expected: 3,
+                    expected: 4,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_3_corpus_is_refused_after_the_summation_tolerances() {
+        // Version 4 changed which answers five entries accept, so a version-3
+        // file is a different corpus and must not load as this one.
+        assert_eq!(CORPUS_FORMAT_VERSION, 4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_corpus(&dir, "corpus.json", r#"{"version": 3, "entries": []}"#);
+        let err = load_corpus(&path).expect_err("a version-3 corpus must fail");
+        assert!(
+            matches!(
+                err,
+                CorpusError::UnsupportedVersion {
+                    found: 3,
+                    expected: 4,
                     ..
                 }
             ),
@@ -1722,7 +1742,7 @@ mod tests {
             &dir,
             "corpus.json",
             r#"{
-              "version": 3,
+              "version": 4,
               "entries": [
                 {
                   "id": "mb_a",
@@ -1973,6 +1993,156 @@ mod tests {
         assert_eq!(selected, 400_000);
         assert_eq!(points, 121);
         assert_eq!(selected * points, 48_400_000, "the uncollapsed answer");
+    }
+
+    /// `n` with comma thousands separators, as the corpus reasons write it.
+    fn grouped(n: u64) -> String {
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// Roundings an inner `rate`/`increase` adds over a left-open window of
+    /// `window_secs` at `scrape_secs`: one subtraction plus one counter-reset
+    /// correction per further sample, then nine extrapolation operations, and
+    /// for `rate` the division by the range.
+    fn counter_fn_roundings(window_secs: u64, scrape_secs: u64, is_rate: bool) -> u64 {
+        let samples = window_secs / scrape_secs;
+        samples + 9 + u64::from(is_rate)
+    }
+
+    /// Every corpus-version-4 tolerance equals the bound its `modified` reason
+    /// derives, recomputed here from the generator's own series counts: per
+    /// engine, n-1 ULPs per sum over n series plus the inner function's
+    /// roundings, plus one per division; doubled for two engines; rounded up
+    /// to a power of two. Editing a tolerance without its derivation, or a
+    /// series count in the workload, fails here.
+    #[test]
+    fn every_summation_tolerance_equals_the_bound_its_reason_derives() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/metrics/metrics.corpus.json");
+        let entries = load_corpus(path).expect("the checked-in corpus loads");
+        let workload = checked_in_workload();
+        let scrape = workload
+            .profile("cardinality")
+            .expect("cardinality declared")
+            .scrape_interval_secs;
+        let rate_5m = counter_fn_roundings(300, scrape, true);
+        let increase_30m = counter_fn_roundings(1800, scrape, false);
+        assert_eq!((rate_5m, increase_30m), (30, 129));
+
+        // (entry, roundings each summed term carries, divisions).
+        let derivations: [(&str, u64, u64); 5] = [
+            ("mb_selective_job_rate_sum", rate_5m, 0),
+            ("mb_selective_region_avg", 0, 1),
+            ("mb_selective_error_ratio", rate_5m, 1),
+            ("mb_fanout_total_rate", rate_5m, 0),
+            ("mb_full_range_counter_increase", increase_30m, 0),
+        ];
+        let mut derived = Vec::new();
+        for (id, inner, divisions) in derivations {
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id} present"));
+            let reason = entry
+                .modified
+                .reason()
+                .unwrap_or_else(|| panic!("{id} discloses its tolerance"));
+            let selectors = read_selectors(&entry.promql).expect("selectors read");
+            let mut terms = Vec::new();
+            let mut per_engine = divisions;
+            for selector in &selectors {
+                let mut by_profile = Vec::new();
+                for profile in workload
+                    .profiles
+                    .iter()
+                    .filter(|p| entry.runs_under(&p.name))
+                {
+                    let mut n = 0u64;
+                    visit_series(&workload, profile, selector, |labels| {
+                        if selector.matchers.iter().all(|m| m.matches(labels)) {
+                            n += 1;
+                        }
+                        true
+                    })
+                    .expect("visit runs")
+                    .expect("the family exists");
+                    by_profile.push((profile.name.as_str(), n));
+                }
+                let (largest, n) = by_profile
+                    .iter()
+                    .copied()
+                    .max_by_key(|(_, n)| *n)
+                    .expect("the entry runs under some profile");
+                assert_eq!(largest, "cardinality", "{id}: {by_profile:?}");
+                for (profile, count) in &by_profile {
+                    assert!(
+                        reason.contains(&grouped(*count)),
+                        "{id}: the reason omits {profile}'s {count} series: {reason}"
+                    );
+                }
+                per_engine += n - 1 + inner;
+                terms.push(if inner == 0 {
+                    grouped(n - 1)
+                } else {
+                    format!("{} + {inner}", grouped(n - 1))
+                });
+            }
+            let mut expression = if terms.len() == 1 {
+                terms.remove(0)
+            } else {
+                terms
+                    .iter()
+                    .map(|t| format!("({t})"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            if divisions > 0 {
+                expression.push_str(&format!(" + {divisions}"));
+            }
+            let both = 2 * per_engine;
+            let tolerance = both.next_power_of_two();
+            let exponent = tolerance.trailing_zeros();
+            for claim in [
+                format!("tolerance_ulps {tolerance} (2^{exponent})"),
+                format!("within {expression} = {} ULPs", grouped(per_engine)),
+                format!("at most {} ULPs", grouped(both)),
+                format!("next power of two is 2^{exponent}"),
+                "comment 6459784933".to_string(),
+                "next cardinality run".to_string(),
+            ] {
+                assert!(reason.contains(&claim), "{id}: no `{claim}` in {reason}");
+            }
+            assert_eq!(
+                entry.tolerance_ulps.map(u64::from),
+                Some(tolerance),
+                "{id}"
+            );
+            derived.push((id, per_engine, tolerance));
+        }
+        assert_eq!(
+            derived,
+            vec![
+                ("mb_selective_job_rate_sum", 75_029, 1 << 18),
+                ("mb_selective_region_avg", 133_336, 1 << 19),
+                ("mb_selective_error_ratio", 300_059, 1 << 20),
+                ("mb_fanout_total_rate", 300_029, 1 << 20),
+                ("mb_full_range_counter_increase", 300_128, 1 << 20),
+            ]
+        );
+
+        // Single-series answers carry no summation residue and stay exact.
+        for id in ["mb_single_counter_rate", "mb_histogram_native_p95"] {
+            let entry = entries.iter().find(|e| e.id == id).expect("present");
+            assert_eq!(entry.tolerance_ulps, None, "{id}");
+        }
     }
 
     #[test]

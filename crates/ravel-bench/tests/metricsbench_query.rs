@@ -56,7 +56,7 @@ fn workload_path() -> PathBuf {
 /// histogram family. Entries copied from the checked-in corpus.
 fn corpus() -> Json {
     json!({
-        "version": 3,
+        "version": 4,
         "entries": [
             {
                 "id": "mb_single_gauge_instant",

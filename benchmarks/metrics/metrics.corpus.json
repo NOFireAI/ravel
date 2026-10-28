@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "entries": [
     {
       "id": "mb_absent_instant",
@@ -80,7 +80,13 @@
         "matrix selector",
         "vector selector",
         "label matcher ="
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 4 adds tolerance_ulps 262144 (2^18); the query is unchanged: each step's answer is one sum over the rates of every selected counter series, and engines that add in another order, or with compensated summation, differ in the last bits; naive summation of n non-negative values errs by at most n-1 ULPs of the sum, and n is 75,000 counter series with job=\"metricsbench-api\" on cardinality, the most of any profile the entry runs under (churn creates 30,000 over its whole run, history 750, ci 75); the inner rate adds at most 30 roundings, each at most one ULP of the result: 20 in the delta over the at most 20 samples a left-open 5m window holds at a 15s scrape (one subtraction and up to 19 counter-reset corrections) and 10 in extrapolation (three timestamp-to-seconds conversions, a multiplication and a division for the zero-point clamp, two additions for the extrapolated interval, the factor division, the multiplication by the factor and the division by the range); one engine's answer is within 74,999 + 30 = 75,029 ULPs of the exact sum, two engines that err in opposite directions differ by at most 150,058 ULPs, and the next power of two is 2^18; measured on ci (nightly run 40623286253, #2821 comment 6459784933) the gap was 1 ULP for ravel and 1 for mimir, while victoriametrics, whose rate algorithm differs, was 2,339,342,372,231,417 ULPs off and still reads as incorrect; the gap is checked again by the next cardinality run"
+        }
+      },
+      "tolerance_ulps": 262144
     },
     {
       "id": "mb_selective_region_avg",
@@ -94,7 +100,13 @@
         "paren expression",
         "vector selector",
         "label matcher =~"
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 4 adds tolerance_ulps 524288 (2^19); the query is unchanged: each answer is one mean over every selected gauge series, a sum followed by one division by the count, and engines that add in another order, or with compensated summation, differ in the last bits; naive summation of n non-negative values (cpu percent, 0 to 100) errs by at most n-1 ULPs of the sum, and n is 133,336 gauge series with region eu-west-1 on cardinality, the only region the regex matches and the most of any profile the entry runs under (churn creates 53,336 over its whole run, history 1,336, ci 136); the selector reads raw samples, so no inner function adds error, and the division adds one; one engine's answer is within 133,335 + 1 = 133,336 ULPs of the exact mean, two engines that err in opposite directions differ by at most 266,672 ULPs, and the next power of two is 2^19; measured on ci (nightly run 40623286253, #2821 comment 6459784933) the gap was 4 ULPs for ravel, with no gap listed for mimir or victoriametrics; the gap is checked again by the next cardinality run"
+        }
+      },
+      "tolerance_ulps": 524288
     },
     {
       "id": "mb_selective_error_ratio",
@@ -112,7 +124,13 @@
         "vector selector",
         "label matcher =",
         "label matcher !="
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 4 adds tolerance_ulps 1048576 (2^20); the query is unchanged: each step's answer divides one sum of counter rates by another, and engines that add in another order, or with compensated summation, differ in the last bits; naive summation of n non-negative values errs by at most n-1 ULPs of the sum, and on cardinality, the most of any profile the entry runs under, the numerator sums 74,992 counter series with status 500 and the denominator 225,008 without it (churn creates 30,000 and 90,000 over its whole run, history 744 and 2,256, ci 64 and 236); each inner rate adds at most 30 roundings, each at most one ULP of the result: 20 in the delta over the at most 20 samples a left-open 5m window holds at a 15s scrape (one subtraction and up to 19 counter-reset corrections) and 10 in extrapolation (three timestamp-to-seconds conversions, a multiplication and a division for the zero-point clamp, two additions for the extrapolated interval, the factor division, the multiplication by the factor and the division by the range); the relative errors of a quotient's operands add, and the division adds one, so one engine's answer is within (74,991 + 30) + (225,007 + 30) + 1 = 300,059 ULPs of the exact ratio, two engines that err in opposite directions differ by at most 600,118 ULPs, and the next power of two is 2^20; measured on ci (nightly run 40623286253, #2821 comment 6459784933) the gap was 2 ULPs for ravel and 2 for mimir, while victoriametrics, whose rate algorithm differs, was 1,877,575,138,056,483 ULPs off and still reads as incorrect; the gap is checked again by the next cardinality run"
+        }
+      },
+      "tolerance_ulps": 1048576
     },
     {
       "id": "mb_fanout_total_rate",
@@ -126,7 +144,13 @@
         "rate",
         "matrix selector",
         "vector selector"
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 4 adds tolerance_ulps 1048576 (2^20); the query is unchanged: each step's answer is one sum over the rates of every counter series, and engines that add in another order, or with compensated summation, differ in the last bits; naive summation of n non-negative values errs by at most n-1 ULPs of the sum, and n is 300,000 counter series on cardinality (1,000,000 x 300/1000), the most of any profile the entry runs under (churn creates 120,000 over its whole run, history 3,000, ci 300); the inner rate adds at most 30 roundings, each at most one ULP of the result: 20 in the delta over the at most 20 samples a left-open 5m window holds at a 15s scrape (one subtraction and up to 19 counter-reset corrections) and 10 in extrapolation (three timestamp-to-seconds conversions, a multiplication and a division for the zero-point clamp, two additions for the extrapolated interval, the factor division, the multiplication by the factor and the division by the range); one engine's answer is within 299,999 + 30 = 300,029 ULPs of the exact sum, two engines that err in opposite directions differ by at most 600,058 ULPs, and the next power of two is 2^20; measured on ci (nightly run 40623286253, #2821 comment 6459784933) the gap was 1 ULP for ravel and 1 for mimir, while victoriametrics, whose rate algorithm differs, was 1,395,624,456,039,935 ULPs off and still reads as incorrect; the gap is checked again by the next cardinality run"
+        }
+      },
+      "tolerance_ulps": 1048576
     },
     {
       "id": "mb_fanout_topk_instances",
@@ -202,7 +226,13 @@
         "increase",
         "matrix selector",
         "vector selector"
-      ]
+      ],
+      "modified": {
+        "modified": {
+          "reason": "corpus version 4 adds tolerance_ulps 1048576 (2^20); the query is unchanged: the answer is one sum over the increases of every counter series, and engines that add in another order, or with compensated summation, differ in the last bits; naive summation of n non-negative values errs by at most n-1 ULPs of the sum, and n is 300,000 counter series on cardinality (1,000,000 x 300/1000), the most of any profile the entry runs under (churn creates 120,000 over its whole run, history 3,000, ci 300); the inner increase adds at most 129 roundings, each at most one ULP of the result: 120 in the delta over the at most 120 samples a left-open 30m window holds at a 15s scrape (one subtraction and up to 119 counter-reset corrections) and 9 in extrapolation (three timestamp-to-seconds conversions, a multiplication and a division for the zero-point clamp, two additions for the extrapolated interval, the factor division and the multiplication by the factor); one engine's answer is within 299,999 + 129 = 300,128 ULPs of the exact sum, two engines that err in opposite directions differ by at most 600,256 ULPs, and the next power of two is 2^20; measured on ci (nightly run 40623286253, #2821 comment 6459784933) no gap was listed for ravel or mimir, while victoriametrics, whose increase algorithm differs, was 484,832,405,549,241 ULPs off and still reads as incorrect; the gap is checked again by the next cardinality run"
+        }
+      },
+      "tolerance_ulps": 1048576
     },
     {
       "id": "mb_join_cpu_on_build_version",
