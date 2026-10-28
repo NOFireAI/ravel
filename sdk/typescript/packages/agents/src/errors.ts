@@ -46,6 +46,8 @@ export type RavelAgentsErrorCode =
   | "BudgetExceeded"
   | "StoreUnavailable"
   | "UnsupportedFormat"
+  // The server's authentication refusal, carried in its plain error body.
+  | "Forbidden"
   // SDK-local: raised by the step runner, never carried on the wire.
   | "ConcurrentStep"
   | "InvalidStepInput";
@@ -156,6 +158,25 @@ export class UnsupportedFormat extends RavelAgentsError {
   override readonly name = "UnsupportedFormat";
   readonly code = "UnsupportedFormat";
   readonly retry = "never";
+}
+
+/**
+ * The server refused the credential: HTTP 401 for a token it does not
+ * resolve, 403 for a token that lacks the route's capability (`agents` or
+ * `agents_worker`). Retrying with the same token cannot succeed.
+ */
+export class Forbidden extends RavelAgentsError {
+  override readonly name = "Forbidden";
+  readonly code = "Forbidden";
+  readonly retry = "never";
+
+  constructor(
+    readonly status: 401 | 403,
+    message: string,
+    options: RavelAgentsErrorOptions = {},
+  ) {
+    super(message, options);
+  }
 }
 
 /**

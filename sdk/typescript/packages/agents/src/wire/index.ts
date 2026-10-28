@@ -246,6 +246,44 @@ export const TurnLease = z.object({
 });
 export type TurnLease = z.output<typeof TurnLease>;
 
+/**
+ * The lease a poll hands out: the commit-time fields plus the turn's
+ * recorded time and random seed, both fixed by the server so a retried turn
+ * replays with the same clock and the same random stream.
+ */
+export const PolledLease = TurnLease.extend({
+  recorded_unix_ns: UnixNs,
+  random_seed: z.string().regex(/^[0-9a-f]{32}$/),
+});
+export type PolledLease = z.output<typeof PolledLease>;
+
+/** The fields of a polled lease that heartbeat, step and commit bodies carry. */
+export function heldLease(lease: PolledLease): TurnLease {
+  return {
+    agent_id: lease.agent_id,
+    incarnation: lease.incarnation,
+    owner_id: lease.owner_id,
+    epoch: lease.epoch,
+    turn_id: lease.turn_id,
+    base_state_version: lease.base_state_version,
+    handler_version: lease.handler_version,
+    handler_digest: lease.handler_digest,
+    observed_root_revision: lease.observed_root_revision,
+  };
+}
+
+export const WorkerRegisterRequest = z.object({ handlers: z.array(HandlerPinBody) });
+export type WorkerRegisterRequest = z.output<typeof WorkerRegisterRequest>;
+
+export const WorkerRegisterResponse = z.object({ worker_id: z.string() });
+export type WorkerRegisterResponse = z.output<typeof WorkerRegisterResponse>;
+
+export const WorkerHeartbeatRequest = z.object({ lease: TurnLease });
+export type WorkerHeartbeatRequest = z.output<typeof WorkerHeartbeatRequest>;
+
+export const WorkerHeartbeatResponse = z.object({ lease_expires_unix_ns: UnixNs });
+export type WorkerHeartbeatResponse = z.output<typeof WorkerHeartbeatResponse>;
+
 export const StepBody = z.object({
   step_id: z.string(),
   step_key: z.string(),
@@ -258,7 +296,7 @@ export const StepBody = z.object({
 export type StepBody = z.output<typeof StepBody>;
 
 export const TurnAssignment = z.object({
-  lease: TurnLease,
+  lease: PolledLease,
   agent: AgentRef,
   operation: z.string(),
   accept_seq: U64,
@@ -358,6 +396,17 @@ export const ErrorBody = z.object({
 export type ErrorBody = z.output<typeof ErrorBody>;
 
 /**
+ * The server-wide body of a 401 or 403, which the agents routes share with
+ * every other route rather than answering with an {@link ErrorBody}.
+ */
+export const AuthErrorBody = z.object({
+  status: z.literal("error"),
+  errorType: z.string(),
+  error: z.string(),
+});
+export type AuthErrorBody = z.output<typeof AuthErrorBody>;
+
+/**
  * Each golden fixture under `sdk/fixtures/`, by file stem, and the schema
  * that reads it. `wire.test.ts` fails on a fixture missing here and on a
  * request or response schema missing from here.
@@ -392,8 +441,12 @@ export const WIRE_FIXTURES = {
   worker_commit_failed_request: WorkerCommitRequest,
   worker_commit_request: WorkerCommitRequest,
   worker_commit_response: WorkerCommitResponse,
+  worker_heartbeat_request: WorkerHeartbeatRequest,
+  worker_heartbeat_response: WorkerHeartbeatResponse,
   worker_poll_request: WorkerPollRequest,
   worker_poll_response: WorkerPollResponse,
+  worker_register_request: WorkerRegisterRequest,
+  worker_register_response: WorkerRegisterResponse,
 } as const;
 
 /** Decode a parsed JSON body; throws a ZodError on a body the schema refuses. */

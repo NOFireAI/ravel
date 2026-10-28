@@ -13,6 +13,7 @@ import {
   stepInputHash,
   toHex,
   turnId,
+  turnRandomSeed,
 } from "./identity.js";
 
 const fixtures = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../fixtures");
@@ -58,6 +59,21 @@ describe("identity", () => {
     expect(stepInputHash("catalog.price", "1", new TextEncoder().encode("A-1"))).toBe(
       step?.input_hash,
     );
+  });
+
+  it("turn random seed matches the worker_poll_response fixture's lease", () => {
+    // The Rust fixture writer fills the lease's random_seed with
+    // wire::turn_random_seed(agent_id, incarnation, accept_seq).
+    const poll = JSON.parse(readFileSync(resolve(fixtures, "worker_poll_response.json"), "utf8")) as {
+      assignment: {
+        accept_seq: number;
+        lease: { agent_id: string; incarnation: number; random_seed: string };
+      };
+    };
+    const { lease, accept_seq } = poll.assignment;
+    expect(lease.random_seed).toBe("8f8d1b06b1618bd08db0300dbba36423");
+    expect(turnRandomSeed(lease.agent_id, lease.incarnation, accept_seq)).toBe(lease.random_seed);
+    expect(turnRandomSeed(lease.agent_id, lease.incarnation, accept_seq + 1)).not.toBe(lease.random_seed);
   });
 
   it("agent id matches the create_agent_response fixture", () => {

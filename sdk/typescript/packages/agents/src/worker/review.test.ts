@@ -215,6 +215,8 @@ describe("step runner review reproductions (#3340)", () => {
 
     const reports: TurnReport[] = [];
     const transport: Transport = {
+      register: (request) => coordinator.register(request),
+      heartbeat: (request) => coordinator.heartbeat(request),
       poll: async (request, signal) => {
         const polled = await coordinator.poll(request, signal);
         if (polled === null) return null;
