@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Cases for run.sh, the MetricsBench end-to-end driver, with docker, curl,
-# uname, sha256sum, the three metricsbench bins and
+# uname, sha256sum, shasum, the three metricsbench bins and
 # capture-effective-config.sh replaced by stubs that log every call. Nothing
-# here starts a container or downloads anything. The sha256sum stub answers
-# run.sh's pinned s3s-fs constant for the bytes the curl stub serves as that
-# arch's asset, and the real hash for anything else, so the comparison under
-# test is run.sh's own.
+# here starts a container or downloads anything. The sha256sum and shasum
+# stubs answer run.sh's pinned s3s-fs constant for the bytes the curl stub
+# serves as that arch's asset, and the real hash for anything else, so the
+# comparison under test is run.sh's own.
 #
 #   a  success run                   -> exit 0; stamps, ingest, effective-config,
 #                                       provenance, report and memory-summary
@@ -59,11 +59,20 @@
 #                                       fetch-s3s-fs, nothing cached or
 #                                       started; n3: a cached binary with
 #                                       another sha256 exits 65, no download,
-#                                       nothing started; n4: an arch other
-#                                       than x86_64/aarch64 exits 65 before
-#                                       stamps; n5: aarch64 fetches its own
+#                                       nothing started; n4: an engine arch
+#                                       other than amd64/arm64 exits 65 before
+#                                       stamps; n5: with the engine silent,
+#                                       uname -m aarch64 fetches the aarch64
 #                                       asset; n6: a failed download exits 70;
-#                                       f: a diagnostic run fetches nothing
+#                                       n7: an arm64 engine on a host whose
+#                                       uname -m says arm64 (macOS) fetches
+#                                       aarch64; n8: an amd64 engine fetches
+#                                       x86_64 whatever uname -m says; n9: no
+#                                       sha256sum, shasum -a 256 hashes; n10:
+#                                       the same refuses a mismatch with 65;
+#                                       n11: neither tool exits 65 before
+#                                       stamps; f: a diagnostic run fetches
+#                                       nothing
 #   p  local-build image           -> --ravel-image REF --ravel-image-id ID passes
 #                                       when docker image inspect reports Id ID;
 #                                       stamps and provenance say local-build
@@ -115,8 +124,9 @@ S3S_SHA_AARCH64="6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717a
 
 # --- stubs -------------------------------------------------------------------
 
-# docker: compose up/ps/config/down/logs, stats, inspect, image inspect and
-# volume ls, with the stack's up/down state in $STUB_STATE.
+# docker: version (Server.Arch is STUB_ENGINE_ARCH, default amd64; exit 1
+# with STUB_ENGINE_DOWN), compose up/ps/config/down/logs, stats, inspect,
+# image inspect and volume ls, with the stack's up/down state in $STUB_STATE.
 cat >"${BIN}/docker" <<'STUB'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"${STUB_LOG}"
@@ -124,6 +134,13 @@ running_services() {
   if [ -f "${STUB_STATE}.services" ]; then cat "${STUB_STATE}.services"; fi
 }
 case "$1" in
+  version)
+    if [ -n "${STUB_ENGINE_DOWN:-}" ]; then
+      echo "Cannot connect to the Docker daemon" >&2
+      exit 1
+    fi
+    echo "${STUB_ENGINE_ARCH:-amd64}"
+    ;;
   compose)
     shift
     while [ "$1" = "-f" ]; do shift 2; done
@@ -262,11 +279,24 @@ else
 fi
 STUB
 
-# sha256sum: the pinned constant for the curl stub's bytes for that arch, the
-# real sha256 for any other content.
-cat >"${BIN}/sha256sum" <<STUB
+# sha256sum (in SHA256SUM_DIR) and shasum (in SHASUM_DIR, answering only
+# -a 256): the pinned constant for the curl stub's bytes for that arch, the
+# real sha256 for any other content. NOHASH_DIR links every other tool on
+# PATH, so a case can run with either or neither hash tool.
+SHA256SUM_DIR="${TMP}/hash-sha256sum"
+SHASUM_DIR="${TMP}/hash-shasum"
+NOHASH_DIR="${TMP}/nohash"
+mkdir -p "${SHA256SUM_DIR}" "${SHASUM_DIR}" "${NOHASH_DIR}"
+# write_hash_stub PATH NAME SHIFT: a hash stub whose file argument follows
+# SHIFT leading arguments.
+write_hash_stub() {
+  cat >"$1" <<STUB
 #!/usr/bin/env bash
-printf 'sha256sum %s\n' "\$*" >>"\${STUB_LOG}"
+printf '$2 %s\n' "\$*" >>"\${STUB_LOG}"
+if [ "$3" -eq 2 ]; then
+  [ "\$1 \$2" = "-a 256" ] || exit 2
+  shift 2
+fi
 [ -f "\$1" ] || exit 1
 case "\$(cat "\$1")" in
   stub-s3s-fs-x86_64) h=${S3S_SHA_X86_64} ;;
@@ -275,6 +305,19 @@ case "\$(cat "\$1")" in
 esac
 printf '%s  %s\n' "\$h" "\$1"
 STUB
+  chmod +x "$1"
+}
+write_hash_stub "${SHA256SUM_DIR}/sha256sum" sha256sum 0
+write_hash_stub "${SHASUM_DIR}/shasum" shasum 2
+IFS=: read -ra path_dirs <<<"${PATH}"
+for d in "${path_dirs[@]}"; do
+  [ -d "$d" ] || continue
+  for t in "$d"/*; do
+    n="${t##*/}"
+    case "$n" in sha256sum | shasum) continue ;; esac
+    [ -x "$t" ] && [ ! -e "${NOHASH_DIR}/${n}" ] && ln -s "$t" "${NOHASH_DIR}/${n}"
+  done
+done
 
 # metricsbench_ingest: an ingest report with a row per endpoint flag given.
 cat >"${BIN}/metricsbench_ingest" <<'STUB'
@@ -340,6 +383,8 @@ chmod +x "${BIN}"/*
 
 # run_case NAME [run.sh args...]: run with a fresh stub state and log; sets
 # rc, OUT (the out-dir), LOG (every stub call) and ERR (run.sh's stderr).
+# HASH_TOOLS picks the hash stubs on PATH: sha256sum (default), shasum, or
+# none; the latter two drop the host's own from PATH as well.
 run_case() {
   local name="$1"
   shift
@@ -349,7 +394,13 @@ run_case() {
   mkdir -p "${TMP}/${name}"
   : >"${LOG}"
   rc=0
-  PATH="${BIN}:${PATH}" \
+  local run_path
+  case "${HASH_TOOLS:-sha256sum}" in
+    sha256sum) run_path="${BIN}:${SHA256SUM_DIR}:${PATH}" ;;
+    shasum) run_path="${BIN}:${SHASUM_DIR}:${NOHASH_DIR}" ;;
+    none) run_path="${BIN}:${NOHASH_DIR}" ;;
+  esac
+  PATH="${run_path}" \
     STUB_LOG="${LOG}" STUB_STATE="${TMP}/${name}/state" STUB_REAL_UNAME="${REAL_UNAME}" \
     METRICSBENCH_S3S_FS_CACHE="${TMP}/${name}/cache" \
     METRICSBENCH_CAPTURE="${BIN}/capture" \
@@ -446,7 +497,7 @@ expect_log "a: ci keeps the in-process row on a memory store" "--store memory --
 check "a: stamps say the in-process row is present" 'j("stamps.json")["in_process_row"] == "present"'
 A_BIN="${TMP}/a/cache/${S3S_RELEASE}/s3s-fs-linux-x86_64"
 expect_log "a: the x86_64 asset downloaded" "https://github.com/NOFireAI/s3s/releases/download/${S3S_RELEASE}/s3s-fs-linux-x86_64"
-check "a: object_store stamped from the download" 'j("stamps.json")["object_store"] == {"implementation": "s3s-fs", "release": "'"${S3S_RELEASE}"'", "arch": "x86_64", "sha256": "'"${S3S_SHA_X86_64}"'", "url": "https://github.com/NOFireAI/s3s/releases/download/'"${S3S_RELEASE}"'/s3s-fs-linux-x86_64", "path": "'"${A_BIN}"'", "source": "download"}'
+check "a: object_store stamped from the download" 'j("stamps.json")["object_store"] == {"implementation": "s3s-fs", "release": "'"${S3S_RELEASE}"'", "arch": "x86_64", "engine_arch": "amd64", "engine_arch_source": "docker version (Server.Arch)", "sha256": "'"${S3S_SHA_X86_64}"'", "url": "https://github.com/NOFireAI/s3s/releases/download/'"${S3S_RELEASE}"'/s3s-fs-linux-x86_64", "path": "'"${A_BIN}"'", "source": "download"}'
 if [ -x "${A_BIN}" ] && [ "$(cat "${A_BIN}")" = "stub-s3s-fs-x86_64" ]; then
   pass "a: the verified download is cached executable"
 else
@@ -651,18 +702,19 @@ expect_no_log "n3 cached mismatch: no download" "releases/download"
 expect_no_log "n3 cached mismatch: nothing started" " up -d"
 
 mapfile -t args < <(full_args "${TMP}/n4/out")
-STUB_ARCH=arm64 run_case n4 "${args[@]}"
+STUB_ENGINE_ARCH=s390x run_case n4 "${args[@]}"
 expect_rc "n4 unknown arch" 65
-expect_err "n4 unknown arch: refusal names the arch" "no s3s-fs release asset is pinned for host arch 'arm64'"
+expect_err "n4 unknown arch: refusal names the engine arch and its source" "no s3s-fs release asset is pinned for engine arch 's390x' (from docker version (Server.Arch))"
 expect_no_log "n4 unknown arch: no download" "releases/download"
 expect_no_log "n4 unknown arch: nothing started" "compose -f"
 expect_no_file n4 stamps.json
 
 mapfile -t args < <(full_args "${TMP}/n5/out")
-STUB_ARCH=aarch64 run_case n5 "${args[@]}"
+STUB_ENGINE_DOWN=1 STUB_ARCH=aarch64 run_case n5 "${args[@]}"
 expect_rc "n5 aarch64" 0
 expect_log "n5 aarch64: the aarch64 asset downloaded" "/releases/download/${S3S_RELEASE}/s3s-fs-linux-aarch64"
 check "n5 aarch64: stamped with the aarch64 sha256" 'j("stamps.json")["object_store"]["arch"] == "aarch64" and j("stamps.json")["object_store"]["sha256"] == "'"${S3S_SHA_AARCH64}"'" and j("stamps.json")["host"]["arch"] == "aarch64"'
+check "n5 aarch64: stamped as read from uname -m" 'j("stamps.json")["object_store"]["engine_arch"] == "aarch64" and j("stamps.json")["object_store"]["engine_arch_source"].startswith("uname -m")'
 expect_log "n5 aarch64: provenance records the aarch64 sha256" "--config store_sha256=${S3S_SHA_AARCH64}"
 
 mapfile -t args < <(full_args "${TMP}/n6/out")
@@ -670,6 +722,40 @@ STUB_S3S_CURL_EXIT=22 run_case n6 "${args[@]}"
 expect_rc "n6 download fails" 70
 check "n6 download fails: stamps name step fetch-s3s-fs" 'j("stamps.json")["failed_step"] == "fetch-s3s-fs" and j("stamps.json")["exit_code"] == 70'
 expect_no_log "n6 download fails: nothing started" " up -d"
+
+mapfile -t args < <(full_args "${TMP}/n7/out")
+STUB_ENGINE_ARCH=arm64 STUB_ARCH=arm64 run_case n7 "${args[@]}"
+expect_rc "n7 arm64 engine, arm64 host" 0
+expect_log "n7 arm64 engine: the aarch64 asset downloaded" "/releases/download/${S3S_RELEASE}/s3s-fs-linux-aarch64"
+check "n7 arm64 engine: stamped aarch64 from docker version" 'j("stamps.json")["object_store"]["arch"] == "aarch64" and j("stamps.json")["object_store"]["sha256"] == "'"${S3S_SHA_AARCH64}"'" and j("stamps.json")["object_store"]["engine_arch"] == "arm64" and j("stamps.json")["object_store"]["engine_arch_source"] == "docker version (Server.Arch)" and j("stamps.json")["host"]["arch"] == "arm64"'
+
+mapfile -t args < <(full_args "${TMP}/n8/out")
+STUB_ENGINE_ARCH=amd64 STUB_ARCH=aarch64 run_case n8 "${args[@]}"
+expect_rc "n8 amd64 engine, aarch64 host" 0
+expect_log "n8 amd64 engine: the x86_64 asset downloaded" "/releases/download/${S3S_RELEASE}/s3s-fs-linux-x86_64"
+expect_no_log "n8 amd64 engine: no aarch64 asset" "s3s-fs-linux-aarch64"
+check "n8 amd64 engine: stamped x86_64 with its sha256" 'j("stamps.json")["object_store"]["arch"] == "x86_64" and j("stamps.json")["object_store"]["sha256"] == "'"${S3S_SHA_X86_64}"'" and j("stamps.json")["object_store"]["engine_arch"] == "amd64"'
+
+mapfile -t args < <(full_args "${TMP}/n9/out")
+HASH_TOOLS=shasum run_case n9 "${args[@]}"
+expect_rc "n9 shasum only" 0
+expect_log "n9 shasum only: the download hashed with shasum -a 256" "shasum -a 256 ${TMP}/n9/cache/${S3S_RELEASE}/s3s-fs-linux-x86_64.download."
+check "n9 shasum only: stamped with the pinned sha256" 'j("stamps.json")["object_store"]["sha256"] == "'"${S3S_SHA_X86_64}"'"'
+
+mapfile -t args < <(full_args "${TMP}/n10/out")
+HASH_TOOLS=shasum STUB_S3S_BYTES=tampered run_case n10 "${args[@]}"
+expect_rc "n10 shasum only, download mismatch" 65
+expect_log "n10 shasum only: the download hashed with shasum -a 256" "shasum -a 256 "
+expect_err "n10 shasum only: refusal names the pinned sha256" "not the pinned ${S3S_SHA_X86_64}"
+expect_no_log "n10 shasum only: nothing started" " up -d"
+
+mapfile -t args < <(full_args "${TMP}/n11/out")
+HASH_TOOLS=none run_case n11 "${args[@]}"
+expect_rc "n11 no hash tool" 65
+expect_err "n11 no hash tool: refusal names both tools" "neither sha256sum nor shasum is on PATH"
+expect_no_log "n11 no hash tool: no download" "releases/download"
+expect_no_log "n11 no hash tool: nothing started" "compose -f"
+expect_no_file n11 stamps.json
 
 # --- p: local-build image ------------------------------------------------------
 LOCAL_REF="ravel-server:nightly-${COMMIT}"

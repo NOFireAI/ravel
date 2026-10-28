@@ -36,14 +36,22 @@ ravel-server idled, so the store bounded the Ravel row. Figures measured on
 RustFS are not compared with figures measured on s3s-fs.
 
 No image carries the binary. `run.sh`'s `fetch-s3s-fs` step downloads the
-release asset for the host arch (`s3s-fs-linux-x86_64` or
+release asset for the Docker engine's arch (`s3s-fs-linux-x86_64` or
 `s3s-fs-linux-aarch64`) into a cache outside the output directory, refuses it
 with exit 65 unless its sha256 equals the constant `run.sh` carries, and
 exports its path as `S3S_FS_BIN`; `docker-compose.yml` bind-mounts that path
-read-only into the `s3s` service and refuses to start without it. The pinned
-values:
+read-only into the `s3s` service and refuses to start without it. The binary
+runs inside the engine's Linux containers, so the asset follows the engine's
+arch, `docker version --format '{{.Server.Arch}}'`: `amd64` or `x86_64` picks
+`x86_64`, `arm64` or `aarch64` picks `aarch64` (cases n7 and n8), so a macOS
+host whose `uname -m` says `arm64` fetches the `aarch64` asset. Only when the
+engine does not answer does `uname -m` stand in (case n5); `object_store` in
+`stamps.json` records the engine arch and which of the two it came from. The
+sha256 is computed with `sha256sum`, else `shasum -a 256` (macOS; cases n9
+and n10), and a host with neither is refused with exit 65 (case n11). The
+pinned values:
 
-| Arch (`uname -m`) | sha256 |
+| Asset arch | sha256 |
 |---|---|
 | `x86_64` | `0ac5480b51389c1913f9645d0e1ff2ff1dfdd3a44bb396a7cb74c5e91176c01f` |
 | `aarch64` | `6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717ad` |
@@ -130,8 +138,8 @@ as every other system here.
 **Compose stack (2026-10-26, ravel-server 0.27.0, darwin/arm64 Docker).**
 `RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:0.27.0 docker compose -f
 docker-compose.yml -f ravel.yml up -d rustfs createbuckets ravel-qualify
-ravel-server` brought the overlay up on the stack's object store, then
-RustFS (the service was named `rustfs`). Results:
+ravel-server` brought the overlay up on the stack's object store, which was
+RustFS at the time (the service was named `rustfs`). Results:
 
 | Step or request | Result |
 |---|---|
@@ -619,10 +627,10 @@ Before the stack starts, the `fetch-s3s-fs` step resolves the s3s-fs binary
 the pin is reused without a download (case n1); a cached binary with another
 sha256 is refused with exit 65 and nothing is downloaded (case n3); a download
 whose sha256 differs is refused with exit 65, nothing is cached and nothing
-starts (case n2); a failed download exits 70 naming the step (case n6). A host
-arch other than `x86_64` or `aarch64` is refused with exit 65 before anything
-starts (case n4), and `aarch64` fetches its own asset against its own pin
-(case n5). The cache is `$METRICSBENCH_S3S_FS_CACHE`, else
+starts (case n2); a failed download exits 70 naming the step (case n6). An
+engine arch other than `amd64`/`x86_64` or `arm64`/`aarch64` is refused with
+exit 65 before anything starts (case n4), and `aarch64` fetches its own asset
+against its own pin (cases n5 and n7). The cache is `$METRICSBENCH_S3S_FS_CACHE`, else
 `$XDG_CACHE_HOME/ravel-metricsbench`, else `~/.cache/ravel-metricsbench`, so
 the run's output directory does not carry the binary. The diagnostic mode
 starts no object store and fetches nothing (case f).
@@ -638,9 +646,9 @@ and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.ar
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
 `mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
-f), `object_store` (release, arch, sha256, URL, cached path and whether it
-came from the cache or a download; `not applicable` in the diagnostic mode;
-cases a, f, n1 and n5), `steps_completed`, `failed_step`,
+f), `object_store` (release, asset arch, engine arch and its source, sha256,
+URL, cached path and whether it came from the cache or a download; `not applicable` in the diagnostic mode;
+cases a, f, n1, n5 and n7), `steps_completed`, `failed_step`,
 `exit_code`, `status` and `teardown`.
 
 ### The falsification run
