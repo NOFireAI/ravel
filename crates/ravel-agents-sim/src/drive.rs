@@ -175,14 +175,20 @@
 //! An inferred reply that is an error means the reference refuses a call
 //! whose write applied, so that call is listed in [`Run::unmappable`]
 //! (`tests::a_crashed_write_the_reference_refuses_outside_the_exemption_is_unmappable`,
-//! a completion with no started turn answered `OwnershipLost`). Two kinds
-//! are exempt, because production writes before it answers them: a manual
-//! step whose attempt was lost latches its effect in doubt and answers
-//! `EffectInDoubt`
-//! (`tests::a_crashed_manual_step_whose_attempt_was_lost_infers_effect_in_doubt`),
-//! and a step whose call changed blocks the turn and answers
-//! `NonDeterministicReplay` (no test builds that shape). No schedule
-//! reaches this rule today: no reply a schedule infers is an error.
+//! a completion with no started turn answered `OwnershipLost`). Three
+//! shapes are exempt, because production writes before it answers them:
+//! a manual step whose attempt was lost latches its effect in doubt and
+//! answers `EffectInDoubt`
+//! (`tests::a_crashed_manual_step_whose_attempt_was_lost_infers_effect_in_doubt`);
+//! a step whose call changed blocks the turn and answers
+//! `NonDeterministicReplay` (no test builds that shape); and a step that
+//! journaled its start, with no attempt, after a cancel and died before
+//! the cancel check would have answered `OwnershipLost`, the crashed form
+//! of the exception under Linearization
+//! (`tests::a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost`,
+//! reached by
+//! `schedules::effects::a_worker_dead_between_its_step_journal_and_its_cancel_check_is_fenced`).
+//! `OwnershipLost` inferred for any other crashed write stays unmappable.
 //!
 //! Anything else the driver cannot map is listed in [`Run::unmappable`],
 //! and every schedule asserts that list is empty.
@@ -663,10 +669,14 @@ impl Recorder {
         let mut inferred = Vec::new();
         let mut applied = Vec::new();
         for item in items {
+            let mut start_only = false;
             let event = match (&item.observed, &item.event, &item.applied) {
                 (None, Event::Step { operation, step }, Some(body)) => {
                     match crashed_step(&shadow, operation, step, body) {
-                        Ok(event) => event,
+                        Ok((event, journaled_start)) => {
+                            start_only = journaled_start;
+                            event
+                        }
                         Err(what) => {
                             unmappable.push(format!("{} step: {what}", item.actor));
                             continue;
@@ -679,11 +689,15 @@ impl Recorder {
             let reply = match item.observed {
                 Some(reply) => reply,
                 None => {
+                    let exempt = match expected {
+                        Reply::Error(
+                            ErrorKind::EffectInDoubt | ErrorKind::NonDeterministicReplay,
+                        ) => true,
+                        Reply::Error(ErrorKind::OwnershipLost) => start_only,
+                        _ => false,
+                    };
                     if let Reply::Error(kind) = expected
-                        && !matches!(
-                            kind,
-                            ErrorKind::EffectInDoubt | ErrorKind::NonDeterministicReplay
-                        )
+                        && !exempt
                     {
                         unmappable.push(format!(
                             "{}: applied a write the reference refuses {kind:?}: {event:?}",
@@ -817,12 +831,15 @@ struct Item {
 /// committed intent at attempt 0 is that shape, since the reference has no
 /// intents; an intent at any other attempt is unmappable. When the root it
 /// wrote holds what [`Event::Step`] would leave, the step ran through.
+/// The flag is true when that root holds the step's journaled start alone,
+/// no attempt and no completion: the only crashed step whose inferred
+/// `OwnershipLost` maps.
 fn crashed_step(
     shadow: &ReferenceMachine,
     operation: &Handle,
     step: &StepCall,
     body: &Bytes,
-) -> Result<Event, String> {
+) -> Result<(Event, bool), String> {
     let head = Head::decode(body).map_err(|e| format!("root does not decode: {e:?}"))?;
     let HandleItem::Operation(seq) = operation.item else {
         return Err(format!("{operation:?} names no input"));
@@ -847,6 +864,7 @@ fn crashed_step(
         .steps
         .iter()
         .any(|s| s.step_key == step.key && s.status == StepStatus::Completed);
+    let start_only = written.is_none() && !completed;
     let mut ran = shadow.clone();
     let event = Event::Step {
         operation: *operation,
@@ -856,12 +874,15 @@ fn crashed_step(
     if ran.effect_view(operation, &step.key) == written
         && ran.step_completed(&step.key) == completed
     {
-        Ok(event)
+        Ok((event, start_only))
     } else {
-        Ok(Event::StepStarted {
-            operation: *operation,
-            step: step.clone(),
-        })
+        Ok((
+            Event::StepStarted {
+                operation: *operation,
+                step: step.clone(),
+            },
+            false,
+        ))
     }
 }
 
@@ -1988,6 +2009,48 @@ mod tests {
         let last = run.history.calls().last().expect("a call");
         assert_eq!(last.event, run_step);
         assert_eq!(last.observed, Reply::Error(ErrorKind::EffectInDoubt));
+        assert_eq!(run.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost() {
+        let rec = Recorder::default();
+        let mut reference = machine().expect("machine");
+        let op = accepted(&rec, &mut reference);
+        let run_step = Event::Step {
+            operation: op,
+            step: StepCall {
+                key: "lookup".to_string(),
+                tool: "search".to_string(),
+                version: "v1".to_string(),
+                input: b"q".to_vec(),
+                policy: RecoveryPolicy::AtLeastOnce,
+            },
+        };
+        answered(
+            &rec,
+            &mut reference,
+            Event::TurnStarted { operation: op },
+            3,
+        );
+        let cancel = Event::Client(ClientOp::Cancel { operation: op });
+        answered(&rec, &mut reference, cancel, 4);
+        // The step journaled its start, no attempt, then the process died
+        // before the cancel check that would have refused it.
+        let rig = Rig::new(FaultPlan::empty());
+        rig.setup(|p| async move {
+            p.create().await.map_err(|e| format!("create: {e:?}"))?;
+            Ok(())
+        })
+        .expect("setup");
+        let head = rig.head().expect("head");
+        crashed(&rec, run_step.clone(), 5, Bytes::from(head.encode()));
+        let run = rec.build().expect("build");
+        assert_eq!(run.unmappable, Vec::<String>::new());
+        assert_eq!(run.inferred, vec![("w2".to_string(), run_step.clone())]);
+        let last = run.history.calls().last().expect("a call");
+        assert_eq!(last.event, run_step);
+        assert_eq!(last.observed, Reply::Error(ErrorKind::OwnershipLost));
         assert_eq!(run.check(), Ok(()));
     }
 
