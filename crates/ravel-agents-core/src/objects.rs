@@ -2,18 +2,18 @@
 //!
 //! Each object is written once and named by the blake3 of its bytes, so
 //! these codecs never re-encode a decoded value. Decoding applies the same
-//! gate as HEAD: `format_version == 1` read first, then the full message,
+//! gate as HEAD: `format_version == 1` ([`OBJECT_FORMAT_VERSION`]) read first, then the full message,
 //! then the seal, then every typed field.
 
 use prost::Message as _;
 use ravel_proto::agents::v1 as pb;
 
 use crate::head::{
-    CodecError, EffectRecord, EventEntry, FORMAT_VERSION, InboxEntry, Receipt, ResultEntry, SEAL,
-    StepRecord, TimerEntry, check_format_version, check_seal, effect_from_proto, effect_to_proto,
-    event_from_proto, event_to_proto, inbox_from_proto, inbox_to_proto, peek_format_version,
-    receipt_from_proto, receipt_to_proto, result_from_proto, result_to_proto, step_from_proto,
-    step_to_proto, timer_from_proto, timer_to_proto,
+    CodecError, EffectRecord, EventEntry, InboxEntry, OBJECT_FORMAT_VERSION, Receipt, ResultEntry,
+    SEAL, StepRecord, TimerEntry, check_format_version, check_seal, effect_from_proto,
+    effect_to_proto, event_from_proto, event_to_proto, inbox_from_proto, inbox_to_proto,
+    peek_format_version, receipt_from_proto, receipt_to_proto, result_from_proto, result_to_proto,
+    step_from_proto, step_to_proto, timer_from_proto, timer_to_proto,
 };
 use crate::identity::Id128;
 
@@ -37,7 +37,7 @@ macro_rules! entry_page {
     ($encode:ident, $decode:ident, $msg:ident, $entry:ty, $to:ident, $from:ident) => {
         pub fn $encode(entries: &[$entry]) -> Vec<u8> {
             pb::$msg {
-                format_version: FORMAT_VERSION,
+                format_version: OBJECT_FORMAT_VERSION,
                 entries: entries.iter().map($to).collect(),
                 seal: SEAL,
             }
@@ -86,7 +86,7 @@ entry_page!(
 
 pub fn encode_timer_table(timers: &[TimerEntry]) -> Vec<u8> {
     pb::TimerTable {
-        format_version: FORMAT_VERSION,
+        format_version: OBJECT_FORMAT_VERSION,
         timers: timers.iter().map(timer_to_proto).collect(),
         seal: SEAL,
     }
@@ -101,7 +101,7 @@ pub fn decode_timer_table(bytes: &[u8]) -> Result<Vec<TimerEntry>, CodecError> {
 
 pub fn encode_step_transcript(turn_id: Id128, steps: &[StepRecord]) -> Vec<u8> {
     pb::StepTranscript {
-        format_version: FORMAT_VERSION,
+        format_version: OBJECT_FORMAT_VERSION,
         turn_id: turn_id.0.to_vec(),
         steps: steps.iter().map(step_to_proto).collect(),
         seal: SEAL,
@@ -123,7 +123,7 @@ pub fn decode_step_transcript(bytes: &[u8]) -> Result<(Id128, Vec<StepRecord>), 
 
 pub fn encode_effect_journal(turn_id: Id128, effects: &[EffectRecord]) -> Vec<u8> {
     pb::EffectJournal {
-        format_version: FORMAT_VERSION,
+        format_version: OBJECT_FORMAT_VERSION,
         turn_id: turn_id.0.to_vec(),
         effects: effects.iter().map(effect_to_proto).collect(),
         seal: SEAL,
@@ -154,7 +154,7 @@ pub struct StateSnapshot {
 impl StateSnapshot {
     pub fn encode(&self) -> Vec<u8> {
         pb::StateSnapshot {
-            format_version: FORMAT_VERSION,
+            format_version: OBJECT_FORMAT_VERSION,
             state_version: self.state_version,
             content_type: self.content_type.clone(),
             state: self.state.clone(),
@@ -233,7 +233,7 @@ mod tests {
     fn a_repeated_format_version_field_is_gated_on_its_decoded_value() {
         let found: Result<(), CodecError> = Err(CodecError::UnsupportedFormat { found: 2 });
         let page = with_second_version(encode_inbox_page(&[]), 2);
-        assert_eq!(peek_format_version(&page), Ok(FORMAT_VERSION));
+        assert_eq!(peek_format_version(&page), Ok(OBJECT_FORMAT_VERSION));
         assert_eq!(decode_inbox_page(&page).map(|_| ()), found.clone());
         let table = with_second_version(encode_timer_table(&[]), 2);
         assert_eq!(decode_timer_table(&table).map(|_| ()), found.clone());
