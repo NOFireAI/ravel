@@ -964,8 +964,7 @@ async fn interval_zero_runs_no_periodic_pass_and_polls_sweep_at_the_floor() {
     idle_poll().await;
     assert_eq!(passes(&api.scrape().await), 1);
     fixture.advance(
-        i64::try_from(ravel_server::agents::POLL_SWEEP_FLOOR_MS).expect("floor")
-            * 1_000_000,
+        i64::try_from(ravel_server::agents::POLL_SWEEP_FLOOR_MS).expect("floor") * 1_000_000,
     );
     idle_poll().await;
     assert_eq!(passes(&api.scrape().await), 2);
