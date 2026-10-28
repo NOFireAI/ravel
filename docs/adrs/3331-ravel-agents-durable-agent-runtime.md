@@ -711,7 +711,28 @@ pages. Decision 3 now reads as follows for those lists.
   exact membership with no false negatives, a false-positive read only on
   a 32-bit collision, and 4 bytes per entry against a bloom filter's
   roughly 1.2 bytes at 1% that would cost an expected 0.64 extra reads
-  across 64 pages.
+  across 64 pages. Two receipts sealed under one fingerprint are each
+  found by their own request id at one page read
+  (`colliding_receipt_fingerprints_resolve_to_their_own_receipts`). A
+  command whose missing page the planner did not name loads every sealed
+  page, is answered as the planned path answers it, and is counted in
+  `planner_misses` (`a_planner_miss_loads_every_page_and_is_counted`).
+- **Production read paths.** No production caller reads every page. The
+  runtime's reload of a loaded root, the sweep's per-agent visit and the
+  directory scan read HEAD alone (`AgentStore::read_head_shallow`; the
+  sweep's one GET is pinned in `timers::tests`), and a scan then attaches
+  the inbox page holding the first input and the one holding the active
+  input, one GET each, before it offers the agent. A resumed turn loads
+  its input's page (`a_takeover_resumes_a_turn_whose_input_is_on_a_sealed_inbox_page`,
+  and `cold_restart_resumes_the_active_turn_at_two_entries_a_page`). On
+  the server, over a 769-turn history with 12 sealed pages per list, a
+  result wait reads HEAD, one results page and the output object; an
+  events page reads HEAD, the events page holding the cursor and the
+  event payloads; and a poll reads HEAD for `BeginTurn`, the state and
+  payload objects, and HEAD again for the route's recorded time, with no
+  sealed page (`agents_e2e::hot_routes_read_one_page_of_a_deep_history`).
+  `AgentStore::read_head_full` GETs every page and is the inspection read
+  of the simulator and the tests.
 - **Byte cap.** The guard keeps a page reserve: a guarded command is
   refused while HEAD could not hold the `PageRef`s that the results and
   events its pending work will append can still seal into
@@ -726,19 +747,29 @@ pages. Decision 3 now reads as follows for those lists.
   store test `a_version_one_head_migrates_on_the_next_cas`). A HEAD already
   paged is left as it is.
 
-Rollout replaces the readers-before-writers sequence decision 3 stated.
-That sequence guarded against a version 1 writer re-encoding a version 2
-HEAD and dropping its page references. The version 1 release already
-refuses any HEAD whose format version is above 1 as `UnsupportedFormat`
-before it decodes the rest, and so never re-encodes one
+Rollout replaces the readers-before-writers sequence decision 3 stated,
+and in doing so departs from ADR-0066's readers-first rule under the
+pre-1.0 regime ADR-0531 keeps in force. The basis is that no released
+build contains the agents crates: they landed after v0.27.0, the `agents`
+feature of `services/ravel-server/Cargo.toml` is not among its default
+features (the crate declares none), and the published image's `Dockerfile`
+builds `ravel-server` with `--features sql,flight-sql,otap` only. The
+sequence guarded against a version 1 writer re-encoding a version 2 HEAD
+and dropping its page references. A version 1 build refuses any HEAD whose
+format version is above 1 as `UnsupportedFormat` before it decodes the
+rest, and so never re-encodes one
 (`head::tests::a_version_one_reader_refuses_a_version_two_head`, store test
 `a_newer_head_format_is_unsupported_and_never_written`). Reader and writer
 therefore ship in one release. During a mixed rollout a version 1 node
-answers `UnsupportedFormat` for an agent a version 2 node has written; no
-accepted message is lost.
+answers `UnsupportedFormat` with `RetryHint::Never` for an agent a version
+2 node has written; no accepted message is lost, but that agent is
+unavailable through the version 1 node. A writer rollback is impossible
+once a version 2 HEAD exists: a version 1 build cannot read it, and
+nothing rewrites a version 2 HEAD back to version 1.
 
 Costs this leaves in place: a timer page cannot seal past a timer still
 scheduled, so history behind a long-lived timer stays inline until it
-fires or is cancelled; `AgentStore::read_head`, the inspection read,
-GETs every page; and a command whose page need the planner did not name
-falls back to loading every sealed page HEAD references, with a warning.
+fires or is cancelled; `AgentStore::read_head_full`, the inspection read,
+GETs every page; a poll reads HEAD twice; and a command whose page need
+the planner did not name falls back to loading every sealed page HEAD
+references, with a warning and a `planner_misses` count.

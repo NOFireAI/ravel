@@ -99,7 +99,9 @@ fn agents_classification_table() -> BTreeMap<&'static str, Class> {
     BTreeMap::from([
         // The per-agent root at `ag/<agent_id>/head`: read, modified and
         // written back under CAS, so every additive change bumps the version.
-        ("AgentHead", CasMutable(&[1])),
+        // Version 2 carries the paged index of the ADR-3331 index-page
+        // amendment; readers accept both versions.
+        ("AgentHead", CasMutable(&[1, 2])),
         // Content-addressed objects under `ag/<agent_id>/o/`, written once
         // with CreateIfAbsent and never rewritten.
         ("InboxPage", Immutable(&[1])),
