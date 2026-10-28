@@ -499,6 +499,9 @@ async fn completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_ow
     let effects = listed["effects"].as_array().expect("effects");
     assert_eq!(effects.len(), 1, "{listed}");
     assert_eq!(effects[0]["effect"], json!(effect));
+    assert_eq!(effects[0]["tool_name"], json!("catalog.price"));
+    assert_eq!(effects[0]["tool_version"], json!("1"));
+    assert_eq!(effects[0]["policy"], json!("at_least_once"));
     assert_eq!(effects[0]["status"], json!("completed"));
     assert_eq!(effects[0]["attempt"], json!(2));
     assert_eq!(effects[0]["turn_id"], assigned_b["lease"]["turn_id"]);
@@ -632,6 +635,12 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
     for token in [CLIENT, WORKER, PLAIN] {
         let (status, refused) = api.post(token, "reconcile", &reconcile).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{token}: {refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("requires the agents_admin capability"),
+            "{token}: {refused}"
+        );
     }
     let reconciled = api.ok(ADMIN, "reconcile", &reconcile).await;
     assert_eq!(reconciled["effect"], json!(effect));
@@ -816,8 +825,15 @@ async fn a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail() {
     assert_eq!(steps.len(), 1, "{assigned_b}");
     assert_eq!(steps[0]["status"], json!("started"), "{assigned_b}");
     assert_eq!(steps[0]["output"], Value::Null, "{assigned_b}");
+    assert_ne!(
+        assigned_b["lease"]["turn_id"], assigned_a["lease"]["turn_id"],
+        "the retry runs under a new turn id"
+    );
+    assert_eq!(steps[0]["step_id"], a_step["step"]["step_id"], "{assigned_b}");
     let (status, replayed) = step(&api, &assigned_b, "at_least_once").await;
     assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["effect"], json!(effect), "the retry reuses the effect");
+    assert_eq!(replayed["attempt"], json!(1));
     assert_eq!(replayed["failure"], json!("out of stock"));
     assert_eq!(replayed["step"]["status"], json!("started"));
     assert_eq!(replayed["step"]["output"], Value::Null);
