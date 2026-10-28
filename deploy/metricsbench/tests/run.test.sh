@@ -10,9 +10,19 @@
 #                                       readiness stamped; Ravel's token never
 #                                       on a command line; torn down with
 #                                       down -v
-#   b  ingest fails                  -> exit 70, the message and stamps.json
-#                                       name step ingest, no report.json, still
-#                                       torn down
+#   b  ingest fails, no report       -> exit 70, the message and stamps.json
+#                                       name step ingest, no report.json, no
+#                                       query run, still torn down
+#   q  a row's read-back fails       -> exit 70 naming ingest; every later step
+#                                       still runs, query with
+#                                       --diagnostic-after-failed-ingest, validate
+#                                       refuses the report; mimir-readiness is
+#                                       stamped, not checked
+#   q2 a row stalls                  -> the same, exit 70 naming ingest
+#   q3 q plus an --rss-band breach   -> exit 70 naming ingest, memory listed in
+#                                       failed_after_ingest
+#   r  ingest exits non-zero, every  -> exit 70 naming ingest at once, no
+#      row verified                     capture, no query
 #   c  --ravel-image without digest  -> exit 65, nothing started, no stamps
 #   d  --rss-band breach             -> exit 75, memory-summary.json records
 #                                       the band as above, torn down
@@ -252,11 +262,22 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --*-endpoint)
       sys="${args[$i]#--}"
       sys="${sys%-endpoint}"
-      rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback\":{\"series_count\":1000,\"sample_count\":120000,\"matches_expected\":true,\"mismatches\":[]}}"
+      if [ "${STUB_INGEST_READBACK_FAIL:-}" = "$sys" ]; then
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query samples.0 failed: 422\"}"
+      else
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback\":{\"series_count\":1000,\"sample_count\":120000,\"matches_expected\":true,\"mismatches\":[]}}"
+      fi
       ;;
   esac
 done
-printf '{"profile":{"name":"ci","scrape_interval_secs":15,"run":{"steps":120,"anchor_ms":%s}},"systems":[%s]}\n' "$anchor" "$rows"
+stalled=""
+[ -z "${STUB_INGEST_STALL:-}" ] ||
+  stalled=",\"stalled\":[{\"system\":\"${STUB_INGEST_STALL}\",\"error\":\"projected 9000 s past the 600 s ceiling\"}]"
+printf '{"profile":{"name":"ci","scrape_interval_secs":15,"run":{"steps":120,"anchor_ms":%s}},"systems":[%s]%s}\n' "$anchor" "$rows" "$stalled"
+if [ -n "${STUB_INGEST_READBACK_FAIL:-}${STUB_INGEST_STALL:-}${STUB_INGEST_EXIT_AFTER_REPORT:-}" ]; then
+  echo "stub ingest: a row failed its verification" >&2
+  exit 1
+fi
 STUB
 
 cat >"${BIN}/metricsbench_query" <<'STUB'
@@ -264,8 +285,12 @@ cat >"${BIN}/metricsbench_query" <<'STUB'
 printf 'metricsbench_query %s\n' "$*" >>"${STUB_LOG}"
 printf 'metricsbench_query env token=%s\n' "${METRICSBENCH_RAVEL_TOKEN:+set}" >>"${STUB_LOG}"
 args=("$@")
+verdict=""
+for a in "$@"; do
+  [ "$a" = "--diagnostic-after-failed-ingest" ] && verdict=',"run_verdict":"failed"'
+done
 for ((i = 0; i < ${#args[@]}; i++)); do
-  [ "${args[$i]}" = "--out" ] && printf '{"stub":"report"}\n' >"${args[$((i + 1))]}"
+  [ "${args[$i]}" = "--out" ] && printf '{"stub":"report"%s}\n' "$verdict" >"${args[$((i + 1))]}"
 done
 exit 0
 STUB
@@ -275,7 +300,13 @@ cat >"${BIN}/metricsbench_report" <<'STUB'
 printf 'metricsbench_report %s\n' "$*" >>"${STUB_LOG}"
 case "$1" in
   provenance) printf '{"ravel_git_commit":"%s"}\n' "${GITHUB_SHA}" ;;
-  validate) [ -s "$2" ] || exit 1 ;;
+  validate)
+    [ -s "$2" ] || exit 1
+    if grep -qF run_verdict "$2"; then
+      echo "report $2 does not stand: report is a diagnostic of a failed run, never a result" >&2
+      exit 1
+    fi
+    ;;
 esac
 exit 0
 STUB
@@ -415,6 +446,8 @@ expect_no_log "a: the token never on a command line" "metricsbench-token"
 expect_log "a: ci keeps the in-process row on a memory store" "--store memory --tenant metricsbench"
 check "a: stamps say the in-process row is present" 'j("stamps.json")["in_process_row"] == "present"'
 expect_cp_before_down a
+expect_no_log "a: query is not run as a diagnostic" "--diagnostic-after-failed-ingest"
+check "a: nothing failed after ingest" 'j("stamps.json")["failed_after_ingest"] == []'
 check "a: stamps say RustFS's logs were copied" 'j("stamps.json")["rustfs_logs"] == "copied to rustfs-logs/"'
 expect_file a rustfs-logs/rustfs.log
 
@@ -425,9 +458,52 @@ expect_rc b 70
 expect_err "b: message names step ingest" "step ingest failed"
 check "b: stamps name step ingest, status failed" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed" and j("stamps.json")["exit_code"] == 70'
 expect_no_file b report.json
+expect_no_log "b: no query run" "metricsbench_query"
 expect_log "b: still torn down" " down -v"
 expect_file b memory-summary.json
 expect_cp_before_down b
+
+# --- q: a row's read-back fails ------------------------------------------------
+mapfile -t args < <(full_args "${TMP}/q/out")
+STUB_INGEST_READBACK_FAIL=mimir run_case q "${args[@]}"
+expect_rc q 70
+expect_err "q: message names step ingest and the row" "step ingest failed: metricsbench_ingest exited 1: mimir: read-back failed"
+expect_err "q: message says the run went on as a diagnostic" "the run went on as a diagnostic"
+check "q: stamps name step ingest, status failed, exit 70" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed" and j("stamps.json")["exit_code"] == 70'
+check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["up","qualify","image","ready","sampler","capture","provenance","fold-state","query","validate","memory"]'
+check "q: nothing failed after ingest" 'j("stamps.json")["failed_after_ingest"] == []'
+check "q: Mimir readiness line stamped as not matching" 'j("stamps.json")["mimir_readiness"].startswith("ingest read-back for mimir did not match")'
+expect_log "q: query run as a diagnostic" "--diagnostic-after-failed-ingest"
+check "q: the report says run_verdict failed" 'j("report.json")["run_verdict"] == "failed"'
+expect_log "q: report validated by path" "metricsbench_report validate ${OUT}/report.json"
+expect_err "q: validate refused the diagnostic" "step validate refused the diagnostic report"
+expect_file q memory-summary.json
+expect_log "q: torn down" " down -v"
+
+# --- q2: a row stalls --------------------------------------------------------------
+mapfile -t args < <(full_args "${TMP}/q2/out")
+STUB_INGEST_STALL=victoriametrics run_case q2 "${args[@]}"
+expect_rc q2 70
+expect_err "q2: message names the stalled row" "victoriametrics: stalled"
+check "q2: stamps name step ingest" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["exit_code"] == 70'
+expect_log "q2: query run as a diagnostic" "--diagnostic-after-failed-ingest"
+check "q2: Mimir readiness still checked" '"mimir-readiness" in j("stamps.json")["steps_completed"]'
+
+# --- q3: a failed read-back and an --rss-band breach ------------------------------
+mapfile -t args < <(full_args "${TMP}/q3/out")
+STUB_INGEST_READBACK_FAIL=prometheus STUB_MEM_ravel_server=2GiB run_case q3 "${args[@]}" \
+  --rss-band ravel-server:0:1073741824
+expect_rc q3 70
+check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"]'
+expect_err "q3: the band is still said" "--rss-band ravel-server:0:1073741824 above"
+
+# --- r: ingest fails with every row verified ---------------------------------------
+mapfile -t args < <(full_args "${TMP}/r/out")
+STUB_INGEST_EXIT_AFTER_REPORT=1 run_case r "${args[@]}"
+expect_rc r 70
+check "r: stamps name step ingest" 'j("stamps.json")["failed_step"] == "ingest"'
+expect_no_log "r: no query run" "metricsbench_query"
+expect_no_log "r: capture not run" "capture --out"
 
 # --- c: image without a digest -----------------------------------------------
 run_case c --profile ci --ravel-image ghcr.io/nofireai/ravel-server:latest --ravel-source-commit "${COMMIT}" \
