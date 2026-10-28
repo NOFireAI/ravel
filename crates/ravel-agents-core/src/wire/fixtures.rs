@@ -318,6 +318,7 @@ fn samples() -> Vec<Sample> {
                 step_key: "charge".to_string(),
                 result_attempt: Some(2),
                 result: Some(json!({"charge_id": "ch_2"})),
+                failure: None,
                 attempts: vec![
                     EffectAttemptBody {
                         attempt: 1,
@@ -331,6 +332,7 @@ fn samples() -> Vec<Sample> {
                 evidence: vec![EffectEvidenceBody {
                     attempt: 1,
                     result: json!({"charge_id": "ch_1"}),
+                    failure: None,
                 }],
             },
         ),
@@ -477,7 +479,7 @@ fn samples() -> Vec<Sample> {
                 tool_name: "catalog.price".to_string(),
                 tool_version: "1".to_string(),
                 policy: Policy::AtLeastOnce,
-                input_hash: identity::step_input_hash("catalog.price", "1", b"A-1").to_hex(),
+                input_hash: price_input_hash(),
             },
         ),
         sample(
@@ -488,7 +490,7 @@ fn samples() -> Vec<Sample> {
                     step_key: "price".to_string(),
                     tool_name: "catalog.price".to_string(),
                     tool_version: "1".to_string(),
-                    input_hash: identity::step_input_hash("catalog.price", "1", b"A-1").to_hex(),
+                    input_hash: price_input_hash(),
                     status: StepState::Started,
                     output: None,
                 },
@@ -573,6 +575,13 @@ fn fixtures_match_the_wire_types() {
         .filter(|name| name.ends_with(".json"))
         .collect();
     assert_eq!(present, names, "sdk/fixtures holds a file no sample names");
+}
+
+/// The `input_hash` a worker sends for the `price` step's input
+/// `{"sku": "A-1"}`: the hash of its canonical JSON, as the SDK computes it.
+fn price_input_hash() -> String {
+    let canonical = canonical_json(&json!({"sku": "A-1"}));
+    identity::step_input_hash("catalog.price", "1", canonical.as_bytes()).to_hex()
 }
 
 /// The canonical step-input encoding [`StepRecordRequest::input_hash`]
