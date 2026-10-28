@@ -26,6 +26,11 @@
 //! interleave column admissions with aggregate growth against one memory
 //! budget, under best-effort admission (B) and admission with a headroom
 //! margin (M).
+//!
+//! Trace D keeps Trace C's shape and margin admission, but the step racing a
+//! refused aggregate retry is a checked scan reservation by every other
+//! partition, under an evictor that frees the shortfall (M-exact) or the
+//! shortfall plus the margin (M-slack).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -932,6 +937,210 @@ fn print_trace_c(runs: &[TraceCStats; 4]) {
 }
 
 // ---------------------------------------------------------------------------
+// Trace D: q33 with concurrent checked reservations racing the refused retry.
+
+const D_SCAN: u64 = 2_000_000;
+const D_CAPS: [u64; 3] = [4 * GB, 8 * GB, 12 * GB];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Evictor {
+    /// Frees the shortfall only.
+    Exact,
+    /// Frees the shortfall plus the margin.
+    Slack,
+}
+
+impl Evictor {
+    fn name(self) -> &'static str {
+        match self {
+            Evictor::Exact => "M-exact",
+            Evictor::Slack => "M-slack",
+        }
+    }
+}
+
+const D_RUNS: [(Evictor, u64); 6] = [
+    (Evictor::Exact, D_CAPS[0]),
+    (Evictor::Exact, D_CAPS[1]),
+    (Evictor::Exact, D_CAPS[2]),
+    (Evictor::Slack, D_CAPS[0]),
+    (Evictor::Slack, D_CAPS[1]),
+    (Evictor::Slack, D_CAPS[2]),
+];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TraceDStats {
+    c: TraceCStats,
+    scan_reservations: u64,
+    scan_refusals: u64,
+    /// Largest amount a refused aggregate retry was short by.
+    max_short: u64,
+}
+
+/// Trace C's cache and budget under margin admission, where the step racing a
+/// refused aggregate retry is a checked scan reservation by every other
+/// partition. A partition releases its scan charges at its next block.
+struct TraceD {
+    c: TraceC,
+    evictor: Evictor,
+    scans: [u64; C_PARTITIONS],
+    scan_reservations: u64,
+    scan_refusals: u64,
+    max_short: u64,
+}
+
+impl TraceD {
+    fn new(evictor: Evictor, cap: u64) -> Self {
+        Self {
+            c: TraceC::new(Admission::Margin, cap),
+            evictor,
+            scans: [0; C_PARTITIONS],
+            scan_reservations: 0,
+            scan_refusals: 0,
+            max_short: 0,
+        }
+    }
+
+    /// One evictor pass for a refused reservation of `bytes`.
+    fn evict_for(&mut self, bytes: u64) {
+        let shortfall = (self.c.reserved + bytes).saturating_sub(C_LIMIT);
+        let target = match self.evictor {
+            Evictor::Exact => shortfall,
+            Evictor::Slack => shortfall + self.c.margin,
+        };
+        self.c.stats.evictor_passes += 1;
+        let mut freed = 0;
+        while freed < target {
+            match self.c.evict_one() {
+                Some(bytes) => freed += bytes,
+                None => break,
+            }
+        }
+        self.c.stats.evictor_freed += freed;
+    }
+
+    fn try_scan(&mut self, p: usize) -> bool {
+        if self.c.reserved + D_SCAN > C_LIMIT {
+            return false;
+        }
+        self.c.reserved += D_SCAN;
+        self.c.note_unreserved();
+        self.scans[p] += D_SCAN;
+        self.scan_reservations += 1;
+        true
+    }
+
+    /// A nested checked reservation: on refusal the evictor runs and the
+    /// reservation retries once; a second refusal drops it.
+    fn scan(&mut self, p: usize) {
+        if self.try_scan(p) {
+            return;
+        }
+        self.evict_for(D_SCAN);
+        if !self.try_scan(p) {
+            self.scan_refusals += 1;
+        }
+    }
+
+    fn release_scans(&mut self, p: usize) {
+        self.c.reserved -= self.scans[p];
+        self.scans[p] = 0;
+    }
+
+    /// Partition `p`'s checked aggregate reservation at `block`: on refusal the
+    /// evictor runs, every other partition makes one checked scan reservation,
+    /// and `p` retries once.
+    fn grow(&mut self, p: usize, block: u64) {
+        if self.c.try_grow() {
+            return;
+        }
+        self.evict_for(C_GROW);
+        for q in (0..C_PARTITIONS).filter(|&q| q != p) {
+            self.scan(q);
+        }
+        if !self.c.try_grow() {
+            let short = self.c.reserved + C_GROW - C_LIMIT;
+            self.max_short = self.max_short.max(short);
+            self.c.stats.refusals += 1;
+            self.c.stats.first_refusal_block.get_or_insert(block);
+        }
+    }
+}
+
+fn run_trace_d(evictor: Evictor, cap: u64) -> TraceDStats {
+    let mut sim = TraceD::new(evictor, cap);
+    let mut held: Vec<Vec<u64>> = vec![Vec::new(); C_PARTITIONS];
+    let mut local = [0u64; C_PARTITIONS];
+    for block in 0..C_BLOCKS {
+        let p = (block % C_PARTITIONS as u64) as usize;
+        sim.release_scans(p);
+        for key in std::mem::take(&mut held[p]) {
+            sim.c.hold(key, -1);
+        }
+        for _ in 0..C_COLUMNS {
+            if let Some(key) = sim.c.offer(true) {
+                held[p].push(key);
+            }
+        }
+        local[p] += 1;
+        if local[p].is_multiple_of(C_GROW_EVERY) && sim.c.aggregate < C_AGG_TARGET {
+            sim.grow(p, block);
+        }
+    }
+    sim.c.stats.resident_end = sim.c.resident;
+    TraceDStats {
+        c: sim.c.stats,
+        scan_reservations: sim.scan_reservations,
+        scan_refusals: sim.scan_refusals,
+        max_short: sim.max_short,
+    }
+}
+
+fn trace_d() -> &'static [TraceDStats; 6] {
+    static TRACE: OnceLock<[TraceDStats; 6]> = OnceLock::new();
+    TRACE.get_or_init(|| D_RUNS.map(|(evictor, cap)| run_trace_d(evictor, cap)))
+}
+
+fn trace_d_run(evictor: Evictor, cap: u64) -> TraceDStats {
+    let i = D_RUNS
+        .iter()
+        .position(|r| *r == (evictor, cap))
+        .expect("Trace D run");
+    trace_d()[i]
+}
+
+fn print_trace_d(runs: &[TraceDStats; 6]) {
+    println!(
+        "== Trace D: Trace C's q33 shape and budget, margin on admission; a refused aggregate grow runs the evictor, then each other partition makes one checked 2,000,000 B scan reservation (held to its next block), then the grow retries once"
+    );
+    println!(
+        "policy  cap_GB refusals first_block max_short_MB grows peak_agg_GB cache_end_GB admissions skip_margin evictor_passes evictor_freed_MB scan_res scan_refused min_unreserved_MB"
+    );
+    for ((evictor, cap), d) in D_RUNS.iter().zip(runs) {
+        let s = &d.c;
+        println!(
+            "{:<7} {:>6} {:>8} {:>11} {:>12.1} {:>5} {:>11.3} {:>12.3} {:>10} {:>11} {:>14} {:>16.1} {:>8} {:>12} {:>17.1}",
+            evictor.name(),
+            cap / GB,
+            s.refusals,
+            s.first_refusal_block
+                .map_or_else(|| "-".to_string(), |b| b.to_string()),
+            d.max_short as f64 / MB as f64,
+            s.grows,
+            s.peak_aggregate as f64 / GB as f64,
+            s.resident_end as f64 / GB as f64,
+            s.admissions,
+            s.skipped_margin,
+            s.evictor_passes,
+            s.evictor_freed as f64 / MB as f64,
+            d.scan_reservations,
+            d.scan_refusals,
+            s.min_unreserved as f64 / MB as f64,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 
 #[test]
@@ -1113,4 +1322,54 @@ fn trace_c_margin_4gb_and_12gb_never_refuse() {
 #[test]
 fn decoded_sim_trace_c_report() {
     print_trace_c(trace_c());
+}
+
+/// Trace D (a): an evictor that frees the exact shortfall loses the freed
+/// bytes to concurrent scan reservations and refuses q33's aggregate at 8 GB.
+#[test]
+fn trace_d_exact_8gb_refuses() {
+    let d = trace_d_run(Evictor::Exact, 8 * GB);
+    assert!(
+        d.c.refusals >= 1,
+        "Trace D M-exact 8 GB: {} refusals (first at block {:?}, max short {} B), peak aggregate {} B, {} evictor passes freeing {} B, {} scan reservations; band at least 1",
+        d.c.refusals,
+        d.c.first_refusal_block,
+        d.max_short,
+        d.c.peak_aggregate,
+        d.c.evictor_passes,
+        d.c.evictor_freed,
+        d.scan_reservations
+    );
+}
+
+/// Trace D (b): an evictor that frees the shortfall plus the margin never
+/// refuses q33's aggregate at 4, 8 or 12 GB.
+#[test]
+fn trace_d_slack_never_refuses() {
+    for cap in D_CAPS {
+        let d = trace_d_run(Evictor::Slack, cap);
+        assert_eq!(
+            d.c.refusals,
+            0,
+            "Trace D M-slack {} GB: {} refusals (first at block {:?}, max short {} B), peak aggregate {} B, {} evictor passes freeing {} B",
+            cap / GB,
+            d.c.refusals,
+            d.c.first_refusal_block,
+            d.max_short,
+            d.c.peak_aggregate,
+            d.c.evictor_passes,
+            d.c.evictor_freed
+        );
+        assert!(
+            d.c.peak_aggregate >= C_AGG_TARGET,
+            "Trace D M-slack {} GB: peak aggregate {} B, target {C_AGG_TARGET}",
+            cap / GB,
+            d.c.peak_aggregate
+        );
+    }
+}
+
+#[test]
+fn decoded_sim_trace_d_report() {
+    print_trace_d(trace_d());
 }
