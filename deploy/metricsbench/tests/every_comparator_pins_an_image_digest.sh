@@ -170,8 +170,11 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # ci.yml's per-PR `quickstart` job was removed (ADR-0081 A6): a checkout and a
 # rust-cache. Lowered 110->109 when k8s-nightly.yml's `k8s-build` job moved its
 # cargo build into the builder image and dropped its sccache-action step,
-# which no longer reached the build (#3146).
-WORKFLOW_EXPECTED_ACTION_COUNT=109
+# which no longer reached the build (#3146). Raised 109->115 when ci.yml
+# gained the features-agents and features-mcp jobs (a checkout and a
+# rust-cache each) and the sdk job (a checkout and a setup-node), epic
+# #3331 task T2.
+WORKFLOW_EXPECTED_ACTION_COUNT=115
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
