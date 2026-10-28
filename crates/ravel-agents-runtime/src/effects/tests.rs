@@ -1280,3 +1280,56 @@ async fn a_completed_turn_with_an_open_attempt_does_not_wedge_the_next_turn() {
         .collect();
     assert_eq!(open, vec![(e.effect.effect_id, 1)]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_reconciled_attempt_survives_a_takeover_before_the_next_step() {
+    let (clock, store, co) = rig();
+    let (a, _) = leased(&co, "o-1").await;
+    let s = spec("wire-funds", RecoveryPolicy::Manual);
+    let hook = Hook::default();
+    let d1 = dispatched(&co, &a, &s, &hook).await;
+    let b = takeover(&co, &clock).await;
+    let err = co
+        .run_step(&b.lease, &s, &hook)
+        .await
+        .expect_err("in doubt");
+    assert_eq!(err.kind, ErrorKind::EffectInDoubt);
+    assert!(
+        co.reconcile_authorize(&d1.effect, 2)
+            .await
+            .expect("authorize")
+    );
+
+    // B abandoned the blocked turn; its lease expires before its next step.
+    let c = takeover(&co, &clock).await;
+    assert_ne!(
+        (&c.lease.owner_id, c.lease.epoch),
+        (&b.lease.owner_id, b.lease.epoch)
+    );
+    let d2 = dispatched(&co, &c, &s, &hook).await;
+    assert_eq!((d2.effect, d2.attempt), (d1.effect, 2));
+    assert_eq!(hook.calls(), 2, "the new owner's step dispatched attempt 2");
+    let err = co
+        .run_step(&c.lease, &s, &hook)
+        .await
+        .expect_err("attempt 2 is open");
+    assert_eq!(err.kind, ErrorKind::IdempotencyConflict);
+    assert_eq!(hook.calls(), 2, "dispatched once");
+    let h = head(&store, "o-1").await;
+    assert_eq!(
+        (effect_of(&h, &d1).status, effect_of(&h, &d1).attempt),
+        (EffectStatus::Authorized, 2)
+    );
+
+    assert_eq!(
+        co.complete_effect(&d2.effect, 2, &json!({"cents": 1700}))
+            .await
+            .expect("result"),
+        EffectSettled::Recorded
+    );
+    assert_eq!(
+        step_output(&co, &c, &s, &hook).await,
+        json!({"cents": 1700})
+    );
+    assert_eq!(hook.calls(), 2);
+}

@@ -224,9 +224,9 @@ pub(crate) struct OpenAttempt {
     incarnation: u64,
     accept_seq: u64,
     attempt: u32,
-    /// Authorized by [`Coordinator::reconcile_authorize`] and not yet handed
-    /// to the owner: the owner's next `run_step` for the effect's step
-    /// dispatches it.
+    /// Authorized by [`Coordinator::reconcile_authorize`] and not yet
+    /// claimed: the next `run_step` for the effect's step under the same
+    /// incarnation, whichever owner and epoch it runs under, dispatches it.
     reconciled: bool,
 }
 
@@ -361,7 +361,7 @@ impl Coordinator {
         };
         let attempt = match &journal.effect {
             Some(effect) if reconciled => {
-                if let Err(err) = self.refuse_cancelled(&agent).await {
+                if let Err(err) = self.refuse_cancelled_fresh(&agent).await {
                     self.release_reconciled(&agent, effect.effect_id);
                     return Err(err);
                 }
@@ -610,11 +610,15 @@ impl Coordinator {
         Ok(true)
     }
 
-    /// Claim the attempt of `effect` a reconcile handed to the fence's owner,
-    /// if it holds one not yet dispatched: `true` once, for the one
-    /// `run_step` that dispatches it. A concurrent step that finds the
-    /// attempt already claimed is refused `IdempotencyConflict`, since that
-    /// attempt is open.
+    /// Claim the attempt of `effect` a reconcile handed over, if this
+    /// coordinator holds it unclaimed: `true` once, for the one `run_step`
+    /// that dispatches it. The hand-over is keyed on the incarnation and the
+    /// attempt, not on the owner, since `Authority::Reconcile` is fenced by
+    /// incarnation only and an unclaimed record proves no step in this
+    /// process dispatched the attempt; a takeover between the reconcile and
+    /// the next step does not lose it. The claim moves the record to the
+    /// fence's owner and epoch, so a concurrent step of that owner is refused
+    /// `IdempotencyConflict`, since the attempt is open.
     fn claim_reconciled(
         &self,
         agent: &AgentId,
@@ -628,22 +632,23 @@ impl Coordinator {
         let Some(open) = attempts.get_mut(&(*agent, effect.effect_id)) else {
             return Ok(false);
         };
-        if open.owner_id != fence.owner.owner_id
-            || open.epoch != fence.owner.epoch
-            || open.incarnation != fence.owner.incarnation
-            || open.attempt != effect.attempt
-        {
+        if open.incarnation != fence.owner.incarnation || open.attempt != effect.attempt {
             return Ok(false);
         }
-        if !open.reconciled {
+        if open.reconciled {
+            open.reconciled = false;
+            open.owner_id = fence.owner.owner_id.clone();
+            open.epoch = fence.owner.epoch;
+            return Ok(true);
+        }
+        if open.owner_id == fence.owner.owner_id && open.epoch == fence.owner.epoch {
             return Err(refused(
                 agent,
                 ErrorKind::IdempotencyConflict,
                 "a step's attempt is still open; steps are sequential",
             ));
         }
-        open.reconciled = false;
-        Ok(true)
+        Ok(false)
     }
 
     /// Hand a claimed reconciled attempt back when its step was refused
@@ -738,8 +743,8 @@ impl Coordinator {
             .iter()
             .filter(|((a, _), open)| {
                 a == agent
-                    && open.owner_id == fence.owner.owner_id
-                    && open.epoch == fence.owner.epoch
+                    && ((open.owner_id == fence.owner.owner_id && open.epoch == fence.owner.epoch)
+                        || (open.reconciled && open.incarnation == fence.owner.incarnation))
             })
             .map(|((_, effect_id), open)| {
                 (*effect_id, open.accept_seq, open.attempt, open.reconciled)
@@ -781,15 +786,18 @@ impl Coordinator {
     /// Drop the attempts recorded for `agent` under an epoch older than
     /// `head`'s, since no lease of that epoch can journal another step, and
     /// those whose input `head` shows settled, since no step of that input
-    /// follows.
+    /// follows. An unclaimed hand-over outlives its epoch: whichever owner
+    /// runs the step next dispatches it.
     pub(crate) fn prune_open_attempts(&self, agent: &AgentId, head: &Head) {
         let mut attempts = self.open_attempts.lock();
         if attempts.is_empty() {
             return;
         }
         attempts.retain(|(a, _), open| {
+            let current = open.epoch >= head.epoch
+                || (open.reconciled && open.incarnation == head.incarnation);
             a != agent
-                || (open.epoch >= head.epoch
+                || (current
                     && !(open.incarnation == head.incarnation
                         && head.results.iter().any(|r| r.accept_seq == open.accept_seq)))
         });
@@ -803,18 +811,15 @@ impl Coordinator {
             Some(head) => head,
             None => self.reload(agent).await?,
         };
-        if head
-            .active_turn
-            .as_ref()
-            .is_some_and(|t| t.cancellation == Cancellation::Requested)
-        {
-            return Err(refused(
-                agent,
-                ErrorKind::OwnershipLost,
-                "EffectStateAdmits: the effect's input is being cancelled",
-            ));
-        }
-        Ok(())
+        refuse_cancelling(agent, &head)
+    }
+
+    /// [`Coordinator::refuse_cancelled`] against HEAD read now. A hand-over
+    /// can wait on an operator for longer than any lease, so its dispatch is
+    /// checked against a fresh read rather than the loaded root.
+    async fn refuse_cancelled_fresh(&self, agent: &AgentId) -> Result<(), AgentError> {
+        let head = self.reload(agent).await?;
+        refuse_cancelling(agent, &head)
     }
 
     /// Run an effect command, running it again while its outcome is unknown.
@@ -875,6 +880,21 @@ impl Coordinator {
 }
 
 /// The effect HEAD journals for `step_key` under the active turn's input.
+fn refuse_cancelling(agent: &AgentId, head: &Head) -> Result<(), AgentError> {
+    if head
+        .active_turn
+        .as_ref()
+        .is_some_and(|t| t.cancellation == Cancellation::Requested)
+    {
+        return Err(refused(
+            agent,
+            ErrorKind::OwnershipLost,
+            "EffectStateAdmits: the effect's input is being cancelled",
+        ));
+    }
+    Ok(())
+}
+
 fn step_effect<'a>(head: &'a Head, step_key: &str) -> Option<&'a EffectRecord> {
     let turn = head.active_turn.as_ref()?;
     let id = effect_id(head.incarnation, turn.input_accept_seq, step_key);
