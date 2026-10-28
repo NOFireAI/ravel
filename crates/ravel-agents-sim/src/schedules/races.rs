@@ -234,7 +234,7 @@ const CANCELS_WON: usize = 46;
 /// production answers `requested: true`; ADR-3331 decision 5 and the wire
 /// doc answer `requested: false`, since the cancel itself ends the input.
 #[test]
-#[ignore = "suspected defect: kernel cancel of an accepted input answers requested=true"]
+#[ignore = "suspected defect #3404: kernel cancel of an accepted input answers requested=true"]
 fn cancel_of_an_accepted_input_reports_requested_false() {
     let rig = Rig::new(FaultPlan::empty());
     create_with_inputs(&rig, 1);

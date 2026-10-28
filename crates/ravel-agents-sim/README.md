@@ -103,7 +103,8 @@ Each of these is a test in the crate:
 
 - `races::cancel_of_an_accepted_input_reports_requested_false` (ignored):
   production answers `requested: true` when it cancels an input no turn
-  has bound. ADR-3331 and the wire doc say `requested: false`.
+  has bound. ADR-3331 and the wire doc say `requested: false`. Tracked
+  on #3404.
 - `effects::takeover_retried_on_fresh_head_fences_a_live_turn` (ignored):
   two workers poll at once. One begins the turn while the other's
   takeover loses its CAS; the store's publish loop re-applies the takeover
@@ -112,6 +113,7 @@ Each of these is a test in the crate:
   `Coordinator::takeover_due` documents a takeover as allowed only while
   the owner holds no active turn or its lease and grace ran out, a check
   the retry never repeats. 25 of the 64 seeds reach it with no fault.
+  Tracked on #3415.
 - `workers::stale_owner_commit_after_takeover_is_fenced`: the reference
   machine cannot express the ownership fence.
 - `workers::lost_commit_ack_then_takeover_is_a_known_false_negative`: an
