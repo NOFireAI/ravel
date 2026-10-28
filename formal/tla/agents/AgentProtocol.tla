@@ -41,7 +41,8 @@
 (* Witnesses: `lastCas` holds the HEAD content and version read from the  *)
 (* store immediately before and after the HEAD write the step just taken  *)
 (* made, and NoCas after a step that wrote no HEAD (the write was checked *)
-(* in the state right after it, and forgetting it merges states);         *)
+(* in the state right after it, and forgetting it merges states). Next    *)
+(* derives it from store and store' (CasWitness); no action sets it;      *)
 (* `acked` holds the handle each client was returned. Every invariant     *)
 (* reads the store, lastCas or acked, never a flag the action under check *)
 (* sets about itself.                                                     *)
@@ -150,14 +151,21 @@ FreshHead(ak, inc, rev, owner, epoch, turns, gen) ==
      results |-> {}, nextSeq |-> 0, active |-> NoTurn, turns |-> turns,
      cancels |-> {}, timer |-> [gen |-> gen, st |-> "none"]]
 
-\* Record the store's HEAD content and version on both sides of a write.
-\* Must follow the conjunct that sets store'.
-RecordCas(ak) ==
-    lastCas' = [ak |-> ak,
-                before |-> IF HeadUp(ak) THEN Head(ak) ELSE NoC,
-                vb |-> Store!VersionOf(HeadKey(ak)),
-                after |-> store'[HeadKey(ak)].content,
-                va |-> store'[HeadKey(ak)].version]
+\* The witness is derived once per step, in Next, from store and store': no
+\* action sets it, so no action can describe its own write. Every action
+\* writes at most one HEAD; the witness records that HEAD's content and
+\* version on both sides of the step, or NoCas when no HEAD changed.
+ChangedHeads == {ak \in AKs : store'[HeadKey(ak)] # store[HeadKey(ak)]}
+
+CasWitness ==
+    lastCas' =
+        IF ChangedHeads = {} THEN NoCas
+        ELSE LET ak == CHOOSE x \in ChangedHeads : TRUE
+             IN [ak |-> ak,
+                 before |-> IF HeadUp(ak) THEN Head(ak) ELSE NoC,
+                 vb |-> Store!VersionOf(HeadKey(ak)),
+                 after |-> store'[HeadKey(ak)].content,
+                 va |-> store'[HeadKey(ak)].version]
 
 CasOk(ak, v) == Store!CasResult(HeadKey(ak), v) = "Ok"
 
@@ -168,9 +176,7 @@ CasOk(ak, v) == Store!CasResult(HeadKey(ak), v) = "Ok"
 \* CAS loses no behaviour. CasNow is that folded CAS on the current version.
 \* Where a dependency PUT sits between the read and the CAS (enqueue, turn
 \* completion) the two stay separate actions.
-CasNow(ak, new) ==
-    /\ Store!PutCasVersion(HeadKey(ak), Store!VersionOf(HeadKey(ak)), new)
-    /\ RecordCas(ak)
+CasNow(ak, new) == Store!PutCasVersion(HeadKey(ak), Store!VersionOf(HeadKey(ak)), new)
 
 \* --- Root transitions (pure functions of an observed HEAD) ---------------
 
@@ -254,7 +260,6 @@ Init ==
 CreateHead(ak) ==
     /\ ~HeadUp(ak)
     /\ Store!PutCreateIfAbsent(HeadKey(ak), FreshHead(ak, 1, 1, NoWorker, 0, 0, 0))
-    /\ RecordCas(ak)
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* Administrative writes are one read and one CAS on the version read.
@@ -325,7 +330,6 @@ ReadHead(c) ==
                  /\ SetCl(c, [cl[c] EXCEPT !.pc = "dep", !.ver = Store!VersionOf(CK(c)),
                                            !.obs = h])
                  /\ UNCHANGED acked
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
 \* The enqueue CAS: links the payload, allocates accept_seq, records the
@@ -338,10 +342,8 @@ EnqueueCas(c) ==
         new == EnqueueHead(h, cl[c].rid, Hc(c))
     IN /\ Store!PutCasVersion(CK(c), cl[c].ver, new)
        /\ IF CasOk(ak, cl[c].ver)
-            THEN /\ AckWith(c, [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))])
-                 /\ RecordCas(ak)
+            THEN AckWith(c, [ak |-> ak, rcpt |-> NewReceipt(h, cl[c].rid, Hc(c))])
             ELSE /\ SetCl(c, [cl[c] EXCEPT !.pc = "start", !.ver = 0, !.obs = NoC])
-                 /\ lastCas' = NoCas
                  /\ UNCHANGED acked
     /\ UNCHANGED <<wk, co, crashedOnce, due>>
 
@@ -353,10 +355,7 @@ CasHead(c) ==
 \* sees an unknown outcome, never a success.
 CasHeadLostResponse(c) ==
     /\ cl[c].pc = "dep"
-    /\ LET ak == cl[c].ak
-           new == EnqueueHead(cl[c].obs, cl[c].rid, Hc(c))
-       IN /\ Store!PutCasVersionLostResponse(CK(c), cl[c].ver, new)
-          /\ IF CasOk(ak, cl[c].ver) THEN RecordCas(ak) ELSE lastCas' = NoCas
+    /\ Store!PutCasVersionLostResponse(CK(c), cl[c].ver, EnqueueHead(cl[c].obs, cl[c].rid, Hc(c)))
     /\ SetCl(c, [cl[c] EXCEPT !.pc = "unknown", !.ver = 0, !.obs = NoC])
     /\ UNCHANGED <<wk, co, crashedOnce, due, acked>>
 
@@ -399,10 +398,8 @@ SetWk(w, f) == wk' = [wk EXCEPT ![w] = f]
 WorkerCas(w, new, okPc, failPc) ==
     /\ Store!PutCasVersion(WK(w), wk[w].ver, new)
     /\ IF CasOk(wk[w].ak, wk[w].ver)
-         THEN /\ RecordCas(wk[w].ak)
-              /\ SetWk(w, IF okPc = "idle" THEN WorkerIdle ELSE [wk[w] EXCEPT !.pc = okPc])
-         ELSE /\ lastCas' = NoCas
-              /\ SetWk(w, IF failPc = "idle" THEN WorkerIdle ELSE [wk[w] EXCEPT !.pc = failPc])
+         THEN SetWk(w, IF okPc = "idle" THEN WorkerIdle ELSE [wk[w] EXCEPT !.pc = okPc])
+         ELSE SetWk(w, IF failPc = "idle" THEN WorkerIdle ELSE [wk[w] EXCEPT !.pc = failPc])
 
 \* Claim an agent with work (pending input or an armed timer) by advancing
 \* its epoch.
@@ -448,7 +445,6 @@ PutTurnOutput(w, ak) ==
           /\ SetWk(w, [pc |-> "dep", ak |-> ak, ver |-> Store!VersionOf(HeadKey(ak)),
                        obs |-> h, turn |-> a.turn, seq |-> a.seq, base |-> a.base,
                        epoch |-> h.epoch, inc |-> a.inc])
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
 \* The final turn CAS: new state, consumed input and its result together.
@@ -460,7 +456,6 @@ CompleteTurn(w) ==
 CompleteTurnLostResponse(w) ==
     /\ wk[w].pc = "dep"
     /\ Store!PutCasVersionLostResponse(WK(w), wk[w].ver, CompleteHead(Ob(w), wk[w], "completed", w))
-    /\ IF CasOk(wk[w].ak, wk[w].ver) THEN RecordCas(wk[w].ak) ELSE lastCas' = NoCas
     /\ SetWk(w, [wk[w] EXCEPT !.pc = "rebase"])
     /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
@@ -486,8 +481,7 @@ CompleteTurnRebase(w) ==
        IN IF ~OwnResult(w, h) /\ ~h.tomb /\ h.owner = w /\ h.epoch = wk[w].epoch
                 /\ h.active.turn = wk[w].turn /\ h.sv = wk[w].base
             THEN CasNow(ak, CompleteHead(h, wk[w], "completed", w))
-            ELSE /\ UNCHANGED sVars
-                 /\ lastCas' = NoCas
+            ELSE UNCHANGED sVars
     /\ SetWk(w, WorkerIdle)
     /\ UNCHANGED <<cl, co, crashedOnce, due, acked>>
 
@@ -527,7 +521,6 @@ WorkerCrash(w) ==
     /\ w \notin crashedOnce
     /\ crashedOnce' = crashedOnce \cup {w}
     /\ SetWk(w, WorkerIdle)
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<sVars, cl, co, due, acked>>
 
 \* --- Timers, hints and the sweep -------------------------------------------
@@ -542,7 +535,6 @@ WriteHint(ak) ==
     /\ co[ak] < Head(ak).timer.gen
     /\ Store!PutOverwrite(HintKey(ak, Head(ak).timer.gen), <<"hint", Head(ak).timer.gen>>)
     /\ co' = [co EXCEPT ![ak] = Head(ak).timer.gen]
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<cl, wk, crashedOnce, due, acked>>
 
 \* Time passes for the armed generation (environment; no clock is read).
@@ -551,7 +543,6 @@ TimerDue(ak) ==
     /\ Head(ak).timer.st = "armed"
     /\ due[ak] < Head(ak).timer.gen
     /\ due' = [due EXCEPT ![ak] = Head(ak).timer.gen]
-    /\ lastCas' = NoCas
     /\ UNCHANGED <<sVars, cl, wk, co, crashedOnce, acked>>
 
 \* The sweep serves a due hint: it reads the HEAD the hint names and, when
@@ -570,13 +561,12 @@ FireTimer(ak, g) ==
     /\ LET h == Head(ak)
        IN IF h.timer = [gen |-> g, st |-> "armed"] /\ ~h.tomb
             THEN CasNow(ak, FireHead(h, g))
-            ELSE /\ Store!Delete(HintKey(ak, g))
-                 /\ lastCas' = NoCas
+            ELSE Store!Delete(HintKey(ak, g))
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* --- Specification --------------------------------------------------------
 
-Next ==
+Step ==
     \/ \E ak \in AKs : CreateHead(ak) \/ Destroy(ak) \/ Recreate(ak)
     \/ \E c \in Clients :
          \/ ReadHead(c) \/ CasHead(c) \/ CasHeadLostResponse(c) \/ Cancel(c)
@@ -590,24 +580,28 @@ Next ==
          \/ WriteHint(ak) \/ TimerDue(ak)
          \/ \E g \in 1..MaxTimerGen : FireTimer(ak, g)
 
+\* Every step records its HEAD write in the witness (CasWitness).
+Next == Step /\ CasWitness
+
 Spec == Init /\ [][Next]_vars
 
 \* Liveness assumptions: a crashed worker restarts (a compatible worker
 \* stays available), workers keep acting on accepted work, the scheduler
 \* writes its hint and the sweep keeps serving due hints. Store
 \* availability: a transient failure is a stutter, which weak fairness rules
-\* out forever; contention is bounded because every writer is.
+\* out forever; contention is bounded because every writer is. Each fair
+\* action is taken with the witness, as Next takes it.
 Fairness ==
     /\ \A w \in Workers :
-         /\ WF_vars(\E ak \in AKs : Takeover(w, ak))
-         /\ WF_vars(\E ak \in AKs : BeginTurn(w, ak))
-         /\ WF_vars(\E ak \in AKs : PutTurnOutput(w, ak))
-         /\ WF_vars(CompleteTurn(w))
-         /\ WF_vars(CompleteTurnRebase(w))
+         /\ WF_vars((\E ak \in AKs : Takeover(w, ak)) /\ CasWitness)
+         /\ WF_vars((\E ak \in AKs : BeginTurn(w, ak)) /\ CasWitness)
+         /\ WF_vars((\E ak \in AKs : PutTurnOutput(w, ak)) /\ CasWitness)
+         /\ WF_vars(CompleteTurn(w) /\ CasWitness)
+         /\ WF_vars(CompleteTurnRebase(w) /\ CasWitness)
     /\ \A ak \in AKs :
-         /\ WF_vars(CreateHead(ak))
-         /\ WF_vars(WriteHint(ak))
-         /\ WF_vars(\E g \in 1..MaxTimerGen : FireTimer(ak, g))
+         /\ WF_vars(CreateHead(ak) /\ CasWitness)
+         /\ WF_vars(WriteHint(ak) /\ CasWitness)
+         /\ WF_vars((\E g \in 1..MaxTimerGen : FireTimer(ak, g)) /\ CasWitness)
 
 FairSpec == Spec /\ Fairness
 
