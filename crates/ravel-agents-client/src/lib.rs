@@ -307,6 +307,12 @@ impl AgentsClient {
             .await
     }
 
+    /// `GET /api/v1/agents/health`: the agents feature mode and settings. It
+    /// answers without a token, so it doubles as a readiness probe.
+    pub async fn health(&self) -> Result<Value, ClientError> {
+        self.get("health", &[], DEFAULT_TIMEOUT).await
+    }
+
     pub async fn create(&self, agent: &AgentRef) -> Result<CreateAgentResponse, ClientError> {
         let body = CreateAgentRequest {
             agent: agent.clone(),
@@ -848,6 +854,7 @@ mod tests {
             (200, json!({"operation": "op", "status": "cancelled", "requested": false})),
             (200, json!({"effect": "e/1", "status": "completed", "attempt": 1})),
             (200, json!({"outcome": "cancelled"})),
+            (200, json!({"mode": "enabled"})),
         ])
         .await;
         let client = server.client();
@@ -867,6 +874,7 @@ mod tests {
             })
             .await
             .expect("cancel timer");
+        client.health().await.expect("health");
         let seen = server.seen();
         let shape: Vec<(&str, &str)> = seen
             .iter()
@@ -882,6 +890,7 @@ mod tests {
                 ("POST", "/api/v1/agents/cancel"),
                 ("POST", "/api/v1/agents/reconcile"),
                 ("DELETE", "/api/v1/agents/timers"),
+                ("GET", "/api/v1/agents/health"),
             ]
         );
         assert!(seen.iter().all(|s| s.auth == "Bearer tok"));

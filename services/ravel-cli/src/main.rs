@@ -189,6 +189,21 @@ fn command_hashes_tenant(command: &Command) -> bool {
             TenantCommand::Token { .. } => false,
             TenantCommand::ParquetGrant { .. } => true,
         },
+        // The agents reads open HEAD and its objects under
+        // `t/<tenant_hash>/ag/` from their `--tenant`. `dev` and `scaffold`
+        // address no tenant prefix themselves (dev's `store qualify` child
+        // runs its own gate), and `reconcile` leaves the hashing to the
+        // server it calls.
+        Command::Agents { command } => match command {
+            AgentsCommand::List { .. }
+            | AgentsCommand::Inspect { .. }
+            | AgentsCommand::Operation { .. }
+            | AgentsCommand::Events { .. }
+            | AgentsCommand::Effects { .. } => true,
+            AgentsCommand::Dev { .. }
+            | AgentsCommand::Scaffold { .. }
+            | AgentsCommand::Reconcile { .. } => false,
+        },
     }
 }
 
@@ -336,6 +351,20 @@ fn command_is_write(command: &Command) -> bool {
         | Command::Cache { .. }
         // `inspect cstat` and `inspect kidx` only read the named object.
         | Command::Inspect { .. } => false,
+        // The agents reads only read. `reconcile` writes through the server,
+        // which owns the bucket's write gate; `scaffold` writes local files;
+        // `dev` writes only through its `store qualify` child, which clears
+        // the gate itself.
+        Command::Agents { command } => match command {
+            AgentsCommand::List { .. }
+            | AgentsCommand::Inspect { .. }
+            | AgentsCommand::Operation { .. }
+            | AgentsCommand::Events { .. }
+            | AgentsCommand::Effects { .. }
+            | AgentsCommand::Reconcile { .. }
+            | AgentsCommand::Scaffold { .. }
+            | AgentsCommand::Dev { .. } => false,
+        },
     }
 }
 
@@ -407,6 +436,13 @@ enum Command {
     Idem {
         #[command(subcommand)]
         command: IdemCommand,
+    },
+    /// Ravel Agents (ADR-3331 decision 11): read agent state straight from
+    /// the bucket, settle an effect through the server, start a development
+    /// server, and scaffold the TypeScript example.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
     },
     /// Inspect the bucket's tenant-hash scheme marker (ADR-0050 section 3).
     Tenancy {
@@ -1752,6 +1788,160 @@ enum IdemCommand {
     },
 }
 
+/// Names one agent: the id `agents list` prints, or `--kind` and `--key`.
+#[derive(Debug, clap::Args)]
+struct AgentArg {
+    /// The agent id (32 hex characters), as `agents list` prints it.
+    #[arg(conflicts_with_all = ["kind", "key"], required_unless_present_all = ["kind", "key"])]
+    agent: Option<String>,
+    /// The agent's kind; with `--key`, instead of the id.
+    #[arg(long, requires = "key")]
+    kind: Option<String>,
+    /// The agent's key; with `--kind`, instead of the id.
+    #[arg(long, requires = "kind")]
+    key: Option<String>,
+}
+
+impl AgentArg {
+    fn selector(self) -> anyhow::Result<ravel_cli::agents::AgentSelector> {
+        Ok(ravel_cli::agents::AgentSelector::from_flags(
+            self.agent, self.kind, self.key,
+        )?)
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentsCommand {
+    /// Start a development server on the compose RustFS store: bring RustFS
+    /// up when the bucket does not answer, wait for the `createbucket`
+    /// service, run `store qualify`, then start `ravel-server --agents` on
+    /// loopback with a fresh token holding the agents, agents_worker and
+    /// agents_admin capabilities for tenant `dev`, and print it. Refuses the
+    /// memory store, an omitted `--store` included, before starting anything.
+    Dev {
+        /// The compose file that defines the `rustfs` and `createbucket`
+        /// services.
+        #[arg(long, value_name = "FILE", default_value = ravel_cli::agents::DEV_COMPOSE_FILE)]
+        compose_file: std::path::PathBuf,
+        /// The `ravel-server` binary to start; it must be built with the
+        /// `agents` feature.
+        #[arg(long, value_name = "PATH", env = "RAVEL_SERVER_BIN", default_value = "ravel-server")]
+        server_bin: std::path::PathBuf,
+        /// HTTP listener for the server; refused unless loopback.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:4318")]
+        listen: std::net::SocketAddr,
+        /// OTLP gRPC listener for the server; refused unless loopback.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:4317")]
+        listen_grpc: std::net::SocketAddr,
+        /// Print the ready line as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write the TypeScript assistant example into DIR. Refuses a DIR that
+    /// exists and is not empty.
+    Scaffold {
+        /// Directory to create or fill.
+        dir: std::path::PathBuf,
+        /// Print the files written as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the tenant's agents from the bucket's agent directory, one
+    /// bounded page at a time.
+    List {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// Most agents to print; above 1000 is refused.
+        #[arg(long, default_value_t = ravel_cli::agents::LIST_LIMIT_DEFAULT)]
+        limit: usize,
+        /// The `next_cursor` a previous page printed.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Print the page as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print an agent's HEAD from the bucket: state version, state, active
+    /// turn, mailbox depth and timers. Needs no server.
+    Inspect {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        #[command(flatten)]
+        agent: AgentArg,
+        /// Print the `state` route's body plus the HEAD fields as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print an operation's status from its agent's HEAD in the bucket.
+    Operation {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// The operation handle `send` or `call` returned.
+        handle: String,
+        /// Print the `operation` route's body as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one page of an agent's events from the bucket, after a cursor.
+    Events {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        #[command(flatten)]
+        agent: AgentArg,
+        /// The `next_cursor` a previous page printed; omitted reads from the
+        /// first event.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Most events to print; above 1000 is refused.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Print the `events` route's body as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print every effect an agent's HEAD journals, from the bucket.
+    Effects {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        #[command(flatten)]
+        agent: AgentArg,
+        /// Print the `effects` route's body as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Settle an effect in doubt through the server: attach the result the
+    /// operator confirmed, or authorize one more attempt. Needs a token
+    /// with the agents_admin capability.
+    Reconcile {
+        /// The effect handle, as `agents effects` or `agents operation`
+        /// prints it.
+        effect: String,
+        /// The attempt the decision is about.
+        #[arg(long)]
+        attempt: u32,
+        /// The confirmed result, as JSON.
+        #[arg(long, value_name = "JSON", conflicts_with = "authorize_attempt", required_unless_present = "authorize_attempt")]
+        attach_result: Option<String>,
+        /// Authorize the next attempt instead.
+        #[arg(long)]
+        authorize_attempt: bool,
+        /// The server's HTTP root.
+        #[arg(long, default_value = "http://127.0.0.1:4318")]
+        url: String,
+        /// Bearer token with agents_admin.
+        #[arg(long, env = "RAVEL_AGENTS_TOKEN", hide_env_values = true)]
+        token: String,
+        /// Print the `reconcile` route's body as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum TenancyCommand {
     /// Print the bucket's `sys/tenancy` marker: its scheme and, for a keyed
@@ -2433,6 +2623,145 @@ fn run_ipcrypt_transform(
     )
 }
 
+/// `ravel-cli agents`. The reads run after `run_logged` installed the
+/// bucket's tenant-hash scheme.
+async fn run_agents(
+    command: AgentsCommand,
+    store_args: &store::StoreArgs,
+    tenancy: &TenancyArgs,
+) -> anyhow::Result<()> {
+    use ravel_cli::agents;
+    let stdout = &mut std::io::stdout();
+    let reader = |tenant: &str| {
+        let hash = TenantId::new(tenant).hash();
+        Ok::<_, anyhow::Error>((agents::reader(store::build_store(store_args)?, hash), hash))
+    };
+    match command {
+        AgentsCommand::Dev {
+            compose_file,
+            server_bin,
+            listen,
+            listen_grpc,
+            json,
+        } => {
+            let options = agents::DevOptions {
+                store: store_args.selection(),
+                listen_http: listen,
+                listen_grpc,
+            };
+            agents::check_dev(&options)?;
+            let tenancy_flags = match &tenancy.tenant_hash_key_file {
+                Some(file) => vec![
+                    "--tenant-hash-key-file".to_string(),
+                    file.display().to_string(),
+                ],
+                None => vec!["--tenant-hash-unkeyed".to_string()],
+            };
+            let store_env = [
+                ("RAVEL_S3_ACCESS_KEY", &store_args.s3_access_key),
+                ("RAVEL_S3_SECRET_KEY", &store_args.s3_secret_key),
+                ("RAVEL_S3_SESSION_TOKEN", &store_args.s3_session_token),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| value.clone().map(|v| (name.to_string(), v)))
+            .collect();
+            let mut host = agents::ProcessDevHost {
+                compose_file,
+                server_bin,
+                listen_http: listen,
+                listen_grpc,
+                store_flags: store_args.echo_flags(&|_| true),
+                tenancy_flags,
+                store_env,
+                probe: store::build_store(store_args)?,
+                child: None,
+                token_dir: None,
+            };
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            agents::run_dev(&options, &mut host, &token, stdout, json).await
+        }
+        AgentsCommand::Scaffold { dir, json } => {
+            let written = agents::scaffold(&dir)?;
+            let names: Vec<String> = written.iter().map(|p| p.display().to_string()).collect();
+            agents::emit(stdout, json, &names, |names| {
+                let mut text: String = names.iter().map(|n| format!("{n}\n")).collect();
+                text.push_str(&format!(
+                    "wrote the assistant example to {}; see its README.md to run it\n",
+                    dir.display()
+                ));
+                text
+            })
+        }
+        AgentsCommand::List {
+            tenant,
+            limit,
+            cursor,
+            json,
+        } => {
+            agents::check_list_limit(limit)?;
+            let (reader, hash) = reader(&tenant)?;
+            let page = agents::list(&reader, &hash, cursor.as_deref(), limit).await?;
+            agents::emit(stdout, json, &page, agents::render_list)
+        }
+        AgentsCommand::Inspect {
+            tenant,
+            agent,
+            json,
+        } => {
+            let agent = agent.selector()?.resolve()?;
+            let (reader, _) = reader(&tenant)?;
+            let out = agents::inspect(&reader, agent).await?;
+            agents::emit(stdout, json, &out, agents::render_inspect)
+        }
+        AgentsCommand::Operation {
+            tenant,
+            handle,
+            json,
+        } => {
+            let (reader, _) = reader(&tenant)?;
+            let out = agents::operation(&reader, &handle).await?;
+            agents::emit(stdout, json, &out, agents::render_operation)
+        }
+        AgentsCommand::Events {
+            tenant,
+            agent,
+            cursor,
+            limit,
+            json,
+        } => {
+            let agent = agent.selector()?.resolve()?;
+            let (reader, _) = reader(&tenant)?;
+            let out = agents::events(&reader, agent, cursor.as_deref(), limit).await?;
+            agents::emit(stdout, json, &out, agents::render_events)
+        }
+        AgentsCommand::Effects {
+            tenant,
+            agent,
+            json,
+        } => {
+            let agent = agent.selector()?.resolve()?;
+            let (reader, _) = reader(&tenant)?;
+            let out = agents::effects(&reader, agent).await?;
+            agents::emit(stdout, json, &out, agents::render_effects)
+        }
+        AgentsCommand::Reconcile {
+            effect,
+            attempt,
+            attach_result,
+            authorize_attempt,
+            url,
+            token,
+            json,
+        } => {
+            let choice =
+                agents::ReconcileChoice::parse(attach_result.as_deref(), authorize_attempt)?;
+            let client = ravel_agents_client::AgentsClient::new(&url, token)?;
+            let out = agents::reconcile(&client, &effect, attempt, choice).await?;
+            agents::emit(stdout, json, &out, agents::render_reconcile)
+        }
+    }
+}
+
 /// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
 /// than stderr.
 async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
@@ -3049,6 +3378,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             ravel_cli::erase::status(store::build_store(&cli.store)?, &tenant, signal, request_id)
                 .await
         }
+        Command::Agents { command } => run_agents(command, &cli.store, &cli.tenancy).await,
         Command::Idem {
             command: IdemCommand::Inspect { key },
         } => {
@@ -5549,6 +5879,23 @@ mod tests {
                 &["ravel", "tenant", "parquet-grant", "ls", "--tenant", "t"],
                 false,
             ),
+            (&["ravel", "agents", "list", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "agents",
+                    "reconcile",
+                    "e",
+                    "--attempt",
+                    "1",
+                    "--authorize-attempt",
+                    "--token",
+                    "x",
+                ],
+                false,
+            ),
+            (&["ravel", "agents", "dev"], false),
+            (&["ravel", "agents", "scaffold", "d"], false),
         ];
         for (args, expect_write) in cases {
             let cli =
@@ -5560,6 +5907,61 @@ mod tests {
                 super::command_is_write(&cli.command),
                 expect_write
             );
+        }
+    }
+
+    /// Every `agents` subcommand, classified on both gates: the five reads
+    /// hash their `--tenant` and write nothing; `dev`, `scaffold` and
+    /// `reconcile` neither hash a tenant nor write to the bucket themselves.
+    /// Flipping any arm of either `Command::Agents` match fails its row.
+    #[test]
+    fn agents_subcommands_are_classified_on_both_gates() {
+        let cases: &[(&[&str], bool, bool)] = &[
+            (&["ravel", "agents", "list", "--tenant", "t"], true, false),
+            (
+                &["ravel", "agents", "inspect", "--tenant", "t", "--kind", "k", "--key", "a"],
+                true,
+                false,
+            ),
+            (
+                &["ravel", "agents", "operation", "--tenant", "t", "op_x"],
+                true,
+                false,
+            ),
+            (
+                &["ravel", "agents", "events", "--tenant", "t", "00112233445566778899aabbccddeeff"],
+                true,
+                false,
+            ),
+            (
+                &["ravel", "agents", "effects", "--tenant", "t", "--kind", "k", "--key", "a"],
+                true,
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "agents",
+                    "reconcile",
+                    "e",
+                    "--attempt",
+                    "1",
+                    "--attach-result",
+                    "{}",
+                    "--token",
+                    "x",
+                ],
+                false,
+                false,
+            ),
+            (&["ravel", "agents", "dev"], false, false),
+            (&["ravel", "agents", "scaffold", "d"], false, false),
+        ];
+        for (args, hashes, writes) in cases {
+            let cli =
+                Cli::try_parse_from(*args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert_eq!(super::command_hashes_tenant(&cli.command), *hashes, "{args:?}");
+            assert_eq!(super::command_is_write(&cli.command), *writes, "{args:?}");
         }
     }
 
