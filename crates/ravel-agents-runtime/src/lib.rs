@@ -49,11 +49,16 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 mod dispatch;
+mod effects;
 mod failure;
 mod metrics;
 mod ownership;
 mod unload;
 
+pub use effects::{
+    Dispatch, EffectDispatcher, EffectRef, EffectSettled, StepJournal, StepProgress, StepSpec,
+    UNKNOWN_OUTCOME_RETRIES,
+};
 pub use failure::FailOutcome;
 pub use metrics::AgentsMetricsSnapshot;
 pub use ownership::TakeoverReason;
@@ -169,6 +174,9 @@ pub struct Coordinator {
     pub(crate) unsupported_reported: Mutex<HashSet<AgentId>>,
     pub(crate) wake: Notify,
     pub(crate) metrics: Metrics,
+    /// The effect attempts this coordinator dispatched and has seen no
+    /// result for, by agent and effect id (see `effects`).
+    pub(crate) open_attempts: Mutex<HashMap<(AgentId, Id128), effects::OpenAttempt>>,
 }
 
 impl Coordinator {
@@ -191,6 +199,7 @@ impl Coordinator {
             unsupported_reported: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             metrics: Metrics::default(),
+            open_attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -680,7 +689,7 @@ pub(crate) fn fence_from_lease(lease: &TurnLease) -> Result<(AgentId, TurnFence)
     ))
 }
 
-fn json_bytes(agent: &AgentId, value: &Value) -> Result<Bytes, AgentError> {
+pub(crate) fn json_bytes(agent: &AgentId, value: &Value) -> Result<Bytes, AgentError> {
     serde_json::to_vec(value)
         .map(Bytes::from)
         .map_err(|_| refused(agent, ErrorKind::BudgetExceeded, "value is not JSON"))
