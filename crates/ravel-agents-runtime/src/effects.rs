@@ -58,6 +58,15 @@
 //! (authorize another attempt and dispatch it). Each is idempotent, and the
 //! kernel appends one audit event to the effect's turn's event stream for
 //! each one that changes HEAD (`tests::reconcile_is_idempotent_and_audited_once`).
+//! One race is not covered: when another admin's `reconcile_authorize` for
+//! the same attempt lands between this call's read of HEAD and its write, and
+//! this call's write comes back with an unknown outcome, the retry cannot
+//! tell the other admin's authorization from its own and dispatches the
+//! attempt a second time. Telling them apart needs a caller identity in
+//! `Authority::Reconcile` or in the audit event, a format change tracked on
+//! issue #3408. Without an unknown outcome the other admin's attempt is
+//! never dispatched again
+//! (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
 //! The `agents_admin` capability check belongs to the route that calls them.
 //!
 //! A command whose HEAD write outcome is unknown runs again, up to
@@ -417,6 +426,23 @@ impl Coordinator {
     /// retry finds the attempt authorized one past the effect's attempt this
     /// call started from, and the attempt is dispatched
     /// (`tests::a_reconcile_authorization_with_a_lost_ack_dispatches_once`).
+    /// When another admin's reconcile of the same attempt landed first and
+    /// this call's write lost the race with a known outcome, this call
+    /// answers `false` and dispatches nothing
+    /// (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
+    ///
+    /// Not idempotent across admins in one case: when another admin's
+    /// reconcile lands between this call's reload and its write, and this
+    /// call's write comes back `OutcomeUnknown`, the retry reads the other
+    /// admin's attempt as this call's and dispatches it a second time. The
+    /// fix needs a caller identity in `Authority::Reconcile` or in the audit
+    /// event, a format change tracked on issue #3408.
+    ///
+    /// When all [`UNKNOWN_OUTCOME_RETRIES`] retries also come back unknown,
+    /// the error is returned and nothing is dispatched, even if a write
+    /// landed: HEAD may then hold the attempt authorized with no dispatch,
+    /// and it stays undispatched until the owner's next `run_step` finds it
+    /// lost and relatches it (a `manual` effect latches in doubt again).
     pub async fn reconcile_authorize(
         &self,
         effect: &EffectRef,
@@ -451,10 +477,10 @@ impl Coordinator {
             ));
         };
         // The retry read HEAD after the unknown outcome; the attempt is this
-        // call's when the effect was in doubt before it and now holds the next
-        // attempt authorized.
+        // call's when the effect now holds the attempt after the one this call
+        // started from, authorized. That also implies the effect was in doubt
+        // before: a replay started from `attempt` itself.
         let landed_unacknowledged = retried
-            && record.status == EffectStatus::InDoubt
             && journaled(&out.head, effect).is_ok_and(|now| {
                 now.status == EffectStatus::Authorized
                     && Some(now.attempt) == record.attempt.checked_add(1)
