@@ -736,9 +736,9 @@ enum Command {
         /// below one slice's estimate (`--batch-rows / --shards` rows) is
         /// exceeded by the first write into an empty buffer and reproduces
         /// the `1` layout; a shard whose slice falls under that estimate can
-        /// still accumulate across batches. A load
-        /// whose target turned out to lay the objects out exactly as `1`
-        /// would have says so on stderr and in the load report.
+        /// still accumulate across batches. A load whose target turned out to
+        /// lay the objects out exactly as `1` would have says so on stderr and
+        /// in the load report.
         ///
         /// On a logs load buffered batches stay charged to
         /// `--load-memory-bytes` until their flush finishes. When two checks
@@ -755,9 +755,13 @@ enum Command {
         /// that ack waits for one: the size trigger, the depth flush, the
         /// wall-clock age trigger (`--max-flush-delay`, 60s by default) or, at
         /// the end of the input, the loader's own force-flush. `0` is
-        /// rejected, and so is a target above 360,000,000,000
-        /// (`MAX_TARGET_BYTES`), whose encode allowance in the ack deadline
-        /// (see `--ack-margin`) would exceed one hour.
+        /// rejected.
+        ///
+        /// A target above 360,000,000,000 (`MAX_TARGET_BYTES`) is refused
+        /// whether or not `--ack-margin` is given: the bound is one hour of
+        /// encode at 100,000,000 bytes per second, the allowance the ack
+        /// deadline adds when `--ack-margin` is unset. A target derived with
+        /// the flag unset is clamped to the same bound.
         #[arg(long, value_name = "BYTES")]
         target_bytes: Option<usize>,
         /// How long a shard buffer may age before the router flushes it,

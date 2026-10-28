@@ -1506,8 +1506,11 @@ before its PUT starts. At the 60 s default delay the stock
 1,850,000,000 target adds 18.5 s, a 138.5 s deadline; a 7,400,000,000
 target at `--max-flush-delay 90s` gets 224 s. Only `--target-bytes 1`
 adds nothing, so its deadline stays the delay plus 60 s. A
-`--target-bytes` above 360,000,000,000, whose encode time would exceed
-an hour, is refused. The stderr geometry line prints the deadline as
+`--target-bytes` above 360,000,000,000 is refused whether or not
+`--ack-margin` is given: the bound is one hour of encode at 100,000,000
+bytes per second, the allowance the deadline adds when `--ack-margin` is
+unset. A target derived with the flag unset is clamped to the same
+bound. The stderr geometry line prints the deadline as
 `ack deadline <N>s`.
 
 - `--ack-margin <SECONDS>` replaces the whole margin, encode allowance
