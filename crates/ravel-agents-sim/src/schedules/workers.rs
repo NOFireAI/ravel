@@ -342,11 +342,11 @@ const KILL_TOTALS: KillCounts = KillCounts {
     false_negatives: 0,
 };
 
-/// `w1` begins op 1 and is held before its commit. `w2`, on another
-/// coordinator, finds the lease expired, takes over and completes op 1.
-/// `w1`'s commit is then refused.
-#[test]
-fn suspended_worker_commit_is_refused_after_takeover() {
+/// `w1` begins op 1 and is held at its commit-time HEAD read. `w2`, on
+/// another coordinator, moves the clock past the lease and polls. Returns
+/// whether `w2` took over first, in which case `w1`'s commit is refused;
+/// otherwise `w1` commits and `w2` finds nothing to do.
+fn suspended(seed: u64, script: ScheduleScript) -> bool {
     let rig = Rig::new(FaultPlan::empty());
     create_with_inputs(&rig, 1);
     let w1 = worker(&rig, "w1", 10, |p| async move {
@@ -354,8 +354,9 @@ fn suspended_worker_commit_is_refused_after_takeover() {
         let a = a.ok_or("no assignment")?;
         let (state, output) = turn_values(&a);
         match p.commit(&a, &state, &output).await {
+            Ok(_) => Ok(()),
             Err(e) if e.kind == ErrorKind::OwnershipLost => Ok(()),
-            other => Err(format!("commit: {other:?}")),
+            Err(e) => Err(format!("commit: {e:?}")),
         }
     })
     .with_gates(vec![gate(Op::Get, "/head", 4)]);
@@ -366,13 +367,7 @@ fn suspended_worker_commit_is_refused_after_takeover() {
         Ok(())
     })
     .with_gates(vec![gate(Op::List, "", 1)]);
-    let out = run(
-        &rig,
-        1,
-        ScheduleScript::new(vec![ScriptStep::Release(1), ScriptStep::Release(0)]),
-        vec![w1, w2],
-    )
-    .expect("schedule");
+    let out = run(&rig, seed, script, vec![w1, w2]).expect("schedule");
     let run = checked(&rig, &out);
     sim_assert!(out, run.inferred.is_empty(), "{:?}", run.inferred);
     let commits: Vec<Reply> = run
@@ -382,23 +377,104 @@ fn suspended_worker_commit_is_refused_after_takeover() {
         .filter(|c| matches!(c.event, Event::TurnCompleted { .. }))
         .map(|c| c.observed.clone())
         .collect();
-    sim_assert_eq!(
-        out,
-        commits,
-        vec![
-            Reply::Committed {
-                status: ravel_agents_core::wire::OperationStatus::Completed,
-                state_version: 1
-            },
-            Reply::Error(ErrorKind::OwnershipLost),
-        ]
-    );
     let w1 = rig.proc_named("w1").expect("w1").co.metrics();
     let w2 = rig.proc_named("w2").expect("w2").co.metrics();
-    sim_assert_eq!(out, (w1.turns_committed, w1.ownership_lost_refusals), (0, 1));
-    sim_assert_eq!(out, (w2.takeovers, w2.turns_committed), (1, 1));
+    let committed = Reply::Committed {
+        status: ravel_agents_core::wire::OperationStatus::Completed,
+        state_version: 1,
+    };
+    let taken_over = w2.takeovers == 1;
+    if taken_over {
+        sim_assert_eq!(
+            out,
+            commits,
+            vec![committed, Reply::Error(ErrorKind::OwnershipLost)]
+        );
+        sim_assert_eq!(out, (w1.turns_committed, w1.ownership_lost_refusals), (0, 1));
+        sim_assert_eq!(out, w2.turns_committed, 1);
+    } else {
+        sim_assert_eq!(out, commits, vec![committed]);
+        sim_assert_eq!(out, (w1.turns_committed, w1.ownership_lost_refusals), (1, 0));
+        sim_assert_eq!(out, (w2.takeovers, w2.turns_committed), (0, 0));
+    }
     one_terminal_result_per_input(&rig.head().expect("head")).unwrap_or_else(|e| panic!("{e}"));
+    taken_over
 }
+
+#[test]
+fn suspended_worker_commit_is_refused_after_takeover() {
+    let script = ScheduleScript::new(vec![ScriptStep::Release(1), ScriptStep::Release(0)]);
+    assert!(suspended(1, script));
+}
+
+#[test]
+fn suspended_worker_across_seeds() {
+    let mut runs = 0;
+    let mut taken_over = 0;
+    for seed in seeds() {
+        if suspended(seed, seeded(seed, 2, 2, 0)) {
+            taken_over += 1;
+        }
+        runs += 1;
+    }
+    assert_eq!(runs, 64);
+    assert_eq!(taken_over, SUSPENDED_TAKEN_OVER);
+}
+
+/// Runs of the batch where `w2` took over before `w1`'s commit.
+const SUSPENDED_TAKEN_OVER: usize = 31;
+
+/// The cold restart with the restarted client and worker racing: `c`
+/// sends `r3` and reads op 1's result while `w-restarted` takes the agent
+/// over, then a drain runs what is left. Returns `w-restarted`'s turns.
+fn cold_restart_race(seed: u64) -> u64 {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 2);
+    let w = worker(&rig, "w", 10, |p| async move {
+        p.work(1).await;
+        Ok(())
+    });
+    run(&rig, seed, ScheduleScript::new(Vec::new()), vec![w]).expect("first life");
+    rig.clock.advance_ms(crate::drive::PAST_LEASE_MS);
+    let c = client(&rig, "c", 40, |p| async move {
+        p.send("r3", &payload(3)).await.map_err(|e| format!("send: {e:?}"))?;
+        p.result(&op(1)).await.map_err(|e| format!("result: {e:?}"))?;
+        Ok(())
+    });
+    let w = worker(&rig, "w-restarted", 50, |p| async move {
+        p.work(4).await;
+        Ok(())
+    });
+    let out = run(&rig, seed, seeded(seed, 2, 60, 0), vec![c, w]).expect("restart");
+    drain(&rig, seed);
+    let run = checked(&rig, &out);
+    sim_assert!(out, run.inferred.is_empty(), "{:?}", run.inferred);
+    sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
+    let head = rig.head().expect("head");
+    one_terminal_result_per_input(&head).unwrap_or_else(|e| panic!("{e}"));
+    sim_assert_eq!(out, head.next_accept_seq, 4);
+    sim_assert_eq!(out, head.results.len(), 3);
+    let restarted = rig.proc_named("w-restarted").expect("w").co.metrics();
+    let drained = rig.proc_named(DRAIN).expect("drain").co.metrics();
+    sim_assert_eq!(out, restarted.takeovers, 1);
+    sim_assert_eq!(out, restarted.turns_committed + drained.turns_committed, 2);
+    restarted.turns_committed
+}
+
+#[test]
+fn cold_restart_across_seeds() {
+    let mut runs = 0;
+    let mut turns = 0;
+    for seed in seeds() {
+        turns += cold_restart_race(seed);
+        runs += 1;
+    }
+    assert_eq!(runs, 64);
+    assert_eq!(turns, COLD_RESTART_TURNS);
+}
+
+/// `w-restarted`'s turns over the batch; the drain ran the rest of 128.
+const COLD_RESTART_TURNS: u64 = 113;
 
 /// A worker completes op 1. Then every process restarts cold: a client on a
 /// new coordinator sends `r3` and reads `r1`, and a worker on another new

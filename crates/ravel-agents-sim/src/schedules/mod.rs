@@ -87,11 +87,6 @@ where
     (actor, faults)
 }
 
-/// Faults of `kind` on `op` that fired in an actor's own layer.
-pub(crate) fn fired(faults: &Faults, op: Op, kind: FaultKind) -> u64 {
-    faults.get().map_or(0, |f| f.fault_count(op, kind))
-}
-
 /// Every fault an actor's layer injected, by op and kind.
 pub(crate) fn all_fired(faults: &Faults) -> Vec<((Op, FaultKind), u64)> {
     let mut all: Vec<_> = faults
