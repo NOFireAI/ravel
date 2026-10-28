@@ -35,7 +35,9 @@ router is otherwise empty.
 
 Where a dedicated mutual-TLS listener is configured (`--mtls-listener`), it
 serves the same ingest and query routes with the mTLS resolver. It serves
-neither the health routes nor `/metrics`.
+neither `/healthz`, `/readyz` nor `/metrics`. The one exception is
+`GET /api/v1/agents/health`, which `--agents` mounts on both listeners; it
+is unauthenticated there too and reports operator settings only.
 
 ## Ingest routes
 
@@ -102,6 +104,7 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | POST | `/api/v1/esql` | JSON: `query`, optional `start`, `end`, `timeout` | JSON: typed columns, rows, `stats`, and `warnings` when there are any | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `esql` |
 | GET | `/api/traces/{trace_id}` | path `trace_id`, plus optional `start`, `end`, `timeout`, `min_commit_token` (`<token>` or `spans:<token>`) | The `/api/v1/sql` response for every span of the trace: Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
 | POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
+| GET | `/api/v1/agents/health` | none | JSON: `feature`, `mode`, `activation_concurrency`, `poll_concurrency`, `memory_budget_bytes` and the five `quotas` as `--agents-*` set them | 200 | No | `all`, `query`, and only with `--agents`; also on the mTLS listener | `agents` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
 
@@ -571,7 +574,10 @@ Status codes:
 
 ## Health and metrics routes
 
-Unauthenticated, and served in every mode, including maintain mode.
+Unauthenticated, and served in every mode, including maintain mode. The
+agents health route in the query table above is also unauthenticated but is
+mode- and feature-gated and needs `--agents`; it does not inherit this
+section's rule.
 
 | Method | Path | Request | Response | Status codes | Credential | Modes | Feature |
 | --- | --- | --- | --- | --- | --- | --- | --- |

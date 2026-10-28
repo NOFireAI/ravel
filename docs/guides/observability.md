@@ -2388,6 +2388,33 @@ query incurred up to that point, not zeros:
   of the fetches that had completed by then.
 - Fetches that the query did not issue before it stopped are not counted.
 
+### Ravel Agents settings (`ravel_agents_*`)
+
+Labels: `mode` on every sample. A process built with the `agents` feature
+renders all nine gauges on every scrape, with or without `--agents`; a build
+without the feature omits them. One sample per family.
+
+Only the first gauge describes behaviour. The other eight repeat the
+`--agents-*` settings as parsed: in this release they are reported and not
+enforced (the flags reference says the same of each flag), so a scrape
+showing `ravel_agents_max_mailbox 256` says what the operator set, not what
+the process refused.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_agents_enabled` | 1 when this process mounted the Ravel Agents routes, which needs `--agents` under `--mode all` or `--mode query`; 0 otherwise, including a build with the feature started without the flag. |
+| `ravel_agents_activation_concurrency_limit` | The `--agents-activation-concurrency` setting: most agent turns this process would activate at once. |
+| `ravel_agents_poll_concurrency_limit` | The `--agents-poll-concurrency` setting: most worker long-polls this process would hold open at once. |
+| `ravel_agents_memory_budget_bytes` | The `--agents-memory-budget` setting in bytes. No reservation is taken from the process memory budget in this release. |
+| `ravel_agents_max_agents` | The `--agents-max-agents` setting: most live agents one tenant may hold. |
+| `ravel_agents_max_mailbox` | The `--agents-max-mailbox` setting: most accepted inputs one agent's mailbox may hold. |
+| `ravel_agents_max_state_bytes` | The `--agents-max-state-bytes` setting: most bytes of objects one agent's root may reference. |
+| `ravel_agents_max_receipts` | The `--agents-max-receipts` setting: most idempotency receipts one agent retains. |
+| `ravel_agents_max_timers` | The `--agents-max-timers` setting: most pending timers one agent may hold. |
+
+Test: `metrics_scrape_reports_every_agents_family_once_with_the_mode_label`
+and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`.
+
 ### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
 
 Labels: `mode` and `tenant_hash` on every sample, folded the same way as in

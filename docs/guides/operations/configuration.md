@@ -1233,7 +1233,7 @@ then widen to every tenant that storage discovers, and startup does not
 refuse. A Secret mount that failed to populate produces this state, with no
 error at startup.
 
-### The ddl and ipcrypt capabilities
+### The ddl, ipcrypt and agents capabilities
 
 A `TENANT` may end in `;` and a comma-separated capability list. The tenant
 is the text before the LAST `;`. Each capability is absent by default.
@@ -1242,27 +1242,38 @@ is the text before the LAST `;`. Each capability is absent by default.
 - `ipcrypt`: the `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt` SQL functions
   over `POST /api/v1/sql`. The [query guide](../query.md#matching-pseudonymized-addresses) says when the
   server registers them.
+- `agents`, `agents_worker` and `agents_admin`: the three Ravel Agents roles:
+  client operations, worker registration and turn commits, and
+  reconciliation. Each word grants only its own role;
+  `agents_admin` does not imply `agents`. No route checks them in this
+  release: `GET /api/v1/agents/health` is the only agents route and is
+  unauthenticated.
 
-`acme;ddl`, `acme;ipcrypt`, `acme;ddl,ipcrypt` and `acme;ipcrypt,ddl` all name
-tenant `acme`, each granting the capabilities it lists.
+`acme;ddl`, `acme;ipcrypt`, `acme;ddl,ipcrypt`, `acme;ipcrypt,ddl` and
+`acme;ddl,agents,agents_worker` all name tenant `acme`, each granting the
+capabilities it lists.
 
-- A name other than `ddl` or `ipcrypt`, a name listed twice, an empty list
-  or list entry, or an empty tenant before the `;` refuses startup. The error
-  names the flag position or the line number in the token file, never the
-  text of the pair.
+- A name other than the five above, a name listed twice, an empty list or
+  list entry, or an empty tenant before the `;` refuses startup. Matching is
+  exact: `AGENTS`, `agent` and `agents-worker` are refused. The error names
+  the flag position or the line number in the token file, never the text of
+  the pair.
 - A tenant with no `;` is unchanged and carries no capability.
 - [Background](#background) links the decisions behind this.
 
 `ravel-ingest-router` accepts the same `--tenant-token` spelling and strips
-the capability list, so it routes `acme;ddl,ipcrypt` by the tenant `acme`. It
-never grants a capability.
+the capability list, so it routes `acme;ddl,ipcrypt,agents` by the tenant
+`acme`. It never grants a capability.
 
 Tokens in the durable `sys/auth` map cannot carry a capability. The map is
 read without suffix parsing, so an entry written as `acme;ddl` names a tenant
 literally called `acme;ddl`, with no capability and no error. Grant `ddl` only
-through `--tenant-token`, `--tenant-token-file` or `--oidc-ddl-claim`, and
+through `--tenant-token`, `--tenant-token-file` or `--oidc-ddl-claim`,
 `ipcrypt` only through `--tenant-token`, `--tenant-token-file` or
-`--oidc-ipcrypt-claim`. Flight SQL grants neither.
+`--oidc-ipcrypt-claim`, and each agents role only through `--tenant-token`,
+`--tenant-token-file` or its own claim flag (`--oidc-agents-claim`,
+`--oidc-agents-worker-claim`, `--oidc-agents-admin-claim`). Flight SQL grants
+none of them.
 
 Withholding `ipcrypt` does not stop a caller encrypting guesses if it can
 also write: write access to a tenant is an encryption oracle, because a token
@@ -1357,8 +1368,9 @@ because a trusted hop set it, and anyone can forge it if that hop is absent.
 
 Dependent flags fail fast. Each of these combinations refuses to start:
 
-- `--oidc-tenant-claim`, `--oidc-ddl-claim`, `--oidc-ipcrypt-claim`, or
-  `--oidc-audience` without OIDC enabled
+- `--oidc-tenant-claim`, `--oidc-ddl-claim`, `--oidc-ipcrypt-claim`,
+  `--oidc-agents-claim`, `--oidc-agents-worker-claim`,
+  `--oidc-agents-admin-claim`, or `--oidc-audience` without OIDC enabled
 - `--mtls-header` or `--mtls-listener` without `--mtls-enabled`
 - `--mtls-enabled` without `--mtls-listener`
 - `--mtls-trust-forwarded-header` without `--mtls-listener`
