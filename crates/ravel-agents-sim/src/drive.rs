@@ -83,8 +83,9 @@
 //!   [`Reply::StepJournaled`] with the step's completed flag and its
 //!   effect's phase and attempt
 //!   (`schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
-//!   An effect showing an intent with no attempt is unmappable; no schedule
-//!   reaches this.
+//!   An effect showing an intent at attempt 0 is no effect yet, as
+//!   `crashed_step` reads it; an intent past attempt 0 is unmappable, and no
+//!   schedule reaches this.
 //! - `Coordinator::run_step` is [`Event::Step`], answered
 //!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher,
 //!   [`Reply::StepCompleted`] with the output's bytes, or, for
@@ -128,6 +129,36 @@
 //! - `OutcomeUnknown` reaching the caller is unmappable: the coordinator
 //!   settles it on every path, so a client never has to. No schedule
 //!   reaches this.
+//! - `Coordinator::schedule_timer` is a client `SetTimer` with the bytes of
+//!   a null payload, answered [`Reply::TimerSet`] with the generation and
+//!   the timer handle whose id the response names, found by trying
+//!   incarnations 1 to `MAX_INCARNATION` under the timer key
+//!   (`schedules::timers::a_cancel_before_the_fire_wins_and_the_sweep_fires_nothing`).
+//!   An id matching no incarnation is unmappable; no schedule reaches this.
+//! - `Coordinator::cancel_timer` answers [`Reply::TimerCancel`] with its
+//!   outcome (`Cancelled` in
+//!   `schedules::timers::a_cancel_before_the_fire_wins_and_the_sweep_fires_nothing`,
+//!   `AlreadyFired` in
+//!   `schedules::timers::a_cancel_after_the_fire_is_already_fired`).
+//! - The wake hint a schedule writes after its HEAD write is not an event:
+//!   the reference has no hints, and a lost or missing hint only changes
+//!   which half of a sweep pass reaches the timer
+//!   (`schedules::timers::a_lost_hint_put_is_delivered_by_the_sweep_within_its_interval`,
+//!   `schedules::timers::a_crash_between_the_root_write_and_the_hint_write_still_fires`).
+//! - A sweep pass ([`Proc::sweep`]) is one [`Event::TimerDue`] per HEAD
+//!   write it applied, answered [`Reply::TimerFired`] with the input that
+//!   write enqueued
+//!   (`schedules::timers::two_sweepers_on_one_hint_fire_it_once`), then an
+//!   [`Event::Wake`] at its last HEAD access, from `Hint` when it read a
+//!   hint and from `Sweep` otherwise, answered with nothing left to fire
+//!   (`schedules::timers::a_premature_hint_fires_nothing_and_is_kept`,
+//!   `schedules::timers::a_lost_hint_put_due_on_a_pass_fires_on_that_pass`).
+//!   A write that does not decode, or whose newest input no timer enqueued,
+//!   is unmappable; no schedule reaches this.
+//! - A pass with a failed HEAD write is a [`Refusal`] of `StoreUnavailable`
+//!   in place of its wake
+//!   (`schedules::timers::a_sweep_whose_fire_write_fails_is_a_store_unavailable_refusal`).
+//!   A crashed pass keeps only its writes; no schedule crashes a pass.
 //!
 //! # Calls that never answered
 //!
@@ -144,14 +175,20 @@
 //! An inferred reply that is an error means the reference refuses a call
 //! whose write applied, so that call is listed in [`Run::unmappable`]
 //! (`tests::a_crashed_write_the_reference_refuses_outside_the_exemption_is_unmappable`,
-//! a completion with no started turn answered `OwnershipLost`). Two kinds
-//! are exempt, because production writes before it answers them: a manual
-//! step whose attempt was lost latches its effect in doubt and answers
-//! `EffectInDoubt`
-//! (`tests::a_crashed_manual_step_whose_attempt_was_lost_infers_effect_in_doubt`),
-//! and a step whose call changed blocks the turn and answers
-//! `NonDeterministicReplay` (no test builds that shape). No schedule
-//! reaches this rule today: no reply a schedule infers is an error.
+//! a completion with no started turn answered `OwnershipLost`). Three
+//! shapes are exempt, because production writes before it answers them:
+//! a manual step whose attempt was lost latches its effect in doubt and
+//! answers `EffectInDoubt`
+//! (`tests::a_crashed_manual_step_whose_attempt_was_lost_infers_effect_in_doubt`);
+//! a step whose call changed blocks the turn and answers
+//! `NonDeterministicReplay` (no test builds that shape); and a step that
+//! journaled its start, with no attempt, after a cancel and died before
+//! the cancel check would have answered `OwnershipLost`, the crashed form
+//! of the exception under Linearization
+//! (`tests::a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost`,
+//! reached by
+//! `schedules::effects::a_worker_dead_between_its_step_journal_and_its_cancel_check_is_fenced`).
+//! `OwnershipLost` inferred for any other crashed write stays unmappable.
 //!
 //! Anything else the driver cannot map is listed in [`Run::unmappable`],
 //! and every schedule asserts that list is empty.
@@ -162,19 +199,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ravel_agents_core::error::{AgentError, ErrorKind};
-use ravel_agents_core::head::{EffectStatus, Head, StepStatus};
-use ravel_agents_core::identity::{AgentId, agent_id, effect_id, step_input_hash};
+use ravel_agents_core::head::{EffectStatus, Head, InputSource, StepStatus};
+use ravel_agents_core::identity::{AgentId, agent_id, effect_id, step_input_hash, timer_id};
 use ravel_agents_core::kernel::DerivedIds;
 use ravel_agents_core::keys::{AgentKey, AgentKind, head_key};
 use ravel_agents_core::state::{Handle, HandleItem, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, CancelRequest, CancelResponse, CreateAgentRequest, CreateAgentResponse,
-    HandlerPinBody, OperationStatus, SendRequest, SendResponse, TurnAssignment, TurnOutcome,
-    WorkerCommitRequest, WorkerCommitResponse, WorkerPollRequest,
+    AgentRef, CancelRequest, CancelResponse, CancelTimerRequest, CancelTimerResponse,
+    CreateAgentRequest, CreateAgentResponse, HandlerPinBody, OperationStatus, SendRequest,
+    SendResponse, TimerRequest, TimerResponse, TurnAssignment, TurnOutcome, WorkerCommitRequest,
+    WorkerCommitResponse, WorkerPollRequest,
 };
 use ravel_agents_runtime::{
     Coordinator, DEFAULT_POLL_WAIT_CAP_MS, Dispatch, EffectDispatcher, EffectRef, EffectSettled,
-    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec,
+    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec, SweepConfig, SweepReport,
 };
 use ravel_agents_store::backoff::NoBackoff;
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
@@ -190,7 +228,7 @@ use serde_json::Value;
 use crate::history::History;
 use crate::reference::{
     ClientOp, EffectPhase, EffectView, Event, Outcome, RecoveryPolicy, ReferenceMachine, Reply,
-    StepCall,
+    StepCall, WakeSource,
 };
 
 /// The tenant every rig's store serves.
@@ -278,8 +316,13 @@ impl Rng for CountingRng {
 struct Stamps {
     /// Sequence number and body of the last HEAD write it applied.
     write: Option<(u64, Bytes)>,
+    /// Every HEAD write it applied, in order.
+    writes: Vec<(u64, Bytes)>,
     /// Sequence number of the last HEAD read it made.
     read: Option<u64>,
+    /// HEAD writes its process saw fail with anything but a lost race,
+    /// counted at the process's own store boundary, above every fault.
+    failed_puts: u64,
 }
 
 type Cell = Arc<Mutex<Stamps>>;
@@ -297,6 +340,9 @@ pub struct StampStore {
     inner: Arc<dyn ObjectStoreBackend>,
     seq: AtomicU64,
     head_puts: AtomicU64,
+    /// A process's boundary layer: it stamps nothing and only counts the
+    /// HEAD writes that failed, as the process saw them.
+    boundary: bool,
 }
 
 impl StampStore {
@@ -305,6 +351,15 @@ impl StampStore {
             inner,
             seq: AtomicU64::new(0),
             head_puts: AtomicU64::new(0),
+            boundary: false,
+        }
+    }
+
+    /// The layer [`Rig::proc`] puts directly under a process's store.
+    fn boundary(inner: Arc<dyn ObjectStoreBackend>) -> StampStore {
+        StampStore {
+            boundary: true,
+            ..StampStore::new(inner)
         }
     }
 
@@ -334,20 +389,36 @@ impl ObjectStoreBackend for StampStore {
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
         let head = is_head(key);
+        if self.boundary {
+            let out = self.inner.put(key, data, opts).await;
+            if head
+                && let Err(e) = &out
+                && !matches!(
+                    e,
+                    StoreError::PreconditionFailed | StoreError::AlreadyExists
+                )
+            {
+                let _ = CALL.try_with(|cell| lock(cell).failed_puts += 1);
+            }
+            return out;
+        }
         if head {
             self.head_puts.fetch_add(1, Ordering::SeqCst);
         }
         let body = data.clone();
         let out = self.inner.put(key, data, opts).await;
         if head && out.is_ok() {
-            self.stamp(|s, seq| s.write = Some((seq, body)));
+            self.stamp(|s, seq| {
+                s.writes.push((seq, body.clone()));
+                s.write = Some((seq, body));
+            });
         }
         out
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         let out = self.inner.get(key, range).await;
-        if is_head(key) && out.is_ok() {
+        if !self.boundary && is_head(key) && out.is_ok() {
             self.stamp(|s, seq| s.read = Some(seq));
         }
         out
@@ -422,6 +493,9 @@ pub enum Observed {
     Unmappable(String),
     /// Not an event: a poll that found nothing.
     Skip,
+    /// A sweep pass that completed. Its events are read from what it wrote;
+    /// see [`Recorder::build`].
+    Swept,
 }
 
 /// A recorded call answered with an error the reference does not model.
@@ -521,11 +595,22 @@ impl Recorder {
                     kind: *kind,
                 });
             }
+            if entry.call == SWEEP {
+                sweep_items(
+                    entry,
+                    order,
+                    &stamps,
+                    &mut items,
+                    &mut unmappable,
+                    &mut refusals,
+                );
+                continue;
+            }
             match (&entry.observed, applied, stamp) {
                 (Some(Observed::Unmappable(what)), _, _) => {
                     unmappable.push(format!("{} {}: {what}", entry.actor, entry.call));
                 }
-                (Some(Observed::Skip), _, _) => {}
+                (Some(Observed::Skip | Observed::Swept), _, _) => {}
                 (Some(Observed::Modelled(reply)), applied, Some(stamp)) => match &entry.event {
                     Some(event) => items.push(Item {
                         stamp,
@@ -584,10 +669,14 @@ impl Recorder {
         let mut inferred = Vec::new();
         let mut applied = Vec::new();
         for item in items {
+            let mut start_only = false;
             let event = match (&item.observed, &item.event, &item.applied) {
                 (None, Event::Step { operation, step }, Some(body)) => {
                     match crashed_step(&shadow, operation, step, body) {
-                        Ok(event) => event,
+                        Ok((event, journaled_start)) => {
+                            start_only = journaled_start;
+                            event
+                        }
                         Err(what) => {
                             unmappable.push(format!("{} step: {what}", item.actor));
                             continue;
@@ -600,11 +689,15 @@ impl Recorder {
             let reply = match item.observed {
                 Some(reply) => reply,
                 None => {
+                    let exempt = match expected {
+                        Reply::Error(
+                            ErrorKind::EffectInDoubt | ErrorKind::NonDeterministicReplay,
+                        ) => true,
+                        Reply::Error(ErrorKind::OwnershipLost) => start_only,
+                        _ => false,
+                    };
                     if let Reply::Error(kind) = expected
-                        && !matches!(
-                            kind,
-                            ErrorKind::EffectInDoubt | ErrorKind::NonDeterministicReplay
-                        )
+                        && !exempt
                     {
                         unmappable.push(format!(
                             "{}: applied a write the reference refuses {kind:?}: {event:?}",
@@ -628,6 +721,97 @@ impl Recorder {
     }
 }
 
+/// The name a sweep pass is recorded under.
+const SWEEP: &str = "sweep";
+
+/// Place a sweep pass in the history: one [`Event::TimerDue`] per HEAD
+/// write it applied, answered with the input that write enqueued, then,
+/// for a pass that completed with no failed HEAD write, an [`Event::Wake`]
+/// at its last HEAD access answered with nothing left to fire. A pass with
+/// a failed HEAD write is a [`Refusal`] of `StoreUnavailable` instead of
+/// that wake. A crashed or refused pass keeps only its writes.
+fn sweep_items(
+    entry: &Entry,
+    order: usize,
+    stamps: &Stamps,
+    items: &mut Vec<Item>,
+    unmappable: &mut Vec<String>,
+    refusals: &mut Vec<Refusal>,
+) {
+    let Some(Event::Wake { now_unix_ns, by }) = &entry.event else {
+        unmappable.push(format!("{} sweep: recorded without its clock", entry.actor));
+        return;
+    };
+    for (seq, body) in &stamps.writes {
+        match fired_by(body, *now_unix_ns) {
+            Ok((event, reply)) => items.push(Item {
+                stamp: *seq,
+                order,
+                actor: entry.actor.clone(),
+                event,
+                observed: Some(reply),
+                applied: Some(body.clone()),
+            }),
+            Err(what) => unmappable.push(format!("{} sweep: {what}", entry.actor)),
+        }
+    }
+    if entry.observed != Some(Observed::Swept) {
+        return;
+    }
+    if stamps.failed_puts > 0 {
+        refusals.push(Refusal {
+            actor: entry.actor.clone(),
+            call: entry.call,
+            kind: ErrorKind::StoreUnavailable,
+        });
+        return;
+    }
+    let last = stamps.writes.last().map(|(seq, _)| *seq).max(stamps.read);
+    if let Some(stamp) = last {
+        items.push(Item {
+            stamp,
+            order,
+            actor: entry.actor.clone(),
+            event: Event::Wake {
+                now_unix_ns: *now_unix_ns,
+                by: *by,
+            },
+            observed: Some(Reply::Woken(Vec::new())),
+            applied: None,
+        });
+    }
+}
+
+/// The fire a sweep's HEAD write `body` applied: the newest inbox entry,
+/// which a `FireTimer` enqueues from a timer, and that timer's key.
+fn fired_by(body: &Bytes, now_unix_ns: i64) -> Result<(Event, Reply), String> {
+    let head = Head::decode(body).map_err(|e| format!("root does not decode: {e:?}"))?;
+    let newest = head.next_accept_seq.saturating_sub(1);
+    let Some(input) = head.inbox.iter().find(|e| e.accept_seq == newest) else {
+        return Err(format!("wrote a root whose inbox lacks input {newest}"));
+    };
+    let InputSource::Timer {
+        timer_id,
+        generation,
+    } = input.source
+    else {
+        return Err(format!("wrote input {newest} from {:?}", input.source));
+    };
+    let Some(timer) = head.timers.iter().find(|t| t.timer_id == timer_id) else {
+        return Err(format!(
+            "input {newest} names a timer the root does not hold"
+        ));
+    };
+    Ok((
+        Event::TimerDue {
+            timer_key: timer.timer_key.clone(),
+            generation,
+            now_unix_ns,
+        },
+        Reply::TimerFired(Some(Handle::operation(agent(), head.incarnation, newest))),
+    ))
+}
+
 /// One call placed in the history.
 struct Item {
     stamp: u64,
@@ -647,12 +831,15 @@ struct Item {
 /// committed intent at attempt 0 is that shape, since the reference has no
 /// intents; an intent at any other attempt is unmappable. When the root it
 /// wrote holds what [`Event::Step`] would leave, the step ran through.
+/// The flag is true when that root holds the step's journaled start alone,
+/// no attempt and no completion: the only crashed step whose inferred
+/// `OwnershipLost` maps.
 fn crashed_step(
     shadow: &ReferenceMachine,
     operation: &Handle,
     step: &StepCall,
     body: &Bytes,
-) -> Result<Event, String> {
+) -> Result<(Event, bool), String> {
     let head = Head::decode(body).map_err(|e| format!("root does not decode: {e:?}"))?;
     let HandleItem::Operation(seq) = operation.item else {
         return Err(format!("{operation:?} names no input"));
@@ -677,6 +864,7 @@ fn crashed_step(
         .steps
         .iter()
         .any(|s| s.step_key == step.key && s.status == StepStatus::Completed);
+    let start_only = written.is_none() && !completed;
     let mut ran = shadow.clone();
     let event = Event::Step {
         operation: *operation,
@@ -686,12 +874,15 @@ fn crashed_step(
     if ran.effect_view(operation, &step.key) == written
         && ran.step_completed(&step.key) == completed
     {
-        Ok(event)
+        Ok((event, start_only))
     } else {
-        Ok(Event::StepStarted {
-            operation: *operation,
-            step: step.clone(),
-        })
+        Ok((
+            Event::StepStarted {
+                operation: *operation,
+                step: step.clone(),
+            },
+            false,
+        ))
     }
 }
 
@@ -771,7 +962,12 @@ impl Rig {
     }
 
     pub fn with_limits(plan: FaultPlan, limits: StoreLimits) -> Rig {
-        let memory = Arc::new(MemoryStore::new());
+        Rig::over(MemoryStore::new(), plan, limits)
+    }
+
+    /// A rig over `memory`, for a store with its own page size.
+    pub fn over(memory: MemoryStore, plan: FaultPlan, limits: StoreLimits) -> Rig {
+        let memory = Arc::new(memory);
         let stamps = Arc::new(StampStore::new(memory.clone()));
         let rules = Arc::new(FaultStore::new(stamps.clone(), plan));
         Rig {
@@ -794,9 +990,22 @@ impl Rig {
     /// A process named `name` over `backend`, its coordinator's ids drawn
     /// from `seed`.
     pub fn proc(&self, name: &str, backend: Arc<dyn ObjectStoreBackend>, seed: u64) -> Proc {
+        self.proc_with(name, backend, seed, runtime_config(), None)
+    }
+
+    /// [`Rig::proc`] whose coordinator runs with `config` and sweeps with
+    /// `sweep`, which also starts passes from its idle polls.
+    pub fn proc_with(
+        &self,
+        name: &str,
+        backend: Arc<dyn ObjectStoreBackend>,
+        seed: u64,
+        config: RuntimeConfig,
+        sweep: Option<SweepConfig>,
+    ) -> Proc {
         let store = Arc::new(
             AgentStore::new(
-                backend.clone(),
+                Arc::new(StampStore::boundary(backend.clone())),
                 TENANT,
                 self.limits,
                 self.clock.clone(),
@@ -804,12 +1013,16 @@ impl Rig {
             )
             .with_backoff(Arc::new(NoBackoff)),
         );
-        let co = Arc::new(Coordinator::new(
+        let co = Coordinator::new(
             store.clone(),
-            runtime_config(),
+            config,
             self.clock.clone(),
             Arc::new(CountingRng(AtomicU64::new(seed))),
-        ));
+        );
+        let co = Arc::new(match sweep {
+            Some(config) => co.with_sweep(config),
+            None => co,
+        });
         let worker_id = co
             .register_worker(&[pin()])
             .unwrap_or_else(|_| format!("w-{seed}"));
@@ -826,6 +1039,7 @@ impl Rig {
             worker_id,
             backend,
             dispatches: self.dispatches.clone(),
+            clock: self.clock.clone(),
         }
     }
 
@@ -910,6 +1124,21 @@ impl Rig {
     }
 }
 
+/// Incarnations [`timer_handle`] searches.
+const MAX_INCARNATION: u64 = 16;
+
+/// The handle of timer `hex`, found as the id of `timer_key` in the
+/// incarnation that derives it.
+fn timer_handle(hex: &str, timer_key: &str) -> Option<Handle> {
+    (1..=MAX_INCARNATION)
+        .find(|&inc| timer_id(inc, timer_key).to_hex() == hex)
+        .map(|incarnation| Handle {
+            agent: agent(),
+            incarnation,
+            item: HandleItem::Timer(timer_id(incarnation, timer_key)),
+        })
+}
+
 /// Where the simulated tool provider records each execution.
 pub const PROVIDER_PREFIX: &str = "provider/";
 
@@ -973,6 +1202,7 @@ pub struct Proc {
     /// simulated tool provider writes through it.
     backend: Arc<dyn ObjectStoreBackend>,
     dispatches: Arc<Mutex<Vec<(String, Dispatch)>>>,
+    clock: Arc<SimClock>,
 }
 
 impl Proc {
@@ -1283,9 +1513,10 @@ impl Proc {
                                 phase,
                                 attempt: e.attempt,
                             }),
+                            None if e.attempt == 0 => None,
                             None => {
                                 return Observed::Unmappable(format!(
-                                    "step journal shows an intent with no attempt: {e:?}"
+                                    "step journal shows an intent past attempt 0: {e:?}"
                                 ));
                             }
                         },
@@ -1441,6 +1672,94 @@ impl Proc {
                     })
                 });
                 (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// Schedule `timer_key` due at `due_unix_ns` with an empty payload.
+    pub async fn schedule_timer(
+        &self,
+        timer_key: &str,
+        due_unix_ns: i64,
+    ) -> Result<TimerResponse, AgentError> {
+        let req = TimerRequest {
+            agent: agent_ref(),
+            timer_key: timer_key.to_string(),
+            due_unix_ns,
+            handler: HANDLER.to_string(),
+            payload: Value::Null,
+        };
+        let event = Event::Client(ClientOp::SetTimer {
+            timer_key: timer_key.to_string(),
+            due_unix_ns,
+            handler: HANDLER.to_string(),
+            payload: json_bytes(&Value::Null),
+        });
+        self.record(
+            "schedule_timer",
+            Some(event),
+            self.co.schedule_timer(&req),
+            |r| {
+                let observed = observe(r, |t| match timer_handle(&t.timer, timer_key) {
+                    Some(timer) => Observed::Modelled(Reply::TimerSet {
+                        timer,
+                        generation: t.generation,
+                    }),
+                    None => Observed::Unmappable(format!(
+                        "timer {} is {timer_key} in no incarnation up to {MAX_INCARNATION}",
+                        t.timer
+                    )),
+                });
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    pub async fn cancel_timer(&self, timer_key: &str) -> Result<CancelTimerResponse, AgentError> {
+        let req = CancelTimerRequest {
+            agent: agent_ref(),
+            timer_key: timer_key.to_string(),
+        };
+        let event = Event::Client(ClientOp::CancelTimer {
+            timer_key: timer_key.to_string(),
+        });
+        self.record(
+            "cancel_timer",
+            Some(event),
+            self.co.cancel_timer(&req),
+            |r| {
+                let observed = observe(r, |c| Observed::Modelled(Reply::TimerCancel(c.outcome)));
+                (None, observed)
+            },
+        )
+        .await
+    }
+
+    /// One sweep pass over the tenant: `Coordinator::sweep_once`. It is
+    /// recorded as a wake from a hint when the pass read a due hint, else
+    /// from the sweep; the reference answers both alike.
+    pub async fn sweep(&self) -> Result<SweepReport, AgentError> {
+        let now_unix_ns = self.clock.now_unix_ns();
+        let begun = Event::Wake {
+            now_unix_ns,
+            by: WakeSource::Sweep,
+        };
+        self.record(
+            SWEEP,
+            Some(begun),
+            self.co.sweep_once(&TENANT),
+            |r| match r {
+                Ok(report) => {
+                    let by = if report.hints_read > 0 {
+                        WakeSource::Hint
+                    } else {
+                        WakeSource::Sweep
+                    };
+                    (Some(Event::Wake { now_unix_ns, by }), Observed::Swept)
+                }
+                Err(e) => (None, map_error(e.kind)),
             },
         )
         .await
@@ -1690,6 +2009,48 @@ mod tests {
         let last = run.history.calls().last().expect("a call");
         assert_eq!(last.event, run_step);
         assert_eq!(last.observed, Reply::Error(ErrorKind::EffectInDoubt));
+        assert_eq!(run.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_step_crashed_after_journaling_past_a_cancel_infers_ownership_lost() {
+        let rec = Recorder::default();
+        let mut reference = machine().expect("machine");
+        let op = accepted(&rec, &mut reference);
+        let run_step = Event::Step {
+            operation: op,
+            step: StepCall {
+                key: "lookup".to_string(),
+                tool: "search".to_string(),
+                version: "v1".to_string(),
+                input: b"q".to_vec(),
+                policy: RecoveryPolicy::AtLeastOnce,
+            },
+        };
+        answered(
+            &rec,
+            &mut reference,
+            Event::TurnStarted { operation: op },
+            3,
+        );
+        let cancel = Event::Client(ClientOp::Cancel { operation: op });
+        answered(&rec, &mut reference, cancel, 4);
+        // The step journaled its start, no attempt, then the process died
+        // before the cancel check that would have refused it.
+        let rig = Rig::new(FaultPlan::empty());
+        rig.setup(|p| async move {
+            p.create().await.map_err(|e| format!("create: {e:?}"))?;
+            Ok(())
+        })
+        .expect("setup");
+        let head = rig.head().expect("head");
+        crashed(&rec, run_step.clone(), 5, Bytes::from(head.encode()));
+        let run = rec.build().expect("build");
+        assert_eq!(run.unmappable, Vec::<String>::new());
+        assert_eq!(run.inferred, vec![("w2".to_string(), run_step.clone())]);
+        let last = run.history.calls().last().expect("a call");
+        assert_eq!(last.event, run_step);
+        assert_eq!(last.observed, Reply::Error(ErrorKind::OwnershipLost));
         assert_eq!(run.check(), Ok(()));
     }
 

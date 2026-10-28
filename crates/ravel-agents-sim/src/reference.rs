@@ -23,11 +23,19 @@
 //!   so a completion that committed first wins; an input not yet started
 //!   is cancelled at once; a running input records the request and its next
 //!   commit ends it `cancelled` (decision 5, `CancelResponse.requested`).
-//! - One timer generation counter per agent, shared by every timer key, so
-//!   a timer key has one generation at a time. A due event fires a
-//!   generation at most once, a stale or cancelled generation fires
-//!   nothing, and cancelling after the firing reports `AlreadyFired`
-//!   (decision 8).
+//! - Timers (decision 8). One timer generation counter per agent, shared by
+//!   every timer key, so a timer key has one generation at a time, and each
+//!   `set` records its due time. A fire ([`Event::TimerDue`]) is one atomic
+//!   step: it marks the generation delivered and enqueues its input, and it
+//!   happens only when that generation is still armed and due at the fire's
+//!   clock, so a generation fires at most once and a stale, cancelled or
+//!   not-yet-due one fires nothing. A cancel of an armed generation stops it;
+//!   a cancel after the fire reports `AlreadyFired`, and the input stays.
+//!   A wake ([`Event::Wake`]) fires every armed timer due at its clock,
+//!   earliest first. Hints are accelerators only: a wake from a hint and one
+//!   from the sweep fire exactly the same timers, so a duplicate or
+//!   premature hint changes nothing about what is due, and the sweep alone
+//!   is enough for every due timer to fire.
 //! - The state version changes only when a turn completes (decision 6).
 //! - Steps (decision 7). A turn journals each step by key with its tool
 //!   name, tool version and input bytes; a key reused with any of them
@@ -89,6 +97,16 @@
 //! policy is spent. The timer message's content is not modelled either: a
 //! firing enqueues an input known by its handle alone, and
 //! [`ClientOp::SetTimer`]'s handler and payload are not checked.
+//!
+//! Choices for timers: "due" is `due_unix_ns <= now`, with no margin either
+//! way, against the clock the fire or wake carries; a reschedule of an
+//! armed or delivered key takes a new generation and arms it, and the
+//! earlier generation can no longer fire; a cancel of an already cancelled
+//! generation reports `Cancelled` again; a cancel of a key never set
+//! reports `Unknown`; timers due at the same instant fire in generation
+//! order; and the hint itself, the advisory key a schedule writes, is not an
+//! event, since nothing a client or worker observes depends on it. A hint
+//! that is lost, duplicated or early only moves when a wake happens.
 //!
 //! Choices for steps and effects: an attempt is this turn's own, and so
 //! blocks the next step, when it was dispatched by a step after the input's
@@ -158,6 +176,8 @@ pub enum ClientOp {
     State,
     SetTimer {
         timer_key: String,
+        /// The recorded due time, in unix nanoseconds.
+        due_unix_ns: i64,
         handler: String,
         payload: Vec<u8>,
     },
@@ -184,10 +204,18 @@ pub enum Event {
         operation: Handle,
         error: String,
     },
-    /// A wake hint or the sweep found the timer generation due.
+    /// One fire of the timer generation at `now_unix_ns`: the atomic step
+    /// that marks the generation delivered and enqueues its input.
     TimerDue {
         timer_key: String,
         generation: u64,
+        now_unix_ns: i64,
+    },
+    /// A visit at `now_unix_ns` that fires every armed timer due by then,
+    /// earliest due first, each as [`Event::TimerDue`] would.
+    Wake {
+        now_unix_ns: i64,
+        by: WakeSource,
     },
     /// The turn journals a step without running it.
     StepStarted {
@@ -229,6 +257,14 @@ pub enum Event {
         step_key: String,
         attempt: u32,
     },
+}
+
+/// What brought a [`Event::Wake`] about. Both fire the same timers: a hint
+/// only makes a visit sooner, and the sweep is the authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeSource {
+    Hint,
+    Sweep,
 }
 
 /// One tool call a handler makes, as the reference identifies it.
@@ -301,6 +337,8 @@ pub enum Reply {
     TimerCancel(TimerCancelOutcome),
     /// The input the firing enqueued, or `None` when nothing fired.
     TimerFired(Option<Handle>),
+    /// The inputs a wake enqueued, in firing order.
+    Woken(Vec<Handle>),
     TurnStarted,
     Committed {
         status: OperationStatus,
@@ -354,6 +392,7 @@ enum TimerPhase {
 #[derive(Debug, Clone)]
 struct Timer {
     generation: u64,
+    due_unix_ns: i64,
     phase: TimerPhase,
 }
 
@@ -478,6 +517,25 @@ pub struct ReferenceMachine {
     terminal_log: Vec<(Handle, OperationStatus)>,
 }
 
+/// Fire `generation` of `timer_key` when it is armed and due at `now`: mark
+/// it delivered and enqueue its input, in one step.
+fn fire(
+    agent: AgentId,
+    life: &mut Life,
+    timer_key: &str,
+    generation: u64,
+    now: i64,
+) -> Option<Handle> {
+    let timer = life.timers.get_mut(timer_key)?;
+    if timer.generation != generation || timer.phase != TimerPhase::Armed || timer.due_unix_ns > now
+    {
+        return None;
+    }
+    timer.phase = TimerPhase::Delivered;
+    let seq = life.accept();
+    Some(Handle::operation(agent, life.incarnation, seq))
+}
+
 fn is_terminal(status: OperationStatus) -> bool {
     matches!(
         status,
@@ -560,7 +618,9 @@ impl ReferenceMachine {
             Event::TimerDue {
                 timer_key,
                 generation,
-            } => self.timer_due(timer_key, *generation),
+                now_unix_ns,
+            } => self.timer_due(timer_key, *generation, *now_unix_ns),
+            Event::Wake { now_unix_ns, .. } => self.wake(*now_unix_ns),
             Event::StepStarted { operation, step } => self.step(operation, step, false),
             Event::Step { operation, step } => self.step(operation, step, true),
             Event::EffectResult {
@@ -657,7 +717,11 @@ impl ReferenceMachine {
                 },
                 Err(reply) => reply,
             },
-            ClientOp::SetTimer { timer_key, .. } => self.set_timer(timer_key),
+            ClientOp::SetTimer {
+                timer_key,
+                due_unix_ns,
+                ..
+            } => self.set_timer(timer_key, *due_unix_ns),
             ClientOp::CancelTimer { timer_key } => match self.live_mut() {
                 Ok(life) => Reply::TimerCancel(match life.timers.get_mut(timer_key) {
                     None => TimerCancelOutcome::Unknown,
@@ -857,7 +921,7 @@ impl ReferenceMachine {
         }
     }
 
-    fn set_timer(&mut self, timer_key: &str) -> Reply {
+    fn set_timer(&mut self, timer_key: &str, due_unix_ns: i64) -> Reply {
         let agent = self.agent;
         let life = match self.live_mut() {
             Ok(life) => life,
@@ -869,6 +933,7 @@ impl ReferenceMachine {
             timer_key.to_string(),
             Timer {
                 generation,
+                due_unix_ns,
                 phase: TimerPhase::Armed,
             },
         );
@@ -882,24 +947,34 @@ impl ReferenceMachine {
         }
     }
 
-    fn timer_due(&mut self, timer_key: &str, generation: u64) -> Reply {
+    fn timer_due(&mut self, timer_key: &str, generation: u64, now: i64) -> Reply {
         let agent = self.agent;
         let life = match self.live_mut() {
             Ok(life) => life,
             Err(reply) => return reply,
         };
-        let fires = life
+        Reply::TimerFired(fire(agent, life, timer_key, generation, now))
+    }
+
+    fn wake(&mut self, now: i64) -> Reply {
+        let agent = self.agent;
+        // The sweep passes over a destroyed or absent agent without a write
+        // and without a refusal.
+        let Ok(life) = self.live_mut() else {
+            return Reply::Woken(Vec::new());
+        };
+        let mut due: Vec<(i64, u64, String)> = life
             .timers
-            .get(timer_key)
-            .is_some_and(|t| t.generation == generation && t.phase == TimerPhase::Armed);
-        if !fires {
-            return Reply::TimerFired(None);
-        }
-        if let Some(timer) = life.timers.get_mut(timer_key) {
-            timer.phase = TimerPhase::Delivered;
-        }
-        let seq = life.accept();
-        Reply::TimerFired(Some(Handle::operation(agent, life.incarnation, seq)))
+            .iter()
+            .filter(|(_, t)| t.phase == TimerPhase::Armed && t.due_unix_ns <= now)
+            .map(|(key, t)| (t.due_unix_ns, t.generation, key.clone()))
+            .collect();
+        due.sort();
+        Reply::Woken(
+            due.into_iter()
+                .filter_map(|(_, generation, key)| fire(agent, life, &key, generation, now))
+                .collect(),
+        )
     }
 
     /// A step of the running turn; `run` continues past the journal to
@@ -1145,6 +1220,9 @@ impl ReferenceMachine {
 mod tests {
     use super::*;
     use crate::history::{Divergence, History};
+
+    /// The due time every test timer records, in unix nanoseconds.
+    const DUE: i64 = 1_000;
 
     fn machine() -> ReferenceMachine {
         ReferenceMachine::new("support", "ticket-7").expect("valid agent name")
@@ -1473,6 +1551,7 @@ mod tests {
             (
                 client(ClientOp::SetTimer {
                     timer_key: "nudge".into(),
+                    due_unix_ns: DUE,
                     handler: "remind".into(),
                     payload: b"x".to_vec(),
                 }),
@@ -1485,6 +1564,7 @@ mod tests {
                 Event::TimerDue {
                     timer_key: "nudge".into(),
                     generation: 1,
+                    now_unix_ns: DUE,
                 },
                 Reply::TimerFired(Some(fired)),
             ),
@@ -1493,6 +1573,7 @@ mod tests {
                 Event::TimerDue {
                     timer_key: "nudge".into(),
                     generation: 1,
+                    now_unix_ns: DUE,
                 },
                 Reply::TimerFired(None),
             ),
@@ -1518,6 +1599,7 @@ mod tests {
             (
                 client(ClientOp::SetTimer {
                     timer_key: "nudge".into(),
+                    due_unix_ns: DUE,
                     handler: "remind".into(),
                     payload: b"x".to_vec(),
                 }),
@@ -1536,6 +1618,7 @@ mod tests {
                 Event::TimerDue {
                     timer_key: "nudge".into(),
                     generation: 1,
+                    now_unix_ns: DUE,
                 },
                 Reply::TimerFired(None),
             ),
@@ -1543,6 +1626,7 @@ mod tests {
             (
                 client(ClientOp::SetTimer {
                     timer_key: "nudge".into(),
+                    due_unix_ns: DUE,
                     handler: "remind".into(),
                     payload: b"x".to_vec(),
                 }),
@@ -1555,6 +1639,7 @@ mod tests {
                 Event::TimerDue {
                     timer_key: "nudge".into(),
                     generation: 1,
+                    now_unix_ns: DUE,
                 },
                 Reply::TimerFired(None),
             ),
@@ -1562,9 +1647,177 @@ mod tests {
                 Event::TimerDue {
                     timer_key: "nudge".into(),
                     generation: 2,
+                    now_unix_ns: DUE,
                 },
                 Reply::TimerFired(Some(m.operation(1, 1))),
             ),
+        ]);
+        assert_eq!(h.check(m), Ok(()));
+    }
+
+    fn set(timer_key: &str, due_unix_ns: i64) -> Event {
+        client(ClientOp::SetTimer {
+            timer_key: timer_key.into(),
+            due_unix_ns,
+            handler: "remind".into(),
+            payload: Vec::new(),
+        })
+    }
+
+    fn due(timer_key: &str, generation: u64, now_unix_ns: i64) -> Event {
+        Event::TimerDue {
+            timer_key: timer_key.into(),
+            generation,
+            now_unix_ns,
+        }
+    }
+
+    fn wake(now_unix_ns: i64, by: WakeSource) -> Event {
+        Event::Wake { now_unix_ns, by }
+    }
+
+    #[test]
+    fn a_timer_fires_at_its_due_time_and_not_a_nanosecond_before() {
+        let m = machine();
+        let h = history(vec![
+            (client(ClientOp::Create), created(1, true)),
+            (
+                set("nudge", DUE),
+                Reply::TimerSet {
+                    timer: m.timer(1, "nudge"),
+                    generation: 1,
+                },
+            ),
+            // A premature hint and a premature sweep both fire nothing.
+            (due("nudge", 1, DUE - 1), Reply::TimerFired(None)),
+            (wake(DUE - 1, WakeSource::Hint), Reply::Woken(Vec::new())),
+            (wake(DUE - 1, WakeSource::Sweep), Reply::Woken(Vec::new())),
+            (
+                due("nudge", 1, DUE),
+                Reply::TimerFired(Some(m.operation(1, 1))),
+            ),
+        ]);
+        assert_eq!(h.check(m), Ok(()));
+    }
+
+    #[test]
+    fn a_wake_fires_every_due_timer_once_in_due_then_generation_order() {
+        let m = machine();
+        let h = history(vec![
+            (client(ClientOp::Create), created(1, true)),
+            (
+                set("late", DUE + 5),
+                Reply::TimerSet {
+                    timer: m.timer(1, "late"),
+                    generation: 1,
+                },
+            ),
+            (
+                set("b", DUE),
+                Reply::TimerSet {
+                    timer: m.timer(1, "b"),
+                    generation: 2,
+                },
+            ),
+            (
+                set("a", DUE),
+                Reply::TimerSet {
+                    timer: m.timer(1, "a"),
+                    generation: 3,
+                },
+            ),
+            (
+                set("future", DUE + 100),
+                Reply::TimerSet {
+                    timer: m.timer(1, "future"),
+                    generation: 4,
+                },
+            ),
+            (
+                wake(DUE + 10, WakeSource::Sweep),
+                Reply::Woken(vec![
+                    m.operation(1, 1),
+                    m.operation(1, 2),
+                    m.operation(1, 3),
+                ]),
+            ),
+            // The second pass at the same clock, or a late hint, finds every
+            // due generation delivered.
+            (wake(DUE + 10, WakeSource::Hint), Reply::Woken(Vec::new())),
+            (due("b", 2, DUE + 10), Reply::TimerFired(None)),
+            (
+                client(ClientOp::CancelTimer {
+                    timer_key: "a".into(),
+                }),
+                Reply::TimerCancel(TimerCancelOutcome::AlreadyFired),
+            ),
+            (
+                client(ClientOp::CancelTimer {
+                    timer_key: "future".into(),
+                }),
+                Reply::TimerCancel(TimerCancelOutcome::Cancelled),
+            ),
+            (wake(DUE + 100, WakeSource::Sweep), Reply::Woken(Vec::new())),
+        ]);
+        assert_eq!(h.check(m.clone()), Ok(()));
+
+        // Woken lists the fired inputs in accept order; a reply listing them
+        // out of order diverges.
+        let prefix = || {
+            vec![
+                (client(ClientOp::Create), created(1, true)),
+                (
+                    set("b", DUE),
+                    Reply::TimerSet {
+                        timer: m.timer(1, "b"),
+                        generation: 1,
+                    },
+                ),
+                (
+                    set("a", DUE),
+                    Reply::TimerSet {
+                        timer: m.timer(1, "a"),
+                        generation: 2,
+                    },
+                ),
+            ]
+        };
+        let mut ordered = prefix();
+        ordered.push((
+            wake(DUE, WakeSource::Sweep),
+            Reply::Woken(vec![m.operation(1, 1), m.operation(1, 2)]),
+        ));
+        assert_eq!(history(ordered).check(m.clone()), Ok(()));
+        let mut swapped = prefix();
+        swapped.push((
+            wake(DUE, WakeSource::Sweep),
+            Reply::Woken(vec![m.operation(1, 2), m.operation(1, 1)]),
+        ));
+        assert!(history(swapped).check(m).is_err());
+    }
+
+    #[test]
+    fn a_wake_over_a_destroyed_agent_fires_nothing_and_refuses_nothing() {
+        let m = machine();
+        let h = history(vec![
+            (wake(DUE, WakeSource::Sweep), Reply::Woken(Vec::new())),
+            (client(ClientOp::Create), created(1, true)),
+            (
+                set("nudge", DUE),
+                Reply::TimerSet {
+                    timer: m.timer(1, "nudge"),
+                    generation: 1,
+                },
+            ),
+            (
+                client(ClientOp::Destroy),
+                Reply::Destroyed {
+                    incarnation: 1,
+                    already: false,
+                },
+            ),
+            (wake(DUE, WakeSource::Sweep), Reply::Woken(Vec::new())),
+            (due("nudge", 1, DUE), Reply::Error(ErrorKind::AgentGone)),
         ]);
         assert_eq!(h.check(m), Ok(()));
     }
@@ -1673,6 +1926,7 @@ mod tests {
             (
                 client(ClientOp::SetTimer {
                     timer_key: "nudge".into(),
+                    due_unix_ns: DUE,
                     handler: "remind".into(),
                     payload: Vec::new(),
                 }),
@@ -2141,19 +2395,113 @@ mod tests {
             .prop_map(move |(inc, seq)| Handle::operation(agent, inc, seq))
         }
 
+        const STEP_KEYS: [&str; 2] = ["s0", "s1"];
+        /// Due times a generated `set` records: [`DUE`] or this later one.
+        const LATE: i64 = DUE + 10;
+        /// A clock before every generated due time.
+        const EARLY: i64 = DUE - 1;
+
+        /// A generated event, and the index of an answered handle that
+        /// replaces its operation when `pick` is set and the history has
+        /// answered one; see [`resolve`].
+        #[derive(Debug, Clone)]
+        struct Draw {
+            event: Event,
+            pick: Option<prop::sample::Index>,
+        }
+
         /// Every generated history starts with a Create, so the rest of the
         /// events act on a live agent often enough to reach turn commits
         /// (`the_property_generator_reaches_commits` pins the rate).
-        fn events() -> impl Strategy<Value = Vec<Event>> {
-            prop::collection::vec(event(), 0..48).prop_map(|mut events| {
-                events.insert(0, Event::Client(ClientOp::Create));
-                events
+        fn events() -> impl Strategy<Value = Vec<Draw>> {
+            prop::collection::vec(draw(), 0..48).prop_map(|mut draws| {
+                draws.insert(
+                    0,
+                    Draw {
+                        event: Event::Client(ClientOp::Create),
+                        pick: None,
+                    },
+                );
+                draws
             })
+        }
+
+        fn draw() -> impl Strategy<Value = Draw> {
+            let pick = prop_oneof![
+                1 => Just(None),
+                2 => any::<prop::sample::Index>().prop_map(Some),
+            ];
+            (event(), pick).prop_map(|(event, pick)| Draw { event, pick })
+        }
+
+        /// The event `draw` stands for once `answered` holds the handles the
+        /// history answered so far, oldest first.
+        fn resolve(draw: &Draw, answered: &[Handle]) -> Event {
+            let Some(pick) = &draw.pick else {
+                return draw.event.clone();
+            };
+            if answered.is_empty() {
+                return draw.event.clone();
+            }
+            let chosen = answered[pick.index(answered.len())];
+            let mut event = draw.event.clone();
+            match &mut event {
+                Event::Client(
+                    ClientOp::Operation { operation }
+                    | ClientOp::Result { operation }
+                    | ClientOp::Cancel { operation },
+                )
+                | Event::TurnStarted { operation }
+                | Event::TurnCompleted { operation, .. }
+                | Event::TurnFailed { operation, .. }
+                | Event::StepStarted { operation, .. }
+                | Event::Step { operation, .. }
+                | Event::EffectResult { operation, .. }
+                | Event::ReconcileAttach { operation, .. }
+                | Event::ReconcileAuthorize { operation, .. } => *operation = chosen,
+                _ => {}
+            }
+            event
+        }
+
+        /// The fresh handles a reply answers.
+        fn answers(reply: &Reply) -> Vec<Handle> {
+            match reply {
+                Reply::Accepted {
+                    operation,
+                    duplicate: false,
+                } => vec![*operation],
+                Reply::TimerFired(Some(operation)) => vec![*operation],
+                Reply::Woken(fired) => fired.clone(),
+                _ => Vec::new(),
+            }
+        }
+
+        fn step_call() -> impl Strategy<Value = StepCall> {
+            let policy = prop::sample::select(vec![
+                RecoveryPolicy::ProviderIdempotency,
+                RecoveryPolicy::AtLeastOnce,
+                RecoveryPolicy::Manual,
+            ]);
+            // The input byte varies rarely, so a reused key mostly matches
+            // and only sometimes blocks the turn as non-deterministic.
+            let input = prop_oneof![9 => Just(b'q'), 1 => Just(b'z')];
+            (prop::sample::select(STEP_KEYS.to_vec()), input, policy).prop_map(
+                |(key, input, policy)| StepCall {
+                    key: key.into(),
+                    tool: "crm".into(),
+                    version: "v1".into(),
+                    input: vec![input],
+                    policy,
+                },
+            )
         }
 
         fn event() -> impl Strategy<Value = Event> {
             let ids = prop::sample::select(REQUEST_IDS.to_vec());
             let keys = prop::sample::select(TIMER_KEYS.to_vec());
+            let step_keys = prop::sample::select(STEP_KEYS.to_vec());
+            let clocks = prop::sample::select(vec![EARLY, DUE, LATE]);
             prop_oneof![
                 1 => Just(Event::Client(ClientOp::Create)),
                 1 => Just(Event::Client(ClientOp::Destroy)),
@@ -2166,26 +2514,60 @@ mod tests {
                 })),
                 3 => handle().prop_map(|operation| Event::Client(ClientOp::Cancel { operation })),
                 1 => Just(Event::Client(ClientOp::State)),
-                2 => keys.clone().prop_map(|k| Event::Client(ClientOp::SetTimer {
-                    timer_key: k.into(),
-                    handler: "remind".into(),
-                    payload: Vec::new(),
-                })),
+                3 => (keys.clone(), prop::sample::select(vec![DUE, LATE])).prop_map(|(k, due)| {
+                    Event::Client(ClientOp::SetTimer {
+                        timer_key: k.into(),
+                        due_unix_ns: due,
+                        handler: "remind".into(),
+                        payload: Vec::new(),
+                    })
+                }),
                 1 => keys.clone().prop_map(|k| Event::Client(ClientOp::CancelTimer {
                     timer_key: k.into(),
                 })),
-                2 => (keys, 0u64..4).prop_map(|(k, generation)| Event::TimerDue {
-                    timer_key: k.into(),
-                    generation,
+                2 => (keys, 0u64..4, clocks.clone()).prop_map(|(k, generation, now)| {
+                    Event::TimerDue {
+                        timer_key: k.into(),
+                        generation,
+                        now_unix_ns: now,
+                    }
+                }),
+                3 => (clocks, any::<bool>()).prop_map(|(now, hint)| Event::Wake {
+                    now_unix_ns: now,
+                    by: if hint { WakeSource::Hint } else { WakeSource::Sweep },
                 }),
                 6 => handle().prop_map(|operation| Event::TurnStarted { operation }),
-                4 => handle().prop_map(|operation| Event::TurnCompleted {
+                5 => handle().prop_map(|operation| Event::TurnCompleted {
                     operation,
                     output: b"ok".to_vec(),
                 }),
                 3 => handle().prop_map(|operation| Event::TurnFailed {
                     operation,
                     error: "boom".into(),
+                }),
+                1 => (handle(), step_call())
+                    .prop_map(|(operation, step)| Event::StepStarted { operation, step }),
+                8 => (handle(), step_call()).prop_map(|(operation, step)| Event::Step { operation, step }),
+                3 => (handle(), step_keys.clone(), 0u32..4, prop::sample::select(vec![b'a', b'b']))
+                    .prop_map(|(operation, step_key, attempt, r)| Event::EffectResult {
+                        operation,
+                        step_key: step_key.into(),
+                        attempt,
+                        result: vec![r],
+                    }),
+                1 => (handle(), step_keys.clone()).prop_map(|(operation, step_key)| {
+                    Event::ReconcileAttach {
+                        operation,
+                        step_key: step_key.into(),
+                        result: b"a".to_vec(),
+                    }
+                }),
+                1 => (handle(), step_keys, 1u32..4).prop_map(|(operation, step_key, attempt)| {
+                    Event::ReconcileAuthorize {
+                        operation,
+                        step_key: step_key.into(),
+                        attempt,
+                    }
                 }),
             ]
         }
@@ -2209,7 +2591,12 @@ mod tests {
                 )
                 | Event::TurnStarted { operation }
                 | Event::TurnCompleted { operation, .. }
-                | Event::TurnFailed { operation, .. } => Some(*operation),
+                | Event::TurnFailed { operation, .. }
+                | Event::StepStarted { operation, .. }
+                | Event::Step { operation, .. }
+                | Event::EffectResult { operation, .. }
+                | Event::ReconcileAttach { operation, .. }
+                | Event::ReconcileAuthorize { operation, .. } => Some(*operation),
                 _ => None,
             }
         }
@@ -2222,6 +2609,7 @@ mod tests {
                 (
                     client(ClientOp::SetTimer {
                         timer_key: "t0".into(),
+                        due_unix_ns: DUE,
                         handler: "remind".into(),
                         payload: Vec::new(),
                     }),
@@ -2233,6 +2621,7 @@ mod tests {
                 (
                     client(ClientOp::SetTimer {
                         timer_key: "t1".into(),
+                        due_unix_ns: DUE,
                         handler: "remind".into(),
                         payload: Vec::new(),
                     }),
@@ -2244,6 +2633,7 @@ mod tests {
                 (
                     client(ClientOp::SetTimer {
                         timer_key: "t0".into(),
+                        due_unix_ns: DUE,
                         handler: "remind".into(),
                         payload: Vec::new(),
                     }),
@@ -2306,15 +2696,30 @@ mod tests {
             let mut runner = TestRunner::deterministic();
             let strategy = events();
             let mut commits = 0usize;
+            let mut steps = 0usize;
+            let mut fires = 0usize;
             for _ in 0..1_000 {
-                let events = strategy.new_tree(&mut runner).expect("strategy").current();
+                let draws = strategy.new_tree(&mut runner).expect("strategy").current();
                 let mut m = machine();
-                for event in &events {
-                    if matches!(m.apply(event), Reply::Committed { .. }) {
-                        commits += 1;
+                let mut answered = Vec::new();
+                for draw in &draws {
+                    let event = resolve(draw, &answered);
+                    let reply = m.apply(&event);
+                    match &reply {
+                        Reply::Committed { .. } => commits += 1,
+                        Reply::StepDispatched { .. } | Reply::StepCompleted { .. } => steps += 1,
+                        Reply::TimerFired(Some(_)) => fires += 1,
+                        Reply::Woken(fired) => fires += fired.len(),
+                        _ => {}
                     }
+                    answered.extend(answers(&reply));
                 }
             }
+            assert!(
+                steps >= 100 && fires >= 150,
+                "the generator must reach step dispatches and timer fires often: \
+                 {steps} steps and {fires} fires in 1000 cases"
+            );
             assert!(
                 commits >= 200,
                 "the generator must reach commits often: {commits} in 1000 cases"
@@ -2325,15 +2730,75 @@ mod tests {
             #![proptest_config(ProptestConfig::with_cases(5_000))]
 
             #[test]
-            fn reference_machine_invariants_hold(events in events()) {
+            fn reference_machine_invariants_hold(draws in events()) {
                 let mut m = machine();
+                let mut answered: Vec<Handle> = Vec::new();
+                let mut fired_generations: HashSet<(u64, String, u64)> = HashSet::new();
+                let mut dispatched: HashMap<(Handle, String), u32> = HashMap::new();
                 let mut terminal: HashMap<Handle, OperationStatus> = HashMap::new();
                 let mut state_version: HashMap<u64, u64> = HashMap::new();
                 let mut next_seq: HashMap<u64, u64> = HashMap::new();
                 let mut last_started: HashMap<u64, u64> = HashMap::new();
-                for (index, event) in events.iter().enumerate() {
+                for (index, draw) in draws.iter().enumerate() {
+                    let event = &resolve(draw, &answered);
                     let incarnation = m.incarnation();
+
+                    // A hint is an accelerator only: a wake from a hint and
+                    // one from the sweep at the same clock answer the same.
+                    let other_source = match event {
+                        Event::Wake { now_unix_ns, by } => {
+                            let mut other = m.clone();
+                            let by = match by {
+                                WakeSource::Hint => WakeSource::Sweep,
+                                WakeSource::Sweep => WakeSource::Hint,
+                            };
+                            Some(other.apply(&Event::Wake { now_unix_ns: *now_unix_ns, by }))
+                        }
+                        _ => None,
+                    };
                     let reply = m.apply(event);
+                    if let Some(other) = other_source {
+                        prop_assert_eq!(&other, &reply, "event {} {:?}", index, event);
+                    }
+                    answered.extend(answers(&reply));
+
+                    // Nothing fires before its due time, and a wake leaves no
+                    // armed timer due at its clock.
+                    match (event, &reply) {
+                        (Event::TimerDue { now_unix_ns: EARLY, .. }, Reply::TimerFired(fired)) => {
+                            prop_assert_eq!(fired, &None, "event {} {:?}", index, event);
+                        }
+                        (Event::Wake { now_unix_ns, by }, Reply::Woken(fired)) => {
+                            if *now_unix_ns == EARLY {
+                                prop_assert!(fired.is_empty(), "event {} {:?}", index, event);
+                            }
+                            let again = m.clone().apply(&Event::Wake { now_unix_ns: *now_unix_ns, by: *by });
+                            prop_assert_eq!(again, Reply::Woken(Vec::new()), "event {} {:?}", index, event);
+                        }
+                        _ => {}
+                    }
+
+                    // A generation fires at most once.
+                    if let (
+                        Event::TimerDue { timer_key, generation, .. },
+                        Reply::TimerFired(Some(_)),
+                        Some(inc),
+                    ) = (event, &reply, incarnation)
+                    {
+                        prop_assert!(
+                            fired_generations.insert((inc, timer_key.clone(), *generation)),
+                            "event {} fired {:?} twice", index, event
+                        );
+                    }
+
+                    // A dispatched attempt never goes back.
+                    if let (Event::Step { operation, step }, Reply::StepDispatched { attempt }) =
+                        (event, &reply)
+                    {
+                        let last = dispatched.entry((*operation, step.key.clone())).or_insert(0);
+                        prop_assert!(*attempt >= *last, "event {} dispatched {} after {}", index, attempt, *last);
+                        *last = *attempt;
+                    }
 
                     // A handle from any other incarnation is refused.
                     if let Some(handle) = subject(event)
@@ -2368,11 +2833,12 @@ mod tests {
 
                     // Accept order is dense per incarnation.
                     let fresh = match &reply {
-                        Reply::Accepted { operation, duplicate: false } => Some(*operation),
-                        Reply::TimerFired(Some(operation)) => Some(*operation),
-                        _ => None,
+                        Reply::Accepted { .. } | Reply::TimerFired(_) | Reply::Woken(_) => {
+                            answers(&reply)
+                        }
+                        _ => Vec::new(),
                     };
-                    if let Some(op) = fresh {
+                    for op in fresh {
                         let next = next_seq.entry(op.incarnation).or_insert(FIRST_ACCEPT_SEQ);
                         prop_assert_eq!(op.item, HandleItem::Operation(*next));
                         *next += 1;

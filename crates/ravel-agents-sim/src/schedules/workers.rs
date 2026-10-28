@@ -210,9 +210,15 @@ fn kills(seed: u64) -> KillCounts {
         client(&rig, &format!("c{c}"), 30 + c, move |p| async move {
             for i in 0..2 {
                 let id = format!("c{c}-{i}");
-                p.send(&id, &payload(10 * c + i))
-                    .await
-                    .map_err(|e| format!("send {id}: {e:?}"))?;
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    match p.send(&id, &payload(10 * c + i)).await {
+                        Ok(_) => break,
+                        Err(e) if e.kind == ErrorKind::StoreUnavailable && tries < SEND_TRIES => {}
+                        Err(e) => return Err(format!("send {id}: {e:?}")),
+                    }
+                }
             }
             Ok(())
         })
@@ -223,10 +229,30 @@ fn kills(seed: u64) -> KillCounts {
     let out = run(&rig, seed, script, actors).expect("schedule");
     drain(&rig, seed);
     let run = rig.build().expect("build");
-    sim_assert!(out, run.unmappable.is_empty(), "{:?}", run.unmappable);
+    // The suspected defect
+    // `a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll`
+    // pins: counted, so a batch that reaches it still checks every other
+    // seed.
+    let (escaped, unmappable): (Vec<_>, Vec<_>) = run
+        .unmappable
+        .iter()
+        .partition(|u| u.as_str() == ESCAPED_UNKNOWN);
+    sim_assert!(out, unmappable.is_empty(), "{unmappable:?}");
+    let escaped_unknown = escaped.len();
     let known =
         past_known_divergences(&run).unwrap_or_else(|d| panic!("{d}\n{}", out.failure_context()));
-    sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
+    // The one refusal a kill schedule reaches: a send whose HEAD CAS lost
+    // to the workers' writes past the store's CAS bound, which the client
+    // retries.
+    let contended_sends = run.refusals.len();
+    sim_assert!(
+        out,
+        run.refusals.iter().all(|r| r.call == "send"
+            && r.kind == ErrorKind::StoreUnavailable
+            && r.actor.starts_with('c')),
+        "{:?}",
+        run.refusals
+    );
     let head = rig.head().expect("head");
     sim_assert_eq!(out, head.next_accept_seq, 5);
     one_terminal_result_per_input(&head)
@@ -266,8 +292,17 @@ fn kills(seed: u64) -> KillCounts {
         inferred: run.inferred.len(),
         stale_owner: known.stale_owner,
         false_negatives: known.false_negatives,
+        contended_sends,
+        escaped_unknown,
     }
 }
+
+/// What the driver lists for a poll that handed `OutcomeUnknown` to `w1`.
+const ESCAPED_UNKNOWN: &str = "w1 poll: OutcomeUnknown reached the caller";
+
+/// Times a [`kills`] client sends one input before a `StoreUnavailable`
+/// fails the run.
+const SEND_TRIES: u32 = 4;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct KillCounts {
@@ -279,6 +314,10 @@ struct KillCounts {
     inferred: usize,
     stale_owner: usize,
     false_negatives: usize,
+    /// Sends refused `StoreUnavailable` and retried.
+    contended_sends: usize,
+    /// Polls that answered `w1` `OutcomeUnknown`, a suspected defect.
+    escaped_unknown: usize,
 }
 
 /// Divergences [`past_known_divergences`] answered past, by kind.
@@ -540,10 +579,11 @@ fn worker_kills_across_seeds() {
         totals.inferred += k.inferred;
         totals.stale_owner += k.stale_owner;
         totals.false_negatives += k.false_negatives;
+        totals.contended_sends += k.contended_sends;
+        totals.escaped_unknown += k.escaped_unknown;
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(totals, KILL_TOTALS);
+    pinned("worker_kills", runs, totals, KILL_TOTALS);
 }
 
 /// The seed of [`worker_kills_across_seeds`] whose first run diverged: no
@@ -561,6 +601,49 @@ fn stale_owner_commit_after_takeover_is_fenced() {
             inferred: 0,
             stale_owner: 1,
             false_negatives: 0,
+            contended_sends: 0,
+            escaped_unknown: 0,
+        }
+    );
+}
+
+/// A seed outside the default batch where the scheduler holds `c0`'s send
+/// behind the workers' HEAD writes until its CAS bound runs out: the send
+/// is refused `StoreUnavailable`, and the retry lands it. No worker
+/// crashes; `w1`'s lost-answer rule fires.
+#[test]
+fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
+    assert_eq!(
+        kills(9_000_272),
+        KillCounts {
+            fired: 1,
+            contended_sends: 1,
+            ..KillCounts::default()
+        }
+    );
+}
+
+/// A seed outside the default batch. `w1`'s poll spends its one `BeginTurn`
+/// retry, then the retried `BeginTurn` CAS loses its answer, and the poll
+/// hands `OutcomeUnknown` to the caller with no settle read after the
+/// write: `Coordinator::poll` re-runs `BeginTurn` once under a single flag
+/// shared by `OwnershipLost` and `OutcomeUnknown`, so the second unknown
+/// escapes, where the runtime's failure module says `BeginTurn` is settled.
+#[test]
+#[ignore = "suspected defect: poll returns OutcomeUnknown when a BeginTurn retry loses its answer"]
+fn a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll() {
+    assert_eq!(kills(11_000_167).escaped_unknown, 0);
+}
+
+/// The same seed as counted today: the escape is the run's one divergence.
+#[test]
+fn a_lost_begin_turn_answer_after_a_spent_retry_escapes_the_poll_today() {
+    assert_eq!(
+        kills(11_000_167),
+        KillCounts {
+            fired: 1,
+            escaped_unknown: 1,
+            ..KillCounts::default()
         }
     );
 }
@@ -574,6 +657,8 @@ const KILL_TOTALS: KillCounts = KillCounts {
     inferred: 3,
     stale_owner: 2,
     false_negatives: 0,
+    contended_sends: 0,
+    escaped_unknown: 0,
 };
 
 /// `w1` begins op 1 and is held at its commit-time HEAD read. `w2`, on
@@ -659,8 +744,7 @@ fn suspended_worker_across_seeds() {
         }
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(taken_over, SUSPENDED_TAKEN_OVER);
+    pinned("suspended_worker", runs, taken_over, SUSPENDED_TAKEN_OVER);
 }
 
 /// Runs of the batch where `w2` took over before `w1`'s commit.
@@ -715,8 +799,7 @@ fn cold_restart_across_seeds() {
         turns += cold_restart_race(seed);
         runs += 1;
     }
-    assert_eq!(runs, 64);
-    assert_eq!(turns, COLD_RESTART_TURNS);
+    pinned("cold_restart", runs, turns, COLD_RESTART_TURNS);
 }
 
 /// `w-restarted`'s turns over the batch; the drain ran the rest of 128.
