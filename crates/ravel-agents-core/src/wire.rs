@@ -344,6 +344,48 @@ pub struct EffectsResponse {
     pub effects: Vec<EffectBody>,
 }
 
+/// What one attempt of an effect came to, as `GET /api/v1/agents/effects/{effect}`
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptState {
+    /// The current authorized attempt, with no result yet.
+    Open,
+    /// The current attempt of an effect latched in doubt.
+    InDoubt,
+    /// The attempt whose result is the effect's result.
+    Result,
+    /// An earlier attempt a later one replaced.
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectAttemptBody {
+    pub attempt: u32,
+    pub status: AttemptState,
+}
+
+/// A result reported for an attempt after another attempt's result was
+/// recorded: kept, never the effect's result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectEvidenceBody {
+    pub attempt: u32,
+    pub result: Value,
+}
+
+/// `GET /api/v1/agents/effects/{effect}`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectInspectResponse {
+    #[serde(flatten)]
+    pub effect: EffectBody,
+    pub step_key: String,
+    /// The attempt whose result is recorded, once one is.
+    pub result_attempt: Option<u32>,
+    pub result: Option<Value>,
+    pub attempts: Vec<EffectAttemptBody>,
+    pub evidence: Vec<EffectEvidenceBody>,
+}
+
 /// `POST /api/v1/agents/reconcile`, `agents_admin` only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -432,19 +474,15 @@ pub struct PolledLease {
 /// incarnation and the input's accept_seq (both u64 little-endian), as
 /// lowercase hex. Every attempt at one input derives the same seed.
 pub fn turn_random_seed(agent_id_hex: &str, incarnation: u64, accept_seq: u64) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(crate::identity::DOMAIN);
-    let parts: [&[u8]; 4] = [
-        b"random",
-        agent_id_hex.as_bytes(),
-        &incarnation.to_le_bytes(),
-        &accept_seq.to_le_bytes(),
-    ];
-    for part in parts {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part);
-    }
-    hex::encode(&hasher.finalize().as_bytes()[..16])
+    crate::identity::derive_128(
+        "random",
+        &[
+            agent_id_hex.as_bytes(),
+            &incarnation.to_le_bytes(),
+            &accept_seq.to_le_bytes(),
+        ],
+    )
+    .to_hex()
 }
 
 /// One leased turn. `worker/poll` delivers it with a [`PolledLease`]
@@ -590,7 +628,40 @@ pub struct WorkerCommitResponse {
     pub effects: Vec<String>,
 }
 
-/// `POST /api/v1/agents/effects/complete`
+/// `POST /api/v1/agents/worker/step`: journal a step, or read back the
+/// record it already has, and authorize the attempt the caller runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepRecordRequest {
+    pub lease: TurnLease,
+    pub step_key: String,
+    pub tool_name: String,
+    pub tool_version: String,
+    pub policy: Policy,
+    /// Lowercase hex of [`crate::identity::step_input_hash`] over
+    /// `tool_name`, `tool_version` and the canonical encoding of the step's
+    /// input: its JSON form with object keys sorted by UTF-16 code unit at
+    /// every depth, no insignificant whitespace, strings escaped and numbers
+    /// written as ECMAScript `JSON.stringify` writes them. A replay whose hash
+    /// differs from the journaled one is `NonDeterministicReplay`.
+    /// `sdk/fixtures/identity/step_input_hash.json` pins one input, its
+    /// canonical text and its hash for both implementations.
+    pub input_hash: String,
+}
+
+/// The step's record. A step with a recorded result comes back as it is:
+/// `step.status` `completed` with its output, or `failure` set and `output`
+/// null. Otherwise `attempt` is the attempt the caller is authorized to run
+/// and `effect` the handle its result is completed under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepRecordResponse {
+    pub step: StepBody,
+    pub effect: String,
+    pub attempt: u32,
+    /// The tool failure recorded as the step's result, or null.
+    pub failure: Option<String>,
+}
+
+/// `POST /api/v1/agents/worker/effects/complete`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectCompleteRequest {
     pub effect: String,
@@ -605,6 +676,16 @@ pub struct EffectCompleteResponse {
     /// True when another attempt's result was recorded first; this one is
     /// kept as evidence only.
     pub late: bool,
+}
+
+/// `POST /api/v1/agents/worker/effects/fail`: record a tool's failure as its
+/// attempt's result, under the same `late` rule as `effects/complete`. The
+/// answer is an [`EffectCompleteResponse`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectFailRequest {
+    pub effect: String,
+    pub attempt: u32,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

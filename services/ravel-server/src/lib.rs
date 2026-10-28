@@ -3771,6 +3771,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             http_router = http_router.merge(agents::router(
                 agents_runtime.clone(),
                 config.tenant_resolver.clone(),
+                audit_sink.clone(),
             ));
         }
         query_service_handle = Some(query_service);
@@ -3822,6 +3823,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 mtls_router = mtls_router.merge(agents::router(
                     agents_runtime.clone(),
                     mtls.resolver.clone(),
+                    audit_sink.clone(),
                 ));
             }
             mtls_query_service_handle = Some(mtls_query_service);
