@@ -8,7 +8,8 @@
 //! Every step and effect command goes through the coordinator's effects
 //! methods, never a kernel command built here.
 //! Every refusal after authentication leaves through [`agent_error`], the one
-//! mapping from an [`AgentError`] to a status and an [`ErrorBody`].
+//! mapping from an [`AgentError`] to a status and an [`ErrorBody`], except an
+//! expired `events` cursor, which is `410` with a [`CursorExpiredBody`].
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -20,12 +21,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
-use ravel_agents_core::head::{EffectRecord, EffectStatus, Head, Lifecycle, StepRecord};
+use ravel_agents_core::head::{
+    EffectRecord, EffectStatus, EventEntry, Head, Lifecycle, StepRecord,
+};
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, AttemptState, CallRequest, CallResponse, CancelRequest, CreateAgentRequest,
+    AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest, CursorExpiredBody, CursorRestart, SafeIdsBody, CallResponse, CancelRequest, CreateAgentRequest,
     EffectAttemptBody, EffectBody, EffectCompleteRequest, EffectCompleteResponse,
     EffectEvidenceBody, EffectFailRequest, EffectInspectResponse, EffectsResponse, ErrorBody,
     EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
@@ -52,6 +55,10 @@ use ravel_tenant_resolve::Principal;
 
 /// Most events one `events` page returns, whatever `limit` asks for.
 pub const MAX_EVENTS_PAGE: u32 = 1_000;
+
+/// Most attempts `GET effects/{effect}` lists: the latest ones, so an effect
+/// retried past this many lists attempts starting above 1.
+pub const MAX_INSPECT_ATTEMPTS: u32 = 64;
 
 /// How often a waiting `result` re-reads HEAD when nothing in this process
 /// signalled a change, so a commit through another process is seen.
@@ -83,6 +90,8 @@ pub(super) enum Refusal {
     /// shared error shape: no agent error kind describes either.
     Auth(ServiceError),
     Agent(AgentError),
+    /// An `events` cursor below the retained window (410).
+    CursorExpired(CursorExpiredBody),
 }
 
 impl From<AgentError> for Refusal {
@@ -96,6 +105,7 @@ impl IntoResponse for Refusal {
         match self {
             Refusal::Auth(error) => error.into_response(),
             Refusal::Agent(error) => agent_error(&error),
+            Refusal::CursorExpired(body) => (StatusCode::GONE, Json(body)).into_response(),
         }
     }
 }
@@ -382,14 +392,14 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             .await?;
         let agent = parse_agent(&body.agent)?;
         let after = match body.cursor.as_deref() {
-            None => 0,
-            Some(text) => text.parse::<u64>().map_err(|_| {
+            None => None,
+            Some(text) => Some(text.parse::<u64>().map_err(|_| {
                 refusal(
                     ErrorKind::UnsupportedFormat,
                     ids_for(&agent),
                     "events cursor is not one this server issued",
                 )
-            })?,
+            })?),
         };
         if body.limit == 0 {
             return Err(refusal(
@@ -398,15 +408,44 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
                 "events limit must be at least 1",
             ));
         }
-        let head = read_head(&call.tenant, &agent).await?;
+        let (head, operation) = match body.operation.as_deref() {
+            None => (read_head(&call.tenant, &agent).await?, None),
+            Some(token) => {
+                let handle = decode_operation(token)?;
+                if handle.agent != agent {
+                    return Err(refusal(
+                        ErrorKind::AgentGone,
+                        ids_for(&agent),
+                        "operation is not one of this agent's",
+                    ));
+                }
+                let (head, state) = read_operation(&call.tenant, &handle).await?;
+                (head, Some((operation_seq(&handle), state)))
+            }
+        };
+        let oldest = head
+            .events
+            .first()
+            .map_or(head.next_event_seq, |e| e.event_seq);
+        if let Some(cursor) = after {
+            if cursor.saturating_add(1) < oldest {
+                return Err(Refusal::CursorExpired(CursorExpiredBody {
+                    code: CURSOR_EXPIRED_CODE.to_string(),
+                    cursor: cursor.to_string(),
+                    oldest_cursor: oldest.saturating_sub(1).to_string(),
+                    restart: CursorRestart::RestartFromOldestCursor,
+                    reason: "events below this cursor are no longer retained".to_string(),
+                    ids: SafeIdsBody::from(&ids_for(&agent)),
+                }));
+            }
+        }
+        let after = after.unwrap_or(0);
+        let wanted = |e: &&EventEntry| {
+            e.event_seq > after && operation.is_none_or(|(seq, _)| e.accept_seq == seq)
+        };
         let limit = usize::try_from(body.limit.min(MAX_EVENTS_PAGE)).unwrap_or(1);
         let mut events = Vec::new();
-        for event in head
-            .events
-            .iter()
-            .filter(|e| e.event_seq > after)
-            .take(limit)
-        {
+        for event in head.events.iter().filter(wanted).take(limit) {
             events.push(EventBody {
                 event_seq: event.event_seq,
                 accept_seq: event.accept_seq,
@@ -416,9 +455,22 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             });
         }
         let next = events.last().map_or(after, |e| e.event_seq);
+        let terminal = match operation {
+            Some((seq, state))
+                if state.is_terminal()
+                    && !head
+                        .events
+                        .iter()
+                        .any(|e| e.event_seq > next && e.accept_seq == seq) =>
+            {
+                Some(state.into())
+            }
+            _ => None,
+        };
         Ok::<_, Refusal>(Json(EventsResponse {
             events,
             next_cursor: next.to_string(),
+            terminal,
         }))
     };
     run.await.into_response()
@@ -535,19 +587,28 @@ pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> R
         };
         let effect = effect_id(head.incarnation, seq, &spec.step_key);
         let handle = effect_handle(agent, head.incarnation, effect);
+        // A settled step whose effect record HEAD no longer holds cannot say
+        // which attempt settled it, and this worker no longer owns it.
         let result_attempt = || {
             head.effects
                 .iter()
                 .find(|e| e.effect_id == effect)
-                .map_or(0, |e| e.result_attempt)
+                .map(|e| e.result_attempt)
+                .ok_or_else(|| {
+                    refusal(
+                        ErrorKind::OwnershipLost,
+                        ids_for(&agent),
+                        "the effect record is no longer in HEAD",
+                    )
+                })
         };
         let (step, attempt, failure) = match progress {
             StepProgress::Dispatched(dispatch) => (step_body(step, None), dispatch.attempt, None),
             StepProgress::Completed { output } => {
-                (step_body(step, Some(output)), result_attempt(), None)
+                (step_body(step, Some(output)), result_attempt()?, None)
             }
             StepProgress::Failed { error } => {
-                (step_body(step, None), result_attempt(), Some(error))
+                (step_body(step, None), result_attempt()?, Some(error))
             }
         };
         Ok::<_, Refusal>(Json(StepRecordResponse {
@@ -652,7 +713,11 @@ pub(super) async fn effect_inspect(
         let head = read_head(&call.tenant, &effect.agent).await?;
         let record = effect_record(&head, &effect)?;
         let recorded = record.result.is_some().then_some(record.result_attempt);
-        let attempts = (1..=record.attempt)
+        let first = record
+            .attempt
+            .saturating_sub(MAX_INSPECT_ATTEMPTS - 1)
+            .max(1);
+        let attempts = (first..=record.attempt)
             .map(|attempt| EffectAttemptBody {
                 attempt,
                 status: attempt_state(record, recorded, attempt),
@@ -758,13 +823,23 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
                 return Err(not_in_doubt());
             }
             (ReconcileDecision::Retry, EffectStatus::Authorized)
-                if Some(record.attempt) != body.attempt.checked_add(1) =>
+                if body.attempt == 0 || Some(record.attempt) != body.attempt.checked_add(1) =>
             {
                 return Err(wrong_attempt());
             }
             (ReconcileDecision::Retry, EffectStatus::InDoubt)
             | (ReconcileDecision::Retry, EffectStatus::Authorized) => {}
             _ => return Err(not_in_doubt()),
+        }
+        // A retry of an attempt already superseded by the authorized one after
+        // it is a repeat: it is answered from HEAD as it stands, with no
+        // write, no hand-over and no audit record.
+        if matches!(body.decision, ReconcileDecision::Retry) && !in_doubt {
+            return Ok(Json(ReconcileResponse {
+                effect: body.effect,
+                status: record.status.into(),
+                attempt: record.attempt,
+            }));
         }
         if in_doubt {
             let event = agents_reconcile_audit_event(

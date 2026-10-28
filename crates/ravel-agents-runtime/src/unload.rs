@@ -3,10 +3,9 @@
 //! Unloading drops an agent's loaded root and lease-table entry and nothing
 //! else: no object is written and HEAD is untouched
 //! (`tests::idle_unload_writes_nothing_and_send_reloads_from_head`). The next
-//! send loads the agent from HEAD; the next poll rescans the agent directory
-//! and loads every agent that has work.
-
-use std::sync::atomic::Ordering;
+//! send loads the agent from HEAD. Only an agent with no work is dropped, so
+//! nothing needs rediscovering; work that reaches it later through another
+//! coordinator is found by the sweep.
 
 use crate::Coordinator;
 use crate::ownership::LeaseTable;
@@ -42,9 +41,6 @@ impl Coordinator {
                 .retain(|(a, _), _| !dropped.contains(a));
         }
         forget_all(&self.leases, &dropped);
-        if !dropped.is_empty() {
-            self.discovered.store(false, Ordering::Release);
-        }
         dropped.len()
     }
 }

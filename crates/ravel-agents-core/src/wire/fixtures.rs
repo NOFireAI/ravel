@@ -239,6 +239,16 @@ fn samples() -> Vec<Sample> {
                 agent: agent(),
                 cursor: None,
                 limit: 100,
+                operation: None,
+            },
+        ),
+        sample(
+            "events_request_operation",
+            EventsRequest {
+                agent: agent(),
+                cursor: Some("2".to_string()),
+                limit: 100,
+                operation: Some(operation()),
             },
         ),
         sample(
@@ -252,6 +262,36 @@ fn samples() -> Vec<Sample> {
                     payload: json!({"sku": "A-1"}),
                 }],
                 next_cursor: "2".to_string(),
+                terminal: None,
+            },
+        ),
+        sample(
+            "events_response_terminal",
+            EventsResponse {
+                events: vec![EventBody {
+                    event_seq: 3,
+                    accept_seq: 1,
+                    turn_id: turn_id().to_hex(),
+                    event_type: "order_shipped".to_string(),
+                    payload: json!({"carrier": "post"}),
+                }],
+                next_cursor: "3".to_string(),
+                terminal: Some(OperationStatus::Completed),
+            },
+        ),
+        sample(
+            "cursor_expired",
+            CursorExpiredBody {
+                code: CURSOR_EXPIRED_CODE.to_string(),
+                cursor: "2".to_string(),
+                oldest_cursor: "40".to_string(),
+                restart: CursorRestart::RestartFromOldestCursor,
+                reason: "events after cursor 2 are no longer retained".to_string(),
+                ids: SafeIdsBody {
+                    agent_id: Some(agent_id().to_hex()),
+                    incarnation: Some(1),
+                    ..SafeIdsBody::default()
+                },
             },
         ),
         sample(
@@ -287,6 +327,37 @@ fn samples() -> Vec<Sample> {
             "cancel_timer_response",
             CancelTimerResponse {
                 outcome: TimerCancelOutcome::AlreadyFired,
+            },
+        ),
+        sample(
+            "timers_response",
+            TimersResponse {
+                timers: vec![TimerBody {
+                    timer: Handle {
+                        agent: agent_id(),
+                        incarnation: 1,
+                        item: HandleItem::Timer(identity::timer_id(1, "payment-reminder")),
+                    }
+                    .encode(),
+                    timer_key: "payment-reminder".to_string(),
+                    generation: 2,
+                    due_unix_ns: 1_767_229_200_000_000_000,
+                    handler: "remind".to_string(),
+                    status: TimerState::Delivered,
+                }],
+            },
+        ),
+        sample(
+            "sweep_response",
+            SweepResponse {
+                wake_list_pages: 1,
+                dir_list_pages: 1,
+                head_gets: 2,
+                hints_read: 1,
+                hints_deleted: 1,
+                timers_fired: 1,
+                agents_loaded: 1,
+                dir_entries_repaired: 0,
             },
         ),
         sample(

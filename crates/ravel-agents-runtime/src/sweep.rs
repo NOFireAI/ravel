@@ -47,6 +47,14 @@
 //! so every agent with a HEAD has an entry. An entry whose HEAD is absent
 //! costs one read and is skipped.
 //!
+//! Such an orphan entry is left by a create whose entry PUT landed and whose
+//! HEAD write did not. Nothing deletes it: the next create of the same agent
+//! reuses it, since its `CreateIfAbsent` answers `AlreadyExists` and the
+//! create goes on to write HEAD (`ravel-agents-store`'s
+//! `ensure_dir_entry_writes_only_a_missing_entry`). Until then it costs the
+//! directory half one HEAD read per visit and fires nothing
+//! (`tests::an_orphan_dir_entry_costs_one_read_and_is_skipped`).
+//!
 //! An entry can still go missing outside the runtime, for example by hand.
 //! Such an agent is reached only through its hints, and the pass then
 //! writes the entry back: after the directory half, every agent the wake
@@ -57,8 +65,15 @@
 //! pass pays nothing for the repair; in a larger one, a hint-reached agent
 //! outside the pass's directory slice costs one PUT that answers
 //! `AlreadyExists`. The repair issues no read, and at most one PUT per HEAD
-//! read the wake half made, so the GET budget bounds it. A PUT that fails is
-//! logged and tried again on the next pass that reaches the agent
+//! read the wake half made, so the GET budget bounds it. An agent whose repair
+//! PUT answered, written or `AlreadyExists`, is remembered across passes, in
+//! a set bounded by [`MAX_DIR_KNOWN`] and emptied when full, so a later pass
+//! does not PUT for it again
+//! (`tests::a_hint_reached_agent_outside_the_dir_slice_is_repaired_once_across_passes`).
+//! An entry removed by hand after the agent was remembered is restored once
+//! the set is emptied, or by the agent's next create. A PUT that fails is
+//! logged, not remembered, and tried again on the next pass that reaches the
+//! agent
 //! (`tests::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`,
 //! where every repair PUT is refused).
 //!
@@ -89,19 +104,24 @@
 //!
 //! # Reachability
 //!
-//! A pass runs from [`Coordinator::sweep_once`], and from worker polls once
-//! [`Coordinator::with_sweep`] enabled it, at most once per
-//! [`SweepConfig::interval_ms`] across every poller. A poll runs one only
+//! A pass runs from [`Coordinator::sweep_once`], and from worker polls at
+//! most once per [`SweepConfig::interval_ms`] across every poller. A poll is
+//! how a coordinator finds an agent given work through another coordinator,
+//! and the pass is the only listing a poll issues: there is no separate
+//! directory scan (`crate::tests::a_poll_issues_no_unbounded_list`). A poll runs one only
 //! after its scan found nothing to dispatch, so a ready assignment never
 //! waits for a pass (`tests::a_poll_with_a_ready_turn_runs_no_sweep_pass`),
 //! and a pass that fired a timer or loaded an agent makes the same poll scan
 //! again before it waits
 //! (`tests::an_idle_poll_sweeps_on_the_interval_and_takes_what_the_pass_fired`).
-//! Nothing in `ravel-server` schedules either yet; T19 (#3353) does.
+//! A poll that does not wait runs at most one pass, within the same caps
+//! (`crate::tests::a_poll_with_no_wait_runs_at_most_one_bounded_pass`).
+//! `ravel-server` also runs [`Coordinator::sweep_once`] per tenant on
+//! `agents.sweep_interval_ms`, and on `POST /api/v1/agents/sweep`.
 //!
-//! Each pass's counters are a flat [`SweepReport`], summed into
-//! [`crate::SweepMetricsSnapshot`] for `ravel-server` to render. Nothing
-//! renders them until T19 does.
+//! Each pass's counters are a [`SweepReport`], with the LISTs split by half,
+//! summed into [`crate::SweepMetricsSnapshot`], which `ravel-server` renders
+//! on `/metrics`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -123,6 +143,9 @@ pub const DEFAULT_SWEEP_INTERVAL_MS: u64 = 5_000;
 pub const DEFAULT_SWEEP_MAX_LIST_PAGES: u32 = 8;
 /// Default cap on the HEAD reads of one pass.
 pub const DEFAULT_SWEEP_MAX_HEAD_GETS: u32 = 64;
+/// Most agents the sweep remembers as having a `_dir` entry; the set is
+/// emptied when it would grow past this.
+pub const MAX_DIR_KNOWN: usize = 4_096;
 
 /// Sweep tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,12 +168,14 @@ impl Default for SweepConfig {
     }
 }
 
-/// What one pass did: a flat set of counters, with no per-phase split. The
-/// store's own counters split the same requests by phase.
+/// What one pass did. The LISTs are split by the half that issued them; the
+/// store's own counters split the same requests by store phase.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// LISTs issued, wake and directory halves together.
-    pub list_pages: u64,
+    /// LISTs of `_wake/` the wake half issued.
+    pub wake_list_pages: u64,
+    /// LISTs of `_dir/` the directory half issued.
+    pub dir_list_pages: u64,
     /// HEAD reads issued by the pass itself.
     pub head_gets: u64,
     /// Hints in a due bucket the pass acted on.
@@ -171,6 +196,17 @@ pub struct SweepReport {
 pub(crate) struct SweepCursor {
     wake: Option<String>,
     dir: Option<String>,
+    /// Agents whose repair PUT answered, at most [`MAX_DIR_KNOWN`].
+    dir_known: HashSet<AgentId>,
+}
+
+impl SweepCursor {
+    fn know(&mut self, agent: AgentId) {
+        if self.dir_known.len() >= MAX_DIR_KNOWN && !self.dir_known.contains(&agent) {
+            self.dir_known.clear();
+        }
+        self.dir_known.insert(agent);
+    }
 }
 
 /// One agent as this pass found it.
@@ -195,11 +231,10 @@ struct Pass {
 }
 
 impl Coordinator {
-    /// Use `config` for every pass and start passes from worker polls.
+    /// Use `config` for every pass.
     #[must_use]
     pub fn with_sweep(mut self, config: SweepConfig) -> Coordinator {
         self.sweep = config;
-        self.sweep_on_poll = true;
         self
     }
 
@@ -223,16 +258,13 @@ impl Coordinator {
         self.sweep_pass(&mut cursor).await
     }
 
-    /// A pass from a worker poll, when enabled and the interval has passed.
+    /// A pass from a worker poll, when the interval has passed.
     /// Pollers claim the slot by compare-exchange on the last-pass stamp, so
     /// pollers woken together run one pass; one that finds a pass running
     /// skips it. Only a poll that found nothing to dispatch calls this, so a
     /// ready assignment never waits for a pass. Returns whether the pass
     /// fired a timer or loaded an agent, which is new work to scan for.
     pub(crate) async fn sweep_from_poll(&self) -> bool {
-        if !self.sweep_on_poll {
-            return false;
-        }
         let interval = ms_to_ns(self.sweep.interval_ms);
         let last = self.last_sweep_unix_ns.load(Ordering::Acquire);
         let now = self.now();
@@ -274,7 +306,7 @@ impl Coordinator {
         pass.gets_left += config.max_head_gets - config.max_head_gets / 2;
         let dir = self.sweep_dir(&mut pass, cursor).await;
         if dir.is_ok() {
-            self.repair_dir_entries(&mut pass).await;
+            self.repair_dir_entries(&mut pass, cursor).await;
         }
         self.record_sweep(&pass.report);
         wake.and(dir).map(|()| pass.report)
@@ -291,7 +323,7 @@ impl Coordinator {
                 return Ok(());
             }
             pass.lists_left -= 1;
-            pass.report.list_pages += 1;
+            pass.report.wake_list_pages += 1;
             let page = self.store.list_wake_hints(cursor.wake.as_deref()).await?;
             for hint in &page.items {
                 if hint.bucket > now_bucket {
@@ -339,7 +371,7 @@ impl Coordinator {
                 return Ok(());
             }
             pass.lists_left -= 1;
-            pass.report.list_pages += 1;
+            pass.report.dir_list_pages += 1;
             let page = self.store.list_dir_after(cursor.dir.as_deref()).await?;
             pass.listed
                 .extend(page.items.iter().map(|entry| entry.agent));
@@ -367,16 +399,20 @@ impl Coordinator {
     /// HEAD exists and whose entry the directory half did not list in this
     /// pass: one `CreateIfAbsent` PUT each, which is `AlreadyExists` when
     /// the entry is there after all. At most one per HEAD read the wake half
-    /// made, so the GET budget bounds it.
-    async fn repair_dir_entries(&self, pass: &mut Pass) {
+    /// made, so the GET budget bounds it, and none for an agent whose PUT
+    /// answered on an earlier pass.
+    async fn repair_dir_entries(&self, pass: &mut Pass, cursor: &mut SweepCursor) {
         let hinted = std::mem::take(&mut pass.hinted);
         for agent in hinted {
-            if pass.listed.contains(&agent) {
+            if pass.listed.contains(&agent) || cursor.dir_known.contains(&agent) {
                 continue;
             }
             match self.store.ensure_dir_entry(&agent).await {
-                Ok(true) => pass.report.dir_entries_repaired += 1,
-                Ok(false) => {}
+                Ok(true) => {
+                    pass.report.dir_entries_repaired += 1;
+                    cursor.know(agent);
+                }
+                Ok(false) => cursor.know(agent),
                 Err(error) => {
                     tracing::debug!(agent = %agent.to_hex(), %error, "agents sweep could not repair a dir entry");
                 }

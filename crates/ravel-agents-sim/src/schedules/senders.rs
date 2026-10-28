@@ -537,6 +537,6 @@ fn lost_cas_response_across_seeds() {
     assert_eq!(a_conflicts, LOST_ACK_CONFLICTS);
 }
 
-const LOST_ACK_POSITIONS: (usize, usize, usize) = (40, 13, 11);
+const LOST_ACK_POSITIONS: (usize, usize, usize) = (44, 11, 9);
 /// Conflicts a's faulted CASes took, summed over the batch.
-const LOST_ACK_CONFLICTS: u64 = 45;
+const LOST_ACK_CONFLICTS: u64 = 28;

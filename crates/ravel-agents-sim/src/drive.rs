@@ -174,7 +174,7 @@ use ravel_agents_core::wire::{
 };
 use ravel_agents_runtime::{
     Coordinator, DEFAULT_POLL_WAIT_CAP_MS, Dispatch, EffectDispatcher, EffectRef, EffectSettled,
-    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec,
+    Rng, RuntimeConfig, StepJournal, StepProgress, StepSpec, SweepConfig,
 };
 use ravel_agents_store::backoff::NoBackoff;
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
@@ -726,9 +726,10 @@ pub fn json_bytes(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_default()
 }
 
-/// The coordinator settings every process uses: short leases, and an idle
-/// unload and rescan interval of zero so a poll always sees work that
-/// arrived through another process.
+/// The coordinator settings every process uses: short leases and an idle
+/// unload of zero. With the sweep [`Rig::proc`] sets, an interval of zero
+/// and one LIST a pass, which goes to the directory half, a poll always sees
+/// work that arrived through another process, through one directory LIST.
 pub fn runtime_config() -> RuntimeConfig {
     RuntimeConfig {
         lease_ms: LEASE_MS,
@@ -736,7 +737,6 @@ pub fn runtime_config() -> RuntimeConfig {
         max_turn_attempts: 3,
         idle_unload_after_ms: 0,
         poll_wait_cap_ms: DEFAULT_POLL_WAIT_CAP_MS,
-        rescan_interval_ms: 0,
     }
 }
 
@@ -804,12 +804,19 @@ impl Rig {
             )
             .with_backoff(Arc::new(NoBackoff)),
         );
-        let co = Arc::new(Coordinator::new(
-            store.clone(),
-            runtime_config(),
-            self.clock.clone(),
-            Arc::new(CountingRng(AtomicU64::new(seed))),
-        ));
+        let co = Arc::new(
+            Coordinator::new(
+                store.clone(),
+                runtime_config(),
+                self.clock.clone(),
+                Arc::new(CountingRng(AtomicU64::new(seed))),
+            )
+            .with_sweep(SweepConfig {
+                interval_ms: 0,
+                max_list_pages: 1,
+                ..SweepConfig::default()
+            }),
+        );
         let worker_id = co
             .register_worker(&[pin()])
             .unwrap_or_else(|_| format!("w-{seed}"));

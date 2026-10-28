@@ -103,7 +103,8 @@ async fn a_lost_hint_is_found_by_the_directory_half() {
     assert_eq!(
         pass,
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 1,
             hints_read: 0,
             hints_deleted: 0,
@@ -353,7 +354,8 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
     let deletes = r.store.wake_hint_deletes();
     let pass = cold.sweep_once(&TENANT).await.expect("sweep");
     let expected = SweepReport {
-        list_pages: 2,
+        wake_list_pages: 1,
+        dir_list_pages: 1,
         head_gets: 2,
         hints_read: 1,
         hints_deleted: 1,
@@ -366,7 +368,8 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
         cold.sweep_metrics(),
         SweepMetricsSnapshot {
             passes: 1,
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 2,
             hints_read: 1,
             hints_deleted: 1,
@@ -385,7 +388,8 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
     assert_eq!(
         pass,
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 2,
             ..SweepReport::default()
         }
@@ -394,7 +398,8 @@ async fn sweep_counters_move_by_exactly_what_a_pass_did() {
         cold.sweep_metrics(),
         SweepMetricsSnapshot {
             passes: 2,
-            list_pages: 4,
+            wake_list_pages: 2,
+            dir_list_pages: 2,
             head_gets: 4,
             hints_read: 1,
             hints_deleted: 1,
@@ -454,7 +459,8 @@ async fn a_wake_page_of_unaddressable_keys_moves_the_cursor_past_it() {
     assert_eq!(
         pass,
         SweepReport {
-            list_pages: 3,
+            wake_list_pages: 2,
+            dir_list_pages: 1,
             head_gets: 1,
             hints_read: 1,
             hints_deleted: 1,
@@ -489,7 +495,8 @@ async fn a_dir_page_of_unaddressable_keys_moves_the_cursor_past_it() {
     assert_eq!(
         pass,
         SweepReport {
-            list_pages: 3,
+            wake_list_pages: 1,
+            dir_list_pages: 2,
             head_gets: 1,
             hints_read: 0,
             hints_deleted: 0,
@@ -507,4 +514,74 @@ async fn a_sweep_of_another_tenant_is_refused() {
     let refused = r.co.sweep_once(&TenantHash([8; 16])).await;
     assert!(refused.is_err());
     assert_eq!(r.co.sweep_metrics().passes, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hint_reached_agent_outside_the_dir_slice_is_repaired_once_across_passes() {
+    // Two-key pages and two LISTs a pass: the wake half's one page holds the
+    // one hint, and the directory half lists two entries a pass, so the
+    // hinted agent, last of eight in LIST order, is not listed by the first
+    // three passes while the wake half reaches it on each.
+    let r = rig_over(
+        Arc::new(MemoryStore::with_page_size(2)),
+        SweepConfig {
+            max_list_pages: 2,
+            ..SweepConfig::default()
+        },
+    );
+    let keys: Vec<String> = (0..8).map(|i| format!("o-{i}")).collect();
+    for key in &keys {
+        create(&r.co, key).await;
+    }
+    let mut order = keys.clone();
+    order.sort_by_key(|k| id_of(k).to_hex());
+    let hinted = order[7].clone();
+    // A timer due now and one due later in the same bucket keep the one hint
+    // standing after the first fires.
+    schedule(&r.co, &hinted, "a", T0 + SEC).await;
+    schedule(&r.co, &hinted, "b", T0 + 50 * SEC).await;
+    r.now.advance(SEC);
+
+    let mut puts = Vec::new();
+    for _ in 0..3 {
+        let before = r.store.counters();
+        let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+        assert_eq!(pass.dir_list_pages, 1);
+        assert_eq!(pass.hints_read, 1, "the wake half reaches the agent");
+        assert_eq!(pass.dir_entries_repaired, 0, "the entry is there");
+        puts.push(r.store.counters().since(&before).publish.put);
+    }
+    assert_eq!(puts, vec![1, 0, 0], "one AlreadyExists PUT, then none");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_orphan_dir_entry_costs_one_read_and_is_skipped() {
+    let backend = Arc::new(MemoryStore::new());
+    let r = rig_over(backend.clone(), SweepConfig::default());
+    // The entry a create leaves when its entry PUT lands and its HEAD write
+    // does not.
+    backend.insert_foreign(
+        &dir_key(&TENANT, &id_of("o-1")).expect("dir key"),
+        bytes::Bytes::new(),
+    );
+    for _ in 0..2 {
+        let before = r.store.counters();
+        let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+        assert_eq!(
+            pass,
+            SweepReport {
+                wake_list_pages: 1,
+                dir_list_pages: 1,
+                head_gets: 1,
+                ..SweepReport::default()
+            }
+        );
+        let spent = r.store.counters().since(&before);
+        assert_eq!((spent.publish.put, spent.publish.cas), (0, 0));
+    }
+
+    // The next create reuses it: its CreateIfAbsent answers AlreadyExists.
+    create(&r.co, "o-1").await;
+    let listed = r.store.list_agents(None).await.expect("list").agents;
+    assert_eq!(listed, vec![id_of("o-1")]);
 }

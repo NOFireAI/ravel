@@ -30,10 +30,8 @@ use ravel_agents_core::identity::AgentId;
 use ravel_agents_core::kernel::Reply;
 use ravel_agents_core::state::Handle;
 use ravel_agents_core::wire::{AgentRef, StepBody, TurnAssignment, TurnLease, WorkerPollRequest};
-use ravel_agents_store::HeadState;
 use serde_json::Value;
 
-use crate::ownership::ms_to_ns;
 use crate::{Coordinator, parse_pins, refused};
 
 /// What one pass over the loaded agents found.
@@ -53,9 +51,6 @@ impl Coordinator {
         let wait_ms = u64::from(req.wait_ms).min(self.config.poll_wait_cap_ms);
         let deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(wait_ms));
         let mut waited = false;
-        // At most one in-pass rescan per wake, so an interval of zero rescans
-        // every pass but never spins without reaching the wait below.
-        let mut rescanned = false;
         // At most one sweep pass per wake, run only once the scan found
         // nothing, so a ready assignment never waits for one
         // (`sweep::tests::a_poll_with_a_ready_turn_runs_no_sweep_pass`).
@@ -65,15 +60,18 @@ impl Coordinator {
             tokio::pin!(notified);
             notified.as_mut().enable();
             self.unload_idle();
-            self.discover().await?;
             match self.scan(&req.worker_id, &pins).await? {
                 Scan::Assigned(a) => return Ok(Some(*a)),
                 Scan::Refused(e) => return Err(e),
-                // Nothing loaded has work: an agent given work through
-                // another coordinator is only in the directory, so the next
-                // pass lists it again, at most once per rescan interval
-                // (`tests::a_poll_finds_an_agent_that_got_work_through_another_coordinator`,
-                // `tests::an_idle_poll_rescans_the_directory_at_most_once_per_interval`).
+                // Nothing loaded has work. An agent given work through
+                // another coordinator is found by the sweep's bounded
+                // directory half, never by an unbounded listing on the poll
+                // path (`tests::a_poll_issues_no_unbounded_list`,
+                // `tests::a_poll_finds_an_agent_that_got_work_through_another_coordinator`).
+                // A poll that does not wait still runs at most one pass,
+                // and that pass is held to the sweep's LIST and GET caps and
+                // its interval
+                // (`tests::a_poll_with_no_wait_runs_at_most_one_bounded_pass`).
                 Scan::Nothing => {
                     // A pass that fired a timer or loaded an agent may have
                     // made work this poll can take, so scan again first.
@@ -82,25 +80,6 @@ impl Coordinator {
                         if self.sweep_from_poll().await {
                             continue;
                         }
-                    }
-                    let interval = ms_to_ns(self.config.rescan_interval_ms);
-                    let last = self.last_scan_unix_ns.load(Ordering::Acquire);
-                    let now = self.now();
-                    // Claim the rescan slot before clearing the latch: every
-                    // poller a send wakes reads the same last-scan stamp, and
-                    // only the one whose compare-exchange wins rescans; the
-                    // rest fall through to the wait
-                    // (`tests::pollers_woken_together_share_one_rescan`).
-                    if !rescanned
-                        && now.saturating_sub(last) >= interval
-                        && self
-                            .last_scan_unix_ns
-                            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                    {
-                        rescanned = true;
-                        self.discovered.store(false, Ordering::Release);
-                        continue;
                     }
                 }
             }
@@ -114,74 +93,8 @@ impl Coordinator {
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return Ok(None);
             }
-            rescanned = false;
             swept = false;
         }
-    }
-
-    /// Load every agent in the directory that has work. Runs once per
-    /// start, after an unload, and after a pass that found nothing to
-    /// dispatch once `rescan_interval_ms` has passed since the last scan,
-    /// so work that reached an agent through another coordinator is picked
-    /// up within one interval. An agent whose HEAD this release cannot read
-    /// is logged and skipped, so a rollback below an agent's format version
-    /// is visible in the log rather than as an input that never runs.
-    async fn discover(&self) -> Result<(), AgentError> {
-        if self.discovered.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // One scan at a time: a poller that arrives while another is inside
-        // the scan returns at once and finds the scan's results in the
-        // loaded set on its next pass
-        // (`tests::pollers_woken_together_share_one_rescan`).
-        if self
-            .scanning
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-        let result = self.scan_directory().await;
-        self.scanning.store(false, Ordering::Release);
-        result
-    }
-
-    async fn scan_directory(&self) -> Result<(), AgentError> {
-        let mut page = None;
-        loop {
-            let listed = self.store.list_agents(page).await?;
-            for agent in listed.agents {
-                if self.agents.lock().contains_key(&agent) {
-                    continue;
-                }
-                match self.store.read_head(&agent).await? {
-                    HeadState::Present { head, .. }
-                        if head.active_turn.is_some() || !head.inbox.is_empty() =>
-                    {
-                        self.observe(&agent, &head);
-                    }
-                    HeadState::Present { .. } | HeadState::Absent => {}
-                    HeadState::Unsupported { found } => {
-                        // Once per agent, not once per rescan: the condition
-                        // is static for the life of a rollback.
-                        if self.unsupported_reported.lock().insert(agent) {
-                            tracing::warn!(
-                                agent = %agent.to_hex(),
-                                format_version = found,
-                                "agents directory names an agent whose HEAD format this release cannot read; its inputs are not offered"
-                            );
-                        }
-                    }
-                }
-            }
-            match listed.next {
-                Some(next) => page = Some(next),
-                None => break,
-            }
-        }
-        self.last_scan_unix_ns.store(self.now(), Ordering::Release);
-        self.discovered.store(true, Ordering::Release);
-        Ok(())
     }
 
     /// Agents with work this worker's pins can serve, oldest next input
