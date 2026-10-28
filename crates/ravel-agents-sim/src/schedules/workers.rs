@@ -229,7 +229,16 @@ fn kills(seed: u64) -> KillCounts {
     let out = run(&rig, seed, script, actors).expect("schedule");
     drain(&rig, seed);
     let run = rig.build().expect("build");
-    sim_assert!(out, run.unmappable.is_empty(), "{:?}", run.unmappable);
+    // The suspected defect
+    // `a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll`
+    // pins: counted, so a batch that reaches it still checks every other
+    // seed.
+    let (escaped, unmappable): (Vec<_>, Vec<_>) = run
+        .unmappable
+        .iter()
+        .partition(|u| u.as_str() == ESCAPED_UNKNOWN);
+    sim_assert!(out, unmappable.is_empty(), "{unmappable:?}");
+    let escaped_unknown = escaped.len();
     let known =
         past_known_divergences(&run).unwrap_or_else(|d| panic!("{d}\n{}", out.failure_context()));
     // The one refusal a kill schedule reaches: a send whose HEAD CAS lost
@@ -284,8 +293,12 @@ fn kills(seed: u64) -> KillCounts {
         stale_owner: known.stale_owner,
         false_negatives: known.false_negatives,
         contended_sends,
+        escaped_unknown,
     }
 }
+
+/// What the driver lists for a poll that handed `OutcomeUnknown` to `w1`.
+const ESCAPED_UNKNOWN: &str = "w1 poll: OutcomeUnknown reached the caller";
 
 /// Times a [`kills`] client sends one input before a `StoreUnavailable`
 /// fails the run.
@@ -303,6 +316,8 @@ struct KillCounts {
     false_negatives: usize,
     /// Sends refused `StoreUnavailable` and retried.
     contended_sends: usize,
+    /// Polls that answered `w1` `OutcomeUnknown`, a suspected defect.
+    escaped_unknown: usize,
 }
 
 /// Divergences [`past_known_divergences`] answered past, by kind.
@@ -565,6 +580,7 @@ fn worker_kills_across_seeds() {
         totals.stale_owner += k.stale_owner;
         totals.false_negatives += k.false_negatives;
         totals.contended_sends += k.contended_sends;
+        totals.escaped_unknown += k.escaped_unknown;
         runs += 1;
     }
     pinned("worker_kills", runs, totals, KILL_TOTALS);
@@ -586,6 +602,7 @@ fn stale_owner_commit_after_takeover_is_fenced() {
             stale_owner: 1,
             false_negatives: 0,
             contended_sends: 0,
+            escaped_unknown: 0,
         }
     );
 }
@@ -615,7 +632,20 @@ fn a_send_starved_past_the_cas_bound_is_refused_and_retried() {
 #[test]
 #[ignore = "suspected defect: poll returns OutcomeUnknown when a BeginTurn retry loses its answer"]
 fn a_lost_begin_turn_answer_after_a_spent_retry_is_settled_by_the_poll() {
-    assert_eq!(kills(11_000_167).fired, 1);
+    assert_eq!(kills(11_000_167).escaped_unknown, 0);
+}
+
+/// The same seed as counted today: the escape is the run's one divergence.
+#[test]
+fn a_lost_begin_turn_answer_after_a_spent_retry_escapes_the_poll_today() {
+    assert_eq!(
+        kills(11_000_167),
+        KillCounts {
+            fired: 1,
+            escaped_unknown: 1,
+            ..KillCounts::default()
+        }
+    );
 }
 
 /// Summed over the batch. Pinned: a scheduler or production change that
@@ -628,6 +658,7 @@ const KILL_TOTALS: KillCounts = KillCounts {
     stale_owner: 2,
     false_negatives: 0,
     contended_sends: 0,
+    escaped_unknown: 0,
 };
 
 /// `w1` begins op 1 and is held at its commit-time HEAD read. `w2`, on
