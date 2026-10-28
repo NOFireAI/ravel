@@ -71,7 +71,7 @@ async fn schedule_and_fire(store: &AgentStore, n: usize) {
         incarnation: head.incarnation,
     };
     let command = Command::ScheduleTimer(ScheduleTimer {
-        fence: fence.clone(),
+        fence,
         timer: TimerSpec {
             timer_key: format!("t{n}"),
             due_unix_ns: T0,
@@ -194,7 +194,7 @@ async fn send_receipt_lookup_and_wake_read_at_most_one_index_page_each() {
             .execute(
                 &agent(),
                 &Command::ScheduleTimer(ScheduleTimer {
-                    fence: fence.clone(),
+                    fence,
                     timer: TimerSpec {
                         timer_key: "wake".to_string(),
                         due_unix_ns: T0,
