@@ -854,9 +854,13 @@ enum Command {
         /// this order, so a query projecting them together reads one chunk run;
         /// default none. The other columns follow in name order.
         ///
-        /// A name the data never carries is skipped. An empty, padded or
-        /// repeated name is refused before anything is read. A metrics or spans
-        /// load warns and ignores it.
+        /// A name the data never carries is skipped, and so is one carried only
+        /// as a string or bytes resource attribute that is not an indexed
+        /// field. Before it reads a row, a logs load warns about each name no
+        /// mapped attribute carries and each name the mapping carries only as
+        /// a string or bytes resource attribute. An empty, padded or repeated
+        /// name is refused before anything is read. A metrics or spans load
+        /// warns and ignores it.
         #[arg(
             long,
             value_name = "NAME,NAME,...",
