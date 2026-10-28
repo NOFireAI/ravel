@@ -18,11 +18,14 @@
 # closure this also runs `-p ravel-server --features sql` and `-p ravel-server
 # --features esql`, and when ravel-sql or ravel-server is, `-p ravel-server -p
 # ravel-sql --features flight-sql`, all on the `ci` profile. With ravel-server
-# in the closure it also runs `-p ravel-server --features agents agents` plus
-# ravel-catalog's sys_proto_format_version_classification test, and `-p
-# ravel-server --features mcp mcp`: the trailing word is a test-name filter,
-# because tests/cli_reference.rs fails by construction under any feature that
-# adds a flag. scripts/gates.sh's agents and mcp lanes run the same tests.
+# in the closure it also runs, under `--features agents`, the agents_seam
+# binary and the lib tests filtered by `agents`, plus ravel-catalog's
+# sys_proto_format_version_classification test, and under `--features mcp` the
+# mcp_e2e and trace_by_id binaries and the lib tests filtered by `mcp`. Tests
+# are selected by binary because a name filter never sees the binary, and the
+# whole crate does not run because tests/cli_reference.rs asserts the flag
+# page of a build with the flags it has, which these features extend.
+# scripts/gates.sh's agents and mcp lanes run the same tests.
 # The exit code is the first failing run's, after every run has finished.
 #
 # scripts/gates.sh reads its scoped closure from `-n`, so `-n` prints the
@@ -136,9 +139,15 @@ classification_rc=0
 mcp_rc=0
 case "$affected" in
   *" ravel-server "*)
-    run_tests -p ravel-server --features agents agents || agents_rc=$?
+    run_tests -p ravel-server --features agents --test agents_seam || agents_rc=$?
+    agents_lib_rc=0
+    run_tests -p ravel-server --features agents --lib agents || agents_lib_rc=$?
+    [ "$agents_rc" -ne 0 ] || agents_rc=$agents_lib_rc
     run_tests -p ravel-catalog --test sys_proto_format_version_classification || classification_rc=$?
-    run_tests -p ravel-server --features mcp mcp || mcp_rc=$?
+    run_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id || mcp_rc=$?
+    mcp_lib_rc=0
+    run_tests -p ravel-server --features mcp --lib mcp || mcp_lib_rc=$?
+    [ "$mcp_rc" -ne 0 ] || mcp_rc=$mcp_lib_rc
     ;;
 esac
 
