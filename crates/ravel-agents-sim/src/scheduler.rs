@@ -610,7 +610,7 @@ mod tests {
 
     fn run(seed: u64, script: ScheduleScript) -> (ScheduleOutcome, Vec<String>) {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let outcome = Scheduler::new(AgentSeeds::new(seed), script.clone())
+        let outcome = Scheduler::new(AgentSeeds::from_env_or(seed), script.clone())
             .run(store_with_head(), cas_race(Arc::clone(&log)))
             .unwrap_or_else(|e| panic!("{e}"));
         let log = log.lock().expect("log").clone();
@@ -678,7 +678,7 @@ mod tests {
     fn seeded(seed: u64) -> (ScheduleOutcome, Vec<String>) {
         run(
             seed,
-            ScheduleScript::from_seed(&AgentSeeds::new(seed), 2, 8, 0),
+            ScheduleScript::from_seed(&AgentSeeds::from_env_or(seed), 2, 8, 0),
         )
     }
 
