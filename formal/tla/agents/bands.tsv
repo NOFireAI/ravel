@@ -1,10 +1,14 @@
 # Every figure below comes from a run in results.md (task T20, #3354),
 # measured with -workers 2 and -Xmx4g at revision 8ee0bd2; each row names
-# the results.md row it rests on. A band is about 1% either side of the
-# measured distinct figure, widened where repeat runs of the same config
-# spread further (the AgentEffects VIEW and SYMMETRY rows). Depth is "-" on
-# every row because TLC's reported BFS depth overshoots by a level under
-# -workers auto, which the nightly uses.
+# the results.md row it rests on. A band is about 1 to 2 percent either
+# side of the measured distinct figure (the smoke rows of AgentProtocol
+# and AgentEffects, the two-generations positive and the exhaustive rows
+# sit at about 1%; the Integrated smoke and live rows, the timer-race
+# positive and the Effects live row at about 2%, since each rests on one
+# or two runs), widened further where repeat runs of the same config
+# spread (the AgentEffects VIEW and SYMMETRY rows). Depth is "-" on every
+# row because TLC's reported BFS depth overshoots by a level under
+# -workers auto, which both the per-pull-request lane and the nightly use.
 # MCAgentProtocol.smoke.cfg: R1, 289101 distinct.
 # MCAgentProtocol.exhaustive.cfg (MaxTimerGen 1): R12, 1266296 distinct in
 # 1082 s. MaxTimerGen 2 did not finish in 3000 s (R13), so the row stays at

@@ -16,7 +16,7 @@ no figure here was recomputed, rounded, or recalled from anything other than
 those files.
 
 Section 5 also carries an `agents` area (three modules, ADR-3331), added
-after the rest of this report at commit
+after the rest of this report from runs measured at commit
 `8ee0bd2564ab9b5cb70ea27c76f41d11723c9c35` and copied from
 `agents/results.md` and `agents/bands.tsv` under the same rule. The other
 sections cover the six areas above and do not discuss it.
