@@ -56,6 +56,10 @@ use crate::head::{
     TurnBlock,
 };
 use crate::identity::{self, Hash256, Id128};
+use crate::pages::{
+    Index, ListKind, Need, PageBounds, PageError, id_fingerprint, max_page_ref_bytes,
+    receipt_fingerprint, seal_index,
+};
 
 /// Logical caps enforced inside the kernel (decision 9's per-tenant quotas
 /// are applied per agent here; the store adds the tenant totals).
@@ -123,7 +127,29 @@ pub struct Limits {
     /// error (`tests::the_result_floor_covers_the_varint_widths_of_a_wide_error`).
     /// The entry the terminal publish removes is not credited.
     pub terminal_reserve_per_input_bytes: usize,
+    /// Most entries one sealed index page holds ([`crate::pages`]). The open
+    /// page of a list is sealed once it holds more than this many entries,
+    /// in pages of exactly this many
+    /// (`pages::tests::a_full_page_refuses_the_next_append_typed`).
+    pub max_page_entries: usize,
+    /// Most sealed pages one list's directory holds. A publish past it is
+    /// refused `BudgetExceeded`; a guarded publish is refused earlier, while
+    /// the pages an exempt publish may still seal would not fit
+    /// (`tests::a_guarded_publish_keeps_the_index_page_reserve`). The
+    /// default holds every entry a version 1 HEAD at the byte cap can carry,
+    /// so its migration is never refused for pages
+    /// (`tests::one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`).
+    pub max_index_pages: usize,
 }
+
+/// Bytes the growth guard leaves free per sealed timer page holding a
+/// scheduled timer: an exempt `CancelTimer` rewrites the page, which can
+/// widen its `min_due_unix_ns` (10 bytes and a tag) and its size varint.
+pub const TIMER_PAGE_REWRITE_RESERVE_BYTES: usize = 16;
+
+/// Reason of the `StoreUnavailable` refusal for a command run on a HEAD
+/// without an index page it reads; the store loads the page and re-applies.
+pub const PAGE_NOT_LOADED: &str = "an index page the command reads is not loaded";
 
 /// Bytes the growth guard leaves free for each journaled effect that is not
 /// `Completed`: an owner's retry authorization of an effect already
@@ -191,6 +217,8 @@ impl Default for Limits {
             max_events_per_turn: 32,
             max_intents_per_turn: 16,
             terminal_reserve_per_input_bytes: 512,
+            max_page_entries: 64,
+            max_index_pages: 512,
         }
     }
 }
@@ -226,6 +254,7 @@ impl Limits {
             steps: Vec::new(),
             effects: Vec::new(),
             outbox: Vec::new(),
+            index: Index::default(),
         };
         let wide = Head {
             root_revision: u64::MAX,
@@ -254,18 +283,175 @@ impl Limits {
 
     /// Bytes the growth guard keeps free under `max_head_bytes` for `head`.
     pub fn reserved_bytes(&self, head: &Head) -> usize {
-        let pending = head
-            .effects
-            .iter()
-            .filter(|e| e.status != EffectStatus::Completed)
-            .count();
+        let pending = pending_effects(head);
+        let inputs = usize::try_from(head.inbox_depth()).unwrap_or(usize::MAX);
         self.exempt_growth_slack_bytes(head)
-            .saturating_add(
-                self.terminal_reserve_per_input_bytes
-                    .saturating_mul(head.inbox.len()),
-            )
+            .saturating_add(self.terminal_reserve_per_input_bytes.saturating_mul(inputs))
             .saturating_add(PENDING_EFFECT_RESERVE_BYTES.saturating_mul(pending))
+            .saturating_add(self.index_reserve_bytes(head))
     }
+
+    /// Sealed pages the exempt publishes still open to `head` may add to
+    /// `list`: a result page per `max_page_entries` results the outstanding
+    /// inputs' terminal publishes append to the inline ones, and an event
+    /// page per `max_page_entries` audit events the pending effects'
+    /// reconciled results append, each plus one for the partly filled open
+    /// page. No exempt publish appends to the other lists.
+    pub fn reserved_index_pages(&self, head: &Head, list: ListKind) -> usize {
+        let k = self.max_page_entries.max(1);
+        let inputs = usize::try_from(head.inbox_depth()).unwrap_or(usize::MAX);
+        let (inline, appended) = match list {
+            ListKind::Results => (
+                head.results
+                    .iter()
+                    .filter(|r| head.index.results.is_inline(r.accept_seq))
+                    .count(),
+                inputs,
+            ),
+            ListKind::Events => (
+                head.events
+                    .iter()
+                    .filter(|e| head.index.events.is_inline(e.event_seq))
+                    .count(),
+                pending_effects(head),
+            ),
+            ListKind::Inbox | ListKind::Receipts | ListKind::Timers => return 0,
+        };
+        inline.saturating_add(appended).div_ceil(k).saturating_add(1)
+    }
+
+    /// Bytes the growth guard leaves free for index growth on the exempt
+    /// paths: one widest page reference ([`max_page_ref_bytes`]) per page
+    /// [`Limits::reserved_index_pages`] counts, and
+    /// [`TIMER_PAGE_REWRITE_RESERVE_BYTES`] per sealed timer page an exempt
+    /// `CancelTimer` may rewrite
+    /// (`tests::the_index_reserve_covers_the_exempt_page_growth`).
+    pub fn index_reserve_bytes(&self, head: &Head) -> usize {
+        let k = self.max_page_entries.max(1);
+        let pages = [ListKind::Results, ListKind::Events]
+            .into_iter()
+            .fold(0usize, |acc, list| {
+                acc.saturating_add(
+                    self.reserved_index_pages(head, list)
+                        .saturating_mul(max_page_ref_bytes(list, k)),
+                )
+            });
+        let timer_pages = head
+            .index
+            .timers
+            .pages
+            .iter()
+            .filter(|p| p.marked > 0)
+            .count();
+        pages.saturating_add(TIMER_PAGE_REWRITE_RESERVE_BYTES.saturating_mul(timer_pages))
+    }
+
+    fn page_bounds(&self) -> PageBounds {
+        PageBounds {
+            max_page_entries: self.max_page_entries,
+            max_index_pages: self.max_index_pages,
+        }
+    }
+}
+
+fn pending_effects(head: &Head) -> usize {
+    head.effects
+        .iter()
+        .filter(|e| e.status != EffectStatus::Completed)
+        .count()
+}
+
+/// The entries of the five paged lists `command` reads on `head`, as the
+/// directories locate them. This is the one page reader of the kernel:
+/// [`Kernel::apply`] refuses a command whose entries are not all in memory
+/// before any transition reads a list, and the store loads exactly the pages
+/// [`Kernel::pages_needed`] derives from it. The lookups are a receipt by
+/// `(handler, request_id)` fingerprint, a turn by its id's fingerprint in the
+/// results (`check_turn` on a committed turn) and in the inbox (a retried
+/// `FailTurn`), an input or result by key, the first input, a timer by id
+/// fingerprint or by generation, and the cancelled results. Only the audit
+/// event of a reconciliation whose effect's input is not the active turn's
+/// reads every inbox and result page, since an effect id does not name its
+/// input.
+pub fn page_needs(head: &Head, command: &Command) -> Vec<(ListKind, Need)> {
+    let mut needs = Vec::new();
+    let turn = |needs: &mut Vec<(ListKind, Need)>, fence: &TurnFence| match head
+        .active_turn
+        .as_ref()
+    {
+        Some(t) if t.turn_id == fence.turn_id => {
+            needs.push((ListKind::Inbox, Need::Key(t.input_accept_seq)));
+        }
+        _ => needs.push((
+            ListKind::Results,
+            Need::Fingerprint(id_fingerprint(&fence.turn_id)),
+        )),
+    };
+    let timer = |key: &str| {
+        (
+            ListKind::Timers,
+            Need::Fingerprint(id_fingerprint(&identity::timer_id(head.incarnation, key))),
+        )
+    };
+    let audit = |needs: &mut Vec<(ListKind, Need)>, effect_id: Id128| {
+        let Some(effect) = head.effects.iter().find(|e| e.effect_id == effect_id) else {
+            return;
+        };
+        let active = head.active_turn.as_ref().is_some_and(|t| {
+            identity::effect_id(head.incarnation, t.input_accept_seq, &effect.step_key)
+                == effect.effect_id
+        });
+        if !active {
+            needs.extend([(ListKind::Inbox, Need::All), (ListKind::Results, Need::All)]);
+        }
+    };
+    match command {
+        Command::Create(_) | Command::Takeover(_) | Command::Tombstone(_) => {}
+        Command::Enqueue(c) => needs.push((
+            ListKind::Receipts,
+            Need::Fingerprint(receipt_fingerprint(&c.handler, &c.request_id)),
+        )),
+        Command::BeginTurn(_) => {
+            if head.active_turn.is_none() {
+                needs.push((ListKind::Inbox, Need::First));
+            }
+        }
+        Command::CompleteTurn(c) => {
+            turn(&mut needs, &c.fence);
+            for change in &c.timer_changes {
+                needs.push(match change {
+                    TimerChange::Schedule(spec) => timer(&spec.timer_key),
+                    TimerChange::Cancel { timer_key } => timer(timer_key),
+                });
+            }
+        }
+        Command::FailTurn(c) => {
+            needs.push((
+                ListKind::Inbox,
+                Need::Fingerprint(id_fingerprint(&c.fence.turn_id)),
+            ));
+            turn(&mut needs, &c.fence);
+        }
+        Command::Cancel(c) => {
+            needs.push((ListKind::Results, Need::Key(c.accept_seq)));
+            needs.push((ListKind::Inbox, Need::Key(c.accept_seq)));
+        }
+        Command::ScheduleTimer(c) => needs.push(timer(&c.timer.timer_key)),
+        Command::FireTimer(c) => needs.push((ListKind::Timers, Need::Key(c.generation))),
+        Command::CancelTimer(c) => needs.push(timer(&c.timer_key)),
+        Command::RecordStep(c) => turn(&mut needs, &c.fence),
+        Command::CommitIntent(c) => turn(&mut needs, &c.fence),
+        Command::AuthorizeAttempt(c) => {
+            if matches!(c.authority, Authority::Reconcile(_)) {
+                audit(&mut needs, c.effect_id);
+            }
+        }
+        Command::RecordEffectResult(c) => {
+            needs.push((ListKind::Results, Need::Marked));
+            audit(&mut needs, c.effect_id);
+        }
+    }
+    needs
 }
 
 /// Source of the ids a transition mints. The production source derives
@@ -494,6 +680,24 @@ impl Kernel {
         &self.limits
     }
 
+    /// The sealed pages, as `(list, page index)`, that `command` reads on
+    /// `head` and that are not yet attached, each once. The store loads these
+    /// and nothing else before [`Kernel::apply`]; a `None` head reads none.
+    pub fn pages_needed(&self, head: Option<&Head>, command: &Command) -> Vec<(ListKind, usize)> {
+        let Some(head) = head else {
+            return Vec::new();
+        };
+        let mut out: Vec<(ListKind, usize)> = Vec::new();
+        for (list, need) in page_needs(head, command) {
+            for page in head.index.directory(list).missing(need) {
+                if !out.contains(&(list, page)) {
+                    out.push((list, page));
+                }
+            }
+        }
+        out
+    }
+
     pub fn apply(
         &self,
         head: Option<&Head>,
@@ -512,6 +716,7 @@ impl Kernel {
             };
         };
         self.check_strings(head, command)?;
+        check_pages(head, command)?;
         let outcome = match command {
             Command::Create(c) => self.create(head, c),
             Command::Enqueue(c) => self.enqueue(head, c, now_unix_ns),
@@ -592,6 +797,35 @@ impl Kernel {
             ));
         }
         Ok(())
+    }
+}
+
+/// Refuses `command` while a page it reads ([`page_needs`]) is not attached,
+/// with `StoreUnavailable` and [`PAGE_NOT_LOADED`], before any transition
+/// reads a list, so no transition decides on a partial list.
+fn check_pages(head: &Head, command: &Command) -> Result<(), AgentError> {
+    for (list, need) in page_needs(head, command) {
+        head.index
+            .directory(list)
+            .require(list, need)
+            .map_err(|e| page_error(head, e))?;
+    }
+    Ok(())
+}
+
+fn page_error(head: &Head, error: PageError) -> AgentError {
+    match error {
+        PageError::NotLoaded { .. } => fail(head, ErrorKind::StoreUnavailable, PAGE_NOT_LOADED),
+        PageError::PageFull { .. } => fail(
+            head,
+            ErrorKind::BudgetExceeded,
+            "PageBelowCap: an index page is full",
+        ),
+        PageError::DirectoryFull { .. } => fail(
+            head,
+            ErrorKind::BudgetExceeded,
+            "IndexPagesBelowCap: an index list has max_index_pages pages",
+        ),
     }
 }
 
@@ -806,6 +1040,18 @@ impl Kernel {
                 "HEAD would enter the terminal reserve of its byte cap",
             ));
         }
+        for list in ListKind::ALL {
+            let pages = head.index.directory(list).pages.len();
+            if pages.saturating_add(self.limits.reserved_index_pages(head, list))
+                > self.limits.max_index_pages
+            {
+                return Err(fail(
+                    head,
+                    ErrorKind::BudgetExceeded,
+                    "IndexPagesBelowCap: HEAD would enter the index page reserve",
+                ));
+            }
+        }
         Ok(transition)
     }
 
@@ -826,6 +1072,7 @@ impl Kernel {
             })?,
             None => 1,
         };
+        seal_index(&mut head, self.limits.page_bounds()).map_err(|e| page_error(&head, e))?;
         head.quota = head.computed_quota();
         if head.encode().len() > self.limits.max_head_bytes {
             return Err(fail(
@@ -867,6 +1114,7 @@ impl Kernel {
             steps: Vec::new(),
             effects: Vec::new(),
             outbox: Vec::new(),
+            index: Index::default(),
         };
         self.publish(
             None,
@@ -913,6 +1161,7 @@ impl Kernel {
             steps: Vec::new(),
             effects: Vec::new(),
             outbox: Vec::new(),
+            index: Index::default(),
             ..head.clone()
         };
         self.publish(
@@ -1042,10 +1291,10 @@ impl Kernel {
                 duplicate: true,
             });
         }
-        if head.inbox.len() as u64 >= self.limits.max_mailbox_depth {
+        if head.inbox_depth() >= self.limits.max_mailbox_depth {
             return Err(fail(head, ErrorKind::MailboxFull, "mailbox is full"));
         }
-        if head.receipts.len() as u64 >= self.limits.max_receipts {
+        if head.receipt_count() >= self.limits.max_receipts {
             return Err(fail(
                 head,
                 ErrorKind::BudgetExceeded,
@@ -1105,7 +1354,7 @@ impl Kernel {
             .ok_or_else(|| fail(head, ErrorKind::BudgetExceeded, "epoch is exhausted"))?;
         new.owner_id = c.owner_id.clone();
         new.owner_lease_hint_unix_ns = c.lease_hint_unix_ns;
-        let has_work = !new.inbox.is_empty() || new.active_turn.is_some();
+        let has_work = new.has_inbox() || new.active_turn.is_some();
         let epoch = new.epoch;
         self.publish(
             Some(head),
@@ -1352,7 +1601,7 @@ impl Kernel {
                 });
             }
         }
-        if !new.inbox.is_empty() {
+        if new.has_inbox() {
             effects.push(Effect::WakeWorker);
         }
         let state_version = new.state_version;
@@ -1430,7 +1679,7 @@ impl Kernel {
                 finished_unix_ns: now,
             });
             let mut effects = vec![Effect::OperationTerminal { accept_seq }];
-            if !new.inbox.is_empty() {
+            if new.has_inbox() {
                 effects.push(Effect::WakeWorker);
             }
             return self.publish(Some(head), new, effects, Reply::Cancelled { accept_seq });
@@ -1476,7 +1725,7 @@ impl Kernel {
             finished_unix_ns: now,
         });
         let mut effects = vec![Effect::OperationTerminal { accept_seq }];
-        if !new.inbox.is_empty() {
+        if new.has_inbox() {
             effects.push(Effect::WakeWorker);
         }
         self.publish(
@@ -1532,12 +1781,7 @@ impl Kernel {
     }
 
     fn check_timer_cap(&self, new: &Head) -> Result<(), AgentError> {
-        let scheduled = new
-            .timers
-            .iter()
-            .filter(|t| t.status == TimerStatus::Scheduled)
-            .count() as u64;
-        if scheduled > self.limits.max_timers {
+        if new.scheduled_timers() > self.limits.max_timers {
             return Err(fail(
                 new,
                 ErrorKind::BudgetExceeded,
@@ -1577,7 +1821,7 @@ impl Kernel {
         if timer.due_unix_ns > now {
             return unchanged(Reply::TimerNotDue);
         }
-        if head.inbox.len() as u64 >= self.limits.max_mailbox_depth {
+        if head.inbox_depth() >= self.limits.max_mailbox_depth {
             return Err(fail(head, ErrorKind::MailboxFull, "mailbox is full"));
         }
         let mut new = head.clone();

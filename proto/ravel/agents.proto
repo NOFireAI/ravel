@@ -10,9 +10,11 @@
 // Every other top-level message here is an immutable object, written once
 // with CreateIfAbsent under `o/<object_hash>`.
 //
-// Every top-level message carries `format_version` as field 1. Version 1 is
-// the only version this release reads; a reader refuses any other as an
-// unsupported format and never re-encodes it.
+// Every top-level message carries `format_version` as field 1. AgentHead is
+// read at versions 1 and 2 and written at 2 (ADR-3331, the index-page
+// amendment); every other message here is read and written at version 1. A
+// reader refuses any other version as an unsupported format and never
+// re-encodes it.
 //
 // Every top-level message ends with `seal`, which holds 0x52414731 ("RAG1"),
 // is the highest field number in its message, and is declared last, so the
@@ -33,11 +35,12 @@ enum LifecycleStatus {
   LIFECYCLE_STATUS_TOMBSTONED = 2;
 }
 
-// How the inbox, receipt, result and event lists are held. Format version 1
-// reads only INLINE: the lists live in the repeated fields of AgentHead and
-// every page reference is unset. PAGED is reserved for the index-page
-// representation of ADR-3331 milestone 6, which ships as AgentHead format
-// version 2.
+// How the inbox, receipt, result, event and timer lists are held. Format
+// version 1 reads only INLINE: the lists live in the repeated fields of
+// AgentHead and every page reference is unset. Format version 2 sets PAGED
+// on AgentHead and carries one PageDirectory per list (ADR-3331, the
+// index-page amendment); the single-ObjectRef page fields 13, 15, 17 to 20,
+// 22 and 23 stay unset in both versions.
 enum IndexRepresentation {
   INDEX_REPRESENTATION_UNSPECIFIED = 0;  // never written
   INDEX_REPRESENTATION_INLINE = 1;
@@ -212,9 +215,42 @@ message OutboxIntent {
   bytes turn_id = 7;
 }
 
+// One sealed index page of a PAGED list, as HEAD records it. The page holds
+// the list's entries whose key lies in [first_key, the next page's
+// first_key), or up to the directory's tail_from for the last page; the
+// first page also holds every key below its own first_key. Keys: inbox,
+// receipts and results by accept_seq, events by event_seq, timers by
+// generation.
+message PageRef {
+  uint64 first_key = 1;
+  ObjectRef page = 2;
+  uint32 entries = 3;
+  // Scheduled timers in a timer page; cancelled results in a result page;
+  // zero otherwise.
+  uint32 marked = 4;
+  // Earliest due time of a scheduled timer in a timer page; zero otherwise.
+  int64 min_due_unix_ns = 5;
+  // Bytes of the objects the page's entries reference.
+  uint64 referenced_bytes = 6;
+  // Sorted 4-byte big-endian fingerprints, one per entry that has one: a
+  // receipt's (handler, request_id), a result's turn_id, a timer's
+  // timer_id. A lookup by that identity reads only pages listing its
+  // fingerprint.
+  bytes fingerprints = 7;
+}
+
+// The sealed pages of one list in a version 2 HEAD, in key order. Entries
+// with a key at or above tail_from stay inline in AgentHead's repeated
+// field, the list's open page.
+message PageDirectory {
+  IndexRepresentation representation = 1;
+  repeated PageRef pages = 2;
+  uint64 tail_from = 3;
+}
+
 // The mutable root of one agent at `t/<tenant_hash>/ag/<agent_id>/head`.
 message AgentHead {
-  uint32 format_version = 1;  // = 1
+  uint32 format_version = 1;  // = 1 or 2
   bytes tenant_hash = 2;      // 16 bytes
   string kind = 3;
   string key = 4;
@@ -249,6 +285,12 @@ message AgentHead {
   repeated StepRecord steps = 32;
   repeated EffectRecord effects = 33;
   repeated OutboxIntent outbox_intents = 34;
+  // Version 2 only: the PAGED directories of the five indexed lists.
+  PageDirectory inbox_pages = 35;
+  PageDirectory receipt_pages = 36;
+  PageDirectory result_pages = 37;
+  PageDirectory event_pages = 38;
+  PageDirectory timer_pages = 39;
   fixed32 seal = 2047;
 }
 
