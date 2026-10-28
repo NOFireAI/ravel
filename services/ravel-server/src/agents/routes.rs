@@ -1,10 +1,12 @@
-//! The agents client and worker routes (ADR-3331 decision 9, milestones 1
-//! and 2).
+//! The agents client, worker and admin routes (ADR-3331 decision 9,
+//! milestones 1 to 3).
 //!
 //! Every handler runs the same prologue, [`Api::admit`]: resolve the
 //! principal on this listener's resolver, check the route's capability,
 //! take a permit from the route's admission lane, then read the body under
-//! the router's byte limit. Only then does it touch a coordinator or store.
+//! the route's byte limit. Only then does it touch a coordinator or store.
+//! Every step and effect command goes through the coordinator's effects
+//! methods, never a kernel command built here.
 //! Every refusal after authentication leaves through [`agent_error`], the one
 //! mapping from an [`AgentError`] to a status and an [`ErrorBody`].
 
@@ -14,30 +16,40 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
-use ravel_agents_core::head::{EffectStatus, Head, Lifecycle};
-use ravel_agents_core::identity::{AgentId, agent_id, effect_id};
+use ravel_agents_core::head::{EffectRecord, EffectStatus, Head, Lifecycle, StepRecord};
+use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    AgentRef, CallRequest, CallResponse, CancelRequest, CreateAgentRequest, ErrorBody, EventBody,
-    EventsRequest, EventsResponse, OperationResponse, OperationStatus, ResolveRequest,
-    ResolveResponse, ResultBody, ResultResponse, SendRequest, StateResponse, WorkerCommitRequest,
-    WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest, WorkerPollResponse,
-    WorkerRegisterRequest, WorkerRegisterResponse,
+    AgentRef, AttemptState, CallRequest, CallResponse, CancelRequest, CreateAgentRequest,
+    EffectAttemptBody, EffectBody, EffectCompleteRequest, EffectCompleteResponse,
+    EffectEvidenceBody, EffectFailRequest, EffectInspectResponse, EffectsResponse, ErrorBody,
+    EventBody, EventsRequest, EventsResponse, OperationResponse, OperationStatus,
+    ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse,
+    ResultBody, ResultResponse, SendRequest, StateResponse, StepBody, StepRecordRequest,
+    StepRecordResponse, StepState, WorkerCommitRequest, WorkerHeartbeatRequest,
+    WorkerHeartbeatResponse, WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest,
+    WorkerRegisterResponse,
 };
-use ravel_agents_store::HeadState;
+use ravel_agents_runtime::{EffectRef, EffectSettled, StepProgress, StepSpec};
+use ravel_agents_store::{Clock, HeadState, SystemClock};
+use ravel_maintain::QueryAuditSink;
 use ravel_query::http::TenantResolver;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::runtime::{AgentsRuntime, LONG_POLL_CAP_MS, Lane, ResultWaitCounters, TenantAgents};
+use super::audit::{ReconcileAction, agents_reconcile_audit_event};
+use super::runtime::{
+    AgentsRuntime, LONG_POLL_CAP_MS, Lane, RecordingDispatcher, ResultWaitCounters, TenantAgents,
+};
 use crate::service::{ServiceError, authenticate_principal};
+use ravel_tenant_resolve::Principal;
 
 /// Most events one `events` page returns, whatever `limit` asks for.
 pub const MAX_EVENTS_PAGE: u32 = 1_000;
@@ -53,13 +65,17 @@ pub(super) enum Capability {
     Agents,
     /// Worker routes.
     AgentsWorker,
+    /// Operator routes: reconcile.
+    AgentsAdmin,
 }
 
-/// Router state: the process runtime and this listener's resolver.
+/// Router state: the process runtime, this listener's resolver and the
+/// server's audit sink.
 #[derive(Clone)]
 pub(super) struct Api {
     pub(super) runtime: Arc<AgentsRuntime>,
     pub(super) resolver: Arc<dyn TenantResolver>,
+    pub(super) audit: Arc<dyn QueryAuditSink>,
 }
 
 /// Why a request was not served.
@@ -116,9 +132,10 @@ fn ids_for(agent: &AgentId) -> SafeIds {
     }
 }
 
-/// What the prologue hands a handler: the caller's tenant runtime and the
+/// What the prologue hands a handler: the caller, its tenant runtime and the
 /// admission permit, held until the response is built.
 struct Admitted {
+    principal: Principal,
     tenant: Arc<TenantAgents>,
     _permit: OwnedSemaphorePermit,
 }
@@ -136,6 +153,7 @@ impl Api {
         let (granted, name) = match capability {
             Capability::Agents => (principal.agents, "agents"),
             Capability::AgentsWorker => (principal.agents_worker, "agents_worker"),
+            Capability::AgentsAdmin => (principal.agents_admin, "agents_admin"),
         };
         if !granted {
             return Err(Refusal::Auth(ServiceError::forbidden(format!(
@@ -151,11 +169,12 @@ impl Api {
         };
         Ok(Admitted {
             tenant: self.runtime.tenant(principal.tenant.hash()),
+            principal,
             _permit: permit,
         })
     }
 
-    /// [`Api::admit`], then the JSON body, read under the router's limit.
+    /// [`Api::admit`], then the JSON body, read under `max_body_bytes`.
     async fn admit_body<T: DeserializeOwned>(
         &self,
         req: Request<Body>,
@@ -169,7 +188,7 @@ impl Api {
                 refusal(
                     ErrorKind::BudgetExceeded,
                     SafeIds::default(),
-                    "request body exceeds the agents body limit",
+                    "request body could not be read in full within the agents body limit",
                 )
             })?;
         let body = serde_json::from_slice(&bytes).map_err(|_| {
@@ -373,8 +392,15 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
                 )
             })?,
         };
+        if body.limit == 0 {
+            return Err(refusal(
+                ErrorKind::UnsupportedFormat,
+                ids_for(&agent),
+                "events limit must be at least 1",
+            ));
+        }
         let head = read_head(&call.tenant, &agent).await?;
-        let limit = usize::try_from(body.limit.clamp(1, MAX_EVENTS_PAGE)).unwrap_or(1);
+        let limit = usize::try_from(body.limit.min(MAX_EVENTS_PAGE)).unwrap_or(1);
         let mut events = Vec::new();
         for event in head
             .events
@@ -418,8 +444,14 @@ pub(super) async fn worker_poll(State(api): State<Api>, req: Request<Body>) -> R
         let deadline = deadline(u64::from(body.wait_ms));
         let assignment = match call.tenant.coordinator.poll(&body, deadline).await? {
             None => None,
-            Some(assignment) => {
+            Some(mut assignment) => {
                 let recorded = recorded_unix_ns(&call.tenant, &assignment.lease).await?;
+                for step in &mut assignment.steps {
+                    if step.output.as_ref().and_then(step_failure).is_some() {
+                        step.status = StepState::Started;
+                        step.output = None;
+                    }
+                }
                 Some(assignment.polled(recorded))
             }
         };
@@ -451,6 +483,431 @@ pub(super) async fn worker_heartbeat(State(api): State<Api>, req: Request<Body>)
         }))
     };
     run.await.into_response()
+}
+
+/// Journal a step, or read back its record, and authorize the attempt the
+/// caller runs. The route's dispatcher records the attempt and executes
+/// nothing: the caller runs the tool and reports through `effects/complete`
+/// or `effects/fail`.
+pub(super) async fn worker_step(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<StepRecordRequest>(req, Capability::AgentsWorker, Lane::Activation)
+            .await?;
+        let agent = lease_agent(&body.lease)?;
+        let input_hash = hex::decode(&body.input_hash)
+            .ok()
+            .and_then(|bytes| Hash256::from_slice(&bytes))
+            .filter(|hash| hash.to_hex() == body.input_hash)
+            .ok_or_else(|| {
+                refusal(
+                    ErrorKind::UnsupportedFormat,
+                    ids_for(&agent),
+                    "step input_hash is not 64 lowercase hex characters",
+                )
+            })?;
+        let spec = StepSpec {
+            step_key: body.step_key,
+            tool_name: body.tool_name,
+            tool_version: body.tool_version,
+            policy: body.policy.into(),
+            input_hash,
+        };
+        let dispatcher = RecordingDispatcher::default();
+        let progress = call
+            .tenant
+            .coordinator
+            .run_step(&body.lease, &spec, &dispatcher)
+            .await?;
+        let head = read_head(&call.tenant, &agent).await?;
+        let Some(turn) = head
+            .active_turn
+            .as_ref()
+            .filter(|t| t.turn_id.to_hex() == body.lease.turn_id)
+        else {
+            return Err(refusal(
+                ErrorKind::OwnershipLost,
+                ids_for(&agent),
+                "the step's turn is no longer active",
+            ));
+        };
+        let seq = turn.input_accept_seq;
+        let id = step_id(head.incarnation, seq, &spec.step_key);
+        let Some(step) = head.steps.iter().find(|s| s.step_id == id) else {
+            return Err(refusal(
+                ErrorKind::OwnershipLost,
+                ids_for(&agent),
+                "the step is no longer journaled",
+            ));
+        };
+        let effect = effect_id(head.incarnation, seq, &spec.step_key);
+        let handle = effect_handle(agent, head.incarnation, effect);
+        let (step, attempt, failure) = match progress {
+            StepProgress::Dispatched(dispatch) => (step_body(step, None), dispatch.attempt, None),
+            StepProgress::Completed { output } => {
+                let attempt = head
+                    .effects
+                    .iter()
+                    .find(|e| e.effect_id == effect)
+                    .map_or(0, |e| e.result_attempt);
+                match step_failure(&output) {
+                    Some(error) => {
+                        let mut body = step_body(step, None);
+                        body.status = StepState::Started;
+                        (body, attempt, Some(error.to_string()))
+                    }
+                    None => (step_body(step, Some(output)), attempt, None),
+                }
+            }
+        };
+        Ok::<_, Refusal>(Json(StepRecordResponse {
+            step,
+            effect: handle,
+            attempt,
+            failure,
+        }))
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn effect_complete(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<EffectCompleteRequest>(req, Capability::AgentsWorker, Lane::Activation)
+            .await?;
+        let effect = decode_effect(&body.effect)?;
+        let settled = call
+            .tenant
+            .coordinator
+            .complete_effect(&effect, body.attempt, &body.result)
+            .await?;
+        settle(&call.tenant, body.effect, &effect, body.attempt, settled).await
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn effect_fail(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<EffectFailRequest>(req, Capability::AgentsWorker, Lane::Activation)
+            .await?;
+        let effect = decode_effect(&body.effect)?;
+        let settled = call
+            .tenant
+            .coordinator
+            .fail_effect(&effect, body.attempt, &body.error)
+            .await?;
+        settle(&call.tenant, body.effect, &effect, body.attempt, settled).await
+    };
+    run.await.into_response()
+}
+
+/// The answer to a reported result: HEAD's effect status, and `late` when
+/// the result was kept as evidence, which [`TenantAgents::evidence`] then
+/// names for `GET /api/v1/agents/effects/{effect}`.
+async fn settle(
+    tenant: &TenantAgents,
+    handle: String,
+    effect: &EffectRef,
+    attempt: u32,
+    settled: EffectSettled,
+) -> Reply<EffectCompleteResponse> {
+    let late = match settled {
+        EffectSettled::Recorded => false,
+        EffectSettled::Evidence { result } => {
+            tenant
+                .evidence
+                .record(effect.agent, effect.effect_id, attempt, result);
+            true
+        }
+    };
+    tenant.changed.notify_waiters();
+    let head = read_head(tenant, &effect.agent).await?;
+    let record = effect_record(&head, effect)?;
+    Ok(Json(EffectCompleteResponse {
+        effect: handle,
+        status: record.status.into(),
+        late,
+    }))
+}
+
+pub(super) async fn effects(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let call = api.admit(req.headers(), Capability::Agents, Lane::Activation)?;
+        let q: StateQuery = query(req.uri())?;
+        let agent = parse_agent(&AgentRef {
+            kind: q.kind,
+            key: q.key,
+        })?;
+        let head = read_head(&call.tenant, &agent).await?;
+        Ok::<_, Refusal>(Json(EffectsResponse {
+            effects: head
+                .effects
+                .iter()
+                .map(|e| effect_body(agent, head.incarnation, e))
+                .collect(),
+        }))
+    };
+    run.await.into_response()
+}
+
+pub(super) async fn effect_inspect(
+    State(api): State<Api>,
+    Path(token): Path<String>,
+    req: Request<Body>,
+) -> Response {
+    let run = async move {
+        let call = api.admit(req.headers(), Capability::Agents, Lane::Activation)?;
+        let effect = decode_effect(&token)?;
+        let head = read_head(&call.tenant, &effect.agent).await?;
+        let record = effect_record(&head, &effect)?;
+        let recorded = record.result.is_some().then_some(record.result_attempt);
+        let attempts = (1..=record.attempt)
+            .map(|attempt| EffectAttemptBody {
+                attempt,
+                status: attempt_state(record, recorded, attempt),
+            })
+            .collect();
+        let mut evidence = Vec::new();
+        for (attempt, result) in call.tenant.evidence.of(effect.agent, effect.effect_id) {
+            evidence.push(EffectEvidenceBody {
+                attempt,
+                result: read_json(&call.tenant, &effect.agent, Some(result)).await?,
+            });
+        }
+        let result = match record.result {
+            Some(dep) => Some(read_json(&call.tenant, &effect.agent, Some(dep)).await?),
+            None => None,
+        };
+        Ok::<_, Refusal>(Json(EffectInspectResponse {
+            effect: effect_body(effect.agent, head.incarnation, record),
+            step_key: record.step_key.clone(),
+            result_attempt: recorded,
+            result,
+            attempts,
+            evidence,
+        }))
+    };
+    run.await.into_response()
+}
+
+/// What `attempt` of `record` came to. Only the latest attempt can be open
+/// or in doubt; an earlier one without the recorded result was superseded.
+fn attempt_state(record: &EffectRecord, recorded: Option<u32>, attempt: u32) -> AttemptState {
+    if recorded == Some(attempt) {
+        return AttemptState::Result;
+    }
+    match record.status {
+        EffectStatus::Authorized if attempt == record.attempt => AttemptState::Open,
+        EffectStatus::InDoubt if attempt == record.attempt => AttemptState::InDoubt,
+        _ => AttemptState::Superseded,
+    }
+}
+
+/// Reconcile an effect: attach an operator-verified result to its latest
+/// attempt, or authorize the attempt after it. Each is idempotent: a repeat
+/// of an applied decision answers the effect as it stands and changes
+/// nothing. A decision that will change the effect is audited first, so an
+/// audit sink that refuses leaves the effect as it was.
+pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<ReconcileRequest>(req, Capability::AgentsAdmin, Lane::Activation)
+            .await?;
+        let effect = decode_effect(&body.effect)?;
+        let head = read_head(&call.tenant, &effect.agent).await?;
+        let record = effect_record(&head, &effect)?.clone();
+        let ids = || SafeIds {
+            effect_id: Some(effect.effect_id.to_hex()),
+            ..ids_for(&effect.agent)
+        };
+        let not_in_doubt = || {
+            refusal(
+                ErrorKind::OwnershipLost,
+                ids(),
+                "EffectStateAdmits: reconciliation needs an effect in doubt",
+            )
+        };
+        let wrong_attempt = || {
+            refusal(
+                ErrorKind::IdempotencyConflict,
+                ids(),
+                "reconcile names an attempt other than the effect's latest",
+            )
+        };
+        let in_doubt = record.status == EffectStatus::InDoubt;
+        let action = match body.decision {
+            ReconcileDecision::RecordResult { .. } => ReconcileAction::RecordResult,
+            ReconcileDecision::Retry => ReconcileAction::Retry,
+        };
+        match (&body.decision, record.status) {
+            (ReconcileDecision::RecordResult { .. }, EffectStatus::InDoubt)
+                if body.attempt != record.attempt =>
+            {
+                return Err(wrong_attempt());
+            }
+            (ReconcileDecision::RecordResult { .. }, EffectStatus::Completed)
+                if body.attempt != record.result_attempt =>
+            {
+                return Err(wrong_attempt());
+            }
+            (ReconcileDecision::RecordResult { .. }, EffectStatus::InDoubt)
+            | (ReconcileDecision::RecordResult { .. }, EffectStatus::Completed) => {}
+            (ReconcileDecision::Retry, EffectStatus::InDoubt) if body.attempt != record.attempt => {
+                return Err(wrong_attempt());
+            }
+            (ReconcileDecision::Retry, EffectStatus::Authorized)
+                if Some(record.attempt) != body.attempt.checked_add(1) =>
+            {
+                return Err(wrong_attempt());
+            }
+            (ReconcileDecision::Retry, EffectStatus::InDoubt)
+            | (ReconcileDecision::Retry, EffectStatus::Authorized) => {}
+            _ => return Err(not_in_doubt()),
+        }
+        if in_doubt {
+            let event = agents_reconcile_audit_event(
+                &call.principal.tenant.hash(),
+                SystemClock.now_unix_ns(),
+                &call.principal,
+                &body.effect,
+                body.attempt,
+                action,
+            );
+            if let Err(error) = api.audit.submit(event).await {
+                tracing::warn!(error = %error, "agents reconcile audit record was not written");
+                return Err(refusal(
+                    ErrorKind::StoreUnavailable,
+                    ids(),
+                    "the reconcile audit record could not be written; nothing was changed",
+                ));
+            }
+        }
+        match body.decision {
+            ReconcileDecision::RecordResult { result } => {
+                call.tenant
+                    .coordinator
+                    .reconcile_attach(&effect, &result)
+                    .await?;
+            }
+            ReconcileDecision::Retry => {
+                let next = body.attempt.checked_add(1).ok_or_else(not_in_doubt)?;
+                call.tenant
+                    .coordinator
+                    .reconcile_authorize(&effect, next, &RecordingDispatcher::default())
+                    .await?;
+            }
+        }
+        call.tenant.changed.notify_waiters();
+        let head = read_head(&call.tenant, &effect.agent).await?;
+        let record = effect_record(&head, &effect)?;
+        Ok::<_, Refusal>(Json(ReconcileResponse {
+            effect: body.effect,
+            status: record.status.into(),
+            attempt: record.attempt,
+        }))
+    };
+    run.await.into_response()
+}
+
+/// The tool failure a step's output records: exactly `{"error": <string>}`,
+/// the shape `Coordinator::fail_effect` stores.
+fn step_failure(output: &Value) -> Option<&str> {
+    let object = output.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object.get("error")?.as_str()
+}
+
+fn step_body(step: &StepRecord, output: Option<Value>) -> StepBody {
+    StepBody {
+        step_id: step.step_id.to_hex(),
+        step_key: step.step_key.clone(),
+        tool_name: step.tool_name.clone(),
+        tool_version: step.tool_version.clone(),
+        input_hash: step.input_hash.to_hex(),
+        status: step.status.into(),
+        output,
+    }
+}
+
+fn effect_handle(
+    agent: AgentId,
+    incarnation: u64,
+    effect: ravel_agents_core::identity::Id128,
+) -> String {
+    Handle {
+        agent,
+        incarnation,
+        item: HandleItem::Effect(effect),
+    }
+    .encode()
+}
+
+fn effect_body(agent: AgentId, incarnation: u64, record: &EffectRecord) -> EffectBody {
+    EffectBody {
+        effect: effect_handle(agent, incarnation, record.effect_id),
+        turn_id: record.turn_id.to_hex(),
+        tool_name: record.tool_name.clone(),
+        tool_version: record.tool_version.clone(),
+        policy: record.policy.into(),
+        status: record.status.into(),
+        attempt: record.attempt,
+    }
+}
+
+/// An effect handle. A token that does not decode as one is `AgentGone`
+/// with no ids, since its text is not known to be safe to echo.
+fn decode_effect(token: &str) -> Result<EffectRef, Refusal> {
+    let malformed = || {
+        refusal(
+            ErrorKind::AgentGone,
+            SafeIds::default(),
+            "effect handle is malformed",
+        )
+    };
+    let handle = Handle::decode_kind(token, "effect").map_err(|_| malformed())?;
+    match handle.item {
+        HandleItem::Effect(effect_id) => Ok(EffectRef {
+            agent: handle.agent,
+            incarnation: handle.incarnation,
+            effect_id,
+        }),
+        _ => Err(malformed()),
+    }
+}
+
+/// The effect `effect` names in `head`: `AgentGone` from another
+/// incarnation or when HEAD does not journal it.
+fn effect_record<'a>(head: &'a Head, effect: &EffectRef) -> Result<&'a EffectRecord, Refusal> {
+    let gone = || {
+        refusal(
+            ErrorKind::AgentGone,
+            SafeIds {
+                effect_id: Some(effect.effect_id.to_hex()),
+                ..ids_for(&effect.agent)
+            },
+            "effect is not known to this agent",
+        )
+    };
+    if head.incarnation != effect.incarnation {
+        return Err(gone());
+    }
+    head.effects
+        .iter()
+        .find(|e| e.effect_id == effect.effect_id)
+        .ok_or_else(gone)
+}
+
+fn lease_agent(lease: &ravel_agents_core::wire::TurnLease) -> Result<AgentId, Refusal> {
+    AgentId::from_hex(&lease.agent_id).ok_or_else(|| {
+        refusal(
+            ErrorKind::AgentGone,
+            SafeIds::default(),
+            "lease agent id is malformed",
+        )
+    })
 }
 
 fn parse_agent(agent: &AgentRef) -> Result<AgentId, Refusal> {
@@ -663,13 +1120,7 @@ async fn recorded_unix_ns(
             "turn moved on before its assignment was returned",
         )
     };
-    let agent = AgentId::from_hex(&lease.agent_id).ok_or_else(|| {
-        refusal(
-            ErrorKind::AgentGone,
-            SafeIds::default(),
-            "lease agent id is malformed",
-        )
-    })?;
+    let agent = lease_agent(lease)?;
     let head = read_head(tenant, &agent).await?;
     match &head.active_turn {
         Some(turn) if turn.turn_id.to_hex() == lease.turn_id => Ok(turn.started_unix_ns),

@@ -121,6 +121,12 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | POST | `/api/v1/agents/worker/poll` | JSON: `worker_id`, `handlers`, `wait_ms` | JSON: `assignment` (`lease`, `agent`, `operation`, `accept_seq`, `handler`, `state`, `payload`, `steps`), null when nothing is due | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/worker/commit` | JSON: `lease` as polled, `outcome` (`completed` with `state`, `output`, `events`, `timers`, `intents`; or `failed` with `error`, `terminal`) | JSON: `operation`, `status`, `state_version`, `rebased`, `effects` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/worker/heartbeat` | JSON: `lease` as polled | JSON: `lease_expires_unix_ns` | 200, 401, 403, 404, 409, 413, 422, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/step` | JSON: `lease` as polled, `step_key`, `tool_name`, `tool_version`, `policy` (`provider_idempotency`, `at_least_once`, `manual`), `input_hash` (64 lowercase hex) | JSON: `step` (a `steps` entry), `effect`, `attempt`, `failure` (null unless the recorded result is a tool failure) | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/effects/complete` | JSON: `effect`, `attempt`, `result` | JSON: `effect`, `status`, `late` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/worker/effects/fail` | JSON: `effect`, `attempt`, `error` | JSON: `effect`, `status`, `late` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/effects` | `kind`, `key` | JSON: `effects` (each `effect`, `turn_id`, `tool_name`, `tool_version`, `policy`, `status`, `attempt`) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/effects/{effect}` | none | JSON: the `effects` entry plus `step_key`, `result_attempt`, `result`, `attempts` (each `attempt`, `status`), `evidence` (each `attempt`, `result`) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/reconcile` | JSON: `effect`, `attempt`, `decision` (`record_result` with `result`, or `retry`) | JSON: `effect`, `status`, `attempt` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_admin` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
 
@@ -379,10 +385,13 @@ The `/api/v1/agents` routes are behind the
 `agents` cargo feature and `--agents`. Both listeners mount them, each with
 its own tenant resolver, and the tenant always comes from the credential,
 never from the request (`agents_e2e::capabilities_are_enforced_on_both_listeners`).
-Client routes need the principal's `agents` capability and worker routes its
-`agents_worker` capability. A credential without it gets 403 with a body
-naming the capability, before any coordinator or store call. Timer, effect
-and reconcile routes are not mounted in this release.
+Client routes need the principal's `agents` capability, worker routes its
+`agents_worker` capability, and `reconcile` its `agents_admin` capability.
+A credential without it gets 403 with a body naming the capability, before
+any coordinator or store call
+(`agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`).
+Timer routes are not mounted in this release, and the router answers 404
+for any path outside the table above.
 
 The router carries its own body limit and its own admission counter, one
 lane for the waiting routes (`call`, `result`, `worker/poll`) sized by
@@ -419,8 +428,9 @@ at the next poll interval
 (`agents_e2e::send_then_result_through_real_server_survives_worker_replacement`).
 
 **Event cursor.** `events` returns committed events strictly after
-`cursor`, in event sequence order, at most `limit` per page (clamped to
-1..=1000). The cursor is the decimal committed event sequence; null starts
+`cursor`, in event sequence order, at most `limit` per page. A `limit`
+above 1000 reads 1000, and a `limit` of 0 is 422 `unsupported_format`
+(`events limit must be at least 1`). The cursor is the decimal committed event sequence; null starts
 at the beginning. `next_cursor` is the last sequence returned, or the input
 cursor when the page is empty, so resuming from it never repeats or skips
 an event (`agents_e2e::events_page_after_the_durable_cursor_without_duplicates`).
@@ -439,6 +449,56 @@ same clock and randomness. `call`, `cancel` and `worker/heartbeat` are
 covered by `agents_e2e::call_heartbeat_and_cancel_through_real_server`.
 One coordinator per tenant per server process is assumed; several servers
 coordinating the same tenant is out of scope for this release.
+
+**Steps and effects.** A worker journals each tool call with
+`worker/step` before running it, under the turn's lease. Steps are
+sequential: a second step while one's attempt is still open is 409
+`idempotency_conflict`. A step with a recorded result answers it without a
+write: `step.status` `completed` with its output, or `failure` set when the
+result is a tool failure reported through `worker/effects/fail`
+(`agents_effects_e2e::a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail`).
+Otherwise `attempt` is the attempt the caller may run and `effect` the
+handle to report it under. A replay whose `input_hash` differs from the
+journaled one is 409 `non_deterministic_replay`, and the operation reads
+`blocked`
+(`agents_effects_e2e::a_drifted_replay_is_non_deterministic_and_blocks_the_turn`).
+A step whose input is being cancelled is 409 `ownership_lost` and no new
+attempt is authorized
+(`agents_effects_e2e::cancel_during_an_open_attempt_refuses_the_replay_and_the_result_is_late`).
+
+When a worker dies holding an open attempt, the replacement's replay of the
+step follows the step's `policy`. `provider_idempotency` hands out the same
+attempt again, so whichever result arrives first is the result
+(`agents_effects_e2e::provider_idempotency_redispatches_the_same_attempt_and_the_late_result_counts`).
+`at_least_once` authorizes the next attempt; a result for the earlier one
+then answers `late: true`, is kept as evidence and never becomes the result
+(`agents_effects_e2e::at_least_once_replays_a_new_attempt_and_keeps_the_late_result_as_evidence`).
+`manual` latches the effect in doubt: the step is 409 `effect_in_doubt`,
+the operation reads `blocked` with `blocked_effect` set, and the turn may
+neither continue nor fail until an `agents_admin` caller reconciles it. A
+repeat of the same result for an attempt is accepted, and a different one
+is 409 `idempotency_conflict`
+(`agents_effects_e2e::a_conflicting_final_result_for_the_same_attempt_is_refused`).
+
+`effects` lists an agent's journaled effects and `effects/{effect}`
+inspects one: each attempt as `open`, `in_doubt`, `result` or
+`superseded`, the result and the attempt it came from, and the late results
+kept as evidence. Evidence is held by the serving process and is not
+durable; a restart forgets it.
+
+**Reconcile.** `reconcile` settles an effect in doubt: `record_result`
+attaches an operator-verified result, and `retry` authorizes one more
+attempt. `attempt` must name the effect's latest attempt, else 409
+`idempotency_conflict`; repeating a decision that already took effect
+answers the same body and changes nothing. Before changing an effect in
+doubt the server submits one audit record with `kind` `agents_reconcile`
+to the audit pipeline, which writes it into the tenant's audit shard,
+naming the effect, attempt, decision and the caller's tenant and
+capabilities (a principal carries no subject, so two admins of one tenant
+are not told apart). Without `--audit-mode` no record is written. When the
+submission fails the reconcile is 503 `store_unavailable` and nothing
+changes
+(`agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`).
 
 ### Query status codes
 

@@ -3461,8 +3461,10 @@ pub struct AgentsConfig {
     pub max_receipts: u64,
     /// Most pending timers one agent may hold.
     pub max_timers: u64,
-    /// Largest request body the agents router reads; a larger one is refused
-    /// with 413 before any handler runs.
+    /// Largest request body an agents route reads. Each handler first
+    /// authenticates, checks the route's capability and takes an admission
+    /// permit, then reads the body; one that cannot be read in full within
+    /// this limit is refused with 413 before it is parsed.
     pub max_body_bytes: usize,
     /// How long a worker's turn lease runs from its grant or last heartbeat.
     pub lease_ms: u64,
