@@ -129,29 +129,46 @@ impl Coordinator {
             observed_epoch: head.epoch,
             lease_hint_unix_ns: lease_hint,
         });
-        let out = match self.store.execute(agent, &command).await {
-            Ok(out) => out,
+        let (epoch, incarnation, published) = match self.store.execute(agent, &command).await {
+            Ok(out) => {
+                let Reply::Owned { epoch } = out.reply else {
+                    return Err(refused(
+                        agent,
+                        ErrorKind::OwnershipLost,
+                        "takeover answered without an epoch",
+                    ));
+                };
+                self.after_outcome(&out);
+                (epoch, out.head.incarnation, out.published)
+            }
             Err(e) if e.kind == ErrorKind::OwnershipLost => {
                 self.reload(agent).await?;
                 return Err(e);
             }
+            // A takeover has no operation handle to resolve; HEAD settles it:
+            // this owner at the next epoch means the lost write landed.
+            Err(e) if e.kind == ErrorKind::OutcomeUnknown => {
+                let fresh = self.reload(agent).await?;
+                if fresh.owner_id != owner_id
+                    || fresh.incarnation != head.incarnation
+                    || fresh.epoch != head.epoch.saturating_add(1)
+                {
+                    return Err(e);
+                }
+                self.metrics
+                    .outcome_unknown_resolved
+                    .fetch_add(1, Ordering::Relaxed);
+                (fresh.epoch, fresh.incarnation, true)
+            }
             Err(e) => return Err(e),
         };
-        let Reply::Owned { epoch } = out.reply else {
-            return Err(refused(
-                agent,
-                ErrorKind::OwnershipLost,
-                "takeover answered without an epoch",
-            ));
-        };
-        if out.published {
+        if published {
             self.metrics.takeovers.fetch_add(1, Ordering::Relaxed);
         }
         tracing::debug!(agent = %agent.to_hex(), epoch, ?reason, "agents takeover");
         self.leases.grant(agent, owner_id, epoch, lease_hint);
-        self.after_outcome(&out);
         Ok(OwnerFence {
-            incarnation: out.head.incarnation,
+            incarnation,
             owner_id: owner_id.to_string(),
             epoch,
         })

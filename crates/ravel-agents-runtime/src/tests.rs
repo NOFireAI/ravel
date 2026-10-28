@@ -526,6 +526,50 @@ async fn one_failure_short_of_the_bound_then_success_completes_the_input() {
     assert_eq!(after.state_version, 1);
 }
 
+/// A poll whose `nth` HEAD write loses its acknowledgement. HEAD writes:
+/// create 1, enqueue 2, takeover 3, begin 4.
+async fn poll_with_lost_head_ack(nth: u64) {
+    let clock = clock();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)
+            .with_key_contains("/head")
+            .with_occurrence(Occurrence::Nth(nth)),
+    );
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store = store_over(fault.clone(), &clock);
+    let co = coordinator(&store, &clock, 100);
+    create(&co, "o-1").await;
+    let sent = send(&co, "o-1", "r-1", json!(1)).await;
+    let w = worker(&co, "v1");
+    let before = store.counters();
+    let a = poll_now(&co, &w, "v1")
+        .await
+        .expect("leased despite the lost ack");
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+    assert_eq!(a.accept_seq, sent.accept_seq);
+    assert_eq!((a.lease.owner_id.as_str(), a.lease.epoch), (w.as_str(), 1));
+    assert_eq!(store.counters().since(&before).publish.cas, 2);
+    let m = co.metrics();
+    assert_eq!(m.outcome_unknown_resolved, 1);
+    assert_eq!(m.takeovers, 1);
+    let h = head(&store, "o-1").await;
+    let turn = h.active_turn.expect("active turn");
+    assert_eq!(turn.turn_id.to_hex(), a.lease.turn_id);
+    co.commit(&completed(&a.lease, json!("ok")))
+        .await
+        .expect("commit under the settled lease");
+}
+
+#[tokio::test(start_paused = true)]
+async fn takeover_with_a_lost_acknowledgement_is_settled_from_head() {
+    poll_with_lost_head_ack(3).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn begin_turn_with_a_lost_acknowledgement_resumes_without_a_second_cas() {
+    poll_with_lost_head_ack(4).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn lost_acknowledgement_is_resolved_without_a_second_cas() {
     let clock = clock();

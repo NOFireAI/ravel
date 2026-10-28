@@ -227,7 +227,17 @@ impl Coordinator {
             });
             let out = match self.store.execute(agent, &command).await {
                 Ok(out) => out,
-                Err(e) if e.kind == ErrorKind::OwnershipLost && !retried => {
+                // Re-running against the reloaded root resumes a turn whose
+                // `BeginTurn` landed without its acknowledgement.
+                Err(e)
+                    if matches!(e.kind, ErrorKind::OwnershipLost | ErrorKind::OutcomeUnknown)
+                        && !retried =>
+                {
+                    if e.kind == ErrorKind::OutcomeUnknown {
+                        self.metrics
+                            .outcome_unknown_resolved
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     retried = true;
                     self.reload(agent).await?;
                     continue;
