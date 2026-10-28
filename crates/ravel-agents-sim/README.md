@@ -21,7 +21,8 @@ clock wait.
 
 The schedules live in `src/schedules/`. Each one has a fixed test with a
 hand-written script and a batch over the 64 seeds `0x5eed0000..0x5eed0040`
-(`schedules::seeds`). A batch checks every run against the reference machine
+(`schedules::seeds`), or over the 64 seeds from `RAVEL_SIM_SEED` when that
+is set. A batch checks every run against the reference machine
 and then asserts exact totals. A scheduler or production change that moves
 any total fails the batch.
 
@@ -60,19 +61,24 @@ answer lost, settled after a takeover, answers `OwnershipLost`.
 
 ## Turning a failed batch into a named regression test
 
-A failing `sim_assert` prints the seed, the script and the trace of held
-calls, for example:
+A failing `sim_assert` prints the batch seed, the seed the scheduler drew
+from, the script and the trace of held calls, for example:
 
 ```text
-seed: 1592590387
-replay: RAVEL_SIM_SEED=1592590387 cargo test -p ravel-agents-sim
+batch seed: 1592590387 (0x5eed0033)
+scheduler seed: 1592590387 (0x5eed0033)
+test: schedules::workers::worker_kills_across_seeds
+replay: RAVEL_SIM_SEED=1592590387 cargo test -p ravel-agents-sim -- --exact schedules::workers::worker_kills_across_seeds
 schedule: ScheduleScript { steps: [...] }
 ```
 
-The schedules pass an explicit seed to the scheduler, so `RAVEL_SIM_SEED`
-does not narrow a batch. To reproduce a failure:
+The two seeds differ under `relay`, which derives each later worker's
+seed from the batch seed. The replay line sets `RAVEL_SIM_SEED` to the
+batch seed, and a batch starts from it, so the failing seed runs first.
+The batch's pinned totals then fail too, since they hold only for the
+default seeds. To keep a failure as a regression test:
 
-1. Copy the seed from the message.
+1. Copy the batch seed from the message.
 2. Add a `#[test]` beside the batch. It calls the batch's schedule function
    with that seed as a literal.
 3. Assert the exact counts that run returns.

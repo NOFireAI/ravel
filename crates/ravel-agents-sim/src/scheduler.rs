@@ -17,8 +17,9 @@
 //! generator, which the seed does not control.
 //!
 //! Every [`ScheduleError`] and every failed [`sim_assert!`] or
-//! [`sim_assert_eq!`] message carries the seed, a replay line and the
-//! script's `Debug` form.
+//! [`sim_assert_eq!`] message carries the batch seed and the scheduler's
+//! own seed, a replay line from the batch seed, and the script's `Debug`
+//! form.
 //!
 //! [`sim_assert!`]: crate::sim_assert
 //! [`sim_assert_eq!`]: crate::sim_assert_eq
@@ -204,7 +205,11 @@ pub enum ActorEnd {
 /// A run that ended with every actor finished or crashed.
 #[derive(Debug, Clone)]
 pub struct ScheduleOutcome {
+    /// The seed this run's scheduler drew from.
     pub seed: u64,
+    /// The seed of the batch the run belongs to; see
+    /// [`Scheduler::with_batch_seed`].
+    pub batch_seed: u64,
     pub script: ScheduleScript,
     pub trace: Vec<TraceEntry>,
     pub ends: Vec<ActorEnd>,
@@ -233,6 +238,7 @@ impl ScheduleOutcome {
 #[derive(Debug, Clone)]
 pub struct ScheduleError {
     pub seed: u64,
+    pub batch_seed: u64,
     pub script: ScheduleScript,
     pub trace: Vec<TraceEntry>,
     pub reason: String,
@@ -244,7 +250,7 @@ impl fmt::Display for ScheduleError {
             f,
             "{}\n{}\ntrace: {:?}",
             self.reason,
-            failure_context(self.seed, &self.script),
+            failure_context(self.seed, self.batch_seed, &self.script),
             self.trace
         )
     }
@@ -252,18 +258,21 @@ impl fmt::Display for ScheduleError {
 
 impl std::error::Error for ScheduleError {}
 
-/// The lines every failure message carries: the seed, the test, how to
-/// replay that test from that seed, and the schedule. The test is named
-/// from the thread libtest runs it on.
-pub fn failure_context(seed: u64, script: &ScheduleScript) -> String {
+/// The lines every failure message carries: the batch seed, the seed the
+/// scheduler drew from, the test, how to replay that test from the batch
+/// seed, and the schedule. The test is named from the thread libtest runs
+/// it on. The replay names the batch seed because a batch starts from
+/// `RAVEL_SIM_SEED` and a run may draw from a seed derived from it.
+pub fn failure_context(seed: u64, batch_seed: u64, script: &ScheduleScript) -> String {
     let current = std::thread::current();
     let test = current
         .name()
         .filter(|name| *name != "main")
         .unwrap_or("<test name>");
     format!(
-        "seed: {seed} ({seed:#x})\ntest: {test}\nreplay: RAVEL_SIM_SEED={seed} cargo test -p \
-         ravel-agents-sim -- --exact {test}\nschedule: {script:?}"
+        "batch seed: {batch_seed} ({batch_seed:#x})\nscheduler seed: {seed} ({seed:#x})\ntest: \
+         {test}\nreplay: RAVEL_SIM_SEED={batch_seed} cargo test -p ravel-agents-sim -- --exact \
+         {test}\nschedule: {script:?}"
     )
 }
 
@@ -276,7 +285,7 @@ impl FailureContext for ScheduleOutcome {
     fn failure_context(&self) -> String {
         format!(
             "{}\ntrace: {:?}",
-            failure_context(self.seed, &self.script),
+            failure_context(self.seed, self.batch_seed, &self.script),
             self.trace
         )
     }
@@ -290,7 +299,7 @@ impl FailureContext for ScheduleError {
 
 impl FailureContext for (u64, &ScheduleScript) {
     fn failure_context(&self) -> String {
-        failure_context(self.0, self.1)
+        failure_context(self.0, self.0, self.1)
     }
 }
 
@@ -336,6 +345,7 @@ macro_rules! sim_assert_eq {
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     seeds: AgentSeeds,
+    batch_seed: u64,
     script: ScheduleScript,
     settle_bound: Duration,
     max_steps: usize,
@@ -358,10 +368,19 @@ impl Scheduler {
     pub fn new(seeds: AgentSeeds, script: ScheduleScript) -> Scheduler {
         Scheduler {
             seeds,
+            batch_seed: seeds.seed(),
             script,
             settle_bound: Duration::from_secs(3600),
             max_steps: 10_000,
         }
+    }
+
+    /// The seed of the batch this run belongs to, when the scheduler draws
+    /// from a seed derived from it. Failure messages replay from it.
+    /// Defaults to the scheduler's own seed.
+    pub fn with_batch_seed(mut self, batch_seed: u64) -> Scheduler {
+        self.batch_seed = batch_seed;
+        self
     }
 
     /// Virtual time the runtime may idle while waiting for live actors to
@@ -398,6 +417,7 @@ impl Scheduler {
     fn error(&self, trace: Vec<TraceEntry>, reason: String) -> ScheduleError {
         ScheduleError {
             seed: self.seeds.seed(),
+            batch_seed: self.batch_seed,
             script: self.script.clone(),
             trace,
             reason,
@@ -522,6 +542,7 @@ impl Scheduler {
             .collect();
         Ok(ScheduleOutcome {
             seed: self.seeds.seed(),
+            batch_seed: self.batch_seed,
             script: self.script.clone(),
             trace,
             ends,
@@ -736,7 +757,10 @@ mod tests {
             .downcast_ref::<String>()
             .cloned()
             .expect("a formatted panic message");
-        assert!(message.contains("seed: 42 (0x2a)\n"), "{message}");
+        assert!(
+            message.contains("batch seed: 42 (0x2a)\nscheduler seed: 42 (0x2a)\n"),
+            "{message}"
+        );
         assert!(
             message.contains(
                 "replay: RAVEL_SIM_SEED=42 cargo test -p ravel-agents-sim -- --exact \
@@ -861,7 +885,10 @@ mod tests {
             .expect_err("the client fails");
         let message = err.to_string();
         assert!(message.contains("C failed: get:"), "{message}");
-        assert!(message.contains("seed: 9"), "{message}");
+        assert!(
+            message.contains("batch seed: 9 (0x9)\nscheduler seed: 9 (0x9)\n"),
+            "{message}"
+        );
         let test = "scheduler::tests::a_failing_actor_reports_the_seed_and_the_script";
         assert!(message.contains(&format!("test: {test}\n")), "{message}");
         assert!(
@@ -871,6 +898,44 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(&format!("{script:?}")), "{message}");
+    }
+
+    #[test]
+    fn a_run_on_a_derived_seed_replays_from_its_batch_seed() {
+        let script = ScheduleScript::from_seed(&AgentSeeds::new(9), 1, 4, 0);
+        let scheduler = Scheduler::new(AgentSeeds::new(9), script).with_batch_seed(5);
+        let err = scheduler
+            .run(
+                store_with_head(),
+                vec![Actor::client("C", |store: ActorStore| async move {
+                    store
+                        .get("missing", GetRange::Full)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("get: {e}"))
+                })],
+            )
+            .expect_err("the client fails");
+        let outcome = scheduler
+            .run(
+                store_with_head(),
+                vec![Actor::client("C", |_: ActorStore| async move { Ok(()) })],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let test = "scheduler::tests::a_run_on_a_derived_seed_replays_from_its_batch_seed";
+        for message in [err.to_string(), outcome.failure_context()] {
+            assert!(
+                message.contains("batch seed: 5 (0x5)\nscheduler seed: 9 (0x9)\n"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "replay: RAVEL_SIM_SEED=5 cargo test -p ravel-agents-sim -- --exact {test}\n"
+                )),
+                "{message}"
+            );
+            assert!(!message.contains("RAVEL_SIM_SEED=9"), "{message}");
+        }
     }
 
     #[test]

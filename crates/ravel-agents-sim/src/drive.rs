@@ -42,7 +42,8 @@
 //!   from `operation` and the `duplicate` flag. The event's payload is
 //!   `serde_json::to_vec` of the request's JSON, the bytes production
 //!   uploads (`schedules::senders::same_request_twice_is_a_duplicate`). An
-//!   `accept_seq` that disagrees with the handle is unmappable.
+//!   `accept_seq` that disagrees with the handle is unmappable; no schedule
+//!   reaches this.
 //! - A send whose HEAD write applied and whose acknowledgement was lost
 //!   answers through the coordinator's settle; it is recorded at the write
 //!   it applied, not at the settle's reads
@@ -56,7 +57,7 @@
 //!   with the response's status and state version
 //!   (`schedules::races::cancel_racing_completion_one_wins`, where the status
 //!   is `cancelled`). A response with effects is unmappable: the reference
-//!   has no intents.
+//!   has no intents. No schedule reaches this.
 //! - `Coordinator::cancel` answers [`Reply::Cancel`] with its status and
 //!   `requested` flag (`schedules::races::cancel_racing_completion_one_wins`).
 //! - [`Proc::operation`] reads through `AgentStore::resolve` and answers
@@ -74,12 +75,13 @@
 //! - [`Proc::resolve`] reads HEAD once and answers [`Reply::Resolved`] with
 //!   the receipt matching both handler and request id
 //!   (`schedules::senders::same_id_different_payload_conflicts`). A receipt
-//!   whose input has no state is unmappable.
+//!   whose input has no state is unmappable; no schedule reaches this.
 //! - `Coordinator::record_step` is [`Event::StepStarted`], answered
 //!   [`Reply::StepJournaled`] with the step's completed flag and its
-//!   effect's phase and attempt; an effect showing an intent with no attempt
-//!   is unmappable
+//!   effect's phase and attempt
 //!   (`schedules::effects::journaled_step_with_a_failed_attempt_replays_the_failure`).
+//!   An effect showing an intent with no attempt is unmappable; no schedule
+//!   reaches this.
 //! - `Coordinator::run_step` is [`Event::Step`], answered
 //!   [`Reply::StepDispatched`] with the attempt it handed the dispatcher or
 //!   [`Reply::StepCompleted`] with the output's bytes
@@ -111,7 +113,8 @@
 //!   [`Refusal`]s, which each schedule asserts exactly
 //!   (`schedules::errors`).
 //! - `OutcomeUnknown` reaching the caller is unmappable: the coordinator
-//!   settles it on every path, so a client never has to.
+//!   settles it on every path, so a client never has to. No schedule
+//!   reaches this.
 //!
 //! # Calls that never answered
 //!
@@ -124,6 +127,18 @@
 //! The same holds for a call that applied a write and then answered a
 //! refusal (`schedules::errors::corrupt_dependency_is_store_unavailable`).
 //! A crashed call that wrote nothing changed nothing and is dropped.
+//!
+//! An inferred reply that is an error means the reference refuses a call
+//! whose write applied, so that call is listed in [`Run::unmappable`]
+//! (`tests::a_crashed_write_the_reference_refuses_outside_the_exemption_is_unmappable`,
+//! a completion with no started turn answered `OwnershipLost`). Two kinds
+//! are exempt, because production writes before it answers them: a manual
+//! step whose attempt was lost latches its effect in doubt and answers
+//! `EffectInDoubt`
+//! (`tests::a_crashed_manual_step_whose_attempt_was_lost_infers_effect_in_doubt`),
+//! and a step whose call changed blocks the turn and answers
+//! `NonDeterministicReplay` (no test builds that shape). No schedule
+//! reaches this rule today: no reply a schedule infers is an error.
 //!
 //! Anything else the driver cannot map is listed in [`Run::unmappable`],
 //! and every schedule asserts that list is empty.
@@ -1544,4 +1559,114 @@ pub fn status_of(head: &Head, accept_seq: u64) -> Option<OperationStatus> {
         .iter()
         .find(|r| r.accept_seq == accept_seq)
         .map(|r| r.status.into())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_agents_core::head::{EffectRecord, RecoveryPolicy as HeadPolicy};
+    use ravel_agents_core::identity::{Hash256, Id128};
+
+    use super::*;
+
+    /// Record a call that answered what `reference` answers, stamped as a
+    /// read at `seq`.
+    fn answered(rec: &Recorder, reference: &mut ReferenceMachine, event: Event, seq: u64) {
+        let reply = reference.apply(&event);
+        let (index, cell) = rec.begin("w1", "call", Some(event));
+        lock(&cell).read = Some(seq);
+        rec.finish(index, None, Observed::Modelled(reply));
+    }
+
+    /// Record a call that applied a write of `body` at `seq` and never
+    /// answered.
+    fn crashed(rec: &Recorder, event: Event, seq: u64, body: Bytes) {
+        let (_, cell) = rec.begin("w2", "call", Some(event));
+        lock(&cell).write = Some((seq, body));
+    }
+
+    /// Create the agent and accept input 1.
+    fn accepted(rec: &Recorder, reference: &mut ReferenceMachine) -> Handle {
+        answered(rec, reference, Event::Client(ClientOp::Create), 1);
+        let send = Event::Client(ClientOp::Send {
+            handler: HANDLER.to_string(),
+            request_id: "r1".to_string(),
+            payload: b"{}".to_vec(),
+        });
+        answered(rec, reference, send, 2);
+        reference.operation(1, 1)
+    }
+
+    #[test]
+    fn a_crashed_write_the_reference_refuses_outside_the_exemption_is_unmappable() {
+        let rec = Recorder::default();
+        let mut reference = machine().expect("machine");
+        let op = accepted(&rec, &mut reference);
+        // No turn started: the reference refuses the completion.
+        let commit = Event::TurnCompleted {
+            operation: op,
+            output: b"out".to_vec(),
+        };
+        crashed(&rec, commit.clone(), 3, Bytes::from_static(b"root"));
+        let run = rec.build().expect("build");
+        assert_eq!(
+            run.unmappable,
+            vec![format!(
+                "w2: applied a write the reference refuses OwnershipLost: {commit:?}"
+            )]
+        );
+        assert_eq!(run.inferred, vec![("w2".to_string(), commit)]);
+    }
+
+    #[test]
+    fn a_crashed_manual_step_whose_attempt_was_lost_infers_effect_in_doubt() {
+        let rec = Recorder::default();
+        let mut reference = machine().expect("machine");
+        let op = accepted(&rec, &mut reference);
+        let step = StepCall {
+            key: "lookup".to_string(),
+            tool: "search".to_string(),
+            version: "v1".to_string(),
+            input: b"q".to_vec(),
+            policy: RecoveryPolicy::Manual,
+        };
+        let run_step = Event::Step {
+            operation: op,
+            step: step.clone(),
+        };
+        let begin = Event::TurnStarted { operation: op };
+        answered(&rec, &mut reference, begin.clone(), 3);
+        answered(&rec, &mut reference, run_step.clone(), 4);
+        // A takeover: attempt 1 was dispatched by a turn that is gone.
+        answered(&rec, &mut reference, begin, 5);
+        // The step latched the effect in doubt, then the process died.
+        let rig = Rig::new(FaultPlan::empty());
+        rig.setup(|p| async move {
+            p.create().await.map_err(|e| format!("create: {e:?}"))?;
+            Ok(())
+        })
+        .expect("setup");
+        let mut head = rig.head().expect("head");
+        head.effects.push(EffectRecord {
+            effect_id: effect_id(1, 1, &step.key),
+            step_key: step.key.clone(),
+            tool_name: step.tool.clone(),
+            tool_version: step.version.clone(),
+            input_hash: Hash256([0; 32]),
+            policy: HeadPolicy::Manual,
+            status: EffectStatus::InDoubt,
+            attempt: 1,
+            result: None,
+            result_attempt: 0,
+            turn_id: Id128([0; 16]),
+        });
+        crashed(&rec, run_step.clone(), 6, Bytes::from(head.encode()));
+        let run = rec.build().expect("build");
+        assert_eq!(run.unmappable, Vec::<String>::new());
+        assert_eq!(run.inferred, vec![("w2".to_string(), run_step.clone())]);
+        let last = run.history.calls().last().expect("a call");
+        assert_eq!(last.event, run_step);
+        assert_eq!(last.observed, Reply::Error(ErrorKind::EffectInDoubt));
+        assert_eq!(run.check(), Ok(()));
+    }
 }

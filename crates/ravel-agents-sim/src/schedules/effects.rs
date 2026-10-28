@@ -1018,11 +1018,45 @@ fn relay(rig: &Rig, seed: u64, workers: Vec<Actor>) -> (ScheduleOutcome, usize) 
             rig.clock.advance_ms(PAST_LEASE_MS);
         }
         let s = seed ^ ((i as u64) << 32);
-        let out = run(rig, s, seeded(s, 1, 40, 80), vec![w]).expect("relay");
+        let out = run_in_batch(rig, seed, s, seeded(s, 1, 40, 80), vec![w]).expect("relay");
         crashed += crashes(&out);
         last = Some(out);
     }
     (last.expect("one worker"), crashed)
+}
+
+/// A relay worker after the first draws from a seed derived from the
+/// batch seed; its failure message labels both and replays the batch.
+#[test]
+fn a_relay_failure_replays_from_the_batch_seed() {
+    let rig = Rig::new(FaultPlan::empty());
+    create_with_inputs(&rig, 1);
+    let w1 = worker(&rig, "w1", 10, |p| async move {
+        p.work(1).await;
+        Ok(())
+    });
+    let w2 = worker(&rig, "w2", 20, |p| async move {
+        p.work(1).await;
+        Ok(())
+    });
+    let (out, _) = relay(&rig, BASE, vec![w1, w2]);
+    let derived = BASE ^ (1 << 32);
+    assert_eq!((out.batch_seed, out.seed), (BASE, derived));
+    let message = out.failure_context();
+    assert!(
+        message.contains(&format!(
+            "batch seed: {BASE} ({BASE:#x})\nscheduler seed: {derived} ({derived:#x})\n"
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("replay: RAVEL_SIM_SEED={BASE} cargo test")),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&format!("RAVEL_SIM_SEED={derived}")),
+        "{message}"
+    );
 }
 
 /// Check the whole run and count it. Every input reached one terminal
