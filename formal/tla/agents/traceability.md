@@ -77,7 +77,7 @@ below, with the ticket that builds each.
 | `CancellationRespected` (effects form) | a commit on a turn with a cancel request publishes it `cancelled`, and no write rewrites a published result. An owner authorization on a turn with a cancel request is refused (kernel.rs:1764; negative `authorize-ignores-cancel-request`), and a result for an input settled cancelled leaves HEAD unchanged (kernel.rs:1856; negative `cancelled-result-recorded`). The runner refuses a new intent or authorization once it reads the request (`refuse_cancelled`, effects.rs:657). Model differences: the model's owner journals no new step once it reads the request, while `record_step` (through `require_running`) and the runner's step journal do not read it; and the model refuses the manual latch under a cancel request, as the runner does, while the kernel admits it (kernel.rs:1762) | `crates/ravel-agents-core/src/kernel.rs::Kernel::complete_turn` `crates/ravel-agents-core/src/kernel.rs::Kernel::authorize_attempt` `crates/ravel-agents-core/src/kernel.rs::Kernel::record_effect_result` `crates/ravel-agents-runtime/src/effects.rs::Coordinator::refuse_cancelled` | `crates/ravel-agents-core/src/kernel/tests.rs::cancel_settles_pending_input_and_flags_the_running_turn` `crates/ravel-agents-core/src/kernel/tests.rs::a_cancel_requested_before_a_retryable_failure_consumes_the_input_as_cancelled` `crates/ravel-agents-core/src/kernel/tests.rs::a_new_attempt_for_a_cancelled_input_is_refused` `crates/ravel-agents-core/src/kernel/tests.rs::superseded_and_cancelled_results_are_evidence` `crates/ravel-agents-runtime/src/effects/tests.rs::a_new_attempt_for_a_cancelled_input_is_refused_and_the_completion_settles_cancelled` | new test needed: record a step after a cancel request and assert whether `require_running` refuses it |
 | `TimerDue` | a timer is due when the store clock reaches its recorded due time; the runtime fires only timers HEAD holds as scheduled with `due_unix_ns <= now`, and the kernel refuses an early fire with `TimerNotDue` | `crates/ravel-agents-runtime/src/timers.rs::due_timers` `crates/ravel-agents-runtime/src/timers.rs::Coordinator::fire_due` | `crates/ravel-agents-runtime/src/timers/tests.rs::a_timer_fires_at_its_recorded_due_time_and_not_a_nanosecond_before` | none |
 | `HintObservedEarly` | a `_wake` hint is advisory: the sweep reads HEAD before acting on one, so a hint listed before its bucket is due, or one whose timer was cancelled or rescheduled, fires nothing, and a hint is deleted only after a HEAD read in the same pass shows no timer still armed in its bucket. Model difference: the store keys the hint by due bucket, the model by generation, so the stale-generation case is the cancelled and superseded timers the cited tests use | `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_wake` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::visit` `crates/ravel-agents-runtime/src/timers.rs::armed_in` | `crates/ravel-agents-runtime/src/timers/tests.rs::fire_and_cancel_race_resolves_at_head_and_a_stale_hint_never_fires_a_cancelled_generation` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_premature_hint_fires_nothing_and_is_kept` `crates/ravel-agents-runtime/src/sweep/tests.rs::duplicate_hints_for_one_generation_fire_it_once` | none |
-| `FireTimer` (sweep half) | the sweep that drives `FireTimer` in production: each pass reads HEAD and fires the generation HEAD holds, never one named by a hint; the directory half reaches an agent whose hint was never written or was lost, and a pass is bounded by list pages and HEAD GETs with a cursor that resumes in list order | `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_dir` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_from_poll` | `crates/ravel-agents-runtime/src/timers/tests.rs::a_schedule_whose_hint_was_never_written_still_fires_when_due` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_lost_hint_is_found_by_the_directory_half_within_one_pass` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_bounded_pass_walks_the_directory_in_list_order_across_passes` | none |
+| `FireTimer` (sweep half) | the sweep that drives `FireTimer` in production: each pass reads HEAD and fires the generation HEAD holds, never one named by a hint; the directory half reaches an agent whose hint was never written or was lost, and a pass is bounded by list pages and HEAD GETs with a cursor that resumes in list order | `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_dir` `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_from_poll` | `crates/ravel-agents-runtime/src/timers/tests.rs::a_schedule_whose_hint_was_never_written_still_fires_when_due` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_lost_hint_is_found_by_the_directory_half` `crates/ravel-agents-runtime/src/sweep/tests.rs::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes` `crates/ravel-agents-runtime/src/sweep/tests.rs::a_bounded_pass_walks_the_directory_in_list_order_across_passes` | none |
 
 ## Design rows (not yet built)
 
@@ -97,9 +97,20 @@ table above in the task that builds its symbol.
   citing the coordinator's lease expiry and takeover path, and the end-to-end
   crash test is T13 (#3346) in `ravel-agents-sim`.
 - Liveness: `InputEventuallyResolved` and `DueTimerEventuallyDelivered` hold
-  only under the coordinator's fairness (dispatch, retry and the sweep), so
-  their tests land with T13 (#3346) and T15 (#3348), citing the simulation
-  schedules for a resolved input and a delivered timer.
+  only under the coordinator's fairness (dispatch, retry and the sweep). The
+  sweep has landed (`crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once`):
+  a bounded pass resumes from a cursor, so every agent it can list is read
+  within a bounded number of passes
+  (`crates/ravel-agents-runtime/src/sweep/tests.rs::a_bounded_pass_walks_the_directory_in_list_order_across_passes`,
+  `crates/ravel-agents-runtime/src/sweep/tests.rs::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`).
+  The rows wait for simulation schedules that drive a resolved input and a
+  delivered timer through the production crates; the T13 (#3346) drivers
+  schedule no timers yet. Model difference: the model reaches a timer only
+  through its hint and assumes the hint write under `Fairness` (the
+  HEAD-listing half of the sweep is not modelled). The code's backstop for
+  a lost hint is the `_dir` listing, not a HEAD listing, so an agent with
+  neither (its create-time `_dir` PUT failed and its hint was lost) is not
+  reached; the `sweep` module docs state the bound and the gap.
 - The effect runner: T14 built the coordinator's step and effect path
   (`Coordinator::run_step`, `record_result`, `reconcile_attach`,
   `reconcile_authorize` in `crates/ravel-agents-runtime/src/effects.rs`),
@@ -109,9 +120,11 @@ table above in the task that builds its symbol.
   remaining guards the README lists under "Differences from the kernel".
 - `SweepRead` and `SweepFire` in `AgentIntegrated`: the sweep reads HEAD
   and fires a due generation with a CAS on the version it read, and a
-  failed CAS leaves HEAD alone. T15 (#3348) builds it.
+  failed CAS leaves HEAD alone. The code is
+  `crates/ravel-agents-runtime/src/sweep.rs::Coordinator::sweep_once`, which
+  reads HEAD and fires through `timers.rs::fire_due`.
 - Liveness in the two new models: `InputSettledOrEffectBlocked`
   (`AgentEffects`, `AgentIntegrated`) and `EnqueueEventuallyAnswered`
   (`AgentIntegrated`) hold under the runner's and the sweep's fairness. The
   runner exists (`Coordinator::run_step`) but no test cited here pins either
-  property; the sweep half lands with T15 (#3348).
+  property; the sweep half is `Coordinator::sweep_once`.

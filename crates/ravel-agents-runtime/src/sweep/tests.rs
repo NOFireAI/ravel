@@ -85,7 +85,7 @@ async fn a_premature_hint_fires_nothing_and_is_kept() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_lost_hint_is_found_by_the_directory_half_within_one_pass() {
+async fn a_lost_hint_is_found_by_the_directory_half() {
     let fault = lost_hints();
     let r = rig_over(fault.clone(), SweepConfig::default());
     create(&r.co, "o-1").await;
@@ -165,6 +165,78 @@ async fn a_bounded_pass_walks_the_directory_in_list_order_across_passes() {
     // Every agent was read once; the next pass starts over.
     let fourth = r.co.sweep_once(&TENANT).await.expect("sweep");
     assert_eq!((fourth.head_gets, fourth.timers_fired), (4, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes() {
+    // No `_dir` entry is ever written, so only the wake half reaches an agent.
+    let fault = Arc::new(FaultStore::new(
+        MemoryStore::new(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("dir lost".to_string()))
+                .with_key_contains("/_dir/")
+                .with_occurrence(Occurrence::Always),
+        ),
+    ));
+    let r = rig_over(
+        fault.clone(),
+        SweepConfig {
+            max_head_gets: 4,
+            ..SweepConfig::default()
+        },
+    );
+    // Each agent holds a timer due now and one due later in the same bucket,
+    // so one hint per agent stands for both and is kept after the first
+    // fires: a pass that restarted the wake listing would re-read the same
+    // hints and never reach the later ones.
+    let keys: Vec<String> = (0..5).map(|i| format!("o-{i}")).collect();
+    for key in &keys {
+        create(&r.co, key).await;
+        schedule(&r.co, key, "a", T0 + SEC).await;
+        schedule(&r.co, key, "b", T0 + 50 * SEC).await;
+    }
+    assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 5);
+    assert_eq!(hint_keys(r.backend.as_ref()).await.len(), 5);
+    r.now.advance(SEC);
+    // Wake keys share one bucket, so LIST order is agent id order.
+    let mut order = keys.clone();
+    order.sort_by_key(|k| id_of(k).to_hex());
+
+    let mut delivered = BTreeSet::new();
+    let mut fired_per_pass = Vec::new();
+    let mut reports = Vec::new();
+    for _ in 0..3 {
+        let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+        let mut now_delivered = BTreeSet::new();
+        for key in &keys {
+            if status(&head(&r.store, key).await, "a") == TimerStatus::Delivered {
+                now_delivered.insert(key.clone());
+            }
+        }
+        fired_per_pass.push(
+            now_delivered
+                .difference(&delivered)
+                .cloned()
+                .collect::<BTreeSet<String>>(),
+        );
+        reports.push((
+            pass.head_gets,
+            pass.hints_read,
+            pass.timers_fired,
+            pass.hints_deleted,
+        ));
+        delivered = now_delivered;
+    }
+    let expect = |range: std::ops::Range<usize>| -> BTreeSet<String> {
+        order[range].iter().cloned().collect()
+    };
+    assert_eq!(
+        fired_per_pass,
+        vec![expect(0..2), expect(2..4), expect(4..5)]
+    );
+    // Half of a cap of four per pass, and the directory half reads nothing.
+    assert_eq!(reports, vec![(2, 2, 2, 0), (2, 2, 2, 0), (1, 1, 1, 0)]);
+    assert_eq!(hint_keys(r.backend.as_ref()).await.len(), 5);
 }
 
 #[tokio::test(start_paused = true)]
