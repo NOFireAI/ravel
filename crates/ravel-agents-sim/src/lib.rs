@@ -22,6 +22,7 @@
 //! runtime crates through the scheduler and check their recorded histories
 //! here. Until then this crate's own tests are its only caller.
 
+pub mod drive;
 pub mod history;
 pub mod reference;
 pub mod scheduler;
