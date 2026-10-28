@@ -1,30 +1,32 @@
-# Smoke band: measured 289101 distinct at depth 26 with 2 workers; depth is
-# "-" because TLC's reported BFS depth overshoots by a level under
-# -workers auto. The exhaustive row is an unmeasured placeholder: its distinct
-# band is the full 0-999999999 range, so it only sets budget_s; a single local
-# run (2 workers) measured 362907 distinct at depth 27, and the row gets a real
-# band once the nightly lane has measured it on its own runner.
-# Positive rows, 2 workers: stale-turn-rebase-unreachable measured 289101
-# distinct (the smoke figure: its switch enables nothing); two-generations
-# measured 243171 distinct at depth 31 in 62 s.
-# AgentEffects, 2 workers: smoke measured 222513 distinct at depth 45 in 22 s;
-# live (one worker, MaxEpoch 1, liveness on) measured 127749 distinct at
-# depth 43 in 30 s. The exhaustive row is a placeholder like the protocol
-# one; a single local run measured 1944775 distinct at depth 48 in 188 s.
-# AgentIntegrated, 2 workers: smoke measured 427920 distinct at depth 44 in
-# 42 s; live (one worker, no timer, liveness on) measured 13617 distinct at
-# depth 35 in 8 s; positive/integrated-timer-race.cfg measured 1190621
-# distinct at depth 45 in 92 s. The exhaustive config is not enrolled: no
-# run has finished it, so its budget is unproven, and it sits under
-# unenrolled/ until T20 (#3354) measures it on the nightly runner and moves
-# it back with a row here.
+# Every figure below comes from a run in results.md (task T20, #3354),
+# measured with -workers 2 and -Xmx4g at revision 8ee0bd2; each row names
+# the results.md row it rests on. A band is about 1% either side of the
+# measured distinct figure, widened where repeat runs of the same config
+# spread further (the AgentEffects VIEW and SYMMETRY rows). Depth is "-" on
+# every row because TLC's reported BFS depth overshoots by a level under
+# -workers auto, which the nightly uses.
+# MCAgentProtocol.smoke.cfg: R1, 289101 distinct.
+# MCAgentProtocol.exhaustive.cfg (MaxTimerGen 1): R12, 1266296 distinct in
+# 1082 s. MaxTimerGen 2 did not finish in 3000 s (R13), so the row stays at
+# MaxTimerGen 1.
+# positive/stale-turn-rebase-unreachable.cfg: R4, 289101 distinct.
+# positive/two-generations.cfg: R5, 243171 distinct.
+# MCAgentEffects.smoke.cfg: R2, R7-R9, R20, 222504 to 222728 distinct.
+# MCAgentEffects.exhaustive.cfg: R11, R16, R17, 1942312 to 1944848 distinct.
+# MCAgentEffects.live.cfg: R18, 127749 distinct.
+# MCAgentIntegrated.smoke.cfg: R3, 427920 distinct.
+# MCAgentIntegrated.live.cfg: R19, 13617 distinct.
+# positive/integrated-timer-race.cfg: R6, 1190621 distinct.
+# The integrated exhaustive config has no row and stays under unenrolled/:
+# at MaxTimerGen 1 it did not finish in 3000 s (R14), nor at MaxTimerGen 2
+# (R15).
 cfg	min_distinct	max_distinct	min_depth	max_depth	budget_s
 MCAgentProtocol.smoke.cfg	286000	292000	-	-
-MCAgentProtocol.exhaustive.cfg	0	999999999	-	-	3000
+MCAgentProtocol.exhaustive.cfg	1253000	1280000	-	-	3000
 positive/stale-turn-rebase-unreachable.cfg	286000	292000	-	-
 positive/two-generations.cfg	240000	246000	-	-
 MCAgentEffects.smoke.cfg	219000	226000	-	-
-MCAgentEffects.exhaustive.cfg	0	999999999	-	-	3000
+MCAgentEffects.exhaustive.cfg	1925000	1965000	-	-	3000
 MCAgentEffects.live.cfg	125500	130000	-	-
 MCAgentIntegrated.smoke.cfg	422000	434000	-	-
 MCAgentIntegrated.live.cfg	13350	13900	-	-

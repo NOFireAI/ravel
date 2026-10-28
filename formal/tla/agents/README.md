@@ -48,36 +48,35 @@ every liveness result carries its fairness assumptions. The object
 store's own conformance to its contract is an assumption, stated as such and
 not checked here.
 
-No `results.md` exists yet: recorded figures are task T20. `bands.tsv` carries
-one row per smoke, live, exhaustive and positive config, and its header
-comments record each measurement (2 workers). A smoke, live or positive row
-pins a distinct-state band around the measured figure with depth waived by
-`-`, so a change that narrows what the run reaches fails that lane:
+[`results.md`](results.md) records every measured run (task T20, #3354:
+`-workers 2`, `-Xmx4g`, revision `8ee0bd2`), one row per run with its run id,
+and `bands.tsv` carries one row per enrolled smoke, live, exhaustive and
+positive config, each citing the `results.md` row it rests on. A row pins a
+distinct-state band around the measured figure with depth waived by `-`, so a
+change that narrows what the run reaches fails that lane:
 
-| Config | Band (distinct) | Measured |
-|---|---|---|
-| `MCAgentProtocol.smoke.cfg` | 286000 to 292000 | 289101 |
-| `positive/stale-turn-rebase-unreachable.cfg` | 286000 to 292000 | 289101 |
-| `positive/two-generations.cfg` | 240000 to 246000 | 243171 |
-| `MCAgentEffects.smoke.cfg` | 219000 to 226000 | 222513 |
-| `MCAgentEffects.live.cfg` | 125500 to 130000 | 127749 |
-| `MCAgentIntegrated.smoke.cfg` | 422000 to 434000 | 427920 |
-| `MCAgentIntegrated.live.cfg` | 13350 to 13900 | 13617 |
-| `positive/integrated-timer-race.cfg` | 1170000 to 1210000 | 1190621 |
+| Config | Band (distinct) | Measured | Row |
+|---|---|---|---|
+| `MCAgentProtocol.smoke.cfg` | 286000 to 292000 | 289101 | R1 |
+| `MCAgentProtocol.exhaustive.cfg` (MaxTimerGen 1) | 1253000 to 1280000 | 1266296 | R12 |
+| `positive/stale-turn-rebase-unreachable.cfg` | 286000 to 292000 | 289101 | R4 |
+| `positive/two-generations.cfg` | 240000 to 246000 | 243171 | R5 |
+| `MCAgentEffects.smoke.cfg` | 219000 to 226000 | 222504 to 222728 | R2, R7 to R9, R20 |
+| `MCAgentEffects.exhaustive.cfg` | 1925000 to 1965000 | 1942312 to 1944848 | R11, R16, R17 |
+| `MCAgentEffects.live.cfg` | 125500 to 130000 | 127749 | R18 |
+| `MCAgentIntegrated.smoke.cfg` | 422000 to 434000 | 427920 | R3 |
+| `MCAgentIntegrated.live.cfg` | 13350 to 13900 | 13617 | R19 |
+| `positive/integrated-timer-race.cfg` | 1170000 to 1210000 | 1190621 | R6 |
 
-The two exhaustive rows set only `budget_s` (3000, ADR-3331 decision 13);
-their distinct band is the full `0`-`999999999` range and their depth cells
-are `-`, so the harness enforces nothing on them until T20 measures them on
-the nightly runner. `MCAgentIntegrated.exhaustive.cfg` has no row and sits
-under `unenrolled/`, where the exhaustive lane does not find it, because no
-run has finished it (see "Exhaustive runs"); T20 enrols it once it is
-measured. The exhaustive lane is safety-only for `AgentEffects` and
-`AgentIntegrated`: their exhaustive configs carry no `PROPERTY` line, since
-`VIEW` and `SYMMETRY` are sound for invariants only, and their liveness runs
-in the `live` lane. The harness requires the distinct cells to be integers, so
-that range is the placeholder for an unmeasured row; `formal/tla/README.md`
-does not define an unmeasured form. "Exhaustive runs" below gives what the
-local runs reached.
+The `AgentEffects` rows carry a range because their distinct count moved
+between repeat runs under `VIEW`, `SYMMETRY` and two workers. The two
+exhaustive rows keep `budget_s` at 3000 (ADR-3331 decision 13).
+`MCAgentIntegrated.exhaustive.cfg` has no row and stays under `unenrolled/`,
+where the exhaustive lane does not find it, because it did not finish inside
+3000 s (see "Exhaustive runs"). The exhaustive lane is safety-only for
+`AgentEffects`: its exhaustive config carries no `PROPERTY` line, since
+`VIEW` and `SYMMETRY` are sound for invariants only, and its liveness runs in
+the `live` lane.
 
 ## AgentProtocol: scope
 
@@ -205,24 +204,23 @@ Every config: one tenant, one agent, two workers, `MaxEpoch = 2`.
 | `positive/two-generations.cfg` | 1 each | 4 | 2 | the 11 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 | `positive/stale-turn-rebase-unreachable.cfg` | 2 each | 6 | 0 | the 11 invariants with `StaleTurnRebase` on, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 
-The bounds are split because the full product does not fit a budget. In
-local runs, two clients and two workers with one timer generation, even at
-`MaxRevision = 4` and with the view and symmetry, passed 2.3 million distinct
-states without finishing, and the one-client exhaustive config at
-`MaxRevision = 6` had not finished after 9 minutes (about 866,000 distinct
-states). So competing senders
-are checked without timers (smoke), and timers and liveness are checked with
-one sender and `MaxRevision = 4` (exhaustive). A second timer generation does
-not fit either: the exhaustive config at `MaxTimerGen = 2` passed 3.9 million
-distinct states with 1.4 million queued when the 3000 s budget ran out
-(2 workers, 2 GiB; measured before timer schedule and cancel were bounded
-by `MaxRevision`). A `FireTimer` that ignored the generation passes every
+The bounds are split because the full product does not fit a budget: in
+T17's local runs, two clients and two workers with one timer generation, even
+at `MaxRevision = 4` and with the view and symmetry, did not finish, and
+neither did the one-client exhaustive config at `MaxRevision = 6`. Those
+runs were not repeated for T20 and their figures are not recorded. So
+competing senders are checked without timers (smoke), and timers and
+liveness are checked with one sender and `MaxRevision = 4` (exhaustive). A
+second timer generation does not fit either: the exhaustive config at
+`MaxTimerGen = 2` had 2879377 distinct states with 1058019 queued when the
+3000 s budget ran out (2 workers, 4 GiB; `results.md` row R13). A
+`FireTimer` that ignored the generation passes every
 config at `MaxTimerGen = 1`, so the clean spec's invariants at a second
 generation are checked by the positive config `positive/two-generations.cfg`:
 every switch off, one client, one input, two workers, `MaxRevision = 4`,
 `MaxEpoch = 2`, `MaxTimerGen = 2`, the smoke config's view and symmetry, the
-eleven invariants and no liveness (243171 distinct states at depth 31, 62 s
-with 2 workers). Under those bounds a reschedule of an armed generation, a
+eleven invariants and no liveness (243171 distinct states at depth 31, 26 s
+with 2 workers; row R5). Under those bounds a reschedule of an armed generation, a
 hint left behind for a superseded generation, and a delivered generation 2
 are each reached; a scratch probe invariant per case was violated by TLC
 (exit 12). A `FireTimer` whose generation check was replaced by
@@ -230,8 +228,8 @@ are each reached; a scratch probe invariant per case was violated by TLC
 TimerGenerationDeliveredOnce is violated.` (exit 12, a 7-state trace); that
 mutant was run on a scratch copy and is not shipped. The negative
 `stale-timer-generation-fired` and the `second-generation-reachable` probe
-run at the same timer bounds. Raising the exhaustive bound is T20's call once
-the nightly lane has measured it.
+run at the same timer bounds. The exhaustive lane checks `MaxTimerGen = 1`,
+the largest bound that finished inside its 3000 s budget (1082 s, row R12).
 
 `View` drops the store's version integers and keeps, for each held CAS token,
 only whether it equals the current HEAD version. Nothing reads a version
@@ -280,7 +278,7 @@ which changes the epoch, so the rebase's owner and epoch checks already
 refuse every root on which the turn check would. TLC finds no violation with
 the switch on, and the config now runs in the positive lane as
 `positive/stale-turn-rebase-unreachable.cfg` (switch on, all eleven
-invariants, smoke bounds, 289101 distinct states as in smoke). In the model
+invariants, smoke bounds, 289101 distinct states as in smoke; row R4). In the model
 the turn check is defensive.
 
 Reachability probes, each a config with every switch off and one probe
@@ -481,12 +479,12 @@ and cancelling, and the result endpoint are not fair.
 |---|---|---|---|---|
 | `MCAgentIntegrated.smoke.cfg` | 2, 2 | all three | 0 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 | `positive/integrated-timer-race.cfg` | 1, 1 | `at_least_once`, `manual` | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
-| `unenrolled/MCAgentIntegrated.exhaustive.cfg` (not run by any lane until T20 enrols it) | 2, 2 | all three | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
+| `unenrolled/MCAgentIntegrated.exhaustive.cfg` (not run by any lane: it does not finish in 3000 s) | 2, 2 | all three | 1 | the 14 invariants, under `VIEW View` and `SYMMETRY WorkerSymmetry` |
 | `MCAgentIntegrated.live.cfg` | 1, 1 | all three | 0 | the 14 invariants and both liveness properties, no VIEW or SYMMETRY |
 
 Every config has one client and `MaxAttempt = 2`. The bounds are split the
 same way as `AgentProtocol`'s: two workers with the timer on is the exhaustive
-config, which did not finish locally (see "Exhaustive runs"), so the required
+config, which did not finish in 3000 s (see "Exhaustive runs"), so the required
 lanes check takeover without the timer (smoke) and the timer race with one
 worker that crashes and restarts (`positive/integrated-timer-race.cfg`).
 
@@ -658,32 +656,37 @@ differences that remain, each with the property that rests on it:
   answer (a cancel on a delivered generation is not enabled); the receipt index as pages; the HEAD size cap and
   quotas; format versions and `UnsupportedFormat`; operation states other than
   pending and resolved.
-- `bands.tsv` uses a placeholder for the two unmeasured exhaustive rows,
-  and a third exhaustive config sits unenrolled under `unenrolled/` (see
-  the claims section); T20 measures all three.
+- `AgentIntegrated` has no exhaustive check with two workers and a timer:
+  its exhaustive config does not finish inside 3000 s and sits under
+  `unenrolled/` (see "Exhaustive runs"). `AgentProtocol` is checked
+  exhaustively at one timer generation only.
 
 ## Exhaustive runs
 
-Each exhaustive config was run once locally with 2 workers, outside the
-harness; the T17 runs used `-Xmx4g` on an aarch64 host with 4 cores:
+Budgets and the nightly bound rest on the T20 runs in
+[`results.md`](results.md) (fleet executor, x86_64, 16 cores, `-workers 2`,
+`-Xmx4g`, revision `8ee0bd2`). Each exhaustive row's `budget_s` is 3000 s.
+The nightly runner's speed was not measured: these wall times are this
+host's.
 
-- `MCAgentProtocol.exhaustive.cfg`: 362907 distinct states at depth 27, as
-  recorded in the `bands.tsv` comments.
-- `MCAgentEffects.exhaustive.cfg` finished: 1944775 distinct states at depth
-  48 in 188 s, no violation (re-run after the effects model was aligned with
-  the kernel's late-result and cancelled-input answers).
-- `MCAgentIntegrated.exhaustive.cfg` did not finish. It was stopped at 560 s
-  with 6422545 distinct states at depth 27 and 1849641 still queued, and the
-  queue was still growing; no violation was found in the states it reached.
-  That run predates the alignment, which shrank every other integrated
-  config by about a fifth to a third, and it was not repeated. Its
-  invariants are checked to completion only at the smoke and timer race
-  bounds. No run has shown this config finishes inside a 3000 s budget, so
-  it is not enrolled: it sits under `unenrolled/`, which the exhaustive lane
-  does not read, and has no `bands.tsv` row. A lane that is expected to
-  time out would turn the nightly red every night. Whether to raise the
-  budget or lower the bounds, and then move the config back with a measured
-  row, is T20's (#3354) decision, on the nightly runner.
+- `MCAgentProtocol.exhaustive.cfg` at `MaxTimerGen = 1` finished: 1266296
+  distinct states at depth 27 in 1082 s, both liveness properties checked
+  (row R12). At `MaxTimerGen = 2` (a scratch copy) it did not finish: stopped
+  at the 3000 s budget with 2879377 distinct states and 1058019 queued (row
+  R13). The nightly exhaustive lane checks `MaxTimerGen = 1`.
+- `MCAgentEffects.exhaustive.cfg` finished three times, 1942312 to 1944848
+  distinct states at depth 48 in 110 s to 150 s (rows R11, R16, R17). It has
+  no timers.
+- `MCAgentIntegrated.exhaustive.cfg` did not finish at `MaxTimerGen = 1`:
+  stopped at the 3000 s budget with 44348194 distinct states at BFS level 35
+  and 5350152 queued (row R14). At `MaxTimerGen = 2` (a scratch copy):
+  stopped at the 3000 s budget with 53745308 distinct states at BFS level 26
+  and 14786866 queued (row R15). No violation was found in the states either run
+  reached. It stays under `unenrolled/`, which the exhaustive lane does not
+  read, with no `bands.tsv` row: a lane expected to time out would turn the
+  nightly red every night. Its invariants are checked to completion at the
+  smoke bounds (`MaxTimerGen = 0`, row R3) and, with one timer generation and
+  one worker, by `positive/integrated-timer-race.cfg` (row R6).
 
 ## Running
 
