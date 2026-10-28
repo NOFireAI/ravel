@@ -13,7 +13,7 @@ An agent is a named, long-lived unit of state that handles messages one at a
 time:
 
 - **One durable HEAD per agent.** An agent is named by a kind and a key,
-  each any UTF-8 string up to 256 bytes. Its whole state hangs off one
+  each a non-empty UTF-8 string of at most 256 bytes. Its whole state hangs off one
   record in the bucket, its HEAD, which is changed only by a conditional
   write. Two writers cannot both win; the loser re-reads and tries again or
   gets a typed error. See [the HEAD record](../agents.md#the-head-record).

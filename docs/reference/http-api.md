@@ -35,7 +35,8 @@ router is otherwise empty.
 
 Where a dedicated mutual-TLS listener is configured (`--mtls-listener`), it
 serves the same ingest and query routes with the mTLS resolver. It serves
-neither `/healthz`, `/readyz` nor `/metrics`. The one exception is
+none of the four probe routes (`/healthz`, `/readyz`, `/-/healthy`,
+`/-/ready`) nor `/metrics`. The one exception is
 `GET /api/v1/agents/health`, which `--agents` mounts on both listeners; it
 is unauthenticated there too and reports operator settings only.
 
