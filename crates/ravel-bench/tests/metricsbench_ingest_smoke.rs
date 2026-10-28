@@ -662,6 +662,12 @@ type StubTsdb =
 /// `/api/v1/series` over a `__name__=~` alternation, `count_over_time` over an
 /// exact selector, and an instant exact selector honouring stale markers.
 fn stub_receiver(db: StubTsdb) -> axum::Router {
+    stub_receiver_storing(db, true)
+}
+
+/// [`stub_receiver`], storing native histograms only when `histograms` is
+/// set: VictoriaMetrics acknowledges them without storing them.
+fn stub_receiver_storing(db: StubTsdb, histograms: bool) -> axum::Router {
     use ravel_remote_write::proto::prometheus::WriteRequest;
 
     let write_db = db.clone();
@@ -686,7 +692,7 @@ fn stub_receiver(db: StubTsdb) -> axum::Router {
                         for s in ts.samples {
                             points.push((s.timestamp, StubPoint::Float(s.value.to_bits())));
                         }
-                        for h in ts.histograms {
+                        for h in ts.histograms.iter().filter(|_| histograms) {
                             points.push((h.timestamp, StubPoint::Histogram));
                         }
                     }
@@ -1102,4 +1108,118 @@ fn a_failed_readback_still_prints_the_report() {
         report["profile"]["run"]["stream_digest"].is_string(),
         "{report}"
     );
+}
+
+/// One row's failed read-back does not stop the rows after it: three stub
+/// receivers in row order, Prometheus first answering 422 to every
+/// read-back query, then VictoriaMetrics and Mimir storing and reading back
+/// what they are sent. `ingest.json` holds all three rows with their ingest
+/// figures, the first carrying `readback_error` and the other two matching
+/// read-backs, and the bin still exits 1, its code for a read-back failure.
+///
+/// TO SEE THIS FAIL: in `run`, return the failure as soon as a row's
+/// read-back fails, as the bin did before: `ingest.json` then holds only the
+/// Prometheus row.
+#[test]
+fn a_failed_readback_does_not_stop_the_later_rows() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let refuse = || async {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "query refused",
+        )
+    };
+    let refusing = axum::Router::new()
+        .route(
+            "/api/v1/write",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route("/api/v1/series", axum::routing::get(refuse))
+        .route("/api/v1/query", axum::routing::get(refuse));
+    let mut urls = Vec::new();
+    for app in [
+        refusing,
+        stub_receiver_storing(StubTsdb::default(), false),
+        stub_receiver(StubTsdb::default()),
+    ] {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        urls.push(format!("http://{addr}"));
+    }
+    let writes: Vec<String> = urls.iter().map(|u| format!("{u}/api/v1/write")).collect();
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    let stdout = std::fs::File::create(&ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            "2",
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "5",
+            "--prometheus-endpoint",
+            &writes[0],
+            "--prometheus-query-url",
+            &urls[0],
+            "--victoriametrics-endpoint",
+            &writes[1],
+            "--victoriametrics-query-url",
+            &urls[1],
+            "--mimir-endpoint",
+            &writes[2],
+            "--mimir-query-url",
+            &urls[2],
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("reading prometheus back failed"),
+        "{stderr}"
+    );
+
+    let text = std::fs::read_to_string(&ingest_json).expect("read ingest.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&text).expect("ingest.json is a JSON report");
+    let systems = report["systems"].as_array().expect("systems");
+    let names: Vec<&str> = systems
+        .iter()
+        .map(|r| r["system"].as_str().expect("system"))
+        .collect();
+    assert_eq!(names, ["prometheus", "victoriametrics", "mimir"], "{report}");
+    for row in systems {
+        let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
+        assert!(offered > 0, "{row}");
+        assert_eq!(row["ingest"]["accepted_samples"], offered, "{row}");
+    }
+    let error = systems[0]["readback_error"]
+        .as_str()
+        .expect("readback_error");
+    assert!(error.contains("422"), "{error}");
+    assert!(systems[0].get("readback").is_none(), "{}", systems[0]);
+    for row in &systems[1..] {
+        assert!(row.get("readback_error").is_none(), "{row}");
+        assert_eq!(row["readback"]["matches_expected"], true, "{row}");
+    }
+    assert!(report.get("stalled").is_none(), "{report}");
 }
