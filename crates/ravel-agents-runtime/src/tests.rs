@@ -1043,6 +1043,30 @@ async fn a_poll_needs_no_registration_on_this_coordinator() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
+    // c2's first poll lists an empty directory; the agent is then created and
+    // sent an input through c1, and c2's next poll must list again rather
+    // than trust its earlier scan.
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator(&store, &clock, 200);
+    let w = worker(&c2, "v1");
+    assert!(poll_now(&c2, &w, "v1").await.is_none());
+    let lists_before = store.counters().resolve.list;
+
+    create(&c1, "o-1").await;
+    let sent = send(&c1, "o-1", "r-1", json!(1)).await;
+    let leased = poll_now(&c2, &w, "v1")
+        .await
+        .expect("the second poll lists the directory again and finds the input");
+    assert_eq!(leased.accept_seq, sent.accept_seq);
+    assert_eq!(leased.lease.owner_id, w);
+    assert_eq!(store.counters().resolve.list - lists_before, 1);
+    assert_eq!(c2.metrics().agents_loaded, 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn cancelling_a_pending_input_ends_it_cancelled_and_commits_nothing() {
     let (_clock, store, co) = rig();
     create(&co, "o-1").await;

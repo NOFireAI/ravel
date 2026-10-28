@@ -61,7 +61,11 @@ impl Coordinator {
             match self.scan(&req.worker_id, &pins).await? {
                 Scan::Assigned(a) => return Ok(Some(*a)),
                 Scan::Refused(e) => return Err(e),
-                Scan::Nothing => {}
+                // Nothing loaded has work: an agent given work through
+                // another coordinator is only in the directory, so the next
+                // pass lists it again
+                // (`tests::a_poll_finds_an_agent_that_got_work_through_another_coordinator`).
+                Scan::Nothing => self.discovered.store(false, Ordering::Release),
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(None);
@@ -76,8 +80,10 @@ impl Coordinator {
         }
     }
 
-    /// Load every agent in the directory that has work, once per start or
-    /// unload.
+    /// Load every agent in the directory that has work. Runs once per
+    /// start, after an unload, and after a pass that found nothing to
+    /// dispatch, so work that reached an agent through another coordinator
+    /// is picked up on the next pass.
     async fn discover(&self) -> Result<(), AgentError> {
         if self.discovered.load(Ordering::Acquire) {
             return Ok(());
@@ -122,9 +128,6 @@ impl Coordinator {
                         continue;
                     }
                     if !pins.iter().any(|p| pinned(p, turn)) {
-                        self.metrics
-                            .incompatible_handler_refusals
-                            .fetch_add(1, Ordering::Relaxed);
                         refusal = Some(refused(
                             agent,
                             ErrorKind::IncompatibleHandler,
@@ -174,7 +177,14 @@ impl Coordinator {
             }
         }
         Ok(match refusal {
-            Some(e) => Scan::Refused(e),
+            // Counted here, not where the candidate was skipped: a pass that
+            // assigned another agent refused nothing.
+            Some(e) => {
+                self.metrics
+                    .incompatible_handler_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                Scan::Refused(e)
+            }
             None => Scan::Nothing,
         })
     }
