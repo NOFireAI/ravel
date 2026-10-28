@@ -30,7 +30,9 @@ pub enum LogSegError {
     UnsupportedVersion(u16),
     /// A build-side limit or precondition was not met. Among them: a value
     /// that would take a `VarBytes` column past the `u32::MAX` bytes its `u32`
-    /// offsets address, one byte short of 4 GiB (`VarBytes::try_push`).
+    /// offsets address, one byte short of 4 GiB (`VarBytes::try_push`), and a
+    /// plain string page whose values would take one block's decoded column
+    /// past that same `u32` offset range.
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
     /// A read of `[start, end)` from a [`crate::source::SparseObject`] that

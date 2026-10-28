@@ -2290,7 +2290,7 @@ fn apply_arm(
         },
         Arm::BytesEq { col, target } => match block.str_column(*col) {
             Some(StrColumn::Plain(cells)) => {
-                sel.retain(|row| Ok(cells.get(row).and_then(Option::as_deref) == Some(target)))
+                sel.retain(|row| Ok(cells.cell(row) == Some(target.as_slice())))
             }
             Some(StrColumn::Dict(d)) => {
                 // The entries equal to the target, found once per dictionary;
@@ -2317,12 +2317,9 @@ fn apply_arm(
             }
         },
         Arm::Word { col, word } => match block.str_column(*col) {
-            Some(StrColumn::Plain(cells)) => sel.retain(|row| {
-                Ok(cells
-                    .get(row)
-                    .and_then(Option::as_deref)
-                    .is_some_and(|c| phrase_match(c, word)))
-            }),
+            Some(StrColumn::Plain(cells)) => {
+                sel.retain(|row| Ok(cells.cell(row).is_some_and(|c| phrase_match(c, word))))
+            }
             Some(StrColumn::Dict(d)) => {
                 // One `phrase_match` per dictionary entry a selected row uses,
                 // over every block sharing the dictionary.
@@ -2436,8 +2433,8 @@ fn contains_kernel(
     };
     match arm.col.and_then(|c| Some((c, block.str_column(c)?))) {
         None => rows.retain(sel, fallback, |_, fb| fb),
-        Some((_, StrColumn::Plain(cells))) => rows.retain(sel, fallback, |row, fb| {
-            match cells.get(row).and_then(Option::as_deref) {
+        Some((_, StrColumn::Plain(cells))) => {
+            rows.retain(sel, fallback, |row, fb| match cells.cell(row) {
                 None => fb,
                 Some(cell) => {
                     *tested += 1;
@@ -2448,8 +2445,8 @@ fn contains_kernel(
                         fb
                     }
                 }
-            }
-        }),
+            })
+        }
         Some((col, StrColumn::Dict(d))) => {
             let values = d.values();
             let verdicts = dict_slot(contains, arm.index, values, |v| vec![None; v.len()]);
@@ -2807,7 +2804,7 @@ impl ContainsKernelBench {
             hits += usize::from(needle.is_in(cell));
         };
         match col.and_then(|c| self.block.str_column(c)) {
-            Some(StrColumn::Plain(cells)) => cells.iter().flatten().for_each(|c| search(c)),
+            Some(StrColumn::Plain(cells)) => cells.present_cells().for_each(&mut search),
             Some(StrColumn::Dict(d)) => {
                 let values = d.values();
                 self.dict_keys
@@ -9369,9 +9366,10 @@ mod tests {
                                     b.str_at(COL_ATTRS_RAW, r).map(<[u8]>::to_vec)
                                 }
                             })
-                            .collect();
-                        *b.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") =
-                            StrColumn::Plain(cells);
+                            .collect::<Vec<_>>();
+                        *b.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") = StrColumn::Plain(
+                            crate::block::PlainColumn::from_cells(&cells).expect("plain column"),
+                        );
                         b
                     };
 
@@ -9628,9 +9626,10 @@ mod tests {
                                 block.str_at(COL_ATTRS_RAW, r).map(<[u8]>::to_vec)
                             }
                         })
-                        .collect();
-                    *block.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") =
-                        StrColumn::Plain(cells);
+                        .collect::<Vec<_>>();
+                    *block.str_column_mut(COL_ATTRS_RAW).expect("attrs_raw") = StrColumn::Plain(
+                        crate::block::PlainColumn::from_cells(&cells).expect("plain column"),
+                    );
                     let pred = contains("s", "ab", false);
                     let run = |rows: &[usize]| {
                         arm_on_rows(&reader, &short.stream_dir, &pred, &block, rows)

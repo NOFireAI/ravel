@@ -30,6 +30,7 @@ use crate::rlog_codec::{
     StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64_into, encode_column_ref,
     i64_candidates, shape_candidates, string_dict_shape, string_shape,
 };
+use crate::varint::get_uvarint;
 
 /// Upper bound on a block's decoded record count (untrusted-input guard). A
 /// real block never approaches this; it caps allocation from a hostile header.
@@ -780,11 +781,12 @@ pub fn write_block_columnar(
 /// A decoded string column, kept in whichever shape its page carried
 /// (ADR-0099 decision 4). A dictionary page keeps its distinct set and per-row
 /// keys instead of materializing one owned `Vec<u8>` per row; a plain page keeps
-/// the per-row values. Both are addressed by block row position and carry
-/// presence separately: an absent row reads `None` either way.
+/// the per-row values in one buffer plus offsets (ADR-3326 decision 2). Both are
+/// addressed by block row position and carry presence separately: an absent row
+/// reads `None` either way.
 pub(crate) enum StrColumn {
-    /// Per-row values, `None` for an absent row. What a plain page decodes to.
-    Plain(Vec<Option<Vec<u8>>>),
+    /// Per-row values in one buffer. What a plain page decodes to.
+    Plain(PlainColumn),
     /// A shared dictionary plus one key per block row.
     Dict(DictColumn),
 }
@@ -973,13 +975,137 @@ impl DictColumn {
     }
 }
 
+/// The most value bytes one [`PlainColumn`] holds: the largest `u32` offset,
+/// one byte short of 4 GiB.
+const PLAIN_VALUES_MAX: usize = u32::MAX as usize;
+
+/// The plain form of a string column (ADR-3326 decision 2): every present
+/// row's bytes concatenated in row order, `rows + 1` `u32` offsets into them,
+/// and the rows' presence. Row `r` spans `offsets[r]..offsets[r + 1]`; an
+/// absent row's span is empty and its presence bit unset, so it reads `None`
+/// while a present empty string reads `Some(&[])`.
+pub(crate) struct PlainColumn {
+    values: Vec<u8>,
+    offsets: Vec<u32>,
+    present: Validity,
+}
+
+impl PlainColumn {
+    /// Decodes a plain string page straight into the column: `encoded` holds
+    /// one length varint per present row in `present`, then the values
+    /// concatenated. `present_count` is the number of set entries of `present`.
+    /// Values totalling more than `limit` bytes (capped at
+    /// [`PLAIN_VALUES_MAX`]) are refused with [`LogSegError::LimitExceeded`].
+    fn decode(
+        encoded: &[u8],
+        present: &[bool],
+        present_count: usize,
+        limit: usize,
+    ) -> Result<Self, LogSegError> {
+        let limit = limit.min(PLAIN_VALUES_MAX) as u64;
+        let mut offsets = Vec::with_capacity(present.len() + 1);
+        offsets.push(0u32);
+        let mut bits = Validity::unset(present.len());
+        let mut pos = 0usize;
+        let mut total: u64 = 0;
+        let mut seen = 0usize;
+        for (row, &p) in present.iter().enumerate() {
+            if p {
+                if seen == present_count {
+                    return Err(LogSegError::Corrupted(
+                        "presence/value count mismatch".into(),
+                    ));
+                }
+                seen += 1;
+                let len = get_uvarint(encoded, &mut pos)?;
+                total = total
+                    .checked_add(len)
+                    .ok_or_else(|| LogSegError::Corrupted("string length overflow".into()))?;
+                bits.set(row);
+            }
+            // A total past the limit is refused below, before any offset is read.
+            offsets.push(u32::try_from(total.min(limit)).unwrap_or(u32::MAX));
+        }
+        if seen != present_count {
+            return Err(LogSegError::Corrupted(
+                "value page longer than presence".into(),
+            ));
+        }
+        let blob = encoded.get(pos..).unwrap_or_default();
+        if blob.len() as u64 != total {
+            return Err(LogSegError::Corrupted(format!(
+                "string blob {} != declared {total}",
+                blob.len()
+            )));
+        }
+        if total > limit {
+            return Err(LogSegError::LimitExceeded(format!(
+                "a plain string page of {total} value bytes is past the limit of {limit} \
+                 bytes, the most a decoded column's u32 offsets address in one block"
+            )));
+        }
+        Ok(PlainColumn {
+            values: blob.to_vec(),
+            offsets,
+            present: bits,
+        })
+    }
+
+    /// The column holding `cells`, one per block row. Test constructor.
+    #[cfg(test)]
+    pub(crate) fn from_cells(cells: &[Option<Vec<u8>>]) -> Result<Self, LogSegError> {
+        let mut encoded = Vec::new();
+        let present: Vec<bool> = cells.iter().map(Option::is_some).collect();
+        for c in cells.iter().flatten() {
+            crate::varint::put_uvarint(&mut encoded, c.len() as u64);
+        }
+        for c in cells.iter().flatten() {
+            encoded.extend_from_slice(c);
+        }
+        let n = cells.iter().flatten().count();
+        Self::decode(&encoded, &present, n, PLAIN_VALUES_MAX)
+    }
+
+    /// The bytes at block row `row`, or `None` when the row is absent (or out
+    /// of range).
+    pub(crate) fn cell(&self, row: usize) -> Option<&[u8]> {
+        if !self.present.get(row) {
+            return None;
+        }
+        match *self.offsets.get(row..row.checked_add(2)?)? {
+            [start, end] => self.values.get(start as usize..end as usize),
+            _ => None,
+        }
+    }
+
+    /// Every present row's bytes, in row order.
+    pub(crate) fn present_cells(&self) -> impl Iterator<Item = &[u8]> {
+        self.offsets
+            .windows(2)
+            .enumerate()
+            .filter(|&(row, _)| self.present.get(row))
+            .filter_map(|(_, span)| match *span {
+                [start, end] => self.values.get(start as usize..end as usize),
+                _ => None,
+            })
+    }
+
+    /// The values buffer, the offsets and the presence bitmap, at their
+    /// capacities.
+    fn heap_bytes(&self) -> usize {
+        self.values.capacity()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.present.heap_bytes()
+    }
+}
+
 impl StrColumn {
     /// The bytes at block row `row`, or `None` when the row is absent (or out of
     /// range). Both shapes read identically here, which is what lets the storage
     /// shape stay invisible above [`DecodedBlock`].
     pub(crate) fn cell(&self, row: usize) -> Option<&[u8]> {
         match self {
-            StrColumn::Plain(v) => v.get(row)?.as_deref(),
+            StrColumn::Plain(p) => p.cell(row),
             StrColumn::Dict(d) => d.cell(row),
         }
     }
@@ -1371,12 +1497,7 @@ impl DecodedBlock {
         // that no longer exists (ADR-0099 decision 4).
         for col in self.str_cols.values() {
             match col {
-                StrColumn::Plain(v) => {
-                    total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
-                    for cell in v.iter().flatten() {
-                        total += cell.capacity();
-                    }
-                }
+                StrColumn::Plain(p) => total += p.heap_bytes(),
                 StrColumn::Dict(d) => total += d.heap_bytes(),
             }
         }
@@ -1859,9 +1980,22 @@ fn decode_columns(
                         })?;
                     let ids = decode_dict_ids(encoded, present_count, dict.len())?;
                     StrColumn::Dict(DictColumn::new(Arc::clone(dict), &present, ids, true)?)
+                } else if enc == Enc::Plain {
+                    StrColumn::Plain(PlainColumn::decode(
+                        encoded,
+                        &present,
+                        present_count,
+                        PLAIN_VALUES_MAX,
+                    )?)
                 } else {
                     match decode_strings_columnar(enc, encoded, present_count)? {
-                        DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
+                        // Only an `Enc::Plain` page, handled above, decodes
+                        // to the plain form.
+                        DecodedStrings::Plain(_) => {
+                            return Err(LogSegError::Corrupted(format!(
+                                "enc {enc:?} decoded as a plain string page"
+                            )));
+                        }
                         DecodedStrings::Dict { dict, ids } => {
                             let values = if deferred.contains(&column_id) {
                                 Arc::new(DictValues::unvalidated(&dict)?)
@@ -2716,6 +2850,211 @@ mod tests {
         let out = write_block(&rows, &plans, 3).expect("write");
         let dec = decode_out(&out, &plans, None).expect("read");
         assert!(dec.bool_col(12).is_none());
+    }
+
+    /// 100 rows of string column 10: every tenth row from row 3 absent, every
+    /// tenth from row 7 an empty string, the other 80 a distinct 9-byte value,
+    /// so the writer stores a plain page.
+    fn plain_fixture() -> (Vec<Option<Vec<u8>>>, BlockWriteOut, Vec<ColumnPlan>) {
+        let plans = vec![ColumnPlan {
+            column_id: 10,
+            ty: FieldType::Str,
+        }];
+        let cells: Vec<Option<Vec<u8>>> = (0..100)
+            .map(|i| match i % 10 {
+                3 => None,
+                7 => Some(Vec::new()),
+                _ => Some(format!("value-{i:03}").into_bytes()),
+            })
+            .collect();
+        let rows: Vec<ResolvedRow> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut r = row(0, i as i64);
+                if let Some(c) = c {
+                    r.columns.push((10, ColumnValue::Str(c.clone())));
+                }
+                r
+            })
+            .collect();
+        let out = write_block(&rows, &plans, 3).expect("write");
+        (cells, out, plans)
+    }
+
+    /// The pre-ADR-3326 plain decode: the codec's per-value strings scattered
+    /// to one owned cell per row.
+    fn reference_plain(
+        encoded: &[u8],
+        present: &[bool],
+    ) -> Result<Vec<Option<Vec<u8>>>, LogSegError> {
+        let n = present.iter().filter(|&&p| p).count();
+        match decode_strings_columnar(Enc::Plain, encoded, n)? {
+            DecodedStrings::Plain(vals) => scatter(present, vals),
+            DecodedStrings::Dict { .. } => panic!("a plain page decoded as a dictionary"),
+        }
+    }
+
+    /// The plain page of `cells`: one length varint per present cell, then the
+    /// values concatenated.
+    fn plain_page(cells: &[Option<Vec<u8>>]) -> (Vec<u8>, Vec<bool>) {
+        let mut encoded = Vec::new();
+        for c in cells.iter().flatten() {
+            crate::varint::put_uvarint(&mut encoded, c.len() as u64);
+        }
+        for c in cells.iter().flatten() {
+            encoded.extend_from_slice(c);
+        }
+        (encoded, cells.iter().map(Option::is_some).collect())
+    }
+
+    /// `decoded_heap_bytes` charges a plain string column its values buffer,
+    /// its `u32` offsets and its validity bitmap at their capacities (ADR-3326
+    /// decision 2), pinned exactly for the fixture: 720 value bytes, 101
+    /// offsets and two bitmap words, 1,140 bytes, plus the slot vector. The
+    /// `Vec<Option<Vec<u8>>>` form charged 100 * 24 + 720 = 3,120 bytes.
+    #[test]
+    fn plain_decoded_heap_bytes_counts_buffer_offsets_and_validity() {
+        let (cells, out, plans) = plain_fixture();
+        let keep = ColumnIdSet::from_iter([10]);
+        let dec = decode_out(&out, &plans, Some(&keep)).expect("read");
+        assert!(matches!(dec.str_column(10), Some(StrColumn::Plain(_))));
+        assert!(dec.str_dict(10).is_none());
+
+        let values: usize = cells.iter().flatten().map(Vec::len).sum();
+        assert_eq!(values, 720);
+        let plain_figure = values + 101 * std::mem::size_of::<u32>() + 2 * 8;
+        assert_eq!(plain_figure, 1140);
+        let slots = 11 * std::mem::size_of::<Option<StrColumn>>();
+        assert_eq!(dec.decoded_heap_bytes(), plain_figure + slots);
+
+        // The per-row form the plain page decoded to before, built as the old
+        // producer built it, and the charge the old arm computed over it.
+        let present: Vec<bool> = cells.iter().map(Option::is_some).collect();
+        let old = scatter(&present, cells.iter().flatten().cloned().collect()).expect("scatter");
+        let old_figure = old.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+            + old.iter().flatten().map(Vec::capacity).sum::<usize>();
+        assert_eq!(old_figure, 3120);
+    }
+
+    /// A plain column decoded from a block's page reads, cell for cell, what
+    /// the per-row reference decode of the same page holds: absent rows `None`,
+    /// empty strings `Some(&[])`, and `None` past the last row.
+    #[test]
+    fn plain_column_from_a_block_page_matches_the_reference_decode() {
+        let (cells, out, plans) = plain_fixture();
+        let dec = decode_out(&out, &plans, None).expect("read");
+        let Some(StrColumn::Plain(col)) = dec.str_column(10) else {
+            panic!("column 10 is a plain page");
+        };
+
+        let mut at = 0usize;
+        let mut pages = Vec::new();
+        for d in &out.descs {
+            let end = at + d.len as usize;
+            if d.column_id == 10 {
+                pages.push((
+                    d.enc,
+                    read_page(&out.payload[at..end], d, 1 << 30).expect("page"),
+                ));
+            }
+            at = end;
+        }
+        let [(Enc::Bitmap, bits), (Enc::Plain, encoded)] = pages.as_slice() else {
+            panic!("column 10 is a presence page and a plain value page");
+        };
+        let present = decode_bitmap(bits, cells.len()).expect("presence");
+        let reference = reference_plain(encoded, &present).expect("reference");
+        assert_eq!(reference, cells);
+
+        for (r, want) in reference.iter().enumerate() {
+            assert_eq!(col.cell(r), want.as_deref(), "row {r}");
+        }
+        assert_eq!(col.cell(3), None);
+        assert_eq!(col.cell(7), Some(&[][..]));
+        assert_eq!(col.cell(cells.len()), None);
+        assert_eq!(
+            col.present_cells().collect::<Vec<_>>(),
+            cells
+                .iter()
+                .flatten()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A page whose values total more than the column's limit is refused with
+    /// `LimitExceeded`, and one exactly at it decodes. The limit is lowered
+    /// from `u32::MAX` through `PlainColumn::decode`'s `limit` argument so the
+    /// refusal is reached without a 4 GiB page.
+    #[test]
+    fn plain_page_past_the_offset_limit_is_refused() {
+        let cells = vec![Some(b"abcd".to_vec()), None, Some(b"efghij".to_vec())];
+        let (encoded, present) = plain_page(&cells);
+
+        let at = PlainColumn::decode(&encoded, &present, 2, 10).expect("at the limit");
+        assert_eq!(at.cell(2), Some(&b"efghij"[..]));
+
+        match PlainColumn::decode(&encoded, &present, 2, 9) {
+            Err(LogSegError::LimitExceeded(msg)) => {
+                assert!(msg.contains("10 value bytes"), "{msg}")
+            }
+            Err(e) => panic!("expected LimitExceeded, got {e}"),
+            Ok(_) => panic!("a 10-byte page decoded under a 9-byte limit"),
+        }
+        assert_eq!(PLAIN_VALUES_MAX, u32::MAX as usize);
+    }
+
+    /// Corrupt plain pages are refused as the reference decode refuses them.
+    #[test]
+    fn plain_page_corruption_is_typed() {
+        let cells = vec![Some(b"abc".to_vec()), Some(Vec::new())];
+        let (encoded, present) = plain_page(&cells);
+        for bad in [
+            &encoded[..encoded.len() - 1],
+            &[encoded.as_slice(), b"x"].concat()[..],
+            &encoded[..1],
+        ] {
+            let ours = PlainColumn::decode(bad, &present, 2, PLAIN_VALUES_MAX);
+            let want = reference_plain(bad, &present).expect_err("reference refuses");
+            match ours {
+                Err(LogSegError::Corrupted(m)) => {
+                    assert_eq!(m, want.to_string().replace("corrupted segment: ", ""))
+                }
+                Err(e) => panic!("expected Corrupted, got {e}"),
+                Ok(_) => panic!("a corrupt page decoded"),
+            }
+        }
+    }
+
+    mod plain_column_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            /// Any plain page decodes, cell for cell, to what the per-row
+            /// reference decode of the same page holds.
+            #[test]
+            fn plain_column_matches_the_reference(
+                cells in proptest::collection::vec(
+                    proptest::option::of(proptest::collection::vec(any::<u8>(), 0..12)),
+                    0..80,
+                ),
+            ) {
+                let (encoded, present) = plain_page(&cells);
+                let n = cells.iter().flatten().count();
+                let col = PlainColumn::decode(&encoded, &present, n, PLAIN_VALUES_MAX)
+                    .expect("decode");
+                let reference = reference_plain(&encoded, &present).expect("reference");
+                prop_assert_eq!(&reference, &cells);
+                for (r, want) in reference.iter().enumerate() {
+                    prop_assert_eq!(col.cell(r), want.as_deref());
+                }
+                prop_assert_eq!(col.cell(cells.len()), None);
+            }
+        }
     }
 
     mod column_id_set_proptest {
