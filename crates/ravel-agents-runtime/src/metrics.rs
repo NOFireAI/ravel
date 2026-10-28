@@ -14,7 +14,9 @@ pub struct AgentsMetricsSnapshot {
     /// Loaded agents whose root records an active turn.
     pub turns_active: u64,
     /// Completions published, including a lost acknowledgement confirmed
-    /// through `resolve`.
+    /// through `resolve`. A commit whose acknowledgement was lost and whose
+    /// agent was taken over before the settle is answered `OwnershipLost`
+    /// and is not counted here, although it landed (see `failure.rs`).
     pub turns_committed: u64,
     /// `FailTurn` publications, retryable or final.
     pub turns_failed: u64,
