@@ -238,8 +238,11 @@ argued here, not checked.
   modelled separately.
 - `WorkerCrash` returns the worker to idle; there is no separate
   `WorkerRecover`.
-- There is no separate `SweepRead`: `FireTimer` reads HEAD in its CAS step,
-  and `HintObservedEarly` is the sweep listing an early hint and keeping it.
+- There is no separate `SweepRead`: `FireTimer` reads HEAD in its CAS step.
+  A sweep pass that lists a hint before its generation is due keeps it and
+  writes nothing, so it is a stutter with no action of its own (the comment
+  on `FireTimer` says so); `early-hint-forgotten.cfg` checks that deleting
+  it instead is caught.
 
 ## Gaps
 

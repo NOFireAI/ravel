@@ -70,7 +70,8 @@ table above in the task that builds its symbol.
   `TurnResumed`) exists; the crash detection and re-dispatch are T9 (#3343),
   citing the coordinator's lease expiry and takeover path, and the end-to-end
   crash test is T13 (#3346) in `ravel-agents-sim`.
-- `TimerDue`, `HintObservedEarly`, and the sweep that drives `FireTimer` in
+- `TimerDue`, the early-hint stutter (no action of its own; see the
+  `FireTimer` comment), and the sweep that drives `FireTimer` in
   production: wake hints under `_wake/` are accelerators only, and the
   reconciliation sweep acts on HEAD rather than on the hint. The store's
   hint write is in the table above; the hint reader, the early-hint
