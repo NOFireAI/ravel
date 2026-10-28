@@ -3818,6 +3818,9 @@ fn check_stall(
     }
 }
 
+/// A full batch and the shard it goes to.
+type ShardBatch = (usize, Vec<LogicalPoint>);
+
 /// The producer's state across rounds: the points pulled but not yet routed,
 /// each shard's filling batch, the offer tally, the read-back plan, and the
 /// time spent generating and routing.
@@ -3853,7 +3856,7 @@ impl Producer {
         source: &mut S,
         mut shard_of: R,
         now: N,
-    ) -> Result<Option<Vec<(usize, Vec<LogicalPoint>)>>, LaneError>
+    ) -> Result<Option<Vec<ShardBatch>>, LaneError>
     where
         S: SampleBatches + ?Sized,
         R: FnMut(&LogicalPoint) -> usize,
