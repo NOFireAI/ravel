@@ -28,18 +28,18 @@ use tokio::time::Instant;
 
 use super::*;
 
-const MS: i64 = 1_000_000;
-const T0: i64 = 1_800_000_000_000 * MS;
-const LEASE_MS: u64 = 1_000;
-const GRACE_MS: u64 = 500;
-const MAX_ATTEMPTS: u32 = 3;
-const IDLE_MS: u64 = 10_000;
-const RESCAN_MS: u64 = 2_000;
+pub(crate) const MS: i64 = 1_000_000;
+pub(crate) const T0: i64 = 1_800_000_000_000 * MS;
+pub(crate) const LEASE_MS: u64 = 1_000;
+pub(crate) const GRACE_MS: u64 = 500;
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
+pub(crate) const IDLE_MS: u64 = 10_000;
+pub(crate) const RESCAN_MS: u64 = 2_000;
 
-struct TestClock(AtomicI64);
+pub(crate) struct TestClock(AtomicI64);
 
 impl TestClock {
-    fn advance_ms(&self, ms: u64) {
+    pub(crate) fn advance_ms(&self, ms: u64) {
         self.0
             .fetch_add(i64::try_from(ms).expect("ms") * MS, Ordering::SeqCst);
     }
@@ -52,7 +52,7 @@ impl Clock for TestClock {
 }
 
 /// Counts up from its seed.
-struct FixedRng(AtomicU64);
+pub(crate) struct FixedRng(AtomicU64);
 
 impl Rng for FixedRng {
     fn next_u64(&self) -> u64 {
@@ -60,7 +60,7 @@ impl Rng for FixedRng {
     }
 }
 
-fn config() -> RuntimeConfig {
+pub(crate) fn config() -> RuntimeConfig {
     RuntimeConfig {
         lease_ms: LEASE_MS,
         heartbeat_grace_ms: GRACE_MS,
@@ -71,11 +71,14 @@ fn config() -> RuntimeConfig {
     }
 }
 
-fn clock() -> Arc<TestClock> {
+pub(crate) fn clock() -> Arc<TestClock> {
     Arc::new(TestClock(AtomicI64::new(T0)))
 }
 
-fn store_over(backend: Arc<dyn ObjectStoreBackend>, clock: &Arc<TestClock>) -> Arc<AgentStore> {
+pub(crate) fn store_over(
+    backend: Arc<dyn ObjectStoreBackend>,
+    clock: &Arc<TestClock>,
+) -> Arc<AgentStore> {
     Arc::new(
         AgentStore::new(
             backend,
@@ -88,7 +91,11 @@ fn store_over(backend: Arc<dyn ObjectStoreBackend>, clock: &Arc<TestClock>) -> A
     )
 }
 
-fn coordinator(store: &Arc<AgentStore>, clock: &Arc<TestClock>, seed: u64) -> Arc<Coordinator> {
+pub(crate) fn coordinator(
+    store: &Arc<AgentStore>,
+    clock: &Arc<TestClock>,
+    seed: u64,
+) -> Arc<Coordinator> {
     Arc::new(Coordinator::new(
         store.clone(),
         config(),
@@ -98,28 +105,28 @@ fn coordinator(store: &Arc<AgentStore>, clock: &Arc<TestClock>, seed: u64) -> Ar
 }
 
 /// One coordinator over a fresh `MemoryStore`.
-fn rig() -> (Arc<TestClock>, Arc<AgentStore>, Arc<Coordinator>) {
+pub(crate) fn rig() -> (Arc<TestClock>, Arc<AgentStore>, Arc<Coordinator>) {
     let clock = clock();
     let store = store_over(Arc::new(MemoryStore::new()), &clock);
     let co = coordinator(&store, &clock, 100);
     (clock, store, co)
 }
 
-fn agent_ref(key: &str) -> AgentRef {
+pub(crate) fn agent_ref(key: &str) -> AgentRef {
     AgentRef {
         kind: "order".to_string(),
         key: key.to_string(),
     }
 }
 
-fn id_of(key: &str) -> AgentId {
+pub(crate) fn id_of(key: &str) -> AgentId {
     agent_id(
         &AgentKind::new("order").expect("kind"),
         &AgentKey::new(key).expect("key"),
     )
 }
 
-fn pin(version: &str) -> HandlerPinBody {
+pub(crate) fn pin(version: &str) -> HandlerPinBody {
     let fill = match version {
         "v1" => 1u8,
         _ => 2u8,
@@ -131,7 +138,7 @@ fn pin(version: &str) -> HandlerPinBody {
     }
 }
 
-fn poll_req(worker: &str, version: &str, wait_ms: u32) -> WorkerPollRequest {
+pub(crate) fn poll_req(worker: &str, version: &str, wait_ms: u32) -> WorkerPollRequest {
     WorkerPollRequest {
         worker_id: worker.to_string(),
         handlers: vec![pin(version)],
@@ -139,18 +146,22 @@ fn poll_req(worker: &str, version: &str, wait_ms: u32) -> WorkerPollRequest {
     }
 }
 
-fn worker(co: &Coordinator, version: &str) -> String {
+pub(crate) fn worker(co: &Coordinator, version: &str) -> String {
     co.register_worker(&[pin(version)]).expect("register")
 }
 
 /// A poll that does not wait.
-async fn poll_now(co: &Coordinator, worker: &str, version: &str) -> Option<TurnAssignment> {
+pub(crate) async fn poll_now(
+    co: &Coordinator,
+    worker: &str,
+    version: &str,
+) -> Option<TurnAssignment> {
     co.poll(&poll_req(worker, version, 0), Instant::now())
         .await
         .expect("poll")
 }
 
-fn completed(lease: &TurnLease, state: Value) -> WorkerCommitRequest {
+pub(crate) fn completed(lease: &TurnLease, state: Value) -> WorkerCommitRequest {
     WorkerCommitRequest {
         lease: lease.clone(),
         outcome: TurnOutcome::Completed {
@@ -163,7 +174,7 @@ fn completed(lease: &TurnLease, state: Value) -> WorkerCommitRequest {
     }
 }
 
-fn failed(lease: &TurnLease) -> WorkerCommitRequest {
+pub(crate) fn failed(lease: &TurnLease) -> WorkerCommitRequest {
     WorkerCommitRequest {
         lease: lease.clone(),
         outcome: TurnOutcome::Failed {
@@ -173,7 +184,7 @@ fn failed(lease: &TurnLease) -> WorkerCommitRequest {
     }
 }
 
-async fn create(co: &Coordinator, key: &str) {
+pub(crate) async fn create(co: &Coordinator, key: &str) {
     co.create(&CreateAgentRequest {
         agent: agent_ref(key),
     })
@@ -181,7 +192,12 @@ async fn create(co: &Coordinator, key: &str) {
     .expect("create");
 }
 
-async fn send(co: &Coordinator, key: &str, request_id: &str, payload: Value) -> SendResponse {
+pub(crate) async fn send(
+    co: &Coordinator,
+    key: &str,
+    request_id: &str,
+    payload: Value,
+) -> SendResponse {
     co.send(&SendRequest {
         agent: agent_ref(key),
         handler: "step".to_string(),
@@ -192,14 +208,14 @@ async fn send(co: &Coordinator, key: &str, request_id: &str, payload: Value) -> 
     .expect("send")
 }
 
-async fn head(store: &AgentStore, key: &str) -> Head {
+pub(crate) async fn head(store: &AgentStore, key: &str) -> Head {
     match store.read_head(&id_of(key)).await.expect("read head") {
         HeadState::Present { head, .. } => *head,
         other => panic!("no head: {other:?}"),
     }
 }
 
-fn past_lease_and_grace() -> u64 {
+pub(crate) fn past_lease_and_grace() -> u64 {
     LEASE_MS + GRACE_MS + 1
 }
 

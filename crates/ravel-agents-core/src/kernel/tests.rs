@@ -1732,6 +1732,76 @@ fn terminal_commands_keep_a_path_through_the_byte_cap() {
     ));
 }
 
+/// The lifecycle commands only move an owner, a timer or an incarnation
+/// along; refusing them at the cap would leave an agent nobody can take
+/// over, unschedule, tombstone or recreate.
+#[test]
+fn the_lifecycle_commands_publish_at_the_byte_cap() {
+    let mut sim = Sim::started();
+    sim.run(&Command::ScheduleTimer(ScheduleTimer {
+        fence: inc_fence(sim.head()),
+        timer: TimerSpec {
+            timer_key: "remind".to_string(),
+            due_unix_ns: sim.now + SECOND,
+            handler: "h".to_string(),
+            payload: None,
+        },
+    }));
+    let head = sim.head().clone();
+    let used = head.encode().len();
+    let kernel = Kernel::new(Limits {
+        max_head_bytes: used + 512,
+        terminal_reserve_per_input_bytes: 512,
+        ..Limits::default()
+    });
+    let now = sim.now;
+    let apply = |head: &Head, cmd: &Command| {
+        kernel
+            .apply(Some(head), cmd, now, &DerivedIds)
+            .map(|t| t.reply().clone())
+    };
+    assert_eq!(
+        apply(&head, &enqueue_cmd(&head, "r-growth", b"p"))
+            .expect_err("growth is guarded")
+            .kind,
+        ErrorKind::BudgetExceeded
+    );
+    assert!(matches!(
+        apply(&head, &takeover_cmd(&head, "w2")),
+        Ok(Reply::Owned { .. })
+    ));
+    assert_eq!(
+        apply(
+            &head,
+            &Command::CancelTimer(CancelTimer {
+                fence: inc_fence(&head),
+                timer_key: "remind".to_string(),
+            })
+        )
+        .expect("a timer cancel publishes at the cap"),
+        Reply::TimerCancelled
+    );
+    let Transition::Publish {
+        head: tombstoned, ..
+    } = kernel
+        .apply(
+            Some(&head),
+            &Command::Tombstone(Tombstone {
+                fence: inc_fence(&head),
+            }),
+            now,
+            &DerivedIds,
+        )
+        .expect("a tombstone publishes at the cap")
+    else {
+        panic!("a tombstone publishes");
+    };
+    assert_eq!(
+        apply(&tombstoned, &create_cmd()).expect("a recreate publishes at the cap"),
+        Reply::Created { incarnation: 2 }
+    );
+}
+
 #[test]
 fn an_oversized_caller_string_is_refused_before_any_transition() {
     let mut sim = Sim::started();
@@ -3043,7 +3113,11 @@ fn reconciliation_is_audited_once_in_the_event_stream() {
             reply: Reply::AttemptAuthorized { attempt: 2, .. }
         }
     ));
-    let attempt = (AUDIT_RECONCILE_ATTEMPT.to_string(), accept_seq, journaled_by);
+    let attempt = (
+        AUDIT_RECONCILE_ATTEMPT.to_string(),
+        accept_seq,
+        journaled_by,
+    );
     assert_eq!(audits(&sim), vec![attempt.clone()]);
 
     // The reconciled attempt is lost too; attaching its verified result twice

@@ -701,11 +701,16 @@ fn identity_strings(command: &Command) -> (Vec<&str>, Vec<&str>) {
 }
 
 /// Whether the growth guard applies to a publish. Exempt are the terminal
-/// paths (`FailTurn`, `Cancel`), the commands that only move a turn or an
-/// owner along (`Takeover`, `BeginTurn`, `CancelTimer`, `Tombstone`,
-/// `Create`), the latches (a publish answering `Reply::Blocked`, which
-/// blocks the turn or marks an effect `InDoubt`), and what an effect needs
-/// to settle (`RecordEffectResult`). Refusing a latch would let the next
+/// paths (`FailTurn`, `Cancel`;
+/// `tests::terminal_commands_keep_a_path_through_the_byte_cap`), the
+/// commands that only move a turn or an owner along (`Takeover`,
+/// `BeginTurn`, `CancelTimer`, `Tombstone`, `Create`;
+/// `tests::the_lifecycle_commands_publish_at_the_byte_cap`,
+/// `tests::the_terminal_paths_fit_at_every_cap_after_the_worst_exempt_growth`),
+/// the latches (a publish answering `Reply::Blocked`, which blocks the turn
+/// or marks an effect `InDoubt`; `tests::a_blocking_replay_is_recorded_inside_the_reserve`),
+/// and what an effect needs to settle (`RecordEffectResult`;
+/// `tests::pending_effects_settle_inside_the_reserve`). Refusing a latch would let the next
 /// `CompleteTurn` commit past it. A `Reconcile` authorization is guarded: it
 /// appends an audit event every time it publishes, and an effect can be
 /// latched and reconciled any number of times, so its growth has no bound a
