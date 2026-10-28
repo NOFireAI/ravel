@@ -30,12 +30,12 @@ any total fails the batch.
 |---|---|---|
 | Competing senders | `senders::competing_senders_take_distinct_accept_seqs` | `senders::competing_senders_across_seeds`: 108 HEAD CAS conflicts |
 | Duplicate and conflict | `senders::same_request_twice_is_a_duplicate`, `senders::same_id_different_payload_conflicts` | `senders::duplicate_and_conflict_across_seeds`: 36 duplicates, 92 conflicts |
-| Lost CAS response (acceptance test) | `senders::lost_cas_response_followed_by_later_revisions_still_resolves_the_same_operation`, `senders::a_driver_taking_the_newest_receipt_diverges` | `senders::lost_cas_response_across_seeds`: lost write landed first/second/third 40/13/11 times, 45 conflicts |
-| Worker killed at a publication boundary | `workers::worker_killed_{before,after}_{begin_turn_cas,output_put,commit_cas}` (six tests) | `workers::worker_kills_across_seeds`: 52 crashes, 30 runs where `DuplicateDelivery` fired (each a lost acknowledgement of an applied write or a conflicted CAS answered `Transient`), 3 inferred events, 2 stale-owner fences, 0 false negatives |
+| Lost CAS response (acceptance test) | `senders::lost_cas_response_followed_by_later_revisions_still_resolves_the_same_operation`, `senders::a_driver_taking_the_newest_receipt_diverges` | `senders::lost_cas_response_across_seeds`: lost write landed first/second/third 44/11/9 times, 28 conflicts |
+| Worker killed at a publication boundary | `workers::worker_killed_{before,after}_{begin_turn_cas,output_put,commit_cas}` (six tests) | `workers::worker_kills_across_seeds`: 28 crashes, 19 runs where `DuplicateDelivery` fired (each a lost acknowledgement of an applied write or a conflicted CAS answered `Transient`), 2 inferred events, 0 stale-owner fences, 0 false negatives |
 | Suspended worker after a takeover | `workers::suspended_worker_commit_is_refused_after_takeover` | `workers::suspended_worker_across_seeds`: 31 takeovers before the suspended commit |
 | Enqueue racing a completion | `races::enqueue_racing_completion_rebases_and_keeps_the_input` | `races::enqueue_racing_completion_across_seeds`: 42 commit-time conflicts |
 | Cancel racing a completion | `races::cancel_racing_completion_one_wins` | `races::cancel_racing_completion_across_seeds`: cancel won 46 of 64 |
-| Cold restart, second coordinator | `workers::cold_restart_with_a_second_coordinator` | `workers::cold_restart_across_seeds`: 113 of 128 remaining turns run by the restarted worker |
+| Cold restart, second coordinator | `workers::cold_restart_with_a_second_coordinator` | `workers::cold_restart_across_seeds`: 112 of 128 remaining turns run by the restarted worker |
 | Typed errors | `errors::*` (eight tests, one per refusal) | `errors::contended_refusals_across_seeds`: client `a` accepted 63 times, 85 conflicts |
 | Effect kill points, provider idempotency | `effects::provider_idempotency_{killed_before_tool_call,killed_after_execution,suspended_before_result_publication}` | `effects::provider_idempotency_kills_across_seeds`: 114 crashes, 29 inferred, 144 dispatches of 128 distinct attempts, 128 executions, 0 duplicates |
 | Effect kill points, at least once and manual | `effects::at_least_once_{killed_before_tool_call,killed_after_execution,late_result_after_takeover_is_evidence}`, `effects::manual_{killed_before_tool_call,killed_after_execution,suspended_before_result_publication}` | `effects::at_least_once_duplicate_execution_is_reachable_and_manual_policy_never_redispatches`: at least once 140 executions with 12 duplicates; manual 0 duplicates, 15 in doubt, 15 reconciled, each authorized attempt dispatched by the next step of the process that reconciled it |
@@ -43,6 +43,15 @@ any total fails the batch.
 | Conflicting results | `effects::conflicting_results_for_one_attempt_are_idempotency_conflict` | `effects::conflicting_reporters_across_seeds`: 64 conflicts |
 | Handler version change | `effects::handler_version_change_while_a_turn_is_suspended` | `effects::handler_version_changes_across_seeds`: 134 crashes, 39 polls refused `IncompatibleHandler`, 0 duplicates |
 | Unknown handle, journal and failed attempt | `effects::query_of_a_handle_with_no_input`, `effects::journaled_step_with_a_failed_attempt_replays_the_failure` | none |
+
+The lost CAS response, worker kill and cold restart totals moved when a
+worker poll stopped listing the tenant itself (issue #3353): the poll path
+no longer issues `discover()`'s LIST and HEAD GET calls, so a poll makes
+fewer store calls. Fewer calls are fewer points where the scheduler
+interleaves processes, so the scripted crashes and lost acknowledgements
+land at other calls, and fewer of them land at all. The same shift moved
+the batch's one stale-owner run out of the 64 seeds; it is pinned from
+seed `0x5eed00db` instead.
 
 The "after" kill points use `DuplicateDelivery` to lose the answer to a
 write that applied. Each kill test then runs a replacement worker
@@ -96,6 +105,8 @@ over and began the same turn again, and `w1`'s commit was then fenced
 there, because it has no worker identity. The production fence is
 correct, so `workers::past_known_divergences` drops that call and counts
 it. The run is pinned as `workers::stale_owner_commit_after_takeover_is_fenced`.
+Since the poll change above no seed of the batch reaches that shape, and
+the test runs seed `0x5eed00db`, past the batch, which does.
 
 ## Known gaps
 
