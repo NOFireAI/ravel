@@ -4494,15 +4494,21 @@ dependencies = [
 name = "ravel-agents-sim"
 version = "0.27.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
+ "hex",
  "proptest",
  "rand 0.10.2",
  "ravel-agents-core",
+ "ravel-agents-runtime",
+ "ravel-agents-store",
  "ravel-commit",
  "ravel-object-store",
  "ravel-sim",
  "ravel-test-support",
+ "ravel-types",
+ "serde_json",
  "tokio",
 ]
 
