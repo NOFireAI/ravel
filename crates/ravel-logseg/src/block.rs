@@ -1483,7 +1483,8 @@ impl DecodedBlock {
     /// Capacity, not length, because capacity is what is allocated. The
     /// per-kind `HashMap` spines are not counted: they hold one entry per
     /// decoded column, bounded by the scan's column selection and negligible
-    /// against the cells.
+    /// against the cells. Nor is each column's `Arc` header (its two counts and
+    /// the vector or struct it wraps), for the same reason.
     pub fn decoded_heap_bytes(&self) -> usize {
         let mut total = 0usize;
         // The slot vectors themselves, before the columns they hold.
@@ -3548,6 +3549,11 @@ mod tests {
             .collect()
     }
 
+    /// The stored key of every row, absent rows included.
+    fn raw_keys(col: &DictColumn) -> Vec<i32> {
+        col.keys.to_vec()
+    }
+
     #[test]
     fn cloned_dict_column_shares_its_buffers() {
         let (_, col) = shared_dict_fixture();
@@ -3587,10 +3593,7 @@ mod tests {
         col.restrict_to(narrowed, &[1, 4]);
 
         assert_eq!(dict_cells(&other), before);
-        assert_eq!(
-            other.keys.iter().copied().collect::<Vec<_>>(),
-            [1, 2, 0, 1, 2, 1]
-        );
+        assert_eq!(raw_keys(&other), [1, 2, 0, 1, 2, 1]);
         assert_eq!(dict_cells(&col), [None, two.clone(), None, None, two, None]);
         assert!(!Arc::ptr_eq(&col.keys, &other.keys));
         assert!(!Arc::ptr_eq(&col.present, &other.present));
@@ -3604,10 +3607,7 @@ mod tests {
         let narrowed = Arc::new(DictValues::from_entries(&entries).expect("dict"));
         col.restrict_to(narrowed, &[1, 4]);
         assert_eq!(Arc::as_ptr(&col.keys), at);
-        assert_eq!(
-            col.keys.iter().copied().collect::<Vec<_>>(),
-            [0, 2, 0, 0, 2, 0]
-        );
+        assert_eq!(raw_keys(&col), [0, 2, 0, 0, 2, 0]);
     }
 
     /// A string column whose value page carries an enc that is neither a
