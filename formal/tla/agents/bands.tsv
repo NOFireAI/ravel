@@ -10,11 +10,12 @@
 # AgentEffects, 2 workers: smoke measured 222513 distinct at depth 45 in 22 s;
 # live (one worker, MaxEpoch 1, liveness on) measured 127749 distinct at
 # depth 43 in 30 s. The exhaustive row is a placeholder like the protocol
-# one; a single local run measured 2807644 distinct at depth 49 in 270 s.
+# one; a single local run measured 1944775 distinct at depth 48 in 188 s.
 # AgentIntegrated, 2 workers: smoke measured 427920 distinct at depth 44 in
 # 42 s; live (one worker, no timer, liveness on) measured 13617 distinct at
 # depth 35 in 8 s; positive/integrated-timer-race.cfg measured 1190621
-# distinct at depth 45 in 92 s. The exhaustive row is a placeholder.
+# distinct at depth 45 in 92 s. The exhaustive row is a placeholder, and no
+# run has finished it, so its 3000 s budget is unproven (T20, #3354).
 cfg	min_distinct	max_distinct	min_depth	max_depth	budget_s
 MCAgentProtocol.smoke.cfg	286000	292000	-	-
 MCAgentProtocol.exhaustive.cfg	0	999999999	-	-	3000
