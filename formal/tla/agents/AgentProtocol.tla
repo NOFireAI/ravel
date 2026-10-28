@@ -99,7 +99,9 @@ AllKeys ==
 
 \* --- HEAD content ---------------------------------------------------------
 
-NoTurn == [turn |-> 0, seq |-> 0, base |-> 0, inc |-> 0]
+\* creq: a cancellation was requested for the active turn's input; the
+\* turn's next commit publishes it as cancelled.
+NoTurn == [turn |-> 0, seq |-> 0, base |-> 0, inc |-> 0, creq |-> FALSE]
 
 TimerStates == {"none", "armed", "delivered", "cancelled"}
 
@@ -114,7 +116,7 @@ HeadRecs ==
      owner: Workers \cup {NoWorker}, epoch: Nat, sv: Nat,
      stateRef: ObjIds \cup {NoC}, inputs: SUBSET InputRecs, inbox: SUBSET Nat,
      receipts: SUBSET ReceiptRecs, results: SUBSET ResultRecs, nextSeq: Nat,
-     active: [turn: Nat, seq: Nat, base: Nat, inc: Nat], turns: Nat,
+     active: [turn: Nat, seq: Nat, base: Nat, inc: Nat, creq: BOOLEAN], turns: Nat,
      cancels: SUBSET Nat, timer: [gen: Nat, st: TimerStates]]
 
 \* A hint names the incarnation and generation it was written for; the key
@@ -200,22 +202,32 @@ TurnResult(h, ctx, kind, w) ==
      owner |-> w, sv |-> IF kind = "completed" THEN h.sv + 1 ELSE h.sv,
      inc |-> ctx.inc]
 
-CompleteHead(h, ctx, kind, w) ==
-    [h EXCEPT !.rev = @ + 1,
-              !.inbox = @ \ {ctx.seq},
-              !.active = NoTurn,
-              !.results = @ \cup {TurnResult(h, ctx, kind, w)},
-              !.sv = IF kind = "completed" THEN @ + 1 ELSE @,
-              !.stateRef = IF kind = "completed" THEN OutId(ctx.turn) ELSE @]
+\* A turn commit on a root with a requested cancellation publishes a
+\* cancelled result whatever the handler produced, and leaves the state as
+\* it was.
+CommitKind(h, kind) == IF h.active.creq THEN "cancelled" ELSE kind
 
+CompleteHead(h, ctx, kind, w) ==
+    LET k == CommitKind(h, kind)
+    IN [h EXCEPT !.rev = @ + 1,
+                 !.inbox = @ \ {ctx.seq},
+                 !.active = NoTurn,
+                 !.results = @ \cup {TurnResult(h, ctx, k, w)},
+                 !.sv = IF k = "completed" THEN @ + 1 ELSE @,
+                 !.stateRef = IF k = "completed" THEN OutId(ctx.turn) ELSE @]
+
+\* An active input is only marked; a pending one is settled at once.
 CancelHead(h, s, inc) ==
-    [h EXCEPT !.rev = @ + 1,
-              !.inbox = @ \ {s},
-              !.cancels = @ \cup {s},
-              !.results = @ \cup {[seq |-> s, kind |-> "cancelled", turn |-> 0,
-                                   epoch |-> 0, owner |-> NoWorker, sv |-> h.sv,
-                                   inc |-> inc]},
-              !.active = IF h.active.turn # 0 /\ h.active.seq = s THEN NoTurn ELSE @]
+    IF h.active.turn # 0 /\ h.active.seq = s
+      THEN [h EXCEPT !.rev = @ + 1,
+                     !.cancels = @ \cup {s},
+                     !.active.creq = TRUE]
+      ELSE [h EXCEPT !.rev = @ + 1,
+                     !.inbox = @ \ {s},
+                     !.cancels = @ \cup {s},
+                     !.results = @ \cup {[seq |-> s, kind |-> "cancelled", turn |-> 0,
+                                          epoch |-> 0, owner |-> NoWorker, sv |-> h.sv,
+                                          inc |-> inc]}]
 
 TimerInput(h, g) ==
     [seq |-> h.nextSeq, src |-> <<"timer", g>>, hash |-> TimerMsg, inc |-> h.inc]
@@ -373,12 +385,15 @@ CasHeadLostResponse(c) ==
 \* --- Client: cancel -------------------------------------------------------
 
 \* Cancellation linearizes at HEAD. A pending input is consumed with a
-\* cancelled result; an active one is consumed too and its turn cleared, so
-\* the owner's completion CAS fails and its rebase finds the turn gone. An
-\* input that already has a result answers AlreadyCompleted. The command
-\* carries the handle's incarnation; a tombstoned HEAD or another
-\* incarnation answers AgentGone. Those two answers write nothing, so only
-\* the cancel that writes is an action. Read and CAS are one step (CasNow).
+\* cancelled result. An active one stays bound to its turn with the request
+\* recorded, and the owner's next commit of that turn (complete, fail or
+\* rebase) publishes it as cancelled, as the kernel's settle on a turn with
+\* CancellationState::Requested does. An input that already has a result
+\* answers AlreadyTerminal and a repeated request answers CancelRequested.
+\* The command carries the handle's incarnation; a tombstoned HEAD or
+\* another incarnation answers AgentGone. Those answers write nothing, so
+\* only the cancel that writes is an action. Read and CAS are one step
+\* (CasNow).
 Cancel(c) ==
     /\ cl[c].pc = "acked"
     /\ HeadUp(cl[c].ak)
@@ -388,6 +403,7 @@ Cancel(c) ==
        IN /\ ~h.tomb
           /\ h.inc = acked[c].rcpt.inc
           /\ ~\E r \in h.results : r.seq = s
+          /\ s \notin h.cancels
           /\ h.rev < MaxRevision
           /\ CasNow(ak, CancelHead(h, s, acked[c].rcpt.inc))
     /\ SetCl(c, [cl[c] EXCEPT !.pc = "done"])
@@ -437,7 +453,7 @@ BeginTurn(w, ak) ==
           /\ h.inbox # {}
           /\ CasNow(ak, [h EXCEPT !.rev = @ + 1, !.turns = @ + 1,
                            !.active = [turn |-> h.turns + 1, seq |-> Min(h.inbox),
-                                       base |-> h.sv, inc |-> h.inc]])
+                                       base |-> h.sv, inc |-> h.inc, creq |-> FALSE]])
     /\ UNCHANGED <<cl, wk, co, crashedOnce, due, acked>>
 
 \* GET HEAD, run its active turn (the handler is a black box) and PUT the
@@ -680,13 +696,14 @@ TurnCommitAtomic ==
                  a.sv = b.sv + 1 /\ r.sv = a.sv /\ a.stateRef = OutId(r.turn)
            /\ (\A r \in NewResults : r.kind # "completed") =>
                  a.sv = b.sv /\ a.stateRef = b.stateRef
-           /\ \A r \in NewResults : r.kind # "cancelled" => a.active = NoTurn
+           /\ \A r \in NewResults : r.turn # 0 => a.active = NoTurn
 
-\* A turn result lands only on a root whose owner, epoch and active turn are
-\* the ones the committing command was bound to.
+\* A turn result (any result carrying a turn id, a cancelled one published
+\* by the turn's commit included) lands only on a root whose owner, epoch and
+\* active turn are the ones the committing command was bound to.
 NoStaleOwnerCommit ==
     SameInc =>
-        \A r \in NewResults : r.kind # "cancelled" =>
+        \A r \in NewResults : r.turn # 0 =>
             /\ LC.before.owner = r.owner
             /\ LC.before.epoch = r.epoch
             /\ LC.before.active.turn = r.turn
@@ -732,13 +749,17 @@ TimerGenerationDeliveredOnce ==
          /\ (LC.before.timer.st = "delivered" /\ LC.after.timer.gen = LC.before.timer.gen)
                => LC.after.timer.st = "delivered"
 
-\* A cancelled input ends cancelled, never completed or failed, and is never
-\* pending or active again.
+\* A cancelled input ends cancelled, never completed or failed. Until it
+\* settles it is the active turn's input with the request recorded: it is
+\* never pending without a turn, and no new turn binds it.
 CancellationRespected ==
     /\ \A ak \in AKs : HeadUp(ak) =>
          LET h == Head(ak)
          IN /\ \A r \in h.results : r.seq \in h.cancels => r.kind = "cancelled"
-            /\ h.cancels \cap h.inbox = {}
+            /\ \A s \in h.cancels \cap h.inbox :
+                  h.active.turn # 0 /\ h.active.seq = s /\ h.active.creq
+    /\ SameInc => \A s \in LC.before.cancels \cap LC.before.inbox :
+         s \in LC.after.inbox => LC.after.active.turn = LC.before.active.turn
     /\ SameInc => LC.before.cancels \subseteq LC.after.cancels
 
 \* A HEAD names its own tenant and agent, every record in it carries the

@@ -1,9 +1,10 @@
-# Smoke band: measured 278143 distinct at depth 26 with 2 workers; depth is
+# Smoke band: measured 289101 distinct at depth 26 with 2 workers; depth is
 # "-" because TLC's reported BFS depth overshoots by a level under
 # -workers auto. The exhaustive row is an unmeasured placeholder: its distinct
 # band is the full 0-999999999 range, so it only sets budget_s; a single local
 # run (2 workers) measured 362907 distinct at depth 27, and the row gets a real
 # band once the nightly lane has measured it on its own runner.
 cfg	min_distinct	max_distinct	min_depth	max_depth	budget_s
-MCAgentProtocol.smoke.cfg	275000	281000	-	-
+MCAgentProtocol.smoke.cfg	286000	292000	-	-
 MCAgentProtocol.exhaustive.cfg	0	999999999	-	-	3000
+positive/stale-turn-rebase-unreachable.cfg	286000	292000	-	-
