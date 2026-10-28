@@ -75,6 +75,13 @@ fn principals() -> Arc<dyn ravel_query::http::TenantResolver> {
 /// The `--mode all` process `agents_e2e.rs` starts, over `store`, with the
 /// audit pipeline installed in required mode.
 async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Running {
+    start_server_with(store, agents_config()).await
+}
+
+async fn start_server_with(
+    store: Arc<dyn ObjectStoreBackend>,
+    agents: AgentsConfig,
+) -> ravel_server::Running {
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
@@ -83,7 +90,7 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
         }),
         audit_text: Default::default(),
         query_budgets: QueryBudgets {
-            agents: agents_config(),
+            agents,
             ..Default::default()
         },
         max_inflight_flushes: 1,
@@ -223,7 +230,11 @@ async fn read(response: reqwest::Response) -> (StatusCode, Value) {
 }
 
 fn agent() -> Value {
-    json!({"kind": "order", "key": "o-1"})
+    agent_keyed("o-1")
+}
+
+fn agent_keyed(key: &str) -> Value {
+    json!({"kind": "order", "key": key})
 }
 
 fn pins() -> Value {
@@ -251,12 +262,18 @@ async fn poll(api: &Api, worker_id: &str, wait_ms: u64) -> Value {
 /// Create the agent, send one input, and hand its turn to worker A.
 /// Answers the operation handle and A's assignment.
 async fn begin(api: &Api) -> (String, Value) {
-    api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
+    begin_on(api, "o-1").await
+}
+
+/// [`begin`] on the agent keyed `key`.
+async fn begin_on(api: &Api, key: &str) -> (String, Value) {
+    api.ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
+        .await;
     let sent = api
         .ok(
             CLIENT,
             "send",
-            &json!({"agent": agent(), "handler": "place", "request_id": "req-1", "payload": {"sku": "A-1"}}),
+            &json!({"agent": agent_keyed(key), "handler": "place", "request_id": "req-1", "payload": {"sku": "A-1"}}),
         )
         .await;
     let operation = sent["operation"].as_str().expect("operation").to_string();
@@ -972,6 +989,132 @@ async fn a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(attr(&records[0], "agents.decision"), Some("retry"));
     assert_eq!(attr(&records[0], "agents.attempt"), Some("1"));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A reconcile retry is answered as a repeat only for an attempt a reconcile
+/// in this process handed over and no step has claimed. An `at_least_once`
+/// effect whose attempt B's step raised to 2 after a takeover was never in
+/// doubt, so a retry naming attempt 1 is `ownership_lost`, writes no audit
+/// record, and hands nothing over: B's next step is still refused while its
+/// own attempt 2 is open.
+#[tokio::test]
+async fn a_reconcile_retry_of_an_attempt_a_takeover_raised_is_ownership_lost() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let (_, assigned_a) = begin(&api).await;
+    let (status, a_step) = step(&api, &assigned_a, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let assigned_b = take_over(&api, &assigned_a).await;
+    let (status, b_step) = step(&api, &assigned_b, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{b_step}");
+    assert_eq!(b_step["attempt"], json!(2));
+
+    let retry = json!({"effect": effect, "attempt": 1, "decision": "retry"});
+    let (status, refused) = api.post(ADMIN, "reconcile", &retry).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("ownership_lost"), "{refused}");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("hand-over")),
+        "{refused}"
+    );
+    let inspected = inspect(&api, &effect).await;
+    assert_eq!(inspected["status"], json!("authorized"), "{inspected}");
+    assert_eq!(inspected["attempt"], json!(2), "{inspected}");
+    let (status, refused) = step(&api, &assigned_b, "at_least_once").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("idempotency_conflict"));
+    assert!(reconcile_audit_records(store.as_ref()).await.is_empty());
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The evidence index gives a settled effect's slot to a new one. With room
+/// for one effect: o-1's superseded `at_least_once` attempt is evidence
+/// until attempt 2's result settles the effect; o-2's late result arrives
+/// after its input was cancelled and takes o-1's slot; o-3's `manual`
+/// effect, reconciled to attempt 2 and then in doubt again under a third
+/// owner, still lists attempt 1's late result.
+#[tokio::test]
+async fn settled_effects_give_their_evidence_slot_to_an_effect_in_doubt() {
+    let running = start_server_with(
+        Arc::new(MemoryStore::new()),
+        AgentsConfig {
+            max_evidence_effects: 1,
+            ..agents_config()
+        },
+    )
+    .await;
+    let api = Api::public(&running);
+
+    let (_, a1) = begin_on(&api, "o-1").await;
+    let (status, a_step) = step(&api, &a1, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let e1 = a_step["effect"].as_str().expect("effect").to_string();
+    let b1 = take_over(&api, &a1).await;
+    let (status, b_step) = step(&api, &b1, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{b_step}");
+    let (_, late) = complete(&api, &e1, 1, json!({"cents": 1100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    assert_eq!(
+        inspect(&api, &e1).await["evidence"],
+        json!([{"attempt": 1, "result": {"cents": 1100}}])
+    );
+    let (_, recorded) = complete(&api, &e1, 2, json!({"cents": 1299})).await;
+    assert_eq!(recorded["status"], json!("completed"), "{recorded}");
+    let (_, replayed) = step(&api, &b1, "at_least_once").await;
+    assert_eq!(replayed["step"]["status"], json!("completed"), "{replayed}");
+    api.ok(WORKER, "worker/commit", &commit_body(&b1, json!({})))
+        .await;
+
+    let (op2, a2) = begin_on(&api, "o-2").await;
+    let (status, a_step) = step(&api, &a2, "at_least_once").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let e2 = a_step["effect"].as_str().expect("effect").to_string();
+    api.ok(CLIENT, "cancel", &json!({"operation": op2})).await;
+    let b2 = take_over(&api, &a2).await;
+    api.ok(WORKER, "worker/commit", &commit_body(&b2, json!({})))
+        .await;
+    let (_, late) = complete(&api, &e2, 1, json!({"cents": 2100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    assert_eq!(
+        inspect(&api, &e2).await["evidence"],
+        json!([{"attempt": 1, "result": {"cents": 2100}}])
+    );
+    assert_eq!(inspect(&api, &e1).await["evidence"], json!([]), "evicted");
+
+    let (_, a3) = begin_on(&api, "o-3").await;
+    let (status, a_step) = step(&api, &a3, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let e3 = a_step["effect"].as_str().expect("effect").to_string();
+    let b3 = take_over(&api, &a3).await;
+    let (_, refused) = step(&api, &b3, "manual").await;
+    assert_eq!(refused["code"], json!("effect_in_doubt"), "{refused}");
+    api.ok(
+        ADMIN,
+        "reconcile",
+        &json!({"effect": e3, "attempt": 1, "decision": "retry"}),
+    )
+    .await;
+    let (_, handed) = step(&api, &b3, "manual").await;
+    assert_eq!(handed["attempt"], json!(2), "{handed}");
+    let (_, late) = complete(&api, &e3, 1, json!({"cents": 3100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    let c3 = take_over(&api, &b3).await;
+    let (_, refused) = step(&api, &c3, "manual").await;
+    assert_eq!(refused["code"], json!("effect_in_doubt"), "{refused}");
+
+    let inspected = inspect(&api, &e3).await;
+    assert_eq!(inspected["status"], json!("in_doubt"), "{inspected}");
+    assert_eq!(
+        inspected["evidence"],
+        json!([{"attempt": 1, "result": {"cents": 3100}}]),
+        "{inspected}"
+    );
+    assert_eq!(inspect(&api, &e2).await["evidence"], json!([]), "evicted");
     running.shutdown().await.expect("clean shutdown");
 }
 

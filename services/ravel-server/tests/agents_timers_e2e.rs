@@ -4,7 +4,9 @@
 //! The agents clock is injected, so a timer comes due when a test advances
 //! it, and `sweep_interval_ms` is 0, so the only sweep passes are the ones a
 //! test asks for with `POST /api/v1/agents/sweep`. No worker polls in the
-//! timer tests, so no poll-driven pass runs either. The store is a
+//! timer tests, so no poll-driven pass runs either. The interval sweep tests
+//! set their own interval; it runs on the tokio timer, which the agents
+//! clock does not drive, so they wait real time for it. The store is a
 //! `FaultStore` over `MemoryStore` behind a wrapper that counts the agent
 //! LISTs and HEAD reads, so a sweep's reported counts are checked against
 //! the requests the store actually served.
@@ -157,10 +159,17 @@ impl Fixture {
     }
 
     async fn start(&self) -> ravel_server::Running {
+        self.start_with_interval(0).await
+    }
+
+    /// A server whose tenants run the periodic sweep every
+    /// `sweep_interval_ms`.
+    async fn start_with_interval(&self, sweep_interval_ms: u64) -> ravel_server::Running {
         let now = self.now.clone();
         start_server(
             self.store.clone(),
             AgentsClock(Some(Arc::new(move || now.load(Ordering::SeqCst)))),
+            sweep_interval_ms,
         )
         .await
     }
@@ -198,12 +207,12 @@ impl Fixture {
     }
 }
 
-fn agents_config(clock: AgentsClock) -> AgentsConfig {
+fn agents_config(clock: AgentsClock, sweep_interval_ms: u64) -> AgentsConfig {
     AgentsConfig {
         enabled: true,
         activation_concurrency: 16,
         poll_concurrency: 16,
-        sweep_interval_ms: 0,
+        sweep_interval_ms,
         clock,
         ..AgentsConfig::default()
     }
@@ -237,13 +246,14 @@ fn principals() -> Arc<dyn ravel_query::http::TenantResolver> {
 async fn start_server(
     store: Arc<dyn ObjectStoreBackend>,
     clock: AgentsClock,
+    sweep_interval_ms: u64,
 ) -> ravel_server::Running {
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: QueryBudgets {
-            agents: agents_config(clock),
+            agents: agents_config(clock, sweep_interval_ms),
             ..Default::default()
         },
         max_inflight_flushes: 1,
@@ -872,6 +882,93 @@ async fn sweep_route_counts_match_the_store_and_needs_agents_admin() {
         )),
         report["dir_list_pages"]
     );
+    running.shutdown().await.expect("server stops");
+}
+
+const SWEEP_INTERVAL_MS: u64 = 50;
+
+fn passes(scrape: &str) -> u64 {
+    value(scrape, "ravel_agents_sweep_passes_total", "mode=")
+}
+
+/// The periodic sweep runs with no worker poll and no `sweep` call: once
+/// the tenant is served, each interval runs one pass, which lists `_wake/`,
+/// and never more than one. Waits on `/metrics` up to a deadline, so a slow
+/// box only makes it wait longer.
+#[tokio::test]
+async fn the_interval_sweep_runs_a_pass_per_interval_with_no_poll() {
+    let fixture = Fixture::new(FaultPlan::empty());
+    let running = fixture.start_with_interval(SWEEP_INTERVAL_MS).await;
+    let api = Api::public(&running);
+    create(&api, "o-1").await;
+    let scrape = api.scrape().await;
+    assert_eq!(
+        value(&scrape, "ravel_agents_sweep_interval_ms", "mode="),
+        SWEEP_INTERVAL_MS
+    );
+    let first = passes(&scrape);
+    let lists_before = fixture.requests.snapshot().0;
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    let mut last = first;
+    while last < first + 3 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(SWEEP_INTERVAL_MS)).await;
+        last = passes(&api.scrape().await);
+    }
+    // hygiene-allow: wall-clock -- the interval runs on the tokio timer, which
+    // the agents clock does not drive; this bounds passes from above only.
+    let intervals = started.elapsed().as_millis() as u64 / SWEEP_INTERVAL_MS;
+    assert!(last >= first + 3, "{} passes in 30 s", last - first);
+    // hygiene-allow: wall-clock -- an upper bound, which load cannot break.
+    assert!(
+        last - first <= intervals + 2,
+        "{} passes in {intervals} intervals",
+        last - first
+    );
+    assert!(
+        fixture.requests.snapshot().0 >= lists_before + 3,
+        "each pass lists _wake/"
+    );
+    running.shutdown().await.expect("server stops");
+}
+
+/// `sweep_interval_ms` 0 runs no periodic pass. Worker polls still sweep,
+/// at most once per [`ravel_server::agents::POLL_SWEEP_FLOOR_MS`]
+/// of the agents clock: two idle polls in a row run one pass, and a poll
+/// after the clock moved past the floor runs one more.
+#[tokio::test]
+async fn interval_zero_runs_no_periodic_pass_and_polls_sweep_at_the_floor() {
+    let fixture = Fixture::new(FaultPlan::empty());
+    let running = fixture.start().await;
+    let api = Api::public(&running);
+    create(&api, "o-1").await;
+    tokio::time::sleep(Duration::from_millis(10 * SWEEP_INTERVAL_MS)).await;
+    let scrape = api.scrape().await;
+    assert_eq!(value(&scrape, "ravel_agents_sweep_interval_ms", "mode="), 0);
+    assert_eq!(passes(&scrape), 0, "a periodic pass ran");
+
+    let registered = api
+        .ok(WORKER, "worker/register", &json!({"handlers": pins()}))
+        .await;
+    let idle_poll = || async {
+        let polled = api
+            .ok(
+                WORKER,
+                "worker/poll",
+                &json!({"worker_id": registered["worker_id"], "handlers": pins(), "wait_ms": 0}),
+            )
+            .await;
+        assert_eq!(polled["assignment"], Value::Null, "{polled}");
+    };
+    idle_poll().await;
+    idle_poll().await;
+    assert_eq!(passes(&api.scrape().await), 1);
+    fixture.advance(
+        i64::try_from(ravel_server::agents::POLL_SWEEP_FLOOR_MS).expect("floor")
+            * 1_000_000,
+    );
+    idle_poll().await;
+    assert_eq!(passes(&api.scrape().await), 2);
     running.shutdown().await.expect("server stops");
 }
 

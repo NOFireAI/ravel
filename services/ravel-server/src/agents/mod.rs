@@ -36,7 +36,7 @@ pub use routes::{
 };
 pub use runtime::{
     AgentsRuntime, EvidenceIndex, LONG_POLL_CAP_MS, Lane, MAX_EVIDENCE_EFFECTS,
-    MAX_EVIDENCE_PER_EFFECT, TenantAgents, WorkerDispatcher,
+    MAX_EVIDENCE_PER_EFFECT, POLL_SWEEP_FLOOR_MS, TenantAgents, WorkerDispatcher,
 };
 
 /// The unauthenticated settings route.
