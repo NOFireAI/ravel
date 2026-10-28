@@ -84,7 +84,7 @@ describe("client bundle", () => {
     const graph = moduleGraph(resolve(srcRoot, "client", "index.ts"), readSource);
     // The walk really ran: the entry and the modules it re-exports are in it.
     expect(graph.files).toEqual(
-      expect.arrayContaining(["src/client/index.ts", "src/errors.ts", "src/not-implemented.ts"]),
+      expect.arrayContaining(["src/client/index.ts", "src/errors.ts", "src/wire/index.ts", "src/wire/errors.ts"]),
     );
     expect(serverOnlyViolations(graph)).toEqual([]);
   });

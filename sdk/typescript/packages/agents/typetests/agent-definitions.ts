@@ -10,6 +10,7 @@ import { defineTool } from "@ravel/agents/tools";
 import { defineAgent, message, serveAgents } from "@ravel/agents/worker";
 import { createTestHarness } from "@ravel/agents/testing";
 import type { ToolDefinition } from "@ravel/agents";
+import type { Transport } from "@ravel/agents/worker";
 
 type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2
   ? true
@@ -37,8 +38,11 @@ export const counter = defineAgent({
       payload: z.object({ by: z.number() }),
       result: z.number(),
       handler: async (ctx, payload) => {
-        assertType<Equal<typeof ctx.state, Readonly<{ total: number }>>>();
-        const looked = await ctx.callTool("lookup-1", lookup, { key: "k" });
+        assertType<Equal<typeof ctx.state, { total: number }>>();
+        const looked = await ctx.step("lookup-1", lookup, { key: "k" });
+        assertType<Equal<typeof looked, { value: number }>>();
+        // @ts-expect-error a step's input is checked against the tool's input schema
+        await ctx.step("lookup-2", lookup, { key: 1 });
         const total = ctx.state.total + payload.by + looked.value;
         ctx.setState({ total });
         return total;
@@ -106,12 +110,14 @@ defineAgent({
   }),
 });
 
+declare const transport: Transport;
+
 const client = createClient({ url: "http://127.0.0.1:9090", token: "dev" });
 const agent = client.agent<typeof counter>("counter", "c-1");
 
 export async function sends(): Promise<number> {
   const handle = await agent.send("increment", { by: 1 });
-  const result = await handle.wait();
+  const result = await handle.result();
   assertType<Equal<typeof result, number>>();
 
   // @ts-expect-error invalid payload type: by is a number
@@ -154,7 +160,7 @@ defineTool({
 // interface admits a narrower instantiation in a list. These two must keep
 // compiling.
 export const serveWithTool = () =>
-  serveAgents({ url: "http://127.0.0.1:0", token: "t", agents: [counter], tools: [lookup] });
+  serveAgents({ transport, agents: [counter], tools: [lookup] });
 export const harnessWithTool = () => createTestHarness({ agents: [counter], tools: [lookup] });
 
 const lookupInput = z.object({ key: z.string() });
@@ -169,7 +175,7 @@ const annotated: ToolDefinition<typeof lookupInput, typeof lookupOutput> = {
   run: (input: { key: string }) => Promise.resolve({ value: input.key.length }),
 };
 export const serveWithAnnotatedTool = () =>
-  serveAgents({ url: "http://127.0.0.1:0", token: "t", agents: [counter], tools: [annotated] });
+  serveAgents({ transport, agents: [counter], tools: [annotated] });
 export const harnessWithAnnotatedTool = () =>
   createTestHarness({ agents: [counter], tools: [annotated] });
 
@@ -180,8 +186,7 @@ export const harnessWithAnnotatedTool = () =>
 // and the one that fails if the option types revert to ToolDefinition[].
 export const serveWithLiteralTool = () =>
   serveAgents({
-    url: "http://127.0.0.1:0",
-    token: "t",
+    transport,
     agents: [counter],
     tools: [
       {

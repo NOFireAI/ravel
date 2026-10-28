@@ -1,9 +1,9 @@
 /**
  * Worker entry: define agents and their message handlers, and serve them
- * against a Ravel server. Server-only; the client entry never imports it.
+ * against a coordinator through a {@link Transport}. Server-only; the client
+ * entry never imports it.
  */
 import type { z } from "zod";
-import { notImplemented } from "../not-implemented.js";
 import type {
   AgentDefinition,
   AnyAgentDefinition,
@@ -13,6 +13,8 @@ import type {
   MessageDefinition,
   Schema,
 } from "../types.js";
+import { handlerDigest, runTurn, type TurnReport } from "./runner.js";
+import type { Transport } from "./transport.js";
 
 export type {
   AgentDefinition,
@@ -21,6 +23,13 @@ export type {
   HandlerContext,
   MessageDefinition,
 } from "../types.js";
+export { ConcurrentStepError, handlerDigest, runTurn, type TurnReport } from "./runner.js";
+export type {
+  PolledTurn,
+  StepRecordRequest,
+  StepRecordResponse,
+  Transport,
+} from "./transport.js";
 
 export interface MessageOptions<P extends Schema, R extends Schema, S> {
   readonly payload: P;
@@ -39,9 +48,17 @@ export type MessageFactory<S> = <P extends Schema, R extends Schema>(
  * `messages` builder, which carries the agent's state type.
  */
 export function message<P extends Schema, R extends Schema, S = unknown>(
-  _options: MessageOptions<P, R, S>,
+  options: MessageOptions<P, R, S>,
 ): MessageDefinition<P, R, S> {
-  throw notImplemented("message");
+  if (typeof options.handler !== "function") {
+    throw new TypeError("message: handler must be a function");
+  }
+  return Object.freeze({
+    kind: "message",
+    payload: options.payload,
+    result: options.result,
+    handler: options.handler,
+  });
 }
 
 export interface AgentOptions<
@@ -66,24 +83,85 @@ export function defineAgent<
   N extends string,
   St extends Schema,
   M extends Record<string, AnyMessageDefinition<z.output<St>>>,
->(_options: AgentOptions<N, St, M>): AgentDefinition<N, St, M> {
-  throw notImplemented("defineAgent");
+>(options: AgentOptions<N, St, M>): AgentDefinition<N, St, M> {
+  const messages =
+    typeof options.messages === "function"
+      ? options.messages(message)
+      : options.messages;
+  return Object.freeze({
+    kind: "agent",
+    name: options.name,
+    version: options.version,
+    state: options.state,
+    initialState: options.state.parse(options.initialState),
+    messages: Object.freeze({ ...messages }),
+  });
 }
 
 export interface ServeOptions {
-  /** Base URL of a Ravel server started with `--agents`. */
-  readonly url: string;
-  readonly token: string;
+  readonly transport: Transport;
   readonly agents: readonly AnyAgentDefinition[];
+  /** The tools handlers may run; listed for registration, not required by the runner. */
   readonly tools?: readonly AnyToolDefinition[];
+  /** Defaults to a random id. */
+  readonly workerId?: string;
+  /** Long-poll wait per poll; the wire caps it at 20 s. */
+  readonly pollWaitMs?: number;
+  /** Observes every turn the worker finishes or abandons. */
+  readonly onTurn?: (report: TurnReport) => void;
 }
 
 export interface WorkerHandle {
   readonly ownerId: string;
-  /** Stop taking turns and release ownership; in-flight turns are not committed. */
+  /** Stop taking turns; an in-flight turn is aborted and not committed. */
   close(): Promise<void>;
 }
 
-export function serveAgents(_options: ServeOptions): Promise<WorkerHandle> {
-  throw notImplemented("serveAgents");
+function randomId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Poll `transport` for turns of `agents` and run each to a commit until closed. */
+export function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
+  const workerId = options.workerId ?? `worker-${randomId()}`;
+  const agents = new Map(options.agents.map((a) => [a.name, a]));
+  const handlers = options.agents.flatMap((agent) =>
+    Object.keys(agent.messages).map((handler) => ({
+      handler,
+      version: agent.version,
+      digest: handlerDigest(agent, handler),
+    })),
+  );
+  const controller = new AbortController();
+  const waitMs = Math.min(options.pollWaitMs ?? 20_000, 20_000);
+
+  const stopped = (): boolean => controller.signal.aborted;
+  const loop = (async () => {
+    while (!stopped()) {
+      let polled;
+      try {
+        polled = await options.transport.poll(
+          { worker_id: workerId, handlers, wait_ms: waitMs },
+          controller.signal,
+        );
+      } catch {
+        if (stopped()) return;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
+      }
+      if (polled === null) continue;
+      const report = await runTurn(polled, agents, options.transport, controller.signal);
+      options.onTurn?.(report);
+    }
+  })();
+
+  return Promise.resolve({
+    ownerId: workerId,
+    close: async () => {
+      controller.abort(new Error("worker closed"));
+      await loop;
+    },
+  });
 }

@@ -14,7 +14,9 @@ export interface SafeIds {
   readonly operationId?: string;
   readonly turnId?: string;
   readonly stepKey?: string;
+  readonly stepId?: string;
   readonly effectId?: string;
+  readonly timerId?: string;
   readonly epoch?: number;
 }
 
@@ -73,11 +75,22 @@ export class IdempotencyConflict extends RavelAgentsError {
   readonly retry = "never";
 }
 
-/** The store failed after a CAS was attempted; the operation may have landed. */
-export class OutcomeUnknown extends RavelAgentsError {
+/**
+ * The operation may have landed, or a wait ended before it finished. The
+ * client attaches the operation handle as `handle` so the caller resolves it
+ * instead of sending again (`client.test.ts`, "a result() deadline throws
+ * OutcomeUnknown carrying the handle").
+ */
+export class OutcomeUnknown<H = unknown> extends RavelAgentsError {
   override readonly name = "OutcomeUnknown";
   readonly code = "OutcomeUnknown";
   readonly retry = "resolve";
+  readonly handle: H | undefined;
+
+  constructor(message: string, options: RavelAgentsErrorOptions & { readonly handle?: H } = {}) {
+    super(message, options);
+    this.handle = options.handle;
+  }
 }
 
 /** The epoch advanced past this worker; it can no longer commit. */

@@ -20,10 +20,13 @@ export type OperationState =
   | "failed"
   | "cancelled";
 
+/** What a tool's `run` receives besides its input (ADR-3331 decision 7). */
 export interface ToolContext {
-  /** The effect id, stable across re-dispatches of one effect. */
+  /** The effect id: stable across attempts at one input, the key a provider deduplicates on. */
   readonly effectId: string;
+  /** The attempt this run is, starting at 1. */
   readonly attempt: number;
+  /** Aborted when the worker stops or loses the turn. */
   readonly signal: AbortSignal;
 }
 
@@ -34,26 +37,40 @@ export interface ToolDefinition<I extends Schema = Schema, O extends Schema = Sc
   readonly input: I;
   readonly output: O;
   readonly recovery: RecoveryPolicy;
-  readonly run: (input: z.output<I>, ctx: ToolContext) => Promise<z.output<O>>;
+  readonly run: (input: z.output<I>, effect: ToolContext) => Promise<z.output<O>>;
 }
 
 export interface HandlerContext<S> {
+  readonly agent: { readonly kind: string; readonly key: string };
   readonly agentId: string;
+  readonly operationId: string;
   readonly turnId: string;
-  readonly state: Readonly<S>;
+  /**
+   * A draft of the agent's state. Mutate it or replace it with `setState`;
+   * the runner publishes it only in the turn's commit.
+   */
+  readonly state: S;
   setState(next: S): void;
-  /** A durable step: a completed step replays from its journal record. */
-  step<T>(key: string, run: () => Promise<T>): Promise<T>;
-  /** Run a tool as a durable step under the tool's recovery policy. */
-  callTool<I extends Schema, O extends Schema>(
+  /**
+   * Run `tool` as the durable step `key`. A step completed by an earlier
+   * attempt at this input returns its recorded output without running the
+   * tool; a key reused with a different tool or input fails
+   * `NonDeterministicReplay`. Steps are sequential: a second call while one
+   * is in flight is refused with `ConcurrentStepError`.
+   */
+  step<I extends Schema, O extends Schema>(
     key: string,
     tool: ToolDefinition<I, O>,
     input: z.input<I>,
   ): Promise<z.output<O>>;
-  /** Recorded time, identical on replay. */
+  /** Events buffered here are published with the turn's commit. */
+  readonly events: { emit(eventType: string, payload: unknown): void };
+  /** The turn's recorded start time; the same value on every attempt at this input. */
   now(): Date;
-  /** Seeded random value in [0, 1), identical on replay. */
+  /** A value in [0, 1) from a sequence seeded by the input's identity. */
   random(): number;
+  /** Aborted when the worker stops or loses the turn. */
+  readonly signal: AbortSignal;
 }
 
 export type Handler<S, P, R> = (ctx: HandlerContext<S>, payload: P) => Promise<R>;
