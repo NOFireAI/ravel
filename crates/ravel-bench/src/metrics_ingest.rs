@@ -8358,6 +8358,103 @@ mod tests {
         assert!(stall_check_due(&ceiling, s(70), Some(s(10))));
     }
 
+    /// A stream smaller than the shard buffers is offered whole before the
+    /// first response, so only the drain can stop it: with every response
+    /// delayed and a ceiling the run cannot meet, the replay stops with
+    /// `IngestStalled` after offering the whole stream instead of waiting the
+    /// stream out.
+    ///
+    /// TO SEE THIS FAIL: in `replay_over_http_with_plan`, delete the
+    /// `check_stall` call in the drain loop (the replay then returns `Ok`
+    /// once the delayed response arrives), or the `sending_since` line in
+    /// the final flush (no check ever runs, since the only batch is that
+    /// flush).
+    #[tokio::test]
+    async fn the_drain_stops_a_row_whose_whole_stream_is_already_offered() {
+        let points = class_mix(base_ts_ms());
+        let app = axum::Router::new().route(
+            "/api/v1/write",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                axum::http::StatusCode::NO_CONTENT
+            }),
+        );
+        let (addr, server) = serve(app).await;
+        let config = HttpReplayConfig {
+            receiver: Receiver::Prometheus,
+            endpoint: format!("http://{addr}/api/v1/write"),
+            bearer_token: None,
+            tenant: None,
+            batch_size: 100,
+            max_retries: 0,
+            timeout_secs: 5,
+            shards: 1,
+            stall_ceiling: Some(StallCeiling {
+                max_ingest_secs: 0,
+                stream_points: points.len() as u64,
+                grace: Duration::ZERO,
+                recheck: Duration::from_millis(20),
+            }),
+        };
+        let outcome = replay_over_http_with_plan(&config, &mut SlicePoints::new(&points)).await;
+        server.abort();
+        match outcome {
+            Err(LaneError::IngestStalled {
+                offered_points,
+                stream_points,
+                ceiling_secs,
+                ..
+            }) => {
+                assert_eq!(offered_points, points.len() as u64);
+                assert_eq!(stream_points, points.len() as u64);
+                assert_eq!(ceiling_secs, 0);
+            }
+            Err(other) => panic!("expected IngestStalled, got {other}"),
+            Ok(_) => panic!("expected IngestStalled, the replay ran to its end"),
+        }
+    }
+
+    /// A producer round adds its routing (plan observation, the shard
+    /// function, the buffer push) to `generation`, not only the pull from
+    /// the stream: with a clock that only the shard function advances, one
+    /// second per point, `generation` is one second per routed point.
+    ///
+    /// TO SEE THIS FAIL: in `Producer::round`, add to `generation` right
+    /// after `fill_valid` instead of after the routing loop (`generation` is
+    /// then zero).
+    #[test]
+    fn a_producer_round_counts_routing_as_generation() {
+        use std::cell::Cell;
+        let points = class_mix(base_ts_ms());
+        let clock = Cell::new(Duration::ZERO);
+        let routed = Cell::new(0u64);
+        let mut producer = Producer::new(Receiver::Prometheus, 1, 100);
+        let mut source = SlicePoints::new(&points);
+        let shard_of = |_: &LogicalPoint| {
+            clock.set(clock.get() + Duration::from_secs(1));
+            routed.set(routed.get() + 1);
+            0
+        };
+        let full = producer
+            .round(&mut source, shard_of, || clock.get())
+            .expect("round")
+            .expect("the stream has points");
+        assert!(full.is_empty(), "9 points never fill a 100-point batch");
+        let valid = producer.offer.samples + producer.offer.histograms
+            - producer.offer.rejected_samples
+            - producer.offer.rejected_histograms;
+        assert!(valid > 0);
+        assert_eq!(routed.get(), valid);
+        assert_eq!(producer.buffers[0].len() as u64, valid);
+        assert_eq!(producer.generation, Duration::from_secs(valid));
+        assert!(
+            producer
+                .round(&mut source, |_| 0, || clock.get())
+                .expect("round")
+                .is_none()
+        );
+    }
+
     /// A row is sender bound only on the wall basis, with generation at
     /// least 90 % of its wall time.
     #[test]
