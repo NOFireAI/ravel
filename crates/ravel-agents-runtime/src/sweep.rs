@@ -66,12 +66,17 @@
 //! outside the pass's directory slice costs one PUT that answers
 //! `AlreadyExists`. The repair issues no read, and at most one PUT per HEAD
 //! read the wake half made, so the GET budget bounds it. An agent whose repair
-//! PUT answered, written or `AlreadyExists`, is remembered across passes, in
-//! a set bounded by [`MAX_DIR_KNOWN`] and emptied when full, so a later pass
-//! does not PUT for it again
+//! PUT answered, written or `AlreadyExists`, is remembered until the
+//! directory cursor wraps, in a set bounded by [`MAX_DIR_KNOWN`] and also
+//! emptied when full, so a later pass in the same directory cycle does not
+//! PUT for it again
 //! (`tests::a_hint_reached_agent_outside_the_dir_slice_is_repaired_once_across_passes`).
-//! An entry removed by hand after the agent was remembered is restored once
-//! the set is emptied, or by the agent's next create. A PUT that fails is
+//! A hint-reached agent outside the directory slices therefore costs one
+//! PUT per directory cycle. An entry removed by hand after the agent was
+//! remembered is restored by the first pass after the wrap whose wake half
+//! reaches the agent, so within one directory cycle
+//! (`tests::a_vanished_dir_entry_is_restored_once_the_directory_cursor_wraps`),
+//! or by the agent's next create. A PUT that fails is
 //! logged, not remembered, and tried again on the next pass that reaches the
 //! agent
 //! (`tests::the_wake_half_reads_its_share_of_the_get_cap_and_resumes_across_passes`,
@@ -121,7 +126,12 @@
 //!
 //! Each pass's counters are a [`SweepReport`], with the LISTs split by half,
 //! summed into [`crate::SweepMetricsSnapshot`], which `ravel-server` renders
-//! on `/metrics`.
+//! on `/metrics`. The snapshot also counts directory cycles, one each time
+//! the directory cursor wraps, and holds how long the last one took on the
+//! injected clock, from the start of the pass that listed its first page to
+//! the wrap (`tests::a_directory_cycle_is_counted_and_timed_when_the_cursor_wraps`).
+//! A cycle reads every agent's HEAD once, so its duration is the observed
+//! bound on how late a pass reaches an agent given work elsewhere.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -196,8 +206,13 @@ pub struct SweepReport {
 pub(crate) struct SweepCursor {
     wake: Option<String>,
     dir: Option<String>,
-    /// Agents whose repair PUT answered, at most [`MAX_DIR_KNOWN`].
+    /// Agents whose repair PUT answered, at most [`MAX_DIR_KNOWN`]; emptied
+    /// when the directory cursor wraps.
     dir_known: HashSet<AgentId>,
+    /// When the directory cycle in progress began: the clock reading of the
+    /// pass that listed its first page. `None` between a wrap and the next
+    /// directory LIST.
+    dir_cycle_started_unix_ns: Option<i64>,
 }
 
 impl SweepCursor {
@@ -372,6 +387,9 @@ impl Coordinator {
             }
             pass.lists_left -= 1;
             pass.report.dir_list_pages += 1;
+            if cursor.dir.is_none() {
+                cursor.dir_cycle_started_unix_ns.get_or_insert(pass.now);
+            }
             let page = self.store.list_dir_after(cursor.dir.as_deref()).await?;
             pass.listed
                 .extend(page.items.iter().map(|entry| entry.agent));
@@ -386,6 +404,7 @@ impl Coordinator {
             }
             if !page.more {
                 cursor.dir = None;
+                self.complete_directory_cycle(cursor);
                 return Ok(());
             }
             match page.last_key {
@@ -393,6 +412,18 @@ impl Coordinator {
                 None => return Ok(()),
             }
         }
+    }
+
+    /// The directory cursor wrapped: every agent's HEAD was read once since
+    /// the cycle began. Count the cycle, time it on the injected clock, and
+    /// forget which agents' entries were known, so an entry that vanished
+    /// since is written back the next time a hint reaches its agent.
+    fn complete_directory_cycle(&self, cursor: &mut SweepCursor) {
+        let now = self.now();
+        let started = cursor.dir_cycle_started_unix_ns.take().unwrap_or(now);
+        let elapsed_ms = now.saturating_sub(started).max(0) / 1_000_000;
+        self.record_directory_cycle(u64::try_from(elapsed_ms).unwrap_or(0));
+        cursor.dir_known.clear();
     }
 
     /// Restore the `_dir` entry of every agent the wake half reached whose

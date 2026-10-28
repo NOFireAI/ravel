@@ -385,6 +385,13 @@ until the index is full, then gives its slot to a new effect; an effect
 still in doubt keeps its slot
 (`runtime::tests::a_full_index_gives_only_a_settled_effects_slot_away`,
 `settled_effects_give_their_evidence_slot_to_an_effect_in_doubt`).
+A late result the index cannot list, because every slot holds an effect
+still in doubt or its effect already lists 16 late results, is still
+stored but not listed. Each one counts on
+`ravel_agents_evidence_dropped_total`, and the process logs a warning
+naming the tenant, the effect and the cap at most once a minute per tenant
+(`a_late_result_the_full_evidence_index_drops_is_counted`,
+`runtime::tests::every_late_result_the_index_cannot_list_is_counted`).
 
 Timers. `timers` (`TimerRequest`) arms the agent's timer `timer_key` at
 `due_unix_ns` and answers its id and generation (`TimerResponse`);
@@ -489,7 +496,13 @@ the agent within `ceil(agents / directory GETs per pass)` passes (at
 least 32 directory GETs per pass by default, half of the pass's 64 HEAD
 reads plus whatever the wake half left;
 `a_bounded_pass_walks_the_directory_in_list_order_across_passes`), one pass
-per sweep interval.
+per sweep interval. One directory cycle reads every agent's HEAD once, so
+this bound is observable on `/metrics`:
+`ravel_agents_sweep_directory_cycles_total` counts the cycles the passes
+completed, and `ravel_agents_sweep_last_directory_cycle_ms` is how long the
+last full cycle took on the coordinator's clock, the largest over the
+tenants this process sweeps
+(`tests::a_directory_cycle_is_counted_and_timed_when_the_cursor_wraps`).
 The owner lease hint in HEAD is advisory and revokes nothing; only an epoch
 advance does (ADR-3331 decision 6).
 

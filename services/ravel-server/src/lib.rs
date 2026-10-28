@@ -2427,6 +2427,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     )?;
     validate_min_flush_bytes(config.min_flush_bytes)?;
     validate_loop_intervals(&config)?;
+    config.query_budgets.agents.check()?;
 
     // Install the rustls process-level crypto provider before any TLS endpoint
     // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
@@ -6032,6 +6033,36 @@ mod loop_interval_startup_tests {
                 faults.counters_snapshot()
             );
         }
+    }
+
+    /// `start` runs [`crate::config::AgentsConfig::check`]: an agents evidence index
+    /// with no slot refuses startup with the typed error.
+    #[tokio::test]
+    async fn start_refuses_a_zero_agents_evidence_index() {
+        let mut config = startup_test_support::server_config(Mode::Query);
+        config.query_budgets.agents.max_evidence_effects = 0;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let result = start(
+            config,
+            store.clone(),
+            store,
+            Arc::new(StoreMetrics::default()),
+            None,
+        )
+        .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(running) => {
+                running.shutdown().await.expect("server shuts down");
+                panic!("a zero evidence index must refuse startup");
+            }
+        };
+        assert_eq!(
+            err.downcast_ref::<crate::config::AgentsConfigError>(),
+            Some(&crate::config::AgentsConfigError::ZeroMaxEvidenceEffects),
+            "{err:#}"
+        );
     }
 
     /// A fold, maintain or alert-evaluation loop that is DISABLED but carries

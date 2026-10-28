@@ -61,13 +61,16 @@ pub(crate) struct Metrics {
     pub(crate) sweep_hints_deleted: AtomicU64,
     pub(crate) sweep_agents_loaded: AtomicU64,
     pub(crate) sweep_dir_entries_repaired: AtomicU64,
+    pub(crate) sweep_directory_cycles: AtomicU64,
+    pub(crate) sweep_last_directory_cycle_ms: AtomicU64,
 }
 
 /// The timer and sweep counters, summed over every pass since the
 /// coordinator started: the [`crate::SweepReport`] fields plus the pass
-/// count. `ravel-server` renders them on `/metrics`, the LISTs under a
-/// `phase` label of `wake` or `dir`. Kept apart from
-/// [`AgentsMetricsSnapshot`], which `ravel-server` builds field by field.
+/// count and the directory cycles. `ravel-server` renders them on
+/// `/metrics`, the LISTs under a `phase` label of `wake` or `dir`. Kept
+/// apart from [`AgentsMetricsSnapshot`], which `ravel-server` builds field
+/// by field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepMetricsSnapshot {
     /// Passes run, from polls and from `sweep_once`, including failed ones.
@@ -88,6 +91,14 @@ pub struct SweepMetricsSnapshot {
     pub agents_loaded: u64,
     /// Missing `_dir` entries a pass wrote back.
     pub dir_entries_repaired: u64,
+    /// Directory cycles completed: the directory half walked `_dir/` from
+    /// its first entry to the end of the listing, reading every agent's
+    /// HEAD once, over one pass or several.
+    pub directory_cycles: u64,
+    /// Milliseconds the last completed directory cycle took on the
+    /// coordinator's clock, from the start of the pass that began it to the
+    /// end of the listing; 0 before the first.
+    pub last_directory_cycle_ms: u64,
 }
 
 impl Coordinator {
@@ -104,7 +115,16 @@ impl Coordinator {
             timers_fired: m.timers_fired.load(Ordering::Relaxed),
             agents_loaded: m.sweep_agents_loaded.load(Ordering::Relaxed),
             dir_entries_repaired: m.sweep_dir_entries_repaired.load(Ordering::Relaxed),
+            directory_cycles: m.sweep_directory_cycles.load(Ordering::Relaxed),
+            last_directory_cycle_ms: m.sweep_last_directory_cycle_ms.load(Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn record_directory_cycle(&self, duration_ms: u64) {
+        let m = &self.metrics;
+        m.sweep_last_directory_cycle_ms
+            .store(duration_ms, Ordering::Relaxed);
+        m.sweep_directory_cycles.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_sweep(&self, report: &crate::SweepReport) {
