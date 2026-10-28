@@ -96,19 +96,54 @@ Worker and steps (`src/worker/`):
   the tool again, and the turn commits once. Test: `replay after
   crashWorker with two completed steps replays both without calling run
   and commits once` (`replay.test.ts`).
-- A step key reused with a different tool, version or input hash fails
-  `NonDeterministicReplay` and blocks the operation; nothing commits. Test:
-  `reused step key with a different input hash fails
-  NonDeterministicReplay` (`replay.test.ts`).
+- The runner decides from the journal's current record, not from the
+  transcript the lease carried: a step the lease saw as started but whose
+  result landed since then replays that result. Test: `P1 a manual tool
+  completed by a dead worker after takeover is not run again`
+  (`review.test.ts`).
+- A tool's result or failure that arrives after another attempt settled
+  the step is kept as evidence only, and the step returns the journal's
+  result. Test: `a late tool result is kept as evidence and the step
+  returns the journal's result`.
+- A tool that throws is journaled as the step's failure before the turn
+  commits as failed, and a retried turn gets that failure back as
+  `StepFailed` instead of running the tool again. Test: `P11 a tool failure
+  is journaled as the step's result before the failed commit, and
+  replayed` (`review.test.ts`).
+- An error a tool throws, typed or not, reaches the handler and does not
+  block the operation; only the runner's own `NonDeterministicReplay` and
+  `EffectInDoubt`, and a coordinator refusal, block it. Test: `P9 a tool
+  that throws a typed RavelAgentsError does not wedge the operation`
+  (`review.test.ts`).
+- A step key reused with a different tool name, tool version or input hash
+  fails `NonDeterministicReplay` and blocks the operation; nothing commits.
+  Tests: `reused step key with a different input hash fails
+  NonDeterministicReplay` (`replay.test.ts`), `P3 a tool version bump under
+  a reused step key fails NonDeterministicReplay` (`review.test.ts`).
+- The input hash covers the input's JSON form (`toJSON` applied, as
+  `JSON.stringify` does), so a different `Date` is a different input. Any
+  value that has no plain JSON form (a `Map`, `Set`, `bigint`, `undefined`,
+  function, non-finite number or class instance) is refused with
+  `InvalidStepInput` before the tool runs. Tests: `P10 a different Date
+  under the same step key is detected` (`review.test.ts`), `canonical JSON
+  refuses %s` (`identity.test.ts`), `a step input that is not plain JSON is
+  refused with InvalidStepInput before its tool runs, and fails terminally
+  uncaught`.
 - One step at a time per turn: a second `ctx.step` while one is in flight
-  rejects with `ConcurrentStepError`. Test: `a second step started while
-  one is in flight is refused with ConcurrentStepError`.
+  rejects with `ConcurrentStepError`, which fails the operation terminally
+  if the handler does not catch it. Tests: `a second step started while one
+  is in flight is refused with ConcurrentStepError`, `an uncaught
+  ConcurrentStepError fails the operation terminally, without retries`.
 - `ctx.now()` and `ctx.random()` are the same on every attempt at one
   input. Test: `recorded time and seeded random are the same on every
   attempt at one input`.
-- A turn whose handler version the worker lacks is abandoned with
-  `IncompatibleHandler`. Test: `a worker without the leased handler
-  version abandons the turn with IncompatibleHandler`.
+- A turn whose handler version or handler digest the worker does not match
+  is abandoned with `IncompatibleHandler`. Tests: `a worker without the
+  leased handler version abandons the turn with IncompatibleHandler`, `a
+  worker whose handler digest differs from the leased one abandons the turn
+  with IncompatibleHandler`.
+
+Unless a test file is named, the tests above are in `steps.test.ts`.
 
 Tools (`src/tools/`) take one of three recovery policies, and any other
 value is a `TypeError` (test: `refuses a recovery policy outside the
@@ -119,7 +154,7 @@ signal (test: `a tool receives the effect id, attempt and signal`).
 |---|---|---|
 | `at_least_once` | Runs again under the same effect id, attempt + 1 | `an at_least_once tool interrupted by a crash runs again under the same effect id` |
 | `provider_idempotency` | Runs again under the same effect id; the provider dedupes on it | `a tool receives the effect id, attempt and signal` (the id it would dedupe on) |
-| `manual` | Does not run again; the operation blocks with `EffectInDoubt` | `a manual tool interrupted by a crash blocks the operation with EffectInDoubt` |
+| `manual` | Does not run again: a result recorded since replays, and an attempt with no result blocks the operation with `EffectInDoubt` | `a manual tool interrupted by a crash blocks the operation with EffectInDoubt`, `P1 a manual tool completed by a dead worker after takeover is not run again` |
 
 Client (`src/client/`):
 
@@ -144,8 +179,13 @@ Client (`src/client/`):
   with OperationFailed`, `cancel is idempotent and a cancelled operation
   rejects result()`.
 - `handle.events()` yields only that operation's events, waits while it
-  runs, ends once it is terminal, and resumes from any event's `cursor`.
-  Tests in `events.test.ts`.
+  runs, ends once it is terminal and the first page past it has been read,
+  and resumes from any event's `cursor`. A cursor names the last delivered
+  event sequence, so resuming with a different page size repeats nothing.
+  Tests in `events.test.ts`, among them `a cursor is the last delivered
+  event seq, so a different page size resumes without duplicates` and `a
+  terminal operation's events end at the first page past it, not at an
+  empty page`.
 
 Wire (`src/wire/`): every golden fixture under `sdk/fixtures/` decodes and
 re-encodes to the same bytes, and every body schema has a fixture
@@ -179,6 +219,22 @@ An unknown code, or a 2xx body that does not match its schema, reads as
 `UnsupportedFormat` (test: `an unknown error code or an off-schema response
 reads as UnsupportedFormat`).
 
+Two more errors are local to the SDK and have no wire code: they are raised
+in the worker and never cross the wire. Both subclass `RavelAgentsError`
+with `retry` `never` (test: `the SDK-local errors are typed and never
+retried`), and an uncaught one fails the operation terminally (the
+`ConcurrentStepError` and `InvalidStepInput` tests in `steps.test.ts`).
+
+| Class | Raised when |
+|---|---|
+| `ConcurrentStepError` | A handler starts a step while another is in flight |
+| `InvalidStepInput` | A step input has no plain JSON form |
+
+A handler that catches a failed step's error sees `StepFailed`, on the run
+that recorded the failure and on every retry that replays it; it carries
+the step key and the recorded error text (test: `P11 a tool failure is
+journaled as the step's result before the failed commit, and replayed`).
+
 ## The test harness is not durable
 
 `createTestHarness` runs a fake coordinator in process memory. It models the
@@ -187,9 +243,13 @@ blocked operations), not its storage: every agent, operation, step and
 event is lost on `close()` or when the process exits. `crashWorker()`
 revokes the worker's leases and starts a fresh worker against the same
 fake; it simulates a worker crash, not a coordinator or store crash.
-`advanceTime(ms)` is the only thing that moves the fake's clock; the fake
-reads no wall-clock time (`delayNext` holds a response back with a timer
-but changes no state). A test that passes against the harness says the
+`advanceTime(ms)` is the only thing that moves the fake's clock. The fake
+reads wall-clock time only to bound the long-poll waits in `poll` and
+`waitTerminal`, and `delayNext` holds a response back with a timer; none of
+these changes state. The fake refuses a failed commit while a step's
+attempt is authorized without a result, as the kernel does (test: `P11 the
+fake refuses FailTurn while a step's attempt is authorized without a
+result`, `review.test.ts`). A test that passes against the harness says the
 handler behaves under replay; it says nothing about what Ravel persists.
 
 ## Wire gaps
@@ -198,14 +258,20 @@ The wire contract this package was written against has gaps, filled
 provisionally on the SDK side:
 
 - No route records a step, so `Transport.recordStep` has no HTTP mapping.
+  Its answer carries a `failure` field, and `Transport.failEffect` records
+  a tool's failure; both are SDK-local shapes. The wire `StepState` has
+  only `started` and `completed`, so a failed step reads as `started` on
+  the wire.
 - No recorded turn time or random seed travels on the wire. `ctx.now()`
   reads the poll's `startedUnixNs`, local to the SDK, and `ctx.random()` is
   seeded from the agent id, incarnation and accept sequence.
 - The canonical encoding of step input is unspecified; the SDK hashes
-  sorted-key JSON.
+  sorted-key JSON of the input's JSON form and refuses anything that is not
+  plain JSON.
 - u64 counters are numbers capped at `Number.MAX_SAFE_INTEGER` and refused
   past it (test: `a u64 counter past the safe-integer range is refused,
-  not rounded`).
+  not rounded`). Nanosecond timestamps are strings refused outside the i64
+  range (test: `a timestamp outside i64 is refused on decode and encode`).
 
 ## Checks
 

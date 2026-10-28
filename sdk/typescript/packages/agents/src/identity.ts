@@ -5,6 +5,7 @@
  * a server would. `identity.test.ts` pins each against a value the Rust side
  * wrote into `sdk/fixtures/`.
  */
+import { InvalidStepInput } from "./errors.js";
 
 const IV = new Uint32Array([
   0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -225,23 +226,66 @@ export function requestHash(handler: string, payload: Uint8Array): string {
   return toHex(derive("request", [handler, payload]));
 }
 
+function notJson(path: string, what: string): InvalidStepInput {
+  return new InvalidStepInput(`${path} is ${what}, not plain JSON`);
+}
+
+function canonical(value: unknown, path: string): string {
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return JSON.stringify(value);
+    case "number":
+      if (!Number.isFinite(value)) throw notJson(path, String(value));
+      return JSON.stringify(value);
+    case "object":
+      break;
+    default:
+      throw notJson(path, `a ${typeof value}`);
+  }
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((v: unknown, i) => canonical(v, `${path}[${String(i)}]`)).join(",")}]`;
+  }
+  const proto: unknown = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    const name = (value as { constructor?: { name?: unknown } }).constructor?.name;
+    throw notJson(path, `a ${typeof name === "string" ? name : "class instance"}`);
+  }
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v, `${path}.${k}`)}`).join(",")}}`;
+}
+
 /**
  * JSON with object keys sorted at every depth: the bytes the SDK hashes a
  * step input over, so two equal inputs hash equal whatever their key order.
+ * A value `JSON.stringify` would encode lossily or not at all (a `Date`,
+ * `Map`, `Set`, `bigint`, function, non-finite number, `undefined`, or any
+ * other class instance) is refused with `InvalidStepInput`, so two different
+ * inputs cannot hash equal by both encoding as `{}`.
  */
 export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    const text = JSON.stringify(value) as string | undefined;
-    if (text === undefined) throw new TypeError(`not a JSON value: ${typeof value}`);
-    return text;
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+  return canonical(value, "value");
 }
 
 export function canonicalBytes(value: unknown): Uint8Array {
   return encoder.encode(canonicalJson(value));
+}
+
+/**
+ * The JSON form of a schema's output, as `JSON.stringify` would produce it:
+ * every `toJSON` method applied (a `Date` becomes its ISO string). Anything
+ * else is left in place for {@link canonicalJson} to accept or refuse.
+ */
+export function jsonForm(value: unknown, key = ""): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  const toJSON = (value as { toJSON?: unknown }).toJSON;
+  if (typeof toJSON === "function") return jsonForm((toJSON as (key: string) => unknown).call(value, key), key);
+  if (Array.isArray(value)) return value.map((v: unknown, i) => jsonForm(v, String(i)));
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, jsonForm(v, k)]),
+  );
 }

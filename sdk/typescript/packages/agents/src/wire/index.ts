@@ -3,15 +3,24 @@
  * `crates/ravel-agents-core/src/wire.rs`. Field names and order follow the
  * Rust structs, so `encodeWire` reproduces a fixture byte for byte
  * (`wire.test.ts`). Every `*_unix_ns` field is a canonical decimal string on
- * the wire and a `bigint` in TypeScript; u64 counters are numbers refused
+ * the wire and a `bigint` in TypeScript, refused outside i64; u64 counters are numbers refused
  * past `Number.MAX_SAFE_INTEGER` rather than rounded.
  */
 import { z } from "zod";
 
-const UnixNs = z.codec(z.string().regex(/^(0|-?[1-9][0-9]*)$/), z.bigint(), {
-  decode: (text) => BigInt(text),
-  encode: (value) => value.toString(),
-});
+const I64_MIN = -(2n ** 63n);
+const I64_MAX = 2n ** 63n - 1n;
+const UnixNs = z.codec(
+  z
+    .string()
+    .regex(/^(0|-?[1-9][0-9]*)$/, { abort: true })
+    .refine((text) => BigInt(text) >= I64_MIN && BigInt(text) <= I64_MAX, "outside i64"),
+  z.bigint().min(I64_MIN).max(I64_MAX),
+  {
+    decode: (text) => BigInt(text),
+    encode: (value) => value.toString(),
+  },
+);
 const U64 = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const U32 = z.number().int().min(0).max(0xffffffff);
 const Json = z.json();

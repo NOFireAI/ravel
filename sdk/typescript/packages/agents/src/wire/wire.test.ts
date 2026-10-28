@@ -59,6 +59,21 @@ describe("wire fixtures", () => {
     expect(() => wire.decodeWire(wire.ResultResponse, body)).toThrow(z.ZodError);
   });
 
+  it("a timestamp outside i64 is refused on decode and encode", () => {
+    const body = JSON.parse(read("result_response")) as { result: Record<string, unknown> };
+    body.result.finished_unix_ns = "9223372036854775807";
+    expect(wire.decodeWire(wire.ResultResponse, body).result?.finished_unix_ns).toBe(2n ** 63n - 1n);
+    body.result.finished_unix_ns = "-9223372036854775808";
+    expect(wire.decodeWire(wire.ResultResponse, body).result?.finished_unix_ns).toBe(-(2n ** 63n));
+    body.result.finished_unix_ns = "9223372036854775808";
+    expect(() => wire.decodeWire(wire.ResultResponse, body)).toThrow(z.ZodError);
+    body.result.finished_unix_ns = "-9223372036854775809";
+    expect(() => wire.decodeWire(wire.ResultResponse, body)).toThrow(z.ZodError);
+    const decoded = wire.decodeWire(wire.ResultResponse, JSON.parse(read("result_response")));
+    const result = decoded.result === null ? null : { ...decoded.result, finished_unix_ns: 2n ** 63n };
+    expect(() => wire.encodeWire(wire.ResultResponse, { ...decoded, result })).toThrow(z.ZodError);
+  });
+
   it("a u64 counter past the safe-integer range is refused, not rounded", () => {
     const body = JSON.parse(read("send_response")) as Record<string, unknown>;
     body.accept_seq = 2 ** 53;

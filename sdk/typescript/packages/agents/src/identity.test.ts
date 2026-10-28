@@ -2,7 +2,18 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { agentId, blake3, canonicalJson, effectId, stepId, stepInputHash, toHex, turnId } from "./identity.js";
+import { InvalidStepInput } from "./errors.js";
+import {
+  agentId,
+  blake3,
+  canonicalJson,
+  effectId,
+  jsonForm,
+  stepId,
+  stepInputHash,
+  toHex,
+  turnId,
+} from "./identity.js";
 
 const fixtures = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../fixtures");
 
@@ -66,5 +77,29 @@ describe("identity", () => {
 
   it("canonical JSON sorts keys at every depth", () => {
     expect(canonicalJson({ b: [{ d: 1, c: 2 }], a: null })).toBe('{"a":null,"b":[{"c":2,"d":1}]}');
+  });
+
+  it("canonical JSON refuses a Date with InvalidStepInput", () => {
+    expect(() => canonicalJson({ at: new Date(0) })).toThrow(InvalidStepInput);
+    expect(() => canonicalJson({ at: new Date(0) })).toThrow("value.at is a Date, not plain JSON");
+  });
+
+  it.each([
+    ["a Map", { m: new Map() }],
+    ["a Set", [new Set()]],
+    ["a bigint", { n: 1n }],
+    ["undefined inside an object", { u: undefined }],
+    ["a function", { f: () => 1 }],
+    ["a non-finite number", { n: Number.NaN }],
+    ["a class instance", { c: new (class Point { readonly x = 1; })() }],
+  ])("canonical JSON refuses %s", (_what, value) => {
+    expect(() => canonicalJson(value)).toThrow(InvalidStepInput);
+  });
+
+  it("the JSON form applies toJSON as JSON.stringify does", () => {
+    const at = new Date(Date.UTC(2026, 0, 1));
+    expect(canonicalJson(jsonForm({ at, list: [at] }))).toBe(
+      '{"at":"2026-01-01T00:00:00.000Z","list":["2026-01-01T00:00:00.000Z"]}',
+    );
   });
 });

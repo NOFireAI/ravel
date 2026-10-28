@@ -53,7 +53,13 @@ import {
   type WorkerPollRequest,
 } from "../wire/index.js";
 import { serveAgents, type TurnReport, type WorkerHandle } from "../worker/index.js";
-import type { PolledTurn, StepRecordRequest, StepRecordResponse, Transport } from "../worker/transport.js";
+import type {
+  EffectFailRequest,
+  PolledTurn,
+  StepRecordRequest,
+  StepRecordResponse,
+  Transport,
+} from "../worker/transport.js";
 
 type Json = z.output<typeof SendRequest>["payload"];
 
@@ -106,6 +112,21 @@ interface StepRecord {
   attempt: number;
   effectState: EffectState;
   output: Json | null;
+  /** The tool failure recorded as the attempt's result. */
+  failure: string | null;
+}
+
+/** A journaled step as the fake holds it. `failed` and `error` have no wire form yet. */
+export interface JournaledStep extends Omit<StepBody, "status"> {
+  readonly status: StepBody["status"] | "failed";
+  readonly error: string | null;
+}
+
+/** An attempt's result that arrived after the journal settled the step. */
+export interface LateResult {
+  readonly effect: string;
+  readonly attempt: number;
+  readonly result: { readonly output: Json } | { readonly error: string };
 }
 
 interface OperationRecord {
@@ -161,6 +182,8 @@ export class FakeCoordinator implements Transport {
   readonly received: ReceivedRequest[] = [];
   /** Every commit the fake accepted. */
   readonly commits: WorkerCommitRequest[] = [];
+  /** Every late effect result, kept as evidence; none changed a journal entry. */
+  readonly evidence: LateResult[] = [];
 
   private readonly definitions: ReadonlyMap<string, AnyAgentDefinition>;
   private readonly maxAttempts: number;
@@ -213,9 +236,15 @@ export class FakeCoordinator implements Transport {
   }
 
   /** The operation's journaled steps, for assertions. */
-  steps(operation: string): StepBody[] {
+  steps(operation: string): JournaledStep[] {
     const op = this.operations.get(operation);
-    return op === undefined ? [] : [...op.steps.values()].map((s) => this.stepBody(s));
+    return op === undefined
+      ? []
+      : [...op.steps.values()].map((s) => ({
+          ...this.stepBody(s),
+          ...(s.failure === null ? {} : { status: "failed" as const }),
+          error: s.failure,
+        }));
   }
 
   close(): void {
@@ -277,6 +306,7 @@ export class FakeCoordinator implements Transport {
     return agent;
   }
 
+  /** The wire form: a failed step reads `started`, since `StepState` has no failed state. */
   private stepBody(s: StepRecord): StepBody {
     return {
       step_id: s.stepId,
@@ -284,9 +314,13 @@ export class FakeCoordinator implements Transport {
       tool_name: s.toolName,
       tool_version: s.toolVersion,
       input_hash: s.inputHash,
-      status: s.effectState === "completed" ? "completed" : "started",
+      status: s.effectState === "completed" && s.failure === null ? "completed" : "started",
       output: s.output,
     };
+  }
+
+  private stepRecord(s: StepRecord): StepRecordResponse {
+    return { step: this.stepBody(s), effect: s.effect, attempt: s.attempt, failure: s.failure };
   }
 
   private finish(op: OperationRecord, result: Omit<ResultBody, "finished_unix_ns">): void {
@@ -400,7 +434,7 @@ export class FakeCoordinator implements Transport {
         existing.attempt += 1;
         existing.effectState = "authorized";
       }
-      return Promise.resolve({ step: this.stepBody(existing), effect: existing.effect, attempt: existing.attempt });
+      return Promise.resolve(this.stepRecord(existing));
     }
     const inc = op.agent.incarnation;
     const step: StepRecord = {
@@ -414,24 +448,41 @@ export class FakeCoordinator implements Transport {
       attempt: 1,
       effectState: "authorized",
       output: null,
+      failure: null,
     };
     op.steps.set(step.stepKey, step);
     this.effects.set(step.effect, { operation: op, step });
-    return Promise.resolve({ step: this.stepBody(step), effect: step.effect, attempt: 1 });
+    return Promise.resolve(this.stepRecord(step));
   }
 
-  completeEffect(request: EffectCompleteRequest): Promise<EffectCompleteResponse> {
+  /**
+   * Record an attempt's result. Not fenced: a worker that lost its lease may
+   * still report what its tool did. A result for a settled step or a
+   * superseded attempt is late and goes to {@link evidence}.
+   */
+  private settle(request: LateResult): Promise<EffectCompleteResponse> {
     const found = this.effects.get(request.effect);
     if (found === undefined) {
       return Promise.reject(new UnsupportedFormat(`unknown effect ${request.effect}`));
     }
     const { step } = found;
     const late = step.effectState === "completed" || request.attempt !== step.attempt;
-    if (!late) {
+    if (late) {
+      this.evidence.push(structuredClone(request));
+    } else {
       step.effectState = "completed";
-      step.output = request.result;
+      if ("output" in request.result) step.output = request.result.output;
+      else step.failure = request.result.error;
     }
     return Promise.resolve({ effect: step.effect, status: step.effectState, late });
+  }
+
+  completeEffect(request: EffectCompleteRequest): Promise<EffectCompleteResponse> {
+    return this.settle({ effect: request.effect, attempt: request.attempt, result: { output: request.result } });
+  }
+
+  failEffect(request: EffectFailRequest): Promise<EffectCompleteResponse> {
+    return this.settle({ effect: request.effect, attempt: request.attempt, result: { error: request.error } });
   }
 
   commit(request: WorkerCommitRequest): Promise<WorkerCommitResponse> {
@@ -440,6 +491,26 @@ export class FakeCoordinator implements Transport {
       op = this.fenced(request.lease);
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    if (request.outcome === "failed") {
+      // The kernel refuses FailTurn while an authorized attempt has no result.
+      const pending = [...op.steps.values()].find((s) => s.effectState === "authorized");
+      if (pending !== undefined) {
+        return Promise.reject(
+          new EffectInDoubt(
+            `NoAuthorizedAttemptPending: an authorized attempt has no result (effect ${pending.effect})`,
+            {
+              ids: {
+                agentId: op.agent.agentId,
+                operationId: op.id,
+                turnId: request.lease.turn_id,
+                stepKey: pending.stepKey,
+                effectId: pending.effect,
+              },
+            },
+          ),
+        );
+      }
     }
     const agent = op.agent;
     agent.leased = undefined;
