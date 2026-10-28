@@ -186,9 +186,15 @@ jobs:
           # agents_area (ADR-3331 decision 14): the agents crates, the server's
           # agents module and seam test, the server manifest that declares the
           # `agents` feature, the two scripts that define the lane, and this
-          # workflow. Not an area_paths entry below: it narrows only
-          # features-agents and leaves the catch-all's view of the Rust lanes
-          # unchanged.
+          # workflow. Only ^crates/ravel-agents- is also an area_paths entry
+          # below, so a change confined to the agents crates runs
+          # features-agents, the docs_only jobs and, when formal_area says so,
+          # the tla lane, and not sql, flight-sql, object-store-contract,
+          # bench-smoke or promql-difftest: those lanes do not build the
+          # agents crates (ravel-server links them only under `agents`). The
+          # other paths here set server_or_operator, take the workspace-level
+          # branch, or are the catch-all on purpose (a gate script change must
+          # run everything).
           if echo "$changed" | grep -qE '^crates/ravel-agents-|^services/ravel-server/src/agents/|^services/ravel-server/tests/agents_seam\.rs$|^services/ravel-server/Cargo\.toml$|^scripts/gates\.sh$|^scripts/affected-tests\.sh$|^\.github/workflows/ci\.yml$'; then
             agents_area=true
           fi
@@ -208,12 +214,16 @@ jobs:
           # which sets sql_area true) and an unlisted one (e.g. ravel-types)
           # in the same diff must still force every area true for the
           # unlisted crate's sake, even though sql_area is already true.
-          area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'
+          area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^crates/ravel-agents-'
           # Provably irrelevant to every Rust lane: prose, the TLA+ models, and
           # the TLA+ harness (all three already handled above, and listed again
           # here so this test can be read on its own).
-          # The TypeScript SDK tree and its runner reach no Rust lane (the sdk
-          # job covers them); sdk/fixtures stays out of this list because the
+          # The TypeScript SDK tree and its runner reach no area-gated Rust
+          # lane (the sdk job covers them): listing them here only stops the
+          # catch-all from forcing the four area flags. The jobs gated on
+          # docs_only alone (lint, check-shard, features-lane, features-otap,
+          # all-features, supply-chain, fuzz, docker-build) still run on such
+          # a change. sdk/fixtures stays out of this list because the
           # ravel-agents-core fixture test reads it.
           known_irrelevant='\.(md|svg)$|^formal/|^scripts/check-tla\.sh$|^sdk/typescript/|^scripts/gates-sdk\.sh$'
           # Any changed path that is neither in a named area list nor provably
@@ -1511,8 +1521,8 @@ jobs:
   # ravel-server's `agents` feature (ADR-3331 decision 14), the same shape as
   # `features-otap`: its own job-scoped rust-cache key and the disk steps.
   # Mirrors scripts/gates.sh's agents lane: `cargo clippy -p ravel-server
-  # --features agents --all-targets`, the server tests whose path contains
-  # `agents` (`cargo test ... --features agents agents`), and ravel-catalog's
+  # --features agents --all-targets`, the agents_seam test binary and the lib
+  # tests whose path contains `agents`, and ravel-catalog's
   # sys_proto_format_version_classification test, which covers
   # proto/ravel/agents.proto (ADR-3331 decision 3). Gated on agents_area.
   #
@@ -1553,12 +1563,16 @@ jobs:
           key: ci-profile
       - name: Clippy ravel-server --features agents
         run: cargo clippy --locked --profile ci -p ravel-server --features agents --all-targets -- -D warnings
-        # Filtered by name, not the whole test set: `tests/cli_reference.rs`
-        # pins the flag page of a build with NO optional features, and
-        # `--features agents` adds flags, so that test fails by construction.
-        # `--all-targets` on the clippy step above still compiles it.
-      - name: Test ravel-server --features agents (tests named agents)
-        run: cargo test --locked --profile ci -p ravel-server --features agents agents
+        # Selected by binary, not by a test-name filter, which matches the test
+        # path and never the binary, so a seam test whose name omits `agents`
+        # would run nowhere. Not the whole crate either: `tests/cli_reference.rs`
+        # asserts the flag page of a build with the flags it has, and
+        # `--features agents` adds flags. `--all-targets` on the clippy step
+        # above still compiles every target.
+      - name: Test ravel-server --features agents (agents_seam binary)
+        run: cargo test --locked --profile ci -p ravel-server --features agents --test agents_seam
+      - name: Test ravel-server --features agents (lib tests named agents)
+        run: cargo test --locked --profile ci -p ravel-server --features agents --lib agents
       - name: Test the sys proto format_version classification
         run: cargo test --locked --profile ci -p ravel-catalog --test sys_proto_format_version_classification
       - name: Report the lowest free space the job reached
@@ -1569,8 +1583,8 @@ jobs:
 
   # ravel-server's `mcp` feature (ADR-1374), the same shape as
   # `features-agents` above. Mirrors scripts/gates.sh's mcp lane: `cargo
-  # clippy -p ravel-server --features mcp --all-targets` and the server tests
-  # whose path contains `mcp` (`cargo test ... --features mcp mcp`). Gated on
+  # clippy -p ravel-server --features mcp --all-targets`, the mcp_e2e and
+  # trace_by_id test binaries, and the lib tests whose path contains `mcp`. Gated on
   # server_or_operator, since the feature lives entirely in ravel-server and
   # ravel-mcp, and any unlisted path forces server_or_operator true.
   #
@@ -1603,10 +1617,13 @@ jobs:
           key: ci-profile
       - name: Clippy ravel-server --features mcp
         run: cargo clippy --locked --profile ci -p ravel-server --features mcp --all-targets -- -D warnings
-        # Filtered by name for the cli_reference reason given in
-        # `features-agents` above.
-      - name: Test ravel-server --features mcp (tests named mcp)
-        run: cargo test --locked --profile ci -p ravel-server --features mcp mcp
+        # Selected by binary for the reasons given in `features-agents` above:
+        # mcp_e2e and trace_by_id (whose `with_mcp` module compiles only under
+        # the feature) whole, and the lib tests whose path contains `mcp`.
+      - name: Test ravel-server --features mcp (mcp_e2e and trace_by_id binaries)
+        run: cargo test --locked --profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
+      - name: Test ravel-server --features mcp (lib tests named mcp)
+        run: cargo test --locked --profile ci -p ravel-server --features mcp --lib mcp
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
