@@ -43,16 +43,17 @@
 (*   - Enqueue, timers, tombstone and recreate are AgentProtocol's; the   *)
 (*     single input is accepted before the first state.                   *)
 (*                                                                         *)
-(* Runner rules this module states and the kernel does not enforce (see   *)
-(* the README, "Differences from the kernel"):                            *)
-(*   - An owner that reads a cancel request on its turn authorizes no     *)
-(*     further attempt and commits the turn. `Kernel::authorize_attempt`  *)
-(*     does not read the request; the negative                            *)
-(*     authorize-ignores-cancel-request shows the property that rests     *)
-(*     on the runner.                                                     *)
+(* An owner that reads a cancel request on its turn authorizes no further *)
+(* attempt: `Kernel::authorize_attempt` refuses an owner authorization    *)
+(* while cancellation is requested, and the negative                      *)
+(* authorize-ignores-cancel-request shows the property that rests on it.  *)
+(* Rules this module states that HEAD does not carry (see the README,     *)
+(* "Differences from the kernel"):                                        *)
 (*   - An owner leaves alone a manual attempt whose reconcile audit       *)
 (*     object exists: that attempt is the reconciler's to dispatch. The   *)
-(*     root carries no field that says so; the audit object does.        *)
+(*     runtime keeps that only in memory (its open attempts); the root    *)
+(*     carries no field that says so, and the model reads the audit       *)
+(*     object.                                                            *)
 (*                                                                         *)
 (* Witnesses: `lastCas` holds the HEAD before and after the HEAD write the *)
 (* step made (NoCas otherwise), derived in Next from store and store'.    *)
@@ -83,8 +84,10 @@ ASSUME MaxEpoch \in Nat /\ MaxTurns \in Nat \ {0} /\ MaxAttempt \in Nat \ {0}
 
 Actors == Workers \cup {Admin}
 
-\* Each attempt is dispatched once by a correct runner; the bound only stops
-\* a broken one from dispatching forever.
+\* Each attempt is dispatched once by a correct runner, except that under
+\* provider_idempotency attempt 1 is dispatched again, at most MaxAttempt
+\* times in all; the bound only stops a broken runner from dispatching
+\* forever.
 MaxCalls == 2 * MaxAttempt
 
 HeadKey == <<"head">>
@@ -210,6 +213,17 @@ BlockHead(h) == [h EXCEPT !.rev = @ + 1, !.active.block = TRUE]
 RecordResultHead(h, att, val) ==
     [h EXCEPT !.rev = @ + 1, !.eff.st = "completed", !.eff.ratt = att, !.eff.rval = val]
 
+\* The input ended cancelled. Its effect's results are evidence from then on.
+InputCancelled(h) == \E r \in h.results : r.kind = "cancelled"
+
+\* Only the journaled attempt's result settles an unsettled effect of an input
+\* that did not end cancelled. Anything else is LateResultIgnored: the caller
+\* keeps it as evidence and HEAD does not change.
+ResultAdmitted(h, att) ==
+    /\ h.eff.st \in {"authorized", "indoubt"}
+    /\ att = h.eff.att
+    /\ ~InputCancelled(h)
+
 \* The owner may act on its turn only while the turn is unblocked and
 \* uncancelled.
 Running(h) == h.active.turn # 0 /\ ~h.active.block /\ ~h.active.creq
@@ -217,6 +231,10 @@ Running(h) == h.active.turn # 0 /\ ~h.active.block /\ ~h.active.creq
 \* A manual attempt authorized by reconciliation belongs to the reconciler.
 ReconcilerOwns(h) ==
     h.eff.pol = "manual" /\ h.eff.st = "authorized" /\ AuditUp("attempt", h.eff.att)
+
+\* Reconciliation acts only on an effect in doubt: the runtime's
+\* reconcile_attach and reconcile_authorize refuse any other state.
+Reconcilable(h) == h.eff.pol = "manual" /\ h.eff.st = "indoubt"
 
 \* --- Initial state --------------------------------------------------------
 
@@ -246,7 +264,7 @@ Read(a) ==
     /\ RootUp
     /\ \/ ac[a].pc = "idle"
        \/ ac[a].pc = "ready" /\ ac[a].ver # Ver
-    /\ a = Admin => (ac[a].held = "result" \/ Root.eff.st = "indoubt" \/ ReconcilerOwns(Root))
+    /\ a = Admin => (ac[a].held = "result" \/ Reconcilable(Root))
     /\ SetAc(a, [ac[a] EXCEPT
                    !.pc = "ready", !.ver = Ver, !.obs = Root,
                    !.held = IF @ = "authz"
@@ -341,34 +359,47 @@ AuthorizeFirst(w) ==
                [ActorIdle EXCEPT !.pc = "exec", !.att = 1])
     /\ UNCHANGED <<calls, crashed, cl, pol>>
 
+\* Dispatches made so far count against the attempt bound under
+\* provider_idempotency, where every dispatch carries the same attempt.
+DispatchBudgetLeft(h) ==
+    IF h.eff.pol = "provider_idempotency" THEN Len(calls) < MaxAttempt
+    ELSE h.eff.att < MaxAttempt
+
 \* An attempt is ambiguous when the owner reads it authorized without a
 \* result and does not hold it from its own lost response: it may have been
 \* dispatched. Only the policy decides what happens next. Under manual the
 \* owner's next authorization publishes InDoubt (Blocked) and nothing is
-\* dispatched; otherwise it authorizes attempt + 1 and dispatches that.
+\* dispatched; under provider_idempotency the owner dispatches the same
+\* effect id and attempt again with no write; under at_least_once it
+\* authorizes attempt + 1 and dispatches that.
 Reauthorize(w) ==
     /\ Ready(w)
     /\ Own(w)
     /\ Running(O(w))
     /\ O(w).eff.st = "authorized"
     /\ ~ReconcilerOwns(O(w))
-    /\ O(w).eff.att < MaxAttempt
+    /\ DispatchBudgetLeft(O(w))
     /\ LET h == O(w)
-       IN IF h.eff.pol = "manual"
-            THEN CasThen(w, [Bump(h) EXCEPT !.eff.st = "indoubt"], ActorIdle)
-            ELSE CasThen(w, AuthorizeHead(h, h.eff.att + 1),
-                         [ActorIdle EXCEPT !.pc = "exec", !.att = h.eff.att + 1])
+       IN CASE h.eff.pol = "manual" ->
+                 /\ CasThen(w, [Bump(h) EXCEPT !.eff.st = "indoubt"], ActorIdle)
+            [] h.eff.pol = "provider_idempotency" ->
+                 /\ SetAc(w, [ActorIdle EXCEPT !.pc = "exec", !.att = h.eff.att])
+                 /\ UNCHANGED sVars
+            [] OTHER ->
+                 /\ CasThen(w, AuthorizeHead(h, h.eff.att + 1),
+                            [ActorIdle EXCEPT !.pc = "exec", !.att = h.eff.att + 1])
     /\ UNCHANGED <<calls, crashed, cl, pol>>
 
 \* The authorization CAS applied and its response was lost. The owner keeps
 \* the attempt in memory and re-reads; finding it authorized, the retried
-\* command answers AttemptAuthorized and the owner dispatches it.
+\* command answers AttemptAuthorized and the owner dispatches it. Only the
+\* first attempt and an at_least_once retry are authorized by a write.
 AuthorizeLostResponse(w) ==
     /\ Ready(w)
     /\ Own(w)
     /\ Running(O(w))
     /\ \/ O(w).eff.st = "intent"
-       \/ /\ O(w).eff.st = "authorized" /\ O(w).eff.pol # "manual"
+       \/ /\ O(w).eff.st = "authorized" /\ O(w).eff.pol = "at_least_once"
           /\ O(w).eff.att < MaxAttempt
     /\ LET h == O(w)
            n == IF h.eff.st = "intent" THEN 1 ELSE h.eff.att + 1
@@ -460,36 +491,40 @@ Respond(a) ==
     /\ UNCHANGED <<sVars, calls, crashed, cl, pol>>
 
 \* The response is lost: the attempt may or may not have executed, and the
-\* dispatcher forgets it. Below MaxAttempt only, so that the provider
-\* eventually answers (the liveness assumption).
+\* dispatcher forgets it. Only while the attempt bound (DispatchBudgetLeft)
+\* is not spent, so that the provider eventually answers (the liveness
+\* assumption).
 LoseResponse(a) ==
     /\ ac[a].pc = "await"
-    /\ ac[a].att < MaxAttempt
+    /\ IF pol = "provider_idempotency" THEN Len(calls) < MaxAttempt
+       ELSE ac[a].att < MaxAttempt
     /\ SetAc(a, ActorIdle)
     /\ UNCHANGED <<sVars, calls, crashed, cl, pol>>
 
 \* Record a held provider result in the journal (RecordEffectResult; fenced
-\* by incarnation only, so a displaced owner records it too). A completed
-\* effect answers without a write: the same result is idempotent, another
-\* attempt's is LateResultIgnored.
+\* by incarnation only, so a displaced owner records it too). A result the
+\* kernel does not admit answers without a write: on a completed effect the
+\* same result is idempotent and another attempt's is LateResultIgnored, and
+\* an older attempt's result or one for a cancelled input is
+\* LateResultIgnored too, kept as evidence outside HEAD.
 RecordHeldResult(a) ==
     /\ ac[a].pc = "ready"
     /\ Fresh(a)
     /\ ac[a].held = "result"
-    /\ IF O(a).eff.st = "completed"
-         THEN /\ SetAc(a, ActorIdle)
+    /\ IF ResultAdmitted(O(a), ac[a].att)
+         THEN CasThen(a, RecordResultHead(O(a), ac[a].att, ac[a].val), ActorIdle)
+         ELSE /\ SetAc(a, ActorIdle)
               /\ UNCHANGED sVars
-         ELSE CasThen(a, RecordResultHead(O(a), ac[a].att, ac[a].val), ActorIdle)
     /\ UNCHANGED <<calls, crashed, cl, pol>>
 
 \* The result-completion endpoint: an authenticated result for a dispatched
-\* attempt, posted after its dispatcher lost the response or died. It is
-\* recorded even after the turn ended, as evidence.
+\* attempt, posted after its dispatcher lost the response or died. It writes
+\* HEAD only when the kernel admits it; any other result is evidence stored
+\* outside HEAD, which is a stutter here.
 ResultCallback(i) ==
     /\ RootUp
     /\ i \in PhysCalls
-    /\ Root.eff.st \in {"authorized", "indoubt"}
-    /\ calls[i].att =< Root.eff.att
+    /\ ResultAdmitted(Root, calls[i].att)
     /\ Store!PutCasVersion(HeadKey, Ver, RecordResultHead(Root, calls[i].att, i))
     /\ UNCHANGED <<ac, calls, crashed, cl, pol>>
 
@@ -528,8 +563,6 @@ Cancel ==
     /\ UNCHANGED <<ac, calls, crashed, pol>>
 
 \* --- Admin reconciliation -------------------------------------------------
-
-Reconcilable(h) == h.eff.pol = "manual" /\ (h.eff.st = "indoubt" \/ ReconcilerOwns(h))
 
 \* Attach a verified result: the admin looked up what the provider did for
 \* the current attempt. The audit object is written before the CAS.
@@ -640,43 +673,47 @@ DispatchRequiresCommittedAuthorization ==
         /\ Root.eff.st \notin {"none", "intent"}
         /\ calls[i].att =< Root.eff.att
 
-\* Each authorized attempt is dispatched at most once. Under manual, no
-\* attempt after the first is authorized or dispatched without a reconcile
-\* audit object, and no turn result lands while the effect is in doubt.
-\* Under provider_idempotency the provider executes at most once.
-\* at_least_once is unconstrained (DuplicateExecutionUnreachable is its
-\* probe).
+\* Under manual and at_least_once each authorized attempt is dispatched at
+\* most once, and under manual no attempt after the first is authorized or
+\* dispatched without a reconcile audit object, and no turn result lands
+\* while the effect is in doubt. Under provider_idempotency the one attempt
+\* is the only one ever authorized: a lost attempt is dispatched again
+\* under the same effect id and attempt, and the provider executes at most
+\* once. at_least_once executions are unconstrained
+\* (DuplicateExecutionUnreachable is its probe).
 PolicyControlsRedispatch ==
-    /\ \A i, j \in 1..Len(calls) : i # j => calls[i].att # calls[j].att
+    /\ (RootUp /\ Root.eff.pol # "provider_idempotency") =>
+         \A i, j \in 1..Len(calls) : i # j => calls[i].att # calls[j].att
     /\ (RootUp /\ Root.eff.pol = "manual") =>
          /\ \A i \in 1..Len(calls) : calls[i].att = 1 \/ AuditUp("attempt", calls[i].att)
          /\ Root.eff.att > 1 => AuditUp("attempt", Root.eff.att)
-    /\ (RootUp /\ Root.eff.pol = "provider_idempotency") => Cardinality(PhysCalls) =< 1
+    /\ (RootUp /\ Root.eff.pol = "provider_idempotency") =>
+         /\ Root.eff.att =< 1
+         /\ \A i \in 1..Len(calls) : calls[i].att = 1
+         /\ Cardinality(PhysCalls) =< 1
     /\ (Wrote /\ LC.before.eff.st = "indoubt") => NewResults = {}
 
-\* A recorded result came from a physical execution of an attempt the
-\* journal authorized, and is recorded for an authorized attempt. Under
-\* provider_idempotency the execution may belong to another attempt than
-\* the one the result is recorded for: the provider answers a repeat of the
-\* effect id with the first execution's result.
+\* A recorded result came from a physical execution of the attempt it is
+\* recorded for, and that attempt is the journaled one: an older attempt's
+\* result never becomes the effect's.
 EffectResultFromExecution ==
     (RootUp /\ Root.eff.st = "completed") =>
         /\ Root.eff.rval \in PhysCalls
-        /\ calls[Root.eff.rval].att =< Root.eff.att
-        /\ 1 =< Root.eff.ratt /\ Root.eff.ratt =< Root.eff.att
-        /\ Root.eff.pol # "provider_idempotency" =>
-             calls[Root.eff.rval].att = Root.eff.ratt
+        /\ Root.eff.ratt = Root.eff.att
+        /\ calls[Root.eff.rval].att = Root.eff.ratt
 
 \* Effects form: a commit on a turn with a cancel request publishes it
 \* cancelled; once the request is on the root the owner journals no new
 \* step or intent and authorizes no new attempt (only a reconcile audit
-\* object admits one); and nothing rewrites a published result, so a late
-\* effect result after cancellation or takeover is evidence only.
+\* object admits one); nothing rewrites a published result; and once the
+\* input ended cancelled no write changes its effect, so a late effect
+\* result after cancellation is evidence only.
 CancellationRespected ==
     Wrote =>
         LET b == LC.before
             a == LC.after
         IN /\ b.results \subseteq a.results
+           /\ InputCancelled(b) => a.eff = b.eff
            /\ b.active.creq =>
                 /\ \A r \in NewResults : r.kind = "cancelled"
                 /\ b.step.st = "none" => a.step.st = "none"
@@ -688,14 +725,16 @@ CancellationRespected ==
 \* Blocked terminals: the effect awaits reconciliation (in doubt, or a
 \* reconcile attempt whose outcome the admin has not settled), or the run
 \* spent the model's attempt bound on an ambiguous attempt.
-AwaitsReconciliation(h) == Reconcilable(h)
-AttemptBoundReached(h) == h.eff.st = "authorized" /\ h.eff.att = MaxAttempt
+AwaitsReconciliation(h) == Reconcilable(h) \/ ReconcilerOwns(h)
+AttemptBoundReached(h) == h.eff.st = "authorized" /\ ~DispatchBudgetLeft(h)
 
 \* A turn blocked by replay drift while its attempt is authorized without a
-\* result: fail_turn is refused (NoAuthorizedAttemptPending) and the runner
-\* authorizes nothing on a blocked turn (`authorize_attempt` itself checks
-\* only the fence), so only the result endpoint or the dispatcher's own
-\* response moves it. A design gap the README reports.
+\* result: fail_turn is refused (NoAuthorizedAttemptPending), and the
+\* runtime authorizes and dispatches nothing on a blocked turn (its run_step
+\* journals the step first, which require_running refuses on a blocked
+\* turn; `authorize_attempt` itself does not read the block), so only the
+\* result endpoint or the dispatcher's own response moves it. A design gap
+\* the README reports.
 BlockedWithPendingAttempt(h) == h.active.block /\ h.eff.st = "authorized"
 
 \* The input is eventually settled, or the turn waits on a blocked effect.

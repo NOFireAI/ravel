@@ -14,7 +14,10 @@ CONSTANTS
     StepInputDrift,                \* rewrite a step record a replay disagrees with
     AuthorizeIgnoresCancelRequest, \* authorize an attempt on a cancelled turn
     LateResultOverwrites,          \* a late result replaces the recorded one
-    CommitWhileInDoubt             \* commit the turn while its effect is in doubt
+    CommitWhileInDoubt,            \* commit the turn while its effect is in doubt
+    ProviderReauthorizes,          \* provider_idempotency authorizes attempt + 1
+    OlderResultRecorded,           \* an older attempt's result settles the effect
+    CancelledResultRecorded        \* a cancelled input's result settles the effect
 
 ASSUME DispatchBeforeIntent \in BOOLEAN
 ASSUME AmbiguousManualAttemptRetried \in BOOLEAN
@@ -22,6 +25,9 @@ ASSUME StepInputDrift \in BOOLEAN
 ASSUME AuthorizeIgnoresCancelRequest \in BOOLEAN
 ASSUME LateResultOverwrites \in BOOLEAN
 ASSUME CommitWhileInDoubt \in BOOLEAN
+ASSUME ProviderReauthorizes \in BOOLEAN
+ASSUME OlderResultRecorded \in BOOLEAN
+ASSUME CancelledResultRecorded \in BOOLEAN
 
 \* --- Broken worker steps ---------------------------------------------------
 
@@ -98,14 +104,58 @@ BrokenCommitWhileInDoubt(w) ==
     /\ CasThen(w, EndTurn(O(w), "completed", w), ActorIdle)
     /\ UNCHANGED <<calls, crashed, cl, pol>>
 
+\* Under provider_idempotency the owner treats a lost attempt as at_least_once
+\* does: it authorizes attempt + 1 with a HEAD write and dispatches that,
+\* instead of dispatching the same effect id and attempt again.
+BrokenProviderReauthorizes(w) ==
+    /\ ProviderReauthorizes
+    /\ Ready(w)
+    /\ Own(w)
+    /\ Running(O(w))
+    /\ O(w).eff.st = "authorized"
+    /\ O(w).eff.pol = "provider_idempotency"
+    /\ O(w).eff.att < MaxAttempt
+    /\ CasThen(w, AuthorizeHead(O(w), O(w).eff.att + 1),
+               [ActorIdle EXCEPT !.pc = "exec", !.att = O(w).eff.att + 1])
+    /\ UNCHANGED <<calls, crashed, cl, pol>>
+
+\* The result endpoint records an attempt's result on an unsettled effect
+\* although a retry already authorized a newer attempt, instead of
+\* answering LateResultIgnored.
+BrokenOlderResultRecorded(i) ==
+    /\ OlderResultRecorded
+    /\ RootUp
+    /\ i \in PhysCalls
+    /\ Root.eff.st \in {"authorized", "indoubt"}
+    /\ calls[i].att < Root.eff.att
+    /\ Store!PutCasVersion(HeadKey, Ver, RecordResultHead(Root, calls[i].att, i))
+    /\ UNCHANGED <<ac, calls, crashed, cl, pol>>
+
+\* The result endpoint records the journaled attempt's result although the
+\* effect's input already ended cancelled, instead of answering
+\* LateResultIgnored.
+BrokenCancelledResultRecorded(i) ==
+    /\ CancelledResultRecorded
+    /\ RootUp
+    /\ i \in PhysCalls
+    /\ Root.eff.st \in {"authorized", "indoubt"}
+    /\ calls[i].att = Root.eff.att
+    /\ InputCancelled(Root)
+    /\ Store!PutCasVersion(HeadKey, Ver, RecordResultHead(Root, calls[i].att, i))
+    /\ UNCHANGED <<ac, calls, crashed, cl, pol>>
+
 Broken ==
     \/ \E w \in Workers :
          \/ BrokenDispatchBeforeIntent(w)
          \/ BrokenAmbiguousManualAttemptRetried(w)
          \/ BrokenAuthorizeIgnoresCancelRequest(w)
          \/ BrokenCommitWhileInDoubt(w)
+         \/ BrokenProviderReauthorizes(w)
          \/ \E x \in Hashes : BrokenStepInputDrift(w, x)
-    \/ \E i \in 1..MaxCalls : BrokenLateResultOverwrites(i)
+    \/ \E i \in 1..MaxCalls :
+         \/ BrokenLateResultOverwrites(i)
+         \/ BrokenOlderResultRecorded(i)
+         \/ BrokenCancelledResultRecorded(i)
 
 MCNext == (Step \/ Broken) /\ CasWitness
 
