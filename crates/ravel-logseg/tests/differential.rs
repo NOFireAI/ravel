@@ -104,7 +104,12 @@ fn make_record(
         ts_ns: ts,
         observed_ts_ns: ts,
         severity_num: sev,
-        severity_text: if sev % 2 == 0 { "INFO" } else { "WARN" }.to_string(),
+        severity_text: if sev.is_multiple_of(2) {
+            "INFO"
+        } else {
+            "WARN"
+        }
+        .to_string(),
         body,
         trace_id: trace,
         span_id: None,
@@ -149,7 +154,7 @@ fn arb_typed_attr(stream: u8, ts: i64) -> impl Strategy<Value = (&'static str, A
         4 => proptest::sample::select(WORDS).prop_map(|w| AttrValue::Str(w.to_string())),
         1 => Just(AttrValue::Str(String::new())),
     ];
-    let even = stream % 2 == 0;
+    let even = stream.is_multiple_of(2);
     prop_oneof![
         1 => (
             Just("svc"),
