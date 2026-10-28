@@ -1538,3 +1538,102 @@ async fn a_failed_readback_is_queried_as_a_diagnostic_only_with_the_flag() {
         stderr(&validated)
     );
 }
+
+/// A stalled row binds only as a diagnostic: `bind` refuses it, and
+/// `bind_diagnostic` leaves the stalled engine out of the binding and names
+/// the stall as a failed check with no band number. A stalled oracle refuses
+/// even as a diagnostic, and a report with no failed row is not one.
+///
+/// TO SEE THIS FAIL: drop the `is_stalled` skip in `bind_rows`' engine loop:
+/// the diagnostic bind then refuses with no ingest row for mimir.
+#[test]
+fn a_stalled_row_binds_only_as_a_diagnostic_and_leaves_its_engine_out() {
+    use ravel_bench::metrics_ingest::StalledRow;
+    use ravel_bench::metrics_query::{
+        BindError, bind, bind_diagnostic, endpoints, parse_engine_spec,
+    };
+    use ravel_bench::report_schema::FailedCheck;
+
+    let urls = Urls {
+        prometheus: "http://127.0.0.1:9".to_string(),
+        ravel: "http://127.0.0.1:9".to_string(),
+        victoriametrics: "http://127.0.0.1:9".to_string(),
+        mimir: "http://127.0.0.1:9".to_string(),
+    };
+    let workload_bytes = std::fs::read(workload_path()).expect("workload");
+    let workload = ravel_bench::metrics_workload::load_workload(workload_path()).expect("workload");
+    let specs = [
+        parse_engine_spec("name=prometheus,url=http://127.0.0.1:9").expect("spec"),
+        parse_engine_spec("name=mimir,url=http://127.0.0.1:9").expect("spec"),
+    ];
+    let stalled = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest.systems.retain(|r| r.system != system);
+        ingest.stalled = vec![StalledRow {
+            system: system.to_string(),
+            endpoint: "http://127.0.0.1:9/api/v1/push".to_string(),
+            projected_secs: 9_000.0,
+            ceiling_secs: 600,
+            offered_points: 50,
+            stream_points: 1_000,
+            error: "projected 9000 s past the 600 s ceiling".to_string(),
+        }];
+        ingest
+    };
+
+    let err = bind(
+        &stalled("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("bind refuses a stalled row");
+    assert!(
+        matches!(&err, BindError::Stalled { system, .. } if system == "mimir"),
+        "{err}"
+    );
+
+    let (binding, failed) = bind_diagnostic(
+        &stalled("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a stalled comparator binds as a diagnostic");
+    assert_eq!(
+        endpoints(&binding).keys().copied().collect::<Vec<_>>(),
+        vec!["prometheus"]
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].band, None);
+    assert_eq!(failed[0].check, FailedCheck::Stall);
+    assert_eq!(failed[0].system, "mimir");
+
+    let err = bind_diagnostic(
+        &stalled("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a stalled oracle refuses");
+    assert!(
+        matches!(&err, BindError::Stalled { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+
+    let err = bind_diagnostic(
+        &ingest_report(&urls),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("no failed row, no diagnostic");
+    assert!(matches!(err, BindError::NoFailedRow), "{err}");
+}

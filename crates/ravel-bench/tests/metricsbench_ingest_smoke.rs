@@ -1206,7 +1206,11 @@ fn a_failed_readback_does_not_stop_the_later_rows() {
         .iter()
         .map(|r| r["system"].as_str().expect("system"))
         .collect();
-    assert_eq!(names, ["prometheus", "victoriametrics", "mimir"], "{report}");
+    assert_eq!(
+        names,
+        ["prometheus", "victoriametrics", "mimir"],
+        "{report}"
+    );
     for row in systems {
         let offered = row["ingest"]["offered_samples"].as_u64().expect("offered");
         assert!(offered > 0, "{row}");

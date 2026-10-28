@@ -33,8 +33,8 @@ use clap::Parser;
 use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
-    BindError, Diagnostics, EngineSpec, RunOptions, bind, bind_diagnostic, endpoints, parse_engine_spec, run,
-    system_name,
+    BindError, Diagnostics, EngineSpec, RunOptions, bind, bind_diagnostic, endpoints,
+    parse_engine_spec, run, system_name,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;

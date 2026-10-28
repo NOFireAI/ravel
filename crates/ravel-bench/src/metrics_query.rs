@@ -51,8 +51,8 @@ use crate::metrics_ingest::{
 use crate::metrics_workload::{FamilyKind, Profile, WorkloadFile};
 use crate::promql_corpus::{CorpusEntry, EvalKind};
 use crate::report_schema::{
-    EngineDenominators, ExpectedCase, FailedBand, FailedCheck, Figure, MIN_VARIANCE_PASSES, Measurement, ResultStatus,
-    rel_mad_pct, row_status,
+    EngineDenominators, ExpectedCase, FailedBand, FailedCheck, Figure, MIN_VARIANCE_PASSES,
+    Measurement, ResultStatus, rel_mad_pct, row_status,
 };
 
 /// The query parameter Ravel's HTTP API reads commit tokens from.

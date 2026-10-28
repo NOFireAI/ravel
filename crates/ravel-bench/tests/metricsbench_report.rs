@@ -359,7 +359,8 @@ fn the_provenance_subcommand_stamps_a_block_a_report_accepts() {
 /// A report that says `run_verdict: "failed"` is a diagnostic of a failed
 /// run, never a result: `validate` refuses it naming the verdict and every
 /// failed band, although the rest of it stands, and `render` prints that
-/// verdict and prints no table.
+/// verdict and prints no table. A verdict without failed bands, or failed
+/// bands without the verdict, is refused as inconsistent.
 ///
 /// TO SEE THIS FAIL: make `validate`'s `(Some(RunVerdict::Failed), false)`
 /// arm fall through to `validate_body`: the report then validates.
@@ -391,4 +392,24 @@ fn validate_refuses_a_report_with_a_failed_run_verdict() {
         "{stderr}"
     );
     assert!(out.stdout.is_empty(), "no table for a failed run");
+
+    // Either field without the other is refused as inconsistent.
+    let mut verdict_only = valid_v3_json();
+    verdict_only["run_verdict"] = serde_json::json!("failed");
+    let mut bands_only = valid_v3_json();
+    bands_only["failed_bands"] = serde_json::json!([
+        {"band": null, "check": "stall", "system": "mimir", "reason": "projected 9000 s"}
+    ]);
+    for (name, doc) in [
+        ("verdict_only.json", verdict_only),
+        ("bands_only.json", bands_only),
+    ] {
+        let out = run_validate(&dir, name, &doc);
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("run_verdict and failed_bands disagree"),
+            "{name}: {stderr}"
+        );
+    }
 }

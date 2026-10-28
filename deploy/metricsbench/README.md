@@ -501,7 +501,8 @@ A compose project `metricsbench` that already has containers or volumes is
 refused with exit 65 before anything starts (case h), since an earlier run's
 data would be measured.
 
-Steps, in order, stopping at the first failure:
+Steps, in order, stopping at the first failure, except a failed ingest
+verification (step 6), after which the run goes on as a diagnostic:
 
 1. `up`: `docker compose -f docker-compose.yml -f ravel.yml up -d` (case a).
 2. `qualify`: `createbuckets` and `ravel-qualify` exited 0; otherwise exit
@@ -521,11 +522,26 @@ Steps, in order, stopping at the first failure:
    VictoriaMetrics acknowledges a write before it is queryable; each row's
    `readback` records `attempts` and `settled_after_ms`. Ravel's token reaches it
    only through `--ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN`, never on
-   a command line (case a). A failing ingest exits 70 naming the step and the
-   stack is still torn down (case b). When the failure is a read-back,
-   `ingest.json` still holds the rows replayed so far, the failed row with
-   its mismatching `readback` or its `readback_error`, for diagnosis only
-   (`metricsbench_ingest_smoke::a_failed_readback_still_prints_the_report`).
+   a command line (case a). A row whose read-back fails (an error, a
+   refusal or a mismatch) or that stalls does not stop the bin: it is
+   recorded and every later row is still replayed, and the bin exits 1 after
+   the last row with `ingest.json` holding every row, the failed one with its
+   mismatching `readback` or its `readback_error`
+   (`metricsbench_ingest_smoke::a_failed_readback_does_not_stop_the_later_rows`),
+   a stalled one under `stalled` with its projected seconds and ceiling (the
+   `LaneError::IngestStalled` arm of `metricsbench_ingest`'s row loop; no
+   test drives a stall through the bin, since its grace period is 60 s).
+   On such a failed ingest verification run.sh records `ingest` as
+   `failed_step` in `stamps.json` and goes on through every later step:
+   `mimir-readiness` is stamped without being checked, `query` passes
+   `--diagnostic-after-failed-ingest`, `validate` must refuse the report as
+   a diagnostic of a failed run, and the run then exits 70 naming step
+   ingest (cases q, q2). A later step's failure, an `--rss-band` breach
+   included, is listed in `stamps.json` as `failed_after_ingest` and the
+   exit stays 70 naming ingest (case q3). Any other failing ingest (no
+   report on stdout, or a report with no failed row, such as a band 4
+   accounting failure) exits 70 naming the step at once, before capture or
+   query, and the stack is still torn down (cases b, r).
    The `ci` profile keeps the ingest's
    in-process diagnostic row on a memory store (case a); every other profile
    passes `--no-in-process-row` (case l), since cardinality's and history's
@@ -552,11 +568,13 @@ Steps, in order, stopping at the first failure:
    `--http-timeout-secs` bounds writes only. Each
    row's `readback.query_ms` records every read-back query's wall time in
    milliseconds, and a failed query names its elapsed time. A row whose
-   projected wall time passes its ceiling makes the bin exit 1, so the run
-   exits 70 naming step ingest, like any failed ingest; a profile with no
+   projected wall time passes its ceiling stops that row only and makes the
+   bin exit 1 after the last row, so the run goes on as a diagnostic and
+   exits 70 naming step ingest (case q2); a profile with no
    ceiling in run.sh is refused with exit 65 before anything starts.
 7. `mimir-readiness`: the ingest row for Mimir read back exactly what it
-   accepted; the line is stamped (case a).
+   accepted; the line is stamped (case a). After a failed ingest
+   verification the line is stamped and the step is not checked (case q).
 8. `capture`: `capture-effective-config.sh` into `effective-config.json`,
    which must exit 0; a partial capture (exit 1) fails the step with exit
    70 before any query runs (case k).
@@ -570,8 +588,13 @@ Steps, in order, stopping at the first failure:
     `report.json`, with `--diagnostics diagnostics.json` for the per-entry
     ULP gaps against the oracle and every oracle retry (case a; the
     sidecar's fields are in benchmarks/metrics/README.md, "Portable query
-    run").
+    run"). After a failed ingest verification the run passes
+    `--diagnostic-after-failed-ingest`, and `report.json` carries
+    `run_verdict: "failed"` and `failed_bands` (case q).
 12. `validate`: `metricsbench_report validate report.json` exits 0 (case a).
+    After a failed ingest verification it must refuse the report, naming it
+    a diagnostic of a failed run; a validate that accepts it fails the run
+    (case q).
 13. `memory`: the sampler stops, `memory-summary.json` records peak and
     final bytes per container and `OOMKilled` from `docker inspect` (case a),
     and every `--rss-band` is checked (case d). An OOM-killed container exits
@@ -599,7 +622,8 @@ and `anchor_source`, `started_at` and `ended_at`, `store_kind: rustfs`,
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
 `mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
 f), `rustfs_logs` (cases a, f and n), `steps_completed`, `failed_step`,
-`exit_code`, `status` and `teardown`.
+`failed_after_ingest` (cases a, q and q3), `exit_code`, `status` and
+`teardown`.
 
 ### The falsification run
 
@@ -614,7 +638,9 @@ series count; no `report.json` is written and stamps say `diagnostic: true`
 since no Ravel starts. A `--profile` the corpus does not declare
 `mb_long_range_7d_avg` for (today only `history`) is refused with exit 65
 before anything starts: elsewhere the query loads too few samples to reach
-the limit, and its success would falsify nothing (case f2).
+the limit, and its success would falsify nothing (case f2). A failed ingest
+stops this run at once, whatever the failure: it has no query step to go on
+to.
 
 ```sh
 deploy/metricsbench/run.sh --profile history --bin-dir target/release \
@@ -626,7 +652,7 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | 0 | Every step passed (cases a, f, g). |
 | 64 | Usage error (cases h, p). |
 | 65 | A refused input; nothing was started (cases c, h, p). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, r). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step or an `--rss-band` failed too (cases q, q2, q3). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
