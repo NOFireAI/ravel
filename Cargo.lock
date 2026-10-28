@@ -4456,6 +4456,16 @@ dependencies = [
 [[package]]
 name = "ravel-agents-client"
 version = "0.27.0"
+dependencies = [
+ "axum",
+ "ravel-agents-core",
+ "ravel-agents-runtime",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "ravel-agents-core"
