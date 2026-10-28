@@ -516,9 +516,14 @@ Steps, in order, stopping at the first failure:
    `--readback-timeout-secs`, the per-request timeout of each read-back
    query with its body read, per profile: ci 30, cardinality 900, history
    300, churn 900 (case m). A read-back that hangs on every query can hold
-   a row for the 60 s settle window plus one read's five or six queries at
-   that timeout, up to about 91 minutes on cardinality and churn, though
-   each engine's own 120 s query deadline normally ends a query first.
+   a row for the 60 s settle window plus one read at that timeout per
+   query. A read is 3 + 3W queries, W being the profile's day windows
+   (the series read, the histogram series read and the stale-marker read,
+   plus one query per window for each of up to three count probes): ci
+   W = 1, 6 queries, about 4 minutes; cardinality W = 1, 6 queries, about
+   91 minutes; churn W = 2, 9 queries, about 136 minutes; history W = 30,
+   93 queries, about 7.8 hours. Each engine's own 120 s query deadline
+   normally ends a query first, which caps history at about 3.1 hours.
    `--http-timeout-secs` bounds writes only. Each
    row's `readback.query_ms` records every read-back query's wall time in
    milliseconds, and a failed query names its elapsed time. A row whose
