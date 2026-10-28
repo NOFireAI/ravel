@@ -1088,8 +1088,10 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
 
     let before = store.counters();
     let resolved = co.metrics().outcome_unknown_resolved;
-    for id in gate.held() {
-        gate.release(id);
+    let held = gate.held();
+    assert_eq!(held.len(), 1, "only this call's HEAD write is held");
+    for id in held {
+        assert!(gate.release(id), "the held write is released");
     }
     let dispatched_here = reconciling.await.expect("join").expect("this reconcile");
     assert!(!dispatched_here, "the attempt is the other admin's");
@@ -1099,4 +1101,91 @@ async fn a_reconcile_another_admin_landed_first_is_not_dispatched_again() {
     let h = head(&store, "o-1").await;
     assert_eq!(h, landed);
     assert_eq!(audits(&h, AUDIT_RECONCILE_ATTEMPT), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stale_open_attempt_of_a_settled_input_does_not_block_the_next_step() {
+    let (_clock, _store, co) = rig();
+    create(&co, "o-1").await;
+    let sent = send(&co, "o-1", "r-1", json!({"n": 1})).await;
+    let w = worker(&co, "v1");
+    let a = poll_now(&co, &w, "v1").await.expect("leased");
+    let hook = Hook::default();
+    let s = spec("send-email", RecoveryPolicy::AtLeastOnce);
+    let d = dispatched(&co, &a, &s, &hook).await;
+    co.cancel(&CancelRequest {
+        operation: sent.operation,
+    })
+    .await
+    .expect("cancel");
+    co.commit(&completed(&a.lease, json!("ok")))
+        .await
+        .expect("commit");
+    send(&co, "o-1", "r-2", json!({"n": 2})).await;
+    let b = poll_now(&co, &w, "v1").await.expect("next turn");
+    assert_eq!(
+        (&b.lease.owner_id, b.lease.epoch),
+        (&a.lease.owner_id, a.lease.epoch)
+    );
+
+    // The settled input's entry is back, as for a coordinator that never
+    // observed the settlement; the guard must skip it by input.
+    co.open_attempts.lock().insert(
+        (d.effect.agent, d.effect.effect_id),
+        OpenAttempt {
+            owner_id: a.lease.owner_id.clone(),
+            epoch: a.lease.epoch,
+            incarnation: d.effect.incarnation,
+            accept_seq: a.accept_seq,
+            attempt: d.attempt,
+        },
+    );
+    let next = spec("next", RecoveryPolicy::AtLeastOnce);
+    let e = dispatched(&co, &b, &next, &hook).await;
+    assert_eq!(hook.calls(), 2, "the next input's step is dispatched");
+    assert_ne!(e.effect, d.effect);
+    assert_eq!(e.attempt, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completed_turn_with_an_open_attempt_does_not_wedge_the_next_turn() {
+    let (_clock, store, co) = rig();
+    create(&co, "o-1").await;
+    send(&co, "o-1", "r-1", json!({"n": 1})).await;
+    let w = worker(&co, "v1");
+    let a = poll_now(&co, &w, "v1").await.expect("leased");
+    let hook = Hook::default();
+    let s = spec("send-email", RecoveryPolicy::AtLeastOnce);
+    let d = dispatched(&co, &a, &s, &hook).await;
+    let done = co
+        .commit(&completed(&a.lease, json!("ok")))
+        .await
+        .expect("commit");
+    assert_eq!(done.status, OperationStatus::Completed);
+    assert!(
+        !co.open_attempts
+            .lock()
+            .contains_key(&(d.effect.agent, d.effect.effect_id)),
+        "the commit that settled the input dropped its attempt"
+    );
+    let h = head(&store, "o-1").await;
+    assert_eq!(effect_of(&h, &d).status, EffectStatus::Authorized);
+
+    send(&co, "o-1", "r-2", json!({"n": 2})).await;
+    let b = poll_now(&co, &w, "v1").await.expect("next turn");
+    assert_eq!(
+        (&b.lease.owner_id, b.lease.epoch),
+        (&a.lease.owner_id, a.lease.epoch)
+    );
+    let next = spec("next", RecoveryPolicy::AtLeastOnce);
+    let e = dispatched(&co, &b, &next, &hook).await;
+    assert_eq!(hook.calls(), 2, "the next turn's step is dispatched");
+    assert_eq!(e.attempt, 1);
+    let open: Vec<_> = co
+        .open_attempts
+        .lock()
+        .iter()
+        .map(|((_, effect_id), open)| (*effect_id, open.attempt))
+        .collect();
+    assert_eq!(open, vec![(e.effect.effect_id, 1)]);
 }
