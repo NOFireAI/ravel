@@ -1699,6 +1699,28 @@ fn a_row_failure_or_failed_replay_does_not_bind() {
     assert_eq!(failed[0].check, FailedCheck::Ingest);
     assert_eq!(failed[0].system, "mimir");
 
+    // A row_failure on the oracle's row is refused even as a diagnostic:
+    // every other engine would be classified against a receiver that does
+    // not hold the stream.
+    let mut oracle_failed = ingest_report(&urls);
+    let row = oracle_failed
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "prometheus")
+        .expect("prometheus row");
+    row.ingest.accepted_digests.scalar = "not-the-expected-set".to_string();
+    row.row_failure = Some(RowFailure {
+        band: Some(6),
+        error: "prometheus: the accepted scalar set is not the expected set".to_string(),
+    });
+    let err = bind_diagnostic(&oracle_failed, &workload_bytes, &workload, &specs, |_| None)
+        .map(|_| ())
+        .expect_err("a row_failure on the oracle refuses even as a diagnostic");
+    assert!(
+        matches!(&err, BindError::RowFailed { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+
     let replay_failed = |system: &str| {
         let mut ingest = ingest_report(&urls);
         ingest.systems.retain(|r| r.system != system);

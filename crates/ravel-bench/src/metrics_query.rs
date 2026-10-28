@@ -426,7 +426,9 @@ fn bind_rows(
         .filter(|r| r.system != IN_PROCESS_SYSTEM)
     {
         if let Some(failure) = &row.row_failure {
-            if !diagnostic {
+            // The oracle every engine is classified against must hold the
+            // stream, as for a stalled or failed-replay oracle below.
+            if !diagnostic || row.system == system_name(Engine::Prometheus) {
                 return Err(BindError::RowFailed {
                     system: row.system.clone(),
                     detail: failure.error.clone(),
