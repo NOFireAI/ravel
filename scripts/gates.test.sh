@@ -121,7 +121,7 @@ ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets 
 agents_clippy='==> cargo clippy --locked -p ravel-server --features agents --all-targets -- -D warnings'
 # The agents and mcp lanes select tests by binary: a test-name filter alone
 # (the *_name_filter forms) never runs a test whose path omits the keyword.
-agents_test='==> cargo nextest run --locked -p ravel-server --features agents --test agents_seam --test agents_effects_e2e'
+agents_test='==> cargo nextest run --locked -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e'
 agents_lib_test='==> cargo nextest run --locked -p ravel-server --features agents --lib'
 agents_name_filter='==> cargo nextest run --locked -p ravel-server --features agents agents'
 agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification'
@@ -338,7 +338,7 @@ check_eq "affected-tests -p ravel-query: flight-sql tests" "1" \
 check_eq "affected-tests -p ravel-query: esql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features esql')"
 check_eq "affected-tests -p ravel-query: agents seam and effects binaries" "1" \
-  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --test agents_seam --test agents_effects_e2e')"
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e')"
 check_eq "affected-tests -p ravel-query: agents lib tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features agents --lib')"
 check_eq "affected-tests -p ravel-query: no bare agents name filter" "0" \

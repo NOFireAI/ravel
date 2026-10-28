@@ -636,6 +636,36 @@ async fn events_page_after_the_durable_cursor_without_duplicates() {
         .await;
     assert_eq!(resumed["events"], json!([]));
     assert_eq!(resumed["next_cursor"], json!("3"));
+
+    let (status, body) = api
+        .post(
+            CLIENT,
+            "events",
+            &json!({"agent": agent(), "cursor": null, "limit": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], json!("unsupported_format"));
+    assert_eq!(body["reason"], json!("events limit must be at least 1"));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A path under `/api/v1/agents` outside the route table is 404, a timer
+/// route included, on both listeners, and with a capable credential.
+#[tokio::test]
+async fn a_path_outside_the_route_table_is_404() {
+    let running = start_memory().await;
+    for (api, client) in [
+        (Api::public(&running), CLIENT),
+        (Api::mtls(&running), MTLS_CLIENT),
+    ] {
+        for path in ["timers", "timers/schedule", "sweep", "no-such-route"] {
+            let (status, body) = api.post(client, path, &json!({})).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "POST {path}: {body}");
+            let (status, body) = api.get(client, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "GET {path}: {body}");
+        }
+    }
     running.shutdown().await.expect("clean shutdown");
 }
 
