@@ -4,7 +4,6 @@ import { runKillAndRecover } from "../../../examples/assistant/scenario.js";
 import { plan, type RunningServer, startServer, TOKENS } from "./server.js";
 
 const target = plan();
-if (target.missing !== undefined) console.warn(`e2e skipped: ${target.missing}`);
 
 const ANSWER =
   "A worker that dies mid-turn is replaced and the turn is re-run. " +
@@ -45,6 +44,7 @@ describe.skipIf(target.missing !== undefined)(
       const drafts = run.calls.filter((c) => c.tool === "kb.draft");
       expect(drafts.map((c) => c.attempt)).toEqual([1, 2]);
       expect(drafts[1]?.effectId).toBe(drafts[0]?.effectId);
+      expect(run.resultError).toBeNull();
       expect(run.result).toEqual({ answer: ANSWER, articles: ["kb-2", "kb-3"], ticket: null });
       expect(run.answered).toBe(1);
       expect(run.effects.map((e) => [e.tool_name, e.status, e.attempt])).toEqual([
@@ -69,6 +69,7 @@ describe.skipIf(target.missing !== undefined)(
       // routes are pending), so the server still reads it as running.
       expect(run.inDoubt?.serverStatus).toBe("running");
       expect(run.counts).toEqual({ search: 1, draft: 1, ticket: 1 });
+      expect(run.resultError).toBeNull();
       expect(run.result).toEqual({ answer: ANSWER, articles: ["kb-2", "kb-3"], ticket: "T-1001" });
       expect(run.answered).toBe(1);
       expect(run.effects.map((e) => [e.tool_name, e.status])).toEqual([

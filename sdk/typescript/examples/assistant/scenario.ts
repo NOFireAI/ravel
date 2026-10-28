@@ -50,7 +50,10 @@ export interface ScenarioResult {
   readonly retriedOperationId: string | undefined;
   readonly workerA: string;
   readonly workerB: string;
-  readonly result: { answer: string; articles: string[]; ticket: string | null };
+  /** The operation's result, or null when it did not arrive within `waitMs`. */
+  readonly result: { answer: string; articles: string[]; ticket: string | null } | null;
+  /** Why `result` is null. */
+  readonly resultError: string | null;
   readonly calls: readonly ToolCall[];
   readonly counts: { readonly search: number; readonly draft: number; readonly ticket: number };
   /** The journal's effects once the operation completed. */
@@ -169,7 +172,12 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
       log(`reconciled ${effect.effect} attempt ${String(effect.attempt)} with ticket ${filed}`);
     }
 
-    const result = await first.result({ deadlineMs: waitMs });
+    // A miss is reported with the tool counts rather than thrown, so a
+    // caller can see which tool ran again when the operation never finished.
+    const settled = await first.result({ deadlineMs: waitMs }).then(
+      (value) => ({ value, error: null }),
+      (error: unknown) => ({ value: null, error: String(error) }),
+    );
     const recoveryMs = Date.now() - killedAt;
     const state = await agent.state();
     return {
@@ -177,7 +185,8 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
       retriedOperationId: retried.operationId,
       workerA: workerA.ownerId,
       workerB: workerB.ownerId,
-      result,
+      result: settled.value,
+      resultError: settled.error,
       calls: [...fixture.calls],
       counts: {
         search: fixture.count("kb.search"),
@@ -185,7 +194,9 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
         ticket: fixture.count(TICKET),
       },
       effects: await journal.effects(operationId),
-      answered: state.state.answered,
+      // The server reads a never-committed agent's state as null, which the
+      // client's type does not admit.
+      answered: (state.state as { answered: number } | null)?.answered ?? 0,
       inDoubt,
       recoveryMs,
     };
