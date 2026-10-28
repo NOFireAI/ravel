@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

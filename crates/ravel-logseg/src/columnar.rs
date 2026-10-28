@@ -360,6 +360,8 @@ pub struct ColumnarBlockView<'a> {
     block: &'a DecodedBlock,
     /// Block row positions of the surviving rows, ascending.
     rows: &'a [usize],
+    /// Column ids served from the decoded-column cache (ADR-3326).
+    served: &'a [u32],
 }
 
 /// Shape only. Formatting a block's cells would defeat the point of a view that
@@ -388,7 +390,13 @@ impl<'a> ColumnarBlockView<'a> {
             field_dir,
             block,
             rows,
+            served: &[],
         }
+    }
+
+    pub(crate) fn with_served(mut self, served: &'a [u32]) -> Self {
+        self.served = served;
+        self
     }
 
     /// The block's total row count, before the content predicate.
@@ -443,6 +451,20 @@ impl<'a> ColumnarBlockView<'a> {
     /// content predicate that drops rows does not shrink the decoded columns.
     pub fn decoded_bytes(&self) -> usize {
         self.block.decoded_heap_bytes()
+    }
+
+    /// Column ids of this block served from the decoded-column cache
+    /// (ADR-3326) rather than decoded.
+    pub fn served_columns(&self) -> &[u32] {
+        self.served
+    }
+
+    /// [`Self::decoded_bytes`] less the bytes of the columns served from the
+    /// decoded-column cache, whose entry reservations already charge them
+    /// (ADR-3326 decision 4). Equal to `decoded_bytes` when nothing was
+    /// served.
+    pub fn resident_charge_bytes(&self) -> usize {
+        self.block.heap_bytes_excluding(self.served)
     }
 
     // --- fixed columns ------------------------------------------------------

@@ -658,6 +658,7 @@ fn metrics_app(store: Arc<dyn ObjectStoreBackend>, cache: &ReadCache) -> Router 
         heartbeat: ravel_server::health_listener::Heartbeat::new(Arc::new(
             ravel_ingest::SystemClock,
         )),
+        decoded_cache: None,
     })
 }
 

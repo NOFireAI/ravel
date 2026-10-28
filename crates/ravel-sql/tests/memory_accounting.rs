@@ -828,9 +828,10 @@ async fn the_columnar_path_charges_the_same_order_of_bytes_as_the_row_path() {
     assert!(
         row.peak * 10 >= fast.peak * low,
         "the columnar path's peak charge ({} bytes) is within {low}/10 of the \
-         row path's ({} bytes) for the identical block and projection: it has \
-         grown past the measured ratio of 3.02, so something is charged that \
-         the scan does not hold.",
+         row path's ({} bytes) for the identical block and projection: the \
+         columnar charge has grown relative to the row path's, so something \
+         is charged that the scan does not hold (for example, a block charged \
+         twice).",
         fast.peak,
         row.peak
     );

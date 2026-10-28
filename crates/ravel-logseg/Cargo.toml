@@ -24,7 +24,9 @@ test-support = []
 
 [dependencies]
 bytes = { workspace = true }
+ravel-cache = { workspace = true }
 ravel-codec = { workspace = true }
+ravel-memory = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-types = { workspace = true }
 thiserror = { workspace = true }

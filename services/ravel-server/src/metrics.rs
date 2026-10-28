@@ -3960,6 +3960,98 @@ fn render_runtime_family(out: &mut String, mode: Mode, runtime: &RuntimeSnapshot
     }
 }
 
+/// The decoded column-block cache's figures read at scrape time (ADR-3326).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedCacheMetrics {
+    pub resident_bytes: u64,
+    pub max_bytes: u64,
+    pub entries: u64,
+    pub counters: ravel_logseg::decoded_cache::DecodedCacheSnapshot,
+    pub pressure: ravel_logseg::decoded_cache::PressureSnapshot,
+    pub expired_drops: u64,
+}
+
+impl DecodedCacheMetrics {
+    pub fn of(cache: &ravel_logseg::decoded_cache::DecodedColumnCache) -> Self {
+        DecodedCacheMetrics {
+            resident_bytes: cache.resident_bytes(),
+            max_bytes: cache.max_bytes(),
+            entries: cache.len() as u64,
+            counters: cache.process_counters(),
+            pressure: cache.pressure_counters(),
+            expired_drops: cache.expired_drops(),
+        }
+    }
+}
+
+/// The ADR-3326 decoded column-block cache families, `{mode}` only: occupancy
+/// as gauges, and the process-wide hit, miss, admission, ghost-hit, margin-skip,
+/// pressure-eviction and age-drop counts as counters.
+fn render_decoded_cache_family(out: &mut String, mode: Mode, m: &DecodedCacheMetrics) {
+    let gauges = [
+        (
+            "ravel_decoded_cache_resident_bytes",
+            "Bytes of decoded columns the decoded column-block cache's index holds.",
+            m.resident_bytes,
+        ),
+        (
+            "ravel_decoded_cache_max_bytes",
+            "The decoded column-block cache's ceiling (--decoded-cache-max-bytes).",
+            m.max_bytes,
+        ),
+        (
+            "ravel_decoded_cache_entries",
+            "Decoded columns the decoded column-block cache's index holds.",
+            m.entries,
+        ),
+    ];
+    for (name, help, value) in gauges {
+        write_header(out, name, help, "gauge");
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+    let counters = [
+        (
+            "ravel_decoded_cache_hits_total",
+            "Decoded columns served from the decoded column-block cache.",
+            m.counters.hits,
+        ),
+        (
+            "ravel_decoded_cache_misses_total",
+            "Decoded-column lookups the decoded column-block cache could not serve.",
+            m.counters.misses,
+        ),
+        (
+            "ravel_decoded_cache_admissions_total",
+            "Decoded columns admitted to the decoded column-block cache.",
+            m.counters.admissions,
+        ),
+        (
+            "ravel_decoded_cache_ghost_hits_total",
+            "Second touches by a bulk scan that found the column on the ghost list and admitted it.",
+            m.counters.ghost_hits,
+        ),
+        (
+            "ravel_decoded_cache_margin_skips_total",
+            "Admissions skipped because reserving the entry would leave less than the admission margin unreserved.",
+            m.counters.margin_skips,
+        ),
+        (
+            "ravel_decoded_cache_pressure_evictions_total",
+            "Entries the memory budget's evictor dropped to satisfy a refused reservation.",
+            m.pressure.evictions,
+        ),
+        (
+            "ravel_decoded_cache_expired_drops_total",
+            "Entries dropped for exceeding the age bound, at access or by the periodic sweep.",
+            m.expired_drops,
+        ),
+    ];
+    for (name, help, value) in counters {
+        write_header(out, name, help, "counter");
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+}
+
 /// The ADR-1702 decision 11 heartbeat age, `{mode}` only: time since the
 /// heartbeat task on the main runtime last beat, rendered in every mode.
 fn render_heartbeat_age_family(out: &mut String, mode: Mode, age: std::time::Duration) {
@@ -9182,6 +9274,11 @@ pub struct MetricsState {
     /// and beats one in every mode. Read at scrape time for
     /// `ravel_health_heartbeat_age_seconds`.
     pub heartbeat: crate::health_listener::Heartbeat,
+    /// The ADR-3326 decoded column-block cache, the same instance the SQL
+    /// executor's logs fetcher reads through. `Some` only when
+    /// `--decoded-cache-max-bytes` is nonzero in a `sql` build that serves
+    /// queries; `None` leaves the `ravel_decoded_cache_*` families off.
+    pub decoded_cache: Option<Arc<ravel_logseg::decoded_cache::DecodedColumnCache>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -9532,6 +9629,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .as_ref(),
     );
     render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
+    if let Some(cache) = &state.decoded_cache {
+        render_decoded_cache_family(&mut body, state.mode, &DecodedCacheMetrics::of(cache));
+    }
     render_memory_gate_family(
         &mut body,
         state.mode,
@@ -17160,6 +17260,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             fold_loop: Default::default(),
             refold: refold_queue_with_one_eviction(),
             heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+            decoded_cache: None,
         };
 
         let response = metrics_handler(State(state)).await.into_response();

@@ -14,6 +14,21 @@ pub(super) struct PartitionCtx {
 }
 
 impl PartitionCtx {
+    /// Attaches the process decoded-column cache, when the fetcher has one, to
+    /// a scan this partition opened (ADR-3326). The scan's columnar exit then
+    /// reads and fills it under the statement's access intent.
+    fn attach_decoded_cache(&self, scan: &mut LogSegmentScan, seg: &SegmentRef) {
+        if let Some(cache) = self.fetcher.decoded_cache() {
+            scan.attach_decoded_cache(ravel_logseg::decoded_cache::DecodedCacheAttach {
+                cache: Arc::clone(cache),
+                tenant: self.tenant_hash.0,
+                object: seg.content_hash,
+                intent: self.phase_accounting.scan().access_intent(),
+                counters: Arc::clone(self.phase_accounting.decoded_cache()),
+            });
+        }
+    }
+
     /// Whether the whole-segment fast path should open `seg` by column chunk
     /// rather than with one whole-object GET (issue #862).
     ///
@@ -180,7 +195,7 @@ fn open_segment_subset(
         let survivors = survivors.ok_or_else(|| {
             SqlError::Internal("striped segment open with no plan-phase survivor list".into())
         })?;
-        let scan = ctx
+        let mut scan = ctx
             .fetcher
             .scan_accounted_with_tenant_subset_raw(
                 &seg,
@@ -196,6 +211,9 @@ fn open_segment_subset(
             )
             .await
             .map_err(SqlError::from)?;
+        if let Some(s) = scan.as_mut() {
+            ctx.attach_decoded_cache(s, &seg);
+        }
         Ok(scan)
     })
 }
@@ -220,7 +238,7 @@ fn open_segment_subset(
 fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
-        let scan = ctx
+        let mut scan = ctx
             .fetcher
             .scan_whole_accounted_with_tenant(
                 &seg,
@@ -231,6 +249,9 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
             )
             .await
             .map_err(SqlError::from)?;
+        if let Some(s) = scan.as_mut() {
+            ctx.attach_decoded_cache(s, &seg);
+        }
         Ok(scan)
     })
 }
@@ -253,7 +274,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
 fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
-        let scan = ctx
+        let mut scan = ctx
             .fetcher
             .scan_accounted_with_tenant(
                 &seg,
@@ -264,6 +285,9 @@ fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
             )
             .await
             .map_err(SqlError::from)?;
+        if let Some(s) = scan.as_mut() {
+            ctx.attach_decoded_cache(s, &seg);
+        }
         Ok(scan)
     })
 }
@@ -660,7 +684,9 @@ impl ColumnarBlockJob {
                 ColumnarStep::Fallback
             }
             Ok(ColumnarBlockOutcome::Block(view)) => {
-                if let Err(e) = resident.try_resize(view.decoded_bytes()) {
+                // Columns served from the decoded-column cache are charged by
+                // their entries' reservations, not again here (ADR-3326).
+                if let Err(e) = resident.try_resize(view.resident_charge_bytes()) {
                     return ColumnarStep::Failed(e);
                 }
                 if view.has_attrs_raw_page() {
