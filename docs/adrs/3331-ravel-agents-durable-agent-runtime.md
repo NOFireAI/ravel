@@ -183,7 +183,9 @@ so milestone 6 is format version 2, rolled out readers before writers as
 ADR-0066 requires: a version 1 writer that decoded a version 2 HEAD would
 drop the page references on re-encode and CAS away accepted messages. A
 version 1 binary refuses a version 2 HEAD as `UnsupportedFormat`; the
-milestone 6 task ships the reader one release before the writer.
+milestone 6 task ships the reader one release before the writer (replaced
+by the index-page amendment below: reader and writer ship together, and the
+next CAS migrates a version 1 HEAD).
 
 ### 4. The publication rule
 
@@ -531,7 +533,7 @@ required checks at approval time; until then they are advisory.
 | 3 Steps and tools | pinned handlers, step journal, intents, attempts, policies, completion endpoint, cancellation | response-loss tests pass under every policy; manual tools block visibly |
 | 4 Timers and discovery | timer generations, atomic firing, hints, sweep, liveness tests, TLA effects and integrated models | fire and cancel races and bad hints covered by models and tests |
 | 5 Developer experience | dev and scaffold commands, inspector page, CLI, event resume, MCP tools, Rust client, projection | the kill-and-recover walkthrough runs from a clean checkout with no API key |
-| 6 Release hardening | paged indexes, bounded cold wake, resource isolation, migration refusal tests, benchmarks with pre-registered bands, operator guide, image flip | the feature matrix matches executable tests; no unbounded root or history load |
+| 6 Release hardening | paged indexes (see the index-page amendment below), bounded cold wake, resource isolation, migration refusal tests, benchmarks with pre-registered bands, operator guide, image flip | the feature matrix matches executable tests; no unbounded root or history load |
 
 Benchmarks report GET, PUT, CAS, LIST, bytes and conflicts per accepted
 message, turn, step and activation, cold and warm, for one hot agent, many
@@ -663,3 +665,80 @@ the index complete:
 The entry stays advisory in one sense: a reader never acts on it without
 reading HEAD. The key layout and the write mode in decision 2 are
 unchanged.
+
+## Amendment (2026-10-28): index pages, a per-list representation, and migration on the next CAS
+
+<!-- amendment-applies: sections="3. The HEAD record|15. Milestones" pointer="index-page amendment" -->
+<!-- amendment-supersedes: phrase="the milestone 6 task ships the reader one release before the writer" pointer="index-page amendment" -->
+
+Milestone 6 (#3359) moves the five indexes HEAD carries (inbox, receipts,
+results, events and timers) out of the root record into immutable index
+pages. Decision 3 now reads as follows for those lists.
+
+- **Representation.** HEAD format version 2 carries one `PageDirectory`
+  per list, fields 35 to 39 of `AgentHead`: a representation (`INLINE` or
+  `PAGED`), the `PageRef`s of the sealed pages in key order, and
+  `tail_from`, the first key still held inline. A version 1 HEAD decodes
+  with every list `INLINE` and no pages (`head::tests::a_version_one_head_decodes_with_every_list_inline`).
+- **Pages.** A page is an `o/<object_hash>` object holding the existing
+  `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or `TimerTable`
+  message at object format version 1. It holds at most
+  `Limits::max_page_entries` entries; an append past that is refused with
+  `PageFull`, and a directory past `Limits::max_index_pages` pages with
+  `DirectoryFull`, both surfaced as `BudgetExceeded`
+  (`a_full_page_refuses_the_next_append_typed`,
+  `a_full_directory_refuses_the_next_page_typed`). A command writes every page it seals
+  with `CreateIfAbsent` before the HEAD CAS that first references it
+  (store test `pages_are_written_before_the_cas_that_references_them`). A
+  lost CAS re-runs the kernel, seals byte-identical pages and meets the
+  objects the first attempt wrote under the same hashes
+  (`a_lost_cas_reuses_the_page_hash_on_retry`).
+- **Sealing.** The open tail stays inline. A full page of the tail seals
+  when its entries can no longer change: inbox, receipts and events seal
+  any full page, results seal below the oldest pending input, and timers
+  seal below the lowest generation still scheduled, so a sealed timer page
+  never holds a timer that can fire.
+- **Reads.** A command names the pages it needs before it runs
+  (`Kernel::pages_needed`); the store GETs those and no others. A send of a
+  new request reads HEAD and no page, a repeat send and a receipt lookup
+  read at most one receipt page, a wake reads no timer page, and events
+  are read by `event_seq` range from the page holding the cursor
+  (`send_receipt_lookup_and_wake_read_at_most_one_index_page_each` at 13
+  and 49 inputs, `events_are_read_by_seq_range`). A receipt is found by
+  request id, not by accept sequence, so a key range over receipt pages
+  cannot answer the lookup. Each receipt `PageRef` carries the sorted
+  4-byte blake3 fingerprints of its request ids instead of a bloom filter:
+  exact membership with no false negatives, a false-positive read only on
+  a 32-bit collision, and 4 bytes per entry against a bloom filter's
+  roughly 1.2 bytes at 1% that would cost an expected 0.64 extra reads
+  across 64 pages.
+- **Byte cap.** The guard keeps a page reserve: a guarded command is
+  refused while HEAD could not hold the `PageRef`s that the results and
+  events its pending work will append can still seal into
+  (`kernel::tests::pages::a_guarded_publish_keeps_the_index_page_reserve`,
+  `the_index_reserve_covers_the_exempt_page_growth`), and a HEAD stays
+  under `max_head_bytes` with its lists at `max_index_pages`
+  (`head_stays_under_the_cap_with_every_list_at_max_pages`).
+- **Migration.** The first CAS by a version 2 writer on a version 1 HEAD
+  seals every inline list in that same command and writes version 2. A
+  maximal inline HEAD under the byte cap migrates in one CAS and lands
+  under the cap (`one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`,
+  store test `a_version_one_head_migrates_on_the_next_cas`). A HEAD already
+  paged is left as it is.
+
+Rollout replaces the readers-before-writers sequence decision 3 stated.
+That sequence guarded against a version 1 writer re-encoding a version 2
+HEAD and dropping its page references. The version 1 release already
+refuses any HEAD whose format version is above 1 as `UnsupportedFormat`
+before it decodes the rest, and so never re-encodes one
+(`head::tests::a_version_one_reader_refuses_a_version_two_head`, store test
+`a_newer_head_format_is_unsupported_and_never_written`). Reader and writer
+therefore ship in one release. During a mixed rollout a version 1 node
+answers `UnsupportedFormat` for an agent a version 2 node has written; no
+accepted message is lost.
+
+Costs this leaves in place: a timer page cannot seal past a timer still
+scheduled, so history behind a long-lived timer stays inline until it
+fires or is cancelled; `AgentStore::read_head`, the inspection read,
+GETs every page; and a command whose page need the planner did not name
+falls back to loading every sealed page HEAD references, with a warning.
