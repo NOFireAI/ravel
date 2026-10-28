@@ -1,0 +1,30 @@
+{
+  "effect": "djE6ZWZmZWN0OjE5Y2QwZTY4NzY5OTEzMTRjMWI2ZGJkOGJkMTI5Mjk3OjE6NTIyYjgzNzg5NzkyOWY4MmFhMDdlNmJkYzZmNDYyMGI",
+  "turn_id": "d746246fc5bd6d52e210c7e1883ca81e",
+  "tool_name": "payments.charge",
+  "tool_version": "2",
+  "policy": "at_least_once",
+  "status": "completed",
+  "attempt": 2,
+  "step_key": "charge",
+  "result_attempt": 2,
+  "result": null,
+  "failure": "card declined",
+  "attempts": [
+    {
+      "attempt": 1,
+      "status": "superseded"
+    },
+    {
+      "attempt": 2,
+      "status": "result"
+    }
+  ],
+  "evidence": [
+    {
+      "attempt": 1,
+      "result": null,
+      "failure": "gateway timeout"
+    }
+  ]
+}
