@@ -32,13 +32,15 @@
 #               missing from --bin-dir, an out-dir that already holds a run's output, a
 #               profile the workload does not declare, an off-grid anchor, or
 #               a metricsbench compose project (containers or volumes) left
-#               from an earlier run, or a host arch (uname -m) other than
-#               x86_64 or aarch64; nothing is started
+#               from an earlier run, a Docker engine arch (docker version
+#               Server.Arch, else uname -m when the engine does not answer)
+#               other than amd64/x86_64 or arm64/aarch64, or neither
+#               sha256sum nor shasum on PATH; nothing is started
 #   stamps      <out>/stamps.json, written before the first step and completed
 #               at the end, whatever the outcome
 #   fetch-s3s-fs  the s3s-fs binary the s3s service runs (ADR-0927 amendment
-#               2026-10-29): the cached copy for this arch if its sha256
-#               equals the pinned constant below, else the release asset
+#               2026-10-29): the cached copy for the engine's arch if its
+#               sha256 equals the pinned constant below, else the release asset
 #               downloaded and checked against it; any other sha256 is
 #               refused with exit 65 before anything starts. Its path is
 #               exported as S3S_FS_BIN and stamped (object_store)
@@ -623,12 +625,33 @@ fi
 
 host_arch="$(uname -m)"
 if [ "$diagnostic" -eq 0 ]; then
-  case "$host_arch" in
+  # The binary runs inside the engine's Linux containers, so the engine's arch
+  # picks the asset, not the host's (macOS reports arm64 for linux/aarch64).
+  engine_arch="$("$DOCKER" version --format '{{.Server.Arch}}' 2>/dev/null)" || engine_arch=""
+  if [ -n "$engine_arch" ]; then
+    engine_arch_source="docker version (Server.Arch)"
+  else
+    engine_arch="$host_arch"
+    engine_arch_source="uname -m (the Docker engine did not answer docker version)"
+  fi
+  case "$engine_arch" in
+    amd64 | x86_64) s3s_fs_arch="x86_64" ;;
+    arm64 | aarch64) s3s_fs_arch="aarch64" ;;
+    *) refuse "no s3s-fs release asset is pinned for engine arch '$engine_arch' (from ${engine_arch_source}); only amd64/x86_64 and arm64/aarch64 are" ;;
+  esac
+  case "$s3s_fs_arch" in
     x86_64) s3s_fs_sha256="$S3S_FS_SHA256_X86_64" ;;
     aarch64) s3s_fs_sha256="$S3S_FS_SHA256_AARCH64" ;;
-    *) refuse "no s3s-fs release asset is pinned for host arch '$host_arch' (uname -m); only x86_64 and aarch64 are" ;;
   esac
-  s3s_fs_asset="s3s-fs-linux-${host_arch}"
+  s3s_fs_asset="s3s-fs-linux-${s3s_fs_arch}"
+  # macOS ships shasum, not sha256sum.
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256_cmd=(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    sha256_cmd=(shasum -a 256)
+  else
+    refuse "neither sha256sum nor shasum is on PATH; the s3s-fs binary cannot be checked against its pin"
+  fi
 fi
 
 if [ "$ravel_image_kind" = "local-build" ]; then
@@ -906,7 +929,7 @@ memory_step() {
 # sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
 sha256_of() {
   local out
-  out="$(sha256sum "$1")" || return 1
+  out="$("${sha256_cmd[@]}" "$1")" || return 1
   printf '%s\n' "${out%% *}"
 }
 
@@ -947,8 +970,8 @@ fetch_s3s_fs() {
     from="download"
   fi
   export S3S_FS_BIN="$bin"
-  stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps(dict(zip(["implementation","release","arch","sha256","url","path","source"], sys.argv[1:]))))' \
-    s3s-fs "$S3S_FS_RELEASE" "$host_arch" "$got" "$url" "$bin" "$from")"
+  stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps(dict(zip(["implementation","release","arch","engine_arch","engine_arch_source","sha256","url","path","source"], sys.argv[1:]))))' \
+    s3s-fs "$S3S_FS_RELEASE" "$s3s_fs_arch" "$engine_arch" "$engine_arch_source" "$got" "$url" "$bin" "$from")"
   step_done fetch-s3s-fs
 }
 
