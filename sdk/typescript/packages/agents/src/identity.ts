@@ -91,7 +91,7 @@ function chainingValue(o: Output): Uint32Array {
 }
 
 function chunkOutput(chunk: Uint8Array, counter: number): Output {
-  let cv = IV;
+  let cv: Uint32Array = IV;
   const blocks = Math.max(1, Math.ceil(chunk.length / BLOCK_LEN));
   for (let i = 0; i < blocks - 1; i++) {
     const flags = i === 0 ? CHUNK_START : 0;

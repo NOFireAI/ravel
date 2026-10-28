@@ -17,7 +17,7 @@ function read(stem: string): string {
 
 /** Every exported request, response or error schema: one wire body each. */
 function bodySchemas(): [string, z.ZodType][] {
-  return Object.entries(wire).filter(
+  return Object.entries(wire as Record<string, unknown>).filter(
     (entry): entry is [string, z.ZodType] =>
       entry[1] instanceof z.ZodType && /(Request|Response|^ErrorBody)$/.test(entry[0]),
   );
