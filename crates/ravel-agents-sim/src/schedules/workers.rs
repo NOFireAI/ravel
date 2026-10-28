@@ -73,7 +73,11 @@ fn killed(kp: KillPoint) {
         .iter()
         .map(|t| (t.name.as_str(), t.action, t.op, t.key.contains(&key)))
         .collect();
-    sim_assert_eq!(out, crashed, vec![("w1", Action::Crashed, kp.gate.op, true)]);
+    sim_assert_eq!(
+        out,
+        crashed,
+        vec![("w1", Action::Crashed, kp.gate.op, true)]
+    );
     let drained = drain(&rig, 2);
     let run = checked(&rig, &drained);
     sim_assert!(out, run.refusals.is_empty(), "{:?}", run.refusals);
@@ -86,7 +90,8 @@ fn killed(kp: KillPoint) {
         run.inferred
     );
     let head = rig.head().expect("head");
-    one_terminal_result_per_input(&head).unwrap_or_else(|e| panic!("{e}\n{}", out.failure_context()));
+    one_terminal_result_per_input(&head)
+        .unwrap_or_else(|e| panic!("{e}\n{}", out.failure_context()));
     sim_assert_eq!(
         out,
         head.results[0].output,
@@ -227,7 +232,13 @@ fn kills(seed: u64) -> KillCounts {
     one_terminal_result_per_input(&head)
         .unwrap_or_else(|e| panic!("{e}\n{}", out.failure_context()));
     // The rule fires on w1's k-th HEAD write, if w1 lived to issue one.
-    let w1_cas = rig.proc_named("w1").expect("w1").store.counters().publish.cas;
+    let w1_cas = rig
+        .proc_named("w1")
+        .expect("w1")
+        .store
+        .counters()
+        .publish
+        .cas;
     let lost = usize::from(w1_cas >= k);
     let expected = if lost == 1 {
         vec![((Op::Put, FaultKind::DuplicateDelivery), 1)]
@@ -409,11 +420,19 @@ fn suspended(seed: u64, script: ScheduleScript) -> bool {
             commits,
             vec![committed, Reply::Error(ErrorKind::OwnershipLost)]
         );
-        sim_assert_eq!(out, (w1.turns_committed, w1.ownership_lost_refusals), (0, 1));
+        sim_assert_eq!(
+            out,
+            (w1.turns_committed, w1.ownership_lost_refusals),
+            (0, 1)
+        );
         sim_assert_eq!(out, w2.turns_committed, 1);
     } else {
         sim_assert_eq!(out, commits, vec![committed]);
-        sim_assert_eq!(out, (w1.turns_committed, w1.ownership_lost_refusals), (1, 0));
+        sim_assert_eq!(
+            out,
+            (w1.turns_committed, w1.ownership_lost_refusals),
+            (1, 0)
+        );
         sim_assert_eq!(out, (w2.takeovers, w2.turns_committed), (0, 0));
     }
     one_terminal_result_per_input(&rig.head().expect("head")).unwrap_or_else(|e| panic!("{e}"));
@@ -456,8 +475,12 @@ fn cold_restart_race(seed: u64) -> u64 {
     run(&rig, seed, ScheduleScript::new(Vec::new()), vec![w]).expect("first life");
     rig.clock.advance_ms(crate::drive::PAST_LEASE_MS);
     let c = client(&rig, "c", 40, |p| async move {
-        p.send("r3", &payload(3)).await.map_err(|e| format!("send: {e:?}"))?;
-        p.result(&op(1)).await.map_err(|e| format!("result: {e:?}"))?;
+        p.send("r3", &payload(3))
+            .await
+            .map_err(|e| format!("send: {e:?}"))?;
+        p.result(&op(1))
+            .await
+            .map_err(|e| format!("result: {e:?}"))?;
         Ok(())
     });
     let w = worker(&rig, "w-restarted", 50, |p| async move {
@@ -509,9 +532,15 @@ fn cold_restart_with_a_second_coordinator() {
     let first = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![w]).expect("first life");
     rig.clock.advance_ms(crate::drive::PAST_LEASE_MS);
     let c = client(&rig, "c", 40, |p| async move {
-        p.send("r3", &payload(3)).await.map_err(|e| format!("send: {e:?}"))?;
-        p.resolve("r1").await.map_err(|e| format!("resolve: {e:?}"))?;
-        p.result(&op(1)).await.map_err(|e| format!("result: {e:?}"))?;
+        p.send("r3", &payload(3))
+            .await
+            .map_err(|e| format!("send: {e:?}"))?;
+        p.resolve("r1")
+            .await
+            .map_err(|e| format!("resolve: {e:?}"))?;
+        p.result(&op(1))
+            .await
+            .map_err(|e| format!("result: {e:?}"))?;
         Ok(())
     });
     run(&rig, 2, ScheduleScript::new(Vec::new()), vec![c]).expect("client restart");
@@ -526,7 +555,12 @@ fn cold_restart_with_a_second_coordinator() {
         .history
         .calls()
         .iter()
-        .filter(|c| matches!(c.event, Event::Client(crate::reference::ClientOp::Result { .. })))
+        .filter(|c| {
+            matches!(
+                c.event,
+                Event::Client(crate::reference::ClientOp::Result { .. })
+            )
+        })
         .map(|c| c.observed.clone())
         .collect();
     sim_assert_eq!(
@@ -543,7 +577,11 @@ fn cold_restart_with_a_second_coordinator() {
     sim_assert_eq!(out, head.next_accept_seq, 4);
     let first_metrics = rig.proc_named("w").expect("w").co.metrics();
     let second = rig.proc_named("w-restarted").expect("w").co.metrics();
-    sim_assert_eq!(out, (first_metrics.takeovers, first_metrics.turns_committed), (1, 1));
+    sim_assert_eq!(
+        out,
+        (first_metrics.takeovers, first_metrics.turns_committed),
+        (1, 1)
+    );
     sim_assert_eq!(out, (second.takeovers, second.turns_committed), (1, 2));
 }
 
@@ -575,7 +613,9 @@ fn lost_commit_ack_then_takeover_is_a_known_false_negative() {
     );
     let w1 = w1.with_gates(vec![gate(Op::Get, "/head", 5)]);
     let c = client(&rig, "c", 30, |p| async move {
-        p.send("r2", &payload(2)).await.map_err(|e| format!("send: {e:?}"))?;
+        p.send("r2", &payload(2))
+            .await
+            .map_err(|e| format!("send: {e:?}"))?;
         Ok(())
     })
     .with_gates(vec![gate(Op::Get, "/head", 1)]);
@@ -610,11 +650,19 @@ fn lost_commit_ack_then_takeover_is_a_known_false_negative() {
             state_version: 1
         }
     );
-    sim_assert_eq!(out, divergence.observed, Reply::Error(ErrorKind::OwnershipLost));
+    sim_assert_eq!(
+        out,
+        divergence.observed,
+        Reply::Error(ErrorKind::OwnershipLost)
+    );
     let head = rig.head().expect("head");
     one_terminal_result_per_input(&head).unwrap_or_else(|e| panic!("{e}"));
     sim_assert_eq!(out, head.results[0].status, ResultStatus::Completed);
-    sim_assert_eq!(out, head.results[0].output, Some(ObjectRef::of(&output_of(1))));
+    sim_assert_eq!(
+        out,
+        head.results[0].output,
+        Some(ObjectRef::of(&output_of(1)))
+    );
     sim_assert_eq!(out, head.state_version, 2);
     sim_assert_eq!(
         out,
@@ -623,6 +671,10 @@ fn lost_commit_ack_then_takeover_is_a_known_false_negative() {
     );
     let w1 = rig.proc_named("w1").expect("w1").co.metrics();
     let w2 = rig.proc_named("w2").expect("w2").co.metrics();
-    sim_assert_eq!(out, (w1.turns_committed, w1.ownership_lost_refusals), (0, 1));
+    sim_assert_eq!(
+        out,
+        (w1.turns_committed, w1.ownership_lost_refusals),
+        (0, 1)
+    );
     sim_assert_eq!(out, (w2.takeovers, w2.turns_committed), (1, 1));
 }

@@ -44,7 +44,9 @@ fn enqueue_race(seed: u64, script: ScheduleScript, gated: bool) -> u64 {
     });
     let c = client(&rig, "c", 20, |p| async move {
         for (id, n) in [("r2", 2), ("r3", 3)] {
-            p.send(id, &payload(n)).await.map_err(|e| format!("send {id}: {e:?}"))?;
+            p.send(id, &payload(n))
+                .await
+                .map_err(|e| format!("send {id}: {e:?}"))?;
         }
         Ok(())
     });
@@ -132,7 +134,10 @@ fn cancel_race(seed: u64, script: ScheduleScript, gated: bool) -> Winner {
     let c = client(&rig, "c", 20, |p| async move {
         let mut running = false;
         for _ in 0..64 {
-            let status = p.operation(&op(1)).await.map_err(|e| format!("operation: {e:?}"))?;
+            let status = p
+                .operation(&op(1))
+                .await
+                .map_err(|e| format!("operation: {e:?}"))?;
             if status != Reply::Status(OperationStatus::Accepted) {
                 running = true;
                 break;
@@ -141,8 +146,12 @@ fn cancel_race(seed: u64, script: ScheduleScript, gated: bool) -> Winner {
         if !running {
             return Err("op 1 never left accepted".to_string());
         }
-        p.cancel(&op(1)).await.map_err(|e| format!("cancel: {e:?}"))?;
-        p.result(&op(1)).await.map_err(|e| format!("result: {e:?}"))?;
+        p.cancel(&op(1))
+            .await
+            .map_err(|e| format!("cancel: {e:?}"))?;
+        p.result(&op(1))
+            .await
+            .map_err(|e| format!("result: {e:?}"))?;
         Ok(())
     });
     let actors = if gated {
@@ -230,7 +239,9 @@ fn cancel_of_an_accepted_input_reports_requested_false() {
     let rig = Rig::new(FaultPlan::empty());
     create_with_inputs(&rig, 1);
     let c = client(&rig, "c", 20, |p| async move {
-        p.cancel(&op(1)).await.map_err(|e| format!("cancel: {e:?}"))?;
+        p.cancel(&op(1))
+            .await
+            .map_err(|e| format!("cancel: {e:?}"))?;
         Ok(())
     });
     let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![c]).expect("schedule");

@@ -18,8 +18,7 @@ use serde_json::{Value, json};
 
 use crate::drive::{Proc, Rig, Run};
 use crate::scheduler::{
-    Actor, ActorStore, Role, ScheduleError, ScheduleOutcome, ScheduleScript, Scheduler,
-    ScriptStep,
+    Actor, ActorStore, Role, ScheduleError, ScheduleOutcome, ScheduleScript, Scheduler, ScriptStep,
 };
 use crate::seeds::AgentSeeds;
 
@@ -91,7 +90,12 @@ where
 pub(crate) fn all_fired(faults: &Faults) -> Vec<((Op, FaultKind), u64)> {
     let mut all: Vec<_> = faults
         .get()
-        .map(|f| f.counters_snapshot().into_iter().filter(|(_, n)| *n > 0).collect())
+        .map(|f| {
+            f.counters_snapshot()
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .collect()
+        })
         .unwrap_or_default();
     all.sort_by_key(|((op, kind), _)| (format!("{op:?}"), format!("{kind:?}")));
     all

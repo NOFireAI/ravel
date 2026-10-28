@@ -680,7 +680,11 @@ impl Rig {
 
     /// The process named `name`; the last one when the name repeats.
     pub fn proc_named(&self, name: &str) -> Option<ProcHandle> {
-        lock(&self.procs).iter().rev().find(|p| p.name == name).cloned()
+        lock(&self.procs)
+            .iter()
+            .rev()
+            .find(|p| p.name == name)
+            .cloned()
     }
 
     /// Head CAS attempts and conflicts summed over every process.
@@ -823,10 +827,7 @@ impl Proc {
                     None,
                     Observed::Unmappable(format!("bad handle {}", assignment.operation)),
                 );
-                return self
-                    .co
-                    .commit(&completion(assignment, state, output))
-                    .await;
+                return self.co.commit(&completion(assignment, state, output)).await;
             }
         };
         let event = Event::TurnCompleted {
@@ -904,7 +905,12 @@ impl Proc {
                 return Ok(Reply::Result(None));
             };
             let output = match result.output {
-                Some(dep) => Some(self.store.read_object(&operation.agent, dep).await?.to_vec()),
+                Some(dep) => Some(
+                    self.store
+                        .read_object(&operation.agent, dep)
+                        .await?
+                        .to_vec(),
+                ),
                 None => None,
             };
             Ok(Reply::Result(Some(Outcome {
@@ -944,14 +950,19 @@ impl Proc {
             })
         };
         let out: Result<Result<Reply, String>, AgentError> = self
-            .record("resolve", Some(event), fut, |r: &Result<Result<Reply, String>, AgentError>| {
-                let observed = match r {
-                    Ok(Ok(reply)) => Observed::Modelled(reply.clone()),
-                    Ok(Err(what)) => Observed::Unmappable(what.clone()),
-                    Err(e) => map_error(e.kind),
-                };
-                (None, observed)
-            })
+            .record(
+                "resolve",
+                Some(event),
+                fut,
+                |r: &Result<Result<Reply, String>, AgentError>| {
+                    let observed = match r {
+                        Ok(Ok(reply)) => Observed::Modelled(reply.clone()),
+                        Ok(Err(what)) => Observed::Unmappable(what.clone()),
+                        Err(e) => map_error(e.kind),
+                    };
+                    (None, observed)
+                },
+            )
             .await;
         match out {
             Ok(Ok(reply)) => Ok(reply),

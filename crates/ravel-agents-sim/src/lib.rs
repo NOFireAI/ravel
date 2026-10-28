@@ -17,7 +17,6 @@
 //!   `FaultStore` gate, and releases or crashes them in a seed-derived order.
 //! - [`seeds`]: the agent seed domains split from one `MasterSeed`, and the
 //!   seeded `RngSource` for runtime ids.
-//!
 //! - [`drive`]: runs the production store and runtime crates through the
 //!   scheduler and records their histories for the checker.
 //!

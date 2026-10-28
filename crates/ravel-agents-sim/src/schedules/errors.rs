@@ -5,8 +5,8 @@
 use bytes::Bytes;
 use ravel_agents_core::error::ErrorKind;
 use ravel_agents_core::head::ObjectRef;
-use ravel_agents_core::keys::object_key;
 use ravel_agents_core::kernel::Limits;
+use ravel_agents_core::keys::object_key;
 use ravel_agents_core::state::Handle;
 use ravel_agents_core::wire::{AgentRef, HandlerPinBody, SendRequest};
 use ravel_agents_store::StoreLimits;
@@ -95,7 +95,11 @@ fn corrupt_dependency_is_store_unavailable() {
         run.inferred,
         vec![("w".to_string(), Event::TurnStarted { operation: op(1) })]
     );
-    sim_assert_eq!(out, rig.rules.fault_count(Op::Get, FaultKind::CorruptRange), 1);
+    sim_assert_eq!(
+        out,
+        rig.rules.fault_count(Op::Get, FaultKind::CorruptRange),
+        1
+    );
     let w = rig.proc_named("w").expect("w").co.metrics();
     sim_assert_eq!(out, w.turns_committed, 0);
 }
@@ -172,11 +176,14 @@ fn tenant_mismatch_is_store_unavailable() {
     sim_assert_eq!(out, c.store.counters().publish.cas, 0);
 }
 
+/// One hostile send's answer and the HEAD reads it cost.
+type HostileAnswer = (Result<(), ErrorKind>, u64);
+
 /// Hostile agent names: path separators, traversal, NUL, empty and
 /// oversized parts. Each answers `AgentGone`, writes nothing, and reads at
 /// most the HEAD key of its own hashed agent id, never a key spelled from
 /// the name. Returns `(kind, HEAD reads)` per name, in order.
-fn hostile_sends() -> (ScheduleOutcome, Rig, Vec<(Result<(), ErrorKind>, u64)>) {
+fn hostile_sends() -> (ScheduleOutcome, Rig, Vec<HostileAnswer>) {
     let rig = Rig::new(FaultPlan::empty());
     create(&rig);
     let names: Vec<(String, String)> = [
@@ -204,7 +211,9 @@ fn hostile_sends() -> (ScheduleOutcome, Rig, Vec<(Result<(), ErrorKind>, u64)>) 
             let before = p.store.counters().resolve.get;
             let answer = p.co.send(&req).await.map(|_| ()).map_err(|e| e.kind);
             let reads = p.store.counters().resolve.get - before;
-            sink.lock().map_err(|e| e.to_string())?.push((answer, reads));
+            sink.lock()
+                .map_err(|e| e.to_string())?
+                .push((answer, reads));
         }
         Ok(())
     });
@@ -249,7 +258,7 @@ fn hostile_keys_are_agent_gone() {
 /// Per hostile name, in [`hostile_sends`] order: the answer and the HEAD
 /// reads it cost. An empty part and the oversized key are refused before
 /// any store call; the rest are hashed into an agent id nobody created.
-const HOSTILE_ANSWERS: [(Result<(), ErrorKind>, u64); 7] = [
+const HOSTILE_ANSWERS: [HostileAnswer; 7] = [
     (Err(ErrorKind::AgentGone), 0),
     (Err(ErrorKind::AgentGone), 3),
     (Err(ErrorKind::AgentGone), 3),
@@ -274,7 +283,9 @@ fn oversized_payload_is_budget_exceeded() {
             Err(e) if e.kind == ErrorKind::BudgetExceeded => {}
             other => return Err(format!("big send: {other:?}")),
         }
-        p.send("r2", &payload(2)).await.map_err(|e| format!("send: {e:?}"))?;
+        p.send("r2", &payload(2))
+            .await
+            .map_err(|e| format!("send: {e:?}"))?;
         Ok(())
     });
     let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![c]).expect("schedule");
@@ -339,7 +350,6 @@ fn contended_refusals(seed: u64) -> (usize, u64) {
             max_mailbox_depth: 2,
             ..Limits::default()
         },
-        ..StoreLimits::default()
     };
     let rig = Rig::with_limits(FaultPlan::empty(), limits);
     create(&rig);
@@ -349,14 +359,21 @@ fn contended_refusals(seed: u64) -> (usize, u64) {
             for (id, body) in sends {
                 match p.send(id, &body).await {
                     Ok(_) => {}
-                    Err(e) if matches!(e.kind, ErrorKind::MailboxFull | ErrorKind::BudgetExceeded) => {}
+                    Err(e)
+                        if matches!(e.kind, ErrorKind::MailboxFull | ErrorKind::BudgetExceeded) => {
+                    }
                     Err(e) => return Err(format!("send {id}: {e:?}")),
                 }
             }
             Ok(())
         }
     };
-    let a = client(&rig, "a", 20, sends(vec![("a1", payload(1)), ("a2", payload(2))]));
+    let a = client(
+        &rig,
+        "a",
+        20,
+        sends(vec![("a1", payload(1)), ("a2", payload(2))]),
+    );
     let b = client(
         &rig,
         "b",
@@ -437,11 +454,11 @@ fn poll_with_mismatched_pins_is_incompatible_handler() {
     );
     sim_assert!(out, run.inferred.is_empty(), "{:?}", run.inferred);
     let w2 = rig.proc_named("w2").expect("w2").co.metrics();
-    sim_assert_eq!(out, (w2.incompatible_handler_refusals, w2.turns_committed), (1, 0));
-    let head = rig.head().expect("head");
     sim_assert_eq!(
         out,
-        head.active_turn.map(|t| t.input_accept_seq),
-        Some(1)
+        (w2.incompatible_handler_refusals, w2.turns_committed),
+        (1, 0)
     );
+    let head = rig.head().expect("head");
+    sim_assert_eq!(out, head.active_turn.map(|t| t.input_accept_seq), Some(1));
 }

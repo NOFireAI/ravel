@@ -133,8 +133,12 @@ fn same_request_twice_is_a_duplicate() {
     let rig = Rig::new(FaultPlan::empty());
     create(&rig);
     let c = client(&rig, "c", 10, |p| async move {
-        p.send("r1", &payload(1)).await.map_err(|e| format!("{e:?}"))?;
-        p.send("r1", &payload(1)).await.map_err(|e| format!("{e:?}"))?;
+        p.send("r1", &payload(1))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        p.send("r1", &payload(1))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
         Ok(())
     });
     let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![c]).expect("schedule");
@@ -163,7 +167,9 @@ fn same_id_different_payload_conflicts() {
     let rig = Rig::new(FaultPlan::empty());
     create(&rig);
     let c = client(&rig, "c", 10, |p| async move {
-        p.send("r1", &payload(1)).await.map_err(|e| format!("{e:?}"))?;
+        p.send("r1", &payload(1))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
         match p.send("r1", &payload(2)).await {
             Err(e) if e.kind == ErrorKind::IdempotencyConflict => {}
             other => return Err(format!("second send: {other:?}")),
@@ -284,8 +290,13 @@ fn lost_ack(seed: u64, script: ScheduleScript, gated: bool) -> LostAck {
             .with_occurrence(Occurrence::Always),
     );
     let (a, faults) = faulty(&rig, Role::Client, "a", 10, plan, |p| async move {
-        let sent = p.send("r1", &payload(1)).await.map_err(|e| format!("send: {e:?}"))?;
-        p.resolve("r1").await.map_err(|e| format!("resolve: {e:?}"))?;
+        let sent = p
+            .send("r1", &payload(1))
+            .await
+            .map_err(|e| format!("send: {e:?}"))?;
+        p.resolve("r1")
+            .await
+            .map_err(|e| format!("resolve: {e:?}"))?;
         p.result(&decode(&sent.operation)?)
             .await
             .map_err(|e| format!("result: {e:?}"))?;
@@ -293,7 +304,9 @@ fn lost_ack(seed: u64, script: ScheduleScript, gated: bool) -> LostAck {
     });
     let b = client(&rig, "b", 20, |p| async move {
         for (id, n) in [("r2", 2), ("r3", 3)] {
-            p.send(id, &payload(n)).await.map_err(|e| format!("send {id}: {e:?}"))?;
+            p.send(id, &payload(n))
+                .await
+                .map_err(|e| format!("send {id}: {e:?}"))?;
         }
         Ok(())
     });
@@ -480,7 +493,10 @@ fn lost_cas_response_across_seeds() {
         sim_assert!(*out, l.run.unmappable.is_empty(), "{:?}", l.run.unmappable);
         sim_assert!(*out, l.run.refusals.is_empty(), "{:?}", l.run.refusals);
         if let Err(d) = l.run.check() {
-            panic!("{d}\n{}", crate::scheduler::FailureContext::failure_context(out));
+            panic!(
+                "{d}\n{}",
+                crate::scheduler::FailureContext::failure_context(out)
+            );
         }
         let sent = replies(&l.run.history, |e| is_send(e, "r1"));
         let Some(Reply::Accepted {
@@ -507,10 +523,10 @@ fn lost_cas_response_across_seeds() {
         );
         sim_assert_eq!(*out, a.co.metrics().outcome_unknown_resolved, 1);
         a_conflicts += a_publish.conflict;
-        if let Reply::Accepted { operation, .. } = &sent[0] {
-            if let ravel_agents_core::state::HandleItem::Operation(seq) = operation.item {
-                accepted_seqs.push(seq);
-            }
+        if let Reply::Accepted { operation, .. } = &sent[0]
+            && let ravel_agents_core::state::HandleItem::Operation(seq) = operation.item
+        {
+            accepted_seqs.push(seq);
         }
         runs += 1;
     }
