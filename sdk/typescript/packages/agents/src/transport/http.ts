@@ -71,7 +71,7 @@ export class HttpTransport implements Transport {
   readonly journal: StepJournal;
   private readonly base: string;
   private readonly fetchImpl: typeof fetch;
-  /** The scope of every turn this transport polled and has not committed. */
+  /** The scope of every turn this transport polled and the runner has not released. */
   private readonly scopes = new Map<string, StepScope>();
 
   constructor(private readonly options: HttpTransportOptions) {
@@ -99,7 +99,13 @@ export class HttpTransport implements Transport {
       if (signal?.aborted === true) throw signal.reason;
       throw new OutcomeUnknown(`worker/${route}: request failed: ${String(error)}`, { cause: error });
     }
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      if (signal?.aborted === true) throw signal.reason;
+      throw new OutcomeUnknown(`worker/${route}: response body failed: ${String(error)}`, { cause: error });
+    }
     let json: unknown;
     try {
       json = text === "" ? undefined : JSON.parse(text);
@@ -207,6 +213,10 @@ export class HttpTransport implements Transport {
     const response = await this.exchange("commit", WorkerCommitRequest, request, WorkerCommitResponse);
     this.scopes.delete(request.lease.turn_id);
     return response;
+  }
+
+  release(turnId: string): void {
+    this.scopes.delete(turnId);
   }
 }
 

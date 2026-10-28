@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   EffectInDoubt,
   Forbidden,
+  IncompatibleHandler,
   NonDeterministicReplay,
   OutcomeUnknown,
   OwnershipLost,
@@ -17,7 +18,7 @@ import { effectId, stepId } from "../identity.js";
 import { defineTool } from "../tools/index.js";
 import { gate, until } from "../test-util.js";
 import { decodeWire, heldLease, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
-import { defineAgent, handlerDigest, serveAgents, type TurnReport } from "../worker/index.js";
+import { defineAgent, handlerDigest, runTurn, serveAgents, type TurnReport } from "../worker/index.js";
 import type { StepRecordRequest } from "../worker/transport.js";
 import { createHttpTransport, MAX_POLL_WAIT_MS, MemoryStepJournal } from "./http.js";
 
@@ -163,6 +164,34 @@ describe("HttpTransport error mapping", () => {
     expect(await caught(notFound.transport.register({ handlers: [] }))).toBeInstanceOf(UnsupportedFormat);
   });
 
+  it("maps a response body that fails mid-read to OutcomeUnknown", async () => {
+    const failingBodies: (() => Response)[] = [
+      // A stream that errors, as a connection dropped mid-body does.
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new TypeError("terminated"));
+            },
+          }),
+          { status: 200 },
+        ),
+      // A response whose text() itself rejects.
+      () => ({ ok: true, status: 200, text: () => Promise.reject(new DOMException("aborted", "AbortError")) }) as unknown as Response,
+    ];
+    for (const body of failingBodies) {
+      const transport = createHttpTransport({
+        url: "http://ravel.test",
+        token: "t",
+        fetch: () => Promise.resolve(body()),
+      });
+      expect(await caught(transport.heartbeat({ lease: LEASE }))).toBeInstanceOf(OutcomeUnknown);
+      expect(await caught(transport.commit({ lease: LEASE, outcome: "failed", error: "x", terminal: false }))).toBeInstanceOf(
+        OutcomeUnknown,
+      );
+    }
+  });
+
   it("maps every failure to a RavelAgentsError", async () => {
     const answers: Answer[] = [{ status: 500 }, { status: 418, text: "{" }, new Error("reset"), { status: 200, text: "nope" }];
     for (const answer of answers) {
@@ -224,6 +253,68 @@ describe("HttpTransport steps", () => {
       }),
     );
     expect(error).toBeInstanceOf(UnsupportedFormat);
+  });
+
+  it("an abandoned turn leaves no scope behind", async () => {
+    const killer = new AbortController();
+    const ticket = defineTool({
+      name: "desk.ticket",
+      version: "1",
+      input: z.object({}),
+      output: z.object({}),
+      recovery: "manual",
+      run: () => {
+        killer.abort(new Error("worker killed inside the step"));
+        return new Promise<never>(() => undefined);
+      },
+    });
+    const agent = defineAgent({
+      name: "order",
+      version: "1.0.0",
+      state: z.unknown(),
+      initialState: null,
+      messages: (message) => ({
+        place: message({ payload: z.unknown(), result: z.object({}), handler: (ctx) => ctx.step("ticket", ticket, {}) }),
+      }),
+    });
+    const agents = new Map([[agent.name, agent]]);
+    const ours = { ...pollFixture, assignment: { ...pollFixture.assignment, lease: { ...pollFixture.assignment.lease, handler_digest: handlerDigest(agent, "place") }, steps: [] } };
+    let next: unknown = ours;
+    const { transport, sent } = transportWith((route) => {
+      if (route === "poll") return { status: 200, body: next };
+      if (route === "heartbeat") return { status: 200, body: { lease_expires_unix_ns: "1" } };
+      return { status: 404 };
+    });
+    const poll = () => transport.poll({ worker_id: "w", handlers: [], wait_ms: 1 }, new AbortController().signal);
+    /** recordStep for `lease` must be refused as never polled, with no request sent. */
+    const scopeGone = async (lease: StepRecordRequest["lease"]) => {
+      const before = sent.length;
+      const error = await caught(
+        transport.recordStep({ lease, step_key: "ticket", tool_name: "desk.ticket", tool_version: "1", policy: "manual", input_hash: "" }),
+      );
+      expect(error).toBeInstanceOf(UnsupportedFormat);
+      expect((error as Error).message).toMatch(/was not polled through this transport/);
+      expect(sent.length).toBe(before);
+    };
+
+    // Abandoned because the worker stopped mid-tool.
+    const killed = (await poll()) ?? fail();
+    const stopped = await runTurn(killed, agents, transport, killer.signal);
+    expect(stopped.outcome).toBe("abandoned");
+    await scopeGone(heldLease(killed.assignment.lease));
+
+    // Re-polled, the manual step's attempt has no result: blocked in doubt.
+    const replayed = (await poll()) ?? fail();
+    const blocked = await runTurn(replayed, agents, transport, new AbortController().signal);
+    expect(blocked.outcome === "abandoned" && blocked.error).toBeInstanceOf(EffectInDoubt);
+    await scopeGone(heldLease(replayed.assignment.lease));
+
+    // A handler digest this worker does not have: abandoned before any step.
+    next = pollFixture;
+    const foreign = (await poll()) ?? fail();
+    const incompatible = await runTurn(foreign, agents, transport, new AbortController().signal);
+    expect(incompatible.outcome === "abandoned" && incompatible.error).toBeInstanceOf(IncompatibleHandler);
+    await scopeGone(heldLease(foreign.assignment.lease));
   });
 
   it("refuses a failed commit while an authorized attempt has no result, and sends it once settled", async () => {

@@ -4,6 +4,7 @@
  * entry never imports it.
  */
 import type { z } from "zod";
+import { EffectInDoubt, RavelAgentsError } from "../errors.js";
 import type {
   AgentDefinition,
   AnyAgentDefinition,
@@ -13,6 +14,7 @@ import type {
   MessageDefinition,
   Schema,
 } from "../types.js";
+import { Backoff } from "./backoff.js";
 import { handlerDigest, runTurn, type TurnReport } from "./runner.js";
 import type { Transport } from "./transport.js";
 
@@ -121,20 +123,41 @@ export interface ServeOptions {
   /** Long-poll wait per poll; the wire caps it at 20 s. */
   readonly pollWaitMs?: number;
   /**
-   * Pause after an abandoned turn before polling again, so a turn the
-   * coordinator hands straight back to its owner (one blocked on an effect in
-   * doubt) is not re-run in a tight loop. Default 250 ms.
+   * Pause after an abandoned turn before polling again. A turn abandoned with
+   * `EffectInDoubt` is handed straight back to its owner until someone
+   * reconciles the effect, so each consecutive one doubles the pause, up to
+   * `maxBackoffMs`, and a committed turn resets it. Default 250 ms.
    */
   readonly abandonDelayMs?: number;
+  /** Cap on the doubling pauses after in-doubt abandonments and failed polls. Default 30 s. */
+  readonly maxBackoffMs?: number;
   /** Observes every turn the worker finishes or abandons. */
   readonly onTurn?: (report: TurnReport) => void;
+  /**
+   * Called with every error a poll rejects with. An error whose `retry` is
+   * `never` (such as `Forbidden` for a refused token) stops the worker; any
+   * other is retried after a pause that doubles from 50 ms up to
+   * `maxBackoffMs` and resets on the next poll that answers. Without
+   * `onError`, a stopping error rejects {@link WorkerHandle.done}; an
+   * `onError` that throws stops the worker with what it threw.
+   */
+  readonly onError?: (error: unknown) => void;
 }
 
 export interface WorkerHandle {
   readonly ownerId: string;
-  /** Stop taking turns; an in-flight turn is aborted and not committed. */
+  /**
+   * Settles when the worker stops: fulfils after `close()` or after a stopping
+   * error that `onError` handled, and rejects with a stopping error when no
+   * `onError` is set. Observe it: an unobserved rejection is an unhandled one.
+   */
+  readonly done: Promise<void>;
+  /** Stop taking turns; an in-flight turn is aborted and not committed. Resolves once stopped. */
   close(): Promise<void>;
 }
+
+/** The first pause after a failed poll. */
+const POLL_RETRY_MS = 50;
 
 /** Resolves after `ms`, or as soon as `signal` aborts. */
 function pause(ms: number, signal: AbortSignal): Promise<void> {
@@ -171,6 +194,9 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
   const controller = new AbortController();
   const waitMs = Math.min(options.pollWaitMs ?? 20_000, 20_000);
   const abandonDelayMs = options.abandonDelayMs ?? 250;
+  const maxBackoffMs = options.maxBackoffMs ?? 30_000;
+  const inDoubtDelay = new Backoff(abandonDelayMs, maxBackoffMs);
+  const pollRetryDelay = new Backoff(POLL_RETRY_MS, maxBackoffMs);
 
   const stopped = (): boolean => controller.signal.aborted;
   const loop = (async () => {
@@ -182,11 +208,18 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
           { worker_id: workerId, handlers, wait_ms: waitMs },
           controller.signal,
         );
-      } catch {
+      } catch (error) {
         if (stopped()) return;
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (error instanceof RavelAgentsError && error.retry === "never") {
+          if (options.onError === undefined) throw error;
+          options.onError(error);
+          return;
+        }
+        options.onError?.(error);
+        await pause(pollRetryDelay.next(), controller.signal);
         continue;
       }
+      pollRetryDelay.reset();
       if (polled === null) {
         // An empty answer that came back before the wait elapsed is a
         // transport that is not long-polling (or a closed fake): back off
@@ -198,15 +231,22 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
       }
       const report = await runTurn(polled, agents, options.transport, controller.signal);
       options.onTurn?.(report);
-      if (report.outcome === "abandoned") await pause(abandonDelayMs, controller.signal);
+      if (report.outcome === "committed") {
+        inDoubtDelay.reset();
+      } else if (report.error instanceof EffectInDoubt) {
+        await pause(inDoubtDelay.next(), controller.signal);
+      } else {
+        await pause(abandonDelayMs, controller.signal);
+      }
     }
   })();
 
   return {
     ownerId: workerId,
+    done: loop,
     close: async () => {
       controller.abort(new Error("worker closed"));
-      await loop;
+      await loop.catch(() => undefined);
     },
   };
 }

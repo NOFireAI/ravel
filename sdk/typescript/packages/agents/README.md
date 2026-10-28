@@ -155,6 +155,21 @@ Worker and steps (`src/worker/`):
   leased handler version abandons the turn with IncompatibleHandler`, `a
   worker whose handler digest differs from the leased one abandons the turn
   with IncompatibleHandler`.
+- After a turn abandoned with `EffectInDoubt`, which the coordinator hands
+  straight back until someone reconciles the effect, the worker pauses
+  before polling again, doubling from `abandonDelayMs` (250 ms) up to
+  `maxBackoffMs` (30 s); a committed turn resets the pause, and any other
+  abandonment pauses the fixed `abandonDelayMs`. Tests: `doubles the pause
+  after each EffectInDoubt abandonment up to the cap and resets it on a
+  commit`, `a Backoff doubles from its start to its cap and starts over on
+  reset` (`serve.test.ts`).
+- A poll error whose `retry` is `never` stops the worker: it goes to
+  `onError`, or without one rejects the handle's `done`. Any other poll
+  error goes to `onError` and is retried after a pause doubling from 50 ms.
+  Tests: `a Forbidden poll stops the worker and rejects done with it`, `a
+  Forbidden poll goes to onError, stops the worker and fulfils done`, `a
+  transient OutcomeUnknown poll is retried after a doubling pause and the
+  next poll runs its turn` (`serve.test.ts`).
 
 Unless a test file is named, the tests above are in `steps.test.ts`.
 
@@ -213,6 +228,12 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   than OutcomeUnknown`, `maps an untyped 5xx and a request with no answer
   to OutcomeUnknown`, `maps an off-schema 2xx and an untyped 4xx to
   UnsupportedFormat`.
+- A response whose body fails mid-read is `OutcomeUnknown`, like a request
+  with no answer. Test: `maps a response body that fails mid-read to
+  OutcomeUnknown`.
+- The transport holds a polled turn's step scope until the runner releases
+  the turn, committed or abandoned, so a long-running worker keeps none for
+  turns it gave up. Test: `an abandoned turn leaves no scope behind`.
 - A step heartbeats the lease before it is journaled, and is refused for a
   fenced lease or a turn the transport never polled. Tests: `heartbeats the
   lease before journaling a step and derives ids from incarnation and
@@ -255,6 +276,14 @@ typed error` (`client.test.ts`) asserts the wire mapping.
 | `budget_exceeded` | `BudgetExceeded` | `never` |
 | `store_unavailable` | `StoreUnavailable` | `backoff` |
 | `unsupported_format` | `UnsupportedFormat` | `never` |
+
+`Forbidden` has no wire code: the server refuses a credential with HTTP 401
+or 403 and a plain body, which the client and the worker transport map to
+`Forbidden` with `retry` `never`. A worker whose poll is refused stops
+instead of retrying, while a transient poll failure is retried. Tests: `a
+Forbidden poll stops the worker and rejects done with it`, `a transient
+OutcomeUnknown poll is retried after a doubling pause and the next poll
+runs its turn` (`serve.test.ts`).
 
 An unknown code, or a 2xx body that does not match its schema, reads as
 `UnsupportedFormat` (test: `an unknown error code or an off-schema response
