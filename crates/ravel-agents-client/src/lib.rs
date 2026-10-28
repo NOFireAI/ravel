@@ -421,6 +421,7 @@ impl AgentsClient {
             agent: agent.clone(),
             cursor,
             limit: limit.min(EVENTS_PAGE_CAP),
+            operation: None,
         };
         self.post("events", &body, DEFAULT_TIMEOUT).await
     }
