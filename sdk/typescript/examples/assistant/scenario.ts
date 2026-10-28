@@ -87,11 +87,16 @@ async function within<T>(what: string, ms: number, work: Promise<T>): Promise<T>
   }
 }
 
-async function waitFor(what: string, ms: number, condition: () => boolean): Promise<void> {
+async function waitFor(
+  what: string,
+  ms: number,
+  condition: () => boolean,
+  stopped: Promise<never>,
+): Promise<void> {
   const deadline = Date.now() + ms;
   while (!condition()) {
     if (Date.now() > deadline) throw new Error(`${what}: not reached within ${String(ms)} ms`);
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await Promise.race([new Promise((resolve) => setTimeout(resolve, 25)), stopped]);
   }
 }
 
@@ -105,6 +110,14 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
   const agent = client.agent<Assistant>("assistant", options.key);
   const payload = { ...PAYLOAD, escalate: options.policy === "manual" };
   const workers: WorkerHandle[] = [];
+  // A stopping error on either worker (a refused poll) rejects `stopped`, and
+  // every wait below races it, so the run rejects with that error instead of
+  // running into a deadline.
+  let stop: (error: unknown) => void = () => undefined;
+  const stopped = new Promise<never>((_, reject) => {
+    stop = reject;
+  });
+  stopped.catch(() => undefined);
   const serve = (onTurn?: (report: TurnReport) => void) =>
     serveAgents({
       transport: createHttpTransport({ url: options.url, token: options.workerToken, journal }),
@@ -113,6 +126,7 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
       ...(onTurn === undefined ? {} : { onTurn }),
     }).then((worker) => {
       workers.push(worker);
+      worker.done.catch(stop);
       return worker;
     });
 
@@ -135,8 +149,8 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
     const first = await agent.send("ask", payload, { requestId: options.requestId });
     const operationId = first.operationId ?? "";
     log(`sent request ${options.requestId}: operation ${operationId}`);
-    await waitFor("worker A killed inside the step", waitMs, () => killed !== undefined);
-    await within("worker A closed", waitMs, killed ?? Promise.resolve());
+    await waitFor("worker A killed inside the step", waitMs, () => killed !== undefined, stopped);
+    await within("worker A closed", waitMs, Promise.race([killed ?? Promise.resolve(), stopped]));
     log(`worker A killed inside ${options.policy === "manual" ? TICKET : DRAFT} attempt 1`);
 
     // A client that lost the first answer sends again under the same request id.
@@ -149,8 +163,11 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
 
     let inDoubt: ScenarioResult["inDoubt"] = null;
     if (options.policy === "manual") {
-      await waitFor("worker B blocked on the effect in doubt", waitMs, () =>
-        reports.some((r) => r.outcome === "abandoned" && r.error instanceof EffectInDoubt),
+      await waitFor(
+        "worker B blocked on the effect in doubt",
+        waitMs,
+        () => reports.some((r) => r.outcome === "abandoned" && r.error instanceof EffectInDoubt),
+        stopped,
       );
       const blocked = reports.find((r) => r.outcome === "abandoned" && r.error instanceof EffectInDoubt);
       const effects = await journal.effects(operationId);
@@ -174,10 +191,14 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
 
     // A miss is reported with the tool counts rather than thrown, so a
     // caller can see which tool ran again when the operation never finished.
-    const settled = await first.result({ deadlineMs: waitMs }).then(
-      (value) => ({ value, error: null }),
-      (error: unknown) => ({ value: null, error: String(error) }),
-    );
+    // A stopped worker is not a miss: it rejects the run.
+    const settled = await Promise.race([
+      first.result({ deadlineMs: waitMs }).then(
+        (value) => ({ value, error: null }),
+        (error: unknown) => ({ value: null, error: String(error) }),
+      ),
+      stopped,
+    ]);
     const recoveryMs = Date.now() - killedAt;
     const state = await agent.state();
     return {

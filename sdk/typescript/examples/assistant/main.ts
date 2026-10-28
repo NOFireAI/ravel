@@ -9,8 +9,15 @@
 import { randomUUID } from "node:crypto";
 import { createAssistant, type Assistant } from "./assistant.js";
 import { AssistantFixture } from "./fixture.js";
+import { RavelAgentsError } from "@ravel/agents";
 import { createClient } from "@ravel/agents/client";
 import { createHttpTransport, serveAgents } from "@ravel/agents/worker";
+
+/** The error's code, when it carries one, and its message, on one line. */
+function oneLine(error: unknown): string {
+  const text = error instanceof RavelAgentsError ? `${error.code}: ${error.message}` : String(error);
+  return text.replace(/\s*\n\s*/g, " ");
+}
 
 function required(name: string): string {
   const value = process.env[name];
@@ -33,6 +40,15 @@ const worker = await serveAgents({
   agents: [assistant],
   tools,
 });
+// A refused poll (a revoked worker token, say) stops the worker and rejects
+// `done`: end the run there rather than wait out the result's deadline.
+const stopped = worker.done.then(
+  () => undefined,
+  (error: unknown) => {
+    console.error(`worker stopped: ${oneLine(error)}`);
+    process.exit(1);
+  },
+);
 try {
   const agent = createClient({ url, token: clientToken }).agent<Assistant>("assistant", `example-${randomUUID()}`);
   await agent.create();
@@ -45,3 +61,4 @@ try {
 } finally {
   await worker.close();
 }
+await stopped;

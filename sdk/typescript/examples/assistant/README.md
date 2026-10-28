@@ -28,7 +28,9 @@ npm run example:assistant
 `RAVEL_URL` defaults to `http://127.0.0.1:4318`, and the question to "How
 does a worker recover a step after a crash?" (pass another as arguments
 after `--`). It prints the operation id, the articles found, the answer and
-the tools that ran. No test runs `main.ts`; the figures for the default
+the tools that ran. A refused worker token stops the worker and rejects its
+`WorkerHandle.done`; the example then prints the error's code and message on
+one line to stderr and exits 1 (`kill-and-recover.ts` does the same). No test runs `main.ts`; the figures for the default
 question are asserted through the kill-and-recover path below
 (`RESULT_ARTICLES` `kb-2,kb-3`).
 

@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { runKillAndRecover, type ScenarioPolicy } from "./scenario.js";
+import { RavelAgentsError } from "@ravel/agents";
 
 const policy = process.argv[2];
 if (policy !== "at_least_once" && policy !== "manual") {
@@ -21,6 +22,7 @@ const env = (name: string): string => {
   return value;
 };
 
+// A worker stopped by a refused poll rejects the run with that error.
 const run = await runKillAndRecover({
   url: env("RAVEL_URL"),
   clientToken: env("RAVEL_AGENTS_TOKEN"),
@@ -31,6 +33,11 @@ const run = await runKillAndRecover({
   log: (line) => {
     console.error(`[${policy}] ${line}`);
   },
+}).catch((error: unknown) => {
+  if (!(error instanceof RavelAgentsError)) throw error;
+  const reason = `${error.code}: ${error.message}`.replace(/\s*\n\s*/g, " ");
+  console.error(`[${policy}] stopped: ${reason}`);
+  process.exit(1);
 });
 
 const draftCalls = run.calls.filter((c) => c.tool === "kb.draft");
