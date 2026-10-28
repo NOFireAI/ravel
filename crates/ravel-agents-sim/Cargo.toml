@@ -6,5 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 description = "Dev-only deterministic simulation of Ravel Agents (ADR-3331 decision 13). No crate depends on it."
 
+[dependencies]
+ravel-agents-core = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-sim = { path = "../ravel-sim", version = "0.27.0" }
+futures = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros", "test-util"] }
+
+[dev-dependencies]
+ravel-test-support = { workspace = true }
+bytes = { workspace = true }
+proptest = { workspace = true }
+
 [lints]
 workspace = true
