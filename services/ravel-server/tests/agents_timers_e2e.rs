@@ -490,6 +490,10 @@ async fn due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint()
     let before = fixture.requests.snapshot();
     let report = api.sweep().await;
     let after = fixture.requests.snapshot();
+    let fired = timer_inputs(&state(&api, "o-1").await);
+    assert_eq!(fired.len(), 1, "delivered once: {fired:?}");
+    assert_eq!(fired[0]["timer"], scheduled["timer"]);
+    assert_eq!(fired[0]["generation"], json!(1));
     assert_eq!(report["timers_fired"], json!(1), "{report}");
     assert_eq!(report["hints_read"], json!(0), "{report}");
     assert_eq!(report["wake_list_pages"], json!(1), "{report}");
@@ -499,10 +503,6 @@ async fn due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint()
     assert_eq!(after.1 - before.1, 1, "dir LISTs the store served");
     assert_eq!(after.2 - before.2, 2, "HEAD GETs: the pass's read and the fire CAS's");
 
-    let fired = timer_inputs(&state(&api, "o-1").await);
-    assert_eq!(fired.len(), 1, "delivered once: {fired:?}");
-    assert_eq!(fired[0]["timer"], scheduled["timer"]);
-    assert_eq!(fired[0]["generation"], json!(1));
     let listed = timers(&api, "o-1").await;
     assert_eq!(listed["timers"][0]["status"], json!("delivered"));
 
@@ -731,6 +731,63 @@ async fn events_resume_from_a_cursor_to_terminal_and_expire_below_the_window() {
 
     let (status, body) = events_page(&api, None, 0, None).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    running.shutdown().await.expect("server stops");
+}
+
+/// `effects/{effect}` lists at most the latest 64 attempts. The effect's
+/// attempt counter is raised to 70 in HEAD directly, since driving 70 real
+/// attempts would take 70 lease expiries.
+#[tokio::test]
+async fn effect_inspect_lists_at_most_the_latest_64_attempts() {
+    let fixture = Fixture::new(FaultPlan::empty());
+    let running = fixture.start().await;
+    let api = Api::public(&running);
+    create(&api, "o-1").await;
+    api.ok(
+        CLIENT,
+        "send",
+        &json!({"agent": agent("o-1"), "handler": "place", "request_id": "req-1", "payload": {}}),
+    )
+    .await;
+    let registered = api
+        .ok(WORKER, "worker/register", &json!({"handlers": pins()}))
+        .await;
+    let polled = api
+        .ok(
+            WORKER,
+            "worker/poll",
+            &json!({"worker_id": registered["worker_id"], "handlers": pins(), "wait_ms": 2_000}),
+        )
+        .await;
+    let stepped = api
+        .ok(
+            WORKER,
+            "worker/step",
+            &json!({
+                "lease": polled["assignment"]["lease"],
+                "step_key": "price",
+                "tool_name": "catalog.price",
+                "tool_version": "1",
+                "policy": "at_least_once",
+                "input_hash": "ab".repeat(32),
+            }),
+        )
+        .await;
+    let effect = stepped["effect"].as_str().expect("effect").to_string();
+
+    let mut head = fixture.read_head("o-1").await;
+    assert_eq!(head.effects.len(), 1);
+    head.effects[0].attempt = 70;
+    fixture.write_head("o-1", &head).await;
+    let inspected = api.ok_get(CLIENT, &format!("effects/{effect}")).await;
+    let attempts: Vec<u64> = inspected["attempts"]
+        .as_array()
+        .expect("attempts")
+        .iter()
+        .map(|a| a["attempt"].as_u64().expect("attempt"))
+        .collect();
+    assert_eq!(attempts, (7..=70).collect::<Vec<u64>>());
+    assert_eq!(inspected["attempt"], json!(70));
     running.shutdown().await.expect("server stops");
 }
 

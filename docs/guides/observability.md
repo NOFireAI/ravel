@@ -2431,7 +2431,7 @@ counter with the `mode` label; `ravel_agents_sweep_list_pages_total` adds
 Test: `metrics_scrape_reports_every_agents_family_once_with_the_mode_label`
 and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`; the
 sweep counters by `sweep_route_counts_match_the_store_and_needs_agents_admin`
-in `services/ravel-server/tests/agents_timers_e2e.rs`.
+in the `agents_timers_e2e` test binary.
 
 ### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
 

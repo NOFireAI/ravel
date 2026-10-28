@@ -115,8 +115,12 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | GET | `/api/v1/agents/result` | `operation`, optional `wait_ms` | JSON: `operation`, `result` (null until terminal) | 200, 401, 403, 404, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/resolve` | JSON: `agent`, `handler`, `request_id` | JSON: `operation` and `status`, both null when no receipt matches | 200, 401, 403, 404, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/cancel` | JSON: `operation` | JSON: `operation`, `status`, `requested` | 200, 401, 403, 404, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
-| GET | `/api/v1/agents/state` | `kind`, `key` | JSON: `agent_id`, `incarnation`, `state_version`, `content_type`, `state` | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
-| POST | `/api/v1/agents/events` | JSON: `agent`, `cursor` (null for the start), `limit` | JSON: `events`, `next_cursor` | 200, 401, 403, 404, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/state` | `kind`, `key` | JSON: `agent_id`, `incarnation`, `state_version`, `content_type`, `state`, `active_turn` (absent when no turn is open), `mailbox` (each `accept_seq`, `handler`, `source`, `accepted_unix_ns`, `failed_attempts`; absent when empty) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/events` | JSON: `agent`, `cursor` (null for the start), `limit`, optional `operation` | JSON: `events`, `next_cursor`, `terminal` (only on the page that drains a finished `operation`) | 200, 401, 403, 404, 410, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/timers` | JSON: `agent`, `timer_key`, `due_unix_ns` (decimal string), `handler`, `payload` | JSON: `timer`, `generation` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/timers/cancel` | JSON: `agent`, `timer_key` | JSON: `outcome` (`cancelled`, `already_fired`, `unknown`) | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/timers` | `kind`, `key` | JSON: `timers` (each `timer`, `timer_key`, `generation`, `due_unix_ns`, `handler`, `status`) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/inspector` | none | `text/html; charset=utf-8`: the embedded inspector page | 200, 401, 403, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/worker/register` | JSON: `handlers` (each `handler`, `version`, `digest`) | JSON: `worker_id` | 200, 401, 403, 409, 413, 422, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/worker/poll` | JSON: `worker_id`, `handlers`, `wait_ms` | JSON: `assignment` (`lease`, `agent`, `operation`, `accept_seq`, `handler`, `state`, `payload`, `steps`), null when nothing is due | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/worker/commit` | JSON: `lease` as polled, `outcome` (`completed` with `state`, `output`, `events`, `timers`, `intents`; or `failed` with `error`, `terminal`) | JSON: `operation`, `status`, `state_version`, `rebased`, `effects` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_worker` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
@@ -127,6 +131,7 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | GET | `/api/v1/agents/effects` | `kind`, `key` | JSON: `effects` (each `effect`, `turn_id`, `tool_name`, `tool_version`, `policy`, `status`, `attempt`) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | GET | `/api/v1/agents/effects/{effect}` | none | JSON: the `effects` entry plus `step_key`, `result_attempt`, `result`, `failure` (present only when the result is a tool failure), `attempts` (each `attempt`, `status`), `evidence` (each `attempt`, `result`, and `failure` when the report was one) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/reconcile` | JSON: `effect`, `attempt`, `decision` (`record_result` with `result`, or `retry`) | JSON: `effect`, `status`, `attempt` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_admin` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/sweep` | none | JSON: `wake_list_pages`, `dir_list_pages`, `head_gets`, `hints_read`, `hints_deleted`, `timers_fired`, `agents_loaded`, `dir_entries_repaired` | 200, 401, 403, 500, 503 | Yes, `agents_admin` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
 
@@ -386,15 +391,18 @@ The `/api/v1/agents` routes are behind the
 its own tenant resolver, and the tenant always comes from the credential,
 never from the request (`agents_e2e::capabilities_are_enforced_on_both_listeners`).
 Client routes need the principal's `agents` capability, worker routes its
-`agents_worker` capability, and `reconcile` its `agents_admin` capability.
-A credential without it gets 403 with a body naming the capability, before
-any coordinator or store call
-(`agents_e2e::capabilities_are_enforced_on_both_listeners` for `agents` and
-`agents_worker`,
+`agents_worker` capability, and `reconcile` and `sweep` its `agents_admin`
+capability. Every handler admits its capability before anything else, and a
+credential without it gets 403 with a body naming the capability: the
+server's route table carries each route's capability, and
+`agents::tests::every_route_refuses_a_token_lacking_its_capability` sends
+every route in it a token holding every capability but that one
+(end to end: `agents_e2e::capabilities_are_enforced_on_both_listeners` for
+`agents` and `agents_worker`,
 `agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`
-for `agents_admin`). Timer routes are not mounted in this release, and the
-router answers 404 for any path outside the table above
-(`agents_e2e::a_path_outside_the_route_table_is_404`).
+and `agents_timers_e2e::sweep_route_counts_match_the_store_and_needs_agents_admin`
+for `agents_admin`). The router answers 404 for any path outside the table
+above (`agents_e2e::a_path_outside_the_route_table_is_404`).
 
 The router carries its own admission counter, one
 lane for the waiting routes (`call`, `result`, `worker/poll`) sized by
@@ -437,7 +445,59 @@ above 1000 reads 1000, and a `limit` of 0 is 422 `unsupported_format`
 at the beginning. `next_cursor` is the last sequence returned, or the input
 cursor when the page is empty, so resuming from it never repeats or skips
 an event (`agents_e2e::events_page_after_the_durable_cursor_without_duplicates`).
-A cursor that is not a decimal sequence is 422.
+A cursor that is not a decimal sequence is 422. With `operation` set (an
+operation handle of `agent`), a page holds only the events that
+operation's turns committed, and the page that holds its last event once
+it is finished carries `terminal`, its final status; no later page holds
+an event of it. A cursor below the oldest retained event is 410 with
+`code` `cursor_expired`, the `cursor` sent, `oldest_cursor` and `restart`
+`restart_from_oldest_cursor`: read again from `oldest_cursor`
+(`agents_timers_e2e::events_resume_from_a_cursor_to_terminal_and_expire_below_the_window`,
+which also pins the resumed pages' exact sequences and the 422 for a
+`limit` of 0). This release never trims events, so the 410 is the
+contract for a later one that retains a window.
+
+**Timers.** `timers` arms the agent's timer `timer_key` at `due_unix_ns`,
+in nanoseconds since the Unix epoch as a decimal string, and answers the
+timer id and its generation. Scheduling the same key again bumps the
+generation and supersedes the earlier one, so only the new generation
+fires, once
+(`agents_timers_e2e::a_reschedule_supersedes_the_earlier_generation`).
+`timers/cancel` answers `cancelled` before the firing, `already_fired` once
+the firing committed (its input is then in the mailbox, which `GET state`
+lists with `source.kind` `timer`), and `unknown` for a key never scheduled
+(`agents_timers_e2e::cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`).
+`GET timers` lists the latest generation of each key as `scheduled`,
+`delivered` or `cancelled`. A due timer fires from the sweep alone; the
+`_wake` hint written beside it only speeds that up, and a timer whose hint
+write failed is still delivered once, by a later process over the same
+store
+(`agents_timers_e2e::due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint`).
+
+**Sweep.** Each tenant's coordinator runs a sweep pass every
+`agents.sweep_interval_ms` (5000 by default; 0 runs no periodic pass, and
+worker polls and `sweep` still run one), for the tenants this process has
+served since it started. `sweep` runs one pass over the caller's tenant on
+demand under the same budgets and answers what it did: the `_wake/` and
+`_dir/` LIST pages, HEAD reads, hints read and deleted, timers fired, agents
+loaded and `_dir` entries repaired. The counts are the requests the store
+served for that pass, and the `ravel_agents_sweep_*` families on
+`/metrics` move by the same amounts
+(`agents_timers_e2e::sweep_route_counts_match_the_store_and_needs_agents_admin`).
+`GET /api/v1/agents/health` reports `sweep_interval_ms`.
+
+**Inspector.** `GET inspector` serves one embedded HTML page with no
+external asset and a content security policy that admits no origin but
+this server. The route needs `agents` like any other, so a plain browser
+navigation, which sends no bearer token, is 401; the page itself asks for
+the token and reads `state`, `timers`, `effects`, `effects/{effect}` and
+`events` with it. It shows the state version, the active turn, the
+mailbox, the timers, the effect-backed steps and the effects with their
+status, and for a blocked agent its reason and the action that unblocks
+it. Hashes and raw payloads sit under `<details>`, and every payload
+preview is labelled "preview"
+(`agents_timers_e2e::inspector_is_served_to_agents_tokens_with_every_section`,
+`agents::tests::inspector_serves_the_embedded_page_as_html`).
 
 **Workers.** `worker/register` mints a fresh worker id per call, so a
 worker process registers once at start and a restarted process gets a new
@@ -495,8 +555,10 @@ inspects one: each attempt as `open`, `in_doubt`, `result` or
 `superseded`, the result and the attempt it came from, and the late results
 kept as evidence
 (`agents_effects_e2e::completion_from_a_dead_worker_attempt_records_the_effect_and_the_new_owner_commits_the_turn`).
+`attempts` lists at most the latest 64 attempts
+(`agents_timers_e2e::effect_inspect_lists_at_most_the_latest_64_attempts`).
 Evidence is held by the serving process and is not durable; a restart
-forgets it.
+forgets it, and so does a reconcile that settles the effect out of doubt.
 
 **Reconcile.** `reconcile` settles an effect in doubt: `record_result`
 attaches an operator-verified result, and `retry` authorizes one more
@@ -522,10 +584,14 @@ doubt the server submits one audit record with `kind` `agents_reconcile`
 to the audit pipeline, which writes it into the tenant's audit shard,
 naming the effect, attempt, decision and the caller's tenant and
 capabilities. A principal carries no subject, so two admins of one tenant
-are not told apart. Without `--audit-mode` no record is written. When the
-submission fails the reconcile is 503 `store_unavailable` and nothing
-changes
+are not told apart. Without `--audit-mode` no record is written. Only
+`--audit-mode required` refuses on a failed audit write: the reconcile is
+then 503 `store_unavailable` and nothing changes
 (`agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`).
+Under `--audit-mode best-effort` the pipeline reports a failed write as
+written, so the reconcile proceeds without its record. A reconcile that
+repeats a decision already taken writes no second record
+(`agents_effects_e2e::a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`).
 
 ### Query status codes
 
