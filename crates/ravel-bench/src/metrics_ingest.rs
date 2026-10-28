@@ -4610,11 +4610,13 @@ struct ApiReader<'a> {
 }
 
 impl ApiReader<'_> {
-    async fn get(
+    /// GET `path` with `params` and the commit-token fence; a non-2xx answer
+    /// is an error carrying its body.
+    async fn send(
         &self,
         path: &str,
         params: &[(&str, String)],
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<reqwest::Response, String> {
         let mut url = reqwest::Url::parse(&format!("{}{path}", self.base))
             .map_err(|e| format!("query URL {}{path} does not parse: {e}", self.base))?;
         {
@@ -4635,13 +4637,27 @@ impl ApiReader<'_> {
             .await
             .map_err(|e| format!("GET {path} failed: {e}"))?;
         let code = response.status();
-        let body = response
+        if !code.is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|e| format!("GET {path} body read failed: {e}"))?;
+            return Err(format!("GET {path} answered {code}: {body}"));
+        }
+        Ok(response)
+    }
+
+    async fn get(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<serde_json::Value, String> {
+        let body = self
+            .send(path, params)
+            .await?
             .text()
             .await
             .map_err(|e| format!("GET {path} body read failed: {e}"))?;
-        if !code.is_success() {
-            return Err(format!("GET {path} answered {code}: {body}"));
-        }
         let value: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("GET {path} answered non-JSON: {e}"))?;
         if value.get("status").and_then(|s| s.as_str()) != Some("success") {
@@ -4656,10 +4672,9 @@ impl ApiReader<'_> {
     async fn series_count(&self, matcher: &str, window: &[(&str, String)]) -> Result<u64, String> {
         let mut params = vec![("match[]", matcher.to_string())];
         params.extend(window.iter().cloned());
-        let data = self.get("/api/v1/series", &params).await?;
-        data.as_array()
-            .map(|a| a.len() as u64)
-            .ok_or_else(|| "series data is not an array".to_string())
+        let path = "/api/v1/series";
+        let response = self.send(path, &params).await?;
+        count_series_body(path, response).await
     }
 
     /// The instant vector of `query` at `ts_ms`.
@@ -4698,6 +4713,145 @@ impl ApiReader<'_> {
     /// How many series an instant query of `selector` at `ts_ms` returns.
     async fn instant_series(&self, selector: &str, ts_ms: i64) -> Result<u64, String> {
         Ok(self.instant(selector, ts_ms).await?.len() as u64)
+    }
+}
+
+/// Body chunks in flight between the network and the series counter.
+const SERIES_BODY_CHUNKS_IN_FLIGHT: usize = 4;
+
+/// Count the elements of the `data` array of a `/api/v1/series` answer as
+/// its body streams in, refusing a `status` other than `"success"`. The body
+/// is never held whole: chunks pass through a channel of
+/// [`SERIES_BODY_CHUNKS_IN_FLIGHT`] to a parser that discards each element
+/// as [`serde::de::IgnoredAny`] once counted, so a 1,000,000-series answer
+/// costs a few chunks and one element, not the body
+/// (`tests::series_count_streams_a_200000_series_answer`).
+async fn count_series_body(path: &str, mut response: reqwest::Response) -> Result<u64, String> {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, String>>(SERIES_BODY_CHUNKS_IN_FLIGHT);
+    let parser = tokio::task::spawn_blocking(move || {
+        let reader = std::io::BufReader::new(ChunkReader {
+            rx,
+            current: bytes::Bytes::new(),
+        });
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        let body = SeriesBody::deserialize(&mut de)?;
+        de.end()?;
+        Ok::<_, serde_json::Error>(body)
+    });
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => Ok(chunk),
+            Ok(None) => break,
+            Err(e) => Err(format!("GET {path} body read failed: {e}")),
+        };
+        let failed = chunk.is_err();
+        // A closed channel means the parser already stopped; its error is
+        // the one reported.
+        if tx.send(chunk).await.is_err() || failed {
+            break;
+        }
+    }
+    drop(tx);
+    let body = parser
+        .await
+        .map_err(|e| format!("GET {path} body parse task failed: {e}"))?
+        .map_err(|e| format!("GET {path} answered a body that is not a series answer: {e}"))?;
+    if body.status.as_deref() != Some("success") {
+        return Err(format!(
+            "GET {path} answered a non-success body: status {:?}, errorType {:?}, error {:?}",
+            body.status, body.error_type, body.error
+        ));
+    }
+    body.count
+        .ok_or_else(|| format!("GET {path} answered no data"))
+}
+
+/// A blocking [`std::io::Read`] over body chunks sent from the async side.
+struct ChunkReader {
+    rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, String>>,
+    current: bytes::Bytes,
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            match self.rx.blocking_recv() {
+                Some(Ok(chunk)) => self.current = chunk,
+                Some(Err(detail)) => return Err(std::io::Error::other(detail)),
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current.split_to(n));
+        Ok(n)
+    }
+}
+
+/// The fields of a `/api/v1/series` answer the read-back uses, with `data`
+/// reduced to its element count.
+#[derive(Default)]
+struct SeriesBody {
+    status: Option<String>,
+    error_type: Option<String>,
+    error: Option<String>,
+    count: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for SeriesBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BodyVisitor;
+        impl<'de> serde::de::Visitor<'de> for BodyVisitor {
+            type Value = SeriesBody;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Prometheus API answer object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<SeriesBody, A::Error> {
+                let mut body = SeriesBody::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "status" => body.status = map.next_value()?,
+                        "errorType" => body.error_type = map.next_value()?,
+                        "error" => body.error = map.next_value()?,
+                        "data" => body.count = map.next_value::<Option<ElementCount>>()?.map(|c| c.0),
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(body)
+            }
+        }
+        deserializer.deserialize_map(BodyVisitor)
+    }
+}
+
+/// The length of a JSON array, read without keeping its elements.
+struct ElementCount(u64);
+
+impl<'de> Deserialize<'de> for ElementCount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CountVisitor;
+        impl<'de> serde::de::Visitor<'de> for CountVisitor {
+            type Value = ElementCount;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the series array")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ElementCount, A::Error> {
+                let mut n = 0u64;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    n += 1;
+                }
+                Ok(ElementCount(n))
+            }
+        }
+        deserializer.deserialize_seq(CountVisitor)
     }
 }
 
