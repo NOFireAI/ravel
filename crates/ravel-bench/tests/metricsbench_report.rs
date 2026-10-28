@@ -84,6 +84,8 @@ fn valid_report() -> MetricsBenchReport {
         cases_expected: vec![],
         denominators: vec![],
         exclusions: vec![],
+        run_verdict: None,
+        failed_bands: vec![],
     }
 }
 

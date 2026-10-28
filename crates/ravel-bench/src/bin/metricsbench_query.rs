@@ -9,6 +9,14 @@
 //! `--diagnostics` it then writes the [`ravel_bench::metrics_query::Diagnostics`]
 //! sidecar, which is not part of the report.
 //!
+//! With `--diagnostic-after-failed-ingest` (passed by
+//! `deploy/metricsbench/run.sh` only after an ingest whose read-back failed or
+//! that stalled) an ingest report with such a row binds as a diagnostic
+//! ([`ravel_bench::metrics_query::bind_diagnostic`]): the report carries
+//! `run_verdict: "failed"` and `failed_bands`, is checked by
+//! [`ravel_bench::report_schema::validate_diagnostic`], and is refused by
+//! `validate` everywhere else.
+//!
 //! Exit codes: 0 the report (and any sidecar) was written; 64 a usage error (an `--engine`
 //! value that does not parse); 65 the inputs cannot bind a run or the run is
 //! void (a digest mismatch, a band-6 or accounting failure on a portable
@@ -25,14 +33,14 @@ use clap::Parser;
 use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
-    BindError, Diagnostics, EngineSpec, RunOptions, bind, endpoints, parse_engine_spec, run,
+    BindError, Diagnostics, EngineSpec, RunOptions, bind, bind_diagnostic, endpoints, parse_engine_spec, run,
     system_name,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
 use ravel_bench::report_schema::{
     ConfigEntry, INSUFFICIENT_PASSES, MIN_VARIANCE_PASSES, MetricsBenchReport, Provenance,
-    SCHEMA_VERSION, VARIANCE_CONFIG_KEY, validate,
+    RunVerdict, SCHEMA_VERSION, VARIANCE_CONFIG_KEY, validate, validate_diagnostic,
 };
 
 const EX_USAGE: u8 = 64;
@@ -90,6 +98,14 @@ struct Args {
     /// after the report. Not part of the report.
     #[arg(long)]
     diagnostics: Option<PathBuf>,
+    /// Query a run whose ingest verification failed, as a diagnostic: a row
+    /// whose read-back failed is queried, a stalled row's engine is left out,
+    /// and the report says `run_verdict: "failed"` with every failure in
+    /// `failed_bands`, so `metricsbench_report validate` refuses it.
+    /// Without this flag such an ingest report is refused (exit 65); with it,
+    /// an ingest report with no failed row is refused.
+    #[arg(long)]
+    diagnostic_after_failed_ingest: bool,
 }
 
 #[tokio::main]
@@ -155,9 +171,12 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         )
     })?;
 
-    let binding = bind(&ingest, &workload_bytes, &workload, &specs, |var| {
-        std::env::var(var).ok()
-    })
+    let env = |var: &str| std::env::var(var).ok();
+    let (binding, failed_bands) = if args.diagnostic_after_failed_ingest {
+        bind_diagnostic(&ingest, &workload_bytes, &workload, &specs, env)
+    } else {
+        bind(&ingest, &workload_bytes, &workload, &specs, env).map(|b| (b, Vec::new()))
+    }
     .map_err(|e: BindError| (EX_DATAERR, e.to_string()))?;
 
     let corpus_digest = blake3_digest(&corpus_bytes);
@@ -247,8 +266,15 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         cases_expected: std::mem::take(&mut output.cases_expected),
         denominators: std::mem::take(&mut output.denominators),
         exclusions: Vec::new(),
+        run_verdict: (!failed_bands.is_empty()).then_some(RunVerdict::Failed),
+        failed_bands,
     };
-    validate(&report).map_err(|e| {
+    let checked = if report.run_verdict.is_some() {
+        validate_diagnostic(&report)
+    } else {
+        validate(&report)
+    };
+    checked.map_err(|e| {
         (
             EX_SOFTWARE,
             format!("the assembled report fails validation, nothing written: {e}"),
