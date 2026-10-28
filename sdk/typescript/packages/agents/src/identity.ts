@@ -184,6 +184,42 @@ export function stepId(incarnation: number, acceptSeq: number, stepKey: string):
   );
 }
 
+/** `identity::agent_id`: the domain, then kind and key each prefixed by its u16le length. */
+export function agentId(kind: string, key: string): string {
+  const k = encoder.encode(kind);
+  const v = encoder.encode(key);
+  const domain = encoder.encode(DOMAIN);
+  const buf = new Uint8Array(domain.length + 4 + k.length + v.length);
+  const view = new DataView(buf.buffer);
+  buf.set(domain, 0);
+  view.setUint16(domain.length, k.length, true);
+  buf.set(k, domain.length + 2);
+  view.setUint16(domain.length + 2 + k.length, v.length, true);
+  buf.set(v, domain.length + 4 + k.length);
+  return toHex(blake3(buf).subarray(0, 16));
+}
+
+/** `identity::effect_id`, as lowercase hex. */
+export function effectId(incarnation: number, acceptSeq: number, intentKey: string): string {
+  return toHex(
+    derive("effect", [u64le(BigInt(incarnation)), u64le(BigInt(acceptSeq)), intentKey]).subarray(0, 16),
+  );
+}
+
+/** `identity::turn_id`, as lowercase hex. */
+export function turnId(incarnation: number, acceptSeq: number, epoch: number, failedAttempts: number): string {
+  const attempts = new Uint8Array(4);
+  new DataView(attempts.buffer).setUint32(0, failedAttempts, true);
+  return toHex(
+    derive("turn", [
+      u64le(BigInt(incarnation)),
+      u64le(BigInt(acceptSeq)),
+      u64le(BigInt(epoch)),
+      attempts,
+    ]).subarray(0, 16),
+  );
+}
+
 /** `identity::request_hash`, as lowercase hex. */
 export function requestHash(handler: string, payload: Uint8Array): string {
   return toHex(derive("request", [handler, payload]));

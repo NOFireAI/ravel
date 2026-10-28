@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { blake3, canonicalJson, stepId, stepInputHash, toHex } from "./identity.js";
+import { agentId, blake3, canonicalJson, effectId, stepId, stepInputHash, toHex, turnId } from "./identity.js";
 
 const fixtures = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../fixtures");
 
@@ -47,6 +47,21 @@ describe("identity", () => {
     expect(stepInputHash("catalog.price", "1", new TextEncoder().encode("A-1"))).toBe(
       step?.input_hash,
     );
+  });
+
+  it("agent id matches the create_agent_response fixture", () => {
+    const created = JSON.parse(readFileSync(resolve(fixtures, "create_agent_response.json"), "utf8")) as {
+      agent_id: string;
+    };
+    expect(agentId("order", "o-1")).toBe(created.agent_id);
+    expect(agentId("ab", "c")).not.toBe(agentId("a", "bc"));
+  });
+
+  it("effect id and turn id match identity.rs's derivations", () => {
+    // Reference values from the Rust derive() of identity.rs: effect_id(3, 7,
+    // "charge") and turn_id(3, 7, 11, 2).
+    expect(effectId(3, 7, "charge")).toBe("9783259fa007c3c5b7335f6a12380c98");
+    expect(turnId(3, 7, 11, 2)).toBe("156eebeadce74319b27ad6ad03a54816");
   });
 
   it("canonical JSON sorts keys at every depth", () => {
