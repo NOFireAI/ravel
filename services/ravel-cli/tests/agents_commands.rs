@@ -220,9 +220,9 @@ async fn dev_command_refuses_the_memory_store_and_inspect_reads_head_from_the_bu
         err.downcast_ref::<AgentsCliError>(),
         Some(&AgentsCliError::MemoryStore)
     );
-    assert!(host.calls.is_empty(), "no step ran: {:?}", host.calls);
     assert!(host.listener.is_none(), "no listener was opened");
     TcpListener::bind(options.listen_http).expect("the HTTP address is still free");
+    assert!(host.calls.is_empty(), "no step ran: {:?}", host.calls);
     assert!(out.is_empty(), "nothing was printed as ready");
 
     // inspect on a MemoryStore bucket, with no server anywhere.

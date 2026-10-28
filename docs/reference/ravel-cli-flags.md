@@ -295,6 +295,109 @@ Re-verify the content-addressed chain for a tenant at rest (both signals): every
 | `--tenant` |  |  |  |
 | `--versioning-aware` |  |  | Also list noncurrent (prior) versions under the tenant's keys and report "deleted but recoverable as prior version" as a distinct anomaly class (ADR-0064 §7, S4-12). The ObjectStoreBackend contract exposes no versioned listing, so against a real backend this reports an honest gap rather than an anomaly |
 
+## agents
+
+Ravel Agents (ADR-3331): a local development server, the SDK example scaffold, and read-only inspection of agents straight from the bucket
+
+_No flags._
+
+### agents dev
+
+Run a local development server for Ravel Agents. Refuses the memory store before doing anything else: agents keep their state in the bucket, and an in-process store would lose it on exit. Brings up the compose RustFS when the store does not answer, waits for its createbucket job, runs `store qualify`, then starts ravel-server with --agents and freshly generated development tokens on loopback listeners only, and prints the `agents scaffold` command to start an example against it. Runs until the server exits
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--compose-file` |  | `deploy/docker-compose/rustfs.yml` | The compose file that defines the rustfs and createbucket services |
+| `--json` |  |  | Print the ready report as one JSON line |
+| `--listen-grpc` |  | `127.0.0.1:4317` | Address of the server's gRPC listener; must be loopback |
+| `--listen-http` |  | `127.0.0.1:4318` | Address of the server's HTTP listener; must be loopback |
+| `--ready-timeout-secs` |  | `60` | Seconds to wait for the server to report ready |
+| `--server-bin` | `RAVEL_SERVER_BIN` | `ravel-server` | The ravel-server binary to start, built with the agents feature |
+| `--tenant` |  | `dev` | Tenant the development tokens are bound to |
+
+### agents scaffold
+
+Write the TypeScript SDK's assistant example into DIR, ready for `npm install` and `npm start` against `agents dev`. Refuses a DIR that exists and is not empty
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the report as JSON |
+| `--sdk-package` |  | `sdk/typescript/packages/agents` | The `@ravel/agents` package directory the example depends on |
+| `<DIR>` |  |  | Directory to write the example into; created when absent |
+
+### agents list
+
+List one tenant's agent ids from the bucket's agent directory, one page at a time. Reads the bucket directly; no server needed
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--cursor` |  |  | Resume after this agent id, the `next_cursor` a previous page printed |
+| `--json` |  |  | Print the page as JSON |
+| `--limit` |  | `100` | Agents per page, at most 1000; a larger value is refused |
+| `--tenant` |  |  |  |
+
+### agents inspect
+
+Print one agent's HEAD: state_version, the active turn, timers and queue depths. Reads the bucket directly; no server needed
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print HEAD as JSON |
+| `--key` |  |  | The agent's key; with --kind, names the agent instead of its id |
+| `--kind` |  |  | The agent's kind; with --key, names the agent instead of its id |
+| `--tenant` |  |  |  |
+| `<AGENT>` |  |  | The agent id (32 hex characters), as `list` prints it |
+
+### agents operation
+
+Print an operation's status, as `GET /api/v1/agents/operation` reports it. Reads the bucket directly; no server needed
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the status as JSON (the route's response body) |
+| `--tenant` |  |  |  |
+| `<HANDLE>` |  |  | The operation handle `send` or `call` returned |
+
+### agents events
+
+Print one page of an agent's event log, as `POST /api/v1/agents/events` returns it. Reads the bucket directly; no server needed
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--cursor` |  |  | Resume after this cursor, the `next_cursor` a previous page printed. Unset starts at the first event |
+| `--json` |  |  | Print the page as JSON (the route's response body) |
+| `--key` |  |  | The agent's key; with --kind, names the agent instead of its id |
+| `--kind` |  |  | The agent's kind; with --key, names the agent instead of its id |
+| `--limit` |  | `100` | Events per page, at most 1000; a larger value is refused |
+| `--tenant` |  |  |  |
+| `<AGENT>` |  |  | The agent id (32 hex characters), as `list` prints it |
+
+### agents effects
+
+List an agent's effects, as `GET /api/v1/agents/effects` reports them. Reads the bucket directly; no server needed
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--json` |  |  | Print the list as JSON (the route's response body) |
+| `--key` |  |  | The agent's key; with --kind, names the agent instead of its id |
+| `--kind` |  |  | The agent's kind; with --key, names the agent instead of its id |
+| `--tenant` |  |  |  |
+| `<AGENT>` |  |  | The agent id (32 hex characters), as `list` prints it |
+
+### agents reconcile
+
+Settle an in-doubt effect through a running server: attach the result an operator confirmed out of band (--result), or authorize one more attempt (--retry). The token needs the agents_admin capability
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--attempt` |  |  | The attempt the decision is about, the effect's latest |
+| `--json` |  |  | Print the server's answer as JSON (the route's response body) |
+| `--result` |  |  | Record this JSON value as the effect's result |
+| `--retry` |  |  | Authorize the attempt after --attempt |
+| `--token` | `RAVEL_AGENTS_ADMIN_TOKEN` |  | Bearer token with the agents_admin capability |
+| `--url` | `RAVEL_URL` | `http://127.0.0.1:4318` | Base URL of the server |
+| `<EFFECT>` |  |  | The effect handle `effects` or `operation` printed |
+
 ## store
 
 Object store backend qualification (ADR-0050 section 6)
