@@ -250,7 +250,8 @@ fn a_premature_hint_fires_nothing_and_is_kept() {
     assert_eq!(
         early,
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 1,
             hints_read: 1,
             ..SweepReport::default()
@@ -262,7 +263,8 @@ fn a_premature_hint_fires_nothing_and_is_kept() {
     assert_eq!(
         due,
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 1,
             hints_read: 1,
             hints_deleted: 1,
@@ -289,7 +291,8 @@ fn a_hint_in_a_later_bucket_is_not_listed() {
     assert_eq!(
         report,
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 1,
             ..SweepReport::default()
         }
@@ -319,7 +322,8 @@ fn a_duplicate_hint_fires_its_generation_once() {
     assert_eq!(
         report,
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 1,
             hints_read: 2,
             hints_deleted: 2,
@@ -449,7 +453,8 @@ fn lost_hint(due_ms: u64) -> usize {
     assert_eq!(
         passes[fired_at],
         SweepReport {
-            list_pages: 2,
+            wake_list_pages: 1,
+            dir_list_pages: 1,
             head_gets: 1,
             timers_fired: 1,
             agents_loaded: 1,
