@@ -191,7 +191,7 @@ async function render(dir: string, options: ScaffoldOptions): Promise<Map<string
 function readme(name: string, link: string): string {
   return `# ${name}
 
-A starter project for one Ravel agent, written by \`ravel-agents-scaffold\`.
+A starter project for one Ravel agent, written by the SDK's scaffold bin.
 It needs node 22.15 or later 22.x. Its tests run the agent against an
 in-process fake coordinator: no server, no network and no API key.
 
@@ -218,6 +218,15 @@ npm run typecheck   # tsc over src/
 checkout this project was generated from, at \`${link}\` relative to this
 directory; moving either one breaks the link, and editing that path in
 \`package.json\` and running \`npm install\` again mends it.
+
+## Another project
+
+From the SDK checkout's \`sdk/typescript/\` directory, after \`npm ci\`, run
+\`node packages/agents/bin/ravel-agents-scaffold.js <dir>\`. Run the bin by
+its path: \`npm ci\` does not link it into \`node_modules/.bin\`, because the
+lockfile does not list a bin for that workspace package, and
+\`npx ravel-agents-scaffold\` would look the name up in the public npm
+registry instead, so never use the bare name.
 
 ## Changing the agent
 
