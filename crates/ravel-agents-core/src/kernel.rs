@@ -360,7 +360,8 @@ fn pending_effects(head: &Head) -> usize {
 /// fingerprint or by generation, and the cancelled results. Only the audit
 /// event of a reconciliation whose effect's input is not the active turn's
 /// reads every inbox and result page, since an effect id does not name its
-/// input.
+/// input: at most `2 * Limits::max_index_pages` page GETs, 1024 at the
+/// defaults.
 pub fn page_needs(head: &Head, command: &Command) -> Vec<(ListKind, Need)> {
     let mut needs = Vec::new();
     let turn =

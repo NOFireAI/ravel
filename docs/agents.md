@@ -188,14 +188,31 @@ hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
   reads no page, a repeat send or a receipt lookup at most one, a wake no
   timer page, and `read_events` reads by `event_seq` range
   (`tests::pages::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`,
-  `tests::pages::events_are_read_by_seq_range`). `read_head`, the inspection
-  read, GETs every page.
+  `tests::pages::events_are_read_by_seq_range`). Receipts that share a
+  fingerprint are each found by their own request id
+  (`tests::pages::colliding_receipt_fingerprints_resolve_to_their_own_receipts`);
+  a page the planner failed to name makes the command load every page and
+  counts a `planner_misses`
+  (`tests::pages::a_planner_miss_loads_every_page_and_is_counted`).
+- No production path reads every page. The runtime's reload, the sweep's
+  per-agent visit and the directory scan read HEAD alone
+  (`read_head_shallow`); a scan then attaches the inbox pages holding the
+  first and the active input. On the server a result wait reads HEAD, one
+  results page and the output; an events page reads HEAD, the page holding
+  the cursor and the payloads; a poll reads HEAD twice plus the state and
+  payload objects and no sealed page (server test
+  `agents_e2e::hot_routes_read_one_page_of_a_deep_history`, 769 turns, 12
+  sealed pages per list). `read_head_full`, the inspection read of the
+  simulator and the tests, GETs every page.
 - A version 1 HEAD migrates on the next command's own CAS; the HEAD it
   writes is version 2 and under the byte cap (kernel test
   `one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`, store test
   `tests::pages::a_version_one_head_migrates_on_the_next_cas`). Reader and
-  writer ship in one release: a version 1 binary refuses the version 2 HEAD
-  as `UnsupportedFormat` and never re-encodes it.
+  writer ship in one release, a pre-1.0 departure from ADR-0066's
+  readers-first rule that rests on no released build carrying the agents
+  crates: a version 1 binary refuses the version 2 HEAD as
+  `UnsupportedFormat` with `RetryHint::Never` and never re-encodes it, and
+  a writer rollback is impossible once a version 2 HEAD exists.
 
 A HEAD is not deleted. `destroy` sets `Tombstoned`; `create` on a tombstoned
 agent bumps `incarnation` in the same HEAD, and a handle from an earlier
