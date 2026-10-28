@@ -17,12 +17,16 @@
 //!   `FaultStore` gate, and releases or crashes them in a seed-derived order.
 //! - [`seeds`]: the agent seed domains split from one `MasterSeed`, and the
 //!   seeded `RngSource` for runtime ids.
+//! - [`drive`]: runs the production store and runtime crates through the
+//!   scheduler and records their histories for the checker.
 //!
-//! Task T13 (#3346) adds the drivers that run the production store and
-//! runtime crates through the scheduler and check their recorded histories
-//! here. Until then this crate's own tests are its only caller.
+//! The named schedules are this crate's own tests, its only caller; the
+//! crate README lists each with its pinned batch totals.
 
+pub mod drive;
 pub mod history;
 pub mod reference;
 pub mod scheduler;
+#[cfg(test)]
+mod schedules;
 pub mod seeds;
