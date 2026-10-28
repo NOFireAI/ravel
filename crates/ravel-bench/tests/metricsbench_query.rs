@@ -1692,7 +1692,7 @@ fn a_row_failure_or_failed_replay_does_not_bind() {
             .expect("a row_failure binds as a diagnostic");
     assert_eq!(
         endpoints(&binding).keys().copied().collect::<Vec<_>>(),
-        vec!["prometheus", "mimir"]
+        vec!["mimir", "prometheus"]
     );
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].band, Some(6));
