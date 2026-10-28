@@ -4481,6 +4481,18 @@ version = "0.27.0"
 [[package]]
 name = "ravel-agents-sim"
 version = "0.27.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "proptest",
+ "rand 0.10.2",
+ "ravel-agents-core",
+ "ravel-commit",
+ "ravel-object-store",
+ "ravel-sim",
+ "ravel-test-support",
+ "tokio",
+]
 
 [[package]]
 name = "ravel-agents-store"
