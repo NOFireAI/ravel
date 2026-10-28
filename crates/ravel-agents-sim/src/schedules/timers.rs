@@ -6,6 +6,7 @@
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use ravel_agents_core::error::ErrorKind;
 use ravel_agents_core::head::{Head, TimerStatus};
 use ravel_agents_core::keys::{DueBucket, WAKE_BUCKET_WIDTH_NS, wake_key, wake_prefix};
 use ravel_agents_core::state::Handle;
@@ -15,7 +16,7 @@ use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, Scri
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 
 use super::*;
-use crate::drive::{HANDLER, T0_NS, TENANT, agent, json_bytes, status_of};
+use crate::drive::{HANDLER, Refusal, T0_NS, TENANT, agent, json_bytes, status_of};
 use crate::reference::{ClientOp, Event, Reply};
 use crate::{sim_assert, sim_assert_eq};
 
@@ -471,6 +472,45 @@ fn a_lost_hint_put_is_delivered_by_the_sweep_within_its_interval() {
 #[test]
 fn a_lost_hint_put_due_on_a_pass_fires_on_that_pass() {
     assert_eq!(lost_hint(2_000), 2);
+}
+
+/// A pass whose fire write fails fires nothing and is a `StoreUnavailable`
+/// refusal rather than a wake; the timer and its hint stay for a later pass.
+#[test]
+fn a_sweep_whose_fire_write_fails_is_a_store_unavailable_refusal() {
+    let rig = Rig::new(FaultPlan::empty());
+    armed(&rig, DUE);
+    rig.clock.advance_ms(1);
+    let swept: Reports = Arc::default();
+    let cell = Arc::clone(&swept);
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+            .with_key_contains("/head"),
+    );
+    let (s, faults) = faulty(&rig, Role::Client, "s", 10, plan, move |p| async move {
+        let report = p.sweep().await.map_err(|e| format!("sweep: {e:?}"))?;
+        cell.lock().map_err(|_| "reports poisoned")?.push(report);
+        Ok(())
+    });
+    let out = run(&rig, 1, ScheduleScript::new(Vec::new()), vec![s]).expect("schedule");
+    let run = checked(&rig, &out);
+    assert_eq!(
+        run.refusals,
+        vec![Refusal {
+            actor: "s".to_string(),
+            call: "sweep",
+            kind: ErrorKind::StoreUnavailable,
+        }]
+    );
+    assert_eq!(fires(&run), Vec::<Reply>::new());
+    // The pass tries the fire once and does not retry it.
+    assert_eq!(all_fired(&faults), vec![((Op::Put, FaultKind::Throttled), 1)]);
+    let report = reports(&swept);
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].timers_fired, 0);
+    let head = rig.head().expect("head");
+    assert_eq!(timer_status(&head), Some(TimerStatus::Scheduled));
+    assert_eq!(hint_keys(&rig), vec![hint_for(DUE)]);
 }
 
 /// Client `c` schedules the timer and is crashed per `script` under the

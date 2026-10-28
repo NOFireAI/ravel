@@ -129,6 +129,36 @@
 //! - `OutcomeUnknown` reaching the caller is unmappable: the coordinator
 //!   settles it on every path, so a client never has to. No schedule
 //!   reaches this.
+//! - `Coordinator::schedule_timer` is a client `SetTimer` with the bytes of
+//!   a null payload, answered [`Reply::TimerSet`] with the generation and
+//!   the timer handle whose id the response names, found by trying
+//!   incarnations 1 to `MAX_INCARNATION` under the timer key
+//!   (`schedules::timers::a_cancel_before_the_fire_wins_and_the_sweep_fires_nothing`).
+//!   An id matching no incarnation is unmappable; no schedule reaches this.
+//! - `Coordinator::cancel_timer` answers [`Reply::TimerCancel`] with its
+//!   outcome (`Cancelled` in
+//!   `schedules::timers::a_cancel_before_the_fire_wins_and_the_sweep_fires_nothing`,
+//!   `AlreadyFired` in
+//!   `schedules::timers::a_cancel_after_the_fire_is_already_fired`).
+//! - The wake hint a schedule writes after its HEAD write is not an event:
+//!   the reference has no hints, and a lost or missing hint only changes
+//!   which half of a sweep pass reaches the timer
+//!   (`schedules::timers::a_lost_hint_put_is_delivered_by_the_sweep_within_its_interval`,
+//!   `schedules::timers::a_crash_between_the_root_write_and_the_hint_write_still_fires`).
+//! - A sweep pass ([`Proc::sweep`]) is one [`Event::TimerDue`] per HEAD
+//!   write it applied, answered [`Reply::TimerFired`] with the input that
+//!   write enqueued
+//!   (`schedules::timers::two_sweepers_on_one_hint_fire_it_once`), then an
+//!   [`Event::Wake`] at its last HEAD access, from `Hint` when it read a
+//!   hint and from `Sweep` otherwise, answered with nothing left to fire
+//!   (`schedules::timers::a_premature_hint_fires_nothing_and_is_kept`,
+//!   `schedules::timers::a_lost_hint_put_due_on_a_pass_fires_on_that_pass`).
+//!   A write that does not decode, or whose newest input no timer enqueued,
+//!   is unmappable; no schedule reaches this.
+//! - A pass with a failed HEAD write is a [`Refusal`] of `StoreUnavailable`
+//!   in place of its wake
+//!   (`schedules::timers::a_sweep_whose_fire_write_fails_is_a_store_unavailable_refusal`).
+//!   A crashed pass keeps only its writes; no schedule crashes a pass.
 //!
 //! # Calls that never answered
 //!
