@@ -141,8 +141,9 @@ impl HealthBody {
 }
 
 /// `GET /api/v1/agents/health`. It reads no store and no tenant data, only
-/// operator settings `/metrics` also exposes, so like `/healthz` it carries no
-/// authentication.
+/// operator settings `/metrics` also exposes, so it carries no authentication
+/// on either listener, including the mTLS one, where `/healthz` itself is not
+/// served (ADR-3331 decision 9 mounts it on both).
 pub fn router(settings: AgentsSettings) -> Router {
     Router::new()
         .route(HEALTH_PATH, get(health))
