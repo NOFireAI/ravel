@@ -2,6 +2,8 @@
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
 pub mod admission_reconcile;
+#[cfg(feature = "agents")]
+pub mod agents;
 pub mod alert_sink;
 pub mod alert_state_memo;
 pub mod alerting;
@@ -2820,11 +2822,22 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // it exhausts its respawn budget; the log and span routers do not respawn,
     // so they condemn on the first shard death. All three sources feed the same
     // probe.
-    let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(
+    #[cfg_attr(not(feature = "agents"), allow(unused_mut))]
+    let mut readiness_sources = ingest_health_sources(
         ingest_router.as_ref(),
         log_ingest_router.as_ref(),
         span_ingest_router.as_ref(),
-    ));
+    );
+    // Set once the agents router is mounted in the query block below. With
+    // `--agents` it also gates `/readyz`, so the process is not ready while
+    // the routes the flag promises are absent.
+    #[cfg(feature = "agents")]
+    let agents_readiness = Arc::new(agents::AgentsReadiness::new());
+    #[cfg(feature = "agents")]
+    if config.query_budgets.agents.enabled {
+        readiness_sources.push(agents_readiness.clone() as Arc<dyn health::IngestHealth>);
+    }
+    let readiness = health::Readiness::new().with_ingest_health(readiness_sources);
     let mut http_router = Router::new().merge(health::router(readiness.clone()));
     // The dedicated mTLS listener's router (ADR-0050 section 1): built up in
     // parallel with `http_router` below, merging the same tenant-resolving
@@ -3196,6 +3209,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         sql_slice_rejects: None,
         #[cfg(feature = "flight-sql")]
         sql_slice_tls_dials: None,
+        #[cfg(feature = "agents")]
+        agents: Some(agents::AgentsMetricsSnapshot::new(
+            agents::AgentsSettings::from_server_config(&config),
+            agents_readiness.clone(),
+        )),
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
         normalize_reject_metrics: normalize_reject_metrics.clone(),
@@ -3738,6 +3756,15 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 mcp_settings(&config, app_state.engine.config())?,
             )?);
         }
+        // The Ravel Agents routes (ADR-3331 decision 9), under the same
+        // predicate `Cli::validate` checks: this block's mode test plus
+        // `--agents`.
+        #[cfg(feature = "agents")]
+        if config.query_budgets.agents.enabled {
+            http_router = http_router.merge(agents::router(
+                agents::AgentsSettings::from_server_config(&config),
+            ));
+        }
         query_service_handle = Some(query_service);
 
         // The mTLS listener gets its own instance. Everything a control needs
@@ -3782,7 +3809,17 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     mcp_settings(&config, app_state.engine.config())?,
                 )?);
             }
+            #[cfg(feature = "agents")]
+            if config.query_budgets.agents.enabled {
+                mtls_router = mtls_router.merge(agents::router(
+                    agents::AgentsSettings::from_server_config(&config),
+                ));
+            }
             mtls_query_service_handle = Some(mtls_query_service);
+        }
+        #[cfg(feature = "agents")]
+        if config.query_budgets.agents.enabled {
+            agents_readiness.mark_mounted();
         }
 
         // Same `QueryEngine` (and, under the `sql` feature, the same

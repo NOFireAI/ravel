@@ -4315,6 +4315,69 @@ fn render_shutdown_family(out: &mut String, mode: Mode, drain_overrun_total: u64
     );
 }
 
+/// The Ravel Agents settings (ADR-3331 decision 9), one gauge per budget and
+/// quota flag plus whether the agents router is mounted. Exists only in an
+/// `agents` build; the budgets and quotas are reported, not yet enforced.
+#[cfg(feature = "agents")]
+pub(crate) fn render_agents_families(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &crate::agents::AgentsMetricsSnapshot,
+) {
+    let settings = &snapshot.settings;
+    let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    for (name, help, value) in [
+        (
+            "ravel_agents_enabled",
+            "Whether this process mounted the Ravel Agents routes (1) or not (0): 1 only with --agents in --mode all or --mode query.",
+            u64::from(snapshot.enabled()),
+        ),
+        (
+            "ravel_agents_activation_concurrency_limit",
+            "The --agents-activation-concurrency setting: most agent turns this process activates at once. Reported only; not enforced in this release.",
+            as_u64(settings.activation_concurrency),
+        ),
+        (
+            "ravel_agents_poll_concurrency_limit",
+            "The --agents-poll-concurrency setting: most worker long-polls this process holds open at once. Reported only; not enforced in this release.",
+            as_u64(settings.poll_concurrency),
+        ),
+        (
+            "ravel_agents_memory_budget_bytes",
+            "The --agents-memory-budget setting in bytes. Reported only; no reservation is taken from the process memory budget in this release.",
+            settings.memory_budget_bytes,
+        ),
+        (
+            "ravel_agents_max_agents",
+            "The --agents-max-agents setting: most live agents one tenant may hold. Reported only; not enforced in this release.",
+            settings.max_agents,
+        ),
+        (
+            "ravel_agents_max_mailbox",
+            "The --agents-max-mailbox setting: most accepted inputs one agent's mailbox may hold. Reported only; not enforced in this release.",
+            settings.max_mailbox,
+        ),
+        (
+            "ravel_agents_max_state_bytes",
+            "The --agents-max-state-bytes setting: most bytes of objects one agent's root may reference. Reported only; not enforced in this release.",
+            settings.max_state_bytes,
+        ),
+        (
+            "ravel_agents_max_receipts",
+            "The --agents-max-receipts setting: most idempotency receipts one agent retains. Reported only; not enforced in this release.",
+            settings.max_receipts,
+        ),
+        (
+            "ravel_agents_max_timers",
+            "The --agents-max-timers setting: most pending timers one agent may hold. Reported only; not enforced in this release.",
+            settings.max_timers,
+        ),
+    ] {
+        write_header(out, name, help, "gauge");
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+}
+
 /// The three bucket-protection gauges (ADR-0072 decision 3, ADR-1727 decision
 /// 5), from the last `--require-bucket-protection` startup check, all 0 when
 /// the flag is off. Single source, no labels, the same shape as
@@ -8866,6 +8929,11 @@ pub struct MetricsState {
     /// `ravel_sql_slice_tls_dials_total` off the exposition.
     #[cfg(feature = "flight-sql")]
     pub sql_slice_tls_dials: Option<ravel_sql::SliceTlsDialCounter>,
+    /// The Ravel Agents settings and mount flag (ADR-3331 decision 9) behind
+    /// the `ravel_agents_*` families. `crate::start` always sets it in an
+    /// `agents` build; `None` leaves the families off the exposition.
+    #[cfg(feature = "agents")]
+    pub agents: Option<crate::agents::AgentsMetricsSnapshot>,
     /// The durable `sys/auth` background-refresh state (ADR-0066 decision 6),
     /// read at scrape time for its three refresh-loop counters. `Some` only
     /// when `--deployment-key` is set in a request-serving mode
@@ -9263,6 +9331,12 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .as_ref()
             .map(ravel_sql::SliceTlsDialCounter::get),
     );
+    // Appended for the same reason: the agents surface exists only in an
+    // `agents` build.
+    #[cfg(feature = "agents")]
+    if let Some(snapshot) = &state.agents {
+        render_agents_families(&mut body, state.mode, snapshot);
+    }
     // Appended for the same reason: DDL exists only in a `sql` build.
     #[cfg(feature = "sql")]
     render_sql_ddl_family(
@@ -16899,6 +16973,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             sql_slice_rejects: None,
             #[cfg(feature = "flight-sql")]
             sql_slice_tls_dials: None,
+            #[cfg(feature = "agents")]
+            agents: None,
             durable_auth: None,
             ingest_byte_metrics: Arc::new(crate::ingest_byte_metrics::IngestByteMetrics::new()),
             normalize_reject_metrics: Arc::new(

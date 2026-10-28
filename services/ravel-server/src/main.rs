@@ -370,6 +370,9 @@ async fn main() -> anyhow::Result<()> {
         ravel_server::tenant::OidcCapabilityClaims {
             ddl: cli.oidc_ddl_claim.clone(),
             ipcrypt: cli.oidc_ipcrypt_claim.clone(),
+            agents: cli.oidc_agents_claim.clone(),
+            agents_worker: cli.oidc_agents_worker_claim.clone(),
+            agents_admin: cli.oidc_agents_admin_claim.clone(),
         },
     )?;
     // Retention windows are validated at startup against the ADR-0019 floor

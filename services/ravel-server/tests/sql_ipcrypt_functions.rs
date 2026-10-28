@@ -127,6 +127,9 @@ fn principals() -> HashMap<String, Principal> {
                 tenant: TenantId::new(tenant),
                 ddl: ipcrypt,
                 ipcrypt,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             },
         );
     }

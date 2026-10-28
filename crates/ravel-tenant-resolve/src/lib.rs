@@ -41,7 +41,9 @@ pub enum TenantSuffixError {
     EmptyTenant,
     #[error("the capability list after ';' is empty or has an empty entry")]
     EmptyCapability,
-    #[error("unknown capability after ';', expected ddl or ipcrypt")]
+    #[error(
+        "unknown capability after ';', expected ddl, ipcrypt, agents, agents_worker or agents_admin"
+    )]
     UnknownCapability,
     #[error("a capability after ';' is named more than once")]
     DuplicateCapability,
@@ -56,11 +58,22 @@ pub struct TokenCapabilities {
     pub ddl: bool,
     /// The IPCrypt SQL functions (ADR-2993 decision 6).
     pub ipcrypt: bool,
+    /// Ravel Agents client operations (ADR-3331 decision 9).
+    pub agents: bool,
+    /// Ravel Agents worker registration, turn commits and effect completion
+    /// (ADR-3331 decision 9).
+    pub agents_worker: bool,
+    /// Ravel Agents reconciliation (ADR-3331 decision 9).
+    pub agents_admin: bool,
 }
+
+/// Every word a `;`-suffix may name.
+const CAPABILITY_WORDS: [&str; 5] = ["ddl", "ipcrypt", "agents", "agents_worker", "agents_admin"];
 
 /// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`. The
 /// suffix after it is a comma-separated capability list drawn from `ddl`
-/// (ADR-2040 decision 4) and `ipcrypt` (ADR-2993 decision 6), each at most
+/// (ADR-2040 decision 4), `ipcrypt` (ADR-2993 decision 6), and `agents`,
+/// `agents_worker` and `agents_admin` (ADR-3331 decision 9), each at most
 /// once and the list never empty, so `acme;ddl`, `acme;ipcrypt` and
 /// `acme;ddl,ipcrypt` all name tenant `acme`. A tenant with no `;` is returned
 /// unchanged with no capability. An unknown word (matching is case-sensitive),
@@ -84,7 +97,7 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), Tenan
     if let Some(tenant_idx) = tenant.rfind(';')
         && tenant[tenant_idx + 1..]
             .split(',')
-            .any(|word| matches!(word, "ddl" | "ipcrypt"))
+            .any(|word| CAPABILITY_WORDS.contains(&word))
     {
         return Err(TenantSuffixError::CapabilityInTenant);
     }
@@ -94,6 +107,9 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), Tenan
             "" => return Err(TenantSuffixError::EmptyCapability),
             "ddl" => &mut caps.ddl,
             "ipcrypt" => &mut caps.ipcrypt,
+            "agents" => &mut caps.agents,
+            "agents_worker" => &mut caps.agents_worker,
+            "agents_admin" => &mut caps.agents_admin,
             _ => return Err(TenantSuffixError::UnknownCapability),
         };
         if *slot {
@@ -115,11 +131,19 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), Tenan
 /// - `ipcrypt`: may call `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt`
 ///   (ADR-2993 decision 6). Without it the SQL session does not register
 ///   them, so a call fails as an unknown function.
+/// - `agents`: may run Ravel Agents client operations (ADR-3331 decision 9).
+/// - `agents_worker`: may register as a Ravel Agents worker, commit turns and
+///   complete effects (ADR-3331 decision 9). It does not imply `agents`.
+/// - `agents_admin`: may run Ravel Agents reconciliation (ADR-3331 decision
+///   9). It implies neither of the other two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub tenant: TenantId,
     pub ddl: bool,
     pub ipcrypt: bool,
+    pub agents: bool,
+    pub agents_worker: bool,
+    pub agents_admin: bool,
 }
 
 impl Principal {
@@ -129,6 +153,9 @@ impl Principal {
             tenant,
             ddl: false,
             ipcrypt: false,
+            agents: false,
+            agents_worker: false,
+            agents_admin: false,
         }
     }
 }
@@ -140,7 +167,7 @@ pub trait TenantResolver: Send + Sync {
     /// Resolves the full [`Principal`], including its capabilities. The
     /// default forwards to [`resolve`](Self::resolve) and reports no
     /// capability, so a resolver that does not override this keeps its
-    /// current behavior: `ddl` and `ipcrypt` are opt-in per resolver, never
+    /// current behavior: every capability is opt-in per resolver, never
     /// inferred.
     fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
         Ok(Principal::tenant_only(self.resolve(headers)?))
@@ -509,6 +536,9 @@ pub struct OidcResolver {
     tenant_claim: String,
     ddl_claim: Option<String>,
     ipcrypt_claim: Option<String>,
+    agents_claim: Option<String>,
+    agents_worker_claim: Option<String>,
+    agents_admin_claim: Option<String>,
 }
 
 impl OidcResolver {
@@ -520,8 +550,12 @@ impl OidcResolver {
     /// tenant identity is read from (e.g. `tenant`). No capability claim is
     /// configured, so [`resolve_principal`](Self::resolve_principal) reports
     /// no `ddl` capability until [`with_ddl_claim`](Self::with_ddl_claim) is
-    /// used, and no `ipcrypt` capability until
-    /// [`with_ipcrypt_claim`](Self::with_ipcrypt_claim) is.
+    /// used, no `ipcrypt` capability until
+    /// [`with_ipcrypt_claim`](Self::with_ipcrypt_claim) is, and none of the
+    /// three agents capabilities until
+    /// [`with_agents_claim`](Self::with_agents_claim),
+    /// [`with_agents_worker_claim`](Self::with_agents_worker_claim) or
+    /// [`with_agents_admin_claim`](Self::with_agents_admin_claim) is.
     pub fn new(
         cache: Arc<OidcJwksCache>,
         issuer: impl Into<String>,
@@ -535,6 +569,9 @@ impl OidcResolver {
             tenant_claim: tenant_claim.into(),
             ddl_claim: None,
             ipcrypt_claim: None,
+            agents_claim: None,
+            agents_worker_claim: None,
+            agents_admin_claim: None,
         }
     }
 
@@ -554,6 +591,30 @@ impl OidcResolver {
     /// claim name configured (the default) it is never granted via OIDC.
     pub fn with_ipcrypt_claim(mut self, ipcrypt_claim: impl Into<String>) -> Self {
         self.ipcrypt_claim = Some(ipcrypt_claim.into());
+        self
+    }
+
+    /// Configure the claim that grants the `agents` capability (ADR-3331
+    /// decision 9), read exactly as [`with_ddl_claim`](Self::with_ddl_claim)
+    /// reads its claim.
+    pub fn with_agents_claim(mut self, agents_claim: impl Into<String>) -> Self {
+        self.agents_claim = Some(agents_claim.into());
+        self
+    }
+
+    /// Configure the claim that grants the `agents_worker` capability
+    /// (ADR-3331 decision 9), read exactly as
+    /// [`with_ddl_claim`](Self::with_ddl_claim) reads its claim.
+    pub fn with_agents_worker_claim(mut self, agents_worker_claim: impl Into<String>) -> Self {
+        self.agents_worker_claim = Some(agents_worker_claim.into());
+        self
+    }
+
+    /// Configure the claim that grants the `agents_admin` capability
+    /// (ADR-3331 decision 9), read exactly as
+    /// [`with_ddl_claim`](Self::with_ddl_claim) reads its claim.
+    pub fn with_agents_admin_claim(mut self, agents_admin_claim: impl Into<String>) -> Self {
+        self.agents_admin_claim = Some(agents_admin_claim.into());
         self
     }
 
@@ -631,6 +692,9 @@ impl TenantResolver for OidcResolver {
             tenant,
             ddl: granted(&self.ddl_claim),
             ipcrypt: granted(&self.ipcrypt_claim),
+            agents: granted(&self.agents_claim),
+            agents_worker: granted(&self.agents_worker_claim),
+            agents_admin: granted(&self.agents_admin_claim),
         })
     }
 }
@@ -736,19 +800,93 @@ mod tests {
     const NONE: TokenCapabilities = TokenCapabilities {
         ddl: false,
         ipcrypt: false,
+        agents: false,
+        agents_worker: false,
+        agents_admin: false,
     };
-    const DDL: TokenCapabilities = TokenCapabilities {
-        ddl: true,
-        ipcrypt: false,
-    };
+    const DDL: TokenCapabilities = TokenCapabilities { ddl: true, ..NONE };
     const IPCRYPT: TokenCapabilities = TokenCapabilities {
-        ddl: false,
         ipcrypt: true,
+        ..NONE
     };
     const BOTH: TokenCapabilities = TokenCapabilities {
         ddl: true,
         ipcrypt: true,
+        ..NONE
     };
+    const AGENTS: TokenCapabilities = TokenCapabilities {
+        agents: true,
+        ..NONE
+    };
+    const AGENTS_WORKER: TokenCapabilities = TokenCapabilities {
+        agents_worker: true,
+        ..NONE
+    };
+    const AGENTS_ADMIN: TokenCapabilities = TokenCapabilities {
+        agents_admin: true,
+        ..NONE
+    };
+    const ALL: TokenCapabilities = TokenCapabilities {
+        ddl: true,
+        ipcrypt: true,
+        agents: true,
+        agents_worker: true,
+        agents_admin: true,
+    };
+
+    /// Each agents word grants exactly its own capability and nothing else,
+    /// so `agents_worker` does not imply `agents` (ADR-3331 decision 9).
+    #[test]
+    fn split_tenant_suffix_agents_words_grant_only_their_own_capability() {
+        assert_eq!(
+            split_tenant_suffix("acme;agents").unwrap(),
+            ("acme", AGENTS)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;agents_worker").unwrap(),
+            ("acme", AGENTS_WORKER)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;agents_admin").unwrap(),
+            ("acme", AGENTS_ADMIN)
+        );
+    }
+
+    #[test]
+    fn split_tenant_suffix_every_word_combines_in_any_order() {
+        assert_eq!(
+            split_tenant_suffix("acme;ddl,ipcrypt,agents,agents_worker,agents_admin").unwrap(),
+            ("acme", ALL)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;agents_admin,agents_worker,agents,ipcrypt,ddl").unwrap(),
+            ("acme", ALL)
+        );
+    }
+
+    #[test]
+    fn split_tenant_suffix_agents_word_repeated_or_misspelled_is_refused() {
+        assert_eq!(
+            split_tenant_suffix("acme;agents_worker,agents_worker"),
+            Err(TenantSuffixError::DuplicateCapability)
+        );
+        for raw in [
+            "acme;AGENTS",
+            "acme;agent",
+            "acme;agents-worker",
+            "acme;agents_",
+        ] {
+            assert_eq!(
+                split_tenant_suffix(raw),
+                Err(TenantSuffixError::UnknownCapability),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            split_tenant_suffix("acme;agents;agents_admin"),
+            Err(TenantSuffixError::CapabilityInTenant)
+        );
+    }
 
     #[test]
     fn split_tenant_suffix_no_semicolon_is_unchanged_no_capability() {
@@ -1153,6 +1291,9 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
                 tenant: TenantId::new("acme"),
                 ddl: false,
                 ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             })
         );
 
@@ -1377,6 +1518,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: false,
                 ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             }
         );
 
@@ -1388,6 +1532,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: true,
                 ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             },
         )]));
         assert_eq!(
@@ -1398,6 +1545,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: true,
                 ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             }
         );
 
@@ -1413,6 +1563,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: true,
                 ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             }
         );
 
@@ -1499,6 +1652,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: true,
                 ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             }
         );
     }
@@ -1521,11 +1677,17 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             tenant: TenantId::new("acme"),
             ddl: false,
             ipcrypt: false,
+            agents: false,
+            agents_worker: false,
+            agents_admin: false,
         };
         let granted = Principal {
             tenant: TenantId::new("acme"),
             ddl: true,
             ipcrypt: true,
+            agents: false,
+            agents_worker: false,
+            agents_admin: false,
         };
         let first_denies = FallbackResolver::new(vec![
             Arc::new(Fixed(denied.clone())),
@@ -1592,6 +1754,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: false,
                 ipcrypt: true,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             }
         );
         assert_eq!(
@@ -1606,6 +1771,9 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 tenant: TenantId::new("acme"),
                 ddl: true,
                 ipcrypt: true,
+                agents: false,
+                agents_worker: false,
+                agents_admin: false,
             }
         );
         // The ddl claim does not grant ipcrypt.
@@ -1619,5 +1787,94 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
         assert!(!principal_for(&[("can_ipcrypt", serde_json::json!(1))], true).ipcrypt);
         assert!(!principal_for(&[("can_ipcrypt", serde_json::json!([true]))], true).ipcrypt);
         assert!(!principal_for(&[("can_ipcrypt", serde_json::json!(true))], false).ipcrypt);
+    }
+
+    /// Each agents claim grants exactly its own capability, read like the ddl
+    /// claim: only the JSON boolean `true` on a configured claim name.
+    #[test]
+    fn oidc_agents_claims_grant_only_their_own_capability() {
+        let principal_for = |extra: &[(&str, serde_json::Value)], configured: bool| {
+            let cache = cache_with(&jwks_with(KID));
+            let mut c = claims(Some("acme"), 3600);
+            for (name, value) in extra {
+                c[*name] = value.clone();
+            }
+            let token = sign_es256(&c, KID, EC_PRIV_PEM);
+            let oidc = resolver(cache);
+            let oidc = if configured {
+                oidc.with_agents_claim("can_agents")
+                    .with_agents_worker_claim("can_agents_worker")
+                    .with_agents_admin_claim("can_agents_admin")
+            } else {
+                oidc
+            };
+            oidc.resolve_principal(&bearer(&token)).expect("resolves")
+        };
+
+        assert_eq!(
+            principal_for(&[("can_agents_worker", serde_json::json!(true))], true),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: false,
+                ipcrypt: false,
+                agents: false,
+                agents_worker: true,
+                agents_admin: false,
+            }
+        );
+        assert_eq!(
+            principal_for(&[("can_agents", serde_json::json!(true))], true),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: false,
+                ipcrypt: false,
+                agents: true,
+                agents_worker: false,
+                agents_admin: false,
+            }
+        );
+        assert_eq!(
+            principal_for(&[("can_agents_admin", serde_json::json!(true))], true),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: false,
+                ipcrypt: false,
+                agents: false,
+                agents_worker: false,
+                agents_admin: true,
+            }
+        );
+        // A missing claim, a non-boolean claim, or no configured claim name:
+        // no capability.
+        let none = Principal::tenant_only(TenantId::new("acme"));
+        assert_eq!(principal_for(&[], true), none);
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!([true]),
+        ] {
+            assert_eq!(
+                principal_for(
+                    &[
+                        ("can_agents", value.clone()),
+                        ("can_agents_worker", value.clone()),
+                        ("can_agents_admin", value),
+                    ],
+                    true
+                ),
+                none
+            );
+        }
+        assert_eq!(
+            principal_for(
+                &[
+                    ("can_agents", serde_json::json!(true)),
+                    ("can_agents_worker", serde_json::json!(true)),
+                    ("can_agents_admin", serde_json::json!(true)),
+                ],
+                false
+            ),
+            none
+        );
     }
 }
