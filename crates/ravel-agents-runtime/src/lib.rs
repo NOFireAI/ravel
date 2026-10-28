@@ -15,10 +15,10 @@
 //! Timers ([`Coordinator::schedule_timer`], [`Coordinator::cancel_timer`])
 //! fire only from the reconciliation sweep in `sweep`, which reads HEAD for
 //! every agent it acts on. The sweep runs from [`Coordinator::sweep_once`]
-//! and, once [`Coordinator::with_sweep`] enabled it, from worker polls on an
-//! injected interval. Nothing in `ravel-server` schedules either until T19
-//! (#3353). The simulation crate (T13, #3346) drives the coordinator
-//! directly.
+//! and from worker polls on an injected interval ([`SweepConfig`]); it is
+//! also how a poll finds an agent given work through another coordinator.
+//! `ravel-server` runs it per tenant on `agents.sweep_interval_ms`. The
+//! simulation crate (T13, #3346) drives the coordinator directly.
 //!
 //! The bodies are the `ravel_agents_core::wire` types wherever one exists.
 //! Worker registration, heartbeat, activation, takeover and a failure's
@@ -30,7 +30,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -127,11 +127,6 @@ pub struct RuntimeConfig {
     pub idle_unload_after_ms: u64,
     /// Upper bound on one worker long-poll.
     pub poll_wait_cap_ms: u64,
-    /// Least time between two directory rescans triggered by a pass that
-    /// found nothing to dispatch. Bounds the LIST and per-agent HEAD reads
-    /// an idle coordinator spends looking for work that arrived through
-    /// another coordinator.
-    pub rescan_interval_ms: u64,
 }
 
 /// The long-poll cap of ADR-3331 decision 9.
@@ -145,7 +140,6 @@ impl Default for RuntimeConfig {
             max_turn_attempts: 3,
             idle_unload_after_ms: 300_000,
             poll_wait_cap_ms: DEFAULT_POLL_WAIT_CAP_MS,
-            rescan_interval_ms: 5_000,
         }
     }
 }
@@ -167,21 +161,8 @@ pub struct Coordinator {
     pub(crate) rng: Arc<dyn Rng>,
     pub(crate) agents: Mutex<HashMap<AgentId, Loaded>>,
     pub(crate) leases: LeaseTable,
-    /// Whether the agent directory needs no scan before the next dispatch
-    /// pass. Cleared at start, by an unload, and by a pass that found
-    /// nothing to dispatch once `rescan_interval_ms` has passed since the
-    /// last scan.
-    pub(crate) discovered: AtomicBool,
-    /// Set while one poller is inside the directory scan; a second poller
-    /// arriving then skips the scan rather than running its own.
-    pub(crate) scanning: AtomicBool,
-    /// When the directory was last scanned, in the injected clock's
-    /// nanoseconds; `i64::MIN` before the first scan. A poller that wants
-    /// a rescan claims this stamp with a compare-exchange first, so pollers
-    /// woken together share one scan.
-    pub(crate) last_scan_unix_ns: AtomicI64,
-    /// Agents the scan has already reported as unreadable by this release,
-    /// so a rollback is logged once per agent, not once per rescan.
+    /// Agents the sweep has already reported as unreadable by this release,
+    /// so a rollback is logged once per agent, not once per pass.
     pub(crate) unsupported_reported: Mutex<HashSet<AgentId>>,
     pub(crate) wake: Notify,
     pub(crate) metrics: Metrics,
@@ -192,8 +173,6 @@ pub struct Coordinator {
     /// (`prune_open_attempts`).
     pub(crate) open_attempts: Mutex<HashMap<(AgentId, Id128), effects::OpenAttempt>>,
     pub(crate) sweep: SweepConfig,
-    /// Whether worker polls start sweep passes; set by `with_sweep`.
-    pub(crate) sweep_on_poll: bool,
     /// Where the next sweep pass resumes. Held for the whole pass, so two
     /// passes never run at once.
     pub(crate) sweep_cursor: tokio::sync::Mutex<sweep::SweepCursor>,
@@ -216,15 +195,11 @@ impl Coordinator {
             rng,
             agents: Mutex::new(HashMap::new()),
             leases: LeaseTable::default(),
-            discovered: AtomicBool::new(false),
-            scanning: AtomicBool::new(false),
-            last_scan_unix_ns: AtomicI64::new(i64::MIN),
             unsupported_reported: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             metrics: Metrics::default(),
             open_attempts: Mutex::new(HashMap::new()),
             sweep: SweepConfig::default(),
-            sweep_on_poll: false,
             sweep_cursor: tokio::sync::Mutex::new(sweep::SweepCursor::default()),
             last_sweep_unix_ns: AtomicI64::new(i64::MIN),
         }

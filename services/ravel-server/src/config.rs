@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
@@ -3470,7 +3471,45 @@ pub struct AgentsConfig {
     pub lease_ms: u64,
     /// How long past lease expiry another worker waits before taking over.
     pub heartbeat_grace_ms: u64,
+    /// How often each tenant's coordinator in this process runs one bounded
+    /// sweep pass: fires due timers, deletes settled wake hints and repairs
+    /// missing directory entries (ADR-3331 decision 8). Zero runs no
+    /// periodic pass; polls and `POST /api/v1/agents/sweep` still sweep.
+    pub sweep_interval_ms: u64,
+    /// The clock every tenant coordinator and store reads: the host's wall
+    /// clock unless a test injects one.
+    pub clock: AgentsClock,
 }
+
+/// The time source of the agents runtime, in unix nanoseconds. `None` is the
+/// host's wall clock; tests inject their own to move time past a timer's due
+/// instant without waiting for it.
+#[derive(Clone, Default)]
+pub struct AgentsClock(pub Option<Arc<dyn Fn() -> i64 + Send + Sync>>);
+
+impl std::fmt::Debug for AgentsClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "injected"
+        } else {
+            "system"
+        })
+    }
+}
+
+/// Two clocks are equal when both are the wall clock or both are the same
+/// injected function.
+impl PartialEq for AgentsClock {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AgentsClock {}
 
 impl Default for AgentsConfig {
     fn default() -> Self {
@@ -3487,6 +3526,8 @@ impl Default for AgentsConfig {
             max_body_bytes: DEFAULT_AGENTS_MAX_BODY_BYTES,
             lease_ms: DEFAULT_AGENTS_LEASE_MS,
             heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
+            sweep_interval_ms: DEFAULT_AGENTS_SWEEP_INTERVAL_MS,
+            clock: AgentsClock::default(),
         }
     }
 }
@@ -3515,6 +3556,8 @@ pub const DEFAULT_AGENTS_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 pub const DEFAULT_AGENTS_LEASE_MS: u64 = 30_000;
 /// Agents takeover grace past lease expiry: 10 s, the coordinator's default.
 pub const DEFAULT_AGENTS_HEARTBEAT_GRACE_MS: u64 = 10_000;
+/// [`AgentsConfig::sweep_interval_ms`] default.
+pub const DEFAULT_AGENTS_SWEEP_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
@@ -7276,6 +7319,8 @@ impl Cli {
                 max_body_bytes: DEFAULT_AGENTS_MAX_BODY_BYTES,
                 lease_ms: DEFAULT_AGENTS_LEASE_MS,
                 heartbeat_grace_ms: DEFAULT_AGENTS_HEARTBEAT_GRACE_MS,
+                sweep_interval_ms: DEFAULT_AGENTS_SWEEP_INTERVAL_MS,
+                clock: AgentsClock::default(),
             },
             fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
             sql_spill: SqlSpillSettings {
@@ -17551,6 +17596,8 @@ mod tests {
                 max_body_bytes: 5 * 1024 * 1024,
                 lease_ms: 30_000,
                 heartbeat_grace_ms: 10_000,
+                sweep_interval_ms: 5_000,
+                clock: AgentsClock::default(),
             }
         );
     }

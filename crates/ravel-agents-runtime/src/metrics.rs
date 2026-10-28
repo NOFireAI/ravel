@@ -54,7 +54,8 @@ pub(crate) struct Metrics {
     pub(crate) polls_waited: AtomicU64,
     pub(crate) timers_fired: AtomicU64,
     pub(crate) sweep_passes: AtomicU64,
-    pub(crate) sweep_list_pages: AtomicU64,
+    pub(crate) sweep_wake_list_pages: AtomicU64,
+    pub(crate) sweep_dir_list_pages: AtomicU64,
     pub(crate) sweep_head_gets: AtomicU64,
     pub(crate) sweep_hints_read: AtomicU64,
     pub(crate) sweep_hints_deleted: AtomicU64,
@@ -63,17 +64,18 @@ pub(crate) struct Metrics {
 }
 
 /// The timer and sweep counters, summed over every pass since the
-/// coordinator started: the [`crate::SweepReport`] fields, a flat set of
-/// counters with no per-phase split, plus the pass count. Exported here for
-/// `ravel-server` to render; nothing renders them until T19 (#3353) does.
-/// Kept apart from [`AgentsMetricsSnapshot`], which `ravel-server` builds
-/// field by field.
+/// coordinator started: the [`crate::SweepReport`] fields plus the pass
+/// count. `ravel-server` renders them on `/metrics`, the LISTs under a
+/// `phase` label of `wake` or `dir`. Kept apart from
+/// [`AgentsMetricsSnapshot`], which `ravel-server` builds field by field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepMetricsSnapshot {
     /// Passes run, from polls and from `sweep_once`, including failed ones.
     pub passes: u64,
-    /// LISTs the passes issued over `_wake/` and `_dir/`.
-    pub list_pages: u64,
+    /// LISTs the passes issued over `_wake/`.
+    pub wake_list_pages: u64,
+    /// LISTs the passes issued over `_dir/`.
+    pub dir_list_pages: u64,
     /// HEAD reads the passes issued themselves.
     pub head_gets: u64,
     /// Due hints acted on.
@@ -89,13 +91,13 @@ pub struct SweepMetricsSnapshot {
 }
 
 impl Coordinator {
-    /// The timer and sweep counters. Read by this crate's tests only until
-    /// `ravel-server` renders them (T19, #3353).
+    /// The timer and sweep counters.
     pub fn sweep_metrics(&self) -> SweepMetricsSnapshot {
         let m = &self.metrics;
         SweepMetricsSnapshot {
             passes: m.sweep_passes.load(Ordering::Relaxed),
-            list_pages: m.sweep_list_pages.load(Ordering::Relaxed),
+            wake_list_pages: m.sweep_wake_list_pages.load(Ordering::Relaxed),
+            dir_list_pages: m.sweep_dir_list_pages.load(Ordering::Relaxed),
             head_gets: m.sweep_head_gets.load(Ordering::Relaxed),
             hints_read: m.sweep_hints_read.load(Ordering::Relaxed),
             hints_deleted: m.sweep_hints_deleted.load(Ordering::Relaxed),
@@ -108,8 +110,10 @@ impl Coordinator {
     pub(crate) fn record_sweep(&self, report: &crate::SweepReport) {
         let m = &self.metrics;
         m.sweep_passes.fetch_add(1, Ordering::Relaxed);
-        m.sweep_list_pages
-            .fetch_add(report.list_pages, Ordering::Relaxed);
+        m.sweep_wake_list_pages
+            .fetch_add(report.wake_list_pages, Ordering::Relaxed);
+        m.sweep_dir_list_pages
+            .fetch_add(report.dir_list_pages, Ordering::Relaxed);
         m.sweep_head_gets
             .fetch_add(report.head_gets, Ordering::Relaxed);
         m.sweep_hints_read

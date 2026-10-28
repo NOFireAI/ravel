@@ -34,7 +34,7 @@ pub(crate) const LEASE_MS: u64 = 1_000;
 pub(crate) const GRACE_MS: u64 = 500;
 pub(crate) const MAX_ATTEMPTS: u32 = 3;
 pub(crate) const IDLE_MS: u64 = 10_000;
-pub(crate) const RESCAN_MS: u64 = 2_000;
+pub(crate) const SWEEP_MS: u64 = 2_000;
 
 pub(crate) struct TestClock(AtomicI64);
 
@@ -67,7 +67,6 @@ pub(crate) fn config() -> RuntimeConfig {
         max_turn_attempts: MAX_ATTEMPTS,
         idle_unload_after_ms: IDLE_MS,
         poll_wait_cap_ms: DEFAULT_POLL_WAIT_CAP_MS,
-        rescan_interval_ms: RESCAN_MS,
     }
 }
 
@@ -96,12 +95,32 @@ pub(crate) fn coordinator(
     clock: &Arc<TestClock>,
     seed: u64,
 ) -> Arc<Coordinator> {
-    Arc::new(Coordinator::new(
-        store.clone(),
-        config(),
-        clock.clone(),
-        Arc::new(FixedRng(AtomicU64::new(seed))),
-    ))
+    coordinator_with(
+        store,
+        clock,
+        seed,
+        SweepConfig {
+            interval_ms: SWEEP_MS,
+            ..SweepConfig::default()
+        },
+    )
+}
+
+pub(crate) fn coordinator_with(
+    store: &Arc<AgentStore>,
+    clock: &Arc<TestClock>,
+    seed: u64,
+    sweep: SweepConfig,
+) -> Arc<Coordinator> {
+    Arc::new(
+        Coordinator::new(
+            store.clone(),
+            config(),
+            clock.clone(),
+            Arc::new(FixedRng(AtomicU64::new(seed))),
+        )
+        .with_sweep(sweep),
+    )
 }
 
 /// One coordinator over a fresh `MemoryStore`.
@@ -1062,9 +1081,9 @@ async fn a_poll_needs_no_registration_on_this_coordinator() {
 
 #[tokio::test(start_paused = true)]
 async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
-    // c2's first poll lists an empty directory; the agent is then created and
-    // sent an input through c1, and c2's next poll must list again rather
-    // than trust its earlier scan.
+    // c2's first poll sweeps an empty tenant; the agent is then created and
+    // sent an input through c1, and c2's next poll past the sweep interval
+    // finds it through the sweep's directory half.
     let clock = clock();
     let store = store_over(Arc::new(MemoryStore::new()), &clock);
     let c1 = coordinator(&store, &clock, 100);
@@ -1075,23 +1094,27 @@ async fn a_poll_finds_an_agent_that_got_work_through_another_coordinator() {
 
     create(&c1, "o-1").await;
     let sent = send(&c1, "o-1", "r-1", json!(1)).await;
-    clock.advance_ms(RESCAN_MS);
+    clock.advance_ms(SWEEP_MS);
     let leased = poll_now(&c2, &w, "v1")
         .await
-        .expect("the second poll lists the directory again and finds the input");
+        .expect("the second poll sweeps again and finds the input");
     assert_eq!(leased.accept_seq, sent.accept_seq);
     assert_eq!(leased.lease.owner_id, w);
-    assert_eq!(store.counters().resolve.list - lists_before, 1);
+    assert_eq!(
+        store.counters().resolve.list - lists_before,
+        2,
+        "one wake page and one directory page"
+    );
     assert_eq!(c2.metrics().agents_loaded, 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn pollers_woken_together_share_one_rescan() {
+async fn pollers_woken_together_share_one_sweep_pass() {
     // Three dormant agents known only from the directory; two workers wait
-    // on long polls; one wake past the rescan interval releases both. The
-    // rescan's LIST is held at a gate so the second poller runs its whole
-    // pass while the first is inside the scan: it must neither clear the
-    // latch again nor start a scan of its own.
+    // on long polls; one wake past the sweep interval releases both. The
+    // pass's first LIST is held at a gate so the second poller runs its
+    // whole loop while the first is inside the pass: it must not start a
+    // pass of its own.
     let clock = clock();
     let fa = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
     let store = store_over(fa.clone(), &clock);
@@ -1102,8 +1125,9 @@ async fn pollers_woken_together_share_one_rescan() {
     }
     let wa = worker(&co, "v1");
     let wb = worker(&co, "v1");
-    assert!(poll_now(&co, &wa, "v1").await.is_none(), "the start scan");
-    // The next LIST is the rescan; hold it (occurrences count from the hold).
+    assert!(poll_now(&co, &wa, "v1").await.is_none(), "the first pass");
+    // The next LIST is the pass's wake page; hold it (occurrences count
+    // from the hold).
     let gate = fa.hold(Op::List, None, Occurrence::Nth(1));
     let before = store.counters();
     let deadline = Instant::now() + Duration::from_millis(1_000);
@@ -1115,10 +1139,10 @@ async fn pollers_woken_together_share_one_rescan() {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        clock.advance_ms(RESCAN_MS);
+        clock.advance_ms(SWEEP_MS);
         co.wake.notify_waiters();
         gate.wait_until_held(1).await;
-        // The other poller runs its pass against the held scan.
+        // The other poller runs its loop against the held pass.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -1130,45 +1154,97 @@ async fn pollers_woken_together_share_one_rescan() {
     assert!(ra.expect("poll a").is_none());
     assert!(rb.expect("poll b").is_none());
     let delta = store.counters().since(&before);
-    assert_eq!(delta.resolve.list, 1, "one shared rescan after the wake");
+    assert_eq!(
+        delta.resolve.list, 2,
+        "one shared pass: a wake and a dir page"
+    );
     assert_eq!(delta.resolve.get, 3, "three dormant HEADs read once");
+    assert_eq!(co.sweep_metrics().passes, 2);
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_idle_poll_rescans_the_directory_at_most_once_per_interval() {
-    // Three dormant agents created through another coordinator, so this
-    // one knows them only from the directory, and no work: the first poll
-    // scans (one LIST, one HEAD read per agent); polls inside the rescan
-    // interval read nothing; the first poll past it scans once more.
+async fn a_poll_issues_no_unbounded_list() {
+    // Ten dormant agents over two-key pages, known only from the directory,
+    // and a sweep capped at four LISTs and four HEAD reads: a poll lists and
+    // reads no more than the caps however large the directory is, polls
+    // inside the interval list nothing, and the next pass resumes where the
+    // last one stopped.
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::with_page_size(2)), &clock);
+    let other = coordinator(&store, &clock, 100);
+    let sweep = SweepConfig {
+        interval_ms: SWEEP_MS,
+        max_list_pages: 4,
+        max_head_gets: 4,
+    };
+    let co = coordinator_with(&store, &clock, 200, sweep);
+    for i in 0..10 {
+        create(&other, &format!("o-{i}")).await;
+    }
+    let w = worker(&co, "v1");
+    // One empty wake page, then directory pages of two until the four reads
+    // are spent and one more page finds none left.
+    let expect = |label: &str, delta: PhaseCounts, list: u64, get: u64| {
+        assert_eq!((delta.list, delta.get), (list, get), "{label}");
+    };
+    let before = store.counters();
+    assert!(poll_now(&co, &w, "v1").await.is_none());
+    expect("first poll", store.counters().since(&before).resolve, 4, 4);
+
+    let before = store.counters();
+    clock.advance_ms(SWEEP_MS / 2);
+    for _ in 0..5 {
+        assert!(poll_now(&co, &w, "v1").await.is_none());
+    }
+    expect(
+        "inside the interval",
+        store.counters().since(&before).resolve,
+        0,
+        0,
+    );
+
+    let before = store.counters();
+    clock.advance_ms(SWEEP_MS);
+    assert!(poll_now(&co, &w, "v1").await.is_none());
+    expect("next pass", store.counters().since(&before).resolve, 4, 4);
+    assert_eq!(
+        co.sweep_metrics().head_gets,
+        8,
+        "eight distinct agents read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_with_no_wait_runs_at_most_one_bounded_pass() {
+    // An agent given work through another coordinator. A poll that does not
+    // wait runs one pass, takes the turn the pass found, and the poll after
+    // it, at the same instant, runs none.
     let clock = clock();
     let store = store_over(Arc::new(MemoryStore::new()), &clock);
     let other = coordinator(&store, &clock, 100);
     let co = coordinator(&store, &clock, 200);
-    for key in ["o-1", "o-2", "o-3"] {
-        create(&other, key).await;
-    }
+    create(&other, "o-1").await;
+    create(&other, "o-2").await;
+    send(&other, "o-1", "r-1", json!(1)).await;
+    send(&other, "o-2", "r-1", json!(2)).await;
     let w = worker(&co, "v1");
-    let before = store.counters();
-    assert!(poll_now(&co, &w, "v1").await.is_none());
-    let first = store.counters().since(&before);
-    assert_eq!(first.resolve.list, 1);
-    assert_eq!(first.resolve.get, 3, "one HEAD read per dormant agent");
 
     let before = store.counters();
-    clock.advance_ms(RESCAN_MS / 2);
-    for _ in 0..5 {
-        assert!(poll_now(&co, &w, "v1").await.is_none());
-    }
-    let inside = store.counters().since(&before);
-    assert_eq!(inside.resolve.list, 0, "no rescan inside the interval");
-    assert_eq!(inside.resolve.get, 0);
+    assert!(
+        poll_now(&co, &w, "v1").await.is_some(),
+        "the pass found work"
+    );
+    assert_eq!(co.sweep_metrics().passes, 1);
+    let first = store.counters().since(&before).resolve;
+    assert_eq!(first.list, 2, "one wake page and one directory page");
 
     let before = store.counters();
-    clock.advance_ms(RESCAN_MS);
-    assert!(poll_now(&co, &w, "v1").await.is_none());
-    let after = store.counters().since(&before);
-    assert_eq!(after.resolve.list, 1, "one rescan once the interval passed");
-    assert_eq!(after.resolve.get, 3);
+    assert!(
+        poll_now(&co, &w, "v1").await.is_some(),
+        "the second agent, already loaded"
+    );
+    assert_eq!(co.sweep_metrics().passes, 1, "no pass inside the interval");
+    assert_eq!(store.counters().since(&before).resolve.list, 0);
 }
 
 #[tokio::test(start_paused = true)]
