@@ -229,10 +229,6 @@ async fn read(response: reqwest::Response) -> (StatusCode, Value) {
     (status, body)
 }
 
-fn agent() -> Value {
-    agent_keyed("o-1")
-}
-
 fn agent_keyed(key: &str) -> Value {
     json!({"kind": "order", "key": key})
 }
