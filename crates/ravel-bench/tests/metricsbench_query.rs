@@ -1459,3 +1459,82 @@ fn a_report_whose_readback_failed_does_not_bind() {
         "{err}"
     );
 }
+
+/// With `--diagnostic-after-failed-ingest`, an ingest report whose mimir row
+/// failed its read-back is queried as a diagnostic: the report says
+/// `run_verdict: "failed"` and names band 6 on mimir in `failed_bands`, every
+/// engine is still measured, and `metricsbench_report validate` refuses it as a
+/// diagnostic of a failed run. Without the flag the same input refuses (65)
+/// and writes nothing.
+///
+/// TO SEE THIS FAIL: drop the `--diagnostic-after-failed-ingest` branch in
+/// `metricsbench_query`'s `run_main` (bind with `bind` always): the flagged run
+/// then exits 65 like the unflagged one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_readback_is_queried_as_a_diagnostic_only_with_the_flag() {
+    let s = stubs().await;
+    let failed = || {
+        let mut ingest = ingest_report(&s.urls);
+        let row = ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == "mimir")
+            .expect("mimir row");
+        row.readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+        ingest
+    };
+
+    let refused = run_bin(failed(), &s.urls).await;
+    assert_eq!(
+        refused.output.status.code(),
+        Some(65),
+        "{}",
+        stderr(&refused.output)
+    );
+    assert!(!refused.out.exists());
+
+    let run = run_bin_with(
+        failed(),
+        &s.urls,
+        WARMUP,
+        &["--diagnostic-after-failed-ingest"],
+    )
+    .await;
+    assert!(run.output.status.success(), "{}", stderr(&run.output));
+    let text = std::fs::read_to_string(&run.out).expect("report written");
+    let json: Json = serde_json::from_str(&text).expect("report parses");
+    assert_eq!(json["run_verdict"], "failed", "{json}");
+    let bands = json["failed_bands"].as_array().expect("failed_bands");
+    assert_eq!(bands.len(), 1, "{json}");
+    assert_eq!(bands[0]["band"], 6);
+    assert_eq!(bands[0]["check"], "readback");
+    assert_eq!(bands[0]["system"], "mimir");
+    assert!(
+        bands[0]["reason"].as_str().expect("reason").contains("422"),
+        "{json}"
+    );
+    let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    for engine in [
+        Engine::Prometheus,
+        Engine::Ravel,
+        Engine::VictoriaMetrics,
+        Engine::Mimir,
+    ] {
+        assert!(
+            report.measurements.iter().any(|m| m.engine == Some(engine)),
+            "no measurement for {engine:?}"
+        );
+    }
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_metricsbench_report"))
+        .arg("validate")
+        .arg(&run.out)
+        .output()
+        .expect("run metricsbench_report");
+    assert!(!validated.status.success());
+    assert!(
+        stderr(&validated).contains("diagnostic of a failed run"),
+        "{}",
+        stderr(&validated)
+    );
+}
