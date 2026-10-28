@@ -26,4 +26,6 @@ pub mod drive;
 pub mod history;
 pub mod reference;
 pub mod scheduler;
+#[cfg(test)]
+mod schedules;
 pub mod seeds;
