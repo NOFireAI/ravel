@@ -132,6 +132,13 @@
 //! the wrap (`tests::a_directory_cycle_is_counted_and_timed_when_the_cursor_wraps`).
 //! A cycle reads every agent's HEAD once, so its duration is the observed
 //! bound on how late a pass reaches an agent given work elsewhere.
+//!
+//! The directory half also measures each listed agent's fill from the HEAD it
+//! read ([`ravel_agents_core::kernel::Usage`]), with no further request, and
+//! the wrap publishes the cycle's highest fill per list and its near-cap
+//! counts as [`crate::FillSnapshot`]
+//! (`tests::a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts`,
+//! `tests::the_fill_is_published_only_when_a_directory_cycle_completes`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
