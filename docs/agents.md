@@ -554,8 +554,9 @@ routes of a running server.
 
 Two checks run the agents store on the compose RustFS
 (`deploy/docker-compose/rustfs.yml`) instead of `MemoryStore`, and k8s-nightly's
-`agents-chaos` job runs both every night (ADR-3331 decision 13). To run them
-locally, start the store with
+`agents-chaos` job runs both every night (ADR-3331 decision 13). The chaos
+script needs GNU date and bash 4.4 or later, so a local run is a Linux run.
+To run them locally, start the store with
 `docker compose -f deploy/docker-compose/rustfs.yml up -d rustfs` and create
 the bucket with
 `AWS_ACCESS_KEY_ID=ravel AWS_SECRET_ACCESS_KEY=ravel-dev-secret AWS_DEFAULT_REGION=us-east-1 scripts/ci-create-bucket.sh http://127.0.0.1:9000 ravel-chaos`,
