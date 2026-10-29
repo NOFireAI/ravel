@@ -113,7 +113,9 @@ type from `ExternalStore`, which stays read-only.
 
   The page size is a `GcsStore` constructor argument, sent as `maxResults`,
   and it is what `store qualify --list-page-size` passes. So the cross-page
-  probes test the size the store really serves.
+  probes test the size the store really serves. (A delimited listing sends
+  a fixed wire maximum instead; see the XML listing correction at the end of
+  this ADR.)
 - **Multipart.** `multipart: false`. A single GCS upload takes objects far
   larger than any Ravel object, so no caller needs it.
 - **Upload checksum.** `upload_checksum: false` in this ADR. CRC32C through
@@ -328,3 +330,11 @@ day, its HEAD ETag is a dash followed by its JSON `etag` (JSON
 reported that way. A listed object with neither field fails the listing call
 rather than being given a guessed ETag. Ravel never composes objects, so the
 composite case can only arise from a foreign object.
+
+D1's page-size sentence holds for `list` and `list_after`, which send the
+configured page size as `maxResults`. A delimited listing (`list_delimited`)
+drains every page in one call, so it sends a fixed `maxResults` of 1000,
+exactly as the S3 lister does for the same case. The contract suite's
+delimited probes therefore finish in one response. The multi-response
+delimited drain is covered by the listing client's own unit tests, not by
+the cross-page probes.
