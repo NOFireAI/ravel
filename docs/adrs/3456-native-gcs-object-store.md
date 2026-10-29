@@ -2,7 +2,7 @@
 
 - Status: Accepted (2026-10-29)
 - Date: 2026-10-29
-- Refs: #3456, ADR-0002, ADR-0008, ADR-0050, ADR-0055, ADR-1702, ADR-2040, ADR-2637
+- Refs: #3456, ADR-0002, ADR-0008, ADR-0050, ADR-0055, ADR-1685, ADR-2040, ADR-2637
 
 ## Context
 
@@ -59,16 +59,40 @@ type from `ExternalStore`, which stays read-only.
     `PreconditionFailed`.
   - `Overwrite` sends no precondition.
 
-  Whether `object_store`'s `PutMode::Update` carries the generation through
-  `UpdateVersion::version` is pinned by a test that asserts the header on the
-  wire against an in-process fake endpoint, not assumed. If it does not,
-  `GcsStore` sends the header itself.
-- **Reads.** Ranged, suffix and pinned reads use `get_opts`. A pinned read
-  sends `x-goog-if-generation-match` (by generation, not ETag).
-- **Listing.** GCS lists in lexicographic order and returns names verbatim.
-  `GcsStore` pages with `list_with_offset`. Its page size is a constructor
-  argument, and that is the value `store qualify --list-page-size` passes, so
-  the cross-page probes test the size the store really serves.
+  `object_store` 0.14 sends both headers itself: `PutMode::Create` as
+  generation 0, and `PutMode::Update` from `UpdateVersion::version`, failing
+  with `MissingVersion` when it is absent. A test asserts each header on the
+  wire against an in-process fake endpoint, so an upgrade that changes this
+  fails CI.
+- **Reads.** Ranged and suffix reads use `get_opts`. A pinned read keeps the
+  `get_pinned` contract (`ObjectStoreBackend::get_pinned`): the pin's
+  version is the generation, sent as the `generation` selector (which
+  `get_opts` does for `GetOptions::version`), so a generation that no longer
+  exists answers 404 and maps to `NotFound`. The pin's ETag, when present, is
+  compared against the selected object, and a mismatch is
+  `PreconditionFailed`. A generation precondition header is not used for
+  reads: it would turn a vanished generation into `PreconditionFailed`, which
+  the trait reserves for a changed object.
+- **Listing.** `GcsStore` does not list through `object_store`. ADR-2637
+  removed `Path`-based listing from `S3Store`: `Path::parse` fails a whole
+  page on a key it rejects, and resuming from `Path::from(last_key)`
+  re-delivers or skips keys that `Path` re-encodes. Every base backend's
+  listing must instead hand raw keys to `classify_objects` and
+  `classify_prefixes`, so unaddressable keys are reported in
+  `ListPage::unaddressable` rather than failing the page. `GcsStore`
+  therefore carries its own listing client, beside `s3/list.rs`:
+  - It calls GCS's object listing API with the prefix, delimiter and start
+    offset as raw names.
+  - It sends an explicit maximum results per page and resumes from the
+    service's opaque page token, never from a re-encoded key.
+  - It authenticates with the same Application Default Credentials as the
+    data-plane client, and runs through the shared connector (D3).
+
+  The page size is a `GcsStore` constructor argument, and it is what
+  `store qualify --list-page-size` passes. So the cross-page probes test the
+  size the store really serves. `object_store`'s GCS client hard-wires its
+  page size and offers no setter, which is a second reason not to list
+  through it.
 - **Multipart.** `multipart: false`. A single GCS upload takes objects far
   larger than any Ravel object, so no caller needs it.
 - **Upload checksum.** `upload_checksum: false` in this ADR. CRC32C through
@@ -84,13 +108,15 @@ Workload Identity or the metadata server in a cluster, or
 `GOOGLE_APPLICATION_CREDENTIALS` where an operator chooses to point at a key
 file. There are no Ravel flags carrying credentials, so no secret ever
 passes through Ravel's configuration. A hidden `--gcs-endpoint` sets the
-base URL, for tests against a fake endpoint only.
+base URL, for tests against a fake endpoint only. When it is set, the
+backend identity records it (D5), so a qualification taken against a fake
+endpoint cannot read as one taken against the real bucket.
 
 ### D3. The same instrumentation as S3
 
 The S3 store observes every HTTP attempt through its own connector
 (`s3/connector.rs`). That connector feeds `ravel_store_attempts_total` and
-`observed_store_time_ns`, and the ingest clock-lag check (ADR-1702) reads the
+`observed_store_time_ns`, and the ingest clock-lag check (ADR-1685) reads the
 second. A backend without it reports zero attempts and turns the clock-lag
 check off without saying so. `GcsStore` installs the same connector through
 `GoogleCloudStorageBuilder::with_http_connector`. Per-operation call and
@@ -116,8 +142,10 @@ CAS-mutable key (catalog `HEAD`) retries like any throttle.
 
 - `--store gcs` with `--gcs-bucket` (env `RAVEL_GCS_BUCKET`) on ravel-server
   and on every ravel-cli command that takes `--store`.
-- The backend identity is `gs://<bucket>`, written into `sys/qualification`
-  by `store qualify` and compared at server startup exactly as `s3://` is.
+- The backend identity is `gs://<bucket>`, or `gs://<bucket>@<endpoint>`
+  when `--gcs-endpoint` is set, the same shape as `s3://<bucket>@<endpoint>`.
+  It is written into `sys/qualification` by `store qualify` and compared at
+  server startup exactly as `s3://` is.
 - The conformance suite runs unchanged: it takes `&dyn ObjectStoreBackend`.
   A GCS bucket is qualified by running `ravel-cli --store gcs store qualify`
   against it. The server refuses to start on an unqualified bucket, as it does
@@ -175,7 +203,7 @@ flowchart LR
     gcs --> conn
   end
   build --> trait
-  gcs -->|"JSON/XML API, ADC token"| bucket[("GCS bucket\nsys/qualification\ngs://bucket")]
+  gcs -->|"object_store data plane + own raw listing, ADC token"| bucket[("GCS bucket\nsys/qualification\ngs://bucket")]
   s3 -->|"SigV4"| s3b[("S3 bucket")]
 ```
 
