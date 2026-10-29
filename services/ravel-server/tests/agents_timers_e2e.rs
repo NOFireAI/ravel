@@ -606,6 +606,42 @@ async fn a_reschedule_supersedes_the_earlier_generation() {
     running.shutdown().await.expect("server stops");
 }
 
+/// `GET timers` lists every key's latest generation, including the delivered
+/// ones that sealed onto timer pages once more than a page of them settled.
+#[tokio::test]
+async fn timers_route_lists_delivered_timers_on_sealed_pages() {
+    let fixture = Fixture::new(FaultPlan::empty());
+    let running = fixture.start().await;
+    let api = Api::public(&running);
+    create(&api, "o-1").await;
+    let mut fired = 0;
+    for batch in 0..2 {
+        for i in 0..35 {
+            let due = fixture.now() + 60 * SECOND_NS;
+            schedule(&api, "o-1", &format!("t-{batch}-{i}"), due).await;
+        }
+        fixture.advance(120 * SECOND_NS);
+        loop {
+            let pass = api.sweep().await["timers_fired"]
+                .as_u64()
+                .expect("timers_fired");
+            if pass == 0 {
+                break;
+            }
+            fired += pass;
+        }
+    }
+    assert_eq!(fired, 70, "every timer fired once");
+    let listed = timers(&api, "o-1").await;
+    let entries = listed["timers"].as_array().expect("timers");
+    assert_eq!(entries.len(), 70, "every key listed: {}", entries.len());
+    assert!(
+        entries.iter().all(|t| t["status"] == json!("delivered")),
+        "{listed}"
+    );
+    running.shutdown().await.expect("server stops");
+}
+
 fn pins() -> Value {
     json!([{"handler": "place", "version": "1.0.0", "digest": "01".repeat(32)}])
 }

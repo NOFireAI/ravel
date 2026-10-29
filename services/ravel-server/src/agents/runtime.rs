@@ -238,13 +238,18 @@ impl EvidenceIndex {
 
 /// Whether `head` shows `effect` past any operator decision: gone from
 /// HEAD, completed, or journaled for an input that is neither waiting nor
-/// the active turn's.
+/// the active turn's, with every inbox page loaded.
 fn settled_in(head: &Head, effect: Id128) -> bool {
     let Some(record) = head.effects.iter().find(|e| e.effect_id == effect) else {
         return true;
     };
     if record.status == EffectStatus::Completed {
         return true;
+    }
+    // A shallow HEAD does not show the inputs on sealed inbox pages, and one
+    // of them may be waiting to retry this effect's step.
+    if !head.index.inbox.unloaded().is_empty() {
+        return false;
     }
     let pending = head
         .inbox
@@ -633,6 +638,68 @@ mod tests {
 
     fn id(n: u128) -> Id128 {
         Id128(n.to_be_bytes())
+    }
+
+    /// An effect of an input waiting to retry on a sealed inbox page stays
+    /// in doubt under a shallow HEAD, so a full index keeps its slot.
+    #[test]
+    fn an_effect_of_a_retrying_input_on_a_sealed_page_keeps_its_slot() {
+        use ravel_agents_core::head::{EffectRecord, InboxEntry, InputSource, RecoveryPolicy};
+        use ravel_agents_core::identity::Hash256;
+        use ravel_agents_core::pages::{PageBounds, seal_index};
+
+        let mut head = empty_head();
+        for seq in 1..=3 {
+            head.inbox.push(InboxEntry {
+                accept_seq: seq,
+                handler: "place".to_string(),
+                source: InputSource::Message {
+                    request_id: format!("r-{seq}"),
+                    request_hash: Hash256([0; 32]),
+                },
+                payload: None,
+                accepted_unix_ns: 0,
+                failed_attempts: u32::from(seq == 1),
+                last_failed_turn_id: (seq == 1).then_some(id(7)),
+            });
+        }
+        head.next_accept_seq = 4;
+        let effect = effect_id(head.incarnation, 1, "charge");
+        head.effects.push(EffectRecord {
+            effect_id: effect,
+            step_key: "charge".to_string(),
+            tool_name: "pay".to_string(),
+            tool_version: "1".to_string(),
+            input_hash: Hash256([0; 32]),
+            policy: RecoveryPolicy::Manual,
+            status: EffectStatus::InDoubt,
+            attempt: 1,
+            result: None,
+            result_attempt: 0,
+            turn_id: id(7),
+        });
+        seal_index(
+            &mut head,
+            PageBounds {
+                max_page_entries: 2,
+                max_index_pages: 512,
+            },
+        )
+        .expect("seal");
+        let shallow = Head::decode(&head.encode()).expect("decode");
+        assert!(
+            shallow.inbox.iter().all(|e| e.accept_seq != 1),
+            "the retrying input is on a sealed page"
+        );
+        assert_eq!(shallow.index.inbox.unloaded(), vec![0]);
+
+        let index = index(1);
+        let result = ObjectRef::of(b"late");
+        index.record(agent(0), effect, 1, result);
+        index.note(agent(0), &shallow);
+        index.record(agent(1), id(9), 1, result);
+        assert_eq!(index.of(agent(0), effect), vec![(1, result)]);
+        assert!(index.of(agent(1), id(9)).is_empty(), "no slot given away");
     }
 
     /// A full index takes no new effect until one it names leaves doubt and

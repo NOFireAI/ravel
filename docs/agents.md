@@ -194,16 +194,42 @@ hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
   a page the planner failed to name makes the command load every page and
   counts a `planner_misses`
   (`tests::pages::a_planner_miss_loads_every_page_and_is_counted`).
-- No production path reads every page. The runtime's reload, the sweep's
-  per-agent visit and the directory scan read HEAD alone
-  (`read_head_shallow`); a scan then attaches the inbox pages holding the
-  first and the active input. On the server a result wait reads HEAD, one
-  results page and the output; an events page reads HEAD, the page holding
-  the cursor and the payloads; a poll reads HEAD twice plus the state and
-  payload objects and no sealed page (server test
-  `agents_e2e::hot_routes_read_one_page_of_a_deep_history`, 769 turns, 12
-  sealed pages per list). `read_head_full`, the inspection read of the
-  simulator and the tests, GETs every page.
+- No server or runtime path reads every page of every list. The
+  runtime's reload and the sweep's per-agent visit read HEAD alone
+  (`read_head_shallow`); a sweep visit to an agent with sealed pages is
+  one GET (runtime test
+  `sweep::tests::a_visit_reads_only_the_head_of_an_agent_with_sealed_pages`).
+  A dispatch scan then attaches the inbox pages holding the first and the active
+  input. Server test `agents_e2e::hot_routes_read_one_page_of_a_deep_history`
+  (770 turns, 12 sealed pages per list) pins each route's GETs:
+  - a result wait reads HEAD, one results page and the output;
+  - a resolve over a sealed receipt reads HEAD, one receipts page and one
+    results page;
+  - an events page reads HEAD, the events pages from the one holding the
+    cursor until it holds `limit` events (at most `ceil(limit / K) + 1`
+    pages at `K` entries a page), and the payloads. A cursor into sealed
+    history is served: the oldest retained seq is the first sealed page's
+    first key;
+  - an operation filter applies before the limit, and the read stops
+    loading pages only once it holds `limit` matching events; nothing
+    bounds one operation's event seqs, so any filtered page whose
+    operation has fewer matching events than that after the cursor,
+    including the page that reports the operation terminal, reads every
+    events page from the cursor on, at most `max_index_pages` GETs;
+  - a poll reads HEAD twice plus the state and payload objects and no
+    sealed page when the runtime holds the agent's root and the input is
+    on the open inbox page; a cold root adds the scan's inbox pages and an
+    input on a sealed page adds its page;
+  - a state read attaches every inbox page, so its mailbox lists every
+    queued input;
+  - a timers read reads HEAD and attaches every timer page, so it lists
+    the delivered and cancelled generations sealed there (server test
+    `agents_timers_e2e::timers_route_lists_delivered_timers_on_sealed_pages`).
+
+  `read_head_full`, the inspection read of the simulator, the tests and
+  the CLI's `inspect`, `effects` and `operation` commands, GETs every
+  page. The CLI's `list` reads HEAD alone and its `events` reads as the
+  route does (`agents_commands::events_and_list_read_only_the_pages_they_print`).
 - A version 1 HEAD migrates on the next command's own CAS; the HEAD it
   writes is version 2 and under the byte cap (kernel test
   `one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`, store test
@@ -439,7 +465,10 @@ reported result, an operation status read or an inspection showed settled
 until the index is full, then gives its slot to a new effect; an effect
 still in doubt keeps its slot
 (`runtime::tests::a_full_index_gives_only_a_settled_effects_slot_away`,
-`settled_effects_give_their_evidence_slot_to_an_effect_in_doubt`).
+`settled_effects_give_their_evidence_slot_to_an_effect_in_doubt`). A HEAD
+read whose inbox has sealed pages it did not load shows no uncompleted
+effect settled, since an input waiting to retry may sit on one of them
+(`runtime::tests::an_effect_of_a_retrying_input_on_a_sealed_page_keeps_its_slot`).
 A late result the index cannot list, because every slot holds an effect
 still in doubt or its effect already lists 16 late results, is still
 stored but not listed. Each one counts on
@@ -459,7 +488,8 @@ firing committed first and its input is already in the mailbox, and
 `unknown` for a key never scheduled
 (`cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`).
 `GET timers` (`TimersResponse`) lists the latest generation of each key as
-`scheduled`, `delivered` or `cancelled`. A fired timer is an input like a
+`scheduled`, `delivered` or `cancelled`, sealed timer pages included
+(`timers_route_lists_delivered_timers_on_sealed_pages`). A fired timer is an input like a
 message: `GET state` lists it in `mailbox` with `source` `{"kind": "timer",
 "timer", "generation"}`. Timer commands reach HEAD only through the
 coordinator, and `FireTimer` only from its sweep. The sweep is the
