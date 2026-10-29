@@ -398,11 +398,17 @@ jobs:
           RAVEL_REAL_STORE_BUCKET: ravel-chaos
         run: |
           set -o pipefail
+          mkdir -p .gate-logs
           cargo test --release --locked -p ravel-server --features agents \
             --test agents_real_store -- --nocapture --test-threads 1 --color never \
             | tee .gate-logs/agents-real-store.log
           if grep -q 'skipping agents real-store' .gate-logs/agents-real-store.log; then
             echo "::error::agents_real_store skipped: RAVEL_REAL_STORE_URL did not reach the test"
+            exit 1
+          fi
+          n=$(grep -c '^test result: ok. 2 passed; 0 failed' .gate-logs/agents-real-store.log || true)
+          if [ "$n" != 1 ]; then
+            echo "::error::agents_real_store: expected one '2 passed' result line, found $n"
             exit 1
           fi
       # rustfs_up (scripts/chaos/lib.sh) finds the store above healthy, reuses

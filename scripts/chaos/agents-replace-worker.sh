@@ -129,6 +129,7 @@ expect_same() {
   a=$(figure "$file" "$key_a")
   b=$(figure "$file" "$key_b")
   [[ -n "$a" ]] || fail "$key_a is empty"
+  [[ -n "$b" ]] || fail "$key_b is empty"
   if [[ "$want" == "same" ]]; then
     [[ "$a" == "$b" ]] || fail "$key_b=$b, expected the same as $key_a=$a"
     log "ok $key_b=$b (expected equal to $key_a)"

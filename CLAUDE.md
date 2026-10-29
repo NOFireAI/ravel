@@ -114,9 +114,11 @@ the `sql` lane runs when ravel-server is in it, the `flight-sql` lane
 when ravel-sql or ravel-server is, and the `esql` lane when ravel-esql,
 ravel-sql or ravel-server is, so `-p ravel-query` runs all three. Two more
 ravel-server lanes run whenever ravel-server is in the closure: `agents`
-(clippy, the agents_seam, agents_e2e and agents_effects_e2e binaries and
-the lib tests, plus ravel-catalog's
-sys_proto_format_version_classification test) and `mcp` (clippy, the
+(clippy, the agents_seam, agents_effects_e2e, agents_e2e,
+agents_timers_e2e and agents_real_store binaries and the lib tests, plus
+ravel-catalog's sys_proto_format_version_classification test;
+agents_real_store prints a skip line and passes unless
+RAVEL_REAL_STORE_URL is set) and `mcp` (clippy, the
 mcp_e2e and trace_by_id binaries and the lib tests), so `-p ravel-query`
 runs five lanes, and each of them builds into the same `target/` as the
 other four (the disk figures below predate these two lanes). An unscoped
