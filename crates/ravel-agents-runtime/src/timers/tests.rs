@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use ravel_agents_core::head::{Head, TimerStatus};
-use ravel_agents_core::kernel::DerivedIds;
+use ravel_agents_core::kernel::{DerivedIds, Limits};
 use ravel_agents_core::keys::wake_prefix;
 use ravel_agents_core::wire::{
     CancelTimerRequest, TimerCancelOutcome, TimerRequest, TimerResponse,
@@ -62,11 +62,16 @@ pub(crate) struct Rig {
 impl Rig {
     /// A second coordinator over the same store, with nothing loaded.
     pub(crate) fn cold(&self, sweep: SweepConfig) -> Arc<Coordinator> {
-        coordinator(&self.store, &self.now, sweep)
+        coordinator(&self.store, &self.now, sweep, *self.co.limits())
     }
 }
 
-fn coordinator(store: &Arc<AgentStore>, now: &Arc<Now>, sweep: SweepConfig) -> Arc<Coordinator> {
+fn coordinator(
+    store: &Arc<AgentStore>,
+    now: &Arc<Now>,
+    sweep: SweepConfig,
+    limits: Limits,
+) -> Arc<Coordinator> {
     Arc::new(
         Coordinator::new(
             store.clone(),
@@ -74,7 +79,8 @@ fn coordinator(store: &Arc<AgentStore>, now: &Arc<Now>, sweep: SweepConfig) -> A
             now.clone(),
             Arc::new(Seq(AtomicU64::new(100))),
         )
-        .with_sweep(sweep),
+        .with_sweep(sweep)
+        .with_limits(limits),
     )
 }
 
@@ -94,13 +100,13 @@ pub(crate) fn rig_with(
         AgentStore::new(
             backend.clone(),
             TENANT,
-            limits,
+            limits.clone(),
             now.clone(),
             Arc::new(DerivedIds),
         )
         .with_backoff(Arc::new(NoBackoff)),
     );
-    let co = coordinator(&store, &now, sweep);
+    let co = coordinator(&store, &now, sweep, limits.kernel);
     Rig {
         now,
         backend,
