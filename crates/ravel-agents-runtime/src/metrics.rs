@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ravel_agents_store::counters::CounterSnapshot;
 
 use crate::Coordinator;
+use crate::projection::ProjectionMetricsSnapshot;
 
 /// A point-in-time copy of the coordinator's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,9 @@ pub struct AgentsMetricsSnapshot {
     pub polls_waited: u64,
     /// The store's per-phase request counters.
     pub store: CounterSnapshot,
+    /// The projector's lag, backlog and delivery counters; all zero when
+    /// the coordinator has no projector.
+    pub projection: ProjectionMetricsSnapshot,
 }
 
 #[derive(Debug, Default)]
@@ -168,6 +172,11 @@ impl Coordinator {
             outcome_unknown_resolved: m.outcome_unknown_resolved.load(Ordering::Relaxed),
             polls_waited: m.polls_waited.load(Ordering::Relaxed),
             store: self.store.counters(),
+            projection: self
+                .projection
+                .as_ref()
+                .map(|p| p.metrics())
+                .unwrap_or_default(),
         }
     }
 }
