@@ -64,7 +64,7 @@ Come back to one lane when you have a specific question.
   worked examples that read segments, commit records and catalog listings
   from the bucket, to show what is stored.
 - [guides/mcp-server.md](guides/mcp-server.md): the MCP server for an AI
-  agent host. How to connect, the nine tools grouped by task, the result
+  agent host. How to connect, the tools grouped by task, the result
   envelope field by field, budgets and cursors, and what an empty result
   means.
 - [guides/agents.md](guides/agents.md): Ravel Agents, the durable agent
