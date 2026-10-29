@@ -172,8 +172,13 @@ async fn agents_router_mounts_on_both_listeners_only_with_feature_and_flag() {
                     "lag_max": 0,
                     "backlog": 0,
                     "events_projected": 0,
+                    "spans_projected": 0,
                     "sink_failures": 0,
                     "backlog_full": 0,
+                    "read_failures": 0,
+                    "records_rejected": 0,
+                    "last_sink_error": null,
+                    "last_rejection": null,
                 },
             }),
             "{url}"
