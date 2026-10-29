@@ -178,6 +178,49 @@ pub struct AnalyzeTimeseriesInput {
     pub evidence_ref: Option<String>,
 }
 
+/// The agent a Ravel Agents tool reads: `ravel_agent_describe`,
+/// `ravel_agent_state` and `ravel_agent_blocked_effects`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentInput {
+    pub kind: String,
+    pub key: String,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentSendInput {
+    pub kind: String,
+    pub key: String,
+    pub handler: String,
+    /// The handler's input, any JSON value.
+    #[serde(default)]
+    pub payload: AnyJson,
+    /// Becomes the send's request id: a repeat with the same key answers the
+    /// same operation and accepts nothing new.
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentOperationInput {
+    /// The handle a send answered.
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AgentEventsInput {
+    pub kind: String,
+    pub key: String,
+    /// Resume after this cursor; omitted reads from the oldest event.
+    pub cursor: Option<String>,
+    /// Only this operation's events.
+    pub operation: Option<String>,
+    /// Events per page; default 200, at most 1,000.
+    pub max_rows: Option<u32>,
+    pub max_response_bytes: Option<u64>,
+}
+
 fn read_only_annotations() -> ToolAnnotations {
     ToolAnnotations::new()
         .read_only(true)
@@ -253,11 +296,79 @@ fn tool<T: JsonSchema + 'static>(
     title: &'static str,
     description: &'static str,
 ) -> Tool {
+    annotated_tool::<T>(name, title, description, read_only_annotations())
+}
+
+fn annotated_tool<T: JsonSchema + 'static>(
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    annotations: ToolAnnotations,
+) -> Tool {
     Tool::new_with_raw(name, Some(description.into()), JsonObject::default())
         .with_input_schema::<T>()
         .with_raw_output_schema(envelope_output_schema())
         .with_title(title)
-        .with_annotations(read_only_annotations())
+        .with_annotations(annotations)
+}
+
+/// `ravel_agent_send` is the one tool in either catalog that writes: it
+/// accepts an input into an agent's inbox. It is not destructive (it removes
+/// nothing) and it is idempotent under its key, which is the one case rmcp
+/// documents `idempotentHint` as meaningful for.
+fn send_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(false)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false)
+}
+
+/// The six Ravel Agents tools (ADR-3331 decision 10), in the order the
+/// reference doc lists them. The server merges these into `tools/list` only
+/// when it is built with both the `mcp` and `agents` features and runs with
+/// both enabled; every call requires the `agents` capability on the
+/// caller's principal.
+pub fn agents_tool_catalog() -> Vec<Tool> {
+    vec![
+        tool::<AgentInput>(
+            "ravel_agent_describe",
+            "Describe agent",
+            "Ravel Agents: an agent's identity, state version, open turn and \
+             inbox depth, without its state",
+        ),
+        annotated_tool::<AgentSendInput>(
+            "ravel_agent_send",
+            "Send to agent",
+            "Ravel Agents: accept one input into an agent's inbox and return \
+             its operation. A repeat with the same idempotency_key returns the \
+             same operation and accepts nothing new",
+            send_annotations(),
+        ),
+        tool::<AgentOperationInput>(
+            "ravel_agent_operation",
+            "Agent operation",
+            "Ravel Agents: an operation's status, and the effect blocking it",
+        ),
+        tool::<AgentInput>(
+            "ravel_agent_state",
+            "Agent state",
+            "Ravel Agents: an agent's state at its current version, open turn \
+             and inbox",
+        ),
+        tool::<AgentEventsInput>(
+            "ravel_agent_events",
+            "Agent events",
+            "Ravel Agents: an agent's events in order, one page after the \
+             cursor",
+        ),
+        tool::<AgentInput>(
+            "ravel_agent_blocked_effects",
+            "Blocked effects",
+            "Ravel Agents: an agent's effects in doubt and the reconcile \
+             request that unblocks each",
+        ),
+    ]
 }
 
 /// The nine D2 tools, in the fixed order the reference doc
@@ -552,5 +663,74 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(schema, vec![Value::String("query".to_string())]);
+    }
+
+    /// The exact serialized size of `tools/list` with the six Ravel Agents
+    /// tools merged after the nine, as a server built with `mcp` and
+    /// `agents` and run with both enabled answers it. Pinned for the same
+    /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
+    /// (ADR-3331 decision 10).
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 22_723;
+
+    const _: () = assert!(
+        COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,
+        "the combined tools/list must serialize to under 24576 bytes"
+    );
+
+    #[test]
+    fn combined_tools_list_serializes_inside_band() {
+        let agents = agents_tool_catalog();
+        assert_eq!(agents.len(), 6, "ADR-3331 decision 10 names six tools");
+        let mut tools = tool_catalog();
+        tools.extend(agents);
+        let result = ListToolsResult::with_all_items(tools);
+        let bytes = serde_json::to_vec(&result).expect("tools/list serializes");
+        assert_eq!(bytes.len(), COMBINED_TOOLS_LIST_SERIALIZED_LEN);
+    }
+
+    /// Every agents tool carries the D2 prefix, an input schema of type
+    /// object, the envelope output schema, and its annotations: read-only
+    /// for all but `ravel_agent_send`, which writes, is not destructive, and
+    /// is idempotent under its key.
+    #[test]
+    fn every_agents_tool_is_annotated_and_only_send_writes() {
+        let catalog = agents_tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(names, crate::tools::agents::AGENTS_TOOLS);
+
+        let envelope = envelope_output_schema();
+        for tool in &catalog {
+            assert!(tool.name.starts_with("ravel_agent_"), "{}", tool.name);
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&json!("object")),
+                "{}",
+                tool.name
+            );
+            assert_eq!(tool.output_schema.as_deref(), Some(envelope.as_ref()));
+            assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()));
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} carries annotations", tool.name));
+            let writes = tool.name == "ravel_agent_send";
+            assert_eq!(annotations.read_only_hint, Some(!writes), "{}", tool.name);
+            assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
+            assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+            let idempotent = if writes { Some(true) } else { None };
+            assert_eq!(annotations.idempotent_hint, idempotent, "{}", tool.name);
+        }
+
+        let send = &catalog[1];
+        let required = send
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            required.contains(&json!("idempotency_key")),
+            "send requires its idempotency key: {required:?}"
+        );
     }
 }

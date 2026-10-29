@@ -20,17 +20,21 @@ use std::sync::{Arc, OnceLock};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::Request;
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
+use axum::http::{HeaderMap, HeaderValue, Method, Request};
 use axum::response::Response;
 use axum::routing::post;
 use rand::TryRng;
 use rand::rngs::SysRng;
 use ravel_ingest::Clock;
 use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
-use ravel_mcp::catalog::tool_catalog;
+use ravel_mcp::catalog::{agents_tool_catalog, tool_catalog};
 use ravel_mcp::compact;
 use ravel_mcp::cursor::{CURSOR_KEY_LEN, CursorKey};
 use ravel_mcp::envelope::{Envelope, NextStep, Status};
+use ravel_mcp::tools::agents::{
+    AGENTS_TOOLS, AgentsBackend, AgentsCall, AgentsMethod, AgentsReply, dispatch_agents,
+};
 use ravel_mcp::tools::{ToolContext, ToolError, dispatch};
 use ravel_query::{ByteLimit, EngineConfig, RequestBudgets, RequestLimit};
 use ravel_types::TenantHash;
@@ -73,6 +77,11 @@ pub struct McpSettings {
     /// how long a pinned snapshot stays protected from the sweeper.
     pub protection_horizon_ns: i64,
     pub clock: Arc<dyn Clock>,
+    /// The listener's Ravel Agents client routes, when the server runs with
+    /// `--agents`. Present, the six agents tools join `tools/list` and their
+    /// calls are served through these routes in process (ADR-3331 decision
+    /// 10); absent, `tools/list` is the nine-tool catalog alone.
+    pub agents: Option<Router>,
 }
 
 /// The per-listener state the route handler needs: the checks, the resolver
@@ -101,6 +110,7 @@ pub fn router(service: QueryService, settings: McpSettings) -> anyhow::Result<Ro
         protection_horizon_ns: settings.protection_horizon_ns,
         clock: settings.clock,
         cursor_key: cursor_key()?,
+        agents: settings.agents,
     };
 
     // `max_request_body_bytes` repeats the cap `auth` already enforces, so a
@@ -179,6 +189,7 @@ struct RavelMcp {
     protection_horizon_ns: i64,
     clock: Arc<dyn Clock>,
     cursor_key: &'static CursorKey,
+    agents: Option<Router>,
 }
 
 impl ServerHandler for RavelMcp {
@@ -205,7 +216,11 @@ impl ServerHandler for RavelMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tool_catalog()))
+        let mut tools = tool_catalog();
+        if self.agents.is_some() {
+            tools.extend(agents_tool_catalog());
+        }
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -246,6 +261,20 @@ impl ServerHandler for RavelMcp {
         // The cancellation arm is biased first so a token already cancelled
         // drops the tool future before it is ever polled, rather than
         // spending a store request on a call whose client is gone.
+        let agents = match &self.agents {
+            Some(router) if AGENTS_TOOLS.contains(&request.name.as_ref()) => {
+                Some(AgentsRoute::new(router.clone(), &context))
+            }
+            _ => None,
+        };
+        let call = async {
+            match &agents {
+                Some(route) => dispatch_agents(&request.name, args, &ctx, route)
+                    .await
+                    .ok_or_else(|| ToolError::UnknownTool(request.name.to_string())),
+                None => dispatch(&request.name, args, &ctx, &backend).await,
+            }
+        };
         let dispatched = tokio::select! {
             biased;
             () = context.ct.cancelled() => {
@@ -255,7 +284,7 @@ impl ServerHandler for RavelMcp {
                     None,
                 ));
             }
-            dispatched = dispatch(&request.name, args, &ctx, &backend) => dispatched,
+            dispatched = call => dispatched,
         };
 
         match dispatched {
@@ -292,6 +321,99 @@ impl ServerHandler for RavelMcp {
 /// Absent means the request did not pass through the checks, which cannot
 /// happen on this route. It is an internal error rather than a fallback to an
 /// anonymous tenant: guessing one would serve another tenant's data.
+/// The bound on an agents route's answer read back into a tool body. The
+/// route bounds its own bodies (a state is at most `--agents-max-state-bytes`
+/// and an events page at most 1,000 events); this only keeps a defect there
+/// from growing without limit here.
+const MAX_AGENTS_REPLY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The listener's agents client routes, called in process with the MCP
+/// request's own headers. The route authenticates the caller with the
+/// listener's resolver and checks the `agents` capability, takes its
+/// admission permit and runs the coordinator, exactly as it does for an HTTP
+/// request: the MCP layer adds no check of its own and skips none.
+struct AgentsRoute {
+    router: Router,
+    headers: HeaderMap,
+}
+
+impl AgentsRoute {
+    fn new(router: Router, context: &RequestContext<RoleServer>) -> Self {
+        let mut headers = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .map(|parts| parts.headers.clone())
+            .unwrap_or_default();
+        for name in [CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING] {
+            headers.remove(name);
+        }
+        AgentsRoute { router, headers }
+    }
+}
+
+impl AgentsBackend for AgentsRoute {
+    async fn call(&self, call: AgentsCall) -> AgentsReply {
+        let mut uri = format!("/api/v1/agents/{}", call.route);
+        for (index, (name, value)) in call.query.iter().enumerate() {
+            uri.push(if index == 0 { '?' } else { '&' });
+            uri.push_str(name);
+            uri.push('=');
+            percent_encode(value, &mut uri);
+        }
+        let method = match call.method {
+            AgentsMethod::Get => Method::GET,
+            AgentsMethod::Post => Method::POST,
+        };
+        let body = match &call.body {
+            Some(body) => Body::from(serde_json::to_vec(body).unwrap_or_default()),
+            None => Body::empty(),
+        };
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(headers) = builder.headers_mut() {
+            headers.extend(self.headers.clone());
+            if call.body.is_some() {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            }
+        }
+        let request = match builder.body(body) {
+            Ok(request) => request,
+            Err(_) => return unanswered(),
+        };
+        let response = match tower::ServiceExt::oneshot(self.router.clone(), request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+        let status = response.status().as_u16();
+        match axum::body::to_bytes(response.into_body(), MAX_AGENTS_REPLY_BYTES).await {
+            Ok(bytes) => AgentsReply {
+                status,
+                body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            },
+            Err(_) => unanswered(),
+        }
+    }
+}
+
+/// A request this adapter could not build or a reply it could not read: the
+/// body renders it as an internal failure.
+fn unanswered() -> AgentsReply {
+    AgentsReply {
+        status: 500,
+        body: Value::Null,
+    }
+}
+
+/// Percent-encode a query value, keeping only RFC 3986 unreserved bytes.
+fn percent_encode(value: &str, out: &mut String) {
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+}
+
 fn tenant(context: &RequestContext<RoleServer>) -> Result<TenantHash, McpError> {
     context
         .extensions

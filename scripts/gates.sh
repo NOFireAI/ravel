@@ -378,11 +378,15 @@ run_feature_lanes() {
   # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
   # compile only under it. Same shape as the agents lane above: mcp_e2e and
   # trace_by_id (whose `with_mcp` module compiles only under the feature)
-  # whole, and the lib tests whole.
+  # whole, and the lib tests whole. The Ravel Agents MCP tools compile only
+  # with both features, so mcp_agents_e2e and the clippy run that covers the
+  # adapter's agents path run under `mcp,agents`.
   if [[ ${want_mcp} -eq 1 ]]; then
     run cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
     run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
     run_lane_tests -p ravel-server --features mcp --lib
+    run cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings
+    run_lane_tests -p ravel-server --features mcp,agents --test mcp_agents_e2e
   fi
   if [[ ${want_flight_sql} -eq 1 ]]; then
     run_feature_lane flight-sql -p ravel-server -p ravel-sql
