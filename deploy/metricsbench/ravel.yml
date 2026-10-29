@@ -180,8 +180,9 @@ services:
       # it stops equalling what this command derives. At one GET per object
       # and the 8 objects per second above, a read over the whole
       # uncompacted replay needs 169,825 s (47.2 h) of ingest to reach it,
-      # so --max-segments refuses first, at 125,000 s; range reads per object
-      # bring this cap earlier. A hit is refused(budget).
+      # and --max-segments refuses first, at 125,000 s. Range reads raise
+      # the requests per object: above about 1.36 (1,358,600 / 1,000,000)
+      # this cap refuses first instead. A hit is refused(budget).
       - "--max-s3-requests"
       - "1358600"
       # Series per query: replaces the default 10000 (#3306). 1,000,000 is

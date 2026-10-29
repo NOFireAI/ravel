@@ -122,10 +122,10 @@ workflow runs it; it does not gate a merge. metricsbench-nightly's
 through `deploy/metricsbench/run.sh` once a day and pulls Prometheus,
 VictoriaMetrics, Mimir and the AWS CLI for its `createbuckets` service from
 Docker Hub; deploy/metricsbench/README.md, "Pinned image digests", says why
-the AWS CLI is there. It does not gate a merge either: a throttled pull fails that night's run and nothing else. The ECR
-Public image is also pulled by `docker-compose/rustfs.yml`, `deploy/k8s`,
-`scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, and the interop-nightly
-Flight SQL test.
+the AWS CLI is there. It does not gate a merge either: a throttled pull
+fails that night's run and nothing else. The ECR Public image is also
+pulled by `docker-compose/rustfs.yml`, `deploy/k8s`, `scripts/demo.sh`,
+`scripts/dr`, `scripts/chaos`, and the interop-nightly Flight SQL test.
 
 MinIO is not an option: its public images cannot be pulled without
 credentials from Docker Hub or quay.io, so the object store is RustFS and its
