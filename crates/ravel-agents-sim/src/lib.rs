@@ -23,6 +23,7 @@
 //! The named schedules are this crate's own tests, its only caller; the
 //! crate README lists each with its pinned batch totals.
 
+pub mod bench;
 pub mod drive;
 pub mod history;
 pub mod reference;

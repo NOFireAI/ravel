@@ -160,6 +160,9 @@ protocol or byte layout, or when you are changing the code.
 - [agents.md](agents.md): Ravel Agents storage: the key layout under
   `t/<tenant>/ag/`, the HEAD record, the publication rule, operation states,
   the typed errors, and each guarantee with its test or milestone.
+- [agents-benchmarks.md](agents-benchmarks.md): the Ravel Agents cost
+  benchmarks: the scenarios, how to run them, the report format and byte
+  kinds, and the pre-registered bands every figure is checked against.
 - [segment-format.md](segment-format.md): RSEG, the segment format for
   metrics. One supported version.
 - [log-segment-format.md](log-segment-format.md): RLOG, the segment format
