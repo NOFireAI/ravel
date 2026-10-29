@@ -212,6 +212,22 @@ with a rising `backlog_full_total` is backpressure from the sink; a rising
 `records_rejected_total` is the log ingest window refusing old records, which
 is permanent for those records.
 
+The projected logs and traces are a view of agent history, not its record.
+The record is the agent's committed history in the bucket: the events route
+and the inspector read it in full, including events on sealed pages
+(`hot_routes_read_one_page_of_a_deep_history`), and nothing trims it in this
+release. Reconcile decisions are written to the audit pipeline, not to the
+projection. So a record the log ingest window refuses leaves a counted gap in
+the logs, never in the history. To fill such a gap after an outage, raise
+`--max-ingest-lag` past the outage's length
+(`the_configured_max_ingest_lag_is_the_bound_projection_meets`) and restart
+the process: the restart re-projects each agent's history under the same ids
+(`a_restart_repeats_history_under_the_same_ids`), so records the window now
+admits arrive and the ones already stored are duplicates you drop on
+`agent.event_id`. `--max-ingest-lag` is a process setting: it widens the
+window for every tenant's telemetry this process ingests, not only for
+agents, so lower it again once the gap is filled.
+
 A restart re-projects history from the start under the same ids
 (`a_restart_repeats_history_under_the_same_ids`): up to 32,768 duplicate
 records per agent per process start, at about 520 GETs for an agent with a
