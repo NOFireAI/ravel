@@ -6,6 +6,701 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-30
+
+### Fixed
+
+- **Every long-running service in the MetricsBench stack runs with `nofile`
+  524288 soft and hard** (issue #2821). That is Docker's hard default, which
+  the Go engines already raise their soft limit to themselves; ravel-server
+  and the object store do not, and would otherwise run at the 1,024 soft
+  default.
+- **A cold `/api/v1/series` listing no longer runs the host out of memory**
+  (issue #3434). The metrics discovery reads (`/api/v1/series`,
+  `/api/v1/labels`, `/api/v1/label/{name}/values`) kept every segment's
+  matched series until the last segment was fetched, so a series appeared once
+  per object it wrote to. A tenant with 1,000,000 series in about 15,000
+  objects drew the server down to its host memory floor and was refused there.
+  Each segment's series are now folded into one copy per series as its fetch
+  completes, and the retained series are charged to the memory budget, so a
+  `match[]` selector whose series do not fit is refused against the budget's
+  limit. The merge of several selectors' series is not charged yet.
+
+### Added
+
+- **MetricsBench classifies every engine answer into one of seven statuses**
+  (issue #938). `ravel_bench::metrics_correctness::classify` maps a Ravel,
+  Prometheus, VictoriaMetrics or Mimir query outcome to `ok`, `incorrect`,
+  `partial`, `timeout`, `error`, `unsupported_construct` or `refused`
+  (reason `budget` or `partial_coverage`), comparing data against the oracle
+  through the difftest comparator. Engine query limits are matched against a
+  per-engine budget table that cites a source for every row, a 503 is never
+  mapped by its status code alone, and warnings never change a status. A
+  failed oracle, or an empty oracle answer on an entry not marked
+  intended-empty, is an error of the experiment, not a status. The
+  difftest's `QueryOutcome::Transport` now carries the response's HTTP status
+  when headers arrived before the failure.
+- **MetricsBench report schema version 3 and `metricsbench_report validate`**
+  (issues #938, #2821). A version-3 report keys each row by engine, query id
+  and query kind, records every pass's status (the row's status is the first
+  non-`ok` pass), carries latency and per-pass medians on `ok` rows only, a
+  `refusal_reason` on exactly the `refused` rows, and per-engine corpus,
+  correctness, timing and coverage denominators that the validator recomputes
+  from the rows. The rows must cover exactly the expected cases, Prometheus
+  rows are flagged as the oracle, `in-process` endpoints are refused, and
+  `rel_mad_pct` over the pass medians is required with five or more passes.
+  `metricsbench_report validate <path>` exits 0 only when a report stands and
+  otherwise names the failing rule. Version 1 and 2 reports still validate
+  under their own rules.
+- **MetricsBench runs the PromQL corpus over HTTP against every engine**
+  (issue #938). The new `metricsbench_query` binary binds to a
+  `metricsbench_ingest` report (anchor, steps, workload digest and seed,
+  stream digest, Ravel's per-shard commit tokens), refuses a run whose
+  portable ingest rows fail band 6 or their accounting, queries Prometheus as
+  the oracle and Ravel, VictoriaMetrics and Mimir against it with one range
+  request per range entry, marks native-histogram entries
+  `unsupported_construct` on an engine whose ingest row declares the class
+  unsupported, and writes a validated version-3 report in which only `ok`
+  rows carry latency.
+  `PrometheusClient` gains `with_bearer_token` and `with_extra_params`; a
+  bearer token is read from an environment variable and is not written to
+  the report.
+- **`metricsbench_query` retries an unavailable oracle answer before voiding
+  the run** (issue #3370). When Prometheus' answer for an entry is lost to a
+  timeout or a transport failure, `metricsbench_query` re-sends that oracle
+  query up to `--oracle-retries` more times (default 2), one second apart,
+  and names each retry on stderr. A 502, 503 or 504 is retried too. Any
+  other received answer (another HTTP status, a body over the cap, a body
+  that is not JSON) is not. Prometheus' own row keeps the first attempt's
+  outcome, so a retry cannot make it faster. The provenance config records
+  `oracle_retries`, `oracle_retries_used` and `oracle_retry_entries`. A run
+  whose retries are exhausted is void.
+- **`metricsbench_query --diagnostics` writes a sidecar with ULP gaps and
+  oracle retries** (issues #938, #3370). For every entry and every engine
+  other than Prometheus it records the largest ULP distance to the oracle's
+  answer over every step, repetition and timed pass (null when no answer
+  aligned), and it lists every oracle retry with its entry, pass, repetition
+  and attempt, beside the run's profile and corpus digest. The version-3
+  report and its validation are unchanged. `ravel-promql-difftest`'s
+  comparator gains a public `ulp_distance`.
+- **The MetricsBench ingest lane sends every payload type, and drives Ravel
+  over HTTP** (issue #2821). Staleness markers go on the wire as the
+  Prometheus stale NaN and native histograms as Remote Write 1.0
+  `Histogram` messages, so `excluded_stale_marker` and
+  `excluded_native_histogram` are zero and each row reports native
+  histograms as their own class (`offered_histograms`, `accepted_histograms`,
+  `rejected_histograms`, `dropped_histograms`). `offered_digest` covers stale
+  markers by bit pattern and histograms by every encoded field.
+  `metricsbench_ingest --ravel-endpoint <url> --ravel-bearer-token-env <VAR>`
+  adds a portable Ravel row (`system: ravel`, `endpoint: <url>`) that records
+  the `x-ravel-commit-token` answers (see the band 6 entry below); the bearer
+  token is read from the named environment variable and never written to
+  the report. The in-process row stays, with `endpoint: in-process`.
+  `--osn-endpoint` is renamed `--mimir-endpoint` and its row's `system` is
+  `mimir`.
+- **`metricsbench_ingest` reads each receiver's accepted set back and
+  enforces band 6** (issues #2821, #3330). Each HTTP row reads its receiver's
+  response by that receiver's rule (a Prometheus 400 rejects the request, a
+  Mimir 400 rejects only the samples it names, a VictoriaMetrics 2xx stores
+  everything but native histograms, Ravel is confirmed by read-back) and
+  records `acceptance_basis`, `unsupported_classes` and `tenant`. After each
+  replay the bin reads the data back over the receiver's query API, records
+  `readback`, and fails on a mismatch; every HTTP endpoint now needs its
+  `--<system>-query-url`, and `--ravel-endpoint` needs `--ravel-tenant`,
+  equal to `--tenant` when the in-process row is built. Band 6 compares
+  per-class accepted and expected digests on every row and the expected
+  digests across rows, and band 4 counts unsupported points. The portable
+  Ravel row keeps the highest `(epoch, seq)` commit token per shard in
+  `commit_tokens_by_shard` and joins them as `last_commit_token`. Drops
+  ended on a retryable status are keyed by it in
+  `retry_exhausted_by_status`, and a zero scrape interval exits 65. Reports
+  written before these fields existed still load.
+  A read-back whose figures do not match what was sent is repeated every
+  500 ms for up to `--readback-settle-secs` (default 60, the same for every
+  system), since VictoriaMetrics acknowledges a write before it is
+  queryable; `readback` records `attempts` and `settled_after_ms`. Each
+  `count_over_time` is summed over consecutive windows of at most one day,
+  since Prometheus refuses one query over a 30-day replay with a 422, and
+  `readback.query_windows` records the window count per query. The
+  `/api/v1/series` answer is counted as it streams, so a 1,000,000-series
+  answer fits, and one whose `status` is not `success` is refused.
+  Read-back queries take `--readback-timeout-secs` (default 30), separate
+  from the write timeout `--http-timeout-secs`, and `readback.query_ms`
+  records each query's wall time; `deploy/metricsbench/run.sh` passes the
+  read-back timeout per profile (ci 30, cardinality 900, history 300, churn
+  900). A failed read-back exits non-zero after printing the report for the
+  rows replayed so far, the failed row carrying its mismatching `readback`
+  or its query error in `readback_error`, so `ingest.json` keeps the ingest
+  figures for diagnosis. `metricsbench_query` refuses such a report as a
+  run result.
+- **`metricsbench_ingest --no-in-process-row` runs the portable rows only**
+  (issue #2821). The run builds no `ravel-in-process` row, opens no store and
+  runs no post-ingest query, so the `cardinality` and `history` profiles can
+  run beside the engine containers without a memory store. The report records
+  `in_process_row: "skipped"` (`"present"` otherwise). Band 4, band 6, the
+  read-back and the cross-row expected-digest check still run on every
+  portable row; only the comparison with the in-process scalar digest is
+  skipped. The flag with no portable endpoint exits 64.
+- **`/metrics` shows what the catalog's decoded-output caches hold** (issue
+  #3244). New series: the gauge
+  `ravel_catalog_decoded_cache_reserved_bytes{cache="part"|"postings"}`, the
+  bytes the cached decoded snapshot parts and name postings reserve across
+  every tenant, and the counters `ravel_catalog_decode_reserve_retries_total`
+  and `ravel_catalog_decoded_cache_memory_evictions_total`, which move only
+  when the process memory budget refuses a catalog decode, so they read 0
+  where that budget is unlimited (`gateway` mode, or an unknown host memory
+  size with no `--memory-budget-bytes`). Exporting them changes no read,
+  cache or eviction behaviour.
+- **`ravel-cli load --signal logs` warns about a `--chunk-order` name the
+  mapping does not carry** (issue #3276). Before any row is read, each name no
+  `[[attribute]]` or `[[resource_attribute]]` key of the mapping names prints
+  `warning: --chunk-order names <name>, which no mapped attribute carries` to
+  stderr, one line per name in the order given. The RLOG writer still skips
+  such a name, as before; the warning makes a misspelled name visible instead
+  of silent. A name the mapping carries only as a string or bytes resource
+  attribute gets a column only when it is one of the tenant's indexed fields,
+  which the load cannot know before it flushes, so it prints
+  `warning: --chunk-order names <name>, a string resource attribute, which
+  gets a column only if it is an indexed field` (or `a bytes resource
+  attribute`). A numeric resource key and a key also mapped as an
+  `[[attribute]]` get a column and are not warned about.
+- **`--max-series` and `--max-samples` set the PromQL per-query ceilings**
+  (issue #3306). Both were fixed at 10,000 series and 10,000,000 samples; the
+  two ravel-server flags now set them process-wide, with the same defaults when
+  unset, and a `0` is refused. Startup logs both values and their sources, and
+  the selector-cache cap derived from `--max-samples`. The refusal text and its
+  422 `execution` mapping are unchanged.
+- **Opt-in decoded column-block cache for the SQL `logs` scan**
+  (`--decoded-cache-max-bytes`, ADR-3326, issue #3448): it serves decoded
+  columns to the columnar path, charges them to the process memory budget,
+  and is off by default. An interactive statement admits a column on its
+  first decode and any other statement on its second touch; a touch whose
+  reservation the memory budget refuses keeps that second-touch credit.
+- **Ravel Agents contracts land as `ravel-agents-core`** (issue #3331). The
+  new `proto/ravel/agents.proto` defines the per-agent `AgentHead` root and
+  eight immutable object types, each sealed. The objects are at
+  `format_version` 1; HEAD is written at version 2, which keeps the open tail
+  of each indexed list inline and the rest in sealed index pages (see the
+  index-page entry below), and is read at version 1 or 2. The crate holds
+  the `t/<tenant_hash>/ag/<agent_id>/` key layout, agent and minted-id
+  hashing, the HEAD codecs, typed commands
+  and errors, a pure transition kernel in which a turn commit publishes the
+  new state, the consumed input, its result, events and effect intents in
+  one root, and the HTTP wire types, with JSON fixtures under
+  `sdk/fixtures/`. Every `*_unix_ns` wire field is a decimal string, since
+  a JSON number loses precision past 2^53. `ravel-agents-store`,
+  `ravel-agents-runtime`, `ravel-agents-client` and the dev-only
+  `ravel-agents-sim` build on it (entries below).
+- **`ravel-server` gains an off-by-default `agents` feature and `--agents`**
+  (issue #3331). With the feature, `--agents` mounts
+  `GET /api/v1/agents/health` on the public and the mTLS listener of an
+  `all` or `query` process; it answers the mode and the settings of
+  `--agents-activation-concurrency`, `--agents-poll-concurrency`,
+  `--agents-memory-budget` and the five per-agent and per-tenant quota flags,
+  which `/metrics` also reports as `ravel_agents_*` gauges.
+  `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers`
+  are enforced; `--agents-memory-budget`, `--agents-max-agents` and
+  `--agents-max-state-bytes` are parsed and reported only. A build without
+  the feature refuses `--agents`, and the published image is built without
+  it, so agents are served only by a ravel-server built with the `agents`
+  cargo feature. `--agents` under `gateway` or `maintain` is refused.
+  Static tokens accept `agents`, `agents_worker` and `agents_admin` after
+  `;`, and `--oidc-agents-claim`, `--oidc-agents-worker-claim` and
+  `--oidc-agents-admin-claim` grant the same capabilities from OIDC; every
+  agents route but `health` checks the one it needs.
+- **`ravel-agents-store` publishes agent commands over the object store**
+  (issue #3331, task #3338). `AgentStore` runs every command through one
+  skeleton: read HEAD, let the kernel resolve the request against the
+  receipt index and validate it, upload the referenced objects with
+  `CreateIfAbsent` (reading back and hash-checking an object that already
+  exists), then CAS HEAD. A refused CAS re-reads and revalidates, at most 8
+  times; a lost answer to the HEAD write returns `OutcomeUnknown` with the
+  operation handle, which `resolve` settles through the receipt index. A
+  HEAD of a newer format version is reported as `UnsupportedFormat` and
+  never written. Every store call is counted per phase (resolve, build,
+  store, publish).
+- **`ravel-agents-runtime` coordinates agent turns for workers**
+  (issue #3331, task #3343). `Coordinator` drives `AgentStore` for workers,
+  and a poll needs no registration on the coordinator that serves it: a
+  long poll (capped at 20 s) offers the agent whose
+  next input was accepted earliest, taking ownership over with one
+  `Takeover` CAS when the agent is unowned, its owner holds no active turn,
+  or its lease and grace have run out (so with several workers on one agent
+  each turn boundary costs one such CAS), and binds the oldest input with
+  `BeginTurn`, so one agent's turns run
+  in `accept_seq` order. A commit or failure is fenced by the owner and epoch
+  the worker's own lease carries, never by a re-read HEAD, so a worker paused
+  past a takeover is refused `OwnershipLost` without a write. Failed
+  attempts retry up to `max_turn_attempts` and then dead-letter the input;
+  `OutcomeUnknown` is settled through `resolve` (or, for a takeover or turn
+  start, by re-reading HEAD) before anything is retried, so a lost
+  acknowledgement never commits twice. Heartbeats renew the lease in the
+  receiving coordinator's memory without writing HEAD (another coordinator
+  still sees the takeover's lease hint, so a turn longer than the lease plus
+  grace can be taken over through it), idle agents are unloaded without
+  writing anything,
+  and a restarted coordinator resumes an active turn from the object store
+  alone: HEAD, plus the inbox page holding the turn's input once that input
+  is sealed. Counters are read through `AgentsMetricsSnapshot`.
+- **`--agents` now serves the agents client and worker HTTP API** (issue
+  #3345). Under `/api/v1/agents`, on the public and the mTLS listener,
+  client routes (`create`, `send`, `call`, `operation`, `result`, `resolve`,
+  `cancel`, `state`, `events`) need the `agents` capability and worker
+  routes (`worker/register`, `worker/poll`, `worker/commit`,
+  `worker/heartbeat`) need `agents_worker`; a missing capability is 403.
+  Long polls are capped at 20 s, `events` pages after the committed event
+  sequence, refusals are typed `ErrorBody` responses, and the router has its
+  own body limit and admission lanes and never takes a query permit.
+  `--agents-activation-concurrency` and `--agents-poll-concurrency` now
+  bound that admission, and `/metrics` adds the coordinator's
+  `ravel_agents_*` counters beside the settings gauges.
+- **`ravel-agents-sim` runs the production agents store and runtime under
+  the step scheduler** (issue #3331, task #3346). Named schedules cover
+  competing senders, duplicate and conflicting sends, a lost CAS response,
+  workers killed before and after each publication boundary, a suspended
+  worker after a takeover, enqueue and cancel racing a completion, a cold
+  restart on a second coordinator, and typed errors. Each runs a fixed
+  script and a batch of 64 seeds, and checks every history against the
+  reference machine with exact counts. Test-only; no request path changes.
+- **`ravel-agents-runtime` journals tool steps and their effects** (issue
+  #3331). `Coordinator::run_step` records a step, commits its intent and
+  authorizes an attempt before handing it to an `EffectDispatcher`, and
+  replays a completed step without a write. After a lost attempt,
+  `provider_idempotency` re-dispatches the same effect id, `at_least_once`
+  authorizes a new attempt, and `manual` blocks `EffectInDoubt` until
+  `reconcile_attach` or `reconcile_authorize` settles it.
+  `reconcile_authorize` dispatches nothing: it hands the new attempt to the
+  owner's next `run_step` for that step. Each reconciliation is recorded
+  once as an audit event in the turn's event stream. A result for a
+  superseded attempt or a cancelled input is kept as evidence. The server's
+  step, effect and reconcile routes call it (entry below).
+- **Agent timers fire from HEAD, and a bounded sweep reconciles wake hints**
+  (issue #3348). `Coordinator::schedule_timer` and `cancel_timer` settle an
+  unknown CAS outcome by re-reading HEAD, and `Coordinator::sweep_once` runs
+  one reconciliation pass for the coordinator's tenant: it lists `_wake`
+  hints up to the current minute bucket, then walks the agent directory,
+  reads each agent's HEAD, fires every timer HEAD holds as scheduled and
+  due, and deletes a hint only once that HEAD read shows no timer still
+  armed in its bucket. A hint is never trusted on its own, so a premature,
+  duplicated or stale hint fires nothing extra, and a lost hint is found
+  by the directory half. A create now writes the agent's `_dir` entry
+  before its HEAD and fails with `StoreUnavailable`, writing no HEAD, when
+  the entry cannot be written, so the directory lists every agent that has
+  a HEAD; a pass that reaches an agent through a hint writes a missing
+  entry back (ADR-3331, the directory amendment to decision 8). A listing
+  page of keys the store cannot address still moves the pass's cursor. A
+  pass is capped by `SweepConfig` (default 8 list pages and 64 HEAD GETs,
+  resumed from a cursor next pass). An idle worker poll starts at most one
+  pass per 5 s interval, and a poll with a ready turn starts none.
+  `Coordinator::sweep_metrics` returns a flat set of counters (passes, list
+  pages, HEAD GETs, hints read and deleted, timers fired, agents loaded,
+  `_dir` entries repaired and directory cycles), which `ravel-server`
+  renders on `/metrics` as `ravel_agents_sweep_*`. The gateway and query IAM
+  templates grant `s3:DeleteObject` on `t/*/ag/_wake/*` for the hint delete.
+  `ravel-server` schedules the sweep per tenant (issue #3353, below).
+- **`--agents` now serves the step, effect and reconcile routes** (issue
+  #3349), in a server built with the `agents` feature, which the published
+  image is not. Workers journal each tool call with `worker/step` and
+  report its attempt with `worker/effects/complete` or
+  `worker/effects/fail`; a replacement worker's replay follows the step's
+  recovery policy, a result for a superseded attempt answers `late: true`
+  and is kept as evidence, and a `manual` effect in doubt blocks the turn
+  with 409 `effect_in_doubt`. A failed tool call is kept as a typed failure: the
+  step stays open, its replay and `GET effects/{effect}` carry `failure`,
+  and a non-terminal failed turn replays it on the next turn. Clients list
+  and inspect effects with `GET effects` and `GET effects/{effect}`, and an
+  `agents_admin` caller settles an effect in doubt with `reconcile`, which
+  writes one `agents_reconcile` audit record per change through the audit
+  pipeline. A `retry` hands the new attempt to the next `worker/step` for
+  that step, from whichever worker holds the turn by then, instead of
+  dispatching it from the reconcile request; the hand-over lives in the
+  server's memory, so after a restart, or on another server process, the
+  step is in doubt again and needs a second `reconcile`. An `events`
+  request with `limit` 0 is 422.
+- **Agents simulation covers steps and their effects** (issue #3352). The
+  reference machine models step journaling, attempt dispatch under each
+  recovery policy, effect results and evidence, and operator reconcile, and
+  `ravel-agents-sim` drives the production runtime through kill points
+  around a tool call, late and conflicting results, a cancel with an open
+  attempt and a handler version change, each with a 64-seed batch and
+  pinned totals. A takeover re-applied after a lost CAS that fences a live
+  turn is pinned as an ignored suspected defect.
+- **Agents timers, sweep, event resume and inspector routes** (issue
+  #3353). Under `/api/v1/agents`, `timers`, `timers/cancel` and `GET
+  timers` schedule, cancel and list an agent's timers by id and generation;
+  a due timer is delivered once by the sweep whether or not its wake hint
+  was written. Each tenant's coordinator runs a sweep pass every 5 s
+  (`agents.sweep_interval_ms`, which no flag sets), and `POST sweep`, under
+  the `agents_admin` capability, runs one on demand and answers its LIST,
+  GET, hint and timer counts, which `/metrics` reports as
+  `ravel_agents_sweep_*`. `events` takes an `operation` filter, marks the
+  page that finishes an operation with `terminal`, and answers a cursor
+  below the retained window with 410 `cursor_expired`. `GET inspector`
+  serves a self-contained HTML page showing an agent's state, mailbox,
+  timers, steps, effects and events, and why a blocked agent is blocked.
+  Every route checks its capability before anything else, and effect
+  inspection lists at most the latest 64 attempts. A `reconcile` retry
+  naming the attempt before one a worker's own step authorized is 409
+  `ownership_lost`, and a full evidence index gives a settled effect's slot
+  to a new effect.
+- **`ravel-agents-client` and `ravel-cli agents`** (issue #3355). The new
+  crate is a typed HTTP client for the agents routes: each error code maps
+  to its `ErrorKind`, long polls are clamped to 20 s, and nothing is
+  retried: `send_resolving` makes one resolve call, and only when an
+  `outcome_unknown` body says `retry: resolve_operation`. `ravel-cli agents
+  list`, `inspect`, `operation`, `events` and `effects` read agent HEADs
+  and objects straight from the bucket with no server running, and every
+  page is bounded. `agents reconcile` settles an effect in doubt through
+  the server with an `agents_admin` token. `agents dev` starts RustFS from
+  the compose file, qualifies the bucket and runs `ravel-server --agents`
+  on loopback with a fresh token; it refuses the memory store before
+  starting anything, and prints the scaffold command once the server is
+  ready. `agents dev` and `agents reconcile` need a `ravel-server` built
+  with the `agents` feature, which the published image's is not (`agents
+  dev` starts `--server-bin`, `ravel-server` on `PATH` by default).
+  `agents scaffold DIR` runs the TypeScript SDK's generator with node to
+  write a starter project into a new or empty directory. Every command
+  takes `--json`. Timer commands are not in this release; the client exposes
+  `set_timer` and `cancel_timer`.
+- **ravel-agents-sim checks the agent runtime against a reference machine
+  over seeded fault schedules** (issue #3356). Twenty schedules (enqueue and
+  cancel races, contended refusals, competing senders, lost CAS answers,
+  worker kills and suspensions, every effect policy under kills and cancels,
+  timer races and lost hint writes, recovery storms) each run a fixed test and
+  a 64-seed batch with pinned totals. The crate's `nightly.sh` runs every
+  batch and prints one line per schedule; `RAVEL_SIM_SEED` and
+  `RAVEL_SIM_SEEDS` choose another window, and a new `agents-sim` job in the
+  `sim-nightly` workflow runs the default batch, the default batch again at
+  index page size 2, and a fresh 512-seed window each night.
+- **MCP tools for Ravel Agents** (issue #3357). A server built with
+  `--features mcp,agents` and run with `--mcp --agents` lists six more
+  tools, `ravel_agent_describe`, `ravel_agent_send`,
+  `ravel_agent_operation`, `ravel_agent_state`, `ravel_agent_events` and
+  `ravel_agent_blocked_effects`, served in process through the agents
+  client routes, so the `agents` capability check is the route's own and a
+  principal without it gets `unauthorized`. `ravel_agent_send` is the first
+  MCP tool that writes; it is idempotent under its required
+  `idempotency_key`. Each call is bounded by its effective deadline and
+  ends with the `deadline` class past it. Every agents tool takes
+  `deadline_ms` and `max_response_bytes`, and `ravel_agent_events` also
+  takes `max_rows`; only its envelope reports a `max_rows`, the page size
+  it used. `tools/list` is 23,589 bytes with the agents tools and
+  byte-identical to before without them. ADR-1374 D2 and D7 carry an
+  amendment for the write tool.
+- **Committed agent history now projects into logs and traces** (issue
+  #3360, ADR-3331 decision 12). Each committed event becomes a log record
+  and each committed turn a span, under a stable event id that is the same
+  on every retry, restart and process, so the `agent.event_id` attribute is
+  the deduplication key for queries; every process serving or sweeping a
+  tenant re-projects each agent it touches from its first event, up to
+  32,768 duplicate records per agent per process. Payloads are redacted to
+  an unkeyed hash and a size unless the tenant is named by
+  `--agents-projection-payload-tenant`. A process with an ingest buffer
+  projects through its own OTLP log and trace handlers, with the tenant's
+  admission, limits and IPCrypt rules; `--agents-projection-endpoint` sends
+  to an OTLP gateway instead and is accepted only as plain `http://` on a
+  loopback host until the credential model lands. `--agents` in a process
+  with neither refuses to start unless `--agents-projection off` is given,
+  and `off` beside an endpoint refuses too. A record carries its turn's
+  finish time where the projector holds it, else its read time, and says
+  which in `agent.time_source`; a record the ingest path refuses for good
+  (too old, over a structural limit) is skipped and counted while transient refusals are
+  retried. A projection outage changes no agent state.
+  `--agents-projection-backlog` bounds the undelivered records per tenant,
+  and `GET /api/v1/agents/health` and the new `ravel_agents_projection_*`
+  `/metrics` family report the projection lag, backlog and delivery
+  counters.
+- **Agent HEAD indexes move into bounded immutable pages** (issue #3359).
+  HEAD format version 2 keeps only the open tail of the inbox, receipts,
+  results, events and timers inline and references sealed `o/<hash>` index
+  pages of at most `max_page_entries` entries, at most `max_index_pages` per
+  list, each written `CreateIfAbsent` before the CAS that references it. A
+  new send reads no index page, a repeat send or a receipt lookup at most
+  one (by request-id fingerprint), a wake no timer page, and events are read
+  by sequence range. The runtime's reload, the sweep and the directory scan
+  read HEAD alone, and the server's poll, result wait, resolve and events
+  routes read HEAD plus the pages they need; an events read filtered to one
+  operation reads only the events pages whose recorded `accept_seq` range
+  holds it. An events cursor into sealed
+  history is served, and the state route's mailbox lists every queued
+  input, sealed pages included. No release wrote version 1; a version 1
+  HEAD from a pre-release build migrates to version 2 on the next command's
+  CAS. The inspection read, `read_head_full`, GETs every page.
+- **Ravel Agents has cost benchmarks with pre-registered bands** (issue
+  #3361). `cargo bench -p ravel-agents-sim --bench agents_cost` runs the hot,
+  slow, many, dormant, index (page size 64 and 2), storm, discovery and
+  baseline scenarios on an in-memory store with injected latency and a fixed
+  seed, and prints GET, PUT, CAS and LIST counts per phase, object-body bytes,
+  CAS conflicts, p50/p99/max latency on the injected clock and peak heap, each
+  per message, turn, step or activation. Every figure is checked against
+  `benchmarks/agents/prereg.md` and the run exits non-zero on a figure outside its
+  band, missing, or printed twice. Discovery runs with no wake hint due,
+  the ceil(N/64)-pass best case, and with the wake half saturated, asserted
+  against the guaranteed ceil(N/32) passes (313, about 26 minutes at the
+  5 s sweep interval, for 10,000 agents). Dollars are derived from
+  `benchmarks/agents/prices.toml`, labelled as assumptions and never asserted on.
+  `docs/agents-benchmarks.md` describes the scenarios and the report format.
+- **Agents store checked on a real backend** (issue #3331, task #3363).
+  The `agents_real_store` test binary runs the HEAD publish's
+  conditional writes and a `CreateIfAbsent` collision (one case above the
+  multipart threshold) on an S3-compatible store named by
+  `RAVEL_REAL_STORE_URL` and asserts the typed outcomes equal `MemoryStore`'s;
+  unset, it prints a skip line. `scripts/chaos/agents-replace-worker.sh`
+  SIGKILLs a worker inside a step and the server with a turn in flight, and
+  asserts that a resend returns the same operation, that the replacement runs
+  the same effect as attempt 2 within the lease and grace band, and that a
+  restart neither takes the turn over nor writes the result twice. Both run
+  nightly in k8s-nightly's new `agents-chaos` job against RustFS.
+- **Agents report how close each agent is to its lifetime limits** (issue
+  #3454). The sweep measures every agent's receipts, sealed results, events
+  and timers pages and encoded HEAD size from the HEAD each directory cycle
+  already reads, and `/metrics` adds
+  `ravel_agents_index_fill_max_ratio{list}`,
+  `ravel_agents_head_bytes_max_ratio` and `ravel_agents_agents_near_cap{list}`
+  (agents at or above 75% of a cap), plus
+  `ravel_agents_budget_refusals_total{cap}` counting every command the kernel
+  refuses for a cap. A cap refusal's error body names the cap in a new
+  optional `cap` field, `GET /api/v1/agents/state` adds an optional `usage`
+  object with the counts behind each cap, and `ravel-cli agents inspect`
+  prints them.
+- **`GcsStore`, a read-write Google Cloud Storage backend in
+  ravel-object-store** (issue #3458, ADR-3456). It uses the object's
+  generation as the version token on every path, sends
+  `x-goog-if-generation-match: 0` for create-if-absent and the expected
+  generation for compare-and-swap, and refuses a compare-and-swap token
+  that is not a positive decimal generation of at most `i64::MAX` before
+  sending anything. It lists through the JSON
+  API's `objects.list` (`maxResults` is the page size for `list` and
+  `list_after`, and 1000 for a delimited listing, as on S3), so a name it
+  cannot address is reported as unaddressable instead of failing the page.
+  A resumed call returns its response's names, one short of the page size
+  when the response held the inclusive start name, rather than sending a
+  second request, so at a page size above 1 and against full responses
+  every call is one request. A listed ETag matches the one `head` reports,
+  for a composite object too.
+  It takes Application Default Credentials only, and counts its HTTP
+  attempts into `ravel_store_attempts_total` and its responses' `Date` into
+  the observed store time, as S3 does. It reports no multipart upload, no
+  upload checksums and no bucket-protection probes. Its qualification
+  identity is `gs://<bucket>`, or `gs://<bucket>@<base_url>` against an
+  emulator. The contract suite runs against it on an in-process fake GCS
+  endpoint in every run, and against a real bucket when
+  `RAVEL_GCS_TEST_BUCKET` is set. `--store gcs` selects it in ravel-server
+  (#3459) and ravel-cli (#3460), below.
+- **`ravel-server --store gcs` keeps its data in a Google Cloud Storage
+  bucket** (issue #3459, ADR-3456). `--gcs-bucket` (`RAVEL_GCS_BUCKET`) names
+  the bucket, and credentials come from Application Default Credentials (GKE
+  Workload Identity in a cluster). The server refuses to start on an
+  unqualified bucket, records the backend as `gs://<bucket>`, and reports into
+  the same store metrics as S3. The S3-only flags (`--s3-*`, `--s3-kms-key`,
+  `--tenant-kms-config`, `--require-bucket-protection`) are refused under
+  `--store gcs` when passed or set through their environment variables, and a
+  Parquet credential profile on Ravel's own GCS bucket is refused at config
+  time.
+- **ravel-cli accepts `--store gcs`** (issue #3460, ADR-3456). A
+  `ravel-cli` command that takes `--store` can run against a Google Cloud
+  Storage bucket named by `--gcs-bucket` (`RAVEL_GCS_BUCKET`), with
+  credentials from Application Default Credentials. `store qualify`
+  records the bucket as `gs://<bucket>` (or `gs://<bucket>@<endpoint>`) in
+  `sys/qualification` and passes `--list-page-size` to the GCS listing.
+  Under `--store gcs`, these refuse with a non-zero exit before any
+  request: `store verify-protection` (exit 2, no report, since it does not
+  check GCS bucket protection), `--tenant-kms-config`, a `--s3-*` flag
+  given on the command line or through its environment variable (a
+  defaulted one is not refused), and `agents dev`, which drives the compose
+  RustFS bucket.
+
+### Changed
+
+- **`metricsbench_ingest` requires `--anchor-ms` and records its provenance**
+  (issue #2821). A missing anchor, a negative one, one off the profile's
+  scrape grid, or one whose last step passes 9223372036854 ms exits 64 with
+  the reason; no clock default remains. `profile.run` records
+  `workload_version`, `workload_digest`, `seed`, `anchor_ms` and
+  `stream_digest`, and each row records `offered_digest`. `comparable` is
+  now also false when the recorded stream digest differs from the one the
+  manifest and anchor regenerate. Band 4 checks each classified type against
+  the generator's own count and the offering identity from the row's own
+  fields. A comparator row splits `dropped_samples` into
+  `rejected_by_status`, keyed by HTTP status, and `retry_exhausted_samples`.
+  Reports written before these fields existed still load.
+- **MetricsBench workload moves to format version 2, and the corpus is
+  checked against it** (issue #2821). Every profile in
+  `benchmarks/metrics/workload.json` declares a `range_eval` grid (start and
+  end offsets from the newest sample, and a step) for the corpus's range
+  queries, and a manifest without it is refused naming the missing block.
+  The generator's out-of-order sample now lands one and a half scrape
+  intervals early, between two scrape points, so it never repeats a
+  timestamp its series already carries; the ci stream digest changes with
+  it. The corpus repairs two join queries that could not answer
+  on the generated data (a many-to-many `group_left` and an unreachable rate
+  threshold) and gains a gate against the manifest: every selector matches a
+  generated series, every `group_left` key is unique on its one side, and
+  every range query's window plus lookback fits inside its profile's stream
+  span.
+- **MetricsBench corpus moves to format version 4, and an entry may declare
+  a ULP tolerance** (issue #2821). The `mb_full_range_avg_over_time` query
+  becomes `avg(avg_over_time(metricsbench_gauge_cpu_percent[30m]))`: it scans
+  the same data but answers one series instead of one per gauge series. On
+  the cardinality profile the old answer was 48,400,000 points, above the
+  256 MiB response cap, so no engine's answer could be compared; the new one
+  is 121 points. The entry discloses the rewrite in `modified`.
+  `tolerance_ulps` is optional, absent means bit-exact, and the runner hands
+  it to the comparator. The corpus gate refuses a zero tolerance and a
+  tolerance on an entry without a `modified` reason.
+  `mb_full_range_avg_over_time` carries 2^20 ULPs, so a different summation
+  order over its 400,000 cardinality series cannot read as an incorrect
+  answer. The other entries that sum floats across series carry one too:
+  `mb_selective_job_rate_sum` (2^18), `mb_selective_region_avg` (2^19),
+  `mb_selective_error_ratio`, `mb_fanout_total_rate` and
+  `mb_full_range_counter_increase` (2^20 each), each derived in its
+  `modified` reason from the largest series count it sums on any profile:
+  n-1 ULPs per sum of n non-negative values, plus the inner
+  `rate`/`increase` roundings and one per division, doubled for two engines
+  and rounded up to a power of two. The nightly ci run measured Ravel 1 to 4
+  ULPs off the oracle on four of these five entries and Mimir 1 to 2 ULPs
+  off on three, which bit-exact comparison read as `incorrect`;
+  VictoriaMetrics' gaps of 4.8e14 ULPs and more still do. Single-series
+  entries stay bit-exact, and a corpus file of an earlier version is
+  refused.
+- **`metricsbench_ingest` keeps requests in flight per series shard, the way
+  Prometheus does** (issue #2821, ADR-0927 2026-10-28 amendment). Each HTTP row
+  routes every series by a BLAKE3 hash of its labels to one of
+  `--http-shards` shards (default 50) and keeps one request in flight per
+  shard, sending `--http-batch-size` points per request (default 2000, was
+  500). Retries back off from 30 ms, doubling to 5 s, instead of a fixed
+  250 ms, and a 429 is retried. An HTTP row's `elapsed_secs` is now wall time,
+  marked `elapsed_basis: "wall_in_flight"`, beside new `generation_secs` and
+  `sender_bound` fields; the in-process row stays `timed_segments`. Per-class
+  accepted and expected digests are order-independent multiset digests, so
+  they do not depend on the order points arrive in. The portable Ravel row
+  keeps the highest `(epoch, seq)` commit token per shard and refuses two
+  writers on one shard. `--max-ingest-secs` stops a row whose projected wall
+  time exceeds it (exit 1), and `deploy/metricsbench/run.sh` passes a ceiling
+  per profile.
+- **The MetricsBench nightly measures the Ravel it checked out** (issue
+  #2821). `metricsbench-nightly.yml` builds the root Dockerfile's `server`
+  target from the run's own commit, keeps the image local, and passes it to
+  `run.sh` by tag and content Id, so a regression merged later reaches the
+  next nightly. `run.sh` takes the new local-build form `--ravel-image REF
+  --ravel-image-id sha256:ID`, refuses it (exit 65) unless `docker image
+  inspect REF` reports that Id or when the profile is not `ci`, and stamps
+  `ravel_image.kind` `local-build` or `published` in `stamps.json` and the
+  provenance. A local-build run is never publishable. The nightly's job
+  timeout rises from 30 to 140 minutes to cover the full stack run and the
+  image build.
+- **The MetricsBench stack's object store is s3s-fs, not RustFS** (issue
+  #2821, ADR-0927 amendment 2026-10-29). `deploy/metricsbench/run.sh` gains a
+  `fetch-s3s-fs` step that downloads the `s3s-fs-0.17.0-ravel.1` release
+  binary for the Docker engine's arch (`docker version` Server.Arch, else
+  `uname -m`; x86_64 or aarch64) into a cache outside the output directory,
+  hashes it with `sha256sum` or `shasum -a 256`, refuses it with exit 65
+  unless its sha256 equals the pin
+  in `run.sh`, and hands its path to compose as `S3S_FS_BIN`; compose runs it
+  as the `s3s` service on the distroless/cc base the root Dockerfile uses, at
+  the same 1 CPU and 2 GiB envelope RustFS had. `stamps.json` records
+  `store_kind: s3s-fs`, `host.arch` and an `object_store` block (release,
+  sha256, source) in place of `rustfs_logs`; the RustFS log copy is gone,
+  since s3s-fs logs to stdout into `compose.log`. The pin guard
+  `every_comparator_pins_an_image_digest.sh` gains a seventh category that
+  fails when either sha256 constant or either comparison is removed.
+  Figures measured on RustFS are not comparable with figures measured on
+  s3s-fs.
+- **A warm resolve no longer re-derives each cached L0 segment from its commit
+  record** (ravel-catalog). The two costly steps of turning a cached commit
+  record into a segment reference, the data object key check and the gated
+  declared-column stamp read, now run once per record and their result is kept
+  with the cached record, which is immutable; each listed key is also parsed
+  once per resolve instead of three times. The full warm resolve over 408
+  cached records against an in-memory store, as measured on one machine by
+  the ignored `warm_resolve_derived_work_split` test harness, fell from about
+  2450 to about 1280 microseconds. The expected-field checks still run on every cache hit, a
+  derivation that fails is never kept and fails every resolve, and evicting a
+  record drops what was kept with it. Every commit-cache entry is now charged
+  32 more bytes for the slot that holds the kept result, which keeps an
+  ordinary stats-free entry (896 bytes) inside the 900-byte planning rate; a
+  record carrying declared-column stamps is also charged the stamp list it
+  keeps (339 bytes for the four stamps a ClickBench flush carries: 16 bytes of
+  counters plus, per stamp, its 72-byte struct and its name), so a byte-bound
+  tenant whose records carry stamps holds fewer of them at once.
+- **High-cardinality `GROUP BY` statements spend less CPU** (ravel-sql): a
+  partial aggregation partition now stops pre-aggregating once its probe finds
+  a new group for more than one row in ten (ratio 0.1, was 0.5).
+- **Catalog decodes are charged to the process memory budget** (issue
+  #3244). The server's catalog now reserves its snapshot-part, name-postings
+  and column-statistics decodes against the same ADR-1170 budget the SQL
+  executor and the fetchers share, and those bytes show under
+  `ravel_memory_reserved_bytes{component="fetch"}`. Under memory pressure a
+  part or postings decode can now be refused, which answers 422 on that
+  query, a fold tick whose postings decode is refused fails and is retried
+  by the next tick (a postings object larger than the whole budget is
+  refused on every tick, so that tenant's fold stays failed), and
+  `ravel_catalog_decode_reserve_retries_total` and
+  `ravel_catalog_decoded_cache_memory_evictions_total` can move. Nothing
+  changes where the budget is unlimited (`gateway` mode, or an unknown host
+  memory size with no `--memory-budget-bytes`).
+  Outside those cases, the server also caps the catalog's decoded part and
+  postings caches at 1% of the budget, through the new
+  `CatalogConfig::decoded_cache_max_bytes` setting (unset by default). The cap
+  covers both caches together across every tenant and evicts the least
+  recently used entries of either cache; a decoded object larger than the
+  cap is not cached and is decoded again each time it is needed. The new
+  `ravel_catalog_decoded_cache_byte_bound_evictions_total` and
+  `ravel_catalog_decoded_cache_byte_bound_refusals_total` count the entries
+  that cap evicts and the objects too large to cache under it.
+- **The cache's S3-FIFO ghost window covers 30% of the cache in bytes**
+  (ravel-cache, issue #3270). A key evicted from probation is remembered
+  while it is inside the old key window (`max_bytes / max_entry_bytes` keys)
+  or while the ghost's evicted sizes sum to at most 30% of `max_bytes`,
+  whichever is wider. Before, a 6.95 GB cache at the 64 MiB entry cap
+  remembered about 100 keys, so a repeated statement reading more than the
+  probation queue plus that window in 1.3 MB ranges was never served from
+  the cache: in the ClickBench hot sweep simulation q31, q32 and q33 now
+  serve their second and third timed calls in full, where they served
+  nothing. Both tiers use the policy. A hot set under a cold scan (ADR-0046
+  decision 6) and loops larger than the cache are served at least as before
+  in the simulation. The ghost's key count is capped at one per mille of
+  `max_bytes` in ghost bookkeeping.
+- **`ravel-cli load` refuses a `--target-bytes` above 360,000,000,000, and
+  every target above 1 now carries its encode allowance in the ack deadline**
+  (issues #3289, #3376 and #3382). The bound is the target whose encode
+  allowance at 100,000,000 bytes per second is one hour; before, a mistyped
+  7,400,000,000,000 added 74,000 s of encode allowance, raising every Strict
+  write's ack deadline past 20 hours. A given target above the bound is
+  refused for logs, metrics and spans loads alike, whether or not
+  `--ack-margin` is given, with `--target-bytes must be at most 360000000000
+  (one hour of encode at 100000000 bytes per second, the allowance the ack
+  deadline adds when --ack-margin is unset); N was given`; the
+  `--target-bytes` help and the ingest guide state it as an absolute bound.
+  A target derived with `--target-bytes` unset is clamped to the same bound.
+  The load report's geometry carries a new `target_clamped` field, and the
+  geometry line and the no-effect warning name a clamped derived target as
+  clamped: the warning reads `the derived flush target of 360000000000 bytes
+  (250000 rows at the first batch's estimated <N> bytes per row, clamped to
+  the 360000000000 maximum)`. With `--ack-margin` given, the margin replaces
+  the allowance. A target at or below one batch's estimated
+  per-shard slice used to add no encode time, on the assumption that every
+  write then flushed on its own; shards do not split a batch evenly, so such
+  a buffer can still accumulate to the target and be released by the age
+  trigger, and it now gets the same allowance as any larger target. Only
+  `--target-bytes 1` adds nothing. The no-effect warning now says its
+  per-shard slice explanation holds at an even split.
+- **A `LIKE '%lit%'` pushed into a logs scan no longer fetches the BLOOM
+  section** (issue #3295), which the reader never reads for it: on the test
+  fixture of four objects that is 4 fewer GETs and 69,440 fewer bytes.
+- The log reader's `Contains` kernel spends less time outside its needle search (issue #3295): on the crate's `contains_kernel_block` bench over one 8,192-row block that time falls from 94.4 to 38.4 µs with a value per row, from 131.1 to 48.5 µs with a 2,000-entry dictionary, and from 153.1 to 122.8 µs with an overflowing attribute on 5% of rows.
+- **Plain string pages decode into one values buffer plus `u32` offsets**
+  (ravel-logseg, perf): a decoded plain string column costs 4 bytes per row
+  plus its data and a presence bit instead of an owned buffer per row, and the
+  `contains_kernel_block` plain case runs at about 17.6 ns per row against
+  16.4 to 17.3 ns with the #3295 kernel change alone, measured on one shared
+  machine.
+- **`ag` is a reserved Parquet table name, and the IAM templates grant the
+  Ravel Agents namespace `t/*/ag/*`** (ADR-3331): the gateway and query roles
+  may list, read and write it, the maintain role may list and read it. An
+  existing Parquet table named `ag` stops resolving; `ravel-cli parquet repair
+  --stray` reports its manifests as `ReservedName`.
+
 ## [0.27.0] - 2026-10-26
 
 ### Fixed
