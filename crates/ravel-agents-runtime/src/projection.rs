@@ -93,15 +93,77 @@ pub struct ProjectedEvent {
     pub payload: ProjectedPayload,
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
-    /// When the projector read the event, on its clock. Events carry no
-    /// commit time of their own.
-    pub observed_unix_ns: i64,
+    /// The record's time: its turn's finish time when the projector found it
+    /// committed, else the read time. Never the delivery time.
+    pub time_unix_ns: i64,
+    pub time_source: TimeSource,
+}
+
+/// Where a record's time came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeSource {
+    /// The turn's committed `finished_unix_ns`, from the open page of the
+    /// agent's results.
+    TurnFinished,
+    /// The projector's clock when it read the event: the turn's result had
+    /// left the open results page, and the projector reads no sealed page.
+    Read,
+}
+
+impl TimeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeSource::TurnFinished => "turn_finished",
+            TimeSource::Read => "read",
+        }
+    }
+}
+
+/// A record body cut to fit a sink's body limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FittedBody {
+    pub text: String,
+    /// The carried payload text was cut short to fit.
+    pub truncated: bool,
 }
 
 impl ProjectedEvent {
     /// The record body every sink writes, so the event id and the redacted
     /// payload are searchable as log text.
     pub fn body(&self) -> String {
+        self.body_within(usize::MAX).text
+    }
+
+    /// [`Self::body`] in at most `max_bytes`: carried payload text is cut at a
+    /// char boundary and the body says `payload_truncated=true` before it. A
+    /// body with no carried text is returned whole whatever its length.
+    pub fn body_within(&self, max_bytes: usize) -> FittedBody {
+        let head = self.body_head();
+        let Some(text) = &self.payload.body else {
+            return FittedBody {
+                text: head,
+                truncated: false,
+            };
+        };
+        let whole = head.len() + " payload=".len() + text.len();
+        if whole <= max_bytes {
+            return FittedBody {
+                text: format!("{head} payload={text}"),
+                truncated: false,
+            };
+        }
+        let prefix = format!("{head} payload_truncated=true payload=");
+        let mut keep = max_bytes.saturating_sub(prefix.len()).min(text.len());
+        while !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        FittedBody {
+            text: format!("{prefix}{}", &text[..keep]),
+            truncated: true,
+        }
+    }
+
+    fn body_head(&self) -> String {
         let mut out = format!(
             "agent event event_id={} agent_id={} incarnation={} event_seq={} accept_seq={} turn_id={} type={}",
             self.event_id.to_hex(),
@@ -119,12 +181,8 @@ impl ProjectedEvent {
                     " payload_hash={hash} payload_size={}",
                     self.payload.size_bytes
                 ));
-                match &self.payload.body {
-                    Some(body) => {
-                        out.push_str(" payload=");
-                        out.push_str(body);
-                    }
-                    None => out.push_str(" payload=redacted"),
+                if self.payload.body.is_none() {
+                    out.push_str(" payload=redacted");
                 }
             }
         }
@@ -154,16 +212,30 @@ pub struct ProjectionBatch {
     pub turns: Vec<ProjectedTurn>,
 }
 
-/// A sink refused or failed a delivery; the batch is retried with the same
-/// ids.
+/// A sink refused or failed a delivery for a reason that can pass on a later
+/// attempt (admission, a rate, the active-stream cap, a buffer budget, the
+/// store, the network); the batch is retried whole with the same ids.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("projection sink failed: {0}")]
 pub struct SinkError(pub String);
 
-pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+/// A delivery the sink finished. The records it rejected for a reason that
+/// fails identically on every retry (too old, too long, malformed) are not
+/// written and never retried; the rest are written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Delivered {
+    pub rejected_events: u64,
+    pub rejected_spans: u64,
+    /// The last rejection's reason, when anything was rejected.
+    pub rejection: Option<String>,
+}
+
+pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<Delivered, SinkError>> + Send + 'a>>;
 
 /// Where projected records go: the process's own ingest routers, an OTLP
-/// endpoint, or a test double.
+/// endpoint, or a test double. A sink returns [`SinkError`] only for a
+/// refusal a retry can get past; one that fails the same way every time is a
+/// rejection in [`Delivered`], or the projector would retry it forever.
 pub trait ProjectionSink: Send + Sync {
     fn deliver<'a>(&'a self, batch: &'a ProjectionBatch) -> SinkFuture<'a>;
 }
@@ -242,6 +314,9 @@ pub struct ProjectionMetricsSnapshot {
     /// Store reads that failed; the events stay committed and are read on a
     /// later pass.
     pub read_failures: u64,
+    /// Records (log records and spans) the sink rejected for good and the
+    /// projector skipped.
+    pub records_rejected: u64,
 }
 
 impl ProjectionMetricsSnapshot {
@@ -251,6 +326,7 @@ impl ProjectionMetricsSnapshot {
             lag_max: self.lag_max.max(other.lag_max),
             backlog: self.backlog.saturating_add(other.backlog),
             backlog_bound: self.backlog_bound.saturating_add(other.backlog_bound),
+            records_rejected: self.records_rejected.saturating_add(other.records_rejected),
             events_projected: self.events_projected.saturating_add(other.events_projected),
             spans_projected: self.spans_projected.saturating_add(other.spans_projected),
             sink_failures: self.sink_failures.saturating_add(other.sink_failures),
@@ -286,6 +362,25 @@ struct Counters {
     sink_failures: AtomicU64,
     backlog_full: AtomicU64,
     read_failures: AtomicU64,
+    records_rejected: AtomicU64,
+}
+
+/// The text of a projector's last sink failure and last rejection, for the
+/// health route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionErrors {
+    pub last_sink_error: Option<String>,
+    pub last_rejection: Option<String>,
+}
+
+impl ProjectionErrors {
+    /// Fold two tenants' texts, keeping the first present of each.
+    pub fn merge(self, other: ProjectionErrors) -> ProjectionErrors {
+        ProjectionErrors {
+            last_sink_error: self.last_sink_error.or(other.last_sink_error),
+            last_rejection: self.last_rejection.or(other.last_rejection),
+        }
+    }
 }
 
 /// Projects one tenant's committed history.
@@ -301,6 +396,7 @@ pub struct Projector {
     pass: tokio::sync::Mutex<()>,
     wake: Notify,
     counters: Counters,
+    errors: Mutex<ProjectionErrors>,
 }
 
 /// What one [`Projector::project_once`] pass did.
@@ -337,6 +433,7 @@ impl Projector {
             pass: tokio::sync::Mutex::new(()),
             wake: Notify::new(),
             counters: Counters::default(),
+            errors: Mutex::new(ProjectionErrors::default()),
         }
     }
 
@@ -409,7 +506,13 @@ impl Projector {
             sink_failures: c.sink_failures.load(Ordering::Relaxed),
             backlog_full: c.backlog_full.load(Ordering::Relaxed),
             read_failures: c.read_failures.load(Ordering::Relaxed),
+            records_rejected: c.records_rejected.load(Ordering::Relaxed),
         }
+    }
+
+    /// The last sink failure's and the last rejection's text.
+    pub fn errors(&self) -> ProjectionErrors {
+        self.errors.lock().clone()
     }
 
     /// The store's request counters for the projector's own reads.
@@ -484,13 +587,17 @@ impl Projector {
         let mut turns: Vec<ProjectedTurn> = Vec::new();
         for event in &events {
             let payload = self.payload_view(agent, event).await?;
-            let record = self.record(agent, incarnation, event, payload, now);
+            let at = match finished.get(&event.accept_seq) {
+                Some(finished) => (*finished, TimeSource::TurnFinished),
+                None => (now, TimeSource::Read),
+            };
+            let record = self.record(agent, incarnation, event, payload, at);
             match turns.last_mut() {
                 Some(turn) if turn.turn_id == event.turn_id => {
                     turn.last_event_seq = event.event_seq;
                 }
                 _ => {
-                    let at = finished.get(&event.accept_seq).copied().unwrap_or(now);
+                    let at = record.time_unix_ns;
                     turns.push(ProjectedTurn {
                         agent: *agent,
                         incarnation,
@@ -558,7 +665,7 @@ impl Projector {
         incarnation: u64,
         event: &EventEntry,
         payload: ProjectedPayload,
-        now: i64,
+        (time_unix_ns, time_source): (i64, TimeSource),
     ) -> ProjectedEvent {
         ProjectedEvent {
             event_id: event_id(&self.tenant, agent, incarnation, event.event_seq),
@@ -571,7 +678,8 @@ impl Projector {
             payload,
             trace_id: trace_id(&self.tenant, agent, incarnation, event.accept_seq),
             span_id: span_id(&self.tenant, agent, &event.turn_id),
-            observed_unix_ns: now,
+            time_unix_ns,
+            time_source,
         }
     }
 
@@ -602,10 +710,17 @@ impl Projector {
                     .collect();
                 ProjectionBatch { events, turns }
             };
-            if self.sink.deliver(&batch).await.is_err() {
-                self.counters.sink_failures.fetch_add(1, Ordering::Relaxed);
-                report.sink_failed = true;
-                return;
+            let delivered = match self.sink.deliver(&batch).await {
+                Ok(delivered) => delivered,
+                Err(SinkError(error)) => {
+                    self.counters.sink_failures.fetch_add(1, Ordering::Relaxed);
+                    self.errors.lock().last_sink_error = Some(error);
+                    report.sink_failed = true;
+                    return;
+                }
+            };
+            if let Some(rejection) = delivered.rejection {
+                self.errors.lock().last_rejection = Some(rejection);
             }
             let mut state = self.state.lock();
             state.backlog.drain(..batch.events.len());
@@ -618,8 +733,12 @@ impl Projector {
                 }
             }
             drop(state);
-            let events = batch.events.len() as u64;
-            let spans = batch.turns.len() as u64;
+            let events = (batch.events.len() as u64).saturating_sub(delivered.rejected_events);
+            let spans = (batch.turns.len() as u64).saturating_sub(delivered.rejected_spans);
+            self.counters.records_rejected.fetch_add(
+                delivered.rejected_events + delivered.rejected_spans,
+                Ordering::Relaxed,
+            );
             self.counters
                 .events_projected
                 .fetch_add(events, Ordering::Relaxed);
@@ -649,10 +768,12 @@ mod tests {
         TestClock, clock, coordinator, create, head, id_of, poll_now, send, store_over, worker,
     };
 
-    /// Records every delivery; fails while `down` is set.
+    /// Records every delivery; fails while `down` is set, and rejects for
+    /// good the events whose seq is in `reject`.
     #[derive(Default)]
     struct TestSink {
         down: AtomicBool,
+        reject: Mutex<Vec<u64>>,
         attempts: Mutex<Vec<Id128>>,
         delivered: Mutex<Vec<ProjectedEvent>>,
         spans: Mutex<Vec<ProjectedTurn>>,
@@ -667,9 +788,18 @@ mod tests {
                 if self.down.load(Ordering::SeqCst) {
                     return Err(SinkError("down".to_string()));
                 }
-                self.delivered.lock().extend(batch.events.iter().cloned());
+                let reject = self.reject.lock().clone();
+                let mut delivered = Delivered::default();
+                for event in &batch.events {
+                    if reject.contains(&event.event_seq) {
+                        delivered.rejected_events += 1;
+                        delivered.rejection = Some(format!("seq {} too old", event.event_seq));
+                    } else {
+                        self.delivered.lock().push(event.clone());
+                    }
+                }
                 self.spans.lock().extend(batch.turns.iter().cloned());
-                Ok(())
+                Ok(delivered)
             })
         }
     }
@@ -779,6 +909,11 @@ mod tests {
         assert_eq!(m.lag_max, 2);
         assert_eq!(m.sink_failures, 2);
         assert_eq!(m.events_projected, 0);
+        assert_eq!(m.records_rejected, 0);
+        assert_eq!(
+            rig.projector.errors().last_sink_error.as_deref(),
+            Some("down")
+        );
 
         rig.sink.down.store(false, Ordering::SeqCst);
         let pass = rig.projector.project_once().await;
@@ -924,6 +1059,123 @@ mod tests {
         // same two under the same ids, then the new event.
         assert_eq!(ids, [first.clone(), first, vec![third]].concat());
         assert_eq!(restarted.projector.metrics().lag_max, 0);
+    }
+
+    /// A record the sink rejects for good is skipped and counted, its reason
+    /// kept, and the turns after it project; nothing about it is retried.
+    #[tokio::test]
+    async fn a_rejected_record_is_skipped_and_counted_and_never_blocks_the_agent() {
+        let rig = rig(ProjectionLimits::default(), PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        rig.sink.reject.lock().push(1);
+        turn(&rig, "r1", 2).await;
+        let pass = rig.projector.project_once().await;
+        assert!(!pass.sink_failed);
+        assert_eq!(pass.events_delivered, 1);
+        let m = rig.projector.metrics();
+        assert_eq!(m.lag_max, 0);
+        assert_eq!(m.records_rejected, 1);
+        assert_eq!(m.events_projected, 1);
+        assert_eq!(m.sink_failures, 0);
+        assert_eq!(
+            rig.projector.errors().last_rejection.as_deref(),
+            Some("seq 1 too old")
+        );
+
+        turn(&rig, "r2", 1).await;
+        rig.projector.project_once().await;
+        let seqs: Vec<u64> = rig
+            .sink
+            .delivered
+            .lock()
+            .iter()
+            .map(|e| e.event_seq)
+            .collect();
+        assert_eq!(seqs, vec![2, 3]);
+        let attempts = rig.sink.attempts.lock().clone();
+        let agent = id_of("a");
+        let rejected = event_id(&TenantHash([7; 16]), &agent, 1, 1);
+        assert_eq!(attempts.iter().filter(|id| **id == rejected).count(), 1);
+        let m = rig.projector.metrics();
+        assert_eq!((m.lag_max, m.records_rejected), (0, 1));
+    }
+
+    /// A record carries its turn's committed finish time, not the time the
+    /// projector delivered it: a delivery an hour after the commit still
+    /// stamps the commit time.
+    #[tokio::test]
+    async fn a_record_carries_its_turns_finish_time_not_the_delivery_time() {
+        let rig = rig(ProjectionLimits::default(), PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        rig.sink.down.store(true, Ordering::SeqCst);
+        turn(&rig, "r1", 1).await;
+        let committed = rig.clock.now_unix_ns();
+        rig.projector.project_once().await;
+        rig.clock.advance_ms(3_600_000);
+        rig.sink.down.store(false, Ordering::SeqCst);
+        rig.projector.project_once().await;
+        let delivered = rig.sink.delivered.lock().clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].time_unix_ns, committed);
+        assert_eq!(delivered[0].time_source, TimeSource::TurnFinished);
+        let spans = rig.sink.spans.lock().clone();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            (spans[0].start_unix_ns, spans[0].end_unix_ns),
+            (committed, committed)
+        );
+    }
+
+    #[test]
+    fn a_body_over_the_limit_cuts_the_payload_text_and_says_so() {
+        let event = ProjectedEvent {
+            event_id: Id128([1; 16]),
+            agent: AgentId([2; 16]),
+            incarnation: 1,
+            event_seq: 1,
+            accept_seq: 1,
+            turn_id: Id128([3; 16]),
+            event_type: "paid".to_string(),
+            payload: ProjectedPayload {
+                hash: Some("ab".to_string()),
+                size_bytes: 400,
+                body: Some("é".repeat(200)),
+            },
+            trace_id: [4; 16],
+            span_id: [5; 8],
+            time_unix_ns: 1,
+            time_source: TimeSource::Read,
+        };
+        let whole = event.body_within(usize::MAX);
+        assert!(!whole.truncated);
+        assert_eq!(whole.text, event.body());
+        assert!(whole.text.ends_with(&"é".repeat(200)), "{}", whole.text);
+
+        let limit = whole.text.len() - 101;
+        let cut = event.body_within(limit);
+        assert!(cut.truncated);
+        assert!(cut.text.len() <= limit, "{} > {limit}", cut.text.len());
+        assert!(
+            cut.text.len() >= limit - 1,
+            "{} < {limit} - 1",
+            cut.text.len()
+        );
+        assert!(
+            cut.text.contains(" payload_truncated=true payload=éé"),
+            "{}",
+            cut.text
+        );
+
+        let redacted = ProjectedEvent {
+            payload: ProjectedPayload {
+                body: None,
+                ..event.payload.clone()
+            },
+            ..event
+        };
+        let fitted = redacted.body_within(10);
+        assert!(!fitted.truncated);
+        assert!(fitted.text.ends_with("payload=redacted"), "{}", fitted.text);
     }
 
     #[test]
