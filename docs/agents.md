@@ -585,8 +585,9 @@ replace-worker scenario SIGKILLs worker A inside an `at_least_once` step and
 asserts that a resend under the same request id returns the same operation
 with `OP1_RETRIED_DUPLICATE=true`, that worker B takes the same turn and
 effect over with `B_STEP_ATTEMPT=2`, and that `RECOVERY_FROM_GRANT_MS`, from
-A's grant to B's assignment, lies within [40000, 60000] (the 30 s lease plus
-10 s grace, both counted from the grant, plus one 20 s long poll). It also
+A's grant to B's assignment, lies within [39000, 60000] (the 30 s lease plus
+10 s grace, both counted from the grant, less 1 s for reading the grant time
+after the server set it, plus one 20 s long poll). It also
 asserts `GRANT_TO_KILL_MS`, from A's grant to its SIGKILL, at no more than
 10000, so A dies while its lease is live. Its restart-server scenario SIGKILLs
 and restarts the server with worker C's turn in flight and asserts
