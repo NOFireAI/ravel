@@ -259,12 +259,14 @@ are per operation unless the metric says otherwise.
 | * | hot | cold | message | resolve | get | 2 | [1.95, 2.05] | lead loads, 0.75 retries |
 | * | hot | * | message | store | put | 1.75 | [1.75, 1.8] | payload plus 0.75 retried PUTs, at most 1/64 sealing |
 | * | hot | * | message | store | get | 0.75 | [0.75, 0.75] | read-back after AlreadyExists on each retry |
+| * | hot | * | message | store | conflict | 0.75 | [0.75, 0.75] | each retried payload PUT is answered AlreadyExists, counted as a store conflict |
 | * | hot | * | message | publish | cas | 1.75 | [1.75, 1.75] | 1 + 0.75 retries |
 | * | hot | * | message | publish | conflict | 0.75 | [0.75, 0.75] | 3 conflicts per round of 4 |
 | * | slow | warm | message | resolve | get | 1.875 | [1.0, 1.9] | as hot, but jitter can separate the CASes and remove retries |
 | * | slow | cold | message | resolve | get | 2 | [1.25, 2.05] | as hot, jitter may remove retries |
 | * | slow | * | message | store | put | 1.75 | [1.0, 1.8] | as hot, jitter may remove retries |
 | * | slow | * | message | store | get | 0.75 | [0, 0.75] | as hot, jitter may remove retries |
+| * | slow | * | message | store | conflict | 0.75 | [0, 0.75] | as hot, jitter may remove retries |
 | * | slow | * | message | publish | cas | 1.75 | [1.0, 1.75] | at most 3 conflicts among 3 contenders |
 | * | slow | * | message | publish | conflict | 0.75 | [0, 0.75] | at most 3 per round |
 | * | many | warm | message | resolve | get | 1.5 | [1.5, 1.5] | half the messages load the agent |
@@ -277,6 +279,7 @@ are per operation unless the metric says otherwise.
 | * | storm | cold | pass | resolve | get | 8 | [8, 8] | the pass's 8 HEAD reads |
 | * | storm | cold | pass | resolve | list | 4 | [3, 4] | 1 wake LIST, 2 or 3 directory LISTs |
 | * | storm | cold | activation | resolve | get | 1 | [1, 1] | the takeover poll's HEAD read |
+| * | storm | cold | activation | store | put | 0 | [0, 0] | the takeover poll writes no object |
 | * | storm | cold | activation | publish | cas | 1 | [1, 1] | takeover and BeginTurn in one CAS |
 | * | storm | cold | ingest | telemetry | put | 1 | [1, 1] | one batch PUT |
 | * | storm | cold | ingest | telemetry | get | 1 | [1, 1] | one read-back |
@@ -292,6 +295,7 @@ are per operation unless the metric says otherwise.
 | * | * | * | step | resolve | get | 6 | [5, 7] | three dispatch publishes, one result publish, replay's re-journal and completion |
 | * | * | * | step | store | get | 3 | [2, 3] | result read-back, result read, output read |
 | * | * | * | step | store | put | 2 | [1, 2] | result object, its dependency re-PUT |
+| * | * | * | step | store | conflict | 1 | [1, 1] | the result object PUT, then its publish re-PUTs it as a dependency and is answered AlreadyExists |
 | * | * | * | step | publish | cas | 5 | [5, 6] | journal, intent, authorize, result, completion, maybe a re-journal |
 | * | * | * | activation | resolve | get | 2 | [2, 2] | the load and the enqueue's HEAD read |
 | * | index-p2 | * | activation | store | put | 1.5 | [1, 2] | payload, a receipt page every second message |
@@ -317,6 +321,7 @@ are per operation unless the metric says otherwise.
 | * | * | * | turn | latency | * | 120 | [100, 160] | poll 30 + commit 90, a sealed page adds 20 |
 | * | * | * | step | latency | * | 250 | [200, 320] | dispatch 90, complete 80, replay 60 to 80 |
 | * | * | * | activation | latency | * | 60 | [60, 60] | load GET, enqueue GET, PUT, CAS |
+| * | storm | cold | activation | latency | * | 30 | [30, 30] | the takeover poll: HEAD GET and CAS |
 | * | storm | cold | pass | latency | * | 135 | [100, 160] | 3 or 4 LISTs at 15 and 8 GETs at 10 |
 | * | storm | cold | ingest | latency | * | 30 | [30, 30] | PUT + GET |
 | * | baseline | na | ingest | latency | * | 30 | [30, 30] | PUT + GET |
