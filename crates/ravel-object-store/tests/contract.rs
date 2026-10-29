@@ -29,7 +29,7 @@ use ravel_object_store::s3::{
 };
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
-    MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions,
+    MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
     PutOutcome, StoreError, StoreMetrics, UploadChecksum, list_all,
 };
 use std::sync::Arc;
@@ -1756,6 +1756,62 @@ async fn floci_contract() {
     }
 }
 
+/// The order a GCS pinned read is judged in (ADR-3456): the generation
+/// selector before the ETag precondition. Run against the fake and against a
+/// real bucket, so the fake's ordering is checked against the service's.
+async fn gcs_pinned_read_ordering(store: &GcsStore, root: &str) {
+    let key = format!("{root}/pinned/k");
+    let bytes = Bytes::from_static(b"pinned");
+    let wrong_etag = "\"0123456789abcdef0123456789abcdef\"";
+
+    let absent = Pin::from_store(wrong_etag, Some("1".to_string()));
+    let read = store
+        .get_pinned(&format!("{root}/pinned/absent"), GetRange::Full, &absent)
+        .await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "absent key with a pin: {read:?}"
+    );
+
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let (_, live) = store.pin_of(&key).await.expect("pin_of");
+    let read = store
+        .get_pinned(
+            &key,
+            GetRange::Full,
+            &Pin::from_store(wrong_etag, live.version.clone()),
+        )
+        .await;
+    assert!(
+        matches!(read, Err(StoreError::PreconditionFailed)),
+        "live generation, wrong ETag: {read:?}"
+    );
+
+    let read = store
+        .get_pinned(&key, GetRange::Full, &live)
+        .await
+        .expect("live generation, its own ETag");
+    assert_eq!(read.outcome.data, bytes);
+
+    // Identical bytes keep the ETag, so only the generation is stale.
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("identical rewrite");
+    let (_, replaced) = store.pin_of(&key).await.expect("pin_of");
+    assert_eq!(replaced.etag, live.etag);
+    assert_ne!(replaced.version, live.version);
+    let read = store.get_pinned(&key, GetRange::Full, &live).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, its stale ETag: {read:?}"
+    );
+    store.delete(&key).await.expect("delete");
+}
+
 /// `GcsStore` against the in-process fake GCS endpoint, in every run. A page
 /// size of 2 so listing crosses continuation tokens.
 #[tokio::test]
@@ -1771,6 +1827,7 @@ async fn gcs_store_contract_against_the_fake() {
     assert_eq!(store.capabilities(), Capabilities::mandatory());
 
     run_contract_suite(&store, "gcs-fake").await;
+    gcs_pinned_read_ordering(&store, "gcs-fake").await;
 }
 
 /// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
@@ -1796,6 +1853,7 @@ async fn gcs_contract() {
 
     assert_eq!(store.capabilities(), Capabilities::mandatory());
     run_contract_suite(&store, &root).await;
+    gcs_pinned_read_ordering(&store, &root).await;
     assert!(
         store.observed_store_time_ns().is_some(),
         "every GCS response carries a Date header"
