@@ -2447,4 +2447,104 @@ mod tests {
             "one more LIST at the production size"
         );
     }
+
+    fn gcs_args(extra: &[&str]) -> StoreArgs {
+        let mut argv = vec!["ravel-cli", "--store", "gcs"];
+        argv.extend_from_slice(extra);
+        StoreArgs::try_parse_recorded(argv).expect("store flags parse")
+    }
+
+    fn gcs_config_error(args: &StoreArgs) -> String {
+        match gcs_config(args, None) {
+            Ok(config) => panic!("expected a refusal, built {config:?}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// The defaulted `--s3-upload-integrity` and `--s3-request-stored-checksum`
+    /// are not refused under gcs, and the page size reaches GcsConfig.
+    #[test]
+    fn defaulted_s3_flags_are_not_refused_under_gcs() {
+        let args = gcs_args(&["--gcs-bucket", "b"]);
+        assert_eq!(args.given_s3_flags, Some(Vec::new()));
+        let config = gcs_config(&args, Some(7)).expect("gcs config builds");
+        assert_eq!(config.bucket, "b");
+        assert_eq!(config.list_page_size, 7);
+        assert_eq!(config.base_url, None);
+        assert!(!config.allow_http);
+    }
+
+    /// A `--s3-*` flag given on the command line is refused under gcs, each
+    /// named, including one given at its default value.
+    #[test]
+    fn given_s3_flags_are_refused_under_gcs() {
+        let args = gcs_args(&[
+            "--gcs-bucket",
+            "b",
+            "--s3-bucket",
+            "x",
+            "--s3-request-stored-checksum=true",
+        ]);
+        let err = gcs_config_error(&args);
+        assert!(
+            err.contains(
+                "--s3-bucket (RAVEL_S3_BUCKET), --s3-request-stored-checksum \
+                 (RAVEL_S3_REQUEST_STORED_CHECKSUM) given"
+            ),
+            "{err}"
+        );
+    }
+
+    /// Args parsed without recording their sources cannot tell a given
+    /// `--s3-*` flag from a defaulted one, so gcs refuses rather than guess.
+    #[test]
+    fn gcs_refuses_unrecorded_flag_sources() {
+        let args = StoreArgs::try_parse_from(["ravel-cli", "--store", "gcs", "--gcs-bucket", "b"])
+            .expect("store flags parse");
+        assert!(
+            gcs_config_error(&args).contains("could not tell which --s3-* flags were given"),
+        );
+    }
+
+    #[test]
+    fn gcs_bucket_is_required() {
+        let err = gcs_config_error(&gcs_args(&[]));
+        assert_eq!(err, "--store gcs requires --gcs-bucket (RAVEL_GCS_BUCKET)");
+    }
+
+    /// Plain http is accepted only for a loopback endpoint; an endpoint with
+    /// no scheme is refused.
+    #[test]
+    fn gcs_endpoint_scheme_rules() {
+        let loopback = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "http://127.0.0.1:9"]);
+        let config = gcs_config(&loopback, None).expect("loopback http builds");
+        assert!(config.allow_http);
+        assert_eq!(config.base_url.as_deref(), Some("http://127.0.0.1:9"));
+
+        let remote = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "http://gcs.example"]);
+        assert!(gcs_config_error(&remote).contains("is plaintext HTTP to a host that is not"));
+
+        let schemeless = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "gcs.example"]);
+        assert!(gcs_config_error(&schemeless).contains("needs an http:// or https:// scheme"));
+    }
+
+    /// Under gcs the identity is the `gs://` form and the echoed flags name the
+    /// GCS bucket and endpoint, never an S3 field.
+    #[test]
+    fn gcs_identity_and_echo_flags() {
+        let args = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "http://127.0.0.1:9"]);
+        assert_eq!(args.backend_identity(), "gs://b@http://127.0.0.1:9");
+        assert_eq!(
+            args.echo_flags(&|_| false),
+            [
+                "--store",
+                "gcs",
+                "--gcs-bucket",
+                "b",
+                "--gcs-endpoint",
+                "http://127.0.0.1:9"
+            ]
+        );
+        assert_eq!(gcs_args(&["--gcs-bucket", "b"]).backend_identity(), "gs://b");
+    }
 }
