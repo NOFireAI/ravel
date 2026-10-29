@@ -678,7 +678,15 @@ pages. Decision 3 now reads as follows for those lists.
 - **Representation.** HEAD format version 2 carries one `PageDirectory`
   per list, fields 35 to 39 of `AgentHead`: a representation (`INLINE` or
   `PAGED`), the `PageRef`s of the sealed pages in key order, and
-  `tail_from`, the first key still held inline. A version 1 HEAD decodes
+  `tail_from`, the first key still held inline. A `PageRef` records the
+  page's first key, object reference, entry count, marked count
+  (scheduled timers, cancelled results), referenced bytes and lookup
+  fingerprints; an events `PageRef` also records the lowest and highest
+  `accept_seq` of its events, fields 8 and 9, which the decoder refuses
+  inverted or on any other list
+  (`pages::tests::an_inverted_or_misplaced_accept_range_is_refused`). It
+  records no due time: a sealed timer page never holds a timer that can
+  fire, so field 5, once `min_due_unix_ns`, is reserved. A version 1 HEAD decodes
   with every list `INLINE` and no pages (`head::tests::a_version_one_head_decodes_with_every_list_inline`).
 - **Pages.** A page is an `o/<object_hash>` object holding the existing
   `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or `TimerTable`
@@ -745,10 +753,17 @@ pages. Decision 3 now reads as follows for those lists.
   - an operation-filtered events page applies the filter before the
     limit and stops loading pages only once it holds `limit` matching
     events (the page that says the operation is terminal looks one event
-    past the limit); nothing bounds one operation's event seqs, so any
-    filtered page whose operation has fewer matching events than that
-    after the cursor reads every events page from the cursor on, at most
-    `max_index_pages` GETs (12 in the test);
+    past the limit). It GETs only the events pages whose `accept_seq`
+    range holds the operation and skips the rest with no GET, so a page
+    whose operation has fewer matching events than that after the cursor,
+    the terminal page among them, reads HEAD and normally one events page
+    (one of 12 in the test). A reconciliation's audit event carries its
+    effect's input, older than the events before it, and widens its
+    page's range down to that input, so a filtered read can also GET the
+    pages such events widened over its operation, at most
+    `max_index_pages` (store tests
+    `an_operation_read_skips_pages_outside_its_accept_range`,
+    `an_audit_event_widens_its_page_range_and_is_read_for_its_operation`);
   - a poll reads HEAD for `BeginTurn`, the state and payload objects, and
     HEAD again for the route's recorded time, and no sealed page. That
     holds when the runtime already holds the agent's root and the input is
@@ -804,13 +819,19 @@ Costs this leaves in place: a timer page cannot seal past a timer still
 scheduled, so history behind a long-lived timer stays inline until it
 fires or is cancelled; `AgentStore::read_head_full`, the inspection read,
 GETs every page; a poll reads HEAD twice; a state read GETs every inbox
-page; a timers read GETs HEAD and every timer page; any
-operation-filtered events page whose operation has fewer than `limit`
-matching events after its cursor, the terminal page among them, GETs every
-events page from its cursor on, up to `max_index_pages`; and a command whose page need
+page; a timers read GETs HEAD and every timer page; an
+operation-filtered events page GETs, besides HEAD, the events pages
+whose `accept_seq` range holds its operation: normally one, more only
+where reconciliation audit events widened ranges over it, at most
+`max_index_pages`; and a command whose page need
 the planner did not name falls back to loading every sealed page HEAD
-references, with a warning and a `planner_misses` count. The events list
-is never pruned, so an agent holds at most `max_index_pages *
-max_page_entries` events (32,768 at the defaults); the publish that
-would append past that is refused `BudgetExceeded`, and this release
-gives an operator no way to trim it.
+references, with a warning and a `planner_misses` count. The events,
+results and timers lists are never pruned, and each stops at
+`max_index_pages * max_page_entries` entries (32,768 at the defaults):
+events, one or more per committed turn; results, one per settled
+input, so after that many lifetime inputs; timers, every delivered and
+cancelled generation, which stays forever, since `max_timers` counts
+only scheduled ones. The publish that would seal a page past that bound
+is refused `BudgetExceeded`. The agent stays consistent but refuses new
+work for good: this release gives an operator no way to trim any of the
+three lists.

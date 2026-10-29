@@ -529,11 +529,31 @@ impl Head {
             Index::inline()
         } else {
             Index {
-                inbox: directory_from_proto(raw.inbox_pages.take(), "inbox_pages")?,
-                receipts: directory_from_proto(raw.receipt_pages.take(), "receipt_pages")?,
-                results: directory_from_proto(raw.result_pages.take(), "result_pages")?,
-                events: directory_from_proto(raw.event_pages.take(), "event_pages")?,
-                timers: directory_from_proto(raw.timer_pages.take(), "timer_pages")?,
+                inbox: directory_from_proto(
+                    raw.inbox_pages.take(),
+                    ListKind::Inbox,
+                    "inbox_pages",
+                )?,
+                receipts: directory_from_proto(
+                    raw.receipt_pages.take(),
+                    ListKind::Receipts,
+                    "receipt_pages",
+                )?,
+                results: directory_from_proto(
+                    raw.result_pages.take(),
+                    ListKind::Results,
+                    "result_pages",
+                )?,
+                events: directory_from_proto(
+                    raw.event_pages.take(),
+                    ListKind::Events,
+                    "event_pages",
+                )?,
+                timers: directory_from_proto(
+                    raw.timer_pages.take(),
+                    ListKind::Timers,
+                    "timer_pages",
+                )?,
                 written: Vec::new(),
             }
         };

@@ -171,9 +171,25 @@ hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
   list at most `Limits::max_index_pages` pages (default 512). Past either
   bound the command fails `BudgetExceeded` (`pages::tests::a_full_page_refuses_the_next_append_typed`,
   `pages::tests::a_full_directory_refuses_the_next_page_typed`).
-- Each `PageRef` records the page's first key, object, entry count and
-  referenced bytes; a receipt page also carries the sorted 4-byte blake3
-  fingerprints of its request ids, a timer page its earliest due time.
+- Nothing prunes the events, results or timers lists, so each stops at
+  `max_index_pages * max_page_entries` entries (32,768 at the defaults):
+  events, one or more per committed turn; results, one per settled input,
+  so after that many lifetime inputs; timers, every delivered and cancelled
+  generation, which stays forever (`max_timers` counts only scheduled
+  timers). The publish that would seal a page past that bound is refused
+  `BudgetExceeded`. The agent stays consistent but refuses new work for
+  good: this release has no way to trim any of the three lists.
+- Each `PageRef` records the page's first key, object, entry count, marked
+  count and referenced bytes; a receipt page also carries the sorted 4-byte
+  blake3 fingerprints of its request ids (a result page its turn ids', a
+  timer page its timer ids'), and an events page the lowest and highest
+  `accept_seq` of its events. The range is not a first value: a
+  reconciliation's audit event carries its effect's input, which can be
+  older than the events before it. The decoder refuses a range with its
+  minimum above its maximum, or one on any other list
+  (`pages::tests::an_inverted_or_misplaced_accept_range_is_refused`). A
+  `PageRef` records no due time, since a sealed timer page never holds a
+  scheduled timer; its old field number, 5, is reserved.
 - A full page of the tail seals once its entries cannot change: inbox,
   receipts and events always; results below the oldest pending input;
   timers below the lowest generation still scheduled
@@ -211,11 +227,14 @@ hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
     history is served: the oldest retained seq is the first sealed page's
     first key;
   - an operation filter applies before the limit, and the read stops
-    loading pages only once it holds `limit` matching events; nothing
-    bounds one operation's event seqs, so any filtered page whose
-    operation has fewer matching events than that after the cursor,
-    including the page that reports the operation terminal, reads every
-    events page from the cursor on, at most `max_index_pages` GETs;
+    loading pages only once it holds `limit` matching events. It GETs
+    only the events pages whose `accept_seq` range holds the operation,
+    normally one, and skips the rest with no GET, the page that reports
+    the operation terminal included. A page whose range a reconciliation
+    audit event widened over the operation is read too, so the count is
+    more than one only there, and at most `max_index_pages` (store tests
+    `tests::pages::an_operation_read_skips_pages_outside_its_accept_range`,
+    `tests::pages::an_audit_event_widens_its_page_range_and_is_read_for_its_operation`);
   - a poll reads HEAD twice plus the state and payload objects and no
     sealed page when the runtime holds the agent's root and the input is
     on the open inbox page; a cold root adds the scan's inbox pages and an

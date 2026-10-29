@@ -474,7 +474,7 @@ pub async fn events(
     let head = live_root(store, &agent).await?;
     let mut page = Vec::new();
     for event in store
-        .events_in(&agent, head, after, limit as usize, |_| true)
+        .events_in(&agent, head, after, limit as usize, None)
         .await?
     {
         page.push(EventBody {

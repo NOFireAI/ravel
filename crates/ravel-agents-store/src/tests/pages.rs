@@ -2,9 +2,12 @@
 //! amendment): which pages each path reads, counted per phase, and when the
 //! page objects are written relative to the HEAD CAS.
 
-use ravel_agents_core::command::{EventSpec, FireTimer};
-use ravel_agents_core::head::{FORMAT_VERSION, MAX_HEAD_BYTES, peek_format_version};
+use ravel_agents_core::command::{Authority, AuthorizeAttempt, EventSpec, FireTimer, IntentSpec};
+use ravel_agents_core::head::{
+    FORMAT_VERSION, MAX_HEAD_BYTES, RecoveryPolicy, peek_format_version,
+};
 use ravel_agents_core::identity::Id128;
+use ravel_agents_core::kernel::AUDIT_RECONCILE_ATTEMPT;
 use ravel_agents_core::pages::{ListKind, Need, Representation, receipt_fingerprint};
 use ravel_object_store::fault::{Sequence, SequenceStep};
 
@@ -323,6 +326,181 @@ async fn events_are_read_by_seq_range() {
         .expect("attach");
     assert!(head.results.iter().any(|r| r.accept_seq == turns as u64));
     assert_eq!(store.counters().since(&before).total().requests(), 0);
+}
+
+/// Begin a turn on the oldest input and complete it with `events` events and
+/// `intents`; returns the input's `accept_seq`.
+async fn run_turn(store: &AgentStore, events: usize, intents: Vec<IntentSpec>) -> u64 {
+    let head = shallow(store).await;
+    let (begin, _) = command(&Step::Begin, Some(&head), T0);
+    let begun = store.execute(&agent(), &begin).await.expect("begin");
+    let accept_seq = begun
+        .head
+        .active_turn
+        .as_ref()
+        .map(|t| t.input_accept_seq)
+        .expect("a turn began");
+    let (Command::CompleteTurn(mut complete), deps) =
+        command(&Step::Complete { state: 0 }, Some(&begun.head), T0)
+    else {
+        panic!("not a turn commit");
+    };
+    complete.events = (0..events)
+        .map(|e| EventSpec {
+            event_type: format!("e{e}"),
+            payload: None,
+        })
+        .collect();
+    complete.intents = intents;
+    store
+        .execute_with(&agent(), &Command::CompleteTurn(complete), &deps)
+        .await
+        .expect("complete");
+    accept_seq
+}
+
+/// Create the agent, send `n` inputs and take it over.
+async fn ready(store: &AgentStore, n: usize) {
+    create(store).await;
+    for i in 0..n {
+        send(store, &format!("r{i}")).await.expect("send");
+    }
+    let head = shallow(store).await;
+    let (takeover, _) = command(&Step::Takeover, Some(&head), T0);
+    store.execute(&agent(), &takeover).await.expect("takeover");
+}
+
+/// The `event_seq`s an operation-filtered read returns, and the GETs it
+/// issued: the HEAD read plus every sealed page it loaded.
+async fn operation_read(
+    store: &AgentStore,
+    accept_seq: u64,
+    limit: usize,
+) -> (Vec<EventEntry>, u64) {
+    let before = store.counters();
+    let head = shallow(store).await;
+    let events = store
+        .events_in(&agent(), head, 0, limit, Some(accept_seq))
+        .await
+        .expect("events");
+    (events, store.counters().since(&before).resolve.get)
+}
+
+/// An operation-filtered events read GETs only the sealed pages whose
+/// `accept_seq` range holds the operation. Twelve turns of `K` events each
+/// put each operation's events alone on one page: eleven sealed pages and the
+/// last turn's on the open page.
+#[tokio::test]
+async fn an_operation_read_skips_pages_outside_its_accept_range() {
+    let store = store_with(Arc::new(MemoryStore::new()), paged_limits());
+    let turns = 12;
+    ready(&store, turns).await;
+    let mut ops = Vec::new();
+    for _ in 0..turns {
+        ops.push(run_turn(&store, K, Vec::new()).await);
+    }
+    let head = shallow(&store).await;
+    assert_eq!(sealed(&head, ListKind::Events), turns - 1);
+    let ranges: Vec<(u64, u64)> = head
+        .index
+        .events
+        .pages
+        .iter()
+        .map(|p| (p.min_accept_seq, p.max_accept_seq))
+        .collect();
+    let expected: Vec<(u64, u64)> = ops[..turns - 1].iter().map(|&a| (a, a)).collect();
+    assert_eq!(ranges, expected);
+
+    // The sixth operation's events are seqs 21..=24, alone on page 5. A limit
+    // above its event count reads on looking for more: HEAD and page 5 only.
+    let (events, gets) = operation_read(&store, ops[5], 10).await;
+    let seqs: Vec<u64> = events.iter().map(|e| e.event_seq).collect();
+    assert_eq!(seqs, (21..=24).collect::<Vec<_>>());
+    assert_eq!(gets, 1 + 1);
+
+    // A limit it reaches stops on the same page.
+    let (events, gets) = operation_read(&store, ops[5], 2).await;
+    let seqs: Vec<u64> = events.iter().map(|e| e.event_seq).collect();
+    assert_eq!(seqs, [21, 22]);
+    assert_eq!(gets, 1 + 1);
+
+    // The last operation's events are all on the open page: HEAD only.
+    let (events, gets) = operation_read(&store, ops[turns - 1], 10).await;
+    assert_eq!(events.len(), K);
+    assert_eq!(gets, 1);
+
+    // An operation with no event at all: HEAD only, and nothing returned.
+    let (events, gets) = operation_read(&store, ops[turns - 1] + 1, 10).await;
+    assert!(events.is_empty());
+    assert_eq!(gets, 1);
+}
+
+/// A reconciliation's audit event carries its effect's input, older than the
+/// events before it, and widens its page's `accept_seq` range down to that
+/// input. That page is still read for the older operation, and the audit
+/// event is returned with the operation's own events.
+#[tokio::test]
+async fn an_audit_event_widens_its_page_range_and_is_read_for_its_operation() {
+    let store = store_with(Arc::new(MemoryStore::new()), paged_limits());
+    ready(&store, 5).await;
+    let intent = IntentSpec {
+        intent_key: "charge".to_string(),
+        tool_name: "pay".to_string(),
+        tool_version: "1".to_string(),
+        input_hash: Hash256([7; 32]),
+        policy: RecoveryPolicy::AtLeastOnce,
+        input: None,
+    };
+    // Events 1..=4 (a), 5..=8 (b), 9..=12 (c).
+    let a = run_turn(&store, K, vec![intent]).await;
+    let b = run_turn(&store, K, Vec::new()).await;
+    let c = run_turn(&store, K, Vec::new()).await;
+    // An operator authorizes an attempt of a's effect: audit event 13,
+    // carrying a's accept_seq, after b's and c's events.
+    let head = shallow(&store).await;
+    let effect_id = head.effects.first().expect("a's effect").effect_id;
+    let reconcile = Command::AuthorizeAttempt(AuthorizeAttempt {
+        authority: Authority::Reconcile(IncarnationFence {
+            incarnation: head.incarnation,
+        }),
+        effect_id,
+        attempt: 1,
+    });
+    store
+        .execute(&agent(), &reconcile)
+        .await
+        .expect("reconcile");
+    // Events 14..=16 (d) share the audit event's page; 17..=20 (e) seal it.
+    let d = run_turn(&store, K - 1, Vec::new()).await;
+    let e = run_turn(&store, K, Vec::new()).await;
+    let head = shallow(&store).await;
+    let ranges: Vec<(u64, u64)> = head
+        .index
+        .events
+        .pages
+        .iter()
+        .map(|p| (p.min_accept_seq, p.max_accept_seq))
+        .collect();
+    assert_eq!(ranges, [(a, a), (b, b), (c, c), (a, d)]);
+    assert!(head.events.iter().all(|ev| ev.accept_seq == e));
+
+    // a: its own page and the widened one, and the audit event comes back.
+    let (events, gets) = operation_read(&store, a, 10).await;
+    let seqs: Vec<u64> = events.iter().map(|ev| ev.event_seq).collect();
+    assert_eq!(seqs, [1, 2, 3, 4, 13]);
+    assert_eq!(events[4].event_type, AUDIT_RECONCILE_ATTEMPT);
+    assert_eq!(gets, 1 + 2);
+    // b's range lies inside the widened page's too, which costs a read that
+    // finds none of its events.
+    let (events, gets) = operation_read(&store, b, 10).await;
+    let seqs: Vec<u64> = events.iter().map(|ev| ev.event_seq).collect();
+    assert_eq!(seqs, [5, 6, 7, 8]);
+    assert_eq!(gets, 1 + 2);
+    // d: the widened page alone.
+    let (events, gets) = operation_read(&store, d, 10).await;
+    let seqs: Vec<u64> = events.iter().map(|ev| ev.event_seq).collect();
+    assert_eq!(seqs, [14, 15, 16]);
+    assert_eq!(gets, 1 + 1);
 }
 
 /// A CAS refused once: the retry re-reads HEAD, re-runs the kernel, and seals
