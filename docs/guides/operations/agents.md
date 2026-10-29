@@ -402,8 +402,11 @@ How to verify:
   `[{"attempt":1,"status":"superseded"},{"attempt":2,"status":"open"}]`
   (`a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`).
 - A second `retry` naming attempt 2 while it is open is 409
-  `ownership_lost`, and attempt 0 is 409 `idempotency_conflict`
-  (`a_reconcile_retry_of_an_attempt_a_takeover_raised_is_ownership_lost`).
+  `ownership_lost`, and attempt 0 is 409 `idempotency_conflict`. These two
+  answers come from the reconcile route's decision table; no test pins them
+  yet (`a_reconcile_retry_of_an_attempt_a_takeover_raised_is_ownership_lost`
+  pins the nearby case of a retry naming an attempt a takeover already
+  raised).
 
 `ravel-cli agents reconcile` posts the same body with the admin token
 (`reconcile_posts_the_decision_with_the_admin_token`).
