@@ -441,25 +441,33 @@ impl AgentStore {
         let Some(head) = self.shallow_head(agent).await? else {
             return Ok(Vec::new());
         };
-        self.events_in(agent, head, after, limit).await
+        self.events_in(agent, head, after, limit, |_| true).await
     }
 
-    /// [`Self::read_events`] over a root the caller already read, with the
-    /// same page bound, so a caller that checks the root first (an HTTP
-    /// route refusing a tombstoned agent) pays no second HEAD GET.
+    /// Up to `limit` events with `event_seq > after` that `keep` accepts, in
+    /// order, over a root the caller already read, so a caller that checks
+    /// the root first (an HTTP route refusing a tombstoned agent) pays no
+    /// second HEAD GET. With `keep` accepting every event the page bound is
+    /// [`Self::read_events`]'s; a narrower `keep` reads on past the events
+    /// it skips, up to every page after `after`.
     pub async fn events_in(
         &self,
         agent: &AgentId,
         mut head: Head,
         after: u64,
         limit: usize,
+        keep: impl Fn(&EventEntry) -> bool,
     ) -> Result<Vec<EventEntry>, AgentError> {
         let from = after.saturating_add(1);
         let directory = &head.index.events;
         if let Some(first) = directory.page_for(from) {
             let count = directory.pages.len();
             for page in first..count {
-                let held = head.events.iter().filter(|e| e.event_seq > after).count();
+                let held = head
+                    .events
+                    .iter()
+                    .filter(|e| e.event_seq > after && keep(e))
+                    .count();
                 if held >= limit {
                     break;
                 }
@@ -470,7 +478,7 @@ impl AgentStore {
         let mut events: Vec<EventEntry> = head
             .events
             .into_iter()
-            .filter(|e| e.event_seq > after)
+            .filter(|e| e.event_seq > after && keep(e))
             .collect();
         events.sort_by_key(|e| e.event_seq);
         events.truncate(limit);

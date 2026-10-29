@@ -498,17 +498,21 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             })));
         }
         let after = after.unwrap_or(0);
-        let wanted = |e: &&EventEntry| {
-            e.event_seq > after && operation.is_none_or(|(seq, _)| e.accept_seq == seq)
-        };
+        let keep = |e: &EventEntry| operation.is_none_or(|(seq, _)| e.accept_seq == seq);
         let limit = usize::try_from(body.limit.min(MAX_EVENTS_PAGE)).unwrap_or(1);
-        let page = call
+        // A terminal operation's page reads one event past the limit, so
+        // the page that drains its events says so.
+        let finished = operation.filter(|(_, state)| state.is_terminal());
+        let want = limit.saturating_add(usize::from(finished.is_some()));
+        let mut page = call
             .tenant
             .store
-            .events_in(&agent, head.clone(), after, limit)
+            .events_in(&agent, head, after, want, keep)
             .await?;
+        let more = page.len() > limit;
+        page.truncate(limit);
         let mut events = Vec::new();
-        for event in page.iter().filter(wanted) {
+        for event in &page {
             events.push(EventBody {
                 event_seq: event.event_seq,
                 accept_seq: event.accept_seq,
@@ -518,18 +522,7 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             });
         }
         let next = events.last().map_or(after, |e| e.event_seq);
-        let terminal = match operation {
-            Some((seq, state))
-                if state.is_terminal()
-                    && !head
-                        .events
-                        .iter()
-                        .any(|e| e.event_seq > next && e.accept_seq == seq) =>
-            {
-                Some(state.into())
-            }
-            _ => None,
-        };
+        let terminal = finished.filter(|_| !more).map(|(_, state)| state.into());
         Ok::<_, Refusal>(Json(EventsResponse {
             events,
             next_cursor: next.to_string(),

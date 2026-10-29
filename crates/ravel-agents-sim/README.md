@@ -54,17 +54,22 @@ batch asserts its own pin set (`schedules::pinned_by_page`), and any other
 size prints `unpinned`. Every page GET and PUT is a scheduler gate, so a
 smaller page moves where the seeded script runs out, and past it the
 scheduler releases the lowest actor first. Four totals move at 2 for that
-reason, no invariant changes:
+reason, no invariant changes. The last three were re-measured at both page
+sizes after the worker poll stopped listing the tenant (issue #3353, see
+below): that change moved the default pins, and the same fewer store calls
+per poll moved the pins at 2 (lost CAS response 40 to 25 conflicts, worker
+kills 4 to 3 inferred and 1 to 0 stale-owner fences, cold restart 108 to
+104 turns).
 
 | Batch | Default | At 2 | Why it moves |
 |---|---|---|---|
-| `races::enqueue_racing_completion_across_seeds` | 42 conflicts | 31 | each send writes an inbox and a receipts page before its CAS, so `w`'s commit lands unraced more often |
-| `senders::lost_cas_response_across_seeds` | 45 conflicts | 40 | the same extra page writes per send; the 40/13/11 landing positions do not move |
-| `workers::worker_kills_across_seeds` | 3 inferred, 2 stale-owner fences | 4 inferred, 1 stale-owner fence | one run that raced a takeover into a fenced stale commit settles a lost answer by inference instead |
-| `workers::cold_restart_across_seeds` | 113 turns | 108 | `c`'s page writes and result-page reads release `c` ahead of `w-restarted` past the script, leaving more inputs to the drain |
+| `races::enqueue_racing_completion_across_seeds` | 42 conflicts | 31 | `r2` seals nothing; `r3` always seals a receipts page, and seals an inbox page too when `w` has not committed, each written before its CAS, so the script runs out sooner and `w`'s commit lands unraced more often |
+| `senders::lost_cas_response_across_seeds` | 28 conflicts | 25 | the page writes ahead of each send's CAS spend more of the script on calls that cannot conflict; the 44/11/9 landing positions do not move |
+| `workers::worker_kills_across_seeds` | 2 inferred, 0 stale-owner fences | 3 inferred, 0 stale-owner fences | the page reads and writes move which call a scripted release lands on, and one more run settles a lost answer by inference |
+| `workers::cold_restart_across_seeds` | 112 turns | 104 | `c`'s page writes and result-page reads release `c` ahead of `w-restarted` past the script, leaving more inputs to the drain |
 
-The single-seed reproductions in `workers.rs` (seeds 0x5eed0033, 9000272
-and 11000167) run at the default page size whatever the variable says,
+The single-seed reproductions in `workers.rs` (seeds 0x5eed00db, 20000471
+and 4000067) run at the default page size whatever the variable says,
 since each names an interleaving found there.
 
 | Schedule | Fixed test | Batch test and pinned total |

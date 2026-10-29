@@ -119,9 +119,10 @@ fn enqueue_racing_completion_across_seeds() {
 
 /// `w`'s HEAD conflicts summed over the batch.
 const ENQUEUE_RACE_CONFLICTS: u64 = 42;
-/// The same at [`SMALL_PAGE_ENTRIES`]: each send seals and writes an inbox
-/// page and a receipts page before its CAS, so the 60-step script runs out
-/// earlier in each run, and past it the scheduler releases the lowest
+/// The same at [`SMALL_PAGE_ENTRIES`]: `r2` seals nothing, while `r3`
+/// always seals a receipts page and seals an inbox page too when `w` has
+/// not committed yet, writing each before its CAS. Those writes spend the
+/// 60-step script sooner, and past it the scheduler releases the lowest
 /// actor, `w`, whose commit then lands unraced.
 const SMALL_PAGE_ENQUEUE_RACE_CONFLICTS: u64 = 31;
 

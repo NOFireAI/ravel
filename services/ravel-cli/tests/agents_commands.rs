@@ -51,10 +51,14 @@ impl Clock for FixedClock {
 }
 
 fn writer(backend: Arc<dyn ObjectStoreBackend>) -> AgentStore {
+    writer_with(backend, StoreLimits::default())
+}
+
+fn writer_with(backend: Arc<dyn ObjectStoreBackend>, limits: StoreLimits) -> AgentStore {
     AgentStore::new(
         backend,
         TENANT,
-        StoreLimits::default(),
+        limits,
         Arc::new(FixedClock),
         Arc::new(DerivedIds),
     )
@@ -87,7 +91,10 @@ struct Seeded {
 /// One agent with a completed turn (state version 1, three events), a second
 /// input whose turn is active, and one scheduled timer.
 async fn seed(backend: Arc<dyn ObjectStoreBackend>) -> Seeded {
-    let store = writer(backend);
+    seed_into(&writer(backend)).await
+}
+
+async fn seed_into(store: &AgentStore) -> Seeded {
     let created = store.create(kind(), key("a-1")).await.expect("create");
     let agent = created.agent;
     let incarnation = created.head.incarnation;
@@ -597,6 +604,64 @@ async fn operation_events_and_effects_print_the_wire_types() {
     let round: EffectsResponse =
         serde_json::from_str(&emitted(&effects, agents::render_effects)).expect("effects JSON");
     assert_eq!(round, effects);
+}
+
+fn gets(store: &AgentStore) -> u64 {
+    let c = store.counters();
+    c.resolve.get + c.build.get + c.store.get + c.publish.get
+}
+
+/// `events` and `list` read HEAD without its sealed pages: over a history
+/// written at two entries a page, an events page costs HEAD, the event
+/// pages it spans and one GET per payload, and a list entry costs HEAD
+/// alone, where the full read also loads every sealed page.
+#[tokio::test]
+async fn events_and_list_read_only_the_pages_they_print() {
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let mut limits = StoreLimits::default();
+    limits.kernel.max_page_entries = 2;
+    let seeded = seed_into(&writer_with(backend.clone(), limits)).await;
+    let reader = agents::reader(backend, TENANT);
+
+    let before = gets(&reader);
+    agents::inspect(&reader, seeded.agent)
+        .await
+        .expect("inspect");
+    let full = gets(&reader) - before;
+
+    let before = gets(&reader);
+    let page = agents::events(&reader, seeded.agent, None, 2)
+        .await
+        .expect("events");
+    assert_eq!(
+        page.events.iter().map(|e| e.event_seq).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    // HEAD, the sealed page holding 1 and 2, and two payloads.
+    assert_eq!(gets(&reader) - before, 4);
+
+    let before = gets(&reader);
+    let tail = agents::events(&reader, seeded.agent, Some("2"), 2)
+        .await
+        .expect("events after the sealed page");
+    assert_eq!(
+        tail.events.iter().map(|e| e.event_seq).collect::<Vec<_>>(),
+        vec![3]
+    );
+    // HEAD and one payload: 3 is on the open page.
+    assert_eq!(gets(&reader) - before, 2);
+
+    let before = gets(&reader);
+    let listed = agents::list(&reader, &TENANT, None, 10)
+        .await
+        .expect("list");
+    assert_eq!(listed.agents.len(), 1);
+    assert_eq!(gets(&reader) - before, 1);
+
+    // The full read `inspect` keeps: HEAD, the one sealed page (events 1
+    // and 2) and the state object. A list entry read that way would cost
+    // two GETs, not one.
+    assert_eq!(full, 3);
 }
 
 #[tokio::test]

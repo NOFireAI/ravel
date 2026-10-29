@@ -735,11 +735,9 @@ const KILL_TOTALS: KillCounts = KillCounts {
 
 /// The same at [`SMALL_PAGE_ENTRIES`]. Crashes and lost-answer rule firings
 /// are unchanged; the page reads and writes move which call each scripted
-/// release lands on: one fewer run races a takeover into a fenced stale
-/// commit, and one more settles a lost answer by inference.
+/// release lands on, and one more run settles a lost answer by inference.
 const SMALL_PAGE_KILL_TOTALS: KillCounts = KillCounts {
-    inferred: 4,
-    stale_owner: 1,
+    inferred: 3,
     ..KILL_TOTALS
 };
 
@@ -896,7 +894,7 @@ const COLD_RESTART_TURNS: u64 = 112;
 /// pages and its result read loads a results page, so the 60-step script
 /// runs out sooner, and past it the scheduler releases the lowest actor,
 /// `c`, ahead of `w-restarted`, leaving more inputs to the drain.
-const SMALL_PAGE_COLD_RESTART_TURNS: u64 = 108;
+const SMALL_PAGE_COLD_RESTART_TURNS: u64 = 104;
 
 /// A worker completes op 1. Then every process restarts cold: a client on a
 /// new coordinator sends `r3` and reads `r1`, and a worker on another new

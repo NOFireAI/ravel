@@ -550,4 +550,4 @@ const LOST_ACK_CONFLICTS: u64 = 28;
 /// The same at [`SMALL_PAGE_ENTRIES`]. Where a's write lands is unchanged;
 /// the page writes ahead of each CAS spend more of the script on calls
 /// that cannot conflict, so fewer of a's retries meet a moved HEAD.
-const SMALL_PAGE_LOST_ACK_CONFLICTS: u64 = 40;
+const SMALL_PAGE_LOST_ACK_CONFLICTS: u64 = 25;

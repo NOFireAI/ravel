@@ -150,7 +150,7 @@ impl Coordinator {
 
     /// Attach the pages [`dispatch_needs`] names to every loaded root that
     /// lacks one. A root an operation returned holds only the pages its
-    /// command read, and one found by a directory scan or a sweep holds
+    /// command read, and one a sweep loaded holds
     /// none; each costs one page GET here, once, until it is replaced. A
     /// root whose page cannot be read is left as it is and is not offered
     /// ([`Coordinator::candidates`]), so one agent cannot fail every poll.
