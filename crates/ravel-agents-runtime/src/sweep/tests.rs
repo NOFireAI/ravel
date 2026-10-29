@@ -852,7 +852,8 @@ async fn send_until_refused(co: &crate::Coordinator, key: &str) -> AgentError {
 /// that cap only.
 #[tokio::test(start_paused = true)]
 async fn each_cap_refusal_moves_its_counter_by_exactly_one() {
-    let cases: [(BudgetCap, fn(&mut Limits)); 5] = [
+    type Shape = fn(&mut Limits);
+    let cases: [(BudgetCap, Shape); 5] = [
         (BudgetCap::Mailbox, |l| l.max_mailbox_depth = 2),
         (BudgetCap::Receipts, |l| l.max_receipts = 3),
         (BudgetCap::Timers, |l| l.max_timers = 1),
