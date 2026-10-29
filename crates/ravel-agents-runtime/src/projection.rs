@@ -301,7 +301,8 @@ pub struct ProjectionMetricsSnapshot {
     pub lag_max: u64,
     /// Records read and not yet delivered.
     pub backlog: u64,
-    /// The backlog bound.
+    /// The backlog bound, a per-tenant setting: merged snapshots keep the
+    /// maximum, not the sum.
     pub backlog_bound: u64,
     /// Log records delivered, retries of a failed batch counted once.
     pub events_projected: u64,
@@ -320,12 +321,13 @@ pub struct ProjectionMetricsSnapshot {
 }
 
 impl ProjectionMetricsSnapshot {
-    /// Fold two tenants' snapshots: counters add, lag keeps the maximum.
+    /// Fold two tenants' snapshots: counters and the backlog add, lag and the
+    /// backlog bound keep the maximum.
     pub fn merge(self, other: ProjectionMetricsSnapshot) -> ProjectionMetricsSnapshot {
         ProjectionMetricsSnapshot {
             lag_max: self.lag_max.max(other.lag_max),
             backlog: self.backlog.saturating_add(other.backlog),
-            backlog_bound: self.backlog_bound.saturating_add(other.backlog_bound),
+            backlog_bound: self.backlog_bound.max(other.backlog_bound),
             records_rejected: self.records_rejected.saturating_add(other.records_rejected),
             events_projected: self.events_projected.saturating_add(other.events_projected),
             spans_projected: self.spans_projected.saturating_add(other.spans_projected),
@@ -1072,6 +1074,32 @@ mod tests {
         // same two under the same ids, then the new event.
         assert_eq!(ids, [first.clone(), first, vec![third]].concat());
         assert_eq!(restarted.projector.metrics().lag_max, 0);
+    }
+
+    #[test]
+    fn merged_snapshots_add_counters_and_keep_the_largest_lag_and_bound() {
+        let one = ProjectionMetricsSnapshot {
+            lag_max: 3,
+            backlog: 2,
+            backlog_bound: 8,
+            events_projected: 5,
+            sink_failures: 1,
+            ..ProjectionMetricsSnapshot::default()
+        };
+        let other = ProjectionMetricsSnapshot {
+            lag_max: 1,
+            backlog: 4,
+            backlog_bound: 8,
+            events_projected: 2,
+            sink_failures: 2,
+            ..ProjectionMetricsSnapshot::default()
+        };
+        let merged = one.merge(other);
+        assert_eq!(
+            (merged.lag_max, merged.backlog, merged.backlog_bound),
+            (3, 6, 8)
+        );
+        assert_eq!((merged.events_projected, merged.sink_failures), (7, 3));
     }
 
     /// A pass over an agent whose history is already projected reads HEAD

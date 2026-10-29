@@ -193,7 +193,8 @@ struct HealthBody {
 /// start. `records_rejected` counts records the receiving ingest refused for
 /// good and the projector skipped. `last_sink_error` is the last transient
 /// delivery failure, retried; `last_rejection` names the last skipped record
-/// and why. No `/metrics` family carries these yet.
+/// and why. The counters and gauges are also the
+/// `ravel_agents_projection_*` `/metrics` family.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProjectionBody {
     mode: &'static str,
@@ -202,8 +203,10 @@ struct ProjectionBody {
     lag_max: u64,
     backlog: u64,
     events_projected: u64,
+    spans_projected: u64,
     sink_failures: u64,
     backlog_full: u64,
+    read_failures: u64,
     records_rejected: u64,
     last_sink_error: Option<String>,
     last_rejection: Option<String>,
@@ -245,8 +248,10 @@ impl HealthBody {
                 lag_max: projection.lag_max,
                 backlog: projection.backlog,
                 events_projected: projection.events_projected,
+                spans_projected: projection.spans_projected,
                 sink_failures: projection.sink_failures,
                 backlog_full: projection.backlog_full,
+                read_failures: projection.read_failures,
                 records_rejected: projection.records_rejected,
                 last_sink_error: errors.last_sink_error,
                 last_rejection: errors.last_rejection,
@@ -737,8 +742,10 @@ mod tests {
                     "lag_max": 0,
                     "backlog": 0,
                     "events_projected": 0,
+                    "spans_projected": 0,
                     "sink_failures": 0,
                     "backlog_full": 0,
+                    "read_failures": 0,
                     "records_rejected": 0,
                     "last_sink_error": null,
                     "last_rejection": null,

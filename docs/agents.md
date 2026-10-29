@@ -710,8 +710,10 @@ commit waits on it
 Lag is reported on `GET /api/v1/agents/health` under `projection`:
 `lag_max` is the largest committed-minus-projected event count over the
 agents this process has seen, beside `backlog`, `backlog_bound`,
-`events_projected`, `sink_failures` and `backlog_full`. No `/metrics` family
-carries these yet. Limits of this version: a record's timestamp is the
+`events_projected`, `spans_projected`, `sink_failures`, `backlog_full`,
+`read_failures` and `records_rejected`, and on `/metrics` as the
+`ravel_agents_projection_*` family (`docs/guides/observability.md`;
+`projection_metrics_scrape_matches_health_after_an_outage`). Limits of this version: a record's timestamp is the
 projecting process's clock when it read the event, since an event entry
 records no time; a span's end is the result's finish time; and a record
 carries no state or handler version.
