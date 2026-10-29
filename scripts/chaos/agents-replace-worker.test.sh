@@ -128,11 +128,11 @@ case_run "a second commit after the restart fails on the turn count" 1 \
   TURNS_COMMITTED_AFTER_RESTART=2)"
 
 case_run "a takeover before the lease and grace lapse from the grant fails" 1 \
-  "RECOVERY_FROM_GRANT_MS=39999, expected within [40000, 60000]" -- --dry-run \
-  "$(variant early RECOVERY_FROM_GRANT_MS=39999)"
+  "RECOVERY_FROM_GRANT_MS=38999, expected within [39000, 60000]" -- --dry-run \
+  "$(variant early RECOVERY_FROM_GRANT_MS=38999)"
 
 case_run "a takeover after the band fails" 1 \
-  "RECOVERY_FROM_GRANT_MS=60001, expected within [40000, 60000]" -- --dry-run \
+  "RECOVERY_FROM_GRANT_MS=60001, expected within [39000, 60000]" -- --dry-run \
   "$(variant late RECOVERY_FROM_GRANT_MS=60001)"
 
 case_run "a missing takeover figure fails" 1 "RECOVERY_FROM_GRANT_MS printed 0 times" -- \

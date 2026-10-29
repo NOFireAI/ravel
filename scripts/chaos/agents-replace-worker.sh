@@ -77,8 +77,10 @@ INPUT_HASH="5892e7a2b7b5a3aa11b9984ec594f8eb935e25f2f1a69ce17c2387d2bb1c74f0"
 # (A_ASSIGNED_MS, taken when A's poll returns), not from the kill. B
 # long-polls for 20 s and takes the turn over on the first poll that scans
 # after the grace lapses, so RECOVERY_FROM_GRANT_MS has the lease and grace
-# as its floor and one long poll above it as its ceiling.
-RECOVERY_FROM_GRANT_MS_MIN=40000
+# as its floor and one long poll above it as its ceiling. A_ASSIGNED_MS is
+# read after the server granted the lease, so a takeover right at the 40 s
+# point can measure slightly under it; the floor allows 1 s for that read.
+RECOVERY_FROM_GRANT_MS_MIN=39000
 RECOVERY_FROM_GRANT_MS_MAX=60000
 # A must die while its lease is live, so that B's takeover follows a dead
 # owner rather than racing a live one whose lease simply ran out. 10 s is a
