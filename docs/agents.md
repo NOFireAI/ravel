@@ -549,3 +549,49 @@ routes of a running server.
 | Projection of history into logs and traces | M5 | ADR-3331 decision 12 |
 | Bounded paged indexes (format version 2) | M6 | ADR-3331 decision 3 |
 | Live garbage collection of agent objects | out of scope for this release | ADR-3331 decision 2 |
+
+## Testing against a real store
+
+Two checks run the agents store on the compose RustFS
+(`deploy/docker-compose/rustfs.yml`) instead of `MemoryStore`, and k8s-nightly's
+`agents-chaos` job runs both every night (ADR-3331 decision 13). To run them
+locally, start the store with
+`docker compose -f deploy/docker-compose/rustfs.yml up -d rustfs` and create
+the bucket with
+`AWS_ACCESS_KEY_ID=ravel AWS_SECRET_ACCESS_KEY=ravel-dev-secret AWS_DEFAULT_REGION=us-east-1 scripts/ci-create-bucket.sh http://127.0.0.1:9000 ravel-chaos`,
+which gives `ravel-chaos` the Object Lock, versioning and lifecycle settings
+the nightly job's bucket carries.
+
+`RAVEL_REAL_STORE_URL=http://127.0.0.1:9000 cargo test -p ravel-server --features agents --test agents_real_store -- --nocapture`
+runs `services/ravel-server/tests/agents_real_store.rs`; without the
+variable, each of its two tests prints a `skipping agents real-store` line and
+passes. `cas_version_on_absent_key_matches_memory_oracle_on_rustfs` runs the
+HEAD publish's five conditional writes (a `CasVersion` on an absent key, a
+`CreateIfAbsent` on it, a matching and a stale `CasVersion`, and a
+`CreateIfAbsent` on the present key) on RustFS and on `MemoryStore` and
+asserts both give `[PreconditionFailed, Ok, Ok, PreconditionFailed,
+AlreadyExists]`. `create_if_absent_collision_matches_memory_oracle` races two
+`CreateIfAbsent` puts of different bytes on one key, at 64 bytes and at one
+byte over the multipart threshold, and asserts on both stores that one writer
+wins, the loser gets `AlreadyExists`, and the key holds the winner's bytes
+unmixed.
+
+`scripts/chaos/agents-replace-worker.sh` starts `ravel-server --agents`
+(`CHAOS_AGENTS_SERVER_BIN`, built with `--features agents`) against the same
+store and prints every figure it asserts as `KEY=VALUE`; with the store
+already running, `rustfs_up` reuses it and empties the bucket. Its
+replace-worker scenario SIGKILLs worker A inside an `at_least_once` step and
+asserts that a resend under the same request id returns the same operation
+with `OP1_RETRIED_DUPLICATE=true`, that worker B takes the same turn and
+effect over with `B_STEP_ATTEMPT=2`, and that `RECOVERY_MS`, from the kill to
+B's assignment, lies within [35000, 60000] (the 30 s lease plus 10 s grace,
+plus one 20 s long poll). Its restart-server scenario SIGKILLs and restarts
+the server with worker C's turn in flight and asserts
+`OP2_STATUS_AFTER_RESTART=running`, that C commits under its original lease
+with `TAKEOVERS_AFTER_RESTART=0` and `TURNS_COMMITTED_AFTER_RESTART=1`, and
+that the state version moves from `STATE_VERSION_BEFORE_RESTART=1` to
+`STATE_VERSION_AFTER_RESTART=2`, so the result is written once.
+`scripts/chaos/agents-replace-worker.test.sh` runs those assertions on canned
+figures with no store, including a resend that mints a new operation and a
+restart that duplicates the result, both of which must fail; ci.yml's
+doc-scripts job runs it on every pull request.
