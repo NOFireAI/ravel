@@ -261,8 +261,12 @@ services:
           cpus: "1.0"
           memory: 2g
 
+  # The AWS CLI comes from Docker Hub, not ECR Public as in deploy/README.md:
+  # ECR Public refuses anonymous pulls from GitHub's runners with "Data limit
+  # exceeded", and this stack already depends on Docker Hub for Prometheus,
+  # VictoriaMetrics and Mimir. The digest is the one ECR Public serves.
   createbuckets:
-    image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    image: amazon/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
     depends_on: [s3s]
     environment:
       AWS_ACCESS_KEY_ID: mimir

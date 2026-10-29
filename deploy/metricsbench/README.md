@@ -752,8 +752,12 @@ named tag's own registry. The recipe differs by registry, so the two below
 are not interchangeable: substituting a ghcr.io repo path into the Docker
 Hub URL (or vice versa) resolves nothing.
 
-**`prom/prometheus`, `victoriametrics/victoria-metrics`, and `grafana/mimir`**
-are still on Docker Hub and resolve with the Docker Hub registry v2 API:
+**`prom/prometheus`, `victoriametrics/victoria-metrics`, `grafana/mimir`, and
+`amazon/aws-cli`** are on Docker Hub and resolve with the Docker Hub registry
+v2 API. The AWS CLI moved here from ECR Public because ECR Public refused the
+nightly's anonymous pull with `Data limit exceeded` (run 40793034340, both
+attempts); `amazon/aws-cli:2.37.2` resolves to the same digest ECR Public
+served:
 
 ```sh
 curl -sI -H "Authorization: Bearer $TOKEN" \
@@ -762,27 +766,24 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
   | grep -i docker-content-digest
 ```
 
-**`public.ecr.aws/aws-cli/aws-cli`**, and the quickstart's
-`ghcr.io/rustfs/rustfs` that the example below resolves (see deploy/README.md
-for why the object store and its client live off Docker Hub), each issue a
-bearer token from their own auth endpoint rather than accepting
-one minted for Docker Hub, so the recipe is the same shape with a different
-token URL per registry.
+An image on another registry, such as the quickstart's `ghcr.io/rustfs/rustfs`
+that the example below resolves (see deploy/README.md for why the quickstart's
+object store lives off Docker Hub), issues a bearer token from its own auth
+endpoint rather than accepting one minted for Docker Hub, so the recipe is the
+same shape with a different token URL per registry.
 
 This is written as two curl steps rather than a one-liner so the token is
 carried over by hand instead of captured into a shell variable.
 
 ```sh
 # 1. Get a bearer token scoped to the repo, and read the token field out
-#    of the JSON it prints. For the AWS CLI image the token URL is
-#    https://public.ecr.aws/token/?service=public.ecr.aws&scope=repository:aws-cli/aws-cli:pull
+#    of the JSON it prints.
 curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:rustfs/rustfs:pull" \
   | jq -r .token
 
 # 2. HEAD the manifest list, pasting that token in place of <TOKEN> below.
 #    RustFS publishes an OCI image index, so the Accept header names that
-#    media type; the AWS CLI image publishes a Docker manifest list and takes
-#    application/vnd.docker.distribution.manifest.list.v2+json instead.
+#    media type.
 curl -sI -H "Authorization: Bearer <TOKEN>" \
   -H "Accept: application/vnd.oci.image.index.v1+json" \
   https://ghcr.io/v2/rustfs/rustfs/manifests/1.0.0 \
@@ -801,7 +802,7 @@ resolved separately: it is the digest the root `Dockerfile` and
 | `victoriametrics/victoria-metrics` | `v1.115.0` | `sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb` |
 | `grafana/mimir` | `3.2.3` | `sha256:0ed56db7d7713707eff00224ddd4c3096afa6cf1cbe43a6f9391c537f1416099` |
 | `gcr.io/distroless/cc-debian12` | `nonroot` | `sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f` |
-| `public.ecr.aws/aws-cli/aws-cli` | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
+| `amazon/aws-cli` | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
 
 The tag is kept in each `image:` reference alongside the digest for human
 readability; the digest is what pins the run.
