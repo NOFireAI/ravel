@@ -176,9 +176,19 @@ fn ids_for(agent: &AgentId) -> SafeIds {
     }
 }
 
-/// HEAD of a live agent, refused the way the server's routes refuse it.
+/// HEAD of a live agent with every sealed page attached, refused the way the
+/// server's routes refuse it.
 async fn live_head(store: &AgentStore, agent: &AgentId) -> Result<Head, AgentsCliError> {
-    match store.read_head(agent).await? {
+    live(agent, store.read_head_full(agent).await?)
+}
+
+/// [`live_head`] in one GET, sealed pages not attached.
+async fn live_root(store: &AgentStore, agent: &AgentId) -> Result<Head, AgentsCliError> {
+    live(agent, store.read_head_shallow(agent).await?)
+}
+
+fn live(agent: &AgentId, state: HeadState) -> Result<Head, AgentsCliError> {
+    match state {
         HeadState::Present { head, .. } if head.lifecycle != Lifecycle::Tombstoned => Ok(*head),
         HeadState::Present { .. } | HeadState::Absent => {
             Err(
@@ -380,7 +390,7 @@ pub async fn operation(
             "operation is not known to this agent",
         )
     };
-    let head = match store.read_head(&handle.agent).await? {
+    let head = match store.read_head_full(&handle.agent).await? {
         HeadState::Present { head, .. } if head.lifecycle != Lifecycle::Tombstoned => *head,
         HeadState::Present { .. } => return Err(gone().into()),
         HeadState::Absent => {
@@ -461,13 +471,11 @@ pub async fn events(
             .parse::<u64>()
             .map_err(|_| AgentsCliError::BadCursor(text.to_string()))?,
     };
-    let head = live_head(store, &agent).await?;
+    let head = live_root(store, &agent).await?;
     let mut page = Vec::new();
-    for event in head
-        .events
-        .iter()
-        .filter(|e| e.event_seq > after)
-        .take(limit as usize)
+    for event in store
+        .events_in(&agent, head, after, limit as usize, |_| true)
+        .await?
     {
         page.push(EventBody {
             event_seq: event.event_seq,
@@ -658,7 +666,7 @@ async fn list_entry(store: &AgentStore, agent: AgentId) -> Result<ListEntry, Age
         incarnation: None,
         state_version: None,
     };
-    match store.read_head(&agent).await? {
+    match store.read_head_shallow(&agent).await? {
         HeadState::Present { head, .. } => {
             entry.lifecycle = match head.lifecycle {
                 Lifecycle::Active => "active",

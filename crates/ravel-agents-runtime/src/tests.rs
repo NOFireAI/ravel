@@ -74,15 +74,42 @@ pub(crate) fn clock() -> Arc<TestClock> {
     Arc::new(TestClock(AtomicI64::new(T0)))
 }
 
+/// Variable naming the index page size every rig in this crate runs at,
+/// so the whole suite runs again over sealed pages
+/// (`RAVEL_AGENTS_PAGE_ENTRIES=2 cargo test -p ravel-agents-runtime`).
+pub(crate) const PAGE_ENTRIES_ENV: &str = "RAVEL_AGENTS_PAGE_ENTRIES";
+
+/// The store limits of every rig: the defaults, at the page size
+/// [`PAGE_ENTRIES_ENV`] names when it is set. A value that does not parse
+/// panics rather than running the default size unnoticed.
+pub(crate) fn limits() -> StoreLimits {
+    let mut limits = StoreLimits::default();
+    if let Ok(raw) = std::env::var(PAGE_ENTRIES_ENV) {
+        limits.kernel.max_page_entries = raw
+            .trim()
+            .parse::<usize>()
+            .unwrap_or_else(|e| panic!("{PAGE_ENTRIES_ENV}={raw:?}: {e}"));
+    }
+    limits
+}
+
 pub(crate) fn store_over(
     backend: Arc<dyn ObjectStoreBackend>,
     clock: &Arc<TestClock>,
+) -> Arc<AgentStore> {
+    store_with(backend, clock, limits())
+}
+
+pub(crate) fn store_with(
+    backend: Arc<dyn ObjectStoreBackend>,
+    clock: &Arc<TestClock>,
+    limits: StoreLimits,
 ) -> Arc<AgentStore> {
     Arc::new(
         AgentStore::new(
             backend,
             TenantHash([7; 16]),
-            StoreLimits::default(),
+            limits,
             clock.clone(),
             Arc::new(DerivedIds),
         )
@@ -228,7 +255,7 @@ pub(crate) async fn send(
 }
 
 pub(crate) async fn head(store: &AgentStore, key: &str) -> Head {
-    match store.read_head(&id_of(key)).await.expect("read head") {
+    match store.read_head_full(&id_of(key)).await.expect("read head") {
         HeadState::Present { head, .. } => *head,
         other => panic!("no head: {other:?}"),
     }
@@ -402,9 +429,20 @@ async fn completion_racing_an_enqueue_rebases_and_keeps_the_new_input() {
 
 #[tokio::test(start_paused = true)]
 async fn cold_restart_resumes_the_active_turn_from_head_alone() {
+    cold_restart_resumes_at(limits()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_restart_resumes_the_active_turn_at_two_entries_a_page() {
+    let mut small = limits();
+    small.kernel.max_page_entries = 2;
+    cold_restart_resumes_at(small).await;
+}
+
+async fn cold_restart_resumes_at(limits: StoreLimits) {
     let clock = clock();
     let backend = Arc::new(MemoryStore::new());
-    let store1 = store_over(backend.clone(), &clock);
+    let store1 = store_with(backend.clone(), &clock, limits);
     let co1 = coordinator(&store1, &clock, 100);
     create(&co1, "o-1").await;
     for i in 1..=3 {
@@ -418,10 +456,16 @@ async fn cold_restart_resumes_the_active_turn_from_head_alone() {
         .expect("commit 1");
     let active = poll_now(&co1, &w1, "v1").await.expect("second");
     assert_eq!(active.accept_seq, 2);
+    let before = head(&store1, "o-1").await;
+    assert_eq!(
+        before.index.inbox.page_for(active.accept_seq).is_some(),
+        limits.kernel.max_page_entries <= 2,
+        "the active input sits on a sealed page exactly when pages hold two entries"
+    );
     drop(co1);
     drop(store1);
 
-    let store2 = store_over(backend, &clock);
+    let store2 = store_with(backend, &clock, limits);
     let co2 = coordinator(&store2, &clock, 200);
     assert_eq!(co2.metrics().agents_loaded, 0);
     clock.advance_ms(past_lease_and_grace());
@@ -457,6 +501,45 @@ async fn cold_restart_resumes_the_active_turn_from_head_alone() {
         ]
     );
     assert_eq!(after.state_version, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_takeover_resumes_a_turn_whose_input_is_on_a_sealed_inbox_page() {
+    let clock = clock();
+    let backend = Arc::new(MemoryStore::new());
+    let mut small = limits();
+    small.kernel.max_page_entries = 2;
+    let store1 = store_with(backend.clone(), &clock, small);
+    let co1 = coordinator(&store1, &clock, 100);
+    create(&co1, "o-1").await;
+    for i in 1..=7 {
+        send(&co1, "o-1", &format!("r-{i}"), json!({"i": i})).await;
+    }
+    let w1 = worker(&co1, "v1");
+    let active = poll_now(&co1, &w1, "v1").await.expect("first");
+    assert_eq!(active.accept_seq, 1);
+    let sealed = head(&store1, "o-1").await;
+    assert!(
+        sealed.index.inbox.page_for(active.accept_seq).is_some(),
+        "the active input sits on a sealed page"
+    );
+    drop(co1);
+    drop(store1);
+
+    let store2 = store_with(backend, &clock, small);
+    let co2 = coordinator(&store2, &clock, 200);
+    clock.advance_ms(past_lease_and_grace());
+    let w2 = worker(&co2, "v1");
+    let resumed = poll_now(&co2, &w2, "v1").await.expect("resumed");
+    assert_eq!(resumed.lease.turn_id, active.lease.turn_id);
+    assert_eq!(resumed.accept_seq, active.accept_seq);
+    assert_eq!(resumed.payload, json!({"i": 1}));
+    assert_eq!(co2.metrics().takeovers, 1);
+    co2.commit(&completed(&resumed.lease, json!({"done": 1})))
+        .await
+        .expect("commit");
+    let next = poll_now(&co2, &w2, "v1").await.expect("next");
+    assert_eq!(next.accept_seq, 2);
 }
 
 #[tokio::test(start_paused = true)]

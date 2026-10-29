@@ -22,7 +22,7 @@ clock wait.
 line of the form
 
 ```text
-sim-batch <schedule> base=<first seed> seeds=<count> totals=<...> pinned=<...> match|unpinned
+sim-batch <schedule> base=<first seed> seeds=<count> pages=<max page entries> totals=<...> pinned=<...> match|unpinned
 ```
 
 It exits 1 when the tests fail or a schedule's line is missing, doubled or
@@ -44,6 +44,33 @@ batch it then asserts exact totals, so a scheduler or production change that
 moves any total fails it; any other batch prints its totals as `unpinned`
 and is checked per seed only
 (`schedules::tests::a_batch_line_names_its_verdict`).
+
+`RAVEL_AGENTS_PAGE_ENTRIES` sets the store's `max_page_entries` for every
+rig (`drive::sim_limits`; default 64, the production default). At 2 every
+paged list seals after two entries, so the batches exercise sealed inbox,
+receipts, results and timers pages and `Rig::head` loads them before a
+check. The pins in the table below are for the default page size; at 2 each
+batch asserts its own pin set (`schedules::pinned_by_page`), and any other
+size prints `unpinned`. Every page GET and PUT is a scheduler gate, so a
+smaller page moves where the seeded script runs out, and past it the
+scheduler releases the lowest actor first. Four totals move at 2 for that
+reason, no invariant changes. The last three were re-measured at both page
+sizes after the worker poll stopped listing the tenant (issue #3353, see
+below): that change moved the default pins, and the same fewer store calls
+per poll moved the pins at 2 (lost CAS response 40 to 25 conflicts, worker
+kills 4 to 3 inferred and 1 to 0 stale-owner fences, cold restart 108 to
+104 turns).
+
+| Batch | Default | At 2 | Why it moves |
+|---|---|---|---|
+| `races::enqueue_racing_completion_across_seeds` | 42 conflicts | 31 | `r2` seals nothing; `r3` always seals a receipts page, and seals an inbox page too when `w` has not committed, each written before its CAS, so the script runs out sooner and `w`'s commit lands unraced more often |
+| `senders::lost_cas_response_across_seeds` | 28 conflicts | 25 | the page writes ahead of each send's CAS spend more of the script on calls that cannot conflict; the 44/11/9 landing positions do not move |
+| `workers::worker_kills_across_seeds` | 2 inferred, 0 stale-owner fences | 3 inferred, 0 stale-owner fences | the page reads and writes move which call a scripted release lands on, and one more run settles a lost answer by inference |
+| `workers::cold_restart_across_seeds` | 112 turns | 104 | `c`'s page writes and result-page reads release `c` ahead of `w-restarted` past the script, leaving more inputs to the drain |
+
+The single-seed reproductions in `workers.rs` (seeds 0x5eed00db, 20000471
+and 4000067) run at the default page size whatever the variable says,
+since each names an interleaving found there.
 
 | Schedule | Fixed test | Batch test and pinned total |
 |---|---|---|

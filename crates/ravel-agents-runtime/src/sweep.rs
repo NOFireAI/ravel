@@ -451,11 +451,14 @@ impl Coordinator {
         }
     }
 
-    /// Read HEAD once, fire what it holds as due and offer its work.
+    /// Read HEAD once, fire what it holds as due and offer its work. The
+    /// read attaches no sealed page, so it is the one GET the budget
+    /// charges: scheduled timers are never sealed and HEAD alone says
+    /// whether the inbox holds an input (`ravel_agents_core::pages`).
     async fn visit(&self, pass: &mut Pass, agent: &AgentId) {
         pass.gets_left = pass.gets_left.saturating_sub(1);
         pass.report.head_gets += 1;
-        let seen = match self.store.read_head(agent).await {
+        let seen = match self.store.read_head_shallow(agent).await {
             Ok(HeadState::Present { head, .. }) => {
                 let fired = self.fire_due(agent, *head, pass.now).await;
                 pass.report.timers_fired += fired.fired;
@@ -501,7 +504,7 @@ impl Coordinator {
             self.observe(agent, head);
             return;
         }
-        if head.active_turn.is_some() || !head.inbox.is_empty() {
+        if head.active_turn.is_some() || head.has_inbox() {
             self.observe(agent, head);
             pass.report.agents_loaded += 1;
             self.wake.notify_waiters();

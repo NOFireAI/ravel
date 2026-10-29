@@ -108,16 +108,23 @@ fn enqueue_racing_completion_across_seeds() {
         conflicts += enqueue_race(seed, seeded(seed, 2, 60, 0), false);
         runs += 1;
     }
-    pinned(
+    pinned_by_page(
         "enqueue_racing_completion",
         runs,
         conflicts,
-        ENQUEUE_RACE_CONFLICTS,
+        &ENQUEUE_RACE_CONFLICTS,
+        &SMALL_PAGE_ENQUEUE_RACE_CONFLICTS,
     );
 }
 
 /// `w`'s HEAD conflicts summed over the batch.
 const ENQUEUE_RACE_CONFLICTS: u64 = 42;
+/// The same at [`SMALL_PAGE_ENTRIES`]: `r2` seals nothing, while `r3`
+/// always seals a receipts page and seals an inbox page too when `w` has
+/// not committed yet, writing each before its CAS. Those writes spend the
+/// 60-step script sooner, and past it the scheduler releases the lowest
+/// actor, `w`, whose commit then lands unraced.
+const SMALL_PAGE_ENQUEUE_RACE_CONFLICTS: u64 = 31;
 
 /// Which side of the cancel race won.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

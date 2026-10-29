@@ -5,8 +5,9 @@
 //! issued it, when it is issued, whatever it returns:
 //!
 //! - `resolve`: GETs of HEAD (the first read, every re-read after a conflict
-//!   or a retryable read failure, `read_head`, `resolve`) and the LIST of
-//!   `list_agents`.
+//!   or a retryable read failure, `read_head_shallow`, `read_head_full`,
+//!   `resolve`), GETs of sealed index pages (`attach` and every bounded
+//!   read), and the LIST of `list_agents`.
 //! - `build`: the kernel transition and the dependency plan. It issues no
 //!   store call, so its request figures stay zero; it is a phase so a
 //!   snapshot shows that explicitly.
@@ -27,6 +28,11 @@
 //! on a HEAD CAS and `AlreadyExists` on a HEAD create (publish phase), and
 //! `AlreadyExists` on a dependency PUT (store phase, the normal idempotent
 //! path for an object some earlier attempt already wrote).
+//!
+//! `planner_misses` counts commands whose transition found an index page
+//! missing after the pages `Kernel::pages_needed` named were loaded, so the
+//! store loaded every sealed page and applied the command again
+//! (`crate::publish`). Its page GETs count under `resolve` like any other.
 //!
 //! Byte figures count object bodies as handed to and returned by
 //! [`ravel_object_store::ObjectStoreBackend`], not wire bytes: `bytes_out` is
@@ -88,6 +94,7 @@ pub struct Counters {
     store: PhaseCounters,
     publish: PhaseCounters,
     deletes: AtomicU64,
+    planner_misses: AtomicU64,
 }
 
 impl Counters {
@@ -120,6 +127,10 @@ impl Counters {
         self.deletes.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn planner_miss(&self) {
+        self.planner_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn conflict(&self, phase: Phase) {
         self.phase(phase).conflict.fetch_add(1, Ordering::Relaxed);
     }
@@ -142,6 +153,7 @@ impl Counters {
             build: self.build.snapshot(),
             store: self.store.snapshot(),
             publish: self.publish.snapshot(),
+            planner_misses: self.planner_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -184,6 +196,9 @@ pub struct CounterSnapshot {
     pub build: PhaseCounts,
     pub store: PhaseCounts,
     pub publish: PhaseCounts,
+    /// Commands re-applied after loading every sealed page, because the
+    /// pages `Kernel::pages_needed` named were not enough.
+    pub planner_misses: u64,
 }
 
 impl CounterSnapshot {
@@ -203,6 +218,7 @@ impl CounterSnapshot {
             build: self.build.since(&earlier.build),
             store: self.store.since(&earlier.store),
             publish: self.publish.since(&earlier.publish),
+            planner_misses: self.planner_misses.saturating_sub(earlier.planner_misses),
         }
     }
 
