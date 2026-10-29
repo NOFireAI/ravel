@@ -48,6 +48,29 @@ returns the spans in view and does not build the span tree or report missing
 parents or orphans. `include_logs: true` and an `evidence_ref` are refused
 with `unsupported`.
 
+### Ravel Agents tools
+
+Six more tools join `tools/list`, after the nine above, only when the server
+is built with both the `mcp` and `agents` features and run with both `--mcp`
+and `--agents`. In every other build or run `tools/list` is the nine-tool
+catalog, byte for byte. Each call runs in process through the agents client
+route it names, with the MCP request's own headers, so the route's resolver
+and its `agents` capability check decide it: a principal without the
+capability gets `unauthorized`. Every one of them is served.
+
+| Tool | Purpose | Inputs | Agents route | Bounds | Failure classes |
+| --- | --- | --- | --- | --- | --- |
+| `ravel_agent_describe` | One row: agent id, incarnation, state version, content type, state size in bytes, active turn and mailbox depth, without the state itself | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
+| `ravel_agent_send` | Accept one input into an agent's inbox; the only tool that writes. `readOnlyHint: false`, `idempotentHint: true` | `kind`, `key`, `handler`, `payload` (any JSON), `idempotency_key` (required; sent as the request id) | `POST /api/v1/agents/send` | one row: `operation`, `accept_seq`, `duplicate`. A repeat with the same key answers the same operation with `duplicate: true` and accepts nothing new | `unauthorized`, `invalid_argument`, `unavailable`, `internal` (an `outcome_unknown` answer adds the `resend_with_the_same_key` next step) |
+| `ravel_agent_operation` | One operation's status, accept sequence and blocking effect | `operation` | `GET /api/v1/agents/operation` | one row | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
+| `ravel_agent_state` | The agent's state, active turn and mailbox | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor; the route bounds the state itself by `--agents-max-state-bytes` | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
+| `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `max_rows`, `max_response_bytes` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `unavailable`, `internal` |
+| `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
+
+The `tools/list` result is 15,700 bytes with the nine tools and 22,723
+bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
+figures exactly.
+
 ### Filtering a label list
 
 `ravel_find_labels` takes an optional `filter`, a case-sensitive substring
