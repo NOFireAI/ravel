@@ -123,8 +123,9 @@ The matrix describes `main`. Its "In published image" column means that the
 image built from `main` compiles the surface in. A surface that lands after
 the tag that the quickstart pins is not yet in the quickstart image. Every
 entry below that the published image compiles in is in the pinned `0.27.0`
-image, except the Agents API: the image adds it after `0.27.0`, so the
-quickstart image gains it with the next release. After the next feature lands,
+image, except the Agents API: the image adds it after `0.27.0`, and the
+quickstart image gains it only once the pin moves to a release whose
+`CHANGELOG.md` section lists it. After the next feature lands,
 `git log v0.27.0..main` tells you whether that is still true. `CHANGELOG.md`
 records the release that each surface first shipped in.
 

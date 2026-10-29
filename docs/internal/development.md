@@ -25,7 +25,8 @@ One capability difference to keep in mind: the published image is built with
 `--features sql,flight-sql,otap,agents`, so `POST /api/v1/sql` and Flight SQL
 work in the compose quickstart and `--otap` is accepted there. The image adds
 `agents` after `0.27.0`, the release the compose quickstart pins, so `--agents`
-is accepted in the quickstart only from the next release.
+is accepted in the quickstart only once the pin moves to a release whose
+`CHANGELOG.md` section lists agents.
 `make demo` builds the default feature set and enables none of the four, so
 those surfaces are
 unavailable on the from-source path. PromQL, ingest, and the rest are identical

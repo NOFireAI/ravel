@@ -806,11 +806,12 @@ image's `Dockerfile` then built `ravel-server` with
 `--features sql,flight-sql,otap` only. The 0.27.0 section of
 `CHANGELOG.md` carries no agents entry either. That basis ends with the
 image flip of decision 9: the `Dockerfile` now builds
-`--features sql,flight-sql,otap,agents`, so the first release after
-v0.27.0 ships the version 2 reader and writer together, and every later
-HEAD format change finds released builds in the field and follows
-ADR-0066's readers-first order. The sequence guarded against a version 1 writer re-encoding a version 2 HEAD
-and dropping its page references. A version 1 build refuses any HEAD whose
+`--features sql,flight-sql,otap,agents`, so the first release cut from
+a tree with that flip ships the version 2 reader and writer together, and
+every later HEAD format change finds released builds in the field and
+follows ADR-0066's readers-first order. The sequence guarded against a
+version 1 writer re-encoding a version 2 HEAD and dropping its page
+references. A version 1 build refuses any HEAD whose
 format version is above 1 as `UnsupportedFormat` before it decodes the
 rest, and so never re-encodes one
 (`head::tests::a_version_one_reader_refuses_a_version_two_head`, store test
