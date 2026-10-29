@@ -4519,6 +4519,7 @@ dependencies = [
  "ravel-test-support",
  "ravel-types",
  "serde_json",
+ "stats_alloc",
  "tokio",
 ]
 

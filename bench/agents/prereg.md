@@ -328,3 +328,112 @@ are per operation unless the metric says otherwise.
 | * | discovery-* | * | * | heap | peak_bytes | 33554432 | [0, 1073741824] | 10000 agents' HEADs read once; bound only |
 | * | * | * | * | heap | peak_bytes | 4194304 | [0, 268435456] | bound only |
 | * | * | * | * | * | * | 0 | [0, 0] | every figure not named above is zero: no LIST on a hot path, no DELETE, no page GET, no planner miss, no conflict without contention |
+
+## Revision 2026-10-29
+
+Written after the first small run, which failed 124 checks. The table above
+stays as written. A row below with the same selector as a row above restates
+it; the check counts the original as superseded, not as a row that decides
+nothing.
+
+Misses, in the order the method checks them:
+
+1. State. The harness sent the same payload body, `{"n":1}`, on every
+   message. Objects are content-addressed per agent
+   (`t/<tenant>/ag/<agent>/o/<hash>`), so every message after an agent's
+   first was answered AlreadyExists and paid a read-back GET instead of a
+   payload PUT. That is why hot showed a store PUT of 0.25 per message
+   instead of 1.75, and why many, dormant and index showed a store conflict
+   on half or more of their messages. The setup above assumes one new
+   payload per message, so the harness was wrong, not the bands: the
+   payload now carries the request id. Once that was fixed, every message
+   request count landed inside its original band, and the run failed 70
+   checks.
+2. Table. The original rows for hot and slow message latency, and the row
+   for storm activation latency, come after the generic rows that match the
+   same figures. Because the first matching row decides, they decided
+   nothing, and the generic bands judged those figures instead. Restated
+   below, where they come before anything that matches the same figures.
+   With the restated rows, the observed hot p99 of 170 ms and the slow
+   p50 and p99 values fall inside the original bands.
+3. Phase split, turn. The turn totals were off in resolve GETs, store GETs
+   and CASes. Measured separately, the poll and the commit split as
+   follows:
+   - Poll: one HEAD GET, the input-object GET, a GET of the previous state
+     object once the agent has completed a turn, and the `BeginTurn` CAS.
+   - Commit: one HEAD GET, the state and output PUTs, and one CAS.
+   - Takeover: when the polling worker is not the owner recorded in HEAD,
+     the poll first runs a takeover with reason `Activation`
+     (`Coordinator::dispatch_one`, then `take_over`). That costs one more
+     HEAD GET and one ownership CAS.
+
+   The prereg had the commit reading HEAD twice plus the input object, and
+   had no state read and no takeover. So a turn costs 2 resolve GETs and 2
+   CASes, plus 1 of each when the worker takes over the agent, and 1 store
+   GET, plus 1 once the agent has state. That takeover happens on every
+   cold turn, because each one runs on a new worker id. On a warm
+   coordinator it happens on each agent's first turn. This is the
+   runtime's ownership design (ADR-3331 decision 6), not a defect, so the
+   bands follow it.
+4. Phase split, storm. The takeover poll reads HEAD twice and the input
+   object once, and CASes once (50 ms). The prereg's "1 GET" came from
+   T22's per-takeover total of 4 GETs, which is split differently: the
+   poll does 2 HEAD GETs plus the input GET, and the commit 1 HEAD GET.
+   The turn total is unchanged, and the storm's turn rows passed as
+   written.
+5. Phase split, discovery. Assignment includes the same takeover as item
+   3: one more HEAD GET, the input-object GET, and a second CAS. The pass
+   counts, the LIST counts and the delays all landed on their predicted
+   values.
+6. Latency, index. The count bands already include sealed receipt and
+   result pages, but the latency bands left out the 20 ms PUT that a seal
+   adds on the critical path. The small run showed this at page size 2.
+   The full run, made after this revision was first written, showed it at
+   page size 64 too: 256 messages seal 4 pages, which is enough for p99 to
+   land on a sealing operation. The rows below cover both page sizes.
+
+| size | scenario | temp | op | phase | metric | expected | band | reasoning |
+|---|---|---|---|---|---|---|---|---|
+| * | hot | * | message | latency | p99_ms | 170 | [150, 180] | restates the original row; the second retry of the 3-way race |
+| * | hot | * | message | latency | max_ms | 170 | [150, 180] | restates the original row |
+| * | slow | * | message | latency | p50_ms | 1000 | [500, 4000] | restates the original row |
+| * | slow | * | message | latency | p99_ms | 2500 | [500, 8000] | restates the original row |
+| * | slow | * | message | latency | max_ms | 2500 | [500, 8000] | restates the original row |
+| * | storm | cold | activation | latency | * | 50 | [50, 50] | takeover poll: 2 HEAD GETs, the input GET, one CAS (item 4) |
+| * | storm | cold | activation | resolve | get | 2 | [2, 2] | item 4 |
+| * | storm | cold | activation | store | get | 1 | [1, 1] | the input object (item 4) |
+| * | index-* | * | message | latency | * | 60 | [50, 80] | a sealed receipt page adds a 20 ms PUT; 10 more when it loads (item 6) |
+| * | index-* | * | activation | latency | * | 70 | [60, 80] | as message (item 6) |
+| * | index-* | * | turn | latency | * | 140 | [100, 180] | a sealed result page adds a 20 ms PUT (item 6) |
+| * | hot | warm | turn | resolve | get | 2.125 | [2.015, 2.125] | 2 + one takeover over all turns: 1/8 small, 1/64 full (item 3) |
+| * | slow | warm | turn | resolve | get | 2.125 | [2.015, 2.125] | as hot |
+| * | hot | cold | turn | resolve | get | 2.25 | [2.25, 2.25] | 2 + a takeover each round of 4 turns (item 3) |
+| * | slow | cold | turn | resolve | get | 2.25 | [2.25, 2.25] | as hot |
+| * | many | warm | turn | resolve | get | 2.5 | [2.5, 2.5] | 2 + a takeover on each agent's first of 2 turns (item 3) |
+| * | dormant | warm | turn | resolve | get | 2.5 | [2.5, 2.5] | as many |
+| * | index-* | warm | turn | resolve | get | 2.083 | [2.003, 2.084] | 2 + 1/M, M = 12 or 256 (item 3) |
+| * | hot | warm | turn | publish | cas | 2.125 | [2.015, 2.125] | 2 + the takeover CAS, as resolve get (item 3) |
+| * | slow | warm | turn | publish | cas | 2.125 | [2.015, 2.125] | as hot |
+| * | hot | cold | turn | publish | cas | 2.25 | [2.25, 2.25] | as resolve get |
+| * | slow | cold | turn | publish | cas | 2.25 | [2.25, 2.25] | as hot |
+| * | many | warm | turn | publish | cas | 2.5 | [2.5, 2.5] | as resolve get |
+| * | dormant | warm | turn | publish | cas | 2.5 | [2.5, 2.5] | as resolve get |
+| * | index-* | warm | turn | publish | cas | 2.083 | [2.003, 2.084] | as resolve get |
+| * | storm | cold | turn | publish | cas | 2 | [2, 2] | the takeover poll's one CAS and the commit; no separate takeover CAS (item 4) |
+| * | * | cold | turn | publish | cas | 3 | [3, 3] | a takeover on every cold turn (item 3) |
+| * | hot | * | turn | store | get | 1.875 | [1.875, 1.985] | input, plus the previous state on all but the first turn: 15/8 small, 127/64 full (item 3) |
+| * | slow | * | turn | store | get | 1.875 | [1.875, 1.985] | as hot |
+| * | many | * | turn | store | get | 1.5 | [1.5, 1.5] | input, plus state on each agent's second turn (item 3) |
+| * | dormant | * | turn | store | get | 1.5 | [1.5, 1.5] | as many |
+| * | index-* | * | turn | store | get | 1.917 | [1.916, 1.997] | 23/12 small, 511/256 full (item 3) |
+| * | discovery-* | cold | assign | store | get | 1 | [1, 1] | the input object (item 5) |
+| * | discovery-* | cold | assign | publish | cas | 2 | [2, 2] | takeover and BeginTurn (item 5) |
+| * | discovery-n100-start | cold | assign | resolve | get | 66 | [66, 66] | 64 HEAD reads in pass 1, the takeover and the BeginTurn HEAD reads (item 5) |
+| * | discovery-n100-middle | cold | assign | resolve | get | 66 | [66, 66] | as start |
+| * | discovery-n100-end | cold | assign | resolve | get | 102 | [102, 102] | all 100 HEADs + 2 |
+| full | discovery-n1000-start | cold | assign | resolve | get | 66 | [66, 66] | 64 + 2 |
+| full | discovery-n1000-middle | cold | assign | resolve | get | 514 | [514, 514] | 8 * 64 + 2 |
+| full | discovery-n1000-end | cold | assign | resolve | get | 1002 | [1002, 1002] | 1000 + 2 |
+| full | discovery-n10000-start | cold | assign | resolve | get | 66 | [66, 66] | 64 + 2 |
+| full | discovery-n10000-middle | cold | assign | resolve | get | 5058 | [5058, 5058] | 79 * 64 + 2 |
+| full | discovery-n10000-end | cold | assign | resolve | get | 10002 | [10002, 10002] | 10000 + 2 |
