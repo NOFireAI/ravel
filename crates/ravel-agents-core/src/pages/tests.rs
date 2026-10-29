@@ -250,6 +250,128 @@ fn attach_refuses_bytes_that_are_not_the_recorded_page() {
     assert_eq!(shallow.inbox, head.inbox);
 }
 
+fn event(event_seq: u64, accept_seq: u64) -> EventEntry {
+    EventEntry {
+        event_seq,
+        accept_seq,
+        turn_id: Id128([accept_seq as u8; 16]),
+        event_type: "e".to_string(),
+        payload: None,
+    }
+}
+
+/// An events page records the lowest and highest `accept_seq` it holds, not
+/// its first one: an audit event that carries an older input widens the
+/// range downward. Pages of the other lists record none.
+#[test]
+fn an_events_page_records_the_accept_range_of_its_events() {
+    let mut head = sample_head();
+    head.index = Index::default();
+    // Page 1: operations 3 and 4. Page 2: operation 5, then an audit event
+    // for operation 2, then operation 6. The open page: operation 7.
+    head.events = [
+        (1, 3),
+        (2, 3),
+        (3, 4),
+        (4, 4),
+        (5, 5),
+        (6, 2),
+        (7, 6),
+        (8, 6),
+        (9, 7),
+    ]
+    .into_iter()
+    .map(|(seq, accept)| event(seq, accept))
+    .collect();
+    head.inbox = (1..=6).map(inbox_entry).collect();
+    seal_index(&mut head, bounds(4)).expect("seals");
+    let ranges: Vec<(u64, u64)> = head
+        .index
+        .events
+        .pages
+        .iter()
+        .map(|p| (p.min_accept_seq, p.max_accept_seq))
+        .collect();
+    assert_eq!(ranges, [(3, 4), (2, 6)]);
+    let holding = |seq: u64| -> Vec<usize> {
+        let pages = &head.index.events.pages;
+        (0..pages.len())
+            .filter(|&i| pages[i].may_hold_operation(seq))
+            .collect()
+    };
+    assert_eq!(holding(1), Vec::<usize>::new());
+    assert_eq!(holding(2), [1]);
+    assert_eq!(holding(3), [0, 1]);
+    assert_eq!(holding(7), Vec::<usize>::new());
+    assert_eq!(head.index.inbox.pages.len(), 1);
+    let inbox = &head.index.inbox.pages[0];
+    assert_eq!((inbox.min_accept_seq, inbox.max_accept_seq), (0, 0));
+    let decoded = Head::decode(&head.encode()).expect("decodes");
+    assert_eq!(decoded.index, head.index);
+}
+
+/// A page reference whose `accept_seq` range is inverted, or that records one
+/// on a list other than events, is refused on decode; and an events page
+/// whose entries do not span the recorded range is refused on attach.
+#[test]
+fn an_inverted_or_misplaced_accept_range_is_refused() {
+    let mut head = sample_head();
+    head.index = Index::default();
+    head.events = (1..=6).map(|seq| event(seq, seq + 10)).collect();
+    head.inbox = (1..=6).map(inbox_entry).collect();
+    seal_index(&mut head, bounds(4)).expect("seals");
+    let sealed = head.clone();
+    assert_eq!(
+        (
+            sealed.index.events.pages[0].min_accept_seq,
+            sealed.index.events.pages[0].max_accept_seq
+        ),
+        (11, 14)
+    );
+
+    let mut inverted = sealed.clone();
+    inverted.index.events.pages[0].min_accept_seq = 15;
+    assert_eq!(
+        Head::decode(&inverted.encode()),
+        Err(CodecError::Invalid {
+            field: "event_pages"
+        })
+    );
+    // min == max is a range of one operation, and decodes.
+    let mut single = sealed.clone();
+    single.index.events.pages[0].min_accept_seq = 14;
+    assert!(Head::decode(&single.encode()).is_ok());
+
+    let mut misplaced = sealed.clone();
+    misplaced.index.inbox.pages[0].max_accept_seq = 1;
+    assert_eq!(
+        Head::decode(&misplaced.encode()),
+        Err(CodecError::Invalid {
+            field: "inbox_pages"
+        })
+    );
+
+    // The page's bytes are the ones HEAD names, but its events span 11..=14,
+    // not the 12..=14 this HEAD records.
+    let page = sealed
+        .index
+        .written
+        .iter()
+        .find(|w| w.list == ListKind::Events)
+        .expect("an events page")
+        .clone();
+    let mut narrowed = Head::decode(&sealed.encode()).expect("decodes");
+    narrowed.index.events.pages[0].min_accept_seq = 12;
+    assert_eq!(
+        attach_page(&mut narrowed, ListKind::Events, 0, &page.bytes),
+        Err(CodecError::Invalid {
+            field: "page.accept_seq"
+        })
+    );
+    let mut shallow = Head::decode(&sealed.encode()).expect("decodes");
+    attach_page(&mut shallow, ListKind::Events, 0, &page.bytes).expect("attaches");
+}
+
 fn object_ref() -> impl Strategy<Value = ObjectRef> {
     (any::<[u8; 32]>(), any::<u64>()).prop_map(|(h, size_bytes)| ObjectRef {
         hash: ObjectHash(h),
@@ -257,24 +379,32 @@ fn object_ref() -> impl Strategy<Value = ObjectRef> {
     })
 }
 
-fn page_meta(first_key: u64) -> impl Strategy<Value = PageMeta> {
+/// A page reference of `list`: an events page carries an `accept_seq` range
+/// with `min <= max`, every other page none.
+fn page_meta(list: ListKind, first_key: u64) -> impl Strategy<Value = PageMeta> {
     (
         object_ref(),
         any::<u32>(),
         any::<u32>(),
-        any::<i64>(),
+        any::<(u64, u64)>(),
         any::<u64>(),
         vec(any::<u32>(), 0..6),
     )
         .prop_map(
-            move |(page, entries, marked, min_due_unix_ns, referenced_bytes, mut fps)| {
+            move |(page, entries, marked, (a, b), referenced_bytes, mut fps)| {
                 fps.sort_unstable();
+                let (min_accept_seq, max_accept_seq) = if list == ListKind::Events {
+                    (a.min(b), a.max(b))
+                } else {
+                    (0, 0)
+                };
                 PageMeta {
                     first_key,
                     page,
                     entries,
                     marked,
-                    min_due_unix_ns,
+                    min_accept_seq,
+                    max_accept_seq,
                     referenced_bytes,
                     fingerprints: fps,
                 }
@@ -282,10 +412,10 @@ fn page_meta(first_key: u64) -> impl Strategy<Value = PageMeta> {
         )
 }
 
-/// A paged directory: `first_key`s strictly ascending, `tail_from` above the
-/// last, or no page at all.
-fn directory() -> impl Strategy<Value = Directory> {
-    (any::<u32>(), vec(1u64..1_000, 0..4), 1u64..1_000).prop_flat_map(|(start, gaps, tail)| {
+/// A paged directory of `list`: `first_key`s strictly ascending, `tail_from`
+/// above the last, or no page at all.
+fn directory(list: ListKind) -> impl Strategy<Value = Directory> {
+    (any::<u32>(), vec(1u64..1_000, 0..4), 1u64..1_000).prop_flat_map(move |(start, gaps, tail)| {
         let mut keys = Vec::with_capacity(gaps.len());
         let mut key = u64::from(start);
         for gap in gaps {
@@ -294,7 +424,7 @@ fn directory() -> impl Strategy<Value = Directory> {
         }
         let tail_from = if keys.is_empty() { 0 } else { key + tail };
         keys.into_iter()
-            .map(page_meta)
+            .map(|key| page_meta(list, key))
             .collect::<Vec<_>>()
             .prop_map(move |pages| Directory {
                 representation: Representation::Paged,
@@ -311,11 +441,11 @@ fn paged_head() -> impl Strategy<Value = Head> {
     (
         head(),
         [
-            directory(),
-            directory(),
-            directory(),
-            directory(),
-            directory(),
+            directory(ListKind::Inbox),
+            directory(ListKind::Receipts),
+            directory(ListKind::Results),
+            directory(ListKind::Events),
+            directory(ListKind::Timers),
         ],
     )
         .prop_map(|(mut h, [inbox, receipts, results, events, timers])| {

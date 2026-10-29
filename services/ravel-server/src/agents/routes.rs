@@ -22,8 +22,8 @@ use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{
-    Cancellation, EffectRecord, EffectStatus, EventEntry, Head, InboxEntry, InputSource, Lifecycle,
-    StepRecord, TurnBlock,
+    Cancellation, EffectRecord, EffectStatus, Head, InboxEntry, InputSource, Lifecycle, StepRecord,
+    TurnBlock,
 };
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
@@ -511,7 +511,6 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             })));
         }
         let after = after.unwrap_or(0);
-        let keep = |e: &EventEntry| operation.is_none_or(|(seq, _)| e.accept_seq == seq);
         let limit = usize::try_from(body.limit.min(MAX_EVENTS_PAGE)).unwrap_or(1);
         // A terminal operation's page reads one event past the limit, so
         // the page that drains its events says so.
@@ -520,7 +519,7 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
         let mut page = call
             .tenant
             .store
-            .events_in(&agent, head, after, want, keep)
+            .events_in(&agent, head, after, want, operation.map(|(seq, _)| seq))
             .await?;
         let more = page.len() > limit;
         page.truncate(limit);

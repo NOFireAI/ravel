@@ -441,36 +441,40 @@ impl AgentStore {
         let Some(head) = self.shallow_head(agent).await? else {
             return Ok(Vec::new());
         };
-        self.events_in(agent, head, after, limit, |_| true).await
+        self.events_in(agent, head, after, limit, None).await
     }
 
-    /// Up to `limit` events with `event_seq > after` that `keep` accepts, in
-    /// order, over a root the caller already read, so a caller that checks
-    /// the root first (an HTTP route refusing a tombstoned agent) pays no
-    /// second HEAD GET. With `keep` accepting every event the page bound is
-    /// [`Self::read_events`]'s; a narrower `keep` reads on past the events
-    /// it skips, up to every page after `after`.
+    /// Up to `limit` events with `event_seq > after`, in order, over a root
+    /// the caller already read, so a caller that checks the root first (an
+    /// HTTP route refusing a tombstoned agent) pays no second HEAD GET. With
+    /// no `operation` the page bound is [`Self::read_events`]'s. With
+    /// `operation`, only the events whose `accept_seq` is that operation's;
+    /// the read goes on past the events it skips until it holds `limit`, and
+    /// GETs only the sealed pages whose `accept_seq` range holds the
+    /// operation (`tests::pages::an_operation_read_skips_pages_outside_its_accept_range`).
     pub async fn events_in(
         &self,
         agent: &AgentId,
         mut head: Head,
         after: u64,
         limit: usize,
-        keep: impl Fn(&EventEntry) -> bool,
+        operation: Option<u64>,
     ) -> Result<Vec<EventEntry>, AgentError> {
+        let keep = |e: &EventEntry| operation.is_none_or(|seq| e.accept_seq == seq);
         let from = after.saturating_add(1);
         let directory = &head.index.events;
         if let Some(first) = directory.page_for(from) {
             let count = directory.pages.len();
             for page in first..count {
+                let Some(meta) = head.index.events.pages.get(page) else {
+                    break;
+                };
+                if operation.is_some_and(|seq| !meta.may_hold_operation(seq)) {
+                    continue;
+                }
                 // Only events below this page's range come before it; the
                 // open page's are newer than every sealed one.
-                let bound = head
-                    .index
-                    .events
-                    .pages
-                    .get(page)
-                    .map_or(u64::MAX, |p| p.first_key);
+                let bound = meta.first_key;
                 let held = head
                     .events
                     .iter()

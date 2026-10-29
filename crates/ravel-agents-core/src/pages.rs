@@ -81,8 +81,13 @@ pub struct PageMeta {
     /// Scheduled timers in a timer page, cancelled results in a result page;
     /// zero for the other lists.
     pub marked: u32,
-    /// Earliest due time of a scheduled timer in the page; zero otherwise.
-    pub min_due_unix_ns: i64,
+    /// The lowest and highest `accept_seq` of the events in an events page;
+    /// zero for the other lists. Not a first value: a reconciliation's audit
+    /// event carries its effect's input, which can be older than the events
+    /// before it. An events read for one operation skips a page whose range
+    /// does not hold it.
+    pub min_accept_seq: u64,
+    pub max_accept_seq: u64,
     /// Bytes of the objects the page's entries reference.
     pub referenced_bytes: u64,
     /// Sorted fingerprints of the entries' lookup identities
@@ -254,7 +259,8 @@ pub trait PageEntry: Clone + PartialEq + Sized {
     fn marked(&self) -> bool {
         false
     }
-    fn due(&self) -> Option<i64> {
+    /// The operation an event belongs to; `None` for the other lists.
+    fn accept_seq(&self) -> Option<u64> {
         None
     }
     fn referenced_bytes(&self) -> u64;
@@ -378,6 +384,9 @@ impl PageEntry for EventEntry {
     fn key(&self) -> u64 {
         self.event_seq
     }
+    fn accept_seq(&self) -> Option<u64> {
+        Some(self.accept_seq)
+    }
     fn referenced_bytes(&self) -> u64 {
         ref_bytes(&self.payload)
     }
@@ -405,9 +414,6 @@ impl PageEntry for TimerEntry {
     }
     fn marked(&self) -> bool {
         self.status == TimerStatus::Scheduled
-    }
-    fn due(&self) -> Option<i64> {
-        self.marked().then_some(self.due_unix_ns)
     }
     fn referenced_bytes(&self) -> u64 {
         ref_bytes(&self.payload)
@@ -465,12 +471,14 @@ impl<T: PageEntry> PageWriter<T> {
         let mut fingerprints: Vec<u32> = self.entries.iter().filter_map(T::fingerprint).collect();
         fingerprints.sort_unstable();
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let (min_accept_seq, max_accept_seq) = accept_range(&self.entries);
         let meta = PageMeta {
             first_key,
             page: ObjectRef::of(&bytes),
             entries: count(self.entries.len()),
             marked: count(self.entries.iter().filter(|e| e.marked()).count()),
-            min_due_unix_ns: self.entries.iter().filter_map(T::due).min().unwrap_or(0),
+            min_accept_seq,
+            max_accept_seq,
             referenced_bytes: self
                 .entries
                 .iter()
@@ -478,6 +486,20 @@ impl<T: PageEntry> PageWriter<T> {
             fingerprints,
         };
         (meta, bytes)
+    }
+}
+
+/// The lowest and highest `accept_seq` of `entries`, `(0, 0)` for a list whose
+/// entries carry none.
+fn accept_range<T: PageEntry>(entries: &[T]) -> (u64, u64) {
+    let seqs = || entries.iter().filter_map(T::accept_seq);
+    (seqs().min().unwrap_or(0), seqs().max().unwrap_or(0))
+}
+
+impl PageMeta {
+    /// Whether the page may hold an event of the operation `accept_seq`.
+    pub fn may_hold_operation(&self, accept_seq: u64) -> bool {
+        (self.min_accept_seq..=self.max_accept_seq).contains(&accept_seq)
     }
 }
 
@@ -607,6 +629,9 @@ fn attach<T: PageEntry>(head: &mut Head, page: usize, bytes: &[u8]) -> Result<()
     if entries.iter().any(|e| dir.page_for(e.key()) != Some(page)) {
         return Err(invalid("page.first_key"));
     }
+    if accept_range(&entries) != (meta.min_accept_seq, meta.max_accept_seq) {
+        return Err(invalid("page.accept_seq"));
+    }
     head.index.directory_mut(T::LIST).mark_loaded(page);
     let list = T::list_mut(head);
     list.extend(entries);
@@ -615,8 +640,9 @@ fn attach<T: PageEntry>(head: &mut Head, page: usize, bytes: &[u8]) -> Result<()
 }
 
 /// Put the entries of sealed page `page` of `list`, read from `o/<hash>`, into
-/// `head`'s in-memory list. Refuses bytes whose hash, entry count or key range
-/// is not the one HEAD records; a page already attached is a no-op.
+/// `head`'s in-memory list. Refuses bytes whose hash, entry count, key range
+/// or `accept_seq` range is not the one HEAD records; a page already attached
+/// is a no-op.
 pub fn attach_page(
     head: &mut Head,
     list: ListKind,
@@ -838,7 +864,8 @@ fn page_directory(dir: &Directory) -> pb::PageDirectory {
                 page: Some(ref_to_proto(p.page)),
                 entries: p.entries,
                 marked: p.marked,
-                min_due_unix_ns: p.min_due_unix_ns,
+                min_accept_seq: p.min_accept_seq,
+                max_accept_seq: p.max_accept_seq,
                 referenced_bytes: p.referenced_bytes,
                 fingerprints: p
                     .fingerprints
@@ -853,10 +880,13 @@ fn page_directory(dir: &Directory) -> pb::PageDirectory {
 
 /// Decode and validate one version 2 directory: `PAGED`, `first_key`s
 /// strictly ascending and below `tail_from`, every page reference present,
-/// fingerprints whole 4-byte values in ascending order. An absent directory
-/// is a paged list with no sealed page; a present one holds at least one.
+/// fingerprints whole 4-byte values in ascending order, and an `accept_seq`
+/// range with `min_accept_seq <= max_accept_seq` that is zero on every list
+/// but events. An absent directory is a paged list with no sealed page; a
+/// present one holds at least one.
 pub(crate) fn directory_from_proto(
     dir: Option<pb::PageDirectory>,
+    list: ListKind,
     field: &'static str,
 ) -> Result<Directory, CodecError> {
     let Some(dir) = dir else {
@@ -883,13 +913,19 @@ pub(crate) fn directory_from_proto(
         if fingerprints.windows(2).any(|w| w[0] > w[1]) {
             return Err(invalid(field));
         }
+        if p.min_accept_seq > p.max_accept_seq
+            || (list != ListKind::Events && p.max_accept_seq != 0)
+        {
+            return Err(invalid(field));
+        }
         let page = ref_from_proto(p.page, field)?.ok_or(invalid(field))?;
         pages.push(PageMeta {
             first_key: p.first_key,
             page,
             entries: p.entries,
             marked: p.marked,
-            min_due_unix_ns: p.min_due_unix_ns,
+            min_accept_seq: p.min_accept_seq,
+            max_accept_seq: p.max_accept_seq,
             referenced_bytes: p.referenced_bytes,
             fingerprints,
         });
@@ -919,7 +955,8 @@ pub fn max_page_ref_bytes(list: ListKind, max_page_entries: usize) -> usize {
         },
         entries: u32::MAX,
         marked: u32::MAX,
-        min_due_unix_ns: i64::MIN,
+        min_accept_seq: widest_accept_seq(list),
+        max_accept_seq: widest_accept_seq(list),
         referenced_bytes: u64::MAX,
         fingerprints: if list.fingerprinted() {
             vec![u32::MAX; max_page_entries]
@@ -937,6 +974,15 @@ pub fn max_page_ref_bytes(list: ListKind, max_page_entries: usize) -> usize {
     // is covered as well as every later one.
     let len = page_directory(&one).encoded_len();
     len + prost::encoding::encoded_len_varint(len as u64) + 2
+}
+
+/// The widest `accept_seq` a page of `list` records: only events pages carry
+/// one.
+fn widest_accept_seq(list: ListKind) -> u64 {
+    match list {
+        ListKind::Events => u64::MAX,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

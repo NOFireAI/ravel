@@ -228,8 +228,10 @@ message PageRef {
   // Scheduled timers in a timer page; cancelled results in a result page;
   // zero otherwise.
   uint32 marked = 4;
-  // Earliest due time of a scheduled timer in a timer page; zero otherwise.
-  int64 min_due_unix_ns = 5;
+  // Never reused: a sealed timer page holds no scheduled timer, so a due
+  // time recorded here could never be read.
+  reserved 5;
+  reserved "min_due_unix_ns";
   // Bytes of the objects the page's entries reference.
   uint64 referenced_bytes = 6;
   // Sorted 4-byte big-endian fingerprints, one per entry that has one: a
@@ -237,6 +239,14 @@ message PageRef {
   // timer_id. A lookup by that identity reads only pages listing its
   // fingerprint.
   bytes fingerprints = 7;
+  // The lowest and highest accept_seq of the events in an events page,
+  // min_accept_seq <= max_accept_seq; zero on the other lists. A range,
+  // not a first value: a reconciliation's audit event carries its
+  // effect's input, which can be older than the events before it. An
+  // events read for one operation skips a page whose range does not hold
+  // that operation's accept_seq.
+  uint64 min_accept_seq = 8;
+  uint64 max_accept_seq = 9;
 }
 
 // The sealed pages of one list in a version 2 HEAD, in key order. Entries

@@ -1147,11 +1147,10 @@ const SEALED_TURN: u64 = 100;
 /// The bounded-read claim of the ADR-3331 index-page amendment through the
 /// real routes: against an agent with 12 sealed pages in each of its
 /// receipts, results and events lists, a result wait on its first operation,
-/// an events page from its first event or a cursor into sealed history and
-/// a worker poll each GET HEAD and at most one sealed page of a list, never
-/// the history. The terminal page of an operation-filtered read is the one
-/// route here that walks every events page, and the state read lists a
-/// mailbox deeper than one page.
+/// an events page from its first event or a cursor into sealed history, the
+/// terminal page of an operation-filtered read and a worker poll each GET
+/// HEAD and at most one sealed page of a list, never the history, and the
+/// state read lists a mailbox deeper than one page.
 #[tokio::test]
 async fn hot_routes_read_one_page_of_a_deep_history() {
     let spy = Arc::new(AgentGets {
@@ -1306,13 +1305,16 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
         .await;
     assert_eq!(event_seqs(&page), [SEALED_TURN + 1], "{page}");
     assert_eq!(page["terminal"], json!("completed"), "{page}");
-    // Saying so costs every events page from the cursor on: nothing bounds
-    // the event seqs of one operation, so the page looks one event past
-    // the limit through the whole history.
-    let mut want = vec!["HEAD".to_string(), "Results page".to_string()];
-    want.extend(std::iter::repeat_n("Events page".to_string(), 12));
-    want.push("object".to_string());
-    assert_eq!(read(spy.take()), want);
+    // Saying so looks one event past the limit through the whole history,
+    // but only the one events page whose accept_seq range holds the
+    // operation is read, the second; the other 11 are skipped with no GET.
+    let gets = spy.take();
+    assert_eq!(
+        read(gets.clone()),
+        ["HEAD", "Results page", "Events page", "object"]
+    );
+    let second = head.index.events.pages[1].page.hash.to_hex();
+    assert!(gets[2].ends_with(&second), "{gets:?}");
 
     // A poll that hands out a new input: `BeginTurn`'s HEAD read, the
     // assignment's state and payload objects, and the route's HEAD read for

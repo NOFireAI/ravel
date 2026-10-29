@@ -118,6 +118,12 @@ fn the_index_reserve_covers_the_exempt_page_growth() {
     sim.run(&create_cmd());
     let base = sim.head().clone();
     for list in [ListKind::Results, ListKind::Events] {
+        // Only an events page records an accept_seq range.
+        let widest_seq = if list == ListKind::Events {
+            u64::MAX
+        } else {
+            0
+        };
         for k in [1, 4, 64, 256] {
             let mut head = base.clone();
             let mut size = head.encode().len();
@@ -134,7 +140,8 @@ fn the_index_reserve_covers_the_exempt_page_growth() {
                     },
                     entries: u32::MAX,
                     marked: u32::MAX,
-                    min_due_unix_ns: i64::MIN,
+                    min_accept_seq: widest_seq,
+                    max_accept_seq: widest_seq,
                     referenced_bytes: u64::MAX,
                     fingerprints: if list.fingerprinted() {
                         vec![u32::MAX; k]
