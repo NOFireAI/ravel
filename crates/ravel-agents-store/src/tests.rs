@@ -25,6 +25,8 @@ use crate::backoff::{Backoff, JitteredBackoff, NoBackoff};
 use crate::counters::PhaseCounts;
 use crate::publish::{MAX_CAS_ATTEMPTS, reply_handle};
 
+mod pages;
+
 const SECOND: i64 = 1_000_000_000;
 const T0: i64 = 1_800_000_000 * SECOND;
 
@@ -437,9 +439,9 @@ async fn a_head_not_found_blip_is_retried_as_a_transient_read() {
 async fn a_newer_head_format_is_unsupported_and_never_written() {
     let backend = Arc::new(MemoryStore::new());
     let store = store_with(backend.clone(), StoreLimits::default());
-    // Field 1 (format_version), varint 2, then a field this release has
+    // Field 1 (format_version), varint 3, then a field this release has
     // never seen.
-    let newer = Bytes::from_static(&[0x08, 0x02, 0xf8, 0x3f, 0x01]);
+    let newer = Bytes::from_static(&[0x08, 0x03, 0xf8, 0x3f, 0x01]);
     let head = head_key(&tenant(), &agent()).expect("head key");
     backend
         .put(&head, newer.clone(), PutOptions::default())
@@ -448,7 +450,7 @@ async fn a_newer_head_format_is_unsupported_and_never_written() {
 
     assert_eq!(
         store.read_head(&agent()).await.expect("read"),
-        HeadState::Unsupported { found: 2 }
+        HeadState::Unsupported { found: 3 }
     );
     let before = store.counters();
     let error = store

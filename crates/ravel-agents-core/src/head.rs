@@ -1,17 +1,22 @@
-//! The HEAD record model and its codec (ADR-3331 decision 3).
+//! The HEAD record model and its codec (ADR-3331 decision 3 and its
+//! index-page amendment).
 //!
-//! `AgentHead` is CAS-mutable, so the decoder is a gate: it reads only
-//! `format_version == 1` with the `INLINE` representation and refuses
-//! anything else as a typed [`CodecError`] before any field is trusted
+//! `AgentHead` is CAS-mutable, so the decoder is a gate: it reads
+//! `format_version` 1 (every list `INLINE`) and 2 (every list `PAGED`, see
+//! [`crate::pages`]) and refuses anything else as a typed [`CodecError`]
+//! before any field is trusted
 //! (`a_newer_format_version_is_refused_before_the_rest_is_read`,
-//! `paged_representation_and_page_refs_are_refused_by_version_one`,
-//! `a_repeated_format_version_field_is_gated_on_its_decoded_value`). The
-//! encoder never re-encodes a decoded prost value; it builds a fresh
+//! `a_representation_that_does_not_match_the_version_is_refused`,
+//! `a_repeated_format_version_field_is_gated_on_its_decoded_value`). It
+//! writes only version 2; a version 1 binary refuses that as
+//! `UnsupportedFormat` (`a_version_one_reader_refuses_a_version_two_head`).
+//! The encoder never re-encodes a decoded prost value; it builds a fresh
 //! `AgentHead` from the typed [`Head`]. A field this binary does not know,
-//! inside a version 1 record, is therefore dropped by the next CAS write
-//! (`an_unknown_field_within_version_1_is_dropped_on_re_encode`), which is
-//! why every additive change to `AgentHead` bumps `format_version` (ADR-0066
-//! R1): a newer writer's record is refused here before anything is dropped.
+//! inside a record of a version it reads, is therefore dropped by the next
+//! CAS write (`an_unknown_field_within_version_2_is_dropped_on_re_encode`),
+//! which is why every additive change to `AgentHead` bumps `format_version`
+//! (ADR-0066 R1): a newer writer's record is refused here before anything is
+//! dropped.
 
 use prost::Message as _;
 use ravel_proto::agents::v1 as pb;
@@ -20,9 +25,19 @@ use ravel_types::TenantHash;
 use crate::error::ErrorKind;
 use crate::identity::{Hash256, Id128, ObjectHash};
 use crate::keys::{AgentKey, AgentKind};
+use crate::pages::{Directory, Index, ListKind, directory_from_proto, directory_to_proto};
 
-/// The only `AgentHead` format version this release reads or writes.
-pub const FORMAT_VERSION: u32 = 1;
+/// The `AgentHead` format version this release writes. It also reads
+/// [`INLINE_FORMAT_VERSION`].
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The `AgentHead` format version whose lists are all `INLINE`, read and
+/// migrated to [`FORMAT_VERSION`] by the next publish.
+pub const INLINE_FORMAT_VERSION: u32 = 1;
+
+/// The format version of every immutable object under `o/<object_hash>`,
+/// index pages included.
+pub const OBJECT_FORMAT_VERSION: u32 = 1;
 
 /// Value of the `seal` field every top-level message ends with ("RAG1").
 pub const SEAL: u32 = 0x5241_4731;
@@ -42,7 +57,7 @@ pub enum CodecError {
     MissingFormatVersion,
     #[error("format_version {found} is not supported by this release")]
     UnsupportedFormat { found: u32 },
-    #[error("index representation {found} is not supported by format version 1")]
+    #[error("index representation {found} is not supported by this format version")]
     UnsupportedRepresentation { found: i32 },
     #[error("field {field} is missing or out of range")]
     Invalid { field: &'static str },
@@ -68,7 +83,8 @@ struct VersionPeek {
 }
 
 /// Read field 1 of any record in this file without decoding the rest, so a
-/// newer version is refused even when its later fields do not parse.
+/// newer version is refused even when its later fields do not parse. The
+/// caller gates the value; `0` is refused here.
 pub fn peek_format_version(bytes: &[u8]) -> Result<u32, CodecError> {
     // Field 1 is encoded first, so its key byte (tag 1, varint) leads.
     let version = match bytes.split_first() {
@@ -81,14 +97,17 @@ pub fn peek_format_version(bytes: &[u8]) -> Result<u32, CodecError> {
                 .format_version
         }
     };
-    check_format_version(version).map(|()| FORMAT_VERSION)
+    match version {
+        0 => Err(CodecError::MissingFormatVersion),
+        version => Ok(version),
+    }
 }
 
 /// Gate every top-level occurrence of field 1 of a HEAD before it is
 /// decoded. Each occurrence is read as the raw 64-bit varint: prost
 /// truncates a `uint32` varint above `u32::MAX` to its low 32 bits, so a
 /// trailing `2^32 + 1` behind a leading 1 (the occurrence protobuf keeps)
-/// would otherwise decode as version 1 and pass [`check_format_version`].
+/// would otherwise decode as version 1 and pass [`check_head_format_version`].
 /// Such a value is refused as `UnsupportedFormat { found: u32::MAX }`
 /// (`tests::a_format_version_varint_above_u32_is_refused_before_decode`).
 fn gate_every_format_version(bytes: &[u8]) -> Result<(), CodecError> {
@@ -107,7 +126,7 @@ fn gate_every_format_version(bytes: &[u8]) -> Result<(), CodecError> {
             ));
         }
         let raw = decode_varint(&mut rest).map_err(decode)?;
-        check_format_version(u32::try_from(raw).unwrap_or(u32::MAX))?;
+        check_head_format_version(u32::try_from(raw).unwrap_or(u32::MAX))?;
     }
     Ok(())
 }
@@ -117,11 +136,20 @@ fn gate_every_format_version(bytes: &[u8]) -> Result<(), CodecError> {
 /// 1 twice passes [`peek_format_version`] on its first occurrence and only
 /// this check sees the value the decoded message carries. A HEAD is also
 /// gated occurrence by occurrence before decode, which this check cannot do
-/// for a value prost truncated.
+/// for a value prost truncated. This is the gate for an immutable object.
 pub(crate) fn check_format_version(version: u32) -> Result<(), CodecError> {
     match version {
         0 => Err(CodecError::MissingFormatVersion),
-        FORMAT_VERSION => Ok(()),
+        OBJECT_FORMAT_VERSION => Ok(()),
+        found => Err(CodecError::UnsupportedFormat { found }),
+    }
+}
+
+/// [`check_format_version`] for `AgentHead`: versions 1 and 2.
+pub(crate) fn check_head_format_version(version: u32) -> Result<(), CodecError> {
+    match version {
+        0 => Err(CodecError::MissingFormatVersion),
+        INLINE_FORMAT_VERSION | FORMAT_VERSION => Ok(()),
         found => Err(CodecError::UnsupportedFormat { found }),
     }
 }
@@ -323,7 +351,10 @@ pub struct Quota {
     pub timer_count: u64,
 }
 
-/// One agent's root, format version 1, `INLINE` representation.
+/// One agent's root. The five indexed lists hold the entries in memory: the
+/// open page, plus any sealed page the store attached
+/// ([`crate::pages::attach_page`]); `index` says which sealed pages exist and
+/// which of them are in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
     pub tenant: TenantHash,
@@ -351,6 +382,7 @@ pub struct Head {
     pub steps: Vec<StepRecord>,
     pub effects: Vec<EffectRecord>,
     pub outbox: Vec<OutboxIntent>,
+    pub index: Index,
 }
 
 impl Head {
@@ -364,9 +396,30 @@ impl Head {
         peek_format_version(bytes)?;
         gate_every_format_version(bytes)?;
         let raw = pb::AgentHead::decode(bytes).map_err(|e| CodecError::Decode(e.to_string()))?;
-        check_format_version(raw.format_version)?;
+        check_head_format_version(raw.format_version)?;
         check_seal(raw.seal)?;
         Head::from_proto(raw)
+    }
+
+    /// The version 1 (`INLINE`) encoding of this root, every list entry
+    /// inline. Only fixtures write it: it is the record a pre-amendment
+    /// writer produced, which [`crate::pages::seal_index`] migrates.
+    #[doc(hidden)]
+    pub fn encode_version_one(&self) -> Vec<u8> {
+        let mut raw = self.to_proto();
+        raw.format_version = INLINE_FORMAT_VERSION;
+        raw.representation = pb::IndexRepresentation::Inline as i32;
+        raw.inbox_pages = None;
+        raw.receipt_pages = None;
+        raw.result_pages = None;
+        raw.event_pages = None;
+        raw.timer_pages = None;
+        raw.inbox = self.inbox.iter().map(inbox_to_proto).collect();
+        raw.receipts = self.receipts.iter().map(receipt_to_proto).collect();
+        raw.results = self.results.iter().map(result_to_proto).collect();
+        raw.events = self.events.iter().map(event_to_proto).collect();
+        raw.timers = self.timers.iter().map(timer_to_proto).collect();
+        raw.encode_to_vec()
     }
 
     fn to_proto(&self) -> pb::AgentHead {
@@ -382,7 +435,7 @@ impl Head {
             owner_lease_hint_unix_ns: self.owner_lease_hint_unix_ns,
             state_version: self.state_version,
             state: self.state.map(ref_to_proto),
-            representation: pb::IndexRepresentation::Inline as i32,
+            representation: pb::IndexRepresentation::Paged as i32,
             inbox_page: None,
             next_accept_seq: self.next_accept_seq,
             receipt_index: None,
@@ -405,26 +458,110 @@ impl Head {
                 receipt_count: self.quota.receipt_count,
                 timer_count: self.quota.timer_count,
             }),
-            inbox: self.inbox.iter().map(inbox_to_proto).collect(),
-            receipts: self.receipts.iter().map(receipt_to_proto).collect(),
-            results: self.results.iter().map(result_to_proto).collect(),
-            events: self.events.iter().map(event_to_proto).collect(),
-            timers: self.timers.iter().map(timer_to_proto).collect(),
+            inbox: inline(
+                &self.index.inbox,
+                &self.inbox,
+                |e| e.accept_seq,
+                inbox_to_proto,
+            ),
+            receipts: inline(
+                &self.index.receipts,
+                &self.receipts,
+                |r| r.accept_seq,
+                receipt_to_proto,
+            ),
+            results: inline(
+                &self.index.results,
+                &self.results,
+                |r| r.accept_seq,
+                result_to_proto,
+            ),
+            events: inline(
+                &self.index.events,
+                &self.events,
+                |e| e.event_seq,
+                event_to_proto,
+            ),
+            timers: inline(
+                &self.index.timers,
+                &self.timers,
+                |t| t.generation,
+                timer_to_proto,
+            ),
             steps: self.steps.iter().map(step_to_proto).collect(),
             effects: self.effects.iter().map(effect_to_proto).collect(),
             outbox_intents: self.outbox.iter().map(outbox_to_proto).collect(),
+            inbox_pages: directory_to_proto(&self.index.inbox),
+            receipt_pages: directory_to_proto(&self.index.receipts),
+            result_pages: directory_to_proto(&self.index.results),
+            event_pages: directory_to_proto(&self.index.events),
+            timer_pages: directory_to_proto(&self.index.timers),
             seal: SEAL,
         }
     }
 
-    fn from_proto(raw: pb::AgentHead) -> Result<Head, CodecError> {
+    fn from_proto(mut raw: pb::AgentHead) -> Result<Head, CodecError> {
+        let expected = if raw.format_version == INLINE_FORMAT_VERSION {
+            pb::IndexRepresentation::Inline
+        } else {
+            pb::IndexRepresentation::Paged
+        } as i32;
         match raw.representation {
-            r if r == pb::IndexRepresentation::Inline as i32 => {}
-            r if r == pb::IndexRepresentation::Paged as i32 => {
+            r if r == expected => {}
+            r if r == pb::IndexRepresentation::Inline as i32
+                || r == pb::IndexRepresentation::Paged as i32 =>
+            {
                 return Err(CodecError::UnsupportedRepresentation { found: r });
             }
             _ => return Err(invalid("representation")),
         }
+        let index = if raw.format_version == INLINE_FORMAT_VERSION {
+            let paged = raw.inbox_pages.is_some()
+                || raw.receipt_pages.is_some()
+                || raw.result_pages.is_some()
+                || raw.event_pages.is_some()
+                || raw.timer_pages.is_some();
+            if paged {
+                return Err(CodecError::UnsupportedRepresentation {
+                    found: pb::IndexRepresentation::Paged as i32,
+                });
+            }
+            Index::inline()
+        } else {
+            Index {
+                inbox: directory_from_proto(raw.inbox_pages.take(), "inbox_pages")?,
+                receipts: directory_from_proto(raw.receipt_pages.take(), "receipt_pages")?,
+                results: directory_from_proto(raw.result_pages.take(), "result_pages")?,
+                events: directory_from_proto(raw.event_pages.take(), "event_pages")?,
+                timers: directory_from_proto(raw.timer_pages.take(), "timer_pages")?,
+                written: Vec::new(),
+            }
+        };
+        outside_pages(
+            &index.inbox,
+            raw.inbox.iter().map(|e| e.accept_seq),
+            "inbox",
+        )?;
+        outside_pages(
+            &index.receipts,
+            raw.receipts.iter().map(|r| r.accept_seq),
+            "receipts",
+        )?;
+        outside_pages(
+            &index.results,
+            raw.results.iter().map(|r| r.accept_seq),
+            "results",
+        )?;
+        outside_pages(
+            &index.events,
+            raw.events.iter().map(|e| e.event_seq),
+            "events",
+        )?;
+        outside_pages(
+            &index.timers,
+            raw.timers.iter().map(|t| t.generation),
+            "timers",
+        )?;
         for (field, page) in [
             ("inbox_page", &raw.inbox_page),
             ("receipt_index", &raw.receipt_index),
@@ -478,12 +615,20 @@ impl Head {
             steps: collect(raw.steps, step_from_proto)?,
             effects: collect(raw.effects, effect_from_proto)?,
             outbox: collect(raw.outbox_intents, outbox_from_proto)?,
+            index,
         })
     }
 
-    /// Every object this root references, for quota and for the store's
-    /// dependency upload.
+    /// Every object this root references, sealed index pages included, for
+    /// the store's dependency upload. Objects referenced from inside a page
+    /// that is not in memory are not listed: that page was published with
+    /// them, so they are stored already.
     pub fn object_refs(&self) -> impl Iterator<Item = ObjectRef> + '_ {
+        self.payload_refs().chain(self.index.page_refs())
+    }
+
+    /// The objects the in-memory entries reference.
+    fn payload_refs(&self) -> impl Iterator<Item = ObjectRef> + '_ {
         self.state
             .iter()
             .copied()
@@ -496,21 +641,49 @@ impl Head {
             .chain(self.outbox.iter().filter_map(|o| o.input))
     }
 
-    /// The counters this root's lists imply.
+    /// The counters this root's lists imply, sealed pages included: an
+    /// unloaded page contributes the counts and referenced bytes its
+    /// [`PageMeta`](crate::pages::PageMeta) records. The page objects' own
+    /// bytes are index overhead and are not charged.
     pub fn computed_quota(&self) -> Quota {
+        let unloaded_bytes = ListKind::ALL.into_iter().fold(0u64, |acc, l| {
+            acc.saturating_add(self.index.directory(l).unloaded_referenced_bytes())
+        });
         Quota {
             referenced_bytes: self
-                .object_refs()
-                .fold(0u64, |acc, r| acc.saturating_add(r.size_bytes)),
-            mailbox_depth: self.inbox.len() as u64,
-            receipt_count: self.receipts.len() as u64,
-            timer_count: self
-                .timers
-                .iter()
-                .filter(|t| t.status == TimerStatus::Scheduled)
-                .count() as u64,
+                .payload_refs()
+                .fold(unloaded_bytes, |acc, r| acc.saturating_add(r.size_bytes)),
+            mailbox_depth: self.inbox_depth(),
+            receipt_count: self.receipt_count(),
+            timer_count: self.scheduled_timers(),
         }
     }
+}
+
+/// An inline entry's key must fall in the open page, outside every sealed
+/// page's range.
+fn outside_pages(
+    dir: &Directory,
+    mut keys: impl Iterator<Item = u64>,
+    field: &'static str,
+) -> Result<(), CodecError> {
+    if keys.any(|k| !dir.is_inline(k)) {
+        return Err(invalid(field));
+    }
+    Ok(())
+}
+
+fn inline<T, P>(
+    dir: &Directory,
+    entries: &[T],
+    key: impl Fn(&T) -> u64,
+    to_proto: fn(&T) -> P,
+) -> Vec<P> {
+    entries
+        .iter()
+        .filter(|e| dir.is_inline(key(e)))
+        .map(to_proto)
+        .collect()
 }
 
 fn invalid(field: &'static str) -> CodecError {
@@ -1261,6 +1434,7 @@ pub(crate) mod tests {
                     steps,
                     effects,
                     outbox,
+                    index: Index::default(),
                 },
             )
     }
@@ -1291,6 +1465,7 @@ pub(crate) mod tests {
             steps: Vec::new(),
             effects: Vec::new(),
             outbox: Vec::new(),
+            index: Index::default(),
         }
     }
 
@@ -1318,18 +1493,41 @@ pub(crate) mod tests {
     #[test]
     fn a_newer_format_version_is_refused_before_the_rest_is_read() {
         let mut raw = sample_head().to_proto();
-        raw.format_version = 2;
+        raw.format_version = 3;
         let mut bytes = raw.encode_to_vec();
         assert_eq!(
             Head::decode(&bytes),
-            Err(CodecError::UnsupportedFormat { found: 2 })
+            Err(CodecError::UnsupportedFormat { found: 3 })
         );
         // Garbage after field 1 does not mask the version verdict.
         bytes.truncate(2);
         bytes.extend_from_slice(&[0xff, 0xff, 0xff]);
         assert_eq!(
             Head::decode(&bytes),
+            Err(CodecError::UnsupportedFormat { found: 3 })
+        );
+        assert_eq!(
+            CodecError::UnsupportedFormat { found: 3 }.kind(),
+            Some(ErrorKind::UnsupportedFormat)
+        );
+    }
+
+    /// A pre-amendment reader gates a HEAD the way [`check_format_version`]
+    /// gates an object: version 1 only. It refuses every root this release
+    /// writes as `UnsupportedFormat` before reading a list, so it never reads
+    /// a paged list as an empty inline one.
+    #[test]
+    fn a_version_one_reader_refuses_a_version_two_head() {
+        let version_one_gate =
+            |bytes: &[u8]| peek_format_version(bytes).and_then(check_format_version);
+        let written = sample_head().encode();
+        assert_eq!(
+            version_one_gate(&written),
             Err(CodecError::UnsupportedFormat { found: 2 })
+        );
+        assert_eq!(
+            version_one_gate(&sample_head().encode_version_one()),
+            Ok(())
         );
         assert_eq!(
             CodecError::UnsupportedFormat { found: 2 }.kind(),
@@ -1337,22 +1535,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// This release reads a version 1 root: every list inline, nothing paged.
+    /// Re-encoding it writes version 2.
     #[test]
-    fn paged_representation_and_page_refs_are_refused_by_version_one() {
+    fn a_version_one_head_decodes_with_every_list_inline() {
+        let head = sample_head();
+        let decoded = Head::decode(&head.encode_version_one()).expect("version 1 decodes");
+        for list in ListKind::ALL {
+            assert!(decoded.index.directory(list).pages.is_empty());
+        }
+        assert!(decoded.index.any_inline());
+        assert_eq!(decoded.inbox, head.inbox);
+        assert_eq!(decoded.results, head.results);
+        let rewritten = decoded.encode();
+        assert_eq!(peek_format_version(&rewritten), Ok(FORMAT_VERSION));
+        assert_eq!(Head::decode(&rewritten).expect("version 2 decodes"), head);
+    }
+
+    #[test]
+    fn a_representation_that_does_not_match_the_version_is_refused() {
+        let paged = pb::IndexRepresentation::Paged as i32;
+        let inline = pb::IndexRepresentation::Inline as i32;
         let mut raw = sample_head().to_proto();
-        raw.representation = pb::IndexRepresentation::Paged as i32;
+        raw.format_version = INLINE_FORMAT_VERSION;
+        raw.representation = paged;
         assert_eq!(
             Head::decode(&raw.encode_to_vec()),
-            Err(CodecError::UnsupportedRepresentation { found: 2 })
+            Err(CodecError::UnsupportedRepresentation { found: paged })
         );
         let mut raw = sample_head().to_proto();
-        raw.inbox_page = Some(ref_to_proto(ObjectRef::of(b"page")));
+        raw.representation = inline;
         assert_eq!(
             Head::decode(&raw.encode_to_vec()),
-            Err(CodecError::Invalid {
-                field: "inbox_page"
-            })
+            Err(CodecError::UnsupportedRepresentation { found: inline })
         );
+        // A version 1 record carrying a page directory.
+        let mut raw = sample_head().to_proto();
+        raw.format_version = INLINE_FORMAT_VERSION;
+        raw.representation = inline;
+        raw.event_pages = Some(pb::PageDirectory {
+            representation: paged,
+            pages: Vec::new(),
+            tail_from: 0,
+        });
+        assert_eq!(
+            Head::decode(&raw.encode_to_vec()),
+            Err(CodecError::UnsupportedRepresentation { found: paged })
+        );
+        // The pre-paging single-page fields stay refused in both versions.
+        for version in [INLINE_FORMAT_VERSION, FORMAT_VERSION] {
+            let mut raw = sample_head().to_proto();
+            raw.format_version = version;
+            raw.representation = if version == FORMAT_VERSION {
+                paged
+            } else {
+                inline
+            };
+            raw.inbox_page = Some(ref_to_proto(ObjectRef::of(b"page")));
+            assert_eq!(
+                Head::decode(&raw.encode_to_vec()),
+                Err(CodecError::Invalid {
+                    field: "inbox_page"
+                })
+            );
+        }
     }
 
     #[test]
@@ -1373,16 +1619,16 @@ pub(crate) mod tests {
 
     #[test]
     fn a_repeated_format_version_field_is_gated_on_its_decoded_value() {
-        // Field 1 written twice: the leading 1 passes the peek, and protobuf
-        // keeps the last value, 2.
+        // Field 1 written twice: the leading 2 passes the peek, and protobuf
+        // keeps the last value, 3.
         let mut bytes = sample_head().encode();
         let seal = bytes.split_off(bytes.len() - 6);
-        bytes.extend_from_slice(&[0x08, 0x02]);
+        bytes.extend_from_slice(&[0x08, 0x03]);
         bytes.extend_from_slice(&seal);
         assert_eq!(peek_format_version(&bytes), Ok(FORMAT_VERSION));
         assert_eq!(
             Head::decode(&bytes),
-            Err(CodecError::UnsupportedFormat { found: 2 })
+            Err(CodecError::UnsupportedFormat { found: 3 })
         );
     }
 
@@ -1404,7 +1650,7 @@ pub(crate) mod tests {
         // The only occurrence, leading.
         let mut lone = sample_head().encode();
         lone.splice(0..2, [0x08].into_iter().chain(above.iter().copied()));
-        assert_eq!(peek_format_version(&lone), Err(refused.clone()));
+        assert_eq!(peek_format_version(&lone), Ok(u32::MAX));
         assert_eq!(Head::decode(&lone), Err(refused.clone()));
         // A later occurrence behind a leading 1, where it is the value
         // protobuf keeps: the leading peek passes it, and the full gate
@@ -1425,8 +1671,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unknown_field_within_version_1_is_dropped_on_re_encode() {
-        // A v1 reader accepts a field it does not know inside a v1 record and
+    fn an_unknown_field_within_version_2_is_dropped_on_re_encode() {
+        // A v2 reader accepts a field it does not know inside a v2 record and
         // drops it on re-encode, which is why every additive change to
         // AgentHead bumps format_version (ADR-0066 R1): only the version gate
         // keeps a CAS write from losing a newer writer's field.
