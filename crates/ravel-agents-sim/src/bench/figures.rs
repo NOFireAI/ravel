@@ -356,6 +356,23 @@ pub fn check(
                 .push(format!("{key}: printed {n} times, expected once"));
         }
     }
+    let mut groups: BTreeMap<(&str, &str, &str), Vec<(&str, &str)>> = BTreeMap::new();
+    for figure in figures {
+        let k = &figure.key;
+        groups
+            .entry((&k.scenario, &k.temp, &k.op))
+            .or_default()
+            .push((&k.phase, &k.metric));
+    }
+    for ((scenario, temp, op), printed) in &groups {
+        for (phase, metric) in expected_keys(op) {
+            if !printed.contains(&(phase, metric)) {
+                out.failures.push(format!(
+                    "{scenario}.{temp}.{op}.{phase}.{metric}: expected figure missing"
+                ));
+            }
+        }
+    }
     let mut decided: Vec<BTreeMap<usize, usize>> = vec![BTreeMap::new(); bands.tables.len()];
     for figure in figures {
         if figure.is_bytes() && figure.kind.is_none() {
@@ -426,6 +443,51 @@ pub fn check(
         }
     }
     out
+}
+
+const AGENT_PHASES: [&str; 3] = ["resolve", "store", "publish"];
+const AGENT_METRICS: [&str; 7] = [
+    "get",
+    "put",
+    "cas",
+    "list",
+    "conflict",
+    "body_in_bytes",
+    "body_out_bytes",
+];
+const PERCENTILES: [&str; 3] = ["p50_ms", "p99_ms", "max_ms"];
+
+/// Every `(phase, metric)` an operation of kind `op` prints. Listed here
+/// rather than read from the meter, so a figure the meter stops printing
+/// fails the check even where only a wildcard band row covers it.
+fn expected_keys(op: &str) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("ops", "count")];
+    match op {
+        "run" => return Vec::new(),
+        "ingest" => {
+            for metric in ["put", "get", "body_in_bytes", "body_out_bytes"] {
+                keys.push(("telemetry", metric));
+            }
+        }
+        _ => {
+            for phase in AGENT_PHASES {
+                for metric in AGENT_METRICS {
+                    keys.push((phase, metric));
+                }
+            }
+            keys.extend([
+                ("index", "page_gets"),
+                ("index", "planner_misses"),
+                ("other", "delete"),
+            ]);
+        }
+    }
+    if op == "assign" {
+        keys.extend([("latency", "delay_ms"), ("sweep", "passes")]);
+    } else {
+        keys.extend(PERCENTILES.map(|p| ("latency", p)));
+    }
+    keys
 }
 
 /// The price table of `bench/agents/prices.toml`, in dollars.
