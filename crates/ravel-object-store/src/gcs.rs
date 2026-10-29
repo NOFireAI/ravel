@@ -18,10 +18,10 @@
 //!   sends `x-goog-if-generation-match: v`. A 412 is
 //!   [`StoreError::PreconditionFailed`]. `v` must be a positive decimal with
 //!   no leading zero and no sign, at most `i64::MAX`; anything else (`0`,
-//!   `012`, `+1`, an empty, non-numeric or larger token) is refused with [`StoreError::Permanent`] before a request is
-//!   sent. GCS issues no generation 0, and `x-goog-if-generation-match: 0`
-//!   means create-if-absent, so a CAS on `0` would otherwise create an absent
-//!   key.
+//!   `012`, `+1`, an empty, non-numeric or larger token) is refused with
+//!   [`StoreError::Permanent`] before a request is sent. GCS issues no
+//!   generation 0, and `x-goog-if-generation-match: 0` means
+//!   create-if-absent, so a CAS on `0` would otherwise create an absent key.
 //! - `Overwrite` sends no precondition.
 //!
 //! The tests below pin each header on the wire against the in-process fake
@@ -51,11 +51,11 @@
 //! instead of a second request filling the page. At a page size above 1 and
 //! against responses that are each full, every call is therefore one request;
 //! at page size 1 a resumed response holds only the start name, so a resumed
-//! call is two. Up to 16 responses in a row
-//! that leave no name are followed ([`StoreError::ListPageCeiling`] past
-//! that), and a repeated `nextPageToken` fails the call
-//! ([`StoreError::ListRepeatedToken`]). The [`PageToken`] handed back between
-//! calls is the raw last name, as on S3. Listed names go to [`crate::classify_objects`] and
+//! call is two. Up to 16 responses in a row that leave no name are followed
+//! ([`StoreError::ListPageCeiling`] past that), and a repeated
+//! `nextPageToken` fails the call ([`StoreError::ListRepeatedToken`]). The
+//! [`PageToken`] handed back between calls is the raw last name, as on S3.
+//! Listed names go to [`crate::classify_objects`] and
 //! [`crate::classify_prefixes`] as received, so a name this store cannot
 //! address is reported in [`ListPage::unaddressable`] rather than failing the
 //! page. Each listed version is the item's `generation`; an item without a
