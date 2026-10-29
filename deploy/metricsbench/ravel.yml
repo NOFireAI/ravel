@@ -175,11 +175,13 @@ services:
       - "--max-segments"
       - "1000000"
       # S3 requests per query: the derived default 1358600 (4 shards, the
-      # 500ms flush cadence above, 4,800s seal margin), stated, not raised.
-      # At one GET per object and the 8 objects per second above, a read
-      # over the whole uncompacted replay reaches it after 169,825 s (47.2 h)
-      # of ingest; range reads per object bring that earlier. A hit is
-      # refused(budget).
+      # 500ms flush cadence above, 4,800s seal margin), stated, not raised;
+      # services/ravel-server/tests/metricsbench_request_budget.rs fails if
+      # it stops equalling what this command derives. At one GET per object
+      # and the 8 objects per second above, a read over the whole
+      # uncompacted replay needs 169,825 s (47.2 h) of ingest to reach it,
+      # so --max-segments refuses first, at 125,000 s; range reads per object
+      # bring this cap earlier. A hit is refused(budget).
       - "--max-s3-requests"
       - "1358600"
       # Series per query: replaces the default 10000 (#3306). 1,000,000 is
