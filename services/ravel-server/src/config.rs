@@ -2584,10 +2584,13 @@ pub struct Cli {
     pub agents_projection: AgentsProjectionSwitch,
 
     /// OTLP gRPC endpoint of a gateway that ingests agent projection logs and
-    /// traces, e.g. `http://gateway:4317`. Takes precedence over the
+    /// traces, e.g. `http://127.0.0.1:4317`. Takes precedence over the
     /// in-process path. Each request carries the tenant in the
     /// `x-ravel-tenant` metadata header and the `ravel.tenant` resource
-    /// attribute.
+    /// attribute, and no credential, so startup refuses an endpoint that is
+    /// not plain `http://` on a loopback host (localhost, 127.0.0.0/8 or
+    /// `[::1]`) until the credential model of issue #3360 lands. Startup
+    /// also refuses it beside `--agents-projection off`.
     #[arg(long = "agents-projection-endpoint", value_name = "URL")]
     pub agents_projection_endpoint: Option<String>,
 
@@ -3678,7 +3681,7 @@ impl PartialEq for AgentsClock {
 impl Eq for AgentsClock {}
 
 /// An [`AgentsConfig`] the server refuses to start with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AgentsConfigError {
     /// An evidence index with no slot would list no late effect result.
     #[error(
@@ -3695,6 +3698,55 @@ pub enum AgentsConfigError {
          --agents-projection off"
     )]
     ProjectionUnconfigured,
+    /// `--agents-projection off` beside an endpoint: one of the two is a
+    /// mistake, and starting would silently ignore the endpoint.
+    #[error(
+        "--agents-projection off and --agents-projection-endpoint {endpoint} contradict each \
+         other: drop the endpoint to project nothing, or drop off to project to it"
+    )]
+    ProjectionOffWithEndpoint { endpoint: String },
+    /// An endpoint that is not a plain `http://` URI with a host.
+    #[error("--agents-projection-endpoint {endpoint} is not an http:// URI with a host: {reason}")]
+    ProjectionEndpointInvalid { endpoint: String, reason: String },
+    /// An endpoint off this host or over TLS. The projector sends tenant
+    /// data with no credential, so it may only reach a gateway on loopback
+    /// until the credential model lands (issue #3360).
+    #[error(
+        "--agents-projection-endpoint {endpoint} is refused: the projector sends agent history \
+         with no credential, so the endpoint must be plain http:// on a loopback host \
+         (localhost, 127.0.0.0/8 or [::1]) until the credential model of issue #3360 lands; \
+         run a gateway beside this process, or project in process under --mode all"
+    )]
+    ProjectionEndpointNotLoopback { endpoint: String },
+}
+
+/// Accept `endpoint` only as `http://` to a loopback host.
+fn check_projection_endpoint(endpoint: &str) -> Result<(), AgentsConfigError> {
+    let uri: http::Uri = endpoint.parse().map_err(|e: http::uri::InvalidUri| {
+        AgentsConfigError::ProjectionEndpointInvalid {
+            endpoint: endpoint.to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    let invalid = |reason: &str| AgentsConfigError::ProjectionEndpointInvalid {
+        endpoint: endpoint.to_string(),
+        reason: reason.to_string(),
+    };
+    let scheme = uri.scheme_str().ok_or_else(|| invalid("no scheme"))?;
+    let host = uri.host().ok_or_else(|| invalid("no host"))?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match scheme {
+        "http" if loopback => Ok(()),
+        "http" | "https" => Err(AgentsConfigError::ProjectionEndpointNotLoopback {
+            endpoint: endpoint.to_string(),
+        }),
+        _ => Err(invalid("the scheme must be http")),
+    }
 }
 
 impl AgentsConfig {
@@ -3707,18 +3759,29 @@ impl AgentsConfig {
     }
 
     /// Where projection delivers in a process that does (`true`) or does not
-    /// hold an ingest buffer. An endpoint wins over the in-process path; with
-    /// neither and projection not off, refuses with
-    /// [`AgentsConfigError::ProjectionUnconfigured`]. A process without
-    /// `--agents` resolves to `Off`.
+    /// hold an ingest buffer. An endpoint wins over the in-process path and
+    /// must be plain `http://` on loopback; with neither and projection not
+    /// off, refuses with [`AgentsConfigError::ProjectionUnconfigured`]. `off`
+    /// beside an endpoint is refused. A process without `--agents` resolves
+    /// to `Off`.
     pub fn projection_target(
         &self,
         holds_ingest_buffer: bool,
     ) -> Result<AgentsProjectionTarget, AgentsConfigError> {
-        if !self.enabled || self.projection.switch == AgentsProjectionSwitch::Off {
+        if !self.enabled {
             return Ok(AgentsProjectionTarget::Off);
         }
-        if let Some(endpoint) = &self.projection.endpoint {
+        let endpoint = self.projection.endpoint.as_ref();
+        if self.projection.switch == AgentsProjectionSwitch::Off {
+            return match endpoint {
+                None => Ok(AgentsProjectionTarget::Off),
+                Some(endpoint) => Err(AgentsConfigError::ProjectionOffWithEndpoint {
+                    endpoint: endpoint.clone(),
+                }),
+            };
+        }
+        if let Some(endpoint) = endpoint {
+            check_projection_endpoint(endpoint)?;
             return Ok(AgentsProjectionTarget::Endpoint(endpoint.clone()));
         }
         if holds_ingest_buffer {
@@ -17892,8 +17955,8 @@ mod tests {
         };
         let auto = AgentsProjectionSwitch::Auto;
         let off = AgentsProjectionSwitch::Off;
-        let url = Some("http://gateway:4317");
-        let endpoint = AgentsProjectionTarget::Endpoint("http://gateway:4317".to_string());
+        let url = Some("http://127.0.0.1:4317");
+        let endpoint = AgentsProjectionTarget::Endpoint("http://127.0.0.1:4317".to_string());
         assert_eq!(
             on(auto, None).projection_target(true),
             Ok(AgentsProjectionTarget::InProcess)
@@ -17907,7 +17970,9 @@ mod tests {
             );
             assert_eq!(
                 on(off, url).projection_target(buffer),
-                Ok(AgentsProjectionTarget::Off)
+                Err(AgentsConfigError::ProjectionOffWithEndpoint {
+                    endpoint: "http://127.0.0.1:4317".to_string()
+                })
             );
             assert_eq!(
                 AgentsConfig::default().projection_target(buffer),
@@ -17921,6 +17986,73 @@ mod tests {
             msg.contains("--agents-projection-endpoint") && msg.contains("--agents-projection off"),
             "names both ways out: {msg}"
         );
+    }
+
+    /// The projector sends tenant data with no credential, so an endpoint
+    /// is accepted only as plain `http://` on a loopback host; a remote host
+    /// and any `https://` URI are refused naming issue #3360, and a URI that
+    /// does not parse or has no host is refused as invalid.
+    #[test]
+    fn agents_projection_endpoint_is_loopback_http_only() {
+        let target = |endpoint: &str| {
+            AgentsConfig {
+                enabled: true,
+                projection: AgentsProjectionConfig {
+                    endpoint: Some(endpoint.to_string()),
+                    ..AgentsProjectionConfig::default()
+                },
+                ..AgentsConfig::default()
+            }
+            .projection_target(false)
+        };
+        for endpoint in [
+            "http://127.0.0.1:4317",
+            "http://127.9.9.9:4317",
+            "http://localhost:4317",
+            "http://LOCALHOST:4317",
+            "http://[::1]:4317",
+        ] {
+            assert_eq!(
+                target(endpoint),
+                Ok(AgentsProjectionTarget::Endpoint(endpoint.to_string())),
+                "{endpoint}"
+            );
+        }
+        for endpoint in [
+            "http://gateway:4317",
+            "http://10.0.0.7:4317",
+            "http://[2001:db8::1]:4317",
+            "http://localhost.example.com:4317",
+            "https://gateway:4317",
+            "https://127.0.0.1:4317",
+            "https://localhost:4317",
+        ] {
+            let refused = target(endpoint);
+            assert_eq!(
+                refused,
+                Err(AgentsConfigError::ProjectionEndpointNotLoopback {
+                    endpoint: endpoint.to_string()
+                }),
+                "{endpoint}"
+            );
+            let msg = refused.expect_err("refused").to_string();
+            assert!(msg.contains("#3360") && msg.contains(endpoint), "{msg}");
+        }
+        for endpoint in [
+            "127.0.0.1:4317",
+            "grpc://127.0.0.1:4317",
+            "http://",
+            "not a uri",
+        ] {
+            assert!(
+                matches!(
+                    target(endpoint),
+                    Err(AgentsConfigError::ProjectionEndpointInvalid { .. })
+                ),
+                "{endpoint}: {:?}",
+                target(endpoint)
+            );
+        }
     }
 
     /// An evidence index with no slot is refused with a typed error; one slot
