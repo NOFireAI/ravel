@@ -4778,9 +4778,9 @@ fn render_agents_capacity_families(
     mode: Mode,
     runtime: &crate::agents::AgentsRuntime,
 ) {
-    use ravel_agents_runtime::{FILL_LISTS, FillSnapshot};
+    use ravel_agents_runtime::FILL_LISTS;
     let capacity = runtime.capacity_metrics();
-    let fill = capacity.fill.unwrap_or(FillSnapshot::default());
+    let fill = capacity.fill.unwrap_or_default();
     let name = "ravel_agents_index_fill_max_ratio";
     write_header(
         out,

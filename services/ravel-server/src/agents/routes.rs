@@ -39,8 +39,8 @@ use ravel_agents_core::wire::{
     OperationStatus, ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest,
     ResolveResponse, ResultBody, ResultResponse, SafeIdsBody, SendRequest, StateResponse, StepBody,
     StepRecordRequest, StepRecordResponse, SweepResponse, TimerBody, TimerRequest, TimersResponse,
-    UsageBody, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest,
-    WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
+    UsageBody, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};

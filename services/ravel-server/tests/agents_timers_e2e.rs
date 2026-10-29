@@ -1173,7 +1173,12 @@ async fn a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter() {
         ratio(&scrape, "ravel_agents_head_bytes_max_ratio{", "mode="),
         largest as f64 / 262_144.0
     );
-    for (list, want) in [("receipts", 2), ("results", 0), ("events", 0), ("timers", 0)] {
+    for (list, want) in [
+        ("receipts", 2),
+        ("results", 0),
+        ("events", 0),
+        ("timers", 0),
+    ] {
         assert_eq!(
             value(
                 &scrape,
@@ -1207,7 +1212,10 @@ async fn a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter() {
         ("ravel_agents_agents_near_cap", "gauge"),
         ("ravel_agents_budget_refusals_total", "counter"),
     ] {
-        assert!(scrape.contains(&format!("# TYPE {name} {kind}\n")), "{name}");
+        assert!(
+            scrape.contains(&format!("# TYPE {name} {kind}\n")),
+            "{name}"
+        );
     }
     running.shutdown().await.expect("server stops");
 }

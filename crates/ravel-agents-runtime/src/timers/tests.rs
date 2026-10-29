@@ -100,7 +100,7 @@ pub(crate) fn rig_with(
         AgentStore::new(
             backend.clone(),
             TENANT,
-            limits.clone(),
+            limits,
             now.clone(),
             Arc::new(DerivedIds),
         )

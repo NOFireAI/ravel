@@ -874,8 +874,12 @@ fn error_body_carries_the_code_and_retry_hint() {
 #[test]
 fn error_body_names_the_cap_a_budget_refusal_hit() {
     let body = ErrorBody::from(
-        &AgentError::new(ErrorKind::MailboxFull, SafeIds::default(), "mailbox is full")
-            .with_cap(BudgetCap::Mailbox),
+        &AgentError::new(
+            ErrorKind::MailboxFull,
+            SafeIds::default(),
+            "mailbox is full",
+        )
+        .with_cap(BudgetCap::Mailbox),
     );
     assert_eq!(
         serde_json::to_value(&body).expect("json"),

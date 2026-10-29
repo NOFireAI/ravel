@@ -869,8 +869,7 @@ async fn each_cap_refusal_moves_its_counter_by_exactly_one() {
         create(&r.co, "o-1").await;
         let error = if cap == BudgetCap::Timers {
             schedule(&r.co, "o-1", "a", T0 + SEC).await;
-            r.co
-                .schedule_timer(&timer("o-1", "b", T0 + SEC))
+            r.co.schedule_timer(&timer("o-1", "b", T0 + SEC))
                 .await
                 .expect_err("a second timer is past the cap")
         } else {
@@ -889,9 +888,8 @@ async fn a_per_command_refusal_is_not_counted_as_a_cap() {
     let r = rig();
     create(&r.co, "o-1").await;
     let long = "x".repeat(ravel_agents_core::kernel::Limits::default().max_string_bytes + 1);
-    let error = r
-        .co
-        .send(&SendRequest {
+    let error =
+        r.co.send(&SendRequest {
             agent: crate::tests::agent_ref("o-1"),
             handler: "step".to_string(),
             request_id: long,

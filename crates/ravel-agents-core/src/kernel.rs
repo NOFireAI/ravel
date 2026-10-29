@@ -1324,7 +1324,7 @@ impl Kernel {
         }
         if head.inbox_depth() >= self.limits.max_mailbox_depth {
             return Err(
-                fail(head, ErrorKind::MailboxFull, "mailbox is full").with_cap(BudgetCap::Mailbox),
+                fail(head, ErrorKind::MailboxFull, "mailbox is full").with_cap(BudgetCap::Mailbox)
             );
         }
         if head.receipt_count() >= self.limits.max_receipts {
@@ -1816,12 +1816,10 @@ impl Kernel {
 
     fn check_timer_cap(&self, new: &Head) -> Result<(), AgentError> {
         if new.scheduled_timers() > self.limits.max_timers {
-            return Err(fail(
-                new,
-                ErrorKind::BudgetExceeded,
-                "timer count is at its cap",
-            )
-            .with_cap(BudgetCap::Timers));
+            return Err(
+                fail(new, ErrorKind::BudgetExceeded, "timer count is at its cap")
+                    .with_cap(BudgetCap::Timers),
+            );
         }
         Ok(())
     }
@@ -1858,7 +1856,7 @@ impl Kernel {
         }
         if head.inbox_depth() >= self.limits.max_mailbox_depth {
             return Err(
-                fail(head, ErrorKind::MailboxFull, "mailbox is full").with_cap(BudgetCap::Mailbox),
+                fail(head, ErrorKind::MailboxFull, "mailbox is full").with_cap(BudgetCap::Mailbox)
             );
         }
         let mut new = head.clone();

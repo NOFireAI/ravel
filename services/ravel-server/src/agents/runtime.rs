@@ -532,7 +532,9 @@ impl AgentsRuntime {
                     fill: match (a.fill, b.fill) {
                         (Some(x), Some(y)) => Some(FillSnapshot {
                             max_ratio: std::array::from_fn(|i| x.max_ratio[i].max(y.max_ratio[i])),
-                            head_bytes_max_ratio: x.head_bytes_max_ratio.max(y.head_bytes_max_ratio),
+                            head_bytes_max_ratio: x
+                                .head_bytes_max_ratio
+                                .max(y.head_bytes_max_ratio),
                             near_cap: std::array::from_fn(|i| x.near_cap[i] + y.near_cap[i]),
                             agents: x.agents + y.agents,
                         }),
