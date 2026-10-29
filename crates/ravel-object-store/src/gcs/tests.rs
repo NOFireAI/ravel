@@ -730,24 +730,6 @@ fn paged_store(fake: &FakeGcs, page_size: usize) -> GcsStore {
     GcsStore::new(config).expect("store")
 }
 
-/// Follows `list` to the end, returning the keys and the unaddressable names
-/// in the order the pages reported them.
-async fn list_to_the_end(store: &GcsStore, prefix: &str) -> (Vec<String>, Vec<String>) {
-    let mut keys = Vec::new();
-    let mut unaddressable = Vec::new();
-    let mut page_token = None;
-    loop {
-        let page = store.list(prefix, page_token).await.expect("list page");
-        keys.extend(page.objects.into_iter().map(|o| o.key));
-        unaddressable.extend(page.unaddressable.into_iter().map(|u| u.key));
-        match page.next {
-            Some(next) => page_token = Some(next),
-            None => break,
-        }
-    }
-    (keys, unaddressable)
-}
-
 #[tokio::test]
 async fn listing_reports_xml_illegal_and_unaddressable_names_without_failing_the_page() {
     let fake = fake().await;
@@ -776,8 +758,9 @@ async fn listing_reports_xml_illegal_and_unaddressable_names_without_failing_the
     );
 }
 
-/// [`list_to_the_end`], also returning the `objects.list` requests each call
-/// sent.
+/// Follows `list` to the end, returning the keys and the unaddressable names
+/// in the order the pages reported them, and the `objects.list` requests each
+/// call sent.
 async fn list_counting_requests(
     store: &GcsStore,
     fake: &FakeGcs,
