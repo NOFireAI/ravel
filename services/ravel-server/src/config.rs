@@ -3688,8 +3688,8 @@ pub enum AgentsConfigError {
     /// and no endpoint: committed history would project nowhere.
     #[error(
         "--agents needs somewhere to project committed agent history: this process holds no \
-         ingest buffer, so set --agents-projection-endpoint to an OTLP gateway, or pass \
-         --agents-projection off"
+         ingest buffer, so set --agents-projection-endpoint to an OTLP gateway on loopback, run \
+         under --mode all, or pass --agents-projection off"
     )]
     ProjectionUnconfigured,
     /// `--agents-projection off` beside an endpoint: one of the two is a
