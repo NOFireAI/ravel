@@ -1212,6 +1212,20 @@ still defaults to an unlimited budget and the server does not pass it the real
 one, so its reservations account without refusing. These guards come from the
 same RAII `reserve` API, so they read under `component="fetch"`.
 
+**Series held by a discovery read.** Over metrics, `/api/v1/series`,
+`/api/v1/labels` and `/api/v1/label/{name}/values` fold each segment's
+matched series into one map
+as that segment's fetch completes, keeping one copy per series id, and reserve
+each series they add against the same budget: its id, its label set and each
+label's two strings (`retained_series_len` in `engine.rs`). A series appears
+in every object it wrote to, so keeping each segment's entries until the last
+fetch held one copy per object. A listing whose retained series do not fit is
+refused with the same 422 `FetchMemoryExhausted`, against the budget's limit.
+`max_series` is checked as each series is added, so a listing over it is
+refused before its remaining segments are fetched. The reservation is released
+when the map is handed to the endpoint: the response it renders is not
+charged.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.

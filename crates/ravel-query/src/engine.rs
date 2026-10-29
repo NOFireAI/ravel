@@ -1281,9 +1281,8 @@ impl QueryEngine {
             // The bytes-scanned budget (ADR-0061 decision 1) is enforced
             // inside `fetch_all_series`, once per completed segment fetch, so a
             // labels/series query that matches zero series still evaluates the
-            // budget against every segment its snapshot actually fetched -- the
-            // `build_series_by_id` loop below never runs for an empty result.
-            let fetched = self
+            // budget against every segment its snapshot actually fetched.
+            let mut fetched = self
                 .fetch_all_series(
                     tenant_hash,
                     &snapshot,
@@ -1320,28 +1319,18 @@ impl QueryEngine {
                     wall_deadline,
                 )
                 .await?;
-            // Union local + remote identities and enforce `max_series` ONCE
-            // over the combined set, mirroring the query path's single
-            // post-federation merge. A `SeriesId` is a canonical function of
-            // its labels, so cross-cluster duplicate identities collapse
-            // cleanly here (`or_insert` keeps the first, and every copy carries
-            // the same `LabelSet`) -- the sample-level tie-break ambiguity
-            // documented at `is_greater` does not arise for discovery, which
-            // enumerates identities and carries no per-sample provenance.
-            let by_id = build_series_by_id(
-                fetched
-                    .into_iter()
-                    .flatten()
-                    .map(|entry| (entry.series_id, entry.labels))
-                    .chain(fed_series),
-                self.config.max_series,
-            )?;
+            // Union local + remote identities into the one fold, so
+            // `max_series` counts the combined set, mirroring the query path's
+            // single post-federation merge. A `SeriesId` is a canonical
+            // function of its labels, so cross-cluster duplicate identities
+            // collapse cleanly here (the first copy is kept, and every copy
+            // carries the same `LabelSet`) -- the sample-level tie-break
+            // ambiguity documented at `is_greater` does not arise for
+            // discovery, which enumerates identities and carries no per-sample
+            // provenance.
+            fetched.absorb(fed_series)?;
             Ok((
-                (
-                    by_id.into_iter().collect::<Vec<_>>(),
-                    fed_warnings,
-                    fed_partial,
-                ),
+                (fetched.into_series(), fed_warnings, fed_partial),
                 FetchStats::default(),
             ))
         };
@@ -3005,7 +2994,7 @@ impl QueryEngine {
         accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestBudget,
-    ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
+    ) -> Result<SeriesFold, QueryError> {
         let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
@@ -3025,16 +3014,21 @@ impl QueryEngine {
                 }
             })
             .buffer_unordered(concurrency);
-        let mut out = Vec::with_capacity(snapshot.segments.len());
+        // Selective-erasure exclusion for the labels/label-values/series
+        // metadata path (ADR-0064 decision 2): a series erased by a
+        // windowless predicate must not appear in label enumeration either. A
+        // windowed predicate erases only some samples and leaves the series
+        // enumerable (see `erasure::retain_series_entries`). No-op when empty.
+        let erasure = snapshot_erasure_predicates(snapshot);
+        let mut fold = SeriesFold::new(Arc::clone(&self.memory_budget), self.config.max_series);
         // Short-circuit the same way as `fetch_all_samples_and_histograms`:
         // the bytes-scanned budget is checked once per completed segment
         // fetch, so a labels/series query whose matchers resolve to zero
-        // series still evaluates the budget against every segment fetched here
-        // (the caller's `build_series_by_id` loop never runs for an empty
-        // result). Returning early drops the stream and cancels the remaining
-        // in-flight fetches.
+        // series still evaluates the budget against every segment fetched here.
+        // Returning early drops the stream and cancels the remaining in-flight
+        // fetches.
         while let Some(r) = stream.next().await {
-            out.push(r?);
+            let mut entries = r?;
             if let Some(err) = bytes_scanned_exceeded(
                 accounting.snapshot().pooled().total_s3_bytes(),
                 max_bytes_scanned,
@@ -3047,20 +3041,104 @@ impl QueryEngine {
             ) {
                 return Err(err);
             }
+            crate::erasure::retain_series_entries(&mut entries, &erasure);
+            fold.absorb(
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.series_id, entry.labels)),
+            )?;
         }
-        // Selective-erasure exclusion for the labels/label-values/series
-        // metadata path (ADR-0064 decision 2): a series erased by a
-        // windowless predicate must not appear in label enumeration either. A
-        // windowed predicate erases only some samples and leaves the series
-        // enumerable (see `erasure::retain_series_entries`). No-op when empty.
-        let erasure = snapshot_erasure_predicates(snapshot);
-        if !erasure.is_empty() {
-            for entries in &mut out {
-                crate::erasure::retain_series_entries(entries, &erasure);
-            }
-        }
-        Ok(out)
+        Ok(fold)
     }
+}
+
+/// A metadata read's matched series, one copy per [`SeriesId`], folded in as
+/// each segment's fetch completes. A series appears in every object it wrote
+/// to, so holding each segment's entries until the last fetch would hold one
+/// copy per object. The retained copies are charged to the memory budget as
+/// they are added, so a listing the budget cannot hold is refused against the
+/// budget instead of running the host down to its memory floor.
+struct SeriesFold {
+    by_id: HashMap<SeriesId, LabelSet>,
+    max_series: usize,
+    budget: Arc<ravel_memory::MemoryBudget>,
+    reservations: Vec<ravel_memory::Reservation>,
+}
+
+impl SeriesFold {
+    fn new(budget: Arc<ravel_memory::MemoryBudget>, max_series: usize) -> Self {
+        Self {
+            by_id: HashMap::new(),
+            max_series,
+            budget,
+            reservations: Vec::new(),
+        }
+    }
+
+    /// Adds every series not already held, refusing with
+    /// [`QueryError::TooManySeries`] the moment a new one would pass
+    /// `max_series` (ADR-0051 S7), then reserves [`retained_series_len`] for
+    /// the series this batch added. A refused reservation is
+    /// [`FetchError::FetchMemoryExhausted`], the error a fetch reservation
+    /// returns.
+    fn absorb(
+        &mut self,
+        series: impl IntoIterator<Item = (SeriesId, LabelSet)>,
+    ) -> Result<(), QueryError> {
+        let mut added = 0u64;
+        for (series_id, labels) in series {
+            if self.by_id.contains_key(&series_id) {
+                continue;
+            }
+            if self.by_id.len() >= self.max_series {
+                return Err(QueryError::TooManySeries {
+                    count: self.by_id.len() + 1,
+                    max: self.max_series,
+                });
+            }
+            added = added.saturating_add(retained_series_len(&labels));
+            self.by_id.insert(series_id, labels);
+        }
+        if added > 0 {
+            let reservation =
+                self.budget
+                    .reserve(added)
+                    .map_err(|e| FetchError::FetchMemoryExhausted {
+                        requested: e.requested,
+                        reserved: e.reserved,
+                        limit: e.limit,
+                        cause: e.cause,
+                    })?;
+            self.reservations.push(reservation);
+        }
+        Ok(())
+    }
+
+    /// The bytes this fold holds reserved.
+    #[cfg(test)]
+    fn charged(&self) -> u64 {
+        self.reservations
+            .iter()
+            .map(ravel_memory::Reservation::size)
+            .sum()
+    }
+
+    /// The held series. The reservations are released here: the caller owns
+    /// the series from this point.
+    fn into_series(self) -> Vec<(SeriesId, LabelSet)> {
+        self.by_id.into_iter().collect()
+    }
+}
+
+/// The bytes one held series is charged: its id and label set, plus each
+/// label's two strings.
+fn retained_series_len(labels: &LabelSet) -> u64 {
+    let fixed = std::mem::size_of::<SeriesId>() + std::mem::size_of::<LabelSet>();
+    labels.iter().fold(fixed as u64, |acc, label| {
+        acc.saturating_add(std::mem::size_of::<ravel_types::Label>() as u64)
+            .saturating_add(label.name.len() as u64)
+            .saturating_add(label.value.len() as u64)
+    })
 }
 
 /// The pending selective-erasure predicates attached to a resolved snapshot
@@ -7566,6 +7644,219 @@ mod prefetch_tests {
             Duration::from_secs(60),
         )
         .await
+    }
+
+    const LISTING_BUDGET: u64 = 256 * 1024;
+    const LISTING_SEGMENTS: u64 = 40;
+    const LISTING_SERIES: usize = 50;
+
+    /// `count` ids, each `prefix` then a number zero-padded to 200 bytes, so
+    /// one copy of fifty series (about 17 KB) outweighs one object's own fetch
+    /// and catalog decode reservations.
+    fn padded_ids(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("{prefix}{i:0>200}")).collect()
+    }
+
+    /// The `(id, labels)` pairs `publish_metric_segment_multi` writes for
+    /// `ids` under metric `m`.
+    fn padded_batch(ids: &[String]) -> Vec<(SeriesId, LabelSet)> {
+        ids.iter()
+            .map(|id| {
+                let labels = LabelSet::new(vec![
+                    Label {
+                        name: METRIC_NAME_LABEL.to_string(),
+                        value: "m".to_string(),
+                    },
+                    Label {
+                        name: "id".to_string(),
+                        value: id.clone(),
+                    },
+                ])
+                .expect("valid labels");
+                let series_id =
+                    SeriesId::compute(&TenantId::new("acme"), "m", &labels).expect("series id");
+                (series_id, labels)
+            })
+            .collect()
+    }
+
+    /// Lists `{__name__="m"}` over `LISTING_SEGMENTS` objects of
+    /// `LISTING_SERIES` padded series each, one object fetched at a time,
+    /// against a `LISTING_BUDGET` memory budget. `distinct` gives every object
+    /// its own series; otherwise every object repeats the same fifty.
+    async fn list_padded_series(
+        distinct: bool,
+    ) -> (
+        Result<Vec<(SeriesId, LabelSet)>, QueryError>,
+        Arc<ravel_memory::MemoryBudget>,
+    ) {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        for seq in 1..=LISTING_SEGMENTS {
+            let prefix = if distinct {
+                format!("{seq}-")
+            } else {
+                String::new()
+            };
+            let ids = padded_ids(&prefix, LISTING_SERIES);
+            let series = ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.as_str(),
+                        vec![Sample {
+                            ts_ns: BASE_NS - NS_PER_MIN,
+                            value: 1.0,
+                        }],
+                    )
+                })
+                .collect();
+            publish_metric_segment_multi(
+                &store,
+                tenant_hash,
+                seq,
+                "m",
+                series,
+                hour_bucket,
+                BASE_NS,
+            )
+            .await;
+        }
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let eng = engine_with_config(
+            store,
+            EngineConfig {
+                promql_fetch_fanout: Some(1),
+                deadline: Duration::from_secs(60),
+                ..EngineConfig::default()
+            },
+        )
+        .with_memory_budget(Arc::clone(&budget));
+        let listed = eng
+            .resolve_series(
+                tenant_hash,
+                &[name_matcher("m")],
+                TimeRange {
+                    start_ns: BASE_NS - 60 * NS_PER_MIN,
+                    end_ns: BASE_NS,
+                },
+                &[],
+                BASE_NS,
+                Duration::from_secs(60),
+            )
+            .await
+            .map(|(series, _)| series);
+        (listed, budget)
+    }
+
+    /// Issue #3434: a series listing holds one copy of each series however
+    /// many objects carry it. Forty objects repeat the same fifty series: one
+    /// copy (about 17 KB) plus one object's own fetch fits the 256 KiB budget,
+    /// and forty copies (about 690 KB) would not, so charging every object's
+    /// entries instead of the series the fold added refuses this listing.
+    #[tokio::test]
+    async fn a_series_listing_holds_one_copy_of_each_series_across_objects() {
+        let (listed, budget) = list_padded_series(false).await;
+        let series = listed.expect("one copy of fifty series fits the budget");
+        assert_eq!(series.len(), LISTING_SERIES);
+        assert_eq!(budget.accounted_refusals(), 0);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the listing releases its charge once answered"
+        );
+    }
+
+    /// Issue #3434: a listing whose retained series outgrow the memory budget
+    /// is refused against the budget's own limit, not the host-memory gate,
+    /// and holds the series it retained up to the refusal. Forty objects of
+    /// fifty distinct series each retain about 690 KB against a 256 KiB
+    /// budget, while one object's own fetch and decode reserve far less than
+    /// half of it. Without the fold's charge this listing answers all 2,000:
+    /// nothing else holds a reservation once an object's fetch returns.
+    #[tokio::test]
+    async fn a_series_listing_that_outgrows_the_budget_is_refused_against_it() {
+        let (listed, budget) = list_padded_series(true).await;
+        let err = listed.expect_err("2,000 retained series outgrow a 256 KiB budget");
+        match err {
+            QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                reserved,
+                limit,
+                cause,
+                ..
+            }) => {
+                assert_eq!(cause, ravel_memory::ExhaustionCause::Accounted);
+                assert_eq!(limit, LISTING_BUDGET);
+                assert!(
+                    reserved > LISTING_BUDGET / 2,
+                    "the retained series were held at the refusal: {reserved}"
+                );
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused listing releases what it held"
+        );
+    }
+
+    /// The fold's exact charge: the same fifty series absorbed eight times
+    /// hold fifty and reserve `retained_series_len` summed over fifty, not
+    /// eight times that, and consuming the fold releases the charge.
+    #[test]
+    fn a_series_fold_charges_each_series_once() {
+        let batch = padded_batch(&padded_ids("", LISTING_SERIES));
+        let one_copy: u64 = batch
+            .iter()
+            .map(|(_, labels)| retained_series_len(labels))
+            .sum();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        for _ in 0..8 {
+            fold.absorb(batch.clone()).expect("one copy fits");
+        }
+        assert_eq!(fold.charged(), one_copy);
+        assert_eq!(budget.reserved(), one_copy);
+        assert_eq!(fold.into_series().len(), LISTING_SERIES);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The fold refuses a series past `max_series` with `TooManySeries`, and a
+    /// batch one byte over its budget with the fetch layer's budget refusal,
+    /// reserving nothing in either case.
+    #[test]
+    fn a_series_fold_refuses_past_max_series_and_past_its_budget() {
+        let batch = padded_batch(&padded_ids("", LISTING_SERIES));
+        let one_copy: u64 = batch
+            .iter()
+            .map(|(_, labels)| retained_series_len(labels))
+            .sum();
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let mut fold = SeriesFold::new(Arc::clone(&budget), LISTING_SERIES - 1);
+        let err = fold
+            .absorb(batch.clone())
+            .expect_err("fifty series pass a cap of 49");
+        assert!(
+            matches!(err, QueryError::TooManySeries { count: 50, max: 49 }),
+            "{err:?}"
+        );
+        assert_eq!(budget.reserved(), 0);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(one_copy - 1));
+        let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        let err = fold.absorb(batch).expect_err("one byte short of one copy");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted { requested, .. })
+                    if requested == one_copy
+            ),
+            "{err:?}"
+        );
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// Issue #3105: a range query's selector-cache entries are charged to the
