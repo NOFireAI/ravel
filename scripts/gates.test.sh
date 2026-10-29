@@ -9,7 +9,8 @@
 #
 # No toolchain: a stub `cargo` first on PATH answers `cargo metadata` with a
 # synthetic workspace whose edges mirror the real ones these cases are about
-# (ravel-sql and ravel-server depend on ravel-query and ravel-esql, ravel-cli
+# (ravel-sql and ravel-server depend on ravel-query and ravel-esql, ravel-server
+# also on the agents crates, ravel-agents-sim on ravel-agents-runtime, ravel-cli
 # on ravel-sql,
 # ravel-query, ravel-logseg, ravel-ingest and, as a dev-dependency,
 # ravel-server, ravel-ingest on ravel-logseg, ravel-ingest-router on
@@ -66,7 +67,15 @@ pkg() {
   printf ','
   pkg ravel-sql ravel-query ravel-esql
   printf ','
-  pkg ravel-server ravel-sql ravel-query ravel-esql
+  pkg ravel-agents-core ravel-types
+  printf ','
+  pkg ravel-agents-store ravel-agents-core
+  printf ','
+  pkg ravel-agents-runtime ravel-agents-core ravel-agents-store
+  printf ','
+  pkg ravel-agents-sim ravel-agents-core ravel-agents-store ravel-agents-runtime
+  printf ','
+  pkg ravel-server ravel-sql ravel-query ravel-esql ravel-agents-core ravel-agents-store ravel-agents-runtime
   printf ','
   pkg ravel-logseg ravel-types
   printf ','
@@ -84,10 +93,11 @@ pkg() {
 
 # The stub cargo. CARGO_STUB_FAIL_ON, when set, is a fixed string: a call
 # whose arguments contain it exits 3, so the exit-code case can fail one run.
+# A call made with RAVEL_AGENTS_PAGE_ENTRIES set logs it after the arguments.
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' \
   'if [[ "$1" == "metadata" ]]; then echo "cargo $*" >>"${CARGO_STUB_LOG}"; cat "${CARGO_STUB_METADATA}"; exit 0; fi' \
-  'echo "cargo $*" >>"${CARGO_STUB_LOG}"' \
+  'echo "cargo $*${RAVEL_AGENTS_PAGE_ENTRIES:+ [RAVEL_AGENTS_PAGE_ENTRIES=${RAVEL_AGENTS_PAGE_ENTRIES}]}" >>"${CARGO_STUB_LOG}"' \
   'if [[ -n "${CARGO_STUB_FAIL_ON:-}" && "$*" == *"${CARGO_STUB_FAIL_ON}"* ]]; then exit 3; fi' \
   'exit 0' >"${tmp}/bin/cargo"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${tmp}/bin/cargo-nextest"
@@ -125,6 +135,7 @@ agents_test='==> cargo nextest run --locked -p ravel-server --features agents --
 agents_lib_test='==> cargo nextest run --locked -p ravel-server --features agents --lib'
 agents_name_filter='==> cargo nextest run --locked -p ravel-server --features agents agents'
 agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification'
+agents_small_pages='==> env RAVEL_AGENTS_PAGE_ENTRIES=2 cargo nextest run --locked -p ravel-agents-runtime -p ravel-agents-sim'
 mcp_clippy='==> cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings'
 mcp_test='==> cargo nextest run --locked -p ravel-server --features mcp --test mcp_e2e --test trace_by_id'
 mcp_lib_test='==> cargo nextest run --locked -p ravel-server --features mcp --lib'
@@ -152,6 +163,8 @@ check_eq "gates -p ravel-query: agents lane has no bare name filter" "0" \
   "$(count "${out}" "${agents_name_filter}")"
 check_eq "gates -p ravel-query: agents lane classification test" "1" \
   "$(count "${out}" "${agents_classification}")"
+check_eq "gates -p ravel-query: no page-size-2 run (no agents crate in the closure)" "0" \
+  "$(count_matching "${out}" 'RAVEL_AGENTS_PAGE_ENTRIES')"
 check_eq "gates -p ravel-query: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
 check_eq "gates -p ravel-query: mcp lane binaries" "1" "$(count "${out}" "${mcp_test}")"
 check_eq "gates -p ravel-query: mcp lane lib tests" "1" "$(count "${out}" "${mcp_lib_test}")"
@@ -246,6 +259,25 @@ check_eq "gates -p ravel-types: exit 0" "0" "${rc}"
 check_eq "gates -p ravel-types: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
 check_eq "gates -p ravel-types: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
 
+# -p ravel-agents-core: ravel-agents-runtime, ravel-agents-sim and ravel-server
+# depend on it, so the agents lane runs with its page-size-2 run, once.
+run_stubbed agents_core bash "${SCRIPTS}/gates.sh" -p ravel-agents-core --dry-run
+out="${tmp}/agents_core.out"
+check_eq "gates -p ravel-agents-core: exit 0" "0" "${rc}"
+check_eq "gates -p ravel-agents-core: agents lane clippy" "1" "$(count "${out}" "${agents_clippy}")"
+check_eq "gates -p ravel-agents-core: page-size-2 run" "1" "$(count "${out}" "${agents_small_pages}")"
+check_eq "gates -p ravel-agents-core: no other page-size run" "1" \
+  "$(count_matching "${out}" 'RAVEL_AGENTS_PAGE_ENTRIES')"
+check_eq "gates -p ravel-agents-core: builds nothing" "0" "$(builds "${tmp}/agents_core.calls")"
+
+# -p ravel-server: the server depends on the agents crates, not the reverse,
+# so the agents lane runs without the page-size-2 run.
+run_stubbed server bash "${SCRIPTS}/gates.sh" -p ravel-server --dry-run
+check_eq "gates -p ravel-server: agents lane clippy" "1" \
+  "$(count "${tmp}/server.out" "${agents_clippy}")"
+check_eq "gates -p ravel-server: no page-size-2 run" "0" \
+  "$(count_matching "${tmp}/server.out" 'RAVEL_AGENTS_PAGE_ENTRIES')"
+
 # -p ravel-logseg: ravel-cli and ravel-bench depend on it, ravel-server does
 # not, so neither the agents nor the mcp lane runs.
 check_eq "gates -p ravel-logseg: no agents lane" "0" \
@@ -276,6 +308,7 @@ check_eq "gates --dry-run: agents lane seam and effects binaries" "1" "$(count "
 check_eq "gates --dry-run: agents lane lib tests" "1" "$(count "${out}" "${agents_lib_test}")"
 check_eq "gates --dry-run: agents lane classification test" "1" \
   "$(count "${out}" "${agents_classification}")"
+check_eq "gates --dry-run: agents page-size-2 run" "1" "$(count "${out}" "${agents_small_pages}")"
 check_eq "gates --dry-run: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
 check_eq "gates --dry-run: mcp lane binaries" "1" "$(count "${out}" "${mcp_test}")"
 check_eq "gates --dry-run: mcp lane lib tests" "1" "$(count "${out}" "${mcp_lib_test}")"
@@ -351,6 +384,27 @@ check_eq "affected-tests -p ravel-query: mcp lib tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --lib')"
 check_eq "affected-tests -p ravel-query: no bare mcp name filter" "0" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp mcp')"
+
+check_eq "affected-tests -p ravel-query: no page-size-2 run" "0" \
+  "$(count_matching "${calls}" 'RAVEL_AGENTS_PAGE_ENTRIES')"
+
+# ravel-agents-runtime in the closure: its and the sim's tests run again with
+# RAVEL_AGENTS_PAGE_ENTRIES=2 in the environment, once.
+run_stubbed at-agents bash "${SCRIPTS}/affected-tests.sh" -p ravel-agents-core
+calls="${tmp}/at-agents.calls"
+check_eq "affected-tests -p ravel-agents-core: exit 0" "0" "${rc}"
+check_eq "affected-tests -p ravel-agents-core: page-size-2 run" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-agents-runtime -p ravel-agents-sim [RAVEL_AGENTS_PAGE_ENTRIES=2]')"
+check_eq "affected-tests -p ravel-agents-core: only that run sets the page size" "1" \
+  "$(count_matching "${calls}" 'RAVEL_AGENTS_PAGE_ENTRIES')"
+
+# A failing page-size-2 run fails the script, after the flight-sql run still
+# ran.
+CARGO_STUB_FAIL_ON="--cargo-profile ci -p ravel-agents-runtime -p ravel-agents-sim" run_stubbed at-pages-fail \
+  bash "${SCRIPTS}/affected-tests.sh" -p ravel-agents-core
+check_eq "affected-tests, page-size-2 run fails: exit 3" "3" "${rc}"
+check_eq "affected-tests, page-size-2 run fails: flight-sql still ran" "1" \
+  "$(count_matching "${tmp}/at-pages-fail.calls" '--features flight-sql$')"
 
 # Neither crate in the closure: no feature run.
 run_stubbed at-affinity bash "${SCRIPTS}/affected-tests.sh" -p ravel-affinity

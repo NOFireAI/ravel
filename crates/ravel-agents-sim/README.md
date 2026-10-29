@@ -51,7 +51,9 @@ paged list seals after two entries, so the batches exercise sealed inbox,
 receipts, results and timers pages and `Rig::head` loads them before a
 check. The pins in the table below are for the default page size; at 2 each
 batch asserts its own pin set (`schedules::pinned_by_page`), and any other
-size prints `unpinned`. Every page GET and PUT is a scheduler gate, so a
+size prints `unpinned`. CI's features-agents job, the agents lane of
+`scripts/gates.sh` and the sim-nightly workflow run the default batch at 2
+as well as at the default size. Every page GET and PUT is a scheduler gate, so a
 smaller page moves where the seeded script runs out, and past it the
 scheduler releases the lowest actor first. Four totals move at 2 for that
 reason, no invariant changes. The last three were re-measured at both page

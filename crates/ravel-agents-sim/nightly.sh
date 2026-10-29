@@ -7,6 +7,8 @@
 # printed its line other than exactly once. Both variables unset is the
 # default batch, the one the pinned totals were measured on; any other batch
 # prints "unpinned" and is checked by the per-seed invariants alone.
+# RAVEL_AGENTS_PAGE_ENTRIES passes through to the tests: unset or 2 asserts
+# that page size's pins on the default batch, any other size is unpinned.
 #
 # Usage: crates/ravel-agents-sim/nightly.sh [log-file]
 # With GITHUB_STEP_SUMMARY set, the lines are also appended there.
@@ -39,7 +41,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 log="${1:-$root/.gate-logs/sim-nightly.log}"
 mkdir -p "$(dirname "$log")"
 
-echo "seeds: RAVEL_SIM_SEED=${RAVEL_SIM_SEED:-<default>} RAVEL_SIM_SEEDS=${RAVEL_SIM_SEEDS:-<default>}"
+echo "seeds: RAVEL_SIM_SEED=${RAVEL_SIM_SEED:-<default>} RAVEL_SIM_SEEDS=${RAVEL_SIM_SEEDS:-<default>} RAVEL_AGENTS_PAGE_ENTRIES=${RAVEL_AGENTS_PAGE_ENTRIES:-<default>}"
 code=0
 (cd "$root" && cargo test --locked -p ravel-agents-sim -- --nocapture) >"$log" 2>&1 || code=$?
 
@@ -66,7 +68,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
     echo "### ravel-agents-sim seed batches"
     echo
-    echo "RAVEL_SIM_SEED=${RAVEL_SIM_SEED:-default}, RAVEL_SIM_SEEDS=${RAVEL_SIM_SEEDS:-default}, cargo test exit $code"
+    echo "RAVEL_SIM_SEED=${RAVEL_SIM_SEED:-default}, RAVEL_SIM_SEEDS=${RAVEL_SIM_SEEDS:-default}, RAVEL_AGENTS_PAGE_ENTRIES=${RAVEL_AGENTS_PAGE_ENTRIES:-default}, cargo test exit $code"
     echo
     echo '```'
     echo "$lines"

@@ -121,7 +121,13 @@ agents_real_store prints a skip line and passes unless
 RAVEL_REAL_STORE_URL is set) and `mcp` (clippy, the
 mcp_e2e and trace_by_id binaries and the lib tests), so `-p ravel-query`
 runs five lanes, and each of them builds into the same `target/` as the
-other four (the disk figures below predate these two lanes). An unscoped
+other four (the disk figures below predate these two lanes). The agents
+lane has one more run with its own trigger, ravel-agents-runtime or
+ravel-agents-sim in the closure (so any agents crate, not ravel-server
+alone): those two crates' tests again with `RAVEL_AGENTS_PAGE_ENTRIES=2`,
+where every paged list seals after two entries and the sim batches assert
+their size-2 pins; CI's features-agents job and the sim-nightly workflow
+run it too. An unscoped
 run also runs `scripts/gates-sdk.sh` (npm ci, lint, typecheck and test
 under sdk/typescript), which needs node 22 and refuses with exit 64
 without it; `RAVEL_GATES_SKIP_SDK=1` skips that step and leaves CI's
@@ -251,7 +257,8 @@ connection, a pushed-but-broken main).
   `mcp` feature lanes, always in workspace mode, and in scoped mode `sql`,
   `agents` and `mcp` when `ravel-server` is in the closure, `flight-sql`
   when `ravel-sql` or `ravel-server` is, and `esql` when `ravel-esql`,
-  `ravel-sql` or `ravel-server` is. In workspace mode it also runs
+  `ravel-sql` or `ravel-server` is; the agents lane's page-size-2 run
+  follows `ravel-agents-runtime` or `ravel-agents-sim`. In workspace mode it also runs
   `scripts/gates-sdk.sh` (node 22; `RAVEL_GATES_SKIP_SDK=1` skips it).
   This is the executor's gate in fleet specs. A scoped run writes no
   gates-pass receipt. `--dry-run` prints the closure and every cargo

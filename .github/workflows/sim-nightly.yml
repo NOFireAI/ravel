@@ -11,7 +11,9 @@
 # per-PR check job runs that crate's tests on its default batch, 64 seeds per
 # schedule from 0x5eed_0000 with every schedule's totals pinned. The job runs
 # that batch through crates/ravel-agents-sim/nightly.sh, which also fails when
-# a schedule's batch line is missing or doubled, then a fresh 512-seed window
+# a schedule's batch line is missing or doubled, then the same batch with
+# RAVEL_AGENTS_PAGE_ENTRIES=2, which asserts the size-2 pins
+# (schedules::pinned_by_page), then a fresh 512-seed window
 # per schedule. The window's first seed is the UTC day number times 1,000,000,
 # so consecutive nights never overlap, and the job summary prints the
 # RAVEL_SIM_SEED/RAVEL_SIM_SEEDS pair that replays it. A fresh window has no
@@ -93,6 +95,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Default batch (pinned totals)
         run: crates/ravel-agents-sim/nightly.sh .gate-logs/sim-default.log
+      - name: Default batch at page size 2 (pinned totals)
+        if: ${{ !cancelled() }}
+        env:
+          RAVEL_AGENTS_PAGE_ENTRIES: "2"
+        run: crates/ravel-agents-sim/nightly.sh .gate-logs/sim-default-pages-2.log
       - name: Fresh window
         if: ${{ !cancelled() }}
         env:

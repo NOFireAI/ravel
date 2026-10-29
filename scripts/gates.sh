@@ -295,6 +295,7 @@ run_lane_tests() {
 
 want_sql=0
 want_agents=0
+want_agents_small_pages=0
 want_mcp=0
 want_flight_sql=0
 want_esql=0
@@ -305,6 +306,7 @@ want_ingest_shipping=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
   want_agents=1
+  want_agents_small_pages=1
   want_mcp=1
   want_flight_sql=1
   want_esql=1
@@ -319,6 +321,9 @@ else
     esac
     case "${c}" in
       ravel-server) want_agents=1 ;;
+    esac
+    case "${c}" in
+      ravel-agents-runtime | ravel-agents-sim) want_agents_small_pages=1 ;;
     esac
     case "${c}" in
       ravel-server) want_mcp=1 ;;
@@ -374,6 +379,19 @@ run_feature_lanes() {
     run_lane_tests -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e --test agents_timers_e2e --test agents_real_store
     run_lane_tests -p ravel-server --features agents --lib
     run_lane_tests -p ravel-catalog --test sys_proto_format_version_classification
+  fi
+  # The agents lane's second page size: ravel-agents-runtime and
+  # ravel-agents-sim again with RAVEL_AGENTS_PAGE_ENTRIES=2, where every paged
+  # list seals after two entries, so the sealed-page paths run and the sim
+  # batches assert their size-2 pins (SMALL_PAGE_ENTRIES). The main suite runs
+  # them at the default size only. Selected by the closure holding either
+  # crate, not by ravel-server, which depends on them and not the reverse.
+  if [[ ${want_agents_small_pages} -eq 1 ]]; then
+    if [[ ${have_nextest} -eq 1 ]]; then
+      run env RAVEL_AGENTS_PAGE_ENTRIES=2 cargo nextest run --locked -p ravel-agents-runtime -p ravel-agents-sim
+    else
+      run env RAVEL_AGENTS_PAGE_ENTRIES=2 cargo test --locked -p ravel-agents-runtime -p ravel-agents-sim
+    fi
   fi
   # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
   # compile only under it. Same shape as the agents lane above: mcp_e2e and

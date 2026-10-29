@@ -25,7 +25,9 @@
 # `--features mcp` the mcp_e2e and trace_by_id binaries and the lib tests whole. Tests are selected
 # by binary, never by a test-name filter; scripts/gates.sh's run_feature_lanes
 # states why, and why the other integration binaries are left out. Its agents
-# and mcp lanes run the same tests.
+# and mcp lanes run the same tests. With ravel-agents-runtime or
+# ravel-agents-sim in the closure it also runs those two crates' tests with
+# RAVEL_AGENTS_PAGE_ENTRIES=2, as gates.sh does.
 # The exit code is the first failing run's, after every run has finished.
 #
 # scripts/gates.sh reads its scoped closure from `-n`, so `-n` prints the
@@ -151,6 +153,19 @@ case "$affected" in
     ;;
 esac
 
+# The agents lane's second page size, as in scripts/gates.sh: the runtime and
+# sim tests again with RAVEL_AGENTS_PAGE_ENTRIES=2 when either is in the
+# closure.
+small_pages_rc=0
+case "$affected" in
+  *" ravel-agents-runtime "* | *" ravel-agents-sim "*)
+    (
+      export RAVEL_AGENTS_PAGE_ENTRIES=2
+      run_tests -p ravel-agents-runtime -p ravel-agents-sim
+    ) || small_pages_rc=$?
+    ;;
+esac
+
 flight_rc=0
 case "$affected" in
   *" ravel-server "* | *" ravel-sql "*)
@@ -165,7 +180,7 @@ case "$affected" in
     ;;
 esac
 
-for code in "$rc" "$doc_rc" "$sql_rc" "$agents_rc" "$classification_rc" "$mcp_rc" "$flight_rc" "$esql_rc"; do
+for code in "$rc" "$doc_rc" "$sql_rc" "$agents_rc" "$classification_rc" "$mcp_rc" "$small_pages_rc" "$flight_rc" "$esql_rc"; do
   if [ "$code" -ne 0 ]; then
     exit "$code"
   fi
