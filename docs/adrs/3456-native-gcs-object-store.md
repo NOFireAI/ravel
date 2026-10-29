@@ -96,7 +96,8 @@ type from `ExternalStore`, which stays read-only.
   Second, `object_store`'s GCS listing uses the XML API's `list-type=2` with
   no `encoding-type`. So a foreign object whose name XML 1.0 cannot carry
   makes every page that contains it unparseable: the same whole-page failure
-  as the first reason, by another route. Every base backend's
+  as the first reason, by another route. (Measurement showed otherwise; see
+  the XML listing correction at the end of this ADR.) Every base backend's
   listing must instead hand raw keys to `classify_objects` and
   `classify_prefixes`, so unaddressable keys are reported in
   `ListPage::unaddressable` rather than failing the page. `GcsStore`
@@ -292,3 +293,38 @@ flowchart LR
   transition of one agent, so an agent stepping faster than about once a
   second on GCS sees throttle retries, counted like any other throttle.
   Nothing is lost: the CAS either lands or is retried.
+
+## Correction (2026-10-29): GCS's XML listing rewrites names it cannot carry
+
+<!-- amendment-applies: sections="D1. A `GcsStore` backend in ravel-object-store" pointer="XML listing correction" -->
+
+D1 gives, as its second reason for not listing through `object_store`, that
+a name XML 1.0 cannot carry makes the XML listing page unparseable. That is
+not what GCS does. Measured on 2026-10-29 against the same bucket as the
+Context table, with an object named `probe/a<U+0001>b` uploaded through the
+JSON API:
+
+| Listing request | Key returned |
+|---|---|
+| XML `list-type=2`, no `encoding-type` (what `object_store` sends) | `probe/a<U+FFFD>b`, HTTP 200, a well-formed document |
+| XML `list-type=2&encoding-type=url` | `probe/a%01b` |
+| JSON `objects.list` | `probe/a<U+0001>b`, exactly |
+
+So the XML listing that `object_store` uses does not fail the page. It
+reports a key with the character replaced, and that key names an object that
+does not exist. A sweep, a retention pass or a drain acting on it would read
+404 or delete nothing, with no error to say a key was mis-reported. That is
+worse than the page failure D1 described. The decision stands: `GcsStore`
+lists through the JSON API's `objects.list`, which returns names exactly. The
+reason is this one.
+
+The JSON listing also reports a different ETag from the XML API. Its `etag`
+field is not the ETag a HEAD returns. `GcsStore` therefore reports each
+listed object's ETag as the quoted hex of its `md5Hash`, which equals the
+HEAD ETag for an object written in a single upload. Every object Ravel writes
+is a single upload. A composite object has no `md5Hash`. Measured the same
+day, its HEAD ETag is a dash followed by its JSON `etag` (JSON
+`COTqrI7f35cDEAE=`, HEAD `"-COTqrI7f35cDEAE="`), so a listed composite is
+reported that way. A listed object with neither field fails the listing call
+rather than being given a guessed ETag. Ravel never composes objects, so the
+composite case can only arise from a foreign object.

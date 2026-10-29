@@ -445,6 +445,7 @@ Per backend, the same three rules:
 | Backend | Version selector | Unknown or deleted version | ETag mismatch |
 |---|---|---|---|
 | `S3Store` | `versionId` query parameter | `NotFound` | `PreconditionFailed` |
+| `GcsStore` | `generation` query parameter, ETag as `If-Match` | `NotFound` | `PreconditionFailed` |
 | `ExternalStore` GCS | `generation` | `NotFound` | `PreconditionFailed` |
 | `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
 | `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
@@ -452,9 +453,10 @@ Per backend, the same three rules:
 A full read (`GetRange::Full`) is bounded differently per backend. `S3Store`,
 and so the S3 kind of `ExternalStore`, splits it into requests of at most
 `max_get_chunk` bytes, so no single response outlives the request timeout.
-The GCS and Azure kinds of `ExternalStore` issue one unranged request and
-read its whole body. A caller reading a large GCS or Azure object in full
-must bound it with ranged reads itself. ADR-2040's Parquet reader is
+`GcsStore` and the GCS and Azure kinds of `ExternalStore` issue one unranged
+request and read its whole body, so on `GcsStore` a full read has to finish
+inside `GcsConfig::request_timeout` (20 s by default). A caller reading a
+large GCS or Azure object in full must bound it with ranged reads itself. ADR-2040's Parquet reader is
 specified to read by range (the footer, then column chunks), so it is not
 meant to take the unsplit path.
 
@@ -488,7 +490,8 @@ A backend that cannot evaluate preconditions MUST refuse with `Unsupported`,
 which is what the default trait implementation does. It does not fall back
 to an unconditional `get`: silently dropping the precondition serves bytes
 from a replaced file, which is the exact failure the method exists to
-prevent. `MemoryStore`, `S3Store` and `ExternalStore` implement it.
+prevent. `MemoryStore`, `S3Store`, `GcsStore` and `ExternalStore` implement
+it.
 
 #### Learning the version of the bytes you read
 
@@ -502,7 +505,9 @@ read, which is what `CREATE EXTERNAL TABLE` does before any pin exists.
 `ObjectMeta.version` is NOT that pin's version. It is the compare-and-swap
 token a conditional write compares, which on S3 is the ETag. The two are
 different values with different jobs, which is why the version is reported
-through `Pin` and no field was added to `ObjectMeta`.
+through `Pin` and no field was added to `ObjectMeta`. On `GcsStore` both
+happen to be the object's generation (ADR-3456 decision 1), but a caller
+does not rely on that.
 
 Every pin is built from store metadata through one constructor,
 `Pin::from_store(etag, version)`, which drops a version equal to the ETag:
@@ -984,6 +989,82 @@ contract lane above asserts both). The library default is `Off`, so an
 configured; `ravel-server` and `ravel-cli` configure `Crc64Nvme` unless told
 otherwise (see "Upload checksums").
 
+**GCS (`GcsStore`, ADR-3456).** `GcsStore` talks to GCS through
+`object_store`'s `GoogleCloudStorage` client, which speaks the XML API, for
+object requests and lists through the JSON API with a client of its own. It
+reports exactly `Capabilities::mandatory()`. The version token is the
+object's generation as a decimal string on every path (`put`, `get`, `head`,
+`pin_of` and listing entries), never the ETag: an identical rewrite keeps the
+ETag and moves the generation. `CreateIfAbsent` sends
+`x-goog-if-generation-match: 0` and maps a 412 to `AlreadyExists`;
+`CasVersion(v)` sends `x-goog-if-generation-match: v` and maps a 412 to
+`PreconditionFailed`. A `CasVersion` token that is not a positive decimal
+with no leading zero and no sign, at most `i64::MAX` (`0`, `012`, `+1`,
+`-1`, ` 1`, `9223372036854775808`, an empty or non-numeric token) is refused
+with `Permanent` before any request: GCS issues no generation 0, and
+`x-goog-if-generation-match: 0` would turn the CAS into a create-if-absent.
+`Overwrite` sends no precondition.
+
+A pinned read sends the generation as the `generation` query parameter and
+the ETag as `If-Match`. GCS judges the selector first: a key that does not
+exist, or a generation it no longer keeps, is `NotFound` whatever the ETag; a
+live generation with another ETag is `PreconditionFailed`.
+
+Listing is the JSON API's `objects.list` (`storage/v1/b/<bucket>/o`), with
+`maxResults` set to the configured page size (`GcsConfig::list_page_size`,
+1000 by default) on every request, and a `fields` mask naming only the
+response fields the listing reads. The prefix and the resume point go out as
+raw names, the resume point as `startOffset`, which is inclusive, so the
+start name itself is dropped from the result. Within a call the store follows
+the service's opaque `nextPageToken` until it holds a page of names, except
+that a response from which the start name was dropped and that leaves at
+least one name ends the call: its names, one fewer than the page size when
+the response was full, are returned with a `PageToken`, and no second request
+is sent to fill the page. At a page size P above 1 and against responses that
+are each full, every call is one request: the first call of a drain returns P
+names and each later call P - 1, so N names (N > P) take
+1 + ceil((N - P) / (P - 1)) calls and as many requests (six names at two a
+page, five; ten at three a page, five). At page size 1 a resumed response
+holds only the start name, so each resumed call is two requests. Up to 16 responses in a row that leave
+no name are followed before the call fails with `ListPageCeiling`, and a
+repeated `nextPageToken` fails it with `ListRepeatedToken`. The `PageToken`
+handed back between calls is the raw last name. Names are handed to `classify_objects` and `classify_prefixes` as
+received, so a name `GcsStore` cannot address is reported in
+`ListPage::unaddressable` rather than failing the page. A listed item without
+a positive decimal `generation` fails the call with `Permanent`. A listed
+ETag is the ETag `head` reports for the object: the quoted hex of the item's
+`md5Hash` when it has one, and for a composite object (no `md5Hash`, a
+`componentCount`) a dash followed by the JSON `etag`, quoted. An item with
+neither fails the call with `Permanent`, naming the key. Errors are classified by HTTP status: 429 and 503 are
+`Throttled`, with or without an error code in the body, 401 and 403 are
+`AccessDenied`, and 412 depends on the put mode as above. On object requests
+404 is `NotFound`, or `Permanent` when the body names `NoSuchBucket`, so a
+`head` on a bucket that does not exist is `NotFound`, as on S3; a listing of
+a bucket that does not exist is `Permanent`. Every HTTP attempt
+to the store's host, retries included, is counted into the store's
+`StoreMetrics`, so `ravel_store_attempts_total` covers GCS, and each
+response's `Date` header feeds `observed_store_time_ns`. The listing client
+sends through the same connector and takes its bearer token from the
+data-plane client's credential provider. Requests the client makes to fetch
+credentials are neither counted nor dated.
+
+`GcsStore` does not do three things S3 does: **no multipart upload**
+(`multipart: false`, and `put_multipart` refuses, so it does not satisfy
+`required_capabilities(Mode::Maintain)`; see "Mode-conditional
+capabilities"), **no upload checksums** (`upload_checksum:
+false`; a caller's CRC32C is still checked against the buffer before the
+request, and is not sent), and **no bucket-protection probes** (the
+"Required bucket configuration" checks below are S3 control-plane reads with
+no GCS counterpart here). Every full-object read is counted by
+`GcsStore::get_unverified`, since no stored checksum is checked on read.
+
+`crates/ravel-object-store/tests/contract.rs` runs the contract suite against
+`GcsStore` on the in-process fake GCS endpoint (`gcs::fake`, behind the
+`test-support` feature) in every run, and against a real bucket when
+`RAVEL_GCS_TEST_BUCKET` names one, with Application Default Credentials; it
+prints a skip line when the variable is unset. No production caller builds a
+`GcsStore` yet: ravel-server and ravel-cli do not accept `--store gcs`.
+
 ### Credentials
 
 `S3Config` selects a credential source explicitly through `auth`
@@ -1040,6 +1121,17 @@ mode, because S3 performs the KMS call server-side on every PUT. When
 policy must grant `kms:GenerateDataKey` and `kms:Decrypt` on that key, since
 the role is the identity S3 evaluates for the encryption and decryption
 calls.
+
+**GCS.** `GcsStore` takes Application Default Credentials only (ADR-3456
+decision 2), and `GcsConfig` carries no credential field. When
+`GOOGLE_APPLICATION_CREDENTIALS` is set, `GcsStore::new` passes the key file
+it names to the client, because `object_store`'s builder does not read that
+variable itself; otherwise `object_store` looks up the gcloud well-known file
+and then the metadata server. `GcsConfig::skip_signature` (accepted only
+together with a `base_url`, for an emulator or the test fake) looks up no
+credential: object requests carry a fixed placeholder bearer token instead,
+and listing requests carry no `Authorization` header. The field exists only
+in the crate's own tests and in builds with the `test-support` feature.
 
 ## Runtime qualification (executable contract)
 
@@ -1273,7 +1365,11 @@ identity it is configured for and logs a warning on a mismatch, without
 refusing. The identity is endpoint-derived (bucket plus optional endpoint, no
 credentials), so an endpoint rename or a path-style/virtual-host switch alters
 it with no change of backend, and refusing on that benign case would be an
-outage an operator disables. A mismatch is instead the signal that a
+outage an operator disables. A GCS store's identity is `gs://<bucket>`
+on Google's endpoint and `gs://<bucket>@<base_url>` when `GcsConfig::base_url`
+replaces it (`conformance::gcs_backend_identity`, ADR-3456 decision 5), so a
+qualification earned on an emulator or a test fake does not read as one
+earned on GCS. A mismatch is instead the signal that a
 replicated, restored, or migrated bucket carries a qualification a different
 backend earned: verify the backend and re-run `store qualify` if it is
 genuinely a different store. The command only ever writes under
@@ -1688,6 +1784,17 @@ ADR-0042 decision 3.
    above. `list`, `list_after` and `list_delimited` do not go through
    `object_store`: they send their own SigV4-signed ListObjectsV2 GET
    (ADR-2637 decision 1) through the same HTTP connector and credentials.
+4. `GcsStore` (ADR-3456): read-write adapter over `object_store`'s
+   `GoogleCloudStorage` (the GCS XML API), honoring every MUST above with the
+   generation as the version token. It sends through the S3 adapter's HTTP
+   connector, scoped to the store's own host. `list`, `list_after` and
+   `list_delimited` do not go through `object_store`: they send the JSON
+   API's `objects.list` through the same connector and credentials, with
+   `maxResults` set to the page size, returning a page one name short
+   rather than sending a second request when the dropped inclusive start
+   name is the only shortfall (see "Backend support notes"). No
+   multipart, no upload checksums, no bucket-protection probes (see "Backend
+   support notes").
 
 ### Instrumentation decorator
 

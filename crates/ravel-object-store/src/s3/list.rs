@@ -406,7 +406,7 @@ impl Backoff {
         Duration::from_secs_f64(std::mem::replace(&mut self.next_secs, next))
     }
 
-    fn next(&mut self) -> Duration {
+    pub(crate) fn next(&mut self) -> Duration {
         self.next_with(|low, high| rand::rng().random_range(low..high))
     }
 }
@@ -414,7 +414,7 @@ impl Backoff {
 /// Whether a transport failure is retried. A list GET is idempotent, so a
 /// timeout or an interrupted request is retried along with a connect or
 /// request failure; a decode or unknown failure is not.
-fn transport_retryable(kind: HttpErrorKind) -> bool {
+pub(crate) fn transport_retryable(kind: HttpErrorKind) -> bool {
     matches!(
         kind,
         HttpErrorKind::Connect
@@ -424,7 +424,7 @@ fn transport_retryable(kind: HttpErrorKind) -> bool {
     )
 }
 
-fn status_retryable(status: u16) -> bool {
+pub(crate) fn status_retryable(status: u16) -> bool {
     (500..600).contains(&status) || status == 429 || status == 408
 }
 
@@ -625,7 +625,10 @@ impl ListClient {
 }
 
 /// Read a body of at most `limit` bytes; `Ok(None)` when it is longer.
-async fn read_body(response: HttpResponse, limit: usize) -> Result<Option<Vec<u8>>, HttpError> {
+pub(crate) async fn read_body(
+    response: HttpResponse,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, HttpError> {
     let mut stream = response.into_body().bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -691,7 +694,7 @@ pub(crate) fn status_error(prefix: &str, status: u16, code: Option<&str>) -> Sto
 /// `request_target` (a configuration it cannot address) and `parse_document`
 /// (a body that is not a `ListBucketResult`) reach here, and neither changes
 /// on a retry.
-fn control_plane_error(prefix: &str, error: ControlPlaneError) -> StoreError {
+pub(crate) fn control_plane_error(prefix: &str, error: ControlPlaneError) -> StoreError {
     let context = format!("listing {prefix:?}");
     match error {
         ControlPlaneError::AccessDenied(detail) => {
