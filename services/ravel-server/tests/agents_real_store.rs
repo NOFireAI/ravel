@@ -100,8 +100,8 @@ fn put_opts(mode: PutMode) -> PutOptions {
 /// The CAS forms the agent HEAD publish uses, as typed outcomes in order:
 /// expected-absent on an absent key, expected-version with a never-issued
 /// version on an absent key, expected-version matching, expected-version
-/// stale, expected-absent on a present key, and expected-version with the
-/// key's own last version after it was deleted.
+/// stale, and expected-absent on a present key. The agents store never
+/// deletes a HEAD, so no step CASes a deleted key.
 async fn cas_steps(
     store: &dyn ObjectStoreBackend,
     key: &str,
@@ -132,7 +132,7 @@ async fn cas_steps(
         )
         .await;
     out.push(("cas_version_matching", kind(&updated)));
-    let v2 = updated.expect("expected-version update with the current version").version;
+    updated.expect("expected-version update with the current version");
 
     let stale = store
         .put(
@@ -157,16 +157,6 @@ async fn cas_steps(
         b"v2",
         "only the matching CAS may have written the key"
     );
-
-    store.delete(key).await.expect("delete the CAS key");
-    let deleted_cas = store
-        .put(
-            key,
-            Bytes::from_static(b"v5"),
-            put_opts(PutMode::CasVersion(v2)),
-        )
-        .await;
-    out.push(("cas_version_on_deleted_key", kind(&deleted_cas)));
     let _ = store.delete(key).await;
     out
 }
@@ -199,7 +189,6 @@ async fn cas_version_on_absent_key_matches_memory_oracle_on_rustfs() {
             ("cas_version_matching", Kind::Ok),
             ("cas_version_stale", Kind::PreconditionFailed),
             ("create_if_absent_on_present_key", Kind::AlreadyExists),
-            ("cas_version_on_deleted_key", Kind::PreconditionFailed),
         ],
         "memory oracle outcomes"
     );
