@@ -4693,6 +4693,7 @@ dependencies = [
  "ravel-agents-store",
  "ravel-cache",
  "ravel-catalog",
+ "ravel-cli",
  "ravel-codec",
  "ravel-commit",
  "ravel-fleet",

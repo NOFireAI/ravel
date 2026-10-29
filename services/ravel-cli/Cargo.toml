@@ -28,6 +28,13 @@ profiling = ["dep:pprof", "tikv-jemallocator/profiling"]
 # a default build carries no SQL engine in the binary and no way to reach it.
 sql-explain = ["dep:ravel-sql"]
 
+# Test builds only: when RAVEL_GCS_TEST_SKIP_SIGNATURE is set, `--store gcs`
+# sends unsigned requests and looks up no credentials, so this crate's tests
+# can drive the binary against ravel-object-store's fake GCS endpoint
+# (`gcs::fake`). Enabled by the dev-dependency on this crate below; a default
+# build neither reads the variable nor links the fake.
+test-support = ["ravel-object-store/test-support"]
+
 [dependencies]
 # Optional: see the `profiling` feature above. Same version/feature set as
 # crates/ravel-bench's pin so the two crates' flamegraphs are comparable.
@@ -135,6 +142,9 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
 [dev-dependencies]
+# Turns on this crate's `test-support` feature for its own tests (the
+# `--store gcs` fake-endpoint tests), as ravel-object-store does for its own.
+ravel-cli = { path = ".", features = ["test-support"] }
 # Paused tokio time, so a loader test can hold a PUT past the real-time
 # Strict ack deadline without waiting it out. A feature of the existing pin.
 tokio = { workspace = true, features = ["test-util"] }
