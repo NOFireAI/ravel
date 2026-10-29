@@ -273,7 +273,7 @@ mcp = [
 ]
 
 # The Ravel Agents surface under `/api/v1/agents` (ADR-3331 decision 9). Off by
-# default and not in the published image; `--agents` is a second, runtime
+# default; the published image turns it on. `--agents` is a second, runtime
 # opt-in on top, and a build without this feature refuses that flag.
 agents = [
     "dep:ravel-agents-core",

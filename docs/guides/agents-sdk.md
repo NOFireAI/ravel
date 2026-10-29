@@ -195,8 +195,9 @@ server. Its tests are in `transport/http.test.ts`.
   outlasts the server's lease loses the turn to another worker. The lease
   is 30 s by default: the agents runtime's `RuntimeConfig::default` sets
   `lease_ms` to 30000.
-- The server serves no step or effect route yet, so steps are journaled in
-  the worker's own memory and lost with its process. Test: `authorizes a
+- The SDK does not call the server's step and effect routes in this
+  release, so steps are journaled in the worker's own memory and lost with
+  its process. Test: `authorizes a
   new attempt at an unsettled at_least_once step and replays a settled
   one`.
 - A manual step left without a result is in doubt until a reconcile through
@@ -213,8 +214,9 @@ server. Its tests are in `transport/http.test.ts`.
   loses the step journal and a kill across processes cannot replay a step.
   Test: `authorizes a new attempt at an unsettled at_least_once step and
   replays a settled one` (`transport/http.test.ts`).
-- No route reconciles an effect in doubt, and while one is in doubt the
-  server reports the operation as running. Test: `worker killed inside a
+- The server's reconcile route cannot see an SDK worker's step, because the
+  SDK keeps it in memory, and while one is in doubt the server reports the
+  operation as running. Test: `worker killed inside a
   manual step blocks as EffectInDoubt in the in-memory journal until
   reconciled there` (`e2e/recover.test.ts`).
 - The fake coordinator has no timers. Test: `advancing the fake's clock
