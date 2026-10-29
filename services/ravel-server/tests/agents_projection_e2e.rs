@@ -35,7 +35,9 @@ use ravel_server::config::{
     AgentsClock, AgentsConfig, AgentsProjectionConfig, AgentsProjectionSwitch, ProjectionTap,
 };
 use ravel_server::{FoldTaskConfig, Mode, QueryBudgets, ServerConfig};
-use ravel_tenant_resolve::{Principal, StaticBearerTokenResolver};
+use ravel_tenant_resolve::{
+    DevHeaderTenantResolver, FallbackResolver, Principal, StaticBearerTokenResolver,
+};
 use ravel_types::TenantId;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -828,6 +830,87 @@ async fn a_process_that_cannot_project_refuses_to_start_and_off_is_reported() {
     assert_eq!(projection["mode"], json!("endpoint"));
     assert_eq!(projection["endpoint"], json!("http://127.0.0.1:4317"));
     running.shutdown().await.expect("clean shutdown");
+
+    for (switch, endpoint, names) in [
+        (AgentsProjectionSwitch::Auto, "http://gateway:4317", "#3360"),
+        (
+            AgentsProjectionSwitch::Auto,
+            "https://127.0.0.1:4317",
+            "#3360",
+        ),
+        (
+            AgentsProjectionSwitch::Off,
+            "http://127.0.0.1:4317",
+            "contradict",
+        ),
+    ] {
+        let refused = try_start(
+            Arc::new(MemoryStore::new()),
+            agents_config(AgentsProjectionConfig {
+                switch,
+                endpoint: Some(endpoint.to_string()),
+                ..AgentsProjectionConfig::default()
+            }),
+            Mode::Query,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{switch:?} with {endpoint} refuses to start"));
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains(names) && message.contains(endpoint),
+            "{message}"
+        );
+    }
+}
+
+/// A query-mode process with `--agents` projects over OTLP gRPC to a
+/// loopback gateway, and the committed event is a log line on that
+/// gateway's query path, under the id the delivery carried. The two
+/// processes share no store, so the line can only have arrived over OTLP.
+#[tokio::test]
+async fn a_query_mode_process_projects_to_a_loopback_gateway() {
+    let mut gateway_config = server_config(AgentsConfig::default(), Mode::All);
+    let mut tokens = HashMap::new();
+    tokens.insert(
+        CLIENT.to_string(),
+        Principal::tenant_only(TenantId::new("acme")),
+    );
+    gateway_config.tenant_resolver = Arc::new(FallbackResolver::new(vec![
+        Arc::new(StaticBearerTokenResolver::with_principals(tokens)),
+        Arc::new(DevHeaderTenantResolver::default()),
+    ]));
+    let gateway = try_start_with(Arc::new(MemoryStore::new()), gateway_config)
+        .await
+        .expect("gateway starts");
+    let grpc = gateway.grpc_addr.expect("the gateway listens for gRPC");
+    let endpoint = format!("http://{grpc}");
+
+    let tap = Arc::new(Tap::default());
+    let running = try_start(
+        Arc::new(MemoryStore::new()),
+        agents_config(AgentsProjectionConfig {
+            endpoint: Some(endpoint.clone()),
+            ..projecting(&tap)
+        }),
+        Mode::Query,
+    )
+    .await
+    .expect("query mode with a loopback endpoint starts");
+    let api = Api::new(&running);
+    assert_eq!(api.projection().await["endpoint"], json!(endpoint));
+    let worker = setup(&api).await;
+    turn(&api, &worker, "r1", 1).await;
+    let ids = tap.wait_delivered(1).await;
+    let projection = api.wait_projection("events_projected", |n| n == 1).await;
+    assert_eq!(projection["lag_max"], json!(0), "{projection}");
+    assert_eq!(projection["records_rejected"], json!(0), "{projection}");
+    Api::new(&gateway)
+        .wait_log_lines(&format!(".*event_id={} .*type=paid .*", ids[0]), 1)
+        .await;
+
+    running.shutdown().await.expect("clean shutdown");
+    gateway.shutdown().await.expect("clean shutdown");
 }
 
 /// A restarted process projects the agent's history again as it touches the

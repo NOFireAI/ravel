@@ -677,13 +677,20 @@ Where records go depends on the process:
 | Process | `--agents-projection` | `--agents-projection-endpoint` | Records go to | Health `mode` |
 |---|---|---|---|---|
 | holds an ingest buffer (`all`, `gateway`) | `auto` (default) | unset | this process's own log and span ingest routers | `in_process` |
-| any | `auto` | an OTLP gRPC URL | that endpoint, tenant in the `x-ravel-tenant` header | `endpoint` |
+| any | `auto` | plain `http://` on a loopback host | that endpoint over OTLP gRPC, tenant in the `x-ravel-tenant` header | `endpoint` |
+| any | `auto` | another host, or any `https://` URL | refuses to start, naming issue #3360 | none |
 | no ingest buffer (`query`) | `auto` | unset | refuses to start, naming both ways out | none |
-| any | `off` | any | nowhere | `off` |
+| any | `off` | unset | nowhere | `off` |
+| any | `off` | set | refuses to start: the two contradict | none |
 
 So projection is never silently absent
 (`a_process_that_cannot_project_refuses_to_start_and_off_is_reported`,
 `agents_projection_target_resolves_or_refuses_naming_both_ways_out`). The
+endpoint is loopback-only because the projector sends a tenant's history with
+no credential, trusted on the tenant header alone; until the credential model
+of issue #3360 lands, run the receiving gateway on the same host
+(`agents_projection_endpoint_is_loopback_http_only`,
+`a_query_mode_process_projects_to_a_loopback_gateway`). The
 in-process sink applies the tenant's IPCrypt rules like any other ingest, and
 the default normalisation limits. A tenant whose rules cannot be resolved
 fails the batch, which the projector retries.
