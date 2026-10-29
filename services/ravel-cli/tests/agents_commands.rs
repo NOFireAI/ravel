@@ -284,7 +284,11 @@ async fn dev_command_refuses_the_gcs_store() {
         ),
         "{err}"
     );
-    assert!(host.calls.is_empty(), "a refused dev started {:?}", host.calls);
+    assert!(
+        host.calls.is_empty(),
+        "a refused dev started {:?}",
+        host.calls
+    );
     assert!(out.is_empty(), "a refused dev printed a ready line");
 }
 

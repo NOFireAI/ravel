@@ -124,7 +124,10 @@ async fn verify_protection_refuses_under_gcs() {
     );
     assert_eq!(stdout, "", "no report is printed");
     let requests = fake.requests();
-    assert!(requests.is_empty(), "no request reaches the bucket: {requests:?}");
+    assert!(
+        requests.is_empty(),
+        "no request reaches the bucket: {requests:?}"
+    );
 }
 
 /// A `--s3-*` flag given on the command line under `--store gcs` refuses
@@ -147,7 +150,10 @@ async fn given_s3_flag_is_refused_under_gcs() {
         "stderr:\n{stderr}"
     );
     let requests = fake.requests();
-    assert!(requests.is_empty(), "no request reaches the bucket: {requests:?}");
+    assert!(
+        requests.is_empty(),
+        "no request reaches the bucket: {requests:?}"
+    );
 }
 
 /// The same refusal for a `--s3-*` flag set through its environment variable.
@@ -166,7 +172,10 @@ async fn s3_flag_from_environment_is_refused_under_gcs() {
         "stderr:\n{stderr}"
     );
     let requests = fake.requests();
-    assert!(requests.is_empty(), "no request reaches the bucket: {requests:?}");
+    assert!(
+        requests.is_empty(),
+        "no request reaches the bucket: {requests:?}"
+    );
 }
 
 /// `--store gcs` without `--gcs-bucket` refuses and names the flag.
@@ -213,7 +222,9 @@ async fn tenant_kms_is_refused_under_gcs() {
             "--signal",
             "metrics",
         ],
-        &["maintain", "migrate", "--tenant", "t", "--signal", "metrics"],
+        &[
+            "maintain", "migrate", "--tenant", "t", "--signal", "metrics",
+        ],
         &["catalog", "fold", "--tenant", "t"],
     ];
     for command in commands {
@@ -229,5 +240,8 @@ async fn tenant_kms_is_refused_under_gcs() {
         );
     }
     let requests = fake.requests();
-    assert!(requests.is_empty(), "no request reaches the bucket: {requests:?}");
+    assert!(
+        requests.is_empty(),
+        "no request reaches the bucket: {requests:?}"
+    );
 }

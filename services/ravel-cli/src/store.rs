@@ -2501,9 +2501,7 @@ mod tests {
     fn gcs_refuses_unrecorded_flag_sources() {
         let args = StoreArgs::try_parse_from(["ravel-cli", "--store", "gcs", "--gcs-bucket", "b"])
             .expect("store flags parse");
-        assert!(
-            gcs_config_error(&args).contains("could not tell which --s3-* flags were given"),
-        );
+        assert!(gcs_config_error(&args).contains("could not tell which --s3-* flags were given"),);
     }
 
     #[test]
@@ -2545,6 +2543,9 @@ mod tests {
                 "http://127.0.0.1:9"
             ]
         );
-        assert_eq!(gcs_args(&["--gcs-bucket", "b"]).backend_identity(), "gs://b");
+        assert_eq!(
+            gcs_args(&["--gcs-bucket", "b"]).backend_identity(),
+            "gs://b"
+        );
     }
 }
