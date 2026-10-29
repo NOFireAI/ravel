@@ -822,8 +822,8 @@ pub struct Cli {
     /// Repeatable `token=tenant` pair for the static bearer map. The tenant
     /// may end in `;` and a comma-separated capability list drawn from `ddl`
     /// (tenant-scoped DDL), `ipcrypt` (the IPCrypt SQL functions), `agents`,
-    /// `agents_worker` and `agents_admin` (the Ravel Agents roles, which no
-    /// route checks yet), each at most once: `acme;ddl`, `acme;ipcrypt` and
+    /// `agents_worker` and `agents_admin` (the Ravel Agents client, worker and
+    /// admin roles under `/api/v1/agents`), each at most once: `acme;ddl`, `acme;ipcrypt` and
     /// `acme;ddl,ipcrypt,agents` all name tenant `acme`. Any other suffix
     /// fails startup.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
@@ -1491,8 +1491,9 @@ pub struct Cli {
     /// 9), for Ravel Agents client operations, read like `--oidc-ddl-claim`:
     /// only the JSON boolean `true` grants it. Unset (the default), the
     /// capability is never granted via OIDC. Setting it without OIDC enabled
-    /// fails startup rather than silently doing nothing. No route checks the
-    /// capability yet: `/api/v1/agents/health` is the only agents route.
+    /// fails startup rather than silently doing nothing. The agents client
+    /// routes (`create`, `send`, `state`, `events` and the rest) refuse a
+    /// token without it with 403.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_agents_claim: Option<String>,
 
@@ -1501,7 +1502,8 @@ pub struct Cli {
     /// effect completion, read like `--oidc-ddl-claim`. It does not grant
     /// `agents`. Unset (the default), the capability is never granted via
     /// OIDC. Setting it without OIDC enabled fails startup rather than
-    /// silently doing nothing. No route checks the capability yet.
+    /// silently doing nothing. The `worker/*` agents routes refuse a token
+    /// without it with 403.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_agents_worker_claim: Option<String>,
 
@@ -1510,7 +1512,8 @@ pub struct Cli {
     /// `--oidc-ddl-claim`. It grants neither `agents` nor `agents_worker`.
     /// Unset (the default), the capability is never granted via OIDC. Setting
     /// it without OIDC enabled fails startup rather than silently doing
-    /// nothing. No route checks the capability yet.
+    /// nothing. The `reconcile` and `sweep` agents routes refuse a token
+    /// without it with 403.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_agents_admin_claim: Option<String>,
 
@@ -17885,12 +17888,21 @@ mod tests {
         let off = AgentsProjectionSwitch::Off;
         let url = Some("http://gateway:4317");
         let endpoint = AgentsProjectionTarget::Endpoint("http://gateway:4317".to_string());
-        assert_eq!(on(auto, None).projection_target(true), Ok(AgentsProjectionTarget::InProcess));
+        assert_eq!(
+            on(auto, None).projection_target(true),
+            Ok(AgentsProjectionTarget::InProcess)
+        );
         assert_eq!(on(auto, url).projection_target(true), Ok(endpoint.clone()));
         assert_eq!(on(auto, url).projection_target(false), Ok(endpoint));
         for buffer in [true, false] {
-            assert_eq!(on(off, None).projection_target(buffer), Ok(AgentsProjectionTarget::Off));
-            assert_eq!(on(off, url).projection_target(buffer), Ok(AgentsProjectionTarget::Off));
+            assert_eq!(
+                on(off, None).projection_target(buffer),
+                Ok(AgentsProjectionTarget::Off)
+            );
+            assert_eq!(
+                on(off, url).projection_target(buffer),
+                Ok(AgentsProjectionTarget::Off)
+            );
             assert_eq!(
                 AgentsConfig::default().projection_target(buffer),
                 Ok(AgentsProjectionTarget::Off)

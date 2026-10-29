@@ -303,7 +303,10 @@ impl Api {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("projection {field} never reached its mark: {}", self.projection().await);
+        panic!(
+            "projection {field} never reached its mark: {}",
+            self.projection().await
+        );
     }
 
     async fn scrape(&self) -> String {
@@ -435,7 +438,10 @@ fn coordinator_writes(scrape: &str) -> Vec<String> {
 
 /// An operation's result, less its wall-clock finish time.
 async fn result(api: &Api, operation: &str) -> Value {
-    let mut result = api.get(CLIENT, &format!("result?operation={operation}")).await["result"].clone();
+    let mut result = api
+        .get(CLIENT, &format!("result?operation={operation}"))
+        .await["result"]
+        .clone();
     result
         .as_object_mut()
         .expect("result object")
@@ -473,8 +479,11 @@ async fn run(outage: bool) -> Observed {
     // payload's hash and size and never its text.
     api.wait_log_lines(&format!(".*event_id={id} .*event_seq=1 .*type=paid .*"), 1)
         .await;
-    api.wait_log_lines(&format!(".*event_id={id} .*payload_hash=[0-9a-f]+ payload_size=[0-9]+ payload=redacted"), 1)
-        .await;
+    api.wait_log_lines(
+        &format!(".*event_id={id} .*payload_hash=[0-9a-f]+ payload_size=[0-9]+ payload=redacted"),
+        1,
+    )
+    .await;
     assert_eq!(api.log_lines(&format!(".*{SECRET}.*")).await, 0);
 
     if outage {
@@ -504,13 +513,18 @@ async fn run(outage: bool) -> Observed {
             attempts.iter().filter(|a| *a == missed).count() >= if outage { 2 } else { 1 },
             "{missed}: {attempts:?}"
         );
-        api.wait_log_lines(&format!(".*event_id={missed} .*"), 1).await;
+        api.wait_log_lines(&format!(".*event_id={missed} .*"), 1)
+            .await;
     }
     api.wait_log_lines(&format!(".*event_id={id} .*"), 1).await;
     for attempted in &attempts {
         assert!(delivered.contains(attempted), "{attempted} never delivered");
     }
-    assert_eq!(store.agent_writes(), agent_writes, "projection wrote an agent key");
+    assert_eq!(
+        store.agent_writes(),
+        agent_writes,
+        "projection wrote an agent key"
+    );
 
     running.shutdown().await.expect("clean shutdown");
     Observed {
@@ -539,7 +553,8 @@ async fn committed_turn_is_queryable_as_a_log_with_its_stable_event_id_and_a_pro
         clean
             .coordinator_writes
             .iter()
-            .filter(|l| l.starts_with("ravel_agents_store_cas_total{") && l.contains("phase=\"publish\""))
+            .filter(|l| l.starts_with("ravel_agents_store_cas_total{")
+                && l.contains("phase=\"publish\""))
             .count(),
         1,
         "{:?}",
@@ -645,7 +660,10 @@ async fn a_process_that_cannot_project_refuses_to_start_and_off_is_reported() {
     .err()
     .expect("query mode with no endpoint refuses to start");
     let message = format!("{refused:#}");
-    assert!(message.contains("--agents-projection-endpoint"), "{message}");
+    assert!(
+        message.contains("--agents-projection-endpoint"),
+        "{message}"
+    );
     assert!(message.contains("--agents-projection off"), "{message}");
 
     let running = try_start(
