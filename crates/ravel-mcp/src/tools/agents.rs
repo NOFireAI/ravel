@@ -7,6 +7,8 @@
 //! capability, the admission lane and the coordinator are the ones an HTTP
 //! caller meets: nothing here decides who may call what.
 
+use std::time::Duration;
+
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
@@ -46,6 +48,9 @@ pub struct AgentsCall {
     /// Query parameters, unencoded.
     pub query: Vec<(&'static str, String)>,
     pub body: Option<Value>,
+    /// The call's effective deadline: the backend abandons a route that has
+    /// not answered within it and returns [`DeadlinePassed`].
+    pub deadline: Duration,
 }
 
 /// The route's answer: its HTTP status and its JSON body (`null` when the
@@ -56,12 +61,17 @@ pub struct AgentsReply {
     pub body: Value,
 }
 
+/// The route did not answer within [`AgentsCall::deadline`] and the call was
+/// abandoned. A write it started may or may not have applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlinePassed;
+
 /// The agents client routes, as the adapter serves them to a tool body. The
 /// adapter forwards the MCP request's own credentials, so the route
 /// authenticates the same caller the MCP route did.
 #[allow(async_fn_in_trait)]
 pub trait AgentsBackend {
-    async fn call(&self, call: AgentsCall) -> AgentsReply;
+    async fn call(&self, call: AgentsCall) -> Result<AgentsReply, DeadlinePassed>;
 }
 
 /// Route one Ravel Agents tool call. A name outside [`AGENTS_TOOLS`] is
@@ -161,24 +171,39 @@ async fn send<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &B)
         "request_id": input.idempotency_key,
         "payload": input.payload.0,
     });
-    let reply = backend
+    let reply = match backend
         .call(AgentsCall {
             method: AgentsMethod::Post,
             route: "send",
             query: Vec::new(),
             body: Some(request),
+            deadline: ctx.budgets.deadline,
         })
-        .await;
+        .await
+    {
+        Ok(reply) => reply,
+        Err(DeadlinePassed) => {
+            return failed(
+                Failure {
+                    class: FailureClass::Deadline,
+                    message: format!(
+                        "{}; the send's outcome is unknown: the input may or may not have \
+                         been accepted",
+                        deadline_message(ctx)
+                    ),
+                    counter: None,
+                },
+                vec![resend_step()],
+                ctx,
+            );
+        }
+    };
     let outcome_unknown = reply.body["code"] == json!("outcome_unknown");
-    let body = match answered(reply, ctx) {
+    let body = match answered(Ok(reply), ctx) {
         Ok(body) => body,
         Err(mut refused) => {
             if outcome_unknown {
-                refused.next_steps.push(step(
-                    "resend_with_the_same_key",
-                    "ravel_agent_send with the same idempotency_key answers the operation \
-                     if the input was accepted, and accepts it once if it was not",
-                ));
+                refused.next_steps.push(resend_step());
             }
             return *refused;
         }
@@ -241,8 +266,11 @@ async fn operation<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend
     if body["status"] == json!("blocked") {
         envelope.next_steps = vec![step(
             "read_blocked_effects",
-            "ravel_agent_blocked_effects on the operation's agent names the reconcile \
-             request that unblocks it",
+            &format!(
+                "ravel_agent_blocked_effects on the operation's agent lists effect {} with \
+                 the reconcile requests that unblock it",
+                scalar_text(&body["blocked_effect"])
+            ),
         )];
     }
     envelope.fit(ctx.budgets.max_response_bytes).finish(false)
@@ -306,6 +334,7 @@ async fn events<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
             route: "events",
             query: Vec::new(),
             body: Some(request),
+            deadline: ctx.budgets.deadline,
         })
         .await;
     let body = match answered(reply, ctx) {
@@ -464,13 +493,48 @@ async fn get<B: AgentsBackend>(
             route,
             query,
             body: None,
+            deadline: ctx.budgets.deadline,
         })
         .await;
     answered(reply, ctx)
 }
 
-/// A 2xx body, or the refusal envelope for the route's error answer.
-fn answered(reply: AgentsReply, ctx: &ToolContext<'_>) -> Result<Value, Box<Envelope>> {
+/// The step after a send whose outcome is unknown.
+fn resend_step() -> NextStep {
+    step(
+        "resend_with_the_same_key",
+        "ravel_agent_send with the same idempotency_key answers the operation \
+         if the input was accepted, and accepts it once if it was not",
+    )
+}
+
+fn deadline_message(ctx: &ToolContext<'_>) -> String {
+    format!(
+        "the agents route did not answer within the call's {} ms deadline",
+        ctx.budgets.deadline.as_millis()
+    )
+}
+
+/// A 2xx body, or the refusal envelope for the route's error answer or for
+/// a route that did not answer by the deadline.
+fn answered(
+    reply: Result<AgentsReply, DeadlinePassed>,
+    ctx: &ToolContext<'_>,
+) -> Result<Value, Box<Envelope>> {
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(DeadlinePassed) => {
+            return Err(Box::new(failed(
+                Failure {
+                    class: FailureClass::Deadline,
+                    message: deadline_message(ctx),
+                    counter: None,
+                },
+                Vec::new(),
+                ctx,
+            )));
+        }
+    };
     if (200..300).contains(&reply.status) {
         return Ok(reply.body);
     }
@@ -621,21 +685,29 @@ mod tests {
 
     /// A backend that records every call and answers one canned reply.
     struct Canned {
-        reply: AgentsReply,
+        reply: Result<AgentsReply, DeadlinePassed>,
         calls: RefCell<Vec<AgentsCall>>,
     }
 
     impl Canned {
         fn new(status: u16, body: Value) -> Self {
             Canned {
-                reply: AgentsReply { status, body },
+                reply: Ok(AgentsReply { status, body }),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// A route that never answered within the call's deadline.
+        fn late() -> Self {
+            Canned {
+                reply: Err(DeadlinePassed),
                 calls: RefCell::new(Vec::new()),
             }
         }
     }
 
     impl AgentsBackend for Canned {
-        async fn call(&self, call: AgentsCall) -> AgentsReply {
+        async fn call(&self, call: AgentsCall) -> Result<AgentsReply, DeadlinePassed> {
             self.calls.borrow_mut().push(call);
             self.reply.clone()
         }
@@ -742,6 +814,88 @@ mod tests {
         assert_eq!(
             envelope["next_steps"][0]["action"],
             json!("use_an_agents_credential")
+        );
+    }
+
+    /// Every agents tool hands the backend the call's effective deadline.
+    #[test]
+    fn every_route_call_carries_the_effective_deadline() {
+        let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
+        let mut ctx = test_context(&key);
+        ctx.budgets.deadline = Duration::from_millis(1_234);
+        let args = json!({"kind": "order", "key": "o-1", "handler": "place",
+                          "idempotency_key": "k-1", "operation": "op-1"});
+        for name in AGENTS_TOOLS {
+            let backend = Canned::new(200, json!({}));
+            block_on(dispatch_agents(name, args.clone(), &ctx, &backend))
+                .expect("an agents tool name routes");
+            let calls = backend.calls.borrow();
+            assert_eq!(calls.len(), 1, "{name}");
+            assert_eq!(calls[0].deadline, Duration::from_millis(1_234), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_read_past_its_deadline_is_the_deadline_envelope() {
+        let envelope = run("ravel_agent_state", agent_args(), &Canned::late());
+        assert_eq!(envelope["status"], json!("error"));
+        assert_eq!(envelope["failure"]["class"], json!("deadline"));
+        let deadline_ms = envelope["budget"]["effective"]["deadline_ms"]
+            .as_u64()
+            .expect("deadline_ms");
+        assert_eq!(
+            envelope["failure"]["message"],
+            json!(format!(
+                "the agents route did not answer within the call's {deadline_ms} ms deadline"
+            ))
+        );
+        assert_eq!(envelope["next_steps"], json!([]));
+    }
+
+    #[test]
+    fn a_send_past_its_deadline_reports_an_unknown_outcome_and_the_resend_step() {
+        let envelope = run(
+            "ravel_agent_send",
+            json!({"kind": "order", "key": "o-1", "handler": "place",
+                   "idempotency_key": "k-1"}),
+            &Canned::late(),
+        );
+        assert_eq!(envelope["status"], json!("error"));
+        assert_eq!(envelope["failure"]["class"], json!("deadline"));
+        let message = envelope["failure"]["message"].as_str().expect("message");
+        assert!(
+            message.ends_with(
+                "; the send's outcome is unknown: the input may or may not have been accepted"
+            ),
+            "{message}"
+        );
+        let steps = envelope["next_steps"].as_array().expect("next steps");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["action"], json!("resend_with_the_same_key"));
+    }
+
+    #[test]
+    fn a_blocked_operation_names_its_blocking_effect_in_the_next_step() {
+        let backend = Canned::new(
+            200,
+            json!({"operation": "op-1", "status": "blocked", "accept_seq": 1,
+                   "blocked_effect": "eff-9"}),
+        );
+        let envelope = run(
+            "ravel_agent_operation",
+            json!({"operation": "op-1"}),
+            &backend,
+        );
+        assert_eq!(
+            envelope["next_steps"][0]["action"],
+            json!("read_blocked_effects")
+        );
+        assert_eq!(
+            envelope["next_steps"][0]["detail"],
+            json!(
+                "ravel_agent_blocked_effects on the operation's agent lists effect eff-9 \
+                 with the reconcile requests that unblock it"
+            )
         );
     }
 

@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, ScriptedFault, Sequence,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::config::{AgentsConfig, McpConfig};
 use ravel_server::{FoldTaskConfig, Mode, QueryBudgets, ServerConfig};
@@ -256,6 +258,16 @@ fn row(envelope: &Value) -> HashMap<String, Value> {
 
 fn agent_args() -> Value {
     json!({"kind": "order", "key": "o-1"})
+}
+
+/// The store key of the `agent_args()` agent's HEAD object.
+fn head_key() -> String {
+    let kind = ravel_agents_core::keys::AgentKind::new("order").expect("kind");
+    let key = ravel_agents_core::keys::AgentKey::new("o-1").expect("key");
+    format!(
+        "{}/head",
+        ravel_agents_core::identity::agent_id(&kind, &key).to_hex()
+    )
 }
 
 fn send_args(idempotency_key: &str) -> Value {
@@ -650,6 +662,9 @@ async fn ravel_agent_blocked_effects_lists_an_effect_in_doubt_with_the_inspector
     .await;
     assert!(!is_error, "{op}");
     assert_eq!(op["next_steps"][0]["action"], json!("read_blocked_effects"));
+    let detail = op["next_steps"][0]["detail"].as_str().expect("detail");
+    let effect_id = effect.as_str().expect("effect id");
+    assert!(detail.contains(effect_id), "{detail}");
     let op = row(&op);
     assert_eq!(op["status"], json!("blocked"));
     assert_eq!(op["blocked_effect"], effect);
@@ -747,12 +762,7 @@ async fn send_and_operation_store_calls_are_pinned() {
 /// duplicate, and publishes nothing more.
 #[tokio::test]
 async fn a_lost_send_ack_resent_with_the_same_key_answers_the_accepted_operation() {
-    let kind = ravel_agents_core::keys::AgentKind::new("order").expect("kind");
-    let key = ravel_agents_core::keys::AgentKey::new("o-1").expect("key");
-    let head = format!(
-        "{}/head",
-        ravel_agents_core::identity::agent_id(&kind, &key).to_hex()
-    );
+    let head = head_key();
     let plan = FaultPlan::empty()
         .with_sequence(
             Sequence::new(Op::Put)
@@ -815,6 +825,112 @@ async fn a_lost_send_ack_resent_with_the_same_key_answers_the_accepted_operation
         1
     );
     assert_eq!(api.publish_cas().await, published);
+
+    client.cancel().await.expect("client stops");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A `FaultStore` with no scripted faults, so the only thing slowing a call
+/// down is a hold gate the test arms.
+async fn start_faulted() -> (Arc<FaultStore<MemoryStore>>, ravel_server::Running) {
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let running = start_server(
+        faults.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        agents_config(true),
+    )
+    .await;
+    (faults, running)
+}
+
+/// One tool call that must end on its own effective deadline. The outer
+/// bound is far above every deadline these tests set; it only turns a call
+/// that never ends into a failure instead of a hung test.
+async fn call_ending_by_deadline(client: &Client, name: &str, arguments: Value) -> (bool, Value) {
+    tokio::time::timeout(Duration::from_secs(30), call(client, name, arguments))
+        .await
+        .expect("the call ends at its effective deadline")
+}
+
+/// An agents read whose route is held at the store past the call's
+/// `deadline_ms` answers the `deadline` class with that deadline as the
+/// effective one, and the same read under the default deadline succeeds.
+#[tokio::test]
+async fn an_agents_read_held_past_its_deadline_answers_the_deadline_class() {
+    let (faults, running) = start_faulted().await;
+    let api = Api::new(&running);
+    api.create().await;
+    let client = mcp(&running, CLIENT).await;
+    let (is_error, sent) = call(&client, "ravel_agent_send", send_args("k-1")).await;
+    assert!(!is_error, "{sent}");
+    let operation = row(&sent)["operation"].clone();
+
+    // The operation read is one HEAD read; the gate holds the first one
+    // after it is armed and lets every later one through.
+    let gate = faults.hold(Op::Get, Some(head_key()), Occurrence::Nth(1));
+    let (is_error, late) = call_ending_by_deadline(
+        &client,
+        "ravel_agent_operation",
+        json!({"operation": operation, "deadline_ms": 50}),
+    )
+    .await;
+    assert!(is_error, "{late}");
+    assert_eq!(late["status"], json!("error"));
+    assert_eq!(late["failure"]["class"], json!("deadline"), "{late}");
+    assert_eq!(late["budget"]["effective"]["deadline_ms"], json!(50));
+    // The route reached the store and was still held there when the call
+    // ended, so the deadline, not the route, ended it.
+    let held = gate.held();
+    assert_eq!(held.len(), 1);
+    for id in held {
+        gate.release(id);
+    }
+
+    let (is_error, op) = call(
+        &client,
+        "ravel_agent_operation",
+        json!({"operation": operation}),
+    )
+    .await;
+    assert!(!is_error, "{op}");
+    assert_eq!(row(&op)["status"], json!("accepted"));
+
+    client.cancel().await.expect("client stops");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A send whose HEAD write is held past the call's `deadline_ms` answers the
+/// `deadline` class, says its outcome is unknown, and carries the resend
+/// step. The held write never applied, so the resend with the same key under
+/// the default deadline accepts the input once, not as a duplicate.
+#[tokio::test]
+async fn a_send_held_past_its_deadline_reports_an_unknown_outcome_and_the_resend_step() {
+    let (faults, running) = start_faulted().await;
+    let api = Api::new(&running);
+    api.create().await;
+    let client = mcp(&running, CLIENT).await;
+
+    let gate = faults.hold(Op::Put, Some(head_key()), Occurrence::Nth(1));
+    let mut args = send_args("k-1");
+    args["deadline_ms"] = json!(50);
+    let (is_error, late) = call_ending_by_deadline(&client, "ravel_agent_send", args).await;
+    assert!(is_error, "{late}");
+    assert_eq!(late["failure"]["class"], json!("deadline"), "{late}");
+    let message = late["failure"]["message"].as_str().expect("message");
+    assert!(message.contains("outcome is unknown"), "{message}");
+    assert_eq!(
+        late["next_steps"][0]["action"],
+        json!("resend_with_the_same_key")
+    );
+    let held = gate.held();
+    assert_eq!(held.len(), 1);
+    for id in held {
+        gate.release(id);
+    }
+
+    let (is_error, resent) = call(&client, "ravel_agent_send", send_args("k-1")).await;
+    assert!(!is_error, "{resent}");
+    assert_eq!(row(&resent)["duplicate"], json!(false));
 
     client.cancel().await.expect("client stops");
     running.shutdown().await.expect("clean shutdown");

@@ -131,7 +131,8 @@ the nine tools exactly. All six are served, and each description starts with
 - `ravel_agent_send`: accept one input into an agent's inbox. It is the only
   tool here that writes. Pass an `idempotency_key`: a repeat with the same
   key answers the operation the first call accepted and accepts nothing new.
-  If a send reports `outcome_unknown`, send again with the same key.
+  If a send reports `outcome_unknown`, or ends at its deadline, send again
+  with the same key.
 - `ravel_agent_operation`: the status of the operation a send answered.
 - `ravel_agent_events`: one page of the agent's events in order. A full page
   carries a cursor; pass it back to read the next page.
@@ -142,7 +143,8 @@ the nine tools exactly. All six are served, and each description starts with
 Each call goes through the agents client route of the same name inside the
 server, with the credential of the MCP request. The principal needs the
 `agents` capability; without it every one of the six answers `unauthorized`,
-the same refusal the HTTP route gives. The [MCP reference](../reference/mcp.md#ravel-agents-tools)
+the same refusal the HTTP route gives. A call the route has not answered by
+its effective deadline ends with the `deadline` class. The [MCP reference](../reference/mcp.md#ravel-agents-tools)
 lists their inputs, bounds and failure classes.
 
 ## The result envelope
