@@ -1219,12 +1219,14 @@ as that segment's fetch completes, keeping one copy per series id, and reserve
 each series they add against the same budget: its id, its label set and each
 label's two strings (`retained_series_len` in `engine.rs`). A series appears
 in every object it wrote to, so keeping each segment's entries until the last
-fetch held one copy per object. A listing whose retained series do not fit is
-refused with the same 422 `FetchMemoryExhausted`, against the budget's limit.
-`max_series` is checked as each series is added, so a listing over it is
-refused before its remaining segments are fetched. The reservation is released
-when the map is handed to the endpoint: the response it renders is not
-charged.
+fetch held one copy per object. This holds per `match[]` selector: a
+selector whose retained series do not fit is refused with the same 422
+`FetchMemoryExhausted`, against the budget's limit, and `max_series` is
+checked as each series is added, so a selector over it is refused before its
+remaining segments are fetched. The reservation is released when a selector's
+map is handed to the endpoint. The endpoint's merge of several selectors'
+series (`resolve_matched_series` in `http/service.rs`, issue #3473) and the response it
+renders are not charged, and `max_series` does not bound that merged set.
 
 ## Endpoints (Prometheus compatibility subset)
 

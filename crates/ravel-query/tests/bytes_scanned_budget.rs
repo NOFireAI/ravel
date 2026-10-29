@@ -303,9 +303,9 @@ async fn unlimited_budget_fetches_every_segment() {
 
 /// The empty-input gap (review finding 4): a labels/series query whose matchers
 /// resolve to a non-empty snapshot but match zero series still evaluates the
-/// budget, because the check now lives in `fetch_all_series` rather than in the
-/// `build_series_by_id` loop body -- which never runs when nothing matches. The
-/// bounded run trips `TooManyBytesScanned`; the unlimited run proves the query
+/// budget, because the check runs in `fetch_all_series` once per completed
+/// segment fetch, whether or not that segment matched a series. The bounded
+/// run trips `TooManyBytesScanned`; the unlimited run proves the query
 /// genuinely matches zero series (an empty result), so the trip is enforcement
 /// on a truly empty result, not on matched data.
 #[tokio::test]
