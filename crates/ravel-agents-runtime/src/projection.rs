@@ -9,11 +9,13 @@
 //! counter and never as a change to an agent
 //! (`tests::a_failing_sink_changes_no_agent_state_and_retries_the_same_ids`).
 //!
-//! The cursor is in memory, one per agent, and starts at the committed
-//! event the coordinator reported when it first saw the agent. ADR-3331 does
-//! not say where a projection cursor persists, and persisting it in HEAD
-//! would make projection a writer; history committed while no projector
-//! held a cursor stays in the agent store for re-projection.
+//! The cursor is in memory, one per agent, and starts at the agent's first
+//! event when the coordinator first reports the agent. ADR-3331 does not say
+//! where a projection cursor persists, and persisting it in HEAD would make
+//! projection a writer, so a restarted process projects each agent's
+//! history again as it touches the agent: nothing committed while no
+//! projector ran is lost, and the repeats carry the ids they carried before
+//! (`tests::a_restarted_projector_redelivers_history_under_the_same_ids`).
 //!
 //! Every record carries a stable event id derived from the tenant, the
 //! agent, its incarnation and the event seq ([`event_id`]), so a record
@@ -346,13 +348,17 @@ impl Projector {
     pub fn note(&self, agent: &AgentId, head: &Head) {
         let committed = head.next_event_seq.saturating_sub(1);
         let mut state = self.state.lock();
-        let cursor = state.cursors.entry(*agent).or_insert(Cursor {
-            incarnation: head.incarnation,
-            committed,
-            read: committed,
-            projected: committed,
+        let mut moved = false;
+        let cursor = state.cursors.entry(*agent).or_insert_with(|| {
+            moved = committed > 0;
+            Cursor {
+                incarnation: head.incarnation,
+                committed,
+                read: 0,
+                projected: 0,
+            }
         });
-        let moved = if head.incarnation > cursor.incarnation {
+        moved |= if head.incarnation > cursor.incarnation {
             *cursor = Cursor {
                 incarnation: head.incarnation,
                 committed,
@@ -853,7 +859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_restarted_projector_starts_at_the_committed_seq_and_repeats_no_id() {
+    async fn a_restarted_projector_redelivers_history_under_the_same_ids() {
         let rig = rig(ProjectionLimits::default(), PayloadPolicy::Redacted);
         create(&rig.co, "a").await;
         turn(&rig, "r1", 2).await;
@@ -884,9 +890,14 @@ mod tests {
         turn(&restarted, "r2", 1).await;
         restarted.projector.project_once().await;
         let ids: Vec<Id128> = rig.sink.delivered.lock().iter().map(|e| e.event_id).collect();
-        let unique: std::collections::BTreeSet<Id128> = ids.iter().copied().collect();
-        assert_eq!(ids.len(), 3);
-        assert_eq!(unique.len(), 3);
+        let tenant = TenantHash([7; 16]);
+        let agent = id_of("a");
+        let first: Vec<Id128> = (1..=2).map(|s| event_id(&tenant, &agent, 1, s)).collect();
+        let third = event_id(&tenant, &agent, 1, 3);
+        // The first process's two, then the restarted one's replay of the
+        // same two under the same ids, then the new event.
+        assert_eq!(ids, [first.clone(), first, vec![third]].concat());
+        assert_eq!(restarted.projector.metrics().lag_max, 0);
     }
 
     #[test]
