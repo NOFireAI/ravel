@@ -119,10 +119,16 @@ async fn cas_steps(
     out.push(("cas_version_on_absent_key", kind(&absent_cas)));
 
     let created = store
-        .put(key, Bytes::from_static(b"v1"), PutOptions::create_if_absent())
+        .put(
+            key,
+            Bytes::from_static(b"v1"),
+            PutOptions::create_if_absent(),
+        )
         .await;
     out.push(("create_if_absent_on_absent_key", kind(&created)));
-    let v1 = created.expect("expected-absent create on an absent key").version;
+    let v1 = created
+        .expect("expected-absent create on an absent key")
+        .version;
 
     let updated = store
         .put(
@@ -144,7 +150,11 @@ async fn cas_steps(
     out.push(("cas_version_stale", kind(&stale)));
 
     let again = store
-        .put(key, Bytes::from_static(b"v4"), PutOptions::create_if_absent())
+        .put(
+            key,
+            Bytes::from_static(b"v4"),
+            PutOptions::create_if_absent(),
+        )
         .await;
     out.push(("create_if_absent_on_present_key", kind(&again)));
 
