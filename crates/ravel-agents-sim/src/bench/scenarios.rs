@@ -125,8 +125,7 @@ struct World {
 impl World {
     /// Call inside the paused runtime: the clock starts at its instant.
     fn new(memory: MemoryStore, speed: Speed, limits: StoreLimits) -> Result<World, String> {
-        let prefix = tenant_prefix(&TENANT).map_err(|e| format!("tenant prefix: {e:?}"))?;
-        let agents_prefix = format!("{}ag/", prefix.trim_end_matches('/').to_string() + "/");
+        let agents_prefix = tenant_prefix(&TENANT).map_err(|e| format!("tenant prefix: {e:?}"))?;
         Ok(World {
             bench: Arc::new(BenchStore::new(memory, speed, agents_prefix)),
             clock: Arc::new(TokioClock::new()),
@@ -1110,6 +1109,23 @@ fn baseline(iterations: usize) -> Result<Vec<Figure>, String> {
         ));
         figures.extend(heap_figure(SCENARIO, "na"));
         Ok(figures)
+    })
+}
+
+/// Requests one hot send makes to agents keys, as the scenarios' store
+/// counts them.
+#[cfg(test)]
+pub fn hot_send_agents_requests() -> Result<u64, String> {
+    let runtime = paused_runtime()?;
+    runtime.block_on(async {
+        let mut world = World::new(MemoryStore::new(), Speed::Nominal, StoreLimits::default())?;
+        let node = world.node(bench_config(), None);
+        let agent = agent_ref("hot", 0);
+        create(&node, &agent).await?;
+        let mut meter = Meter::new(world.bench.clone(), true);
+        let before = world.bench.tally();
+        send(&mut meter, &node, &agent, "m0".to_string()).await?;
+        Ok(world.bench.tally().since(&before).agents_requests)
     })
 }
 
