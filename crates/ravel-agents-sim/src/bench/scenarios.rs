@@ -23,8 +23,8 @@ use ravel_agents_core::wire::{
     WorkerPollRequest,
 };
 use ravel_agents_runtime::{
-    Coordinator, Dispatch, EffectDispatcher, Rng, RuntimeConfig, StepProgress, StepSpec,
-    SweepConfig,
+    Coordinator, DEFAULT_SWEEP_MAX_HEAD_GETS, Dispatch, EffectDispatcher, Rng, RuntimeConfig,
+    StepProgress, StepSpec, SweepConfig,
 };
 use ravel_agents_store::backoff::NoBackoff;
 use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
@@ -48,9 +48,13 @@ const STORM_SWEEP: SweepConfig = SweepConfig {
     max_list_pages: 4,
     max_head_gets: 8,
 };
-/// Directory HEAD reads one default sweep pass makes, when no wake hint
-/// takes any of them.
-pub const DIRECTORY_GETS_PER_PASS: usize = 64;
+/// Directory HEAD reads one default sweep pass makes when no wake hint takes
+/// any: the directory half also gets the reads the wake half left unused.
+pub const DIRECTORY_GETS_PER_PASS: usize = DEFAULT_SWEEP_MAX_HEAD_GETS as usize;
+/// Directory HEAD reads one default sweep pass makes however many wake hints
+/// are due: the directory half's own share of the budget.
+pub const GUARANTEED_DIRECTORY_GETS_PER_PASS: usize =
+    (DEFAULT_SWEEP_MAX_HEAD_GETS - DEFAULT_SWEEP_MAX_HEAD_GETS / 2) as usize;
 
 fn err(context: &str) -> impl Fn(ravel_agents_core::error::AgentError) -> String + '_ {
     move |e| format!("{context}: {:?} {}", e.kind, e.reason)
@@ -943,9 +947,15 @@ impl Position {
 
 pub const POSITIONS: [Position; 3] = [Position::Start, Position::Middle, Position::End];
 
-/// The pre-registered worst case: passes to read every directory entry.
+/// Passes to read every directory entry when no wake hint is due.
 pub fn worst_case_passes(agents: usize) -> usize {
     agents.div_ceil(DIRECTORY_GETS_PER_PASS)
+}
+
+/// Passes to read every directory entry however many wake hints are due:
+/// the bound a population can rely on.
+pub fn guaranteed_passes(agents: usize) -> usize {
+    agents.div_ceil(GUARANTEED_DIRECTORY_GETS_PER_PASS)
 }
 
 /// Cross-process discovery: a client accepts a message for one of `agents`
