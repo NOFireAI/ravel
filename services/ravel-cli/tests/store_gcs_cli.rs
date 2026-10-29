@@ -25,13 +25,25 @@ fn ravel_cli(args: Vec<String>) -> Command {
     command
         .args(args)
         .env("RAVEL_GCS_TEST_SKIP_SIGNATURE", "1")
-        .env_remove("RAVEL_GCS_BUCKET")
-        .env_remove("RAVEL_S3_BUCKET")
-        .env_remove("RAVEL_S3_ENDPOINT")
-        .env_remove("RAVEL_S3_REGION")
-        .env_remove("RAVEL_S3_ALLOW_HTTP")
-        .env_remove("RAVEL_S3_UPLOAD_INTEGRITY")
-        .env_remove("RAVEL_S3_REQUEST_STORED_CHECKSUM");
+        .env_remove("RAVEL_GCS_BUCKET");
+    // Every variable the --store gcs refusal reads, so a developer's or CI's
+    // own S3 environment cannot turn a test into a refusal.
+    for var in [
+        "RAVEL_S3_ACCESS_KEY",
+        "RAVEL_S3_ALLOW_HTTP",
+        "RAVEL_S3_AUTH",
+        "RAVEL_S3_BUCKET",
+        "RAVEL_S3_CREDENTIALS_FILE",
+        "RAVEL_S3_ENDPOINT",
+        "RAVEL_S3_INSTANCE_METADATA_ENDPOINT",
+        "RAVEL_S3_REGION",
+        "RAVEL_S3_REQUEST_STORED_CHECKSUM",
+        "RAVEL_S3_SECRET_KEY",
+        "RAVEL_S3_SESSION_TOKEN",
+        "RAVEL_S3_UPLOAD_INTEGRITY",
+    ] {
+        command.env_remove(var);
+    }
     command
 }
 
