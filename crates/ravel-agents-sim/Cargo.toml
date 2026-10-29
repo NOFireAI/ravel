@@ -25,6 +25,13 @@ tokio = { workspace = true, features = ["rt", "time", "macros", "test-util"] }
 [dev-dependencies]
 ravel-test-support = { workspace = true }
 proptest = { workspace = true }
+# Peak-heap probe of the agents cost bench, installed as its global
+# allocator without `unsafe` in this crate.
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "agents_cost"
+harness = false
 
 [lints]
 workspace = true
