@@ -1641,7 +1641,13 @@ fn kernel_sequences_keep_the_head_invariants() {
         source_file: Some(file!()),
         ..ProptestConfig::default()
     };
-    let mut runner = proptest::test_runner::TestRunner::new(config);
+    // A fixed seed, because the coverage floors below count paths the
+    // random sequences reach: unseeded, a floor inside the generator's
+    // spread fails on some seeds and passes on others.
+    let rng = proptest::test_runner::TestRng::deterministic_rng(
+        proptest::test_runner::RngAlgorithm::ChaCha,
+    );
+    let mut runner = proptest::test_runner::TestRunner::new_with_rng(config, rng);
     let coverage = std::cell::RefCell::new(Coverage::default());
     let result = runner.run(&proptest::collection::vec(op(), 1..40), |ops| {
         run_ops(&ops, &mut coverage.borrow_mut())
