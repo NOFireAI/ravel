@@ -117,13 +117,15 @@ image: they create their bucket with the aws CLI the GitHub runner image ships
 `createbucket` from ECR Public, and the scheduled `quickstart-published`
 workflow runs it; it does not gate a merge. metricsbench-nightly's
 `metricsbench-rustfs` runs the whole deploy/metricsbench compose stack
-through `deploy/metricsbench/run.sh`, so it pulls the AWS CLI image for that
-stack's `createbuckets` service, and Prometheus, VictoriaMetrics and Mimir
-from Docker Hub, once a day. It does not gate a merge either: a throttled
-pull fails that night's run and nothing else. The same
-image is also pulled by `docker-compose/rustfs.yml`,
-`deploy/k8s`, `scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, the
-MetricsBench compose file, and the interop-nightly Flight SQL test.
+through `deploy/metricsbench/run.sh` once a day and pulls Prometheus,
+VictoriaMetrics, Mimir and the AWS CLI for its `createbuckets` service from
+Docker Hub. Its AWS CLI is `amazon/aws-cli` at the digest ECR Public serves,
+because ECR Public refused that job's anonymous pull with `Data limit
+exceeded` (deploy/metricsbench/docker-compose.yml). It does not gate a merge
+either: a throttled pull fails that night's run and nothing else. The ECR
+Public image is also pulled by `docker-compose/rustfs.yml`, `deploy/k8s`,
+`scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, and the interop-nightly
+Flight SQL test.
 
 MinIO is not an option: its public images cannot be pulled without
 credentials from Docker Hub or quay.io, so the object store is RustFS and its
