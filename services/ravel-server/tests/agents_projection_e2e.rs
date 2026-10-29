@@ -673,6 +673,108 @@ async fn a_full_backlog_counts_and_leaves_the_coordinator_untouched() {
     assert_eq!(writes[0], writes[1]);
 }
 
+/// The one `mode="all"` sample of `name` in a scrape.
+fn sample(scrape: &str, name: &str) -> u64 {
+    let prefix = format!("{name}{{mode=\"all\"}} ");
+    let lines: Vec<&str> = scrape
+        .lines()
+        .filter(|line| line.starts_with(&format!("{name}{{")))
+        .collect();
+    assert_eq!(lines.len(), 1, "{name}: {lines:?}");
+    lines[0]
+        .strip_prefix(&prefix)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{name}: {}", lines[0]))
+}
+
+/// The `ravel_agents_projection_*` family carries the health route's figures:
+/// during an outage that fills the backlog, and after the sink recovers.
+#[tokio::test]
+async fn projection_metrics_scrape_matches_health_after_an_outage() {
+    let tap = Arc::new(Tap::default());
+    tap.down.store(true, Ordering::SeqCst);
+    let running = start(
+        Arc::new(MemoryStore::new()),
+        agents_config(AgentsProjectionConfig {
+            backlog: 2,
+            ..projecting(&tap)
+        }),
+    )
+    .await;
+    let api = Api::new(&running);
+    let worker = setup(&api).await;
+    turn(&api, &worker, "r1", 2).await;
+    turn(&api, &worker, "r2", 1).await;
+    api.wait_projection("backlog_full", |n| n >= 1).await;
+    let scrape = api.scrape().await;
+    for (name, want) in [
+        ("ravel_agents_projection_lag_max", 3),
+        ("ravel_agents_projection_backlog", 2),
+        ("ravel_agents_projection_backlog_bound", 2),
+        ("ravel_agents_projection_events_projected_total", 0),
+        ("ravel_agents_projection_spans_projected_total", 0),
+        ("ravel_agents_projection_read_failures_total", 0),
+        ("ravel_agents_projection_records_rejected_total", 0),
+    ] {
+        assert_eq!(sample(&scrape, name), want, "{name} during the outage");
+    }
+    assert!(sample(&scrape, "ravel_agents_projection_sink_failures_total") >= 1);
+    assert!(sample(&scrape, "ravel_agents_projection_backlog_full_total") >= 1);
+
+    tap.down.store(false, Ordering::SeqCst);
+    api.wait_projection("events_projected", |n| n == 3).await;
+    api.wait_projection("lag_max", |n| n == 0).await;
+    let health = api.projection().await;
+    let scrape = api.scrape().await;
+    for (name, field, want) in [
+        ("ravel_agents_projection_lag_max", "lag_max", Some(0)),
+        ("ravel_agents_projection_backlog", "backlog", Some(0)),
+        (
+            "ravel_agents_projection_backlog_bound",
+            "backlog_bound",
+            Some(2),
+        ),
+        (
+            "ravel_agents_projection_events_projected_total",
+            "events_projected",
+            Some(3),
+        ),
+        (
+            "ravel_agents_projection_spans_projected_total",
+            "spans_projected",
+            Some(2),
+        ),
+        (
+            "ravel_agents_projection_read_failures_total",
+            "read_failures",
+            Some(0),
+        ),
+        (
+            "ravel_agents_projection_records_rejected_total",
+            "records_rejected",
+            Some(0),
+        ),
+        (
+            "ravel_agents_projection_sink_failures_total",
+            "sink_failures",
+            None,
+        ),
+        (
+            "ravel_agents_projection_backlog_full_total",
+            "backlog_full",
+            None,
+        ),
+    ] {
+        let value = sample(&scrape, name);
+        assert_eq!(json!(value), health[field], "{name} against {health}");
+        match want {
+            Some(want) => assert_eq!(value, want, "{name}"),
+            None => assert!(value >= 1, "{name}"),
+        }
+    }
+    running.shutdown().await.expect("clean shutdown");
+}
+
 /// `--agents-projection off` starts and says so; a process with no ingest
 /// buffer and no endpoint refuses to start, naming both ways out; with an
 /// endpoint it starts and reports it.
