@@ -63,6 +63,12 @@ envelope reports: a route that has not answered by then ends the call with
 accepted its input, so it says the outcome is unknown and adds the
 `resend_with_the_same_key` next step.
 
+Only `ravel_agent_events` applies a row cap. Its envelope reports the page
+size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
+`budget.effective.max_rows`. The other five tools never cut their rows at
+`max_rows`, so their envelopes, and every failed agents call, report
+`presentation.max_rows` as 0 and carry no `max_rows` in `budget.effective`.
+
 | Tool | Purpose | Inputs | Agents route | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
 | `ravel_agent_describe` | One row: agent id, incarnation, state version, content type, state size in bytes, active turn and mailbox depth, without the state itself | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |

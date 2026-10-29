@@ -148,6 +148,7 @@ async fn describe<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend:
             ("mailbox_depth", "int"),
         ],
         vec![row],
+        None,
         ctx,
     );
     envelope.next_steps = vec![
@@ -221,6 +222,7 @@ async fn send<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &B)
             ("duplicate", "bool"),
         ],
         vec![row],
+        None,
         ctx,
     );
     envelope.next_steps = vec![step(
@@ -261,6 +263,7 @@ async fn operation<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend
             ("blocked_effect", "string"),
         ],
         vec![row],
+        None,
         ctx,
     );
     if body["status"] == json!("blocked") {
@@ -307,6 +310,7 @@ async fn state<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &B
             ("mailbox", "json"),
         ],
         vec![row],
+        None,
         ctx,
     );
     envelope.fit(ctx.budgets.max_response_bytes).finish(false)
@@ -369,10 +373,10 @@ async fn events<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
             ("payload", "json"),
         ],
         rows,
+        Some(limit),
         ctx,
     );
     envelope.scope.order_by = vec!["event_seq".to_string()];
-    envelope.presentation.max_rows = limit;
     envelope.presentation.row_cap_hit = returned >= limit as usize;
     let next_cursor = scalar_text(&body["next_cursor"]);
     envelope.presentation.cursor = Some(next_cursor.clone());
@@ -445,6 +449,7 @@ async fn blocked_effects<B: AgentsBackend>(
             ("unblock", "json"),
         ],
         rows,
+        None,
         ctx,
     );
     envelope.scope.predicates_applied = vec!["status = in_doubt".to_string()];
@@ -587,14 +592,24 @@ fn failed(failure: Failure, next_steps: Vec<NextStep>, ctx: &ToolContext<'_>) ->
     let envelope = Envelope {
         status: Status::Error,
         failure: Some(failure),
-        budget: budget_block(ctx),
+        budget: budget_block(None, ctx),
         next_steps,
         ..Envelope::default()
     };
     envelope.fit(ctx.budgets.max_response_bytes).finish(false)
 }
 
-fn table(name: &str, columns: &[(&str, &str)], rows: Vec<Row>, ctx: &ToolContext<'_>) -> Envelope {
+/// `row_cap` is the row bound the tool applied to `rows`, if it applied one.
+/// Only `ravel_agent_events` does; every other tool passes `None`, and its
+/// envelope reports `presentation.max_rows` as 0 and no `max_rows` in
+/// `budget.effective`, rather than a cap that cut nothing.
+fn table(
+    name: &str,
+    columns: &[(&str, &str)],
+    rows: Vec<Row>,
+    row_cap: Option<u32>,
+    ctx: &ToolContext<'_>,
+) -> Envelope {
     let mut envelope = Envelope {
         data: Data {
             columns: columns
@@ -607,27 +622,36 @@ fn table(name: &str, columns: &[(&str, &str)], rows: Vec<Row>, ctx: &ToolContext
             row_count: rows.len() as u64,
             rows,
         },
-        budget: budget_block(ctx),
+        budget: budget_block(row_cap, ctx),
         ..Envelope::default()
     };
     envelope.scope.signal = "agents".to_string();
     envelope.scope.table = name.to_string();
     envelope.coverage.complete = true;
     envelope.accuracy.exact = true;
-    envelope.presentation.max_rows = ctx.budgets.max_rows;
+    envelope.presentation.max_rows = row_cap.unwrap_or(0);
     envelope
 }
 
-/// The bounds an agents tool runs under. The route's own store requests are
-/// counted on the agents metrics, not per call, so `actual` and `estimate`
-/// stay empty rather than report a zero the call did not measure.
-fn budget_block(ctx: &ToolContext<'_>) -> Budget {
+/// The bounds an agents tool runs under: `max_rows` only when the tool
+/// applied a row cap, as [`table`] describes. The route's own store requests
+/// are counted on the agents metrics, not per call, so `actual` and
+/// `estimate` stay empty rather than report a zero the call did not measure.
+fn budget_block(row_cap: Option<u32>, ctx: &ToolContext<'_>) -> Budget {
+    let mut effective = Map::new();
+    if let Some(row_cap) = row_cap {
+        effective.insert("max_rows".to_string(), json!(row_cap));
+    }
+    effective.insert(
+        "max_response_bytes".to_string(),
+        json!(ctx.budgets.max_response_bytes),
+    );
+    effective.insert(
+        "deadline_ms".to_string(),
+        json!(ctx.budgets.deadline.as_millis() as u64),
+    );
     Budget {
-        effective: AnyJson(json!({
-            "max_rows": ctx.budgets.max_rows,
-            "max_response_bytes": ctx.budgets.max_response_bytes,
-            "deadline_ms": ctx.budgets.deadline.as_millis() as u64,
-        })),
+        effective: AnyJson(Value::Object(effective)),
         actual: AnyJson(Value::Object(Map::new())),
         estimate: AnyJson(Value::Object(Map::new())),
         estimate_is_upper_envelope: false,
@@ -1037,6 +1061,101 @@ mod tests {
             calls[0].query,
             vec![("kind", "order".to_string()), ("key", "o-1".to_string())]
         );
+    }
+
+    /// `run` with the call's effective `max_rows` set on the context, as the
+    /// adapter's clamp would leave it.
+    fn run_with_max_rows(name: &str, args: Value, backend: &Canned, max_rows: u32) -> Value {
+        let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_rows = max_rows;
+        let envelope = block_on(dispatch_agents(name, args, &ctx, backend))
+            .expect("an agents tool name routes");
+        serde_json::to_value(&envelope).expect("envelope serializes")
+    }
+
+    fn in_doubt_effect(effect: &str) -> Value {
+        json!({"effect": effect, "turn_id": "t", "tool_name": "catalog.price",
+               "tool_version": "1", "policy": "manual", "status": "in_doubt", "attempt": 1})
+    }
+
+    /// `ravel_agent_blocked_effects` does not cut its rows at `max_rows`, so
+    /// its envelope claims no row cap: three effects in doubt under a
+    /// `max_rows` of 2 are three rows, `presentation.max_rows` is 0 and
+    /// `budget.effective` carries no `max_rows`.
+    #[test]
+    fn blocked_effects_reports_no_row_cap_it_does_not_apply() {
+        let backend = Canned::new(
+            200,
+            json!({"effects": [in_doubt_effect("e1"), in_doubt_effect("e2"),
+                               in_doubt_effect("e3")]}),
+        );
+        let envelope = run_with_max_rows("ravel_agent_blocked_effects", agent_args(), &backend, 2);
+        assert_eq!(envelope["status"], json!("ok"), "{envelope}");
+        assert_eq!(envelope["data"]["row_count"], json!(3));
+        assert_eq!(envelope["data"]["rows"].as_array().expect("rows").len(), 3);
+        assert_eq!(envelope["presentation"]["max_rows"], json!(0));
+        assert_eq!(envelope["presentation"]["row_cap_hit"], json!(false));
+        let effective = envelope["budget"]["effective"]
+            .as_object()
+            .expect("budget.effective is an object");
+        assert!(
+            !effective.contains_key("max_rows"),
+            "budget.effective claims a row cap: {effective:?}"
+        );
+        assert!(effective.contains_key("max_response_bytes"));
+        assert!(effective.contains_key("deadline_ms"));
+    }
+
+    /// No agents tool but `ravel_agent_events` applies `max_rows`, and none
+    /// of them reports it, on success or on failure.
+    #[test]
+    fn only_events_reports_a_row_cap() {
+        let args = json!({"kind": "order", "key": "o-1", "handler": "place",
+                          "idempotency_key": "k-1", "operation": "op-1"});
+        for name in AGENTS_TOOLS {
+            if name == "ravel_agent_events" {
+                continue;
+            }
+            for status in [200, 503] {
+                let backend = Canned::new(status, json!({}));
+                let envelope = run_with_max_rows(name, args.clone(), &backend, 2);
+                assert_eq!(
+                    envelope["presentation"]["max_rows"],
+                    json!(0),
+                    "{name} {status}"
+                );
+                assert_eq!(
+                    envelope["budget"]["effective"].get("max_rows"),
+                    None,
+                    "{name} {status}"
+                );
+            }
+        }
+    }
+
+    /// `ravel_agent_events` reports the page size it asked the route for,
+    /// which is the call's `max_rows` held to [`MAX_EVENTS_PAGE`], in both
+    /// `presentation.max_rows` and `budget.effective.max_rows`.
+    #[test]
+    fn events_reports_the_page_size_it_applied() {
+        let backend = Canned::new(200, events_body(1..=2, "2"));
+        let envelope = run_with_max_rows("ravel_agent_events", agent_args(), &backend, 2_000);
+        assert_eq!(
+            backend.calls.borrow()[0].body.as_ref().expect("body")["limit"],
+            json!(MAX_EVENTS_PAGE)
+        );
+        assert_eq!(envelope["presentation"]["max_rows"], json!(MAX_EVENTS_PAGE));
+        assert_eq!(
+            envelope["budget"]["effective"]["max_rows"],
+            json!(MAX_EVENTS_PAGE)
+        );
+
+        let backend = Canned::new(200, events_body(1..=2, "2"));
+        let envelope = run_with_max_rows("ravel_agent_events", agent_args(), &backend, 2);
+        assert_eq!(envelope["presentation"]["max_rows"], json!(2));
+        assert_eq!(envelope["budget"]["effective"]["max_rows"], json!(2));
+        assert_eq!(envelope["presentation"]["row_cap_hit"], json!(true));
     }
 
     #[test]
