@@ -435,7 +435,8 @@ async fn list_and_head_agree_on_the_etag_of_single_and_composite_objects() {
         assert_eq!(from_delimited.etag, head.etag, "{}", from_list.key);
         assert_eq!(Some(from_list.etag.0.clone()), fake.etag_of(&from_list.key));
         // The listed ETag and generation are a pin that reads the object.
-        let listed_pin = Pin::from_store(from_list.etag.0.clone(), Some(from_list.version.0.clone()));
+        let listed_pin =
+            Pin::from_store(from_list.etag.0.clone(), Some(from_list.version.0.clone()));
         assert_eq!(listed_pin, pin);
         store
             .get_pinned(&from_list.key, GetRange::Full, &listed_pin)
@@ -451,7 +452,11 @@ async fn listing_asks_for_only_the_fields_it_reads_and_the_fake_cuts_to_them() {
     fake.insert_object("f/k", Bytes::from_static(b"v"));
     let store = store(&fake);
     store.list("f/", None).await.expect("list");
-    let lists: Vec<_> = fake.requests().into_iter().filter(is_list_request).collect();
+    let lists: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .collect();
     assert_eq!(lists.len(), 1);
     assert_eq!(
         lists[0].query_param("fields"),
@@ -464,7 +469,9 @@ async fn listing_asks_for_only_the_fields_it_reads_and_the_fake_cuts_to_them() {
     let client = reqwest::Client::new();
     let url = format!("{}/storage/v1/b/{BUCKET}/o", fake.endpoint());
     let cut = client
-        .get(format!("{url}?fields=items%28name%2Csize%29%2CnextPageToken"))
+        .get(format!(
+            "{url}?fields=items%28name%2Csize%29%2CnextPageToken"
+        ))
         .send()
         .await
         .expect("send")
@@ -511,7 +518,11 @@ async fn the_listing_client_sends_the_credential_providers_bearer_token() {
         .expect("delimited");
 
     assert_eq!(page.objects.len(), 1);
-    let lists: Vec<_> = fake.requests().into_iter().filter(is_list_request).collect();
+    let lists: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .collect();
     assert_eq!(lists.len(), 2);
     for list in &lists {
         assert_eq!(list.header("authorization"), Some("Bearer listing-bearer"));
@@ -655,7 +666,16 @@ fn generations_are_positive_int64_decimals() {
         assert!(is_generation(token), "{token:?}");
     }
     for token in [
-        "", "0", "00", "012", "abc", "+1", "-1", " 1", "1 ", "9223372036854775808",
+        "",
+        "0",
+        "00",
+        "012",
+        "abc",
+        "+1",
+        "-1",
+        " 1",
+        "1 ",
+        "9223372036854775808",
     ] {
         assert!(!is_generation(token), "{token:?}");
     }
@@ -749,7 +769,9 @@ async fn listing_reports_xml_illegal_and_unaddressable_names_without_failing_the
     assert_eq!(per_call, [1, 1, 1, 1, 1]);
     let requests = fake.requests();
     assert!(
-        requests.iter().all(|r| r.query_param("list-type").is_none()),
+        requests
+            .iter()
+            .all(|r| r.query_param("list-type").is_none()),
         "no S3-style listing: {requests:?}"
     );
 }
@@ -980,7 +1002,11 @@ async fn pinned_read_ordering() {
     // Different bytes move the ETag too: the old pin's generation and its ETag
     // are both stale, and the generation is decided first.
     store
-        .put("o/k", Bytes::from_static(b"other bytes"), PutOptions::default())
+        .put(
+            "o/k",
+            Bytes::from_static(b"other bytes"),
+            PutOptions::default(),
+        )
         .await
         .expect("rewrite with other bytes");
     let (_, rewritten) = store.pin_of("o/k").await.expect("pin_of");

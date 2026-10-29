@@ -999,7 +999,8 @@ ETag and moves the generation. `CreateIfAbsent` sends
 `x-goog-if-generation-match: 0` and maps a 412 to `AlreadyExists`;
 `CasVersion(v)` sends `x-goog-if-generation-match: v` and maps a 412 to
 `PreconditionFailed`. A `CasVersion` token that is not a positive decimal
-with no leading zero (`0`, `012`, an empty or non-numeric token) is refused
+with no leading zero and no sign, at most `i64::MAX` (`0`, `012`, `+1`,
+`-1`, ` 1`, `9223372036854775808`, an empty or non-numeric token) is refused
 with `Permanent` before any request: GCS issues no generation 0, and
 `x-goog-if-generation-match: 0` would turn the CAS into a create-if-absent.
 `Overwrite` sends no precondition.
@@ -1009,20 +1010,32 @@ the ETag as `If-Match`. GCS judges the selector first: a key that does not
 exist, or a generation it no longer keeps, is `NotFound` whatever the ETag; a
 live generation with another ETag is `PreconditionFailed`.
 
-Listing is the JSON API's `objects.list` (`storage/v1/b/<bucket>/o`), one
-request per page of the response, with `maxResults` set to the configured
-page size (`GcsConfig::list_page_size`, 1000 by default) on every request.
-The prefix and the resume point go out as raw names, the resume point as
-`startOffset`, which is inclusive, so the start name itself is dropped from
-the result. Within a call the store follows the service's opaque
-`nextPageToken`; the `PageToken` handed back between calls is the raw last
-name. Names are handed to `classify_objects` and `classify_prefixes` as
+Listing is the JSON API's `objects.list` (`storage/v1/b/<bucket>/o`), with
+`maxResults` set to the configured page size (`GcsConfig::list_page_size`,
+1000 by default) on every request, and a `fields` mask naming only the
+response fields the listing reads. The prefix and the resume point go out as
+raw names, the resume point as `startOffset`, which is inclusive, so the
+start name itself is dropped from the result. Within a call the store follows
+the service's opaque `nextPageToken` until it holds a page of names, except
+that a response from which the start name was dropped and that leaves at
+least one name ends the call: its names, one fewer than the page size when
+the response was full, are returned with a `PageToken`, and no second request
+is sent to fill the page. At a page size P above 1 and against responses that
+are each full, every call is one request: the first call of a drain returns P
+names and each later call P - 1, so N names (N > P) take
+1 + ceil((N - P) / (P - 1)) calls and as many requests (six names at two a
+page, five; ten at three a page, five). At page size 1 a resumed response
+holds only the start name, so each resumed call is two requests. Up to 16 responses in a row that leave
+no name are followed before the call fails with `ListPageCeiling`, and a
+repeated `nextPageToken` fails it with `ListRepeatedToken`. The `PageToken`
+handed back between calls is the raw last name. Names are handed to `classify_objects` and `classify_prefixes` as
 received, so a name `GcsStore` cannot address is reported in
 `ListPage::unaddressable` rather than failing the page. A listed item without
 a positive decimal `generation` fails the call with `Permanent`. A listed
-ETag is the quoted hex of the item's `md5Hash`, the ETag `head` reports; an
-object with no MD5 (a composite) is listed with the JSON `etag`, which `head`
-does not report. Errors are classified by HTTP status: 429 and 503 are
+ETag is the ETag `head` reports for the object: the quoted hex of the item's
+`md5Hash` when it has one, and for a composite object (no `md5Hash`, a
+`componentCount`) a dash followed by the JSON `etag`, quoted. An item with
+neither fails the call with `Permanent`, naming the key. Errors are classified by HTTP status: 429 and 503 are
 `Throttled`, with or without an error code in the body, 401 and 403 are
 `AccessDenied`, and 412 depends on the put mode as above. On object requests
 404 is `NotFound`, or `Permanent` when the body names `NoSuchBucket`, so a
@@ -1776,8 +1789,10 @@ ADR-0042 decision 3.
    generation as the version token. It sends through the S3 adapter's HTTP
    connector, scoped to the store's own host. `list`, `list_after` and
    `list_delimited` do not go through `object_store`: they send the JSON
-   API's `objects.list` through the same connector and credentials, one
-   request per page with `maxResults` set to the page size. No
+   API's `objects.list` through the same connector and credentials, with
+   `maxResults` set to the page size, returning a page one name short
+   rather than sending a second request when the dropped inclusive start
+   name is the only shortfall (see "Backend support notes"). No
    multipart, no upload checksums, no bucket-protection probes (see "Backend
    support notes").
 

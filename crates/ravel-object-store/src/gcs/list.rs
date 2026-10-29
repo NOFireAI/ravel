@@ -614,9 +614,8 @@ mod tests {
                 "{generation:?}: {listed:?}"
             );
         }
-        let listed =
-            listed_object("p/", wire(Some("1790000000000001"), Some(EMPTY_MD5), None))
-                .expect("listed");
+        let listed = listed_object("p/", wire(Some("1790000000000001"), Some(EMPTY_MD5), None))
+            .expect("listed");
         assert_eq!(listed.version.0, "1790000000000001");
     }
 
@@ -629,7 +628,9 @@ mod tests {
         let mut no_etag = wire(Some("7"), None, Some(2));
         no_etag.etag = None;
         match listed_object("p/", no_etag) {
-            Err(StoreError::Permanent(message)) => assert!(message.contains("\"p/k\""), "{message}"),
+            Err(StoreError::Permanent(message)) => {
+                assert!(message.contains("\"p/k\""), "{message}")
+            }
             other => panic!("{other:?}"),
         }
         match listed_object("p/", wire(Some("7"), None, None)) {
@@ -778,7 +779,10 @@ mod tests {
         assert_eq!(listed.next, Some(PageToken("p/c".to_string())));
         assert_eq!(
             script.seen(),
-            [(token("p/b"), None, false), (token("p/b"), token("t1"), false)]
+            [
+                (token("p/b"), None, false),
+                (token("p/b"), token("t1"), false)
+            ]
         );
     }
 
@@ -816,4 +820,3 @@ mod tests {
         );
     }
 }
-

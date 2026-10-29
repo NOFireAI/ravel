@@ -30,7 +30,7 @@ use ravel_object_store::s3::{
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
     MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
-    PutOutcome, StoreError, StoreMetrics, UploadChecksum, list_all,
+    PutOutcome, StoreError, StoreMetrics, UploadChecksum, is_addressable_key, list_all,
 };
 use std::sync::Arc;
 
@@ -1809,7 +1809,71 @@ async fn gcs_pinned_read_ordering(store: &GcsStore, root: &str) {
         matches!(read, Err(StoreError::NotFound)),
         "replaced generation, its stale ETag: {read:?}"
     );
+
+    // Different bytes move the ETag too: the old pin's generation and ETag are
+    // both stale. NotFound, not PreconditionFailed, shows the generation is
+    // judged before If-Match.
+    store
+        .put(
+            &key,
+            Bytes::from_static(b"other bytes"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("rewrite with other bytes");
+    let (_, rewritten) = store.pin_of(&key).await.expect("pin_of");
+    assert_ne!(rewritten.etag, replaced.etag);
+    let read = store.get_pinned(&key, GetRange::Full, &replaced).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, a different stale ETag: {read:?}"
+    );
     store.delete(&key).await.expect("delete");
+}
+
+/// A name holding U+0001, written by another client through the JSON API's
+/// media upload, is listed under its exact name: in `objects` when
+/// `is_addressable_key` accepts it, else in `unaddressable`, and never as a
+/// U+FFFD replacement. The object is deleted before the assertions.
+async fn gcs_foreign_control_character_name(store: &GcsStore, root: &str) {
+    let prefix = format!("{root}/foreign-u0001/");
+    let name = format!("{prefix}a\u{1}b");
+    store
+        .upload_foreign(&name, Bytes::from_static(b"foreign"))
+        .await
+        .expect("upload the foreign object");
+
+    let mut objects = Vec::new();
+    let mut unaddressable = Vec::new();
+    let mut page_token = None;
+    let drained = loop {
+        let page = match store.list(&prefix, page_token).await {
+            Ok(page) => page,
+            Err(e) => break Err(e),
+        };
+        objects.extend(page.objects.into_iter().map(|o| o.key));
+        unaddressable.extend(page.unaddressable.into_iter().map(|u| u.key));
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break Ok(()),
+        }
+    };
+    let deleted = store.delete_foreign(&name).await;
+
+    drained.expect("list the foreign object's prefix");
+    deleted.expect("delete the foreign object");
+    let all: Vec<&String> = objects.iter().chain(&unaddressable).collect();
+    assert!(
+        all.iter().all(|listed| !listed.contains('\u{fffd}')),
+        "{all:?}"
+    );
+    if is_addressable_key(&name) {
+        assert_eq!(objects, [name]);
+        assert!(unaddressable.is_empty(), "{unaddressable:?}");
+    } else {
+        assert_eq!(unaddressable, [name]);
+        assert!(objects.is_empty(), "{objects:?}");
+    }
 }
 
 /// `GcsStore` against the in-process fake GCS endpoint, in every run. A page
@@ -1828,6 +1892,8 @@ async fn gcs_store_contract_against_the_fake() {
 
     run_contract_suite(&store, "gcs-fake").await;
     gcs_pinned_read_ordering(&store, "gcs-fake").await;
+    gcs_foreign_control_character_name(&store, "gcs-fake").await;
+    assert_eq!(fake.data_of("gcs-fake/foreign-u0001/a\u{1}b"), None);
 }
 
 /// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
@@ -1854,6 +1920,7 @@ async fn gcs_contract() {
     assert_eq!(store.capabilities(), Capabilities::mandatory());
     run_contract_suite(&store, &root).await;
     gcs_pinned_read_ordering(&store, &root).await;
+    gcs_foreign_control_character_name(&store, &root).await;
     assert!(
         store.observed_store_time_ns().is_some(),
         "every GCS response carries a Date header"

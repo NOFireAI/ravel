@@ -48,8 +48,10 @@
 //! exception: a response from which the start name was dropped and that
 //! leaves at least one name ends the call, and its names, one short of the
 //! page size when the response was full, are returned with a page token
-//! instead of a second request filling the page. Against responses that are
-//! each full, every call is therefore one request. Up to 16 responses in a row
+//! instead of a second request filling the page. At a page size above 1 and
+//! against responses that are each full, every call is therefore one request;
+//! at page size 1 a resumed response holds only the start name, so a resumed
+//! call is two. Up to 16 responses in a row
 //! that leave no name are followed ([`StoreError::ListPageCeiling`] past
 //! that), and a repeated `nextPageToken` fails the call
 //! ([`StoreError::ListRepeatedToken`]). The [`PageToken`] handed back between
@@ -290,7 +292,6 @@ impl GcsStore {
             get_unverified: AtomicU64::new(0),
         })
     }
-
 
     /// Store `data` under exactly `name` through the JSON API's media upload,
     /// with this store's credentials: a name the `object_store` adapter would
