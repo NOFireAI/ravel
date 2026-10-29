@@ -627,16 +627,40 @@ in `services/ravel-server/tests/agents_projection_e2e.rs`, which matches
 
 The event id is `blake3` over the tenant, the agent, its incarnation and the
 event seq, so it is the same on every delivery attempt and in every process
-(`ids_are_stable_and_separate_every_component`). Delivery may duplicate: a
-retried batch and a restarted process both repeat records, and the event id
-is the deduplication key for queries. A restarted process keeps no cursor and
-projects each agent's history again from its first event once it touches the
-agent, under the ids it carried before
-(`a_restart_repeats_history_under_the_same_ids`,
-`a_restarted_projector_redelivers_history_under_the_same_ids`). The trace id
-is derived from the tenant, agent, incarnation and accept seq, and the span
-id from the tenant, agent and turn id, so a turn's span and its event
-records share a trace.
+(`ids_are_stable_and_separate_every_component`). Delivery duplicates, and
+nothing rate-limits the duplicates. A projection cursor lives only in memory,
+so every process that serves or sweeps a tenant projects each agent it
+touches from that agent's first event, under the ids every earlier delivery
+carried (`a_restart_repeats_history_under_the_same_ids`,
+`a_restarted_projector_redelivers_history_under_the_same_ids`). A restart,
+a second replica serving the same tenant, a sweep pass in another process
+and a retried batch each repeat records. One agent holds at most 32,768
+events (`max_index_pages` 512 times `max_page_entries` 64), so each process
+can deliver up to 32,768 duplicate records per agent, once per process
+start. Re-reading a full history costs about 520 GETs per agent: one
+shallow HEAD per fill (eight fills at the default backlog of 4096) plus the
+512 sealed event pages, and one more GET per event when the tenant's
+payloads are carried. A fleet restart multiplies that by the agents the
+restarted processes touch.
+
+The event id is the deduplication key, carried as the `agent.event_id`
+attribute. A query that must count each event once groups on it:
+
+```sql
+SELECT attrs['agent.event_id'] AS event_id,
+       min(ts) AS ts,
+       min(body) AS body
+FROM logs
+WHERE attrs['service.name'] = 'ravel-agents'
+GROUP BY attrs['agent.event_id']
+ORDER BY ts
+```
+
+The trace id is derived from the tenant, agent, incarnation and accept seq,
+and the span id from the tenant, agent and turn id, so a turn's span and its
+event records share a trace. A process emits one span per turn even when the
+backlog bound splits the turn's events across two reads
+(`a_turn_split_across_two_fills_is_one_span`).
 
 Payloads are redacted by default: a record carries
 `payload_hash=<blake3 hex> payload_size=<bytes> payload=redacted`, and the
@@ -645,14 +669,23 @@ payload text never leaves the agent store
 acceptance test above finds no log line holding the payload text). A tenant
 named by `--agents-projection-payload-tenant` (repeatable) gets
 `payload=<text>` instead (`payload_text_is_projected_only_for_an_opted_in_tenant`).
+The hash is a plain, unkeyed `blake3` of the payload bytes. It hides a
+payload nobody can guess, not one drawn from a small set: anyone who can
+query the tenant's logs can hash a candidate (`yes`, `no`, a short id) and
+confirm it against `payload_hash`. Keep low-entropy secrets out of event
+payloads, or treat the projected logs as readable by whoever can read them.
 
-Where records go depends on the process:
+Where records go depends on the process. `--agents` runs only in `query`
+and `all` modes (`agents_in_a_non_query_mode_is_refused`), and of those only
+`all` holds an ingest buffer. So a `query`-mode process with `--agents` sets
+`--agents-projection off`, points `--agents-projection-endpoint` at a
+loopback gateway, or runs in `all` mode instead:
 
 | Process | `--agents-projection` | `--agents-projection-endpoint` | Records go to | Health `mode` |
 |---|---|---|---|---|
-| holds an ingest buffer (`all`, `gateway`) | `auto` (default) | unset | this process's own log and span ingest routers | `in_process` |
+| holds an ingest buffer (`all`) | `auto` (default) | unset | this process's own log and span ingest routers | `in_process` |
 | any | `auto` | plain `http://` on a loopback host | that endpoint over OTLP gRPC, tenant in the `x-ravel-tenant` header | `endpoint` |
-| any | `auto` | another host, or any `https://` URL | refuses to start, naming issue #3360 | none |
+| any | `auto` | another host, or any `https://` URL | refuses to start, naming the loopback rule | none |
 | no ingest buffer (`query`) | `auto` | unset | refuses to start, naming both ways out | none |
 | any | `off` | unset | nowhere | `off` |
 | any | `off` | set | refuses to start: the two contradict | none |
@@ -661,8 +694,8 @@ So projection is never silently absent
 (`a_process_that_cannot_project_refuses_to_start_and_off_is_reported`,
 `agents_projection_target_resolves_or_refuses_naming_both_ways_out`). The
 endpoint is loopback-only because the projector sends a tenant's history with
-no credential, trusted on the tenant header alone; until the credential model
-of issue #3360 lands, run the receiving gateway on the same host
+no credential, trusted on the tenant header alone; until the projector has a
+credential model (ADR-3331, projection-as-built amendment), run the receiving gateway on the same host
 (`agents_projection_endpoint_is_loopback_http_only`,
 `a_query_mode_process_projects_to_a_loopback_gateway`). The
 in-process sink applies the tenant's IPCrypt rules like any other ingest, and
@@ -694,10 +727,31 @@ agents this process has seen, beside `backlog`, `backlog_bound`,
 `events_projected`, `spans_projected`, `sink_failures`, `backlog_full`,
 `read_failures` and `records_rejected`, and on `/metrics` as the
 `ravel_agents_projection_*` family (`docs/guides/observability.md`;
-`projection_metrics_scrape_matches_health_after_an_outage`). Limits of this version: a record's timestamp is the
-projecting process's clock when it read the event, since an event entry
-records no time; a span's end is the result's finish time; and a record
-carries no state or handler version.
+`projection_metrics_scrape_matches_health_after_an_outage`).
+
+A record's time comes from committed data where the projector can find it.
+An event entry records no time of its own, so a record takes its turn's
+`finished_unix_ns` from the turn's result, and a turn's span starts and ends
+at that time. The projector reads HEAD shallow, without the sealed index
+pages, so it finds the result only while it sits on the open results page;
+for a turn whose result has been sealed away (an agent with more than
+`max_page_entries` results committed since), the record takes the
+projecting process's clock when it read the event. The `agent.time_source`
+attribute says which: `turn_finished` or `read`. Nothing is restamped at
+delivery, so a batch retried across an outage keeps the time it was read
+with (`a_record_carries_its_turns_finish_time_not_the_delivery_time`). The
+tradeoff: a re-projected old turn keeps its old time, so the log ingest
+window can refuse it as too old. That refusal is permanent, counted in
+`records_rejected` and reported in `last_rejection`, and the agent's later
+events still project. Reading the sealed results pages instead would put
+the right time on every record at up to 512 more GETs per full-history
+re-read.
+
+Limits of this version: a record carries the turn's accept seq as its
+message id and the turn id, and no per-event state version or handler
+version, since an event entry records neither; effects are not projected.
+Per-event versions need their own ADR (ADR-3331, amendment "Projection as
+built").
 
 ## Guarantees and limitations
 
