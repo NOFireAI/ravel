@@ -2877,6 +2877,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 (Some(logs), Some(spans)) => agents::ProjectionSinkPlan::InProcess {
                     logs: logs.clone(),
                     spans: spans.clone(),
+                    ipcrypt: ipcrypt.clone(),
                 },
                 _ => anyhow::bail!(
                     "agents projection resolved to the in-process ingest path, but this process \
