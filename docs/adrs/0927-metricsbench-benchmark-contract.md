@@ -933,7 +933,9 @@ Decision:
    generator than about the receiver. `ack_latency_ms` stays per request,
    from send to response, and now includes queueing inside the receiver
    behind the other requests in flight. A durable-on-ack receiver's ack
-   latency still cannot fall below its flush interval, whatever `S` is.
+   latency still cannot fall below its flush interval, whatever `S` is
+   (flush-setting amendment below: only for points that wait for the
+   age-triggered flush; a size-triggered flush acks sooner).
    Ingest figures from before this amendment carry
    `elapsed_basis: "timed_segments"` and are not compared with figures
    measured after it.
@@ -968,14 +970,16 @@ Consequences. Band 4's identities are sums, so they hold under any arrival
 order and are unchanged. Every row's `client_behavior` describes the shard
 model, the backoff and the fixed `S`. Predicted, not measured: with 50
 shards of 2,000 points each answered about every 2.1 s, Ravel's row offers
-about 47,600 points per second (measured at 42,142 on `cardinality`; the
-flush-setting amendment below moves the row to 500 ms). At that rate the Ravel row takes about
+about 47,600 points per second. At that rate the Ravel row takes about
 2.1 hours for `cardinality` (360,000,000 samples), 2.5 hours for `churn`
 (432,000,000) and 10.1 hours for `history` (1,728,000,000). The per-profile
 ceilings are about twice those: 14,400 s, 18,000 s and 72,000 s, and 600 s
 for `ci`. A `history` run therefore needs a box that stays up longer than
-ten hours. The smoke pass that follows this amendment pre-registers each
-profile's figures on #2821 before it runs.
+ten hours. These hours derive from the predicted 47,600, not from a
+measurement: the flush-setting amendment below measured the 2 s default at
+42,142 points per second on `cardinality` and moves the row to a 500 ms
+delay, measured at 114,356. The smoke pass that follows this amendment
+pre-registers each profile's figures on #2821 before it runs.
 
 ## Amendment (2026-10-29): the portable stack's local object store is s3s-fs
 
@@ -1011,11 +1015,12 @@ shows it still binds, is a separate disclosed change.
 ## Amendment (2026-10-29): the Ravel row runs a disclosed 500 ms flush delay
 
 <!-- amendment-applies: sections="3. Acknowledgement semantics are reported, never normalised" pointer="flush-setting amendment" -->
+<!-- amendment-supersedes: phrase="cannot fall below its flush interval" pointer="flush-setting amendment" -->
 
 Context. Decision 3 makes a Ravel Remote Write 2xx durable-on-ack, so a
 request waits for the flush that stores its points. With the shipped
 `--max-flush-delay` of 2 s that flush comes when the tenant buffer ages
-past 2 s, and the replay the 2026-10-28 replay amendment defines then
+past 2 s, and the sending model of the 2026-10-28 replay amendment then
 offers about 42,000 points per second on s3s-fs. Experiment E2 on #2821
 (pre-registration comment 6484279730, readout comment 6496922852) replayed
 the `cardinality` stream into the Ravel row alone on s3s-fs, one variable
@@ -1037,8 +1042,8 @@ past its 120 s deadline.
 
 Decision: the MetricsBench Ravel row runs `--max-flush-delay 500ms`,
 `--max-flush-delay-idle 40s` and `--min-flush-bytes 262144`, on every
-profile and in both the portable and the real-S3 lanes. The three move as
-the set ravel-server requires (ADR-0076 decision 4); the idle delay and
+profile and in both the portable and the real-S3 lanes. The three are
+passed as a set (ADR-0076 decision 4); the idle delay and
 the byte threshold keep their shipped values, so only the active-tenant
 flush age changes. The setting is a deployment setting disclosed beside
 the frozen limits and recorded in each run's effective configuration; it
