@@ -90,7 +90,8 @@ This also fixes a measurement trap: an OTLP-based comparison **could**
 accidentally measure a non-durable ack. The portable lane's use of Remote
 Write forecloses it.
 
-Ack is not visibility. Default `--max-flush-delay` is 2 s. The harness passes
+Ack is not visibility. Default `--max-flush-delay` is 2 s; the MetricsBench
+Ravel row runs 500 ms (see the flush-setting amendment below). The harness passes
 the returned commit tokens as `min_commit_token` for deterministic
 read-your-write rather than sleeping, because sleeping measures the flush
 delay and calls it query latency.
@@ -1005,3 +1006,58 @@ lane produces publishable Ravel performance and cost figures. Figures
 measured on RustFS are not compared with figures measured on s3s-fs; each
 run's provenance records the store. Raising the store's envelope, if a run
 shows it still binds, is a separate disclosed change.
+
+## Amendment (2026-10-29): the Ravel row runs a disclosed 500 ms flush delay
+
+<!-- amendment-applies: sections="3. Acknowledgement semantics are reported, never normalised" pointer="flush-setting amendment" -->
+
+Context. Decision 3 makes a Ravel Remote Write 2xx durable-on-ack, so a
+request waits for the flush that stores its points. With the shipped
+`--max-flush-delay` of 2 s that flush comes when the tenant buffer ages
+past 2 s, and the replay of the 2026-10-28 amendment then offers about
+42,000 points per second whatever the store. Experiment E2 on #2821
+(pre-registration comment 6484279730, readout comment 6496922852) replayed
+the `cardinality` stream into the Ravel row alone on s3s-fs, one variable
+per row, same image (`manual-0bf5fed`), harness and box class:
+
+| Ravel setting | points/s | `.rseg` objects | ack p50 | wall time | source |
+|---|---|---|---|---|---|
+| shipped default (`--max-flush-delay 2s`) | 42,142 | 14,560 | 2,098 ms | 8,525 s | comment 6496922852 |
+| `--max-flush-delay 500ms`, `--max-flush-delay-idle 40s`, `--min-flush-bytes 262144` | 114,356 | 15,252 | 792 ms | 3,142 s | comment 6496922852 |
+| `--strict-flush-policy arrival` (ADR-2793) | 175,769 | 347,412 | 26.7 ms | 2,044 s | comment 6496922852 |
+
+Every row accepted all 323,353,241 samples and 35,928,092 histograms with
+accepted digests equal to expected, no retries, no abandoned flushes and
+no shed buffers. No row was sender-bound: the generator finished in 1,456
+to 1,528 s on each, so the shipped default measured Ravel's flush clock,
+not its ingest path. Arrival writes 22.8 times the 500 ms row's objects
+for 1.54 times its rate, and a series read over its 347,412 objects ran
+past its 120 s deadline.
+
+Decision: the MetricsBench Ravel row runs `--max-flush-delay 500ms`,
+`--max-flush-delay-idle 40s` and `--min-flush-bytes 262144`, on every
+profile and in both the portable and the real-S3 lanes. The three move as
+the set ravel-server requires (ADR-0076 decision 4); the idle delay and
+the byte threshold keep their shipped values, so only the active-tenant
+flush age changes. The setting is a deployment setting disclosed beside
+the frozen limits and recorded in each run's effective configuration; it
+is not a change to Ravel's shipped default, which stays 2 s. Decision 3
+is unchanged: a 2xx still means durable, and the row's ack latency cannot
+fall below its 500 ms flush interval.
+
+Rejected: the shipped default, because it reports the flush clock as
+Ravel's ingest rate; and arrival, because its object count is a read-path
+cost the row would carry into every query. A floor on how often arrival
+flushes one (shard, tenant) would give arrival's latency at a bounded
+object rate; it changes ADR-2793's stated PUT bound and needs its own
+amendment there before this lane could adopt it.
+
+Consequences. Figures measured under the 2 s default are not compared with
+figures measured under this setting; each run's effective configuration
+records which. The frozen-limit rows that derive from a 2 s flush cadence
+(`--max-segments`, `--max-s3-requests`) are restated for 500 ms in the
+change that sets the flags. The setting does not give the row a
+cardinality read-back: at about 15,000 objects the series listing is
+refused by the host memory floor on both the default and this setting
+(#3434), and until that is fixed the row's cardinality result is a
+refusal, and #3433's series count stays untested.
