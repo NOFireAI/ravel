@@ -3,9 +3,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use ravel_agents_core::error::{AgentError, BudgetCap};
 use ravel_agents_core::head::TimerStatus;
+use ravel_agents_core::kernel::Limits;
 use ravel_agents_core::keys::{dir_key, dir_prefix, wake_prefix};
-use ravel_agents_core::wire::TimerRequest;
+use ravel_agents_core::wire::{SendRequest, TimerRequest};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -827,4 +829,79 @@ async fn the_fill_is_published_only_when_a_directory_cycle_completes() {
     assert_eq!(fill.max_ratio[0], 0.75);
     // Agents o-6 to o-9 hold six receipts each.
     assert_eq!(fill.near_cap[0], 4);
+}
+
+/// Send to `key` until a send is refused, and return the refusal.
+async fn send_until_refused(co: &crate::Coordinator, key: &str) -> AgentError {
+    for i in 0..10_000 {
+        let req = SendRequest {
+            agent: crate::tests::agent_ref(key),
+            handler: "step".to_string(),
+            request_id: format!("r-{i}"),
+            payload: json!({"i": i}),
+        };
+        if let Err(e) = co.send(&req).await {
+            return e;
+        }
+    }
+    panic!("no send to {key} was refused");
+}
+
+/// Every cap a test can reach, refused once through the coordinator: the
+/// refusal names its cap, and `budget_refusals` moves by exactly one, under
+/// that cap only.
+#[tokio::test(start_paused = true)]
+async fn each_cap_refusal_moves_its_counter_by_exactly_one() {
+    let cases: [(BudgetCap, fn(&mut Limits)); 5] = [
+        (BudgetCap::Mailbox, |l| l.max_mailbox_depth = 2),
+        (BudgetCap::Receipts, |l| l.max_receipts = 3),
+        (BudgetCap::Timers, |l| l.max_timers = 1),
+        (BudgetCap::IndexPages, |l| {
+            l.max_page_entries = 2;
+            l.max_index_pages = 1;
+        }),
+        (BudgetCap::HeadBytes, |l| l.max_head_bytes = 1_024),
+    ];
+    for (cap, shape) in cases {
+        let mut limits = crate::tests::limits();
+        shape(&mut limits.kernel);
+        let r = rig_with(Arc::new(MemoryStore::new()), SweepConfig::default(), limits);
+        create(&r.co, "o-1").await;
+        let error = if cap == BudgetCap::Timers {
+            schedule(&r.co, "o-1", "a", T0 + SEC).await;
+            r.co
+                .schedule_timer(&timer("o-1", "b", T0 + SEC))
+                .await
+                .expect_err("a second timer is past the cap")
+        } else {
+            send_until_refused(&r.co, "o-1").await
+        };
+        assert_eq!(error.cap, Some(cap), "{error:?}");
+        let mut expected = [0; 5];
+        expected[BudgetCap::ALL.iter().position(|c| *c == cap).expect("cap")] = 1;
+        assert_eq!(r.co.capacity_metrics().budget_refusals, expected, "{cap:?}");
+    }
+}
+
+/// A refusal of a per-command bound names no cap and is not counted.
+#[tokio::test(start_paused = true)]
+async fn a_per_command_refusal_is_not_counted_as_a_cap() {
+    let r = rig();
+    create(&r.co, "o-1").await;
+    let long = "x".repeat(ravel_agents_core::kernel::Limits::default().max_string_bytes + 1);
+    let error = r
+        .co
+        .send(&SendRequest {
+            agent: crate::tests::agent_ref("o-1"),
+            handler: "step".to_string(),
+            request_id: long,
+            payload: json!({}),
+        })
+        .await
+        .expect_err("the request id is past the string cap");
+    assert_eq!(
+        (error.kind, error.cap),
+        (ravel_agents_core::error::ErrorKind::BudgetExceeded, None)
+    );
+    assert_eq!(r.co.capacity_metrics().budget_refusals, [0; 5]);
 }
