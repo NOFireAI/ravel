@@ -265,6 +265,9 @@ anything is built (Measurement).
   callers (`crates/ravel-maintain/src/rlog.rs:2265`,
   `crates/ravel-logseg/src/ranged.rs:717`). A pinned test asserts the
   scan's charge for a block with one cached column and one fresh column.
+  Charged once means once on the process budget: the per-query and
+  per-tenant ceilings do not count served columns (see the tenant-ceiling
+  amendment below).
 - **The reservation travels with the bytes.** It is owned by the shared
   buffer and released when the last `Arc` drops, not when the entry leaves
   the index. Evicting an entry a live scan still holds removes it from the
@@ -654,3 +657,34 @@ ClickBench entry runs with the cache once the delivery steps ship. The
 entry's default cap is chosen in Delivery step 4 from a paired A/B on the
 reference box, with its bands registered on #3326. Every hot figure from a
 run with the cache on states the cap in its stamp, as decision 6 requires.
+
+## Amendment (2026-10-29): served columns are off the tenant ceiling
+
+<!-- amendment-applies: sections="4. Entries are charged to the shared memory budget and give way to queries" pointer="tenant-ceiling amendment" -->
+
+Decision 4 says a hit is charged once. Since the cache merged (#3439) that
+charge is on the process budget only. A scan's resident charge goes
+through the SQL memory pool, which charges the per-query ceiling, the
+per-tenant ceiling and the process budget together. For a column served
+from the cache, the scan leaves the column's bytes out of that charge,
+because the entry's reservation already covers them on the process budget.
+The per-query ceiling (`--sql-max-query-bytes`) and the per-tenant ceiling
+(`--sql-tenant-max-bytes`) therefore do not count served columns.
+
+The owner decided on 2026-10-29 to keep this by design (#3448, item 1).
+The alternative was to charge the two ceilings for served columns while a
+scan holds them, keeping the process budget charged once by the entry.
+
+What this narrows: ADR-0088 describes the per-tenant ceiling as the
+multi-tenant isolation bound, so that one tenant's wide scans cannot starve
+another tenant's query pool. That bound no longer covers the served columns
+of blocks a tenant's scans hold. The bytes involved are those of the blocks
+in flight, not the cache's resident total: a scan holds the entries for the
+block it is reading and lets them go when it moves on, and entries no scan
+holds are evicted, as far as needed, when another consumer's reservation
+would be refused (decision 4). Entries are keyed by tenant, so one tenant's statements are
+never served another tenant's entries. The process budget still counts
+every served byte once, so the process bound is unchanged.
+
+The flag reference for `--sql-tenant-max-bytes` and `docs/query-engine.md`
+state this.

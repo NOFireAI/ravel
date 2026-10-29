@@ -5212,7 +5212,9 @@ the flag.
   lives inside the entry's `Arc`, so it is released when the last handle
   drops, not when the index lets go of the entry. A scan holds the entries it
   was served, and its own resident charge excludes them, so a cached column
-  is charged once. When the budget refuses a reservation, the cache's
+  is charged once, to the process budget. The per-query and per-tenant
+  ceilings (`--sql-max-query-bytes`, `--sql-tenant-max-bytes`) do not count
+  served columns (ADR-3326, tenant-ceiling amendment). When the budget refuses a reservation, the cache's
   registered evictor frees the shortfall plus the same margin from entries no
   scan holds, and the reservation is retried once; `reserve_best_effort`
   never evicts. Each pressure pass logs one INFO line, and a refusal that
