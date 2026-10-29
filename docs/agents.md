@@ -584,11 +584,15 @@ already running, `rustfs_up` reuses it and empties the bucket. Its
 replace-worker scenario SIGKILLs worker A inside an `at_least_once` step and
 asserts that a resend under the same request id returns the same operation
 with `OP1_RETRIED_DUPLICATE=true`, that worker B takes the same turn and
-effect over with `B_STEP_ATTEMPT=2`, and that `RECOVERY_MS`, from the kill to
-B's assignment, lies within [35000, 60000] (the 30 s lease plus 10 s grace,
-plus one 20 s long poll). Its restart-server scenario SIGKILLs and restarts
-the server with worker C's turn in flight and asserts
-`OP2_STATUS_AFTER_RESTART=running`, that C commits under its original lease
+effect over with `B_STEP_ATTEMPT=2`, and that `RECOVERY_FROM_GRANT_MS`, from
+A's grant to B's assignment, lies within [40000, 60000] (the 30 s lease plus
+10 s grace, both counted from the grant, plus one 20 s long poll). It also
+asserts `GRANT_TO_KILL_MS`, from A's grant to its SIGKILL, at no more than
+10000, so A dies while its lease is live. Its restart-server scenario SIGKILLs
+and restarts the server with worker C's turn in flight and asserts
+`RESTART_READY_MS`, from the SIGKILL to the restarted server's `/readyz`, at
+no more than 30000 (C's lease), `OP2_STATUS_AFTER_RESTART=running`, that C
+commits under its original lease
 with `TAKEOVERS_AFTER_RESTART=0` and `TURNS_COMMITTED_AFTER_RESTART=1`, and
 that the state version moves from `STATE_VERSION_BEFORE_RESTART=1` to
 `STATE_VERSION_AFTER_RESTART=2`, so the result is written once.

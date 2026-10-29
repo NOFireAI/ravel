@@ -11,13 +11,15 @@
 #                    at_least_once step, then is SIGKILLed inside that step
 #                    while worker B is already polling. The client resends
 #                    under the same request id. B takes the same turn over
-#                    once A's lease (30 s) and the grace (10 s) have lapsed,
+#                    once A's lease (30 s) and the grace (10 s), both counted
+#                    from A's grant, have lapsed,
 #                    gets attempt 2 of the same effect, and commits.
 #   restart-server   worker C takes the turn of operation 2 and records a
 #                    step; the server is SIGKILLed with that turn in flight
-#                    and restarted on the same store. C completes the effect
-#                    and commits through the restarted server under its
-#                    original lease, and a resend returns the same operation.
+#                    and restarted on the same store inside C's 30 s lease.
+#                    C completes the effect and commits through the
+#                    restarted server under its original lease, and a resend
+#                    returns the same operation.
 #
 # Every figure the run measures is written as KEY=VALUE to a figures file and
 # asserted against an exact value or a stated band (assert_figures below); a
@@ -71,12 +73,23 @@ PINS='[{"handler":"place","version":"1.0.0","digest":"01010101010101010101010101
 INPUT_HASH="5892e7a2b7b5a3aa11b9984ec594f8eb935e25f2f1a69ce17c2387d2bb1c74f0"
 
 # The server's worker lease is 30 s plus 10 s of grace (ADR-3331 decision 6),
-# counted from A's grant; A is killed a few seconds after it. B polls with a
-# 20 s long poll and a takeover is attempted on the poll after the grace
-# lapses, so the band leaves 5 s below 40 s for the time between the grant and
-# the kill, and 20 s above it for one long poll.
-RECOVERY_MS_MIN=35000
-RECOVERY_MS_MAX=60000
+# counted from the grant, so the takeover is measured from A's grant
+# (A_ASSIGNED_MS, taken when A's poll returns), not from the kill. B
+# long-polls for 20 s and takes the turn over on the first poll that scans
+# after the grace lapses, so RECOVERY_FROM_GRANT_MS has the lease and grace
+# as its floor and one long poll above it as its ceiling.
+RECOVERY_FROM_GRANT_MS_MIN=40000
+RECOVERY_FROM_GRANT_MS_MAX=60000
+# A must die while its lease is live, so that B's takeover follows a dead
+# owner rather than racing a live one whose lease simply ran out. 10 s is a
+# third of the lease; between the grant and the kill the script only waits
+# for A's step and B's registration, which take well under a second.
+GRANT_TO_KILL_MS_MAX=10000
+# Worker C commits through the restarted server under the lease it held
+# before the kill, so the restart, from the SIGKILL to /readyz, must finish
+# inside the 30 s lease. That bound is necessary, not sufficient: C's lease
+# started at its grant, before the kill.
+RESTART_READY_MS_MAX=30000
 
 usage() {
   cat <<'EOF'
@@ -160,9 +173,11 @@ assert_figures() {
   expect "$f" OP1_RESULT_STATUS completed
   expect_same "$f" B_WORKER_ID OP1_RESULT_WORKER
   expect "$f" OP1_STATE_VERSION 1
-  expect_band "$f" RECOVERY_MS "$RECOVERY_MS_MIN" "$RECOVERY_MS_MAX"
+  expect_band "$f" GRANT_TO_KILL_MS 0 "$GRANT_TO_KILL_MS_MAX"
+  expect_band "$f" RECOVERY_FROM_GRANT_MS "$RECOVERY_FROM_GRANT_MS_MIN" "$RECOVERY_FROM_GRANT_MS_MAX"
 
   # restart-server: the turn in flight across the restart commits once.
+  expect_band "$f" RESTART_READY_MS 0 "$RESTART_READY_MS_MAX"
   expect_same "$f" OP1_OPERATION_ID OP2_OPERATION_ID differ
   expect "$f" OP2_SEND_DUPLICATE false
   expect_same "$f" OP2_OPERATION_ID C_ASSIGNED_OPERATION_ID
@@ -217,7 +232,9 @@ if [[ "$MODE" == "check" ]]; then
       defects=$(( defects + 1 ))
     fi
   done
-  echo "  OK    recovery band: [${RECOVERY_MS_MIN}, ${RECOVERY_MS_MAX}] ms"
+  echo "  OK    recovery band from A's grant: [${RECOVERY_FROM_GRANT_MS_MIN}, ${RECOVERY_FROM_GRANT_MS_MAX}] ms"
+  echo "  OK    grant-to-kill band: [0, ${GRANT_TO_KILL_MS_MAX}] ms"
+  echo "  OK    restart-ready band: [0, ${RESTART_READY_MS_MAX}] ms"
   for tool in curl jq; do
     if chaos_have_command "$tool"; then
       echo "  OK    tool present: $tool"
@@ -433,7 +450,9 @@ start_worker() {
   LAST_WORKER_OUT=$out
 }
 
-# Copy NAME_* figures a worker wrote (minus its bookkeeping lines).
+# Copy NAME_* figures a worker wrote, minus its bookkeeping lines and its raw
+# NAME_ASSIGNED_MS timestamp, which the run reads with worker_ms and records
+# only as the intervals asserted on it.
 take_worker_figures() {
   local out=$1
   awk '!/_IN_STEP=|_DONE=|_ASSIGNED_MS=/' "$out" >>"$FIGURES"
@@ -442,6 +461,15 @@ take_worker_figures() {
 worker_figure() {
   local out=$1 key=$2
   awk -v k="$key=" 'index($0, k) == 1 { print substr($0, length(k) + 1) }' "$out"
+}
+
+# A millisecond timestamp a worker wrote; fails the run when it is missing,
+# written twice, or not a number, so an interval is never taken from a blank.
+worker_ms() {
+  local out=$1 key=$2 got
+  got=$(worker_figure "$out" "$key")
+  [[ "$got" =~ ^[0-9]+$ ]] || fail "$key=$got in $out is not one millisecond timestamp"
+  printf '%s\n' "$got"
 }
 
 wait_for_line() {
@@ -495,6 +523,8 @@ if [[ -z "$(worker_figure "$a_out" A_COMMIT_STATUS)" ]]; then
   a_killed_before_commit=true
 fi
 record A_KILLED_BEFORE_COMMIT "$a_killed_before_commit"
+a_assigned_ms=$(worker_ms "$a_out" A_ASSIGNED_MS)
+record GRANT_TO_KILL_MS "$(( kill_ms - a_assigned_ms ))"
 take_worker_figures "$a_out"
 
 resent=$(send req-1)
@@ -504,8 +534,8 @@ record OP1_RETRIED_DUPLICATE "$(jq -r .duplicate <<<"$resent")"
 b_code=0
 wait "$b_pid" || b_code=$?
 (( b_code == 0 )) || fail "worker B exited $b_code (log: ${worker_logs[1]})"
-b_assigned_ms=$(worker_figure "$b_out" B_ASSIGNED_MS)
-record RECOVERY_MS "$(( b_assigned_ms - kill_ms ))"
+b_assigned_ms=$(worker_ms "$b_out" B_ASSIGNED_MS)
+record RECOVERY_FROM_GRANT_MS "$(( b_assigned_ms - a_assigned_ms ))"
 take_worker_figures "$b_out"
 
 result1=$(result_of "$op1")
@@ -528,9 +558,14 @@ c_pid=$LAST_WORKER_PID
 c_out=$LAST_WORKER_OUT
 wait_for_line "$c_out" C_IN_STEP 60 || fail "worker C did not reach its step (log: ${worker_logs[2]})"
 
+restart_kill_ms=$(now_ms)
 sigkill_pid "$server_pid"
 server_pid=""
 start_server
+record RESTART_READY_MS "$(( $(now_ms) - restart_kill_ms ))"
+# Checked here as well as in assert_figures: a restart slower than C's lease
+# then fails naming the restart, not as worker C's exit code below.
+expect_band "$FIGURES" RESTART_READY_MS 0 "$RESTART_READY_MS_MAX"
 record OP2_STATUS_AFTER_RESTART "$(get "$CLIENT_TOKEN" "operation?operation=${op2}" | jq -r .status)"
 echo go >"$go_file"
 

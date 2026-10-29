@@ -375,7 +375,7 @@ jobs:
       - name: Put the release binaries on PATH
         run: echo "${GITHUB_WORKSPACE}/target/release" >> "$GITHUB_PATH"
       - name: Agents chaos structure check
-        run: scripts/chaos/agents-replace-worker.sh --check
+        run: CHAOS_CHECK_STRICT=1 scripts/chaos/agents-replace-worker.sh --check
       # The bucket is created the way a --require-bucket-protection server
       # needs it (Object Lock, versioning, lifecycle), the shape the oracle
       # test must hold on.
