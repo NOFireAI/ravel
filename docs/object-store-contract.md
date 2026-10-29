@@ -1043,8 +1043,8 @@ neither fails the call with `Permanent`, naming the key. Errors are classified b
 `Throttled`, with or without an error code in the body, 401 and 403 are
 `AccessDenied`, and 412 depends on the put mode as above. On object requests
 404 is `NotFound`, or `Permanent` when the body names `NoSuchBucket`, so a
-`head` on a bucket that does not exist is `NotFound`, as on S3; a listing of
-a bucket that does not exist is `Permanent`. Every HTTP attempt
+`head` on a missing bucket is `NotFound`, as on S3; a listing of a missing
+bucket is `Permanent`. Every HTTP attempt
 to the store's host, retries included, is counted into the store's
 `StoreMetrics`, so `ravel_store_attempts_total` covers GCS, and each
 response's `Date` header feeds `observed_store_time_ns`. The listing client
@@ -1795,8 +1795,9 @@ ADR-0042 decision 3.
    generation as the version token. It sends through the S3 adapter's HTTP
    connector, scoped to the store's own host. `list`, `list_after` and
    `list_delimited` do not go through `object_store`: they send the JSON
-   API's `objects.list` through the same connector and credentials, with
-   `maxResults` set to the page size, returning a page one name short
+   API's `objects.list` through the same connector and credentials
+   (`maxResults` is the page size for `list` and `list_after` and 1000 for
+   `list_delimited`), returning a page one name short
    rather than sending a second request when the dropped inclusive start
    name is the only shortfall (see "Backend support notes"). No
    multipart, no upload checksums, no bucket-protection probes (see "Backend

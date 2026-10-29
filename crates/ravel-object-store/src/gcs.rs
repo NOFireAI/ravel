@@ -40,10 +40,13 @@
 //! # Listing
 //!
 //! Listing does not go through `object_store`. The `list` module sends the
-//! JSON API's `objects.list`, with `maxResults` set to
-//! [`GcsConfig::list_page_size`] on every request. The prefix and the resume
-//! point are sent as raw names (the resume as `startOffset`, which is
-//! inclusive, so the start name itself is dropped). A call follows the
+//! JSON API's `objects.list`. `maxResults` is [`GcsConfig::list_page_size`]
+//! for `list` and `list_after`, and 1000, the wire maximum, for a
+//! `list_delimited` drain, as on S3. The contract suite's delimited probes
+//! therefore each run in one response, and the multi-response delimited drain
+//! is covered only by the `list` module's `Script` unit tests. The prefix and
+//! the resume point are sent as raw names (the resume as `startOffset`, which
+//! is inclusive, so the start name itself is dropped). A call follows the
 //! service's opaque `nextPageToken` until it holds a page of names, with one
 //! exception: a response from which the start name was dropped and that
 //! leaves at least one name ends the call, and its names, one short of the
