@@ -21,8 +21,8 @@ use ravel_agents_core::head::{EffectStatus, Head, ObjectRef};
 use ravel_agents_core::identity::{AgentId, Id128, effect_id};
 use ravel_agents_core::kernel::{DerivedIds, Limits};
 use ravel_agents_runtime::{
-    AgentsMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher, RuntimeConfig, SweepConfig,
-    SweepMetricsSnapshot, SystemRng,
+    AgentsMetricsSnapshot, CapacityMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher,
+    FillSnapshot, RuntimeConfig, SweepConfig, SweepMetricsSnapshot, SystemRng,
 };
 use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
 use ravel_agents_store::{AgentStore, Clock, StoreLimits, SystemClock};
@@ -401,7 +401,8 @@ impl AgentsRuntime {
                 .with_sweep(SweepConfig {
                     interval_ms: self.poll_sweep_interval_ms(),
                     ..SweepConfig::default()
-                });
+                })
+                .with_limits(self.store_limits().kernel);
                 let agents = Arc::new(TenantAgents {
                     store,
                     coordinator,
@@ -508,6 +509,35 @@ impl AgentsRuntime {
                     last_directory_cycle_ms: a
                         .last_directory_cycle_ms
                         .max(b.last_directory_cycle_ms),
+                }
+            })
+    }
+}
+
+impl AgentsRuntime {
+    /// Every tenant coordinator's budget refusals, summed, and the fill of
+    /// each one's last completed directory cycle: the highest ratio over
+    /// tenants, and the near-cap counts summed. `fill` is `None` until some
+    /// tenant completed a cycle.
+    pub fn capacity_metrics(&self) -> CapacityMetricsSnapshot {
+        let coordinators: Vec<Arc<TenantAgents>> = self.tenants.lock().values().cloned().collect();
+        coordinators
+            .iter()
+            .map(|t| t.coordinator.capacity_metrics())
+            .fold(CapacityMetricsSnapshot::default(), |a, b| {
+                CapacityMetricsSnapshot {
+                    budget_refusals: std::array::from_fn(|i| {
+                        a.budget_refusals[i] + b.budget_refusals[i]
+                    }),
+                    fill: match (a.fill, b.fill) {
+                        (Some(x), Some(y)) => Some(FillSnapshot {
+                            max_ratio: std::array::from_fn(|i| x.max_ratio[i].max(y.max_ratio[i])),
+                            head_bytes_max_ratio: x.head_bytes_max_ratio.max(y.head_bytes_max_ratio),
+                            near_cap: std::array::from_fn(|i| x.near_cap[i] + y.near_cap[i]),
+                            agents: x.agents + y.agents,
+                        }),
+                        (x, y) => x.or(y),
+                    },
                 }
             })
     }

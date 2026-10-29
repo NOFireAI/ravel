@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::*;
-use crate::error::{AgentError, ErrorKind, SafeIds};
+use crate::error::{AgentError, BudgetCap, ErrorKind, SafeIds};
 use crate::identity::{self, AgentId, Id128};
 use crate::keys::{AgentKey, AgentKind};
 use crate::state::{Handle, HandleItem};
@@ -233,6 +233,7 @@ fn samples() -> Vec<Sample> {
                 state: json!({"items": ["A-1"], "paid": false}),
                 active_turn: None,
                 mailbox: Vec::new(),
+                usage: None,
             },
         ),
         sample(
@@ -276,6 +277,16 @@ fn samples() -> Vec<Sample> {
                         failed_attempts: 0,
                     },
                 ],
+                usage: Some(UsageBody {
+                    receipts: 768,
+                    max_receipts: 1024,
+                    results_pages: 12,
+                    events_pages: 400,
+                    timers_pages: 0,
+                    max_index_pages: 512,
+                    head_bytes: 40_960,
+                    max_head_bytes: 262_144,
+                }),
             },
         ),
         sample(
@@ -678,6 +689,21 @@ fn samples() -> Vec<Sample> {
             },
         ),
         sample("error_body", ErrorBody::from(&error)),
+        sample(
+            "error_body_cap",
+            ErrorBody::from(
+                &AgentError::new(
+                    ErrorKind::BudgetExceeded,
+                    SafeIds {
+                        agent_id: Some(agent_id().to_hex()),
+                        incarnation: Some(1),
+                        ..SafeIds::default()
+                    },
+                    "receipt list is at its cap",
+                )
+                .with_cap(BudgetCap::Receipts),
+            ),
+        ),
     ]
 }
 
@@ -841,6 +867,24 @@ fn error_body_carries_the_code_and_retry_hint() {
             "retry": "backoff",
             "reason": "mailbox is full",
             "ids": {}
+        })
+    );
+}
+
+#[test]
+fn error_body_names_the_cap_a_budget_refusal_hit() {
+    let body = ErrorBody::from(
+        &AgentError::new(ErrorKind::MailboxFull, SafeIds::default(), "mailbox is full")
+            .with_cap(BudgetCap::Mailbox),
+    );
+    assert_eq!(
+        serde_json::to_value(&body).expect("json"),
+        json!({
+            "code": "mailbox_full",
+            "retry": "backoff",
+            "reason": "mailbox is full",
+            "ids": {},
+            "cap": "mailbox"
         })
     );
 }

@@ -112,6 +112,48 @@ impl RetryHint {
     }
 }
 
+/// The lifetime cap a `BudgetExceeded` or `MailboxFull` refusal hit. A
+/// refusal for a per-command bound (a string, the events or intents of one
+/// turn, an exhausted counter) names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BudgetCap {
+    /// `Limits::max_receipts`.
+    Receipts,
+    /// `Limits::max_index_pages`, or the entries of one index page.
+    IndexPages,
+    /// `Limits::max_head_bytes`, or the reserve the growth guard keeps under it.
+    HeadBytes,
+    /// `Limits::max_mailbox_depth`.
+    Mailbox,
+    /// `Limits::max_timers`.
+    Timers,
+}
+
+impl BudgetCap {
+    pub const ALL: [BudgetCap; 5] = [
+        BudgetCap::Receipts,
+        BudgetCap::IndexPages,
+        BudgetCap::HeadBytes,
+        BudgetCap::Mailbox,
+        BudgetCap::Timers,
+    ];
+
+    /// Stable snake_case code used on the wire and as a metric label.
+    pub fn code(self) -> &'static str {
+        match self {
+            BudgetCap::Receipts => "receipts",
+            BudgetCap::IndexPages => "index_pages",
+            BudgetCap::HeadBytes => "head_bytes",
+            BudgetCap::Mailbox => "mailbox",
+            BudgetCap::Timers => "timers",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<BudgetCap> {
+        BudgetCap::ALL.into_iter().find(|cap| cap.code() == code)
+    }
+}
+
 /// Identifiers safe to return to any caller of the tenant: hex hashes and
 /// handle tokens. Unset fields are unknown or not relevant to the error.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -133,6 +175,8 @@ pub struct AgentError {
     // Boxed so every `Result<_, AgentError>` stays small.
     pub ids: Box<SafeIds>,
     pub reason: &'static str,
+    /// The lifetime cap the refusal hit, if it was one.
+    pub cap: Option<BudgetCap>,
 }
 
 impl AgentError {
@@ -141,7 +185,15 @@ impl AgentError {
             kind,
             ids: Box::new(ids),
             reason,
+            cap: None,
         }
+    }
+
+    /// The same error, naming the lifetime cap it hit.
+    #[must_use]
+    pub fn with_cap(mut self, cap: BudgetCap) -> Self {
+        self.cap = Some(cap);
+        self
     }
 
     pub fn retry(&self) -> RetryHint {
@@ -167,6 +219,20 @@ mod tests {
             assert_eq!(ErrorKind::from_code(code), Some(kind));
         }
         assert_eq!(ErrorKind::from_code("nope"), None);
+    }
+
+    #[test]
+    fn cap_codes_are_distinct_and_round_trip() {
+        let codes: std::collections::BTreeSet<&str> =
+            BudgetCap::ALL.iter().map(|c| c.code()).collect();
+        assert_eq!(
+            codes.into_iter().collect::<Vec<_>>(),
+            ["head_bytes", "index_pages", "mailbox", "receipts", "timers"]
+        );
+        for cap in BudgetCap::ALL {
+            assert_eq!(BudgetCap::from_code(cap.code()), Some(cap));
+        }
+        assert_eq!(BudgetCap::from_code("nope"), None);
     }
 
     #[test]

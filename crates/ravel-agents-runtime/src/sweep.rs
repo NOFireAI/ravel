@@ -139,11 +139,13 @@ use std::sync::atomic::Ordering;
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::Head;
 use ravel_agents_core::identity::AgentId;
+use ravel_agents_core::kernel::Usage;
 use ravel_agents_core::keys::DueBucket;
 use ravel_agents_store::{HeadState, WakeHint};
 use ravel_types::TenantHash;
 
 use crate::Coordinator;
+use crate::metrics::FillTally;
 use crate::ownership::ms_to_ns;
 use crate::timers::armed_in;
 
@@ -213,6 +215,8 @@ pub(crate) struct SweepCursor {
     /// pass that listed its first page. `None` between a wrap and the next
     /// directory LIST.
     dir_cycle_started_unix_ns: Option<i64>,
+    /// The fill of the directory cycle in progress.
+    fill: FillTally,
 }
 
 impl SweepCursor {
@@ -400,6 +404,9 @@ impl Coordinator {
                     }
                     self.visit(pass, &entry.agent).await;
                 }
+                if let Some(head) = pass.seen.get(&entry.agent).and_then(|s| s.head.as_ref()) {
+                    cursor.fill.add(&Usage::of(head), &self.limits);
+                }
                 cursor.dir = Some(entry.key.clone());
             }
             if !page.more {
@@ -415,14 +422,15 @@ impl Coordinator {
     }
 
     /// The directory cursor wrapped: every agent's HEAD was read once since
-    /// the cycle began. Count the cycle, time it on the injected clock, and
-    /// forget which agents' entries were known, so an entry that vanished
+    /// the cycle began. Count the cycle, time it on the injected clock,
+    /// publish the fill it measured, and forget which agents' entries were known, so an entry that vanished
     /// since is written back the next time a hint reaches its agent.
     fn complete_directory_cycle(&self, cursor: &mut SweepCursor) {
         let now = self.now();
         let started = cursor.dir_cycle_started_unix_ns.take().unwrap_or(now);
         let elapsed_ms = now.saturating_sub(started).max(0) / 1_000_000;
         self.record_directory_cycle(u64::try_from(elapsed_ms).unwrap_or(0));
+        self.publish_fill(std::mem::take(&mut cursor.fill).snapshot(&self.limits));
         cursor.dir_known.clear();
     }
 

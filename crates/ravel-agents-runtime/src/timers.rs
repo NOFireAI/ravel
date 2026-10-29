@@ -90,7 +90,7 @@ impl Coordinator {
                 fence: IncarnationFence { incarnation },
                 timer: spec.clone(),
             });
-            match self.store.execute_with(&agent, &command, &deps).await {
+            match self.execute_with(&agent, &command, &deps).await {
                 Ok(out) => {
                     self.observe(&agent, &out.head);
                     let Reply::TimerScheduled {
@@ -153,7 +153,7 @@ impl Coordinator {
                 fence: IncarnationFence { incarnation },
                 timer_key: req.timer_key.clone(),
             });
-            match self.store.execute(&agent, &command).await {
+            match self.execute(&agent, &command).await {
                 Ok(out) => {
                     self.observe(&agent, &out.head);
                     let outcome = match out.reply {
@@ -234,7 +234,7 @@ impl Coordinator {
                 timer_id: due.timer_id,
                 generation: due.generation,
             });
-            match self.store.execute(agent, &command).await {
+            match self.execute(agent, &command).await {
                 Ok(out) => {
                     let wake = out.effects.contains(&Effect::WakeWorker);
                     let landed = matches!(out.reply, Reply::TimerFired { .. });

@@ -41,7 +41,7 @@ use ravel_agents_core::command::{
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{Head, ObjectRef};
 use ravel_agents_core::identity::{AgentId, Hash256, Id128, agent_id, step_input_hash};
-use ravel_agents_core::kernel::{Effect, Reply};
+use ravel_agents_core::kernel::{Effect, Limits, Reply};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::state::Handle;
 use ravel_agents_core::wire::{
@@ -67,7 +67,10 @@ pub use effects::{
     StepJournal, StepProgress, StepSpec, UNKNOWN_OUTCOME_RETRIES,
 };
 pub use failure::FailOutcome;
-pub use metrics::{AgentsMetricsSnapshot, SweepMetricsSnapshot};
+pub use metrics::{
+    AgentsMetricsSnapshot, CapacityMetricsSnapshot, FILL_LISTS, FillSnapshot, NEAR_CAP_PERCENT,
+    SweepMetricsSnapshot,
+};
 pub use ownership::TakeoverReason;
 pub use sweep::{
     DEFAULT_SWEEP_INTERVAL_MS, DEFAULT_SWEEP_MAX_HEAD_GETS, DEFAULT_SWEEP_MAX_LIST_PAGES,
@@ -179,6 +182,9 @@ pub struct Coordinator {
     /// When a poll last started a sweep pass, in the injected clock's
     /// nanoseconds; `i64::MIN` before the first.
     pub(crate) last_sweep_unix_ns: AtomicI64,
+    /// The kernel limits the store enforces, against which the sweep
+    /// measures each agent's fill ([`Coordinator::with_limits`]).
+    pub(crate) limits: Limits,
 }
 
 impl Coordinator {
@@ -202,11 +208,25 @@ impl Coordinator {
             sweep: SweepConfig::default(),
             sweep_cursor: tokio::sync::Mutex::new(sweep::SweepCursor::default()),
             last_sweep_unix_ns: AtomicI64::new(i64::MIN),
+            limits: Limits::default(),
         }
+    }
+
+    /// Measure fill against `limits`, which must be the kernel limits the
+    /// store was built with: the coordinator has no other way to read them.
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Coordinator {
+        self.limits = limits;
+        self
     }
 
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// The kernel limits fill is measured against.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     pub(crate) fn now(&self) -> i64 {
@@ -230,7 +250,7 @@ impl Coordinator {
         req: &CreateAgentRequest,
     ) -> Result<CreateAgentResponse, AgentError> {
         let (kind, key) = parse_agent(&req.agent)?;
-        let out = self.store.create(kind, key).await?;
+        let out = self.create_agent(kind, key).await?;
         let (incarnation, created) = match out.reply {
             Reply::Created { incarnation } => (incarnation, true),
             Reply::Exists { incarnation } => (incarnation, false),
@@ -256,7 +276,6 @@ impl Coordinator {
         let mut reloaded = false;
         let out = loop {
             match self
-                .store
                 .enqueue(
                     &agent,
                     incarnation,
@@ -493,7 +512,7 @@ impl Coordinator {
             },
             accept_seq,
         });
-        let out = match self.store.execute(&handle.agent, &command).await {
+        let out = match self.execute(&handle.agent, &command).await {
             Ok(out) => out,
             Err(e) if e.kind == ErrorKind::OutcomeUnknown => {
                 self.settle_unknown(&handle.agent, &command, &[], e)

@@ -466,6 +466,15 @@ pub enum Label {
     /// Shares the `phase` key with `AgentsStorePhase`.
     #[cfg(feature = "agents")]
     AgentsSweepList(AgentsSweepList),
+    /// Which agent list a `ravel_agents_index_fill_max_ratio` or
+    /// `ravel_agents_agents_near_cap` sample measures: `receipts`, `results`,
+    /// `events` or `timers` (`ravel_agents_runtime::FILL_LISTS`).
+    #[cfg(feature = "agents")]
+    AgentsFillList(&'static str),
+    /// Which lifetime cap a `ravel_agents_budget_refusals_total` sample
+    /// counts: a closed enum owned by `ravel_agents_core`.
+    #[cfg(feature = "agents")]
+    AgentsBudgetCap(ravel_agents_core::error::BudgetCap),
 }
 
 /// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
@@ -715,6 +724,10 @@ impl Label {
             Label::AgentsStorePhase(_) => "phase",
             #[cfg(feature = "agents")]
             Label::AgentsSweepList(_) => "phase",
+            #[cfg(feature = "agents")]
+            Label::AgentsFillList(_) => "list",
+            #[cfg(feature = "agents")]
+            Label::AgentsBudgetCap(_) => "cap",
         }
     }
 
@@ -775,6 +788,10 @@ impl Label {
             Label::AgentsSweepList(AgentsSweepList::Wake) => "wake".to_string(),
             #[cfg(feature = "agents")]
             Label::AgentsSweepList(AgentsSweepList::Dir) => "dir".to_string(),
+            #[cfg(feature = "agents")]
+            Label::AgentsFillList(list) => (*list).to_string(),
+            #[cfg(feature = "agents")]
+            Label::AgentsBudgetCap(cap) => cap.code().to_string(),
         }
     }
 
@@ -4691,6 +4708,8 @@ pub(crate) fn render_agents_families(
         );
     }
 
+    render_agents_capacity_families(out, mode, runtime);
+
     use ravel_agents_store::counters::{Phase, PhaseCounts};
     let phases = [
         (Phase::Resolve, snapshot.store.resolve),
@@ -4746,6 +4765,77 @@ pub(crate) fn render_agents_families(
                 field(counts),
             );
         }
+    }
+}
+
+/// How close agents are to their lifetime caps (issue #3454): the fill each
+/// tenant's last completed directory cycle measured, the highest ratio over
+/// tenants and the near-cap counts summed, all 0 before the first cycle;
+/// then the kernel's budget refusals by cap. No tenant or agent label.
+#[cfg(feature = "agents")]
+fn render_agents_capacity_families(
+    out: &mut String,
+    mode: Mode,
+    runtime: &crate::agents::AgentsRuntime,
+) {
+    use ravel_agents_runtime::{FILL_LISTS, FillSnapshot};
+    let capacity = runtime.capacity_metrics();
+    let fill = capacity.fill.unwrap_or(FillSnapshot::default());
+    let name = "ravel_agents_index_fill_max_ratio";
+    write_header(
+        out,
+        name,
+        "The highest fill of any agent at the end of the last directory sweep cycle, by list: receipts over the receipt cap, and sealed index pages over max_index_pages for results, events and timers; the largest over tenants, 0 before the first cycle. At 1 the list refuses further growth with budget_exceeded.",
+        "gauge",
+    );
+    for (list, value) in FILL_LISTS.into_iter().zip(fill.max_ratio) {
+        write_sample_f64(
+            out,
+            name,
+            &[Label::Mode(mode), Label::AgentsFillList(list)],
+            value,
+        );
+    }
+    let name = "ravel_agents_head_bytes_max_ratio";
+    write_header(
+        out,
+        name,
+        "The largest encoded agent HEAD over max_head_bytes at the end of the last directory sweep cycle; the largest over tenants, 0 before the first cycle.",
+        "gauge",
+    );
+    write_sample_f64(out, name, &[Label::Mode(mode)], fill.head_bytes_max_ratio);
+    let name = "ravel_agents_agents_near_cap";
+    write_header(
+        out,
+        name,
+        "Agents at or above 75% of a list's cap at the end of the last directory sweep cycle, by list, summed over tenants; 0 before the first cycle.",
+        "gauge",
+    );
+    for (list, value) in FILL_LISTS.into_iter().zip(fill.near_cap) {
+        write_sample(
+            out,
+            name,
+            &[Label::Mode(mode), Label::AgentsFillList(list)],
+            value,
+        );
+    }
+    let name = "ravel_agents_budget_refusals_total";
+    write_header(
+        out,
+        name,
+        "Commands the agent kernel refused for a lifetime cap, by cap: receipts, index_pages, head_bytes, mailbox or timers.",
+        "counter",
+    );
+    for (cap, value) in ravel_agents_core::error::BudgetCap::ALL
+        .into_iter()
+        .zip(capacity.budget_refusals)
+    {
+        write_sample(
+            out,
+            name,
+            &[Label::Mode(mode), Label::AgentsBudgetCap(cap)],
+            value,
+        );
     }
 }
 
@@ -10221,6 +10311,10 @@ mod tests {
                 Label::AgentsStorePhase(_) => "phase",
                 #[cfg(feature = "agents")]
                 Label::AgentsSweepList(_) => "phase",
+                #[cfg(feature = "agents")]
+                Label::AgentsFillList(_) => "list",
+                #[cfg(feature = "agents")]
+                Label::AgentsBudgetCap(_) => "cap",
             })
             .collect();
         assert_eq!(
