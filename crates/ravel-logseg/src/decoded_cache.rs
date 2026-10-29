@@ -7,6 +7,10 @@
 //! column a Contains arm defers (its dictionary is narrowed to survivors
 //! after decode). The row path neither reads nor fills it.
 //!
+//! A hit skips the whole-block CRC cross-check for that block. Per-page CRCs
+//! still cover every byte the scan reads, and a cached column was verified
+//! when it was first decoded.
+//!
 //! Admission follows ADR-3326 decision 3: an interactive statement admits on
 //! first decode, any other intent on a second touch through a ghost key list
 //! whose window spans the cap in bytes. Eviction is CLOCK weighted by bytes.
@@ -439,7 +443,7 @@ impl DecodedColumnCache {
             return None;
         }
         let mut evicted = Vec::new();
-        let admitted = {
+        {
             let mut inner = self.lock();
             if inner.index.contains_key(&key) {
                 return None;
@@ -457,36 +461,44 @@ impl DecodedColumnCache {
                     }
                 }
             }
-            let reservation = match &self.budget {
-                Some(budget) => {
-                    match budget
-                        .reserve_best_effort_keeping(bytes, admission_margin(budget.limit()))
-                    {
-                        Ok(r) => Some(r),
-                        Err(refusal) => {
-                            if refusal.cause == ExhaustionCause::Accounted
-                                && refusal
-                                    .reserved
-                                    .checked_add(bytes)
-                                    .is_some_and(|total| total <= refusal.limit)
-                            {
-                                inner.process.margin_skips += 1;
-                                DecodedCacheCounters::bump(&counters.margin_skips, 1);
-                            }
-                            return None;
+            self.evict_for(&mut inner, bytes, &mut evicted, counters);
+        }
+        // Evicted entries release their reservations here, before the new
+        // entry reserves, so the cache at its cap can swap one entry for
+        // another instead of counting every resident byte against the margin.
+        drop(evicted);
+
+        let reservation = match &self.budget {
+            Some(budget) => {
+                match budget.reserve_best_effort_keeping(bytes, admission_margin(budget.limit())) {
+                    Ok(r) => Some(r),
+                    Err(refusal) => {
+                        if refusal.cause == ExhaustionCause::Accounted
+                            && refusal
+                                .reserved
+                                .checked_add(bytes)
+                                .is_some_and(|total| total <= refusal.limit)
+                        {
+                            let mut inner = self.lock();
+                            inner.process.margin_skips += 1;
+                            DecodedCacheCounters::bump(&counters.margin_skips, 1);
                         }
+                        return None;
                     }
                 }
-                None => None,
-            };
-            Self::evict_until(
-                &mut inner,
-                self.max_bytes.saturating_sub(bytes),
-                &mut evicted,
-            );
-            let n = evicted.len() as u64;
-            inner.process.evictions += n;
-            DecodedCacheCounters::bump(&counters.evictions, n);
+            }
+            None => None,
+        };
+
+        let mut evicted = Vec::new();
+        let admitted = {
+            let mut inner = self.lock();
+            if inner.index.contains_key(&key) {
+                // Admitted concurrently; `reservation` drops with this frame.
+                return None;
+            }
+            // Entries admitted between the two locks may have refilled the cap.
+            self.evict_for(&mut inner, bytes, &mut evicted, counters);
             let entry = Arc::new(DecodedEntry {
                 col: col.clone(),
                 bytes,
@@ -516,6 +528,21 @@ impl DecodedColumnCache {
         };
         drop(evicted);
         Some(admitted)
+    }
+
+    /// Evicts until `bytes` more fit under the cap and counts the evictions.
+    fn evict_for(
+        &self,
+        inner: &mut Inner,
+        bytes: u64,
+        evicted: &mut Vec<Arc<DecodedEntry>>,
+        counters: &DecodedCacheCounters,
+    ) {
+        let before = evicted.len();
+        Self::evict_until(inner, self.max_bytes.saturating_sub(bytes), evicted);
+        let n = (evicted.len() - before) as u64;
+        inner.process.evictions += n;
+        DecodedCacheCounters::bump(&counters.evictions, n);
     }
 
     fn record_ghost(&self, inner: &mut Inner, key: DecodedKey, bytes: u64) {
@@ -995,6 +1022,44 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), LIMIT);
         assert_eq!(budget.accounted_refusals(), 0);
+    }
+
+    /// A cache at its cap swaps one entry for another when the budget leaves
+    /// room for the cap plus the margin but not for one more entry on top: the
+    /// evicted entry's reservation is released before the new one is taken, so
+    /// the offer is admitted, is not a margin skip, and the budget does not
+    /// grow past the cap plus the unrelated reservation.
+    ///
+    /// FLIP: reserve before evicting and the final offer is a margin skip.
+    #[test]
+    fn a_full_cache_swaps_an_entry_when_the_budget_has_no_room_for_both() {
+        const LIMIT: u64 = 4 << 30;
+        let margin = admission_margin(LIMIT);
+        let b = col(64).heap_bytes() as u64;
+        let cap = b * 8;
+        let unrelated = LIMIT - margin - cap;
+        let budget = Arc::new(MemoryBudget::new(LIMIT));
+        budget.reserve_unchecked(unrelated);
+        let cache = DecodedColumnCache::new(cap, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+        for i in 0..8 {
+            assert!(
+                cache
+                    .offer(key(i, 1), &col(64), AccessIntent::Interactive, &c)
+                    .is_some(),
+                "fill {i}"
+            );
+        }
+        assert_eq!(cache.resident_bytes(), cap);
+        assert_eq!(budget.reserved(), cap + unrelated);
+
+        let admitted = cache.offer(key(100, 1), &col(64), AccessIntent::Interactive, &c);
+        assert!(admitted.is_some(), "the swap is admitted");
+        let s = c.snapshot();
+        assert!(s.evictions >= 1, "evictions {}", s.evictions);
+        assert_eq!(s.margin_skips, 0);
+        assert_eq!(s.admissions, 9);
+        assert!(budget.reserved() <= cap + unrelated, "reserved grew");
     }
 
     /// Many threads offering and evicting at once never leave the budget's

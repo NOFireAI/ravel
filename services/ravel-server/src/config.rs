@@ -2738,8 +2738,9 @@ pub struct Cli {
 
     /// Ceiling in bytes for the process-wide decoded column-block cache
     /// (ADR-3326). The SQL `logs` scan's
-    /// columnar path serves decoded columns from it and skips their page
-    /// read and decode; each entry is charged to the process memory budget.
+    /// columnar path serves decoded columns from it and skips their decode
+    /// (byte ranges are planned before the lookup, so the pages are still
+    /// fetched); each entry is charged to the process memory budget.
     /// `0`, the default, disables it, and then every response and counter is
     /// what it is without the flag. When nonzero each SQL response's `stats`
     /// carries `decodedCache`.
