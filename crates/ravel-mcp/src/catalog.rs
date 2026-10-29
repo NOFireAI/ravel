@@ -187,6 +187,7 @@ pub struct AgentInput {
     /// Bounds the whole serialized envelope; default 512 KiB, floored at
     /// 256 KiB.
     pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -200,12 +201,20 @@ pub struct AgentSendInput {
     /// Becomes the send's request id: a repeat with the same key answers the
     /// same operation and accepts nothing new.
     pub idempotency_key: String,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AgentOperationInput {
     /// The handle a send answered.
     pub operation: String,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -218,7 +227,10 @@ pub struct AgentEventsInput {
     pub operation: Option<String>,
     /// Events per page; default 200, at most 1,000.
     pub max_rows: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
     pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
 }
 
 fn read_only_annotations() -> ToolAnnotations {
@@ -596,6 +608,55 @@ mod tests {
         }
     }
 
+    /// The server reads every budget knob out of an agents call's arguments
+    /// the same way it does for a query tool, and an agents tool body bounds
+    /// its route call by `deadline_ms` and its envelope by
+    /// `max_response_bytes`. Each agents tool advertises those two, and
+    /// `ravel_agent_events` also takes `max_rows`, its page size. The other
+    /// tools' row sets are not cut at `max_rows`, and none of them scans the
+    /// store under the query budgets, so advertising those knobs would offer
+    /// a caller a bound that bounds nothing.
+    #[test]
+    fn every_agents_tool_advertises_the_budgets_its_body_applies() {
+        const BUDGET_KEYS: [&str; 6] = [
+            "deadline_ms",
+            "max_bytes_scanned",
+            "max_response_bytes",
+            "max_rows",
+            "max_segments",
+            "max_store_requests",
+        ];
+        const SHARED: &[&str] = &["deadline_ms", "max_response_bytes"];
+        const PAGED: &[&str] = &["deadline_ms", "max_response_bytes", "max_rows"];
+
+        let expected: [(&str, &[&str]); 6] = [
+            ("ravel_agent_describe", SHARED),
+            ("ravel_agent_send", SHARED),
+            ("ravel_agent_operation", SHARED),
+            ("ravel_agent_state", SHARED),
+            ("ravel_agent_events", PAGED),
+            ("ravel_agent_blocked_effects", SHARED),
+        ];
+
+        let catalog = agents_tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_ref()).collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, expected_names, "every agents tool is checked");
+
+        for (tool, (name, keys)) in catalog.iter().zip(expected) {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} advertises input properties"));
+            let present: Vec<&str> = BUDGET_KEYS
+                .into_iter()
+                .filter(|key| properties.contains_key(*key))
+                .collect();
+            assert_eq!(present, keys, "{name} advertises the wrong budget knobs");
+        }
+    }
+
     /// D2's three flat properties of the whole catalog, asserted for all
     /// nine tools at once: the `readOnlyHint: true`, `destructiveHint:
     /// false`, `openWorldHint: false` annotations, the `ravel_` name prefix,
@@ -670,7 +731,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 22_723;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_589;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,

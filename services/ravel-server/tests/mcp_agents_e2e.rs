@@ -41,7 +41,7 @@ const TOOLS_LIST_BUDGET: usize = 24_576;
 /// The nine-tool `tools/list` answer, as `ravel-mcp`'s catalog pin measures it.
 const TOOLS_LIST_BYTES: usize = 15_700;
 /// The nine tools plus the six agents tools.
-const TOOLS_LIST_WITH_AGENTS_BYTES: usize = 22_723;
+const TOOLS_LIST_WITH_AGENTS_BYTES: usize = 23_589;
 
 const INPUT_HASH: &str = "5892e7a2b7b5a3aa11b9984ec594f8eb935e25f2f1a69ce17c2387d2bb1c74f0";
 
