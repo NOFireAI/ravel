@@ -24,9 +24,13 @@ token against a fresh bucket in us-central1 (#3456):
 | PUT `If-Match: <wrong etag>` | 412 | 200, object overwritten |
 | PUT `x-goog-if-generation-match: 0`, twice | 200, then 412 | 200, then 412 |
 | PUT `x-goog-if-generation-match: <wrong>`, then the right generation | 412, then 200 | 412, then 200 |
+| GET `If-Match: <current etag>`, then `If-Match: <wrong etag>` | 200, then 412 | 200, then 412 |
+| GET `?generation=<current>`, then the same generation after an overwrite | 200, then 404 | 200, then 404 |
 
-The XML API ignores the S3 conditional headers and honours only its own
-generation headers. `ravel-cli store qualify` would refuse such a bucket, so
+On PUT, the XML API ignores the S3 conditional headers and honours only its
+own generation headers. On GET it honours `If-Match`, and a generation
+selector naming a replaced generation answers 404 (the GET rows were measured
+the same day, against the same bucket). `ravel-cli store qualify` would refuse such a bucket, so
 the S3 path is unusable on GCS rather than unsafe. Separately, organisation
 policies commonly forbid service-account keys
 (`constraints/iam.disableServiceAccountKeyCreation` refused the HMAC key in
@@ -68,11 +72,14 @@ type from `ExternalStore`, which stays read-only.
   `get_pinned` contract (`ObjectStoreBackend::get_pinned`): the pin's
   version is the generation, sent as the `generation` selector (which
   `get_opts` does for `GetOptions::version`), so a generation that no longer
-  exists answers 404 and maps to `NotFound`. The pin's ETag, when present, is
-  compared against the selected object, and a mismatch is
-  `PreconditionFailed`. A generation precondition header is not used for
-  reads: it would turn a vanished generation into `PreconditionFailed`, which
-  the trait reserves for a changed object.
+  exists answers 404 and maps to `NotFound`. The pin's ETag, when present,
+  goes out as `If-Match` on the same request (`GetOptions::if_match`), so
+  GCS evaluates it on the wire, as the trait requires; GCS answers a mismatch
+  with 412 (measured above), which maps to `PreconditionFailed`. For a pin
+  with no version, that `If-Match` is the whole mechanism. A generation
+  precondition header is not used for reads: it would turn a vanished
+  generation into `PreconditionFailed`, which the trait reserves for a
+  changed object.
 - **Listing.** `GcsStore` does not list through `object_store`. ADR-2637
   removed `Path`-based listing from `S3Store`: `Path::parse` fails a whole
   page on a key it rejects, and resuming from `Path::from(last_key)`
@@ -81,10 +88,12 @@ type from `ExternalStore`, which stays read-only.
   `classify_prefixes`, so unaddressable keys are reported in
   `ListPage::unaddressable` rather than failing the page. `GcsStore`
   therefore carries its own listing client, beside `s3/list.rs`:
-  - It calls GCS's object listing API with the prefix, delimiter and start
-    offset as raw names.
-  - It sends an explicit maximum results per page and resumes from the
-    service's opaque page token, never from a re-encoded key.
+  - It calls the JSON API's `objects.list`
+    (`storage/v1/b/<bucket>/o`), sending `prefix`, `delimiter` and
+    `startOffset` as raw names. The response carries names as JSON strings,
+    with no URL encoding to undo.
+  - It sends `maxResults` on every page, and resumes from the service's
+    opaque `pageToken`, never from a re-encoded key.
   - It authenticates with the same Application Default Credentials as the
     data-plane client, and runs through the shared connector (D3).
 
@@ -161,18 +170,25 @@ naming the flag. None of them is accepted and ignored:
   `--s3-request-stored-checksum`.
 - `--s3-kms-key` and `--tenant-kms-config`. Customer-managed encryption on
   GCS is a bucket default key (CMEK) set outside Ravel.
-- `--require-bucket-protection` and `ravel-cli store verify-protection`.
-  The bucket-protection probes are S3 control-plane calls. Under GCS they
-  report every condition as not checked rather than passing.
+- `--require-bucket-protection`. The bucket-protection probes are S3
+  control-plane calls with no GCS implementation, so a server asked to
+  require protection on GCS refuses to start rather than starting
+  unverified (ADR-0050).
+
+`ravel-cli store verify-protection` under `--store gcs` refuses too: it
+exits non-zero with an error saying that GCS bucket protection is not
+checked, rather than printing a report of conditions it never probed.
 
 ### D7. Ravel's own bucket stays ungrantable as a Parquet location
 
 ADR-2040 D4 refuses a Parquet grant that resolves to Ravel's own bucket. The
 config-time check (`RavelBucket::is_reached_by` in ravel-sql) builds Ravel's
 side as an S3 address, so under `--store gcs` a GCS grant naming Ravel's
-bucket would pass it. `RavelBucket` becomes a per-backend address (S3
-endpoint, region and bucket; or GCS bucket), and a GCS profile on Ravel's GCS
-bucket is refused at config time, as it is today for S3. This ships in the
+bucket would pass it. The profile side already resolves a GCS profile to a
+GCS address. What changes is Ravel's own side: it is built from the
+configured store, a GCS bucket under `--store gcs`, instead of always from
+the S3 configuration. A GCS profile on Ravel's GCS bucket is then refused at
+config time, as an S3 profile on Ravel's S3 bucket is today. This ships in the
 same release as `--store gcs`, never after it.
 
 ### D8. Out of scope, filed as follow-ups
@@ -203,7 +219,7 @@ flowchart LR
     gcs --> conn
   end
   build --> trait
-  gcs -->|"object_store data plane + own raw listing, ADC token"| bucket[("GCS bucket\nsys/qualification\ngs://bucket")]
+  gcs -->|"object_store data plane + own JSON objects.list, ADC token"| bucket[("GCS bucket\nsys/qualification\ngs://bucket")]
   s3 -->|"SigV4"| s3b[("S3 bucket")]
 ```
 
