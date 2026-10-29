@@ -204,7 +204,7 @@ impl Api {
             ));
         };
         Ok(Admitted {
-            tenant: self.runtime.tenant(principal.tenant.hash()),
+            tenant: self.runtime.tenant(&principal.tenant),
             principal,
             _permit: permit,
         })
