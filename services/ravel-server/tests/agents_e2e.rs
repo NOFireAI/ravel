@@ -1126,10 +1126,20 @@ impl ObjectStoreBackend for AgentGets {
     }
 }
 
+fn event_seqs(page: &Value) -> Vec<u64> {
+    page["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| e["event_seq"].as_u64().expect("event_seq"))
+        .collect()
+}
+
 /// Turns run before the measured requests: one receipt, one result and one
 /// event each, so at the default 64 entries a page the receipts, results
-/// and events lists each hold 12 sealed pages.
-const DEEP_TURNS: u64 = 12 * 64 + 1;
+/// and events lists each hold 12 sealed pages and two entries on the open
+/// page, as many as the events page below asks for.
+const DEEP_TURNS: u64 = 12 * 64 + 2;
 
 /// The bounded-read claim of the ADR-3331 index-page amendment through the
 /// real routes: against an agent with 12 sealed pages in each of its
@@ -1238,7 +1248,7 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
             &json!({"agent": agent(), "cursor": Value::Null, "limit": 2}),
         )
         .await;
-    assert_eq!(page["events"].as_array().map(Vec::len), Some(2), "{page}");
+    assert_eq!(event_seqs(&page), [1, 2], "{page}");
     assert_eq!(
         read(spy.take()),
         ["HEAD", "Events page", "object", "object"]
