@@ -188,13 +188,19 @@ struct HealthBody {
 
 /// Where committed history projects, and how far behind it is: `lag_max` is
 /// the largest committed-minus-projected event count over every agent this
-/// process has seen, summed over no tenant.
+/// process has seen, summed over no tenant. `backlog` is the records read and
+/// not yet delivered, summed over tenants; the three counters run from
+/// process start. No `/metrics` family carries these yet.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProjectionBody {
     mode: &'static str,
     endpoint: Option<String>,
     backlog_bound: usize,
     lag_max: u64,
+    backlog: u64,
+    events_projected: u64,
+    sink_failures: u64,
+    backlog_full: u64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -210,6 +216,7 @@ impl HealthBody {
     fn new(runtime: &AgentsRuntime) -> Self {
         let settings = &runtime.settings;
         let plan = runtime.projection_plan();
+        let projection = runtime.projection_metrics();
         HealthBody {
             feature: "agents",
             mode: crate::metrics::mode_name(settings.mode),
@@ -228,7 +235,11 @@ impl HealthBody {
                 mode: plan.sink.mode(),
                 endpoint: plan.sink.endpoint().map(str::to_string),
                 backlog_bound: plan.backlog,
-                lag_max: runtime.projection_metrics().lag_max,
+                lag_max: projection.lag_max,
+                backlog: projection.backlog,
+                events_projected: projection.events_projected,
+                sink_failures: projection.sink_failures,
+                backlog_full: projection.backlog_full,
             },
         }
     }
@@ -712,6 +723,10 @@ mod tests {
                     "endpoint": "http://gateway:4317",
                     "backlog_bound": 37,
                     "lag_max": 0,
+                    "backlog": 0,
+                    "events_projected": 0,
+                    "sink_failures": 0,
+                    "backlog_full": 0,
                 },
             })
         );
