@@ -445,6 +445,7 @@ Per backend, the same three rules:
 | Backend | Version selector | Unknown or deleted version | ETag mismatch |
 |---|---|---|---|
 | `S3Store` | `versionId` query parameter | `NotFound` | `PreconditionFailed` |
+| `GcsStore` | `generation` query parameter, ETag as `If-Match` | `NotFound` | `PreconditionFailed` |
 | `ExternalStore` GCS | `generation` | `NotFound` | `PreconditionFailed` |
 | `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
 | `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
@@ -452,9 +453,10 @@ Per backend, the same three rules:
 A full read (`GetRange::Full`) is bounded differently per backend. `S3Store`,
 and so the S3 kind of `ExternalStore`, splits it into requests of at most
 `max_get_chunk` bytes, so no single response outlives the request timeout.
-The GCS and Azure kinds of `ExternalStore` issue one unranged request and
-read its whole body. A caller reading a large GCS or Azure object in full
-must bound it with ranged reads itself. ADR-2040's Parquet reader is
+`GcsStore` and the GCS and Azure kinds of `ExternalStore` issue one unranged
+request and read its whole body, so on `GcsStore` a full read has to finish
+inside `GcsConfig::request_timeout` (20 s by default). A caller reading a
+large GCS or Azure object in full must bound it with ranged reads itself. ADR-2040's Parquet reader is
 specified to read by range (the footer, then column chunks), so it is not
 meant to take the unsplit path.
 
@@ -488,7 +490,8 @@ A backend that cannot evaluate preconditions MUST refuse with `Unsupported`,
 which is what the default trait implementation does. It does not fall back
 to an unconditional `get`: silently dropping the precondition serves bytes
 from a replaced file, which is the exact failure the method exists to
-prevent. `MemoryStore`, `S3Store` and `ExternalStore` implement it.
+prevent. `MemoryStore`, `S3Store`, `GcsStore` and `ExternalStore` implement
+it.
 
 #### Learning the version of the bytes you read
 
@@ -502,7 +505,9 @@ read, which is what `CREATE EXTERNAL TABLE` does before any pin exists.
 `ObjectMeta.version` is NOT that pin's version. It is the compare-and-swap
 token a conditional write compares, which on S3 is the ETag. The two are
 different values with different jobs, which is why the version is reported
-through `Pin` and no field was added to `ObjectMeta`.
+through `Pin` and no field was added to `ObjectMeta`. On `GcsStore` both
+happen to be the object's generation (ADR-3456 decision 1), but a caller
+does not rely on that.
 
 Every pin is built from store metadata through one constructor,
 `Pin::from_store(etag, version)`, which drops a version equal to the ETag:
@@ -984,6 +989,45 @@ contract lane above asserts both). The library default is `Off`, so an
 configured; `ravel-server` and `ravel-cli` configure `Crc64Nvme` unless told
 otherwise (see "Upload checksums").
 
+**GCS (`GcsStore`, ADR-3456).** `GcsStore` talks to GCS through
+`object_store`'s `GoogleCloudStorage` client, which speaks the XML API, and
+reports exactly `Capabilities::mandatory()`. The version token is the
+object's generation as a decimal string on every path (`put`, `get`, `head`,
+`pin_of` and listing entries), never the ETag: an identical rewrite keeps the
+ETag and moves the generation. `CreateIfAbsent` sends
+`x-goog-if-generation-match: 0` and maps a 412 to `AlreadyExists`;
+`CasVersion(v)` sends `x-goog-if-generation-match: v` and maps a 412 to
+`PreconditionFailed`, and a token that is not a decimal generation is refused
+with `PreconditionFailed` before any request; `Overwrite` sends no
+precondition. Listing is one `list-type=2` request per page with `max-keys`
+set to the configured page size (`GcsConfig::list_page_size`, 1000 by
+default), using the S3 adapter's paging loop, so a key `object_store` cannot
+address is reported unaddressable rather than failing the page. Errors are
+classified by HTTP status: 429 and 503 are `Throttled`, 404 is `NotFound`
+(`Permanent` when the body names `NoSuchBucket`), 401 and 403 are
+`AccessDenied`, and 412 depends on the put mode as above. Every HTTP attempt
+to the store's host, retries included, is counted into the store's
+`StoreMetrics`, so `ravel_store_attempts_total` covers GCS, and each
+response's `Date` header feeds `observed_store_time_ns`. Requests the client
+makes to fetch credentials are neither counted nor dated.
+
+`GcsStore` does not do three things S3 does: **no multipart upload**
+(`multipart: false`, and `put_multipart` refuses, so it does not satisfy
+`required_capabilities(Mode::Maintain)`; see "Mode-conditional
+capabilities"), **no upload checksums** (`upload_checksum:
+false`; a caller's CRC32C is still checked against the buffer before the
+request, and is not sent), and **no bucket-protection probes** (the
+"Required bucket configuration" checks below are S3 control-plane reads with
+no GCS counterpart here). Every full-object read is counted by
+`GcsStore::get_unverified`, since no stored checksum is checked on read.
+
+`crates/ravel-object-store/tests/contract.rs` runs the contract suite against
+`GcsStore` on the in-process fake GCS endpoint (`gcs::fake`, behind the
+`test-support` feature) in every run, and against a real bucket when
+`RAVEL_GCS_TEST_BUCKET` names one, with Application Default Credentials; it
+prints a skip line when the variable is unset. No production caller builds a
+`GcsStore` yet: ravel-server and ravel-cli do not accept `--store gcs`.
+
 ### Credentials
 
 `S3Config` selects a credential source explicitly through `auth`
@@ -1040,6 +1084,15 @@ mode, because S3 performs the KMS call server-side on every PUT. When
 policy must grant `kms:GenerateDataKey` and `kms:Decrypt` on that key, since
 the role is the identity S3 evaluates for the encryption and decryption
 calls.
+
+**GCS.** `GcsStore` takes Application Default Credentials only (ADR-3456
+decision 2), and `GcsConfig` carries no credential field. When
+`GOOGLE_APPLICATION_CREDENTIALS` is set, `GcsStore::new` passes the key file
+it names to the client, because `object_store`'s builder does not read that
+variable itself; otherwise `object_store` looks up the gcloud well-known file
+and then the metadata server. `GcsConfig::skip_signature` (accepted only
+together with a `base_url`, for an emulator or the test fake) looks up no
+credential and sends a fixed placeholder bearer token instead.
 
 ## Runtime qualification (executable contract)
 
@@ -1273,7 +1326,10 @@ identity it is configured for and logs a warning on a mismatch, without
 refusing. The identity is endpoint-derived (bucket plus optional endpoint, no
 credentials), so an endpoint rename or a path-style/virtual-host switch alters
 it with no change of backend, and refusing on that benign case would be an
-outage an operator disables. A mismatch is instead the signal that a
+outage an operator disables. A GCS store's identity is `gs://<bucket>`
+(`conformance::gcs_backend_identity`, ADR-3456 decision 5): GCS has one
+global endpoint, so there is no endpoint part, and an emulator's base URL is
+left out the same way credentials are. A mismatch is instead the signal that a
 replicated, restored, or migrated bucket carries a qualification a different
 backend earned: verify the backend and re-run `store qualify` if it is
 genuinely a different store. The command only ever writes under
@@ -1688,6 +1744,14 @@ ADR-0042 decision 3.
    above. `list`, `list_after` and `list_delimited` do not go through
    `object_store`: they send their own SigV4-signed ListObjectsV2 GET
    (ADR-2637 decision 1) through the same HTTP connector and credentials.
+4. `GcsStore` (ADR-3456): read-write adapter over `object_store`'s
+   `GoogleCloudStorage` (the GCS XML API), honoring every MUST above with the
+   generation as the version token. It sends through the S3 adapter's HTTP
+   connector, scoped to the store's own host, and lists with
+   `list_paginated`, reading each page from the response body the connector
+   keeps because `object_store` drops the generation from list entries. No
+   multipart, no upload checksums, no bucket-protection probes (see "Backend
+   support notes").
 
 ### Instrumentation decorator
 
