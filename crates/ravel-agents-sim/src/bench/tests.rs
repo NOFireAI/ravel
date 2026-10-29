@@ -124,6 +124,26 @@ fn discovery_stays_within_the_worst_case() {
     assert_eq!(worst_case_passes(10_000), 157);
 }
 
+/// Due wake hints take the wake half's 32 reads every pass, so the target at
+/// the end of 100 agents is read in pass 3, inside the guaranteed bound of 4
+/// and past the quiet case's 2.
+#[test]
+fn saturated_discovery_stays_within_the_guaranteed_bound() {
+    let figures = small(DISCOVERY);
+    let name = format!("{DISCOVERY}-saturated-n100-end");
+    assert_scenario(&name, &figures);
+    let key = |metric: &str| format!("{name}.cold.assign.{metric}");
+    assert_value(&figures, &key("sweep.passes"), 3.0);
+    assert_value(&figures, &key("sweep.hints_read"), 96.0);
+    assert_value(&figures, &key("resolve.get"), 265.0);
+    assert_value(&figures, &key("publish.cas"), 101.0);
+    assert_value(&figures, &key("other.delete"), 96.0);
+    let passes = value(&figures, &key("sweep.passes"));
+    assert!(passes <= guaranteed_passes(100) as f64);
+    assert!(passes > worst_case_passes(100) as f64);
+    assert!(value(&figures, &key("latency.delay_ms")) <= guaranteed_passes(100) as f64 * 5000.0);
+}
+
 /// Both budgets come from the runtime's default sweep: 64 HEAD reads a pass
 /// with no wake hint due, the directory half's 32 when the wake half spends
 /// its own 32.

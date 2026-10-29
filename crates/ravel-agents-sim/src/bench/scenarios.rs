@@ -19,8 +19,8 @@ use ravel_agents_core::identity::{agent_id, step_input_hash};
 use ravel_agents_core::kernel::DerivedIds;
 use ravel_agents_core::keys::{AgentKey, AgentKind, tenant_prefix};
 use ravel_agents_core::wire::{
-    AgentRef, CreateAgentRequest, SendRequest, TurnAssignment, TurnOutcome, WorkerCommitRequest,
-    WorkerPollRequest,
+    AgentRef, CreateAgentRequest, SendRequest, TimerRequest, TurnAssignment, TurnOutcome,
+    WorkerCommitRequest, WorkerPollRequest,
 };
 use ravel_agents_runtime::{
     Coordinator, DEFAULT_SWEEP_MAX_HEAD_GETS, Dispatch, EffectDispatcher, Rng, RuntimeConfig,
@@ -31,13 +31,13 @@ use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
 use ravel_agents_store::{AgentStore, StoreLimits};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use super::figures::{Figure, HEAP_LIVE_DELTA, Key, OBJECT_BODY};
 use super::store::{BenchStore, Speed, TELEMETRY_PREFIX, Tally, TokioClock, heap};
 use super::{Config, DISCOVERY, SCENARIOS, SEED, Size};
-use crate::drive::{GRACE_MS, HANDLER, LEASE_MS, PAST_LEASE_MS, TENANT, pin, turn_values};
+use crate::drive::{GRACE_MS, HANDLER, LEASE_MS, PAST_LEASE_MS, T0_NS, TENANT, pin, turn_values};
 
 /// Agent kind of every benchmark agent.
 const KIND: &str = "bench";
@@ -958,11 +958,31 @@ pub fn guaranteed_passes(agents: usize) -> usize {
     agents.div_ceil(GUARANTEED_DIRECTORY_GETS_PER_PASS)
 }
 
+/// Handler of the saturated variant's timers, which no worker serves.
+const UNSERVED_TIMER_HANDLER: &str = "bench-timer";
+
+/// Which of the two discovery cases a run measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wake {
+    /// No wake hint is due: the directory half gets the whole read budget.
+    Quiet,
+    /// Every agent but the target has a due timer, so the wake half spends
+    /// its own reads every pass and the directory half keeps only its share.
+    Saturated,
+}
+
 /// Cross-process discovery: a client accepts a message for one of `agents`
 /// idle agents; a fresh worker coordinator, which never loaded it, polls
 /// once per sweep interval from the accept until it is assigned the turn.
-fn discovery(agents: usize, position: Position) -> Result<Vec<Figure>, String> {
-    let scenario = format!("{DISCOVERY}-n{agents}-{}", position.name());
+fn discovery(agents: usize, position: Position, wake: Wake) -> Result<Vec<Figure>, String> {
+    let scenario = match wake {
+        Wake::Quiet => format!("{DISCOVERY}-n{agents}-{}", position.name()),
+        Wake::Saturated => format!("{DISCOVERY}-saturated-n{agents}-{}", position.name()),
+    };
+    let bound = match wake {
+        Wake::Quiet => worst_case_passes(agents),
+        Wake::Saturated => guaranteed_passes(agents),
+    };
     heap::reset();
     let runtime = paused_runtime()?;
     runtime.block_on(async {
@@ -979,6 +999,22 @@ fn discovery(agents: usize, position: Position) -> Result<Vec<Figure>, String> {
             .get(position.index(agents))
             .map(|(_, agent)| agent.clone())
             .ok_or("empty population")?;
+        if wake == Wake::Saturated {
+            for (_, agent) in population.iter().filter(|(_, a)| *a != target) {
+                let timer = TimerRequest {
+                    agent: agent.clone(),
+                    timer_key: "due".to_string(),
+                    due_unix_ns: T0_NS,
+                    handler: UNSERVED_TIMER_HANDLER.to_string(),
+                    payload: Value::Null,
+                };
+                setup
+                    .co
+                    .schedule_timer(&timer)
+                    .await
+                    .map_err(err("schedule timer"))?;
+            }
+        }
         let client = world.node(bench_config(), None);
         let sweep = SweepConfig::default();
         let worker = world.node(bench_config(), Some(sweep));
@@ -991,7 +1027,7 @@ fn discovery(agents: usize, position: Position) -> Result<Vec<Figure>, String> {
             .map_err(err("client send"))?;
         let accepted = Instant::now();
         let m = meter.start(Some(&worker));
-        let limit = 2 * worst_case_passes(agents) + 4;
+        let limit = 2 * bound + 4;
         let mut assigned = false;
         for k in 0..limit {
             let k = u64::try_from(k).unwrap_or(u64::MAX);
@@ -1013,7 +1049,8 @@ fn discovery(agents: usize, position: Position) -> Result<Vec<Figure>, String> {
         let part = meter.part(Some(&worker), m);
         meter.record("assign", &[part]);
         world.bench.set_latency(false);
-        let passes = worker.co.sweep_metrics().passes;
+        let sweep_metrics = worker.co.sweep_metrics();
+        let passes = sweep_metrics.passes;
         let mut figures = meter.figures(&scenario, "cold")?;
         figures.push(Figure::new(
             Key::new(&scenario, "cold", "assign", "sweep", "passes"),
@@ -1021,11 +1058,25 @@ fn discovery(agents: usize, position: Position) -> Result<Vec<Figure>, String> {
             "passes",
             None,
         ));
-        let worst = worst_case_passes(agents);
-        let bound_ms = as_f64(u64::try_from(worst).unwrap_or(u64::MAX) * sweep.interval_ms);
-        if usize::try_from(passes).unwrap_or(usize::MAX) > worst || part.ms > bound_ms {
+        if wake == Wake::Saturated {
+            let hints = sweep_metrics.hints_read;
+            let wake_gets = u64::from(DEFAULT_SWEEP_MAX_HEAD_GETS / 2);
+            if hints != wake_gets * passes {
+                return Err(format!(
+                    "{scenario}: the wake half read {hints} hints in {passes} passes, not {wake_gets} a pass"
+                ));
+            }
+            figures.push(Figure::new(
+                Key::new(&scenario, "cold", "assign", "sweep", "hints_read"),
+                as_f64(hints),
+                "hints",
+                None,
+            ));
+        }
+        let bound_ms = as_f64(u64::try_from(bound).unwrap_or(u64::MAX) * sweep.interval_ms);
+        if usize::try_from(passes).unwrap_or(usize::MAX) > bound || part.ms > bound_ms {
             return Err(format!(
-                "{scenario}: {passes} passes and {} ms exceed the worst case of {worst} passes, {bound_ms} ms",
+                "{scenario}: {passes} passes and {} ms exceed the bound of {bound} passes, {bound_ms} ms",
                 part.ms
             ));
         }
@@ -1102,8 +1153,9 @@ pub fn run_scenario(name: &str, config: &Config) -> Result<Vec<Figure>, String> 
         DISCOVERY => {
             for &agents in &config.discovery_agents {
                 for position in POSITIONS {
-                    figures.extend(discovery(agents, position)?);
+                    figures.extend(discovery(agents, position, Wake::Quiet)?);
                 }
+                figures.extend(discovery(agents, Position::End, Wake::Saturated)?);
             }
         }
         other => return Err(format!("no scenario {other}")),
