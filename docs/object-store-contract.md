@@ -1012,10 +1012,14 @@ live generation with another ETag is `PreconditionFailed`.
 
 Listing is the JSON API's `objects.list` (`storage/v1/b/<bucket>/o`), with
 `maxResults` set to the configured page size (`GcsConfig::list_page_size`,
-1000 by default) on every request, and a `fields` mask naming only the
+1000 by default) for `list` and `list_after`, and to the wire maximum (1000,
+matching S3's own delimited-listing `max-keys`) for `list_delimited`, which
+drains every response regardless of page size rather than paying one round
+trip per configured-size page, and a `fields` mask naming only the
 response fields the listing reads. The prefix and the resume point go out as
 raw names, the resume point as `startOffset`, which is inclusive, so the
-start name itself is dropped from the result. Within a call the store follows
+start name itself is dropped from the result. Within a call `list` and
+`list_after` follow
 the service's opaque `nextPageToken` until it holds a page of names, except
 that a response from which the start name was dropped and that leaves at
 least one name ends the call: its names, one fewer than the page size when
@@ -1056,7 +1060,9 @@ false`; a caller's CRC32C is still checked against the buffer before the
 request, and is not sent), and **no bucket-protection probes** (the
 "Required bucket configuration" checks below are S3 control-plane reads with
 no GCS counterpart here). Every full-object read is counted by
-`GcsStore::get_unverified`, since no stored checksum is checked on read.
+`GcsStore::get_unverified` and on the shared `StoreMetrics`
+(`ravel_store_get_unverified_total`), since no stored checksum is checked on
+read.
 
 `crates/ravel-object-store/tests/contract.rs` runs the contract suite against
 `GcsStore` on the in-process fake GCS endpoint (`gcs::fake`, behind the
