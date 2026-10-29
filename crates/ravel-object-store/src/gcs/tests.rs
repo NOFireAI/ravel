@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::ClientOptions;
 use object_store::client::{HttpConnector, HttpRequestBody};
+use object_store::gcp::GcpCredential;
+use object_store::{ClientOptions, StaticCredentialProvider};
 
 use super::fake::{FakeGcs, RecordedRequest};
-use super::{GcsConfig, GcsStore, store_authority};
+use super::{GcsConfig, GcsStore, is_generation, list_client, store_authority};
 use crate::conformance::{Property, run_conformance_suite_with_seeder};
 use crate::s3::connector::{self, ObservedStoreTime, S3HttpConnector};
 use crate::{
-    GetRange, InstrumentedStore, ObjectStoreBackend, Pin, PutMode, PutOptions, StoreError,
-    StoreMetrics, StoreOp, Version,
+    GetRange, InstrumentedStore, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
+    StoreError, StoreMetrics, StoreOp, Version,
 };
 
 const BUCKET: &str = "ravel-fake";
@@ -197,9 +198,31 @@ async fn conformance_suite_passes_against_fake_gcs() {
     let mut config = fake.config();
     config.list_page_size = 2;
     let store = GcsStore::new(config).expect("store");
+    // A composite object in the bucket for the whole run, beside the suite's
+    // root so its exact listings are unchanged.
+    let composite = "sys/qualify/composite/blob";
+    fake.insert_composite(composite, Bytes::from_static(b"composed"), 2);
 
     let report =
         run_conformance_suite_with_seeder(&store, "sys/qualify/fake-gcs/", 2, Some(&fake)).await;
+
+    // Every listed ETag, the composite's included, is the one head reports.
+    let mut keys = Vec::new();
+    let mut page_token = None;
+    loop {
+        let page = store.list("", page_token).await.expect("list page");
+        for listed in &page.objects {
+            keys.push(listed.key.clone());
+            let head = store.head(&listed.key).await.expect("head");
+            assert_eq!(listed.etag, head.etag, "{}", listed.key);
+            assert_eq!(listed.version, head.version, "{}", listed.key);
+        }
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    assert!(keys.iter().any(|key| key == composite), "{keys:?}");
 
     assert!(report.not_run.is_empty(), "{:?}", report.not_run);
     let failures: Vec<_> = report
@@ -393,6 +416,109 @@ async fn pinned_reads_select_the_generation_and_send_the_etag() {
 }
 
 #[tokio::test]
+async fn list_and_head_agree_on_the_etag_of_single_and_composite_objects() {
+    let fake = fake().await;
+    let store = store(&fake);
+    fake.insert_object("e/single", Bytes::from_static(b"one upload"));
+    fake.insert_composite("e/composite", Bytes::from_static(b"two parts"), 2);
+    let composite_etag = fake.etag_of("e/composite").expect("planted");
+    assert!(composite_etag.starts_with("\"-"), "{composite_etag}");
+
+    let page = store.list("e/", None).await.expect("list");
+    let delimited = store.list_delimited("e/").await.expect("delimited");
+
+    let listed: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(listed, ["e/composite", "e/single"]);
+    for (from_list, from_delimited) in page.objects.iter().zip(&delimited.objects) {
+        let (head, pin) = store.pin_of(&from_list.key).await.expect("pin_of");
+        assert_eq!(from_list.etag, head.etag, "{}", from_list.key);
+        assert_eq!(from_delimited.etag, head.etag, "{}", from_list.key);
+        assert_eq!(Some(from_list.etag.0.clone()), fake.etag_of(&from_list.key));
+        // The listed ETag and generation are a pin that reads the object.
+        let listed_pin = Pin::from_store(from_list.etag.0.clone(), Some(from_list.version.0.clone()));
+        assert_eq!(listed_pin, pin);
+        store
+            .get_pinned(&from_list.key, GetRange::Full, &listed_pin)
+            .await
+            .expect("the listed pin reads the object");
+    }
+    assert_eq!(page.objects[0].etag.0, composite_etag);
+}
+
+#[tokio::test]
+async fn listing_asks_for_only_the_fields_it_reads_and_the_fake_cuts_to_them() {
+    let fake = fake().await;
+    fake.insert_object("f/k", Bytes::from_static(b"v"));
+    let store = store(&fake);
+    store.list("f/", None).await.expect("list");
+    let lists: Vec<_> = fake.requests().into_iter().filter(is_list_request).collect();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(
+        lists[0].query_param("fields"),
+        Some(
+            "items(name,generation,size,updated,etag,md5Hash,componentCount),prefixes,\
+             nextPageToken"
+        )
+    );
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/storage/v1/b/{BUCKET}/o", fake.endpoint());
+    let cut = client
+        .get(format!("{url}?fields=items%28name%2Csize%29%2CnextPageToken"))
+        .send()
+        .await
+        .expect("send")
+        .text()
+        .await
+        .expect("body");
+    let cut: serde_json::Value = serde_json::from_str(&cut).expect("json");
+    assert_eq!(
+        cut,
+        serde_json::json!({ "items": [{ "name": "f/k", "size": "1" }] })
+    );
+    let refused = client
+        .get(format!("{url}?fields=items%28name"))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// The production path: a listing client holding a credential provider sends
+/// its bearer token on every request.
+#[tokio::test]
+async fn the_listing_client_sends_the_credential_providers_bearer_token() {
+    let fake = fake().await;
+    fake.insert_object("auth/k", Bytes::from_static(b"v"));
+    let mut config = fake.config();
+    config.skip_signature = false;
+    let credentials = Arc::new(StaticCredentialProvider::new(GcpCredential {
+        bearer: "listing-bearer".to_string(),
+    }));
+    let lister = list_client(
+        &config,
+        Arc::default(),
+        Arc::default(),
+        store_authority(config.base_url.as_deref()).expect("authority"),
+        Some(credentials),
+    )
+    .expect("list client");
+
+    let page = lister.list_page("auth/", None).await.expect("list");
+    lister
+        .list_delimited("auth/", crate::MAX_LIST_PAGES)
+        .await
+        .expect("delimited");
+
+    assert_eq!(page.objects.len(), 1);
+    let lists: Vec<_> = fake.requests().into_iter().filter(is_list_request).collect();
+    assert_eq!(lists.len(), 2);
+    for list in &lists {
+        assert_eq!(list.header("authorization"), Some("Bearer listing-bearer"));
+    }
+}
+
+#[tokio::test]
 async fn listing_pages_carry_generations_and_report_unaddressable_keys() {
     let fake = fake().await;
     let mut config = fake.config();
@@ -492,13 +618,47 @@ fn the_store_authority_is_the_base_urls_host_and_port() {
     assert_eq!(authority(None), "storage.googleapis.com");
     assert_eq!(authority(Some("http://127.0.0.1:4443")), "127.0.0.1:4443");
     assert_eq!(
-        authority(Some("https://user@gcs.example:8443/base?x#y")),
+        authority(Some("https://gcs.example:8443/base?x@y#z")),
         "gcs.example:8443"
     );
     assert!(matches!(
         store_authority(Some("http:///path")),
         Err(StoreError::Permanent(_))
     ));
+}
+
+#[test]
+fn a_base_url_with_userinfo_is_refused_without_echoing_it() {
+    for url in [
+        "https://user:hunter2@gcs.example:8443/base",
+        "https://hunter2@gcs.example",
+    ] {
+        match store_authority(Some(url)) {
+            Err(StoreError::Permanent(message)) => {
+                assert!(message.contains("userinfo"), "{message}");
+                assert!(!message.contains("hunter2"), "{message}");
+            }
+            other => panic!("{url}: {other:?}"),
+        }
+        let mut config = GcsConfig::new("b");
+        config.base_url = Some(url.to_string());
+        match GcsStore::new(config) {
+            Err(StoreError::Permanent(message)) => assert!(!message.contains("hunter2")),
+            other => panic!("{url}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn generations_are_positive_int64_decimals() {
+    for token in ["1", "1790000000000001", "9223372036854775807"] {
+        assert!(is_generation(token), "{token:?}");
+    }
+    for token in [
+        "", "0", "00", "012", "abc", "+1", "-1", " 1", "1 ", "9223372036854775808",
+    ] {
+        assert!(!is_generation(token), "{token:?}");
+    }
 }
 
 /// The GCS client sends its credential requests through the same connector;
@@ -580,12 +740,80 @@ async fn listing_reports_xml_illegal_and_unaddressable_names_without_failing_the
         fake.insert_object(key, Bytes::from_static(b"v"));
     }
 
-    let (keys, unaddressable) = list_to_the_end(&store, "x/").await;
+    let (keys, unaddressable, per_call) = list_counting_requests(&store, &fake, "x/").await;
 
     assert_eq!(keys, ["x/a", "x/c", "x/e", "x/f"]);
     assert_eq!(unaddressable, [xml_illegal, unaddressable_name]);
-    let lists = fake.requests().into_iter().filter(is_list_request).count();
-    assert!(lists >= 3, "six names at two per page cross pages: {lists}");
+    // Each resumed response holds the start name and one more, which ends the
+    // call: five calls of one request each, never a second request per call.
+    assert_eq!(per_call, [1, 1, 1, 1, 1]);
+    let requests = fake.requests();
+    assert!(
+        requests.iter().all(|r| r.query_param("list-type").is_none()),
+        "no S3-style listing: {requests:?}"
+    );
+}
+
+/// [`list_to_the_end`], also returning the `objects.list` requests each call
+/// sent.
+async fn list_counting_requests(
+    store: &GcsStore,
+    fake: &FakeGcs,
+    prefix: &str,
+) -> (Vec<String>, Vec<String>, Vec<usize>) {
+    let mut keys = Vec::new();
+    let mut unaddressable = Vec::new();
+    let mut per_call = Vec::new();
+    let mut page_token = None;
+    let mut sent = 0;
+    loop {
+        let page = store.list(prefix, page_token).await.expect("list page");
+        let total = fake.requests().into_iter().filter(is_list_request).count();
+        per_call.push(total - sent);
+        sent = total;
+        keys.extend(page.objects.into_iter().map(|o| o.key));
+        unaddressable.extend(page.unaddressable.into_iter().map(|u| u.key));
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    (keys, unaddressable, per_call)
+}
+
+/// Ten names at three a page: the first call returns three names, each later
+/// one two (its response's other name is the inclusive start name), so the
+/// drain is five calls of one request each, five requests in all.
+#[tokio::test]
+async fn a_resumed_call_returns_a_short_page_rather_than_a_second_request() {
+    let fake = fake().await;
+    let store = paged_store(&fake, 3);
+    let names: Vec<String> = ('a'..='j').map(|c| format!("n/{c}")).collect();
+    for name in &names {
+        fake.insert_object(name, Bytes::from_static(b"v"));
+    }
+
+    let mut pages = Vec::new();
+    let mut per_call = Vec::new();
+    let mut page_token = None;
+    loop {
+        fake.clear_requests();
+        let page = store.list("n/", page_token).await.expect("list page");
+        per_call.push(fake.requests().into_iter().filter(is_list_request).count());
+        pages.push(
+            page.objects
+                .iter()
+                .map(|o| o.key.trim_start_matches("n/").to_string())
+                .collect::<String>(),
+        );
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, ["abc", "de", "fg", "hi", "j"]);
+    assert_eq!(per_call, [1, 1, 1, 1, 1]);
 }
 
 #[tokio::test]
@@ -601,19 +829,27 @@ async fn list_after_skips_the_start_key() {
         .await
         .expect("list_after");
 
+    // The one response holds `s/b` (startOffset is inclusive) and `s/c`; the
+    // call returns `s/c` alone rather than sending a second request.
     let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
-    assert_eq!(keys, ["s/c", "s/d"]);
+    assert_eq!(keys, ["s/c"]);
+    assert_eq!(page.next, Some(PageToken("s/c".to_string())));
     let lists: Vec<_> = fake
         .requests()
         .into_iter()
         .filter(is_list_request)
         .collect();
-    assert!(
-        lists
-            .iter()
-            .all(|r| r.query_param("startOffset") == Some("s/b")),
-        "{lists:?}"
-    );
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    assert_eq!(lists[0].query_param("startOffset"), Some("s/b"));
+    assert_eq!(lists[0].query_param("pageToken"), None);
+
+    let rest = store
+        .list_after("s/", Some("s/b"), page.next)
+        .await
+        .expect("list_after");
+    let keys: Vec<_> = rest.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["s/d"]);
+    assert_eq!(rest.next, None);
 }
 
 #[tokio::test]
@@ -665,7 +901,17 @@ async fn cas_rejects_a_non_generation_token_before_any_request() {
         .expect("overwrite");
     fake.clear_requests();
 
-    for token in ["0", "00", "012", "", "abc"] {
+    for token in [
+        "0",
+        "00",
+        "012",
+        "",
+        "abc",
+        "+1",
+        "-1",
+        " 1",
+        "9223372036854775808",
+    ] {
         let refused = store
             .put(
                 "cas/t",
@@ -729,5 +975,19 @@ async fn pinned_read_ordering() {
     assert!(
         matches!(read, Err(StoreError::NotFound)),
         "replaced generation, its stale ETag: {read:?}"
+    );
+
+    // Different bytes move the ETag too: the old pin's generation and its ETag
+    // are both stale, and the generation is decided first.
+    store
+        .put("o/k", Bytes::from_static(b"other bytes"), PutOptions::default())
+        .await
+        .expect("rewrite with other bytes");
+    let (_, rewritten) = store.pin_of("o/k").await.expect("pin_of");
+    assert_ne!(rewritten.etag, replaced.etag);
+    let read = store.get_pinned("o/k", GetRange::Full, &replaced).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, a different stale ETag: {read:?}"
     );
 }

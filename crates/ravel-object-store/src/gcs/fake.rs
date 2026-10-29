@@ -43,8 +43,21 @@
 //!   a non-number is 400) and `pageToken`. Each item carries `name`,
 //!   `generation` and `size` as decimal strings, `updated` (RFC 3339), a
 //!   JSON-API-style `etag` that is not the object's XML ETag, and `md5Hash`
-//!   (base64). `fields` is accepted and ignored. A response with more results
-//!   left carries an opaque `nextPageToken`; one that does not decode is 400.
+//!   (base64), or for a composite object `componentCount` and no `md5Hash`.
+//!   A `fields` mask (`name`, `name(sub,...)`, comma-separated) keeps only
+//!   the named fields of the response, recursively, as GCS does; a mask it
+//!   cannot parse is 400. A response with more results left carries an
+//!   opaque `nextPageToken`; one that does not decode is 400.
+//! - `DELETE /storage/v1/b/{bucket}/o/{name}`: the JSON API's
+//!   `objects.delete`, `name` percent-decoded; 204, or a JSON 404.
+//! - `POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name={name}`: the
+//!   JSON API's media upload, storing the body under exactly `name` as a PUT
+//!   would and answering 200 with the object's JSON resource. Any other
+//!   `uploadType`, or no `name`, is 400.
+//!
+//! A composite object ([`FakeGcs::insert_composite`]) is planted without a
+//! request. Its XML ETag is a dash followed by its JSON `etag`, quoted, and
+//! its GET and HEAD carry `x-goog-component-count`, as on GCS.
 //!
 //! Anything else is 501 `NotImplemented`.
 //!
@@ -121,6 +134,8 @@ struct StoredObject {
     generation: u64,
     etag: String,
     last_modified_secs: i64,
+    /// `Some` for a composite object: no MD5, a dash-prefixed ETag.
+    component_count: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -271,6 +286,18 @@ impl FakeGcs {
         generation
     }
 
+    /// Store `data` under `key` as a composite object of `component_count`
+    /// components, without a request: no `md5Hash`, and an XML ETag of a
+    /// dash followed by the JSON `etag`. The new generation.
+    pub fn insert_composite(&self, key: &str, data: impl Into<Bytes>, component_count: u32) -> u64 {
+        let mut object = self.inner.new_object(data.into());
+        object.etag = format!("\"-{}\"", json_etag(object.generation));
+        object.component_count = Some(component_count);
+        let generation = object.generation;
+        self.inner.objects.lock().insert(key.to_string(), object);
+        generation
+    }
+
     /// Remove `key` without a request. Whether it was present.
     pub fn remove_object(&self, key: &str) -> bool {
         self.inner.objects.lock().remove(key).is_some()
@@ -304,6 +331,7 @@ impl Inner {
             etag: format!("\"{}\"", hex(&md5(&data))),
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
             last_modified_secs: self.date_secs.load(Ordering::Relaxed),
+            component_count: None,
             data,
         }
     }
@@ -363,20 +391,35 @@ impl Inner {
             }
             return error(status, failure_code(status), "scripted failure");
         }
-        if let Some(bucket) = path
-            .strip_prefix("/storage/v1/b/")
-            .and_then(|rest| rest.strip_suffix("/o"))
-        {
-            if *method != Method::GET {
-                return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method");
-            }
+        if let Some(rest) = path.strip_prefix("/storage/v1/b/") {
+            let (bucket, tail) = rest.split_once('/').unwrap_or((rest, ""));
             if percent_decode(bucket, false).as_deref() != Some(self.bucket.as_str()) {
                 return json_error(
                     StatusCode::NOT_FOUND,
                     "The specified bucket does not exist.",
                 );
             }
-            return self.list(query);
+            return match (method, tail, tail.strip_prefix("o/")) {
+                (&Method::GET, "o", _) => self.list(query),
+                (&Method::DELETE, _, Some(raw)) => match percent_decode(raw, false) {
+                    Some(name) => self.json_delete(&name),
+                    None => json_error(StatusCode::BAD_REQUEST, "bad object name"),
+                },
+                _ => error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method"),
+            };
+        }
+        if let Some(rest) = path.strip_prefix("/upload/storage/v1/b/") {
+            let (bucket, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if percent_decode(bucket, false).as_deref() != Some(self.bucket.as_str()) {
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    "The specified bucket does not exist.",
+                );
+            }
+            if *method != Method::POST || tail != "o" {
+                return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method");
+            }
+            return self.media_upload(query, body);
         }
         let rest = path.strip_prefix('/').unwrap_or(path);
         let (bucket, key) = match rest.split_once('/') {
@@ -522,7 +565,53 @@ impl Inner {
         response
     }
 
+    fn json_delete(&self, name: &str) -> Response {
+        if self.objects.lock().remove(name).is_none() {
+            return json_error(StatusCode::NOT_FOUND, "No such object.");
+        }
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        response
+    }
+
+    fn media_upload(&self, query: &[(String, String)], body: Bytes) -> Response {
+        if query_param(query, "uploadType") != Some("media") {
+            return json_error(StatusCode::BAD_REQUEST, "bad uploadType");
+        }
+        let Some(name) = query_param(query, "name").filter(|name| !name.is_empty()) else {
+            return json_error(StatusCode::BAD_REQUEST, "no object name");
+        };
+        let object = self.new_object(body);
+        let resource = self.resource(name, &object);
+        self.objects.lock().insert(name.to_string(), object);
+        json_response(StatusCode::OK, &resource)
+    }
+
+    /// The JSON API's resource for `object` stored under `name`.
+    fn resource(&self, name: &str, object: &StoredObject) -> serde_json::Value {
+        let mut resource = serde_json::json!({
+            "kind": "storage#object",
+            "name": name,
+            "bucket": self.bucket,
+            "generation": object.generation.to_string(),
+            "metageneration": "1",
+            "size": object.data.len().to_string(),
+            "updated": iso8601(object.last_modified_secs),
+            "etag": json_etag(object.generation),
+        });
+        match object.component_count {
+            Some(count) => resource["componentCount"] = serde_json::json!(count),
+            None => resource["md5Hash"] = serde_json::json!(STANDARD.encode(md5(&object.data))),
+        }
+        resource
+    }
+
     fn list(&self, query: &[(String, String)]) -> Response {
+        let mask = match query_param(query, "fields").map(parse_mask) {
+            None => None,
+            Some(Some(mask)) => Some(mask),
+            Some(None) => return json_error(StatusCode::BAD_REQUEST, "bad fields"),
+        };
         let prefix = query_param(query, "prefix").unwrap_or("");
         let delimiter = query_param(query, "delimiter").filter(|d| !d.is_empty());
         let start_offset = query_param(query, "startOffset");
@@ -582,17 +671,7 @@ impl Inner {
         let mut prefixes = Vec::new();
         for entry in &entries {
             match entry {
-                Entry::Object(name, object) => items.push(serde_json::json!({
-                    "kind": "storage#object",
-                    "name": name,
-                    "bucket": self.bucket,
-                    "generation": object.generation.to_string(),
-                    "metageneration": "1",
-                    "size": object.data.len().to_string(),
-                    "updated": iso8601(object.last_modified_secs),
-                    "etag": json_etag(object.generation),
-                    "md5Hash": STANDARD.encode(md5(&object.data)),
-                })),
+                Entry::Object(name, object) => items.push(self.resource(name, object)),
                 Entry::Prefix(common) => prefixes.push(common.clone()),
             }
         }
@@ -610,7 +689,73 @@ impl Inner {
             };
             body["nextPageToken"] = serde_json::json!(encode_token(resume));
         }
+        if let Some(mask) = &mask {
+            apply_mask(&mut body, mask);
+        }
         json_response(StatusCode::OK, &body)
+    }
+}
+
+/// One field of a `fields` mask, with the mask its value is cut to.
+#[derive(Debug)]
+struct MaskField {
+    name: String,
+    sub: Option<Vec<MaskField>>,
+}
+
+/// `a,b(c,d),e`, or `None` when it does not parse.
+fn parse_mask(text: &str) -> Option<Vec<MaskField>> {
+    let mut rest = text;
+    let mask = parse_mask_list(&mut rest)?;
+    rest.is_empty().then_some(mask)
+}
+
+fn parse_mask_list(rest: &mut &str) -> Option<Vec<MaskField>> {
+    let mut fields = Vec::new();
+    loop {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
+        let name = rest[..end].to_string();
+        *rest = &rest[end..];
+        let sub = match rest.strip_prefix('(') {
+            Some(after) => {
+                *rest = after;
+                let sub = parse_mask_list(rest)?;
+                *rest = rest.strip_prefix(')')?;
+                Some(sub)
+            }
+            None => None,
+        };
+        fields.push(MaskField { name, sub });
+        match rest.strip_prefix(',') {
+            Some(after) => *rest = after,
+            None => return Some(fields),
+        }
+    }
+}
+
+/// Keep only the fields `mask` names, cutting an array's elements and an
+/// object's value to the field's own mask.
+fn apply_mask(value: &mut serde_json::Value, mask: &[MaskField]) {
+    match value {
+        serde_json::Value::Array(elements) => {
+            for element in elements {
+                apply_mask(element, mask);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            map.retain(|key, _| mask.iter().any(|field| field.name == *key));
+            for field in mask {
+                if let (Some(sub), Some(inner)) = (&field.sub, map.get_mut(&field.name)) {
+                    apply_mask(inner, sub);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -641,6 +786,9 @@ fn object_headers(headers: &mut HeaderMap, object: &StoredObject, with_length: b
     set_header(headers, "etag", object.etag.clone());
     set_header(headers, "x-goog-generation", object.generation.to_string());
     set_header(headers, "x-goog-metageneration", "1".into());
+    if let Some(count) = object.component_count {
+        set_header(headers, "x-goog-component-count", count.to_string());
+    }
     set_header(
         headers,
         "last-modified",

@@ -16,13 +16,17 @@
 //!
 //! [`S3HttpConnector`]: crate::s3::connector::S3HttpConnector
 
+use std::collections::HashSet;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use bytes::Bytes;
 use object_store::RetryConfig;
 use object_store::client::{
     HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpRequestBody, HttpResponse,
 };
 use object_store::gcp::GcpCredentialProvider;
+use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Deserialize;
 
@@ -34,8 +38,9 @@ use crate::{DelimitedList, Etag, ListPage, ObjectMeta, PageToken, StoreError, Ve
 const LIST_MAX_BODY_BYTES: usize = crate::s3::list::LIST_MAX_BODY_BYTES;
 
 /// The response fields asked for: everything [`ObjectMeta`] needs, and no
-/// more.
-const FIELDS: &str = "items(name,generation,size,updated,etag,md5Hash),prefixes,nextPageToken";
+/// more. `md5Hash` and `componentCount` decide the listed ETag.
+const FIELDS: &str =
+    "items(name,generation,size,updated,etag,md5Hash,componentCount),prefixes,nextPageToken";
 
 /// Consecutive responses carrying no listed object one `list` call accepts
 /// before it fails with [`StoreError::ListPageCeiling`], as on S3.
@@ -50,11 +55,16 @@ pub(crate) struct GcsListClient {
     retry: RetryConfig,
     /// `<base>/storage/v1/b/<bucket>/o`, the bucket percent-encoded.
     url: String,
+    /// `<base>/upload/storage/v1/b/<bucket>/o`, for the test-only foreign
+    /// writer.
+    #[cfg(any(test, feature = "test-support"))]
+    upload_url: String,
     page_size: usize,
 }
 
 /// One `objects.list` request.
-struct ListRequest<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListRequest<'a> {
     prefix: &'a str,
     start_offset: Option<&'a str>,
     page_token: Option<&'a str>,
@@ -62,10 +72,17 @@ struct ListRequest<'a> {
 }
 
 /// One parsed `objects.list` response, with raw names.
-struct ListResponse {
+#[derive(Debug, Default)]
+pub(crate) struct ListResponse {
     items: Vec<ObjectMeta>,
     prefixes: Vec<String>,
     next_page_token: Option<String>,
+}
+
+/// Where the paging loops get their responses: [`GcsListClient`] in
+/// production, a script in this module's tests.
+pub(crate) trait ListFetch {
+    async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError>;
 }
 
 #[derive(Deserialize)]
@@ -87,6 +104,129 @@ struct WireObject {
     updated: Option<String>,
     etag: Option<String>,
     md5_hash: Option<String>,
+    /// Present on a composite object only; its value is not used.
+    component_count: Option<serde_json::Value>,
+}
+
+/// One [`ListPage`]: up to `page_size` raw names under `prefix` after
+/// `start_after`, following `nextPageToken` within the call. `startOffset` is
+/// inclusive, so the name equal to `start_after` is dropped. When it was the
+/// only name a response dropped and names remain, the call returns them with
+/// a page token rather than sending another request. When names remain, the
+/// page token is the raw last name kept.
+pub(crate) async fn list_page<F: ListFetch>(
+    fetch: &F,
+    prefix: &str,
+    start_after: Option<&str>,
+    page_size: usize,
+) -> Result<ListPage, StoreError> {
+    let page_size = page_size.max(1);
+    let mut listed: Vec<ObjectMeta> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut empty_responses = 0usize;
+    let more = loop {
+        if empty_responses == EMPTY_RESPONSE_ALLOWANCE {
+            return Err(StoreError::ListPageCeiling {
+                prefix: prefix.to_string(),
+                ceiling: EMPTY_RESPONSE_ALLOWANCE,
+            });
+        }
+        let request = ListRequest {
+            prefix,
+            start_offset: start_after,
+            page_token: token.as_deref(),
+            delimited: false,
+        };
+        let response = fetch.fetch(&request).await?;
+        let mut items = response.items;
+        let received = items.len();
+        items.retain(|meta| Some(meta.key.as_str()) != start_after);
+        let dropped_start = items.len() < received;
+        if items.is_empty() {
+            empty_responses += 1;
+        } else {
+            empty_responses = 0;
+        }
+        listed.extend(items);
+        let Some(next) = response.next_page_token else {
+            break listed.len() > page_size;
+        };
+        if listed.len() >= page_size || (dropped_start && !listed.is_empty()) {
+            break true;
+        }
+        token = Some(next_token(prefix, token.as_deref(), next)?);
+    };
+    listed.truncate(page_size);
+    let next = if more {
+        listed.last().map(|meta| PageToken(meta.key.clone()))
+    } else {
+        None
+    };
+    let (objects, unaddressable) = crate::classify_objects(prefix, listed);
+    Ok(ListPage {
+        objects,
+        next,
+        unaddressable,
+    })
+}
+
+/// The whole delimited listing under `prefix`, following `nextPageToken`
+/// until a response carries none, in at most `ceiling` responses. A prefix
+/// two responses both report is listed once.
+pub(crate) async fn list_delimited<F: ListFetch>(
+    fetch: &F,
+    prefix: &str,
+    ceiling: usize,
+) -> Result<DelimitedList, StoreError> {
+    let mut listed: Vec<ObjectMeta> = Vec::new();
+    let mut listed_prefixes: Vec<String> = Vec::new();
+    let mut seen_prefixes: HashSet<String> = HashSet::new();
+    let mut token: Option<String> = None;
+    let mut responses = 0usize;
+    loop {
+        if responses == ceiling {
+            return Err(StoreError::ListPageCeiling {
+                prefix: prefix.to_string(),
+                ceiling,
+            });
+        }
+        let request = ListRequest {
+            prefix,
+            start_offset: None,
+            page_token: token.as_deref(),
+            delimited: true,
+        };
+        let response = fetch.fetch(&request).await?;
+        responses += 1;
+        listed.extend(response.items);
+        for common in response.prefixes {
+            if seen_prefixes.insert(common.clone()) {
+                listed_prefixes.push(common);
+            }
+        }
+        let Some(next) = response.next_page_token else {
+            break;
+        };
+        token = Some(next_token(prefix, token.as_deref(), next)?);
+    }
+    let (objects, unaddressable) = crate::classify_objects(prefix, listed);
+    let (common_prefixes, unaddressable_prefixes) =
+        crate::classify_prefixes(prefix, listed_prefixes);
+    Ok(DelimitedList {
+        objects,
+        common_prefixes,
+        unaddressable,
+        unaddressable_prefixes,
+    })
+}
+
+impl ListFetch for GcsListClient {
+    async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError> {
+        let url = self.request_url(request);
+        let context = format!("listing {:?}", request.prefix);
+        let body = self.send(&context, Method::GET, &url, Bytes::new()).await?;
+        parse_list(request.prefix, &body)
+    }
 }
 
 impl GcsListClient {
@@ -98,125 +238,56 @@ impl GcsListClient {
         bucket: &str,
         page_size: usize,
     ) -> Self {
+        let base_url = base_url.trim_end_matches('/');
+        let bucket = encode_component(bucket);
         GcsListClient {
             http,
             credentials,
             retry,
-            url: format!(
-                "{}/storage/v1/b/{}/o",
-                base_url.trim_end_matches('/'),
-                encode_component(bucket)
-            ),
+            url: format!("{base_url}/storage/v1/b/{bucket}/o"),
+            #[cfg(any(test, feature = "test-support"))]
+            upload_url: format!("{base_url}/upload/storage/v1/b/{bucket}/o"),
             page_size,
         }
     }
 
-    /// One [`ListPage`]: up to `page_size` raw names under `prefix` after
-    /// `start_after`. `startOffset` is inclusive, so the name equal to
-    /// `start_after` is dropped from the responses. Follows `nextPageToken`
-    /// within the call; when names remain, the page token is the raw last
-    /// name kept.
     pub(crate) async fn list_page(
         &self,
         prefix: &str,
         start_after: Option<&str>,
     ) -> Result<ListPage, StoreError> {
-        let page_size = self.page_size.max(1);
-        let mut listed: Vec<ObjectMeta> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut empty_responses = 0usize;
-        let more = loop {
-            if empty_responses == EMPTY_RESPONSE_ALLOWANCE {
-                return Err(StoreError::ListPageCeiling {
-                    prefix: prefix.to_string(),
-                    ceiling: EMPTY_RESPONSE_ALLOWANCE,
-                });
-            }
-            let request = ListRequest {
-                prefix,
-                start_offset: start_after,
-                page_token: token.as_deref(),
-                delimited: false,
-            };
-            let response = self.fetch(&request).await?;
-            let mut items = response.items;
-            items.retain(|meta| Some(meta.key.as_str()) != start_after);
-            if items.is_empty() {
-                empty_responses += 1;
-            } else {
-                empty_responses = 0;
-            }
-            listed.extend(items);
-            let Some(next) = response.next_page_token else {
-                break listed.len() > page_size;
-            };
-            if listed.len() >= page_size {
-                break true;
-            }
-            token = Some(next_token(prefix, token.as_deref(), next)?);
-        };
-        listed.truncate(page_size);
-        let next = if more {
-            listed.last().map(|meta| PageToken(meta.key.clone()))
-        } else {
-            None
-        };
-        let (objects, unaddressable) = crate::classify_objects(prefix, listed);
-        Ok(ListPage {
-            objects,
-            next,
-            unaddressable,
-        })
+        list_page(self, prefix, start_after, self.page_size).await
     }
 
-    /// The whole delimited listing under `prefix`, following `nextPageToken`
-    /// until a response carries none, in at most `ceiling` responses.
     pub(crate) async fn list_delimited(
         &self,
         prefix: &str,
         ceiling: usize,
     ) -> Result<DelimitedList, StoreError> {
-        let mut listed: Vec<ObjectMeta> = Vec::new();
-        let mut listed_prefixes: Vec<String> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut responses = 0usize;
-        loop {
-            if responses == ceiling {
-                return Err(StoreError::ListPageCeiling {
-                    prefix: prefix.to_string(),
-                    ceiling,
-                });
-            }
-            let request = ListRequest {
-                prefix,
-                start_offset: None,
-                page_token: token.as_deref(),
-                delimited: true,
-            };
-            let response = self.fetch(&request).await?;
-            responses += 1;
-            listed.extend(response.items);
-            listed_prefixes.extend(response.prefixes);
-            let Some(next) = response.next_page_token else {
-                break;
-            };
-            token = Some(next_token(prefix, token.as_deref(), next)?);
-        }
-        let (objects, unaddressable) = crate::classify_objects(prefix, listed);
-        let (common_prefixes, unaddressable_prefixes) =
-            crate::classify_prefixes(prefix, listed_prefixes);
-        Ok(DelimitedList {
-            objects,
-            common_prefixes,
-            unaddressable,
-            unaddressable_prefixes,
-        })
+        list_delimited(self, prefix, ceiling).await
     }
 
-    async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError> {
-        let url = self.request_url(request);
-        let body = self.send(request.prefix, &url).await?;
-        parse_list(request.prefix, &body)
+    /// Store `data` under exactly `name` through the JSON API's media upload.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn upload_media(&self, name: &str, data: Bytes) -> Result<(), StoreError> {
+        let url = format!(
+            "{}?uploadType=media&name={}",
+            self.upload_url,
+            encode_component(name)
+        );
+        let context = format!("uploading {name:?}");
+        self.send(&context, Method::POST, &url, data).await?;
+        Ok(())
+    }
+
+    /// Delete exactly `name` through the JSON API.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn delete_object(&self, name: &str) -> Result<(), StoreError> {
+        let url = format!("{}/{}", self.url, encode_component(name));
+        let context = format!("deleting {name:?}");
+        self.send(&context, Method::DELETE, &url, Bytes::new())
+            .await?;
+        Ok(())
     }
 
     fn request_url(&self, request: &ListRequest<'_>) -> String {
@@ -242,16 +313,26 @@ impl GcsListClient {
         format!("{}?{}", self.url, query.join("&"))
     }
 
-    /// Send one GET under the retry rules and return the success body.
-    async fn send(&self, prefix: &str, url: &str) -> Result<Vec<u8>, StoreError> {
+    /// Send one request under the retry rules and return the success body.
+    /// `context` opens every error message.
+    async fn send(
+        &self,
+        context: &str,
+        method: Method,
+        url: &str,
+        body: Bytes,
+    ) -> Result<Vec<u8>, StoreError> {
         let started = tokio::time::Instant::now();
         let mut backoff = Backoff::new(&self.retry.backoff);
         let mut retries = 0usize;
         loop {
             let exhausted =
                 retries >= self.retry.max_retries || started.elapsed() > self.retry.retry_timeout;
-            let outcome = match self.attempt(prefix, url).await? {
-                Ok(response) => read_response(prefix, response).await,
+            let outcome = match self
+                .attempt(context, method.clone(), url, body.clone())
+                .await?
+            {
+                Ok(response) => read_response(context, response).await,
                 Err(failure) => Err(failure),
             };
             let retry = match &outcome {
@@ -262,7 +343,7 @@ impl GcsListClient {
                 Err(Failure::Refused(_)) => false,
             };
             if !retry || exhausted {
-                return outcome.map_err(|failure| failure.into_store_error(prefix));
+                return outcome.map_err(|failure| failure.into_store_error(context));
             }
             tokio::time::sleep(backoff.next()).await;
             retries += 1;
@@ -274,26 +355,29 @@ impl GcsListClient {
     /// inner failure, for the retry loop.
     async fn attempt(
         &self,
-        prefix: &str,
+        context: &str,
+        method: Method,
         url: &str,
+        body: Bytes,
     ) -> Result<Result<HttpResponse, Failure>, StoreError> {
-        let mut request = HttpRequest::new(HttpRequestBody::empty());
-        *request.uri_mut() = url.parse().map_err(|e| {
-            StoreError::Permanent(format!("listing {prefix:?}: invalid request URL: {e}"))
-        })?;
+        let mut request = HttpRequest::new(HttpRequestBody::from(body));
+        *request.method_mut() = method;
+        *request.uri_mut() = url
+            .parse()
+            .map_err(|e| StoreError::Permanent(format!("{context}: invalid request URL: {e}")))?;
         if let Some(credentials) = &self.credentials {
             let credential = match credentials.get_credential().await {
                 Ok(credential) => credential,
                 Err(e) => {
                     return Ok(Err(Failure::Credential(format!(
-                        "listing {prefix:?}: credential fetch failed: {e}"
+                        "{context}: credential fetch failed: {e}"
                     ))));
                 }
             };
             let mut value = HeaderValue::from_str(&format!("Bearer {}", credential.bearer))
                 .map_err(|_| {
                     StoreError::Permanent(format!(
-                        "listing {prefix:?}: the bearer token is not a valid header value"
+                        "{context}: the bearer token is not a valid header value"
                     ))
                 })?;
             value.set_sensitive(true);
@@ -314,20 +398,20 @@ fn next_token(prefix: &str, sent: Option<&str>, received: String) -> Result<Stri
 }
 
 /// The success body, or the failure a response stands for.
-async fn read_response(prefix: &str, response: HttpResponse) -> Result<Vec<u8>, Failure> {
+async fn read_response(context: &str, response: HttpResponse) -> Result<Vec<u8>, Failure> {
     let status = response.status().as_u16();
     if response.status().is_success() {
         return match read_body(response, LIST_MAX_BODY_BYTES).await {
             Ok(Some(body)) => Ok(body),
             Ok(None) => Err(Failure::Refused(StoreError::Permanent(format!(
-                "listing {prefix:?}: the response body exceeds {LIST_MAX_BODY_BYTES} bytes"
+                "{context}: the response body exceeds {LIST_MAX_BODY_BYTES} bytes"
             )))),
             Err(error) => Err(Failure::Transport(error)),
         };
     }
     if response.status().is_redirection() {
         return Err(Failure::Refused(StoreError::Permanent(format!(
-            "listing {prefix:?}: HTTP {status} redirect, not followed"
+            "{context}: HTTP {status} redirect, not followed"
         ))));
     }
     Err(Failure::Status(status))
@@ -346,22 +430,21 @@ enum Failure {
 }
 
 impl Failure {
-    fn into_store_error(self, prefix: &str) -> StoreError {
+    fn into_store_error(self, context: &str) -> StoreError {
         match self {
             Failure::Refused(error) => error,
             Failure::Credential(message) => StoreError::Transient(message),
             Failure::Transport(error) => match error.kind() {
                 HttpErrorKind::Timeout => StoreError::Timeout,
-                _ => StoreError::Transient(format!("listing {prefix:?}: {error}")),
+                _ => StoreError::Transient(format!("{context}: {error}")),
             },
-            Failure::Status(status) => status_error(prefix, status),
+            Failure::Status(status) => status_error(context, status),
         }
     }
 }
 
 /// A final status, classified by the status alone (ADR-3456 decision 4).
-fn status_error(prefix: &str, status: u16) -> StoreError {
-    let context = format!("listing {prefix:?}");
+fn status_error(context: &str, status: u16) -> StoreError {
     match status {
         401 | 403 => StoreError::AccessDenied(format!("{context}: HTTP {status}")),
         404 => StoreError::Permanent(format!("{context}: bucket does not exist (HTTP 404)")),
@@ -423,13 +506,19 @@ fn listed_object(prefix: &str, object: WireObject) -> Result<ObjectMeta, StoreEr
                 "listed object {key:?} has no readable updated time"
             ))
         })?;
-    let etag = match (object.md5_hash, object.etag) {
-        (Some(md5), _) => md5_etag(&md5)
+    let etag = match (object.md5_hash, object.component_count, object.etag) {
+        (Some(md5), _, _) => md5_etag(&md5)
             .ok_or_else(|| refuse(format!("listed object {key:?} has an unreadable md5Hash")))?,
-        (None, Some(etag)) if !etag.is_empty() => etag,
-        (None, _) => {
+        (None, Some(_), Some(etag)) if !etag.is_empty() => composite_etag(&etag),
+        (None, Some(_), _) => {
             return Err(refuse(format!(
-                "listed object {key:?} carries neither md5Hash nor etag"
+                "listed composite object {key:?} carries no etag"
+            )));
+        }
+        (None, None, _) => {
+            return Err(refuse(format!(
+                "listed object {key:?} carries neither md5Hash nor componentCount, so the \
+                 ETag head reports for it is unknown"
             )));
         }
     };
@@ -457,6 +546,12 @@ fn md5_etag(md5_base64: &str) -> Option<String> {
     Some(format!("\"{hex}\""))
 }
 
+/// The ETag the XML API reports for a composite object: a dash followed by
+/// the JSON API's `etag`, quoted.
+fn composite_etag(json_etag: &str) -> String {
+    format!("\"-{json_etag}\"")
+}
+
 /// Percent-encode everything but RFC 3986's unreserved characters, so a
 /// name's bytes reach the service as given (a space is `%20`, never `+`).
 fn encode_component(text: &str) -> String {
@@ -475,6 +570,10 @@ fn encode_component(text: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use parking_lot::Mutex;
+
     use super::*;
 
     #[test]
@@ -488,7 +587,11 @@ mod tests {
         assert_eq!(md5_etag("AAAA"), None);
     }
 
-    fn wire(generation: Option<&str>, md5_hash: Option<&str>) -> WireObject {
+    fn wire(
+        generation: Option<&str>,
+        md5_hash: Option<&str>,
+        component_count: Option<u32>,
+    ) -> WireObject {
         WireObject {
             name: Some("p/k".to_string()),
             generation: generation.map(str::to_string),
@@ -496,29 +599,54 @@ mod tests {
             updated: Some("2026-10-29T10:00:00.000Z".to_string()),
             etag: Some("CJbYtNGqvYkDEAE=".to_string()),
             md5_hash: md5_hash.map(str::to_string),
+            component_count: component_count.map(serde_json::Value::from),
         }
     }
+
+    const EMPTY_MD5: &str = "1B2M2Y8AsgTpgAmY7PhCfg==";
 
     #[test]
     fn a_listed_object_without_a_generation_fails_the_call() {
         for generation in [None, Some(""), Some("0"), Some("012"), Some("abc")] {
-            let listed = listed_object("p/", wire(generation, None));
+            let listed = listed_object("p/", wire(generation, Some(EMPTY_MD5), None));
             assert!(
                 matches!(listed, Err(StoreError::Permanent(_))),
                 "{generation:?}: {listed:?}"
             );
         }
-        let listed = listed_object("p/", wire(Some("1790000000000001"), None)).expect("listed");
+        let listed =
+            listed_object("p/", wire(Some("1790000000000001"), Some(EMPTY_MD5), None))
+                .expect("listed");
         assert_eq!(listed.version.0, "1790000000000001");
     }
 
     #[test]
-    fn the_listed_etag_is_the_md5_and_falls_back_to_the_json_etag() {
-        let with_md5 =
-            listed_object("p/", wire(Some("7"), Some("1B2M2Y8AsgTpgAmY7PhCfg=="))).expect("listed");
+    fn the_listed_etag_is_the_md5_else_the_dashed_composite_etag() {
+        let with_md5 = listed_object("p/", wire(Some("7"), Some(EMPTY_MD5), None)).expect("listed");
         assert_eq!(with_md5.etag.0, "\"d41d8cd98f00b204e9800998ecf8427e\"");
-        let composite = listed_object("p/", wire(Some("7"), None)).expect("listed");
-        assert_eq!(composite.etag.0, "CJbYtNGqvYkDEAE=");
+        let composite = listed_object("p/", wire(Some("7"), None, Some(2))).expect("listed");
+        assert_eq!(composite.etag.0, "\"-CJbYtNGqvYkDEAE=\"");
+        let mut no_etag = wire(Some("7"), None, Some(2));
+        no_etag.etag = None;
+        match listed_object("p/", no_etag) {
+            Err(StoreError::Permanent(message)) => assert!(message.contains("\"p/k\""), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        match listed_object("p/", wire(Some("7"), None, None)) {
+            Err(StoreError::Permanent(message)) => {
+                assert!(message.contains("\"p/k\""), "{message}");
+                assert!(message.contains("componentCount"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_fields_mask_names_what_object_meta_and_the_etag_need() {
+        assert_eq!(
+            FIELDS,
+            "items(name,generation,size,updated,etag,md5Hash,componentCount),prefixes,nextPageToken"
+        );
     }
 
     #[test]
@@ -526,4 +654,166 @@ mod tests {
         assert_eq!(encode_component("a b/c+d~e"), "a%20b%2Fc%2Bd~e");
         assert_eq!(encode_component("\u{1}é"), "%01%C3%A9");
     }
+
+    /// `startOffset`, `pageToken` and whether the request is delimited.
+    type Asked = (Option<String>, Option<String>, bool);
+
+    /// Answers each request from a script and records what was asked.
+    #[derive(Default)]
+    struct Script {
+        responses: Mutex<VecDeque<ListResponse>>,
+        seen: Mutex<Vec<Asked>>,
+    }
+
+    impl Script {
+        fn new(responses: impl IntoIterator<Item = ListResponse>) -> Self {
+            Script {
+                responses: Mutex::new(responses.into_iter().collect()),
+                seen: Mutex::default(),
+            }
+        }
+
+        fn seen(&self) -> Vec<Asked> {
+            self.seen.lock().clone()
+        }
+    }
+
+    impl ListFetch for Script {
+        async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError> {
+            self.seen.lock().push((
+                request.start_offset.map(str::to_string),
+                request.page_token.map(str::to_string),
+                request.delimited,
+            ));
+            Ok(self.responses.lock().pop_front().unwrap_or_default())
+        }
+    }
+
+    fn meta(key: &str) -> ObjectMeta {
+        ObjectMeta {
+            key: key.to_string(),
+            size: 1,
+            etag: Etag("\"e\"".to_string()),
+            version: Version("1".to_string()),
+            last_modified_unix_ms: 0,
+        }
+    }
+
+    fn page(keys: &[&str], token: Option<&str>) -> ListResponse {
+        ListResponse {
+            items: keys.iter().map(|k| meta(k)).collect(),
+            prefixes: Vec::new(),
+            next_page_token: token.map(str::to_string),
+        }
+    }
+
+    fn keys(page: &ListPage) -> Vec<&str> {
+        page.objects.iter().map(|meta| meta.key.as_str()).collect()
+    }
+
+    fn token(text: &str) -> Option<String> {
+        Some(text.to_string())
+    }
+
+    #[tokio::test]
+    async fn an_empty_page_carrying_a_token_is_followed() {
+        let script = Script::new([page(&[], Some("t1")), page(&["p/a", "p/b"], None)]);
+        let listed = list_page(&script, "p/", None, 2).await.expect("listed");
+        assert_eq!(keys(&listed), ["p/a", "p/b"]);
+        assert_eq!(listed.next, None);
+        assert_eq!(
+            script.seen(),
+            [(None, None, false), (None, token("t1"), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_empty_page_ceiling_is_a_typed_error() {
+        let script = Script::new((0..100).map(|i| page(&[], Some(&format!("t{i}")))));
+        match list_page(&script, "p/", None, 2).await {
+            Err(StoreError::ListPageCeiling { prefix, ceiling }) => {
+                assert_eq!(prefix, "p/");
+                assert_eq!(ceiling, EMPTY_RESPONSE_ALLOWANCE);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(script.seen().len(), EMPTY_RESPONSE_ALLOWANCE);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_page_token_fails_the_call() {
+        let script = Script::new([page(&[], Some("t1")), page(&[], Some("t1"))]);
+        match list_page(&script, "p/", None, 2).await {
+            Err(StoreError::ListRepeatedToken { prefix }) => assert_eq!(prefix, "p/"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(script.seen().len(), 2);
+        let script = Script::new([page(&[], Some("t1")), page(&[], Some("t1"))]);
+        match list_delimited(&script, "p/", 8).await {
+            Err(StoreError::ListRepeatedToken { prefix }) => assert_eq!(prefix, "p/"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(script.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_page_that_drops_only_the_start_key_returns_short() {
+        // startOffset is inclusive: the service returns the start key first.
+        let script = Script::new([page(&["p/b", "p/c"], Some("t1")), page(&["p/d"], None)]);
+        let listed = list_page(&script, "p/", Some("p/b"), 2)
+            .await
+            .expect("listed");
+        assert_eq!(keys(&listed), ["p/c"]);
+        assert_eq!(listed.next, Some(PageToken("p/c".to_string())));
+        assert_eq!(script.seen(), [(token("p/b"), None, false)]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_response_holding_only_the_start_key_is_followed() {
+        let script = Script::new([page(&["p/b"], Some("t1")), page(&["p/c"], Some("t2"))]);
+        let listed = list_page(&script, "p/", Some("p/b"), 1)
+            .await
+            .expect("listed");
+        assert_eq!(keys(&listed), ["p/c"]);
+        assert_eq!(listed.next, Some(PageToken("p/c".to_string())));
+        assert_eq!(
+            script.seen(),
+            [(token("p/b"), None, false), (token("p/b"), token("t1"), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_response_dropping_the_start_key_ends_the_listing() {
+        let script = Script::new([page(&["p/b", "p/c"], None)]);
+        let listed = list_page(&script, "p/", Some("p/b"), 2)
+            .await
+            .expect("listed");
+        assert_eq!(keys(&listed), ["p/c"]);
+        assert_eq!(listed.next, None);
+        assert_eq!(script.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delimited_prefixes_repeated_across_responses_are_listed_once() {
+        let mut first = page(&["p/x"], Some("t1"));
+        first.prefixes = vec!["p/a/".to_string(), "p/b/".to_string()];
+        let mut second = page(&[], None);
+        second.prefixes = vec!["p/b/".to_string(), "p/c/".to_string()];
+        let script = Script::new([first, second]);
+        let listed = list_delimited(&script, "p/", 8).await.expect("listed");
+        assert_eq!(listed.common_prefixes, ["p/a/", "p/b/", "p/c/"]);
+        assert_eq!(
+            listed
+                .objects
+                .iter()
+                .map(|meta| meta.key.as_str())
+                .collect::<Vec<_>>(),
+            ["p/x"]
+        );
+        assert_eq!(
+            script.seen(),
+            [(None, None, true), (None, token("t1"), true)]
+        );
+    }
 }
+

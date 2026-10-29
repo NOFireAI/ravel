@@ -17,8 +17,8 @@
 //! - `CasVersion(v)` is `PutMode::Update` carrying `v` as its version, which
 //!   sends `x-goog-if-generation-match: v`. A 412 is
 //!   [`StoreError::PreconditionFailed`]. `v` must be a positive decimal with
-//!   no leading zero; anything else (`0`, `012`, an empty or non-numeric
-//!   token) is refused with [`StoreError::Permanent`] before a request is
+//!   no leading zero and no sign, at most `i64::MAX`; anything else (`0`,
+//!   `012`, `+1`, an empty, non-numeric or larger token) is refused with [`StoreError::Permanent`] before a request is
 //!   sent. GCS issues no generation 0, and `x-goog-if-generation-match: 0`
 //!   means create-if-absent, so a CAS on `0` would otherwise create an absent
 //!   key.
@@ -40,20 +40,31 @@
 //! # Listing
 //!
 //! Listing does not go through `object_store`. The `list` module sends the
-//! JSON API's `objects.list`, one request per page of the response, with
-//! `maxResults` set to [`GcsConfig::list_page_size`] on every request. The
-//! prefix and the resume point are sent as raw names (the resume as
-//! `startOffset`, which is inclusive, so the start name itself is dropped),
-//! and a page is followed within a call by the service's opaque
-//! `nextPageToken`. The [`PageToken`] handed back between calls is the raw
-//! last name, as on S3. Listed names go to [`crate::classify_objects`] and
+//! JSON API's `objects.list`, with `maxResults` set to
+//! [`GcsConfig::list_page_size`] on every request. The prefix and the resume
+//! point are sent as raw names (the resume as `startOffset`, which is
+//! inclusive, so the start name itself is dropped). A call follows the
+//! service's opaque `nextPageToken` until it holds a page of names, with one
+//! exception: a response from which the start name was dropped and that
+//! leaves at least one name ends the call, and its names, one short of the
+//! page size when the response was full, are returned with a page token
+//! instead of a second request filling the page. Against responses that are
+//! each full, every call is therefore one request. Up to 16 responses in a row
+//! that leave no name are followed ([`StoreError::ListPageCeiling`] past
+//! that), and a repeated `nextPageToken` fails the call
+//! ([`StoreError::ListRepeatedToken`]). The [`PageToken`] handed back between
+//! calls is the raw last name, as on S3. Listed names go to [`crate::classify_objects`] and
 //! [`crate::classify_prefixes`] as received, so a name this store cannot
 //! address is reported in [`ListPage::unaddressable`] rather than failing the
 //! page. Each listed version is the item's `generation`; an item without a
 //! positive decimal one fails the call. Each listed ETag is the quoted hex of
-//! the item's `md5Hash`, which is the ETag `head` reports for such an object;
-//! an object without an MD5 (a composite) is listed with the JSON API's
-//! `etag`, which `head` does not report.
+//! the item's `md5Hash`, which is the ETag `head` reports for such an object.
+//! An object without an MD5 is a composite, which the item's `componentCount`
+//! marks; `head` reports its ETag as a dash followed by the JSON API's `etag`,
+//! quoted, and the listing reports the same value. An item with neither
+//! `md5Hash` nor `componentCount` fails the call, naming the key, since the
+//! ETag `head` would report for it is unknown. Responses carry only the
+//! fields these need (the `fields` parameter).
 //!
 //! A listing of a bucket that does not exist is [`StoreError::Permanent`]; a
 //! `head` is [`StoreError::NotFound`], as on S3.
@@ -94,7 +105,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use object_store::gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder};
+use object_store::gcp::{
+    GcpCredential, GcpCredentialProvider, GoogleCloudStorage, GoogleCloudStorageBuilder,
+};
 use object_store::{
     ClientOptions, GetOptions as OsGetOptions, GetRange as OsGetRange, ObjectStore, ObjectStoreExt,
     PutMode as OsPutMode, PutOptions as OsPutOptions, PutPayload, RetryConfig,
@@ -263,35 +276,35 @@ impl GcsStore {
                 config.bucket
             ))
         })?;
-        let list_http = S3HttpConnector::new(metrics, Arc::clone(&store_time))
-            .only_for_authority(authority)
-            .wrap(
-                list_http_client(
-                    &S3HttpConfig {
-                        request_timeout: config.request_timeout,
-                        connect_timeout: config.connect_timeout,
-                        ..S3HttpConfig::default()
-                    },
-                    config.allow_http,
-                )
-                .map_err(|e| {
-                    StoreError::Permanent(format!("failed to build GCS list client: {e}"))
-                })?,
-            );
-        let lister = GcsListClient::new(
-            list_http,
+        let lister = list_client(
+            &config,
+            metrics,
+            Arc::clone(&store_time),
+            authority,
             (!config.skip_signature()).then(|| Arc::clone(store.credentials())),
-            config.retry.clone().unwrap_or_default(),
-            config.base_url.as_deref().unwrap_or(GCS_BASE_URL),
-            &config.bucket,
-            config.list_page_size,
-        );
+        )?;
         Ok(GcsStore {
             store,
             lister,
             store_time,
             get_unverified: AtomicU64::new(0),
         })
+    }
+
+
+    /// Store `data` under exactly `name` through the JSON API's media upload,
+    /// with this store's credentials: a name the `object_store` adapter would
+    /// rewrite, as another writer to the bucket could create.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn upload_foreign(&self, name: &str, data: Bytes) -> Result<(), StoreError> {
+        self.lister.upload_media(name, data).await
+    }
+
+    /// Delete exactly `name` through the JSON API, with this store's
+    /// credentials.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn delete_foreign(&self, name: &str) -> Result<(), StoreError> {
+        self.lister.delete_object(name).await
     }
 
     /// Full-object reads served without a stored-checksum check: every one,
@@ -389,8 +402,40 @@ fn adc_key_file() -> Result<Option<String>, StoreError> {
     }
 }
 
+/// The listing client: its own reqwest client behind the store's recording
+/// connector, sending `credentials`' bearer token (none when `None`).
+fn list_client(
+    config: &GcsConfig,
+    metrics: Arc<StoreMetrics>,
+    store_time: Arc<ObservedStoreTime>,
+    authority: String,
+    credentials: Option<GcpCredentialProvider>,
+) -> Result<GcsListClient, StoreError> {
+    let http = list_http_client(
+        &S3HttpConfig {
+            request_timeout: config.request_timeout,
+            connect_timeout: config.connect_timeout,
+            ..S3HttpConfig::default()
+        },
+        config.allow_http,
+    )
+    .map_err(|e| StoreError::Permanent(format!("failed to build GCS list client: {e}")))?;
+    Ok(GcsListClient::new(
+        S3HttpConnector::new(metrics, store_time)
+            .only_for_authority(authority)
+            .wrap(http),
+        credentials,
+        config.retry.clone().unwrap_or_default(),
+        config.base_url.as_deref().unwrap_or(GCS_BASE_URL),
+        &config.bucket,
+        config.list_page_size,
+    ))
+}
+
 /// The `host[:port]` object requests go to: `base_url`'s as written, or
-/// Google's endpoint. The connector observes only requests to it.
+/// Google's endpoint. The connector observes only requests to it. A
+/// `base_url` carrying userinfo (`user:pass@`) is refused without echoing it:
+/// credentials come from Application Default Credentials only.
 fn store_authority(base_url: Option<&str>) -> Result<String, StoreError> {
     let Some(base_url) = base_url else {
         return Ok(GCS_AUTHORITY.to_string());
@@ -402,9 +447,13 @@ fn store_authority(base_url: Option<&str>) -> Result<String, StoreError> {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
+    if authority.contains('@') {
+        return Err(StoreError::Permanent(
+            "GCS base_url carries userinfo (user:pass@); credentials come from Application \
+             Default Credentials only"
+                .into(),
+        ));
+    }
     if authority.is_empty() {
         return Err(StoreError::Permanent(format!(
             "GCS base_url {base_url:?} names no host"
@@ -424,9 +473,11 @@ fn generation_of(key: &str, generation: Option<String>) -> Result<String, StoreE
 }
 
 /// Whether `token` can be a GCS generation: a positive decimal integer with
-/// no leading zero.
+/// no leading zero and no sign, at most `i64::MAX` (generations are int64).
 fn is_generation(token: &str) -> bool {
-    token.bytes().next().is_some_and(|b| b != b'0') && token.bytes().all(|b| b.is_ascii_digit())
+    token.bytes().next().is_some_and(|b| b != b'0')
+        && token.bytes().all(|b| b.is_ascii_digit())
+        && token.parse::<i64>().is_ok()
 }
 
 /// `put` errors by mode: a refused precondition is `AlreadyExists` under
@@ -464,7 +515,7 @@ impl ObjectStoreBackend for GcsStore {
                     if !is_generation(&version.0) {
                         return Err(StoreError::Permanent(format!(
                             "GCS CAS token {:?} for {key} is not a generation: a positive \
-                             decimal with no leading zero",
+                             decimal with no leading zero, at most i64::MAX",
                             version.0
                         )));
                     }
