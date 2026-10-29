@@ -43,6 +43,7 @@ use ravel_otlp::{LogIngestLimits, LogRejection, SpanIngestLimits, SpanRejection,
 use ravel_types::{Signal, TenantId};
 
 use crate::config::ProjectionTap;
+use crate::ipcrypt::IpcryptPolicy;
 use crate::logs_ingest::handle_export_logs;
 use crate::otlp_http::GatewayState;
 use crate::traces_ingest::handle_export_traces;
@@ -376,6 +377,8 @@ pub struct OtlpSink {
     pub tenant: TenantId,
     pub endpoint: String,
     clock: Arc<dyn Clock>,
+    /// The empty policy: the gateway applies the tenant's rules.
+    ipcrypt: Arc<IpcryptPolicy>,
     channel: Mutex<Option<tonic::transport::Channel>>,
 }
 
@@ -385,6 +388,7 @@ impl OtlpSink {
             tenant,
             endpoint,
             clock,
+            ipcrypt: IpcryptPolicy::disabled(),
             channel: Mutex::new(None),
         }
     }
@@ -412,12 +416,16 @@ impl OtlpSink {
 
     async fn send(&self, batch: &ProjectionBatch) -> Result<Delivered, SinkError> {
         let logs = LogIngestLimits::default();
+        let rules = self
+            .ipcrypt
+            .rules_for(&self.tenant)
+            .map_err(|e| SinkError(e.to_string()))?;
         let screened = screen(
             &self.tenant,
             batch,
             &logs,
             &SpanIngestLimits::default(),
-            &TenantRules::none(),
+            &rules,
             self.clock.now_unix_ns(),
         )?;
         let channel = self.channel()?;
