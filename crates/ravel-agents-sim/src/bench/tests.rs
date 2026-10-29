@@ -281,6 +281,53 @@ fn a_missing_or_doubled_figure_fails_the_check() {
     );
 }
 
+/// A figure only a wildcard row covers is still expected exactly once: each
+/// `(scenario, temp, op)` must print every key its kind of operation emits.
+#[test]
+fn a_dropped_wildcard_covered_figure_fails_the_check() {
+    let bands = bands();
+    for (scenario, dropped) in [
+        ("hot", "hot.warm.message.publish.conflict"),
+        ("many", "many.warm.step.store.body_in_bytes"),
+        ("baseline", "baseline.na.ingest.telemetry.body_in_bytes"),
+        ("storm", "storm.cold.pass.latency.max_ms"),
+    ] {
+        let figures = small(scenario);
+        let scope = Scope::Scenario(scenario);
+        assert!(
+            check(&figures, &bands, Size::Small, false, scope)
+                .failures
+                .is_empty()
+        );
+        let key = Key::parse(dropped).expect("key");
+        let kept: Vec<Figure> = figures.iter().filter(|f| f.key != key).cloned().collect();
+        assert_eq!(kept.len() + 1, figures.len(), "{dropped} printed once");
+        let checked = check(&kept, &bands, Size::Small, false, scope);
+        assert_eq!(
+            checked.failures,
+            vec![format!("{dropped}: expected figure missing")],
+            "{scenario}"
+        );
+    }
+
+    let figures = small(DISCOVERY);
+    let dropped = Key::parse("discovery-n100-end.cold.assign.sweep.passes").expect("key");
+    let kept: Vec<Figure> = figures
+        .iter()
+        .filter(|f| f.key != dropped)
+        .cloned()
+        .collect();
+    let scope = Scope::Scenario("discovery-n100-end");
+    let checked = check(&kept, &bands, Size::Small, false, scope);
+    assert!(
+        checked.failures.contains(
+            &"discovery-n100-end.cold.assign.sweep.passes: expected figure missing".to_string()
+        ),
+        "{:#?}",
+        checked.failures
+    );
+}
+
 #[test]
 fn every_scenario_has_a_runner() {
     let config = Size::Small.config();
