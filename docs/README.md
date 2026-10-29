@@ -78,7 +78,7 @@ Come back to one lane when you have a specific question.
 ## Operate
 
 - [guides/operations.md](guides/operations.md) is the entry point to
-  running a cluster, in four pages:
+  running a cluster, in five pages:
   - [configuration](guides/operations/configuration.md): what to decide
     before you start anything.
   - [deployment](guides/operations/deployment.md): bringing a cluster up
@@ -88,6 +88,9 @@ Come back to one lane when you have a specific question.
   - [troubleshooting](guides/operations/troubleshooting.md): symptom,
     cause, confirmation and action, with the two incident runbooks at the
     top.
+  - [agents](guides/operations/agents.md): running `ravel-server --agents`:
+    budgets, the agent lifetime limit, capabilities, projection, sweep cost,
+    several server processes, clocks, and reconciling an effect in doubt.
 - [guides/observability.md](guides/observability.md): every metric family
   on `GET /metrics`, the closed label allowlist, how to read the per-query
   cost estimate against the actual, and three worked diagnoses.
@@ -159,7 +162,8 @@ protocol or byte layout, or when you are changing the code.
   commit protocol, commit tokens, catalog folds and snapshot resolution.
 - [agents.md](agents.md): Ravel Agents storage: the key layout under
   `t/<tenant>/ag/`, the HEAD record, the publication rule, operation states,
-  the typed errors, and each guarantee with its test or milestone.
+  the typed errors, and the matrix of every promised behaviour with its
+  status, protocol row, fault schedule, store contract section and tests.
 - [agents-benchmarks.md](agents-benchmarks.md): the Ravel Agents cost
   benchmarks: the scenarios, how to run them, the report format and byte
   kinds, and the pre-registered bands every figure is checked against.
