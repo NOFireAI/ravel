@@ -182,9 +182,6 @@ pub struct Coordinator {
     /// When a poll last started a sweep pass, in the injected clock's
     /// nanoseconds; `i64::MIN` before the first.
     pub(crate) last_sweep_unix_ns: AtomicI64,
-    /// The kernel limits the store enforces, against which the sweep
-    /// measures each agent's fill ([`Coordinator::with_limits`]).
-    pub(crate) limits: Limits,
 }
 
 impl Coordinator {
@@ -208,25 +205,17 @@ impl Coordinator {
             sweep: SweepConfig::default(),
             sweep_cursor: tokio::sync::Mutex::new(sweep::SweepCursor::default()),
             last_sweep_unix_ns: AtomicI64::new(i64::MIN),
-            limits: Limits::default(),
         }
-    }
-
-    /// Measure fill against `limits`, which must be the kernel limits the
-    /// store was built with: the coordinator has no other way to read them.
-    #[must_use]
-    pub fn with_limits(mut self, limits: Limits) -> Coordinator {
-        self.limits = limits;
-        self
     }
 
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
     }
 
-    /// The kernel limits fill is measured against.
+    /// The kernel limits fill is measured against: the ones the store
+    /// enforces (`sweep::tests::fill_is_measured_against_the_store_limits`).
     pub fn limits(&self) -> &Limits {
-        &self.limits
+        self.store.kernel_limits()
     }
 
     pub(crate) fn now(&self) -> i64 {

@@ -414,7 +414,7 @@ tool input (`SafeIds`).
 | `UnsupportedFormat` | `unsupported_format` | a record carries a format version or representation this binary does not read | `never` |
 
 The wire form carries the code and the retry hint
-(`wire::fixtures::tests::error_body_carries_the_code_and_retry_hint`). A
+(`wire::fixtures::error_body_carries_the_code_and_retry_hint`). A
 refusal of a lifetime cap also names the cap in `cap`, from `BudgetCap` in
 the same file: `receipts` (`Limits::max_receipts`), `index_pages`
 (`max_index_pages`, or one page's entries), `head_bytes` (`max_head_bytes`,
@@ -433,7 +433,7 @@ The request and response bodies are the `wire` types in
 listed route by route in
 [the HTTP API reference](reference/http-api.md#agents-routes). Their JSON
 forms are pinned by the files in `sdk/fixtures/`, which
-`wire::fixtures::tests` regenerates and checks.
+`wire::fixtures::fixtures_match_the_wire_types` regenerates and checks.
 
 Fill. `GET /api/v1/agents/state` answers `usage`, the counts behind each
 lifetime cap read from the agent's HEAD as stored: `receipts` against
