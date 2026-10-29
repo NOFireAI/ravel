@@ -719,9 +719,10 @@ pages. Decision 3 now reads as follows for those lists.
   `planner_misses` (`a_planner_miss_loads_every_page_and_is_counted`).
 - **Production read paths.** No production caller reads every page. The
   runtime's reload of a loaded root, the sweep's per-agent visit and the
-  directory scan read HEAD alone (`AgentStore::read_head_shallow`; the
-  sweep's one GET is pinned in `timers::tests`), and a scan then attaches
-  the inbox page holding the first input and the one holding the active
+  directory scan read HEAD alone (`AgentStore::read_head_shallow`; a
+  visit to an agent with sealed pages costs one GET,
+  `sweep::tests::a_visit_reads_only_the_head_of_an_agent_with_sealed_pages`),
+  and a scan then attaches the inbox page holding the first input and the one holding the active
   input, one GET each, before it offers the agent. A resumed turn loads
   its input's page (`a_takeover_resumes_a_turn_whose_input_is_on_a_sealed_inbox_page`,
   and `cold_restart_resumes_the_active_turn_at_two_entries_a_page`). On
