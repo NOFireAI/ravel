@@ -5234,7 +5234,8 @@ once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes` and
 `_entries` as gauges and `_hits_total`, `_misses_total`, `_admissions_total`,
 `_evictions_total`, `_ghost_hits_total`, `_margin_skips_total`,
-`_pressure_evictions_total` and `_expired_drops_total` as counters (eight); none of these families appears at `0`.
+`_pressure_evictions_total` and `_expired_drops_total` as counters (eight);
+none of these families appears at `0`.
 
 ## SQL over spans (the `spans` table, ADR-0045)
 

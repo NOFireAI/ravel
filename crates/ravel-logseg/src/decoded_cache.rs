@@ -466,6 +466,8 @@ impl DecodedColumnCache {
         // Evicted entries release their reservations here, before the new
         // entry reserves, so the cache at its cap can swap one entry for
         // another instead of counting every resident byte against the margin.
+        // If the reservation below is still refused, the eviction stands and
+        // nothing is admitted.
         drop(evicted);
 
         let reservation = match &self.budget {
