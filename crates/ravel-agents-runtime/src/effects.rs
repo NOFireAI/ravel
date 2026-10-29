@@ -903,7 +903,7 @@ impl Coordinator {
     ) -> Result<(Outcome, bool), AgentError> {
         let mut retries = 0;
         loop {
-            match self.store.execute_with(agent, command, deps).await {
+            match self.execute_with(agent, command, deps).await {
                 Ok(out) => {
                     if retries > 0 {
                         self.metrics

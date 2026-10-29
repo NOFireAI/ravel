@@ -43,5 +43,15 @@
       "accepted_unix_ns": "1767225601000000000",
       "failed_attempts": 0
     }
-  ]
+  ],
+  "usage": {
+    "receipts": 768,
+    "max_receipts": 1024,
+    "results_pages": 12,
+    "events_pages": 400,
+    "timers_pages": 0,
+    "max_index_pages": 512,
+    "head_bytes": 40960,
+    "max_head_bytes": 262144
+  }
 }

@@ -115,7 +115,7 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | GET | `/api/v1/agents/result` | `operation`, optional `wait_ms` | JSON: `operation`, `result` (null until terminal) | 200, 401, 403, 404, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/resolve` | JSON: `agent`, `handler`, `request_id` | JSON: `operation` and `status`, both null when no receipt matches | 200, 401, 403, 404, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/cancel` | JSON: `operation` | JSON: `operation`, `status`, `requested` | 200, 401, 403, 404, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
-| GET | `/api/v1/agents/state` | `kind`, `key` | JSON: `agent_id`, `incarnation`, `state_version`, `content_type`, `state`, `active_turn` (absent when no turn is open), `mailbox` (each `accept_seq`, `handler`, `source`, `accepted_unix_ns`, `failed_attempts`; absent when empty) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| GET | `/api/v1/agents/state` | `kind`, `key` | JSON: `agent_id`, `incarnation`, `state_version`, `content_type`, `state`, `active_turn` (absent when no turn is open), `mailbox` (each `accept_seq`, `handler`, `source`, `accepted_unix_ns`, `failed_attempts`; absent when empty), `usage` (`receipts` and `max_receipts`, the sealed pages `results_pages`, `events_pages` and `timers_pages` and `max_index_pages`, `head_bytes` and `max_head_bytes`; `agents_timers_e2e::a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter`) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/events` | JSON: `agent`, `cursor` (null for the start), `limit`, optional `operation` | JSON: `events`, `next_cursor`, `terminal` (only on the page that drains a finished `operation`) | 200, 401, 403, 404, 410, 413, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/timers` | JSON: `agent`, `timer_key`, `due_unix_ns` (decimal string), `handler`, `payload` | JSON: `timer`, `generation` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/timers/cancel` | JSON: `agent`, `timer_key` | JSON: `outcome` (`cancelled`, `already_fired`, `unknown`) | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
@@ -414,7 +414,11 @@ agents lane leaves query routes serving
 Every refusal after authentication is an `ErrorBody`: `code`, `retry`,
 `reason`, and `ids` holding only safe identifiers (agent id, incarnation,
 operation, turn, step, effect, timer). Payloads and state never appear in
-an error.
+an error. A `budget_exceeded` or `mailbox_full` refusal of an agent's
+lifetime cap adds `cap`, naming it: `receipts`, `index_pages`,
+`head_bytes`, `mailbox` or `timers`
+(`agents_timers_e2e::a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter`
+answers a send past the receipt cap 413 with `cap` `receipts`).
 
 | `code` | Status | `retry` |
 | --- | --- | --- |

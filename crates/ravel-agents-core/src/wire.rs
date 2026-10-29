@@ -38,6 +38,7 @@ mod unix_ns {
 
 use crate::error::{AgentError, SafeIds};
 use crate::head::{EffectStatus, RecoveryPolicy, ResultStatus, StepStatus, TimerStatus};
+use crate::kernel::{Limits, Usage};
 use crate::state::OperationState;
 
 /// The `(kind, key)` pair a client names an agent by.
@@ -270,6 +271,42 @@ pub struct StateResponse {
     /// is the active turn's input while one runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mailbox: Vec<MailboxEntryBody>,
+    /// How far the agent has grown toward its lifetime caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageBody>,
+}
+
+/// The counts behind each lifetime cap of one agent, from its HEAD as stored.
+/// A send is refused `budget_exceeded` once `receipts` reaches
+/// `max_receipts`; a list's publish once its sealed pages reach
+/// `max_index_pages`; any publish that would encode HEAD past
+/// `max_head_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageBody {
+    pub receipts: u64,
+    pub max_receipts: u64,
+    pub results_pages: u64,
+    pub events_pages: u64,
+    pub timers_pages: u64,
+    pub max_index_pages: u64,
+    pub head_bytes: u64,
+    pub max_head_bytes: u64,
+}
+
+impl UsageBody {
+    pub fn new(usage: Usage, limits: &Limits) -> UsageBody {
+        let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        UsageBody {
+            receipts: usage.receipts,
+            max_receipts: limits.max_receipts,
+            results_pages: wide(usage.results_pages),
+            events_pages: wide(usage.events_pages),
+            timers_pages: wide(usage.timers_pages),
+            max_index_pages: wide(limits.max_index_pages),
+            head_bytes: wide(usage.head_bytes),
+            max_head_bytes: wide(limits.max_head_bytes),
+        }
+    }
 }
 
 /// The open turn of a [`StateResponse`].
@@ -885,6 +922,11 @@ pub struct ErrorBody {
     pub retry: String,
     pub reason: String,
     pub ids: SafeIdsBody,
+    /// The lifetime cap a `budget_exceeded` or `mailbox_full` refusal hit:
+    /// one of the [`crate::error::BudgetCap`] codes. Absent for every other
+    /// error and for a refusal of a per-command bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<String>,
 }
 
 impl From<&AgentError> for ErrorBody {
@@ -894,6 +936,7 @@ impl From<&AgentError> for ErrorBody {
             retry: error.kind.retry().code().to_string(),
             reason: error.reason.to_string(),
             ids: SafeIdsBody::from(&*error.ids),
+            cap: error.cap.map(|cap| cap.code().to_string()),
         }
     }
 }

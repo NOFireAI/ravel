@@ -143,7 +143,7 @@ impl Coordinator {
             observed_epoch: head.epoch,
             lease_hint_unix_ns: lease_hint,
         });
-        let (epoch, incarnation, published) = match self.store.execute(agent, &command).await {
+        let (epoch, incarnation, published) = match self.execute(agent, &command).await {
             Ok(out) => {
                 let Reply::Owned { epoch } = out.reply else {
                     return Err(refused(
