@@ -50,9 +50,11 @@ Read [Maintenance](maintenance.md) before you decide that you do not need a
 
 ## Storage backend and credentials
 
-`--store s3` is the only durable store. `--store memory` is an in-process
-store for tests and local experiments, and nothing in it survives process
-exit.
+`--store s3` and `--store gcs` are the durable stores: an S3-compatible
+bucket, or a Google Cloud Storage bucket (see
+[Google Cloud Storage](#google-cloud-storage)). `--store memory` is an
+in-process store for tests and local experiments, and nothing in it survives
+process exit.
 
 Ravel reads the `RAVEL_S3_*` environment variables and their matching flags,
 and nothing else. It does not use the AWS credential chain (profiles,
@@ -281,6 +283,60 @@ asks for the stored one on every read, as the server does (see
 `ravel-cli store qualify` reports whether the endpoint returns the stored
 checksum. See [qualify the store](deployment.md#qualify-the-store).
 
+### Google Cloud Storage
+
+`ravel-server --store gcs --gcs-bucket <bucket>` keeps every object in a GCS
+bucket. `--gcs-bucket` (`RAVEL_GCS_BUCKET`) is required under
+`--store gcs`, and refused under any other store.
+
+```sh
+ravel-server --store gcs --gcs-bucket my-ravel-bucket ...
+```
+
+Credentials are Application Default Credentials, and no Ravel flag carries
+one:
+
+- On GKE, use Workload Identity. Bind the server's Kubernetes service account
+  to a Google service account that can read, write, list and delete objects in
+  the bucket (for example `roles/storage.objectUser` on the bucket). The pod
+  needs no key file and no secret.
+- On a Compute Engine VM, the metadata server provides the VM's service
+  account.
+- Elsewhere, `GOOGLE_APPLICATION_CREDENTIALS` names a service-account key
+  file, or the gcloud well-known file from
+  `gcloud auth application-default login` is used.
+
+The store uses the same request and connect timeouts as `--store s3`, and it
+reports into the same store metrics (`ravel_store_calls_total`,
+`ravel_store_attempts_total` and the rest), so a GCS deployment's dashboards
+read the same series. The server refuses to start on a bucket that has not
+been qualified, as on S3: qualify it first (see
+[qualify the store](deployment.md#qualify-the-store)). Its backend identity
+is `gs://<bucket>`.
+
+Several flags configure S3 features that have no GCS implementation. Under
+`--store gcs` each of them is refused at startup with an error naming the
+flag, whether it was passed on the command line or set through its
+environment variable. None is accepted and ignored:
+
+- every `--s3-*` flag, including `--s3-upload-integrity` and
+  `--s3-request-stored-checksum`;
+- `--s3-kms-key` and `--tenant-kms-config`. Customer-managed encryption on GCS
+  is the bucket's default key (CMEK), set on the bucket outside Ravel;
+- `--require-bucket-protection`. The bucket-protection probes are S3 calls, so
+  a server asked to require protection on GCS refuses to start rather than
+  start unverified. Configure retention, versioning and soft delete on the
+  bucket yourself.
+
+A flag left at its default is not given: `--s3-request-stored-checksum`
+defaults to on and is ignored under `--store gcs`, as it is under
+`--store memory`. Unset any `RAVEL_S3_*` variable a shared environment
+exports before starting a GCS server.
+
+A Parquet credential profile that resolves to Ravel's own GCS bucket is
+refused at config time, as one on Ravel's own S3 bucket is under
+`--store s3`.
+
 ## Storage credential roles
 
 You can give each process an S3 credential that is scoped to its job. A
@@ -486,7 +542,8 @@ builds is constructed with that key id.
 - It routes writes for the keyspace of a configured tenant to a lazily built
   store, which is constructed with the key of that tenant.
 - Every other tenant, and every read, goes to the default store unchanged.
-- It requires `--store s3` and refuses to start under `--store memory`.
+- It requires `--store s3` and refuses to start under `--store memory` or
+  `--store gcs`.
 
 ```toml
 # --tenant-kms-config kms-tenants.toml

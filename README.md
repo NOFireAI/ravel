@@ -49,8 +49,9 @@ latency on the write path.
 
 **What it is for.**
 
-- Metrics, logs, and traces on any S3-compatible object store, with no
-  stateful ingest layer to operate and no local disk in the durability path.
+- Metrics, logs, and traces on any S3-compatible object store or a Google
+  Cloud Storage bucket, with no stateful ingest layer to operate and no local
+  disk in the durability path.
 - A Prometheus-compatible query API, so existing Grafana dashboards work
   against it.
 - Read-your-write on an object store. A strict acknowledgement returns a
@@ -334,6 +335,7 @@ can reach.
 | To do this | Read |
 |---|---|
 | Point `--store s3` at any S3-compatible store, or use `--s3-auth instance-role` on EC2 in place of static keys | [Choosing a credential source](docs/guides/operations/configuration.md#choosing-a-credential-source) |
+| Keep the data in a Google Cloud Storage bucket with `--store gcs --gcs-bucket`, authenticated through GKE Workload Identity or Application Default Credentials | [Google Cloud Storage](docs/guides/operations/configuration.md#google-cloud-storage) |
 | Size or switch off the read cache that sits in front of object storage | [Caching guide](docs/guides/caching.md) |
 | Run your own build with `make demo`, which does not build the `sql` feature | [Development guide](docs/internal/development.md) |
 

@@ -24,6 +24,19 @@ Run `store qualify` once per bucket, before the first server starts:
 ravel-cli store qualify --store s3 --s3-endpoint ... --s3-bucket ...
 ```
 
+A Google Cloud Storage bucket is qualified the same way, with `--store gcs`
+and `--gcs-bucket`. Run it under the Application
+Default Credentials the server will use, for example from a pod bound to the
+server's Workload Identity service account, so the run proves the
+permissions the server needs as well as the backend:
+
+```sh
+ravel-cli --store gcs --gcs-bucket my-ravel-bucket store qualify
+```
+
+The record names the backend as `gs://<bucket>`, and `ravel-server --store
+gcs` refuses to start until it exists, exactly as on S3.
+
 Ravel's commit protocol and catalog need two things from the store. The store
 must honor conditional writes, so that it rejects a losing writer and does not
 overwrite silently. A listing must show every write that is complete.
@@ -189,6 +202,11 @@ dev bucket Jobs in `deploy/k8s/floci.yaml` and `deploy/k8s/rustfs.yaml`, and
 the compose `createbucket` one-shots, create such a bucket. It has one enabled
 rule over the whole bucket with `ExpiredObjectDeleteMarker`, `NoncurrentDays`
 1 and `AbortIncompleteMultipartUpload` after 7 days.
+
+On `--store gcs`, Ravel probes none of the bucket's protection, and
+`--require-bucket-protection` is refused at startup rather than ignored.
+Configure the bucket's retention policy, object
+versioning and soft delete on the bucket itself, and verify them there.
 
 On `--store s3`, the check reads the bucket's configuration once per start. A
 bucket changed under a running process is seen at the next restart. The check
