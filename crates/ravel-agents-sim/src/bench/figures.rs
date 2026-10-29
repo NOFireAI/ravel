@@ -10,7 +10,7 @@
 //!
 //! with the value to three decimals. Every byte figure names its kind.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::Size;
@@ -356,20 +356,21 @@ pub fn check(
                 .push(format!("{key}: printed {n} times, expected once"));
         }
     }
-    let mut groups: BTreeMap<(&str, &str, &str), Vec<(&str, &str)>> = BTreeMap::new();
-    for figure in figures {
-        let k = &figure.key;
-        groups
-            .entry((&k.scenario, &k.temp, &k.op))
-            .or_default()
-            .push((&k.phase, &k.metric));
-    }
-    for ((scenario, temp, op), printed) in &groups {
+    let groups: BTreeSet<(&str, &str, &str)> = figures
+        .iter()
+        .map(|f| {
+            (
+                f.key.scenario.as_str(),
+                f.key.temp.as_str(),
+                f.key.op.as_str(),
+            )
+        })
+        .collect();
+    for (scenario, temp, op) in groups {
         for (phase, metric) in expected_keys(op) {
-            if !printed.contains(&(phase, metric)) {
-                out.failures.push(format!(
-                    "{scenario}.{temp}.{op}.{phase}.{metric}: expected figure missing"
-                ));
+            let key = Key::new(scenario, temp, op, phase, metric);
+            if !seen.contains_key(&key) {
+                out.failures.push(format!("{key}: expected figure missing"));
             }
         }
     }
