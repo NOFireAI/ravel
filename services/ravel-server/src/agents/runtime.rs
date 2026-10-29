@@ -310,6 +310,7 @@ pub enum ProjectionSinkPlan {
     InProcess {
         logs: Arc<LogIngestRouter>,
         spans: Arc<SpanIngestRouter>,
+        ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
     },
     /// OTLP gRPC to a gateway.
     Endpoint(String),
@@ -515,10 +516,15 @@ impl AgentsRuntime {
     fn projector(&self, tenant_id: &TenantId, clock: &Arc<dyn Clock>) -> Option<Arc<Projector>> {
         let inner: Arc<dyn ProjectionSink> = match &self.projection.sink {
             ProjectionSinkPlan::Off => return None,
-            ProjectionSinkPlan::InProcess { logs, spans } => Arc::new(InProcessSink {
+            ProjectionSinkPlan::InProcess {
+                logs,
+                spans,
+                ipcrypt,
+            } => Arc::new(InProcessSink {
                 tenant: tenant_id.clone(),
                 logs: logs.clone(),
                 spans: spans.clone(),
+                ipcrypt: ipcrypt.clone(),
                 clock: clock.clone(),
             }),
             ProjectionSinkPlan::Endpoint(endpoint) => {

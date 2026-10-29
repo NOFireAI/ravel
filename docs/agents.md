@@ -658,8 +658,9 @@ Where records go depends on the process:
 So projection is never silently absent
 (`a_process_that_cannot_project_refuses_to_start_and_off_is_reported`,
 `agents_projection_target_resolves_or_refuses_naming_both_ways_out`). The
-in-process sink applies no per-tenant attribute rules and the default
-normalisation limits.
+in-process sink applies the tenant's IPCrypt rules like any other ingest, and
+the default normalisation limits. A tenant whose rules cannot be resolved
+fails the batch, which the projector retries.
 
 "A projection failure never changes a committed transition" (ADR-3331
 decision 12). The projector is a reader: its only store calls are HEAD,

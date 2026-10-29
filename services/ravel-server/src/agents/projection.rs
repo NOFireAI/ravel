@@ -26,12 +26,13 @@ use ravel_agents_runtime::projection::{
 };
 use ravel_agents_store::Clock;
 use ravel_ingest::{LogIngestRouter, SpanIngestRouter, WriteMode};
-use ravel_ipcrypt::rules::TenantRules;
+
 use ravel_otlp::traces_normalize::normalize_traces;
 use ravel_otlp::{LogIngestLimits, SpanIngestLimits, normalize_logs};
 use ravel_types::TenantId;
 
 use crate::config::ProjectionTap;
+use crate::ipcrypt::IpcryptPolicy;
 
 /// The `service.name` every projected record carries.
 pub const SERVICE_NAME: &str = "ravel-agents";
@@ -152,22 +153,28 @@ pub fn traces_request(tenant: &TenantId, batch: &ProjectionBatch) -> ExportTrace
     }
 }
 
-/// Writes through this process's ingest routers, durably acknowledged.
+/// Writes through this process's ingest routers, durably acknowledged,
+/// under the tenant's IPCrypt rules like any other ingest.
 pub struct InProcessSink {
     pub tenant: TenantId,
     pub logs: Arc<LogIngestRouter>,
     pub spans: Arc<SpanIngestRouter>,
+    pub ipcrypt: Arc<IpcryptPolicy>,
     pub clock: Arc<dyn Clock>,
 }
 
 impl InProcessSink {
     async fn write(&self, batch: &ProjectionBatch) -> Result<(), SinkError> {
         let now = self.clock.now_unix_ns();
+        let rules = self
+            .ipcrypt
+            .rules_for(&self.tenant)
+            .map_err(|e| SinkError(format!("tenant IPCrypt rules unavailable: {e}")))?;
         if !batch.events.is_empty() {
             let out = normalize_logs(
                 logs_request(&self.tenant, batch),
                 &LogIngestLimits::default(),
-                &TenantRules::none(),
+                &rules,
                 now,
             );
             if !out.rejected.is_empty() {
@@ -190,7 +197,7 @@ impl InProcessSink {
             let out = normalize_traces(
                 traces_request(&self.tenant, batch),
                 &SpanIngestLimits::default(),
-                &TenantRules::none(),
+                &rules,
                 now,
             );
             if !out.rejected.is_empty() {
