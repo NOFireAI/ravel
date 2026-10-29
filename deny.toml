@@ -73,7 +73,7 @@ ignore = [
   # production caller, and on no shipped binary's feature set turning on
   # `object_store`/`cloud` for this DataFusion-side 0.13 copy: the root
   # Dockerfile's four release builds (ravel-server --features
-  # sql,flight-sql,otap; ravel-cli; ravel-operator;
+  # sql,flight-sql,otap,agents; ravel-cli; ravel-operator;
   # ravel-ingest-router) never pass `profiling` or `parquet-baseline`.
   # ravel-object-store's own object_store dependency is 0.14.1, which
   # resolves quick-xml 0.41.0 and is unaffected.

@@ -81,7 +81,9 @@ idempotency and do not expire in this release. The next send fails
 one message a minute, or 17 minutes at one a second
 (`a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` sets the
 cap to 4 and is refused at the fifth send). Raising the flag helps only up to
-about 23,000 sends at one event a turn, where the 256 KiB HEAD cap binds.
+about 23,000 sends at one event a turn, where the 256 KiB HEAD cap binds
+(derived from the HEAD byte budget, not pinned by a test; past it the
+refusal names cap `head_bytes`).
 Separately, the results, events and timers lists stop at 32,768 entries each
 (512 pages of 64), reached by timer-fired inputs, by 32 events a turn after
 about 1,024 turns, or by 32,768 distinct timer keys: the timers list holds
@@ -89,9 +91,11 @@ one entry per distinct timer key, and a rescheduled key replaces its earlier
 generation rather than adding one
 (`a_reschedule_supersedes_the_earlier_generation`). Behind one long-lived
 scheduled timer, the limit is about 3,000 distinct timer keys, because those
-timers stay in HEAD. Nothing trims these lists; the only recovery is destroy
-then create, which starts a new incarnation with empty state and history
-(`a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`).
+timers stay in HEAD (derived from the HEAD byte budget, not pinned by a
+test; past it the refusal names cap `head_bytes`). Nothing trims these
+lists, and no route, CLI command or SDK call destroys an agent in this
+release, so an agent at a cap stays there. Send new work to an agent under a
+new key.
 
 Signals, from the earliest to the most direct:
 
@@ -113,14 +117,18 @@ refusal. The refusal counter and `usage` are updated on the request itself.
 Advice:
 
 - Key an agent by something with a bounded lifetime: a conversation, a
-  ticket, a day. An agent keyed by a user or a device lives as long as the
+  job, a session. An agent keyed by a user or a device lives as long as the
   user does and reaches the receipt cap.
-- A capped agent still drains its queued work, and its state, results and
-  events stay readable, so read what you need before you destroy it.
+- An agent at the receipt cap still runs the inputs already in its mailbox,
+  and its state, results and events stay readable. At a list or HEAD byte
+  cap a completion that would grow a list is refused `budget_exceeded`, and
+  the handler can still fail the turn
+  (`a_completion_that_does_not_fit_is_refused_and_the_turn_can_still_fail`).
 - A retry with the same request id uses no receipt, because the duplicate is
   answered before the cap is checked
-  (`retries_are_idempotent_and_conflicts_are_typed`), and a timer firing uses
-  none either.
+  (`retries_are_idempotent_and_conflicts_are_typed`). A timer firing uses no
+  receipt: the kernel's `fire_timer` handler adds none, and no test pins it
+  yet.
 
 ## Capabilities and tokens
 
@@ -255,17 +263,18 @@ A single process wakes a waiting worker as soon as a send lands, with no
 sweep delay (`a_waiting_poll_wakes_on_send_and_the_wait_is_capped`).
 
 With several `--agents` processes on one tenant, a send writes no wake hint.
-A send that one process accepts for an agent no process holds is found only
-when the sweep's directory cursor reaches that agent on some process. The
+The process that accepts a send loads the agent and wakes only its own
+waiting polls. When the matching worker polls another process, that process
+finds the input only when its sweep's directory cursor reaches the agent. The
 guaranteed bound is ceil(N/32) passes at the 5 s interval, for N agents in
 the tenant. Measured on a cold store
 ([benchmark report](../../../benchmarks/agents/REPORT.md), "Discovery"):
 
-| Agents in the tenant | Discovery delay |
-|---|---|
-| 100 | 11.5 s |
-| 1,000 | 2.5 min |
-| 10,000 | 26.0 min guaranteed, 13.0 min quiet |
+| Agents in the tenant | Guaranteed (wake half saturated) | Quiet |
+|---|---|---|
+| 100 | 11.5 s | 5.5 s |
+| 1,000 | 2.5 min | 75.5 s |
+| 10,000 | 26.0 min | 13.0 min |
 
 So the delay stays under 1 minute up to 384 agents per tenant and under 10
 minutes up to 3,840. The sweep interval and the per-pass budgets have no
@@ -293,6 +302,14 @@ a stale fence is refused, and a commit after a takeover is
 The [storage spec](../../agents.md#clocks) has the detail.
 
 ## Reconciling an effect in doubt
+
+This runbook covers effects a worker records through `worker/step`. The
+TypeScript SDK in this release does not call that route: it keeps steps in
+the worker's own memory. Its in-doubt steps do not appear on the effects
+route, in the inspector or to reconcile, and the server reports the
+operation as running (the deferred SDK row in the
+[storage spec](../../agents.md#guarantees-and-limitations);
+[SDK guide](../agents-sdk.md)).
 
 A step with the `manual` policy whose worker died after the tool may have run
 goes in doubt, and its turn blocks until an operator decides
@@ -341,7 +358,7 @@ Worked example, with `EFF` the effect id from `blocked_effect`:
 ```sh
 # 1. Confirm the block.
 curl -s -H "Authorization: Bearer $AGENTS_TOKEN" \
-  "http://127.0.0.1:8080/api/v1/agents/effects/EFF"
+  "http://127.0.0.1:4318/api/v1/agents/effects/EFF"
 # {"effect":"EFF","status":"in_doubt","attempt":1,
 #  "attempts":[{"attempt":1,"status":"in_doubt"}], ...}
 
@@ -349,14 +366,14 @@ curl -s -H "Authorization: Bearer $AGENTS_TOKEN" \
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"effect":"EFF","attempt":1,"decision":"record_result","result":{"cents":1500}}' \
-  http://127.0.0.1:8080/api/v1/agents/reconcile
+  http://127.0.0.1:4318/api/v1/agents/reconcile
 # {"effect":"EFF","status":"completed","attempt":1}
 
 # 2b. Or the charge did not go through: authorize a second attempt.
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"effect":"EFF","attempt":1,"decision":"retry"}' \
-  http://127.0.0.1:8080/api/v1/agents/reconcile
+  http://127.0.0.1:4318/api/v1/agents/reconcile
 # {"effect":"EFF","status":"authorized","attempt":2}
 ```
 

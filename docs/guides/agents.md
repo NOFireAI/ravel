@@ -48,7 +48,8 @@ Ravel Agents is off by default and needs two switches:
    cargo build -p ravel-server --features agents
    ```
 
-   The published image does not include it.
+   The published `ravel-server` image is built with it; this step is for a
+   source build.
 
 2. Run the server with `--agents`, under `--mode all` or `--mode query`. A
    build without the feature refuses `--agents` at startup rather than
@@ -74,8 +75,8 @@ static token grants them through its suffix (`--tenant-token
 'TOKEN=acme;agents'`), and OIDC through `--oidc-agents-claim`,
 `--oidc-agents-worker-claim` and `--oidc-agents-admin-claim`. Every client
 route requires `agents` and every `worker/` route requires `agents_worker`,
-answering 403 without it. No route needs `agents_admin` yet, because
-reconciliation has no route.
+answering 403 without it. The `reconcile` and `sweep` routes require
+`agents_admin`, answering 403 without it.
 
 The runtime stores objects under `t/<tenant>/ag/` in the bucket. The IAM
 templates in [deploy/iam](../../deploy/iam/README.md#ravel-agents-tag) grant
@@ -85,11 +86,13 @@ and `ravel-cli parquet repair --stray` reports its manifests.
 
 ## What works today
 
-Ravel Agents arrives in seven milestones. This release has the
-contracts, the storage layer and the coordinator, served over HTTP under
-`/api/v1/agents/`. Clients use `create`, `send`, `call`, `operation`,
-`result`, `resolve`, `cancel`, `state` and `events`. Workers use
-`worker/register`, `worker/poll`, `worker/heartbeat` and `worker/commit`.
+Ravel Agents arrives in seven milestones. This release serves the client
+routes (`create`, `send`, `call`, `operation`, `result`, `resolve`,
+`cancel`, `state`, `events`, `timers`, `effects`), the worker routes
+(`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`,
+`worker/step`, `worker/effects/complete`, `worker/effects/fail`), the admin
+`reconcile` and `sweep` routes, and the inspector, all under
+`/api/v1/agents/`.
 The [HTTP API reference](../reference/http-api.md#agents-routes) gives each
 route's body and status codes. The server's `agents_e2e` tests run these
 routes against a real server, for example
@@ -100,14 +103,14 @@ routes against a real server, for example
 |---|---|---|
 | 0 Contracts | key layout, HEAD format, typed errors, the `agents` feature and `--agents` flag | yes |
 | 1 Durable kernel | create, send, read, resolve, turn commit, receipts, quotas | yes, over the client routes; the agent-count, state-size and memory quotas are reported but not enforced |
-| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | the worker routes, leases, heartbeats and takeover are served; the SDK's worker connects over them with `createHttpTransport` and keeps its step journal in its own memory until the server pairs steps with effect records |
-| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | cancellation is served (`cancel`); the step journal, effect intents and recovery policies have no route and are in the transition kernel's tests only |
-| 4 Timers and discovery | timer firing, wake hints, the reconciliation sweep | timer firing in the kernel's tests only; no sweep |
-| 5 Developer experience | `ravel-cli agents`, inspector page, MCP tools, Rust client, projection into logs and traces | no |
-| 6 Release hardening | paged indexes, benchmarks, operator guide, the feature in the published image | no |
+| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | the worker routes, leases, heartbeats and takeover are served; the SDK's worker connects over them with `createHttpTransport` and keeps its step journal in its own memory, because the SDK does not call the server's step and effect routes yet |
+| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | yes; the TypeScript SDK still journals steps in worker memory |
+| 4 Timers and discovery | timer firing, wake hints, the reconciliation sweep | yes; a send writes no wake hint; see the [operator guide](operations/agents.md#several-server-processes) |
+| 5 Developer experience | `ravel-cli agents`, inspector page, MCP tools, Rust client, projection into logs and traces | yes; MCP tools need a build with `mcp` |
+| 6 Release hardening | paged indexes, benchmarks, operator guide, the feature in the published image | yes; see the [operator guide](operations/agents.md) |
 
-The [guarantee table](../agents.md#guarantees-and-limitations) lists each
-property with the test that pins it or the milestone that delivers it.
+The [guarantees and limitations matrix](../agents.md#guarantees-and-limitations)
+lists each behaviour with its status and tests.
 
 ## The TypeScript SDK
 
@@ -115,7 +118,8 @@ The SDK lives in `sdk/typescript/packages/agents`; its
 [README](../../sdk/typescript/packages/agents/README.md) shows how to define
 an agent and a tool and drive them through the test harness. It is not
 published. Its worker reaches the worker routes through
-`createHttpTransport`; the server has no step or effect route yet, so the
-worker journals steps in its own memory and loses them with its process.
+`createHttpTransport`; the SDK does not call the server's step and effect
+routes in this release, so the worker journals steps in its own memory and
+loses them with its process.
 [The SDK guide](agents-sdk.md) takes a first project from a scaffold to a
 run against a server.

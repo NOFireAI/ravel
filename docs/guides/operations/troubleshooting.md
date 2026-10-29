@@ -1564,11 +1564,12 @@ INFO allocator background purge thread resolved allocator_background_thread=true
    `target/release/ravel-server`:
 
    ```sh
-   cargo build --release --locked -p ravel-server --features "sql,flight-sql,otap,heap-profiling"
+   cargo build --release --locked -p ravel-server --features "sql,flight-sql,otap,agents,heap-profiling"
    ```
 
    That is the feature set of the published image (the Dockerfile builds
-   `sql`, `flight-sql` and `otap` with `--locked`) plus `heap-profiling`. To
+   `sql`, `flight-sql`, `otap` and `agents` with `--locked`) plus
+   `heap-profiling`. To
    profile a different deployment, add `heap-profiling` to the feature list
    that the deployment was built with. Allocation sites under a surface that
    the profile lacks cannot appear in the dump.

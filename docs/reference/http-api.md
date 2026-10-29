@@ -519,8 +519,11 @@ The polled lease also carries `recorded_unix_ns` and `random_seed`, fixed
 when the turn begins, so a replacement worker re-runs the turn with the
 same clock and randomness. `call`, `cancel` and `worker/heartbeat` are
 covered by `agents_e2e::call_heartbeat_and_cancel_through_real_server`.
-One coordinator per tenant per server process is assumed; several servers
-coordinating the same tenant is out of scope for this release.
+Several server processes may serve one tenant: every write is conditional
+on HEAD, so the guarantees hold, but a send accepted by a process with no
+waiting worker is found by another process's sweep after a delay, and a
+reconcile retry is handed over only within the process that answered it
+(see docs/guides/operations/agents.md).
 
 **Steps and effects.** A worker journals each tool call with
 `worker/step` before running it, under the turn's lease. Steps are
