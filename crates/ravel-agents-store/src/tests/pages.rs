@@ -230,7 +230,8 @@ async fn send_receipt_lookup_and_wake_read_at_most_one_index_page_each() {
 }
 
 /// Events are read by `event_seq` range: from the page holding `after + 1`
-/// until `limit` events are in hand, never the pages before it. A result
+/// until `limit` events below the next page's first key are in hand, never
+/// the pages before it. A result
 /// the route layer reads by `accept_seq` costs the one page holding it.
 #[tokio::test]
 async fn events_are_read_by_seq_range() {
@@ -288,6 +289,17 @@ async fn events_are_read_by_seq_range() {
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].event_seq, events);
     assert_eq!(store.counters().since(&before).resolve.get, 1);
+
+    // A cursor in sealed history with the open page holding at least
+    // `limit` events: the open page's events are newer than the sealed
+    // pages, so they do not count toward the page being read.
+    let open = head.events.len();
+    assert!(open >= 2, "the open page holds {open} events");
+    let before = store.counters();
+    let read = store.read_events(&agent(), 0, 1).await.expect("oldest");
+    let seqs: Vec<u64> = read.iter().map(|e| e.event_seq).collect();
+    assert_eq!(seqs, vec![1]);
+    assert_eq!(store.counters().since(&before).resolve.get, 1 + 1);
 
     // A result read by accept_seq: one GET for a sealed result, none for
     // one still on the open page.

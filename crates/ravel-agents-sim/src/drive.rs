@@ -271,7 +271,6 @@ pub fn machine() -> Result<ReferenceMachine, String> {
     ReferenceMachine::new(KIND, KEY).map_err(|e| format!("reference machine: {e:?}"))
 }
 
-/// The HEAD key of the simulated agent.
 /// Environment variable that sets every rig's index page size, so the
 /// suite runs a second time with lists sealing every few entries.
 pub const PAGE_ENTRIES_ENV: &str = "RAVEL_AGENTS_PAGE_ENTRIES";
@@ -302,6 +301,7 @@ pub fn page_entries() -> usize {
     sim_limits().kernel.max_page_entries
 }
 
+/// The HEAD key of the simulated agent.
 pub fn head_object_key() -> Result<String, String> {
     head_key(&TENANT, &agent()).map_err(|e| format!("head key: {e:?}"))
 }

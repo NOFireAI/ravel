@@ -1126,16 +1126,32 @@ impl ObjectStoreBackend for AgentGets {
     }
 }
 
+fn event_seqs(page: &Value) -> Vec<u64> {
+    page["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| e["event_seq"].as_u64().expect("event_seq"))
+        .collect()
+}
+
 /// Turns run before the measured requests: one receipt, one result and one
 /// event each, so at the default 64 entries a page the receipts, results
-/// and events lists each hold 12 sealed pages.
-const DEEP_TURNS: u64 = 12 * 64 + 1;
+/// and events lists each hold 12 sealed pages and two entries on the open
+/// page, as many as the events page below asks for.
+const DEEP_TURNS: u64 = 12 * 64 + 2;
+
+/// A turn whose single event sits on the second sealed events page.
+const SEALED_TURN: u64 = 100;
 
 /// The bounded-read claim of the ADR-3331 index-page amendment through the
 /// real routes: against an agent with 12 sealed pages in each of its
 /// receipts, results and events lists, a result wait on its first operation,
-/// an events page from its first event and a worker poll each GET HEAD and
-/// at most one sealed page, never the history.
+/// an events page from its first event or a cursor into sealed history and
+/// a worker poll each GET HEAD and at most one sealed page of a list, never
+/// the history. The terminal page of an operation-filtered read is the one
+/// route here that walks every events page, and the state read lists a
+/// mailbox deeper than one page.
 #[tokio::test]
 async fn hot_routes_read_one_page_of_a_deep_history() {
     let spy = Arc::new(AgentGets {
@@ -1152,6 +1168,7 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
     api.ok(CLIENT, "create", &json!({"agent": agent()})).await;
     let worker = register(&api).await;
     let mut first = String::new();
+    let mut sealed_op = String::new();
     for n in 0..DEEP_TURNS {
         let sent = api
             .ok(
@@ -1162,6 +1179,9 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
             .await;
         if n == 0 {
             first = sent["operation"].as_str().expect("operation").to_string();
+        }
+        if n == SEALED_TURN {
+            sealed_op = sent["operation"].as_str().expect("operation").to_string();
         }
         let assignment = poll(&api, &worker, 2_000).await;
         assert_eq!(assignment["operation"], sent["operation"]);
@@ -1229,6 +1249,20 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
     assert_eq!(body["result"]["status"], json!("completed"), "{body}");
     assert_eq!(read(spy.take()), ["HEAD", "Results page", "object"]);
 
+    // A resolve of the first request, whose receipt is sealed: HEAD, the
+    // receipts page its fingerprint names, and the results page holding
+    // its outcome.
+    let resolved = api
+        .ok(
+            CLIENT,
+            "resolve",
+            &json!({"agent": agent(), "handler": "place", "request_id": "req-0"}),
+        )
+        .await;
+    assert_eq!(resolved["operation"], json!(first), "{resolved}");
+    assert_eq!(resolved["status"], json!("completed"), "{resolved}");
+    assert_eq!(read(spy.take()), ["HEAD", "Receipts page", "Results page"]);
+
     // The first page of events: HEAD, the first events page, and the
     // payload object of each of the two events returned.
     let page = api
@@ -1238,11 +1272,47 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
             &json!({"agent": agent(), "cursor": Value::Null, "limit": 2}),
         )
         .await;
-    assert_eq!(page["events"].as_array().map(Vec::len), Some(2), "{page}");
+    assert_eq!(event_seqs(&page), [1, 2], "{page}");
     assert_eq!(
         read(spy.take()),
         ["HEAD", "Events page", "object", "object"]
     );
+
+    // A cursor into sealed history is served from the page holding it, not
+    // refused as below the retained window.
+    let (status, page) = api
+        .post(
+            CLIENT,
+            "events",
+            &json!({"agent": agent(), "cursor": "1", "limit": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(event_seqs(&page), [2, 3], "{page}");
+    assert_eq!(
+        read(spy.take()),
+        ["HEAD", "Events page", "object", "object"]
+    );
+
+    // The operation filter applies before the limit: the first page of an
+    // operation whose one event is on the second sealed page holds that
+    // event and says the operation is done.
+    let page = api
+        .ok(
+            CLIENT,
+            "events",
+            &json!({"agent": agent(), "cursor": Value::Null, "limit": 1, "operation": sealed_op}),
+        )
+        .await;
+    assert_eq!(event_seqs(&page), [SEALED_TURN + 1], "{page}");
+    assert_eq!(page["terminal"], json!("completed"), "{page}");
+    // Saying so costs every events page from the cursor on: nothing bounds
+    // the event seqs of one operation, so the page looks one event past
+    // the limit through the whole history.
+    let mut want = vec!["HEAD".to_string(), "Results page".to_string()];
+    want.extend(std::iter::repeat_n("Events page".to_string(), 12));
+    want.push("object".to_string());
+    assert_eq!(read(spy.take()), want);
 
     // A poll that hands out a new input: `BeginTurn`'s HEAD read, the
     // assignment's state and payload objects, and the route's HEAD read for
@@ -1255,6 +1325,40 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
     let assignment = poll(&api, &worker, 2_000).await;
     assert_eq!(assignment["operation"], sent["operation"]);
     assert_eq!(read(spy.take()), ["HEAD", "object", "object", "HEAD"]);
+
+    // A mailbox deeper than one page: the state read lists every input in
+    // the inbox, sealed or open, in accept order.
+    const QUEUED: u64 = 2 * 64 + 1;
+    for n in 0..QUEUED {
+        api.ok(
+            CLIENT,
+            "send",
+            &send_body(&format!("queued-{n}"), json!({})),
+        )
+        .await;
+    }
+    let (status, state) = api.get(CLIENT, "state?kind=order&key=o-1").await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    let accepted: Vec<u64> = state["mailbox"]
+        .as_array()
+        .expect("mailbox")
+        .iter()
+        .map(|e| e["accept_seq"].as_u64().expect("accept_seq"))
+        .collect();
+    let active = state["active_turn"]["accept_seq"]
+        .as_u64()
+        .expect("active turn");
+    let expected: Vec<u64> = (active..=active + QUEUED).collect();
+    assert_eq!(accepted, expected);
+    let stored = spy
+        .inner
+        .get(&head_key, ravel_object_store::GetRange::Full)
+        .await
+        .expect("HEAD");
+    let head = ravel_agents_core::head::Head::decode(&stored.data).expect("decode HEAD");
+    // The active input and the queued ones: 130 entries leave two sealed
+    // pages of 64.
+    assert_eq!(head.index.inbox.pages.len(), 2);
 
     running.shutdown().await.expect("clean shutdown");
 }

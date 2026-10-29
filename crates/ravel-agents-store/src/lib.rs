@@ -463,10 +463,18 @@ impl AgentStore {
         if let Some(first) = directory.page_for(from) {
             let count = directory.pages.len();
             for page in first..count {
+                // Only events below this page's range come before it; the
+                // open page's are newer than every sealed one.
+                let bound = head
+                    .index
+                    .events
+                    .pages
+                    .get(page)
+                    .map_or(u64::MAX, |p| p.first_key);
                 let held = head
                     .events
                     .iter()
-                    .filter(|e| e.event_seq > after && keep(e))
+                    .filter(|e| e.event_seq > after && e.event_seq < bound && keep(e))
                     .count();
                 if held >= limit {
                     break;

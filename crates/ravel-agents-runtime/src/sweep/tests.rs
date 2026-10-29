@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::tests::{T0, create, head, id_of, poll_now, send, worker};
 use crate::timers::tests::{
-    SEC, TENANT, hint_keys, rig, rig_over, schedule, status, tick_inputs, timer,
+    SEC, TENANT, hint_keys, rig, rig_over, rig_with, schedule, status, tick_inputs, timer,
 };
 use crate::{SweepConfig, SweepMetricsSnapshot, SweepReport};
 
@@ -670,4 +670,24 @@ async fn a_vanished_dir_entry_is_restored_once_the_directory_cursor_wraps() {
     assert_eq!(puts, vec![0, 0, 1], "remembered until the wrap");
     assert_eq!(repaired, vec![0, 0, 1]);
     r.backend.head(&dir).await.expect("dir entry restored");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_visit_reads_only_the_head_of_an_agent_with_sealed_pages() {
+    let mut small = crate::tests::limits();
+    small.kernel.max_page_entries = 2;
+    let r = rig_with(Arc::new(MemoryStore::new()), SweepConfig::default(), small);
+    create(&r.co, "o-1").await;
+    for i in 1..=7 {
+        send(&r.co, "o-1", &format!("r-{i}"), json!({"i": i})).await;
+    }
+    schedule(&r.co, "o-1", "t", T0 + 3600 * SEC).await;
+    let h = head(&r.store, "o-1").await;
+    assert!(h.index.inbox.pages.len() >= 2, "{:?}", h.index.inbox.pages);
+
+    let before = r.store.counters();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    let moved = r.store.counters().since(&before).total();
+    assert_eq!((pass.head_gets, pass.timers_fired), (1, 0));
+    assert_eq!(moved.get, 1, "one HEAD GET and no page GET");
 }
