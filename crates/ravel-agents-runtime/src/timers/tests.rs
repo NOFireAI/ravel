@@ -10,7 +10,7 @@ use ravel_agents_core::wire::{
     CancelTimerRequest, TimerCancelOutcome, TimerRequest, TimerResponse,
 };
 use ravel_agents_store::backoff::NoBackoff;
-use ravel_agents_store::{AgentStore, Clock, StoreLimits};
+use ravel_agents_store::{AgentStore, Clock};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -86,7 +86,7 @@ pub(crate) fn rig_over(backend: Arc<dyn ObjectStoreBackend>, sweep: SweepConfig)
         AgentStore::new(
             backend.clone(),
             TENANT,
-            StoreLimits::default(),
+            crate::tests::limits(),
             now.clone(),
             Arc::new(DerivedIds),
         )

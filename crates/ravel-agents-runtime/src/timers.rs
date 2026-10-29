@@ -45,6 +45,7 @@ use ravel_agents_core::head::{Head, Lifecycle, TimerEntry, TimerStatus};
 use ravel_agents_core::identity::{AgentId, timer_id};
 use ravel_agents_core::kernel::{Effect, Reply};
 use ravel_agents_core::keys::DueBucket;
+use ravel_agents_core::pages::{ListKind, Need, id_fingerprint};
 use ravel_agents_core::wire::{
     CancelTimerRequest, CancelTimerResponse, TimerCancelOutcome, TimerRequest, TimerResponse,
 };
@@ -170,8 +171,16 @@ impl Coordinator {
                     return Ok(CancelTimerResponse { outcome });
                 }
                 Err(e) if e.kind == ErrorKind::OutcomeUnknown => {
-                    let head = self.reload(&agent).await?;
+                    let mut head = self.reload(&agent).await?;
                     let id = timer_id(head.incarnation, &req.timer_key);
+                    // A cancelled or delivered entry may sit on a sealed page.
+                    self.store
+                        .attach(
+                            &agent,
+                            &mut head,
+                            &[(ListKind::Timers, Need::Fingerprint(id_fingerprint(&id)))],
+                        )
+                        .await?;
                     let outcome = match head.timers.iter().find(|t| t.timer_id == id) {
                         None => Some(TimerCancelOutcome::Unknown),
                         Some(t) => match t.status {

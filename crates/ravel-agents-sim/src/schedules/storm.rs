@@ -16,7 +16,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ravel_agents_core::wire::{AgentRef, CreateAgentRequest, SendRequest, WorkerPollRequest};
 use ravel_agents_runtime::{RuntimeConfig, SweepConfig, SweepReport};
-use ravel_agents_store::StoreLimits;
 use ravel_object_store::fault::{FaultPlan, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -27,7 +26,7 @@ use ravel_object_store::{
 use super::*;
 use rand::RngExt;
 
-use crate::drive::{HANDLER, PAST_LEASE_MS, TENANT, pin, runtime_config, turn_values};
+use crate::drive::{HANDLER, PAST_LEASE_MS, TENANT, pin, runtime_config, sim_limits, turn_values};
 use crate::seeds::AgentSeeds;
 
 /// Agents in the storm.
@@ -218,7 +217,7 @@ fn storm(sweep: SweepConfig, seed: Option<u64>) -> Storm {
     let rig = Rig::over(
         MemoryStore::with_page_size(PAGE),
         FaultPlan::empty(),
-        StoreLimits::default(),
+        sim_limits(),
     );
     let ledger = Arc::new(Mutex::new(Ledger {
         phase: Phase::Setup,

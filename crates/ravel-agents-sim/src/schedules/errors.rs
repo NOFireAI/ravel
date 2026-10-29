@@ -16,7 +16,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_types::TenantHash;
 
 use super::*;
-use crate::drive::{HANDLER, Refusal, TENANT, agent, head_object_key, json_bytes, pin};
+use crate::drive::{HANDLER, Refusal, TENANT, agent, head_object_key, json_bytes, pin, sim_limits};
 use crate::reference::Event;
 use crate::{sim_assert, sim_assert_eq};
 
@@ -273,7 +273,7 @@ const HOSTILE_ANSWERS: [HostileAnswer; 7] = [
 fn oversized_payload_is_budget_exceeded() {
     let limits = StoreLimits {
         max_object_bytes: 64,
-        ..StoreLimits::default()
+        ..sim_limits()
     };
     let rig = Rig::with_limits(FaultPlan::empty(), limits);
     create(&rig);
@@ -307,9 +307,9 @@ fn full_mailbox_is_refused() {
     let limits = StoreLimits {
         kernel: Limits {
             max_mailbox_depth: 2,
-            ..Limits::default()
+            ..sim_limits().kernel
         },
-        ..StoreLimits::default()
+        ..sim_limits()
     };
     let rig = Rig::with_limits(FaultPlan::empty(), limits);
     create(&rig);
@@ -348,7 +348,7 @@ fn contended_refusals(seed: u64) -> (usize, u64) {
         max_object_bytes: 64,
         kernel: Limits {
             max_mailbox_depth: 2,
-            ..Limits::default()
+            ..sim_limits().kernel
         },
     };
     let rig = Rig::with_limits(FaultPlan::empty(), limits);

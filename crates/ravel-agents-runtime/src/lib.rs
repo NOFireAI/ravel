@@ -536,13 +536,14 @@ impl Coordinator {
         self.agents.lock().get(agent).map(|l| l.head.clone())
     }
 
-    /// Read HEAD and replace the loaded root with it.
+    /// Read HEAD and replace the loaded root with it: one GET, no sealed
+    /// page. A caller that reads a list entry attaches its page itself; the
+    /// next scan attaches the pages dispatch reads.
     pub(crate) async fn reload(&self, agent: &AgentId) -> Result<Head, AgentError> {
-        match self.store.read_head(agent).await? {
+        match self.store.read_head_shallow(agent).await? {
             HeadState::Present { head, .. } => {
-                let head = *head;
                 self.replace(agent, &head);
-                Ok(head)
+                Ok(*head)
             }
             HeadState::Absent => Err(refused(agent, ErrorKind::AgentGone, "agent does not exist")),
             HeadState::Unsupported { .. } => Err(refused(

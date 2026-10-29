@@ -27,6 +27,7 @@ use ravel_agents_core::head::{
 };
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
 use ravel_agents_core::keys::{AgentKey, AgentKind};
+use ravel_agents_core::pages::{ListKind, Need, receipt_fingerprint};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
     ActiveTurnBody, AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest, CallResponse,
@@ -357,15 +358,28 @@ pub(super) async fn resolve(State(api): State<Api>, req: Request<Body>) -> Respo
             .admit_body::<ResolveRequest>(req, Capability::Agents, Lane::Activation)
             .await?;
         let agent = parse_agent(&body.agent)?;
-        let head = read_head(&call.tenant, &agent).await?;
-        let receipt = head
+        let mut head = read_head(&call.tenant, &agent).await?;
+        let fingerprint = receipt_fingerprint(&body.handler, &body.request_id);
+        call.tenant
+            .store
+            .attach(
+                &agent,
+                &mut head,
+                &[(ListKind::Receipts, Need::Fingerprint(fingerprint))],
+            )
+            .await?;
+        let accept_seq = head
             .receipts
             .iter()
-            .find(|r| r.request_id == body.request_id && r.handler == body.handler);
-        let reply: Reply<ResolveResponse> = Ok(Json(match receipt {
-            Some(r) => ResolveResponse {
-                operation: Some(Handle::operation(agent, head.incarnation, r.accept_seq).encode()),
-                status: operation_state(&head, r.accept_seq).map(Into::into),
+            .find(|r| r.request_id == body.request_id && r.handler == body.handler)
+            .map(|r| r.accept_seq);
+        if let Some(seq) = accept_seq {
+            attach_operation(&call.tenant, &agent, &mut head, seq).await?;
+        }
+        let reply: Reply<ResolveResponse> = Ok(Json(match accept_seq {
+            Some(seq) => ResolveResponse {
+                operation: Some(Handle::operation(agent, head.incarnation, seq).encode()),
+                status: operation_state(&head, seq).map(Into::into),
             },
             None => ResolveResponse {
                 operation: None,
@@ -484,12 +498,21 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             })));
         }
         let after = after.unwrap_or(0);
-        let wanted = |e: &&EventEntry| {
-            e.event_seq > after && operation.is_none_or(|(seq, _)| e.accept_seq == seq)
-        };
+        let keep = |e: &EventEntry| operation.is_none_or(|(seq, _)| e.accept_seq == seq);
         let limit = usize::try_from(body.limit.min(MAX_EVENTS_PAGE)).unwrap_or(1);
+        // A terminal operation's page reads one event past the limit, so
+        // the page that drains its events says so.
+        let finished = operation.filter(|(_, state)| state.is_terminal());
+        let want = limit.saturating_add(usize::from(finished.is_some()));
+        let mut page = call
+            .tenant
+            .store
+            .events_in(&agent, head, after, want, keep)
+            .await?;
+        let more = page.len() > limit;
+        page.truncate(limit);
         let mut events = Vec::new();
-        for event in head.events.iter().filter(wanted).take(limit) {
+        for event in &page {
             events.push(EventBody {
                 event_seq: event.event_seq,
                 accept_seq: event.accept_seq,
@@ -499,18 +522,7 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
             });
         }
         let next = events.last().map_or(after, |e| e.event_seq);
-        let terminal = match operation {
-            Some((seq, state))
-                if state.is_terminal()
-                    && !head
-                        .events
-                        .iter()
-                        .any(|e| e.event_seq > next && e.accept_seq == seq) =>
-            {
-                Some(state.into())
-            }
-            _ => None,
-        };
+        let terminal = finished.filter(|_| !more).map(|(_, state)| state.into());
         Ok::<_, Refusal>(Json(EventsResponse {
             events,
             next_cursor: next.to_string(),
@@ -1203,8 +1215,10 @@ fn operation_seq(handle: &Handle) -> u64 {
     }
 }
 
+/// HEAD with no sealed page attached: one GET. A route that reads a paged
+/// list entry attaches that entry's page with [`attach`].
 async fn read_head(tenant: &TenantAgents, agent: &AgentId) -> Result<Head, Refusal> {
-    match tenant.store.read_head(agent).await? {
+    match tenant.store.read_head_shallow(agent).await? {
         HeadState::Present { head, .. } if head.lifecycle != Lifecycle::Tombstoned => Ok(*head),
         HeadState::Present { .. } | HeadState::Absent => Err(refusal(
             ErrorKind::AgentGone,
@@ -1217,6 +1231,33 @@ async fn read_head(tenant: &TenantAgents, agent: &AgentId) -> Result<Head, Refus
             "HEAD format version is newer than this release",
         )),
     }
+}
+
+/// Attach to `head` the pages holding the operation `accept_seq` names, so
+/// `operation_state` and its result read the root as a whole would: the
+/// results page, then the inbox page only when the operation has no result
+/// and is not the active turn's.
+async fn attach_operation(
+    tenant: &TenantAgents,
+    agent: &AgentId,
+    head: &mut Head,
+    accept_seq: u64,
+) -> Result<(), Refusal> {
+    let store = &tenant.store;
+    store
+        .attach(agent, head, &[(ListKind::Results, Need::Key(accept_seq))])
+        .await?;
+    let settled = head.results.iter().any(|r| r.accept_seq == accept_seq);
+    let active = head
+        .active_turn
+        .as_ref()
+        .is_some_and(|t| t.input_accept_seq == accept_seq);
+    if !settled && !active {
+        store
+            .attach(agent, head, &[(ListKind::Inbox, Need::Key(accept_seq))])
+            .await?;
+    }
+    Ok(())
 }
 
 /// HEAD and the state of the operation `handle` names. A handle this tenant
@@ -1239,7 +1280,7 @@ async fn read_operation(
             "operation is not known to this agent",
         )
     };
-    let head = match tenant.store.read_head(&handle.agent).await? {
+    let mut head = match tenant.store.read_head_shallow(&handle.agent).await? {
         HeadState::Present { head, .. } if head.lifecycle != Lifecycle::Tombstoned => *head,
         HeadState::Present { .. } => return Err(gone()),
         HeadState::Absent => {
@@ -1260,7 +1301,9 @@ async fn read_operation(
     if head.incarnation != handle.incarnation {
         return Err(gone());
     }
-    let state = operation_state(&head, operation_seq(handle)).ok_or_else(gone)?;
+    let seq = operation_seq(handle);
+    attach_operation(tenant, &handle.agent, &mut head, seq).await?;
+    let state = operation_state(&head, seq).ok_or_else(gone)?;
     Ok((head, state))
 }
 
