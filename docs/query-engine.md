@@ -1214,8 +1214,8 @@ same RAII `reserve` API, so they read under `component="fetch"`.
 
 **Series held by a discovery read.** Over metrics, `/api/v1/series`,
 `/api/v1/labels` and `/api/v1/label/{name}/values` fold each segment's
-matched series into one map
-as that segment's fetch completes, keeping one copy per series id, and reserve
+matched series into one map as that segment's fetch completes, keeping one
+copy per series id, and reserve
 each series they add against the same budget: its id, its label set and each
 label's two strings (`retained_series_len` in `engine.rs`). A series appears
 in every object it wrote to, so keeping each segment's entries until the last
@@ -1225,7 +1225,7 @@ selector whose retained series do not fit is refused with the same 422
 checked as each series is added, so a selector over it is refused before its
 remaining segments are fetched. The reservation is released when a selector's
 map is handed to the endpoint. The endpoint's merge of several selectors'
-series (`resolve_matched_series` in `http/service.rs`, issue #3473) and the response it
+series (`resolve_matched_series` in `http/service.rs`) and the response it
 renders are not charged, and `max_series` does not bound that merged set.
 
 ## Endpoints (Prometheus compatibility subset)
