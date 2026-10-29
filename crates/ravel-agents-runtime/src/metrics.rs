@@ -2,6 +2,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
+use ravel_agents_core::command::Command;
+use ravel_agents_core::error::{AgentError, BudgetCap};
+use ravel_agents_core::identity::AgentId;
+use ravel_agents_core::kernel::{Limits, Usage};
+use ravel_agents_core::keys::{AgentKey, AgentKind};
+use ravel_agents_store::Outcome;
 use ravel_agents_store::counters::CounterSnapshot;
 
 use crate::Coordinator;
@@ -63,6 +70,105 @@ pub(crate) struct Metrics {
     pub(crate) sweep_dir_entries_repaired: AtomicU64,
     pub(crate) sweep_directory_cycles: AtomicU64,
     pub(crate) sweep_last_directory_cycle_ms: AtomicU64,
+    /// Kernel refusals by the cap they hit, in [`BudgetCap::ALL`] order.
+    pub(crate) budget_refusals: [AtomicU64; 5],
+    /// The fill the last completed directory cycle measured.
+    pub(crate) fill: parking_lot::Mutex<Option<FillSnapshot>>,
+}
+
+/// The lists whose fill a directory cycle measures, in the order of
+/// [`FillSnapshot::max_ratio`] and [`FillSnapshot::near_cap`].
+pub const FILL_LISTS: [&str; 4] = ["receipts", "results", "events", "timers"];
+
+/// How close the agents of one tenant were to their lifetime caps over the
+/// last completed directory cycle, which reads every agent's HEAD once. Each
+/// list's figure is the agent's receipt count over `Limits::max_receipts`
+/// for `receipts`, and its sealed pages over `Limits::max_index_pages` for
+/// `results`, `events` and `timers`; inline entries are not counted, since
+/// only sealed pages approach the cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FillSnapshot {
+    /// The highest fill of any agent, per list in [`FILL_LISTS`] order. A
+    /// cap of zero reads as full.
+    pub max_ratio: [f64; 4],
+    /// The highest encoded HEAD size of any agent over `Limits::max_head_bytes`.
+    pub head_bytes_max_ratio: f64,
+    /// Agents at or above [`NEAR_CAP_PERCENT`] of a list's cap, per list in
+    /// [`FILL_LISTS`] order.
+    pub near_cap: [u64; 4],
+    /// Agents the cycle measured: every `_dir` entry whose HEAD was present
+    /// and readable.
+    pub agents: u64,
+}
+
+/// The share of a cap at or above which an agent counts in
+/// [`FillSnapshot::near_cap`].
+pub const NEAR_CAP_PERCENT: u64 = 75;
+
+/// The running tally of the directory cycle in progress.
+#[derive(Debug, Default)]
+pub(crate) struct FillTally {
+    max: [u64; 4],
+    head_bytes_max: u64,
+    near_cap: [u64; 4],
+    agents: u64,
+}
+
+fn caps(limits: &Limits) -> [u64; 4] {
+    let pages = u64::try_from(limits.max_index_pages).unwrap_or(u64::MAX);
+    [limits.max_receipts, pages, pages, pages]
+}
+
+fn ratio(value: u64, cap: u64) -> f64 {
+    if cap == 0 {
+        return 1.0;
+    }
+    value as f64 / cap as f64
+}
+
+impl FillTally {
+    pub(crate) fn add(&mut self, usage: &Usage, limits: &Limits) {
+        let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let values = [
+            usage.receipts,
+            wide(usage.results_pages),
+            wide(usage.events_pages),
+            wide(usage.timers_pages),
+        ];
+        for ((value, cap), (max, near)) in values
+            .into_iter()
+            .zip(caps(limits))
+            .zip(self.max.iter_mut().zip(self.near_cap.iter_mut()))
+        {
+            *max = (*max).max(value);
+            if u128::from(value) * 100 >= u128::from(cap) * u128::from(NEAR_CAP_PERCENT) {
+                *near += 1;
+            }
+        }
+        self.head_bytes_max = self.head_bytes_max.max(wide(usage.head_bytes));
+        self.agents += 1;
+    }
+
+    pub(crate) fn snapshot(&self, limits: &Limits) -> FillSnapshot {
+        let caps = caps(limits);
+        let max_head = u64::try_from(limits.max_head_bytes).unwrap_or(u64::MAX);
+        FillSnapshot {
+            max_ratio: std::array::from_fn(|i| ratio(self.max[i], caps[i])),
+            head_bytes_max_ratio: ratio(self.head_bytes_max, max_head),
+            near_cap: self.near_cap,
+            agents: self.agents,
+        }
+    }
+}
+
+/// The capacity figures `ravel-server` renders on `/metrics`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CapacityMetricsSnapshot {
+    /// Commands the kernel refused for a lifetime cap, in [`BudgetCap::ALL`]
+    /// order.
+    pub budget_refusals: [u64; 5],
+    /// The last completed directory cycle's fill; `None` before the first.
+    pub fill: Option<FillSnapshot>,
 }
 
 /// The timer and sweep counters, summed over every pass since the
@@ -102,6 +208,75 @@ pub struct SweepMetricsSnapshot {
 }
 
 impl Coordinator {
+    /// Refusals by cap and the last directory cycle's fill.
+    pub fn capacity_metrics(&self) -> CapacityMetricsSnapshot {
+        let m = &self.metrics;
+        CapacityMetricsSnapshot {
+            budget_refusals: std::array::from_fn(|i| m.budget_refusals[i].load(Ordering::Relaxed)),
+            fill: *m.fill.lock(),
+        }
+    }
+
+    pub(crate) fn publish_fill(&self, fill: FillSnapshot) {
+        *self.metrics.fill.lock() = Some(fill);
+    }
+
+    /// `result`, after counting a refusal that names the lifetime cap it hit.
+    fn count_refusal<T>(&self, result: Result<T, AgentError>) -> Result<T, AgentError> {
+        if let Err(error) = &result
+            && let Some(cap) = error.cap
+            && let Some(i) = BudgetCap::ALL.iter().position(|c| *c == cap)
+        {
+            self.metrics.budget_refusals[i].fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// [`ravel_agents_store::AgentStore::execute`], counting a cap refusal.
+    pub(crate) async fn execute(
+        &self,
+        agent: &AgentId,
+        command: &Command,
+    ) -> Result<Outcome, AgentError> {
+        self.count_refusal(self.store.execute(agent, command).await)
+    }
+
+    /// [`ravel_agents_store::AgentStore::execute_with`], counting a cap
+    /// refusal.
+    pub(crate) async fn execute_with(
+        &self,
+        agent: &AgentId,
+        command: &Command,
+        deps: &[Bytes],
+    ) -> Result<Outcome, AgentError> {
+        self.count_refusal(self.store.execute_with(agent, command, deps).await)
+    }
+
+    /// [`ravel_agents_store::AgentStore::enqueue`], counting a cap refusal.
+    pub(crate) async fn enqueue(
+        &self,
+        agent: &AgentId,
+        incarnation: u64,
+        request_id: &str,
+        handler: &str,
+        payload: Bytes,
+    ) -> Result<Outcome, AgentError> {
+        self.count_refusal(
+            self.store
+                .enqueue(agent, incarnation, request_id, handler, payload)
+                .await,
+        )
+    }
+
+    /// [`ravel_agents_store::AgentStore::create`], counting a cap refusal.
+    pub(crate) async fn create_agent(
+        &self,
+        kind: AgentKind,
+        key: AgentKey,
+    ) -> Result<Outcome, AgentError> {
+        self.count_refusal(self.store.create(kind, key).await)
+    }
+
     /// The timer and sweep counters.
     pub fn sweep_metrics(&self) -> SweepMetricsSnapshot {
         let m = &self.metrics;

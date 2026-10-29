@@ -165,13 +165,17 @@ impl Fixture {
     /// A server whose tenants run the periodic sweep every
     /// `sweep_interval_ms`.
     async fn start_with_interval(&self, sweep_interval_ms: u64) -> ravel_server::Running {
+        self.start_with(agents_config(self.clock(), sweep_interval_ms))
+            .await
+    }
+
+    async fn start_with(&self, agents: AgentsConfig) -> ravel_server::Running {
+        start_server(self.store.clone(), agents).await
+    }
+
+    fn clock(&self) -> AgentsClock {
         let now = self.now.clone();
-        start_server(
-            self.store.clone(),
-            AgentsClock(Some(Arc::new(move || now.load(Ordering::SeqCst)))),
-            sweep_interval_ms,
-        )
-        .await
+        AgentsClock(Some(Arc::new(move || now.load(Ordering::SeqCst))))
     }
 
     /// The agent's HEAD as the store holds it.
@@ -245,15 +249,14 @@ fn principals() -> Arc<dyn ravel_query::http::TenantResolver> {
 /// clock injected.
 async fn start_server(
     store: Arc<dyn ObjectStoreBackend>,
-    clock: AgentsClock,
-    sweep_interval_ms: u64,
+    agents: AgentsConfig,
 ) -> ravel_server::Running {
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: QueryBudgets {
-            agents: agents_config(clock, sweep_interval_ms),
+            agents,
             ..Default::default()
         },
         max_inflight_flushes: 1,
@@ -1062,6 +1065,156 @@ async fn inspector_is_served_to_agents_tokens_with_every_section() {
             html.matches(&format!("id=\"{id}\"")).count(),
             1,
             "marker {id}"
+        );
+    }
+    running.shutdown().await.expect("server stops");
+}
+
+/// The sample of `name` carrying `label`, as the float it renders.
+fn ratio(scrape: &str, name: &str, label: &str) -> f64 {
+    let lines: Vec<&str> = scrape
+        .lines()
+        .filter(|line| line.starts_with(name) && line.contains(label))
+        .collect();
+    assert_eq!(lines.len(), 1, "{name} {label}: {lines:?}");
+    lines[0]
+        .rsplit(' ')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("float sample")
+}
+
+/// Issue #3454 on the real `/metrics` surface: at `max_receipts` 4, `o-1`
+/// holds 3 receipts and `o-2` 4, whose next send is refused for the
+/// receipts cap; the sweep cycle then publishes the fill. The state route
+/// reports the counts behind it.
+#[tokio::test]
+async fn a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter() {
+    let fixture = Fixture::new(FaultPlan::empty());
+    let running = fixture
+        .start_with(AgentsConfig {
+            max_receipts: 4,
+            ..agents_config(fixture.clock(), 0)
+        })
+        .await;
+    let api = Api::public(&running);
+    let send = |key: &'static str, i: u32| {
+        let api = api.clone();
+        async move {
+            api.post(
+                CLIENT,
+                "send",
+                &json!({"agent": agent(key), "handler": "place", "request_id": format!("r-{i}"), "payload": {}}),
+            )
+            .await
+        }
+    };
+    for (key, sends) in [("o-1", 3), ("o-2", 4), ("o-3", 0)] {
+        create(&api, key).await;
+        for i in 0..sends {
+            let (status, body) = send(key, i).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+    let (status, body) = send("o-2", 4).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(
+        (&body["code"], &body["cap"]),
+        (&json!("budget_exceeded"), &json!("receipts"))
+    );
+
+    let mut head_bytes = Vec::new();
+    for key in ["o-1", "o-2", "o-3"] {
+        let usage = state(&api, key).await["usage"].clone();
+        head_bytes.push(usage["head_bytes"].as_u64().expect("head bytes"));
+        if key == "o-2" {
+            assert_eq!(
+                usage,
+                json!({
+                    "receipts": 4,
+                    "max_receipts": 4,
+                    "results_pages": 0,
+                    "events_pages": 0,
+                    "timers_pages": 0,
+                    "max_index_pages": 512,
+                    "head_bytes": head_bytes[1],
+                    "max_head_bytes": 262_144,
+                })
+            );
+        }
+    }
+    let largest = head_bytes.iter().copied().max().expect("three agents");
+    assert_eq!(
+        largest,
+        fixture.read_head("o-2").await.encode().len() as u64
+    );
+
+    let before = fixture.requests.snapshot();
+    let report = api.sweep().await;
+    let after = fixture.requests.snapshot();
+    assert_eq!(report["head_gets"], json!(3), "{report}");
+    assert_eq!(after.2 - before.2, 3, "one HEAD read an agent and no more");
+
+    let scrape = api.scrape().await;
+    let fill = "ravel_agents_index_fill_max_ratio{";
+    for (list, want) in [
+        ("receipts", 1.0),
+        ("results", 0.0),
+        ("events", 0.0),
+        ("timers", 0.0),
+    ] {
+        assert_eq!(
+            ratio(&scrape, fill, &format!("list=\"{list}\"")),
+            want,
+            "{list}"
+        );
+    }
+    assert_eq!(
+        ratio(&scrape, "ravel_agents_head_bytes_max_ratio{", "mode="),
+        largest as f64 / 262_144.0
+    );
+    for (list, want) in [
+        ("receipts", 2),
+        ("results", 0),
+        ("events", 0),
+        ("timers", 0),
+    ] {
+        assert_eq!(
+            value(
+                &scrape,
+                "ravel_agents_agents_near_cap",
+                &format!("list=\"{list}\"")
+            ),
+            want,
+            "{list}"
+        );
+    }
+    for (cap, want) in [
+        ("receipts", 1),
+        ("index_pages", 0),
+        ("head_bytes", 0),
+        ("mailbox", 0),
+        ("timers", 0),
+    ] {
+        assert_eq!(
+            value(
+                &scrape,
+                "ravel_agents_budget_refusals_total",
+                &format!("cap=\"{cap}\"")
+            ),
+            want,
+            "{cap}"
+        );
+    }
+    for (name, kind) in [
+        ("ravel_agents_index_fill_max_ratio", "gauge"),
+        ("ravel_agents_head_bytes_max_ratio", "gauge"),
+        ("ravel_agents_agents_near_cap", "gauge"),
+        ("ravel_agents_budget_refusals_total", "counter"),
+    ] {
+        assert!(
+            scrape.contains(&format!("# TYPE {name} {kind}\n")),
+            "{name}"
         );
     }
     running.shutdown().await.expect("server stops");

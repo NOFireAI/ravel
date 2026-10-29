@@ -26,9 +26,9 @@ use ravel_agents_core::kernel::DerivedIds;
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::wire::{
     EffectsResponse, EventsResponse, OperationResponse, OperationStatus, ReconcileRequest,
-    ReconcileResponse, StateResponse,
+    ReconcileResponse, StateResponse, UsageBody,
 };
-use ravel_agents_store::{AgentStore, Clock, StoreLimits};
+use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
 use ravel_cli::agents::{
     self, AgentsCliError, DevHost, DevOptions, InspectOutput, ListOutput, ReconcileChoice,
 };
@@ -624,10 +624,37 @@ async fn events_and_list_read_only_the_pages_they_print() {
     let reader = agents::reader(backend, TENANT);
 
     let before = gets(&reader);
-    agents::inspect(&reader, seeded.agent)
+    let inspected = agents::inspect(&reader, seeded.agent)
         .await
         .expect("inspect");
     let full = gets(&reader) - before;
+    let head_bytes = match reader.read_head_shallow(&seeded.agent).await.expect("HEAD") {
+        HeadState::Present { head, .. } => head.encode().len() as u64,
+        other => panic!("no HEAD: {other:?}"),
+    };
+    // The counts behind each cap, against the default caps the reader
+    // enforces: two sends left two receipts, and one sealed events page
+    // holds events 1 and 2.
+    assert_eq!(
+        inspected.state.usage,
+        Some(UsageBody {
+            receipts: 2,
+            max_receipts: 1024,
+            results_pages: 0,
+            events_pages: 1,
+            timers_pages: 0,
+            max_index_pages: 512,
+            head_bytes,
+            max_head_bytes: 262_144,
+        })
+    );
+    let text = agents::render_inspect(&inspected);
+    assert!(
+        text.contains(&format!(
+            "usage (default caps): receipts 2/1024  sealed pages results 0 events 1 timers 0 of 512  head bytes {head_bytes}/262144\n"
+        )),
+        "{text}"
+    );
 
     let before = gets(&reader);
     let page = agents::events(&reader, seeded.agent, None, 2)

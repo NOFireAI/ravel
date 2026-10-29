@@ -3,9 +3,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use ravel_agents_core::error::{AgentError, BudgetCap};
 use ravel_agents_core::head::TimerStatus;
+use ravel_agents_core::kernel::Limits;
 use ravel_agents_core::keys::{dir_key, dir_prefix, wake_prefix};
-use ravel_agents_core::wire::TimerRequest;
+use ravel_agents_core::wire::{SendRequest, TimerRequest};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -18,7 +20,7 @@ use crate::tests::{T0, create, head, id_of, poll_now, send, worker};
 use crate::timers::tests::{
     SEC, TENANT, hint_keys, rig, rig_over, rig_with, schedule, status, tick_inputs, timer,
 };
-use crate::{SweepConfig, SweepMetricsSnapshot, SweepReport};
+use crate::{FillSnapshot, SweepConfig, SweepMetricsSnapshot, SweepReport};
 
 fn lost_hints() -> Arc<FaultStore<MemoryStore>> {
     Arc::new(FaultStore::new(
@@ -690,4 +692,215 @@ async fn a_visit_reads_only_the_head_of_an_agent_with_sealed_pages() {
     let moved = r.store.counters().since(&before).total();
     assert_eq!((pass.head_gets, pass.timers_fired), (1, 0));
     assert_eq!(moved.get, 1, "one HEAD GET and no page GET");
+}
+
+/// Small caps, so every fill is an exact fraction: two entries a page,
+/// eight pages a list, eight receipts.
+fn fill_limits() -> ravel_agents_store::StoreLimits {
+    let mut limits = crate::tests::limits();
+    limits.kernel.max_page_entries = 2;
+    limits.kernel.max_index_pages = 8;
+    limits.kernel.max_receipts = 8;
+    limits
+}
+
+/// Run one turn of `key` to completion, committing `events` events.
+async fn run_turn(co: &crate::Coordinator, worker_id: &str, key: &str, events: usize) {
+    use ravel_agents_core::wire::{EventSpecBody, TurnOutcome, WorkerCommitRequest};
+    let assignment = poll_now(co, worker_id, "v1").await.expect("a turn");
+    assert_eq!(assignment.lease.agent_id, id_of(key).to_hex());
+    co.commit(&WorkerCommitRequest {
+        lease: assignment.lease.clone(),
+        outcome: TurnOutcome::Completed {
+            state: json!({"n": 1}),
+            output: serde_json::Value::Null,
+            events: (0..events)
+                .map(|i| EventSpecBody {
+                    event_type: "e".to_string(),
+                    payload: json!({"i": i}),
+                })
+                .collect(),
+            timers: Vec::new(),
+            intents: Vec::new(),
+        },
+    })
+    .await
+    .expect("commit");
+}
+
+/// Five agents in `_dir` LIST order: receipts at 7 of 8; 6 receipts with 6
+/// results (2 sealed pages) and 12 events (5 sealed pages, 2 inline); 13
+/// cancelled timers (6 sealed pages, 1 inline); one receipt; and, last,
+/// nothing. The highest fill is never the last agent's, and the events and
+/// timers figures differ from their inline entry counts.
+#[tokio::test(start_paused = true)]
+async fn a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts() {
+    let r = rig_with(
+        Arc::new(MemoryStore::new()),
+        SweepConfig::default(),
+        fill_limits(),
+    );
+    let keys: Vec<String> = (0..5).map(|i| format!("f-{i}")).collect();
+    for key in &keys {
+        create(&r.co, key).await;
+    }
+    let mut order = keys.clone();
+    order.sort_by_key(|k| id_of(k).to_hex());
+    let w = worker(&r.co, "v1");
+    for i in 0..6 {
+        send(&r.co, &order[1], &format!("r-{i}"), json!({"i": i})).await;
+        run_turn(&r.co, &w, &order[1], 2).await;
+    }
+    for i in 0..7 {
+        send(&r.co, &order[0], &format!("r-{i}"), json!({"i": i})).await;
+    }
+    for i in 0..13 {
+        let t = format!("t-{i}");
+        schedule(&r.co, &order[2], &t, T0 + 3600 * SEC).await;
+        crate::timers::tests::cancel(&r.co, &order[2], &t).await;
+    }
+    send(&r.co, &order[3], "r-0", json!({})).await;
+
+    let busy = head(&r.store, &order[1]).await;
+    assert_eq!(
+        (
+            busy.index.events.pages.len(),
+            busy.index.results.pages.len()
+        ),
+        (5, 2)
+    );
+    let timed = head(&r.store, &order[2]).await;
+    assert_eq!(timed.index.timers.pages.len(), 6);
+    let mut sizes = Vec::new();
+    for key in &order {
+        sizes.push(head(&r.store, key).await.encode().len());
+    }
+    let largest = sizes.iter().copied().max().expect("five agents");
+    assert_eq!(sizes.iter().position(|s| *s == largest), Some(1));
+    assert_eq!(r.co.capacity_metrics().fill, None, "no cycle yet");
+
+    let before = r.store.counters();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    let moved = r.store.counters().since(&before).total();
+    assert_eq!(pass.head_gets, 5);
+    assert_eq!(
+        (moved.get, moved.list),
+        (5, 2),
+        "one HEAD GET an agent, no page GET for the fill"
+    );
+    let fill = r.co.capacity_metrics().fill.expect("the cycle completed");
+    assert_eq!(
+        fill,
+        FillSnapshot {
+            max_ratio: [0.875, 0.25, 0.625, 0.75],
+            head_bytes_max_ratio: largest as f64 / 262_144.0,
+            near_cap: [2, 0, 0, 1],
+            agents: 5,
+        }
+    );
+}
+
+/// The fill is published when the directory cursor wraps, not per pass: ten
+/// agents at four reads a pass publish after the third pass, over all ten.
+#[tokio::test(start_paused = true)]
+async fn the_fill_is_published_only_when_a_directory_cycle_completes() {
+    let r = rig_with(
+        Arc::new(MemoryStore::with_page_size(3)),
+        SweepConfig {
+            max_head_gets: 4,
+            ..SweepConfig::default()
+        },
+        fill_limits(),
+    );
+    for i in 0..10 {
+        let key = format!("o-{i}");
+        create(&r.co, &key).await;
+        for j in 0..i.min(6) {
+            send(&r.co, &key, &format!("r-{j}"), json!({})).await;
+        }
+    }
+    let mut published = Vec::new();
+    for _ in 0..3 {
+        r.co.sweep_once(&TENANT).await.expect("sweep");
+        published.push(r.co.capacity_metrics().fill.map(|f| f.agents));
+    }
+    assert_eq!(published, vec![None, None, Some(10)]);
+    let fill = r.co.capacity_metrics().fill.expect("published");
+    assert_eq!(fill.max_ratio[0], 0.75);
+    // Agents o-6 to o-9 hold six receipts each.
+    assert_eq!(fill.near_cap[0], 4);
+}
+
+/// Send to `key` until a send is refused, and return the refusal.
+async fn send_until_refused(co: &crate::Coordinator, key: &str) -> AgentError {
+    for i in 0..10_000 {
+        let req = SendRequest {
+            agent: crate::tests::agent_ref(key),
+            handler: "step".to_string(),
+            request_id: format!("r-{i}"),
+            payload: json!({"i": i}),
+        };
+        if let Err(e) = co.send(&req).await {
+            return e;
+        }
+    }
+    panic!("no send to {key} was refused");
+}
+
+/// Every cap a test can reach, refused once through the coordinator: the
+/// refusal names its cap, and `budget_refusals` moves by exactly one, under
+/// that cap only.
+#[tokio::test(start_paused = true)]
+async fn each_cap_refusal_moves_its_counter_by_exactly_one() {
+    type Shape = fn(&mut Limits);
+    let cases: [(BudgetCap, Shape); 5] = [
+        (BudgetCap::Mailbox, |l| l.max_mailbox_depth = 2),
+        (BudgetCap::Receipts, |l| l.max_receipts = 3),
+        (BudgetCap::Timers, |l| l.max_timers = 1),
+        (BudgetCap::IndexPages, |l| {
+            l.max_page_entries = 2;
+            l.max_index_pages = 1;
+        }),
+        (BudgetCap::HeadBytes, |l| l.max_head_bytes = 1_024),
+    ];
+    for (cap, shape) in cases {
+        let mut limits = crate::tests::limits();
+        shape(&mut limits.kernel);
+        let r = rig_with(Arc::new(MemoryStore::new()), SweepConfig::default(), limits);
+        create(&r.co, "o-1").await;
+        let error = if cap == BudgetCap::Timers {
+            schedule(&r.co, "o-1", "a", T0 + SEC).await;
+            r.co.schedule_timer(&timer("o-1", "b", T0 + SEC))
+                .await
+                .expect_err("a second timer is past the cap")
+        } else {
+            send_until_refused(&r.co, "o-1").await
+        };
+        assert_eq!(error.cap, Some(cap), "{error:?}");
+        let mut expected = [0; 5];
+        expected[BudgetCap::ALL.iter().position(|c| *c == cap).expect("cap")] = 1;
+        assert_eq!(r.co.capacity_metrics().budget_refusals, expected, "{cap:?}");
+    }
+}
+
+/// A refusal of a per-command bound names no cap and is not counted.
+#[tokio::test(start_paused = true)]
+async fn a_per_command_refusal_is_not_counted_as_a_cap() {
+    let r = rig();
+    create(&r.co, "o-1").await;
+    let long = "x".repeat(ravel_agents_core::kernel::Limits::default().max_string_bytes + 1);
+    let error =
+        r.co.send(&SendRequest {
+            agent: crate::tests::agent_ref("o-1"),
+            handler: "step".to_string(),
+            request_id: long,
+            payload: json!({}),
+        })
+        .await
+        .expect_err("the request id is past the string cap");
+    assert_eq!(
+        (error.kind, error.cap),
+        (ravel_agents_core::error::ErrorKind::BudgetExceeded, None)
+    );
+    assert_eq!(r.co.capacity_metrics().budget_refusals, [0; 5]);
 }

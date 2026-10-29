@@ -414,7 +414,17 @@ tool input (`SafeIds`).
 | `UnsupportedFormat` | `unsupported_format` | a record carries a format version or representation this binary does not read | `never` |
 
 The wire form carries the code and the retry hint
-(`wire::fixtures::tests::error_body_carries_the_code_and_retry_hint`).
+(`wire::fixtures::tests::error_body_carries_the_code_and_retry_hint`). A
+refusal of a lifetime cap also names the cap in `cap`, from `BudgetCap` in
+the same file: `receipts` (`Limits::max_receipts`), `index_pages`
+(`max_index_pages`, or one page's entries), `head_bytes` (`max_head_bytes`,
+or the reserve the growth guard keeps under it), `mailbox`
+(`max_mailbox_depth`, on `mailbox_full`) or `timers` (`max_timers`)
+(`wire::fixtures::error_body_names_the_cap_a_budget_refusal_hit`; runtime
+`each_cap_refusal_moves_its_counter_by_exactly_one` reaches all five). A
+`budget_exceeded` for a per-command bound (a caller string, one turn's
+events or intents, an exhausted counter) names none
+(`a_per_command_refusal_is_not_counted_as_a_cap`).
 
 ## Wire
 
@@ -424,6 +434,22 @@ listed route by route in
 [the HTTP API reference](reference/http-api.md#agents-routes). Their JSON
 forms are pinned by the files in `sdk/fixtures/`, which
 `wire::fixtures::tests` regenerates and checks.
+
+Fill. `GET /api/v1/agents/state` answers `usage`, the counts behind each
+lifetime cap read from the agent's HEAD as stored: `receipts` against
+`max_receipts`, the sealed pages of the results, events and timers lists
+against `max_index_pages`, and the encoded HEAD size against
+`max_head_bytes` (`a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter`).
+A list's inline entries are not counted, since only sealed pages approach
+the page cap. `ravel-cli agents inspect` prints the same counts against the
+default caps: it reads the bucket directly and cannot see a server's
+`--agents-max-*` flags (`events_and_list_read_only_the_pages_they_print`). The sweep measures the
+same counts for every agent from the HEAD each directory cycle already
+reads, with no further request, and publishes the highest fill per list and
+the agents at or above 75% of a list's cap once the cycle completes
+(runtime `a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts`,
+`the_fill_is_published_only_when_a_directory_cycle_completes`;
+`docs/guides/observability.md`, "Ravel Agents capacity").
 
 Canonical step-input encoding. A step's `input_hash` is
 `identity::step_input_hash(tool_name, tool_version, input)` over the bytes of
@@ -630,7 +656,8 @@ routes of a running server.
 | A command succeeds only when its HEAD CAS returned `Ok` | in the crates (M1) | `an_unknown_cas_outcome_is_never_retried` (an ambiguous CAS is not reported as success), `a_failed_conditional_write_re_reads_and_succeeds_on_retry` (a refused CAS is not) |
 | An ambiguous CAS returns `OutcomeUnknown` with a handle that resolves later | in the crates (M1) | `cas_applied_with_lost_response_is_resolved_by_operation_id_after_a_later_revision` |
 | Duplicate send with the same id and hash returns the same handle; a different hash conflicts | in the crates (M1) | store `enqueue_with_the_same_request_id_and_hash_returns_the_same_handle`, kernel `retries_are_idempotent_and_conflicts_are_typed` |
-| Mailbox and HEAD byte caps refuse with a typed error, never drop; the receipt cap refuses the same way in code but has no test yet (test debt for T14) | in the crates (M1) | kernel `logical_caps_and_the_byte_cap_are_typed`, store `a_full_mailbox_is_refused_before_any_write` |
+| Mailbox, receipt, timer, index page and HEAD byte caps refuse with a typed error naming the cap, never drop | in the crates (M1); the receipt cap end to end | kernel `logical_caps_and_the_byte_cap_are_typed`, store `a_full_mailbox_is_refused_before_any_write`, runtime `each_cap_refusal_moves_its_counter_by_exactly_one`; e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` (a send past `max_receipts` is 413 with `cap` `receipts`) |
+| Each agent's fill against its lifetime caps, and every cap refusal, is reported | end to end | e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` (the four families on `/metrics` and the state route's `usage`); runtime `a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts` (the cycle issues one HEAD GET an agent and no other) |
 | A turn commit publishes state, result, events and intents in one write, and rebases over a concurrent send | in the crates (M1) | kernel `turn_commit_publishes_state_input_result_events_and_intents_together`, `a_commit_rebases_onto_a_root_that_moved_without_touching_the_turn` |
 | A stale owner cannot commit or heartbeat after a takeover | in the crates (kernel); end to end | kernel `a_commit_after_takeover_is_ownership_lost`, `every_fenced_command_refuses_a_stale_fence`; e2e `send_then_result_through_real_server_survives_worker_replacement` (the replaced worker's commit and heartbeat both answer 409 `ownership_lost`) |
 | Failed turns retry under a new turn id, then dead-letter | in the crates (kernel); the retry end to end | kernel `failed_turns_retry_under_a_new_turn_id_then_dead_letter`; e2e `a_failed_effect_replays_as_the_steps_failure_and_the_turn_may_fail` (a retryable failure is accepted and the turn runs again under a new turn id); no e2e test reaches the dead letter |
@@ -649,7 +676,7 @@ routes of a running server.
 | Every route refuses a token lacking its capability with 403, naming the capability | in the server (every route); end to end (the routes named) | server `every_route_refuses_a_token_lacking_its_capability` sends every route in the `ROUTES` table, whose third column is the route's capability, a token holding every capability but that one and expects 403; e2e `capabilities_are_enforced_on_both_listeners` (`agents`, `agents_worker`), `manual_blocks_until_reconciled_and_audits_the_decision_once` (`agents_admin` on `reconcile`), `sweep_route_counts_match_the_store_and_needs_agents_admin` (`agents_admin` on `sweep`), `inspector_is_served_to_agents_tokens_with_every_section` (`agents` on `inspector`) |
 | A HEAD that cannot be read under an operation handle answers `outcome_unknown`, not `agent_gone` | end to end | e2e `a_not_found_blip_under_a_handle_is_outcome_unknown_not_agent_gone`; an unknown handle is `agent_gone` (`unknown_operation_handle_is_agent_gone_with_the_handle`) |
 | HTTP routes for timers and the sweep | end to end | e2e `due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint`, `cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`, `a_reschedule_supersedes_the_earlier_generation`, `sweep_route_counts_match_the_store_and_needs_agents_admin` |
-| `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers` set the kernel caps | on main | the server passes them as the kernel limits of every tenant's store, and the kernel refuses past a cap with a typed error (`logical_caps_and_the_byte_cap_are_typed`); no e2e test sets one below its default |
+| `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers` set the kernel caps | on main | the server passes them as the kernel limits of every tenant's store, and the kernel refuses past a cap with a typed error (`logical_caps_and_the_byte_cap_are_typed`); e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` sets `max_receipts` to 4 and is refused at the fifth send |
 | `--agents-max-agents`, `--agents-max-state-bytes` and `--agents-memory-budget` are enforced | follow-up | The routes do not enforce these three flags: they are parsed and reported on `GET /api/v1/agents/health` and `/metrics` only (`agents_flags_parse_and_reach_query_budgets`, `health_reports_feature_mode_and_every_setting`). Enforcing them is left to a follow-up. |
 | Projection of history into logs and traces | M5 | ADR-3331 decision 12 |
 | Bounded paged indexes (format version 2) | M6 | ADR-3331 decision 3 |

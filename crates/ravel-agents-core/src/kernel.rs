@@ -48,7 +48,7 @@ use crate::command::{
     RecordEffectResult, RecordStep, ScheduleTimer, Takeover, TimerChange, TimerSpec, Tombstone,
     TurnFence,
 };
-use crate::error::{AgentError, ErrorKind, SafeIds};
+use crate::error::{AgentError, BudgetCap, ErrorKind, SafeIds};
 use crate::head::{
     ActiveTurn, Cancellation, EffectRecord, EffectStatus, EventEntry, Head, InboxEntry,
     InputSource, Lifecycle, MAX_HEAD_BYTES, ObjectRef, OutboxIntent, Quota, Receipt,
@@ -338,6 +338,33 @@ impl Limits {
         PageBounds {
             max_page_entries: self.max_page_entries,
             max_index_pages: self.max_index_pages,
+        }
+    }
+}
+
+/// How far one HEAD has grown toward its lifetime caps: the receipt count
+/// against `Limits::max_receipts`, the sealed pages of the results, events
+/// and timers lists against `Limits::max_index_pages`, and the encoded size
+/// against `Limits::max_head_bytes`. Every figure is answerable from a
+/// shallow HEAD, with no sealed page loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub receipts: u64,
+    pub results_pages: usize,
+    pub events_pages: usize,
+    pub timers_pages: usize,
+    pub head_bytes: usize,
+}
+
+impl Usage {
+    pub fn of(head: &Head) -> Usage {
+        let pages = |list| head.index.directory(list).pages.len();
+        Usage {
+            receipts: head.receipt_count(),
+            results_pages: pages(ListKind::Results),
+            events_pages: pages(ListKind::Events),
+            timers_pages: pages(ListKind::Timers),
+            head_bytes: head.encode().len(),
         }
     }
 }
@@ -819,12 +846,14 @@ fn page_error(head: &Head, error: PageError) -> AgentError {
             head,
             ErrorKind::BudgetExceeded,
             "PageBelowCap: an index page is full",
-        ),
+        )
+        .with_cap(BudgetCap::IndexPages),
         PageError::DirectoryFull { .. } => fail(
             head,
             ErrorKind::BudgetExceeded,
             "IndexPagesBelowCap: an index list has max_index_pages pages",
-        ),
+        )
+        .with_cap(BudgetCap::IndexPages),
     }
 }
 
@@ -1037,7 +1066,8 @@ impl Kernel {
                 head,
                 ErrorKind::BudgetExceeded,
                 "HEAD would enter the terminal reserve of its byte cap",
-            ));
+            )
+            .with_cap(BudgetCap::HeadBytes));
         }
         for list in ListKind::ALL {
             let pages = head.index.directory(list).pages.len();
@@ -1048,7 +1078,8 @@ impl Kernel {
                     head,
                     ErrorKind::BudgetExceeded,
                     "IndexPagesBelowCap: HEAD would enter the index page reserve",
-                ));
+                )
+                .with_cap(BudgetCap::IndexPages));
             }
         }
         Ok(transition)
@@ -1078,7 +1109,8 @@ impl Kernel {
                 &head,
                 ErrorKind::BudgetExceeded,
                 "HEAD would exceed its byte cap",
-            ));
+            )
+            .with_cap(BudgetCap::HeadBytes));
         }
         Ok(Transition::Publish {
             head,
@@ -1291,14 +1323,17 @@ impl Kernel {
             });
         }
         if head.inbox_depth() >= self.limits.max_mailbox_depth {
-            return Err(fail(head, ErrorKind::MailboxFull, "mailbox is full"));
+            return Err(
+                fail(head, ErrorKind::MailboxFull, "mailbox is full").with_cap(BudgetCap::Mailbox)
+            );
         }
         if head.receipt_count() >= self.limits.max_receipts {
             return Err(fail(
                 head,
                 ErrorKind::BudgetExceeded,
                 "receipt list is at its cap",
-            ));
+            )
+            .with_cap(BudgetCap::Receipts));
         }
         let mut new = head.clone();
         let accept_seq = new.next_accept_seq;
@@ -1781,11 +1816,10 @@ impl Kernel {
 
     fn check_timer_cap(&self, new: &Head) -> Result<(), AgentError> {
         if new.scheduled_timers() > self.limits.max_timers {
-            return Err(fail(
-                new,
-                ErrorKind::BudgetExceeded,
-                "timer count is at its cap",
-            ));
+            return Err(
+                fail(new, ErrorKind::BudgetExceeded, "timer count is at its cap")
+                    .with_cap(BudgetCap::Timers),
+            );
         }
         Ok(())
     }
@@ -1821,7 +1855,9 @@ impl Kernel {
             return unchanged(Reply::TimerNotDue);
         }
         if head.inbox_depth() >= self.limits.max_mailbox_depth {
-            return Err(fail(head, ErrorKind::MailboxFull, "mailbox is full"));
+            return Err(
+                fail(head, ErrorKind::MailboxFull, "mailbox is full").with_cap(BudgetCap::Mailbox)
+            );
         }
         let mut new = head.clone();
         let accept_seq = new.next_accept_seq;
