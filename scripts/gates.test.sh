@@ -128,6 +128,8 @@ agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sy
 mcp_clippy='==> cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings'
 mcp_test='==> cargo nextest run --locked -p ravel-server --features mcp --test mcp_e2e --test trace_by_id'
 mcp_lib_test='==> cargo nextest run --locked -p ravel-server --features mcp --lib'
+mcp_agents_clippy='==> cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings'
+mcp_agents_test='==> cargo nextest run --locked -p ravel-server --features mcp,agents --test mcp_agents_e2e'
 mcp_name_filter='==> cargo nextest run --locked -p ravel-server --features mcp mcp'
 sdk_gate_re='^==> .*/gates-sdk\.sh$'
 sdk_skip='==> SDK gate skipped (RAVEL_GATES_SKIP_SDK=1): CI'"'"'s sdk job is the gate for sdk/typescript'
@@ -155,6 +157,8 @@ check_eq "gates -p ravel-query: agents lane classification test" "1" \
 check_eq "gates -p ravel-query: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
 check_eq "gates -p ravel-query: mcp lane binaries" "1" "$(count "${out}" "${mcp_test}")"
 check_eq "gates -p ravel-query: mcp lane lib tests" "1" "$(count "${out}" "${mcp_lib_test}")"
+check_eq "gates -p ravel-query: mcp lane agents clippy" "1" "$(count "${out}" "${mcp_agents_clippy}")"
+check_eq "gates -p ravel-query: mcp lane agents binary" "1" "$(count "${out}" "${mcp_agents_test}")"
 check_eq "gates -p ravel-query: mcp lane has no bare name filter" "0" \
   "$(count "${out}" "${mcp_name_filter}")"
 check_eq "gates -p ravel-query: no SDK gate in scoped mode" "0" \
@@ -279,11 +283,13 @@ check_eq "gates --dry-run: agents lane classification test" "1" \
 check_eq "gates --dry-run: mcp lane clippy" "1" "$(count "${out}" "${mcp_clippy}")"
 check_eq "gates --dry-run: mcp lane binaries" "1" "$(count "${out}" "${mcp_test}")"
 check_eq "gates --dry-run: mcp lane lib tests" "1" "$(count "${out}" "${mcp_lib_test}")"
+check_eq "gates --dry-run: mcp lane agents clippy" "1" "$(count "${out}" "${mcp_agents_clippy}")"
+check_eq "gates --dry-run: mcp lane agents binary" "1" "$(count "${out}" "${mcp_agents_test}")"
 check_eq "gates --dry-run: SDK gate" "1" "$(count_matching "${out}" "${sdk_gate_re}")"
 check_eq "gates --dry-run: no SDK skip line without the variable" "0" "$(count "${out}" "${sdk_skip}")"
-check_eq "gates --dry-run: feature lane clippy runs" "9" \
+check_eq "gates --dry-run: feature lane clippy runs" "10" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
-check_eq "gates --dry-run: feature lane nextest runs" "11" \
+check_eq "gates --dry-run: feature lane nextest runs" "12" \
   "$(count_matching "${out}" '^==> cargo nextest run --locked .*--features ')"
 
 # RAVEL_GATES_SKIP_SDK=1: the SDK step becomes one skip line, and nothing else
@@ -349,6 +355,8 @@ check_eq "affected-tests -p ravel-query: mcp binaries" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id')"
 check_eq "affected-tests -p ravel-query: mcp lib tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --lib')"
+check_eq "affected-tests -p ravel-query: mcp agents binary" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp,agents --test mcp_agents_e2e')"
 check_eq "affected-tests -p ravel-query: no bare mcp name filter" "0" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp mcp')"
 
@@ -391,6 +399,11 @@ check_eq "affected-tests, mcp run fails: exit 3" "3" "${rc}"
 CARGO_STUB_FAIL_ON="--features mcp --lib" run_stubbed at-mcp-lib-fail \
   bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
 check_eq "affected-tests, mcp lib run fails: exit 3" "3" "${rc}"
+
+# A failing mcp,agents run fails the script though the mcp runs passed.
+CARGO_STUB_FAIL_ON="--features mcp,agents" run_stubbed at-mcp-agents-fail \
+  bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
+check_eq "affected-tests, mcp,agents run fails: exit 3" "3" "${rc}"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]

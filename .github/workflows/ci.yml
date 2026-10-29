@@ -1584,7 +1584,8 @@ jobs:
   # ravel-server's `mcp` feature (ADR-1374), the same shape as
   # `features-agents` above. Mirrors scripts/gates.sh's mcp lane: `cargo
   # clippy -p ravel-server --features mcp --all-targets`, the mcp_e2e and
-  # trace_by_id test binaries, and the lib tests whose path contains `mcp`. Gated on
+  # trace_by_id test binaries, the lib tests whose path contains `mcp`, and
+  # under `--features mcp,agents` clippy and the mcp_agents_e2e binary. Gated on
   # server_or_operator, since the feature lives entirely in ravel-server and
   # ravel-mcp, and any unlisted path forces server_or_operator true.
   #
@@ -1625,6 +1626,11 @@ jobs:
         run: cargo test --locked --profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
       - name: Test ravel-server --features mcp (lib tests)
         run: cargo test --locked --profile ci -p ravel-server --features mcp --lib
+        # The Ravel Agents MCP tools compile only with both features.
+      - name: Clippy ravel-server --features mcp,agents
+        run: cargo clippy --locked --profile ci -p ravel-server --features mcp,agents --all-targets -- -D warnings
+      - name: Test ravel-server --features mcp,agents (mcp_agents_e2e binary)
+        run: cargo test --locked --profile ci -p ravel-server --features mcp,agents --test mcp_agents_e2e
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage

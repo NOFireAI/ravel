@@ -53,7 +53,9 @@ will always check it against the credential on the current request.
 ## The nine tools
 
 The tools are grouped by task. Every tool is read-only: the default profile
-cannot write data, delete data, or trigger maintenance.
+cannot write data, delete data, or trigger maintenance. The one write the
+server offers over MCP, `ravel_agent_send`, belongs to the
+[Ravel Agents](#ravel-agents) tools below and is present only when they are.
 
 ### Get oriented
 
@@ -113,6 +115,35 @@ cannot write data, delete data, or trigger maintenance.
   over a PromQL range result. The result names the method as a heuristic,
   states the minimum point count that the method needs, and states whether
   the input was downsampled first.
+
+## Ravel Agents
+
+A server built with both `--features mcp,agents` and run with both `--mcp`
+and `--agents` adds six tools for [Ravel Agents](agents.md) to `tools/list`,
+after the nine above. Without either feature or either flag, `tools/list` is
+the nine tools exactly. All six are served, and each description starts with
+"Ravel Agents:".
+
+- `ravel_agent_describe`: an agent's identity, versions, state size, active
+  turn and mailbox depth, without the state.
+- `ravel_agent_state`: the state itself, with the active turn and the
+  mailbox.
+- `ravel_agent_send`: accept one input into an agent's inbox. It is the only
+  tool here that writes. Pass an `idempotency_key`: a repeat with the same
+  key answers the operation the first call accepted and accepts nothing new.
+  If a send reports `outcome_unknown`, send again with the same key.
+- `ravel_agent_operation`: the status of the operation a send answered.
+- `ravel_agent_events`: one page of the agent's events in order. A full page
+  carries a cursor; pass it back to read the next page.
+- `ravel_agent_blocked_effects`: the effects in doubt that hold a turn open,
+  with the same text the agents inspector shows and the two reconcile
+  requests an `agents_admin` caller can send. The tool does not reconcile.
+
+Each call goes through the agents client route of the same name inside the
+server, with the credential of the MCP request. The principal needs the
+`agents` capability; without it every one of the six answers `unauthorized`,
+the same refusal the HTTP route gives. The [MCP reference](../reference/mcp.md#ravel-agents-tools)
+lists their inputs, bounds and failure classes.
 
 ## The result envelope
 

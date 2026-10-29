@@ -12,6 +12,7 @@
 //! else is an [`Envelope`] with a D4 failure class, because ADR-1374 D4
 //! reserves protocol errors for malformed JSON-RPC and unknown tools.
 
+pub mod agents;
 pub mod capabilities;
 pub mod get_trace;
 

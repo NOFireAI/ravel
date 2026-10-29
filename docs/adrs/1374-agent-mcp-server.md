@@ -157,7 +157,10 @@ tool declares an input schema and an output schema. The `structuredContent`
 of each result is the envelope of D4. The text block is a compact rendering
 of the same data, not a second copy of the rows. Every tool carries the
 annotations `readOnlyHint: true`, `destructiveHint: false`, and
-`openWorldHint: false`. Annotations are hints and carry no authority.
+`openWorldHint: false`. Annotations are hints and carry no authority. Six
+Ravel Agents tools, one of them a write, join this catalog under both the
+`mcp` and `agents` features and flags; see the Ravel Agents write tools
+amendment below.
 
 | Tool | Purpose | Prerequisite |
 |---|---|---|
@@ -435,6 +438,8 @@ bundle id is not trustworthy.
   default profile has read tools only. The fold route, ingest, erasure,
   legal holds, retention, alert rules, and maintenance are not reachable
   through MCP. An operator profile needs a principal model and its own ADR.
+  The `agents` capability is that model for one write, `ravel_agent_send`;
+  see the Ravel Agents write tools amendment below.
 - Transport: `POST /mcp` only. The server validates `Origin` against
   `--mcp-allowed-origins` and answers 403 on a mismatch. The body cap is
   1 MiB. Each tool call takes one admission permit. The deadline is clamped.
@@ -457,8 +462,10 @@ bundle id is not trustworthy.
   says that no server-side sanitization makes a model immune to injection.
 - No tool fetches a URL, runs a shell, reads a file, or connects to a
   caller-supplied address.
-- The only writes are audit records and cost metrics. With
-  `audit_mode=required`, a failed audit write fails the call.
+- The only writes are audit records and cost metrics, apart from the agent
+  input that `ravel_agent_send` accepts (the Ravel Agents write tools
+  amendment below). With `audit_mode=required`, a failed audit write fails
+  the call.
 - The adapter must not `tokio::spawn` between the transport and the engine.
   A dropped tool future is the cancellation. `CostGuard` records the spend
   of a cancelled call. Progress notifications go out at phase boundaries
@@ -912,3 +919,44 @@ which answers exactly `ravel-pq://<tenant_hash>/` with that query's
 text above that treats the empty object-store registry as holding for every
 session holds for every session that reads no Parquet table; the code is
 `crates/ravel-sql/src/session.rs` and `crates/ravel-parquet/src/store.rs`.
+
+## Amendment (2026-10-29): Ravel Agents write tools (ADR-3331 decision 10)
+
+<!-- amendment-applies: sections="D2. Nine tools, three resources, two prompts|D7. Security" pointer="Ravel Agents write tools amendment" -->
+
+ADR-3331 decision 10 adds a second catalog, `agents_tool_catalog()` in
+`crates/ravel-mcp/src/catalog.rs`, with six tools in this order:
+`ravel_agent_describe`, `ravel_agent_send`, `ravel_agent_operation`,
+`ravel_agent_state`, `ravel_agent_events`, `ravel_agent_blocked_effects`.
+They join `tools/list` after the nine tools of D2 only when the server is
+built with both the `mcp` and `agents` features and run with both `--mcp`
+and `--agents`. In every other build or run, `tools/list` is the D2 catalog
+byte for byte.
+
+D2 changes in two places:
+
+1. Not every tool is read-only. `ravel_agent_send` accepts an input into an
+   agent's inbox, so it carries `readOnlyHint: false`, `destructiveHint:
+   false`, `idempotentHint: true` and `openWorldHint: false`. It takes a
+   required idempotency key: a resend with the same key answers the
+   operation the first call accepted and accepts nothing new. The other five
+   agents tools carry the D2 annotations. The D2 rule that annotations carry
+   no authority stands.
+2. The 24 KiB bound covers the combined catalog. Measured, `tools/list` is
+   15,700 bytes with the nine tools and 22,723 bytes with all fifteen,
+   against the 24,576-byte budget; both figures are pinned in
+   `services/ravel-server/tests/mcp_agents_e2e.rs`.
+
+D7 changes in two places:
+
+1. The principal model D7 asks for exists for this one write. An agents
+   tool call is not a second implementation of the agents API: the MCP
+   adapter calls the agents client routes in process with the request's own
+   headers, so the route's resolver and its `agents` capability check decide
+   the call, and a principal without the capability gets the route's 403 as
+   an MCP error envelope. No operator surface becomes reachable through MCP;
+   the fold route, ingest, erasure, legal holds, retention, alert rules and
+   maintenance stay out.
+2. The writes are no longer only audit records and cost metrics: an
+   accepted `ravel_agent_send` input is written by the agents store, under
+   the agents store's own durability and compare-and-swap rules.

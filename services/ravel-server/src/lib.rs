@@ -1962,6 +1962,7 @@ fn mcp_settings(
         budget_config: ravel_mcp::budget::McpBudgetConfig::default(),
         protection_horizon_ns: config.gc.protection_horizon_ns,
         clock: Arc::new(SystemClock),
+        agents: None,
     })
 }
 
@@ -3760,23 +3761,31 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         // from the query service just built rather than from a facade of its
         // own, so an MCP tool call and an HTTP query share one admission
         // controller, one cost recorder, one usage sink, and one audit sink.
-        #[cfg(feature = "mcp")]
-        if config.query_budgets.mcp.enabled {
-            http_router = http_router.merge(mcp::router(
-                query_service.clone(),
-                mcp_settings(&config, app_state.engine.config())?,
-            )?);
-        }
         // The Ravel Agents routes (ADR-3331 decision 9), under the same
         // predicate `Cli::validate` checks: this block's mode test plus
-        // `--agents`.
+        // `--agents`. Built before the MCP route, which serves the agents
+        // tools through this same router (ADR-3331 decision 10).
         #[cfg(feature = "agents")]
-        if config.query_budgets.agents.enabled {
-            http_router = http_router.merge(agents::router(
+        let agents_router = config.query_budgets.agents.enabled.then(|| {
+            agents::router(
                 agents_runtime.clone(),
                 config.tenant_resolver.clone(),
                 audit_sink.clone(),
-            ));
+            )
+        });
+        #[cfg(feature = "mcp")]
+        if config.query_budgets.mcp.enabled {
+            #[allow(unused_mut)]
+            let mut settings = mcp_settings(&config, app_state.engine.config())?;
+            #[cfg(feature = "agents")]
+            {
+                settings.agents = agents_router.clone();
+            }
+            http_router = http_router.merge(mcp::router(query_service.clone(), settings)?);
+        }
+        #[cfg(feature = "agents")]
+        if let Some(router) = agents_router {
+            http_router = http_router.merge(router);
         }
         query_service_handle = Some(query_service);
 
@@ -3815,20 +3824,27 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             // above: a certificate-identified caller must be authenticated by
             // `mtls.resolver`, not by the primary listener's bearer-token
             // resolver.
-            #[cfg(feature = "mcp")]
-            if config.query_budgets.mcp.enabled {
-                mtls_router = mtls_router.merge(mcp::router(
-                    mtls_query_service.clone(),
-                    mcp_settings(&config, app_state.engine.config())?,
-                )?);
-            }
             #[cfg(feature = "agents")]
-            if config.query_budgets.agents.enabled {
-                mtls_router = mtls_router.merge(agents::router(
+            let mtls_agents_router = config.query_budgets.agents.enabled.then(|| {
+                agents::router(
                     agents_runtime.clone(),
                     mtls.resolver.clone(),
                     audit_sink.clone(),
-                ));
+                )
+            });
+            #[cfg(feature = "mcp")]
+            if config.query_budgets.mcp.enabled {
+                #[allow(unused_mut)]
+                let mut settings = mcp_settings(&config, app_state.engine.config())?;
+                #[cfg(feature = "agents")]
+                {
+                    settings.agents = mtls_agents_router.clone();
+                }
+                mtls_router = mtls_router.merge(mcp::router(mtls_query_service.clone(), settings)?);
+            }
+            #[cfg(feature = "agents")]
+            if let Some(router) = mtls_agents_router {
+                mtls_router = mtls_router.merge(router);
             }
             mtls_query_service_handle = Some(mtls_query_service);
         }

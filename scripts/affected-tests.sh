@@ -22,7 +22,8 @@
 # agents_effects_e2e, agents_e2e and agents_timers_e2e binaries and the lib
 # tests whole, plus
 # ravel-catalog's sys_proto_format_version_classification test, and under
-# `--features mcp` the mcp_e2e and trace_by_id binaries and the lib tests whole. Tests are selected
+# `--features mcp` the mcp_e2e and trace_by_id binaries and the lib tests whole,
+# and under `--features mcp,agents` the mcp_agents_e2e binary. Tests are selected
 # by binary, never by a test-name filter; scripts/gates.sh's run_feature_lanes
 # states why, and why the other integration binaries are left out. Its agents
 # and mcp lanes run the same tests.
@@ -148,6 +149,9 @@ case "$affected" in
     mcp_lib_rc=0
     run_tests -p ravel-server --features mcp --lib || mcp_lib_rc=$?
     [ "$mcp_rc" -ne 0 ] || mcp_rc=$mcp_lib_rc
+    mcp_agents_rc=0
+    run_tests -p ravel-server --features mcp,agents --test mcp_agents_e2e || mcp_agents_rc=$?
+    [ "$mcp_rc" -ne 0 ] || mcp_rc=$mcp_agents_rc
     ;;
 esac
 
