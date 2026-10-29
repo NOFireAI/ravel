@@ -404,7 +404,9 @@ fn listed_object(prefix: &str, object: WireObject) -> Result<ObjectMeta, StoreEr
             )));
         }
         None => {
-            return Err(refuse(format!("listed object {key:?} carries no generation")));
+            return Err(refuse(format!(
+                "listed object {key:?} carries no generation"
+            )));
         }
     };
     let size: u64 = object
@@ -416,7 +418,11 @@ fn listed_object(prefix: &str, object: WireObject) -> Result<ObjectMeta, StoreEr
         .updated
         .as_deref()
         .and_then(parse_iso8601)
-        .ok_or_else(|| refuse(format!("listed object {key:?} has no readable updated time")))?;
+        .ok_or_else(|| {
+            refuse(format!(
+                "listed object {key:?} has no readable updated time"
+            ))
+        })?;
     let etag = match (object.md5_hash, object.etag) {
         (Some(md5), _) => md5_etag(&md5)
             .ok_or_else(|| refuse(format!("listed object {key:?} has an unreadable md5Hash")))?,
@@ -480,6 +486,39 @@ mod tests {
         );
         assert_eq!(md5_etag("not base64!"), None);
         assert_eq!(md5_etag("AAAA"), None);
+    }
+
+    fn wire(generation: Option<&str>, md5_hash: Option<&str>) -> WireObject {
+        WireObject {
+            name: Some("p/k".to_string()),
+            generation: generation.map(str::to_string),
+            size: Some("3".to_string()),
+            updated: Some("2026-10-29T10:00:00.000Z".to_string()),
+            etag: Some("CJbYtNGqvYkDEAE=".to_string()),
+            md5_hash: md5_hash.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_listed_object_without_a_generation_fails_the_call() {
+        for generation in [None, Some(""), Some("0"), Some("012"), Some("abc")] {
+            let listed = listed_object("p/", wire(generation, None));
+            assert!(
+                matches!(listed, Err(StoreError::Permanent(_))),
+                "{generation:?}: {listed:?}"
+            );
+        }
+        let listed = listed_object("p/", wire(Some("1790000000000001"), None)).expect("listed");
+        assert_eq!(listed.version.0, "1790000000000001");
+    }
+
+    #[test]
+    fn the_listed_etag_is_the_md5_and_falls_back_to_the_json_etag() {
+        let with_md5 =
+            listed_object("p/", wire(Some("7"), Some("1B2M2Y8AsgTpgAmY7PhCfg=="))).expect("listed");
+        assert_eq!(with_md5.etag.0, "\"d41d8cd98f00b204e9800998ecf8427e\"");
+        let composite = listed_object("p/", wire(Some("7"), None)).expect("listed");
+        assert_eq!(composite.etag.0, "CJbYtNGqvYkDEAE=");
     }
 
     #[test]

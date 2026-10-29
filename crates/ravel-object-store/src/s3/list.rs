@@ -625,7 +625,10 @@ impl ListClient {
 }
 
 /// Read a body of at most `limit` bytes; `Ok(None)` when it is longer.
-pub(crate) async fn read_body(response: HttpResponse, limit: usize) -> Result<Option<Vec<u8>>, HttpError> {
+pub(crate) async fn read_body(
+    response: HttpResponse,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, HttpError> {
     let mut stream = response.into_body().bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {

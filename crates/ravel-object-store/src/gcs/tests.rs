@@ -135,7 +135,10 @@ async fn cas_with_a_token_that_is_not_a_generation_sends_nothing() {
         )
         .await;
 
-    assert!(matches!(refused, Err(StoreError::Permanent(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(StoreError::Permanent(_))),
+        "{refused:?}"
+    );
     assert!(fake.requests().is_empty(), "{:?}", fake.requests());
 }
 
@@ -431,7 +434,9 @@ async fn listing_pages_carry_generations_and_report_unaddressable_keys() {
         .collect::<Vec<_>>();
     assert!(!lists.is_empty());
     assert!(
-        lists.iter().all(|r| r.query_param("maxResults") == Some("2")),
+        lists
+            .iter()
+            .all(|r| r.query_param("maxResults") == Some("2")),
         "{lists:?}"
     );
 
@@ -579,11 +584,7 @@ async fn listing_reports_xml_illegal_and_unaddressable_names_without_failing_the
 
     assert_eq!(keys, ["x/a", "x/c", "x/e", "x/f"]);
     assert_eq!(unaddressable, [xml_illegal, unaddressable_name]);
-    let lists = fake
-        .requests()
-        .into_iter()
-        .filter(is_list_request)
-        .count();
+    let lists = fake.requests().into_iter().filter(is_list_request).count();
     assert!(lists >= 3, "six names at two per page cross pages: {lists}");
 }
 
@@ -640,6 +641,11 @@ async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
         assert_eq!(list.query_param("maxResults"), Some("3"));
         assert_eq!(list.query_param("delimiter"), Some("/"));
         assert_eq!(list.query_param("prefix"), Some("d/"));
+        assert_eq!(
+            list.header("authorization"),
+            None,
+            "skip_signature lists unsigned"
+        );
     }
     assert_eq!(lists[0].query_param("pageToken"), None);
     let first_token = fake.page_token_for("d/c");

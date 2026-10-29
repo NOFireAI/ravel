@@ -371,7 +371,10 @@ impl Inner {
                 return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method");
             }
             if percent_decode(bucket, false).as_deref() != Some(self.bucket.as_str()) {
-                return json_error(StatusCode::NOT_FOUND, "The specified bucket does not exist.");
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    "The specified bucket does not exist.",
+                );
             }
             return self.list(query);
         }
