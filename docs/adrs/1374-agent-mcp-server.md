@@ -465,7 +465,9 @@ bundle id is not trustworthy.
 - The only writes are audit records and cost metrics, apart from the agent
   input that `ravel_agent_send` accepts (the Ravel Agents write tools
   amendment below). With `audit_mode=required`, a failed audit write fails
-  the call.
+  the call. An agents tool call submits no query audit record: it runs the
+  agents route in process, and the agents routes audit only reconcile and
+  sweep.
 - The adapter must not `tokio::spawn` between the transport and the engine.
   A dropped tool future is the cancellation. `CostGuard` records the spend
   of a cancelled call. Progress notifications go out at phase boundaries
