@@ -3,8 +3,11 @@
 #
 # Cases for the assertions in scripts/chaos/agents-replace-worker.sh, run on
 # canned figures through its --dry-run mode, with no store and no server. The
-# passing figures are the ones a real run against RustFS printed; each failing
-# case changes exactly the figure the failure it stands for would change.
+# passing figures are the ones a real run against RustFS printed, except the
+# three timing figures (GRANT_TO_KILL_MS, RECOVERY_FROM_GRANT_MS,
+# RESTART_READY_MS), which were added after that run and are canned values
+# inside their bands. Each failing case changes exactly the figure the failure
+# it stands for would change.
 #
 # Exit 0 when every case passes, 1 when one fails, 64 on bad usage.
 set -uo pipefail
@@ -38,7 +41,8 @@ A_EFFECT_ID=djE6ZWZmZWN0OjZhZGY2MDMyNGU4OTA2NTg3MDMwN2EyN2M5MzRhMWM0OjE6NjdiMTlm
 A_STEP_ATTEMPT=1
 OP1_RETRIED_OPERATION_ID=djE6b3A6NmFkZjYwMzI0ZTg5MDY1ODcwMzA3YTI3YzkzNGExYzQ6MTox
 OP1_RETRIED_DUPLICATE=true
-RECOVERY_MS=40210
+GRANT_TO_KILL_MS=412
+RECOVERY_FROM_GRANT_MS=40622
 B_WORKER_ID=w-77de2a170426fb10
 B_ASSIGNED_OPERATION_ID=djE6b3A6NmFkZjYwMzI0ZTg5MDY1ODcwMzA3YTI3YzkzNGExYzQ6MTox
 B_TURN_ID=d746246fc5bd6d52e210c7e1883ca81e
@@ -52,6 +56,7 @@ OP1_STATE_VERSION=1
 OP2_OPERATION_ID=djE6b3A6NmFkZjYwMzI0ZTg5MDY1ODcwMzA3YTI3YzkzNGExYzQ6MToy
 OP2_SEND_DUPLICATE=false
 STATE_VERSION_BEFORE_RESTART=1
+RESTART_READY_MS=1840
 OP2_STATUS_AFTER_RESTART=running
 C_WORKER_ID=w-3a3ec2afbbcfe24c
 C_ASSIGNED_OPERATION_ID=djE6b3A6NmFkZjYwMzI0ZTg5MDY1ODcwMzA3YTI3YzkzNGExYzQ6MToy
@@ -122,13 +127,38 @@ case_run "a second commit after the restart fails on the turn count" 1 \
   "TURNS_COMMITTED_AFTER_RESTART=2, expected 1" -- --dry-run "$(variant dup-turn \
   TURNS_COMMITTED_AFTER_RESTART=2)"
 
-case_run "a takeover before the lease and grace lapse fails the band" 1 \
-  "RECOVERY_MS=12000, expected within [35000, 60000]" -- --dry-run "$(variant early \
-  RECOVERY_MS=12000)"
+case_run "a takeover before the lease and grace lapse from the grant fails" 1 \
+  "RECOVERY_FROM_GRANT_MS=39999, expected within [40000, 60000]" -- --dry-run \
+  "$(variant early RECOVERY_FROM_GRANT_MS=39999)"
 
 case_run "a takeover after the band fails" 1 \
-  "RECOVERY_MS=60001, expected within [35000, 60000]" -- --dry-run "$(variant late \
-  RECOVERY_MS=60001)"
+  "RECOVERY_FROM_GRANT_MS=60001, expected within [40000, 60000]" -- --dry-run \
+  "$(variant late RECOVERY_FROM_GRANT_MS=60001)"
+
+case_run "a missing takeover figure fails" 1 "RECOVERY_FROM_GRANT_MS printed 0 times" -- \
+  --dry-run "$(variant no-recovery RECOVERY_FROM_GRANT_MS)"
+
+case_run "a kill later than the grant-to-kill bound fails" 1 \
+  "GRANT_TO_KILL_MS=10001, expected within [0, 10000]" -- --dry-run \
+  "$(variant late-kill GRANT_TO_KILL_MS=10001)"
+
+case_run "a kill timed before the grant fails" 1 \
+  "GRANT_TO_KILL_MS=-5 is not a number" -- --dry-run \
+  "$(variant kill-before-grant GRANT_TO_KILL_MS=-5)"
+
+case_run "a missing grant-to-kill figure fails" 1 "GRANT_TO_KILL_MS printed 0 times" -- \
+  --dry-run "$(variant no-grant-to-kill GRANT_TO_KILL_MS)"
+
+case_run "a restart slower than the lease fails" 1 \
+  "RESTART_READY_MS=30001, expected within [0, 30000]" -- --dry-run \
+  "$(variant slow-restart RESTART_READY_MS=30001)"
+
+case_run "a restart ready before the kill fails" 1 \
+  "RESTART_READY_MS=-1 is not a number" -- --dry-run \
+  "$(variant restart-before-kill RESTART_READY_MS=-1)"
+
+case_run "a missing restart figure fails" 1 "RESTART_READY_MS printed 0 times" -- \
+  --dry-run "$(variant no-restart-ready RESTART_READY_MS)"
 
 case_run "a replacement that runs the step as attempt 1 fails" 1 \
   "B_STEP_ATTEMPT=1, expected 2" -- --dry-run "$(variant attempt B_STEP_ATTEMPT=1)"
