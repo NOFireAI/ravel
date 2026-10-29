@@ -1,0 +1,622 @@
+//! Projection of committed agent history into logs and traces (ADR-3331
+//! decision 12).
+//!
+//! A [`Projector`] reads the events a tenant's agents committed and hands
+//! them to a [`ProjectionSink`] as one log record per event and one span per
+//! turn. It is a reader only: every store call it makes is a GET
+//! ([`AgentStore::read_head_shallow`], [`AgentStore::events_in`],
+//! [`AgentStore::read_object`]), so a sink outage shows as lag and a failure
+//! counter and never as a change to an agent
+//! (`tests::a_failing_sink_changes_no_agent_state_and_retries_the_same_ids`).
+//!
+//! The cursor is in memory, one per agent, and starts at the committed
+//! event the coordinator reported when it first saw the agent. ADR-3331 does
+//! not say where a projection cursor persists, and persisting it in HEAD
+//! would make projection a writer; history committed while no projector
+//! held a cursor stays in the agent store for re-projection.
+//!
+//! Every record carries a stable event id derived from the tenant, the
+//! agent, its incarnation and the event seq ([`event_id`]), so a record
+//! delivered twice (a retry, a restart) carries the same id twice and the
+//! id is the deduplication key for queries.
+
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
+use ravel_agents_core::error::AgentError;
+use ravel_agents_core::head::{EventEntry, Head};
+use ravel_agents_core::identity::{AgentId, DOMAIN, Id128};
+use ravel_agents_store::{AgentStore, Clock, HeadState};
+use ravel_types::TenantHash;
+use tokio::sync::Notify;
+
+/// Bounds on what a projector holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionLimits {
+    /// Records read from the store and not yet delivered. A full backlog
+    /// stops the projector reading; it never stops the coordinator.
+    pub backlog: usize,
+    /// Records handed to the sink in one delivery.
+    pub batch: usize,
+}
+
+/// The default backlog bound.
+pub const DEFAULT_PROJECTION_BACKLOG: usize = 4096;
+/// The default delivery batch.
+pub const DEFAULT_PROJECTION_BATCH: usize = 256;
+
+impl Default for ProjectionLimits {
+    fn default() -> Self {
+        ProjectionLimits {
+            backlog: DEFAULT_PROJECTION_BACKLOG,
+            batch: DEFAULT_PROJECTION_BATCH,
+        }
+    }
+}
+
+/// Whether a record carries the event's payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadPolicy {
+    /// The default: the payload's hash and size, never its bytes.
+    Redacted,
+    /// The tenant opted in: the payload bytes as text, beside hash and size.
+    Carried,
+}
+
+/// What a record says about an event's payload. Built only by
+/// [`Projector::payload_view`], the one redaction gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedPayload {
+    /// blake3 of the payload bytes, hex; `None` for an event with no payload.
+    pub hash: Option<String>,
+    pub size_bytes: u64,
+    /// The payload as UTF-8 text (lossy), only under [`PayloadPolicy::Carried`].
+    pub body: Option<String>,
+}
+
+/// One committed event, as a log record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedEvent {
+    pub event_id: Id128,
+    pub agent: AgentId,
+    pub incarnation: u64,
+    pub event_seq: u64,
+    pub accept_seq: u64,
+    pub turn_id: Id128,
+    pub event_type: String,
+    pub payload: ProjectedPayload,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    /// When the projector read the event, on its clock. Events carry no
+    /// commit time of their own.
+    pub observed_unix_ns: i64,
+}
+
+impl ProjectedEvent {
+    /// The record body every sink writes, so the event id and the redacted
+    /// payload are searchable as log text.
+    pub fn body(&self) -> String {
+        let mut out = format!(
+            "agent event event_id={} agent_id={} incarnation={} event_seq={} accept_seq={} turn_id={} type={}",
+            self.event_id.to_hex(),
+            self.agent.to_hex(),
+            self.incarnation,
+            self.event_seq,
+            self.accept_seq,
+            self.turn_id.to_hex(),
+            self.event_type,
+        );
+        match &self.payload.hash {
+            None => out.push_str(" payload=none"),
+            Some(hash) => {
+                out.push_str(&format!(
+                    " payload_hash={hash} payload_size={}",
+                    self.payload.size_bytes
+                ));
+                match &self.payload.body {
+                    Some(body) => {
+                        out.push_str(" payload=");
+                        out.push_str(body);
+                    }
+                    None => out.push_str(" payload=redacted"),
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One turn, as a span: the events of the turn the batch holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedTurn {
+    pub agent: AgentId,
+    pub incarnation: u64,
+    pub accept_seq: u64,
+    pub turn_id: Id128,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub first_event_seq: u64,
+    pub last_event_seq: u64,
+    pub start_unix_ns: i64,
+    pub end_unix_ns: i64,
+}
+
+/// What one delivery hands the sink.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionBatch {
+    pub events: Vec<ProjectedEvent>,
+    pub turns: Vec<ProjectedTurn>,
+}
+
+/// A sink refused or failed a delivery; the batch is retried with the same
+/// ids.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("projection sink failed: {0}")]
+pub struct SinkError(pub String);
+
+pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+
+/// Where projected records go: the process's own ingest routers, an OTLP
+/// endpoint, or a test double.
+pub trait ProjectionSink: Send + Sync {
+    fn deliver<'a>(&'a self, batch: &'a ProjectionBatch) -> SinkFuture<'a>;
+}
+
+/// The stable event id: `blake3(DOMAIN, "projection-event", tenant, agent,
+/// incarnation, event_seq)[..16]`, every component length-prefixed.
+pub fn event_id(tenant: &TenantHash, agent: &AgentId, incarnation: u64, event_seq: u64) -> Id128 {
+    Id128(derive_16(
+        "projection-event",
+        &[
+            &tenant.0,
+            &agent.0,
+            &incarnation.to_le_bytes(),
+            &event_seq.to_le_bytes(),
+        ],
+    ))
+}
+
+/// The trace of one input: tenant, agent, incarnation and accept seq.
+pub fn trace_id(tenant: &TenantHash, agent: &AgentId, incarnation: u64, accept_seq: u64) -> [u8; 16] {
+    derive_16(
+        "projection-trace",
+        &[
+            &tenant.0,
+            &agent.0,
+            &incarnation.to_le_bytes(),
+            &accept_seq.to_le_bytes(),
+        ],
+    )
+}
+
+/// The span of one turn. A turn id is unique only within its agent, so the
+/// tenant and agent are hashed in.
+pub fn span_id(tenant: &TenantHash, agent: &AgentId, turn: &Id128) -> [u8; 8] {
+    let full = derive_16("projection-span", &[&tenant.0, &agent.0, &turn.0]);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&full[..8]);
+    out
+}
+
+fn derive_16(purpose: &str, parts: &[&[u8]]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    for part in std::iter::once(purpose.as_bytes()).chain(parts.iter().copied()) {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    out
+}
+
+/// A point-in-time copy of a projector's counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectionMetricsSnapshot {
+    /// The largest committed event seq minus projected event seq over the
+    /// tenant's agents. Summed snapshots keep the maximum.
+    pub lag_max: u64,
+    /// Records read and not yet delivered.
+    pub backlog: u64,
+    /// The backlog bound.
+    pub backlog_bound: u64,
+    /// Log records delivered, retries of a failed batch counted once.
+    pub events_projected: u64,
+    /// Spans delivered.
+    pub spans_projected: u64,
+    /// Deliveries the sink failed.
+    pub sink_failures: u64,
+    /// Passes that left committed events unread because the backlog was full.
+    pub backlog_full: u64,
+    /// Store reads that failed; the events stay committed and are read on a
+    /// later pass.
+    pub read_failures: u64,
+}
+
+impl ProjectionMetricsSnapshot {
+    /// Fold two tenants' snapshots: counters add, lag keeps the maximum.
+    pub fn merge(self, other: ProjectionMetricsSnapshot) -> ProjectionMetricsSnapshot {
+        ProjectionMetricsSnapshot {
+            lag_max: self.lag_max.max(other.lag_max),
+            backlog: self.backlog.saturating_add(other.backlog),
+            backlog_bound: self.backlog_bound.saturating_add(other.backlog_bound),
+            events_projected: self.events_projected.saturating_add(other.events_projected),
+            spans_projected: self.spans_projected.saturating_add(other.spans_projected),
+            sink_failures: self.sink_failures.saturating_add(other.sink_failures),
+            backlog_full: self.backlog_full.saturating_add(other.backlog_full),
+            read_failures: self.read_failures.saturating_add(other.read_failures),
+        }
+    }
+}
+
+/// One agent's projection position.
+#[derive(Debug, Clone, Copy)]
+struct Cursor {
+    incarnation: u64,
+    /// The newest committed event seq a root has shown.
+    committed: u64,
+    /// The newest event seq read into the backlog.
+    read: u64,
+    /// The newest event seq a sink accepted.
+    projected: u64,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    cursors: BTreeMap<AgentId, Cursor>,
+    backlog: Vec<ProjectedEvent>,
+    turns: Vec<ProjectedTurn>,
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    events_projected: AtomicU64,
+    spans_projected: AtomicU64,
+    sink_failures: AtomicU64,
+    backlog_full: AtomicU64,
+    read_failures: AtomicU64,
+}
+
+/// Projects one tenant's committed history.
+pub struct Projector {
+    tenant: TenantHash,
+    store: Arc<AgentStore>,
+    sink: Arc<dyn ProjectionSink>,
+    limits: ProjectionLimits,
+    payload: PayloadPolicy,
+    clock: Arc<dyn Clock>,
+    state: Mutex<State>,
+    /// Serialises passes, so one batch is in flight at a time.
+    pass: tokio::sync::Mutex<()>,
+    wake: Notify,
+    counters: Counters,
+}
+
+/// What one [`Projector::project_once`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectionPass {
+    pub events_delivered: u64,
+    pub spans_delivered: u64,
+    pub sink_failed: bool,
+    pub backlog_full: bool,
+}
+
+impl Projector {
+    /// `store` should be an instance of its own, so the projector's GETs
+    /// never show in the coordinator's request counters.
+    pub fn new(
+        tenant: TenantHash,
+        store: Arc<AgentStore>,
+        sink: Arc<dyn ProjectionSink>,
+        limits: ProjectionLimits,
+        payload: PayloadPolicy,
+        clock: Arc<dyn Clock>,
+    ) -> Projector {
+        Projector {
+            tenant,
+            store,
+            sink,
+            limits: ProjectionLimits {
+                backlog: limits.backlog.max(1),
+                batch: limits.batch.max(1),
+            },
+            payload,
+            clock,
+            state: Mutex::new(State::default()),
+            pass: tokio::sync::Mutex::new(()),
+            wake: Notify::new(),
+            counters: Counters::default(),
+        }
+    }
+
+    pub fn limits(&self) -> ProjectionLimits {
+        self.limits
+    }
+
+    pub fn payload_policy(&self) -> PayloadPolicy {
+        self.payload
+    }
+
+    /// Record a root the coordinator saw. Never blocks on the sink or the
+    /// store: a map update and a wake.
+    pub fn note(&self, agent: &AgentId, head: &Head) {
+        let committed = head.next_event_seq.saturating_sub(1);
+        let mut state = self.state.lock();
+        let cursor = state.cursors.entry(*agent).or_insert(Cursor {
+            incarnation: head.incarnation,
+            committed,
+            read: committed,
+            projected: committed,
+        });
+        let moved = if head.incarnation > cursor.incarnation {
+            *cursor = Cursor {
+                incarnation: head.incarnation,
+                committed,
+                read: 0,
+                projected: 0,
+            };
+            committed > 0
+        } else if head.incarnation == cursor.incarnation && committed > cursor.committed {
+            cursor.committed = committed;
+            true
+        } else {
+            false
+        };
+        drop(state);
+        if moved {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Resolves when a note has moved a cursor since the last wait.
+    pub async fn notified(&self) {
+        self.wake.notified().await;
+    }
+
+    pub fn metrics(&self) -> ProjectionMetricsSnapshot {
+        let (lag_max, backlog) = {
+            let state = self.state.lock();
+            let lag = state
+                .cursors
+                .values()
+                .map(|c| c.committed.saturating_sub(c.projected))
+                .max()
+                .unwrap_or(0);
+            (lag, state.backlog.len() as u64)
+        };
+        let c = &self.counters;
+        ProjectionMetricsSnapshot {
+            lag_max,
+            backlog,
+            backlog_bound: self.limits.backlog as u64,
+            events_projected: c.events_projected.load(Ordering::Relaxed),
+            spans_projected: c.spans_projected.load(Ordering::Relaxed),
+            sink_failures: c.sink_failures.load(Ordering::Relaxed),
+            backlog_full: c.backlog_full.load(Ordering::Relaxed),
+            read_failures: c.read_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The store's request counters for the projector's own reads.
+    pub fn store_counters(&self) -> ravel_agents_store::counters::CounterSnapshot {
+        self.store.counters()
+    }
+
+    /// One pass: fill the backlog from every agent with unread committed
+    /// events, up to the bound, then deliver it in batches. A failed
+    /// delivery keeps the batch, ids and all, for the next pass.
+    pub async fn project_once(&self) -> ProjectionPass {
+        let _pass = self.pass.lock().await;
+        let mut report = ProjectionPass::default();
+        self.fill(&mut report).await;
+        self.deliver(&mut report).await;
+        report
+    }
+
+    async fn fill(&self, report: &mut ProjectionPass) {
+        let behind: Vec<(AgentId, Cursor)> = {
+            let state = self.state.lock();
+            state
+                .cursors
+                .iter()
+                .filter(|(_, c)| c.committed > c.read)
+                .map(|(a, c)| (*a, *c))
+                .collect()
+        };
+        for (agent, cursor) in behind {
+            let room = self
+                .limits
+                .backlog
+                .saturating_sub(self.state.lock().backlog.len());
+            if room == 0 {
+                self.counters.backlog_full.fetch_add(1, Ordering::Relaxed);
+                report.backlog_full = true;
+                return;
+            }
+            if self.read_agent(&agent, cursor, room).await.is_err() {
+                self.counters.read_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn read_agent(
+        &self,
+        agent: &AgentId,
+        cursor: Cursor,
+        room: usize,
+    ) -> Result<(), AgentError> {
+        let head = match self.store.read_head_shallow(agent).await? {
+            HeadState::Present { head, .. } => *head,
+            HeadState::Absent | HeadState::Unsupported { .. } => return Ok(()),
+        };
+        if head.incarnation != cursor.incarnation {
+            // A newer incarnation: the next note resets the cursor.
+            self.note(agent, &head);
+            return Ok(());
+        }
+        let finished: HashMap<u64, i64> = head
+            .results
+            .iter()
+            .map(|r| (r.accept_seq, r.finished_unix_ns))
+            .collect();
+        let incarnation = head.incarnation;
+        let events = self
+            .store
+            .events_in(agent, head, cursor.read, room, None)
+            .await?;
+        let now = self.clock.now_unix_ns();
+        let mut records = Vec::with_capacity(events.len());
+        let mut turns: Vec<ProjectedTurn> = Vec::new();
+        for event in &events {
+            let payload = self.payload_view(agent, event).await?;
+            let record = self.record(agent, incarnation, event, payload, now);
+            match turns.last_mut() {
+                Some(turn) if turn.turn_id == event.turn_id => {
+                    turn.last_event_seq = event.event_seq;
+                }
+                _ => {
+                    let at = finished.get(&event.accept_seq).copied().unwrap_or(now);
+                    turns.push(ProjectedTurn {
+                        agent: *agent,
+                        incarnation,
+                        accept_seq: event.accept_seq,
+                        turn_id: event.turn_id,
+                        trace_id: record.trace_id,
+                        span_id: record.span_id,
+                        first_event_seq: event.event_seq,
+                        last_event_seq: event.event_seq,
+                        start_unix_ns: at,
+                        end_unix_ns: at,
+                    });
+                }
+            }
+            records.push(record);
+        }
+        let Some(last) = events.last().map(|e| e.event_seq) else {
+            return Ok(());
+        };
+        let mut state = self.state.lock();
+        let Some(c) = state.cursors.get_mut(agent) else {
+            return Ok(());
+        };
+        if c.incarnation != incarnation || c.read != cursor.read {
+            return Ok(());
+        }
+        c.read = last;
+        c.committed = c.committed.max(last);
+        state.backlog.extend(records);
+        state.turns.extend(turns);
+        Ok(())
+    }
+
+    /// The redaction gate: the only place a record's payload is built, and
+    /// the only place the projector reads payload bytes.
+    async fn payload_view(
+        &self,
+        agent: &AgentId,
+        event: &EventEntry,
+    ) -> Result<ProjectedPayload, AgentError> {
+        let Some(object) = event.payload else {
+            return Ok(ProjectedPayload {
+                hash: None,
+                size_bytes: 0,
+                body: None,
+            });
+        };
+        let body = match self.payload {
+            PayloadPolicy::Redacted => None,
+            PayloadPolicy::Carried => {
+                let bytes = self.store.read_object(agent, object).await?;
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        Ok(ProjectedPayload {
+            hash: Some(object.hash.to_hex()),
+            size_bytes: object.size_bytes,
+            body,
+        })
+    }
+
+    fn record(
+        &self,
+        agent: &AgentId,
+        incarnation: u64,
+        event: &EventEntry,
+        payload: ProjectedPayload,
+        now: i64,
+    ) -> ProjectedEvent {
+        ProjectedEvent {
+            event_id: event_id(&self.tenant, agent, incarnation, event.event_seq),
+            agent: *agent,
+            incarnation,
+            event_seq: event.event_seq,
+            accept_seq: event.accept_seq,
+            turn_id: event.turn_id,
+            event_type: event.event_type.clone(),
+            payload,
+            trace_id: trace_id(&self.tenant, agent, incarnation, event.accept_seq),
+            span_id: span_id(&self.tenant, agent, &event.turn_id),
+            observed_unix_ns: now,
+        }
+    }
+
+    async fn deliver(&self, report: &mut ProjectionPass) {
+        loop {
+            let batch = {
+                let state = self.state.lock();
+                if state.backlog.is_empty() {
+                    return;
+                }
+                let events: Vec<ProjectedEvent> = state
+                    .backlog
+                    .iter()
+                    .take(self.limits.batch)
+                    .cloned()
+                    .collect();
+                let turns: Vec<ProjectedTurn> = state
+                    .turns
+                    .iter()
+                    .filter(|t| {
+                        events.iter().any(|e| {
+                            e.agent == t.agent
+                                && e.incarnation == t.incarnation
+                                && e.event_seq == t.first_event_seq
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                ProjectionBatch { events, turns }
+            };
+            if self.sink.deliver(&batch).await.is_err() {
+                self.counters.sink_failures.fetch_add(1, Ordering::Relaxed);
+                report.sink_failed = true;
+                return;
+            }
+            let mut state = self.state.lock();
+            state.backlog.drain(..batch.events.len());
+            state.turns.retain(|t| !batch.turns.contains(t));
+            for event in &batch.events {
+                if let Some(c) = state.cursors.get_mut(&event.agent)
+                    && c.incarnation == event.incarnation
+                {
+                    c.projected = c.projected.max(event.event_seq);
+                }
+            }
+            drop(state);
+            let events = batch.events.len() as u64;
+            let spans = batch.turns.len() as u64;
+            self.counters
+                .events_projected
+                .fetch_add(events, Ordering::Relaxed);
+            self.counters
+                .spans_projected
+                .fetch_add(spans, Ordering::Relaxed);
+            report.events_delivered += events;
+            report.spans_delivered += spans;
+        }
+    }
+}
