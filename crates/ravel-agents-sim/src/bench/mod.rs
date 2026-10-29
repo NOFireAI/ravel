@@ -6,7 +6,7 @@
 //! object-body bytes per store phase, CAS conflicts, latency percentiles on
 //! the injected clock, and peak heap when the bench binary installs its
 //! allocator probe. [`run`] checks every figure against the band table in
-//! `bench/agents/prereg.md`. `docs/agents-benchmarks.md` describes the
+//! `benchmarks/agents/prereg.md`. `docs/agents-benchmarks.md` describes the
 //! scenarios, the report format and the byte kinds.
 
 pub mod figures;
@@ -107,14 +107,14 @@ fn repo_file(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-/// `bench/agents/prereg.md`.
+/// `benchmarks/agents/prereg.md`.
 pub fn prereg_path() -> PathBuf {
-    repo_file("bench/agents/prereg.md")
+    repo_file("benchmarks/agents/prereg.md")
 }
 
-/// `bench/agents/prices.toml`.
+/// `benchmarks/agents/prices.toml`.
 pub fn prices_path() -> PathBuf {
-    repo_file("bench/agents/prices.toml")
+    repo_file("benchmarks/agents/prices.toml")
 }
 
 pub fn load_bands() -> Result<Bands, String> {

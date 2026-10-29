@@ -1,7 +1,7 @@
 //! The agents cost benchmarks of ADR-3331 decision 15 (issue #3361).
 //!
 //! Runs every scenario of `ravel_agents_sim::bench` and checks each figure
-//! against the band table in `bench/agents/prereg.md`. Exits non-zero when a
+//! against the band table in `benchmarks/agents/prereg.md`. Exits non-zero when a
 //! figure is outside its band, printed more than once, or expected and
 //! missing. `docs/agents-benchmarks.md` describes the scenarios and the
 //! report format.

@@ -1,5 +1,5 @@
 //! Figures, the report line format, the band table read from
-//! `bench/agents/prereg.md`, the band check, and the price table.
+//! `benchmarks/agents/prereg.md`, the band check, and the price table.
 //!
 //! A figure is keyed `<scenario>.<temp>.<op>.<phase>.<metric>`. A report
 //! line is
@@ -490,7 +490,7 @@ fn expected_keys(op: &str) -> Vec<(&'static str, &'static str)> {
     keys
 }
 
-/// The price table of `bench/agents/prices.toml`, in dollars.
+/// The price table of `benchmarks/agents/prices.toml`, in dollars.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prices {
     pub label: String,

@@ -34,7 +34,7 @@ restarted process pays.
 
 Sizes: `small` (the default, and what the tests run) and `full`. The exact
 counts for each are in the "Scenario sizes" table of
-[bench/agents/prereg.md](../bench/agents/prereg.md). Discovery runs N = 100
+[benchmarks/agents/prereg.md](../benchmarks/agents/prereg.md). Discovery runs N = 100
 on small and N = 100, 1,000 and 10,000 on full.
 
 ## How to run
@@ -96,28 +96,28 @@ Every byte figure names which bytes it counts, and a byte figure without a
 
 ### Prices
 
-`bench/agents/prices.toml` holds per-request and per-GB prices, labelled
+`benchmarks/agents/prices.toml` holds per-request and per-GB prices, labelled
 `assumption` with a date and a source. The runner prints dollars per million
 operations as `agents-bench-usd` lines derived from the measured counts. No
 band is ever on a dollar figure, so a price change cannot turn a run red.
 
 ## Bands
 
-The band table is in [bench/agents/prereg.md](../bench/agents/prereg.md),
+The band table is in [benchmarks/agents/prereg.md](../benchmarks/agents/prereg.md),
 committed before the first measurement. Its dated revision section restates
 the rows the first run showed were predicted on the wrong split; the
 original rows stay as written. The headline bands:
 
 | figure | band | basis |
 |---|---|---|
-| message, warm, uncontended: resolve GET, store PUT, publish CAS | 1.5, 1, 1 per message | bench/agents/prereg.md:68 |
-| turn, warm: resolve GET | 2.5 per turn (many) | bench/agents/prereg.md:332 |
-| turn, cold: resolve GET, publish CAS | 3, 3 per turn (takeover on every turn) | bench/agents/prereg.md:332 |
-| LIST on message, turn or step | 0 | bench/agents/prereg.md:68 |
-| dormant agents' requests | 0 | bench/agents/prereg.md:68 |
-| baseline agents requests | 0 | bench/agents/prereg.md:68 |
-| discovery sweep passes | at most ceil(N/64) | bench/agents/prereg.md:68 |
-| discovery delay | at most ceil(N/64) x 5000 ms | bench/agents/prereg.md:123 |
+| message, warm, uncontended: resolve GET, store PUT, publish CAS | 1.5, 1, 1 per message | benchmarks/agents/prereg.md:68 |
+| turn, warm: resolve GET | 2.5 per turn (many) | benchmarks/agents/prereg.md:332 |
+| turn, cold: resolve GET, publish CAS | 3, 3 per turn (takeover on every turn) | benchmarks/agents/prereg.md:332 |
+| LIST on message, turn or step | 0 | benchmarks/agents/prereg.md:68 |
+| dormant agents' requests | 0 | benchmarks/agents/prereg.md:68 |
+| baseline agents requests | 0 | benchmarks/agents/prereg.md:68 |
+| discovery sweep passes | at most ceil(N/64) | benchmarks/agents/prereg.md:68 |
+| discovery delay | at most ceil(N/64) x 5000 ms | benchmarks/agents/prereg.md:123 |
 
 Discovery measures how long an unassigned agent waits to be found: a sweep
 pass reads at most 64 directory entries, so a target at the end of a
@@ -126,5 +126,5 @@ is 157 passes and about 13 minutes for N = 10,000.
 
 ## Reports
 
-[bench/agents/REPORT.md](../bench/agents/REPORT.md) holds the last recorded
+[benchmarks/agents/REPORT.md](../benchmarks/agents/REPORT.md) holds the last recorded
 run, with its stamp.
