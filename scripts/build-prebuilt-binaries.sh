@@ -68,7 +68,7 @@ docker run --rm --init \
   "${image}" \
   bash -c '
     set -euo pipefail
-    cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
+    cargo build --release --locked -p ravel-server --features sql,flight-sql,otap,agents
     cargo build --release --locked -p ravel-cli
     cargo build --release --locked -p ravel-operator
   '
