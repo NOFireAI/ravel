@@ -1,11 +1,15 @@
 //! `GcsStore`'s own JSON API `objects.list` client (ADR-3456 decision 1).
 //!
 //! Each request is one `GET <base>/storage/v1/b/<bucket>/o` carrying `prefix`,
-//! `delimiter` and `startOffset` as raw names, `maxResults` set to the store's
-//! page size, and the service's opaque `pageToken` when following a page.
-//! Names come back as JSON strings and go to [`crate::classify_objects`] and
-//! [`crate::classify_prefixes`] as received, so a name `object_store`'s `Path`
-//! would rewrite is reported as unaddressable rather than failing the page.
+//! `delimiter` and `startOffset` as raw names, and the service's opaque
+//! `pageToken` when following a page. `maxResults` is the store's configured
+//! page size for `list` and `list_after`, since those stop as soon as one page
+//! is filled, and the wire maximum ([`WIRE_PAGE_KEYS`]) for `list_delimited`,
+//! which drains every response regardless of page size, the same as the S3
+//! lister's own delimited listing. Names come back as JSON strings and go to
+//! [`crate::classify_objects`] and [`crate::classify_prefixes`] as received,
+//! so a name `object_store`'s `Path` would rewrite is reported as
+//! unaddressable rather than failing the page.
 //!
 //! Requests go through the data plane's [`S3HttpConnector`] recording around
 //! a reqwest client with redirects off, inside the caller's
@@ -36,6 +40,13 @@ use crate::{DelimitedList, Etag, ListPage, ObjectMeta, PageToken, StoreError, Ve
 
 /// Largest `objects.list` response body read.
 const LIST_MAX_BODY_BYTES: usize = crate::s3::list::LIST_MAX_BODY_BYTES;
+
+/// The `maxResults` a `list_delimited` request sends, matching the S3
+/// lister's own delimited-listing `max-keys` (`s3/list.rs`'s
+/// `WIRE_PAGE_KEYS`): a delimited drain reads every response regardless of
+/// the store's configured page size, so it asks for the most the wire
+/// allows rather than paying one round trip per configured-size page.
+const WIRE_PAGE_KEYS: usize = 1000;
 
 /// The response fields asked for: everything [`ObjectMeta`] needs, and no
 /// more. `md5Hash` and `componentCount` decide the listed ETag.
@@ -224,7 +235,9 @@ impl ListFetch for GcsListClient {
     async fn fetch(&self, request: &ListRequest<'_>) -> Result<ListResponse, StoreError> {
         let url = self.request_url(request);
         let context = format!("listing {:?}", request.prefix);
-        let body = self.send(&context, Method::GET, &url, Bytes::new()).await?;
+        let body = self
+            .send(&context, Method::GET, &url, Bytes::new(), NotFoundSubject::Bucket)
+            .await?;
         parse_list(request.prefix, &body)
     }
 }
@@ -276,7 +289,14 @@ impl GcsListClient {
             encode_component(name)
         );
         let context = format!("uploading {name:?}");
-        self.send(&context, Method::POST, &url, data).await?;
+        self.send(
+            &context,
+            Method::POST,
+            &url,
+            data,
+            NotFoundSubject::Object,
+        )
+        .await?;
         Ok(())
     }
 
@@ -285,8 +305,14 @@ impl GcsListClient {
     pub(crate) async fn delete_object(&self, name: &str) -> Result<(), StoreError> {
         let url = format!("{}/{}", self.url, encode_component(name));
         let context = format!("deleting {name:?}");
-        self.send(&context, Method::DELETE, &url, Bytes::new())
-            .await?;
+        self.send(
+            &context,
+            Method::DELETE,
+            &url,
+            Bytes::new(),
+            NotFoundSubject::Object,
+        )
+        .await?;
         Ok(())
     }
 
@@ -301,7 +327,12 @@ impl GcsListClient {
         if let Some(offset) = request.start_offset {
             pairs.push(("startOffset", offset.to_string()));
         }
-        pairs.push(("maxResults", self.page_size.max(1).to_string()));
+        let max_results = if request.delimited {
+            WIRE_PAGE_KEYS
+        } else {
+            self.page_size.max(1)
+        };
+        pairs.push(("maxResults", max_results.to_string()));
         if let Some(token) = request.page_token {
             pairs.push(("pageToken", token.to_string()));
         }
@@ -314,13 +345,15 @@ impl GcsListClient {
     }
 
     /// Send one request under the retry rules and return the success body.
-    /// `context` opens every error message.
+    /// `context` opens every error message; `not_found` says what a 404
+    /// means for this request (ADR-3456 decision 4).
     async fn send(
         &self,
         context: &str,
         method: Method,
         url: &str,
         body: Bytes,
+        not_found: NotFoundSubject,
     ) -> Result<Vec<u8>, StoreError> {
         let started = tokio::time::Instant::now();
         let mut backoff = Backoff::new(&self.retry.backoff);
@@ -343,7 +376,7 @@ impl GcsListClient {
                 Err(Failure::Refused(_)) => false,
             };
             if !retry || exhausted {
-                return outcome.map_err(|failure| failure.into_store_error(context));
+                return outcome.map_err(|failure| failure.into_store_error(context, not_found));
             }
             tokio::time::sleep(backoff.next()).await;
             retries += 1;
@@ -430,7 +463,7 @@ enum Failure {
 }
 
 impl Failure {
-    fn into_store_error(self, context: &str) -> StoreError {
+    fn into_store_error(self, context: &str, not_found: NotFoundSubject) -> StoreError {
         match self {
             Failure::Refused(error) => error,
             Failure::Credential(message) => StoreError::Transient(message),
@@ -438,16 +471,30 @@ impl Failure {
                 HttpErrorKind::Timeout => StoreError::Timeout,
                 _ => StoreError::Transient(format!("{context}: {error}")),
             },
-            Failure::Status(status) => status_error(context, status),
+            Failure::Status(status) => status_error(context, status, not_found),
         }
     }
 }
 
-/// A final status, classified by the status alone (ADR-3456 decision 4).
-fn status_error(context: &str, status: u16) -> StoreError {
+/// What a 404 means for one request (ADR-3456 decision 4): `objects.list`
+/// reports a missing *bucket* this way, while the object-scoped JSON API
+/// calls (`delete`, media upload) report a missing *object* the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotFoundSubject {
+    Bucket,
+    Object,
+}
+
+/// A final status, classified by the status and, for 404, by `not_found`.
+fn status_error(context: &str, status: u16, not_found: NotFoundSubject) -> StoreError {
     match status {
         401 | 403 => StoreError::AccessDenied(format!("{context}: HTTP {status}")),
-        404 => StoreError::Permanent(format!("{context}: bucket does not exist (HTTP 404)")),
+        404 => match not_found {
+            NotFoundSubject::Bucket => {
+                StoreError::Permanent(format!("{context}: bucket does not exist (HTTP 404)"))
+            }
+            NotFoundSubject::Object => StoreError::NotFound,
+        },
         429 | 503 => StoreError::Throttled {
             retry_after_ms: 1000,
         },
@@ -654,6 +701,24 @@ mod tests {
     fn components_keep_only_unreserved_bytes() {
         assert_eq!(encode_component("a b/c+d~e"), "a%20b%2Fc%2Bd~e");
         assert_eq!(encode_component("\u{1}é"), "%01%C3%A9");
+    }
+
+    #[test]
+    fn a_404_on_objects_list_means_the_bucket_does_not_exist() {
+        match status_error("listing \"p/\"", 404, NotFoundSubject::Bucket) {
+            StoreError::Permanent(message) => {
+                assert!(message.contains("bucket does not exist"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_404_on_an_object_path_means_the_object_was_not_found() {
+        assert!(matches!(
+            status_error("deleting \"p/k\"", 404, NotFoundSubject::Object),
+            StoreError::NotFound
+        ));
     }
 
     /// `startOffset`, `pageToken` and whether the request is delimited.

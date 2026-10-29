@@ -64,9 +64,10 @@
 //!   recompute, or arrived as several responses none of which is the
 //!   whole object (ADR-1696 decision 3). Like `attempts`, it is recorded by the
 //!   adapter's HTTP connector's owner rather than by this decorator, through
-//!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
-//!   S3 adapter. A non-zero and *growing* value against an endpoint that is
-//!   supposed to store checksums is the signal that it is dropping them.
+//!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is
+//!   neither the S3 adapter nor the GCS adapter. A non-zero and *growing*
+//!   value against an endpoint that is supposed to store checksums is the
+//!   signal that it is dropping them.
 //! - `list_unaddressable` (`ravel_store_list_unaddressable_total`) is a
 //!   store-wide total of listed keys and common prefixes a backend classified
 //!   unaddressable and left out of a page (ADR-2637): objects no operation can

@@ -225,6 +225,11 @@ pub struct GcsStore {
     lister: GcsListClient,
     store_time: Arc<ObservedStoreTime>,
     get_unverified: AtomicU64,
+    /// Where `ravel_store_get_unverified_total` is also recorded (shared with
+    /// [`S3Store`](crate::s3::S3Store)'s own counter), so a caller scraping
+    /// the registry sees GCS's unverified reads too, not just this store's
+    /// private [`GcsStore::get_unverified`] accessor.
+    metrics: Arc<StoreMetrics>,
 }
 
 impl GcsStore {
@@ -280,7 +285,7 @@ impl GcsStore {
         })?;
         let lister = list_client(
             &config,
-            metrics,
+            Arc::clone(&metrics),
             Arc::clone(&store_time),
             authority,
             (!config.skip_signature()).then(|| Arc::clone(store.credentials())),
@@ -290,6 +295,7 @@ impl GcsStore {
             lister,
             store_time,
             get_unverified: AtomicU64::new(0),
+            metrics,
         })
     }
 
@@ -359,6 +365,7 @@ impl GcsStore {
         let data = result.bytes().await.map_err(map_error_common)?;
         if full {
             self.get_unverified.fetch_add(1, Ordering::Relaxed);
+            self.metrics.record_get_unverified();
         }
         Ok(PinnedRead {
             outcome: GetOutcome {

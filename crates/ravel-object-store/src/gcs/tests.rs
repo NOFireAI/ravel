@@ -382,6 +382,29 @@ async fn ranged_reads_select_the_requested_bytes() {
 }
 
 #[tokio::test]
+async fn unverified_reads_are_recorded_on_the_shared_store_metrics() {
+    let fake = fake().await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store =
+        GcsStore::with_metrics(fake.config(), Arc::clone(&metrics)).expect("store");
+    store
+        .put("u/k", Bytes::from_static(b"v"), PutOptions::default())
+        .await
+        .expect("put");
+
+    assert_eq!(metrics.get_unverified(), 0);
+    store.get("u/k", GetRange::Full).await.expect("full");
+    assert_eq!(
+        metrics.get_unverified(),
+        1,
+        "a full read must count on the shared StoreMetrics, not only on \
+         GcsStore's own private counter"
+    );
+    store.get("u/k", GetRange::Full).await.expect("full");
+    assert_eq!(metrics.get_unverified(), 2);
+}
+
+#[tokio::test]
 async fn pinned_reads_select_the_generation_and_send_the_etag() {
     let fake = fake().await;
     let store = store(&fake);
@@ -861,17 +884,21 @@ async fn list_after_skips_the_start_key() {
 async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
     let fake = fake().await;
     let store = paged_store(&fake, 3);
-    // Three entries a page: the first ends at `d/c`, the second holds `d/d`
-    // and the `d/sub/` prefix.
-    for key in ["d/a", "d/b", "d/c", "d/d", "d/sub/x", "d/sub/y"] {
+    // Three entries a page: the first ends at `d/c`, the second holds `d/d`.
+    for key in ["d/a", "d/b", "d/c", "d/d"] {
         fake.insert_object(key, Bytes::from_static(b"v"));
     }
 
-    let delimited = store.list_delimited("d/").await.expect("delimited");
+    let page = store.list("d/", None).await.expect("list");
+    let direct: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(direct, ["d/a", "d/b", "d/c"]);
+    let rest = store
+        .list_after("d/", Some("d/c"), None)
+        .await
+        .expect("list_after");
+    let after: Vec<_> = rest.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(after, ["d/d"]);
 
-    let direct: Vec<_> = delimited.objects.iter().map(|o| o.key.as_str()).collect();
-    assert_eq!(direct, ["d/a", "d/b", "d/c", "d/d"]);
-    assert_eq!(delimited.common_prefixes, ["d/sub/"]);
     let lists: Vec<_> = fake
         .requests()
         .into_iter()
@@ -880,7 +907,6 @@ async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
     assert_eq!(lists.len(), 2, "{lists:?}");
     for list in &lists {
         assert_eq!(list.query_param("maxResults"), Some("3"));
-        assert_eq!(list.query_param("delimiter"), Some("/"));
         assert_eq!(list.query_param("prefix"), Some("d/"));
         assert_eq!(
             list.header("authorization"),
@@ -888,12 +914,32 @@ async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
             "skip_signature lists unsigned"
         );
     }
-    assert_eq!(lists[0].query_param("pageToken"), None);
-    let first_token = fake.page_token_for("d/c");
-    assert_eq!(
-        lists[1].query_param("pageToken"),
-        Some(first_token.as_str())
-    );
+}
+
+/// `list_delimited` drains every response regardless of the store's
+/// configured page size, so it asks for the wire maximum rather than the
+/// configured one (ADR-3456 decision 1).
+#[tokio::test]
+async fn delimited_listing_sends_the_wire_maximum_not_the_page_size() {
+    let fake = fake().await;
+    let store = paged_store(&fake, 2);
+    for key in ["d/a", "d/b", "d/sub/x"] {
+        fake.insert_object(key, Bytes::from_static(b"v"));
+    }
+
+    let delimited = store.list_delimited("d/").await.expect("delimited");
+    let direct: Vec<_> = delimited.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(direct, ["d/a", "d/b"]);
+    assert_eq!(delimited.common_prefixes, ["d/sub/"]);
+
+    let lists: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .collect();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    assert_eq!(lists[0].query_param("maxResults"), Some("1000"));
+    assert_eq!(lists[0].query_param("delimiter"), Some("/"));
 }
 
 #[tokio::test]
