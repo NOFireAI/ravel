@@ -1638,7 +1638,10 @@ pub struct Cli {
     /// (ADR-0088), threaded into `ravel_sql::SqlConfig::max_query_bytes`.
     /// Governs a single SQL query's intermediate `RecordBatch` footprint; a
     /// query whose pool grow would exceed it aborts rather than growing without
-    /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
+    /// bound. Columns a scan is served from the decoded column-block cache
+    /// count against the process memory budget only, not against this pool
+    /// (ADR-3326, tenant-ceiling amendment).
+    /// Process-wide, not per-tenant (per-tenant SQL budgets wait on the
     /// limits-file's per-tenant enforcement gap, ADR-0088). Default when unset:
     /// derived, 50% of MemTotal, the same share as `--sql-tenant-max-bytes`, so
     /// a lone statement may use the tenant's whole SQL share; reference host

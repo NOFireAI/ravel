@@ -686,5 +686,6 @@ would be refused (decision 4). Entries are keyed by tenant, so one tenant's stat
 never served another tenant's entries. The process budget still counts
 every served byte once, so the process bound is unchanged.
 
-The flag reference for `--sql-tenant-max-bytes` and `docs/query-engine.md`
-state this.
+The help text and flag reference rows for `--sql-max-query-bytes` and
+`--sql-tenant-max-bytes`, `docs/guides/operations/configuration.md`,
+`docs/guides/query.md` and `docs/query-engine.md` state this.

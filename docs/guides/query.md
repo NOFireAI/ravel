@@ -606,7 +606,9 @@ directly. Raise this flag for such a workload.
 
 `--sql-max-query-bytes` bounds the DataFusion memory pool of one SQL query.
 `--sql-tenant-max-bytes` bounds the memory that one tenant can hold across its
-concurrent SQL queries. It is the multi-tenant isolation ceiling. At the
+concurrent SQL queries. It is the multi-tenant isolation ceiling. Neither
+flag counts columns a scan is served from the decoded column-block cache:
+those count against the process memory budget only. At the
 derived defaults it equals the per-query pool: one statement can use the whole
 share, and a second concurrent statement gets what the first left. Both flags
 apply only in a build with the `sql` feature.
