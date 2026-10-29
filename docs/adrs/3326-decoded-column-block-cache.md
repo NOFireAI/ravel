@@ -688,4 +688,5 @@ every served byte once, so the process bound is unchanged.
 
 The help text and flag reference rows for `--sql-max-query-bytes` and
 `--sql-tenant-max-bytes`, `docs/guides/operations/configuration.md`,
-`docs/guides/query.md` and `docs/query-engine.md` state this.
+`docs/guides/query.md` and `docs/query-engine.md` state this, and ADR-0088
+carries an amendment pointing here.
