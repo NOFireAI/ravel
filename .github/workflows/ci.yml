@@ -1528,7 +1528,8 @@ jobs:
   # --features agents --all-targets`, the agents_seam, agents_effects_e2e,
   # agents_e2e, agents_timers_e2e and agents_real_store test binaries, the lib tests whole (no path filter), and
   # ravel-catalog's sys_proto_format_version_classification test, which covers
-  # proto/ravel/agents.proto (ADR-3331 decision 3). Gated on agents_area.
+  # proto/ravel/agents.proto (ADR-3331 decision 3), and the ravel-agents-runtime
+  # and ravel-agents-sim tests at RAVEL_AGENTS_PAGE_ENTRIES=2. Gated on agents_area.
   #
   # NOTE: not yet a required check; ADR-3331 decision 14 leaves adding it to
   # the protect-main ruleset to the owner.
@@ -1581,6 +1582,14 @@ jobs:
         run: cargo test --locked --profile ci -p ravel-server --features agents --lib
       - name: Test the sys proto format_version classification
         run: cargo test --locked --profile ci -p ravel-catalog --test sys_proto_format_version_classification
+        # The agents lane's second page size, as in scripts/gates.sh: every
+        # paged list seals after two entries, so the sealed-page paths run
+        # and the sim batches assert their size-2 pins (SMALL_PAGE_ENTRIES).
+        # The check job runs these crates at the default size only.
+      - name: Test ravel-agents-runtime and ravel-agents-sim at page size 2
+        env:
+          RAVEL_AGENTS_PAGE_ENTRIES: "2"
+        run: cargo test --locked --profile ci --color never -p ravel-agents-runtime -p ravel-agents-sim
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
