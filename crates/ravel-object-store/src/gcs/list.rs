@@ -482,6 +482,7 @@ impl Failure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotFoundSubject {
     Bucket,
+    #[cfg(any(test, feature = "test-support"))]
     Object,
 }
 
@@ -493,6 +494,7 @@ fn status_error(context: &str, status: u16, not_found: NotFoundSubject) -> Store
             NotFoundSubject::Bucket => {
                 StoreError::Permanent(format!("{context}: bucket does not exist (HTTP 404)"))
             }
+            #[cfg(any(test, feature = "test-support"))]
             NotFoundSubject::Object => StoreError::NotFound,
         },
         429 | 503 => StoreError::Throttled {
