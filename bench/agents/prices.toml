@@ -1,0 +1,22 @@
+# Price assumptions for the agents cost benchmarks (issue #3361).
+#
+# These are assumptions, not measurements. The bench multiplies its measured
+# request counts by these prices and prints dollars per million operations as
+# derived figures. No assertion is ever made on a dollar figure: the bands in
+# prereg.md are on counts only, so a price change cannot turn a run red.
+
+label = "assumption"
+date = "2026-10-29"
+source = "AWS S3 Standard, us-east-1, public pricing page (https://aws.amazon.com/s3/pricing/), as read on the date above"
+
+# Dollars per 1,000 requests.
+get_per_1k = 0.0004
+put_per_1k = 0.005
+# A CAS is a conditional PUT and is billed as one.
+cas_per_1k = 0.005
+list_per_1k = 0.005
+delete_per_1k = 0.0
+
+# Dollars per GB of object-body bytes moved. In-region transfer to compute in
+# the same region is not billed.
+transfer_per_gb = 0.0
