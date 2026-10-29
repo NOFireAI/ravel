@@ -4613,6 +4613,8 @@ pub(crate) fn render_agents_families(
         write_sample(out, name, &[Label::Mode(mode)], value);
     }
 
+    render_agents_projection_family(out, mode, runtime);
+
     let sweep = runtime.sweep_metrics();
     for (name, help, value) in [
         (
@@ -4746,6 +4748,78 @@ pub(crate) fn render_agents_families(
                 field(counts),
             );
         }
+    }
+}
+
+/// The projection of committed agent history into logs and traces, over every
+/// tenant this process has served: the same figures as the `projection`
+/// block of `GET /api/v1/agents/health`.
+#[cfg(feature = "agents")]
+fn render_agents_projection_family(
+    out: &mut String,
+    mode: Mode,
+    runtime: &crate::agents::AgentsRuntime,
+) {
+    let projection = runtime.projection_metrics();
+    let backlog_bound = u64::try_from(runtime.projection_plan().backlog).unwrap_or(u64::MAX);
+    for (name, help, kind, value) in [
+        (
+            "ravel_agents_projection_lag_max",
+            "Committed agent events not yet projected, the largest over every agent this process projects: committed event seq minus projected event seq.",
+            "gauge",
+            projection.lag_max,
+        ),
+        (
+            "ravel_agents_projection_backlog",
+            "Projection records read and not yet delivered, summed over tenants.",
+            "gauge",
+            projection.backlog,
+        ),
+        (
+            "ravel_agents_projection_backlog_bound",
+            "The --agents-projection-backlog setting: most records one tenant's projector holds read and undelivered.",
+            "gauge",
+            backlog_bound,
+        ),
+        (
+            "ravel_agents_projection_events_projected_total",
+            "Agent events delivered as log records, a retried batch counted once.",
+            "counter",
+            projection.events_projected,
+        ),
+        (
+            "ravel_agents_projection_spans_projected_total",
+            "Turn spans delivered.",
+            "counter",
+            projection.spans_projected,
+        ),
+        (
+            "ravel_agents_projection_sink_failures_total",
+            "Projection deliveries that failed and are retried under the same ids: an ingest refusal that may clear, a store error, or an unreachable endpoint.",
+            "counter",
+            projection.sink_failures,
+        ),
+        (
+            "ravel_agents_projection_backlog_full_total",
+            "Projection passes that left committed events unread because the backlog was at its bound.",
+            "counter",
+            projection.backlog_full,
+        ),
+        (
+            "ravel_agents_projection_read_failures_total",
+            "Agent store reads by the projector that failed; the events stay committed and are read on a later pass.",
+            "counter",
+            projection.read_failures,
+        ),
+        (
+            "ravel_agents_projection_records_rejected_total",
+            "Log records and spans ingest rejected for good, for example older than the ingest lag; the projector skips them and never retries.",
+            "counter",
+            projection.records_rejected,
+        ),
+    ] {
+        write_header(out, name, help, kind);
+        write_sample(out, name, &[Label::Mode(mode)], value);
     }
 }
 

@@ -2438,9 +2438,32 @@ each tenant this process has served (`docs/agents.md`, "Wire"):
 |---|---|
 | `ravel_agents_evidence_dropped_total` | Late effect results the evidence index could not list, because every slot held an effect still in doubt or the effect already listed 16. The result object is still stored; `GET /api/v1/agents/effects/{effect}` does not name it. |
 
+The projection family reports how far the projection of committed agent
+history into logs and traces (`docs/agents.md`, "Projection") trails the
+agent store, over every tenant this process has served. Each sample carries
+the `mode` label; the figures are those of the `projection` block of
+`GET /api/v1/agents/health`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `ravel_agents_projection_lag_max` | gauge | Committed events not yet projected, the largest over the agents this process projects. |
+| `ravel_agents_projection_backlog` | gauge | Records read and not yet delivered, summed over tenants. |
+| `ravel_agents_projection_backlog_bound` | gauge | The `--agents-projection-backlog` setting, which bounds each tenant's backlog; not a sum over tenants. |
+| `ravel_agents_projection_events_projected_total` | counter | Events delivered as log records, a retried batch counted once. |
+| `ravel_agents_projection_spans_projected_total` | counter | Turn spans delivered. |
+| `ravel_agents_projection_sink_failures_total` | counter | Deliveries that failed and are retried under the same ids. |
+| `ravel_agents_projection_backlog_full_total` | counter | Passes that left committed events unread because the backlog was at its bound. |
+| `ravel_agents_projection_read_failures_total` | counter | Agent store reads by the projector that failed; the events are read on a later pass. |
+| `ravel_agents_projection_records_rejected_total` | counter | Records ingest rejected for good, for example older than the ingest lag, which the projector skipped. |
+
+A rising `lag_max` with a rising `sink_failures_total` is an outage of the
+receiving ingest path; a rising `records_rejected_total` is data that will
+never be projected and needs no retry.
+
 Test: `metrics_scrape_reports_every_agents_family_once_with_the_mode_label`
 and `snapshot_enabled_follows_the_mount_flag` in `services/ravel-server`; the
-sweep counters by `sweep_route_counts_match_the_store_and_needs_agents_admin`
+projection family by `projection_metrics_scrape_matches_health_after_an_outage`
+in `agents_projection_e2e`; the sweep counters by `sweep_route_counts_match_the_store_and_needs_agents_admin`
 in the `agents_timers_e2e` test binary; the evidence counter by
 `a_late_result_the_full_evidence_index_drops_is_counted` in
 `agents_effects_e2e`.
