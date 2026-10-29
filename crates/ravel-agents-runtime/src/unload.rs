@@ -25,7 +25,7 @@ impl Coordinator {
                 .filter(|(_, l)| {
                     !l.dispatching
                         && l.head.active_turn.is_none()
-                        && l.head.inbox.is_empty()
+                        && !l.head.has_inbox()
                         && now.saturating_sub(l.touched_unix_ns) >= idle_ns
                 })
                 .map(|(a, _)| *a)

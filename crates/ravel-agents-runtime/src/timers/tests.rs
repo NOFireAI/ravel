@@ -81,12 +81,20 @@ fn coordinator(store: &Arc<AgentStore>, now: &Arc<Now>, sweep: SweepConfig) -> A
 /// One coordinator over `backend`, its clock at `T0`, which is the start of
 /// a due bucket.
 pub(crate) fn rig_over(backend: Arc<dyn ObjectStoreBackend>, sweep: SweepConfig) -> Rig {
+    rig_with(backend, sweep, crate::tests::limits())
+}
+
+pub(crate) fn rig_with(
+    backend: Arc<dyn ObjectStoreBackend>,
+    sweep: SweepConfig,
+    limits: ravel_agents_store::StoreLimits,
+) -> Rig {
     let now = Arc::new(Now(AtomicI64::new(T0)));
     let store = Arc::new(
         AgentStore::new(
             backend.clone(),
             TENANT,
-            crate::tests::limits(),
+            limits,
             now.clone(),
             Arc::new(DerivedIds),
         )

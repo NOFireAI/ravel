@@ -417,7 +417,12 @@ pub(super) async fn state(State(api): State<Api>, req: Request<Body>) -> Respons
             kind: q.kind,
             key: q.key,
         })?;
-        let head = read_head(&call.tenant, &agent).await?;
+        let mut head = read_head(&call.tenant, &agent).await?;
+        // The mailbox lists every input still in the inbox, sealed or open.
+        call.tenant
+            .store
+            .attach(&agent, &mut head, &[(ListKind::Inbox, Need::All)])
+            .await?;
         let state = read_json(&call.tenant, &agent, head.state).await?;
         Ok::<_, Refusal>(Json(StateResponse {
             agent_id: agent.to_hex(),
@@ -481,10 +486,18 @@ pub(super) async fn events(State(api): State<Api>, req: Request<Body>) -> Respon
                 (head, Some((operation_seq(&handle), state)))
             }
         };
+        // A shallow HEAD holds only the open page; sealed history starts at
+        // the first sealed page.
         let oldest = head
+            .index
             .events
+            .pages
             .first()
-            .map_or(head.next_event_seq, |e| e.event_seq);
+            .map(|p| p.first_key)
+            .into_iter()
+            .chain(head.events.first().map(|e| e.event_seq))
+            .min()
+            .unwrap_or(head.next_event_seq);
         if let Some(cursor) = after
             && cursor.saturating_add(1) < oldest
         {
@@ -562,7 +575,12 @@ pub(super) async fn timers(State(api): State<Api>, req: Request<Body>) -> Respon
             kind: q.kind,
             key: q.key,
         })?;
-        let head = read_head(&call.tenant, &agent).await?;
+        let mut head = read_head(&call.tenant, &agent).await?;
+        // Delivered and cancelled generations seal onto timer pages.
+        call.tenant
+            .store
+            .attach(&agent, &mut head, &[(ListKind::Timers, Need::All)])
+            .await?;
         Ok::<_, Refusal>(Json(TimersResponse {
             timers: head
                 .timers
