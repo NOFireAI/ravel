@@ -765,8 +765,10 @@ mod tests {
     use super::*;
     use crate::Coordinator;
     use crate::tests::{
-        TestClock, clock, coordinator, create, head, id_of, poll_now, send, store_over, worker,
+        TestClock, clock, coordinator, create, head, id_of, poll_now, send, store_over, store_with,
+        worker,
     };
+    use ravel_agents_store::StoreLimits;
 
     /// Records every delivery; fails while `down` is set, and rejects for
     /// good the events whose seq is in `reject`.
@@ -813,11 +815,22 @@ mod tests {
     }
 
     fn rig(limits: ProjectionLimits, payload: PayloadPolicy) -> Rig {
+        rig_at(crate::tests::limits(), limits, payload)
+    }
+
+    fn rig_at(store: StoreLimits, limits: ProjectionLimits, payload: PayloadPolicy) -> Rig {
         let clock = clock();
         let backend = Arc::new(MemoryStore::new());
-        let store = store_over(backend.clone(), &clock);
         let sink = Arc::new(TestSink::default());
-        let projector = projector_over(&backend, &clock, &sink, limits, payload);
+        let projector = Arc::new(Projector::new(
+            TenantHash([7; 16]),
+            store_with(backend.clone(), &clock, store),
+            sink.clone(),
+            limits,
+            payload,
+            clock.clone(),
+        ));
+        let store = store_with(backend.clone(), &clock, store);
         let co = coordinator(&store, &clock, 100);
         let co = Arc::new(
             Arc::into_inner(co)
@@ -1059,6 +1072,50 @@ mod tests {
         // same two under the same ids, then the new event.
         assert_eq!(ids, [first.clone(), first, vec![third]].concat());
         assert_eq!(restarted.projector.metrics().lag_max, 0);
+    }
+
+    /// A pass over an agent whose history is already projected reads HEAD
+    /// and the event pages holding the new events, and nothing else: no
+    /// sealed page of older events, results, inbox or receipts.
+    #[tokio::test]
+    async fn a_pass_reads_head_and_only_the_pages_holding_new_events() {
+        let mut small = crate::tests::limits();
+        small.kernel.max_page_entries = 2;
+        let rig = rig_at(small, ProjectionLimits::default(), PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        for i in 1..=4 {
+            turn(&rig, &format!("r{i}"), 2).await;
+        }
+        rig.projector.project_once().await;
+        assert_eq!(rig.sink.delivered.lock().len(), 8);
+        let history = head(&store_with(rig.backend.clone(), &rig.clock, small), "a").await;
+        assert!(
+            history.index.events.pages.len() >= 3,
+            "history spans several sealed event pages"
+        );
+        let other = &history.index;
+        assert!(
+            other.inbox.pages.len() + other.receipts.pages.len() + other.results.pages.len() > 0,
+            "sealed pages outside the event list exist for a full read to load"
+        );
+
+        turn(&rig, "r5", 5).await;
+        let now = head(&store_with(rig.backend.clone(), &rig.clock, small), "a").await;
+        let mut pages: Vec<usize> = (9..=13)
+            .filter_map(|seq| now.index.events.page_for(seq))
+            .collect();
+        pages.dedup();
+        assert!(!pages.is_empty(), "some new events sit on sealed pages");
+        let before = rig.projector.store_counters();
+        let pass = rig.projector.project_once().await;
+        assert_eq!(pass.events_delivered, 5);
+        let read = rig.projector.store_counters().since(&before);
+        let gets: u64 = [read.resolve, read.build, read.store, read.publish]
+            .iter()
+            .map(|p| p.get)
+            .sum();
+        assert_eq!(gets, 1 + pages.len() as u64, "HEAD plus {pages:?}");
+        assert_eq!(writes(&read), 0);
     }
 
     /// A record the sink rejects for good is skipped and counted, its reason
