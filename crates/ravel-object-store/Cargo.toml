@@ -44,7 +44,7 @@ ring = { workspace = true }
 # (?versioning, ?lifecycle, ?replication, ?object-lock, ?retention). 0.41 is the
 # release outside the two advisories deny.toml tracks.
 quick-xml = { workspace = true }
-# The in-process fake GCS XML endpoint (`gcs::fake`, ADR-3456), exported to
+# The in-process fake GCS endpoint (`gcs::fake`, ADR-3456), exported to
 # other crates' tests behind `test-support` and never built otherwise.
 axum = { workspace = true, optional = true }
 

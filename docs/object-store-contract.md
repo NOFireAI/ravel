@@ -990,26 +990,50 @@ configured; `ravel-server` and `ravel-cli` configure `Crc64Nvme` unless told
 otherwise (see "Upload checksums").
 
 **GCS (`GcsStore`, ADR-3456).** `GcsStore` talks to GCS through
-`object_store`'s `GoogleCloudStorage` client, which speaks the XML API, and
+`object_store`'s `GoogleCloudStorage` client, which speaks the XML API, for
+object requests and lists through the JSON API with a client of its own. It
 reports exactly `Capabilities::mandatory()`. The version token is the
 object's generation as a decimal string on every path (`put`, `get`, `head`,
 `pin_of` and listing entries), never the ETag: an identical rewrite keeps the
 ETag and moves the generation. `CreateIfAbsent` sends
 `x-goog-if-generation-match: 0` and maps a 412 to `AlreadyExists`;
 `CasVersion(v)` sends `x-goog-if-generation-match: v` and maps a 412 to
-`PreconditionFailed`, and a token that is not a decimal generation is refused
-with `PreconditionFailed` before any request; `Overwrite` sends no
-precondition. Listing is one `list-type=2` request per page with `max-keys`
-set to the configured page size (`GcsConfig::list_page_size`, 1000 by
-default), using the S3 adapter's paging loop, so a key `object_store` cannot
-address is reported unaddressable rather than failing the page. Errors are
-classified by HTTP status: 429 and 503 are `Throttled`, 404 is `NotFound`
-(`Permanent` when the body names `NoSuchBucket`), 401 and 403 are
-`AccessDenied`, and 412 depends on the put mode as above. Every HTTP attempt
+`PreconditionFailed`. A `CasVersion` token that is not a positive decimal
+with no leading zero (`0`, `012`, an empty or non-numeric token) is refused
+with `Permanent` before any request: GCS issues no generation 0, and
+`x-goog-if-generation-match: 0` would turn the CAS into a create-if-absent.
+`Overwrite` sends no precondition.
+
+A pinned read sends the generation as the `generation` query parameter and
+the ETag as `If-Match`. GCS judges the selector first: a key that does not
+exist, or a generation it no longer keeps, is `NotFound` whatever the ETag; a
+live generation with another ETag is `PreconditionFailed`.
+
+Listing is the JSON API's `objects.list` (`storage/v1/b/<bucket>/o`), one
+request per page of the response, with `maxResults` set to the configured
+page size (`GcsConfig::list_page_size`, 1000 by default) on every request.
+The prefix and the resume point go out as raw names, the resume point as
+`startOffset`, which is inclusive, so the start name itself is dropped from
+the result. Within a call the store follows the service's opaque
+`nextPageToken`; the `PageToken` handed back between calls is the raw last
+name. Names are handed to `classify_objects` and `classify_prefixes` as
+received, so a name `GcsStore` cannot address is reported in
+`ListPage::unaddressable` rather than failing the page. A listed item without
+a positive decimal `generation` fails the call with `Permanent`. A listed
+ETag is the quoted hex of the item's `md5Hash`, the ETag `head` reports; an
+object with no MD5 (a composite) is listed with the JSON `etag`, which `head`
+does not report. Errors are classified by HTTP status: 429 and 503 are
+`Throttled`, with or without an error code in the body, 401 and 403 are
+`AccessDenied`, and 412 depends on the put mode as above. On object requests
+404 is `NotFound`, or `Permanent` when the body names `NoSuchBucket`, so a
+`head` on a bucket that does not exist is `NotFound`, as on S3; a listing of
+a bucket that does not exist is `Permanent`. Every HTTP attempt
 to the store's host, retries included, is counted into the store's
 `StoreMetrics`, so `ravel_store_attempts_total` covers GCS, and each
-response's `Date` header feeds `observed_store_time_ns`. Requests the client
-makes to fetch credentials are neither counted nor dated.
+response's `Date` header feeds `observed_store_time_ns`. The listing client
+sends through the same connector and takes its bearer token from the
+data-plane client's credential provider. Requests the client makes to fetch
+credentials are neither counted nor dated.
 
 `GcsStore` does not do three things S3 does: **no multipart upload**
 (`multipart: false`, and `put_multipart` refuses, so it does not satisfy
@@ -1092,7 +1116,9 @@ it names to the client, because `object_store`'s builder does not read that
 variable itself; otherwise `object_store` looks up the gcloud well-known file
 and then the metadata server. `GcsConfig::skip_signature` (accepted only
 together with a `base_url`, for an emulator or the test fake) looks up no
-credential and sends a fixed placeholder bearer token instead.
+credential: object requests carry a fixed placeholder bearer token instead,
+and listing requests carry no `Authorization` header. The field exists only
+in the crate's own tests and in builds with the `test-support` feature.
 
 ## Runtime qualification (executable contract)
 
@@ -1327,9 +1353,10 @@ refusing. The identity is endpoint-derived (bucket plus optional endpoint, no
 credentials), so an endpoint rename or a path-style/virtual-host switch alters
 it with no change of backend, and refusing on that benign case would be an
 outage an operator disables. A GCS store's identity is `gs://<bucket>`
-(`conformance::gcs_backend_identity`, ADR-3456 decision 5): GCS has one
-global endpoint, so there is no endpoint part, and an emulator's base URL is
-left out the same way credentials are. A mismatch is instead the signal that a
+on Google's endpoint and `gs://<bucket>@<base_url>` when `GcsConfig::base_url`
+replaces it (`conformance::gcs_backend_identity`, ADR-3456 decision 5), so a
+qualification earned on an emulator or a test fake does not read as one
+earned on GCS. A mismatch is instead the signal that a
 replicated, restored, or migrated bucket carries a qualification a different
 backend earned: verify the backend and re-run `store qualify` if it is
 genuinely a different store. The command only ever writes under
@@ -1747,9 +1774,10 @@ ADR-0042 decision 3.
 4. `GcsStore` (ADR-3456): read-write adapter over `object_store`'s
    `GoogleCloudStorage` (the GCS XML API), honoring every MUST above with the
    generation as the version token. It sends through the S3 adapter's HTTP
-   connector, scoped to the store's own host, and lists with
-   `list_paginated`, reading each page from the response body the connector
-   keeps because `object_store` drops the generation from list entries. No
+   connector, scoped to the store's own host. `list`, `list_after` and
+   `list_delimited` do not go through `object_store`: they send the JSON
+   API's `objects.list` through the same connector and credentials, one
+   request per page with `maxResults` set to the page size. No
    multipart, no upload checksums, no bucket-protection probes (see "Backend
    support notes").
 
