@@ -237,28 +237,6 @@ fn next_token(
 /// its still-encoded text, which carries a `%` and so is never addressable: the
 /// listing reports it rather than failing on it.
 pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, ControlPlaneError> {
-    parse_listing(body, ListedVersion::Etag)
-}
-
-/// Which listed element becomes [`ObjectMeta::version`], the CAS token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListedVersion {
-    /// The `ETag`: S3's conditional write compares it.
-    Etag,
-    /// The `Generation` the GCS XML API reports beside each object: GCS's
-    /// conditional write compares that, and an identical rewrite keeps the
-    /// ETag while changing it (ADR-3456). A listed object without one is
-    /// refused rather than given its ETag.
-    Generation,
-}
-
-/// [`parse_list_bucket_result`] for a GCS XML API listing, whose version is
-/// the object's generation.
-pub(crate) fn parse_gcs_list_result(body: &[u8]) -> Result<ListResponse, ControlPlaneError> {
-    parse_listing(body, ListedVersion::Generation)
-}
-
-fn parse_listing(body: &[u8], version: ListedVersion) -> Result<ListResponse, ControlPlaneError> {
     let root = bucket_config::parse_document(body, "ListBucketResult")?;
     let encoded = match root.single("EncodingType")? {
         None => false,
@@ -285,7 +263,7 @@ fn parse_listing(body: &[u8], version: ListedVersion) -> Result<ListResponse, Co
 
     let mut contents = Vec::new();
     for entry in root.children_named("Contents") {
-        contents.push(parse_contents(entry, encoded, version)?);
+        contents.push(parse_contents(entry, encoded)?);
     }
     let mut common_prefixes = Vec::new();
     for entry in root.children_named("CommonPrefixes") {
@@ -304,11 +282,7 @@ fn parse_listing(body: &[u8], version: ListedVersion) -> Result<ListResponse, Co
     })
 }
 
-fn parse_contents(
-    entry: &XmlElement,
-    encoded: bool,
-    version: ListedVersion,
-) -> Result<ObjectMeta, ControlPlaneError> {
+fn parse_contents(entry: &XmlElement, encoded: bool) -> Result<ObjectMeta, ControlPlaneError> {
     let key = match entry.single("Key")? {
         Some(element) => listed_text(&element.text, encoded),
         None => {
@@ -337,23 +311,11 @@ fn parse_contents(
                 "listed object {key:?} has an unreadable LastModified"
             ))
         })?;
-    let version = match version {
-        ListedVersion::Etag => etag.clone(),
-        ListedVersion::Generation => {
-            let generation = required("Generation")?.value().to_string();
-            if generation.is_empty() {
-                return Err(ControlPlaneError::Parse(format!(
-                    "listed object {key:?} has an empty Generation"
-                )));
-            }
-            generation
-        }
-    };
     Ok(ObjectMeta {
         key,
         size,
-        etag: Etag(etag),
-        version: Version(version),
+        etag: Etag(etag.clone()),
+        version: Version(etag),
         last_modified_unix_ms: secs
             .saturating_mul(1000)
             .saturating_add(i64::from(nanos / 1_000_000)),
@@ -444,7 +406,7 @@ impl Backoff {
         Duration::from_secs_f64(std::mem::replace(&mut self.next_secs, next))
     }
 
-    fn next(&mut self) -> Duration {
+    pub(crate) fn next(&mut self) -> Duration {
         self.next_with(|low, high| rand::rng().random_range(low..high))
     }
 }
@@ -452,7 +414,7 @@ impl Backoff {
 /// Whether a transport failure is retried. A list GET is idempotent, so a
 /// timeout or an interrupted request is retried along with a connect or
 /// request failure; a decode or unknown failure is not.
-fn transport_retryable(kind: HttpErrorKind) -> bool {
+pub(crate) fn transport_retryable(kind: HttpErrorKind) -> bool {
     matches!(
         kind,
         HttpErrorKind::Connect
@@ -462,7 +424,7 @@ fn transport_retryable(kind: HttpErrorKind) -> bool {
     )
 }
 
-fn status_retryable(status: u16) -> bool {
+pub(crate) fn status_retryable(status: u16) -> bool {
     (500..600).contains(&status) || status == 429 || status == 408
 }
 
@@ -663,7 +625,7 @@ impl ListClient {
 }
 
 /// Read a body of at most `limit` bytes; `Ok(None)` when it is longer.
-async fn read_body(response: HttpResponse, limit: usize) -> Result<Option<Vec<u8>>, HttpError> {
+pub(crate) async fn read_body(response: HttpResponse, limit: usize) -> Result<Option<Vec<u8>>, HttpError> {
     let mut stream = response.into_body().bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {

@@ -140,6 +140,7 @@ use crate::{
 };
 
 mod bucket_config;
+pub(crate) use bucket_config::parse_iso8601;
 use bucket_config::{BucketControlPlaneClient, ReportNotes};
 
 mod credentials;
@@ -897,7 +898,7 @@ const LIST_USER_AGENT: &str = concat!("ravel-object-store/", env!("CARGO_PKG_VER
 /// sets no redirect policy, so its client follows up to ten; a followed
 /// wrong-region 301 would fail with the target's signature error instead of
 /// the region hint, and would carry the signed request to another host.
-fn list_http_client(
+pub(crate) fn list_http_client(
     http: &S3HttpConfig,
     allow_http: bool,
 ) -> Result<reqwest::Client, reqwest::Error> {

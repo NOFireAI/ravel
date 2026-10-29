@@ -1,4 +1,5 @@
-//! An in-process fake of the GCS XML API, enough of it for [`GcsStore`]
+//! An in-process fake of the GCS XML API's object requests and the JSON API's
+//! `objects.list`, enough of both for [`GcsStore`]
 //! (ADR-3456): one bucket, objects held in memory, served over loopback HTTP
 //! by axum. Built for this crate's tests and, behind the `test-support`
 //! feature, for other crates' tests.
@@ -9,9 +10,10 @@
 //!
 //! Every response, errors included, carries a `Date` header from the fake's
 //! settable clock ([`FakeGcs::set_date_unix_secs`]). A request for any bucket
-//! other than the fake's own is a 404 with code `NoSuchBucket` (no body on a
-//! HEAD). The bucket and the key are the first path segment and the rest,
-//! each percent-decoded, so a key's `/` may arrive as `%2F`.
+//! other than the fake's own is a 404: code `NoSuchBucket` (no body on a HEAD)
+//! on an object request, a JSON error on a listing. On an object request the
+//! bucket and the key are the first path segment and the rest, each
+//! percent-decoded, so a key's `/` may arrive as `%2F`.
 //!
 //! - `PUT /{bucket}/{key}`: stores the body under a new generation, one greater
 //!   than the last one this fake assigned to any write, so a rewrite with
@@ -34,18 +36,21 @@
 //! - `HEAD /{bucket}/{key}`: the GET headers for the whole object, no body; a
 //!   missing object is a bodiless 404.
 //! - `DELETE /{bucket}/{key}`: 204, or 404 `NoSuchKey` for a missing object.
-//! - `GET /{bucket}?list-type=2`: a `ListBucketResult` in key order, honouring
-//!   `prefix`, `delimiter` (rolled up into `CommonPrefixes`), `max-keys`
-//!   (default and ceiling 1000), `start-after`, and `continuation-token`,
-//!   which takes precedence over `start-after`. Each `Contents` carries
-//!   `Key`, `Generation`, `MetaGeneration`, `LastModified`, `ETag` and `Size`.
-//!   A truncated response carries an opaque `NextContinuationToken`; one
-//!   that does not decode is 400 `InvalidArgument`.
+//! - `GET /storage/v1/b/{bucket}/o`: the JSON API's `objects.list`, in
+//!   lexicographic order of the names' bytes, honouring `prefix`,
+//!   `delimiter` (rolled up into `prefixes`, each counted as one result),
+//!   `startOffset` (inclusive), `maxResults` (default and ceiling 1000; 0 or
+//!   a non-number is 400) and `pageToken`. Each item carries `name`,
+//!   `generation` and `size` as decimal strings, `updated` (RFC 3339), a
+//!   JSON-API-style `etag` that is not the object's XML ETag, and `md5Hash`
+//!   (base64). `fields` is accepted and ignored. A response with more results
+//!   left carries an opaque `nextPageToken`; one that does not decode is 400.
 //!
 //! Anything else is 501 `NotImplemented`.
 //!
 //! [`FakeGcs::fail_next`] queues error statuses that the next requests get
-//! instead of their normal answer, whatever they are.
+//! instead of their normal answer, whatever they are, with an XML error code;
+//! [`FakeGcs::fail_next_without_code`] queues them with an empty body.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -55,6 +60,8 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
@@ -71,7 +78,7 @@ const FIRST_GENERATION: u64 = 1_790_000_000_000_000;
 /// 2026-09-21T14:13:20Z.
 const DEFAULT_DATE_UNIX_SECS: i64 = 1_790_000_000;
 
-const MAX_KEYS: usize = 1000;
+const MAX_RESULTS: usize = 1000;
 
 /// One request the fake received.
 #[derive(Debug, Clone)]
@@ -122,7 +129,8 @@ struct Inner {
     objects: Mutex<BTreeMap<String, StoredObject>>,
     next_generation: AtomicU64,
     requests: Mutex<Vec<RecordedRequest>>,
-    failures: Mutex<VecDeque<u16>>,
+    /// Each with whether its body carries an XML error code.
+    failures: Mutex<VecDeque<(u16, bool)>>,
     date_secs: AtomicI64,
 }
 
@@ -214,7 +222,14 @@ impl FakeGcs {
     /// instead of serving them.
     pub fn fail_next(&self, status: u16, times: usize) {
         let mut failures = self.inner.failures.lock();
-        failures.extend(std::iter::repeat_n(status, times));
+        failures.extend(std::iter::repeat_n((status, true), times));
+    }
+
+    /// As [`Self::fail_next`], with an empty body: the status is all the
+    /// client gets.
+    pub fn fail_next_without_code(&self, status: u16, times: usize) {
+        let mut failures = self.inner.failures.lock();
+        failures.extend(std::iter::repeat_n((status, false), times));
     }
 
     /// Set the clock every later response's `Date` reports.
@@ -333,9 +348,26 @@ impl Inner {
         headers: &HeaderMap,
         body: Bytes,
     ) -> Response {
-        if let Some(status) = self.failures.lock().pop_front() {
+        if let Some((status, with_code)) = self.failures.lock().pop_front() {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            if !with_code {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = status;
+                return response;
+            }
             return error(status, failure_code(status), "scripted failure");
+        }
+        if let Some(bucket) = path
+            .strip_prefix("/storage/v1/b/")
+            .and_then(|rest| rest.strip_suffix("/o"))
+        {
+            if *method != Method::GET {
+                return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method");
+            }
+            if percent_decode(bucket, false).as_deref() != Some(self.bucket.as_str()) {
+                return json_error(StatusCode::NOT_FOUND, "The specified bucket does not exist.");
+            }
+            return self.list(query);
         }
         let rest = path.strip_prefix('/').unwrap_or(path);
         let (bucket, key) = match rest.split_once('/') {
@@ -350,17 +382,11 @@ impl Inner {
             );
         }
         match key {
-            None | Some("") => {
-                if *method == Method::GET && query_param(query, "list-type") == Some("2") {
-                    self.list(query)
-                } else {
-                    error(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "NotImplemented",
-                        "bucket request",
-                    )
-                }
-            }
+            None | Some("") => error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "bucket request",
+            ),
             Some(raw) => {
                 let Some(key) = percent_decode(raw, false) else {
                     return error(
@@ -490,25 +516,18 @@ impl Inner {
     fn list(&self, query: &[(String, String)]) -> Response {
         let prefix = query_param(query, "prefix").unwrap_or("");
         let delimiter = query_param(query, "delimiter").filter(|d| !d.is_empty());
-        let max_keys = match query_param(query, "max-keys").map(str::parse::<usize>) {
-            None => MAX_KEYS,
-            Some(Ok(n)) => n.min(MAX_KEYS),
-            Some(Err(_)) => {
-                return error(StatusCode::BAD_REQUEST, "InvalidArgument", "bad max-keys");
-            }
+        let start_offset = query_param(query, "startOffset");
+        let max_results = match query_param(query, "maxResults").map(str::parse::<usize>) {
+            None => MAX_RESULTS,
+            Some(Ok(n)) if n > 0 => n.min(MAX_RESULTS),
+            Some(_) => return json_error(StatusCode::BAD_REQUEST, "bad maxResults"),
         };
-        let marker = match query_param(query, "continuation-token") {
+        let resume = match query_param(query, "pageToken") {
             Some(token) => match decode_token(token) {
-                Some(marker) => Some(marker),
-                None => {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidArgument",
-                        "bad continuation-token",
-                    );
-                }
+                Some(resume) => Some(resume),
+                None => return json_error(StatusCode::BAD_REQUEST, "bad pageToken"),
             },
-            None => query_param(query, "start-after").map(str::to_string),
+            None => None,
         };
 
         enum Entry {
@@ -522,11 +541,14 @@ impl Inner {
                 if !key.starts_with(prefix) {
                     break;
                 }
-                if let Some(marker) = &marker {
-                    // A marker that is a rolled-up prefix skips the keys under it.
-                    let under_marker = delimiter.is_some_and(|d| marker.ends_with(d))
-                        && key.starts_with(marker.as_str());
-                    if key.as_str() <= marker.as_str() || under_marker {
+                if start_offset.is_some_and(|offset| key.as_str() < offset) {
+                    continue;
+                }
+                if let Some(resume) = &resume {
+                    // A token that is a rolled-up prefix skips the names under it.
+                    let under_resume = delimiter.is_some_and(|d| resume.ends_with(d))
+                        && key.starts_with(resume.as_str());
+                    if key.as_str() <= resume.as_str() || under_resume {
                         continue;
                     }
                 }
@@ -545,65 +567,65 @@ impl Inner {
                 }
             }
         }
-        let truncated = entries.len() > max_keys;
-        entries.truncate(max_keys);
-        let next_token = if truncated {
-            entries.last().map(|entry| match entry {
-                Entry::Object(key, _) => encode_token(key),
-                Entry::Prefix(common) => encode_token(common),
-            })
-        } else {
-            None
-        };
-
-        let mut xml = String::from("<?xml version='1.0' encoding='UTF-8'?>");
-        xml.push_str("<ListBucketResult xmlns=\"http://doc.s3.amazonaws.com/2006-03-01\">");
-        push_element(&mut xml, "Name", &self.bucket);
-        push_element(&mut xml, "Prefix", prefix);
-        push_element(&mut xml, "MaxKeys", &max_keys.to_string());
-        if let Some(delimiter) = delimiter {
-            push_element(&mut xml, "Delimiter", delimiter);
-        }
-        push_element(
-            &mut xml,
-            "IsTruncated",
-            if truncated { "true" } else { "false" },
-        );
+        let more = entries.len() > max_results;
+        entries.truncate(max_results);
+        let mut items = Vec::new();
+        let mut prefixes = Vec::new();
         for entry in &entries {
             match entry {
-                Entry::Object(key, object) => {
-                    xml.push_str("<Contents>");
-                    push_element(&mut xml, "Key", key);
-                    push_element(&mut xml, "Generation", &object.generation.to_string());
-                    push_element(&mut xml, "MetaGeneration", "1");
-                    push_element(
-                        &mut xml,
-                        "LastModified",
-                        &iso8601(object.last_modified_secs),
-                    );
-                    push_element(&mut xml, "ETag", &object.etag);
-                    push_element(&mut xml, "Size", &object.data.len().to_string());
-                    xml.push_str("</Contents>");
-                }
-                Entry::Prefix(common) => {
-                    xml.push_str("<CommonPrefixes>");
-                    push_element(&mut xml, "Prefix", common);
-                    xml.push_str("</CommonPrefixes>");
-                }
+                Entry::Object(name, object) => items.push(serde_json::json!({
+                    "kind": "storage#object",
+                    "name": name,
+                    "bucket": self.bucket,
+                    "generation": object.generation.to_string(),
+                    "metageneration": "1",
+                    "size": object.data.len().to_string(),
+                    "updated": iso8601(object.last_modified_secs),
+                    "etag": json_etag(object.generation),
+                    "md5Hash": STANDARD.encode(md5(&object.data)),
+                })),
+                Entry::Prefix(common) => prefixes.push(common.clone()),
             }
         }
-        if let Some(token) = next_token {
-            push_element(&mut xml, "NextContinuationToken", &token);
+        let mut body = serde_json::json!({ "kind": "storage#objects" });
+        if !items.is_empty() {
+            body["items"] = serde_json::Value::Array(items);
         }
-        xml.push_str("</ListBucketResult>");
-        let mut response = Response::new(Body::from(xml));
-        set_header(
-            response.headers_mut(),
-            "content-type",
-            "application/xml".into(),
-        );
-        response
+        if !prefixes.is_empty() {
+            body["prefixes"] = serde_json::json!(prefixes);
+        }
+        if more && let Some(last) = entries.last() {
+            let resume = match last {
+                Entry::Object(name, _) => name,
+                Entry::Prefix(common) => common,
+            };
+            body["nextPageToken"] = serde_json::json!(encode_token(resume));
+        }
+        json_response(StatusCode::OK, &body)
     }
+}
+
+/// An `etag` in the JSON API's style, which is not the object's XML ETag.
+fn json_etag(generation: u64) -> String {
+    STANDARD.encode(format!("generation {generation}"))
+}
+
+fn json_response(status: StatusCode, body: &serde_json::Value) -> Response {
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = status;
+    set_header(
+        response.headers_mut(),
+        "content-type",
+        "application/json; charset=UTF-8".into(),
+    );
+    response
+}
+
+fn json_error(status: StatusCode, message: &str) -> Response {
+    json_response(
+        status,
+        &serde_json::json!({ "error": { "code": status.as_u16(), "message": message } }),
+    )
 }
 
 fn object_headers(headers: &mut HeaderMap, object: &StoredObject, with_length: bool) {
@@ -814,7 +836,7 @@ fn imf_fixdate(secs: i64) -> String {
     )
 }
 
-/// `secs` as the XML API's `LastModified`, `2026-09-21T14:13:20.000Z`.
+/// `secs` as the JSON API's `updated`, `2026-09-21T14:13:20.000Z`.
 fn iso8601(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let of_day = secs.rem_euclid(86_400);
@@ -965,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_tokens_round_trip() {
+    fn page_tokens_round_trip() {
         for marker in ["", "a/b", "dir/", "ünï"] {
             assert_eq!(decode_token(&encode_token(marker)).as_deref(), Some(marker));
         }
