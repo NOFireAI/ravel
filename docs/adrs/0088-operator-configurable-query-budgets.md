@@ -102,6 +102,8 @@ flowchart TD
   Rejected: the per-tenant ceiling exists specifically for multi-tenant
   isolation (one tenant's wide scan should not starve another's query
   pool). Collapsing to one budget removes that isolation property.
+  Columns a scan is served from the decoded column-block cache sit
+  outside both ceilings (see the ADR-3326 tenant-ceiling amendment below).
 - **Auto-tune budgets from host resources at startup.** Rejected as scope
   creep beyond what this ADR decides: the goal is operator control that
   is explicit and auditable in server flags/config, not inference from
@@ -179,6 +181,8 @@ Consequences of the amendment:
   non-explicit per-query value) CLAMPS the per-query pool down and warns:
   lowering the multi-tenant isolation bound an operator explicitly set is
   the one direction this ADR's "Rejected alternatives" defends against.
+  That bound does not count columns served from the decoded column-block
+  cache (see the ADR-3326 tenant-ceiling amendment below).
   Both events are logged at startup (`sql_tenant_max_bytes_raised` /
   `sql_max_query_bytes_clamped`).
 - The amendment answers this ADR's "Auto-tune budgets from host resources
@@ -217,4 +221,19 @@ second concurrent statement gets what the first left. The explicit-flag
 rule is unchanged: an explicit `--sql-max-query-bytes` wins, clamped to an
 explicit tenant ceiling and raising a derived one. The measurement that
 motivated it is in ADR-2414's Context.
+
+## Amendment (2026-10-29, ADR-3326): the tenant-ceiling amendment
+
+<!-- amendment-applies: sections="Rejected alternatives|Amended 2026-09-02: unset means derive (issue #1141)" pointer="ADR-3326 tenant-ceiling amendment" -->
+
+The decoded column-block cache (ADR-3326) holds decoded columns as process
+memory, each entry charged once to the process memory budget. A scan served
+a column from that cache leaves the column out of its SQL memory charge, so
+neither `--sql-max-query-bytes` nor `--sql-tenant-max-bytes` counts it. The
+owner chose to keep this by design (#3448). The isolation bound this ADR
+describes therefore covers what a tenant's statements allocate, not the
+served columns of the blocks its scans are reading. Those are bounded by
+the blocks in flight, entries are keyed by tenant, and the process budget
+still counts every served byte. ADR-3326's tenant-ceiling amendment carries
+the reasoning.
 
