@@ -5344,6 +5344,7 @@ dependencies = [
  "ravel-remote-write",
  "ravel-rspan",
  "ravel-segment",
+ "ravel-server",
  "ravel-sql",
  "ravel-tenant-resolve",
  "ravel-test-support",

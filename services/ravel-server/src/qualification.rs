@@ -97,14 +97,15 @@ fn check_identity(recorded: &str, configured: Option<&str>) -> IdentityCheck {
 /// store is exempt ([`StoreKind::Memory`]) or a current-version record is
 /// present; refuses with a specific [`QualificationError`] otherwise.
 ///
-/// `configured_identity` is the [`ravel_object_store::conformance::s3_backend_identity`]
-/// string this process is configured for, or `None` for the exempt memory
-/// store. When it is present and differs from the record's `backend_identity`,
+/// `configured_identity` is the [`crate::config::Cli::backend_identity`]
+/// string this process is configured for (the `s3://` form of
+/// [`ravel_object_store::conformance::s3_backend_identity`] or the `gs://` form
+/// of [`ravel_object_store::conformance::gcs_backend_identity`]), or `None` for
+/// the exempt memory store. When it is present and differs from the record's `backend_identity`,
 /// [`enforce`] logs a warning and starts anyway. The record lives in the
 /// bucket, so a replicated, restored, or migrated bucket carries a
 /// qualification a different backend earned; a mismatch is the signal for that.
-/// It is deliberately not a refusal: the identity is endpoint-derived (see
-/// [`ravel_object_store::conformance::s3_backend_identity`]), so an endpoint
+/// It is deliberately not a refusal: the identity is endpoint-derived, so an endpoint
 /// rename or an addressing-style switch changes it with no backend change, and
 /// a hard refusal on that benign case would be an outage an operator then
 /// disables, leaving the check protecting nothing. This reader never writes, so

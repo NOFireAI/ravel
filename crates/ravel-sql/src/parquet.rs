@@ -89,9 +89,11 @@ pub enum ExternalStoreError {
     RavelBucket { profile: String, bucket: String },
 }
 
-/// Ravel's own data bucket as the server is configured to reach it: the S3
-/// endpoint (`None` for AWS's regional endpoint), the region and the bucket
-/// name. Ravel's store addresses its bucket path-style.
+/// Ravel's own data bucket as the server's configured store reaches it
+/// (ADR-3456 decision D7). Under `--store s3`: the S3 endpoint (`None` for
+/// AWS's regional endpoint), the region and the bucket name, addressed
+/// path-style. Under `--store gcs`: the bucket on GCS, or at `--gcs-endpoint`
+/// with `/<bucket>` appended when one is set.
 ///
 /// A (profile, bucket) reaches it when their bucket addresses overlap. A
 /// bucket address is where the S3 client sends requests for the bucket: an
@@ -108,17 +110,40 @@ pub enum ExternalStoreError {
 /// host sends every key verbatim, so a key beginning with Ravel's bucket name
 /// reads Ravel's bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RavelBucket {
-    pub endpoint: Option<String>,
-    pub region: String,
-    pub bucket: String,
+pub enum RavelBucket {
+    S3 {
+        endpoint: Option<String>,
+        region: String,
+        bucket: String,
+    },
+    Gcs {
+        endpoint: Option<String>,
+        bucket: String,
+    },
 }
 
 impl RavelBucket {
     /// Whether `profile` reaching `bucket` addresses this bucket, or a
     /// location containing it, by configuration.
     fn is_reached_by(&self, profile: &ExternalProfile, bucket: &str) -> bool {
-        let ravel = BucketAddress::s3(self.endpoint.as_deref(), &self.region, &self.bucket, true);
+        let ravel = match self {
+            RavelBucket::S3 {
+                endpoint,
+                region,
+                bucket,
+            } => BucketAddress::s3(endpoint.as_deref(), region, bucket, true),
+            RavelBucket::Gcs {
+                endpoint: None,
+                bucket,
+            } => BucketAddress {
+                service: Service::Gcs,
+                segments: vec![bucket.clone()],
+            },
+            RavelBucket::Gcs {
+                endpoint: Some(endpoint),
+                bucket,
+            } => BucketAddress::of_url(&format!("{}/{bucket}", endpoint.trim_end_matches('/'))),
+        };
         let theirs = match &profile.kind {
             ExternalKind::S3 {
                 endpoint,
@@ -1314,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn ravels_own_bucket_is_refused_before_anything_is_opened() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let ravel = RavelBucket {
+        let ravel = RavelBucket::S3 {
             endpoint: Some("http://127.0.0.1:9".to_string()),
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1559,7 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn ravels_bucket_is_matched_by_service() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let aws = RavelBucket {
+        let aws = RavelBucket::S3 {
             endpoint: None,
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1581,7 +1606,7 @@ mod tests {
                  "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
         )
         .expect("profiles");
-        let gcs = RavelBucket {
+        let gcs = RavelBucket::S3 {
             endpoint: Some("https://storage.googleapis.com".to_string()),
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1592,6 +1617,68 @@ mod tests {
         assert!(!aws.is_reached_by(&profiles[1], "ravel"));
     }
 
+    /// ADR-3456 D7: under `--store gcs` Ravel's side is a GCS address, so a
+    /// GCS profile naming Ravel's bucket is refused before anything is opened,
+    /// while the same profile's other buckets, an S3 profile naming the same
+    /// bucket name, and an Azure profile are not.
+    #[tokio::test]
+    async fn a_gcs_profile_on_ravels_gcs_bucket_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "g", "kind": "gcs", "credentials": {"mode": "application_default"}},
+                {"name": "z", "kind": "azure", "account": "acct",
+                 "credentials": {"mode": "sas_token", "token": {"from": "env", "name": "T"}}}]"#,
+        )
+        .expect("profiles");
+        let ravel = RavelBucket::Gcs {
+            endpoint: None,
+            bucket: "ravel".to_string(),
+        };
+        assert!(ravel.is_reached_by(&profiles[0], "ravel"));
+        assert!(!ravel.is_reached_by(&profiles[0], "lake"));
+        assert!(!ravel.is_reached_by(&profiles[1], "ravel"));
+        let aws = s3_profile("aws", None, dir.path(), true);
+        assert!(!ravel.is_reached_by(&aws, "ravel"));
+
+        let stores = ProfileStores::new(profiles).refusing(ravel);
+        assert!(
+            matches!(
+                stores.store("g", "ravel"),
+                Err(ExternalStoreError::RavelBucket { ref profile, ref bucket })
+                    if profile == "g" && bucket == "ravel"
+            ),
+            "a GCS profile on Ravel's GCS bucket is refused"
+        );
+        assert!(
+            !matches!(
+                stores.store("g", "lake"),
+                Err(ExternalStoreError::RavelBucket { .. })
+            ),
+            "another bucket on GCS is not Ravel's"
+        );
+    }
+
+    /// `--gcs-endpoint` moves Ravel's bucket to that host: GCS's own host is
+    /// still GCS, and a fake endpoint on another host is not reached by a
+    /// profile on GCS itself.
+    #[test]
+    fn ravels_gcs_bucket_follows_its_endpoint() {
+        let profiles = ravel_object_store::external::load_profiles(
+            r#"[{"name": "g", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
+        )
+        .expect("profiles");
+        let on_gcs = RavelBucket::Gcs {
+            endpoint: Some("https://storage.googleapis.com/".to_string()),
+            bucket: "ravel".to_string(),
+        };
+        assert!(on_gcs.is_reached_by(&profiles[0], "ravel"));
+        let fake = RavelBucket::Gcs {
+            endpoint: Some("http://127.0.0.1:4443".to_string()),
+            bucket: "ravel".to_string(),
+        };
+        assert!(!fake.is_reached_by(&profiles[0], "ravel"));
+    }
+
     /// A path-style profile endpoint carrying a path moves the bucket it
     /// names under the path: `http://ravel-host/ravel-bucket` with bucket `t`
     /// addresses Ravel's keys `t/...`. It is refused as Ravel's bucket when
@@ -1600,7 +1687,7 @@ mod tests {
     #[tokio::test]
     async fn a_profile_endpoint_with_a_path_is_refused() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let ravel = RavelBucket {
+        let ravel = RavelBucket::S3 {
             endpoint: Some("http://ravel-host".to_string()),
             region: "us-east-1".to_string(),
             bucket: "ravel-bucket".to_string(),
@@ -1654,7 +1741,7 @@ mod tests {
         let virtual_hosted = |endpoint: &str| {
             s3_profile_in("v", Some(endpoint), "us-east-1", false, dir.path(), true)
         };
-        let local = RavelBucket {
+        let local = RavelBucket::S3 {
             endpoint: Some("http://ravel-host".to_string()),
             region: "us-east-1".to_string(),
             bucket: "ravel-bucket".to_string(),
@@ -1663,7 +1750,7 @@ mod tests {
         assert!(local.is_reached_by(&virtual_hosted("http://RAVEL-HOST:80/"), "lake"));
         assert!(!local.is_reached_by(&virtual_hosted("http://lake.ravel-host"), "ravel-bucket"));
 
-        let aws = RavelBucket {
+        let aws = RavelBucket::S3 {
             endpoint: None,
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1690,7 +1777,7 @@ mod tests {
     #[test]
     fn default_ports_are_normalised() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let ravel = RavelBucket {
+        let ravel = RavelBucket::S3 {
             endpoint: Some("https://minio.example".to_string()),
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1700,7 +1787,7 @@ mod tests {
         assert!(ravel.is_reached_by(&at("https://Minio.Example./"), "ravel"));
         assert!(!ravel.is_reached_by(&at("https://minio.example:9000"), "ravel"));
         assert!(!ravel.is_reached_by(&at("http://minio.example"), "ravel"));
-        let explicit = RavelBucket {
+        let explicit = RavelBucket::S3 {
             endpoint: Some("http://[::1]:80".to_string()),
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1716,7 +1803,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let in_region = |region: &str| s3_profile_in("p", None, region, true, dir.path(), true);
         let at = |endpoint: &str| s3_profile("p", Some(endpoint), dir.path(), true);
-        let commercial = RavelBucket {
+        let commercial = RavelBucket::S3 {
             endpoint: None,
             region: "us-east-1".to_string(),
             bucket: "ravel".to_string(),
@@ -1727,7 +1814,7 @@ mod tests {
             !commercial.is_reached_by(&at("https://s3-fips.us-gov-west-1.amazonaws.com"), "ravel")
         );
         assert!(!commercial.is_reached_by(&at("https://s3.cn-north-1.amazonaws.com.cn"), "ravel"));
-        let gov = RavelBucket {
+        let gov = RavelBucket::S3 {
             endpoint: None,
             region: "us-gov-west-1".to_string(),
             bucket: "ravel".to_string(),

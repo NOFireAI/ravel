@@ -149,7 +149,8 @@ async fn main() -> anyhow::Result<()> {
     // (three read-only GETs) and refuses to start on a fatal failed condition;
     // an unknown condition, which is every condition on a backend other than
     // S3, logs one warning and raises `ravel_bucket_protection_unknown`
-    // instead of blocking.
+    // instead of blocking. `--store gcs` never reaches this with the flag
+    // set: argument parsing refuses it there (ADR-3456 decision D6).
     ravel_server::bucket_protection::enforce_at_startup_on(
         cli.require_bucket_protection,
         store_s3.as_deref(),

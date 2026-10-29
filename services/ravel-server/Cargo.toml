@@ -288,6 +288,12 @@ agents = [
 # `_RJEM_MALLOC_CONF=prof:true,...` is set at startup.
 heap-profiling = ["tikv-jemallocator/profiling"]
 
+# Test-only: `--gcs-endpoint` also skips request authentication, which a fake
+# GCS endpoint needs (ADR-3456 decision D2). The dev-dependency on this crate
+# below turns it on for test builds; no published build enables it, so no
+# production configuration can send unsigned GCS requests.
+gcs-test-endpoint = ["ravel-object-store/test-support"]
+
 # Examples default to `test = false`; this one carries a test module that
 # pins its no-argument output, which a test target is needed to run.
 [[example]]
@@ -354,6 +360,11 @@ stats_alloc = "0.1.10"
 # every stored object, so the scan for a raw address reads section bodies,
 # not their compressed form. Already in the lockfile through ravel-segment.
 zstd = { workspace = true }
+# Test-only: tests/gcs_store_e2e.rs runs the server on the fake GCS endpoint
+# (`ravel_object_store::gcs::fake`), which needs unsigned requests; this crate's
+# own `gcs-test-endpoint` feature is what lets `--gcs-endpoint` skip them.
+ravel-object-store = { workspace = true, features = ["test-support"] }
+ravel-server = { path = ".", features = ["gcs-test-endpoint"] }
 
 [lints]
 workspace = true
