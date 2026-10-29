@@ -3,7 +3,10 @@
 use super::figures::{
     self, Bands, Figure, Key, OBJECT_BODY, Prices, Scope, check, parse_report, write_report,
 };
-use super::scenarios::{POSITIONS, percentile, run_scenario, worst_case_passes};
+use super::scenarios::{
+    DIRECTORY_GETS_PER_PASS, GUARANTEED_DIRECTORY_GETS_PER_PASS, POSITIONS, guaranteed_passes,
+    percentile, run_scenario, worst_case_passes,
+};
 use super::{DISCOVERY, SCENARIOS, Size, load_bands, load_prices};
 
 fn small(name: &str) -> Vec<Figure> {
@@ -119,6 +122,18 @@ fn discovery_stays_within_the_worst_case() {
     }
     assert_eq!(worst_case_passes(100), 2);
     assert_eq!(worst_case_passes(10_000), 157);
+}
+
+/// Both budgets come from the runtime's default sweep: 64 HEAD reads a pass
+/// with no wake hint due, the directory half's 32 when the wake half spends
+/// its own 32.
+#[test]
+fn directory_budgets_follow_the_default_sweep() {
+    assert_eq!(DIRECTORY_GETS_PER_PASS, 64);
+    assert_eq!(GUARANTEED_DIRECTORY_GETS_PER_PASS, 32);
+    assert_eq!(guaranteed_passes(100), 4);
+    assert_eq!(guaranteed_passes(1_000), 32);
+    assert_eq!(guaranteed_passes(10_000), 313);
 }
 
 /// The acceptance check: a whole small run, every figure inside its band
