@@ -16,6 +16,8 @@ RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-cli
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--gcs-bucket` | `RAVEL_GCS_BUCKET` |  | The bucket `--store gcs` runs against (ADR-3456), required under it. Credentials are Application Default Credentials only: the key file `GOOGLE_APPLICATION_CREDENTIALS` names, else the gcloud well-known file, else the metadata server. Under `--store gcs` every `--s3-*` flag given on the command line or through its environment variable is refused rather than ignored; a defaulted one is not |
+| `--gcs-endpoint` |  |  | Replaces `https://storage.googleapis.com` under `--store gcs`, for an emulator. Plain `http://` is accepted only for a loopback host. Part of the backend identity `store qualify` records |
 | `--parquet-profiles` | `RAVEL_PARQUET_PROFILES` |  | Path to the external credential profile file (ADR-2040 decision D1), the JSON list of named profiles `tenant parquet-grant add` resolves `--profile` against. ravel-server reads the same file, from its own `--parquet-profiles` flag, to read Parquet tables' files. A top-level flag, given before the subcommand, like the tenant-hash flags |
 | `--s3-access-key` | `RAVEL_S3_ACCESS_KEY` |  |  |
 | `--s3-allow-http` | `RAVEL_S3_ALLOW_HTTP` |  | Accept a plaintext `http://` `--s3-endpoint` whose host is not loopback. The S3 client's `allow_http` follows the endpoint's scheme, and a plaintext endpoint on the network carries every object this command writes and reads, plus the credentials signing those requests, in the clear; the command refuses that combination unless this flag says the operator meant it. A loopback `http://` endpoint (the local RustFS every development launcher here points at) needs no flag, and an `https://` endpoint is unaffected. Same flag, env var, and rule as ravel-server's |
@@ -311,7 +313,7 @@ Run the conformance suite against the configured backend and, on a pass, record 
 
 ### store verify-protection
 
-Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. A usage error (a missing or malformed flag) also exits 2, before anything is read, and so does a report that could not be written to stdout (a closed pipe excepted). `object-retention` is not checked by this command: it is printed as not checked and does not affect the exit code. Read-only
+Read the bucket's protection configuration and check it against the deployment's expectations: one line per condition, then a summary. Exits 0 only when every expected condition passes, 1 when any fails, and 2 when any could not be verified or the bucket's control plane could not be reached. A usage error (a missing or malformed flag) also exits 2, before anything is read, and so does a report that could not be written to stdout (a closed pipe excepted). `object-retention` is not checked by this command: it is printed as not checked and does not affect the exit code. Read-only. Under `--store gcs` it refuses and exits 2 without a request: GCS bucket protection is not checked
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
