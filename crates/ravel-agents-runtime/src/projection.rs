@@ -190,7 +190,10 @@ impl ProjectedEvent {
     }
 }
 
-/// One turn, as a span: the events of the turn the batch holds.
+/// One turn, as a span, emitted once per process: the turn's events read in
+/// the fill that read its first event. A turn the backlog bound split across
+/// fills keeps one span id, and its later events carry it too
+/// (`tests::a_turn_split_across_two_fills_is_one_span`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedTurn {
     pub agent: AgentId,
@@ -346,6 +349,9 @@ struct Cursor {
     committed: u64,
     /// The newest event seq read into the backlog.
     read: u64,
+    /// The turn of the event at `read`. Its span went with the fill that
+    /// read the turn's first event, so a later fill emits none for it.
+    read_turn: Option<Id128>,
     /// The newest event seq a sink accepted.
     projected: u64,
 }
@@ -459,6 +465,7 @@ impl Projector {
                 incarnation: head.incarnation,
                 committed,
                 read: 0,
+                read_turn: None,
                 projected: 0,
             }
         });
@@ -467,6 +474,7 @@ impl Projector {
                 incarnation: head.incarnation,
                 committed,
                 read: 0,
+                read_turn: None,
                 projected: 0,
             };
             committed > 0
@@ -598,6 +606,7 @@ impl Projector {
                 Some(turn) if turn.turn_id == event.turn_id => {
                     turn.last_event_seq = event.event_seq;
                 }
+                None if cursor.read_turn == Some(event.turn_id) => {}
                 _ => {
                     let at = record.time_unix_ns;
                     turns.push(ProjectedTurn {
@@ -616,7 +625,7 @@ impl Projector {
             }
             records.push(record);
         }
-        let Some(last) = events.last().map(|e| e.event_seq) else {
+        let Some((last, last_turn)) = events.last().map(|e| (e.event_seq, e.turn_id)) else {
             return Ok(());
         };
         let mut state = self.state.lock();
@@ -627,6 +636,7 @@ impl Projector {
             return Ok(());
         }
         c.read = last;
+        c.read_turn = Some(last_turn);
         c.committed = c.committed.max(last);
         state.backlog.extend(records);
         state.turns.extend(turns);
@@ -1026,6 +1036,33 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
         assert_eq!(rig.projector.metrics().lag_max, 0);
+    }
+
+    #[tokio::test]
+    async fn a_turn_split_across_two_fills_is_one_span() {
+        let limits = ProjectionLimits {
+            backlog: 2,
+            batch: 2,
+        };
+        let rig = rig(limits, PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        turn(&rig, "r1", 3).await;
+        for _ in 0..3 {
+            rig.projector.project_once().await;
+        }
+        let seqs: Vec<u64> = rig
+            .sink
+            .delivered
+            .lock()
+            .iter()
+            .map(|e| e.event_seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        let spans = rig.sink.spans.lock().clone();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].first_event_seq, 1);
+        let delivered = rig.sink.delivered.lock().clone();
+        assert!(delivered.iter().all(|e| e.span_id == spans[0].span_id));
     }
 
     #[tokio::test]
