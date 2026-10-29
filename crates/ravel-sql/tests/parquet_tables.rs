@@ -1983,7 +1983,7 @@ async fn a_file_in_ravels_own_bucket_is_refused_on_read() {
                "secret_access_key": {{"from": "file", "path": {key:?}}}}}}}]"#
     );
     let profiles = ravel_object_store::external::load_profiles(&json).expect("profiles");
-    let stores = ravel_sql::ProfileStores::new(profiles).refusing(ravel_sql::RavelBucket {
+    let stores = ravel_sql::ProfileStores::new(profiles).refusing(ravel_sql::RavelBucket::S3 {
         endpoint: Some("http://127.0.0.1:9".to_string()),
         region: "us-east-1".to_string(),
         bucket: BUCKET.to_string(),
