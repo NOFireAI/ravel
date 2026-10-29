@@ -336,3 +336,93 @@ jobs:
       - name: Tear down RustFS
         if: always()
         run: docker compose -f deploy/docker-compose/rustfs.yml down -v || true
+
+  # Agents real-backend lane (ADR-3331 decision 13, issue #3363). Two parts,
+  # both against the compose RustFS store:
+  #   - services/ravel-server/tests/agents_real_store.rs runs the CAS forms the
+  #     agent HEAD publish uses and a CreateIfAbsent collision (one size above
+  #     the multipart threshold) on RustFS and on the MemoryStore oracle, and
+  #     asserts the typed outcomes are equal. Unset RAVEL_REAL_STORE_URL makes
+  #     both tests print a skip line and pass, so the step fails on that line.
+  #   - scripts/chaos/agents-replace-worker.sh SIGKILLs a worker inside a step
+  #     and the server with a turn in flight, and asserts each recovery figure
+  #     against an exact value or a band. Its assertions are covered on every
+  #     pull request on canned figures by ci.yml's doc-scripts job
+  #     (scripts/chaos/agents-replace-worker.test.sh).
+  agents-chaos:
+    runs-on: ubuntu-latest
+    # A cold release build of ravel-server with agents plus ravel-cli, and the
+    # test build, are most of it; the chaos script itself waits out one lease
+    # and grace (40 s) and one restart.
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CHAOS_LOG_DIR: ${{ github.workspace }}/.gate-logs/chaos
+      CHAOS_KEEP_LOGS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the release binaries the agents chaos script drives
+        run: cargo build --release --locked -p ravel-server -p ravel-cli --features ravel-server/agents
+      - name: Put the release binaries on PATH
+        run: echo "${GITHUB_WORKSPACE}/target/release" >> "$GITHUB_PATH"
+      - name: Agents chaos structure check
+        run: scripts/chaos/agents-replace-worker.sh --check
+      # The bucket is created the way a --require-bucket-protection server
+      # needs it (Object Lock, versioning, lifecycle), the shape the oracle
+      # test must hold on.
+      - name: Start RustFS and create the chaos bucket
+        env:
+          AWS_ACCESS_KEY_ID: ravel
+          AWS_SECRET_ACCESS_KEY: ravel-dev-secret
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker compose -f deploy/docker-compose/rustfs.yml up -d rustfs
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/health >/dev/null
+          scripts/ci-create-bucket.sh http://127.0.0.1:9000 ravel-chaos
+      - name: Agents real-store oracle tests
+        env:
+          RAVEL_REAL_STORE_URL: http://127.0.0.1:9000
+          RAVEL_REAL_STORE_BUCKET: ravel-chaos
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p ravel-server --features agents \
+            --test agents_real_store -- --nocapture --test-threads 1 --color never \
+            | tee .gate-logs/agents-real-store.log
+          if grep -q 'skipping agents real-store' .gate-logs/agents-real-store.log; then
+            echo "::error::agents_real_store skipped: RAVEL_REAL_STORE_URL did not reach the test"
+            exit 1
+          fi
+      # rustfs_up (scripts/chaos/lib.sh) finds the store above healthy, reuses
+      # it, and empties the bucket before the scenarios start.
+      - name: Agents chaos -- replace a killed worker, restart the server
+        if: (success() || failure())
+        run: scripts/chaos/agents-replace-worker.sh
+      - name: Upload the agents chaos process logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agents-chaos-process-logs
+          path: |
+            .gate-logs/chaos/*.log
+            .gate-logs/agents-real-store.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Dump RustFS logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose/rustfs.yml logs --no-color || true
+      - name: Tear down RustFS
+        if: always()
+        run: docker compose -f deploy/docker-compose/rustfs.yml down -v || true
