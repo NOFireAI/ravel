@@ -1065,7 +1065,10 @@ Consequences. Figures measured under the 2 s default are not compared with
 figures measured under this setting; each run's effective configuration
 records which. The frozen-limit rows that derive from a 2 s flush cadence
 (`--max-segments`, `--max-s3-requests`) are restated for 500 ms in the
-change that sets the flags. The setting does not give the row a
+change that sets the flags. At the 114,356 points per second measured on
+`cardinality`, `history`'s 1,728,000,000 points would take about 15,100 s
+(4.2 h), inside its 72,000 s ceiling; that is a projection from
+`cardinality`, not a `history` measurement. The setting does not give the row a
 cardinality read-back: at about 15,000 objects the series listing is
 refused by the host memory floor on both the default and this setting
 (#3434), and until that is fixed the row's cardinality result is a
