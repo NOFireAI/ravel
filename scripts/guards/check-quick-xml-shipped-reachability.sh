@@ -71,7 +71,7 @@ fi
 # The four release builds the root Dockerfile ships (Dockerfile ~53-56), each
 # as "package:features" (features may be empty for a default build).
 BUILDS=(
-  "ravel-server:sql,flight-sql,otap"
+  "ravel-server:sql,flight-sql,otap,agents"
   "ravel-cli:"
   "ravel-operator:"
   "ravel-ingest-router:"

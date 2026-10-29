@@ -14,8 +14,9 @@ The SDK runs against the in-process fake coordinator in
   golden fixtures in `sdk/fixtures/` are written by the Rust side).
   `createClient` maps a 401 or 403 to `Forbidden`.
 - `createHttpTransport` (`@ravel/agents/worker`) is the `Transport` that
-  `serveAgents` uses against a server. The server mounts no step or effect
-  route yet, so steps go to an in-memory step journal (see "Wire gaps").
+  `serveAgents` uses against a server. The SDK does not call the server's
+  step or effect routes yet, so steps go to an in-memory step journal (see
+  "Wire gaps").
   Its behaviour is pinned under "HTTP transport" below.
 - The end-to-end tests in `e2e/` start a built `ravel-server` and kill a
   worker inside a step (see "End-to-end tests").
@@ -493,10 +494,10 @@ the handler behaves under replay; it says nothing about what Ravel persists.
 The wire contract this package was written against has gaps, filled
 provisionally on the SDK side:
 
-- Pending routes (task T16): the server mounts no step, effect complete,
-  effect fail, effect list or reconcile route, and no client or
-  `agents_admin` route reconciles an effect. Until they land,
-  `createHttpTransport` serves `recordStep`, `completeEffect` and
+- Unused routes: the server serves `worker/step`,
+  `worker/effects/complete`, `worker/effects/fail`, `effects` and the
+  `agents_admin` reconcile route, but `createHttpTransport` does not call
+  them yet. Until it does, `createHttpTransport` serves `recordStep`, `completeEffect` and
   `failEffect` from a `MemoryStepJournal`, which lives in one process and
   is lost with it. This is why the end-to-end kill is an in-process abort.
   Tests: `authorizes a new attempt at an unsettled at_least_once step and
@@ -504,8 +505,9 @@ provisionally on the SDK side:
   reconcile records its result`, `hands a reconciled retry out exactly
   once` (`http.test.ts`). Pairing each step with its effect record on the
   server, so the SDK can drop the in-memory journal, is tracked in #3416.
-- While an effect is in doubt the server still reports the operation as
-  `running`, since no route tells it the operation is blocked (asserted in
+- While an SDK step is in doubt the server reports the operation as
+  `running`, because the step lives only in the SDK's journal and the server
+  holds no effect record for it (asserted in
   `worker killed inside a manual step blocks as EffectInDoubt in the
   in-memory journal until reconciled there`, `e2e/recover.test.ts`).
 - Over `createHttpTransport` the lease is heartbeated only before each step

@@ -2395,10 +2395,11 @@ renders all ten gauges on every scrape, with or without `--agents`; a build
 without the feature omits them. One sample per family.
 
 Only the first gauge describes behaviour. The next eight repeat the
-`--agents-*` settings as parsed: in this release they are reported and not
-enforced (the flags reference says the same of each flag), so a scrape
-showing `ravel_agents_max_mailbox 256` says what the operator set, not what
-the process refused.
+`--agents-*` settings as parsed. Five are enforced: the two concurrency
+limits refuse past their lane with 503, and `max_mailbox`, `max_receipts`
+and `max_timers` refuse past their cap with a typed error counted in
+`ravel_agents_budget_refusals_total{cap}`. `memory_budget_bytes`,
+`max_agents` and `max_state_bytes` are reported only in this release.
 
 | Metric | Meaning |
 |---|---|
@@ -2411,7 +2412,7 @@ the process refused.
 | `ravel_agents_max_state_bytes` | The `--agents-max-state-bytes` setting: most bytes of objects one agent's root may reference. |
 | `ravel_agents_max_receipts` | The `--agents-max-receipts` setting: most idempotency receipts one agent retains. |
 | `ravel_agents_max_timers` | The `--agents-max-timers` setting: most pending timers one agent may hold. |
-| `ravel_agents_sweep_interval_ms` | The `agents.sweep_interval_ms` setting: milliseconds between the interval sweeps of each tenant this process has served, 0 for none. Unlike the eight above, it is enforced. |
+| `ravel_agents_sweep_interval_ms` | The `agents.sweep_interval_ms` setting: milliseconds between the interval sweeps of each tenant this process has served, 0 for none. It has no command-line flag in this release; the server sets 5000. |
 
 The sweep counters below sum every tenant this process has served. Each is a
 counter with the `mode` label; `ravel_agents_sweep_list_pages_total` adds
