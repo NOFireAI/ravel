@@ -12,15 +12,25 @@
 //! The cursor is in memory, one per agent, and starts at the agent's first
 //! event when the coordinator first reports the agent. ADR-3331 does not say
 //! where a projection cursor persists, and persisting it in HEAD would make
-//! projection a writer, so a restarted process projects each agent's
-//! history again as it touches the agent: nothing committed while no
-//! projector ran is lost, and the repeats carry the ids they carried before
+//! projection a writer, so every process that serves or sweeps a tenant
+//! projects each agent it touches from that agent's first event, and the
+//! repeats carry the ids they carried before
 //! (`tests::a_restarted_projector_redelivers_history_under_the_same_ids`).
+//! That is up to `max_index_pages * max_page_entries` (32,768 at the
+//! defaults) duplicate records per agent per process, and nothing
+//! rate-limits them. Re-reading a full history costs one shallow HEAD per
+//! fill plus every sealed event page, about 520 GETs at the default backlog,
+//! and one more GET per event under [`PayloadPolicy::Carried`].
 //!
 //! Every record carries a stable event id derived from the tenant, the
 //! agent, its incarnation and the event seq ([`event_id`]), so a record
-//! delivered twice (a retry, a restart) carries the same id twice and the
-//! id is the deduplication key for queries.
+//! delivered twice (a retry, a restart, a second process) carries the same
+//! id twice and the id is the deduplication key for queries.
+//!
+//! A record's time is its turn's committed finish time when the shallow HEAD
+//! still holds the turn's result, else the clock when the event was read
+//! ([`TimeSource`]). Nothing is restamped at delivery, so a re-projected old
+//! turn can fall outside the sink's ingest window and be rejected for good.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;

@@ -439,7 +439,9 @@ accepted value, so projection is never silently absent. Delivery may
 duplicate; the stable event id is the deduplication key for queries, and
 the guide says so. Projection lag is a metric. A projection failure
 never changes a committed transition, and the canonical history stays in
-the agent store for re-projection.
+the agent store for re-projection. The fields as projected, the
+loopback-only endpoint and the time rule are in the projection-as-built
+amendment below.
 
 ### 13. Verification
 
@@ -836,3 +838,45 @@ counts only scheduled ones. The publish that would seal a page past that bound
 is refused `BudgetExceeded`. The agent stays consistent but refuses new
 work for good: this release gives an operator no way to trim any of the
 three lists.
+
+## Amendment (2026-10-29): projection as built (issue #3360)
+
+<!-- amendment-applies: sections="12. Projection into Ravel" pointer="projection-as-built amendment" -->
+
+Decision 12 lists the ids and versions a projected record carries. The
+committed history holds fewer of them than that list assumes, and the
+first projector (#3360) projects what it holds.
+
+Fields. Each committed event is one log record and each committed turn one
+span. A record carries the stable event id, the agent id, incarnation,
+event seq, the turn id, the event type, and the input's accept seq as its
+message id. It carries no per-event state version and no handler version:
+an event entry records neither, and adding them changes the HEAD and page
+formats, which needs its own ADR. Effects are not projected; the effect
+journal stays readable through the effects routes.
+
+Endpoint. A process without an ingest buffer projects over OTLP gRPC to
+`--agents-projection-endpoint`, naming the tenant in the `x-ravel-tenant`
+header and presenting no credential. Until the credential model lands on
+issue #3360, the endpoint is accepted only as plain `http://` on a
+loopback host (`localhost`, `127.0.0.0/8` or `[::1]`), and any other host or
+an `https://` URL refuses startup with an error naming the issue. So
+`--mode query` with `--agents` takes `--agents-projection off`, a loopback
+gateway, or runs as `--mode all`. `--agents-projection off` beside an
+endpoint refuses too, since the two contradict.
+
+Time. An event entry records no time. A record takes its turn's
+`finished_unix_ns` from the committed result when the projector's shallow
+HEAD read holds it (the open results page), and otherwise the projecting
+process's clock when it read the event; the `agent.time_source` attribute
+says which. Nothing is restamped at delivery. A re-projected turn older
+than the log ingest window is refused as too old, which the projector
+counts and skips; it never blocks the agent's later events.
+
+Duplicates. The projection cursor is in memory only, so every process that
+serves or sweeps a tenant projects each agent it touches from its first
+event: up to `max_index_pages * max_page_entries` (32,768) duplicate records
+per agent per process start, at about 520 GETs per full-history agent at
+the default backlog. Nothing rate-limits this. The stable event id is the
+deduplication key, as decision 12 says, and `docs/agents.md` gives the
+query.
