@@ -385,8 +385,7 @@ async fn ranged_reads_select_the_requested_bytes() {
 async fn unverified_reads_are_recorded_on_the_shared_store_metrics() {
     let fake = fake().await;
     let metrics = Arc::new(StoreMetrics::default());
-    let store =
-        GcsStore::with_metrics(fake.config(), Arc::clone(&metrics)).expect("store");
+    let store = GcsStore::with_metrics(fake.config(), Arc::clone(&metrics)).expect("store");
     store
         .put("u/k", Bytes::from_static(b"v"), PutOptions::default())
         .await

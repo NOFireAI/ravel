@@ -236,7 +236,13 @@ impl ListFetch for GcsListClient {
         let url = self.request_url(request);
         let context = format!("listing {:?}", request.prefix);
         let body = self
-            .send(&context, Method::GET, &url, Bytes::new(), NotFoundSubject::Bucket)
+            .send(
+                &context,
+                Method::GET,
+                &url,
+                Bytes::new(),
+                NotFoundSubject::Bucket,
+            )
             .await?;
         parse_list(request.prefix, &body)
     }
@@ -289,14 +295,8 @@ impl GcsListClient {
             encode_component(name)
         );
         let context = format!("uploading {name:?}");
-        self.send(
-            &context,
-            Method::POST,
-            &url,
-            data,
-            NotFoundSubject::Object,
-        )
-        .await?;
+        self.send(&context, Method::POST, &url, data, NotFoundSubject::Object)
+            .await?;
         Ok(())
     }
 
