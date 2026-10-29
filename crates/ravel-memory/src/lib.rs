@@ -286,7 +286,11 @@ impl MemoryBudget {
     ///   evaluator memory rather than fetch buffers, but are counted here;
     /// - `ravel-catalog`'s snapshot-part, postings and column-statistics
     ///   decodes, through [`reserve`] (`Catalog::with_memory_budget`); a
-    ///   decoded part or postings entry keeps its reservation while cached.
+    ///   decoded part or postings entry keeps its reservation while cached;
+    /// - `ravel-logseg`'s decoded column-block cache, one reservation per
+    ///   admitted entry, through [`reserve_best_effort_keeping`], held while
+    ///   the entry is resident or a scan still holds it. Its size is set by
+    ///   `--decoded-cache-max-bytes`, not by in-flight work.
     ///
     /// `try_reserve` and `reserve_unchecked` (the raw counter API SQL's
     /// `TenantMemoryAccountant` uses exclusively) never touch this counter, so
@@ -294,6 +298,7 @@ impl MemoryBudget {
     ///
     /// [`reserve`]: MemoryBudget::reserve
     /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
+    /// [`reserve_best_effort_keeping`]: MemoryBudget::reserve_best_effort_keeping
     pub fn fetch_reserved(&self) -> u64 {
         self.fetch_reserved.load(Ordering::Acquire)
     }
