@@ -945,7 +945,7 @@ D2 changes in two places:
    agents tools carry the D2 annotations. The D2 rule that annotations carry
    no authority stands.
 2. The 24 KiB bound covers the combined catalog. Measured, `tools/list` is
-   15,700 bytes with the nine tools and 22,723 bytes with all fifteen,
+   15,700 bytes with the nine tools and 23,589 bytes with all fifteen,
    against the 24,576-byte budget; both figures are pinned in
    `services/ravel-server/tests/mcp_agents_e2e.rs`.
 
