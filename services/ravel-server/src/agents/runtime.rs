@@ -590,6 +590,7 @@ pub(crate) fn empty_head() -> Head {
         steps: Vec::new(),
         effects: Vec::new(),
         outbox: Vec::new(),
+        index: ravel_agents_core::pages::Index::default(),
     }
 }
 
