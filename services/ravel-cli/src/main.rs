@@ -2032,7 +2032,8 @@ enum StoreCommand {
     /// before anything is read, and so does a report that could not be written
     /// to stdout (a closed pipe excepted). `object-retention` is not checked
     /// by this command: it is printed as not checked and does not affect the
-    /// exit code. Read-only.
+    /// exit code. Read-only. Under `--store gcs` it refuses and exits 2
+    /// without a request: GCS bucket protection is not checked.
     VerifyProtection {
         /// The noncurrent-version expiration, in days, the lifecycle rule
         /// covering `t/` must carry (`E_v`).
@@ -2605,7 +2606,37 @@ enum CatalogCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run(Cli::parse()).await
+    run(parse_cli(std::env::args_os()).unwrap_or_else(|err| err.exit())).await
+}
+
+/// Parse `argv` into a [`Cli`] and record which store flags were given rather
+/// than defaulted, which `--store gcs` needs to refuse a given `--s3-*` flag
+/// (ADR-3456 decision 6).
+fn parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = <Cli as clap::CommandFactory>::command().try_get_matches_from(argv)?;
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
+    cli.store.record_flag_sources(&matches);
+    Ok(cli)
+}
+
+/// The `--tenant-kms-config` flags of the commands that take one.
+fn command_tenant_kms(command: &Command) -> Option<&store::TenantKmsArgs> {
+    match command {
+        Command::Maintain {
+            command:
+                MaintainCommand::CompactBucket { tenant_kms, .. }
+                | MaintainCommand::CompactTenant { tenant_kms, .. }
+                | MaintainCommand::Migrate { tenant_kms, .. },
+        }
+        | Command::Catalog {
+            command: CatalogCommand::Fold { tenant_kms, .. },
+        } => Some(tenant_kms),
+        _ => None,
+    }
 }
 
 /// Install `scheme` process-wide. A second install of the scheme already in
@@ -2798,6 +2829,21 @@ async fn run_agents(
 /// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
 /// than stderr.
 async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
+    // Refused before the store is built, so a refused run sends no request.
+    if let Some(tenant_kms) = command_tenant_kms(&cli.command) {
+        store::refuse_tenant_kms_under_gcs(&cli.store, tenant_kms)?;
+    }
+    if cli.store.store_kind() == store::StoreKind::Gcs
+        && matches!(
+            cli.command,
+            Command::Store {
+                command: StoreCommand::VerifyProtection { .. }
+            }
+        )
+    {
+        eprintln!("error: {}", store::GCS_VERIFY_PROTECTION_REFUSAL);
+        std::process::exit(store::VERIFY_PROTECTION_UNKNOWN);
+    }
     // Refused before the store is built: an unaudited query must not cost a
     // single request unless the operator acknowledged it.
     #[cfg(feature = "sql-explain")]

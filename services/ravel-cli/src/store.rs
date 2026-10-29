@@ -1,16 +1,20 @@
-//! Object store construction, sharing `RAVEL_S3_*` env vars with `ravel-server`.
+//! Object store construction, sharing `RAVEL_S3_*` and `RAVEL_GCS_BUCKET` env
+//! vars with `ravel-server`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, Parser, ValueEnum};
 use ravel_object_store::conformance::{
     BucketControlPlane, BucketProtectionParams, BucketProtectionReport, ConditionState,
     ProtectionConditionId, probe_bucket_protection,
 };
+use ravel_object_store::gcs::{GcsConfig, GcsStore};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{
-    S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity, resolve_s3_allow_http,
+    S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity, is_loopback_endpoint,
+    resolve_s3_allow_http,
 };
 use ravel_object_store::{GetRange, KmsRoutingStore, ObjectStoreBackend, StoreMetrics};
 use ravel_types::{TenantHash, TenantId};
@@ -20,6 +24,8 @@ pub enum StoreKind {
     Memory,
     #[value(name = "s3")]
     S3,
+    #[value(name = "gcs")]
+    Gcs,
 }
 
 impl StoreKind {
@@ -29,6 +35,7 @@ impl StoreKind {
         match self {
             StoreKind::Memory => "memory",
             StoreKind::S3 => "s3",
+            StoreKind::Gcs => "gcs",
         }
     }
 }
@@ -353,9 +360,71 @@ pub struct StoreArgs {
         env = "RAVEL_S3_REQUEST_STORED_CHECKSUM"
     )]
     pub s3_request_stored_checksum: bool,
+
+    /// The bucket `--store gcs` runs against (ADR-3456), required under it.
+    /// Credentials are Application Default Credentials only: the key file
+    /// `GOOGLE_APPLICATION_CREDENTIALS` names, else the gcloud well-known
+    /// file, else the metadata server. Under `--store gcs` every `--s3-*`
+    /// flag given on the command line or through its environment variable is
+    /// refused rather than ignored; a defaulted one is not.
+    #[arg(long, env = "RAVEL_GCS_BUCKET")]
+    pub gcs_bucket: Option<String>,
+
+    /// Replaces `https://storage.googleapis.com` under `--store gcs`, for an
+    /// emulator. Plain `http://` is accepted only for a loopback host. Part
+    /// of the backend identity `store qualify` records.
+    #[arg(long, hide = true, value_name = "URL")]
+    pub gcs_endpoint: Option<String>,
+
+    /// The `--s3-*` flags this invocation was given on the command line or
+    /// through their environment variables, each as `--flag (ENV)`. `None`
+    /// until [`StoreArgs::record_flag_sources`] has read the parse's matches,
+    /// and `--store gcs` refuses to build a store from args in that state.
+    #[arg(skip)]
+    given_s3_flags: Option<Vec<String>>,
 }
 
 impl StoreArgs {
+    /// Parse `argv` as store flags alone and record which `--s3-*` flags were
+    /// given ([`StoreArgs::record_flag_sources`]).
+    pub fn try_parse_recorded<I, T>(argv: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(argv)?;
+        let mut args = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        args.record_flag_sources(&matches);
+        Ok(args)
+    }
+
+    /// Record, from the `ArgMatches` these args were parsed from (the
+    /// top-level matches when they are flattened into a larger command), each
+    /// `--s3-*` flag whose value came from the command line or its environment
+    /// variable. A defaulted value is not recorded: `--store gcs` refuses a
+    /// given S3 flag and ignores a defaulted one (ADR-3456 decision 6).
+    pub fn record_flag_sources(&mut self, matches: &ArgMatches) {
+        let command = Self::command();
+        let given = command
+            .get_arguments()
+            .filter(|arg| arg.get_id().as_str().starts_with("s3_"))
+            .filter(|arg| {
+                matches!(
+                    matches.value_source(arg.get_id().as_str()),
+                    Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                )
+            })
+            .map(|arg| {
+                let flag = format!("--{}", arg.get_long().unwrap_or(arg.get_id().as_str()));
+                match arg.get_env() {
+                    Some(env) => format!("{flag} ({})", env.to_string_lossy()),
+                    None => flag,
+                }
+            })
+            .collect();
+        self.given_s3_flags = Some(given);
+    }
+
     /// The backend this invocation runs against: `--store` when given, memory
     /// otherwise.
     pub fn store_kind(&self) -> StoreKind {
@@ -382,6 +451,10 @@ impl StoreArgs {
                 self.s3_bucket.as_deref(),
                 self.s3_endpoint.as_deref(),
             ),
+            StoreKind::Gcs => ravel_object_store::conformance::gcs_backend_identity(
+                self.gcs_bucket.as_deref().unwrap_or("<unset>"),
+                self.gcs_endpoint.as_deref(),
+            ),
         }
     }
 
@@ -390,14 +463,29 @@ impl StoreArgs {
     /// access key, secret key and session token are left to their `RAVEL_S3_*`
     /// environment variables. One that was set while its variable is unset
     /// came from a flag, so `env_is_set` reporting that adds the placeholder
-    /// word `<your S3 credential flags>` where those flags go.
+    /// word `<your S3 credential flags>` where those flags go. Under `--store
+    /// gcs` the words are the GCS bucket and endpoint and no S3 flag; its
+    /// credentials come from the environment.
     pub fn echo_flags(&self, env_is_set: &dyn Fn(&str) -> bool) -> Vec<String> {
         let Some(kind) = self.store else {
             return Vec::new();
         };
         let mut words = vec!["--store".to_string(), kind.flag_value().to_string()];
-        if kind != StoreKind::S3 {
-            return words;
+        match kind {
+            StoreKind::Memory => return words,
+            StoreKind::Gcs => {
+                for (flag, value) in [
+                    ("--gcs-bucket", &self.gcs_bucket),
+                    ("--gcs-endpoint", &self.gcs_endpoint),
+                ] {
+                    if let Some(value) = value {
+                        words.push(flag.to_string());
+                        words.push(value.clone());
+                    }
+                }
+                return words;
+            }
+            StoreKind::S3 => {}
         }
         let mut push = |flag: &str, value: Option<String>| {
             if let Some(value) = value {
@@ -620,6 +708,30 @@ pub struct TenantKmsArgs {
     pub tenant_kms_config: Option<PathBuf>,
 }
 
+/// The refusal of `--tenant-kms-config` under `--store gcs` (ADR-3456
+/// decision 6).
+pub const GCS_TENANT_KMS_REFUSAL: &str = "--tenant-kms-config is refused under --store gcs: \
+     per-tenant SSE-KMS is an S3 feature with no GCS implementation. Customer-managed \
+     encryption on GCS is the bucket's default key (CMEK), set outside Ravel.";
+
+/// The refusal of `store verify-protection` under `--store gcs` (ADR-3456
+/// decision 6).
+pub const GCS_VERIFY_PROTECTION_REFUSAL: &str = "store verify-protection is refused under \
+     --store gcs: GCS bucket protection (retention policy, object versioning, soft delete) is \
+     not checked by this command, so it reports nothing rather than conditions it never probed.";
+
+/// Refuse `--tenant-kms-config` under `--store gcs` before anything is read,
+/// for the commands that take it (ADR-3456 decision 6).
+pub fn refuse_tenant_kms_under_gcs(
+    args: &StoreArgs,
+    kms_args: &TenantKmsArgs,
+) -> anyhow::Result<()> {
+    if args.store_kind() == StoreKind::Gcs && kms_args.tenant_kms_config.is_some() {
+        anyhow::bail!(GCS_TENANT_KMS_REFUSAL);
+    }
+    Ok(())
+}
+
 /// Read and validate `--tenant-kms-config`, with ravel-server's refusals and
 /// messages: the flag needs `--store s3`, and an unreadable or invalid file is
 /// an error naming the path.
@@ -627,6 +739,9 @@ fn load_tenant_kms_config(
     args: &StoreArgs,
     path: &Path,
 ) -> anyhow::Result<ravel_catalog::tenant_kms::TenantKmsConfig> {
+    if args.store_kind() == StoreKind::Gcs {
+        anyhow::bail!(GCS_TENANT_KMS_REFUSAL);
+    }
     if args.store_kind() != StoreKind::S3 {
         anyhow::bail!(
             "--tenant-kms-config requires --store s3: KmsRoutingStore's per-tenant builder \
@@ -754,7 +869,67 @@ pub fn build_store_handle(
                 http,
             })
         }
+        StoreKind::Gcs => {
+            let config = gcs_config(args, page_size)?;
+            let store = GcsStore::new(config)
+                .map_err(|err| anyhow::anyhow!("failed to build GCS store: {err}"))?;
+            Ok(BuiltStore::Other(Arc::new(store)))
+        }
     }
+}
+
+/// Set to any value in a `test-support` build, makes `--store gcs` send
+/// unsigned requests and look up no credentials, so a test can drive the
+/// command against `ravel_object_store::gcs::fake`. Not read in any other
+/// build.
+pub const GCS_SKIP_SIGNATURE_TEST_ENV: &str = "RAVEL_GCS_TEST_SKIP_SIGNATURE";
+
+/// The `GcsConfig` `--store gcs` builds its store from, with `page_size`
+/// replacing the default list page size when given. Refuses every `--s3-*`
+/// flag that was given rather than defaulted, and a plaintext endpoint that
+/// is not loopback, since its requests carry the bearer token.
+fn gcs_config(args: &StoreArgs, page_size: Option<usize>) -> anyhow::Result<GcsConfig> {
+    let Some(given) = args.given_s3_flags.as_ref() else {
+        anyhow::bail!(
+            "--store gcs could not tell which --s3-* flags were given: the store flags were \
+             parsed without recording their sources"
+        );
+    };
+    if !given.is_empty() {
+        anyhow::bail!(
+            "--store gcs refuses S3 flags, which have no GCS implementation and would otherwise \
+             be ignored: {} given. Unset them (command line or environment) to run against GCS.",
+            given.join(", ")
+        );
+    }
+    let bucket = args
+        .gcs_bucket
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--store gcs requires --gcs-bucket (RAVEL_GCS_BUCKET)"))?;
+    let mut config = GcsConfig::new(bucket);
+    if let Some(n) = page_size {
+        config.list_page_size = n;
+    }
+    if let Some(endpoint) = &args.gcs_endpoint {
+        let lowercased = endpoint.to_ascii_lowercase();
+        if lowercased.starts_with("http://") {
+            if !is_loopback_endpoint(endpoint) {
+                anyhow::bail!(
+                    "--gcs-endpoint {endpoint:?} is plaintext HTTP to a host that is not \
+                     loopback; use https:// so the bearer token is not sent in the clear"
+                );
+            }
+            config.allow_http = true;
+        } else if !lowercased.starts_with("https://") {
+            anyhow::bail!("--gcs-endpoint {endpoint:?} needs an http:// or https:// scheme");
+        }
+        config.base_url = Some(endpoint.clone());
+    }
+    #[cfg(feature = "test-support")]
+    if std::env::var_os(GCS_SKIP_SIGNATURE_TEST_ENV).is_some() {
+        config.skip_signature = true;
+    }
+    Ok(config)
 }
 
 /// Reads `key_or_path` from the local filesystem if it names an existing
@@ -2270,6 +2445,107 @@ mod tests {
             fake.lists().len(),
             3,
             "one more LIST at the production size"
+        );
+    }
+
+    fn gcs_args(extra: &[&str]) -> StoreArgs {
+        let mut argv = vec!["ravel-cli", "--store", "gcs"];
+        argv.extend_from_slice(extra);
+        StoreArgs::try_parse_recorded(argv).expect("store flags parse")
+    }
+
+    fn gcs_config_error(args: &StoreArgs) -> String {
+        match gcs_config(args, None) {
+            Ok(config) => panic!("expected a refusal, built {config:?}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// The defaulted `--s3-upload-integrity` and `--s3-request-stored-checksum`
+    /// are not refused under gcs, and the page size reaches GcsConfig.
+    #[test]
+    fn defaulted_s3_flags_are_not_refused_under_gcs() {
+        let args = gcs_args(&["--gcs-bucket", "b"]);
+        assert_eq!(args.given_s3_flags, Some(Vec::new()));
+        let config = gcs_config(&args, Some(7)).expect("gcs config builds");
+        assert_eq!(config.bucket, "b");
+        assert_eq!(config.list_page_size, 7);
+        assert_eq!(config.base_url, None);
+        assert!(!config.allow_http);
+    }
+
+    /// A `--s3-*` flag given on the command line is refused under gcs, each
+    /// named, including one given at its default value.
+    #[test]
+    fn given_s3_flags_are_refused_under_gcs() {
+        let args = gcs_args(&[
+            "--gcs-bucket",
+            "b",
+            "--s3-bucket",
+            "x",
+            "--s3-request-stored-checksum=true",
+        ]);
+        let err = gcs_config_error(&args);
+        assert!(
+            err.contains(
+                "--s3-bucket (RAVEL_S3_BUCKET), --s3-request-stored-checksum \
+                 (RAVEL_S3_REQUEST_STORED_CHECKSUM) given"
+            ),
+            "{err}"
+        );
+    }
+
+    /// Args parsed without recording their sources cannot tell a given
+    /// `--s3-*` flag from a defaulted one, so gcs refuses rather than guess.
+    #[test]
+    fn gcs_refuses_unrecorded_flag_sources() {
+        let args = StoreArgs::try_parse_from(["ravel-cli", "--store", "gcs", "--gcs-bucket", "b"])
+            .expect("store flags parse");
+        assert!(gcs_config_error(&args).contains("could not tell which --s3-* flags were given"),);
+    }
+
+    #[test]
+    fn gcs_bucket_is_required() {
+        let err = gcs_config_error(&gcs_args(&[]));
+        assert_eq!(err, "--store gcs requires --gcs-bucket (RAVEL_GCS_BUCKET)");
+    }
+
+    /// Plain http is accepted only for a loopback endpoint; an endpoint with
+    /// no scheme is refused.
+    #[test]
+    fn gcs_endpoint_scheme_rules() {
+        let loopback = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "http://127.0.0.1:9"]);
+        let config = gcs_config(&loopback, None).expect("loopback http builds");
+        assert!(config.allow_http);
+        assert_eq!(config.base_url.as_deref(), Some("http://127.0.0.1:9"));
+
+        let remote = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "http://gcs.example"]);
+        assert!(gcs_config_error(&remote).contains("is plaintext HTTP to a host that is not"));
+
+        let schemeless = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "gcs.example"]);
+        assert!(gcs_config_error(&schemeless).contains("needs an http:// or https:// scheme"));
+    }
+
+    /// Under gcs the identity is the `gs://` form and the echoed flags name the
+    /// GCS bucket and endpoint, never an S3 field.
+    #[test]
+    fn gcs_identity_and_echo_flags() {
+        let args = gcs_args(&["--gcs-bucket", "b", "--gcs-endpoint", "http://127.0.0.1:9"]);
+        assert_eq!(args.backend_identity(), "gs://b@http://127.0.0.1:9");
+        assert_eq!(
+            args.echo_flags(&|_| false),
+            [
+                "--store",
+                "gcs",
+                "--gcs-bucket",
+                "b",
+                "--gcs-endpoint",
+                "http://127.0.0.1:9"
+            ]
+        );
+        assert_eq!(
+            gcs_args(&["--gcs-bucket", "b"]).backend_identity(),
+            "gs://b"
         );
     }
 }
