@@ -5,7 +5,7 @@
 use ravel_agents_core::command::{EventSpec, FireTimer};
 use ravel_agents_core::head::{FORMAT_VERSION, MAX_HEAD_BYTES, peek_format_version};
 use ravel_agents_core::identity::Id128;
-use ravel_agents_core::pages::{ListKind, Representation};
+use ravel_agents_core::pages::{ListKind, Need, Representation, receipt_fingerprint};
 use ravel_object_store::fault::{Sequence, SequenceStep};
 
 use crate::counters::CounterSnapshot;
@@ -230,7 +230,8 @@ async fn send_receipt_lookup_and_wake_read_at_most_one_index_page_each() {
 }
 
 /// Events are read by `event_seq` range: from the page holding `after + 1`
-/// until `limit` events are in hand, never the pages before it.
+/// until `limit` events are in hand, never the pages before it. A result
+/// the route layer reads by `accept_seq` costs the one page holding it.
 #[tokio::test]
 async fn events_are_read_by_seq_range() {
     let store = store_with(Arc::new(MemoryStore::new()), paged_limits());
@@ -287,6 +288,29 @@ async fn events_are_read_by_seq_range() {
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].event_seq, events);
     assert_eq!(store.counters().since(&before).resolve.get, 1);
+
+    // A result read by accept_seq: one GET for a sealed result, none for
+    // one still on the open page.
+    let mut head = shallow(&store).await;
+    assert_eq!(sealed(&head, ListKind::Results), pages_for(turns as u64));
+    let before = store.counters();
+    store
+        .attach(&agent(), &mut head, &[(ListKind::Results, Need::Key(1))])
+        .await
+        .expect("attach");
+    assert!(head.results.iter().any(|r| r.accept_seq == 1));
+    assert_eq!(store.counters().since(&before).resolve.get, 1);
+    let before = store.counters();
+    store
+        .attach(
+            &agent(),
+            &mut head,
+            &[(ListKind::Results, Need::Key(turns as u64))],
+        )
+        .await
+        .expect("attach");
+    assert!(head.results.iter().any(|r| r.accept_seq == turns as u64));
+    assert_eq!(store.counters().since(&before).total().requests(), 0);
 }
 
 /// A CAS refused once: the retry re-reads HEAD, re-runs the kernel, and seals
@@ -387,6 +411,83 @@ async fn pages_are_written_before_the_cas_that_references_them() {
     }
 }
 
+/// Two request ids whose receipt fingerprints collide, found by search over
+/// `c0, c1, ...` for handler `h`.
+const COLLIDING: [&str; 2] = ["c24337", "c53026"];
+
+/// A fingerprint names candidate pages, not an entry: two receipts sealed
+/// into one page under the same fingerprint are each found by their own
+/// `(handler, request_id)`, at one page read each, and a repeated send of
+/// the second resolves to its own operation.
+#[tokio::test]
+async fn colliding_receipt_fingerprints_resolve_to_their_own_receipts() {
+    let fp = receipt_fingerprint("h", COLLIDING[0]);
+    assert_eq!(fp, receipt_fingerprint("h", COLLIDING[1]));
+    let store = store_with(Arc::new(MemoryStore::new()), paged_limits());
+    create(&store).await;
+    for rid in COLLIDING.iter().copied().chain(["f0", "f1", "f2"]) {
+        send(&store, rid).await.expect("send");
+    }
+    let head = shallow(&store).await;
+    let pages = &head.index.receipts.pages;
+    assert_eq!(pages.len(), 1);
+    assert_eq!(
+        pages[0].fingerprints.iter().filter(|&&f| f == fp).count(),
+        2,
+        "one page lists the fingerprint twice"
+    );
+    let open: Vec<&str> = head
+        .receipts
+        .iter()
+        .map(|r| r.request_id.as_str())
+        .collect();
+    assert_eq!(open, vec!["f2"], "both colliding receipts are sealed");
+
+    for (rid, seq) in COLLIDING.iter().zip([1, 2]) {
+        let before = store.counters();
+        let receipt = store
+            .find_receipt(&agent(), "h", rid)
+            .await
+            .expect("lookup")
+            .expect("sent");
+        assert_eq!(receipt.request_id, *rid);
+        assert_eq!(receipt.accept_seq, seq);
+        assert_eq!(store.counters().since(&before).resolve.get, 2, "{rid}");
+    }
+
+    let again = send(&store, COLLIDING[1]).await.expect("repeat");
+    assert!(!again.published);
+    assert_eq!(accept_seq(&again), 2);
+}
+
+/// A store that plans no page (`AgentStore::without_page_plan`) stands in
+/// for a planner that omits one: a repeated send whose receipt is sealed
+/// finds the page missing, the miss is counted once, every page is loaded,
+/// and the reply is the one the planned path gives.
+#[tokio::test]
+async fn a_planner_miss_loads_every_page_and_is_counted() {
+    let backend = Arc::new(MemoryStore::new());
+    let planned = store_with(backend.clone(), paged_limits());
+    let head = grow(&planned, 3 * K + 1).await;
+    let pages = head.index.page_refs().count() as u64;
+
+    let (out, delta) = measured_send(&planned, "r0").await;
+    let out = out.expect("planned repeat");
+    assert_eq!(delta.planner_misses, 0);
+    assert_eq!(delta.resolve.get, 2);
+    let planned_reply = out.reply;
+
+    let blind = store_with(backend.clone(), paged_limits()).without_page_plan();
+    let (out, delta) = measured_send(&blind, "r0").await;
+    let out = out.expect("repeat after a miss");
+    assert_eq!(delta.planner_misses, 1);
+    assert_eq!(delta.resolve.get, 1 + pages, "HEAD, then every page");
+    assert!(!out.published);
+    assert_eq!(accept_seq(&out), 1);
+    assert_eq!(out.reply, planned_reply);
+    assert_eq!(delta.publish.requests(), 0);
+}
+
 /// A version 1 HEAD, every list inline and longer than one page, moves to
 /// the paged representation on the next command's own CAS; the HEAD it
 /// writes is version 2, under the byte cap, and every page it references is
@@ -438,7 +539,7 @@ async fn a_version_one_head_migrates_on_the_next_cas() {
         1 + out.head.index.written.len() as u64,
         "the payload and every page the migration sealed"
     );
-    let full = match paged.read_head(&agent()).await.expect("read") {
+    let full = match paged.read_head_full(&agent()).await.expect("read") {
         HeadState::Present { head, .. } => *head,
         other => panic!("{other:?}"),
     };

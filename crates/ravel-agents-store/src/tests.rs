@@ -449,7 +449,7 @@ async fn a_newer_head_format_is_unsupported_and_never_written() {
         .expect("seed");
 
     assert_eq!(
-        store.read_head(&agent()).await.expect("read"),
+        store.read_head_full(&agent()).await.expect("read"),
         HeadState::Unsupported { found: 3 }
     );
     let before = store.counters();
@@ -995,7 +995,7 @@ fn store_matches_kernel(steps: &[Step]) -> Result<Vec<Result<Reply, ErrorKind>>,
                     prop_assert_eq!(actual.map(|o| o.reply), Err(error));
                 }
             }
-            let stored = match store.read_head(&agent()).await {
+            let stored = match store.read_head_full(&agent()).await {
                 Ok(HeadState::Present { head, .. }) => Some(*head),
                 Ok(HeadState::Absent) => None,
                 other => return Err(TestCaseError::fail(format!("{other:?}"))),
