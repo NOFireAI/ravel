@@ -1,4 +1,4 @@
-//! Builds the configured `ObjectStoreBackend` (memory or S3) and
+//! Builds the configured `ObjectStoreBackend` (memory, S3 or GCS) and
 //! enforces the mandatory-capability contract before the backend is used.
 
 use std::sync::Arc;
@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::config::{Cli, Mode, StoreKind};
 use bytes::Bytes;
 use ravel_cache::{Cache, CacheLimits, DiskCache, TieredCache};
+use ravel_object_store::gcs::{GcsConfig, GcsStore};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
 use ravel_object_store::{
@@ -358,6 +359,27 @@ pub use ravel_object_store::s3::{
     resolve_s3_allow_http,
 };
 
+/// Whether `--store gcs` may speak plaintext HTTP to `--gcs-endpoint`. No
+/// endpoint (GCS itself) and an `https://` endpoint are `false`; a loopback
+/// `http://` endpoint, a fake on this host, is `true`. Every other endpoint is
+/// refused: there is no flag accepting plaintext GCS across the network, and
+/// an endpoint with no scheme is not a usable URL.
+pub fn resolve_gcs_allow_http(endpoint: Option<&str>) -> anyhow::Result<bool> {
+    let Some(endpoint) = endpoint else {
+        return Ok(false);
+    };
+    if endpoint.to_ascii_lowercase().starts_with("https://") {
+        return Ok(false);
+    }
+    if endpoint.to_ascii_lowercase().starts_with("http://") && is_loopback_endpoint(endpoint) {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "--gcs-endpoint {endpoint:?} is refused: it must be an https:// URL, or an http:// URL \
+         whose host is loopback (a fake endpoint on this host)"
+    )
+}
+
 /// The argument error for `--s3-auth instance-role` combined with an inline
 /// credential (ADR-0106), or `None` when no inline credential is set.
 ///
@@ -507,6 +529,35 @@ pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore
                 let instrumented = InstrumentedStore::with_metrics(store, Arc::clone(&metrics));
                 (Arc::new(instrumented), metrics, None, s3)
             }
+        }
+        StoreKind::Gcs => {
+            let bucket = cli.gcs_bucket.clone().ok_or_else(|| {
+                anyhow::anyhow!("--store gcs requires --gcs-bucket (RAVEL_GCS_BUCKET)")
+            })?;
+            let allow_http = resolve_gcs_allow_http(cli.gcs_endpoint.as_deref())?;
+            // The S3 path's timeouts, so a slow request is cut at the same
+            // point whichever store the bucket is on.
+            let http = cli.s3_http_config();
+            let mut config = GcsConfig::new(bucket);
+            config.base_url = cli.gcs_endpoint.clone();
+            config.allow_http = allow_http;
+            config.request_timeout = http.request_timeout;
+            config.connect_timeout = http.connect_timeout;
+            // A fake endpoint takes no credentials. Only a test build of this
+            // crate can ask for that (ADR-3456 decision D2); everywhere else
+            // `--gcs-endpoint` is a base URL and ADC still signs.
+            #[cfg(feature = "gcs-test-endpoint")]
+            {
+                config.skip_signature = config.base_url.is_some();
+            }
+            // One metrics block for the connector inside `GcsStore` (HTTP
+            // attempts, `observed_store_time_ns`) and the decorator (completed
+            // calls), as on the S3 path.
+            let metrics = Arc::new(StoreMetrics::default());
+            let store = GcsStore::with_metrics(config, Arc::clone(&metrics))
+                .map_err(|err| anyhow::anyhow!("failed to build GCS store: {err}"))?;
+            let instrumented = InstrumentedStore::with_metrics(store, Arc::clone(&metrics));
+            (Arc::new(instrumented), metrics, None, None)
         }
     };
 

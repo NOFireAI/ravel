@@ -356,6 +356,24 @@ tenant `acme`.
 - To get the PromQL and ingest surfaces without the SQL endpoint, drop
   `--features sql` from the same command.
 
+To run against a Google Cloud Storage bucket instead, unset the `RAVEL_S3_*`
+variables (under `--store gcs` each of them is refused, not ignored) and
+sign in with Application Default Credentials, for example
+`gcloud auth application-default login`. Qualify the bucket, then start the
+server on it:
+
+```sh
+cargo run -p ravel-cli -- --store gcs --gcs-bucket my-ravel-dev store qualify
+
+cargo run -p ravel-server --features sql -- \
+  --store gcs --gcs-bucket my-ravel-dev \
+  --tenant-hash-unkeyed \
+  --tenant-token devtoken=acme
+```
+
+See [Google Cloud Storage](operations/configuration.md#google-cloud-storage)
+for GKE Workload Identity and the flags `--store gcs` refuses.
+
 ### Round trip by hand
 
 An OTLP HTTP export is any valid `ExportMetricsServiceRequest` protobuf.

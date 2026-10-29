@@ -1220,11 +1220,18 @@ pub fn build_sql_state_with_parquet(
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
         let stores = match config.ravel_bucket {
-            Some(ravel) => stores.refusing(ravel_sql::RavelBucket {
-                endpoint: ravel.endpoint,
-                region: ravel.region,
-                bucket: ravel.bucket,
+            Some(crate::config::RavelBucket::S3 {
+                bucket,
+                endpoint,
+                region,
+            }) => stores.refusing(ravel_sql::RavelBucket::S3 {
+                endpoint,
+                region,
+                bucket,
             }),
+            Some(crate::config::RavelBucket::Gcs { bucket, endpoint }) => {
+                stores.refusing(ravel_sql::RavelBucket::Gcs { endpoint, bucket })
+            }
             None => stores,
         };
         Arc::new(stores) as Arc<dyn ravel_sql::ExternalStores>
@@ -2847,26 +2854,36 @@ mod tests {
             r#"[{"name": "lake", "kind": "gcs", "credentials": {"mode": "application_default"}}]"#,
         )
         .expect("profiles");
-        let configured = build(Some(crate::config::ParquetProfiles {
-            profiles,
-            ravel_bucket: Some(crate::config::RavelS3Bucket {
+        // Ravel's bucket as `--store s3` and as `--store gcs` (ADR-3456 D7)
+        // reach it: a GCS profile on it is refused either way.
+        for ravel_bucket in [
+            crate::config::RavelBucket::S3 {
                 bucket: "ravel-data".to_string(),
                 endpoint: Some("https://storage.googleapis.com".to_string()),
                 region: "us-east-1".to_string(),
-            }),
-        }));
-        let sources = configured.executor.parquet_sources().expect("sources");
-        assert!(sources.is_configured());
-        let refused = sources
-            .external_stores()
-            .expect("profile stores")
-            .store("lake", "ravel-data")
-            .err()
-            .expect("Ravel's bucket is refused");
-        assert!(
-            matches!(refused, ravel_sql::ExternalStoreError::RavelBucket { .. }),
-            "{refused:?}"
-        );
+            },
+            crate::config::RavelBucket::Gcs {
+                bucket: "ravel-data".to_string(),
+                endpoint: None,
+            },
+        ] {
+            let configured = build(Some(crate::config::ParquetProfiles {
+                profiles: profiles.clone(),
+                ravel_bucket: Some(ravel_bucket.clone()),
+            }));
+            let sources = configured.executor.parquet_sources().expect("sources");
+            assert!(sources.is_configured());
+            let refused = sources
+                .external_stores()
+                .expect("profile stores")
+                .store("lake", "ravel-data")
+                .err()
+                .expect("Ravel's bucket is refused");
+            assert!(
+                matches!(refused, ravel_sql::ExternalStoreError::RavelBucket { .. }),
+                "{ravel_bucket:?}: {refused:?}"
+            );
+        }
         let unconfigured = build(None);
         assert!(
             !unconfigured
