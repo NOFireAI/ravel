@@ -189,8 +189,11 @@ struct HealthBody {
 /// Where committed history projects, and how far behind it is: `lag_max` is
 /// the largest committed-minus-projected event count over every agent this
 /// process has seen, summed over no tenant. `backlog` is the records read and
-/// not yet delivered, summed over tenants; the three counters run from
-/// process start. No `/metrics` family carries these yet.
+/// not yet delivered, summed over tenants; the counters run from process
+/// start. `records_rejected` counts records the receiving ingest refused for
+/// good and the projector skipped. `last_sink_error` is the last transient
+/// delivery failure, retried; `last_rejection` names the last skipped record
+/// and why. No `/metrics` family carries these yet.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProjectionBody {
     mode: &'static str,
@@ -201,6 +204,9 @@ struct ProjectionBody {
     events_projected: u64,
     sink_failures: u64,
     backlog_full: u64,
+    records_rejected: u64,
+    last_sink_error: Option<String>,
+    last_rejection: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -217,6 +223,7 @@ impl HealthBody {
         let settings = &runtime.settings;
         let plan = runtime.projection_plan();
         let projection = runtime.projection_metrics();
+        let errors = runtime.projection_errors();
         HealthBody {
             feature: "agents",
             mode: crate::metrics::mode_name(settings.mode),
@@ -240,6 +247,9 @@ impl HealthBody {
                 events_projected: projection.events_projected,
                 sink_failures: projection.sink_failures,
                 backlog_full: projection.backlog_full,
+                records_rejected: projection.records_rejected,
+                last_sink_error: errors.last_sink_error,
+                last_rejection: errors.last_rejection,
             },
         }
     }
@@ -729,6 +739,9 @@ mod tests {
                     "events_projected": 0,
                     "sink_failures": 0,
                     "backlog_full": 0,
+                    "records_rejected": 0,
+                    "last_sink_error": null,
+                    "last_rejection": null,
                 },
             })
         );
