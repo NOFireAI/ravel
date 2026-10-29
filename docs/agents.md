@@ -637,14 +637,94 @@ tenants this process sweeps
 The owner lease hint in HEAD is advisory and revokes nothing; only an epoch
 advance does (ADR-3331 decision 6).
 
+## Projection
+
+Committed history projects asynchronously into logs and traces (ADR-3331
+decision 12). Each committed event becomes one log record and each committed
+turn one span, under the `ravel-agents` service name. The record body reads
+`agent event event_id=<id> agent_id=<agent> incarnation=<n> event_seq=<n>
+accept_seq=<n> turn_id=<turn> type=<event type>` followed by the payload
+part, and the same fields are attributes (`agent.event_id`, `agent.id`, and
+so on). A committed event is queryable as a log line under its event id
+through the server's own query path
+(`committed_turn_is_queryable_as_a_log_with_its_stable_event_id_and_a_projection_outage_changes_no_state`
+in `services/ravel-server/tests/agents_projection_e2e.rs`, which matches
+`ravel_log_lines{__body__=~".*event_id=<id> .*"}` on `/api/v1/query`).
+
+The event id is `blake3` over the tenant, the agent, its incarnation and the
+event seq, so it is the same on every delivery attempt and in every process
+(`ids_are_stable_and_separate_every_component`). Delivery may duplicate: a
+retried batch and a restarted process both repeat records, and the event id
+is the deduplication key for queries. A restarted process keeps no cursor and
+projects each agent's history again from its first event once it touches the
+agent, under the ids it carried before
+(`a_restart_repeats_history_under_the_same_ids`,
+`a_restarted_projector_redelivers_history_under_the_same_ids`). The trace id
+is derived from the tenant, agent, incarnation and accept seq, and the span
+id from the tenant, agent and turn id, so a turn's span and its event
+records share a trace.
+
+Payloads are redacted by default: a record carries
+`payload_hash=<blake3 hex> payload_size=<bytes> payload=redacted`, and the
+payload text never leaves the agent store
+(`a_redacted_record_carries_hash_and_size_and_never_the_payload`; the
+acceptance test above finds no log line holding the payload text). A tenant
+named by `--agents-projection-payload-tenant` (repeatable) gets
+`payload=<text>` instead (`payload_text_is_projected_only_for_an_opted_in_tenant`).
+
+Where records go depends on the process:
+
+| Process | `--agents-projection` | `--agents-projection-endpoint` | Records go to | Health `mode` |
+|---|---|---|---|---|
+| holds an ingest buffer (`all`, `gateway`) | `auto` (default) | unset | this process's own log and span ingest routers | `in_process` |
+| any | `auto` | an OTLP gRPC URL | that endpoint, tenant in the `x-ravel-tenant` header | `endpoint` |
+| no ingest buffer (`query`) | `auto` | unset | refuses to start, naming both ways out | none |
+| any | `off` | any | nowhere | `off` |
+
+So projection is never silently absent
+(`a_process_that_cannot_project_refuses_to_start_and_off_is_reported`,
+`agents_projection_target_resolves_or_refuses_naming_both_ways_out`). The
+in-process sink applies the tenant's IPCrypt rules like any other ingest, and
+the default normalisation limits. A tenant whose rules cannot be resolved
+fails the batch, which the projector retries.
+
+"A projection failure never changes a committed transition" (ADR-3331
+decision 12). The projector is a reader: its only store calls are HEAD,
+event page and payload GETs, on a store instance of its own, so its requests
+do not appear in the coordinator's `ravel_agents_store_*` counters. With the
+sink failing across a turn, that turn's state, operation results,
+coordinator writes and agent-key writes equal those of a run with no outage,
+and once the sink recovers the missed events arrive once each under the ids
+every failed attempt carried (the acceptance test above;
+`a_failing_sink_changes_no_agent_state_and_retries_the_same_ids`). A failed
+delivery is retried after one second, and the canonical history stays in the
+agent store.
+
+The ADR sets no bound on undelivered records; this implementation holds at
+most `--agents-projection-backlog` records (default 4096) per tenant. At the
+bound the projector stops reading and counts, the agents fall behind, and no
+commit waits on it
+(`a_full_backlog_counts_and_leaves_the_coordinator_untouched`,
+`a_full_backlog_stops_reading_and_counts_and_never_stops_a_commit`).
+
+Lag is reported on `GET /api/v1/agents/health` under `projection`:
+`lag_max` is the largest committed-minus-projected event count over the
+agents this process has seen, beside `backlog`, `backlog_bound`,
+`events_projected`, `sink_failures` and `backlog_full`. No `/metrics` family
+carries these yet. Limits of this version: a record's timestamp is the
+projecting process's clock when it read the event, since an event entry
+records no time; a span's end is the result's finish time; and a record
+carries no state or handler version.
+
 ## Guarantees and limitations
 
 Milestones are those of ADR-3331 decision 15. "In the crates" means the
 property holds in `ravel-agents-core`, `ravel-agents-store` or
 `ravel-agents-runtime` on `main` and
 is pinned by their own tests. "End to end" means a test in
-`services/ravel-server/tests/agents_e2e.rs` or
-`services/ravel-server/tests/agents_effects_e2e.rs` pins it through the HTTP
+`services/ravel-server/tests/agents_e2e.rs`,
+`services/ravel-server/tests/agents_effects_e2e.rs` or
+`services/ravel-server/tests/agents_projection_e2e.rs` pins it through the HTTP
 routes of a running server.
 
 | Property | Status | Evidence |
@@ -678,7 +758,7 @@ routes of a running server.
 | HTTP routes for timers and the sweep | end to end | e2e `due_timer_is_delivered_once_across_a_coordinator_restart_with_no_hint`, `cancel_after_fire_is_already_fired_and_before_fire_is_cancelled`, `a_reschedule_supersedes_the_earlier_generation`, `sweep_route_counts_match_the_store_and_needs_agents_admin` |
 | `--agents-max-mailbox`, `--agents-max-receipts` and `--agents-max-timers` set the kernel caps | on main | the server passes them as the kernel limits of every tenant's store, and the kernel refuses past a cap with a typed error (`logical_caps_and_the_byte_cap_are_typed`); e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` sets `max_receipts` to 4 and is refused at the fifth send |
 | `--agents-max-agents`, `--agents-max-state-bytes` and `--agents-memory-budget` are enforced | follow-up | The routes do not enforce these three flags: they are parsed and reported on `GET /api/v1/agents/health` and `/metrics` only (`agents_flags_parse_and_reach_query_budgets`, `health_reports_feature_mode_and_every_setting`). Enforcing them is left to a follow-up. |
-| Projection of history into logs and traces | M5 | ADR-3331 decision 12 |
+| Committed history projects into logs and traces under a stable event id, redacted by default, and a projection outage changes no agent state | end to end | e2e `committed_turn_is_queryable_as_a_log_with_its_stable_event_id_and_a_projection_outage_changes_no_state`, `payload_text_is_projected_only_for_an_opted_in_tenant`, `a_full_backlog_counts_and_leaves_the_coordinator_untouched`, `a_process_that_cannot_project_refuses_to_start_and_off_is_reported`, `a_restart_repeats_history_under_the_same_ids` in `agents_projection_e2e.rs`; see Projection above |
 | Bounded paged indexes (format version 2) | M6 | ADR-3331 decision 3 |
 | Live garbage collection of agent objects | out of scope for this release | ADR-3331 decision 2 |
 

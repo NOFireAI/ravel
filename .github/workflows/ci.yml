@@ -195,7 +195,7 @@ jobs:
           # other paths here set server_or_operator, take the workspace-level
           # branch, or are the catch-all on purpose (a gate script change must
           # run everything).
-          if echo "$changed" | grep -qE '^crates/ravel-agents-|^services/ravel-server/src/agents/|^services/ravel-server/tests/agents_seam\.rs$|^services/ravel-server/tests/agents_effects_e2e\.rs$|^services/ravel-server/tests/agents_e2e\.rs$|^services/ravel-server/tests/agents_timers_e2e\.rs$|^services/ravel-server/tests/agents_real_store\.rs$|^services/ravel-server/Cargo\.toml$|^scripts/gates\.sh$|^scripts/affected-tests\.sh$|^\.github/workflows/ci\.yml$'; then
+          if echo "$changed" | grep -qE '^crates/ravel-agents-|^services/ravel-server/src/agents/|^services/ravel-server/tests/agents_seam\.rs$|^services/ravel-server/tests/agents_effects_e2e\.rs$|^services/ravel-server/tests/agents_e2e\.rs$|^services/ravel-server/tests/agents_timers_e2e\.rs$|^services/ravel-server/tests/agents_projection_e2e\.rs$|^services/ravel-server/tests/agents_real_store\.rs$|^services/ravel-server/Cargo\.toml$|^scripts/gates\.sh$|^scripts/affected-tests\.sh$|^\.github/workflows/ci\.yml$'; then
             agents_area=true
           fi
           # sdk_area: the SDK tree and the script the sdk job runs.
@@ -1526,7 +1526,8 @@ jobs:
   # `features-otap`: its own job-scoped rust-cache key and the disk steps.
   # Mirrors scripts/gates.sh's agents lane: `cargo clippy -p ravel-server
   # --features agents --all-targets`, the agents_seam, agents_effects_e2e,
-  # agents_e2e, agents_timers_e2e and agents_real_store test binaries, the lib tests whole (no path filter), and
+  # agents_e2e, agents_timers_e2e, agents_projection_e2e and agents_real_store
+  # test binaries, the lib tests whole (no path filter), and
   # ravel-catalog's sys_proto_format_version_classification test, which covers
   # proto/ravel/agents.proto (ADR-3331 decision 3), and the ravel-agents-runtime
   # and ravel-agents-sim tests at RAVEL_AGENTS_PAGE_ENTRIES=2. Gated on agents_area.
@@ -1569,15 +1570,16 @@ jobs:
       - name: Clippy ravel-server --features agents
         run: cargo clippy --locked --profile ci -p ravel-server --features agents --all-targets -- -D warnings
         # The lib tests whole and the agents_seam, agents_effects_e2e,
-        # agents_e2e, agents_timers_e2e and agents_real_store binaries, the shape of `features-otap` above. Selected by
+        # agents_e2e, agents_timers_e2e, agents_projection_e2e and
+        # agents_real_store binaries, the shape of `features-otap` above. Selected by
         # binary, never by a test-name filter, and not the whole crate: scripts/gates.sh's
         # run_feature_lanes states both reasons, and its agents lane runs
         # these same tests. `--all-targets` on the clippy step above still
         # compiles every target. agents_real_store prints a skip line here,
         # with no RAVEL_REAL_STORE_URL; k8s-nightly.yml's agents-chaos job
         # runs it against RustFS.
-      - name: Test ravel-server --features agents (agents_seam, agents_effects_e2e, agents_e2e, agents_timers_e2e and agents_real_store binaries)
-        run: cargo test --locked --profile ci -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e --test agents_timers_e2e --test agents_real_store
+      - name: Test ravel-server --features agents (agents_seam, agents_effects_e2e, agents_e2e, agents_timers_e2e, agents_projection_e2e and agents_real_store binaries)
+        run: cargo test --locked --profile ci -p ravel-server --features agents --test agents_seam --test agents_effects_e2e --test agents_e2e --test agents_timers_e2e --test agents_projection_e2e --test agents_real_store
       - name: Test ravel-server --features agents (lib tests)
         run: cargo test --locked --profile ci -p ravel-server --features agents --lib
       - name: Test the sys proto format_version classification
