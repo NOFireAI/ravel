@@ -102,9 +102,11 @@ exhausted, which reads like a permissions problem rather than a rate limit.
 
 Where an anonymous mirror exists on another registry, this directory pulls
 from there instead: the object store from `ghcr.io/rustfs/rustfs`, its
-client from `public.ecr.aws/aws-cli/aws-cli`, and the OpenTelemetry Collector
-from `ghcr.io/open-telemetry/opentelemetry-collector-releases/...`. None of
-those registries shares Docker Hub's allowance. Every file that does this
+client from `public.ecr.aws/aws-cli/aws-cli` (everywhere except
+deploy/metricsbench, which pulls it from Docker Hub for the reason below), and
+the OpenTelemetry Collector from
+`ghcr.io/open-telemetry/opentelemetry-collector-releases/...`. None of those
+registries shares Docker Hub's allowance. Every file that does this
 points back to this note with a one-line comment instead of repeating the
 rationale.
 

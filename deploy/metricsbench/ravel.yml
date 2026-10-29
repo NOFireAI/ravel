@@ -83,7 +83,8 @@ services:
       - "--listen-http"
       - "0.0.0.0:4318"
       # Ingest shards: the shipped default 4, stated so the capture shows it
-      # (the derived --max-s3-requests below depends on it).
+      # (the derived --max-s3-requests below depends on it and on the flush
+      # delay).
       - "--shards"
       - "4"
       # One tenant, metricsbench, behind a static bearer token. The harness
@@ -108,6 +109,19 @@ services:
       # left as shipped: a replay of past event time does not reach it.
       - "--max-ingest-lag"
       - "45d"
+      # FLUSH DELAY (disclosed, ADR-0927 flush-setting amendment 2026-10-29):
+      # replaces the shipped 2s active-tenant flush age with 500ms. A Remote
+      # Write 2xx waits for the flush that stores its points, so at 2s the
+      # replay measures the flush clock, not the ingest path (E2 on #2821:
+      # 42,142 points/s at 2s, 114,356 at 500ms). The three flags move as a
+      # set (ADR-0076 decision 4); the idle delay and the byte threshold
+      # keep their shipped values.
+      - "--max-flush-delay"
+      - "500ms"
+      - "--max-flush-delay-idle"
+      - "40s"
+      - "--min-flush-bytes"
+      - "262144"
       # QUERY AUDIT (disclosed, OFF): the default off, stated. No query-audit
       # record is written, so no audit write sits on the query path. A
       # production deployment that audits queries pays that write; this lane
@@ -153,19 +167,21 @@ services:
       - "120s"
       # Segments per query: the derived default 1000000, stated, not
       # raised. Objects are keyed by ingest (wall-clock) hour, so their count
-      # grows with replay duration, not with the 30d event-time span: the 2s
-      # age trigger on 4 shards writes 2 objects per second of ingest, which
-      # reaches 1,000,000 after 500,000 s (5.8 days) before compaction. A
-      # replay that long is not expected; a hit is refused(budget).
+      # grows with replay duration, not with the 30d event-time span: the
+      # 500ms age trigger on 4 shards writes at most 8 objects per second of
+      # ingest, which reaches 1,000,000 after 125,000 s (34.7 h) before
+      # compaction. A replay that long is not expected; a hit is
+      # refused(budget).
       - "--max-segments"
       - "1000000"
-      # S3 requests per query: the derived default 343400 (4 shards, 2s
-      # flush cadence, 4,800s seal margin), stated, not raised. At one GET
-      # per object and the 2 objects per second above, a read over the whole
-      # uncompacted replay reaches it after 171,700 s (47.7 h) of ingest;
-      # range reads per object bring that earlier. A hit is refused(budget).
+      # S3 requests per query: the derived default 1358600 (4 shards, the
+      # 500ms flush cadence above, 4,800s seal margin), stated, not raised.
+      # At one GET per object and the 8 objects per second above, a read
+      # over the whole uncompacted replay reaches it after 169,825 s (47.2 h)
+      # of ingest; range reads per object bring that earlier. A hit is
+      # refused(budget).
       - "--max-s3-requests"
-      - "343400"
+      - "1358600"
       # Series per query: replaces the default 10000 (#3306). 1,000,000 is
       # the cardinality profile's active series and VictoriaMetrics'
       # -search.maxUniqueTimeseries; the widest corpus union is 700,000

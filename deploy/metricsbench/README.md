@@ -118,6 +118,15 @@ value with `source="flag"` at startup:
   catalog listing window. A sample older than the window is dropped per sample
   while the request still answers 2xx (Remote Write 1.0 has no partial-success
   field); the local probe below shows the drop as an empty query result.
+- `--max-flush-delay 500ms`, `--max-flush-delay-idle 40s`,
+  `--min-flush-bytes 262144` replace the shipped 2 s active-tenant flush age
+  (ADR-0927 flush-setting amendment, 2026-10-29). A Remote Write 2xx waits
+  for the flush that stores its points, so at 2 s the replay measures the
+  flush clock: on `cardinality` the default ingested 42,142 points per second
+  and this setting 114,356 (#2821, E2). The three flags move as a set; the
+  idle delay and the byte threshold keep their shipped values. Figures
+  measured under the 2 s default are not compared with figures measured
+  under this setting.
 - `--audit-mode off`, the default, stated: no query-audit record is written,
   so no audit write sits on the query path.
 - `--tenant-hash-unkeyed`: a fresh bucket refuses to start without a
@@ -252,8 +261,8 @@ scrape grid.
 | Ravel | `max_active_streams` (config/ravel-limits.toml) | `200000` | `200000` (unchanged) | Kept: the lane writes no logs | `docs/guides/admission-limits.md`: `Active-stream cap (logs) \| 200,000` |
 | Ravel | `max_bytes_scanned` (config/ravel-limits.toml) | `"unlimited"` | `"unlimited"` (unchanged) | Kept: no comparator has a scanned-byte budget | `docs/guides/admission-limits.md`: `Query bytes-scanned budget \| unlimited` |
 | Ravel | `--gc-max-query-duration` (query deadline) | `120s` | `11m` (derived) | Lowered to Prometheus' `--query.timeout`; a hit is refused(budget) | `--gc-max-query-duration <DURATION>  This process's query-engine deadline ... Default when unset: derived (host-independent): 11m` |
-| Ravel | `--max-segments` | `1000000` | `1000000` (derived, unchanged) | Kept: 4 shards at the 2 s flush age write 2 objects per second of ingest, so 1,000,000 needs 500,000 s (5.8 d) of replay before compaction; a hit is refused(budget) | `--max-segments <N> ... Default when unset: derived (host-independent): 1,000,000` |
-| Ravel | `--max-s3-requests` | `343400` | `343400` (derived, unchanged) | Kept: at one GET per object and 2 objects per second, a read over the whole uncompacted replay reaches it after 171,700 s (47.7 h) of ingest; a hit is refused(budget) | `--max-s3-requests <COUNT> ... That is 343,400 at the default 4 shards, the 2s flush cadence and the catalog's default 4,800s seal margin` |
+| Ravel | `--max-segments` | `1000000` | `1000000` (derived, unchanged) | Kept: 4 shards at this row's 500 ms flush age write at most 8 objects per second of ingest, so 1,000,000 needs 125,000 s (34.7 h) of replay before compaction; a hit is refused(budget) | `--max-segments <N> ... Default when unset: derived (host-independent): 1,000,000` |
+| Ravel | `--max-s3-requests` | `1358600` | `1358600` (derived at this row's 500 ms flush delay, unchanged; `343400` at the shipped 2 s) | Kept: at one GET per object and 8 objects per second, a read over the whole uncompacted replay reaches it after 169,825 s (47.2 h) of ingest; a hit is refused(budget) | `--max-s3-requests <COUNT> ... Omitted (the default): the cap is DERIVED from` the shard count, `the ingest flush cadence, and the seal margin`; 1,358,600 at 4 shards and 500 ms is pinned in `crates/ravel-query/src/segment_admission.rs`, `derived_budget_covers_healthy_tail_plus_stall_alert_window` |
 | Ravel | `--max-series` | `1000000` | `10000` | Raised (#3306): the cardinality profile's 1,000,000 active series, equal to VictoriaMetrics' `-search.maxUniqueTimeseries`; the widest corpus union is 700,000 series. At the default, 15 of the 21 cardinality entries and 12 of the 22 churn entries would be refused | `--max-series <N>  Cap on the distinct series a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SERIES (10,000)` |
 | Ravel | `--max-samples` | `500000000` | `10000000` | Raised (#3306) to Prometheus' and Mimir's value. Ravel counts total materialized samples after dedup, where Prometheus counts peak resident samples, so the equal numbers are not equal semantics; the comparator counting the same quantity is VictoriaMetrics' `-search.maxSamplesPerQuery`, at twice this value. No corpus entry comes near either: the largest read is 96,000,000. The bytes behind them are bounded by `--memory-budget-bytes`, which refuses an oversized materialization `memory exhausted` first. The flag also sizes the range selector-cache cap (2 x max_samples x 16 bytes): 16,000,000,000 bytes here, against 320,000,000 at the default, so that cap is inert and the memory budget alone bounds a range query's cached selector copies. At the default, 5 history entries would be refused, the largest `mb_long_range_7d_avg` at about 40.3M | `--max-samples <N>  Cap on the total samples (summed across series, after cross-segment dedup) a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SAMPLES (10,000,000)` |
 | Ravel | points per range series | `11000` | `11000` (unchanged, no flag) | Kept, same as Prometheus and Mimir: history's grid is 289 points | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_RANGE_POINTS: usize = 11_000` |
