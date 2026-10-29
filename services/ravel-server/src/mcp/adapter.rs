@@ -258,9 +258,6 @@ impl ServerHandler for RavelMcp {
             .map(|token| ProgressReporter::new(context.peer.clone(), token));
         let backend = ServiceBackend::new(self.service.clone(), budgets).with_progress(progress);
 
-        // The cancellation arm is biased first so a token already cancelled
-        // drops the tool future before it is ever polled, rather than
-        // spending a store request on a call whose client is gone.
         let agents = match &self.agents {
             Some(router) if AGENTS_TOOLS.contains(&request.name.as_ref()) => {
                 Some(AgentsRoute::new(router.clone(), &context))
@@ -275,6 +272,9 @@ impl ServerHandler for RavelMcp {
                 None => dispatch(&request.name, args, &ctx, &backend).await,
             }
         };
+        // The cancellation arm is biased first so a token already cancelled
+        // drops the tool future before it is ever polled, rather than
+        // spending a store request on a call whose client is gone.
         let dispatched = tokio::select! {
             biased;
             () = context.ct.cancelled() => {
@@ -315,12 +315,6 @@ impl ServerHandler for RavelMcp {
     }
 }
 
-/// The tenant [`super::auth`] resolved, from the HTTP parts rmcp carries into
-/// the request extensions.
-///
-/// Absent means the request did not pass through the checks, which cannot
-/// happen on this route. It is an internal error rather than a fallback to an
-/// anonymous tenant: guessing one would serve another tenant's data.
 /// The bound on an agents route's answer read back into a tool body. The
 /// route bounds its own bodies (a state is at most `--agents-max-state-bytes`
 /// and an events page at most 1,000 events); this only keeps a defect there
@@ -414,6 +408,12 @@ fn percent_encode(value: &str, out: &mut String) {
     }
 }
 
+/// The tenant [`super::auth`] resolved, from the HTTP parts rmcp carries into
+/// the request extensions.
+///
+/// Absent means the request did not pass through the checks, which cannot
+/// happen on this route. It is an internal error rather than a fallback to an
+/// anonymous tenant: guessing one would serve another tenant's data.
 fn tenant(context: &RequestContext<RoleServer>) -> Result<TenantHash, McpError> {
     context
         .extensions
