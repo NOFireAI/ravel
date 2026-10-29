@@ -829,6 +829,35 @@ async fn the_fill_is_published_only_when_a_directory_cycle_completes() {
     assert_eq!(fill.max_ratio[0], 0.75);
     // Agents o-6 to o-9 hold six receipts each.
     assert_eq!(fill.near_cap[0], 4);
+    // A second full cycle over the same agents publishes the same figures:
+    // the tally restarts at each wrap.
+    for _ in 0..3 {
+        r.co.sweep_once(&TENANT).await.expect("sweep");
+    }
+    assert_eq!(r.co.capacity_metrics().fill, Some(fill));
+}
+
+/// Fill is measured against the limits the store enforces, with no call
+/// beyond `Coordinator::new`: under an eight-receipt cap, six receipts read
+/// 0.75, where the default cap of 1024 would read 6/1024.
+#[tokio::test(start_paused = true)]
+async fn fill_is_measured_against_the_store_limits() {
+    let r = rig_with(
+        Arc::new(MemoryStore::new()),
+        SweepConfig::default(),
+        fill_limits(),
+    );
+    assert_eq!(r.co.limits(), r.store.kernel_limits());
+    assert_eq!(r.co.limits().max_receipts, 8);
+    create(&r.co, "o-1").await;
+    for j in 0..6 {
+        send(&r.co, "o-1", &format!("r-{j}"), json!({})).await;
+    }
+    r.co.sweep_once(&TENANT).await.expect("sweep");
+    let fill = r.co.capacity_metrics().fill.expect("the cycle completed");
+    assert_eq!(fill.max_ratio[0], 0.75);
+    assert_eq!(fill.near_cap[0], 1);
+    assert_eq!(fill.agents, 1);
 }
 
 /// Send to `key` until a send is refused, and return the refusal.

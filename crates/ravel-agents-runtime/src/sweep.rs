@@ -412,7 +412,9 @@ impl Coordinator {
                     self.visit(pass, &entry.agent).await;
                 }
                 if let Some(head) = pass.seen.get(&entry.agent).and_then(|s| s.head.as_ref()) {
-                    cursor.fill.add(&Usage::of(head), &self.limits);
+                    cursor
+                        .fill
+                        .add(&Usage::of(head), self.store.kernel_limits());
                 }
                 cursor.dir = Some(entry.key.clone());
             }
@@ -437,7 +439,7 @@ impl Coordinator {
         let started = cursor.dir_cycle_started_unix_ns.take().unwrap_or(now);
         let elapsed_ms = now.saturating_sub(started).max(0) / 1_000_000;
         self.record_directory_cycle(u64::try_from(elapsed_ms).unwrap_or(0));
-        self.publish_fill(std::mem::take(&mut cursor.fill).snapshot(&self.limits));
+        self.publish_fill(std::mem::take(&mut cursor.fill).snapshot(self.store.kernel_limits()));
         cursor.dir_known.clear();
     }
 
