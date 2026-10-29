@@ -26,13 +26,17 @@ token against a fresh bucket in us-central1 (#3456):
 | PUT `x-goog-if-generation-match: <wrong>`, then the right generation | 412, then 200 | 412, then 200 |
 | GET `If-Match: <current etag>`, then `If-Match: <wrong etag>` | 200, then 412 | 200, then 412 |
 | GET `?generation=<current>`, then the same generation after an overwrite | 200, then 404 | 200, then 404 |
+| GET `?generation=<current>` with `If-Match: <its etag>`, then with a wrong ETag | 200, then 412 | 200, then 412 |
+| GET `?generation=<replaced>` with `If-Match: <that generation's etag>`, and with a wrong ETag | 404, 404 | 404, 404 |
+| GET `?generation=<g>` with `If-Match: <its etag>` after the object is deleted | 404 | 404 |
 
 On PUT, the XML API ignores the S3 conditional headers and honours only its
-own generation headers. On GET it honours `If-Match`, and a generation
-selector naming a replaced generation answers 404 (the GET rows were measured
-the same day, against the same bucket). `ravel-cli store qualify` would refuse such a bucket, so
-the S3 path is unusable on GCS rather than unsafe. Separately, organisation
-policies commonly forbid service-account keys
+own generation headers. On GET it honours `If-Match`. A generation selector
+naming a replaced or deleted generation answers 404, whatever `If-Match`
+says, so GCS decides the selector before the ETag. The GET rows were measured
+the same day, against the same bucket. `ravel-cli store qualify` would refuse
+such a bucket, so the S3 path is unusable on GCS rather than unsafe.
+Separately, organisation policies commonly forbid service-account keys
 (`constraints/iam.disableServiceAccountKeyCreation` refused the HMAC key in
 the measurement project), so the S3 path would have no credential to sign
 with either.
@@ -164,7 +168,12 @@ CAS-mutable key (catalog `HEAD`) retries like any throttle.
 
 Each of these flags is an S3 control-plane feature with no GCS
 implementation in this ADR. Startup refuses the combination with an error
-naming the flag. None of them is accepted and ignored:
+naming the flag. None of them is accepted and ignored. A flag counts as
+given when it was passed on the command line or set through its environment
+variable, read through clap's `ArgMatches::value_source` (the mechanism
+`config.rs` already uses to tell a passed value from a default). A defaulted
+value is not a refusal: `--s3-request-stored-checksum` defaults to true and
+is ignored under `--store gcs` exactly as it is under `--store memory`.
 
 - `--s3-*` flags, including `--s3-upload-integrity` and
   `--s3-request-stored-checksum`.
@@ -252,7 +261,10 @@ flowchart LR
 - CI cannot reach a real bucket. The trait mapping (headers sent, statuses
   mapped) is tested against an in-process fake endpoint in every CI run. The
   contract suite runs against a real bucket when `RAVEL_GCS_TEST_BUCKET` is
-  set, the same opt-in shape as the RustFS and floci lanes. The first real
+  set, the same opt-in shape as the RustFS and floci lanes. That lane also
+  runs the `get_pinned` ordering cases (no object, a replaced generation with
+  a stale ETag, an ETag mismatch on a live generation), because the runtime
+  conformance suite has no pinned-read probe of its own. The first real
   qualification, from an image built on main, is recorded on #3456 before
   `--store gcs` is called supported.
 - Persistent formats, the key layout and the qualification record schema are
