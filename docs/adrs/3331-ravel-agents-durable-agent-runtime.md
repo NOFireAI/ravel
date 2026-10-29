@@ -799,12 +799,17 @@ pages. Decision 3 now reads as follows for those lists.
 Rollout replaces the readers-before-writers sequence decision 3 stated,
 and in doing so departs from ADR-0066's readers-first rule under the
 pre-1.0 regime ADR-0531 keeps in force. The basis is that no released
-build contains the agents crates: they landed after v0.27.0, the `agents`
-feature of `services/ravel-server/Cargo.toml` is not among its default
-features (the crate declares none), and the published image's `Dockerfile`
-builds `ravel-server` with `--features sql,flight-sql,otap` only. The
-0.27.0 section of `CHANGELOG.md` carries no agents entry either. The
-sequence guarded against a version 1 writer re-encoding a version 2 HEAD
+build contained the agents crates when version 2 landed: they landed after
+v0.27.0, the `agents` feature of `services/ravel-server/Cargo.toml` is not
+among its default features (the crate declares none), and the published
+image's `Dockerfile` then built `ravel-server` with
+`--features sql,flight-sql,otap` only. The 0.27.0 section of
+`CHANGELOG.md` carries no agents entry either. That basis ends with the
+image flip of decision 9: the `Dockerfile` now builds
+`--features sql,flight-sql,otap,agents`, so the first release after
+v0.27.0 ships the version 2 reader and writer together, and every later
+HEAD format change finds released builds in the field and follows
+ADR-0066's readers-first order. The sequence guarded against a version 1 writer re-encoding a version 2 HEAD
 and dropping its page references. A version 1 build refuses any HEAD whose
 format version is above 1 as `UnsupportedFormat` before it decodes the
 rest, and so never re-encodes one
