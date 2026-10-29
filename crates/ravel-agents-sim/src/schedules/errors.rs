@@ -127,13 +127,13 @@ fn missing_dependency_is_store_unavailable() {
     );
 }
 
-/// A HEAD written by a newer release: `format_version` 2 and an unknown
+/// A HEAD written by a newer release: `format_version` 3 and an unknown
 /// field this release cannot read.
 #[test]
 fn unsupported_head_format_is_refused() {
     let rig = Rig::new(FaultPlan::empty());
     create(&rig);
-    overwrite_head(&rig, vec![0x08, 0x02, 0xf8, 0x3f, 0x01]);
+    overwrite_head(&rig, vec![0x08, 0x03, 0xf8, 0x3f, 0x01]);
     let c = client(&rig, "c", 20, |p| async move {
         match p.send("r1", &payload(1)).await {
             Err(e) if e.kind == ErrorKind::UnsupportedFormat => Ok(()),

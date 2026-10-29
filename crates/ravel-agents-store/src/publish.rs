@@ -2,14 +2,22 @@
 //! the crate runs goes through [`AgentStore::publish`]:
 //!
 //! 1. GET HEAD and keep `GetOutcome.version` as the CAS token
-//!    ([`AgentStore::read_head_state`]).
+//!    ([`AgentStore::read_head_state`]), then GET the sealed index pages the
+//!    command reads, as [`ravel_agents_core::kernel::Kernel::pages_needed`]
+//!    names them, and nothing else ([`AgentStore::load_pages`];
+//!    `tests::pages::send_receipt_lookup_and_wake_read_at_most_one_index_page_each`).
+//!    A transition that still finds a page missing is a planner miss: it is
+//!    logged and every page is loaded before the command is applied again.
 //! 2. Resolve the command's operation id against the receipt index, and
 //! 3. validate its preconditions: both are the kernel's
 //!    ([`ravel_agents_core::kernel::Kernel::apply`]), run on the root just
 //!    read. A duplicate comes back `Unchanged` and nothing is written
 //!    (`tests::enqueue_with_the_same_request_id_and_hash_returns_the_same_handle`).
 //! 4. Build the dependencies: the objects the new root references that the
-//!    old one did not ([`new_dependencies`]).
+//!    old one did not ([`new_dependencies`]), the index pages the kernel
+//!    sealed into it (`Head::index.written`) among them, so every page is
+//!    written before the CAS that references it
+//!    (`tests::pages::pages_are_written_before_the_cas_that_references_them`).
 //! 5. PUT each with `CreateIfAbsent`; on `AlreadyExists` read it back and
 //!    compare the content hash ([`AgentStore::store_dependency`]).
 //! 6. CAS HEAD from the version read in step 1 to the new root, which the
@@ -52,8 +60,9 @@ use ravel_agents_core::command::Command;
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{CodecError, Head, MAX_HEAD_BYTES, ObjectRef};
 use ravel_agents_core::identity::{AgentId, agent_id};
-use ravel_agents_core::kernel::{Effect, Reply, Transition};
+use ravel_agents_core::kernel::{Effect, PAGE_NOT_LOADED, Reply, Transition};
 use ravel_agents_core::keys::{head_key, object_key};
+use ravel_agents_core::pages::{ListKind, PageObject, attach_page};
 use ravel_agents_core::state::Handle;
 use ravel_object_store::{GetRange, PutMode, PutOptions, StoreError, UploadChecksum, Version};
 
@@ -225,7 +234,7 @@ impl AgentStore {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let (current, version) = match self.read_head_state(agent, !is_create).await? {
+            let (mut current, version) = match self.read_head_state(agent, !is_create).await? {
                 HeadState::Absent => (None, None),
                 HeadState::Present { head, version } => (Some(*head), Some(version)),
                 HeadState::Unsupported { .. } => {
@@ -236,10 +245,29 @@ impl AgentStore {
                     ));
                 }
             };
+            if let Some(head) = current.as_mut() {
+                let needed = self.kernel.pages_needed(Some(head), command);
+                self.load_pages(agent, head, &needed).await?;
+            }
             let now = self.clock.now_unix_ns();
-            let transition =
-                self.kernel
-                    .apply(current.as_ref(), command, now, self.ids.as_ref())?;
+            let transition = match self.kernel.apply(
+                current.as_ref(),
+                command,
+                now,
+                self.ids.as_ref(),
+            ) {
+                Err(error) if error.reason == PAGE_NOT_LOADED => {
+                    // `pages_needed` names every page a transition reads, so
+                    // this is a planner miss: load the rest rather than fail.
+                    tracing::warn!(agent = %agent.to_hex(), "agents index page planner missed a page");
+                    if let Some(head) = current.as_mut() {
+                        self.load_all_pages(agent, head).await?;
+                    }
+                    self.kernel
+                        .apply(current.as_ref(), command, now, self.ids.as_ref())?
+                }
+                other => other?,
+            };
             let (new, effects, reply) = match transition {
                 Transition::Unchanged { reply } => {
                     let (Some(head), Some(version)) = (current, version) else {
@@ -291,7 +319,8 @@ impl AgentStore {
             }
 
             for dep in new_deps {
-                self.store_dependency(agent, dep, deps).await?;
+                self.store_dependency(agent, dep, deps, &new.index.written)
+                    .await?;
             }
 
             // The directory entry goes first, so no HEAD is ever published
@@ -360,15 +389,59 @@ impl AgentStore {
         }
     }
 
-    /// Step 5 for one object the new root references.
+    /// GET each sealed index page in `pages` (counted under
+    /// `Phase::Resolve`) and attach it to `head`. This is the only place the
+    /// store reads an index page.
+    pub(crate) async fn load_pages(
+        &self,
+        agent: &AgentId,
+        head: &mut Head,
+        pages: &[(ListKind, usize)],
+    ) -> Result<(), AgentError> {
+        for &(list, page) in pages {
+            let directory = head.index.directory(list);
+            if directory.is_loaded(page) {
+                continue;
+            }
+            let Some(meta) = directory.pages.get(page) else {
+                return Err(unavailable(agent, "index page is not in the directory"));
+            };
+            let dep = meta.page;
+            let key = object_key(&self.tenant, agent, &dep.hash)
+                .map_err(|_| unavailable(agent, "object key is not addressable"))?;
+            let bytes = self
+                .read_object_in(Phase::Resolve, agent, &key, dep)
+                .await?;
+            attach_page(head, list, page, &bytes).map_err(|e| codec_error(agent, &e))?;
+        }
+        Ok(())
+    }
+
+    /// Every sealed page `head` does not hold yet.
+    pub(crate) async fn load_all_pages(
+        &self,
+        agent: &AgentId,
+        head: &mut Head,
+    ) -> Result<(), AgentError> {
+        let pages = head.index.unloaded();
+        self.load_pages(agent, head, &pages).await
+    }
+
+    /// Step 5 for one object the new root references. A sealed index page
+    /// comes from the new root's own `index.written`.
     async fn store_dependency(
         &self,
         agent: &AgentId,
         dep: ObjectRef,
         supplied: &[Bytes],
+        written: &[PageObject],
     ) -> Result<(), AgentError> {
         let key = object_key(&self.tenant, agent, &dep.hash)
             .map_err(|_| unavailable(agent, "object key is not addressable"))?;
+        if let Some(page) = written.iter().find(|w| w.page == dep) {
+            let bytes = Bytes::from(page.bytes.clone());
+            return self.put_object_at(agent, &key, dep, bytes).await;
+        }
         match supplied.iter().find(|b| ObjectRef::of(b) == dep) {
             Some(bytes) => self.put_object_at(agent, &key, dep, bytes.clone()).await,
             None => self.probe_object(agent, &key, dep).await,
@@ -414,13 +487,24 @@ impl AgentStore {
         key: &str,
         dep: ObjectRef,
     ) -> Result<Bytes, AgentError> {
+        self.read_object_in(Phase::Store, agent, key, dep).await
+    }
+
+    /// [`Self::read_object_at`], counted under `phase`.
+    pub(crate) async fn read_object_in(
+        &self,
+        phase: Phase,
+        agent: &AgentId,
+        key: &str,
+        dep: ObjectRef,
+    ) -> Result<Bytes, AgentError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            self.counters.request(Phase::Store, Request::Get);
+            self.counters.request(phase, Request::Get);
             match self.store.get(key, GetRange::Full).await {
                 Ok(got) => {
-                    self.counters.bytes_in(Phase::Store, got.data.len());
+                    self.counters.bytes_in(phase, got.data.len());
                     if ObjectRef::of(&got.data) != dep {
                         return Err(codec_error(
                             agent,

@@ -18,6 +18,7 @@ pub mod identity;
 pub mod kernel;
 pub mod keys;
 pub mod objects;
+pub mod pages;
 pub mod state;
 pub mod wire;
 
