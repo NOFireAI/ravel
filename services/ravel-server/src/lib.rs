@@ -2861,6 +2861,9 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // the routes the flag promises are absent.
     #[cfg(feature = "agents")]
     let agents_readiness = Arc::new(agents::AgentsReadiness::new());
+    // Resolved once, before the in-process projection sink, the catalog and
+    // every admission bound below are built from it; see `resolve_ingest_lag`.
+    let ingest_lag = resolve_ingest_lag(config.max_ingest_lag)?;
     // Built in every `agents` build so `/metrics` reports the settings even
     // without `--agents`; it touches the store only when a route is called.
     #[cfg(feature = "agents")]
@@ -2872,13 +2875,32 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             })?;
             agents::ProjectionSinkPlan::Endpoint(endpoint.clone())
         }
+        // The same export handlers and admission state `/v1/logs` and
+        // `/v1/traces` use, so projected records are admitted, charged and
+        // acknowledged as any client's are.
         config::AgentsProjectionTarget::InProcess => {
-            match (&log_ingest_router, &span_ingest_router) {
-                (Some(logs), Some(spans)) => agents::ProjectionSinkPlan::InProcess {
-                    logs: logs.clone(),
-                    spans: spans.clone(),
-                    ipcrypt: ipcrypt.clone(),
-                },
+            match (&ingest_router, &log_ingest_router, &span_ingest_router) {
+                (Some(router), Some(logs), Some(spans)) => {
+                    agents::ProjectionSinkPlan::InProcess(gateway_state(
+                        router,
+                        logs,
+                        spans,
+                        config.tenant_resolver.clone(),
+                        &admission,
+                        &store,
+                        &recovery,
+                        &provisioning_writer,
+                        &ingest_concurrency,
+                        &ingest_byte_metrics,
+                        &normalize_reject_metrics,
+                        &ingest_buffer_budget,
+                        &metadata_sink,
+                        &cpu_gates.write,
+                        ingest_lag.admission_lag_ns,
+                        config.strict_flush_policy,
+                        &ipcrypt,
+                    ))
+                }
                 _ => anyhow::bail!(
                     "agents projection resolved to the in-process ingest path, but this process \
                      built no log or span ingest router"
@@ -2925,9 +2947,6 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // exactly in the query-serving modes that spawn one; carried out to
     // `Running` so `shutdown` can drain it.
     let mut running_audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>> = None;
-    // Resolved once, before the catalog and every admission bound below are
-    // built from it; see `resolve_ingest_lag`.
-    let ingest_lag = resolve_ingest_lag(config.max_ingest_lag)?;
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)
     {

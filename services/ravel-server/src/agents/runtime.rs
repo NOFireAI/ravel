@@ -26,7 +26,8 @@ use ravel_agents_core::head::{EffectStatus, Head, ObjectRef};
 use ravel_agents_core::identity::{AgentId, Id128, effect_id};
 use ravel_agents_core::kernel::{DerivedIds, Limits};
 use ravel_agents_runtime::projection::{
-    PayloadPolicy, ProjectionLimits, ProjectionMetricsSnapshot, ProjectionSink, Projector,
+    PayloadPolicy, ProjectionErrors, ProjectionLimits, ProjectionMetricsSnapshot, ProjectionSink,
+    Projector,
 };
 use ravel_agents_runtime::{
     AgentsMetricsSnapshot, CapacityMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher,
@@ -34,7 +35,6 @@ use ravel_agents_runtime::{
 };
 use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
 use ravel_agents_store::{AgentStore, Clock, StoreLimits, SystemClock};
-use ravel_ingest::{LogIngestRouter, SpanIngestRouter};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{TenantHash, TenantId};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
@@ -306,12 +306,8 @@ pub enum Lane {
 pub enum ProjectionSinkPlan {
     /// `--agents-projection off`, or a process without `--agents`.
     Off,
-    /// Through this process's own ingest routers.
-    InProcess {
-        logs: Arc<LogIngestRouter>,
-        spans: Arc<SpanIngestRouter>,
-        ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
-    },
+    /// Through this process's own OTLP export handlers.
+    InProcess(Arc<crate::otlp_http::GatewayState>),
     /// OTLP gRPC to a gateway.
     Endpoint(String),
 }
@@ -321,7 +317,7 @@ impl ProjectionSinkPlan {
     pub fn mode(&self) -> &'static str {
         match self {
             ProjectionSinkPlan::Off => "off",
-            ProjectionSinkPlan::InProcess { .. } => "in_process",
+            ProjectionSinkPlan::InProcess(_) => "in_process",
             ProjectionSinkPlan::Endpoint(_) => "endpoint",
         }
     }
@@ -516,20 +512,16 @@ impl AgentsRuntime {
     fn projector(&self, tenant_id: &TenantId, clock: &Arc<dyn Clock>) -> Option<Arc<Projector>> {
         let inner: Arc<dyn ProjectionSink> = match &self.projection.sink {
             ProjectionSinkPlan::Off => return None,
-            ProjectionSinkPlan::InProcess {
-                logs,
-                spans,
-                ipcrypt,
-            } => Arc::new(InProcessSink {
+            ProjectionSinkPlan::InProcess(ingest) => Arc::new(InProcessSink {
                 tenant: tenant_id.clone(),
-                logs: logs.clone(),
-                spans: spans.clone(),
-                ipcrypt: ipcrypt.clone(),
+                ingest: ingest.clone(),
                 clock: clock.clone(),
             }),
-            ProjectionSinkPlan::Endpoint(endpoint) => {
-                Arc::new(OtlpSink::new(tenant_id.clone(), endpoint.clone()))
-            }
+            ProjectionSinkPlan::Endpoint(endpoint) => Arc::new(OtlpSink::new(
+                tenant_id.clone(),
+                endpoint.clone(),
+                clock.clone(),
+            )),
         };
         let sink: Arc<dyn ProjectionSink> = Arc::new(TappedSink {
             tap: self.projection.tap.clone(),
@@ -591,6 +583,16 @@ impl AgentsRuntime {
     /// Every tenant projector's counters, merged: lag is the largest.
     pub fn projection_metrics(&self) -> ProjectionMetricsSnapshot {
         self.metrics().projection
+    }
+
+    /// The last sink error and the last rejection any tenant projector
+    /// recorded.
+    pub fn projection_errors(&self) -> ProjectionErrors {
+        let tenants: Vec<Arc<TenantAgents>> = self.tenants.lock().values().cloned().collect();
+        tenants
+            .iter()
+            .filter_map(|t| t.coordinator.projection().map(|p| p.errors()))
+            .fold(ProjectionErrors::default(), ProjectionErrors::merge)
     }
 
     /// The least time between two poll-driven passes: the periodic interval,

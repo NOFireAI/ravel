@@ -14,18 +14,25 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueKind;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use prost::Message;
+use ravel_ingest::{AdmissionLimits, RateLimit};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_server::config::{
-    AgentsConfig, AgentsProjectionConfig, AgentsProjectionSwitch, ProjectionTap,
+    AgentsClock, AgentsConfig, AgentsProjectionConfig, AgentsProjectionSwitch, ProjectionTap,
 };
 use ravel_server::{FoldTaskConfig, Mode, QueryBudgets, ServerConfig};
 use ravel_tenant_resolve::{Principal, StaticBearerTokenResolver};
@@ -230,14 +237,48 @@ async fn try_start(
     agents: AgentsConfig,
     mode: Mode,
 ) -> anyhow::Result<ravel_server::Running> {
+    try_start_with(store, server_config(agents, mode)).await
+}
+
+async fn try_start_with(
+    store: Arc<dyn ObjectStoreBackend>,
+    config: ServerConfig,
+) -> anyhow::Result<ravel_server::Running> {
     ravel_server::start(
-        server_config(agents, mode),
+        config,
         store.clone(),
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
     .await
+}
+
+fn real_now_ns() -> i64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after the epoch");
+    i64::try_from(since.as_nanos()).expect("fits i64")
+}
+
+const MINUTE_NS: i64 = 60_000_000_000;
+
+/// An agents clock running at real time plus an offset the test moves, so a
+/// turn can finish in the past and be delivered in the present.
+#[derive(Clone, Default)]
+struct Shifted(Arc<AtomicI64>);
+
+impl Shifted {
+    fn clock(&self) -> AgentsClock {
+        let offset = self.0.clone();
+        AgentsClock(Some(Arc::new(move || {
+            real_now_ns() + offset.load(Ordering::SeqCst)
+        })))
+    }
+
+    fn set(&self, offset_ns: i64) {
+        self.0.store(offset_ns, Ordering::SeqCst);
+    }
 }
 
 async fn start(store: Arc<dyn ObjectStoreBackend>, agents: AgentsConfig) -> ravel_server::Running {
@@ -389,6 +430,11 @@ async fn setup(api: &Api) -> String {
 /// Send one input, take its turn and commit it with `n` events; the
 /// operation id.
 async fn turn(api: &Api, worker: &str, request_id: &str, n: usize) -> String {
+    commit(api, worker, request_id, events(request_id, n)).await
+}
+
+/// [`turn`], committing `events` as given.
+async fn commit(api: &Api, worker: &str, request_id: &str, events: Value) -> String {
     let sent = api
         .post(
             CLIENT,
@@ -413,7 +459,7 @@ async fn turn(api: &Api, worker: &str, request_id: &str, n: usize) -> String {
             "outcome": "completed",
             "state": {"last": request_id},
             "output": {"done": request_id},
-            "events": events(request_id, n),
+            "events": events,
             "timers": [],
             "intents": [],
         }),
@@ -716,5 +762,208 @@ async fn a_restart_repeats_history_under_the_same_ids() {
         .await;
     api.wait_log_lines(&format!(".*event_id={} .*", delivered[1]), 1)
         .await;
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// One OTLP HTTP log export under its own `service.name`, at real time.
+async fn post_log(api: &Api, service: &str) {
+    let text = |s: &str| AnyValue {
+        value: Some(AnyValueKind::StringValue(s.to_string())),
+    };
+    let ts = u64::try_from(real_now_ns()).expect("positive time");
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(text(service)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: ts,
+                    observed_time_unix_nano: ts,
+                    body: Some(text("from another client")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let response = api
+        .http
+        .post(format!("{}/v1/logs", api.base))
+        .bearer_auth(CLIENT)
+        .header("content-type", "application/x-protobuf")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("export completes");
+    let status = response.status();
+    assert_eq!(status, StatusCode::OK, "{}", response.text().await.unwrap());
+}
+
+/// A turn committed `age_ns` in the past by the agents clock, under a
+/// server whose `--max-ingest-lag` is `max_ingest_lag`, delivered only once
+/// the clock reads the present. Its log record and its turn span are older
+/// than the bound: each is skipped and counted, the agent's lag clears, and
+/// the next turn projects. Returns the health block once it has.
+async fn an_old_turn_is_rejected_and_skipped(max_ingest_lag: Duration, age_ns: i64) -> Value {
+    let shifted = Shifted::default();
+    shifted.set(-age_ns);
+    let tap = Arc::new(Tap::default());
+    tap.down.store(true, Ordering::SeqCst);
+    let mut config = server_config(
+        AgentsConfig {
+            clock: shifted.clock(),
+            ..agents_config(projecting(&tap))
+        },
+        Mode::All,
+    );
+    config.max_ingest_lag = max_ingest_lag;
+    let running = try_start_with(Arc::new(MemoryStore::new()), config)
+        .await
+        .expect("server starts");
+    let api = Api::new(&running);
+    let worker = setup(&api).await;
+    turn(&api, &worker, "r1", 1).await;
+    api.wait_projection("sink_failures", |n| n >= 1).await;
+    let old = tap.attempts.lock().unwrap()[0].clone();
+
+    shifted.set(0);
+    tap.down.store(false, Ordering::SeqCst);
+    let projection = api.wait_projection("records_rejected", |n| n >= 2).await;
+    assert_eq!(projection["records_rejected"], json!(2), "{projection}");
+    let projection = api.wait_projection("lag_max", |n| n == 0).await;
+    assert_eq!(projection["events_projected"], json!(0), "{projection}");
+    let reason = projection["last_rejection"].as_str().expect("a rejection");
+    let lag_ns = max_ingest_lag.as_nanos();
+    assert!(
+        reason.contains(&format!("max ingest lag of {lag_ns} ns")),
+        "{reason}"
+    );
+
+    turn(&api, &worker, "r2", 1).await;
+    let projection = api.wait_projection("events_projected", |n| n >= 1).await;
+    assert_eq!(projection["events_projected"], json!(1), "{projection}");
+    assert_eq!(projection["records_rejected"], json!(2), "{projection}");
+    let fresh = tap.delivered().last().expect("r2 delivered").clone();
+    assert_ne!(fresh, old);
+    api.wait_log_lines(&format!(".*event_id={fresh} .*"), 1)
+        .await;
+    assert_eq!(api.log_lines(&format!(".*event_id={old} .*")).await, 0);
+    let projection = api.projection().await;
+    running.shutdown().await.expect("clean shutdown");
+    projection
+}
+
+/// A record carries its turn's finish time, never the delivery time, so a
+/// turn that finished more than the default two-hour bound before an outage
+/// ended is rejected for good instead of retried forever: counted, skipped,
+/// and the agent's later turns still project.
+#[tokio::test]
+async fn a_turn_older_than_the_ingest_lag_after_an_outage_is_rejected_and_never_blocks_the_agent() {
+    an_old_turn_is_rejected_and_skipped(ravel_server::DEFAULT_MAX_INGEST_LAG, 121 * MINUTE_NS)
+        .await;
+}
+
+/// The in-process sink applies the process's configured `--max-ingest-lag`,
+/// not the default: an eleven-minute-old turn the two-hour default admits is
+/// rejected under a ten-minute bound.
+#[tokio::test]
+async fn the_configured_max_ingest_lag_is_the_bound_projection_meets() {
+    an_old_turn_is_rejected_and_skipped(Duration::from_secs(600), 11 * MINUTE_NS).await;
+}
+
+/// A carried payload larger than the log body limit is cut to fit, the
+/// record says so, and it is projected instead of rejected.
+#[tokio::test]
+async fn a_carried_payload_over_the_body_limit_is_truncated_and_projected() {
+    let tap = Arc::new(Tap::default());
+    let running = start(
+        Arc::new(MemoryStore::new()),
+        AgentsConfig {
+            max_body_bytes: 256 * 1024,
+            ..agents_config(AgentsProjectionConfig {
+                payload_tenants: vec!["acme".to_string()],
+                ..projecting(&tap)
+            })
+        },
+    )
+    .await;
+    let api = Api::new(&running);
+    let worker = setup(&api).await;
+    let blob = "x".repeat(70_000);
+    commit(
+        &api,
+        &worker,
+        "r1",
+        json!([{"event_type": "big", "payload": {"blob": blob}}]),
+    )
+    .await;
+    let projection = api.wait_projection("events_projected", |n| n >= 1).await;
+    assert_eq!(projection["events_projected"], json!(1), "{projection}");
+    assert_eq!(projection["records_rejected"], json!(0), "{projection}");
+    let id = &tap.delivered()[0];
+    api.wait_log_lines(
+        &format!(".*event_id={id} .*payload_truncated=true payload=.*xxxx.*"),
+        1,
+    )
+    .await;
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A refusal a retry can get past is retried, never skipped: with the
+/// tenant's stream-creation budget spent by another client, the projected
+/// record fails delivery and is not counted rejected; once the budget
+/// refills it is delivered once.
+#[tokio::test]
+async fn a_transient_admission_refusal_is_retried_not_skipped() {
+    let shifted = Shifted::default();
+    // Behind the time the other client spends the budget at, so the bucket
+    // does not refill until the test moves the clock past it.
+    shifted.set(-MINUTE_NS);
+    let tap = Arc::new(Tap::default());
+    let mut config = server_config(
+        AgentsConfig {
+            clock: shifted.clock(),
+            ..agents_config(projecting(&tap))
+        },
+        Mode::All,
+    );
+    config.limits.tenants.insert(
+        TenantId::new("acme"),
+        AdmissionLimits {
+            series_creation_rate: RateLimit::Bounded {
+                per_sec: 1,
+                burst: 1,
+            },
+            ..AdmissionLimits::default()
+        },
+    );
+    let running = try_start_with(Arc::new(MemoryStore::new()), config)
+        .await
+        .expect("server starts");
+    let api = Api::new(&running);
+    post_log(&api, "another-client").await;
+    let worker = setup(&api).await;
+    turn(&api, &worker, "r1", 1).await;
+
+    let projection = api.wait_projection("sink_failures", |n| n >= 3).await;
+    assert_eq!(projection["events_projected"], json!(0), "{projection}");
+    assert_eq!(projection["records_rejected"], json!(0), "{projection}");
+    assert_eq!(projection["lag_max"], json!(1), "{projection}");
+    let error = projection["last_sink_error"].as_str().expect("an error");
+    assert!(error.contains("creation rate exceeded"), "{error}");
+
+    shifted.set(5_000_000_000);
+    let projection = api.wait_projection("events_projected", |n| n >= 1).await;
+    assert_eq!(projection["events_projected"], json!(1), "{projection}");
+    assert_eq!(projection["records_rejected"], json!(0), "{projection}");
+    let id = &tap.delivered()[0];
+    api.wait_log_lines(&format!(".*event_id={id} .*"), 1).await;
     running.shutdown().await.expect("clean shutdown");
 }
