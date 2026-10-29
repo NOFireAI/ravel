@@ -5216,20 +5216,25 @@ the flag.
   registered evictor frees the shortfall plus the same margin from entries no
   scan holds, and the reservation is retried once; `reserve_best_effort`
   never evicts. Each pressure pass logs one INFO line, and a refusal that
-  stands logs WARN. The server warns at startup when the cap is nonzero and
-  the budget limit is below twice the margin, since admission then rarely
-  succeeds.
+  stands logs WARN. The cache evicts to fit the cap before it reserves, so a
+  full cache swaps one entry for another rather than needing room for both.
+  The server warns at startup when the cap is nonzero and the budget limit is
+  below twice the margin, since admission then rarely succeeds, and when the
+  cap plus the margin exceeds the limit, since the cache then cannot fill to
+  its cap without eating into the margin.
 - Known under-count: a dictionary column's entry is charged its share of the
   dictionary but can keep the whole dictionary alive, and Arrow buffers
   exported from an entry outlive it.
+- Known over-count: an `i64` column-reference column and its target are
+  charged separately when both are cached.
 
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
-exactly once: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
+once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`.
 `/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes` and
 `_entries` as gauges and `_hits_total`, `_misses_total`, `_admissions_total`,
-`_ghost_hits_total`, `_margin_skips_total`, `_pressure_evictions_total` and
-`_expired_drops_total` as counters; none of these families appears at `0`.
+`_evictions_total`, `_ghost_hits_total`, `_margin_skips_total`,
+`_pressure_evictions_total` and `_expired_drops_total` as counters (eight); none of these families appears at `0`.
 
 ## SQL over spans (the `spans` table, ADR-0045)
 

@@ -3578,6 +3578,16 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                          admit little or nothing"
                     );
                 }
+                if decoded_cache_max_bytes.saturating_add(margin) > limit {
+                    tracing::warn!(
+                        decoded_cache_max_bytes,
+                        memory_budget_bytes = limit,
+                        admission_margin_bytes = margin,
+                        "the decoded column-block cache cannot fill to its cap without eating \
+                         into the admission margin: the cap plus the margin exceeds this \
+                         memory budget"
+                    );
+                }
                 // A refused reservation from any other consumer evicts unheld
                 // entries first (ADR-3326 decision 4). Weak, because the cache
                 // already holds the budget. The evictor is asked for the

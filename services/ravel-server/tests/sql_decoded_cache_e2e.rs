@@ -225,13 +225,14 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
     }
 }
 
-const METRIC_FAMILIES: [&str; 10] = [
+const METRIC_FAMILIES: [&str; 11] = [
     "ravel_decoded_cache_resident_bytes",
     "ravel_decoded_cache_max_bytes",
     "ravel_decoded_cache_entries",
     "ravel_decoded_cache_hits_total",
     "ravel_decoded_cache_misses_total",
     "ravel_decoded_cache_admissions_total",
+    "ravel_decoded_cache_evictions_total",
     "ravel_decoded_cache_ghost_hits_total",
     "ravel_decoded_cache_margin_skips_total",
     "ravel_decoded_cache_pressure_evictions_total",
