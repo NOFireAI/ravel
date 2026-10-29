@@ -56,16 +56,21 @@ and `--agents`. In every other build or run `tools/list` is the nine-tool
 catalog, byte for byte. Each call runs in process through the agents client
 route it names, with the MCP request's own headers, so the route's resolver
 and its `agents` capability check decide it: a principal without the
-capability gets `unauthorized`. Every one of them is served.
+capability gets `unauthorized`. Every one of them is served. Each call is
+bounded by its effective deadline, the `budget.effective.deadline_ms` its
+envelope reports: a route that has not answered by then ends the call with
+`deadline`. A `ravel_agent_send` that ends that way may or may not have
+accepted its input, so it says the outcome is unknown and adds the
+`resend_with_the_same_key` next step.
 
 | Tool | Purpose | Inputs | Agents route | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
-| `ravel_agent_describe` | One row: agent id, incarnation, state version, content type, state size in bytes, active turn and mailbox depth, without the state itself | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
-| `ravel_agent_send` | Accept one input into an agent's inbox; the only tool that writes. `readOnlyHint: false`, `idempotentHint: true` | `kind`, `key`, `handler`, `payload` (any JSON), `idempotency_key` (required; sent as the request id) | `POST /api/v1/agents/send` | one row: `operation`, `accept_seq`, `duplicate`. A repeat with the same key answers the same operation with `duplicate: true` and accepts nothing new | `unauthorized`, `invalid_argument`, `unavailable`, `internal` (an `outcome_unknown` answer adds the `resend_with_the_same_key` next step) |
-| `ravel_agent_operation` | One operation's status, accept sequence and blocking effect | `operation` | `GET /api/v1/agents/operation` | one row | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
-| `ravel_agent_state` | The agent's state, active turn and mailbox | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor; the route bounds the state itself by `--agents-max-state-bytes` | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
-| `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `max_rows`, `max_response_bytes` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `unavailable`, `internal` |
-| `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `internal` |
+| `ravel_agent_describe` | One row: agent id, incarnation, state version, content type, state size in bytes, active turn and mailbox depth, without the state itself | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+| `ravel_agent_send` | Accept one input into an agent's inbox; the only tool that writes. `readOnlyHint: false`, `idempotentHint: true` | `kind`, `key`, `handler`, `payload` (any JSON), `idempotency_key` (required; sent as the request id) | `POST /api/v1/agents/send` | one row: `operation`, `accept_seq`, `duplicate`. A repeat with the same key answers the same operation with `duplicate: true` and accepts nothing new | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` (an `outcome_unknown` answer and a `deadline` both add the `resend_with_the_same_key` next step) |
+| `ravel_agent_operation` | One operation's status, accept sequence and blocking effect | `operation` | `GET /api/v1/agents/operation` | one row; a blocked operation's next step names the blocking effect | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+| `ravel_agent_state` | The agent's state, active turn and mailbox | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor; the route bounds the state itself by `--agents-max-state-bytes` | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+| `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `max_rows`, `max_response_bytes` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
+| `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
 The `tools/list` result is 15,700 bytes with the nine tools and 22,723
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both

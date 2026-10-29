@@ -33,7 +33,8 @@ use ravel_mcp::compact;
 use ravel_mcp::cursor::{CURSOR_KEY_LEN, CursorKey};
 use ravel_mcp::envelope::{Envelope, NextStep, Status};
 use ravel_mcp::tools::agents::{
-    AGENTS_TOOLS, AgentsBackend, AgentsCall, AgentsMethod, AgentsReply, dispatch_agents,
+    AGENTS_TOOLS, AgentsBackend, AgentsCall, AgentsMethod, AgentsReply, DeadlinePassed,
+    dispatch_agents,
 };
 use ravel_mcp::tools::{ToolContext, ToolError, dispatch};
 use ravel_query::{ByteLimit, EngineConfig, RequestBudgets, RequestLimit};
@@ -346,7 +347,19 @@ impl AgentsRoute {
 }
 
 impl AgentsBackend for AgentsRoute {
-    async fn call(&self, call: AgentsCall) -> AgentsReply {
+    /// The route and the read of its body together run under the call's
+    /// deadline. Past it the route future is dropped, the same cancellation a
+    /// client cancel applies.
+    async fn call(&self, call: AgentsCall) -> Result<AgentsReply, DeadlinePassed> {
+        let deadline = call.deadline;
+        tokio::time::timeout(deadline, self.route(call))
+            .await
+            .map_err(|_| DeadlinePassed)
+    }
+}
+
+impl AgentsRoute {
+    async fn route(&self, call: AgentsCall) -> AgentsReply {
         let mut uri = format!("/api/v1/agents/{}", call.route);
         for (index, (name, value)) in call.query.iter().enumerate() {
             uri.push(if index == 0 { '?' } else { '&' });
