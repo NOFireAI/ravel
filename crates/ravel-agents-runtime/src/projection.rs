@@ -620,3 +620,284 @@ impl Projector {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use std::sync::atomic::AtomicBool;
+
+    use ravel_agents_core::wire::{EventSpecBody, TurnOutcome, WorkerCommitRequest};
+    use ravel_agents_store::counters::CounterSnapshot;
+    use ravel_object_store::memory::MemoryStore;
+    use serde_json::json;
+
+    use super::*;
+    use crate::Coordinator;
+    use crate::tests::{
+        TestClock, clock, coordinator, create, head, id_of, poll_now, send, store_over, worker,
+    };
+
+    /// Records every delivery; fails while `down` is set.
+    #[derive(Default)]
+    struct TestSink {
+        down: AtomicBool,
+        attempts: Mutex<Vec<Id128>>,
+        delivered: Mutex<Vec<ProjectedEvent>>,
+        spans: Mutex<Vec<ProjectedTurn>>,
+    }
+
+    impl ProjectionSink for TestSink {
+        fn deliver<'a>(&'a self, batch: &'a ProjectionBatch) -> SinkFuture<'a> {
+            Box::pin(async move {
+                self.attempts
+                    .lock()
+                    .extend(batch.events.iter().map(|e| e.event_id));
+                if self.down.load(Ordering::SeqCst) {
+                    return Err(SinkError("down".to_string()));
+                }
+                self.delivered.lock().extend(batch.events.iter().cloned());
+                self.spans.lock().extend(batch.turns.iter().cloned());
+                Ok(())
+            })
+        }
+    }
+
+    struct Rig {
+        clock: Arc<TestClock>,
+        backend: Arc<MemoryStore>,
+        co: Arc<Coordinator>,
+        projector: Arc<Projector>,
+        sink: Arc<TestSink>,
+    }
+
+    fn rig(limits: ProjectionLimits, payload: PayloadPolicy) -> Rig {
+        let clock = clock();
+        let backend = Arc::new(MemoryStore::new());
+        let store = store_over(backend.clone(), &clock);
+        let sink = Arc::new(TestSink::default());
+        let projector = projector_over(&backend, &clock, &sink, limits, payload);
+        let co = coordinator(&store, &clock, 100);
+        let co = Arc::new(
+            Arc::into_inner(co)
+                .expect("sole owner")
+                .with_projection(projector.clone()),
+        );
+        Rig {
+            clock,
+            backend,
+            co,
+            projector,
+            sink,
+        }
+    }
+
+    fn projector_over(
+        backend: &Arc<MemoryStore>,
+        clock: &Arc<TestClock>,
+        sink: &Arc<TestSink>,
+        limits: ProjectionLimits,
+        payload: PayloadPolicy,
+    ) -> Arc<Projector> {
+        Arc::new(Projector::new(
+            TenantHash([7; 16]),
+            store_over(backend.clone(), clock),
+            sink.clone(),
+            limits,
+            payload,
+            clock.clone(),
+        ))
+    }
+
+    /// Send one input and commit its turn with `events` events.
+    async fn turn(rig: &Rig, request: &str, events: usize) {
+        send(&rig.co, "a", request, json!({"n": request})).await;
+        let w = worker(&rig.co, "v1");
+        let a = poll_now(&rig.co, &w, "v1").await.expect("assignment");
+        let events = (0..events)
+            .map(|i| EventSpecBody {
+                event_type: format!("step.{i}"),
+                payload: json!({"secret": format!("{request}-{i}")}),
+            })
+            .collect();
+        rig.co
+            .commit(&WorkerCommitRequest {
+                lease: a.lease.clone(),
+                outcome: TurnOutcome::Completed {
+                    state: json!({"last": request}),
+                    output: json!("ok"),
+                    events,
+                    timers: Vec::new(),
+                    intents: Vec::new(),
+                },
+            })
+            .await
+            .expect("commit");
+    }
+
+    fn writes(c: &CounterSnapshot) -> u64 {
+        [c.resolve, c.build, c.store, c.publish]
+            .iter()
+            .map(|p| p.put + p.cas)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_changes_no_agent_state_and_retries_the_same_ids() {
+        let rig = rig(ProjectionLimits::default(), PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        turn(&rig, "r1", 2).await;
+        rig.sink.down.store(true, Ordering::SeqCst);
+
+        let before_head = head(&store_over(rig.backend.clone(), &rig.clock), "a")
+            .await
+            .encode();
+        let before_co = rig.co.metrics().store;
+        let pass = rig.projector.project_once().await;
+        assert!(pass.sink_failed);
+        let pass = rig.projector.project_once().await;
+        assert!(pass.sink_failed);
+
+        let after_head = head(&store_over(rig.backend.clone(), &rig.clock), "a")
+            .await
+            .encode();
+        assert_eq!(before_head, after_head, "projection wrote HEAD");
+        assert_eq!(rig.co.metrics().store, before_co);
+        assert_eq!(writes(&rig.projector.store_counters()), 0);
+        let m = rig.projector.metrics();
+        assert_eq!(m.lag_max, 2);
+        assert_eq!(m.sink_failures, 2);
+        assert_eq!(m.events_projected, 0);
+
+        rig.sink.down.store(false, Ordering::SeqCst);
+        let pass = rig.projector.project_once().await;
+        assert_eq!(pass.events_delivered, 2);
+        assert_eq!(pass.spans_delivered, 1);
+
+        let attempts = rig.sink.attempts.lock().clone();
+        let delivered: Vec<Id128> = rig.sink.delivered.lock().iter().map(|e| e.event_id).collect();
+        let tenant = TenantHash([7; 16]);
+        let agent = id_of("a");
+        let expected = vec![event_id(&tenant, &agent, 1, 1), event_id(&tenant, &agent, 1, 2)];
+        assert_eq!(delivered, expected);
+        // Three attempts at the same two ids: two failed, one landed.
+        assert_eq!(attempts, [expected.clone(), expected.clone(), expected].concat());
+        assert_eq!(rig.projector.metrics().lag_max, 0);
+        assert_eq!(writes(&rig.projector.store_counters()), 0);
+    }
+
+    #[tokio::test]
+    async fn payloads_are_redacted_by_default_and_carried_on_opt_in() {
+        for policy in [PayloadPolicy::Redacted, PayloadPolicy::Carried] {
+            let rig = rig(ProjectionLimits::default(), policy);
+            create(&rig.co, "a").await;
+            turn(&rig, "r1", 1).await;
+            rig.projector.project_once().await;
+            let delivered = rig.sink.delivered.lock().clone();
+            assert_eq!(delivered.len(), 1);
+            let event = &delivered[0];
+            assert!(event.payload.hash.is_some());
+            assert!(event.payload.size_bytes > 0);
+            let body = event.body();
+            match policy {
+                PayloadPolicy::Redacted => {
+                    assert_eq!(event.payload.body, None);
+                    assert!(body.contains("payload=redacted"), "{body}");
+                    assert!(!body.contains("r1-0"), "{body}");
+                }
+                PayloadPolicy::Carried => {
+                    assert_eq!(
+                        event.payload.body.as_deref(),
+                        Some(r#"{"secret":"r1-0"}"#)
+                    );
+                    assert!(body.contains("r1-0"), "{body}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_backlog_stops_reading_and_counts_and_never_stops_a_commit() {
+        let limits = ProjectionLimits {
+            backlog: 2,
+            batch: 2,
+        };
+        let rig = rig(limits, PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        rig.sink.down.store(true, Ordering::SeqCst);
+        turn(&rig, "r1", 3).await;
+        rig.projector.project_once().await;
+        let m = rig.projector.metrics();
+        assert_eq!(m.backlog, 2);
+        assert_eq!(m.backlog_bound, 2);
+        assert_eq!(m.lag_max, 3);
+        // The bound is reached: the next pass reads nothing more and counts.
+        rig.projector.project_once().await;
+        let m = rig.projector.metrics();
+        assert_eq!(m.backlog, 2);
+        assert_eq!(m.backlog_full, 1);
+
+        // The coordinator commits on while the backlog is full.
+        let committed = rig.co.metrics().turns_committed;
+        turn(&rig, "r2", 1).await;
+        assert_eq!(rig.co.metrics().turns_committed, committed + 1);
+        assert_eq!(rig.projector.metrics().lag_max, 4);
+
+        rig.sink.down.store(false, Ordering::SeqCst);
+        for _ in 0..3 {
+            rig.projector.project_once().await;
+        }
+        let seqs: Vec<u64> = rig.sink.delivered.lock().iter().map(|e| e.event_seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        assert_eq!(rig.projector.metrics().lag_max, 0);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_projector_starts_at_the_committed_seq_and_repeats_no_id() {
+        let rig = rig(ProjectionLimits::default(), PayloadPolicy::Redacted);
+        create(&rig.co, "a").await;
+        turn(&rig, "r1", 2).await;
+        rig.projector.project_once().await;
+        assert_eq!(rig.sink.delivered.lock().len(), 2);
+
+        // A second process over the same store, with a sink of its own.
+        let store = store_over(rig.backend.clone(), &rig.clock);
+        let projector = projector_over(
+            &rig.backend,
+            &rig.clock,
+            &rig.sink,
+            ProjectionLimits::default(),
+            PayloadPolicy::Redacted,
+        );
+        let co = Arc::new(
+            Arc::into_inner(coordinator(&store, &rig.clock, 200))
+                .expect("sole owner")
+                .with_projection(projector.clone()),
+        );
+        let restarted = Rig {
+            clock: rig.clock.clone(),
+            backend: rig.backend.clone(),
+            co,
+            projector,
+            sink: rig.sink.clone(),
+        };
+        turn(&restarted, "r2", 1).await;
+        restarted.projector.project_once().await;
+        let ids: Vec<Id128> = rig.sink.delivered.lock().iter().map(|e| e.event_id).collect();
+        let unique: std::collections::BTreeSet<Id128> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn ids_are_stable_and_separate_every_component() {
+        let t = TenantHash([1; 16]);
+        let a = AgentId([2; 16]);
+        assert_eq!(event_id(&t, &a, 1, 5), event_id(&t, &a, 1, 5));
+        assert_ne!(event_id(&t, &a, 1, 5), event_id(&t, &a, 1, 6));
+        assert_ne!(event_id(&t, &a, 1, 5), event_id(&t, &a, 2, 5));
+        assert_ne!(event_id(&t, &a, 1, 5), event_id(&t, &AgentId([3; 16]), 1, 5));
+        assert_ne!(event_id(&t, &a, 1, 5), event_id(&TenantHash([9; 16]), &a, 1, 5));
+        assert_ne!(event_id(&t, &a, 1, 5).0, trace_id(&t, &a, 1, 5));
+    }
+}
