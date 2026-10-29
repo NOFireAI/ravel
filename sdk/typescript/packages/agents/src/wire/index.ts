@@ -165,6 +165,19 @@ export const MailboxEntryBody = z.object({
 });
 export type MailboxEntryBody = z.output<typeof MailboxEntryBody>;
 
+/** The counts behind each lifetime cap of one agent, from its HEAD as stored. */
+export const UsageBody = z.object({
+  receipts: U64,
+  max_receipts: U64,
+  results_pages: U64,
+  events_pages: U64,
+  timers_pages: U64,
+  max_index_pages: U64,
+  head_bytes: U64,
+  max_head_bytes: U64,
+});
+export type UsageBody = z.output<typeof UsageBody>;
+
 export const StateResponse = z.object({
   agent_id: z.string(),
   incarnation: U64,
@@ -173,6 +186,7 @@ export const StateResponse = z.object({
   state: Json,
   active_turn: ActiveTurnBody.optional(),
   mailbox: z.array(MailboxEntryBody).optional(),
+  usage: UsageBody.optional(),
 });
 export type StateResponse = z.output<typeof StateResponse>;
 
@@ -502,6 +516,8 @@ export const ErrorBody = z.object({
   retry: z.string(),
   reason: z.string(),
   ids: SafeIdsBody,
+  /** The lifetime cap a `budget_exceeded` or `mailbox_full` refusal hit. */
+  cap: z.string().optional(),
 });
 export type ErrorBody = z.output<typeof ErrorBody>;
 
@@ -549,6 +565,7 @@ export const WIRE_FIXTURES = {
   effect_inspect_response_failure: EffectInspectResponse,
   effects_response: EffectsResponse,
   error_body: ErrorBody,
+  error_body_cap: ErrorBody,
   events_request: EventsRequest,
   events_request_operation: EventsRequest,
   events_response: EventsResponse,

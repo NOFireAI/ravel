@@ -1,0 +1,10 @@
+{
+  "code": "budget_exceeded",
+  "retry": "never",
+  "reason": "receipt list is at its cap",
+  "ids": {
+    "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+    "incarnation": 1
+  },
+  "cap": "receipts"
+}

@@ -143,7 +143,7 @@ impl Coordinator {
         command: &Command,
         deps: &[Bytes],
     ) -> Result<Settled, AgentError> {
-        let settled = match self.store.execute_with(agent, command, deps).await {
+        let settled = match self.execute_with(agent, command, deps).await {
             Ok(outcome) => Settled {
                 outcome,
                 confirmed_lost_ack: false,
@@ -201,7 +201,7 @@ impl Coordinator {
             Some(OperationState::Completed | OperationState::Failed | OperationState::Cancelled)
         );
         if !terminal {
-            let outcome = self.store.execute_with(agent, command, deps).await?;
+            let outcome = self.execute_with(agent, command, deps).await?;
             self.metrics
                 .outcome_unknown_resolved
                 .fetch_add(1, Ordering::Relaxed);
@@ -310,7 +310,6 @@ impl Coordinator {
             &request_hash(&req.handler, payload),
         );
         let mut outcome = self
-            .store
             .enqueue(
                 agent,
                 incarnation,

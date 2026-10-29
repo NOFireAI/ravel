@@ -266,7 +266,7 @@ impl Coordinator {
                 fence: fence.clone(),
                 handlers: pins.to_vec(),
             });
-            let out = match self.store.execute(agent, &command).await {
+            let out = match self.execute(agent, &command).await {
                 Ok(out) => out,
                 // Re-running against the reloaded root resumes a turn whose
                 // `BeginTurn` landed without its acknowledgement.

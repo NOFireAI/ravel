@@ -26,6 +26,7 @@ use ravel_agents_core::head::{
     TurnBlock,
 };
 use ravel_agents_core::identity::{AgentId, Hash256, agent_id, effect_id, step_id};
+use ravel_agents_core::kernel::Usage;
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::pages::{ListKind, Need, receipt_fingerprint};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
@@ -38,8 +39,8 @@ use ravel_agents_core::wire::{
     OperationStatus, ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest,
     ResolveResponse, ResultBody, ResultResponse, SafeIdsBody, SendRequest, StateResponse, StepBody,
     StepRecordRequest, StepRecordResponse, SweepResponse, TimerBody, TimerRequest, TimersResponse,
-    WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest,
-    WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
+    UsageBody, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};
@@ -418,6 +419,7 @@ pub(super) async fn state(State(api): State<Api>, req: Request<Body>) -> Respons
             key: q.key,
         })?;
         let mut head = read_head(&call.tenant, &agent).await?;
+        let usage = UsageBody::new(Usage::of(&head), call.tenant.coordinator.limits());
         // The mailbox lists every input still in the inbox, sealed or open.
         call.tenant
             .store
@@ -443,6 +445,7 @@ pub(super) async fn state(State(api): State<Api>, req: Request<Body>) -> Respons
                 non_deterministic_replay: turn.block == TurnBlock::NonDeterministicReplay,
             }),
             mailbox: head.inbox.iter().map(mailbox_entry).collect(),
+            usage: Some(usage),
         }))
     };
     run.await.into_response()

@@ -21,11 +21,12 @@ use ravel_agents_core::head::{
     TurnBlock,
 };
 use ravel_agents_core::identity::{AgentId, effect_id};
+use ravel_agents_core::kernel::Usage;
 use ravel_agents_core::keys::{AgentKey, AgentKind, dir_prefix};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
     ActiveTurnBody, EffectBody, EffectsResponse, EventBody, EventsResponse, InputSourceBody,
-    MailboxEntryBody, OperationResponse, ReconcileResponse, StateResponse,
+    MailboxEntryBody, OperationResponse, ReconcileResponse, StateResponse, UsageBody,
 };
 use ravel_agents_store::{AgentStore, HeadState, StoreLimits};
 use ravel_object_store::ObjectStoreBackend;
@@ -310,6 +311,10 @@ pub async fn inspect(store: &AgentStore, agent: AgentId) -> Result<InspectOutput
                     failed_attempts: entry.failed_attempts,
                 })
                 .collect(),
+            usage: Some(UsageBody::new(
+                Usage::of(&head),
+                &StoreLimits::default().kernel,
+            )),
         },
         kind: head.kind.as_str().to_string(),
         key: head.key.as_str().to_string(),
@@ -358,6 +363,20 @@ pub fn render_inspect(out: &InspectOutput) -> String {
                 ""
             },
         )),
+    }
+    if let Some(usage) = &out.state.usage {
+        text.push_str(&format!(
+            "usage (default caps): receipts {}/{}  sealed pages results {} events {} timers {} of {}  \
+             head bytes {}/{}\n",
+            usage.receipts,
+            usage.max_receipts,
+            usage.results_pages,
+            usage.events_pages,
+            usage.timers_pages,
+            usage.max_index_pages,
+            usage.head_bytes,
+            usage.max_head_bytes,
+        ));
     }
     text.push_str(&format!("timers: {}\n", out.timers.len()));
     for timer in &out.timers {

@@ -2445,6 +2445,46 @@ in the `agents_timers_e2e` test binary; the evidence counter by
 `a_late_result_the_full_evidence_index_drops_is_counted` in
 `agents_effects_e2e`.
 
+### Ravel Agents capacity
+
+How close agents are to the lifetime caps that make them refuse work
+(`docs/agents.md`, "Wire", Fill). At the agent kernel's default limits an agent refuses its 1,025th
+message of an incarnation, because receipts never expire; its results,
+events and timers lists stop at 512 sealed pages of 64 entries; and its
+HEAD stops at 256 KiB. Each of these refusals is `budget_exceeded` with
+retry `never`.
+
+The fill families come from the sweep: each directory cycle reads every
+agent's HEAD once, and the fill is measured from that read with no further
+request. They change only when a cycle completes, so they are as old as
+`ravel_agents_sweep_last_directory_cycle_ms` plus the sweep interval, and
+read 0 until a tenant's first cycle. Labels: `mode` on every sample, `list`
+on two families, `cap` on the counter. There is no per-tenant or per-agent
+label.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_agents_index_fill_max_ratio{list}` | The highest fill of any agent in the last completed cycle, the largest over tenants. `list="receipts"` is receipts over `--agents-max-receipts`; `results`, `events` and `timers` are a list's sealed pages over the page cap (512). Inline entries are not counted. At 1 the list refuses growth with `budget_exceeded`. |
+| `ravel_agents_head_bytes_max_ratio` | The largest encoded HEAD of any agent in the last completed cycle over the HEAD byte cap, the largest over tenants. |
+| `ravel_agents_agents_near_cap{list}` | Agents at or above 75% of a list's cap in the last completed cycle, summed over tenants. An agent counts once per list it is near. |
+| `ravel_agents_budget_refusals_total{cap}` | Commands the agent kernel refused for a lifetime cap, by `cap`: `receipts`, `index_pages`, `head_bytes`, `mailbox` (a `mailbox_full` refusal) or `timers`. A refusal of a per-command bound, such as an over-long request id, is not counted. |
+
+Alert on `ravel_agents_agents_near_cap{list="receipts"} > 0` to find agents
+that should be destroyed and recreated before they refuse sends; the state
+route's `usage` names the counts for one agent.
+
+Test: the four families with exact values on the real `/metrics`, the
+refusal's `cap` and the state route's `usage` by
+`a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` in the
+`agents_timers_e2e` test binary; the maximum, the sealed-page basis, the
+75% count and the absence of extra requests by
+`a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts` in
+`ravel-agents-runtime`; publication at the end of a cycle by
+`the_fill_is_published_only_when_a_directory_cycle_completes`; one count
+per refusal under the right cap, for all five caps, by
+`each_cap_refusal_moves_its_counter_by_exactly_one`, and none for a
+per-command bound by `a_per_command_refusal_is_not_counted_as_a_cap`.
+
 ### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
 
 Labels: `mode` and `tenant_hash` on every sample, folded the same way as in
