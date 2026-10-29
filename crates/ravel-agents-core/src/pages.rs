@@ -896,7 +896,6 @@ pub(crate) fn directory_from_proto(
     }
     if pages.windows(2).any(|w| w[0].first_key >= w[1].first_key)
         || pages.last().is_some_and(|p| p.first_key >= dir.tail_from)
-        || (pages.is_empty() && dir.tail_from != 0)
     {
         return Err(invalid(field));
     }

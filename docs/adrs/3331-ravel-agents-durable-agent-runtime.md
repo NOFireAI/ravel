@@ -809,4 +809,8 @@ operation-filtered events page whose operation has fewer than `limit`
 matching events after its cursor, the terminal page among them, GETs every
 events page from its cursor on, up to `max_index_pages`; and a command whose page need
 the planner did not name falls back to loading every sealed page HEAD
-references, with a warning and a `planner_misses` count.
+references, with a warning and a `planner_misses` count. The events list
+is never pruned, so an agent holds at most `max_index_pages *
+max_page_entries` events (32,768 at the defaults); the publish that
+would append past that is refused `BudgetExceeded`, and this release
+gives an operator no way to trim it.

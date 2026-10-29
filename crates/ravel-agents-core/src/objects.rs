@@ -21,7 +21,7 @@ fn decode_gated<M: prost::Message + Default>(
     bytes: &[u8],
     version_and_seal: impl Fn(&M) -> (u32, u32),
 ) -> Result<M, CodecError> {
-    peek_format_version(bytes)?;
+    check_format_version(peek_format_version(bytes)?)?;
     let message = M::decode(bytes).map_err(|e| CodecError::Decode(e.to_string()))?;
     let (version, seal) = version_and_seal(&message);
     check_format_version(version)?;
@@ -215,6 +215,18 @@ mod tests {
             seal: SEAL,
         }
         .encode_to_vec();
+        assert_eq!(
+            decode_inbox_page(&bytes),
+            Err(CodecError::UnsupportedFormat { found: 2 })
+        );
+    }
+
+    #[test]
+    fn a_newer_object_version_is_refused_before_its_body_is_decoded() {
+        // Field 1 = 2, then a field 2 length prefix promising more bytes
+        // than follow: decoding the body would fail with Decode.
+        let bytes = [0x08, 0x02, 0x12, 0x7f, 0x00];
+        assert!(pb::InboxPage::decode(&bytes[..]).is_err());
         assert_eq!(
             decode_inbox_page(&bytes),
             Err(CodecError::UnsupportedFormat { found: 2 })
