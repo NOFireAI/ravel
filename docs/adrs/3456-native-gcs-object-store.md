@@ -29,6 +29,7 @@ token against a fresh bucket in us-central1 (#3456):
 | GET `?generation=<current>` with `If-Match: <its etag>`, then with a wrong ETag | 200, then 412 | 200, then 412 |
 | GET `?generation=<replaced>` with `If-Match: <that generation's etag>`, and with a wrong ETag | 404, 404 | 404, 404 |
 | GET `?generation=<g>` with `If-Match: <its etag>` after the object is deleted | 404 | 404 |
+| GET a key that never existed: with `If-Match`, with `?generation=`, and with both | 404, 404, 404 | 404, 404, 404 |
 
 On PUT, the XML API ignores the S3 conditional headers and honours only its
 own generation headers. On GET it honours `If-Match`. A generation selector
@@ -64,7 +65,11 @@ type from `ExternalStore`, which stays read-only.
   - `CreateIfAbsent` sends `x-goog-if-generation-match: 0`. A 412 maps to
     `AlreadyExists`.
   - `CasVersion(v)` sends `x-goog-if-generation-match: v`. A 412 maps to
-    `PreconditionFailed`.
+    `PreconditionFailed`. `v` must be a positive decimal generation with no
+    leading zero; anything else is refused before a request is sent. GCS
+    never issues generation 0, and `x-goog-if-generation-match: 0` means
+    create-if-absent, so a CAS token of `0` would otherwise create an absent
+    key instead of failing.
   - `Overwrite` sends no precondition.
 
   `object_store` 0.14 sends both headers itself: `PutMode::Create` as
@@ -84,10 +89,14 @@ type from `ExternalStore`, which stays read-only.
   precondition header is not used for reads: it would turn a vanished
   generation into `PreconditionFailed`, which the trait reserves for a
   changed object.
-- **Listing.** `GcsStore` does not list through `object_store`. ADR-2637
-  removed `Path`-based listing from `S3Store`: `Path::parse` fails a whole
-  page on a key it rejects, and resuming from `Path::from(last_key)`
-  re-delivers or skips keys that `Path` re-encodes. Every base backend's
+- **Listing.** `GcsStore` does not list through `object_store`, for two
+  reasons. First, ADR-2637 removed `Path`-based listing from `S3Store`:
+  `Path::parse` fails a whole page on a key it rejects, and resuming from
+  `Path::from(last_key)` re-delivers or skips keys that `Path` re-encodes.
+  Second, `object_store`'s GCS listing uses the XML API's `list-type=2` with
+  no `encoding-type`. So a foreign object whose name XML 1.0 cannot carry
+  makes every page that contains it unparseable: the same whole-page failure
+  as the first reason, by another route. Every base backend's
   listing must instead hand raw keys to `classify_objects` and
   `classify_prefixes`, so unaddressable keys are reported in
   `ListPage::unaddressable` rather than failing the page. `GcsStore`
@@ -101,11 +110,9 @@ type from `ExternalStore`, which stays read-only.
   - It authenticates with the same Application Default Credentials as the
     data-plane client, and runs through the shared connector (D3).
 
-  The page size is a `GcsStore` constructor argument, and it is what
-  `store qualify --list-page-size` passes. So the cross-page probes test the
-  size the store really serves. `object_store`'s GCS client hard-wires its
-  page size and offers no setter, which is a second reason not to list
-  through it.
+  The page size is a `GcsStore` constructor argument, sent as `maxResults`,
+  and it is what `store qualify --list-page-size` passes. So the cross-page
+  probes test the size the store really serves.
 - **Multipart.** `multipart: false`. A single GCS upload takes objects far
   larger than any Ravel object, so no caller needs it.
 - **Upload checksum.** `upload_checksum: false` in this ADR. CRC32C through
@@ -123,7 +130,9 @@ file. There are no Ravel flags carrying credentials, so no secret ever
 passes through Ravel's configuration. A hidden `--gcs-endpoint` sets the
 base URL, for tests against a fake endpoint only. When it is set, the
 backend identity records it (D5), so a qualification taken against a fake
-endpoint cannot read as one taken against the real bucket.
+endpoint cannot read as one taken against the real bucket. Skipping request
+authentication (which a fake endpoint needs) is constructible only under the
+crate's `test-support` feature, so no production configuration can reach it.
 
 ### D3. The same instrumentation as S3
 
@@ -132,7 +141,11 @@ The S3 store observes every HTTP attempt through its own connector
 `observed_store_time_ns`, and the ingest clock-lag check (ADR-1685) reads the
 second. A backend without it reports zero attempts and turns the clock-lag
 check off without saying so. `GcsStore` installs the same connector through
-`GoogleCloudStorageBuilder::with_http_connector`. Per-operation call and
+`GoogleCloudStorageBuilder::with_http_connector`. `object_store` sends its
+credential requests (the metadata server, the token endpoint) through that
+same connector. So the connector counts, and reads a `Date` from, only
+requests to the storage host; a token refresh is neither a store attempt nor
+a store clock reading. Per-operation call and
 byte counters come from the shared instrumentation wrapper, so the per-phase
 cost split covers GCS exactly as it covers S3.
 
@@ -144,7 +157,9 @@ S3 errors are classified from S3 XML error codes (`SlowDown`,
 
 - 429 and 503 are throttling (retryable);
 - 404 on an object is `NotFound`;
-- 404 on the bucket is a hard error;
+- 404 on the bucket is a hard error, except on HEAD: GCS answers a HEAD on
+  a missing bucket with a bodiless 404, which cannot be told from a missing
+  object and maps to `NotFound`, the same as `S3Store` does;
 - 412 is the precondition outcome named in D1;
 - 401 and 403 are credential errors.
 
