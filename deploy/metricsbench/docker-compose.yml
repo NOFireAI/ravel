@@ -261,7 +261,7 @@ services:
           cpus: "1.0"
           memory: 2g
 
-  # Docker Hub, not ECR Public: see deploy/README.md, "Why the object store ...".
+  # Docker Hub, not ECR Public: see README.md, "Pinned image digests".
   createbuckets:
     image: amazon/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
     depends_on: [s3s]

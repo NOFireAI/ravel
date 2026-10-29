@@ -103,7 +103,7 @@ exhausted, which reads like a permissions problem rather than a rate limit.
 Where an anonymous mirror exists on another registry, this directory pulls
 from there instead: the object store from `ghcr.io/rustfs/rustfs`, its
 client from `public.ecr.aws/aws-cli/aws-cli` (everywhere except
-deploy/metricsbench, which pulls it from Docker Hub for the reason below), and
+deploy/metricsbench, which pulls it from Docker Hub; see below), and
 the OpenTelemetry Collector from
 `ghcr.io/open-telemetry/opentelemetry-collector-releases/...`. None of those
 registries shares Docker Hub's allowance. Every file that does this
@@ -121,10 +121,8 @@ workflow runs it; it does not gate a merge. metricsbench-nightly's
 `metricsbench-rustfs` runs the whole deploy/metricsbench compose stack
 through `deploy/metricsbench/run.sh` once a day and pulls Prometheus,
 VictoriaMetrics, Mimir and the AWS CLI for its `createbuckets` service from
-Docker Hub. Its AWS CLI is `amazon/aws-cli` at the digest ECR Public serves,
-because ECR Public refused that job's anonymous pull with `Data limit
-exceeded` (deploy/metricsbench/docker-compose.yml). It does not gate a merge
-either: a throttled pull fails that night's run and nothing else. The ECR
+Docker Hub; deploy/metricsbench/README.md, "Pinned image digests", says why
+the AWS CLI is there. It does not gate a merge either: a throttled pull fails that night's run and nothing else. The ECR
 Public image is also pulled by `docker-compose/rustfs.yml`, `deploy/k8s`,
 `scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, and the interop-nightly
 Flight SQL test.
