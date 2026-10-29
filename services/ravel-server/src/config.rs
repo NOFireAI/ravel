@@ -2472,14 +2472,19 @@ pub struct Cli {
     /// `agents` cargo feature refuses it at startup rather than ignoring it.
     /// Valid only under `--mode all` and `--mode query`; the routes mount on
     /// both the public HTTP listener and the mTLS listener when one is
-    /// configured. This release mounts only `GET /api/v1/agents/health`,
-    /// which reports the mode and the settings below.
+    /// configured. The routes are the client API (create, send, call,
+    /// operation, result, resolve, cancel, state, events, timers), the worker
+    /// API under `/api/v1/agents/worker/`, the effect reads, the admin
+    /// `reconcile` and `sweep` routes, the inspector, and
+    /// `GET /api/v1/agents/health`, which reports the mode, the settings
+    /// below and the projection state. Committed history projects into logs
+    /// and traces; see `--agents-projection`.
     #[arg(long)]
     pub agents: bool,
 
     /// Most agent turns this process activates at once (ADR-3331 decision 9).
-    /// `0` is rejected. Parsed and reported on `/api/v1/agents/health` and
-    /// `/metrics`; the coordinator that enforces it is not in this release.
+    /// `0` is rejected. Reported on `/api/v1/agents/health`; a request past
+    /// the cap is refused with 503 rather than queued.
     #[arg(
         long = "agents-activation-concurrency",
         value_name = "N",
@@ -2488,8 +2493,8 @@ pub struct Cli {
     pub agents_activation_concurrency: usize,
 
     /// Most worker long-polls this process holds open at once (ADR-3331
-    /// decision 9). `0` is rejected. Parsed and reported only in this
-    /// release, like `--agents-activation-concurrency`.
+    /// decision 9). `0` is rejected. Reported on `/api/v1/agents/health`; a
+    /// long poll past the cap is refused with 503 rather than queued.
     #[arg(
         long = "agents-poll-concurrency",
         value_name = "N",
@@ -2518,7 +2523,7 @@ pub struct Cli {
     pub agents_max_agents: u64,
 
     /// Most accepted inputs one agent's mailbox may hold (ADR-3331 decision 9
-    /// logical quota). Parsed and reported only in this release.
+    /// logical quota). An input past the cap is refused `mailbox_full`.
     #[arg(
         long = "agents-max-mailbox",
         value_name = "N",
@@ -2536,7 +2541,8 @@ pub struct Cli {
     pub agents_max_state_bytes: u64,
 
     /// Most idempotency receipts one agent retains (ADR-3331 decision 9
-    /// logical quota). Parsed and reported only in this release.
+    /// logical quota). An input that would need a receipt past the cap is
+    /// refused `budget_exceeded`.
     #[arg(
         long = "agents-max-receipts",
         value_name = "N",
@@ -2545,13 +2551,51 @@ pub struct Cli {
     pub agents_max_receipts: u64,
 
     /// Most pending timers one agent may hold (ADR-3331 decision 9 logical
-    /// quota). Parsed and reported only in this release.
+    /// quota). A schedule that would pass the cap is refused
+    /// `budget_exceeded`.
     #[arg(
         long = "agents-max-timers",
         value_name = "N",
         default_value_t = DEFAULT_AGENTS_MAX_TIMERS
     )]
     pub agents_max_timers: u64,
+
+    /// Where committed agent history projects as logs and traces (ADR-3331
+    /// decision 12). `auto` writes through this process's own log and span
+    /// ingest when it holds an ingest buffer (`--mode all`), and otherwise
+    /// sends OTLP to `--agents-projection-endpoint`. `off` turns projection
+    /// off. With `--agents`, `auto`, no ingest buffer and no endpoint,
+    /// startup refuses, so projection is never silently absent.
+    #[arg(
+        long = "agents-projection",
+        value_name = "MODE",
+        value_enum,
+        default_value_t = AgentsProjectionSwitch::Auto
+    )]
+    pub agents_projection: AgentsProjectionSwitch,
+
+    /// OTLP gRPC endpoint of a gateway that ingests agent projection logs and
+    /// traces, e.g. `http://gateway:4317`. Takes precedence over the
+    /// in-process path. Each request carries the tenant in the
+    /// `x-ravel-tenant` metadata header and the `ravel.tenant` resource
+    /// attribute.
+    #[arg(long = "agents-projection-endpoint", value_name = "URL")]
+    pub agents_projection_endpoint: Option<String>,
+
+    /// Most projected records one tenant's projector holds undelivered. A
+    /// full backlog stops the projector reading; agent commits never wait on
+    /// it and nothing is dropped. `0` is rejected.
+    #[arg(
+        long = "agents-projection-backlog",
+        value_name = "N",
+        default_value_t = DEFAULT_AGENTS_PROJECTION_BACKLOG
+    )]
+    pub agents_projection_backlog: usize,
+
+    /// Tenant whose projected records carry event payloads as text. Payloads
+    /// are redacted to a hash and a size by default. Repeatable.
+    #[arg(long = "agents-projection-payload-tenant", value_name = "TENANT")]
+    pub agents_projection_payload_tenant: Vec<String>,
 
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
@@ -3495,7 +3539,104 @@ pub struct AgentsConfig {
     /// The clock every tenant coordinator and store reads: the host's wall
     /// clock unless a test injects one.
     pub clock: AgentsClock,
+    /// Where committed agent history projects as logs and traces (ADR-3331
+    /// decision 12).
+    pub projection: AgentsProjectionConfig,
 }
+
+/// The `--agents-projection` flag value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum AgentsProjectionSwitch {
+    /// Project through this process's ingest buffer when it holds one, else
+    /// to `--agents-projection-endpoint`; refuse startup when neither exists.
+    #[default]
+    Auto,
+    /// Project nothing.
+    Off,
+}
+
+/// Where the agents projector delivers, resolved at startup by
+/// [`AgentsConfig::projection_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentsProjectionTarget {
+    /// Through this process's `LogIngestRouter` and `SpanIngestRouter`.
+    InProcess,
+    /// OTLP gRPC to a gateway at this endpoint.
+    Endpoint(String),
+    /// `--agents-projection off`.
+    Off,
+}
+
+impl AgentsProjectionTarget {
+    /// The name the health route reports.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AgentsProjectionTarget::InProcess => "in_process",
+            AgentsProjectionTarget::Endpoint(_) => "endpoint",
+            AgentsProjectionTarget::Off => "off",
+        }
+    }
+}
+
+/// The agents projection settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentsProjectionConfig {
+    /// `--agents-projection`.
+    pub switch: AgentsProjectionSwitch,
+    /// `--agents-projection-endpoint`.
+    pub endpoint: Option<String>,
+    /// `--agents-projection-backlog`: most records one tenant's projector
+    /// holds undelivered.
+    pub backlog: usize,
+    /// `--agents-projection-payload-tenant`: tenants whose records carry
+    /// payload text instead of a hash and a size.
+    pub payload_tenants: Vec<String>,
+    /// How long a projector waits before retrying a failed delivery or a
+    /// failed read. No flag sets it.
+    pub retry_ms: u64,
+    /// A test hook run before every delivery; `None` outside tests.
+    pub tap: ProjectionTap,
+}
+
+impl Default for AgentsProjectionConfig {
+    fn default() -> Self {
+        AgentsProjectionConfig {
+            switch: AgentsProjectionSwitch::Auto,
+            endpoint: None,
+            backlog: DEFAULT_AGENTS_PROJECTION_BACKLOG,
+            payload_tenants: Vec::new(),
+            retry_ms: DEFAULT_AGENTS_PROJECTION_RETRY_MS,
+            tap: ProjectionTap::default(),
+        }
+    }
+}
+
+/// A hook called with the event ids of every delivery attempt before the
+/// sink sees it. An `Err` fails the attempt, which is how tests stage a
+/// projection outage.
+pub type ProjectionTapFn = dyn Fn(&[String]) -> Result<(), String> + Send + Sync;
+
+/// An optional [`ProjectionTapFn`]; compared by pointer like [`AgentsClock`].
+#[derive(Clone, Default)]
+pub struct ProjectionTap(pub Option<Arc<ProjectionTapFn>>);
+
+impl std::fmt::Debug for ProjectionTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "tapped" } else { "none" })
+    }
+}
+
+impl PartialEq for ProjectionTap {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ProjectionTap {}
 
 /// The time source of the agents runtime, in unix nanoseconds. `None` is the
 /// host's wall clock; tests inject their own to move time past a timer's due
@@ -3537,6 +3678,14 @@ pub enum AgentsConfigError {
         DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS
     )]
     ZeroMaxEvidenceEffects,
+    /// `--agents` with projection left on, no ingest buffer in this process
+    /// and no endpoint: committed history would project nowhere.
+    #[error(
+        "--agents needs somewhere to project committed agent history: this process holds no \
+         ingest buffer, so set --agents-projection-endpoint to an OTLP gateway, or pass \
+         --agents-projection off"
+    )]
+    ProjectionUnconfigured,
 }
 
 impl AgentsConfig {
@@ -3546,6 +3695,27 @@ impl AgentsConfig {
             return Err(AgentsConfigError::ZeroMaxEvidenceEffects);
         }
         Ok(())
+    }
+
+    /// Where projection delivers in a process that does (`true`) or does not
+    /// hold an ingest buffer. An endpoint wins over the in-process path; with
+    /// neither and projection not off, refuses with
+    /// [`AgentsConfigError::ProjectionUnconfigured`]. A process without
+    /// `--agents` resolves to `Off`.
+    pub fn projection_target(
+        &self,
+        holds_ingest_buffer: bool,
+    ) -> Result<AgentsProjectionTarget, AgentsConfigError> {
+        if !self.enabled || self.projection.switch == AgentsProjectionSwitch::Off {
+            return Ok(AgentsProjectionTarget::Off);
+        }
+        if let Some(endpoint) = &self.projection.endpoint {
+            return Ok(AgentsProjectionTarget::Endpoint(endpoint.clone()));
+        }
+        if holds_ingest_buffer {
+            return Ok(AgentsProjectionTarget::InProcess);
+        }
+        Err(AgentsConfigError::ProjectionUnconfigured)
     }
 }
 
@@ -3567,6 +3737,7 @@ impl Default for AgentsConfig {
             sweep_interval_ms: DEFAULT_AGENTS_SWEEP_INTERVAL_MS,
             max_evidence_effects: DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS,
             clock: AgentsClock::default(),
+            projection: AgentsProjectionConfig::default(),
         }
     }
 }
@@ -3589,6 +3760,11 @@ pub const DEFAULT_AGENTS_MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_AGENTS_MAX_RECEIPTS: u64 = 1024;
 /// `--agents-max-timers` default, equal to the kernel's `Limits::max_timers`.
 pub const DEFAULT_AGENTS_MAX_TIMERS: u64 = 64;
+/// `--agents-projection-backlog` default, equal to the runtime's
+/// `DEFAULT_PROJECTION_BACKLOG`.
+pub const DEFAULT_AGENTS_PROJECTION_BACKLOG: usize = 4096;
+/// Agents projection retry interval: 1 s.
+pub const DEFAULT_AGENTS_PROJECTION_RETRY_MS: u64 = 1_000;
 /// Agents request body cap: 5 MiB, one 4 MiB store object plus its envelope.
 pub const DEFAULT_AGENTS_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// Agents turn lease: 30 s, the coordinator's own default.
@@ -7367,6 +7543,13 @@ impl Cli {
                 sweep_interval_ms: DEFAULT_AGENTS_SWEEP_INTERVAL_MS,
                 max_evidence_effects: DEFAULT_AGENTS_MAX_EVIDENCE_EFFECTS,
                 clock: AgentsClock::default(),
+                projection: AgentsProjectionConfig {
+                    switch: self.agents_projection,
+                    endpoint: self.agents_projection_endpoint.clone(),
+                    backlog: self.agents_projection_backlog,
+                    payload_tenants: self.agents_projection_payload_tenant.clone(),
+                    ..AgentsProjectionConfig::default()
+                },
             },
             fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
             sql_spill: SqlSpillSettings {
@@ -8450,6 +8633,14 @@ impl Cli {
                 "--agents-poll-concurrency 0 would refuse every worker long-poll; set a positive \
                  limit or leave the flag unset for the default of \
                  {DEFAULT_AGENTS_POLL_CONCURRENCY}"
+            );
+        }
+
+        if self.agents_projection_backlog == 0 {
+            anyhow::bail!(
+                "--agents-projection-backlog 0 would hold no projected record, so nothing would \
+                 ever project; set a positive bound or leave the flag unset for the default of \
+                 {DEFAULT_AGENTS_PROJECTION_BACKLOG}"
             );
         }
 
@@ -17595,6 +17786,16 @@ mod tests {
             "19",
             "--agents-max-timers",
             "23",
+            "--agents-projection",
+            "off",
+            "--agents-projection-endpoint",
+            "http://gateway:4317",
+            "--agents-projection-backlog",
+            "29",
+            "--agents-projection-payload-tenant",
+            "acme",
+            "--agents-projection-payload-tenant",
+            "globex",
         ])
         .expect("every agents flag parses");
         assert!(parsed.agents);
@@ -17613,6 +17814,13 @@ mod tests {
                 max_state_bytes: 17000,
                 max_receipts: 19,
                 max_timers: 23,
+                projection: AgentsProjectionConfig {
+                    switch: AgentsProjectionSwitch::Off,
+                    endpoint: Some("http://gateway:4317".to_string()),
+                    backlog: 29,
+                    payload_tenants: vec!["acme".to_string(), "globex".to_string()],
+                    ..AgentsProjectionConfig::default()
+                },
                 ..AgentsConfig::default()
             }
         );
@@ -17646,7 +17854,54 @@ mod tests {
                 sweep_interval_ms: 5_000,
                 max_evidence_effects: 4_096,
                 clock: AgentsClock::default(),
+                projection: AgentsProjectionConfig {
+                    switch: AgentsProjectionSwitch::Auto,
+                    endpoint: None,
+                    backlog: 4_096,
+                    payload_tenants: Vec::new(),
+                    retry_ms: 1_000,
+                    tap: ProjectionTap::default(),
+                },
             }
+        );
+    }
+
+    /// ADR-3331 decision 12: an endpoint wins, an ingest buffer is the
+    /// fallback, `off` is the only other accepted value, and with none of
+    /// them startup refuses with a typed error naming both ways out. A
+    /// process without `--agents` projects nothing and refuses nothing.
+    #[test]
+    fn agents_projection_target_resolves_or_refuses_naming_both_ways_out() {
+        let on = |switch, endpoint: Option<&str>| AgentsConfig {
+            enabled: true,
+            projection: AgentsProjectionConfig {
+                switch,
+                endpoint: endpoint.map(str::to_string),
+                ..AgentsProjectionConfig::default()
+            },
+            ..AgentsConfig::default()
+        };
+        let auto = AgentsProjectionSwitch::Auto;
+        let off = AgentsProjectionSwitch::Off;
+        let url = Some("http://gateway:4317");
+        let endpoint = AgentsProjectionTarget::Endpoint("http://gateway:4317".to_string());
+        assert_eq!(on(auto, None).projection_target(true), Ok(AgentsProjectionTarget::InProcess));
+        assert_eq!(on(auto, url).projection_target(true), Ok(endpoint.clone()));
+        assert_eq!(on(auto, url).projection_target(false), Ok(endpoint));
+        for buffer in [true, false] {
+            assert_eq!(on(off, None).projection_target(buffer), Ok(AgentsProjectionTarget::Off));
+            assert_eq!(on(off, url).projection_target(buffer), Ok(AgentsProjectionTarget::Off));
+            assert_eq!(
+                AgentsConfig::default().projection_target(buffer),
+                Ok(AgentsProjectionTarget::Off)
+            );
+        }
+        let refused = on(auto, None).projection_target(false);
+        assert_eq!(refused, Err(AgentsConfigError::ProjectionUnconfigured));
+        let msg = refused.expect_err("refused").to_string();
+        assert!(
+            msg.contains("--agents-projection-endpoint") && msg.contains("--agents-projection off"),
+            "names both ways out: {msg}"
         );
     }
 
@@ -17687,6 +17942,7 @@ mod tests {
             "--agents-max-state-bytes",
             "--agents-max-receipts",
             "--agents-max-timers",
+            "--agents-projection-backlog",
         ] {
             for value in ["many", "-1"] {
                 assert!(
@@ -17698,10 +17954,11 @@ mod tests {
     }
 
     #[test]
-    fn agents_zero_activation_or_poll_concurrency_is_refused() {
+    fn agents_zero_concurrency_or_projection_backlog_is_refused() {
         for flag in [
             "--agents-activation-concurrency",
             "--agents-poll-concurrency",
+            "--agents-projection-backlog",
         ] {
             let err = cli(&[flag, "0"])
                 .validate()

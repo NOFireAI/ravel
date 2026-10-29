@@ -9,7 +9,9 @@
 //! client, worker and admin routes, the timer and sweep routes and the
 //! inspector page over one [`ravel_agents_runtime::Coordinator`] per tenant.
 //! Each tenant's coordinator also runs one bounded sweep pass every
-//! `sweep_interval_ms` once the tenant is first served in this process.
+//! `sweep_interval_ms` once the tenant is first served in this process, and,
+//! unless `--agents-projection off`, projects its committed history into logs
+//! and traces through the sinks in [`projection`] (ADR-3331 decision 12).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +28,7 @@ use crate::config::Mode;
 use crate::health::IngestHealth;
 
 mod audit;
+pub mod projection;
 mod routes;
 mod runtime;
 
@@ -36,7 +39,8 @@ pub use routes::{
 };
 pub use runtime::{
     AgentsRuntime, EvidenceIndex, LONG_POLL_CAP_MS, Lane, MAX_EVIDENCE_EFFECTS,
-    MAX_EVIDENCE_PER_EFFECT, POLL_SWEEP_FLOOR_MS, TenantAgents, WorkerDispatcher,
+    MAX_EVIDENCE_PER_EFFECT, POLL_SWEEP_FLOOR_MS, ProjectionPlan, ProjectionSinkPlan,
+    TenantAgents, WorkerDispatcher,
 };
 
 /// The unauthenticated settings route.
@@ -179,6 +183,18 @@ struct HealthBody {
     memory_budget_bytes: u64,
     sweep_interval_ms: u64,
     quotas: QuotaBody,
+    projection: ProjectionBody,
+}
+
+/// Where committed history projects, and how far behind it is: `lag_max` is
+/// the largest committed-minus-projected event count over every agent this
+/// process has seen, summed over no tenant.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProjectionBody {
+    mode: &'static str,
+    endpoint: Option<String>,
+    backlog_bound: usize,
+    lag_max: u64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -191,7 +207,9 @@ struct QuotaBody {
 }
 
 impl HealthBody {
-    fn new(settings: &AgentsSettings) -> Self {
+    fn new(runtime: &AgentsRuntime) -> Self {
+        let settings = &runtime.settings;
+        let plan = runtime.projection_plan();
         HealthBody {
             feature: "agents",
             mode: crate::metrics::mode_name(settings.mode),
@@ -206,13 +224,19 @@ impl HealthBody {
                 max_receipts: settings.max_receipts,
                 max_timers: settings.max_timers,
             },
+            projection: ProjectionBody {
+                mode: plan.sink.mode(),
+                endpoint: plan.sink.endpoint().map(str::to_string),
+                backlog_bound: plan.backlog,
+                lag_max: runtime.projection_metrics().lag_max,
+            },
         }
     }
 }
 
 /// The agents router for one listener. `GET /api/v1/agents/health` reads no
-/// store and no tenant data, only operator settings `/metrics` also exposes,
-/// so it carries no authentication on either listener, including the mTLS
+/// store and no tenant data, only operator settings and the process-wide
+/// projection lag, so it carries no authentication on either listener, including the mTLS
 /// one, where `/healthz` itself is not served (ADR-3331 decision 9 mounts it
 /// on both). Every other route resolves its tenant through `resolver`, the
 /// listener's own, and the reconcile route writes its audit record to
@@ -312,7 +336,7 @@ fn mounted() -> Vec<(&'static str, &'static str, MethodRouter<routes::Api>)> {
 }
 
 async fn health(State(api): State<routes::Api>) -> Json<HealthBody> {
-    Json(HealthBody::new(&api.runtime.settings))
+    Json(HealthBody::new(&api.runtime))
 }
 
 #[cfg(test)]
@@ -346,6 +370,10 @@ mod tests {
     const WORKER_TOKEN: &str = "worker-token";
 
     fn test_router(settings: AgentsSettings) -> Router {
+        test_router_projecting(settings, ProjectionPlan::off())
+    }
+
+    fn test_router_projecting(settings: AgentsSettings, plan: ProjectionPlan) -> Router {
         let mut tokens = std::collections::HashMap::new();
         tokens.insert(
             WORKER_TOKEN.to_string(),
@@ -360,7 +388,8 @@ mod tests {
             settings,
             Arc::new(AgentsReadiness::new()),
             Arc::new(ravel_object_store::memory::MemoryStore::new()),
-        ));
+        )
+        .with_projection(plan));
         router(
             runtime,
             resolver,
@@ -642,7 +671,14 @@ mod tests {
     /// The health route answers 200 with every setting under its own key.
     #[tokio::test]
     async fn health_reports_feature_mode_and_every_setting() {
-        let response = test_router(settings())
+        let plan = ProjectionPlan::new(
+            ProjectionSinkPlan::Endpoint("http://gateway:4317".to_string()),
+            &crate::config::AgentsProjectionConfig {
+                backlog: 37,
+                ..crate::config::AgentsProjectionConfig::default()
+            },
+        );
+        let response = test_router_projecting(settings(), plan)
             .oneshot(
                 Request::get(HEALTH_PATH)
                     .body(Body::empty())
@@ -670,6 +706,12 @@ mod tests {
                     "max_state_bytes": 17,
                     "max_receipts": 19,
                     "max_timers": 23,
+                },
+                "projection": {
+                    "mode": "endpoint",
+                    "endpoint": "http://gateway:4317",
+                    "backlog_bound": 37,
+                    "lag_max": 0,
                 },
             })
         );
