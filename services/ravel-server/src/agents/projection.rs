@@ -7,6 +7,15 @@
 //! one span per turn. The payload reaches a record only through that body
 //! and the hash and size attributes, all three built by the projector's
 //! redaction gate.
+//!
+//! Before a batch is sent each record is screened alone against the
+//! receiving side's normalization: one that fails for a reason a retry
+//! cannot change (older than the ingest-lag bound, malformed, over a size
+//! limit) is left out and reported as a rejection, so it never holds up the
+//! records behind it. A refusal a retry can get past (a time ahead of the
+//! skew bound, admission, a rate, the active-stream cap, a buffer budget,
+//! the store, the network) fails the whole batch, which the projector
+//! retries under the same ids.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,18 +30,22 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use parking_lot::Mutex;
+use prost::Message;
 use ravel_agents_runtime::projection::{
-    ProjectedEvent, ProjectedTurn, ProjectionBatch, ProjectionSink, SinkError, SinkFuture,
+    Delivered, ProjectedEvent, ProjectedTurn, ProjectionBatch, ProjectionSink, SinkError,
+    SinkFuture,
 };
 use ravel_agents_store::Clock;
-use ravel_ingest::{LogIngestRouter, SpanIngestRouter, WriteMode};
-
+use ravel_ingest::WriteMode;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::traces_normalize::normalize_traces;
-use ravel_otlp::{LogIngestLimits, SpanIngestLimits, normalize_logs};
-use ravel_types::TenantId;
+use ravel_otlp::{LogIngestLimits, LogRejection, SpanIngestLimits, SpanRejection, normalize_logs};
+use ravel_types::{Signal, TenantId};
 
 use crate::config::ProjectionTap;
-use crate::ipcrypt::IpcryptPolicy;
+use crate::logs_ingest::handle_export_logs;
+use crate::otlp_http::GatewayState;
+use crate::traces_ingest::handle_export_traces;
 
 /// The `service.name` every projected record carries.
 pub const SERVICE_NAME: &str = "ravel-agents";
@@ -74,8 +87,15 @@ fn resource(tenant: &TenantId) -> Resource {
     }
 }
 
-fn log_record(event: &ProjectedEvent) -> LogRecord {
-    let ts = u64::try_from(event.observed_unix_ns).unwrap_or(0);
+fn flag(key: &str) -> KeyValue {
+    kv(key, Value::BoolValue(true))
+}
+
+/// One event's log record, its body cut to `max_body_len`. The record's
+/// time is the event's own, never the delivery time.
+fn log_record(event: &ProjectedEvent, max_body_len: usize) -> LogRecord {
+    let ts = u64::try_from(event.time_unix_ns).unwrap_or(0);
+    let body = event.body_within(max_body_len);
     let mut attributes = vec![
         text("agent.event_id", event.event_id.to_hex()),
         text("agent.id", event.agent.to_hex()),
@@ -84,10 +104,14 @@ fn log_record(event: &ProjectedEvent) -> LogRecord {
         int("agent.accept_seq", event.accept_seq),
         text("agent.turn_id", event.turn_id.to_hex()),
         text("agent.event_type", event.event_type.clone()),
+        text("agent.time_source", event.time_source.as_str()),
     ];
     if let Some(hash) = &event.payload.hash {
         attributes.push(text("agent.payload_hash", hash.clone()));
         attributes.push(int("agent.payload_size", event.payload.size_bytes));
+    }
+    if body.truncated {
+        attributes.push(flag("agent.payload_truncated"));
     }
     LogRecord {
         time_unix_nano: ts,
@@ -95,7 +119,7 @@ fn log_record(event: &ProjectedEvent) -> LogRecord {
         severity_number: SEVERITY_INFO,
         severity_text: "INFO".to_string(),
         body: Some(AnyValue {
-            value: Some(Value::StringValue(event.body())),
+            value: Some(Value::StringValue(body.text)),
         }),
         attributes,
         trace_id: event.trace_id.to_vec(),
@@ -125,13 +149,20 @@ fn span(turn: &ProjectedTurn) -> Span {
     }
 }
 
-/// The batch's events as one OTLP logs request.
-pub fn logs_request(tenant: &TenantId, batch: &ProjectionBatch) -> ExportLogsServiceRequest {
+/// The events as one OTLP logs request, each body cut to `max_body_len`.
+pub fn logs_request<'a>(
+    tenant: &TenantId,
+    events: impl IntoIterator<Item = &'a ProjectedEvent>,
+    max_body_len: usize,
+) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(resource(tenant)),
             scope_logs: vec![ScopeLogs {
-                log_records: batch.events.iter().map(log_record).collect(),
+                log_records: events
+                    .into_iter()
+                    .map(|event| log_record(event, max_body_len))
+                    .collect(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -139,13 +170,16 @@ pub fn logs_request(tenant: &TenantId, batch: &ProjectionBatch) -> ExportLogsSer
     }
 }
 
-/// The batch's turns as one OTLP traces request.
-pub fn traces_request(tenant: &TenantId, batch: &ProjectionBatch) -> ExportTraceServiceRequest {
+/// The turns as one OTLP traces request.
+pub fn traces_request<'a>(
+    tenant: &TenantId,
+    turns: impl IntoIterator<Item = &'a ProjectedTurn>,
+) -> ExportTraceServiceRequest {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             resource: Some(resource(tenant)),
             scope_spans: vec![ScopeSpans {
-                spans: batch.turns.iter().map(span).collect(),
+                spans: turns.into_iter().map(span).collect(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -153,70 +187,178 @@ pub fn traces_request(tenant: &TenantId, batch: &ProjectionBatch) -> ExportTrace
     }
 }
 
-/// Writes through this process's ingest routers, durably acknowledged,
-/// under the tenant's IPCrypt rules like any other ingest.
+/// A rejection a later retry can get past: a time ahead of the skew bound
+/// is admitted once the receiver's clock catches up. Every other
+/// normalization rejection fails the same record identically on retry.
+fn log_rejection_is_transient(rejection: &LogRejection) -> bool {
+    match rejection {
+        LogRejection::FutureSkew { .. } => true,
+        LogRejection::Grouped { reason, .. } => log_rejection_is_transient(reason),
+        _ => false,
+    }
+}
+
+/// [`log_rejection_is_transient`] for spans.
+fn span_rejection_is_transient(rejection: &SpanRejection) -> bool {
+    match rejection {
+        SpanRejection::FutureSkew { .. } => true,
+        SpanRejection::Grouped { reason, .. } => span_rejection_is_transient(reason),
+        _ => false,
+    }
+}
+
+/// What is left to send of a batch once each record has been screened.
+struct Screened<'a> {
+    events: Vec<&'a ProjectedEvent>,
+    turns: Vec<&'a ProjectedTurn>,
+    delivered: Delivered,
+}
+
+/// Normalizes every event and turn on its own under the receiver's limits,
+/// rules and clock. A permanent rejection leaves that record out and is
+/// counted in the result; a transient one fails the whole batch so the
+/// projector retries it. A rejection that only drops one attribute keeps
+/// the record, as the ingest path does.
+fn screen<'a>(
+    tenant: &TenantId,
+    batch: &'a ProjectionBatch,
+    logs: &LogIngestLimits,
+    spans: &SpanIngestLimits,
+    rules: &TenantRules,
+    now_unix_ns: i64,
+) -> Result<Screened<'a>, SinkError> {
+    let mut screened = Screened {
+        events: Vec::with_capacity(batch.events.len()),
+        turns: Vec::with_capacity(batch.turns.len()),
+        delivered: Delivered::default(),
+    };
+    for event in &batch.events {
+        let request = logs_request(tenant, [event], logs.max_body_len);
+        let out = normalize_logs(request, logs, rules, now_unix_ns);
+        match out.rejected.iter().find(|r| r.rejected_count() > 0) {
+            None => screened.events.push(event),
+            Some(r) if log_rejection_is_transient(r) => {
+                return Err(SinkError(format!(
+                    "log ingest refused event {} for now: {r}",
+                    event.event_id.to_hex()
+                )));
+            }
+            Some(r) => {
+                screened.delivered.rejected_events += 1;
+                screened.delivered.rejection =
+                    Some(format!("event {}: {r}", event.event_id.to_hex()));
+            }
+        }
+    }
+    for turn in &batch.turns {
+        let out = normalize_traces(traces_request(tenant, [turn]), spans, rules, now_unix_ns);
+        match out.rejected.iter().find(|r| r.rejected_count() > 0) {
+            None => screened.turns.push(turn),
+            Some(r) if span_rejection_is_transient(r) => {
+                return Err(SinkError(format!(
+                    "span ingest refused turn {} for now: {r}",
+                    turn.turn_id.to_hex()
+                )));
+            }
+            Some(r) => {
+                screened.delivered.rejected_spans += 1;
+                screened.delivered.rejection = Some(format!("turn {}: {r}", turn.turn_id.to_hex()));
+            }
+        }
+    }
+    Ok(screened)
+}
+
+/// Writes through this process's OTLP export handlers, the ones `/v1/logs`
+/// and `/v1/traces` call: byte-rate and stream admission, the buffer
+/// budget, the configured ingest-lag bound and the tenant's IPCrypt rules
+/// apply as to any client, and a write returns once durably acknowledged.
+/// No idempotency key is sent, since a key would replay a partial write
+/// and drop its unwritten remainder.
 pub struct InProcessSink {
     pub tenant: TenantId,
-    pub logs: Arc<LogIngestRouter>,
-    pub spans: Arc<SpanIngestRouter>,
-    pub ipcrypt: Arc<IpcryptPolicy>,
+    pub ingest: Arc<GatewayState>,
     pub clock: Arc<dyn Clock>,
 }
 
 impl InProcessSink {
-    async fn write(&self, batch: &ProjectionBatch) -> Result<(), SinkError> {
+    fn admit_bytes(&self, signal: Signal, bytes: usize, now: i64) -> Result<(), SinkError> {
+        let bytes = bytes as u64;
+        self.ingest
+            .admission
+            .check_byte_rate(&self.tenant, signal, bytes, now)
+            .map_err(|r| SinkError(format!("{signal:?} ingest byte rate: {}", r.reason)))?;
+        self.ingest
+            .ingest_byte_metrics
+            .record_wire_bytes(&self.tenant, signal, bytes);
+        Ok(())
+    }
+
+    async fn write(&self, batch: &ProjectionBatch) -> Result<Delivered, SinkError> {
         let now = self.clock.now_unix_ns();
-        let rules = self
+        let logs = &self.ingest.logs_ingest;
+        let spans = &self.ingest.traces_ingest;
+        let rules = logs
             .ipcrypt
             .rules_for(&self.tenant)
             .map_err(|e| SinkError(format!("tenant IPCrypt rules unavailable: {e}")))?;
-        if !batch.events.is_empty() {
-            let out = normalize_logs(
-                logs_request(&self.tenant, batch),
-                &LogIngestLimits::default(),
-                &rules,
-                now,
+        let screened = screen(
+            &self.tenant,
+            batch,
+            &logs.limits,
+            &spans.limits,
+            &rules,
+            now,
+        )?;
+        if !screened.events.is_empty() {
+            let request = logs_request(
+                &self.tenant,
+                screened.events.iter().copied(),
+                logs.limits.max_body_len,
             );
-            if !out.rejected.is_empty() {
+            self.admit_bytes(Signal::Logs, request.encoded_len(), now)?;
+            let outcome = handle_export_logs(
+                logs,
+                self.tenant.clone(),
+                WriteMode::StrictArrival,
+                request,
+                now,
+                None,
+            )
+            .await
+            .map_err(|e| SinkError(format!("log ingest refused projected records: {e}")))?;
+            if let Some(partial) = outcome.response.partial_success
+                && partial.rejected_log_records > 0
+            {
                 return Err(SinkError(format!(
-                    "log ingest rejected projected records: {:?}",
-                    out.rejected
+                    "log ingest refused {} projected records: {}",
+                    partial.rejected_log_records, partial.error_message
                 )));
             }
-            self.logs
-                .write(
-                    self.tenant.clone(),
-                    out.records,
-                    WriteMode::StrictArrival,
-                    DELIVERY_DEADLINE,
-                )
-                .await
-                .map_err(|e| SinkError(format!("log ingest write failed: {e}")))?;
         }
-        if !batch.turns.is_empty() {
-            let out = normalize_traces(
-                traces_request(&self.tenant, batch),
-                &SpanIngestLimits::default(),
-                &rules,
+        if !screened.turns.is_empty() {
+            let request = traces_request(&self.tenant, screened.turns.iter().copied());
+            self.admit_bytes(Signal::Spans, request.encoded_len(), now)?;
+            let outcome = handle_export_traces(
+                spans,
+                self.tenant.clone(),
+                WriteMode::StrictArrival,
+                request,
                 now,
-            );
-            if !out.rejected.is_empty() {
+                None,
+            )
+            .await
+            .map_err(|e| SinkError(format!("span ingest refused projected spans: {e}")))?;
+            if let Some(partial) = outcome.response.partial_success
+                && partial.rejected_spans > 0
+            {
                 return Err(SinkError(format!(
-                    "span ingest rejected projected spans: {:?}",
-                    out.rejected
+                    "span ingest refused {} projected spans: {}",
+                    partial.rejected_spans, partial.error_message
                 )));
             }
-            self.spans
-                .write(
-                    self.tenant.clone(),
-                    out.spans,
-                    WriteMode::StrictArrival,
-                    DELIVERY_DEADLINE,
-                )
-                .await
-                .map_err(|e| SinkError(format!("span ingest write failed: {e}")))?;
         }
-        Ok(())
+        Ok(screened.delivered)
     }
 }
 
@@ -227,17 +369,22 @@ impl ProjectionSink for InProcessSink {
 }
 
 /// Sends OTLP gRPC to a gateway, the tenant named in [`TENANT_HEADER`].
+/// Records are screened first under the default OTLP limits, no IPCrypt
+/// rules and this process's clock; the gateway applies its own, and a
+/// record it refuses fails the batch, retried like an outage.
 pub struct OtlpSink {
     pub tenant: TenantId,
     pub endpoint: String,
+    clock: Arc<dyn Clock>,
     channel: Mutex<Option<tonic::transport::Channel>>,
 }
 
 impl OtlpSink {
-    pub fn new(tenant: TenantId, endpoint: String) -> OtlpSink {
+    pub fn new(tenant: TenantId, endpoint: String, clock: Arc<dyn Clock>) -> OtlpSink {
         OtlpSink {
             tenant,
             endpoint,
+            clock,
             channel: Mutex::new(None),
         }
     }
@@ -263,11 +410,25 @@ impl OtlpSink {
         Ok(request)
     }
 
-    async fn send(&self, batch: &ProjectionBatch) -> Result<(), SinkError> {
+    async fn send(&self, batch: &ProjectionBatch) -> Result<Delivered, SinkError> {
+        let logs = LogIngestLimits::default();
+        let screened = screen(
+            &self.tenant,
+            batch,
+            &logs,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+            self.clock.now_unix_ns(),
+        )?;
         let channel = self.channel()?;
-        if !batch.events.is_empty() {
+        if !screened.events.is_empty() {
+            let request = logs_request(
+                &self.tenant,
+                screened.events.iter().copied(),
+                logs.max_body_len,
+            );
             let response = LogsServiceClient::new(channel.clone())
-                .export(self.request(logs_request(&self.tenant, batch))?)
+                .export(self.request(request)?)
                 .await
                 .map_err(|e| SinkError(format!("OTLP logs export failed: {e}")))?;
             if let Some(partial) = response.into_inner().partial_success
@@ -279,9 +440,10 @@ impl OtlpSink {
                 )));
             }
         }
-        if !batch.turns.is_empty() {
+        if !screened.turns.is_empty() {
+            let request = traces_request(&self.tenant, screened.turns.iter().copied());
             let response = TraceServiceClient::new(channel)
-                .export(self.request(traces_request(&self.tenant, batch))?)
+                .export(self.request(request)?)
                 .await
                 .map_err(|e| SinkError(format!("OTLP traces export failed: {e}")))?;
             if let Some(partial) = response.into_inner().partial_success
@@ -293,7 +455,7 @@ impl OtlpSink {
                 )));
             }
         }
-        Ok(())
+        Ok(screened.delivered)
     }
 }
 
@@ -326,7 +488,7 @@ impl ProjectionSink for TappedSink {
 #[allow(clippy::expect_used)]
 mod tests {
     use ravel_agents_core::identity::{AgentId, Id128};
-    use ravel_agents_runtime::projection::ProjectedPayload;
+    use ravel_agents_runtime::projection::{ProjectedPayload, TimeSource};
 
     use super::*;
 
@@ -342,7 +504,25 @@ mod tests {
             payload,
             trace_id: [5; 16],
             span_id: [6; 8],
-            observed_unix_ns: 1_000,
+            time_unix_ns: 1_000,
+            time_source: TimeSource::TurnFinished,
+        }
+    }
+
+    fn batch(events: Vec<ProjectedEvent>) -> ProjectionBatch {
+        ProjectionBatch {
+            events,
+            turns: Vec::new(),
+        }
+    }
+
+    const HOUR_NS: i64 = 3_600_000_000_000;
+
+    fn no_payload() -> ProjectedPayload {
+        ProjectedPayload {
+            hash: None,
+            size_bytes: 0,
+            body: None,
         }
     }
 
@@ -371,13 +551,7 @@ mod tests {
             size_bytes: 6,
             body: None,
         });
-        let request = logs_request(
-            &TenantId::new("acme"),
-            &ProjectionBatch {
-                events: vec![redacted.clone()],
-                turns: Vec::new(),
-            },
-        );
+        let request = logs_request(&TenantId::new("acme"), [&redacted], usize::MAX);
         let record = &request.resource_logs[0].scope_logs[0].log_records[0];
         let body = format!("{:?}", record.body);
         assert!(body.contains(&format!("event_id={}", redacted.event_id.to_hex())));
@@ -390,5 +564,91 @@ mod tests {
         assert_eq!(record.span_id, vec![6; 8]);
         let resource = format!("{:?}", request.resource_logs[0].resource);
         assert!(resource.contains("ravel-agents") && resource.contains("acme"));
+        assert!(attrs.contains(&("agent.time_source".to_string(), "turn_finished".to_string())));
+        assert_eq!(record.time_unix_nano, 1_000);
+        assert_eq!(record.observed_time_unix_nano, 1_000);
+    }
+
+    /// A carried payload over the body limit is cut to fit and the record
+    /// says so, in the body and as an attribute; normalization then accepts
+    /// it instead of rejecting it as too long.
+    #[test]
+    fn a_carried_payload_over_the_body_limit_is_cut_and_marked() {
+        let limits = LogIngestLimits::default();
+        let big = event(ProjectedPayload {
+            hash: Some("abc".to_string()),
+            size_bytes: 70_000,
+            body: Some("x".repeat(70_000)),
+        });
+        let request = logs_request(&TenantId::new("acme"), [&big], limits.max_body_len);
+        let record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        let Some(Value::StringValue(body)) = record.body.as_ref().and_then(|b| b.value.clone())
+        else {
+            panic!("string body expected");
+        };
+        assert!(body.len() <= limits.max_body_len, "{} bytes", body.len());
+        assert!(body.contains("payload_truncated=true"));
+        assert!(attrs(record).contains(&(
+            "agent.payload_truncated".to_string(),
+            "Some(BoolValue(true))".to_string()
+        )));
+        let tenant = TenantId::new("acme");
+        let batch = batch(vec![big]);
+        let screened = screen(
+            &tenant,
+            &batch,
+            &limits,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+            1_000,
+        )
+        .expect("a cut body is admitted");
+        assert_eq!(screened.events.len(), 1);
+        assert_eq!(screened.delivered, Delivered::default());
+    }
+
+    /// A record older than the lag bound is left out and counted, the rest
+    /// of the batch still sent; one ahead of the skew bound fails the batch
+    /// so it is retried rather than skipped.
+    #[test]
+    fn screening_skips_a_permanent_rejection_and_fails_on_a_transient_one() {
+        let tenant = TenantId::new("acme");
+        let limits = LogIngestLimits::default();
+        let now = 1_000 * HOUR_NS;
+        let mut old = event(no_payload());
+        old.time_unix_ns = now - limits.max_ingest_lag_ns - HOUR_NS;
+        let mut fresh = event(no_payload());
+        fresh.event_id = Id128([9; 16]);
+        fresh.time_unix_ns = now;
+        let batch_of_two = batch(vec![old.clone(), fresh]);
+        let screened = screen(
+            &tenant,
+            &batch_of_two,
+            &limits,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+            now,
+        )
+        .expect("a permanent rejection does not fail the batch");
+        assert_eq!(screened.events.len(), 1);
+        assert_eq!(screened.events[0].event_id, Id128([9; 16]));
+        assert_eq!(screened.delivered.rejected_events, 1);
+        let reason = screened.delivered.rejection.expect("a reason is kept");
+        assert!(reason.contains(&old.event_id.to_hex()), "{reason}");
+        assert!(reason.contains("max ingest lag"), "{reason}");
+
+        let mut ahead = event(no_payload());
+        ahead.time_unix_ns = now + limits.max_future_skew_ns + HOUR_NS;
+        let Err(SinkError(error)) = screen(
+            &tenant,
+            &batch(vec![ahead]),
+            &limits,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+            now,
+        ) else {
+            panic!("a record ahead of the skew bound must fail the batch");
+        };
+        assert!(error.contains("future skew"), "{error}");
     }
 }
