@@ -12,7 +12,7 @@ ravel-agents-runtime = { workspace = true }
 ravel-agents-store = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-object-store = { workspace = true }
-ravel-sim = { path = "../ravel-sim", version = "0.27.0" }
+ravel-sim = { path = "../ravel-sim", version = "0.28.0" }
 ravel-types = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
