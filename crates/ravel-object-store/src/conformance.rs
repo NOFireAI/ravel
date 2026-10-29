@@ -101,6 +101,18 @@ pub fn s3_backend_identity(bucket: Option<&str>, endpoint: Option<&str>) -> Stri
     }
 }
 
+/// Canonical `backend_identity` string for a GCS-backed
+/// [`QualificationRecord`] (ADR-3456 decision 5): `gs://<bucket>` on Google's
+/// endpoint, and `gs://<bucket>@<base_url>` when a base URL replaces it, so a
+/// qualification run against an emulator does not read as one of the real
+/// bucket. Credentials are left out, as in [`s3_backend_identity`].
+pub fn gcs_backend_identity(bucket: &str, base_url: Option<&str>) -> String {
+    match base_url {
+        Some(base_url) => format!("gs://{bucket}@{base_url}"),
+        None => format!("gs://{bucket}"),
+    }
+}
+
 /// One property the object store contract requires, named so a failure
 /// report can point at exactly what a backend cannot do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2442,6 +2454,29 @@ mod tests {
     use crate::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use crate::memory::MemoryStore;
     use crate::{Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, PageToken};
+
+    #[test]
+    fn gcs_backend_identity_is_the_gs_url_of_the_bucket() {
+        assert_eq!(gcs_backend_identity("ravel-prod", None), "gs://ravel-prod");
+        assert_eq!(
+            gcs_backend_identity("ravel-prod", Some("http://127.0.0.1:4443")),
+            "gs://ravel-prod@http://127.0.0.1:4443"
+        );
+        assert_ne!(
+            gcs_backend_identity("ravel-prod", Some("http://127.0.0.1:4443")),
+            gcs_backend_identity("ravel-prod", None),
+            "an emulator's qualification must not read as the real bucket's"
+        );
+        assert_ne!(
+            gcs_backend_identity("ravel-prod", None),
+            s3_backend_identity(Some("ravel-prod"), None),
+            "a GCS qualification must not read as an S3 one for the same bucket name"
+        );
+        assert_ne!(
+            gcs_backend_identity("ravel-prod", Some("http://minio:9000")),
+            s3_backend_identity(Some("ravel-prod"), Some("http://minio:9000")),
+        );
+    }
 
     /// Every property [`run_conformance_suite`] gates on. Pinned here so a new
     /// probe has to be acknowledged in the tests that assert the suite's shape

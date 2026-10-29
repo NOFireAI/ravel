@@ -44,12 +44,16 @@ ring = { workspace = true }
 # (?versioning, ?lifecycle, ?replication, ?object-lock, ?retention). 0.41 is the
 # release outside the two advisories deny.toml tracks.
 quick-xml = { workspace = true }
+# The in-process fake GCS endpoint (`gcs::fake`, ADR-3456), exported to
+# other crates' tests behind `test-support` and never built otherwise.
+axum = { workspace = true, optional = true }
 
 [features]
 # Test-only hooks on the reference backends, off in every production build:
 # `MemoryStore::corrupt_stored_byte` (ADR-1696 decision 5). Crates whose tests
-# use them enable this in their dev-dependencies.
-test-support = []
+# use them enable this in their dev-dependencies. It also exports the fake GCS
+# endpoint `gcs::fake`, which needs axum.
+test-support = ["dep:axum"]
 
 [dev-dependencies]
 # This crate's own integration tests (tests/contract.rs) use the test-support

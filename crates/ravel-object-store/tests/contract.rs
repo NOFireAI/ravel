@@ -2,8 +2,10 @@
 //! every `ObjectStoreBackend` implementation this crate ships: the memory
 //! oracle at its default page size and at a tiny one to force pagination,
 //! `FaultStore` wrapping the oracle with an empty plan (must be fully
-//! transparent), and -- gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` --
-//! `S3Store` against a real RustFS and against a real floci.
+//! transparent), `GcsStore` against the in-process fake GCS endpoint, and --
+//! gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` / `RAVEL_GCS_TEST_BUCKET`
+//! -- `S3Store` against a real RustFS and against a real floci, and `GcsStore`
+//! against a real bucket.
 //!
 //! This is an integration-test binary, a crate in its own right, so it
 //! inherits `[lints] workspace = true` (including `clippy::expect_used`
@@ -17,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::gcs::fake::FakeGcs;
+use ravel_object_store::gcs::{GcsConfig, GcsStore};
 use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
 use ravel_object_store::kms_routing::KmsRoutingStore;
 use ravel_object_store::memory::MemoryStore;
@@ -25,8 +29,8 @@ use ravel_object_store::s3::{
 };
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
-    MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions,
-    PutOutcome, StoreError, StoreMetrics, UploadChecksum, list_all,
+    MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
+    PutOutcome, StoreError, StoreMetrics, UploadChecksum, is_addressable_key, list_all,
 };
 use std::sync::Arc;
 
@@ -1743,6 +1747,184 @@ async fn floci_contract() {
     assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
     assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
         .await;
+
+    let leftovers = list_all(&store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// The order a GCS pinned read is judged in (ADR-3456): the generation
+/// selector before the ETag precondition. Run against the fake and against a
+/// real bucket, so the fake's ordering is checked against the service's.
+async fn gcs_pinned_read_ordering(store: &GcsStore, root: &str) {
+    let key = format!("{root}/pinned/k");
+    let bytes = Bytes::from_static(b"pinned");
+    let wrong_etag = "\"0123456789abcdef0123456789abcdef\"";
+
+    let absent = Pin::from_store(wrong_etag, Some("1".to_string()));
+    let read = store
+        .get_pinned(&format!("{root}/pinned/absent"), GetRange::Full, &absent)
+        .await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "absent key with a pin: {read:?}"
+    );
+
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let (_, live) = store.pin_of(&key).await.expect("pin_of");
+    let read = store
+        .get_pinned(
+            &key,
+            GetRange::Full,
+            &Pin::from_store(wrong_etag, live.version.clone()),
+        )
+        .await;
+    assert!(
+        matches!(read, Err(StoreError::PreconditionFailed)),
+        "live generation, wrong ETag: {read:?}"
+    );
+
+    let read = store
+        .get_pinned(&key, GetRange::Full, &live)
+        .await
+        .expect("live generation, its own ETag");
+    assert_eq!(read.outcome.data, bytes);
+
+    // Identical bytes keep the ETag, so only the generation is stale.
+    store
+        .put(&key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("identical rewrite");
+    let (_, replaced) = store.pin_of(&key).await.expect("pin_of");
+    assert_eq!(replaced.etag, live.etag);
+    assert_ne!(replaced.version, live.version);
+    let read = store.get_pinned(&key, GetRange::Full, &live).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, its stale ETag: {read:?}"
+    );
+
+    // Different bytes move the ETag too: the old pin's generation and ETag are
+    // both stale. NotFound, not PreconditionFailed, shows the generation is
+    // judged before If-Match.
+    store
+        .put(
+            &key,
+            Bytes::from_static(b"other bytes"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("rewrite with other bytes");
+    let (_, rewritten) = store.pin_of(&key).await.expect("pin_of");
+    assert_ne!(rewritten.etag, replaced.etag);
+    let read = store.get_pinned(&key, GetRange::Full, &replaced).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, a different stale ETag: {read:?}"
+    );
+    store.delete(&key).await.expect("delete");
+}
+
+/// A name holding U+0001, written by another client through the JSON API's
+/// media upload, is listed under its exact name: in `objects` when
+/// `is_addressable_key` accepts it, else in `unaddressable`, and never as a
+/// U+FFFD replacement. The object is deleted before the assertions.
+async fn gcs_foreign_control_character_name(store: &GcsStore, root: &str) {
+    let prefix = format!("{root}/foreign-u0001/");
+    let name = format!("{prefix}a\u{1}b");
+    store
+        .upload_foreign(&name, Bytes::from_static(b"foreign"))
+        .await
+        .expect("upload the foreign object");
+
+    let mut objects = Vec::new();
+    let mut unaddressable = Vec::new();
+    let mut page_token = None;
+    let drained = loop {
+        let page = match store.list(&prefix, page_token).await {
+            Ok(page) => page,
+            Err(e) => break Err(e),
+        };
+        objects.extend(page.objects.into_iter().map(|o| o.key));
+        unaddressable.extend(page.unaddressable.into_iter().map(|u| u.key));
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break Ok(()),
+        }
+    };
+    let deleted = store.delete_foreign(&name).await;
+
+    drained.expect("list the foreign object's prefix");
+    deleted.expect("delete the foreign object");
+    let all: Vec<&String> = objects.iter().chain(&unaddressable).collect();
+    assert!(
+        all.iter().all(|listed| !listed.contains('\u{fffd}')),
+        "{all:?}"
+    );
+    if is_addressable_key(&name) {
+        assert_eq!(objects, [name]);
+        assert!(unaddressable.is_empty(), "{unaddressable:?}");
+    } else {
+        assert_eq!(unaddressable, [name]);
+        assert!(objects.is_empty(), "{objects:?}");
+    }
+}
+
+/// `GcsStore` against the in-process fake GCS endpoint, in every run. A page
+/// size of 2 so listing crosses continuation tokens.
+#[tokio::test]
+async fn gcs_store_contract_against_the_fake() {
+    let fake = FakeGcs::start("ravel-contract")
+        .await
+        .expect("bind the fake GCS endpoint");
+    let mut config = fake.config();
+    config.list_page_size = 2;
+    let store = GcsStore::new(config).expect("GcsStore against the fake");
+    // Exactly the mandatory set: no multipart and no upload checksums
+    // (ADR-3456 D1).
+    assert_eq!(store.capabilities(), Capabilities::mandatory());
+
+    run_contract_suite(&store, "gcs-fake").await;
+    gcs_pinned_read_ordering(&store, "gcs-fake").await;
+    gcs_foreign_control_character_name(&store, "gcs-fake").await;
+    assert_eq!(fake.data_of("gcs-fake/foreign-u0001/a\u{1}b"), None);
+}
+
+/// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
+/// bucket must already exist; credentials come from Application Default
+/// Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file,
+/// or the metadata server). Keys go under a run-unique root and are deleted
+/// afterwards.
+#[tokio::test]
+async fn gcs_contract() {
+    let Ok(bucket) = env::var("RAVEL_GCS_TEST_BUCKET") else {
+        println!("skipping GCS contract test: RAVEL_GCS_TEST_BUCKET not set");
+        return;
+    };
+    let mut config = GcsConfig::new(bucket);
+    config.list_page_size = 2;
+    let store = GcsStore::new(config).expect("GcsStore with Application Default Credentials");
+
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    let root = format!("contract-gcs-{run_id}");
+
+    assert_eq!(store.capabilities(), Capabilities::mandatory());
+    run_contract_suite(&store, &root).await;
+    gcs_pinned_read_ordering(&store, &root).await;
+    gcs_foreign_control_character_name(&store, &root).await;
+    assert!(
+        store.observed_store_time_ns().is_some(),
+        "every GCS response carries a Date header"
+    );
 
     let leftovers = list_all(&store, &format!("{root}/"))
         .await

@@ -2,7 +2,8 @@
 //! loop, and the three things it observes there: billed requests (issue #928,
 //! ADR-0927 decision 8), the stored checksum a GET response carries
 //! (ADR-1696 decisions 2 to 4), and the store's own clock from each response's
-//! `Date` header (ADR-1685 decision 1).
+//! `Date` header (ADR-1685 decision 1). [`crate::gcs`] installs the same
+//! connector.
 //!
 //! `object_store` runs its own retry loop *inside* each logical S3 operation
 //! (`RetryConfig`, default `max_retries = 10`), so one `get()` that retried
@@ -190,6 +191,7 @@ pub(crate) struct S3HttpConnector {
     metrics: Arc<StoreMetrics>,
     store_time: Arc<ObservedStoreTime>,
     inner: ReqwestConnector,
+    store_authority: Option<String>,
 }
 
 impl S3HttpConnector {
@@ -198,6 +200,7 @@ impl S3HttpConnector {
             metrics,
             store_time,
             inner: ReqwestConnector::default(),
+            store_authority: None,
         }
     }
 
@@ -209,7 +212,19 @@ impl S3HttpConnector {
             metrics: Arc::clone(&self.metrics),
             store_time: Arc::clone(&self.store_time),
             inner: HttpClient::new(client),
+            store_authority: self.store_authority.clone(),
         })
+    }
+
+    /// Observe only requests to `authority` (`host` or `host:port`, matched
+    /// without regard to case); any other request is passed through with no
+    /// attempt counted and no `Date` read. The GCS client sends
+    /// its credential requests (the metadata server, Google's token endpoint)
+    /// through this same connector, and those are neither store attempts nor
+    /// readings of the store's clock.
+    pub(crate) fn only_for_authority(mut self, authority: impl Into<String>) -> Self {
+        self.store_authority = Some(authority.into());
+        self
     }
 }
 
@@ -254,6 +269,7 @@ impl HttpConnector for S3HttpConnector {
             metrics: Arc::clone(&self.metrics),
             store_time: Arc::clone(&self.store_time),
             inner,
+            store_authority: self.store_authority.clone(),
         }))
     }
 }
@@ -268,11 +284,20 @@ struct S3HttpService {
     metrics: Arc<StoreMetrics>,
     store_time: Arc<ObservedStoreTime>,
     inner: HttpClient,
+    store_authority: Option<String>,
 }
 
 #[async_trait]
 impl HttpService for S3HttpService {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if let Some(authority) = &self.store_authority
+            && !req
+                .uri()
+                .authority()
+                .is_some_and(|a| a.as_str().eq_ignore_ascii_case(authority))
+        {
+            return self.inner.execute(req).await;
+        }
         // Count before dispatch: the request is about to go on the wire and be
         // billed whether or not the response ever arrives. A request issued
         // outside any `scope` (e.g. a credential refresh) records nothing.
