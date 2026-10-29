@@ -138,12 +138,12 @@ records the release that each surface first shipped in.
 | Flight SQL | the same five tables, with the same `samples` limit | `flight-sql` | yes |
 | ES&vert;QL over `POST /api/v1/esql` | logs, as `FROM logs` | `esql` | no |
 | Parquet tables over both SQL surfaces | Parquet files read in place from an S3, GCS or Azure location granted to the tenant (`ravel-cli tenant parquet-grant add`, `ravel-server --parquet-profiles`); described below the matrix | `sql` | yes |
-| Agents API under `/api/v1/agents/`, with `--agents` | none: durable agent state, not a telemetry signal; client routes (`create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`) and worker routes (`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`); no timer, effect or reconciliation routes yet | `agents` | no |
+| Agents API under `/api/v1/agents/`, with `--agents` | none: durable agent state, not a telemetry signal; client routes (`create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`) and worker routes (`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`, `worker/effects/*`), timer, effect, `reconcile` and `sweep` routes; operator guide in [docs/guides/operations/agents.md](docs/guides/operations/agents.md) | `agents` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
 The published `ravel-server` image is built with
-`--features sql,flight-sql,otap`. No crate in the workspace declares a default
+`--features sql,flight-sql,otap,agents`. No crate in the workspace declares a default
 feature set, so a source build gets the same surfaces only when you pass the
 same `--features` list to cargo.
 
@@ -152,6 +152,9 @@ same `--features` list to cargo.
   and returns `unimplemented` for prepared statements.
 - OTAP ingest is registered only when the process starts with `--otap`
   ([docs/otap-ingest.md](docs/otap-ingest.md)).
+- The agents routes mount only when the process starts with `--agents`, in
+  `--mode all` or `--mode query`
+  ([operating Ravel Agents](docs/guides/operations/agents.md)).
 - SQL is the only way to query traces, alerts, and audit records.
 - `ipcrypt_encrypt(ip, epoch)` and `ipcrypt_prefix_encrypt(ip, epoch)` turn
   an address into the value an IPCrypt ingest rule stores for it under the

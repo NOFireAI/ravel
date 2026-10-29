@@ -1,6 +1,7 @@
 # Operations
 
-Configure, deploy, run and repair a Ravel cluster with the four pages below.
+Configure, deploy, run and repair a Ravel cluster with the four pages below,
+and operate Ravel Agents with the fifth.
 They are for the person who owns the deployment. That person chooses the
 object store and its credentials, brings the cluster up, keeps it compacting
 and reclaiming, and is paged when it stops. The pages use the vocabulary in
@@ -33,6 +34,12 @@ how to choose a value.
   something is wrong. Each entry gives the symptom, the likely cause, how to
   confirm it, and the corrective action. The procedures where the obvious
   first action makes things worse are at the top.
+- **[Ravel Agents](operations/agents.md)** runs `ravel-server --agents`. It
+  covers the budgets and quotas with their metrics, the agent lifetime limit,
+  the three agents capabilities and their store grants, where projected
+  history goes, the sweep's cost, the discovery delay with several server
+  processes, the clock assumptions, and the runbook for reconciling an effect
+  in doubt.
 
 When you budget host memory, remember the catalog's two per-tenant record
 caches: they are bounded per tenant rather than by a share of the process

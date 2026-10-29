@@ -50,7 +50,7 @@ COPY . .
 # since this Dockerfile has to build on whatever the CI runner and every
 # developer's machine actually provide, not just the box this was measured on.
 ENV CARGO_BUILD_JOBS=2
-RUN cargo build --release --locked -p ravel-server --features sql,flight-sql,otap \
+RUN cargo build --release --locked -p ravel-server --features sql,flight-sql,otap,agents \
     && cargo build --release --locked -p ravel-cli \
     && cargo build --release --locked -p ravel-operator \
     && cargo build --release --locked -p ravel-ingest-router
@@ -58,9 +58,9 @@ RUN cargo build --release --locked -p ravel-server --features sql,flight-sql,ota
 # Split debug info out of each binary (ADR-0086 decision 3). The four cargo
 # invocations above stay four and stay separate: this workspace is
 # resolver = "3", so collapsing them into one -p ... -p ... --features
-# ravel-server/sql,ravel-server/flight-sql,ravel-server/otap would unify the
-# DataFusion and arrow feature trees into the other three binaries and silently
-# change what ships. [profile.release] debug = 1 also
+# ravel-server/sql,ravel-server/flight-sql,ravel-server/otap,ravel-server/agents
+# would unify the DataFusion and arrow feature trees into the other three
+# binaries and silently change what ships. [profile.release] debug = 1 also
 # stays (ADR-0036 depends on it for line-level profiling); rather than dropping
 # symbols to shrink the artifact, we separate them here and strip the shipped
 # copy. Order matters: extract the .debug copy FIRST, then strip and link, or
