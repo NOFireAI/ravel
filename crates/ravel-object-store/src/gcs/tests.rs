@@ -9,8 +9,8 @@ use super::{GcsConfig, GcsStore, store_authority};
 use crate::conformance::{Property, run_conformance_suite_with_seeder};
 use crate::s3::connector::{self, ObservedStoreTime, S3HttpConnector};
 use crate::{
-    GetRange, InstrumentedStore, ObjectStoreBackend, PutMode, PutOptions, StoreError, StoreMetrics,
-    StoreOp, Version,
+    GetRange, InstrumentedStore, ObjectStoreBackend, Pin, PutMode, PutOptions, StoreError,
+    StoreMetrics, StoreOp, Version,
 };
 
 const BUCKET: &str = "ravel-fake";
@@ -28,6 +28,10 @@ fn cas(version: &Version) -> PutOptions {
         mode: PutMode::CasVersion(version.clone()),
         checksum: None,
     }
+}
+
+fn is_list_request(request: &RecordedRequest) -> bool {
+    request.method == "GET" && request.path == format!("/storage/v1/b/{BUCKET}/o")
 }
 
 fn puts_of(fake: &FakeGcs, key: &str) -> Vec<RecordedRequest> {
@@ -131,7 +135,7 @@ async fn cas_with_a_token_that_is_not_a_generation_sends_nothing() {
         )
         .await;
 
-    assert!(matches!(refused, Err(StoreError::PreconditionFailed)));
+    assert!(matches!(refused, Err(StoreError::Permanent(_))), "{refused:?}");
     assert!(fake.requests().is_empty(), "{:?}", fake.requests());
 }
 
@@ -262,6 +266,19 @@ async fn throttle_and_not_found_classification() {
             "{status}: {err:?}"
         );
     }
+    // A bare 429, with no `SlowDown` code in the body, is throttling too.
+    fake.fail_next_without_code(429, 3);
+    let err = store.get("t/k", GetRange::Full).await;
+    assert!(
+        matches!(err, Err(StoreError::Throttled { .. })),
+        "bare 429 on get: {err:?}"
+    );
+    fake.fail_next_without_code(429, 3);
+    let err = store.list("t/", None).await;
+    assert!(
+        matches!(err, Err(StoreError::Throttled { .. })),
+        "bare 429 on list: {err:?}"
+    );
     for status in [401, 403] {
         fake.fail_next(status, 1);
         let err = store.head("t/k").await;
@@ -299,6 +316,8 @@ async fn throttle_and_not_found_classification() {
     assert!(matches!(put, Err(StoreError::Permanent(_))), "{put:?}");
     let list = elsewhere.list("t/", None).await;
     assert!(matches!(list, Err(StoreError::Permanent(_))), "{list:?}");
+    let head = elsewhere.head("t/k").await;
+    assert!(matches!(head, Err(StoreError::NotFound)), "{head:?}");
     let delete = elsewhere.delete("t/k").await;
     assert!(
         matches!(delete, Err(StoreError::Permanent(_))),
@@ -408,10 +427,11 @@ async fn listing_pages_carry_generations_and_report_unaddressable_keys() {
     let lists = fake
         .requests()
         .into_iter()
-        .filter(|r| r.query_param("list-type") == Some("2"))
+        .filter(is_list_request)
         .collect::<Vec<_>>();
+    assert!(!lists.is_empty());
     assert!(
-        lists.iter().all(|r| r.query_param("max-keys") == Some("2")),
+        lists.iter().all(|r| r.query_param("maxResults") == Some("2")),
         "{lists:?}"
     );
 
@@ -517,4 +537,191 @@ async fn requests_to_another_host_are_not_store_attempts() {
     assert_eq!(store_fake.requests().len(), 1);
     assert_eq!(metrics.snapshot().op(StoreOp::Get).attempts, 1);
     assert_eq!(store_time.latest(), Some(store_fake.date_unix_ns()));
+}
+
+fn paged_store(fake: &FakeGcs, page_size: usize) -> GcsStore {
+    let mut config = fake.config();
+    config.list_page_size = page_size;
+    GcsStore::new(config).expect("store")
+}
+
+/// Follows `list` to the end, returning the keys and the unaddressable names
+/// in the order the pages reported them.
+async fn list_to_the_end(store: &GcsStore, prefix: &str) -> (Vec<String>, Vec<String>) {
+    let mut keys = Vec::new();
+    let mut unaddressable = Vec::new();
+    let mut page_token = None;
+    loop {
+        let page = store.list(prefix, page_token).await.expect("list page");
+        keys.extend(page.objects.into_iter().map(|o| o.key));
+        unaddressable.extend(page.unaddressable.into_iter().map(|u| u.key));
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    (keys, unaddressable)
+}
+
+#[tokio::test]
+async fn listing_reports_xml_illegal_and_unaddressable_names_without_failing_the_page() {
+    let fake = fake().await;
+    let store = paged_store(&fake, 2);
+    let xml_illegal = "x/b\u{1}";
+    let unaddressable_name = "x/c//d";
+    assert!(!crate::is_addressable_key(xml_illegal));
+    assert!(!crate::is_addressable_key(unaddressable_name));
+    for key in ["x/a", xml_illegal, "x/c", unaddressable_name, "x/e", "x/f"] {
+        fake.insert_object(key, Bytes::from_static(b"v"));
+    }
+
+    let (keys, unaddressable) = list_to_the_end(&store, "x/").await;
+
+    assert_eq!(keys, ["x/a", "x/c", "x/e", "x/f"]);
+    assert_eq!(unaddressable, [xml_illegal, unaddressable_name]);
+    let lists = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .count();
+    assert!(lists >= 3, "six names at two per page cross pages: {lists}");
+}
+
+#[tokio::test]
+async fn list_after_skips_the_start_key() {
+    let fake = fake().await;
+    let store = paged_store(&fake, 2);
+    for key in ["s/a", "s/b", "s/c", "s/d"] {
+        fake.insert_object(key, Bytes::from_static(b"v"));
+    }
+
+    let page = store
+        .list_after("s/", Some("s/b"), None)
+        .await
+        .expect("list_after");
+
+    let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["s/c", "s/d"]);
+    let lists: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .collect();
+    assert!(
+        lists
+            .iter()
+            .all(|r| r.query_param("startOffset") == Some("s/b")),
+        "{lists:?}"
+    );
+}
+
+#[tokio::test]
+async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
+    let fake = fake().await;
+    let store = paged_store(&fake, 3);
+    // Three entries a page: the first ends at `d/c`, the second holds `d/d`
+    // and the `d/sub/` prefix.
+    for key in ["d/a", "d/b", "d/c", "d/d", "d/sub/x", "d/sub/y"] {
+        fake.insert_object(key, Bytes::from_static(b"v"));
+    }
+
+    let delimited = store.list_delimited("d/").await.expect("delimited");
+
+    let direct: Vec<_> = delimited.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(direct, ["d/a", "d/b", "d/c", "d/d"]);
+    assert_eq!(delimited.common_prefixes, ["d/sub/"]);
+    let lists: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .collect();
+    assert_eq!(lists.len(), 2, "{lists:?}");
+    for list in &lists {
+        assert_eq!(list.query_param("maxResults"), Some("3"));
+        assert_eq!(list.query_param("delimiter"), Some("/"));
+        assert_eq!(list.query_param("prefix"), Some("d/"));
+    }
+    assert_eq!(lists[0].query_param("pageToken"), None);
+    let first_token = fake.page_token_for("d/c");
+    assert_eq!(
+        lists[1].query_param("pageToken"),
+        Some(first_token.as_str())
+    );
+}
+
+#[tokio::test]
+async fn cas_rejects_a_non_generation_token_before_any_request() {
+    let fake = fake().await;
+    let store = store(&fake);
+    store
+        .put("cas/t", Bytes::from_static(b"v1"), PutOptions::default())
+        .await
+        .expect("overwrite");
+    fake.clear_requests();
+
+    for token in ["0", "00", "012", "", "abc"] {
+        let refused = store
+            .put(
+                "cas/t",
+                Bytes::from_static(b"v2"),
+                cas(&Version(token.to_string())),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Permanent(_))),
+            "{token:?}: {refused:?}"
+        );
+        assert!(
+            fake.requests().is_empty(),
+            "{token:?}: {:?}",
+            fake.requests()
+        );
+    }
+    assert_eq!(fake.data_of("cas/t").as_deref(), Some(&b"v1"[..]));
+}
+
+#[tokio::test]
+async fn pinned_read_ordering() {
+    let fake = fake().await;
+    let store = store(&fake);
+    let bytes = Bytes::from_static(b"pinned");
+
+    let absent = Pin::from_store("\"0123456789abcdef0123456789abcdef\"", Some("1".into()));
+    let read = store.get_pinned("o/absent", GetRange::Full, &absent).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "absent key with a pin: {read:?}"
+    );
+
+    store
+        .put("o/k", bytes.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let (_, live) = store.pin_of("o/k").await.expect("pin_of");
+    let wrong_etag = Pin::from_store("\"0123456789abcdef0123456789abcdef\"", live.version.clone());
+    let read = store.get_pinned("o/k", GetRange::Full, &wrong_etag).await;
+    assert!(
+        matches!(read, Err(StoreError::PreconditionFailed)),
+        "live generation, wrong ETag: {read:?}"
+    );
+
+    let read = store
+        .get_pinned("o/k", GetRange::Full, &live)
+        .await
+        .expect("live generation, its own ETag");
+    assert_eq!(read.outcome.data, bytes);
+
+    // Identical bytes keep the ETag, so only the generation is stale.
+    store
+        .put("o/k", bytes.clone(), PutOptions::default())
+        .await
+        .expect("identical rewrite");
+    let (_, replaced) = store.pin_of("o/k").await.expect("pin_of");
+    assert_eq!(replaced.etag, live.etag);
+    assert_ne!(replaced.version, live.version);
+    let read = store.get_pinned("o/k", GetRange::Full, &live).await;
+    assert!(
+        matches!(read, Err(StoreError::NotFound)),
+        "replaced generation, its stale ETag: {read:?}"
+    );
 }

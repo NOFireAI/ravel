@@ -275,6 +275,12 @@ impl FakeGcs {
     pub fn remove_object(&self, key: &str) -> bool {
         self.inner.objects.lock().remove(key).is_some()
     }
+
+    /// The `nextPageToken` an objects.list response carries when its page
+    /// ends at `last`, an object name or a common prefix.
+    pub fn page_token_for(&self, last: &str) -> String {
+        encode_token(last)
+    }
 }
 
 /// Seeds the unaddressable keys the conformance suite plants, as another
