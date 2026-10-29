@@ -880,7 +880,7 @@ async fn list_after_skips_the_start_key() {
 }
 
 #[tokio::test]
-async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
+async fn listing_sends_the_page_size_and_the_prefix_unsigned() {
     let fake = fake().await;
     let store = paged_store(&fake, 3);
     // Three entries a page: the first ends at `d/c`, the second holds `d/d`.
@@ -913,6 +913,34 @@ async fn listing_sends_the_page_size_and_resumes_from_the_page_token() {
             "skip_signature lists unsigned"
         );
     }
+}
+
+/// At page size 1 a resumed first response holds only the inclusive start
+/// name, so the call follows `nextPageToken` and the second request must
+/// carry it as `pageToken`.
+#[tokio::test]
+async fn resumed_listing_follows_the_page_token_on_the_second_request() {
+    let fake = fake().await;
+    let store = paged_store(&fake, 1);
+    for key in ["t/a", "t/b", "t/c"] {
+        fake.insert_object(key, Bytes::from_static(b"v"));
+    }
+
+    let page = store.list_after("t/", Some("t/a"), None).await;
+
+    let lists: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(is_list_request)
+        .collect();
+    assert_eq!(lists.len(), 2, "{lists:?}");
+    assert_eq!(lists[0].query_param("pageToken"), None);
+    let token = fake.page_token_for("t/a");
+    assert_eq!(lists[1].query_param("pageToken"), Some(token.as_str()));
+    let page = page.expect("list_after");
+    let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["t/b"]);
+    assert_eq!(page.next, Some(PageToken("t/b".to_string())));
 }
 
 /// `list_delimited` drains every response regardless of the store's
