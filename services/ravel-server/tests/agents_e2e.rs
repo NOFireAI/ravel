@@ -1356,10 +1356,9 @@ async fn hot_routes_read_one_page_of_a_deep_history() {
         .await
         .expect("HEAD");
     let head = ravel_agents_core::head::Head::decode(&stored.data).expect("decode HEAD");
-    assert!(
-        !head.index.inbox.pages.is_empty(),
-        "the queued inputs sealed an inbox page"
-    );
+    // The active input and the queued ones: 130 entries leave two sealed
+    // pages of 64.
+    assert_eq!(head.index.inbox.pages.len(), 2);
 
     running.shutdown().await.expect("clean shutdown");
 }

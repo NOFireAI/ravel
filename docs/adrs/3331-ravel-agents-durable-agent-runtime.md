@@ -717,23 +717,47 @@ pages. Decision 3 now reads as follows for those lists.
   command whose missing page the planner did not name loads every sealed
   page, is answered as the planned path answers it, and is counted in
   `planner_misses` (`a_planner_miss_loads_every_page_and_is_counted`).
-- **Production read paths.** No production caller reads every page. The
+- **Production read paths.** No server or runtime path reads every page
+  of every list. The
   runtime's reload of a loaded root, the sweep's per-agent visit and the
   directory scan read HEAD alone (`AgentStore::read_head_shallow`; a
   visit to an agent with sealed pages costs one GET,
   `sweep::tests::a_visit_reads_only_the_head_of_an_agent_with_sealed_pages`),
-  and a scan then attaches the inbox page holding the first input and the one holding the active
-  input, one GET each, before it offers the agent. A resumed turn loads
-  its input's page (`a_takeover_resumes_a_turn_whose_input_is_on_a_sealed_inbox_page`,
-  and `cold_restart_resumes_the_active_turn_at_two_entries_a_page`). On
-  the server, over a 769-turn history with 12 sealed pages per list, a
-  result wait reads HEAD, one results page and the output object; an
-  events page reads HEAD, the events page holding the cursor and the
-  event payloads; and a poll reads HEAD for `BeginTurn`, the state and
-  payload objects, and HEAD again for the route's recorded time, with no
-  sealed page (`agents_e2e::hot_routes_read_one_page_of_a_deep_history`).
+  and a scan then attaches the inbox page holding the first input and the
+  one holding the active input, one GET each, before it offers the agent.
+  A resumed turn loads its input's page
+  (`a_takeover_resumes_a_turn_whose_input_is_on_a_sealed_inbox_page`,
+  and `cold_restart_resumes_the_active_turn_at_two_entries_a_page`).
+  On the server, over a 770-turn history with 12 sealed pages per list
+  (`agents_e2e::hot_routes_read_one_page_of_a_deep_history`, which pins
+  each sequence below GET by GET):
+  - a result wait reads HEAD, one results page and the output object;
+  - a resolve of a request whose receipt is sealed reads HEAD, the
+    receipts page its fingerprint names and the results page holding its
+    outcome;
+  - an events page reads HEAD, then the events pages from the one holding
+    the cursor onward until it holds `limit` events, then their payloads.
+    With `K` entries a page that is at most `ceil(limit / K) + 1` pages,
+    the `+ 1` for a cursor partway through a page; the test's pages from
+    the start and from a cursor into sealed history each read one. The
+    oldest retained seq is the first sealed page's first key, so a cursor
+    into sealed history is served, not refused `cursor_expired`;
+  - an operation-filtered events page applies the filter before the
+    limit, and the page that says the operation is terminal looks one
+    event past the limit; nothing bounds one operation's event seqs, so
+    that page reads every events page from the cursor on (12 in the test);
+  - a poll reads HEAD for `BeginTurn`, the state and payload objects, and
+    HEAD again for the route's recorded time, and no sealed page. That
+    holds when the runtime already holds the agent's root and the input is
+    on the open inbox page, as in the test; a cold root adds the scan's
+    inbox page reads above, and an input on a sealed page adds its page;
+  - a state read attaches every inbox page, so its mailbox lists every
+    queued input (129 queued over two sealed pages in the test).
   `AgentStore::read_head_full` GETs every page and is the inspection read
-  of the simulator and the tests.
+  of the simulator, the tests and the CLI's `inspect`, `effects` and
+  `operation` commands; the CLI's `list` reads HEAD alone and its
+  `events` reads as the route does
+  (`agents_commands::events_and_list_read_only_the_pages_they_print`).
 - **Byte cap.** The guard keeps a page reserve: a guarded command is
   refused while HEAD could not hold the `PageRef`s that the results and
   events its pending work will append can still seal into
@@ -755,6 +779,7 @@ build contains the agents crates: they landed after v0.27.0, the `agents`
 feature of `services/ravel-server/Cargo.toml` is not among its default
 features (the crate declares none), and the published image's `Dockerfile`
 builds `ravel-server` with `--features sql,flight-sql,otap` only. The
+0.27.0 section of `CHANGELOG.md` carries no agents entry either. The
 sequence guarded against a version 1 writer re-encoding a version 2 HEAD
 and dropping its page references. A version 1 build refuses any HEAD whose
 format version is above 1 as `UnsupportedFormat` before it decodes the
@@ -771,6 +796,8 @@ nothing rewrites a version 2 HEAD back to version 1.
 Costs this leaves in place: a timer page cannot seal past a timer still
 scheduled, so history behind a long-lived timer stays inline until it
 fires or is cancelled; `AgentStore::read_head_full`, the inspection read,
-GETs every page; a poll reads HEAD twice; and a command whose page need
+GETs every page; a poll reads HEAD twice; a state read GETs every inbox
+page; the terminal page of an operation-filtered events read GETs every
+events page from its cursor on; and a command whose page need
 the planner did not name falls back to loading every sealed page HEAD
 references, with a warning and a `planner_misses` count.

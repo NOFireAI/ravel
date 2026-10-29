@@ -194,16 +194,36 @@ hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
   a page the planner failed to name makes the command load every page and
   counts a `planner_misses`
   (`tests::pages::a_planner_miss_loads_every_page_and_is_counted`).
-- No production path reads every page. The runtime's reload, the sweep's
-  per-agent visit and the directory scan read HEAD alone
-  (`read_head_shallow`); a scan then attaches the inbox pages holding the
-  first and the active input. On the server a result wait reads HEAD, one
-  results page and the output; an events page reads HEAD, the page holding
-  the cursor and the payloads; a poll reads HEAD twice plus the state and
-  payload objects and no sealed page (server test
-  `agents_e2e::hot_routes_read_one_page_of_a_deep_history`, 769 turns, 12
-  sealed pages per list). `read_head_full`, the inspection read of the
-  simulator and the tests, GETs every page.
+- No server or runtime path reads every page of every list. The
+  runtime's reload, the sweep's per-agent visit and the directory scan
+  read HEAD alone (`read_head_shallow`); a sweep visit to an agent with
+  sealed pages is one GET (runtime test
+  `sweep::tests::a_visit_reads_only_the_head_of_an_agent_with_sealed_pages`).
+  A scan then attaches the inbox pages holding the first and the active
+  input. Server test `agents_e2e::hot_routes_read_one_page_of_a_deep_history`
+  (770 turns, 12 sealed pages per list) pins each route's GETs:
+  - a result wait reads HEAD, one results page and the output;
+  - a resolve over a sealed receipt reads HEAD, one receipts page and one
+    results page;
+  - an events page reads HEAD, the events pages from the one holding the
+    cursor until it holds `limit` events (at most `ceil(limit / K) + 1`
+    pages at `K` entries a page), and the payloads. A cursor into sealed
+    history is served: the oldest retained seq is the first sealed page's
+    first key;
+  - an operation filter applies before the limit; the page that reports
+    the operation terminal reads every events page from the cursor on,
+    since nothing bounds one operation's event seqs;
+  - a poll reads HEAD twice plus the state and payload objects and no
+    sealed page when the runtime holds the agent's root and the input is
+    on the open inbox page; a cold root adds the scan's inbox pages and an
+    input on a sealed page adds its page;
+  - a state read attaches every inbox page, so its mailbox lists every
+    queued input.
+
+  `read_head_full`, the inspection read of the simulator, the tests and
+  the CLI's `inspect`, `effects` and `operation` commands, GETs every
+  page. The CLI's `list` reads HEAD alone and its `events` reads as the
+  route does (`agents_commands::events_and_list_read_only_the_pages_they_print`).
 - A version 1 HEAD migrates on the next command's own CAS; the HEAD it
   writes is version 2 and under the byte cap (kernel test
   `one_cas_migrates_a_maximal_inline_head_under_the_byte_cap`, store test
