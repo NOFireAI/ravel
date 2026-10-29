@@ -401,8 +401,7 @@ impl AgentsRuntime {
                 .with_sweep(SweepConfig {
                     interval_ms: self.poll_sweep_interval_ms(),
                     ..SweepConfig::default()
-                })
-                .with_limits(self.store_limits().kernel);
+                });
                 let agents = Arc::new(TenantAgents {
                     store,
                     coordinator,

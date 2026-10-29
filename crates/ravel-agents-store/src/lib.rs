@@ -215,6 +215,12 @@ impl AgentStore {
         self
     }
 
+    /// The kernel limits this store enforces, with the terminal reserve
+    /// raised to its floor ([`Kernel::limits`]).
+    pub fn kernel_limits(&self) -> &Limits {
+        self.kernel.limits()
+    }
+
     /// Wait before the attempt after `attempt`, for the delay the policy
     /// gives the failure that ended it. A refused conditional write passes
     /// no error.

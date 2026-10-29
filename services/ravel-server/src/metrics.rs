@@ -4785,7 +4785,7 @@ fn render_agents_capacity_families(
     write_header(
         out,
         name,
-        "The highest fill of any agent at the end of the last directory sweep cycle, by list: receipts over the receipt cap, and sealed index pages over max_index_pages for results, events and timers; the largest over tenants, 0 before the first cycle. At 1 the list refuses further growth with budget_exceeded.",
+        "The highest fill of any agent at the end of the last directory sweep cycle, by list: receipts over the receipt cap, and sealed index pages over max_index_pages for results, events and timers; the largest over tenants, 0 before the first cycle. Receipts refuse a send at 1. A guarded publish is refused earlier for results and events, once the list's sealed pages plus the pages kept in reserve for queued inputs and pending effects would pass max_index_pages.",
         "gauge",
     );
     for (list, value) in FILL_LISTS.into_iter().zip(fill.max_ratio) {
@@ -4800,7 +4800,7 @@ fn render_agents_capacity_families(
     write_header(
         out,
         name,
-        "The largest encoded agent HEAD over max_head_bytes at the end of the last directory sweep cycle; the largest over tenants, 0 before the first cycle.",
+        "The largest encoded agent HEAD over max_head_bytes at the end of the last directory sweep cycle; the largest over tenants, 0 before the first cycle. A guarded publish such as a send is refused once HEAD plus the reserve (a fixed slack, 512 bytes per queued input, 132 per pending effect) would pass the cap, so at the default mailbox depth of 256 an agent with a full mailbox is refused near 0.5.",
         "gauge",
     );
     write_sample_f64(out, name, &[Label::Mode(mode)], fill.head_bytes_max_ratio);
