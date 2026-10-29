@@ -829,9 +829,10 @@ references, with a warning and a `planner_misses` count. The events,
 results and timers lists are never pruned, and each stops at
 `max_index_pages * max_page_entries` entries (32,768 at the defaults):
 events, one or more per committed turn; results, one per settled
-input, so after that many lifetime inputs; timers, every delivered and
-cancelled generation, which stays forever, since `max_timers` counts
-only scheduled ones. The publish that would seal a page past that bound
+input, so after that many lifetime inputs; timers, one entry per
+distinct timer key, which stays after the timer is delivered or
+cancelled (a reschedule replaces its key's entry), since `max_timers`
+counts only scheduled ones. The publish that would seal a page past that bound
 is refused `BudgetExceeded`. The agent stays consistent but refuses new
 work for good: this release gives an operator no way to trim any of the
 three lists.

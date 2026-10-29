@@ -174,9 +174,10 @@ hold the existing `InboxPage`, `ReceiptPage`, `ResultPage`, `EventPage` or
 - Nothing prunes the events, results or timers lists, so each stops at
   `max_index_pages * max_page_entries` entries (32,768 at the defaults):
   events, one or more per committed turn; results, one per settled input,
-  so after that many lifetime inputs; timers, every delivered and cancelled
-  generation, which stays forever (`max_timers` counts only scheduled
-  timers). The publish that would seal a page past that bound is refused
+  so after that many lifetime inputs; timers, one entry per distinct timer
+  key, which stays after the timer is delivered or cancelled (a reschedule
+  replaces its key's entry; `max_timers` counts only scheduled timers). The
+  publish that would seal a page past that bound is refused
   `BudgetExceeded`. The agent stays consistent but refuses new work for
   good: this release has no way to trim any of the three lists.
 - Each `PageRef` records the page's first key, object, entry count, marked
