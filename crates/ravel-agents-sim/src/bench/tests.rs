@@ -5,7 +5,7 @@ use super::figures::{
 };
 use super::scenarios::{
     DIRECTORY_GETS_PER_PASS, GUARANTEED_DIRECTORY_GETS_PER_PASS, POSITIONS, guaranteed_passes,
-    percentile, run_scenario, worst_case_passes,
+    hot_send_agents_requests, percentile, run_scenario, worst_case_passes,
 };
 use super::{DISCOVERY, SCENARIOS, Size, load_bands, load_prices};
 
@@ -106,6 +106,17 @@ fn baseline_issues_no_agents_request() {
     assert_scenario("baseline", &figures);
     assert_value(&figures, "baseline.na.run.isolation.agents_requests", 0.0);
     assert_value(&figures, "baseline.na.ingest.telemetry.put", 1.0);
+}
+
+/// The baseline's zero means something only if the same counter sees the
+/// agents scenarios' requests.
+#[test]
+fn agents_requests_counts_a_hot_send() {
+    let requests = hot_send_agents_requests().expect("hot send runs");
+    assert!(
+        requests > 0,
+        "a hot send counted {requests} agents requests"
+    );
 }
 
 #[test]
@@ -382,8 +393,41 @@ fn percentiles_are_nearest_rank() {
 fn prices_are_assumptions_with_a_date_and_source() {
     let prices = load_prices().expect("prices.toml parses");
     assert_eq!(prices.label, "assumption");
-    assert_eq!(prices.date, "2026-10-29");
+    assert!(is_iso_date(&prices.date), "date {:?}", prices.date);
     assert!(prices.source.contains("aws.amazon.com/s3/pricing"));
-    let measured = "label = \"measured\"\ndate = \"2026-10-29\"\nsource = \"x\"\n";
-    assert!(Prices::parse(measured).is_err());
+}
+
+fn is_iso_date(date: &str) -> bool {
+    let parts: Vec<&str> = date.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return false;
+    };
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    if !(digits(year, 4) && digits(month, 2) && digits(day, 2)) {
+        return false;
+    }
+    let (Ok(month), Ok(day)) = (month.parse::<u32>(), day.parse::<u32>()) else {
+        return false;
+    };
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// Every key prices.toml carries, so the label is the only thing a fixture
+/// varies.
+fn prices_fixture(label: &str) -> String {
+    format!(
+        "label = \"{label}\"\ndate = \"2026-10-29\"\nsource = \"x\"\n\
+         get_per_1k = 0.0004\nput_per_1k = 0.005\ncas_per_1k = 0.005\n\
+         list_per_1k = 0.005\ndelete_per_1k = 0.0\ntransfer_per_gb = 0.0\n"
+    )
+}
+
+#[test]
+fn prices_refuse_any_label_but_assumption() {
+    let assumed = Prices::parse(&prices_fixture("assumption")).expect("fixture parses");
+    assert_eq!(assumed.label, "assumption");
+    assert_eq!(
+        Prices::parse(&prices_fixture("measured")),
+        Err("prices.toml: label must be \"assumption\"".to_string())
+    );
 }
