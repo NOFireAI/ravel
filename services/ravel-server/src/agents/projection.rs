@@ -57,7 +57,10 @@ fn text(key: &str, value: impl Into<String>) -> KeyValue {
 }
 
 fn int(key: &str, value: u64) -> KeyValue {
-    kv(key, Value::IntValue(i64::try_from(value).unwrap_or(i64::MAX)))
+    kv(
+        key,
+        Value::IntValue(i64::try_from(value).unwrap_or(i64::MAX)),
+    )
 }
 
 fn resource(tenant: &TenantId) -> Resource {
@@ -361,10 +364,13 @@ mod tests {
             size_bytes: 6,
             body: None,
         });
-        let request = logs_request(&TenantId::new("acme"), &ProjectionBatch {
-            events: vec![redacted.clone()],
-            turns: Vec::new(),
-        });
+        let request = logs_request(
+            &TenantId::new("acme"),
+            &ProjectionBatch {
+                events: vec![redacted.clone()],
+                turns: Vec::new(),
+            },
+        );
         let record = &request.resource_logs[0].scope_logs[0].log_records[0];
         let body = format!("{:?}", record.body);
         assert!(body.contains(&format!("event_id={}", redacted.event_id.to_hex())));

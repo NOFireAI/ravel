@@ -183,7 +183,12 @@ pub fn event_id(tenant: &TenantHash, agent: &AgentId, incarnation: u64, event_se
 }
 
 /// The trace of one input: tenant, agent, incarnation and accept seq.
-pub fn trace_id(tenant: &TenantHash, agent: &AgentId, incarnation: u64, accept_seq: u64) -> [u8; 16] {
+pub fn trace_id(
+    tenant: &TenantHash,
+    agent: &AgentId,
+    incarnation: u64,
+    accept_seq: u64,
+) -> [u8; 16] {
     derive_16(
         "projection-trace",
         &[
@@ -781,13 +786,25 @@ mod tests {
         assert_eq!(pass.spans_delivered, 1);
 
         let attempts = rig.sink.attempts.lock().clone();
-        let delivered: Vec<Id128> = rig.sink.delivered.lock().iter().map(|e| e.event_id).collect();
+        let delivered: Vec<Id128> = rig
+            .sink
+            .delivered
+            .lock()
+            .iter()
+            .map(|e| e.event_id)
+            .collect();
         let tenant = TenantHash([7; 16]);
         let agent = id_of("a");
-        let expected = vec![event_id(&tenant, &agent, 1, 1), event_id(&tenant, &agent, 1, 2)];
+        let expected = vec![
+            event_id(&tenant, &agent, 1, 1),
+            event_id(&tenant, &agent, 1, 2),
+        ];
         assert_eq!(delivered, expected);
         // Three attempts at the same two ids: two failed, one landed.
-        assert_eq!(attempts, [expected.clone(), expected.clone(), expected].concat());
+        assert_eq!(
+            attempts,
+            [expected.clone(), expected.clone(), expected].concat()
+        );
         assert_eq!(rig.projector.metrics().lag_max, 0);
         assert_eq!(writes(&rig.projector.store_counters()), 0);
     }
@@ -812,10 +829,7 @@ mod tests {
                     assert!(!body.contains("r1-0"), "{body}");
                 }
                 PayloadPolicy::Carried => {
-                    assert_eq!(
-                        event.payload.body.as_deref(),
-                        Some(r#"{"secret":"r1-0"}"#)
-                    );
+                    assert_eq!(event.payload.body.as_deref(), Some(r#"{"secret":"r1-0"}"#));
                     assert!(body.contains("r1-0"), "{body}");
                 }
             }
@@ -853,7 +867,13 @@ mod tests {
         for _ in 0..3 {
             rig.projector.project_once().await;
         }
-        let seqs: Vec<u64> = rig.sink.delivered.lock().iter().map(|e| e.event_seq).collect();
+        let seqs: Vec<u64> = rig
+            .sink
+            .delivered
+            .lock()
+            .iter()
+            .map(|e| e.event_seq)
+            .collect();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
         assert_eq!(rig.projector.metrics().lag_max, 0);
     }
@@ -889,7 +909,13 @@ mod tests {
         };
         turn(&restarted, "r2", 1).await;
         restarted.projector.project_once().await;
-        let ids: Vec<Id128> = rig.sink.delivered.lock().iter().map(|e| e.event_id).collect();
+        let ids: Vec<Id128> = rig
+            .sink
+            .delivered
+            .lock()
+            .iter()
+            .map(|e| e.event_id)
+            .collect();
         let tenant = TenantHash([7; 16]);
         let agent = id_of("a");
         let first: Vec<Id128> = (1..=2).map(|s| event_id(&tenant, &agent, 1, s)).collect();
@@ -907,8 +933,14 @@ mod tests {
         assert_eq!(event_id(&t, &a, 1, 5), event_id(&t, &a, 1, 5));
         assert_ne!(event_id(&t, &a, 1, 5), event_id(&t, &a, 1, 6));
         assert_ne!(event_id(&t, &a, 1, 5), event_id(&t, &a, 2, 5));
-        assert_ne!(event_id(&t, &a, 1, 5), event_id(&t, &AgentId([3; 16]), 1, 5));
-        assert_ne!(event_id(&t, &a, 1, 5), event_id(&TenantHash([9; 16]), &a, 1, 5));
+        assert_ne!(
+            event_id(&t, &a, 1, 5),
+            event_id(&t, &AgentId([3; 16]), 1, 5)
+        );
+        assert_ne!(
+            event_id(&t, &a, 1, 5),
+            event_id(&TenantHash([9; 16]), &a, 1, 5)
+        );
         assert_ne!(event_id(&t, &a, 1, 5).0, trace_id(&t, &a, 1, 5));
     }
 }

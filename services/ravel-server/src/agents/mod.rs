@@ -39,8 +39,8 @@ pub use routes::{
 };
 pub use runtime::{
     AgentsRuntime, EvidenceIndex, LONG_POLL_CAP_MS, Lane, MAX_EVIDENCE_EFFECTS,
-    MAX_EVIDENCE_PER_EFFECT, POLL_SWEEP_FLOOR_MS, ProjectionPlan, ProjectionSinkPlan,
-    TenantAgents, WorkerDispatcher,
+    MAX_EVIDENCE_PER_EFFECT, POLL_SWEEP_FLOOR_MS, ProjectionPlan, ProjectionSinkPlan, TenantAgents,
+    WorkerDispatcher,
 };
 
 /// The unauthenticated settings route.
@@ -395,12 +395,14 @@ mod tests {
         );
         let resolver: Arc<dyn TenantResolver> =
             Arc::new(ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(tokens));
-        let runtime = Arc::new(AgentsRuntime::new(
-            settings,
-            Arc::new(AgentsReadiness::new()),
-            Arc::new(ravel_object_store::memory::MemoryStore::new()),
-        )
-        .with_projection(plan));
+        let runtime = Arc::new(
+            AgentsRuntime::new(
+                settings,
+                Arc::new(AgentsReadiness::new()),
+                Arc::new(ravel_object_store::memory::MemoryStore::new()),
+            )
+            .with_projection(plan),
+        );
         router(
             runtime,
             resolver,
