@@ -448,18 +448,9 @@ impl DecodedColumnCache {
             if inner.index.contains_key(&key) {
                 return None;
             }
-            if intent != AccessIntent::Interactive {
-                match inner.ghost.remove(&key) {
-                    Some((_, ghost_bytes)) => {
-                        inner.ghost_bytes = inner.ghost_bytes.saturating_sub(ghost_bytes);
-                        inner.process.ghost_hits += 1;
-                        DecodedCacheCounters::bump(&counters.ghost_hits, 1);
-                    }
-                    None => {
-                        self.record_ghost(&mut inner, key, bytes);
-                        return None;
-                    }
-                }
+            if intent != AccessIntent::Interactive && !inner.ghost.contains_key(&key) {
+                self.record_ghost(&mut inner, key, bytes);
+                return None;
             }
             self.evict_for(&mut inner, bytes, &mut evicted, counters);
         }
@@ -498,6 +489,17 @@ impl DecodedColumnCache {
             if inner.index.contains_key(&key) {
                 // Admitted concurrently; `reservation` drops with this frame.
                 return None;
+            }
+            // The reservation succeeded: the touch is spent either way now,
+            // so the ghost record (if the FIFO hasn't already dropped it) is
+            // released and the hit counted here, not when the ghost was
+            // merely found.
+            if intent != AccessIntent::Interactive {
+                if let Some((_, ghost_bytes)) = inner.ghost.remove(&key) {
+                    inner.ghost_bytes = inner.ghost_bytes.saturating_sub(ghost_bytes);
+                }
+                inner.process.ghost_hits += 1;
+                DecodedCacheCounters::bump(&counters.ghost_hits, 1);
             }
             // Entries admitted between the two locks may have refilled the cap.
             self.evict_for(&mut inner, bytes, &mut evicted, counters);
@@ -695,6 +697,57 @@ mod tests {
         assert_eq!(cache.len(), 1);
         let s = c.snapshot();
         assert_eq!((s.ghost_hits, s.admissions), (1, 1));
+    }
+
+    /// A refused reservation must not spend the ghost touch: the record
+    /// stays and the hit is not counted, so a later touch of the same key
+    /// still admits on it rather than needing a fresh pair.
+    ///
+    /// FLIP: bump `ghost_hits` and remove the ghost record as soon as the key
+    /// is found, before the reservation is attempted, and the refused second
+    /// touch spends the credit: the third touch records a fresh ghost entry
+    /// instead of admitting.
+    #[test]
+    fn a_refused_reservation_keeps_the_ghost_record_and_its_hit_uncounted() {
+        const LIMIT: u64 = 4 << 30;
+        let margin = admission_margin(LIMIT);
+        let v = col(8);
+        let bytes = v.heap_bytes() as u64;
+        let budget = Arc::new(MemoryBudget::new(LIMIT));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+
+        // First touch: records the ghost key, admits nothing.
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::BulkScan, &c)
+                .is_none()
+        );
+        assert_eq!(c.snapshot().ghost_hits, 0);
+
+        // Second touch: the reservation is refused, one byte under the
+        // margin, the way `admission_is_skipped_exactly_below_the_margin`
+        // drives a margin skip.
+        let filler = LIMIT - (margin + bytes - 1);
+        budget.reserve_unchecked(filler);
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::BulkScan, &c)
+                .is_none()
+        );
+        let s = c.snapshot();
+        assert_eq!((s.admissions, s.ghost_hits), (0, 0));
+
+        // Free the room back up: the next touch of the same key is admitted
+        // on the ghost record the first touch left, not a fresh one.
+        budget.release(filler);
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::BulkScan, &c)
+                .is_some()
+        );
+        let s = c.snapshot();
+        assert_eq!((s.admissions, s.ghost_hits), (1, 1));
     }
 
     #[test]
