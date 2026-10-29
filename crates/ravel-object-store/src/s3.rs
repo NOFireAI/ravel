@@ -153,10 +153,10 @@ use checksum::{CHECKSUM_MODE_ENABLED, CHECKSUM_MODE_HEADER, ObservedChecksum};
 
 mod http_date;
 
-mod list;
+pub(crate) mod list;
 use list::ListClient;
 
-mod connector;
+pub(crate) mod connector;
 use connector::{GetObservation, ObservedStoreTime, S3HttpConnector, ShuffleResolver};
 
 use crate::instrument::{StoreMetrics, StoreOp};
@@ -1928,7 +1928,10 @@ fn retry_error_inner(text: &str) -> Option<&str> {
 /// checksum is a separate SHA-256/CRC64-NVME `object_store` computes over the
 /// same buffer, so the two together cover the caller's bytes end to end. See
 /// [`UploadIntegrity`] and the doc comment on [`S3Store::capabilities`].
-fn preflight_checksum(data: &Bytes, checksum: Option<UploadChecksum>) -> Result<(), StoreError> {
+pub(crate) fn preflight_checksum(
+    data: &Bytes,
+    checksum: Option<UploadChecksum>,
+) -> Result<(), StoreError> {
     if let Some(UploadChecksum::Crc32c(expected)) = checksum {
         let actual = crc32c::crc32c(data);
         if actual != expected {

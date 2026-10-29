@@ -237,6 +237,28 @@ fn next_token(
 /// its still-encoded text, which carries a `%` and so is never addressable: the
 /// listing reports it rather than failing on it.
 pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, ControlPlaneError> {
+    parse_listing(body, ListedVersion::Etag)
+}
+
+/// Which listed element becomes [`ObjectMeta::version`], the CAS token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListedVersion {
+    /// The `ETag`: S3's conditional write compares it.
+    Etag,
+    /// The `Generation` the GCS XML API reports beside each object: GCS's
+    /// conditional write compares that, and an identical rewrite keeps the
+    /// ETag while changing it (ADR-3456). A listed object without one is
+    /// refused rather than given its ETag.
+    Generation,
+}
+
+/// [`parse_list_bucket_result`] for a GCS XML API listing, whose version is
+/// the object's generation.
+pub(crate) fn parse_gcs_list_result(body: &[u8]) -> Result<ListResponse, ControlPlaneError> {
+    parse_listing(body, ListedVersion::Generation)
+}
+
+fn parse_listing(body: &[u8], version: ListedVersion) -> Result<ListResponse, ControlPlaneError> {
     let root = bucket_config::parse_document(body, "ListBucketResult")?;
     let encoded = match root.single("EncodingType")? {
         None => false,
@@ -263,7 +285,7 @@ pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, Cont
 
     let mut contents = Vec::new();
     for entry in root.children_named("Contents") {
-        contents.push(parse_contents(entry, encoded)?);
+        contents.push(parse_contents(entry, encoded, version)?);
     }
     let mut common_prefixes = Vec::new();
     for entry in root.children_named("CommonPrefixes") {
@@ -282,7 +304,11 @@ pub(crate) fn parse_list_bucket_result(body: &[u8]) -> Result<ListResponse, Cont
     })
 }
 
-fn parse_contents(entry: &XmlElement, encoded: bool) -> Result<ObjectMeta, ControlPlaneError> {
+fn parse_contents(
+    entry: &XmlElement,
+    encoded: bool,
+    version: ListedVersion,
+) -> Result<ObjectMeta, ControlPlaneError> {
     let key = match entry.single("Key")? {
         Some(element) => listed_text(&element.text, encoded),
         None => {
@@ -311,11 +337,23 @@ fn parse_contents(entry: &XmlElement, encoded: bool) -> Result<ObjectMeta, Contr
                 "listed object {key:?} has an unreadable LastModified"
             ))
         })?;
+    let version = match version {
+        ListedVersion::Etag => etag.clone(),
+        ListedVersion::Generation => {
+            let generation = required("Generation")?.value().to_string();
+            if generation.is_empty() {
+                return Err(ControlPlaneError::Parse(format!(
+                    "listed object {key:?} has an empty Generation"
+                )));
+            }
+            generation
+        }
+    };
     Ok(ObjectMeta {
         key,
         size,
-        etag: Etag(etag.clone()),
-        version: Version(etag),
+        etag: Etag(etag),
+        version: Version(version),
         last_modified_unix_ms: secs
             .saturating_mul(1000)
             .saturating_add(i64::from(nanos / 1_000_000)),
@@ -691,7 +729,7 @@ pub(crate) fn status_error(prefix: &str, status: u16, code: Option<&str>) -> Sto
 /// `request_target` (a configuration it cannot address) and `parse_document`
 /// (a body that is not a `ListBucketResult`) reach here, and neither changes
 /// on a retry.
-fn control_plane_error(prefix: &str, error: ControlPlaneError) -> StoreError {
+pub(crate) fn control_plane_error(prefix: &str, error: ControlPlaneError) -> StoreError {
     let context = format!("listing {prefix:?}");
     match error {
         ControlPlaneError::AccessDenied(detail) => {

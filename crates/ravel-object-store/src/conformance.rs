@@ -101,6 +101,15 @@ pub fn s3_backend_identity(bucket: Option<&str>, endpoint: Option<&str>) -> Stri
     }
 }
 
+/// Canonical `backend_identity` string for a GCS-backed
+/// [`QualificationRecord`] (ADR-3456 decision 5): `gs://<bucket>`. GCS has one
+/// global endpoint, so unlike [`s3_backend_identity`] there is no endpoint part
+/// to name, and an emulator's base URL is deliberately left out the same way
+/// credentials are.
+pub fn gcs_backend_identity(bucket: &str) -> String {
+    format!("gs://{bucket}")
+}
+
 /// One property the object store contract requires, named so a failure
 /// report can point at exactly what a backend cannot do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2442,6 +2451,16 @@ mod tests {
     use crate::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use crate::memory::MemoryStore;
     use crate::{Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, PageToken};
+
+    #[test]
+    fn gcs_backend_identity_is_the_gs_url_of_the_bucket() {
+        assert_eq!(gcs_backend_identity("ravel-prod"), "gs://ravel-prod");
+        assert_ne!(
+            gcs_backend_identity("ravel-prod"),
+            s3_backend_identity(Some("ravel-prod"), None),
+            "a GCS qualification must not read as an S3 one for the same bucket name"
+        );
+    }
 
     /// Every property [`run_conformance_suite`] gates on. Pinned here so a new
     /// probe has to be acknowledged in the tests that assert the suite's shape

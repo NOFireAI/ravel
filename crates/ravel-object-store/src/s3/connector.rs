@@ -1,8 +1,10 @@
 //! The HTTP connector the S3 adapter installs below `object_store`'s retry
-//! loop, and the three things it observes there: billed requests (issue #928,
+//! loop, and the four things it observes there: billed requests (issue #928,
 //! ADR-0927 decision 8), the stored checksum a GET response carries
-//! (ADR-1696 decisions 2 to 4), and the store's own clock from each response's
-//! `Date` header (ADR-1685 decision 1).
+//! (ADR-1696 decisions 2 to 4), the store's own clock from each response's
+//! `Date` header (ADR-1685 decision 1), and, for the GCS adapter only, the
+//! body of each successful listing response (ADR-3456). [`crate::gcs`]
+//! installs the same connector.
 //!
 //! `object_store` runs its own retry loop *inside* each logical S3 operation
 //! (`RetryConfig`, default `max_retries = 10`), so one `get()` that retried
@@ -64,6 +66,13 @@
 //! reports it through `ObjectStoreBackend::observed_store_time_ns`.
 //!
 //! [`S3Store`]: crate::s3::S3Store
+//!
+//! # Keeping a listing's body
+//!
+//! Inside [`capture_list_bodies`], the connector reads the body of every
+//! successful `list-type=2` response whole, keeps a copy, and passes
+//! `object_store` an identical response. Outside it (every S3 call) the
+//! response passes through unread.
 
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -97,6 +106,11 @@ tokio::task_local! {
     /// response. Unset outside an [`observe_get`], which is every request that
     /// is not a single object read.
     static GET_OBSERVATION: Arc<Mutex<Option<GetObservation>>>;
+
+    /// Where [`S3HttpService`] leaves the body of every successful
+    /// ListObjectsV2 (`list-type=2`) response. Unset outside a
+    /// [`capture_list_bodies`], which only [`crate::gcs::GcsStore`] installs.
+    static LIST_BODIES: Arc<Mutex<Vec<bytes::Bytes>>>;
 }
 
 /// What one GET response said about the object's stored checksum.
@@ -127,6 +141,31 @@ pub(crate) async fn observe_get<F: Future>(fut: F) -> (F::Output, Option<GetObse
     let output = GET_OBSERVATION.scope(Arc::clone(&slot), fut).await;
     let observed = slot.lock().take();
     (output, observed)
+}
+
+/// Run `fut` with a fresh list-body slot installed, returning its output
+/// alongside the body of every successful `list-type=2` response the connector
+/// passed up while polling it, in arrival order.
+///
+/// `object_store`'s GCS client parses the listing itself and drops each
+/// entry's `<Generation>`, which is the CAS token on GCS; the body is the
+/// only place it survives. The connector reads the body whole and hands
+/// `object_store` an identical copy, so the listing it parses is unchanged.
+pub(crate) async fn capture_list_bodies<F: Future>(fut: F) -> (F::Output, Vec<bytes::Bytes>) {
+    let slot: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+    let output = LIST_BODIES.scope(Arc::clone(&slot), fut).await;
+    let bodies = std::mem::take(&mut *slot.lock());
+    (output, bodies)
+}
+
+/// Whether `req` is a ListObjectsV2 request: a GET whose query carries
+/// `list-type=2`.
+fn is_list_request(req: &HttpRequest) -> bool {
+    req.method() == reqwest::Method::GET
+        && req
+            .uri()
+            .query()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "list-type=2"))
 }
 
 /// The store's own clock as the last response from it reported, in unix
@@ -190,6 +229,7 @@ pub(crate) struct S3HttpConnector {
     metrics: Arc<StoreMetrics>,
     store_time: Arc<ObservedStoreTime>,
     inner: ReqwestConnector,
+    store_authority: Option<String>,
 }
 
 impl S3HttpConnector {
@@ -198,6 +238,7 @@ impl S3HttpConnector {
             metrics,
             store_time,
             inner: ReqwestConnector::default(),
+            store_authority: None,
         }
     }
 
@@ -209,7 +250,19 @@ impl S3HttpConnector {
             metrics: Arc::clone(&self.metrics),
             store_time: Arc::clone(&self.store_time),
             inner: HttpClient::new(client),
+            store_authority: self.store_authority.clone(),
         })
+    }
+
+    /// Observe only requests to `authority` (`host` or `host:port`, matched
+    /// without regard to case); any other request is passed through with no
+    /// attempt counted, no `Date` read and no body kept. The GCS client sends
+    /// its credential requests (the metadata server, Google's token endpoint)
+    /// through this same connector, and those are neither store attempts nor
+    /// readings of the store's clock.
+    pub(crate) fn only_for_authority(mut self, authority: impl Into<String>) -> Self {
+        self.store_authority = Some(authority.into());
+        self
     }
 }
 
@@ -254,6 +307,7 @@ impl HttpConnector for S3HttpConnector {
             metrics: Arc::clone(&self.metrics),
             store_time: Arc::clone(&self.store_time),
             inner,
+            store_authority: self.store_authority.clone(),
         }))
     }
 }
@@ -268,18 +322,40 @@ struct S3HttpService {
     metrics: Arc<StoreMetrics>,
     store_time: Arc<ObservedStoreTime>,
     inner: HttpClient,
+    store_authority: Option<String>,
 }
 
 #[async_trait]
 impl HttpService for S3HttpService {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if let Some(authority) = &self.store_authority
+            && !req
+                .uri()
+                .authority()
+                .is_some_and(|a| a.as_str().eq_ignore_ascii_case(authority))
+        {
+            return self.inner.execute(req).await;
+        }
         // Count before dispatch: the request is about to go on the wire and be
         // billed whether or not the response ever arrives. A request issued
         // outside any `scope` (e.g. a credential refresh) records nothing.
         if let Ok(op) = CURRENT_OP.try_with(|op| *op) {
             self.metrics.record_attempt(op);
         }
+        let list_slot = LIST_BODIES
+            .try_with(Arc::clone)
+            .ok()
+            .filter(|_| is_list_request(&req));
         let response = self.inner.execute(req).await;
+        let response = match (response, list_slot) {
+            (Ok(response), Some(slot)) if response.status().is_success() => {
+                let (parts, body) = response.into_parts();
+                let body = body.bytes().await?;
+                slot.lock().push(body.clone());
+                Ok(HttpResponse::from_parts(parts, body.into()))
+            }
+            (response, _) => response,
+        };
         if let Ok(response) = &response {
             if let Ok(slot) = GET_OBSERVATION.try_with(Arc::clone)
                 && let Some(observation) = observation_of(response)

@@ -2,8 +2,10 @@
 //! every `ObjectStoreBackend` implementation this crate ships: the memory
 //! oracle at its default page size and at a tiny one to force pagination,
 //! `FaultStore` wrapping the oracle with an empty plan (must be fully
-//! transparent), and -- gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` --
-//! `S3Store` against a real RustFS and against a real floci.
+//! transparent), `GcsStore` against the in-process fake GCS endpoint, and --
+//! gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` / `RAVEL_GCS_TEST_BUCKET`
+//! -- `S3Store` against a real RustFS and against a real floci, and `GcsStore`
+//! against a real bucket.
 //!
 //! This is an integration-test binary, a crate in its own right, so it
 //! inherits `[lints] workspace = true` (including `clippy::expect_used`
@@ -17,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::gcs::fake::FakeGcs;
+use ravel_object_store::gcs::{GcsConfig, GcsStore};
 use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
 use ravel_object_store::kms_routing::KmsRoutingStore;
 use ravel_object_store::memory::MemoryStore;
@@ -1743,6 +1747,59 @@ async fn floci_contract() {
     assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
     assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
         .await;
+
+    let leftovers = list_all(&store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// `GcsStore` against the in-process fake GCS endpoint, in every run. A page
+/// size of 2 so listing crosses continuation tokens.
+#[tokio::test]
+async fn gcs_store_contract_against_the_fake() {
+    let fake = FakeGcs::start("ravel-contract")
+        .await
+        .expect("bind the fake GCS endpoint");
+    let mut config = fake.config();
+    config.list_page_size = 2;
+    let store = GcsStore::new(config).expect("GcsStore against the fake");
+    // Exactly the mandatory set: no multipart and no upload checksums
+    // (ADR-3456 D1).
+    assert_eq!(store.capabilities(), Capabilities::mandatory());
+
+    run_contract_suite(&store, "gcs-fake").await;
+}
+
+/// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
+/// bucket must already exist; credentials come from Application Default
+/// Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file,
+/// or the metadata server). Keys go under a run-unique root and are deleted
+/// afterwards.
+#[tokio::test]
+async fn gcs_contract() {
+    let Ok(bucket) = env::var("RAVEL_GCS_TEST_BUCKET") else {
+        println!("skipping GCS contract test: RAVEL_GCS_TEST_BUCKET not set");
+        return;
+    };
+    let mut config = GcsConfig::new(bucket);
+    config.list_page_size = 2;
+    let store = GcsStore::new(config).expect("GcsStore with Application Default Credentials");
+
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    let root = format!("contract-gcs-{run_id}");
+
+    assert_eq!(store.capabilities(), Capabilities::mandatory());
+    run_contract_suite(&store, &root).await;
+    assert!(
+        store.observed_store_time_ns().is_some(),
+        "every GCS response carries a Date header"
+    );
 
     let leftovers = list_all(&store, &format!("{root}/"))
         .await
