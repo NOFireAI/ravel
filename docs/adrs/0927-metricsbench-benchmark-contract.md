@@ -91,8 +91,8 @@ accidentally measure a non-durable ack. The portable lane's use of Remote
 Write forecloses it.
 
 Ack is not visibility. Default `--max-flush-delay` is 2 s; the MetricsBench
-Ravel row runs 500 ms (see the flush-setting amendment below). The harness passes
-the returned commit tokens as `min_commit_token` for deterministic
+Ravel row runs 500 ms (see the flush-setting amendment below). The harness
+passes the returned commit tokens as `min_commit_token` for deterministic
 read-your-write rather than sleeping, because sleeping measures the flush
 delay and calls it query latency.
 
@@ -968,7 +968,8 @@ Consequences. Band 4's identities are sums, so they hold under any arrival
 order and are unchanged. Every row's `client_behavior` describes the shard
 model, the backoff and the fixed `S`. Predicted, not measured: with 50
 shards of 2,000 points each answered about every 2.1 s, Ravel's row offers
-about 47,600 points per second. At that rate the Ravel row takes about
+about 47,600 points per second (measured at 42,142 on `cardinality`; the
+flush-setting amendment below moves the row to 500 ms). At that rate the Ravel row takes about
 2.1 hours for `cardinality` (360,000,000 samples), 2.5 hours for `churn`
 (432,000,000) and 10.1 hours for `history` (1,728,000,000). The per-profile
 ceilings are about twice those: 14,400 s, 18,000 s and 72,000 s, and 600 s
@@ -1014,8 +1015,8 @@ shows it still binds, is a separate disclosed change.
 Context. Decision 3 makes a Ravel Remote Write 2xx durable-on-ack, so a
 request waits for the flush that stores its points. With the shipped
 `--max-flush-delay` of 2 s that flush comes when the tenant buffer ages
-past 2 s, and the replay of the 2026-10-28 amendment then offers about
-42,000 points per second whatever the store. Experiment E2 on #2821
+past 2 s, and the replay the 2026-10-28 replay amendment defines then
+offers about 42,000 points per second on s3s-fs. Experiment E2 on #2821
 (pre-registration comment 6484279730, readout comment 6496922852) replayed
 the `cardinality` stream into the Ravel row alone on s3s-fs, one variable
 per row, same image (`manual-0bf5fed`), harness and box class:
@@ -1042,8 +1043,11 @@ the byte threshold keep their shipped values, so only the active-tenant
 flush age changes. The setting is a deployment setting disclosed beside
 the frozen limits and recorded in each run's effective configuration; it
 is not a change to Ravel's shipped default, which stays 2 s. Decision 3
-is unchanged: a 2xx still means durable, and the row's ack latency cannot
-fall below its 500 ms flush interval.
+is unchanged: a 2xx still means durable. A request whose points wait for
+the age-triggered flush acks no sooner than 500 ms after its tenant
+buffer opened; a flush triggered by size (`target_bytes`, 8 MiB by
+default) or by the memory backstop can ack it sooner, so 500 ms is not a
+floor on the row's ack latency.
 
 Rejected: the shipped default, because it reports the flush clock as
 Ravel's ingest rate; and arrival, because its object count is a read-path
