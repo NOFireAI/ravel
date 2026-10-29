@@ -80,6 +80,13 @@ pub enum AgentsCliError {
         if *defaulted { " (no --store given, which means memory)" } else { "" }
     )]
     DevRefusesMemoryStore { defaulted: bool },
+    #[error(
+        "agents dev refuses --store gcs: it starts, creates and qualifies the compose \
+         RustFS bucket ({DEV_COMPOSE_FILE}), which is an S3 endpoint. Against a GCS bucket, \
+         qualify it with ravel-cli --store gcs store qualify and start ravel-server on it \
+         yourself; the other agents commands take --store gcs"
+    )]
+    DevRefusesGcsStore,
     #[error("--{flag} {addr} is not a loopback address; agents dev binds loopback only")]
     ListenNotLoopback {
         flag: &'static str,
@@ -839,6 +846,9 @@ pub fn check_dev(options: &DevOptions) -> Result<(), AgentsCliError> {
         return Err(AgentsCliError::DevRefusesMemoryStore {
             defaulted: options.store.is_defaulted_memory(),
         });
+    }
+    if options.store.kind() == StoreKind::Gcs {
+        return Err(AgentsCliError::DevRefusesGcsStore);
     }
     for (flag, addr) in [
         ("listen", options.listen_http),
