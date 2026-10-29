@@ -262,6 +262,36 @@ fn emitted<T: serde::Serialize>(value: &T, text: impl FnOnce(&T) -> String) -> S
     String::from_utf8(out).expect("utf-8")
 }
 
+/// `agents dev` drives the compose RustFS bucket, so `--store gcs` refuses
+/// before the host starts anything.
+#[tokio::test]
+async fn dev_command_refuses_the_gcs_store() {
+    let mut host = RecordingHost::default();
+    let mut out = Vec::new();
+    let err = agents::run_dev(
+        &dev_options(StoreSelection::explicit(StoreKind::Gcs)),
+        &mut host,
+        "tok",
+        &mut out,
+        false,
+    )
+    .await
+    .expect_err("dev on the gcs store must refuse");
+    assert!(
+        matches!(
+            err.downcast_ref::<AgentsCliError>(),
+            Some(AgentsCliError::DevRefusesGcsStore)
+        ),
+        "{err}"
+    );
+    assert!(
+        host.calls.is_empty(),
+        "a refused dev started {:?}",
+        host.calls
+    );
+    assert!(out.is_empty(), "a refused dev printed a ready line");
+}
+
 #[tokio::test]
 async fn dev_command_refuses_the_memory_store_and_inspect_reads_head_from_the_bucket() {
     for (selection, defaulted) in [
