@@ -2449,6 +2449,12 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     validate_min_flush_bytes(config.min_flush_bytes)?;
     validate_loop_intervals(&config)?;
     config.query_budgets.agents.check()?;
+    // ADR-3331 decision 12: with `--agents`, projection is never silently
+    // absent, so a process with nowhere to project refuses here.
+    let agents_projection_target = config
+        .query_budgets
+        .agents
+        .projection_target(config.mode.holds_ingest_buffer())?;
 
     // Install the rustls process-level crypto provider before any TLS endpoint
     // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
@@ -2858,13 +2864,42 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // Built in every `agents` build so `/metrics` reports the settings even
     // without `--agents`; it touches the store only when a route is called.
     #[cfg(feature = "agents")]
+    let agents_projection_sink = match &agents_projection_target {
+        config::AgentsProjectionTarget::Off => agents::ProjectionSinkPlan::Off,
+        config::AgentsProjectionTarget::Endpoint(endpoint) => {
+            tonic::transport::Endpoint::from_shared(endpoint.clone()).map_err(|e| {
+                anyhow::anyhow!("--agents-projection-endpoint {endpoint} is not a URI: {e}")
+            })?;
+            agents::ProjectionSinkPlan::Endpoint(endpoint.clone())
+        }
+        config::AgentsProjectionTarget::InProcess => {
+            match (&log_ingest_router, &span_ingest_router) {
+                (Some(logs), Some(spans)) => agents::ProjectionSinkPlan::InProcess {
+                    logs: logs.clone(),
+                    spans: spans.clone(),
+                    ipcrypt: ipcrypt.clone(),
+                },
+                _ => anyhow::bail!(
+                    "agents projection resolved to the in-process ingest path, but this process \
+                     built no log or span ingest router"
+                ),
+            }
+        }
+    };
+    #[cfg(not(feature = "agents"))]
+    let _ = &agents_projection_target;
+    #[cfg(feature = "agents")]
     let agents_runtime = Arc::new(
         agents::AgentsRuntime::new(
             agents::AgentsSettings::from_server_config(&config),
             agents_readiness.clone(),
             store.clone(),
         )
-        .with_clock(config.query_budgets.agents.clock.clone()),
+        .with_clock(config.query_budgets.agents.clock.clone())
+        .with_projection(agents::ProjectionPlan::new(
+            agents_projection_sink,
+            &config.query_budgets.agents.projection,
+        )),
     );
     #[cfg(feature = "agents")]
     if config.query_budgets.agents.enabled {

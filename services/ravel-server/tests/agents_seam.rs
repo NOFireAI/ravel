@@ -165,6 +165,16 @@ async fn agents_router_mounts_on_both_listeners_only_with_feature_and_flag() {
                     "max_receipts": 19,
                     "max_timers": 23,
                 },
+                "projection": {
+                    "mode": "in_process",
+                    "endpoint": null,
+                    "backlog_bound": 4096,
+                    "lag_max": 0,
+                    "backlog": 0,
+                    "events_projected": 0,
+                    "sink_failures": 0,
+                    "backlog_full": 0,
+                },
             }),
             "{url}"
         );

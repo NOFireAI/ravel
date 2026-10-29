@@ -4488,6 +4488,7 @@ dependencies = [
 name = "ravel-agents-runtime"
 version = "0.27.0"
 dependencies = [
+ "blake3",
  "bytes",
  "hex",
  "parking_lot",
@@ -4496,6 +4497,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-types",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
 ]

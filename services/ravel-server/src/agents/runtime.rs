@@ -10,6 +10,11 @@
 //! sweep every `sweep_interval_ms`, which stops once the [`AgentsRuntime`]
 //! or the tenant is dropped. It is the authority that fires due timers; the
 //! `_wake` hints only make it cheap (ADR-3331 decision 8).
+//!
+//! When projection is on, each tenant's coordinator also carries a
+//! [`Projector`] over a store instance of its own, and a task per tenant runs
+//! its passes on every committed root the coordinator sees and on a retry
+//! interval (ADR-3331 decision 12).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -20,18 +25,23 @@ use parking_lot::Mutex;
 use ravel_agents_core::head::{EffectStatus, Head, ObjectRef};
 use ravel_agents_core::identity::{AgentId, Id128, effect_id};
 use ravel_agents_core::kernel::{DerivedIds, Limits};
+use ravel_agents_runtime::projection::{
+    PayloadPolicy, ProjectionLimits, ProjectionMetricsSnapshot, ProjectionSink, Projector,
+};
 use ravel_agents_runtime::{
     AgentsMetricsSnapshot, CapacityMetricsSnapshot, Coordinator, Dispatch, EffectDispatcher,
     FillSnapshot, RuntimeConfig, SweepConfig, SweepMetricsSnapshot, SystemRng,
 };
 use ravel_agents_store::counters::{CounterSnapshot, PhaseCounts};
 use ravel_agents_store::{AgentStore, Clock, StoreLimits, SystemClock};
+use ravel_ingest::{LogIngestRouter, SpanIngestRouter};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_types::TenantHash;
+use ravel_types::{TenantHash, TenantId};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
+use super::projection::{InProcessSink, OtlpSink, TappedSink};
 use super::{AgentsReadiness, AgentsSettings};
-use crate::config::AgentsClock;
+use crate::config::{AgentsClock, AgentsProjectionConfig, ProjectionTap};
 
 /// The long-poll cap of ADR-3331 decision 9, applied to `worker/poll`,
 /// `result` and `call` whatever `wait_ms` a caller asks for.
@@ -292,6 +302,73 @@ pub enum Lane {
     Activation,
 }
 
+/// Where this process's projectors deliver, resolved at startup.
+pub enum ProjectionSinkPlan {
+    /// `--agents-projection off`, or a process without `--agents`.
+    Off,
+    /// Through this process's own ingest routers.
+    InProcess {
+        logs: Arc<LogIngestRouter>,
+        spans: Arc<SpanIngestRouter>,
+        ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
+    },
+    /// OTLP gRPC to a gateway.
+    Endpoint(String),
+}
+
+impl ProjectionSinkPlan {
+    /// The mode name the health route reports.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            ProjectionSinkPlan::Off => "off",
+            ProjectionSinkPlan::InProcess { .. } => "in_process",
+            ProjectionSinkPlan::Endpoint(_) => "endpoint",
+        }
+    }
+
+    /// The endpoint, in `Endpoint` mode.
+    pub fn endpoint(&self) -> Option<&str> {
+        match self {
+            ProjectionSinkPlan::Endpoint(endpoint) => Some(endpoint),
+            _ => None,
+        }
+    }
+}
+
+/// The projection settings of one process.
+pub struct ProjectionPlan {
+    pub sink: ProjectionSinkPlan,
+    pub backlog: usize,
+    pub payload_tenants: Vec<String>,
+    pub retry_ms: u64,
+    pub tap: ProjectionTap,
+}
+
+impl ProjectionPlan {
+    /// Projection off.
+    pub fn off() -> ProjectionPlan {
+        ProjectionPlan::new(ProjectionSinkPlan::Off, &AgentsProjectionConfig::default())
+    }
+
+    pub fn new(sink: ProjectionSinkPlan, config: &AgentsProjectionConfig) -> ProjectionPlan {
+        ProjectionPlan {
+            sink,
+            backlog: config.backlog,
+            payload_tenants: config.payload_tenants.clone(),
+            retry_ms: config.retry_ms,
+            tap: config.tap.clone(),
+        }
+    }
+
+    fn payload_policy(&self, tenant: &TenantId) -> PayloadPolicy {
+        if self.payload_tenants.iter().any(|t| t == tenant.as_str()) {
+            PayloadPolicy::Carried
+        } else {
+            PayloadPolicy::Redacted
+        }
+    }
+}
+
 /// The agents surface of one process.
 pub struct AgentsRuntime {
     pub settings: AgentsSettings,
@@ -302,7 +379,9 @@ pub struct AgentsRuntime {
     activation_permits: Arc<Semaphore>,
     pub result_waits: ResultWaitCounters,
     clock: AgentsClock,
-    /// Dropped with the runtime, which ends every tenant's interval sweep.
+    projection: ProjectionPlan,
+    /// Dropped with the runtime, which ends every tenant's interval sweep
+    /// and projection task.
     stop_sweeps: watch::Sender<()>,
 }
 
@@ -345,8 +424,20 @@ impl AgentsRuntime {
             activation_permits: Arc::new(Semaphore::new(settings.activation_concurrency)),
             result_waits: ResultWaitCounters::default(),
             clock: AgentsClock::default(),
+            projection: ProjectionPlan::off(),
             stop_sweeps: watch::channel(()).0,
         }
+    }
+
+    /// The same runtime projecting committed history per `plan`. Applies to
+    /// tenants built after the call.
+    pub fn with_projection(mut self, plan: ProjectionPlan) -> Self {
+        self.projection = plan;
+        self
+    }
+
+    pub fn projection_plan(&self) -> &ProjectionPlan {
+        &self.projection
     }
 
     /// The same runtime reading `clock` instead of the host's wall clock.
@@ -379,7 +470,8 @@ impl AgentsRuntime {
 
     /// The tenant's coordinator, built on first use and kept for the life of
     /// the process.
-    pub fn tenant(&self, tenant: TenantHash) -> Arc<TenantAgents> {
+    pub fn tenant(&self, tenant_id: &TenantId) -> Arc<TenantAgents> {
+        let tenant = tenant_id.hash();
         let mut tenants = self.tenants.lock();
         tenants
             .entry(tenant)
@@ -402,6 +494,10 @@ impl AgentsRuntime {
                     interval_ms: self.poll_sweep_interval_ms(),
                     ..SweepConfig::default()
                 });
+                let coordinator = match self.projector(tenant_id, &clock) {
+                    Some(projector) => coordinator.with_projection(projector),
+                    None => coordinator,
+                };
                 let agents = Arc::new(TenantAgents {
                     store,
                     coordinator,
@@ -409,9 +505,92 @@ impl AgentsRuntime {
                     evidence: EvidenceIndex::new(tenant, self.settings.max_evidence_effects, clock),
                 });
                 self.spawn_sweep(tenant, &agents);
+                self.spawn_projection(&agents);
                 agents
             })
             .clone()
+    }
+
+    /// The tenant's projector, over a store instance of its own so its reads
+    /// never count against the coordinator's; `None` when projection is off.
+    fn projector(&self, tenant_id: &TenantId, clock: &Arc<dyn Clock>) -> Option<Arc<Projector>> {
+        let inner: Arc<dyn ProjectionSink> = match &self.projection.sink {
+            ProjectionSinkPlan::Off => return None,
+            ProjectionSinkPlan::InProcess {
+                logs,
+                spans,
+                ipcrypt,
+            } => Arc::new(InProcessSink {
+                tenant: tenant_id.clone(),
+                logs: logs.clone(),
+                spans: spans.clone(),
+                ipcrypt: ipcrypt.clone(),
+                clock: clock.clone(),
+            }),
+            ProjectionSinkPlan::Endpoint(endpoint) => {
+                Arc::new(OtlpSink::new(tenant_id.clone(), endpoint.clone()))
+            }
+        };
+        let sink: Arc<dyn ProjectionSink> = Arc::new(TappedSink {
+            tap: self.projection.tap.clone(),
+            inner,
+        });
+        let tenant = tenant_id.hash();
+        let store = Arc::new(AgentStore::new(
+            self.object_store.clone(),
+            tenant,
+            self.store_limits(),
+            clock.clone(),
+            Arc::new(DerivedIds),
+        ));
+        Some(Arc::new(Projector::new(
+            tenant,
+            store,
+            sink,
+            ProjectionLimits {
+                backlog: self.projection.backlog,
+                ..ProjectionLimits::default()
+            },
+            self.projection.payload_policy(tenant_id),
+            clock.clone(),
+        )))
+    }
+
+    /// Start the tenant's projection task, when it has a projector and a
+    /// tokio runtime is current. A pass runs on every committed root the
+    /// coordinator notes and every retry interval; a pass that stopped at a
+    /// full backlog with the sink healthy runs again at once.
+    fn spawn_projection(&self, agents: &Arc<TenantAgents>) {
+        let Some(projector) = agents.coordinator.projection() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let projector: Weak<Projector> = Arc::downgrade(projector);
+        let mut stop = self.stop_sweeps.subscribe();
+        let retry = Duration::from_millis(self.projection.retry_ms.max(1));
+        handle.spawn(async move {
+            loop {
+                let Some(projector) = projector.upgrade() else {
+                    return;
+                };
+                let pass = projector.project_once().await;
+                if pass.backlog_full && !pass.sink_failed {
+                    continue;
+                }
+                tokio::select! {
+                    _ = projector.notified() => {}
+                    _ = tokio::time::sleep(retry) => {}
+                    _ = stop.changed() => return,
+                }
+            }
+        });
+    }
+
+    /// Every tenant projector's counters, merged: lag is the largest.
+    pub fn projection_metrics(&self) -> ProjectionMetricsSnapshot {
+        self.metrics().projection
     }
 
     /// The least time between two poll-driven passes: the periodic interval,
@@ -557,6 +736,7 @@ fn empty_snapshot() -> AgentsMetricsSnapshot {
         outcome_unknown_resolved: 0,
         polls_waited: 0,
         store: CounterSnapshot::default(),
+        projection: ProjectionMetricsSnapshot::default(),
     }
 }
 
@@ -580,6 +760,7 @@ fn add_snapshots(a: AgentsMetricsSnapshot, b: AgentsMetricsSnapshot) -> AgentsMe
             publish: add_phase(a.store.publish, b.store.publish),
             planner_misses: a.store.planner_misses + b.store.planner_misses,
         },
+        projection: a.projection.merge(b.projection),
     }
 }
 

@@ -58,6 +58,7 @@ mod effects;
 mod failure;
 mod metrics;
 mod ownership;
+pub mod projection;
 mod sweep;
 mod timers;
 mod unload;
@@ -182,6 +183,8 @@ pub struct Coordinator {
     /// When a poll last started a sweep pass, in the injected clock's
     /// nanoseconds; `i64::MIN` before the first.
     pub(crate) last_sweep_unix_ns: AtomicI64,
+    /// Told of every root this coordinator sees; never awaited.
+    pub(crate) projection: Option<Arc<projection::Projector>>,
 }
 
 impl Coordinator {
@@ -205,7 +208,19 @@ impl Coordinator {
             sweep: SweepConfig::default(),
             sweep_cursor: tokio::sync::Mutex::new(sweep::SweepCursor::default()),
             last_sweep_unix_ns: AtomicI64::new(i64::MIN),
+            projection: None,
         }
+    }
+
+    /// Report every root this coordinator sees to `projector`, which reads
+    /// the committed events on its own schedule (ADR-3331 decision 12).
+    pub fn with_projection(mut self, projector: Arc<projection::Projector>) -> Coordinator {
+        self.projection = Some(projector);
+        self
+    }
+
+    pub fn projection(&self) -> Option<&Arc<projection::Projector>> {
+        self.projection.as_ref()
     }
 
     pub fn config(&self) -> &RuntimeConfig {
@@ -565,6 +580,7 @@ impl Coordinator {
     /// Record a root an operation returned, unless a newer one is loaded.
     pub(crate) fn observe(&self, agent: &AgentId, head: &Head) {
         self.prune_open_attempts(agent, head);
+        self.note_projection(agent, head);
         let now = self.now();
         let mut agents = self.agents.lock();
         match agents.get_mut(agent) {
@@ -592,6 +608,7 @@ impl Coordinator {
     /// Record a root read fresh from HEAD, whatever is loaded.
     pub(crate) fn replace(&self, agent: &AgentId, head: &Head) {
         self.prune_open_attempts(agent, head);
+        self.note_projection(agent, head);
         let now = self.now();
         let mut agents = self.agents.lock();
         let loaded = agents.entry(*agent).or_insert_with(|| Loaded {
@@ -601,6 +618,12 @@ impl Coordinator {
         });
         loaded.head = head.clone();
         loaded.touched_unix_ns = now;
+    }
+
+    fn note_projection(&self, agent: &AgentId, head: &Head) {
+        if let Some(projector) = &self.projection {
+            projector.note(agent, head);
+        }
     }
 
     pub(crate) fn after_outcome(&self, out: &Outcome) {
