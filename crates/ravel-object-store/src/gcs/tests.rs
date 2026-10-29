@@ -668,13 +668,13 @@ async fn cas_rejects_a_non_generation_token_before_any_request() {
             )
             .await;
         assert!(
-            matches!(refused, Err(StoreError::Permanent(_))),
-            "{token:?}: {refused:?}"
-        );
-        assert!(
             fake.requests().is_empty(),
             "{token:?}: {:?}",
             fake.requests()
+        );
+        assert!(
+            matches!(refused, Err(StoreError::Permanent(_))),
+            "{token:?}: {refused:?}"
         );
     }
     assert_eq!(fake.data_of("cas/t").as_deref(), Some(&b"v1"[..]));
