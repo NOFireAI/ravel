@@ -1660,7 +1660,10 @@ pub struct Cli {
     /// Per-tenant ceiling, in bytes, on the SQL memory a single tenant may hold
     /// across its concurrent queries (ADR-0088), threaded into the
     /// `SqlExecutor`'s per-tenant accountant. The multi-tenant isolation bound:
-    /// one tenant's wide scans cannot starve another tenant's query pool. Sits
+    /// one tenant's wide scans cannot starve another tenant's query pool.
+    /// Columns a scan is served from the decoded column-block cache count
+    /// against the process memory budget only, not against this ceiling
+    /// (ADR-3326, tenant-ceiling amendment). Sits
     /// above `--sql-max-query-bytes` (the per-query ceiling). Process-wide, not
     /// itself per-tenant-overridable (ADR-0088). Default when unset: derived,
     /// 50% of MemTotal; reference host (16 cores, 30 GiB): 16,106,127,360.
