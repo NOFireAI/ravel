@@ -437,3 +437,139 @@ Misses, in the order the method checks them:
 | full | discovery-n10000-start | cold | assign | resolve | get | 66 | [66, 66] | 64 + 2 |
 | full | discovery-n10000-middle | cold | assign | resolve | get | 5058 | [5058, 5058] | 79 * 64 + 2 |
 | full | discovery-n10000-end | cold | assign | resolve | get | 10002 | [10002, 10002] | 10000 + 2 |
+
+## Revision 2026-10-29 (2)
+
+Written after review of the first revision and before the saturated-wake
+discovery scenario below ran. Its table takes precedence over both tables
+above.
+
+1. Correction to item 5 of the first revision. It says the discovery delays
+   "all landed on their predicted values". They did not: each delay came in
+   40 ms above the original prediction, which is the takeover item 5
+   describes (a HEAD GET at 10 ms and an ownership CAS at 20 ms) plus the
+   input-object GET at 10 ms. The pass counts and the LIST counts did land
+   on their predicted values. Every delay was still inside its original
+   band. The delay rows are restated below with the takeover included:
+   delay = `(passes - 1) * 5000 + 15 + 15 + 10 * g + 70` ms, `g` the HEAD
+   reads of the final pass, `70` the takeover (GET 10, CAS 20) and the
+   BeginTurn (HEAD GET 10, input GET 10, CAS 20). The bands are unchanged.
+2. Saturated-wake discovery. The original discovery rows measure the best
+   case: no wake hint is due, so the wake half lists once, reads nothing,
+   and gives its 32 HEAD reads to the directory half, which reads 64 entries
+   a pass. When hints are due, the wake half spends its own
+   `max_head_gets / 2` = 32 reads first, and the directory half is left with
+   `max_head_gets - max_head_gets / 2` = 32 (`sweep_pass` in
+   `crates/ravel-agents-runtime/src/sweep.rs`). That is the budget a
+   population can rely on, so the guaranteed bound is `ceil(N / 32)` passes:
+   4, 32 and 313 for N = 100, 1,000 and 10,000, which at the 5 s interval is
+   20 s, 160 s and 1,565 s (about 26 minutes) for N = 10,000. The best case
+   stays `ceil(N / 64)`.
+
+   Scenario `discovery-saturated-nN-end`, N as for discovery (100 on small;
+   100, 1,000 and 10,000 on full), target at the end of the directory only.
+   Setup schedules a timer due at setup time on every agent except the
+   target, with a handler the worker does not serve and no payload, so
+   every pass finds at least 32 due hints and a fired timer loads its agent
+   without the worker dispatching it. All the hints sit in one wake bucket,
+   in the same agent-id order as the directory. Per pass:
+   - Pass 1: the wake half lists once and reads hints 0 to 31: a HEAD GET,
+     then the `FireTimer` publish (a HEAD GET and a CAS), then the hint
+     DELETE. The directory half lists once, skips the 32 agents the wake
+     half already read, and reads 32 to 63, firing each one's timer.
+   - Pass p >= 2: the wake half reads the 32 hints the directory half fired
+     in pass p - 1. Their timers are settled, so each costs a HEAD GET and
+     the hint DELETE, and the pass writes back their `_dir` entries, because
+     the directory half has not listed them this pass (32 PUTs, counted in
+     the publish phase). The directory half reads the next 32 entries.
+   - The target at position N - 1 is read in pass `p = floor((N - 1) / 32)`:
+     3, 31 and 312. That is one pass under the guaranteed bound because the
+     target is the one agent with no hint, so pass 1's wake half and
+     directory half both read 32 agents ahead of it.
+
+   Totals per assignment, p as above:
+   - resolve get: the sweep's HEAD reads, `32p` by the wake half plus
+     `N - 32p + 32 - 32` by the directory half (`N + 32p - 32`), plus the
+     `N - 1` `FireTimer` HEAD GETs, plus the takeover and BeginTurn: `2N +
+     32p - 31`.
+   - publish cas: `N - 1` `FireTimer` CASes plus takeover and BeginTurn.
+   - publish put: `32 (p - 1)` directory entries written back.
+   - other delete: `32p` hints.
+   - resolve list: 2 a pass.
+   - delay: `(p - 1) * 5000` plus the final pass: the wake LIST and 32 HEAD
+     GETs and DELETEs (15 + 640), the directory LIST (15), `N - 32p - 1`
+     fired agents ahead of the target at 40 ms each (GET, GET, CAS) and the
+     target's GET (10), the 32 write-backs (640), then the takeover and
+     BeginTurn (70). The band runs from `(p - 1) * 5000` to the guaranteed
+     bound.
+   - `sweep.hints_read`, a new figure for this scenario only, from the
+     worker's `SweepMetricsSnapshot`: `32p`, which is the saturation check.
+     The run also refuses a result where it is not 32 per pass.
+3. Latency arithmetic of the first revision's widened index rows, which it
+   stated without the sums. Each is the original upper bound plus one 20 ms
+   PUT of a sealed page: message 60 + 20 = 80, activation 60 + 20 = 80
+   (the original row was [60, 60]), turn 160 + 20 = 180. Restated below
+   with the same bands.
+4. Heap and byte rows. A band whose lower bound is 0 passes a probe that
+   recorded nothing. The heap rows are restated with a lower bound of 1.
+   The generic byte rows keep 0, because some operations legitimately
+   write or read no object (a storm pass, a discovery assignment's store
+   PUTs); the rows below give a lower bound of 1 to each byte figure the
+   first run showed is always written: message, turn and step object and
+   HEAD bodies written, turn and step objects read, the discovery
+   assignment's input object.
+
+| size | scenario | temp | op | phase | metric | expected | band | reasoning |
+|---|---|---|---|---|---|---|---|---|
+| * | discovery-saturated-n100-end | cold | assign | sweep | passes | 3 | [3, 3] | floor(99 / 32); guaranteed bound ceil(100 / 32) = 4 (item 2) |
+| * | discovery-saturated-n100-end | cold | assign | sweep | hints_read | 96 | [96, 96] | 32 a pass, 3 passes |
+| * | discovery-saturated-n100-end | cold | assign | resolve | list | 6 | [6, 6] | 2 a pass |
+| * | discovery-saturated-n100-end | cold | assign | resolve | get | 265 | [265, 265] | 2 * 100 + 32 * 3 - 31 |
+| * | discovery-saturated-n100-end | cold | assign | publish | cas | 101 | [101, 101] | 99 timers fired, takeover, BeginTurn |
+| * | discovery-saturated-n100-end | cold | assign | publish | put | 64 | [64, 64] | 32 * (3 - 1) entries written back |
+| * | discovery-saturated-n100-end | cold | assign | other | delete | 96 | [96, 96] | 32 * 3 hints |
+| * | discovery-saturated-n100-end | cold | assign | latency | delay_ms | 11510 | [10000, 20000] | 2 * 5000 + 655 + 15 + 3 * 40 + 10 + 640 + 70; bound 4 * 5000 |
+| full | discovery-saturated-n1000-end | cold | assign | sweep | passes | 31 | [31, 31] | floor(999 / 32); guaranteed bound 32 |
+| full | discovery-saturated-n1000-end | cold | assign | sweep | hints_read | 992 | [992, 992] | 32 * 31 |
+| full | discovery-saturated-n1000-end | cold | assign | resolve | list | 62 | [62, 62] | 2 a pass |
+| full | discovery-saturated-n1000-end | cold | assign | resolve | get | 2961 | [2961, 2961] | 2 * 1000 + 32 * 31 - 31 |
+| full | discovery-saturated-n1000-end | cold | assign | publish | cas | 1001 | [1001, 1001] | 999 + 2 |
+| full | discovery-saturated-n1000-end | cold | assign | publish | put | 960 | [960, 960] | 32 * 30 |
+| full | discovery-saturated-n1000-end | cold | assign | other | delete | 992 | [992, 992] | 32 * 31 |
+| full | discovery-saturated-n1000-end | cold | assign | latency | delay_ms | 151670 | [150000, 160000] | 30 * 5000 + 655 + 15 + 7 * 40 + 10 + 640 + 70; bound 32 * 5000 |
+| full | discovery-saturated-n10000-end | cold | assign | sweep | passes | 312 | [312, 312] | floor(9999 / 32); guaranteed bound 313 |
+| full | discovery-saturated-n10000-end | cold | assign | sweep | hints_read | 9984 | [9984, 9984] | 32 * 312 |
+| full | discovery-saturated-n10000-end | cold | assign | resolve | list | 624 | [624, 624] | 2 a pass |
+| full | discovery-saturated-n10000-end | cold | assign | resolve | get | 29953 | [29953, 29953] | 2 * 10000 + 32 * 312 - 31 |
+| full | discovery-saturated-n10000-end | cold | assign | publish | cas | 10001 | [10001, 10001] | 9999 + 2 |
+| full | discovery-saturated-n10000-end | cold | assign | publish | put | 9952 | [9952, 9952] | 32 * 311 |
+| full | discovery-saturated-n10000-end | cold | assign | other | delete | 9984 | [9984, 9984] | 32 * 312 |
+| full | discovery-saturated-n10000-end | cold | assign | latency | delay_ms | 1556990 | [1555000, 1565000] | 311 * 5000 + 655 + 15 + 15 * 40 + 10 + 640 + 70; bound 313 * 5000 |
+| * | discovery-saturated-* | cold | assign | publish | conflict | 0 | [0, 0] | one worker, no contention |
+| * | discovery-saturated-* | cold | assign | store | get | 1 | [1, 1] | the input object; a timer with no payload reads no object |
+| * | discovery-saturated-* | cold | assign | resolve | body_in_bytes | 1000000 | [1, 1000000000] | about one HEAD body per GET; bound only |
+| * | discovery-saturated-* | cold | assign | publish | body_out_bytes | 1000000 | [1, 1000000000] | one HEAD body per CAS and an entry per write-back; bound only |
+| * | discovery-n100-start | cold | assign | latency | delay_ms | 740 | [0, 1500] | 15 + 15 + 640 + 70 (item 1) |
+| * | discovery-n100-middle | cold | assign | latency | delay_ms | 740 | [0, 1500] | as start |
+| * | discovery-n100-end | cold | assign | latency | delay_ms | 5460 | [5000, 6500] | 5000 + 15 + 15 + 360 + 70; bound 10000 |
+| full | discovery-n1000-start | cold | assign | latency | delay_ms | 740 | [0, 1500] | one pass |
+| full | discovery-n1000-middle | cold | assign | latency | delay_ms | 35740 | [35000, 36500] | 7 * 5000 + 740 |
+| full | discovery-n1000-end | cold | assign | latency | delay_ms | 75500 | [75000, 76500] | 15 * 5000 + 30 + 400 + 70; bound 80000 |
+| full | discovery-n10000-start | cold | assign | latency | delay_ms | 740 | [0, 1500] | one pass |
+| full | discovery-n10000-middle | cold | assign | latency | delay_ms | 390740 | [390000, 391500] | 78 * 5000 + 740 |
+| full | discovery-n10000-end | cold | assign | latency | delay_ms | 780260 | [780000, 781500] | 156 * 5000 + 30 + 160 + 70; bound 785000 |
+| * | discovery-* | cold | assign | store | body_in_bytes | 64 | [1, 65536] | the input object (item 4) |
+| * | index-* | * | message | latency | * | 60 | [50, 80] | original upper bound 60 + one 20 ms seal PUT = 80 (item 3) |
+| * | index-* | * | activation | latency | * | 70 | [60, 80] | original 60 + 20 = 80 (item 3) |
+| * | index-* | * | turn | latency | * | 140 | [100, 180] | original upper bound 160 + 20 = 180 (item 3) |
+| * | * | * | message | store | body_out_bytes | 64 | [1, 65536] | the payload object (item 4) |
+| * | * | * | turn | store | body_out_bytes | 64 | [1, 65536] | state and output objects (item 4) |
+| * | * | * | step | store | body_out_bytes | 64 | [1, 65536] | the result object (item 4) |
+| * | * | * | turn | store | body_in_bytes | 64 | [1, 65536] | the input object (item 4) |
+| * | * | * | step | store | body_in_bytes | 64 | [1, 65536] | result and output objects (item 4) |
+| * | * | * | message | publish | body_out_bytes | 2048 | [1, 262144] | the HEAD CAS body (item 4) |
+| * | * | * | turn | publish | body_out_bytes | 2048 | [1, 262144] | the BeginTurn and commit CAS bodies (item 4) |
+| * | * | * | step | publish | body_out_bytes | 2048 | [1, 262144] | the step's CAS bodies (item 4) |
+| * | * | * | activation | publish | body_out_bytes | 2048 | [1, 262144] | every activation publishes (item 4) |
+| * | discovery-* | * | * | heap | peak_bytes | 33554432 | [1, 1073741824] | restates the original row with a lower bound of 1 (item 4) |
+| * | * | * | * | heap | peak_bytes | 4194304 | [1, 268435456] | restates the original row with a lower bound of 1 (item 4) |
