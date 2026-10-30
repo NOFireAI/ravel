@@ -160,7 +160,9 @@ rule on thread placement.
    below: an ingest decompression whose format declares no uncompressed
    length it can trust is sized by an upper bound on that length. The
    non-framed OTAP payload amendment below records where an OTAP payload's
-   size undercounts its decode.)
+   size undercounts its decode. The parallel page encode amendment below
+   lets a logs ingest flush at or above the floor run its column pages as
+   separate gated jobs.)
 
 5. **Cancellation.** A waiter dropped before it holds a permit never runs.
    A decode that has started runs to completion, because a `zstd::bulk`
@@ -1082,3 +1084,26 @@ caches combined, across every tenant:
   entry refused for being larger than the bound is counted in neither, but
   in `Catalog::decoded_cache_byte_bound_refusals`, so a cache that refuses
   every insert can be told apart from one that is cold.
+
+## Amendment (2026-10-30): the parallel page encode amendment (ADR-3492)
+
+<!-- amendment-applies: sections="Decision" pointer="parallel page encode amendment" -->
+
+Decision 4 has the gate wrap a whole block with all its pages, never a single
+page, and applies the inline floor to each unit. ADR-3492 decision 7 narrows
+both rules for one caller, the logs ingest flush:
+
+- The floor applies to the flush as a whole. A flush below the write gate's
+  floor stays one inline job, as before.
+- A flush at or above the floor encodes the column pages of a block as
+  separate jobs on the blocking pool. Each page job takes one write-gate
+  permit, whatever its own size, so the gate still bounds total encode
+  concurrency.
+- The flush assembles the sealed pages in the writer's column order, so the
+  object's bytes equal a serial encode.
+
+The dispatch-cost argument behind "never a single page" is about 4096 pages
+per block on the read path. A logs flush block has one page per column, tens
+rather than thousands, and the measured reason to split it is the ack
+latency of a flush holding 7.5k lines (ADR-3492, "What strict acks can
+reach"). Every other caller keeps decision 4 as written.
