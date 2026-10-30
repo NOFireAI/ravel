@@ -13,6 +13,9 @@ storage is its only durable component: Ravel has no write-ahead log, no
 replicated ingest quorum, and no StatefulSet. You can kill any Ravel process
 at any instant, and every strictly acknowledged write is still there.
 
+Ravel can also run durable agents on the same bucket. See
+[Ravel Agents](#ravel-agents).
+
 ![Ingesting one sample under strict acknowledgement, SIGKILLing the ravel-server container, replacing it with a fresh one, and reading the pre-kill sample back by its commit token.](docs/demo.gif)
 
 Strict acknowledgement is the default. Ravel acknowledges a request only after
@@ -365,6 +368,153 @@ The [HTTP API reference](docs/reference/http-api.md) lists every route. One
 of them, `POST /api/v1/admin/fold`, triggers a
 [catalog fold on demand](docs/architecture.md#on-demand-catalog-fold).
 
+## Ravel Agents
+
+Ravel Agents runs durable agents on the same bucket as your telemetry. An
+agent is a named unit of state, such as one order or one conversation.
+Clients send it messages. A worker that you write runs a handler for each
+message, and Ravel commits the new state, the result and the events to the
+bucket in one conditional write. Any server or worker process can stop at
+any time. The next process reads the agent from the bucket and continues.
+
+Ravel Agents is not the [MCP server](#mcp-server-for-ai-agents), which lets
+an AI agent host query your telemetry.
+
+### What an agent gives you
+
+- **Safe retries.** Each send carries a request id. A send that repeats
+  the id and the payload returns the first send's operation, and a
+  different payload under the same id is refused.
+- **One turn at a time.** The handler runs the accepted messages in order.
+  A turn's state, result and events become visible together.
+- **Durable steps.** A handler calls tools through steps. A completed step
+  replays from its record when the turn runs again. Each tool declares what
+  happens when an attempt's outcome is unknown: run it again
+  (`at_least_once`), rely on the provider's idempotency (`provider_idempotency`),
+  or block until an operator decides (`manual`).
+- **Timers.** An agent can schedule a message to itself. Each timer fires
+  once.
+- **Takeover.** A worker holds an agent under a lease. When the worker
+  stops, another worker takes the agent over and runs the open turn again
+  with the same recorded clock and random seed.
+- **History in your logs and traces.** Committed history is projected into
+  the tenant's logs and traces, with payloads redacted by default.
+- **Typed errors.** Every refusal is one of eleven typed errors, and each
+  carries a retry hint.
+
+The [Ravel Agents guide](docs/guides/agents.md) explains each of these, and
+the [storage spec](docs/agents.md#guarantees-and-limitations) lists every
+guarantee with the test that backs it.
+
+### Try it
+
+You need Docker, a Rust toolchain and node 22.15 or a later 22.x. Run these
+commands from the repository root.
+
+1. Build the server with the `agents` feature, and build the CLI:
+
+   ```sh
+   cargo build -p ravel-server --features agents
+   cargo build -p ravel-cli
+   ```
+
+2. Start a development server:
+
+   ```sh
+   RAVEL_S3_ACCESS_KEY=ravel RAVEL_S3_SECRET_KEY=ravel-dev-secret \
+     target/debug/ravel-cli --store s3 --s3-endpoint http://127.0.0.1:9000 \
+       --s3-bucket ravel-dev --s3-region us-east-1 \
+     agents dev --server-bin target/debug/ravel-server
+   ```
+
+   `agents dev` starts RustFS with Docker Compose if the bucket does not
+   answer. Then it starts `ravel-server --agents` on `127.0.0.1:4318`, prints
+   a token for tenant `dev`, and runs until you press Ctrl-C. The token
+   holds all three agents capabilities.
+
+3. In a second terminal, write a starter project and run its tests:
+
+   ```sh
+   (cd sdk/typescript && npm ci)
+   target/debug/ravel-cli agents scaffold ../my-agent
+   cd ../my-agent
+   npm install
+   npm test
+   ```
+
+   The project defines one agent, `order`. Its `checkout` handler prices a
+   line through a durable step. The tests run against an in-process fake,
+   so they need no server and no API key.
+
+4. Run the project against the server, with the token from step 2:
+
+   ```sh
+   RAVEL_AGENTS_TOKEN=<token> RAVEL_WORKER_TOKEN=<token> npm start -- A-1 2
+   ```
+
+   It serves the `order` agent from a worker, sends `checkout` for two of
+   SKU `A-1` to a new order, and prints the operation id, the line and the
+   total.
+
+The [SDK guide](docs/guides/agents-sdk.md) continues from here.
+
+### The HTTP API
+
+Clients and workers use the routes under `/api/v1/agents/` with a bearer
+token. With `TOKEN` set to the token from `agents dev`, a client creates an
+agent and then sends it a message:
+
+```sh
+curl -s -X POST http://127.0.0.1:4318/api/v1/agents/create \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent":{"kind":"order","key":"o-1"}}'
+
+curl -s -X POST http://127.0.0.1:4318/api/v1/agents/call \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent":{"kind":"order","key":"o-1"},"handler":"checkout",
+       "request_id":"req-1","payload":{"sku":"A-1","qty":2},"wait_ms":10000}'
+```
+
+`call` accepts the message and waits for the result for up to `wait_ms`, at
+most 20 s. If no worker finishes the turn in that time, `result` is null, and
+you read it later from `GET /api/v1/agents/result`. Use `send` to accept a
+message without waiting. Other routes read the agent's state, events, timers
+and effects. `GET /api/v1/agents/inspector` serves a page that shows one
+agent's state and what blocks it.
+
+| Capability | Lets a token |
+|---|---|
+| `agents` | create agents, send messages and read results, state and events |
+| `agents_worker` | register a worker, poll for turns and commit them |
+| `agents_admin` | settle an effect in doubt and run a sweep on demand |
+
+A static token takes capabilities in its suffix, for example
+`--tenant-token 'TOKEN=acme;agents'`. The
+[HTTP API reference](docs/reference/http-api.md#agents-routes) lists every
+route with its body and status codes.
+
+### Running it
+
+The published `ravel-server` image is built with the `agents` feature. The
+routes mount only when the server also runs with `--agents`, in
+`--mode all` or `--mode query`. The `CHANGELOG.md` section of a release says
+whether its image carries the feature.
+
+Know these limits before you put agents in production:
+
+- An agent accepts at most `--agents-max-receipts` messages in its life,
+  1,024 by default. Use a key with a bounded life, such as one order or one
+  conversation, and not a key that receives messages forever.
+- No route destroys an agent in this release. An agent at a cap stays
+  there, so send new work to a new key.
+- With several server processes on one tenant, a message can wait for a
+  sweep before a worker on another process sees it. At 10,000 agents that
+  wait can reach 26 minutes. One process has no such wait.
+
+The [operator guide](docs/guides/operations/agents.md) covers the budgets
+and their metrics, the capabilities and bucket grants, projection, the
+sweep's cost, clock assumptions and how to settle an effect in doubt.
+
 ## MCP server for AI agents
 
 The MCP server, the query surface for an AI agent host, is documented in
@@ -461,6 +611,9 @@ Replace `v0.27.0` and `0.27.0` with the release you are verifying. The tag ref i
 - The [documentation index](docs/README.md) lists every guide, spec, and decision
   record.
 - [Architecture](docs/architecture.md) is the mental model.
+- The [Ravel Agents guide](docs/guides/agents.md), the
+  [SDK guide](docs/guides/agents-sdk.md) and the
+  [operator guide](docs/guides/operations/agents.md) cover durable agents.
 - [Contributing](CONTRIBUTING.md), the [changelog](CHANGELOG.md), and the
   [AI policy](AI_POLICY.md).
 
