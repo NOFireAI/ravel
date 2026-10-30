@@ -65,8 +65,10 @@ The two cases share one threshold. The bands are:
   flush size has not reached that floor then waits for the sub-floor hold
   instead of the idle clock.
   - The hold is the flush lifetime of the pipeline (1 h) less one flush tick
-    (200 ms). `age_threshold_s` for such a buffer is therefore 3,599.8 instead
-    of 40, which is 24 flushes a day instead of 2,160.
+    (200 ms at the default 2 s flush delay; a quarter of a shorter delay,
+    down to 25 ms). `age_threshold_s` for such a buffer is
+    therefore 3,599.8 at the defaults instead of 40, which is 24 flushes a
+    day instead of 2,160.
   - The floor must be below `min_flush_bytes`. A server given a floor at or
     above it refuses to start.
   - This band is a durability trade, not only a cost trade. An acknowledged

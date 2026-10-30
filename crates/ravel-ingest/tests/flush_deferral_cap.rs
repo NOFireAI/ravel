@@ -963,7 +963,7 @@ fn spawn_metric_write(
 fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: r.stream_id,
-        stream_attrs: r.stream_attrs.clone(),
+        stream_attrs: r.stream_attrs.to_vec(),
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
         severity_num: r.severity_num,
@@ -1003,7 +1003,7 @@ fn log_record(i: usize) -> NormalizedLogRecord {
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
     NormalizedLogRecord {
         stream_id: log_stream_id(&res, "scope", "", &scope_attrs),
-        stream_attrs: stream_attrs_bytes(&res, "scope", "", &scope_attrs),
+        stream_attrs: stream_attrs_bytes(&res, "scope", "", &scope_attrs).into(),
         ts_ns: 1_000 + i as i64,
         observed_ts_ns: 1_000 + i as i64,
         severity_num: 9,

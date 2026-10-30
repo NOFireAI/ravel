@@ -7,12 +7,11 @@
 //! `tests/normalize_allocations.rs`.
 //!
 //! Normalization owns the decoded request, so every string it stores (keys,
-//! string values, severity text, body) is moved out of it, never copied. What
-//! a record still allocates is its own attribute `Vec` and its copy of the
-//! stream's attribute blob (`NormalizedLogRecord::stream_attrs` is a `Vec<u8>`
-//! per record, so it cannot be shared yet): two allocations per record. The
-//! measurement differences two request
-//! sizes under one scope, so the per-request and per-scope allocations cancel.
+//! string values, severity text, body) is moved out of it, never copied, and
+//! the stream's attribute blob is built once per scope and shared by its
+//! records. What a record still allocates is its own attribute `Vec`: one
+//! allocation per record. The measurement differences two request sizes
+//! under one scope, so the per-request and per-scope allocations cancel.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -38,9 +37,8 @@ const INGEST_TS_NS: i64 = 1_700_000_000_000_000_000;
 /// String attributes per record.
 const ATTRS: usize = 40;
 
-/// The moved-value floor: the record's attribute `Vec` and its copy of the
-/// stream blob.
-const FLOOR_PER_RECORD: usize = 2;
+/// The moved-value floor: the record's attribute `Vec`.
+const FLOOR_PER_RECORD: usize = 1;
 
 fn string_kv(key: String, value: String) -> KeyValue {
     KeyValue {

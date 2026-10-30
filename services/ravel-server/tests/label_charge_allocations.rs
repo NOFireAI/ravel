@@ -116,23 +116,27 @@ fn wide_gauge_request() -> ExportMetricsServiceRequest {
     }
 }
 
+/// One record under each of `UNITS` copies of the wide resource. Normalization
+/// builds one stream-attribute blob per scope and shares it across that
+/// scope's records (ADR-3492 decision 3a), so a resource per record is what
+/// makes it build one blob per record, as the projection charges.
 fn wide_stream_log_request() -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
-        resource_logs: vec![ResourceLogs {
-            resource: Some(wide_resource()),
-            scope_logs: vec![ScopeLogs {
-                log_records: (0..UNITS)
-                    .map(|i| LogRecord {
+        resource_logs: (0..UNITS)
+            .map(|i| ResourceLogs {
+                resource: Some(wide_resource()),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
                         time_unix_nano: INGEST_TS_NS as u64 + i as u64,
                         observed_time_unix_nano: INGEST_TS_NS as u64,
                         severity_number: 9,
                         ..Default::default()
-                    })
-                    .collect(),
+                    }],
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        }],
+            })
+            .collect(),
     }
 }
 

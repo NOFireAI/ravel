@@ -123,7 +123,7 @@ fn norm_log_record(ts_ns: i64, body: &str) -> NormalizedLogRecord {
     let stream_attrs = stream_attrs_bytes(&resource, "scope", "", &scope_attrs);
     NormalizedLogRecord {
         stream_id,
-        stream_attrs,
+        stream_attrs: stream_attrs.into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,

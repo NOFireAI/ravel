@@ -25,8 +25,8 @@ use ravel_logseg::record::{COL_BODY, COL_SEVERITY_TEXT};
 use ravel_logseg::rlog_bloom::RlogBloomSection;
 use ravel_logseg::tokenizer::tokens;
 use ravel_logseg::{
-    FieldType, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter,
-    read_section,
+    FieldType, LogRecord, ObjectIdentity, PageChoice, Predicate, RlogConfig, RlogReader,
+    RlogWriter, read_section,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
 use ravel_object_store::memory::MemoryStore;
@@ -78,7 +78,7 @@ fn rec(ts_ns: i64, body: &str, attrs: Vec<(&str, AttrValue)>) -> NormalizedLogRe
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
     NormalizedLogRecord {
         stream_id: log_stream_id(&res, "scope", "", &scope_attrs),
-        stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs),
+        stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs).into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,
@@ -410,7 +410,7 @@ async fn bloom_scope_reaches_the_object() {
 fn to_log_record(rec: NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: rec.stream_id,
-        stream_attrs: rec.stream_attrs,
+        stream_attrs: rec.stream_attrs.to_vec(),
         ts_ns: rec.ts_ns,
         observed_ts_ns: rec.observed_ts_ns,
         severity_num: rec.severity_num,
@@ -423,7 +423,8 @@ fn to_log_record(rec: NormalizedLogRecord) -> LogRecord {
     }
 }
 
-/// `records` written by a writer with no builder calls under `ftr`'s identity.
+/// `records` written by a writer with no builder calls under `ftr`'s identity,
+/// with the page choice the ingest flush uses (ADR-3492 decision 1).
 fn direct_object(ftr: &LogFooter, records: Vec<NormalizedLogRecord>) -> Vec<u8> {
     let identity = ObjectIdentity {
         tenant_hash: ftr.tenant_hash,
@@ -432,7 +433,11 @@ fn direct_object(ftr: &LogFooter, records: Vec<NormalizedLogRecord>) -> Vec<u8> 
         writer_epoch: ftr.writer_epoch,
         writer_seq: ftr.writer_seq,
     };
-    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    let cfg = RlogConfig {
+        page_choice: PageChoice::Estimated,
+        ..RlogConfig::default()
+    };
+    let mut writer = RlogWriter::new(cfg, identity);
     for r in records {
         writer.push(to_log_record(r)).expect("push");
     }

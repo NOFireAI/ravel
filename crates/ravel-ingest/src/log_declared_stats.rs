@@ -872,7 +872,7 @@ mod tests {
     ) -> NormalizedLogRecord {
         NormalizedLogRecord {
             stream_id: LogStreamId([stream; 16]),
-            stream_attrs: stream_attrs.to_vec(),
+            stream_attrs: stream_attrs.into(),
             ts_ns: 0,
             observed_ts_ns: 0,
             severity_num: 0,
@@ -1180,7 +1180,7 @@ mod tests {
         let stream = blob(&[("k", AttrValue::I64(7))], &[]);
         let to_logrecord = |r: &NormalizedLogRecord| LogRecord {
             stream_id: r.stream_id,
-            stream_attrs: r.stream_attrs.clone(),
+            stream_attrs: r.stream_attrs.to_vec(),
             ts_ns: r.ts_ns,
             observed_ts_ns: r.observed_ts_ns,
             severity_num: r.severity_num,
@@ -1329,7 +1329,7 @@ mod tests {
 
         let to_logrecord = |r: &NormalizedLogRecord| LogRecord {
             stream_id: r.stream_id,
-            stream_attrs: r.stream_attrs.clone(),
+            stream_attrs: r.stream_attrs.to_vec(),
             ts_ns: r.ts_ns,
             observed_ts_ns: r.observed_ts_ns,
             severity_num: r.severity_num,
@@ -1404,7 +1404,7 @@ mod tests {
         ])];
         let to_logrecord = |r: &NormalizedLogRecord| LogRecord {
             stream_id: r.stream_id,
-            stream_attrs: r.stream_attrs.clone(),
+            stream_attrs: r.stream_attrs.to_vec(),
             ts_ns: r.ts_ns,
             observed_ts_ns: r.observed_ts_ns,
             severity_num: r.severity_num,

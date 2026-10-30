@@ -46,7 +46,8 @@ use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::rng::RngSource;
 use ravel_logseg::{
-    ColumnarLogBatch, DynCells, LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
+    ColumnarLogBatch, DynCells, LogRecord, LogSegError, ObjectIdentity, PageChoice, RlogConfig,
+    RlogWriter,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -89,10 +90,43 @@ use ravel_cpu_gate::WriteSite;
 
 pub(crate) type LogAck = oneshot::Sender<Result<CommitToken, LogWriteError>>;
 
+/// One shard's share of a row-major write, carrying the [`est_record_bytes`]
+/// sum the router already computed to charge the byte budget, so the shard
+/// buffers it without walking every record's attributes a second time.
+#[derive(Debug, Default)]
+pub(crate) struct ShardRecords {
+    records: Vec<NormalizedLogRecord>,
+    est_bytes: usize,
+}
+
+impl ShardRecords {
+    /// Appends `record`, whose [`est_record_bytes`] the caller computed as
+    /// `est_bytes`.
+    pub(crate) fn push(&mut self, record: NormalizedLogRecord, est_bytes: usize) {
+        self.records.push(record);
+        self.est_bytes += est_bytes;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+}
+
+impl From<Vec<NormalizedLogRecord>> for ShardRecords {
+    fn from(records: Vec<NormalizedLogRecord>) -> Self {
+        let est_bytes = records.iter().map(est_record_bytes).sum();
+        Self { records, est_bytes }
+    }
+}
+
 pub(crate) enum LogShardMsg {
     Write {
         tenant: TenantId,
-        records: Vec<NormalizedLogRecord>,
+        records: ShardRecords,
         ack: Option<LogAck>,
         /// This request's global ingest-byte-budget charge (ADR-0069), held in
         /// the tenant buffer until it flushes, then dropped -- refunding the
@@ -373,13 +407,26 @@ pub fn est_log_records_object_bytes(records: &[NormalizedLogRecord]) -> usize {
     records.iter().map(est_record_object_bytes).sum()
 }
 
+/// The writer configuration of an ingest flush. The flush estimates each
+/// page's encoding instead of sealing every candidate (ADR-3492 decision 1);
+/// every other RLOG writer keeps the exhaustive default.
+fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
+    RlogConfig {
+        zstd_level: config.rlog_zstd_level.get(),
+        group_target_blocks: config.rlog_group_target_blocks.get(),
+        chunk_order: config.rlog_chunk_order.get(),
+        page_choice: PageChoice::Estimated,
+        ..RlogConfig::default()
+    }
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
-/// writer's [`LogRecord`]. Every field maps one to one; there is no data
-/// transformation, only a struct rename.
+/// writer's [`LogRecord`]. Every field maps one to one; the only copy is the
+/// shared `stream_attrs` blob, which `LogRecord` owns per record.
 fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: rec.stream_id,
-        stream_attrs: rec.stream_attrs,
+        stream_attrs: rec.stream_attrs.to_vec(),
         ts_ns: rec.ts_ns,
         observed_ts_ns: rec.observed_ts_ns,
         severity_num: rec.severity_num,
@@ -405,11 +452,48 @@ fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> Result<ColumnarLogBatch, 
     .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
 }
 
+/// A row buffer's flush input as one columnar batch (ADR-3492 decision 2).
+/// The writer produces the same bytes from it as from the records pushed one
+/// by one, but the batch keeps only the first `stream_attrs` blob per stream
+/// id, so the row writer's directory check runs first and its refusal is
+/// reported where the row writer reports it, from `finish`.
+fn flush_rows_batch(
+    records: Vec<NormalizedLogRecord>,
+) -> Result<ColumnarLogBatch, RlogEncodeError> {
+    check_stream_attrs(&records).map_err(RlogEncodeError::Finish)?;
+    ColumnarLogBatch::try_from_records(
+        &records
+            .into_iter()
+            .map(to_logseg_record)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(RlogEncodeError::Push)
+}
+
+/// The row writer's stream-directory check, with its message: the first
+/// record, in push order, whose `stream_attrs` differ from the first blob seen
+/// for its stream id refuses the whole object.
+fn check_stream_attrs(records: &[NormalizedLogRecord]) -> Result<(), LogSegError> {
+    let mut streams: HashMap<LogStreamId, &Arc<[u8]>> = HashMap::new();
+    for r in records {
+        let first = *streams.entry(r.stream_id).or_insert(&r.stream_attrs);
+        if !Arc::ptr_eq(first, &r.stream_attrs) && first[..] != r.stream_attrs[..] {
+            return Err(LogSegError::InconsistentStreamAttrs(format!(
+                "stream {} carries two different stream_attrs blobs ({} and {} bytes)",
+                r.stream_id.to_hex(),
+                first.len(),
+                r.stream_attrs.len(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The inverse of [`to_logseg_record`], for records a refused build hands back.
 fn from_logseg_record(rec: LogRecord) -> NormalizedLogRecord {
     NormalizedLogRecord {
         stream_id: rec.stream_id,
-        stream_attrs: rec.stream_attrs,
+        stream_attrs: rec.stream_attrs.into(),
         ts_ns: rec.ts_ns,
         observed_ts_ns: rec.observed_ts_ns,
         severity_num: rec.severity_num,
@@ -531,7 +615,7 @@ impl LogTenantBuf {
     /// collision check is deferred to [`RlogWriter::finish`] at flush time.
     fn merge_rows(
         &mut self,
-        records: Vec<NormalizedLogRecord>,
+        records: ShardRecords,
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added = self.merge_rows_unstamped(records)?;
@@ -541,11 +625,11 @@ impl LogTenantBuf {
 
     /// [`Self::merge_rows`] without the arrival stamp, for handed-back records
     /// whose arrival bookkeeping travels with them ([`HandBackArrival`]).
-    fn merge_rows_unstamped(
-        &mut self,
-        records: Vec<NormalizedLogRecord>,
-    ) -> Result<usize, LogWriteError> {
-        let bytes_added: usize = records.iter().map(est_record_bytes).sum();
+    fn merge_rows_unstamped(&mut self, records: ShardRecords) -> Result<usize, LogWriteError> {
+        let ShardRecords {
+            records,
+            est_bytes: bytes_added,
+        } = records;
         let object_bytes_added: usize = records.iter().map(est_record_object_bytes).sum();
         // ADR-0873 wave 5a: fold this write's eligible declared-column extrema
         // in the one pass that already visits the records, on the accepted arms
@@ -631,7 +715,7 @@ impl LogTenantBuf {
                 if matches!(self.content, BufContent::Columnar(_)) {
                     self.merge_columnar_unstamped(rows_to_batch(records)?)?;
                 } else {
-                    self.merge_rows_unstamped(records)?;
+                    self.merge_rows_unstamped(records.into())?;
                 }
             }
             FlushPayload::Columnar(batches) => {
@@ -885,12 +969,7 @@ impl LogFlushCtx {
             .into_iter()
             .map(|col| (col.key, declared_type_tag(col.ty)))
             .collect();
-        let rlog_config = RlogConfig {
-            zstd_level: self.config.rlog_zstd_level.get(),
-            group_target_blocks: self.config.rlog_group_target_blocks.get(),
-            chunk_order: self.config.rlog_chunk_order.get(),
-            ..RlogConfig::default()
-        };
+        let rlog_config = flush_rlog_config(&self.config);
         // The encode runs on the write gate when one is attached (ADR-1702).
         // The job takes the byte charges with the payload and returns them with
         // the object, so they stay held through the permit wait and the encode
@@ -911,15 +990,15 @@ impl LogFlushCtx {
                     .with_sort_descriptor(writer_layout.descriptor, writer_layout.generation)
                     .with_bloom_scope(writer_layout.bloom_scope);
                 let push_result = match payload {
-                    FlushPayload::Rows(records) => records
-                        .into_iter()
-                        .try_for_each(|rec| writer.push(to_logseg_record(rec))),
+                    FlushPayload::Rows(records) => flush_rows_batch(records).and_then(|batch| {
+                        writer.push_columnar(batch).map_err(RlogEncodeError::Push)
+                    }),
                     FlushPayload::Columnar(batches) => batches
                         .into_iter()
-                        .try_for_each(|batch| writer.push_columnar(batch)),
+                        .try_for_each(|batch| writer.push_columnar(batch))
+                        .map_err(RlogEncodeError::Push),
                 };
                 let finish_result = push_result
-                    .map_err(RlogEncodeError::Push)
                     .and_then(|()| writer.finish_with_stats().map_err(RlogEncodeError::Finish));
                 // `Encode` closes here, immediately after `finish_with_stats`
                 // returns: the hash below and the bloom-sample fold and
@@ -1450,7 +1529,8 @@ impl LogShardActor {
         // test that advances the injected clock past `max_flush_delay` drives a
         // flush tick deterministically with no real sleep.
         let clock = Arc::clone(&self.clock);
-        let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
+        let flush_tick_ns =
+            i64::try_from(self.config.effective_flush_tick().as_nanos()).unwrap_or(i64::MAX);
         let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
         loop {
             let until_ns = next_tick_ns.saturating_sub(clock.now_ns()).max(0);
@@ -1565,7 +1645,7 @@ impl LogShardActor {
     async fn handle_write(
         &mut self,
         tenant: TenantId,
-        records: Vec<NormalizedLogRecord>,
+        records: ShardRecords,
         mut ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
         arrival: bool,
@@ -1978,7 +2058,7 @@ impl LogShardActor {
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
     /// (ADR-0051 section 7), or, below a non-zero `idle_flush_byte_floor`, for
-    /// the sub-floor hold, `max_flush_lifetime` less one `flush_tick`
+    /// the sub-floor hold, `max_flush_lifetime` less one `effective_flush_tick()`
     /// (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
     /// is a claim about the object, so this
     /// reads the object-bytes estimate, not the buffered-memory charge (issue
@@ -3119,7 +3199,8 @@ mod tests {
                         "scope",
                         1_000,
                         body,
-                    )],
+                    )]
+                    .into(),
                     ack: None,
                     charge: None,
                 })
@@ -3145,7 +3226,7 @@ mod tests {
         let stream_attrs = stream_attrs_bytes(&res, scope_name, "", &scope_attrs);
         NormalizedLogRecord {
             stream_id,
-            stream_attrs,
+            stream_attrs: stream_attrs.into(),
             ts_ns,
             observed_ts_ns: ts_ns,
             severity_num: 9,
@@ -3198,7 +3279,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records,
+            records: records.into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3245,7 +3326,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records,
+            records: records.into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3290,6 +3371,168 @@ mod tests {
             .collect();
         h.shutdown().await;
         groups
+    }
+
+    /// ADR-3492 decision 1: the ingest flush estimates page encodings and
+    /// carries the configured writer knobs; nothing else departs from the
+    /// writer default.
+    #[test]
+    fn the_flush_writer_estimates_page_encodings() {
+        let config = flush_on_first();
+        let cfg = flush_rlog_config(&config);
+        assert_eq!(cfg.page_choice, PageChoice::Estimated);
+        assert_eq!(RlogConfig::default().page_choice, PageChoice::Exhaustive);
+        assert_eq!(cfg.zstd_level, config.rlog_zstd_level.get());
+        assert_eq!(
+            cfg.group_target_blocks,
+            config.rlog_group_target_blocks.get()
+        );
+        assert_eq!(cfg.chunk_order, config.rlog_chunk_order.get());
+        let default = RlogConfig::default();
+        assert_eq!(cfg.block_target_records, default.block_target_records);
+        assert_eq!(cfg.block_max_bytes, default.block_max_bytes);
+        assert_eq!(cfg.max_dynamic_columns, default.max_dynamic_columns);
+    }
+
+    /// ADR-3492 decision 5: the shard buffers a write at the estimate the
+    /// router carried with it, not at one it recomputes from the records.
+    #[test]
+    fn the_shard_buffers_the_carried_record_estimate() {
+        let records = interleaved_tie_records();
+        let computed: usize = records.iter().map(est_record_bytes).sum();
+        let mut carried = ShardRecords::default();
+        for record in records.clone() {
+            carried.push(record, 1_000);
+        }
+        let mut buf = LogTenantBuf::default();
+        let added = buf
+            .merge_rows(carried, 7)
+            .expect("rows into an empty buffer");
+        assert_eq!(added, 1_000 * records.len());
+        assert_eq!(buf.est_bytes, 1_000 * records.len());
+        assert_ne!(buf.est_bytes, computed);
+        assert_eq!(ShardRecords::from(records).est_bytes, computed);
+    }
+
+    /// Records of two streams interleaved in arrival order, each stream holding
+    /// timestamp ties with distinct bodies, so any reordering before the
+    /// writer's stable sort moves a body.
+    fn interleaved_tie_records() -> Vec<NormalizedLogRecord> {
+        (0..48)
+            .map(|i: i64| {
+                let service = if i % 3 == 0 { "api" } else { "worker" };
+                let mut rec = norm_record(
+                    &[("service.name", service)],
+                    "scope",
+                    1_000 + i / 4,
+                    &format!("body {i:03}"),
+                );
+                rec.attrs = vec![
+                    (
+                        "region".to_string(),
+                        AttrValue::Str(["eu", "us"][(i % 2) as usize].to_string()),
+                    ),
+                    ("n".to_string(), AttrValue::I64(i * 7 % 5)),
+                ];
+                rec
+            })
+            .collect()
+    }
+
+    fn flush_identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: TenantId::new("acme").hash().0,
+            shard: 3,
+            writer_id: [7; 16],
+            writer_epoch: 2,
+            writer_seq: 11,
+        }
+    }
+
+    fn region_sort_descriptor() -> ravel_logseg::footer::SortDescriptor {
+        use ravel_logseg::footer::{SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType};
+        SortDescriptor {
+            bucket_width: SortBucketWidth::SixHours,
+            key_columns: vec![SortKeyColumn {
+                name: "region".to_string(),
+                ty: SortKeyType::Str,
+            }],
+        }
+    }
+
+    /// The object the row writer produces from `records`, pushed one by one.
+    fn row_written(
+        cfg: RlogConfig,
+        sort: Option<ravel_logseg::footer::SortDescriptor>,
+        records: Vec<NormalizedLogRecord>,
+    ) -> Vec<u8> {
+        let mut writer = RlogWriter::new(cfg, flush_identity()).with_sort_descriptor(sort, 4);
+        for rec in records {
+            writer.push(to_logseg_record(rec)).expect("row push");
+        }
+        writer.finish().expect("row finish")
+    }
+
+    /// The object the ingest flush produces from a row buffer's `records`.
+    fn flush_written(
+        cfg: RlogConfig,
+        sort: Option<ravel_logseg::footer::SortDescriptor>,
+        records: Vec<NormalizedLogRecord>,
+    ) -> Vec<u8> {
+        let mut writer = RlogWriter::new(cfg, flush_identity()).with_sort_descriptor(sort, 4);
+        let Ok(batch) = flush_rows_batch(records) else {
+            panic!("the flush batch builds");
+        };
+        writer.push_columnar(batch).expect("columnar push");
+        writer.finish().expect("columnar finish")
+    }
+
+    /// ADR-3492 decision 2: the flush's columnar write of a row buffer is the
+    /// row writer's object, byte for byte, under either page choice, with and
+    /// without a clustering key.
+    #[test]
+    fn the_columnar_flush_writes_the_row_writers_bytes() {
+        let records = interleaved_tie_records();
+        for page_choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            for sort in [None, Some(region_sort_descriptor())] {
+                let cfg = RlogConfig {
+                    page_choice,
+                    ..flush_rlog_config(&IngestConfig::default())
+                };
+                let row = row_written(cfg, sort.clone(), records.clone());
+                let flushed = flush_written(cfg, sort.clone(), records.clone());
+                assert!(
+                    row == flushed,
+                    "{page_choice:?}, sort {}: the flush's object differs from the row \
+                     writer's ({} and {} bytes)",
+                    sort.is_some(),
+                    flushed.len(),
+                    row.len(),
+                );
+            }
+        }
+    }
+
+    /// The flush batch refuses a stream id carrying two blobs with the row
+    /// writer's error and message, reported from `finish` as the row writer
+    /// reports it, so the flush still answers with a stream-id collision.
+    #[test]
+    fn the_flush_batch_refuses_diverging_stream_attrs_as_the_row_writer_does() {
+        let mut records = interleaved_tie_records();
+        records[5].stream_attrs = b"different".as_slice().into();
+        let mut writer = RlogWriter::new(RlogConfig::default(), flush_identity());
+        for rec in records.clone() {
+            writer.push(to_logseg_record(rec)).expect("row push");
+        }
+        let Err(LogSegError::InconsistentStreamAttrs(row_msg)) = writer.finish() else {
+            panic!("the row writer refuses the object");
+        };
+        let Err(RlogEncodeError::Finish(LogSegError::InconsistentStreamAttrs(flush_msg))) =
+            flush_rows_batch(records)
+        else {
+            panic!("the flush batch refuses the records from finish");
+        };
+        assert_eq!(flush_msg, row_msg);
     }
 
     /// ADR-3217 decision 5: `rlog_group_target_blocks` reaches the flush's
@@ -3340,7 +3583,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records,
+            records: records.into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3419,7 +3662,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records,
+            records: records.into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3452,7 +3695,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: None,
             charge: None,
         })
@@ -3500,7 +3743,7 @@ mod tests {
             h.tx.send(LogShardMsg::Write {
                 arrival: false,
                 tenant: tenant.clone(),
-                records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+                records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
                 ack: Some(ack_tx),
                 charge: None,
             })
@@ -3670,7 +3913,7 @@ mod tests {
             h.tx.send(LogShardMsg::Write {
                 arrival: false,
                 tenant: tenant.clone(),
-                records: vec![norm_record(&[("service.name", name)], "scope", 1_000, "x")],
+                records: vec![norm_record(&[("service.name", name)], "scope", 1_000, "x")].into(),
                 ack: Some(ack_tx),
                 charge: None,
             })
@@ -3695,7 +3938,7 @@ mod tests {
         // Not something normalize_logs would ever produce; hand-built here.
         let good = norm_record(&[("service.name", "api")], "scope", 1_000, "x");
         let mut collider = good.clone();
-        collider.stream_attrs = b"deliberately-different-attrs".to_vec();
+        collider.stream_attrs = b"deliberately-different-attrs".as_slice().into();
         assert_eq!(
             good.stream_id, collider.stream_id,
             "the fixture must share a stream_id for finish() to compare attrs"
@@ -3705,7 +3948,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![good, collider],
+            records: vec![good, collider].into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3745,7 +3988,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![first, second],
+            records: vec![first, second].into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3796,7 +4039,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: TenantId::new("acme"),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3836,7 +4079,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: TenantId::new("acme"),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3901,7 +4144,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -3973,7 +4216,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: TenantId::new("acme"),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: None,
             charge: None,
         })
@@ -4041,7 +4284,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: TenantId::new("acme"),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: Some(ack_tx),
             charge: Some(charge),
         })
@@ -4078,7 +4321,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: TenantId::new("acme"),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: Some(ack_tx),
             charge: Some(charge),
         })
@@ -4145,7 +4388,7 @@ mod tests {
         tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: TenantId::new("acme"),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
             ack: None,
             charge: Some(charge),
         })
@@ -4197,7 +4440,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "a")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "a")].into(),
             ack: Some(ack_a_tx),
             charge: None,
         })
@@ -4211,7 +4454,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![norm_record(&[("service.name", "api")], "scope", 2_000, "b")],
+            records: vec![norm_record(&[("service.name", "api")], "scope", 2_000, "b")].into(),
             ack: Some(ack_b_tx),
             charge: None,
         })
@@ -4319,7 +4562,8 @@ mod tests {
             records: vec![
                 norm_record_with_status("200"),
                 norm_record_with_status("500"),
-            ],
+            ]
+            .into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -4365,7 +4609,7 @@ mod tests {
         h.tx.send(LogShardMsg::Write {
             arrival: false,
             tenant: tenant.clone(),
-            records: vec![norm_record_with_status("200")],
+            records: vec![norm_record_with_status("200")].into(),
             ack: Some(ack_tx),
             charge: None,
         })
@@ -4478,7 +4722,7 @@ mod tests {
                     let stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
                     NormalizedLogRecord {
                         stream_id,
-                        stream_attrs,
+                        stream_attrs: stream_attrs.into(),
                         ts_ns: 1,
                         observed_ts_ns: 1,
                         severity_num,
@@ -4562,7 +4806,7 @@ mod tests {
         )];
         let rec = NormalizedLogRecord {
             stream_id: ravel_types::logstream::log_stream_id(&res, "scope", "", &[]),
-            stream_attrs: stream_attrs_bytes(&res, "scope", "", &[]),
+            stream_attrs: stream_attrs_bytes(&res, "scope", "", &[]).into(),
             ts_ns: 1,
             observed_ts_ns: 1,
             severity_num: 9,
@@ -4596,7 +4840,7 @@ mod tests {
             h.tx.send(LogShardMsg::Write {
                 arrival: false,
                 tenant: tenant.clone(),
-                records: vec![row],
+                records: vec![row].into(),
                 ack: Some(a1),
                 charge: None,
             })
@@ -4656,7 +4900,7 @@ mod tests {
             h.tx.send(LogShardMsg::Write {
                 arrival: false,
                 tenant: tenant.clone(),
-                records: vec![row],
+                records: vec![row].into(),
                 ack: Some(a2),
                 charge: None,
             })
@@ -5012,7 +5256,7 @@ mod tests {
                 .send(LogShardMsg::Write {
                     arrival: false,
                     tenant: TenantId::new(tenant),
-                    records: Self::six_records(),
+                    records: Self::six_records().into(),
                     ack,
                     charge: Some(Arc::clone(&charge)),
                 })
@@ -6022,7 +6266,7 @@ mod tests {
         let rows = HandBackRig::six_records();
         let handed = HandBackRig::six_records();
         let mut buf = LogTenantBuf::default();
-        buf.merge_rows_unstamped(rows.clone())
+        buf.merge_rows_unstamped(rows.clone().into())
             .expect("rows into an empty buffer");
         let before = buf.est_bytes;
         let handed_batch = rows_to_batch(handed).expect("the records convert");

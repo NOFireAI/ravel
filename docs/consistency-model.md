@@ -44,7 +44,8 @@ Strict mode (default):
   deferred for at least the flush deferral cap (ADR-1642 deferral cap
   amendment): `FLUSH_BOUND_SLACK_HOURS` (2 h) less `max_flush_lifetime`, less
   the largest of `max_flush_delay`, `max_flush_delay_idle` and (with adaptive
-  flush delay on) the corridor's widest ceiling, and one `flush_tick`,
+  flush delay on) the corridor's widest ceiling, and one effective flush tick
+  (`min(flush_tick, max(max_flush_delay / 4, 25 ms))`, ADR-3492 decision 6),
   3559.8 s at the defaults. This keeps every acknowledged strict row inside the
   read-side scan slack. A strict waiter on a buffer whose deferral reached the
   cap is answered with the retryable `Abandoned` (503), which here means
@@ -70,7 +71,7 @@ Buffered mode (opt-in per request, named "buffered"):
   adaptive corridor can widen it); any other buffer triggers on `max_flush_delay_idle` (40 s). With
   `--idle-flush-byte-floor` set to a non-zero byte count (ADR-1737), a buffer
   holding fewer estimated object bytes than that floor instead waits for the
-  sub-floor hold, one `flush_tick` short of `max_flush_lifetime`, so an
+  sub-floor hold, one effective flush tick short of `max_flush_lifetime`, so an
   acknowledged buffered row in such a buffer may sit in process memory for up
   to `max_flush_lifetime` (1 h) before its flush even opens, plus the flush's
   own time. The flag defaults to 0, which disables the tier: unless an
