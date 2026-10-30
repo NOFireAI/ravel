@@ -440,7 +440,7 @@ impl LogWalk<'_> {
         let stored_before = self.records.len();
         let projecting = self.projecting();
         let mut records = log_records.into_iter();
-        while let Some(record) = records.next() {
+        for record in records.by_ref() {
             let (normalized, charge) = normalize_record(
                 record,
                 stream_id,
