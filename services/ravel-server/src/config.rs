@@ -113,6 +113,16 @@ impl Mode {
         !matches!(self, Mode::Gateway)
     }
 
+    /// Whether anything in this mode reads the catalog's per-tenant commit-
+    /// and compaction-record caches, and so whether
+    /// `--catalog-record-cache-max-bytes-per-tenant` has an effect (ADR-3513).
+    /// A resolve reads them in [`Mode::All`] and [`Mode::Query`], and a fold
+    /// reads commit records through them in [`Mode::All`], [`Mode::Maintain`]
+    /// and on demand in [`Mode::Query`]. [`Mode::Gateway`] runs neither.
+    pub fn reads_record_caches(self) -> bool {
+        !matches!(self, Mode::Gateway)
+    }
+
     /// Whether [`crate::start`] builds the metrics, log and span ingest routers
     /// for this mode, which buffer ingest bytes under the
     /// `--max-ingest-buffer-bytes` ceiling: [`Mode::All`] and [`Mode::Gateway`].
@@ -2801,6 +2811,30 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES")]
     pub column_stats_cache_max_bytes: Option<u64>,
 
+    /// Per-tenant byte budget of the catalog's commit-record and compaction-record caches, 45 MB or more; default 45 MB (45000000).
+    ///
+    /// The figure is per actively-queried tenant and sits outside the process
+    /// memory budget's shares: neither cache takes a share of
+    /// `--cache-max-bytes`, `--catalog-cache-max-bytes` or
+    /// `--column-stats-cache-max-bytes`, so budget host memory for it
+    /// separately, times the number of tenants queried concurrently
+    /// (ADR-3513). Each cache gets half of it. The per-tenant entry bound is
+    /// the capacity derived from `--shards` and `--max-flush-delay`, held
+    /// between the 10,000-entry floor and this budget divided by 1,800 bytes
+    /// (900 bytes per entry in each of the two caches), and each cache is
+    /// held to that bound times 900 bytes. So the worst case for one
+    /// actively-queried tenant is at most this figure, both halves enforced
+    /// in bytes: 45 MB unset, 400 MB at `400000000`.
+    ///
+    /// Raise it when a tenant's unsealed tail is larger than the default
+    /// 25,000-entry bound holds and every resolve pays a GET per record past
+    /// it. Startup refuses a value below the 45 MB default, the flag together
+    /// with `--disable-cache` (which holds the caches at the floor), and the
+    /// flag in `--mode gateway`, which runs no resolve and no fold, so nothing
+    /// reads the record caches there. Read at startup only.
+    #[arg(long, value_name = "BYTES")]
+    pub catalog_record_cache_max_bytes_per_tenant: Option<u64>,
+
     /// Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that bulk-scan reads hold against interactive admissions, strictly between 0 and 1; default 0.5.
     ///
     /// A `POST /api/v1/sql` statement is a bulk scan (ADR-3072 decision 3a)
@@ -2967,7 +3001,9 @@ pub struct Cli {
     /// derived capacity (`query::build_catalog`), which is the lowest capacity
     /// short of disabling the resolve path's record cache entirely: 10,000
     /// entries and a 9 MB byte budget in each of the two caches, about 18 MB
-    /// per actively-queried tenant.
+    /// per actively-queried tenant. It cannot be combined with
+    /// `--catalog-record-cache-max-bytes-per-tenant`, the flag that raises the
+    /// record caches' per-tenant budget above its 45 MB default.
     #[arg(long)]
     pub disable_cache: bool,
 
@@ -4009,6 +4045,13 @@ pub struct QueryBudgets {
     /// `query_budgets`, beside the query-path figures, while the two byte
     /// cache caps ride on `ServerConfig` directly.
     pub column_stats_cache_max_bytes: u64,
+    /// The per-tenant byte budget of the catalog's two record caches,
+    /// `--catalog-record-cache-max-bytes-per-tenant` (ADR-3513), default
+    /// `ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT`.
+    /// [`crate::query::build_catalog_for_server`] derives the per-tenant entry
+    /// bound under it. Not a query budget; it rides here for the same reason as
+    /// [`Self::column_stats_cache_max_bytes`].
+    pub record_cache_max_bytes_per_tenant: u64,
     /// The MCP surface's settings (ADR-1374). Not a query budget; it rides
     /// here because this is the query-surface configuration `start` receives.
     pub mcp: McpConfig,
@@ -4051,6 +4094,7 @@ impl Default for QueryBudgets {
             store_cost_profile: StoreCostProfile::reference(),
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
             column_stats_cache_max_bytes: ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+            record_cache_max_bytes_per_tenant: ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT,
             mcp: McpConfig::default(),
             agents: AgentsConfig::default(),
             fold_lag_interval: None,
@@ -7703,6 +7747,9 @@ impl Cli {
             store_cost_profile: self.resolve_store_cost_profile()?,
             logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
             column_stats_cache_max_bytes: resolved.column_stats_cache_max_bytes,
+            record_cache_max_bytes_per_tenant: self
+                .catalog_record_cache_max_bytes_per_tenant
+                .unwrap_or(ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT),
             mcp: McpConfig {
                 enabled: self.mcp,
                 allowed_origins: self.mcp_allowed_origins.clone(),
@@ -8640,6 +8687,36 @@ impl Cli {
                  smaller count.",
                 ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
             );
+        }
+
+        // ADR-3513: the record-cache budget only ever raises the entry bound,
+        // and only where something reads the record caches.
+        if let Some(budget) = self.catalog_record_cache_max_bytes_per_tenant {
+            let floor = ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT;
+            if budget < floor {
+                anyhow::bail!(
+                    "--catalog-record-cache-max-bytes-per-tenant '{budget}' is below the \
+                     {floor}-byte default: the flag only raises the per-tenant record-cache \
+                     budget. Omit it to keep the default, or set {floor} or more."
+                );
+            }
+            if self.disable_cache {
+                anyhow::bail!(
+                    "--catalog-record-cache-max-bytes-per-tenant was set with --disable-cache: \
+                     --disable-cache holds the record caches at the \
+                     {}-entry floor, so the budget would be inert. Drop one of the two flags.",
+                    ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT
+                );
+            }
+            if !self.mode.reads_record_caches() {
+                anyhow::bail!(
+                    "--catalog-record-cache-max-bytes-per-tenant was set with --mode {}: that \
+                     mode runs no resolve and no fold, so nothing reads the record caches and \
+                     the budget would be inert. It applies in --mode all, query and maintain. \
+                     Drop the flag, or run one of those modes.",
+                    format!("{:?}", self.mode).to_lowercase()
+                );
+            }
         }
 
         for (flag, permits) in [
@@ -10716,6 +10793,197 @@ mod tests {
              \"about {total_mb} MB per actively-queried tenant\", computed from that \
              share times RECORD_CACHES_PER_TENANT: {help}"
         );
+        assert!(
+            help.contains("--catalog-record-cache-max-bytes-per-tenant"),
+            "--disable-cache help must name the record-cache budget flag it refuses: {help}"
+        );
+        assert!(
+            help.contains(&format!(
+                "above its {} MB default",
+                mb(ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT)
+            )),
+            "--disable-cache help must state the budget flag's default as computed from \
+             MAX_RECORD_CACHE_BYTES_PER_TENANT: {help}"
+        );
+    }
+
+    /// `--catalog-record-cache-max-bytes-per-tenant`'s help states the default,
+    /// the floor, that the figure is per actively-queried tenant and outside the
+    /// process memory budget's shares, and the worst case for one tenant
+    /// (ADR-3513). Every figure is computed from the catalog constants, so a
+    /// constant that moves without the help fails here.
+    #[test]
+    fn record_cache_budget_help_states_the_figures_the_constants_derive() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "catalog_record_cache_max_bytes_per_tenant")
+            .expect("--catalog-record-cache-max-bytes-per-tenant is defined on the command");
+        let short = arg.get_help().expect("short help").to_string();
+        let help = arg.get_long_help().expect("long help").to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let budget = ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT;
+        assert_eq!(budget, 45_000_000);
+        let budget_mb = budget / 1_000_000;
+        let pair = ravel_catalog::RECORD_CACHE_ENTRY_BYTES * ravel_catalog::RECORD_CACHES_PER_TENANT;
+        let grouped = |n: u64| {
+            let digits = n.to_string();
+            let mut out = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            out
+        };
+
+        for needle in [
+            format!("{budget_mb} MB or more"),
+            format!("default {budget_mb} MB ({budget})"),
+        ] {
+            assert!(short.contains(&needle), "short help must state {needle:?}: {short}");
+        }
+        for needle in [
+            "per actively-queried tenant and sits outside the process memory budget's shares"
+                .to_owned(),
+            format!(
+                "between the {}-entry floor and this budget divided by {} bytes ({} bytes per \
+                 entry in each of the two caches)",
+                grouped(ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT as u64),
+                grouped(pair),
+                ravel_catalog::RECORD_CACHE_ENTRY_BYTES
+            ),
+            format!(
+                "the worst case for one actively-queried tenant is at most this figure, both \
+                 halves enforced in bytes: {budget_mb} MB unset"
+            ),
+            format!(
+                "default {}-entry bound",
+                grouped(ravel_catalog::MAX_CACHE_CAPACITY_PER_TENANT as u64)
+            ),
+            format!("refuses a value below the {budget_mb} MB default"),
+            "together with `--disable-cache`".to_owned(),
+            "in `--mode gateway`".to_owned(),
+        ] {
+            assert!(help.contains(&needle), "long help must state {needle:?}: {help}");
+        }
+        assert_eq!(
+            budget / pair,
+            ravel_catalog::MAX_CACHE_CAPACITY_PER_TENANT as u64,
+            "the default budget divided by the per-entry pair is the default bound"
+        );
+        // "At most this figure": a deployment whose derivation reaches the
+        // ceiling holds both caches to the budget less the remainder of the
+        // division, and never above it.
+        for (configured, worst_case) in [(budget, 45_000_000), (400_000_000, 399_999_600)] {
+            let bound = ravel_catalog::derive_cache_capacity_per_tenant_within(
+                64,
+                std::time::Duration::from_secs(2),
+                configured,
+            ) as u64;
+            assert_eq!(bound * pair, worst_case, "budget {configured}");
+            assert!(worst_case <= configured);
+        }
+    }
+
+    /// The budget reaches `QueryBudgets` through `Cli::query_budgets`, the
+    /// path `main` builds `ServerConfig` with; unset it is the 45 MB default.
+    #[test]
+    fn record_cache_budget_flag_reaches_query_budgets() {
+        let unset = cli(&[]);
+        assert_eq!(
+            unset
+                .query_budgets(&resolved_from(&unset))
+                .expect("budgets resolve")
+                .record_cache_max_bytes_per_tenant,
+            ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT
+        );
+        let set = cli(&["--catalog-record-cache-max-bytes-per-tenant", "400000000"]);
+        set.validate().expect("400 MB validates in --mode all");
+        assert_eq!(
+            set.query_budgets(&resolved_from(&set))
+                .expect("budgets resolve")
+                .record_cache_max_bytes_per_tenant,
+            400_000_000
+        );
+    }
+
+    /// Startup refuses a budget below the 45 MB default, naming the flag; the
+    /// default itself is accepted.
+    #[test]
+    fn record_cache_budget_below_the_default_is_refused() {
+        let err = cli(&["--catalog-record-cache-max-bytes-per-tenant", "44999999"])
+            .validate()
+            .expect_err("a budget below the default must refuse startup");
+        assert!(
+            err.to_string()
+                .starts_with("--catalog-record-cache-max-bytes-per-tenant '44999999' is below"),
+            "names the flag: {err}"
+        );
+        cli(&["--catalog-record-cache-max-bytes-per-tenant", "45000000"])
+            .validate()
+            .expect("the default itself validates");
+    }
+
+    /// Startup refuses the budget together with `--disable-cache`, naming both.
+    #[test]
+    fn record_cache_budget_with_disable_cache_is_refused() {
+        let err = cli(&[
+            "--catalog-record-cache-max-bytes-per-tenant",
+            "400000000",
+            "--disable-cache",
+        ])
+        .validate()
+        .expect_err("the budget with --disable-cache must refuse startup");
+        assert!(
+            err.to_string().starts_with(
+                "--catalog-record-cache-max-bytes-per-tenant was set with --disable-cache"
+            ),
+            "names the flag: {err}"
+        );
+        cli(&["--disable-cache"])
+            .validate()
+            .expect("--disable-cache alone validates");
+    }
+
+    /// Startup refuses the budget in `--mode gateway`, which reads no record
+    /// cache, naming the flag and the mode; the three modes that read them
+    /// accept it.
+    #[test]
+    fn record_cache_budget_is_refused_in_gateway_mode_only() {
+        let err = cli(&[
+            "--mode",
+            "gateway",
+            "--catalog-record-cache-max-bytes-per-tenant",
+            "400000000",
+        ])
+        .validate()
+        .expect_err("the budget in --mode gateway must refuse startup");
+        assert!(
+            err.to_string().starts_with(
+                "--catalog-record-cache-max-bytes-per-tenant was set with --mode gateway"
+            ),
+            "names the flag and the mode: {err}"
+        );
+
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+        for args in [
+            vec!["--mode", "all"],
+            vec!["--mode", "query"],
+            vec!["--mode", "maintain", "--maintain-key-file", key_path],
+        ] {
+            let mut argv = args.clone();
+            argv.extend(["--catalog-record-cache-max-bytes-per-tenant", "400000000"]);
+            cli(&argv)
+                .validate()
+                .unwrap_or_else(|err| panic!("{args:?} accepts the budget: {err}"));
+        }
+        assert!(!Mode::Gateway.reads_record_caches());
     }
 
     /// Records every event at `level` as one combined string (`" name=value"`
