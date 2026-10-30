@@ -795,17 +795,15 @@ fn page(block: u32, enc: Enc) -> PageEntry {
 }
 
 fn one_chunk(block_count: u32, pages: Vec<PageEntry>) -> PageDir {
-    PageDir {
-        groups: vec![GroupEntry {
-            first_block: 0,
-            block_count,
-            chunks: vec![ChunkEntry {
-                column_id: 10,
-                offset: 0,
-                pages,
-            }],
+    PageDir::new(vec![GroupEntry {
+        first_block: 0,
+        block_count,
+        chunks: vec![ChunkEntry {
+            column_id: 10,
+            offset: 0,
+            pages,
         }],
-    }
+    }])
 }
 
 fn decodes(dir: &PageDir) -> Result<PageDir, LogSegError> {

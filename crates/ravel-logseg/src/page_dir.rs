@@ -139,9 +139,209 @@ pub struct GroupEntry {
 }
 
 /// The decoded PAGE_DIR section.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+///
+/// Carries an in-memory index of where each block's pages start in each column
+/// chunk ([`BlockIndex`]), so [`Self::block_pages`] and
+/// [`Self::block_dict_pages`] slice a chunk instead of scanning it. The index
+/// is built by [`Self::new`] and [`Self::decode`]. A chunk whose group's block
+/// or chunk count, or whose own page count, no longer matches the index is
+/// scanned instead ([`BlockIndex::runs`],
+/// `index_tests::a_stale_index_falls_back_to_the_scan`); an in-place edit of
+/// `groups` that keeps every count must be followed by [`Self::reindex`].
+#[derive(Clone, Default)]
 pub struct PageDir {
     pub groups: Vec<GroupEntry>,
+    index: BlockIndex,
+}
+
+/// Equality and debug output are over `groups` only: the index is derived from
+/// them and is not part of the section.
+impl PartialEq for PageDir {
+    fn eq(&self, other: &Self) -> bool {
+        self.groups == other.groups
+    }
+}
+
+impl Eq for PageDir {}
+
+impl std::fmt::Debug for PageDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageDir")
+            .field("groups", &self.groups)
+            .finish()
+    }
+}
+
+/// Per group, per column chunk, where each block's run of pages starts.
+///
+/// Memory: one `(u32, u32)` per (column chunk, block) plus one more per chunk,
+/// that is `8 * (block_count + 1)` bytes for each chunk of a group, plus a
+/// `Vec` header per group and a page count and box per chunk. A chunk the
+/// index cannot describe (see [`ChunkRuns::build`]) keeps no runs and is
+/// scanned.
+#[derive(Clone, Default)]
+struct BlockIndex {
+    groups: Vec<GroupIndex>,
+}
+
+#[derive(Clone)]
+struct GroupIndex {
+    block_count: u32,
+    chunks: Vec<ChunkIndex>,
+}
+
+#[derive(Clone)]
+struct ChunkIndex {
+    /// The chunk's page count when the index was built.
+    pages: usize,
+    runs: Option<ChunkRuns>,
+}
+
+/// `starts[b]` is `(index of block b's first page, that page's offset relative
+/// to the chunk's offset)`; `starts[block_count]` is `(page count, chunk
+/// length)`, so block `b`'s pages are `starts[b].0..starts[b + 1].0`.
+#[derive(Clone)]
+struct ChunkRuns {
+    starts: Box<[(u32, u32)]>,
+}
+
+impl ChunkRuns {
+    /// The runs of a chunk in the shape decode admits: an optional dictionary
+    /// page first, then no other dictionary page, every page's block inside
+    /// the group and the blocks non-decreasing. `None` for any other chunk,
+    /// or one whose page count, length, or absolute end does not fit, and the
+    /// lookups scan that chunk exactly as they did before the index.
+    fn build(chunk: &ChunkEntry, block_count: u32) -> Option<Self> {
+        let lead = usize::from(chunk.dict_page().is_some());
+        let pages = chunk.pages.get(lead..)?;
+        let mut total = 0u64;
+        for p in &chunk.pages {
+            total = total.checked_add(p.len)?;
+        }
+        chunk.offset.checked_add(total)?;
+        u32::try_from(total).ok()?;
+        u32::try_from(chunk.pages.len()).ok()?;
+        let mut starts = Vec::with_capacity(block_count as usize + 1);
+        let mut i = lead;
+        let mut rel = chunk.pages.get(..lead)?.iter().map(|p| p.len).sum::<u64>();
+        let mut prev = 0u32;
+        for p in pages {
+            if p.enc == Enc::DictPage || p.block >= block_count || p.block < prev {
+                return None;
+            }
+            prev = p.block;
+        }
+        for b in 0..=block_count {
+            starts.push((u32::try_from(i).ok()?, u32::try_from(rel).ok()?));
+            while let Some(p) = chunk.pages.get(i).filter(|p| p.block == b) {
+                rel += p.len;
+                i += 1;
+            }
+        }
+        Some(ChunkRuns {
+            starts: starts.into_boxed_slice(),
+        })
+    }
+
+    /// Block `within`'s pages in `chunk`: `(first, end, offset of first
+    /// relative to the chunk)`. Every page of the run is checked to name
+    /// `within`, and its neighbours on either side to name another block, so
+    /// a run read from an index that no longer matches the chunk is `None`
+    /// rather than a wrong slice; the caller then scans the chunk.
+    fn run(&self, chunk: &ChunkEntry, within: u32) -> Option<(usize, usize, u64)> {
+        let b = within as usize;
+        let (s, rel) = *self.starts.get(b)?;
+        let (e, _) = *self.starts.get(b + 1)?;
+        let (s, e) = (s as usize, e as usize);
+        let lead = self.starts.first()?.0 as usize;
+        let run = chunk.pages.get(s..e)?;
+        visit(run.len());
+        if run
+            .iter()
+            .any(|p| p.block != within || p.enc == Enc::DictPage)
+        {
+            return None;
+        }
+        if s > lead {
+            visit(1);
+            if chunk.pages.get(s - 1)?.block >= within {
+                return None;
+            }
+        }
+        if let Some(next) = chunk.pages.get(e) {
+            visit(1);
+            if next.block <= within {
+                return None;
+            }
+        }
+        Some((s, e, u64::from(rel)))
+    }
+}
+
+impl BlockIndex {
+    fn build(groups: &[GroupEntry]) -> Self {
+        BlockIndex {
+            groups: groups
+                .iter()
+                .map(|g| GroupIndex {
+                    block_count: g.block_count,
+                    chunks: g
+                        .chunks
+                        .iter()
+                        .map(|c| ChunkIndex {
+                            pages: c.pages.len(),
+                            runs: ChunkRuns::build(c, g.block_count),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The runs of chunk `ci` of group `gi`, when the index still describes
+    /// `group` (same block count, chunk count, and the chunk's page count).
+    fn runs(&self, gi: usize, group: &GroupEntry, ci: usize) -> Option<&ChunkRuns> {
+        let g = self.groups.get(gi).filter(|g| {
+            g.block_count == group.block_count && g.chunks.len() == group.chunks.len()
+        })?;
+        let c = g.chunks.get(ci)?;
+        let chunk = group.chunks.get(ci)?;
+        (c.pages == chunk.pages.len()).then_some(())?;
+        c.runs.as_ref()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pages a lookup looked at, for the cost tests.
+    static PAGES_VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn visit(n: usize) {
+    PAGES_VISITED.with(|v| v.set(v.get() + n as u64));
+}
+
+#[cfg(not(test))]
+fn visit(_: usize) {}
+
+/// Block `within`'s pages in `chunk` by walking every page of it, the lookup
+/// for a chunk [`BlockIndex`] does not describe. `None` when an offset
+/// overflows.
+fn scan_chunk_pages(chunk: &ChunkEntry, within: u32, out: &mut Vec<PageLoc>) -> Option<()> {
+    visit(chunk.pages.len());
+    let mut at = chunk.offset;
+    for p in &chunk.pages {
+        if p.block == within && p.enc != Enc::DictPage {
+            out.push(PageLoc {
+                desc: p.desc(chunk.column_id),
+                crc32c: p.crc32c,
+                offset: at,
+            });
+        }
+        at = at.checked_add(p.len)?;
+    }
+    Some(())
 }
 
 /// One located page: its descriptor, its checksum, and where its stored bytes
@@ -154,17 +354,37 @@ pub struct PageLoc {
 }
 
 impl PageDir {
+    /// A directory over `groups`, with its block index built.
+    pub fn new(groups: Vec<GroupEntry>) -> Self {
+        let index = BlockIndex::build(&groups);
+        PageDir { groups, index }
+    }
+
+    /// Rebuilds the block index after `groups` was edited in place.
+    pub fn reindex(&mut self) {
+        self.index = BlockIndex::build(&self.groups);
+    }
+
     /// The group holding whole-object block index `block`, and the block's
     /// index within that group.
     pub fn locate_block(&self, block: u32) -> Option<(&GroupEntry, u32)> {
+        let (gi, within) = self.locate_group(block)?;
+        Some((self.groups.get(gi)?, within))
+    }
+
+    /// [`Self::locate_block`] by group position.
+    fn locate_group(&self, block: u32) -> Option<(usize, u32)> {
         // `decode` proves the groups are consecutive runs from block 0, so
         // the candidate is the last group whose first block is at or before
         // `block`; the scan calls this once per block, so it must not walk
         // every group.
-        let idx = self.groups.partition_point(|g| g.first_block <= block);
-        let g = self.groups.get(idx.checked_sub(1)?)?;
+        let idx = self
+            .groups
+            .partition_point(|g| g.first_block <= block)
+            .checked_sub(1)?;
+        let g = self.groups.get(idx)?;
         (u64::from(block) < u64::from(g.first_block) + u64::from(g.block_count))
-            .then_some((g, block - g.first_block))
+            .then_some((idx, block - g.first_block))
     }
 
     /// Every page of whole-object block index `block`, in `column_id` order,
@@ -174,23 +394,34 @@ impl PageDir {
     ///
     /// A row group dictionary page is never one of them: it belongs to the
     /// chunk, not to any block, and [`Self::block_dict_pages`] returns it.
+    ///
+    /// This is on the scan's per-block path, so a chunk is sliced through
+    /// [`BlockIndex`] to the block's run of pages rather than walked: the cost
+    /// is the pages returned plus at most two per chunk
+    /// (`index_tests::block_pages_visits_only_the_blocks_run`), and the result is
+    /// the full scan's, page for page (`index_tests::index_matches_the_scan`).
     pub fn block_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
-        let (group, within) = self.locate_block(block)?;
-        // The per-page offset is derived by running the chunk's offset forward,
-        // inline rather than through `page_offsets`: this is on the scan's
-        // per-block path and a wide object has one chunk per column, so a
-        // per-chunk allocation here would scale with the column count.
+        let (gi, within) = self.locate_group(block)?;
+        let group = self.groups.get(gi)?;
         let mut out = Vec::new();
-        for chunk in &group.chunks {
-            let mut at = chunk.offset;
-            for p in &chunk.pages {
-                if p.block == within && p.enc != Enc::DictPage {
-                    out.push(PageLoc {
-                        desc: p.desc(chunk.column_id),
-                        crc32c: p.crc32c,
-                        offset: at,
-                    });
-                }
+        for (ci, chunk) in group.chunks.iter().enumerate() {
+            let run = self
+                .index
+                .runs(gi, group, ci)
+                .and_then(|r| r.run(chunk, within));
+            let Some((s, e, rel)) = run else {
+                scan_chunk_pages(chunk, within, &mut out)?;
+                continue;
+            };
+            // `ChunkRuns::build` proved the chunk's absolute end fits, so no
+            // offset inside it overflows.
+            let mut at = chunk.offset.checked_add(rel)?;
+            for p in chunk.pages.get(s..e)? {
+                out.push(PageLoc {
+                    desc: p.desc(chunk.column_id),
+                    crc32c: p.crc32c,
+                    offset: at,
+                });
                 at = at.checked_add(p.len)?;
             }
         }
@@ -203,17 +434,28 @@ impl PageDir {
     /// as [`Self::block_pages`] returns them. `None` when `block` is outside
     /// the directory.
     pub fn block_dict_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
-        let (group, within) = self.locate_block(block)?;
+        let (gi, within) = self.locate_group(block)?;
+        let group = self.groups.get(gi)?;
         let mut out = Vec::new();
-        for chunk in &group.chunks {
+        for (ci, chunk) in group.chunks.iter().enumerate() {
             let Some(d) = chunk.dict_page() else {
                 continue;
             };
-            if chunk
-                .pages
-                .iter()
-                .any(|p| p.block == within && p.enc != Enc::DictPage)
+            let has_page = match self
+                .index
+                .runs(gi, group, ci)
+                .and_then(|r| r.run(chunk, within))
             {
+                Some((s, e, _)) => s < e,
+                None => {
+                    visit(chunk.pages.len());
+                    chunk
+                        .pages
+                        .iter()
+                        .any(|p| p.block == within && p.enc != Enc::DictPage)
+                }
+            };
+            if has_page {
                 out.push(PageLoc {
                     desc: d.desc(chunk.column_id),
                     crc32c: d.crc32c,
@@ -621,7 +863,7 @@ impl PageDir {
         if pos != bytes.len() {
             return Err(LogSegError::Corrupted("page_dir trailing bytes".into()));
         }
-        Ok(PageDir { groups })
+        Ok(PageDir::new(groups))
     }
 }
 
@@ -671,35 +913,33 @@ mod tests {
     /// Two groups of two blocks, three columns each; column 5 is partially
     /// present in block 0 so it carries a presence page and a value page there.
     fn sample() -> PageDir {
-        PageDir {
-            groups: vec![
-                GroupEntry {
-                    first_block: 0,
-                    block_count: 2,
-                    chunks: vec![
-                        ChunkEntry {
-                            column_id: 0,
-                            offset: 0,
-                            pages: vec![page(0, 10), page(1, 12)],
-                        },
-                        ChunkEntry {
-                            column_id: 5,
-                            offset: 22,
-                            pages: vec![page(0, 3), page(0, 7), page(1, 9)],
-                        },
-                    ],
-                },
-                GroupEntry {
-                    first_block: 2,
-                    block_count: 1,
-                    chunks: vec![ChunkEntry {
+        PageDir::new(vec![
+            GroupEntry {
+                first_block: 0,
+                block_count: 2,
+                chunks: vec![
+                    ChunkEntry {
                         column_id: 0,
-                        offset: 41,
-                        pages: vec![page(0, 4)],
-                    }],
-                },
-            ],
-        }
+                        offset: 0,
+                        pages: vec![page(0, 10), page(1, 12)],
+                    },
+                    ChunkEntry {
+                        column_id: 5,
+                        offset: 22,
+                        pages: vec![page(0, 3), page(0, 7), page(1, 9)],
+                    },
+                ],
+            },
+            GroupEntry {
+                first_block: 2,
+                block_count: 1,
+                chunks: vec![ChunkEntry {
+                    column_id: 0,
+                    offset: 41,
+                    pages: vec![page(0, 4)],
+                }],
+            },
+        ])
     }
 
     fn is_corrupted<T>(r: Result<T, LogSegError>) -> bool {
@@ -1032,8 +1272,8 @@ mod tests {
             entry("n", FieldType::I64, 10),
             entry("s", FieldType::Str, 11),
         ]);
-        let chunk = |column_id, pages| PageDir {
-            groups: vec![GroupEntry {
+        let chunk = |column_id, pages| {
+            PageDir::new(vec![GroupEntry {
                 first_block: 0,
                 block_count: 2,
                 chunks: vec![ChunkEntry {
@@ -1041,7 +1281,7 @@ mod tests {
                     offset: 0,
                     pages,
                 }],
-            }],
+            }])
         };
         let dict = |block, enc| PageEntry {
             enc,
@@ -1182,7 +1422,7 @@ mod proptests {
                 });
                 first_block += block_count;
             }
-            PageDir { groups: out }
+            PageDir::new(out)
         })
     }
 
@@ -1279,6 +1519,393 @@ mod proptests {
                 Ok(_) | Err(LogSegError::Corrupted(_)) => {}
                 Err(other) => prop_assert!(false, "unexpected error: {other:?}"),
             }
+        }
+    }
+}
+
+/// The block index against the full scan it replaces.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod index_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// [`PageDir::block_pages`] as it was before the index: every page of
+    /// every chunk of the block's group, each counted as visited.
+    fn scan_block_pages(dir: &PageDir, block: u32) -> Option<Vec<PageLoc>> {
+        let (group, within) = dir.locate_block(block)?;
+        let mut out = Vec::new();
+        for chunk in &group.chunks {
+            let mut at = chunk.offset;
+            for p in &chunk.pages {
+                visit(1);
+                if p.block == within && p.enc != Enc::DictPage {
+                    out.push(PageLoc {
+                        desc: p.desc(chunk.column_id),
+                        crc32c: p.crc32c,
+                        offset: at,
+                    });
+                }
+                at = at.checked_add(p.len)?;
+            }
+        }
+        Some(out)
+    }
+
+    /// [`PageDir::block_dict_pages`] as it was before the index.
+    fn scan_block_dict_pages(dir: &PageDir, block: u32) -> Option<Vec<PageLoc>> {
+        let (group, within) = dir.locate_block(block)?;
+        let mut out = Vec::new();
+        for chunk in &group.chunks {
+            let Some(d) = chunk.dict_page() else {
+                continue;
+            };
+            if chunk
+                .pages
+                .iter()
+                .any(|p| p.block == within && p.enc != Enc::DictPage)
+            {
+                out.push(PageLoc {
+                    desc: d.desc(chunk.column_id),
+                    crc32c: d.crc32c,
+                    offset: chunk.offset,
+                });
+            }
+        }
+        Some(out)
+    }
+
+    fn visited<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        PAGES_VISITED.with(|v| v.set(0));
+        let out = f();
+        (out, PAGES_VISITED.with(|v| v.get()))
+    }
+
+    /// Both lookups agree with the scan for every block of the directory and
+    /// the two past its end.
+    fn assert_matches_scan(dir: &PageDir) -> Result<(), TestCaseError> {
+        let end = u32::try_from(dir.block_count()).expect("block count");
+        for b in 0..end + 2 {
+            prop_assert_eq!(dir.block_pages(b), scan_block_pages(dir, b), "block {}", b);
+            prop_assert_eq!(
+                dir.block_dict_pages(b),
+                scan_block_dict_pages(dir, b),
+                "dict pages of block {}",
+                b
+            );
+        }
+        Ok(())
+    }
+
+    fn entry(block: u32, enc: Enc, len: u64, crc32c: u32) -> PageEntry {
+        PageEntry {
+            block,
+            enc,
+            comp: 0,
+            len,
+            uncomp_len: len,
+            crc32c,
+        }
+    }
+
+    /// One chunk as drawn: whether it leads with a dictionary page, then the
+    /// page count of each block (0, 1 or 2; at most 1 under a dictionary), and
+    /// a seed for the page lengths. A chunk drawn with no pages at all stays
+    /// empty, which decode refuses but [`PageDir::new`] accepts.
+    type RawChunk = (bool, Vec<u8>, u64);
+
+    fn build_dir(groups: Vec<(u32, Vec<RawChunk>)>) -> PageDir {
+        let mut out = Vec::new();
+        let mut first_block = 0u32;
+        let mut offset = 0u64;
+        for (block_count, raw) in groups {
+            let mut chunks = Vec::new();
+            for (ci, (dict, counts, seed)) in raw.into_iter().enumerate() {
+                let mut pages = Vec::new();
+                if dict {
+                    pages.push(entry(block_count, Enc::DictPage, seed % 9 + 1, 1));
+                }
+                for b in 0..block_count {
+                    let n = counts.get(b as usize).copied().unwrap_or(0);
+                    let n = if dict { n.min(1) } else { n };
+                    for k in 0..n {
+                        let i = pages.len() as u64;
+                        let enc = if dict {
+                            Enc::DictIds
+                        } else if n == 2 && k == 0 {
+                            Enc::Bitmap
+                        } else {
+                            Enc::Plain
+                        };
+                        let crc = (b << 8) | (ci as u32) << 1 | u32::from(k);
+                        pages.push(entry(b, enc, (seed + i * 31) % 50, crc));
+                    }
+                }
+                let total: u64 = pages.iter().map(|p| p.len).sum();
+                chunks.push(ChunkEntry {
+                    column_id: ci as u32 * 3,
+                    offset,
+                    pages,
+                });
+                offset += total;
+            }
+            out.push(GroupEntry {
+                first_block,
+                block_count,
+                chunks,
+            });
+            first_block += block_count;
+        }
+        PageDir::new(out)
+    }
+
+    /// Several row groups of up to 80 blocks, up to six chunks each, every
+    /// block carrying 0 to 2 pages per chunk, with and without dictionaries.
+    fn arb_wide_dir() -> impl Strategy<Value = PageDir> {
+        proptest::collection::vec(
+            (
+                1u32..80,
+                proptest::collection::vec(
+                    (
+                        any::<bool>(),
+                        proptest::collection::vec(0u8..3, 0..80),
+                        any::<u64>().prop_map(|s| s % 1000),
+                    ),
+                    0..6,
+                ),
+            ),
+            1..4,
+        )
+        .prop_map(build_dir)
+    }
+
+    /// One edit that takes a directory outside the shape decode admits.
+    #[derive(Clone, Debug)]
+    enum Damage {
+        /// Two pages of one chunk change places.
+        Swap(usize, usize),
+        /// A page names a block past its group.
+        PastGroup(usize),
+        /// A dictionary page lands after the chunk's first page.
+        LateDict(usize),
+        /// The chunk sits so close to the end of the offset space that its
+        /// running offset overflows.
+        Overflow,
+    }
+
+    fn arb_damage() -> impl Strategy<Value = Damage> {
+        prop_oneof![
+            (any::<usize>(), any::<usize>()).prop_map(|(a, b)| Damage::Swap(a, b)),
+            any::<usize>().prop_map(Damage::PastGroup),
+            any::<usize>().prop_map(Damage::LateDict),
+            Just(Damage::Overflow),
+        ]
+    }
+
+    /// Applies `damage` to one non-empty chunk picked by `pick`, in `groups`.
+    /// `false` when the directory has no page to damage.
+    fn apply(groups: &mut [GroupEntry], pick: usize, damage: &Damage) -> bool {
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        for (gi, g) in groups.iter().enumerate() {
+            for (ci, c) in g.chunks.iter().enumerate() {
+                if !c.pages.is_empty() {
+                    chunks.push((gi, ci));
+                }
+            }
+        }
+        let Some(&(gi, ci)) = chunks.get(pick % chunks.len().max(1)) else {
+            return false;
+        };
+        let block_count = groups[gi].block_count;
+        let chunk = &mut groups[gi].chunks[ci];
+        let n = chunk.pages.len();
+        match *damage {
+            Damage::Swap(a, b) => chunk.pages.swap(a % n, b % n),
+            Damage::PastGroup(a) => chunk.pages[a % n].block = block_count + (a % 3) as u32,
+            Damage::LateDict(a) => {
+                let at = 1 + a % n;
+                chunk.pages.insert(at, entry(0, Enc::DictPage, 3, 9));
+            }
+            Damage::Overflow => {
+                let len: u64 = chunk.pages.iter().map(|p| p.len).sum();
+                chunk.offset = u64::MAX - len / 2;
+                if len < 2 {
+                    chunk.pages[0].len = 4;
+                }
+            }
+        }
+        true
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The index returns exactly what the full scan returned, page for page
+        /// and in order, for every block: `None` outside the directory, the
+        /// same pages with the same offsets inside it, and the same dictionary
+        /// pages. A directory that round-trips through decode is checked again
+        /// as decode builds it.
+        #[test]
+        fn index_matches_the_scan(dir in arb_wide_dir()) {
+            assert_matches_scan(&dir)?;
+            if let Ok(decoded) = PageDir::decode(&dir.encode()) {
+                prop_assert_eq!(&decoded, &dir);
+                assert_matches_scan(&decoded)?;
+            }
+        }
+
+        /// A directory outside the shape decode admits (pages out of block
+        /// order, a page past its group, a dictionary page after the first,
+        /// an overflowing offset), built directly, still gets the scan's
+        /// answer for every block; decode either refuses its bytes as
+        /// `Corrupted` or admits them and the decoded directory matches too.
+        #[test]
+        fn malformed_directories_match_the_scan(
+            dir in arb_wide_dir(),
+            pick in any::<usize>(),
+            damage in arb_damage(),
+        ) {
+            let mut groups = dir.groups.clone();
+            prop_assume!(apply(&mut groups, pick, &damage));
+            let damaged = PageDir::new(groups);
+            assert_matches_scan(&damaged)?;
+            // A swap inside one block's run can leave the shape admissible.
+            match PageDir::decode(&damaged.encode()) {
+                Ok(decoded) => assert_matches_scan(&decoded)?,
+                Err(LogSegError::Corrupted(_)) => {}
+                Err(other) => prop_assert!(false, "unexpected error: {other:?}"),
+            }
+        }
+
+        /// The same damage applied in place after the index was built, then
+        /// `reindex`: the lookups follow the edited groups.
+        #[test]
+        fn reindex_follows_in_place_edits(
+            dir in arb_wide_dir(),
+            pick in any::<usize>(),
+            damage in arb_damage(),
+        ) {
+            let mut dir = dir;
+            prop_assume!(apply(&mut dir.groups, pick, &damage));
+            dir.reindex();
+            assert_matches_scan(&dir)?;
+        }
+    }
+
+    /// One group of 64 blocks and eight chunks: two dense ones with presence
+    /// and value pages, two dictionary chunks, sparse ones, and an empty one.
+    fn wide_group() -> PageDir {
+        let counts = |f: fn(u32) -> u8| (0..64).map(f).collect::<Vec<u8>>();
+        build_dir(vec![(
+            64,
+            vec![
+                (false, counts(|_| 2), 7),
+                (false, counts(|_| 1), 11),
+                (true, counts(|_| 1), 13),
+                (true, counts(|b| u8::from(b % 3 == 0)), 17),
+                (false, counts(|b| (b % 3) as u8), 19),
+                (false, counts(|b| u8::from(b % 7 == 0)), 23),
+                (false, Vec::new(), 29),
+                (false, counts(|b| if b < 32 { 2 } else { 0 }), 31),
+            ],
+        )])
+    }
+
+    /// Each lookup looks at the block's own pages plus at most the page on
+    /// either side of its run in each chunk, where the scan it replaces looks
+    /// at every page of the group for every block.
+    #[test]
+    fn block_pages_visits_only_the_blocks_run() {
+        let dir = wide_group();
+        let chunks = dir.groups[0].chunks.len() as u64;
+        let group_pages: u64 = dir.groups[0]
+            .chunks
+            .iter()
+            .map(|c| c.pages.len() as u64)
+            .sum();
+        assert!(group_pages > 300, "group holds {group_pages} pages");
+        for b in 0..64 {
+            let (pages, cost) = visited(|| dir.block_pages(b).expect("block"));
+            let bound = pages.len() as u64 + 2 * chunks;
+            assert!(cost <= bound, "block {b}: visited {cost}, bound {bound}");
+
+            let (dicts, cost) = visited(|| dir.block_dict_pages(b).expect("block"));
+            // A dictionary chunk's run is at most one id page.
+            assert!(cost <= 3 * 2, "block {b}: dict lookup visited {cost}");
+            assert_eq!(Some(dicts), scan_block_dict_pages(&dir, b));
+
+            let (scanned, scan_cost) = visited(|| scan_block_pages(&dir, b).expect("block"));
+            assert_eq!(pages, scanned);
+            assert_eq!(scan_cost, group_pages);
+            assert!(
+                scan_cost > bound,
+                "block {b}: the scan visits {scan_cost}, over the bound {bound}"
+            );
+        }
+    }
+
+    /// Hand-built cases of each damage, at a block boundary: none loses a page
+    /// the scan returns.
+    #[test]
+    fn unordered_pages_are_never_dropped() {
+        let chunk = |pages| {
+            PageDir::new(vec![GroupEntry {
+                first_block: 0,
+                block_count: 3,
+                chunks: vec![ChunkEntry {
+                    column_id: 1,
+                    offset: 0,
+                    pages,
+                }],
+            }])
+        };
+        let plain = |b| entry(b, Enc::Plain, 5, b);
+        // Block 1's second page sits after block 2's.
+        let dir = chunk(vec![plain(0), plain(1), plain(2), plain(1)]);
+        assert_eq!(dir.block_pages(1).expect("block 1").len(), 2);
+        // A page past the group, mid-chunk.
+        let dir = chunk(vec![plain(0), plain(7), plain(1), plain(2)]);
+        // A dictionary page that is not the first.
+        let late = chunk(vec![
+            plain(0),
+            entry(1, Enc::DictPage, 5, 0),
+            plain(1),
+            plain(2),
+        ]);
+        // An offset that overflows on the chunk's last page.
+        let mut over = chunk(vec![plain(0), plain(1), plain(2)]);
+        over.groups[0].chunks[0].offset = u64::MAX - 12;
+        over.reindex();
+        for d in [&dir, &late, &over] {
+            for b in 0..4 {
+                assert_eq!(d.block_pages(b), scan_block_pages(d, b), "block {b}");
+                assert_eq!(d.block_dict_pages(b), scan_block_dict_pages(d, b));
+            }
+            assert!(matches!(
+                PageDir::decode(&d.encode()),
+                Err(LogSegError::Corrupted(_))
+            ));
+        }
+        assert_eq!(over.block_pages(0), None);
+    }
+
+    /// An index left behind by an edit that changes a group's or chunk's shape
+    /// (the writer appends groups to a directory it built) is not used for
+    /// what it no longer describes.
+    #[test]
+    fn a_stale_index_falls_back_to_the_scan() {
+        let mut dir = wide_group();
+        let extra = wide_group().groups.remove(0);
+        dir.groups.push(GroupEntry {
+            first_block: 64,
+            ..extra
+        });
+        dir.groups[0].chunks[1].pages.pop();
+        dir.groups[0].chunks.swap(2, 3);
+        dir.groups[0].chunks.pop();
+        for b in 0..130 {
+            assert_eq!(dir.block_pages(b), scan_block_pages(&dir, b), "block {b}");
+            assert_eq!(dir.block_dict_pages(b), scan_block_dict_pages(&dir, b));
         }
     }
 }
