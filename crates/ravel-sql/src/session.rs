@@ -161,6 +161,7 @@ use crate::metadata_agg::MetadataOnlyAggregate;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::parquet::ParquetSession;
 use crate::provider::RavelTableProvider;
+use crate::regexp_replace_udf::regexp_replace_udf;
 use crate::spans_provider::SpansTableProvider;
 use crate::trace_id_planner::trace_id_hex_literal_planner;
 use crate::udf::{label_match_udf, label_udf};
@@ -998,6 +999,11 @@ pub fn build_session_with_tables(
     // this line replaces it. This is independent of the public `sum` UDAF,
     // which is untouched (ADR-0024).
     ctx.register_udaf(sequential_avg_udaf());
+    // Replace the built-in regexp_replace with one that compiles a constant
+    // pattern once per session instead of once per batch (epic #3231); every
+    // other argument shape runs the built-in. It stays in `ADMITTED_SCALARS`,
+    // so the scalar loop above keeps the built-in until this line replaces it.
+    ctx.register_udf(regexp_replace_udf());
     // The table-function registry (ADR-0097 decision 2), enumerated like the
     // others rather than removed by hardcoded name. `with_default_features()`
     // (inside `new_with_config_rt` above) registers `range`/`generate_series`
@@ -2548,5 +2554,66 @@ mod tests {
                 .parquet
                 .pushdown_filters
         );
+    }
+
+    /// `regexp_replace` in a Ravel session resolves to
+    /// [`crate::regexp_replace_udf::RegexpReplaceUdf`], and a statement calling
+    /// it returns what DataFusion's built-in returns under the same config.
+    #[tokio::test]
+    async fn regexp_replace_is_the_ravel_udf_and_matches_the_builtin() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ctx = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            logs_table(&store),
+            false,
+            SpillDecision::Disabled,
+            &no_capabilities(),
+        )
+        .expect("logs session builds");
+        let udf = ctx
+            .udf("regexp_replace")
+            .expect("regexp_replace registered");
+        assert!(
+            udf.inner()
+                .is::<crate::regexp_replace_udf::RegexpReplaceUdf>()
+        );
+
+        let builtin_ctx = SessionContext::new_with_config(ctx.copied_config());
+        builtin_ctx.register_udf(
+            datafusion::functions::regex::regexp_replace()
+                .as_ref()
+                .clone(),
+        );
+        let rows = "(VALUES ('https://www.a.com/x'), ('http://a.com/y'), \
+                    ('ftp://b/z'), (NULL), ('https://c.org/\nq')) AS t";
+        for sql in [
+            format!(
+                "SELECT regexp_replace(column1, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') \
+                 AS k, count(*) AS c FROM {rows} GROUP BY k ORDER BY k"
+            ),
+            format!("SELECT regexp_replace(column1, '[a-c]', 'X', 'g') AS k FROM {rows}"),
+            format!("SELECT regexp_replace(column1, column1, 'X') AS k FROM {rows}"),
+        ] {
+            let ours = ctx
+                .sql(&sql)
+                .await
+                .expect("plans")
+                .collect()
+                .await
+                .expect("runs");
+            let theirs = builtin_ctx
+                .sql(&sql)
+                .await
+                .expect("plans")
+                .collect()
+                .await
+                .expect("runs");
+            assert_eq!(format!("{ours:?}"), format!("{theirs:?}"), "{sql}");
+            assert!(
+                ours.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+                "{sql}"
+            );
+        }
     }
 }

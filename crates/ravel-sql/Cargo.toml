@@ -75,6 +75,10 @@ ravel-esql = { workspace = true }
 # derive their per-epoch keys with `ravel_ipcrypt::rules::EpochKey`. Default
 # features only: the marker feature's object-store client is not needed here.
 ravel-ipcrypt = { workspace = true }
+# The `regexp_replace` UDF (crate::regexp_replace_udf) compiles and caches its
+# own `regex::Regex`. The workspace pin resolves to the same regex release
+# datafusion-functions links, so this adds no lockfile entry.
+regex = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the

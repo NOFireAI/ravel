@@ -5436,6 +5436,7 @@ dependencies = [
  "ravel-segment",
  "ravel-test-support",
  "ravel-types",
+ "regex",
  "rustix",
  "serde_json",
  "stats_alloc",
