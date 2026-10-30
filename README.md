@@ -501,10 +501,11 @@ route with its body and status codes.
 
 The `ravel-server` image built from `main` includes the `agents` feature. The
 routes mount only when the server also runs with `--agents`, in
-`--mode all` or `--mode query`. The quickstart pins `0.27.0`, which predates
-the feature, so the quickstart server refuses `--agents` (see the
-[support matrix note](#what-works)). An image gains the feature from the
-first release whose `CHANGELOG.md` section lists agents.
+`--mode all` or `--mode query`. The quickstart pins `0.28.0`, whose image is
+built without the feature, so the quickstart server refuses `--agents` (see
+the [support matrix note](#what-works)). `--agents` works there only once the
+pin moves to a release whose `CHANGELOG.md` section says the published image
+carries Ravel Agents.
 
 Know these limits before you put agents in production:
 
