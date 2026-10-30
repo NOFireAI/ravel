@@ -693,7 +693,10 @@ async fn a_budget_that_holds_the_tail_keeps_the_saving_the_default_budget_loses(
     let delay = std::time::Duration::from_secs(2);
 
     let holding = ravel_catalog::derive_cache_capacity_per_tenant_within(1, delay, HOLDING_BUDGET);
-    assert_eq!(holding as u64, RECORD_COUNT, "the budget holds the whole tail");
+    assert_eq!(
+        holding as u64, RECORD_COUNT,
+        "the budget holds the whole tail"
+    );
     let default_bound = ravel_catalog::derive_cache_capacity_per_tenant_within(
         1,
         delay,

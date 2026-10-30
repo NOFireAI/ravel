@@ -365,7 +365,8 @@ pub fn build_catalog_for_server(
     )?;
     let sizing = catalog.config();
     tracing::info!(
-        record_cache_budget_bytes_per_tenant = config.query_budgets.record_cache_max_bytes_per_tenant,
+        record_cache_budget_bytes_per_tenant =
+            config.query_budgets.record_cache_max_bytes_per_tenant,
         cache_capacity_per_tenant = sizing.cache_capacity_per_tenant,
         record_cache_worst_case_bytes_per_tenant = sizing
             .commit_cache_max_bytes_per_tenant()

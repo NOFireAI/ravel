@@ -10828,12 +10828,13 @@ mod tests {
         let budget = ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT;
         assert_eq!(budget, 45_000_000);
         let budget_mb = budget / 1_000_000;
-        let pair = ravel_catalog::RECORD_CACHE_ENTRY_BYTES * ravel_catalog::RECORD_CACHES_PER_TENANT;
+        let pair =
+            ravel_catalog::RECORD_CACHE_ENTRY_BYTES * ravel_catalog::RECORD_CACHES_PER_TENANT;
         let grouped = |n: u64| {
             let digits = n.to_string();
             let mut out = String::new();
             for (i, c) in digits.chars().enumerate() {
-                if i > 0 && (digits.len() - i) % 3 == 0 {
+                if i > 0 && (digits.len() - i).is_multiple_of(3) {
                     out.push(',');
                 }
                 out.push(c);
@@ -10845,7 +10846,10 @@ mod tests {
             format!("{budget_mb} MB or more"),
             format!("default {budget_mb} MB ({budget})"),
         ] {
-            assert!(short.contains(&needle), "short help must state {needle:?}: {short}");
+            assert!(
+                short.contains(&needle),
+                "short help must state {needle:?}: {short}"
+            );
         }
         for needle in [
             "per actively-queried tenant and sits outside the process memory budget's shares"
@@ -10869,7 +10873,10 @@ mod tests {
             "together with `--disable-cache`".to_owned(),
             "in `--mode gateway`".to_owned(),
         ] {
-            assert!(help.contains(&needle), "long help must state {needle:?}: {help}");
+            assert!(
+                help.contains(&needle),
+                "long help must state {needle:?}: {help}"
+            );
         }
         assert_eq!(
             budget / pair,

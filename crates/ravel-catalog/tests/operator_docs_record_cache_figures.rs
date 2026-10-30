@@ -294,7 +294,9 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
     assert_doc_states(
         CACHING_GUIDE,
         &caching,
-        &format!("| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `{budget}` ({budget_mb} MB) |"),
+        &format!(
+            "| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `{budget}` ({budget_mb} MB) |"
+        ),
         &marker_budget,
         3,
         "the record-cache budget flag's default (flag table row)",

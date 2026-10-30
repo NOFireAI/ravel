@@ -308,8 +308,7 @@ pub fn derive_cache_capacity_per_tenant_within(
     budget_bytes: u64,
 ) -> usize {
     let floor = DEFAULT_CACHE_CAPACITY_PER_TENANT as u64;
-    let ceiling =
-        (budget_bytes / (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT)).max(floor);
+    let ceiling = (budget_bytes / (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT)).max(floor);
     let flush_secs = max_flush_delay.as_secs_f64();
     let flushes_per_hour: u64 = if flush_secs > 0.0 {
         (3_600.0 / flush_secs).ceil() as u64
