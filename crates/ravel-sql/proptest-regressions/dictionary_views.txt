@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7abb1da5d46282a806dd85e9ac9e3f0871d68f86801647808590a68cfdb22aea # shrinks to (entries, dictionaries, batches) = (1, [[None, None, None]], [(0, [Some(0), None, None, None], 0, 0)])
+cc f5561bd57130a9d9b107aa9135796e4d0929541a3f68eb8ac3fae7bc764c04d6 # shrinks to (entries, dictionaries, batches) = (1, [[(false, ""), (false, ""), (false, "")]], [(0, [None, None, None, None], 0, 0), (0, [], 0, 0)])
+cc a4f400d99d5e28374030a4c6650652eae82e15c63850d56b333f2453dd2babf0 # shrinks to (entries, dictionaries, batches) = (1, [[(false, ""), (false, ""), (false, "")], [(false, ""), (false, ""), (false, "a")]], [(0, [None, None, None], 0, 0), (1, [None, None], 0, 0)])

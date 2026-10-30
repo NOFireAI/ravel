@@ -65,9 +65,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    CeilingBreach, DeclaredColumn, DeclaredType, DictionaryGroupKeysAsViews, ErrorClass,
-    MSG_INTERNAL, PinnedStream, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlRequest,
-    StaticDeclaredColumns, TenantDelegatingPool, TenantMemoryAccountant,
+    CeilingBreach, DeclaredColumn, DeclaredType, DictionaryGroupKeysAsViews, DictionaryViewsCast,
+    ErrorClass, MSG_INTERNAL, PinnedStream, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor,
+    SqlRequest, StaticDeclaredColumns, TenantDelegatingPool, TenantMemoryAccountant,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantId, TimeRange};
@@ -351,14 +351,17 @@ fn nodes(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     }
 }
 
-/// How many `CastExpr`s to `ty` the node's own expressions hold, at any depth.
+/// How many casts to `ty` the node's own expressions hold, at any depth: a
+/// `CastExpr`, or for `Utf8View` the rule's `DictionaryViewsCast`.
 fn casts_to(node: &Arc<dyn ExecutionPlan>, ty: &DataType) -> usize {
     let mut count = 0;
     node.apply_expressions(&mut |expr| {
         expr.apply(|sub| {
-            if sub
-                .downcast_ref::<CastExpr>()
-                .is_some_and(|cast| cast.cast_type() == ty)
+            let views = *ty == DataType::Utf8View && sub.is::<DictionaryViewsCast>();
+            if views
+                || sub
+                    .downcast_ref::<CastExpr>()
+                    .is_some_and(|cast| cast.cast_type() == ty)
             {
                 count += 1;
             }
