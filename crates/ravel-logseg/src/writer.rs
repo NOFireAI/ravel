@@ -14,12 +14,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
+#[cfg(doc)]
+use crate::block::PageEncodeJob;
 use crate::block::{
     BlockEncoder, BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput,
     PageChoice, PageEncodeExecutor,
 };
-#[cfg(doc)]
-use crate::block::PageEncodeJob;
 use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
 use crate::encoding::Enc;

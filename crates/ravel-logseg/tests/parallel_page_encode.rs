@@ -129,13 +129,19 @@ fn multi_block_row_groups_are_byte_identical() {
             };
             let mut pool = ScopedPool::new(THREADS);
             let (serial, parallel) = both(cfg, &records, columnar, PUSH_BATCH, &mut pool);
-            assert!(dict_pages(&serial) > 0, "{choice:?}: no row group dictionary");
+            assert!(
+                dict_pages(&serial) > 0,
+                "{choice:?}: no row group dictionary"
+            );
             assert!(
                 serial == parallel,
                 "{choice:?} columnar={columnar}: parallel encode differs from finish"
             );
             assert_eq!(pool.split_calls, 8, "eight blocks, each split");
-            assert!(pool.out_of_order_calls > 0, "no block came back out of order");
+            assert!(
+                pool.out_of_order_calls > 0,
+                "no block came back out of order"
+            );
         }
     }
 }
@@ -175,7 +181,10 @@ fn arb_record() -> impl Strategy<Value = LogRecord> {
             LogRecord {
                 stream_id: stream_id(stream),
                 stream_attrs: stream_attrs_bytes(
-                    &[("service.name".to_string(), AttrValue::Str(format!("s{stream}")))],
+                    &[(
+                        "service.name".to_string(),
+                        AttrValue::Str(format!("s{stream}")),
+                    )],
                     "scope",
                     "1",
                     &[],
@@ -285,7 +294,9 @@ fn an_executor_that_drops_a_result_is_refused() {
     };
     let mut w = RlogWriter::new(RlogConfig::default(), identity());
     w.push(narrow_record(3)).expect("push");
-    let err = w.finish_on(&mut exec).expect_err("a missing result must fail");
+    let err = w
+        .finish_on(&mut exec)
+        .expect_err("a missing result must fail");
     assert!(matches!(err, LogSegError::PageEncode(_)), "{err:?}");
 }
 
@@ -297,5 +308,8 @@ fn an_executor_error_propagates() {
     let mut w = RlogWriter::new(RlogConfig::default(), identity());
     w.push(narrow_record(3)).expect("push");
     let err = w.finish_on(&mut exec).expect_err("executor error");
-    assert!(matches!(&err, LogSegError::PageEncode(m) if m == "pool closed"), "{err:?}");
+    assert!(
+        matches!(&err, LogSegError::PageEncode(m) if m == "pool closed"),
+        "{err:?}"
+    );
 }

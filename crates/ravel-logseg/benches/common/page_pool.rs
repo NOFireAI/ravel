@@ -56,7 +56,11 @@ impl PageEncodeExecutor for ScopedPool {
             .map_err(|_| LogSegError::PageEncode("a worker panicked".into()))?;
         if count > 1 {
             self.split_calls += 1;
-            if finished.iter().enumerate().any(|(pos, (index, _))| pos != *index) {
+            if finished
+                .iter()
+                .enumerate()
+                .any(|(pos, (index, _))| pos != *index)
+            {
                 self.out_of_order_calls += 1;
             }
         }

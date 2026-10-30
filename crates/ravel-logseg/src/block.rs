@@ -189,6 +189,10 @@ struct StagedPage {
     page: SealedPage,
 }
 
+/// A block's page descriptors, their stored bytes concatenated in descriptor
+/// order, and its string columns in dictionary shape.
+type StagedPages = (Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>);
+
 /// A block's pages in staging order, each sealed as it is staged, or, when
 /// `deferred` is set, each column's input copied out for a page encode job
 /// that runs the same staging call later ([`OwnedColumn::encode`]).
@@ -390,7 +394,7 @@ impl Stager {
     }
 
     /// Lays the sealed pages out in staging order.
-    fn finish(self) -> (Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>) {
+    fn finish(self) -> StagedPages {
         let mut payload = Vec::new();
         let descs = self
             .pages
@@ -482,7 +486,11 @@ impl OwnedColumn {
     /// Pages this column stages: its value page, after a presence bitmap page
     /// when it is partially present.
     fn page_count(&self) -> usize {
-        if self.present.iter().all(|&p| p) { 1 } else { 2 }
+        if self.present.iter().all(|&p| p) {
+            1
+        } else {
+            2
+        }
     }
 
     /// Seals this column's pages through the same [`Stager`] call a serial
@@ -611,10 +619,7 @@ fn page_jobs(columns: Vec<OwnedColumn>, zstd_level: i32, choice: PageChoice) -> 
 /// Lays the results of `jobs` jobs out in job order, which is staging order:
 /// the same descriptors, payload and row group dictionary entries
 /// [`Stager::finish`] produces for a serial encode.
-fn assemble_pages(
-    jobs: usize,
-    done: Vec<PageEncodeDone>,
-) -> Result<(Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>), LogSegError> {
+fn assemble_pages(jobs: usize, done: Vec<PageEncodeDone>) -> Result<StagedPages, LogSegError> {
     if done.len() != jobs {
         return Err(LogSegError::PageEncode(format!(
             "{} results for {jobs} jobs",
@@ -717,10 +722,7 @@ struct BlockMeta {
 }
 
 impl BlockMeta {
-    fn with_pages(
-        self,
-        (descs, payload, str_values): (Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>),
-    ) -> BlockWriteOut {
+    fn with_pages(self, (descs, payload, str_values): StagedPages) -> BlockWriteOut {
         BlockWriteOut {
             descs,
             payload,
