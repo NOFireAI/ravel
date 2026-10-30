@@ -7,9 +7,17 @@
 //! through [`SqlExecutor::execute`], a wrapper over the same call, over a
 //! `MemoryStore` holding N published, never-folded logs commit records, twice
 //! in a row on one executor (one process, so its catalog caches carry over
-//! between the two runs as they do in the server), and records the GETs per
-//! phase from the outcome's phase accounting and per key prefix from a counting
-//! store underneath everything.
+//! between the two runs), and records the GETs per phase from the outcome's
+//! phase accounting and per key prefix from a counting store underneath
+//! everything.
+//!
+//! The catalog here differs from the server's in two ways that change the
+//! figures, not the attribution. The server builds its catalog with
+//! provisioning enforcement, which adds one GET of the tenant's provisioning
+//! record to a cold query, so the server's cold poll is N + 2 where this test
+//! pins N + 1. Both queries here run inside one catalog HEAD cache lifetime
+//! (30 s); at the harness's 15 s interval about every other poll re-reads
+//! the HEAD, about half a GET per poll.
 //!
 //! Arms:
 //! - N = 100, 1,000 and 5,000 at the shipped commit-record cache bound
@@ -575,7 +583,10 @@ async fn unfolded_count_issues_one_get_per_commit_record_once_per_process() {
 /// Past the cache bound the repeat query is no longer free: it refetches every
 /// record the bound could not hold, N - bound GETs per query, every query. At
 /// the benchmark's end state (about 179k unfolded records against the shipped
-/// 25,000) the same arithmetic would give about 154k GETs per poll.
+/// 25,000) the same arithmetic would give at least about 154k GETs per poll.
+/// It is a lower bound: these records declare no column statistics, so the
+/// 25,000-entry cap binds before the cache's byte budget, and records that
+/// carry statistics fill the byte budget with fewer entries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unfolded_count_past_the_cache_bound_refetches_the_overflow_every_query() {
     let (n, bound) = (5_000u64, 1_000usize);
