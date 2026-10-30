@@ -44,10 +44,10 @@ the version-4 BLOOM parser would misread a version-5 section. The footer gained
 two fields (`sort_descriptor`, `clustering_generation`). By default the writer
 at version 5 records no sort descriptor and generation 0, covers every column
 version 4 indexed, and emits tags 10 to 13. It chooses each page's encoding
-by stored size (or by estimate under the `Estimated` page choice; see
-"Encoding choice"), and stores a string column chunk on one row-group dictionary
-(tags 12 and 13) when that is strictly smaller (see "Encodings (tag
-registry)" and "Row-group string dictionaries"). A version-4 object is
+by stored size (by estimate under the `Estimated` page choice; see
+"Encoding choice"), and stores a string column chunk on one row-group
+dictionary (tags 12 and 13) when that is strictly smaller (see "Encodings
+(tag registry)" and "Row-group string dictionaries"). A version-4 object is
 refused with `UnsupportedVersion` from the
 trailer alone, before the footer or any section is requested. Under the
 pre-v1.0 posture below, a development store holding version-4 objects is wiped
@@ -541,18 +541,19 @@ are not counted. A tie keeps the per-block pages. A chunk with one block's
 value page in it therefore keeps that page whenever neither form is
 compressed: its dictionary form holds the bytes of the block's tag 7 page less
 the width byte, split over two pages that each carry an entry of at least 9
-bytes, and under the `Exhaustive` page choice the per-block page was already
-the smallest of its candidates, tag 7 among them. Because the entries are counted before PAGE_DIR's own
-section compression, a decision can still move the finished object by a few
-bytes either way. The dictionary's entries are
+bytes, and under the `Exhaustive` page choice the per-block page was
+already the smallest of its candidates, tag 7 among them. Because the
+entries are counted before PAGE_DIR's own section compression, a decision
+can still move the finished object by a few bytes either way. The
+dictionary's entries are
 sorted bytewise and an id is the entry's rank, so the row-major and columnar
 write paths produce the same dictionary and the same bytes. A column whose
 group dictionary would pass 65,536 entries, or whose distinct bytes plus 4
 bytes for each present value's id would take the group's total across string
 columns past the writer's `block_max_bytes` (8 MiB by default), is dropped
-from the decision and keeps its per-block pages, and so is a column one of
-whose blocks chose a plain value page under the `Estimated` page choice. The
-writer holds those ids
+from the decision and keeps its per-block pages. Under the `Estimated` page
+choice, so is a column for which any block of the group chose a plain value
+page. The writer holds those ids
 until the group flushes, so they take at most the budget plus one block's ids,
 the most one block's fold can pass it by. A decoded block's dictionary for a
 column is the subset of the group's entries that block uses, in the same
@@ -711,20 +712,20 @@ picks among the candidate encodings of a page in one of two ways, set by
   which give every candidate's encoded length exactly (when the GCD exceeds
   1, a second pass over the quotients sizes tag 10 and its inner encoding);
   the candidate with the smallest encoded length wins, the earlier one in
-  priority order on a tie. For a string page, the candidate the `distinct / total <= 0.5`
-  heuristic ranks first wins; the distinct values and ids come from a hash
-  map, and the dictionary is then sorted, so a dictionary page holds the
-  same bytes it holds under `Exhaustive`. The row-group dictionary decision
-  skips a column any of whose blocks chose a plain page (see "Row-group
-  string dictionaries").
+  priority order on a tie. For a string page, the candidate the
+  `distinct / total <= 0.5` heuristic ranks first wins; the distinct values
+  and ids come from a hash map, and the dictionary is then sorted, so a
+  dictionary page holds the same bytes it holds under `Exhaustive`. The
+  row-group dictionary decision skips a column any of whose blocks chose a
+  plain page (see "Row-group string dictionaries").
 
 Under either choice the object is a function of the records written and the
 writer configuration (no hash-map iteration order reaches the bytes), and
 the row-major and columnar write paths produce the same bytes. Which writers
-use which: the logs ingest flush is to select `Estimated` (issue #3498 wires
-it; until then it writes `Exhaustive`); compaction, the erasure rewrite and
-`ravel-cli load` write `Exhaustive`. Readers are unaffected: an object
-decodes the same way whichever choice wrote it.
+use which: the logs ingest flush selects `Estimated` once ADR-3492 decision 1
+is wired into it, and writes `Exhaustive` until then; compaction, the
+erasure rewrite and `ravel-cli load` write `Exhaustive`. Readers are
+unaffected: an object decodes the same way whichever choice wrote it.
 
 The candidates, in priority order:
 
