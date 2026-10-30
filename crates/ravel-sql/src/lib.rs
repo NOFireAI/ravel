@@ -134,7 +134,7 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
-pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec};
+pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
     CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,

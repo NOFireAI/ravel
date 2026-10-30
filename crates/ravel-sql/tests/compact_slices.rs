@@ -541,3 +541,39 @@ async fn an_aggregate_output_carrying_the_labels_dictionary_answers_with_the_rul
         "every column, the labels dictionary included, is the same on both sides"
     );
 }
+
+/// The ClickBench q34 shape: `GROUP BY` a string key, `ORDER BY` the count
+/// `DESC LIMIT 10`, no `HAVING`.
+const Q34_SHAPE: &str = "SELECT concat('g', CAST(CAST(value AS BIGINT) AS VARCHAR)) AS k, \
+                         count(value) AS c, avg(value) AS a \
+                         FROM samples GROUP BY k ORDER BY c DESC LIMIT 10";
+
+/// Through the production session the q34 shape plans the exec with the
+/// TopK's ordering and fetch, the exec drops rows before compacting, and the
+/// answer is the one the session gives without the rule.
+#[tokio::test]
+async fn the_q34_shape_plans_the_topk_prefilter_and_answers_the_same() {
+    let specs = corpus();
+    let fixture = Fixture::memory(&[(&tenant(), &specs)]).await;
+    let on = run(&fixture, Q34_SHAPE, true).await;
+    let exec_line = on
+        .plan
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("CompactSlicesExec"))
+        .unwrap_or_else(|| panic!("an exec:\n{}", on.plan));
+    assert!(
+        exec_line.starts_with("CompactSlicesExec: topk=[")
+            && exec_line.ends_with("DESC], fetch=10"),
+        "the exec carries the TopK's ordering and fetch:\n{}",
+        on.plan
+    );
+    assert!(
+        compact_metric(&on.physical, "topk_dropped_rows") > 0,
+        "the pre-filter dropped rows:\n{}",
+        on.plan
+    );
+    assert_eq!(rows(&on.batches), expected_top_k());
+    let off = run(&fixture, Q34_SHAPE, false).await;
+    assert_eq!(rows(&on.batches), rows(&off.batches));
+}
