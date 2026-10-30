@@ -1230,7 +1230,10 @@ renders are not charged, and `max_series` does not bound that merged set.
 
 **Objects a discovery read skips.** The same reads also keep the id of every
 series a decoded object held, matched or not, and charge 32 bytes per id to
-the budget (`SEEN_SERIES_LEN` in `engine.rs`). An object's catalog sections
+the budget (`SEEN_SERIES_LEN` in `engine.rs`). The set only saves work, so
+it never refuses a read: once it would hold more than half the budget's
+limit, or the budget refuses its charge, it is emptied, its charge released,
+and every remaining object is decoded. An object's catalog sections
 are fetched in the same single GET as before, and its SERIES_IDS section is
 decoded first. When every id in it was already seen, the rest of the catalog
 is not decoded, because the object adds nothing: a series id is canonical

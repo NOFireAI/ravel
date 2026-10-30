@@ -3053,7 +3053,7 @@ impl QueryEngine {
             let crate::fetcher::ListedObject::Decoded { ids, mut entries } = listed else {
                 continue;
             };
-            fold.mark_seen(ids)?;
+            fold.mark_seen(ids);
             crate::erasure::retain_series_entries(&mut entries, &erasure);
             fold.absorb(
                 entries
@@ -3076,15 +3076,19 @@ impl QueryEngine {
 /// A series id is canonical over its labels, so the matchers and a windowless
 /// erasure predicate give it the same verdict in every object: an object whose
 /// ids have all been seen adds nothing, and the fetch tasks read [`seen`]
-/// to skip its catalog decode.
+/// to skip its catalog decode. The seen set only saves work, so a budget that
+/// cannot hold it ends the skip instead of the listing.
 ///
 /// [`seen`]: SeriesFold::seen
 struct SeriesFold {
     by_id: HashMap<SeriesId, LabelSet>,
     seen: Arc<std::sync::RwLock<HashSet<SeriesId>>>,
+    /// False once the budget refused the seen set: ids are no longer recorded.
+    tracking_seen: bool,
     max_series: usize,
     budget: Arc<ravel_memory::MemoryBudget>,
     reservations: Vec<ravel_memory::Reservation>,
+    seen_reservations: Vec<ravel_memory::Reservation>,
 }
 
 /// The bytes one seen series id is charged: the id and the hash set's own
@@ -3096,9 +3100,11 @@ impl SeriesFold {
         Self {
             by_id: HashMap::new(),
             seen: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tracking_seen: true,
             max_series,
             budget,
             reservations: Vec::new(),
+            seen_reservations: Vec::new(),
         }
     }
 
@@ -3108,18 +3114,42 @@ impl SeriesFold {
     }
 
     /// Records every id a decoded object held and reserves
-    /// [`SEEN_SERIES_LEN`] for each one not seen before. A refused
-    /// reservation is [`FetchError::FetchMemoryExhausted`], as in
-    /// [`absorb`](Self::absorb).
-    fn mark_seen(&mut self, ids: Vec<SeriesId>) -> Result<(), QueryError> {
-        let added = {
-            let mut seen = self
-                .seen
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ids.into_iter().filter(|id| seen.insert(*id)).count() as u64
+    /// [`SEEN_SERIES_LEN`] for each one not seen before. The seen set may
+    /// hold at most half the budget's limit, so it never starves the fetches
+    /// it exists to save. Past that, or when the budget refuses the
+    /// reservation, the set is emptied, its reservations are released, and no
+    /// later id is recorded, so every remaining object is decoded.
+    fn mark_seen(&mut self, ids: Vec<SeriesId>) {
+        if !self.tracking_seen {
+            return;
+        }
+        let mut seen = self
+            .seen
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let added = ids.into_iter().filter(|id| seen.insert(*id)).count() as u64;
+        if added == 0 {
+            return;
+        }
+        let charge = added.saturating_mul(SEEN_SERIES_LEN);
+        let held: u64 = self
+            .seen_reservations
+            .iter()
+            .map(ravel_memory::Reservation::size)
+            .sum();
+        let reservation = if held.saturating_add(charge) <= self.budget.limit() / 2 {
+            self.budget.reserve(charge).ok()
+        } else {
+            None
         };
-        self.reserve(added.saturating_mul(SEEN_SERIES_LEN))
+        match reservation {
+            Some(reservation) => self.seen_reservations.push(reservation),
+            None => {
+                *seen = HashSet::new();
+                self.seen_reservations.clear();
+                self.tracking_seen = false;
+            }
+        }
     }
 
     fn reserve(&mut self, bytes: u64) -> Result<(), QueryError> {
@@ -3171,6 +3201,7 @@ impl SeriesFold {
     fn charged(&self) -> u64 {
         self.reservations
             .iter()
+            .chain(&self.seen_reservations)
             .map(ravel_memory::Reservation::size)
             .sum()
     }
@@ -7768,6 +7799,19 @@ mod prefetch_tests {
         Arc<ravel_memory::MemoryBudget>,
         u64,
     ) {
+        list_objects_within(objects, matchers, LISTING_BUDGET).await
+    }
+
+    /// [`list_objects`] against a `budget_bytes` memory budget.
+    async fn list_objects_within(
+        objects: Vec<Vec<String>>,
+        matchers: &[LabelMatcher],
+        budget_bytes: u64,
+    ) -> (
+        Result<Vec<(SeriesId, LabelSet)>, QueryError>,
+        Arc<ravel_memory::MemoryBudget>,
+        u64,
+    ) {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
         let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
@@ -7795,7 +7839,7 @@ mod prefetch_tests {
             )
             .await;
         }
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(budget_bytes));
         let eng = engine_with_config(
             store,
             EngineConfig {
@@ -7938,7 +7982,7 @@ mod prefetch_tests {
         let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
         let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
         for _ in 0..8 {
-            fold.mark_seen(ids.clone()).expect("fifty ids fit");
+            fold.mark_seen(ids.clone());
         }
         let one_copy = LISTING_SERIES as u64 * SEEN_SERIES_LEN;
         assert_eq!(fold.charged(), one_copy);
@@ -7948,6 +7992,92 @@ mod prefetch_tests {
             LISTING_SERIES
         );
         drop(fold);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The seen set ends the skip, not the listing, once it would pass half
+    /// the budget's limit: the set is emptied, its charge released, and no
+    /// later id is recorded, even one that would fit. The fold still absorbs
+    /// series. Twenty-five ids (800 bytes) fit under a 1,599-byte half; fifty
+    /// do not.
+    #[test]
+    fn a_series_fold_drops_its_seen_set_past_half_the_budget() {
+        let batch = padded_batch(&padded_ids("", LISTING_SERIES));
+        let ids: Vec<SeriesId> = batch.iter().map(|(id, _)| *id).collect();
+        let half_of_ids = LISTING_SERIES as u64 / 2 * SEEN_SERIES_LEN;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(
+            2 * LISTING_SERIES as u64 * SEEN_SERIES_LEN - 2,
+        ));
+        let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        fold.mark_seen(ids[..LISTING_SERIES / 2].to_vec());
+        assert_eq!(budget.reserved(), half_of_ids, "half the ids fit");
+        fold.mark_seen(ids[LISTING_SERIES / 2..].to_vec());
+        assert!(fold.seen().read().expect("unpoisoned").is_empty());
+        assert_eq!(fold.charged(), 0);
+        assert_eq!(budget.reserved(), 0);
+        fold.mark_seen(ids[..1].to_vec());
+        assert!(
+            fold.seen().read().expect("unpoisoned").is_empty(),
+            "no id is recorded once the set is dropped"
+        );
+        assert_eq!(budget.reserved(), 0);
+        fold.absorb(batch[..1].to_vec())
+            .expect("the fold still holds series");
+        assert_eq!(fold.into_series().len(), 1);
+    }
+
+    /// A budget that refuses the seen set's reservation, though the set is
+    /// under half its limit, drops the set the same way instead of failing:
+    /// another holder leaves 700 bytes free and twenty-five ids ask for 800.
+    #[test]
+    fn a_series_fold_drops_its_seen_set_when_the_budget_refuses_it() {
+        let ids: Vec<SeriesId> = padded_batch(&padded_ids("", LISTING_SERIES))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let limit = 4 * LISTING_SERIES as u64 * SEEN_SERIES_LEN;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let other = budget.reserve(limit - 700).expect("another holder");
+        let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        fold.mark_seen(ids[..LISTING_SERIES / 2].to_vec());
+        assert!(fold.seen().read().expect("unpoisoned").is_empty());
+        assert_eq!(fold.charged(), 0);
+        assert_eq!(budget.accounted_refusals(), 1);
+        drop(other);
+        fold.mark_seen(ids[..1].to_vec());
+        assert!(
+            fold.seen().read().expect("unpoisoned").is_empty(),
+            "no id is recorded once the set is dropped"
+        );
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #3481: a selective listing over a tenant whose distinct series
+    /// outgrow the budget's room for their ids still answers. One hundred
+    /// objects of fifty distinct series each hold 5,000 ids, 160,000 bytes of
+    /// seen set against a 128 KiB budget, while the one matched series and
+    /// one object's own fetch fit. A seen set charged without the half-limit
+    /// drop starves the later fetches, and the listing fails with
+    /// `FetchMemoryExhausted`.
+    #[tokio::test]
+    async fn a_selective_listing_answers_when_its_seen_set_outgrows_the_budget() {
+        let objects: Vec<Vec<String>> = (1..=100)
+            .map(|seq| padded_ids(&format!("{seq}-"), LISTING_SERIES))
+            .collect();
+        let wanted = objects[0][0].clone();
+        let matchers = [
+            name_matcher("m"),
+            LabelMatcher {
+                name: "id".to_string(),
+                op: MatchOp::Eq,
+                value: wanted.clone(),
+            },
+        ];
+        let (listed, budget, _) = list_objects_within(objects, &matchers, 128 * 1024).await;
+        let series = listed.expect("the matched series fits the budget");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].1.get("id"), Some(wanted.as_str()));
+        assert_eq!(budget.accounted_refusals(), 0);
         assert_eq!(budget.reserved(), 0);
     }
 
