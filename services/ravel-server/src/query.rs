@@ -173,6 +173,11 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// documented as the one for a memory-constrained container, so it must not
 /// be the path that raises record-cache memory; it does not turn the record
 /// caches off, which is why it lands on the floor and not on `0`.
+///
+/// The derivation runs under the default
+/// [`ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT`] budget.
+/// [`build_catalog_for_server`] is the path that applies
+/// `--catalog-record-cache-max-bytes-per-tenant` (ADR-3513).
 #[allow(clippy::too_many_arguments)]
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
@@ -197,10 +202,14 @@ pub fn build_catalog(
         resolve_ceiling,
         max_ingest_lag_ns,
         max_flush_delay,
+        ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT,
     )
 }
 
-/// [`build_catalog`] over `base` instead of [`server_catalog_config_base`].
+/// [`build_catalog`] over `base` instead of [`server_catalog_config_base`],
+/// with the record-cache entry bound derived under
+/// `record_cache_max_bytes_per_tenant` (ADR-3513) instead of the default
+/// budget.
 #[allow(clippy::too_many_arguments)]
 fn build_catalog_from(
     base: CatalogConfig,
@@ -213,6 +222,7 @@ fn build_catalog_from(
     resolve_ceiling: Option<usize>,
     max_ingest_lag_ns: Option<i64>,
     max_flush_delay: Duration,
+    record_cache_max_bytes_per_tenant: u64,
 ) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
@@ -234,7 +244,11 @@ fn build_catalog_from(
     let cache_capacity_per_tenant = if disable_cache {
         ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT
     } else {
-        ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay)
+        ravel_catalog::derive_cache_capacity_per_tenant_within(
+            shard_count,
+            max_flush_delay,
+            record_cache_max_bytes_per_tenant,
+        )
     };
     let mut catalog_config = CatalogConfig {
         shard_count,
@@ -324,12 +338,16 @@ pub fn server_seal_margin() -> ravel_query::SealMargin {
 /// every test green. `catalog_window_ns` is the one input that is not a
 /// `ServerConfig` field: `start` resolves it through `resolve_ingest_lag`
 /// first.
+///
+/// It logs the record caches' sizing once at startup: the per-tenant byte
+/// budget, the entry bound derived under it, and the worst case for one
+/// actively-queried tenant across both caches.
 pub fn build_catalog_for_server(
     store: Arc<dyn ObjectStoreBackend>,
     config: &ServerConfig,
     catalog_window_ns: i64,
 ) -> anyhow::Result<Arc<Catalog>> {
-    build_catalog_from(
+    let catalog = build_catalog_from(
         CatalogConfig {
             build_key_index_leaves: config.fold.build_key_index_leaves,
             ..server_catalog_config_base()
@@ -343,7 +361,21 @@ pub fn build_catalog_for_server(
         config.catalog_resolve_concurrency,
         Some(catalog_window_ns),
         config.max_flush_delay,
-    )
+        config.query_budgets.record_cache_max_bytes_per_tenant,
+    )?;
+    let sizing = catalog.config();
+    tracing::info!(
+        record_cache_budget_bytes_per_tenant =
+            config.query_budgets.record_cache_max_bytes_per_tenant,
+        cache_capacity_per_tenant = sizing.cache_capacity_per_tenant,
+        record_cache_worst_case_bytes_per_tenant = sizing
+            .commit_cache_max_bytes_per_tenant()
+            .saturating_add(sizing.compaction_cache_max_bytes_per_tenant()),
+        disable_cache = config.disable_cache,
+        "catalog record caches sized: worst case per actively-queried tenant, outside the \
+         process memory budget"
+    );
+    Ok(catalog)
 }
 
 /// Why `start` refused `query_budgets.fold_lag_interval`. Nothing is spawned.
@@ -2550,6 +2582,54 @@ mod catalog_cache_tests {
             catalog.config().column_stats_cache_max_bytes,
             0,
             "--disable-cache reaches the column-statistics cache"
+        );
+    }
+
+    /// `--catalog-record-cache-max-bytes-per-tenant` (ADR-3513) reaches the
+    /// record caches' entry bound on the catalog the server builds. At 2
+    /// shards and a 100 ms flush delay the derivation is 1,296,000 entries
+    /// uncapped; a 400 MB budget holds it to `400_000_000 / 1_800 = 222_222`,
+    /// where the default budget holds it to 25,000. Each cache's byte budget
+    /// follows from the bound: `222_222 * 900 = 199_999_800` bytes.
+    ///
+    /// RED: pass `ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT` in place of
+    /// `record_cache_max_bytes_per_tenant` in `build_catalog_from` and the
+    /// first assertion reads 25,000 against 222,222.
+    #[test]
+    fn build_catalog_for_server_applies_the_record_cache_budget() {
+        let config = crate::ServerConfig {
+            shard_count: 2,
+            max_flush_delay: Duration::from_millis(100),
+            query_budgets: crate::config::QueryBudgets {
+                record_cache_max_bytes_per_tenant: 400_000_000,
+                ..crate::config::QueryBudgets::default()
+            },
+            ..server_config()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 9_000_000_000_000).expect("catalog builds");
+        assert_eq!(catalog.config().cache_capacity_per_tenant, 222_222);
+        assert_eq!(
+            catalog.config().commit_cache_max_bytes_per_tenant(),
+            199_999_800
+        );
+        assert_eq!(
+            catalog.config().compaction_cache_max_bytes_per_tenant(),
+            199_999_800
+        );
+
+        let default_budget = crate::ServerConfig {
+            query_budgets: crate::config::QueryBudgets::default(),
+            ..config
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog_for_server(store, &default_budget, 9_000_000_000_000)
+            .expect("catalog builds");
+        assert_eq!(
+            catalog.config().cache_capacity_per_tenant,
+            ravel_catalog::MAX_CACHE_CAPACITY_PER_TENANT,
+            "unset, the budget is 45 MB and the bound is the 25,000-entry cap"
         );
     }
 }

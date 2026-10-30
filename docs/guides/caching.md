@@ -155,6 +155,7 @@ reclaiming a pre-namespacing cache directory.
 | `--cache-max-bytes <n>` | derived: 25% of the process memory budget, or 24% against a loopback `--s3-endpoint` (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the fetcher cache's RAM tier holds. Bounds the fetcher cache only; the catalog byte cache has its own `--catalog-cache-max-bytes` below and this flag never reaches it. **Unset**, it derives from the process memory budget (effective, cgroup-capped memory minus an overhead reserve, not raw host memory -- fixed at 2 GiB from 8 GiB of memory up and scaled down below it at the default ingest ceiling, and raised above 2 GiB in `--mode all` by an ingest ceiling above 1.75 GiB, see the [configuration guide](operations/configuration.md)): 25% (`7516192768` on the 30 GiB reference host) normally, or 24% (`7215545057` there) when the store is `s3` against a loopback endpoint. The loopback share comes from a ClickBench measurement on a RustFS loopback store: a cache of about 7 GB in place of the earlier 40% carve cut the concurrent error ratio from 0.099 to 0.029 at the same hot time, because the cache is carved from the budget that queries and fetches share. That gain has a cost: with the smaller carve alone, concurrent throughput was 11% lower (0.512 QPS against 0.574), while the smaller carve together with the loopback `latency-first` default raised it to 0.678 QPS. Set `--cache-max-bytes` to keep a larger cache. Startup refuses to start, rather than silently clamping, if an explicit value here together with the catalog byte cache's and the column-statistics cache's ceilings brings their sum to or above the process memory budget (not under `--disable-cache`, which builds none of these caches, so no cap claims anything, and not in `--mode gateway`, which serves no query and derives no memory budget). Read once at startup; there is no live resize. |
 | `--catalog-cache-max-bytes <n>` | derived: 5% of the process memory budget (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog byte cache's RAM tier holds. A separate ceiling from `--cache-max-bytes` above; unset, it derives its own 5% share of the process memory budget (`1503238553` on the 30 GiB reference host) regardless of `--cache-max-bytes` or the loopback share it may have taken. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
 | `--column-stats-cache-max-bytes <n>` | derived: 2% of the process memory budget (`67108864`, 64 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog's column-statistics cache holds: the decoded `.cstat` objects the resolve path reuses, one entry per snapshot part holding that part's summaries and only the dictionaries statements have asked for. A separate ceiling from the two flags above, RAM only, with no disk tier under `--cache-dir`. An entry larger than the ceiling is served but not cached. Unset, it derives its own 2% share of the process memory budget (`601295421` on the 30 GiB reference host), the same on a loopback store. The share was sized when an entry held a whole decoded `.cstat` (266,736,092 bytes on that host, of which 1.83 MB is summaries and the rest per-value dictionaries); a part's entry now holds its summaries plus only the requested dictionaries. `0` builds no column-statistics cache, and so does `--disable-cache`. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
+| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `45000000` (45 MB) | Per-tenant byte budget of the catalog's two record caches. It is per actively-queried tenant and sits outside the process memory budget's shares, so it is counted in no startup refusal above. Each cache gets at most half of it, and the derived capacity is capped at the budget divided by 1,800 bytes, so raising it lets a tenant keep more of its unsealed tail resident; see [the catalog record caches](#the-catalog-record-caches). Startup refuses a value below the default, the flag together with `--disable-cache`, and the flag in `--mode gateway`, which reads no record cache. Read once at startup. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by its resolved `--cache-max-bytes`, the catalog byte cache's by its resolved `--catalog-cache-max-bytes`. There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
 | `--cache-bulk-share <fraction>` | `0.5` | Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that `bulk_scan` reads hold against interactive admissions, strictly between 0 and 1. See [admission by access intent](#admission-by-access-intent) for what the region does with it and [which statements read as bulk](#which-statements-read-as-bulk) for what reaches it. It applies to the RAM tier only: the disk tier admits every read under its own policy whatever its intent. `0`, `1`, a value outside that range, and `NaN` are refused at startup. Ignored when the fetcher cache is off. Read once at startup. |
 | `--cache-bulk-scan-min-bytes <bytes>` | unset | Read bytes at or above which a filtered `logs` statement sent as SQL text reads as `bulk_scan` from its next execution, unless it is a KEY_IDX key lookup; a `samples` statement, or one that did not arrive as SQL text, is never affected; see [which statements read as bulk](#which-statements-read-as-bulk). The threshold in force is this value raised to `--cache-max-bytes`, the RAM tier's size, when that is larger (a `--cache-dir` disk tier adds nothing to it); with the fetcher cache off it is this value as given. Startup logs it on a `performance default resolved` line with `setting="cache_bulk_scan_min_bytes"`, whose `source` is `flag`, or `flag-floored-to-cache-max-bytes` when the cache size replaced it. Unset, only the predicate-free rule applies. Read once at startup. |
@@ -658,7 +659,10 @@ delay, not from a flat constant:
 shards * 6 signals * ceil(3600 / max_flush_delay_seconds) * 3 unsealed hours
 ```
 
-The result is floored at 10,000 entries and capped at 25,000. Each cache is
+The result is floored at 10,000 entries and capped at 25,000. The cap is the
+default per-tenant budget divided by 1,800 bytes, one 900-byte entry in each
+of the two caches; `--catalog-record-cache-max-bytes-per-tenant` raises the
+budget and the cap with it. Each cache is
 ALSO held to a byte budget of `capacity x 900 bytes`, 22.5 MB per tenant at
 the cap, and evicts against whichever bound binds first. The byte budget
 exists because neither record type has a bounded size:
@@ -700,7 +704,14 @@ Budget it as 45 MB times the number of tenants queried concurrently: 100 of
 them is 4.5 GB worst case,
 and idle tenants are reclaimed by idle-tenant eviction. At the shipped
 2-second cadence the cap decides the value for every shard count, so
-`--shards` does not move it there.
+`--shards` does not move it there. With
+`--catalog-record-cache-max-bytes-per-tenant` set, the worst case per
+actively-queried tenant is at most that budget instead, less the remainder of
+its division by 1,800 bytes, and the product scales with it. It is less when
+the derived capacity sits below the budget's cap: one shard at the 2-second
+cadence derives 32,400 entries, 58.3 MB at a 400 MB budget. Startup reports
+the budget in force, the entry bound and the exact worst case on the `catalog
+record caches sized` log line.
 
 The capacity covers the unsealed tail of a tenant up to the cap, not the whole
 tail. Three things put a real tail past it:
@@ -710,32 +721,51 @@ tail. Three things put a real tail past it:
 - The flush cadence term. It counts the age trigger only, while a shard also
   flushes as soon as its estimated object bytes reach `target_bytes` (8 MiB by
   default).
-- The three unsealed hours, which assume the default seal parameters. An
-  operator can move this term. `--gc-max-flush-lifetime 4h` puts the seal
-  margin at 4h20m, so the oldest unsealed hour can have started 5h20m ago and
-  the tail spans up to 5.34 hours. Three under-counts that by about 1.8x.
+- A fold that runs late. The three unsealed hours assume the catalog's seal
+  parameters, a 1-hour flush lifetime, a 5-minute clock-skew allowance and a
+  15-minute fold safety margin, so an hour seals 1h20m after it ends; it
+  stays in the tail until a fold runs after that.
+
+No server flag moves the seal parameters. `--gc-max-flush-lifetime` feeds the
+compactor (`CompactorConfig::max_flush_lifetime_ns`), not the catalog's fold
+or resolve, and the capacity derivation does not read it either, so it is not
+a lever on this tail.
 
 A tenant over the bound pays a per-record GET on every resolve. That is a
 change: the old cache held a flat 10,000 records whatever they cost. A tenant
 whose records carry typed attribute column statistics now holds fewer records
 than the entry capacity, and pays GETs for the records that it cannot hold.
 The bound trades that hit rate for a memory figure that the eviction path
-enforces. The levers are a coarser
-`--max-flush-delay`, a shorter `--gc-max-flush-lifetime`, or a lower shard
-count. All of them shrink the tail itself.
+enforces. The levers are a coarser `--max-flush-delay` or a lower shard
+count. Both shrink the tail itself. The other lever leaves the tail as
+it is and raises the bound: a larger
+`--catalog-record-cache-max-bytes-per-tenant`, paid for in memory per
+actively-queried tenant.
 
 `--disable-cache` does not turn these caches off, because a resolve with no
 record cache re-reads every record from the store. It does hold the capacity
 at the 10,000-entry floor rather than the derived value, so the flag costs
 about 18 MB per actively-queried tenant: a 9 MB byte budget for each of the
-two caches, both enforced.
+two caches, both enforced. Startup refuses it together with
+`--catalog-record-cache-max-bytes-per-tenant`, whose budget it would override.
 
-Neither cache is exported. The resident-bytes gauge covers the object-byte
-read caches only: `ravel_cache_resident_bytes` is emitted for the tiers of the
-fetch family, and `ravel_cache_max_bytes` for the fetch and catalog byte
-ceilings. No scrape-time figure shows how many bytes the record caches of a
-tenant hold. The numbers above are bounds to budget against. You cannot read
-them back off a running server.
+Two gauges report what the record caches hold, summed over every tenant in
+the process, one sample per cache (`cache="commit"` and
+`cache="compaction"`):
+
+- `ravel_catalog_record_cache_held_bytes{cache}` is the bytes the cache
+  charges, the figure its per-tenant eviction is bounded by. It is the sum of
+  each entry's charge, not the entry count times 900 bytes.
+- `ravel_catalog_record_cache_entries{cache}` is the entries it holds.
+
+Their ratio is the measured bytes per entry. Use it, not the 900-byte planning
+rate, to size `--catalog-record-cache-max-bytes-per-tenant`: the budget to hold
+a tail of N records is about N times the commit cache's measured bytes per
+entry times 2, since each cache gets at most half of it. The gauges sum over
+tenants, so read them while one tenant dominates the caches, or divide by the
+tenants that are resident. They are not the generic read-cache gauges:
+`ravel_cache_resident_bytes` covers the tiers of the fetch family only, and
+`ravel_cache_max_bytes` the fetch and catalog byte ceilings.
 
 ## Background
 
