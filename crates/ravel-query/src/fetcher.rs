@@ -2095,6 +2095,43 @@ impl SegmentFetcher {
     ///   catalog GET plus a page GET spanning the whole object;
     /// - the object is at least [`SPARSE_PROBE_MIN_OBJECT_SIZE`], so the page
     ///   bytes skipped outweigh the extra selective page-range round trips.
+    /// The ranges [`decode_selected`](Self::decode_selected) fetches for an
+    /// object's catalog, branch for branch: LABEL_DICT, SERIES_IDS and
+    /// SERIES_META when the object carries SERIES_META, the four sparse
+    /// catalog sections when the sparse probe qualifies, otherwise the whole
+    /// object. Each range is `(start, end)`.
+    fn catalog_ranges(
+        &self,
+        footer: &Footer,
+        total_size: u64,
+        matchers: &[LabelMatcher],
+    ) -> Vec<(u64, u64)> {
+        let span = |(off, len): (u64, u64)| (off, off + len);
+        if let Some(meta) = section_range(footer, SECTION_SERIES_META) {
+            [
+                section_range(footer, SECTION_LABEL_DICT),
+                section_range(footer, SECTION_SERIES_IDS),
+                Some(meta),
+            ]
+            .into_iter()
+            .flatten()
+            .map(span)
+            .collect()
+        } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
+            [
+                sparse.label_dict,
+                sparse.series_ids,
+                sparse.series_idx,
+                sparse.meta_chunks,
+            ]
+            .into_iter()
+            .map(span)
+            .collect()
+        } else {
+            vec![(0, total_size)]
+        }
+    }
+
     fn sparse_probe_qualifies(
         &self,
         footer: &Footer,
@@ -2960,11 +2997,14 @@ impl SegmentFetcher {
                 ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
             )
         })?;
+        // The same single GET `decode_selected` would issue, so a decoded
+        // object costs no more requests than `fetch_series_phase_accounted`
+        // and the decode below finds every range it needs already held.
         self.ensure_ranges(
             seg_ref,
             tenant_hash,
             &suffix_etag,
-            &[(si_off, si_off + si_len)],
+            &self.catalog_ranges(&footer, total_size, matchers),
             1,
             &mut regions,
             accounting.probe(),
@@ -5338,6 +5378,70 @@ mod tests {
         let latency = metrics.get_latency().snapshot();
         let got = GetPhase::ALL.map(|phase| latency.phase(phase).ok_count());
         assert_eq!(got, want, "resolve, plan, probe, scan, unattributed");
+    }
+
+    /// Issue #3481: a series listing's read of an object issues the GETs a
+    /// series fetch issues, phase for phase and byte for byte, whether the
+    /// object is decoded or skipped, because the SERIES_IDS read rides in the
+    /// catalog's single GET. Run over a chunked catalog that takes the sparse
+    /// probe (4,096 series) and over a SERIES_META catalog (1,000 series),
+    /// both opened from a footer tail. A SERIES_IDS read of its own costs a
+    /// decoded chunked object a second probe GET.
+    #[tokio::test]
+    async fn a_series_listing_read_issues_the_gets_of_a_series_fetch() {
+        fn gets(accounting: &PhaseAccounting) -> [u64; 4] {
+            let snap = accounting.snapshot();
+            [
+                snap.plan.s3_requests(AccountedOp::Get),
+                snap.plan.s3_bytes(AccountedOp::Get),
+                snap.probe.s3_requests(AccountedOp::Get),
+                snap.probe.s3_bytes(AccountedOp::Get),
+            ]
+        }
+        let matchers = [LabelMatcher::regex("__name__", "sparse_metric_.*").expect("valid regex")];
+        for n_series in [4096, 1000] {
+            let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(n_series, 32).await;
+            let (fetcher, _) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+            let fetcher = fetcher.with_whole_object_threshold(0);
+            let fetched_accounting = PhaseAccounting::new();
+            let fetched = fetcher
+                .fetch_series_phase_accounted(tenant_hash, &seg_ref, &matchers, &fetched_accounting)
+                .await
+                .expect("fetch series");
+            assert_eq!(fetched.len(), n_series);
+            let want = gets(&fetched_accounting);
+            if n_series == 4096 {
+                assert!(want[2] > 0, "the chunked catalog is a probe GET: {want:?}");
+            }
+            for seen in [false, true] {
+                let (fetcher, _) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+                let fetcher = fetcher.with_whole_object_threshold(0);
+                let accounting = PhaseAccounting::new();
+                let listed = fetcher
+                    .list_series_phase_accounted(
+                        tenant_hash,
+                        &seg_ref,
+                        &matchers,
+                        &accounting,
+                        &|_: &[SeriesId]| seen,
+                    )
+                    .await
+                    .expect("list series");
+                match listed {
+                    ListedObject::AllSeen => assert!(seen, "{n_series} series"),
+                    ListedObject::Decoded { ids, entries } => {
+                        assert!(!seen, "{n_series} series");
+                        assert_eq!(ids.len(), n_series);
+                        assert_eq!(entries, fetched);
+                    }
+                }
+                assert_eq!(
+                    gets(&accounting),
+                    want,
+                    "{n_series} series, all seen: {seen}"
+                );
+            }
+        }
     }
 
     /// `decode_sparse_catalog` charges the bytes the chunked catalog actually
