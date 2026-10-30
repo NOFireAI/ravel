@@ -2973,12 +2973,15 @@ impl SegmentFetcher {
         Ok(entries.into_iter().map(|e| e.entry).collect())
     }
 
-    /// A series listing's read of one object. SERIES_IDS is read and decoded
-    /// first; when `all_seen` holds for the object's ids, no catalog section
-    /// is read or decoded and the object adds nothing to the listing.
-    /// Otherwise the catalog is decoded exactly as
+    /// A series listing's read of one object. The catalog's sections are
+    /// fetched in the one GET [`decode_selected`](Self::decode_selected) would
+    /// issue, under the probe phase, and SERIES_IDS is decoded from them
+    /// first. When `all_seen` holds for the object's ids, the rest of the
+    /// catalog is not decoded and the object adds nothing to the listing: the
+    /// skip saves decode CPU, not requests or bytes. Otherwise the catalog is
+    /// decoded exactly as
     /// [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
-    /// decodes it. The SERIES_IDS GET is recorded under the probe phase.
+    /// decodes it.
     pub(crate) async fn list_series_phase_accounted(
         &self,
         tenant_hash: TenantHash,
