@@ -15,7 +15,9 @@
 /// two records claiming one stream id but disagreeing on the resource+scope
 /// bytes behind it. `InvalidSortDescriptor` is writer-side validation of a
 /// caller's sort descriptor. `InvalidRowOrder` is a writer-side internal check
-/// on its own row order. `Io` wraps compression backend failures.
+/// on its own row order. `PageEncode` is a caller's page encode executor
+/// returning results the writer cannot assemble. `Io` wraps compression
+/// backend failures.
 #[derive(Debug, thiserror::Error)]
 pub enum LogSegError {
     #[error("corrupted segment: {0}")]
@@ -87,6 +89,12 @@ pub enum LogSegError {
     /// drop or repeat a record. Nothing was decoded, so it is never `Corrupted`.
     #[error("invalid row order: {0}")]
     InvalidRowOrder(String),
+    /// A [`crate::block::PageEncodeExecutor`] handed back results that are not
+    /// exactly one per job it was given (an index missing, repeated or out of
+    /// range), or reported a failure of its own. The writer refuses the block
+    /// rather than assemble pages it cannot place in staging order.
+    #[error("page encode: {0}")]
+    PageEncode(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

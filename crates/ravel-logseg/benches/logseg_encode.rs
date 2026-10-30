@@ -6,14 +6,16 @@
 //! thin), at three record-count totals.
 //!
 //! The `ingest_shape` group encodes one ingest flush of the ADR-3492 benchmark
-//! shape (`common/ingest_shape.rs`) four ways: the row writer and the columnar
-//! writer, each under both page choices. The columnar arms time
-//! `ColumnarLogBatch::try_from_records` per push batch too, the work
-//! `rows_to_batch` does at ingest. The writer is single-threaded, so the
-//! timings are CPU time. Before timing, each flush size's stored object bytes
-//! are printed per arm, and the run fails unless the two writers agree byte
-//! for byte under each choice and `Estimated` stores at most
-//! [`MAX_ESTIMATED_GROWTH`] more than `Exhaustive` (ADR-3492, exit criteria).
+//! shape (`common/ingest_shape.rs`) eight ways: the row writer and the
+//! columnar writer, each under both page choices, each finished serially and
+//! with its column pages encoded on [`THREADS`] threads (ADR-3492 decision 7).
+//! The columnar arms time `ColumnarLogBatch::try_from_records` per push batch
+//! too, the work `rows_to_batch` does at ingest. A serial arm's timing is CPU
+//! time; a threaded arm's is wall time. Before timing, each flush size's
+//! stored object bytes are printed per arm, and the run fails unless the two
+//! writers and the threaded encode agree byte for byte under each choice and
+//! `Estimated` stores at most [`MAX_ESTIMATED_GROWTH`] more than `Exhaustive`
+//! (ADR-3492, exit criteria).
 #![allow(clippy::expect_used)]
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -26,6 +28,13 @@ use support::{bench_config, bench_identity, build_corpus};
 #[path = "common/ingest_shape.rs"]
 mod ingest_shape;
 use ingest_shape::{PUSH_BATCH, ingest_records};
+
+#[path = "common/page_pool.rs"]
+mod page_pool;
+use page_pool::ScopedPool;
+
+/// Threads the threaded arms encode column pages on.
+const THREADS: usize = 4;
 
 /// Record-count totals for the sweep. Kept well under the 8192-record block
 /// target's multi-block territory but large enough to amortize per-object
@@ -85,21 +94,37 @@ fn writer(choice: PageChoice) -> RlogWriter {
     RlogWriter::new(cfg, bench_identity())
 }
 
-fn encode_rows(records: Vec<LogRecord>, choice: PageChoice) -> Vec<u8> {
+/// Finishes `w` serially, or with its pages encoded on `pool`.
+fn finish(w: RlogWriter, pool: Option<&mut ScopedPool>) -> Vec<u8> {
+    match pool {
+        Some(pool) => w.finish_on(pool).expect("finish_on"),
+        None => w.finish().expect("finish"),
+    }
+}
+
+fn encode_rows(
+    records: Vec<LogRecord>,
+    choice: PageChoice,
+    pool: Option<&mut ScopedPool>,
+) -> Vec<u8> {
     let mut w = writer(choice);
     for r in records {
         w.push(r).expect("push");
     }
-    w.finish().expect("finish")
+    finish(w, pool)
 }
 
-fn encode_columnar(records: Vec<LogRecord>, choice: PageChoice) -> Vec<u8> {
+fn encode_columnar(
+    records: Vec<LogRecord>,
+    choice: PageChoice,
+    pool: Option<&mut ScopedPool>,
+) -> Vec<u8> {
     let mut w = writer(choice);
     for batch in records.chunks(PUSH_BATCH) {
         let batch = ColumnarLogBatch::try_from_records(batch).expect("batch");
         w.push_columnar(batch).expect("push_columnar");
     }
-    w.finish().expect("finish")
+    finish(w, pool)
 }
 
 /// Prints each arm's stored object bytes for a flush and fails the run when
@@ -107,11 +132,22 @@ fn encode_columnar(records: Vec<LogRecord>, choice: PageChoice) -> Vec<u8> {
 fn check_sizes(flush: usize, records: &[LogRecord]) {
     let mut sizes = [0usize; 2];
     for (k, &(name, choice)) in CHOICES.iter().enumerate() {
-        let row = encode_rows(records.to_vec(), choice);
-        let columnar = encode_columnar(records.to_vec(), choice);
+        let row = encode_rows(records.to_vec(), choice, None);
+        let columnar = encode_columnar(records.to_vec(), choice, None);
         assert!(
             row == columnar,
             "{flush} records, {name}: row and columnar bytes differ"
+        );
+        let mut pool = ScopedPool::new(THREADS);
+        let row_threaded = encode_rows(records.to_vec(), choice, Some(&mut pool));
+        let columnar_threaded = encode_columnar(records.to_vec(), choice, Some(&mut pool));
+        assert!(
+            row_threaded == row && columnar_threaded == row,
+            "{flush} records, {name}: threaded page encode bytes differ from finish"
+        );
+        assert!(
+            pool.split_calls > 0 && pool.out_of_order_calls > 0,
+            "{flush} records, {name}: no block was split and returned out of order"
         );
         println!(
             "ingest_shape/{flush} stored_bytes row_{name}={} columnar_{name}={}",
@@ -142,14 +178,30 @@ fn bench_ingest_shape(c: &mut Criterion) {
             group.bench_function(format!("{flush}/row_{name}"), |b| {
                 b.iter_batched(
                     || records.clone(),
-                    |records| encode_rows(records, choice),
+                    |records| encode_rows(records, choice, None),
                     BatchSize::LargeInput,
                 );
             });
             group.bench_function(format!("{flush}/columnar_{name}"), |b| {
                 b.iter_batched(
                     || records.clone(),
-                    |records| encode_columnar(records, choice),
+                    |records| encode_columnar(records, choice, None),
+                    BatchSize::LargeInput,
+                );
+            });
+            group.bench_function(format!("{flush}/row_{name}_{THREADS}threads"), |b| {
+                let mut pool = ScopedPool::new(THREADS);
+                b.iter_batched(
+                    || records.clone(),
+                    |records| encode_rows(records, choice, Some(&mut pool)),
+                    BatchSize::LargeInput,
+                );
+            });
+            group.bench_function(format!("{flush}/columnar_{name}_{THREADS}threads"), |b| {
+                let mut pool = ScopedPool::new(THREADS);
+                b.iter_batched(
+                    || records.clone(),
+                    |records| encode_columnar(records, choice, Some(&mut pool)),
                     BatchSize::LargeInput,
                 );
             });

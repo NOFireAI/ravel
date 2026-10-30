@@ -727,6 +727,17 @@ is wired into it, and writes `Exhaustive` until then; compaction, the
 erasure rewrite and `ravel-cli load` write `Exhaustive`. Readers are
 unaffected: an object decodes the same way whichever choice wrote it.
 
+**Parallel page encode (ADR-3492 decision 7).** `RlogWriter::finish_on`
+hands each block's page encodes to a caller's `PageEncodeExecutor` as one
+`PageEncodeJob` per staged column, each `Send + 'static` and owning its
+input, and assembles the results in staging order whatever order they come
+back in; `finish` seals the same pages inline as it stages them. The object is byte-identical to
+`finish`'s under either page choice. The row-group dictionary decision still
+runs once per column across the group's blocks, after every job of every
+block has returned. A block that stages fewer than `PAGE_JOB_FLOOR` (8)
+pages is handed over as a single job. This is a writer property only; it
+changes nothing a reader sees.
+
 The candidates, in priority order:
 
 - i64 pages (`ts`, `observed_ts`, `stream_ref`, `severity_num`, `flags`,
@@ -871,10 +882,13 @@ compressed. The writer compresses a page only when its encoded length is
 at least the 512-byte floor and zstd is strictly smaller; below the floor
 zstd overhead exceeds the win and the page stays raw. The descriptor
 records `comp` (0=none, 2=zstd), `len` (stored bytes), and `uncomp_len`
-(encoded bytes before compression). Under the `Exhaustive` page choice the
-writer applies this envelope to every candidate encoding of an i64 or string
-page and compares candidates by the resulting `len` (see "Encoding choice"),
-so a candidate under the floor competes with its raw length.
+(encoded bytes before compression). The floor and the zstd envelope apply to
+every page the writer stores, under both page choices. Only the comparison
+between candidates by stored length is `Exhaustive`-only: under it the writer
+applies this envelope to every candidate encoding of an i64 or string page and
+compares candidates by the resulting `len` (see "Encoding choice"), so a
+candidate under the floor competes with its raw length. Under `Estimated` the
+one candidate the estimate picks is the one sealed.
 
 Readers reject an unknown `comp` tag, an `uncomp_len` above the config cap
 (default 64 MiB per page) before allocating, and a decompressed length
