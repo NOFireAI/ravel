@@ -3978,4 +3978,71 @@ mod tests {
             }
         }
     }
+
+    /// Rows with an i64 column present in half of them, a low-cardinality
+    /// string column, and a body and a string column with a distinct value
+    /// per row.
+    fn choice_rows() -> (Vec<ResolvedRow>, Vec<ColumnPlan>) {
+        let plans = vec![
+            ColumnPlan {
+                column_id: 10,
+                ty: FieldType::I64,
+            },
+            ColumnPlan {
+                column_id: 11,
+                ty: FieldType::Str,
+            },
+            ColumnPlan {
+                column_id: 12,
+                ty: FieldType::Str,
+            },
+        ];
+        let rows = (0..300i64)
+            .map(|i| {
+                let mut r = row((i % 7) as u32, 1_000_000 * i + i % 5);
+                if i % 2 == 0 {
+                    put(&mut r, 10, ColumnValue::I64(i % 16));
+                }
+                put(&mut r, 11, ColumnValue::Str(format!("svc-{}", i % 4).into_bytes()));
+                put(&mut r, 12, ColumnValue::Str(format!("req-{i:08}").into_bytes()));
+                r
+            })
+            .collect();
+        (rows, plans)
+    }
+
+    fn sealed_by(f: impl FnOnce() -> BlockWriteOut) -> (BlockWriteOut, u64) {
+        let before = crate::page::SEALS.with(std::cell::Cell::get);
+        let out = f();
+        (out, crate::page::SEALS.with(std::cell::Cell::get) - before)
+    }
+
+    #[test]
+    fn estimated_seals_one_candidate_per_page() {
+        let (rows, plans) = choice_rows();
+        let (est, seals) = sealed_by(|| {
+            write_block_with(&rows, &plans, 3, PageChoice::Estimated).expect("write")
+        });
+        assert_eq!(seals, est.descs.len() as u64);
+        let (exh, seals) = sealed_by(|| {
+            write_block_with(&rows, &plans, 3, PageChoice::Exhaustive).expect("write")
+        });
+        assert!(seals > exh.descs.len() as u64, "{seals} seals for {} pages", exh.descs.len());
+
+        let plain: Vec<(u32, bool)> = est.str_values.iter().map(|v| (v.column_id, v.plain)).collect();
+        assert_eq!(
+            plain,
+            [(COL_SEVERITY_TEXT, false), (COL_BODY, true), (11, false), (12, true)]
+        );
+        assert!(exh.str_values.iter().all(|v| !v.plain));
+
+        let est = decode_out(&est, &plans, None).expect("decode");
+        let exh = decode_out(&exh, &plans, None).expect("decode");
+        for cid in [COL_TS, COL_OBSERVED_TS, COL_STREAM_REF, COL_SEVERITY_NUM, COL_FLAGS, 10] {
+            assert_eq!(est.i64_col(cid), exh.i64_col(cid), "column {cid}");
+        }
+        for cid in [COL_SEVERITY_TEXT, COL_BODY, 11, 12] {
+            assert_eq!(est.str_col_fused(cid), exh.str_col_fused(cid), "column {cid}");
+        }
+    }
 }

@@ -1022,5 +1022,150 @@ mod tests {
             prop_assert_eq!(&string_dict_candidates(&dref, &ids), &cands);
             prop_assert_eq!(&cands[0], &encode_strings_dict(&dref, &ids));
         }
+
+        #[test]
+        fn i64_raw_sizes_match_candidate_lengths(vals in i64_page()) {
+            let lengths: Vec<(Enc, u64)> = i64_candidates(&vals)
+                .into_iter()
+                .map(|(enc, bytes)| (enc, bytes.len() as u64))
+                .collect();
+            prop_assert_eq!(i64_raw_sizes(&vals), lengths);
+        }
+
+        #[test]
+        fn i64_estimated_is_the_smallest_encoded_candidate(vals in i64_page()) {
+            prop_assert_eq!(i64_estimated(&vals), smallest_encoded(i64_candidates(&vals)));
+        }
+
+        #[test]
+        fn string_estimate_is_the_heuristic_first_candidate(
+            vals in proptest::collection::vec(
+                prop_oneof![
+                    proptest::collection::vec(0u8..3, 0..3),
+                    proptest::collection::vec(any::<u8>(), 0..6),
+                ],
+                0..80,
+            ),
+            unused in proptest::collection::vec(proptest::collection::vec(0u8..3, 0..3), 0..4),
+        ) {
+            let refs: Vec<&[u8]> = vals.iter().map(Vec::as_slice).collect();
+            let first = string_candidates(&refs).swap_remove(0);
+            let estimate = estimated_string_page(string_shape_if_dict(&refs), &refs);
+            prop_assert_eq!(&estimate, &first);
+            if let Some(shape) = string_shape_if_dict(&refs) {
+                prop_assert_eq!(shape, string_shape(&refs));
+            }
+            // A dictionary-shaped column whose dictionary repeats values and
+            // holds entries no row references reaches the same page.
+            let mut dict: Vec<&[u8]> = unused.iter().map(Vec::as_slice).collect();
+            let mut ids: Vec<u32> = Vec::new();
+            for (i, v) in refs.iter().enumerate() {
+                if i % 3 == 0 || !dict.contains(v) {
+                    dict.push(v);
+                }
+                let id = dict.iter().rposition(|d| d == v).expect("pushed");
+                ids.push(id as u32);
+            }
+            let estimate = estimated_string_page(string_dict_shape_if_dict(&dict, &ids), &refs);
+            prop_assert_eq!(&estimate, &first);
+        }
+    }
+
+    fn i64_page() -> impl Strategy<Value = Vec<i64>> {
+        prop_oneof![
+            (any::<i64>(), 0usize..300).prop_map(|(v, n)| vec![v; n]),
+            proptest::collection::vec(
+                prop_oneof![any::<i64>(), -40i64..40, Just(i64::MIN), Just(i64::MAX)],
+                0..300,
+            ),
+            (any::<i64>(), proptest::collection::vec(0i64..20, 1..300)).prop_map(|(b, steps)| {
+                let mut t = b;
+                steps.iter().map(|s| {
+                    t = t.wrapping_add(1_000 + s);
+                    t
+                }).collect()
+            }),
+            (
+                any::<i64>(),
+                proptest::collection::vec(0u64..1000, 1..200),
+                prop::sample::select(vec![2u64, 3, 1_000, 1 << 62]),
+            )
+                .prop_map(|(base, steps, scale)| {
+                    steps
+                        .iter()
+                        .map(|s| (base as u64).wrapping_add(s.wrapping_mul(scale)) as i64)
+                        .collect()
+                }),
+        ]
+    }
+
+    /// The page the `Estimated` choice encodes for a string page, given its
+    /// dictionary shape when the heuristic ranks the dictionary first.
+    fn estimated_string_page(shape: Option<StrShape<'_>>, values: &[&[u8]]) -> (Enc, Vec<u8>) {
+        match shape {
+            Some(shape) => (Enc::Dict, dict_strings_page(&shape)),
+            None => (Enc::Plain, plain_strings_page(values.iter().copied())),
+        }
+    }
+
+    /// A deterministic pseudo-random sequence (xorshift64).
+    fn xorshift(seed: u64, n: usize) -> Vec<u64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            })
+            .collect()
+    }
+
+    /// The candidate `i64_estimated` picked, checked against every candidate's
+    /// encoded length: it is the expected one and strictly shorter than the
+    /// rest.
+    fn assert_clear_pick(vals: &[i64], expected: Enc) {
+        let (enc, bytes) = i64_estimated(vals);
+        assert_eq!(enc, expected);
+        for (other, b) in i64_candidates(vals) {
+            if other != enc {
+                assert!(bytes.len() < b.len(), "{enc:?} {} vs {other:?} {}", bytes.len(), b.len());
+            }
+        }
+    }
+
+    #[test]
+    fn estimated_picks_the_cheapest_raw_candidate() {
+        assert_clear_pick(&[1_700_000_000_000_000_000; 4096], Enc::Constant);
+
+        let mut t = 1_700_000_000_000_000_000i64;
+        let ts: Vec<i64> = xorshift(7, 4096)
+            .iter()
+            .map(|r| {
+                t += 1_000_000 + (r % 8) as i64;
+                t
+            })
+            .collect();
+        assert_clear_pick(&ts, Enc::DoubleDelta);
+
+        let small: Vec<i64> = xorshift(11, 4096).iter().map(|r| (r % 16) as i64).collect();
+        assert_clear_pick(&small, Enc::ForBitpack);
+
+        let low: Vec<Vec<u8>> = xorshift(13, 4096)
+            .iter()
+            .map(|r| format!("service-{}", r % 12).into_bytes())
+            .collect();
+        let low: Vec<&[u8]> = low.iter().map(Vec::as_slice).collect();
+        let shape = string_shape_if_dict(&low).expect("12 distinct of 4096 is a dictionary");
+        assert!(dict_strings_page(&shape).len() < plain_strings_page(low.iter().copied()).len());
+
+        let high: Vec<Vec<u8>> = xorshift(17, 4096)
+            .iter()
+            .map(|r| format!("request-{r:016x}").into_bytes())
+            .collect();
+        let high: Vec<&[u8]> = high.iter().map(Vec::as_slice).collect();
+        assert_eq!(string_shape_if_dict(&high), None);
+        let plain = plain_strings_page(high.iter().copied());
+        assert!(plain.len() < dict_strings_page(&string_shape(&high)).len());
     }
 }

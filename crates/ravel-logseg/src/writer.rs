@@ -4176,6 +4176,32 @@ mod group_dict_decision {
         );
     }
 
+    /// A block that chose a plain page under `PageChoice::Estimated` drops its
+    /// column from the decision for the whole group, before or after the blocks
+    /// that chose a dictionary page, and frees what the column was charged.
+    #[test]
+    fn a_plain_block_drops_its_column_from_the_decision() {
+        let plain = |mut out: BlockWriteOut| {
+            out.str_values[0] = BlockStrValues {
+                column_id: A,
+                plain: true,
+                ..BlockStrValues::default()
+            };
+            out
+        };
+        let mut b = builder();
+        b.push(block());
+        b.push(plain(block()));
+        b.push(block());
+        assert_eq!((charged(&b, A), b.str_bytes), (None, 122));
+        let (_, _, dir) = b.finish_checked().expect("no fault");
+        assert_eq!(encs(&dir, A), vec![Enc::Plain, Enc::Plain, Enc::Plain]);
+        assert_eq!(
+            encs(&dir, B),
+            vec![Enc::DictPage, Enc::DictIds, Enc::DictIds, Enc::DictIds]
+        );
+    }
+
     fn encs(dir: &PageDir, column_id: u32) -> Vec<Enc> {
         dir.groups[0]
             .chunks
