@@ -48,11 +48,11 @@ pub use attribution::{
 pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, IngestByteShed};
 pub use clock::{Clock, SystemClock};
 pub use config::{
-    IngestConfig, IngestConfigError, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, MIN_PLAUSIBLE_INGEST_CLOCK_NS, RlogChunkOrder, RlogChunkOrderError,
-    RlogGroupTargetBlocks, RlogGroupTargetBlocksError, RlogZstdLevel, RlogZstdLevelError,
-    SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION, STRICT_VISIBILITY_RESERVE_NS,
-    buffer_memory_backstop_bytes, plausible_ingest_clock,
+    FLUSH_TICK_FLOOR, IngestConfig, IngestConfigError, LOG_SEGMENT_FORMAT_VERSION,
+    MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, MIN_PLAUSIBLE_INGEST_CLOCK_NS, RlogChunkOrder,
+    RlogChunkOrderError, RlogGroupTargetBlocks, RlogGroupTargetBlocksError, RlogZstdLevel,
+    RlogZstdLevelError, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
+    STRICT_VISIBILITY_RESERVE_NS, buffer_memory_backstop_bytes, plausible_ingest_clock,
 };
 pub use error::WriteError;
 pub use format_floor::{

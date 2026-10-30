@@ -78,7 +78,7 @@ fn record(ts_ns: i64, value: Option<i64>) -> NormalizedLogRecord {
     let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs);
     NormalizedLogRecord {
         stream_id,
-        stream_attrs,
+        stream_attrs: stream_attrs.into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,
@@ -96,7 +96,7 @@ fn record(ts_ns: i64, value: Option<i64>) -> NormalizedLogRecord {
 fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: r.stream_id,
-        stream_attrs: r.stream_attrs.clone(),
+        stream_attrs: r.stream_attrs.to_vec(),
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
         severity_num: r.severity_num,

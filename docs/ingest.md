@@ -290,7 +290,8 @@ The flush deferral cap bounds it for every acknowledged strict-mode write
 before its flush trigger fires leaving out the sub-floor hold: the largest of
 `max_flush_delay`, `max_flush_delay_idle` and (when adaptive delay is on) the
 adaptive corridor's widest ceiling, `strict_visibility_budget_ns` less one
-`put_retry_base_delay`, plus one `flush_tick`:
+`put_retry_base_delay`, plus one flush tick
+(`IngestConfig::effective_flush_tick`, described with the age trigger below):
 `7200s - 3600s - (40s + 0.2s) = 3559.8s` at the defaults, whatever
 `idle_flush_byte_floor` holds, since the sub-floor hold is not a term. For a
 buffered row outside that hold the cap bounds when the refusal starts: before
@@ -572,8 +573,12 @@ Loop over `select!`:
   order (deferred buffers first, oldest deferral first, then oldest row).
   The scan covers the buffers the actor already holds, so it costs the
   tenant count per reap and nothing per write.
-- flush tick (interval default 200 ms): flush if `oldest_ns` older than an
-  age threshold, and buffer non-empty. The threshold is `max_flush_delay`
+- flush tick (interval `min(flush_tick, max_flush_delay / 4)`, where the
+  quarter delay is raised to a 25 ms floor, ADR-3492 decision 6; `flush_tick`
+  defaults to 200 ms, so the interval is 200 ms at the default 2 s
+  `max_flush_delay`, 100 ms at 400 ms and 25 ms at 100 ms or less, while a
+  `flush_tick` configured below 25 ms is used as is): flush if `oldest_ns`
+  older than an age threshold, and buffer non-empty. The threshold is `max_flush_delay`
   (default 2 s) when the buffer has a strict-mode waiter or already holds
   at least `min_flush_bytes` (default 256 KiB) of object bytes, on the same
   `flush_est_bytes` estimate the size trigger reads; otherwise the buffer is idle
@@ -589,13 +594,15 @@ Loop over `select!`:
   A third tier sits under the idle one and is off unless an operator asks for
   it (ADR-1737). With `--idle-flush-byte-floor` set to a non-zero byte count,
   an idle buffer holding fewer than that many object bytes waits for the
-  sub-floor hold, `max_flush_lifetime` less one `flush_tick`, instead of
+  sub-floor hold, `max_flush_lifetime` less one flush tick, instead of
   `max_flush_delay_idle`, and the flush that opens is recorded as
   `FlushTrigger::AgeFloor` and counted in `flushes_by_age_floor` rather than
   in `flushes_by_age`. The tick is held back so that the age check's own tick
   of lateness fits inside the hour: the worst buffer age when the flush opens
   is then exactly `max_flush_lifetime`, which is the figure
-  `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. The floor is read
+  `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. Since the tick
+  follows `max_flush_delay`, a shorter delay lengthens the hold: at a 25 ms
+  tick it is 175 ms longer than at the default delay's 200 ms. The floor is read
   against `flush_est_bytes`, the same object-bytes estimate `min_flush_bytes`
   uses, and a buffer crosses tiers upward as rows arrive, so a trickle that
   reaches the floor flushes on the idle clock measured from its oldest row
@@ -1012,7 +1019,10 @@ under ADR-1642, so this actor does not park on it either) and diverge in
 exactly five places:
 
 - Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
-  with `SegmentWriter`. They land under the `l` keyspace
+  with `SegmentWriter`. The flush configures the writer with
+  `PageChoice::Estimated` (ADR-3492 decision 1), and hands a row-major buffer
+  to it as one `ColumnarLogBatch` through `push_columnar` (decision 2), which
+  writes the object byte for byte as pushing the rows one at a time would. They land under the `l` keyspace
   (`t/<tenant>/l/l0/...`); commit records under `t/<tenant>/l/c/...`.
   `keys::data_key` and the commit protocol are already
   `Signal`-parameterized, so nothing in `ravel-commit` changed for logs.
@@ -1027,9 +1037,10 @@ exactly five places:
 - The fail-loud identity check does not live in the shard buffer. Where
   `TenantBuf::merge` checks an incoming point's `series_id` against the
   label set that id already claims (ADR-0005), `LogTenantBuf::merge` checks
-  nothing: `RlogWriter::finish()` already compares every buffered record's
-  `stream_attrs` for a shared `stream_id` and rejects the whole object with
-  `LogSegError::InconsistentStreamAttrs`. The flush step maps
+  nothing: the flush compares every buffered record's `stream_attrs` for a
+  shared `stream_id` before it builds the batch, as `RlogWriter::finish()`
+  does for rows pushed one at a time, and rejects the whole object with
+  `LogSegError::InconsistentStreamAttrs` and the message `finish()` gives. The flush step maps
   that one variant to `LogWriteError::StreamIdCollision` and counts it in
   `stream_id_collisions`; every other `LogSegError` becomes
   `LogWriteError::SegmentBuild`. Duplicating the check in the buffer would
@@ -1368,6 +1379,10 @@ Four layers, each enforced before the allocation it bounds, in this order:
    which partially admits: rejected series/streams are dropped from the
    write and folded into the signal's existing partial-success reporting
    (`ExportMetricsPartialSuccess`/`ExportLogsPartialSuccess`).
+   `admit_streams` decides each distinct stream of a request once and gives
+   every record of that stream the stream's outcome, which is the outcome
+   deciding record by record would give; `series_admitted_total` and
+   `series_rejected_cap_total` still count records (ADR-3492 decision 5).
 
 Rejection is per signal and per layer:
 
@@ -1875,7 +1890,7 @@ waiting for their ack.
 | max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
 | strict flush policy (process default, all strict surfaces) | `aged` (`--strict-flush-policy`, `RAVEL_STRICT_FLUSH_POLICY`; `arrival` opens a strict write's flush on arrival) |
 | min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
-| idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
+| idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one effective flush tick and widens the buffered-mode loss window to match) |
 | put retry budget | 4 retries (5 attempts), 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max pending strict acks (process-wide, one budget shared by the three routers) | 8,192 (`--max-pending-strict-acks`, `RAVEL_MAX_PENDING_STRICT_ACKS`: the in-flight ingest ceiling times eight, 0 = unlimited, refused above the tokio semaphore maximum) |

@@ -48,6 +48,8 @@
 //! stored. A tenant with no matching rule, or [`TenantRules::none()`], leaves
 //! every value unchanged.
 
+use std::sync::Arc;
+
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -76,8 +78,10 @@ pub struct NormalizedLogRecord {
     /// `RlogWriter::finish()` are the only places positioned to detect a
     /// stream-id collision (two different resource+scope inputs hashing to
     /// the same `stream_id`): `finish()` does that by comparing this field
-    /// across every record sharing a `stream_id`.
-    pub stream_attrs: Vec<u8>,
+    /// across every record sharing a `stream_id`. Normalization builds one
+    /// blob per `ScopeLogs` and every record under it holds a reference to it
+    /// (ADR-3492 decision 3a).
+    pub stream_attrs: Arc<[u8]>,
     pub ts_ns: i64,
     pub observed_ts_ns: i64,
     pub severity_num: u8,
@@ -436,8 +440,8 @@ impl LogWalk<'_> {
         // same converted (and, where matched, encrypted) attribute vectors, and
         // reused for every record below.
         let stream_id = log_stream_id(resource_attrs, &scope_name, &scope_version, &scope_attrs);
-        let stream_attrs =
-            stream_attrs_bytes(resource_attrs, &scope_name, &scope_version, &scope_attrs);
+        let stream_attrs: Arc<[u8]> =
+            stream_attrs_bytes(resource_attrs, &scope_name, &scope_version, &scope_attrs).into();
 
         let stored_before = self.records.len();
         let projecting = self.projecting();
@@ -446,6 +450,7 @@ impl LogWalk<'_> {
             let (normalized, charge) = normalize_record(
                 record,
                 stream_id,
+                &stream_attrs,
                 stream_encoded,
                 self.limits,
                 self.rules,
@@ -458,8 +463,7 @@ impl LogWalk<'_> {
                 break;
             }
             match normalized {
-                Ok((mut normalized, dropped_attrs, converted_body)) => {
-                    normalized.stream_attrs = stream_attrs.clone();
+                Ok((normalized, dropped_attrs, converted_body)) => {
                     self.records.push(normalized);
                     self.rejected.extend(dropped_attrs);
                     if converted_body {
@@ -482,7 +486,7 @@ type RecordOutcome = Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogR
 /// record; `Ok`'s second element carries per-attribute rejections for
 /// attributes dropped from an otherwise admitted record, and its third says
 /// whether a structured body was converted to canonical JSON to admit it.
-/// The admitted record's `stream_attrs` is left empty for the caller to fill.
+/// The admitted record references the scope's `stream_attrs` blob.
 ///
 /// The second result is the record's projection charge (its copy of the
 /// `stream_encoded`-byte preimage plus its attributes, as
@@ -493,6 +497,7 @@ type RecordOutcome = Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogR
 fn normalize_record(
     record: LogRecord,
     stream_id: LogStreamId,
+    stream_attrs: &Arc<[u8]>,
     stream_encoded: usize,
     limits: &LogIngestLimits,
     rules: &TenantRules,
@@ -584,7 +589,7 @@ fn normalize_record(
         Ok((
             NormalizedLogRecord {
                 stream_id,
-                stream_attrs: Vec::new(),
+                stream_attrs: Arc::clone(stream_attrs),
                 ts_ns,
                 observed_ts_ns,
                 // OTLP defines severity_number over 0..=24. A value outside u8
@@ -1427,6 +1432,11 @@ mod tests {
         assert_eq!(out.records.len(), 2);
         assert_eq!(out.records[0].stream_id, out.records[1].stream_id);
         assert_eq!(out.records[0].stream_attrs, out.records[1].stream_attrs);
+        // ADR-3492 decision 3a: one blob per scope, referenced by each record.
+        assert!(Arc::ptr_eq(
+            &out.records[0].stream_attrs,
+            &out.records[1].stream_attrs
+        ));
     }
 
     #[test]
@@ -3710,13 +3720,14 @@ mod tests {
         let out = normalize_logs(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 15);
-        // What each record actually allocated: its stream-attribute copy, its
-        // attribute `Vec`'s element capacity, and every key and value.
+        // What each record holds: the stream-attribute blob it references
+        // (counted whole, though a scope's records share one), its attribute
+        // `Vec`'s element capacity, and every key and value.
         let built: usize = out
             .records
             .iter()
             .map(|r| {
-                r.stream_attrs.capacity()
+                r.stream_attrs.len()
                     + r.attrs.capacity() * std::mem::size_of::<(String, AttrValue)>()
                     + r.attrs
                         .iter()
@@ -3746,7 +3757,8 @@ mod tests {
     /// `rules`, check that every kept key and value sits at exact capacity,
     /// and that the projection's per-record term (two records less one, so
     /// the once-per-resource and once-per-scope copies give no slack) is at
-    /// least what the record allocated. Returns the number of kept records.
+    /// least what the record holds, its shared stream blob counted whole.
+    /// Returns the number of kept records.
     fn check_record_capacity(
         resource: &[KeyValue],
         attributes: &[KeyValue],
@@ -3779,7 +3791,7 @@ mod tests {
                 proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);
                 proptest::prop_assert!(attr_value_is_exact(v), "{}: {:?}", k, v);
             }
-            let built = r.stream_attrs.capacity()
+            let built = r.stream_attrs.len()
                 + r.attrs.capacity() * std::mem::size_of::<(String, AttrValue)>()
                 + r.attrs
                     .iter()

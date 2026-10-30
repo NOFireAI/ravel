@@ -441,7 +441,7 @@ fn log_record(i: usize) -> NormalizedLogRecord {
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
     NormalizedLogRecord {
         stream_id: log_stream_id(&resource, "scope", "", &scope_attrs),
-        stream_attrs: stream_attrs_bytes(&resource, "scope", "", &scope_attrs),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "", &scope_attrs).into(),
         ts_ns: ROW_TS_NS + i as i64,
         observed_ts_ns: ROW_TS_NS + i as i64,
         severity_num: 9,

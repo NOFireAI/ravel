@@ -842,7 +842,8 @@ impl SpanShardActor {
         // that advances the injected clock past `max_flush_delay` drives a
         // flush tick deterministically with no real sleep.
         let clock = Arc::clone(&self.clock);
-        let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
+        let flush_tick_ns =
+            i64::try_from(self.config.effective_flush_tick().as_nanos()).unwrap_or(i64::MAX);
         let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
         loop {
             let until_ns = next_tick_ns.saturating_sub(clock.now_ns()).max(0);
@@ -1178,7 +1179,7 @@ impl SpanShardActor {
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
     /// (ADR-0051 section 7), or, below a non-zero `idle_flush_byte_floor`, for
-    /// the sub-floor hold, `max_flush_lifetime` less one `flush_tick`
+    /// the sub-floor hold, `max_flush_lifetime` less one `effective_flush_tick()`
     /// (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
     /// is a claim about the object, so this
     /// reads the object-bytes estimate, not the buffered-memory charge (issue

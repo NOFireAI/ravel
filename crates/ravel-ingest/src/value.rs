@@ -361,7 +361,7 @@ mod tests {
     fn log_record_with(attr_count: usize) -> NormalizedLogRecord {
         NormalizedLogRecord {
             stream_id: LogStreamId([0u8; 16]),
-            stream_attrs: Vec::new(),
+            stream_attrs: Vec::new().into(),
             ts_ns: 1_000,
             observed_ts_ns: 1_000,
             severity_num: 9,

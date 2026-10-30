@@ -32,7 +32,9 @@ use crate::generation::{
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
 use crate::log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
-use crate::log_shard::{LogShardActor, LogShardMsg, est_columnar_bytes, est_record_bytes};
+use crate::log_shard::{
+    LogShardActor, LogShardMsg, ShardRecords, est_columnar_bytes, est_record_bytes,
+};
 use crate::pending_ack::{PendingAckBudget, PendingAckPermit};
 use crate::router::WriteMode;
 #[cfg(feature = "stage-timing")]
@@ -581,9 +583,12 @@ impl LogIngestRouter {
         // drops the not-yet-handed-off clones, so nothing leaks.
         #[cfg(feature = "stage-timing")]
         let admit_start = std::time::Instant::now();
-        let estimate: u64 = records
+        // Each record's estimate is computed once here and carried with it to
+        // its shard (ADR-3492 decision 5), which buffers it at this figure.
+        let record_bytes: Vec<usize> = records.iter().map(est_record_bytes).collect();
+        let estimate: u64 = record_bytes
             .iter()
-            .map(|r| est_record_bytes(r) as u64)
+            .map(|&bytes| bytes as u64)
             .fold(0u64, u64::saturating_add);
         let charge = Arc::new(
             self.budget
@@ -604,10 +609,10 @@ impl LogIngestRouter {
         // floor of the view just routed with, before any shard buffers it.
         self.admit_floor(tenant.hash())?;
         let shard_count = set.len() as u32;
-        let mut by_shard: HashMap<u32, Vec<NormalizedLogRecord>> = HashMap::new();
-        for record in records {
+        let mut by_shard: HashMap<u32, ShardRecords> = HashMap::new();
+        for (record, bytes) in records.into_iter().zip(record_bytes) {
             let shard = shard_for_log(&record.stream_id, shard_count);
-            by_shard.entry(shard).or_default().push(record);
+            by_shard.entry(shard).or_default().push(record, bytes);
         }
         if by_shard.is_empty() {
             return Ok(LogSubmitted {
@@ -1617,7 +1622,7 @@ mod tests {
             .collect();
         let rec = NormalizedLogRecord {
             stream_id: LogStreamId([0u8; 16]),
-            stream_attrs: Vec::new(),
+            stream_attrs: Vec::new().into(),
             ts_ns: 1_000,
             observed_ts_ns: 1_000,
             severity_num: 9,
@@ -1736,7 +1741,7 @@ mod tests {
     fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
         LogRecord {
             stream_id: r.stream_id,
-            stream_attrs: r.stream_attrs.clone(),
+            stream_attrs: r.stream_attrs.to_vec(),
             ts_ns: r.ts_ns,
             observed_ts_ns: r.observed_ts_ns,
             severity_num: r.severity_num,
@@ -1793,7 +1798,7 @@ mod tests {
             };
             out.push(NormalizedLogRecord {
                 stream_id,
-                stream_attrs,
+                stream_attrs: stream_attrs.into(),
                 ts_ns: 1_000 + i as i64,
                 observed_ts_ns: 1_000 + i as i64,
                 severity_num: (i % 24) as u8,
@@ -2104,7 +2109,7 @@ mod tests {
                     ("host".to_string(), AttrValue::Str(format!("h{}", i % 6))),
                 ];
                 r.stream_id = log_stream_id(&res, "scope", "", &[]);
-                r.stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
+                r.stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]).into();
                 r
             })
             .collect();
@@ -2762,7 +2767,7 @@ mod tests {
                     ("host".to_string(), AttrValue::Str(format!("h{}", i % 6))),
                 ];
                 r.stream_id = log_stream_id(&res, "scope", "", &[]);
-                r.stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
+                r.stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]).into();
                 r.ts_ns = 1_000 + (i / 12) as i64;
                 let mut record = to_logrecord(&r);
                 record
