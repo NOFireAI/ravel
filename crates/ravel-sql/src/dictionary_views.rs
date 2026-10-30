@@ -1,21 +1,29 @@
 //! A memoized `Dictionary(Int32, Utf8)` to `Utf8View` cast, the group-key
 //! cast [`crate::DictionaryGroupKeysAsViews`] inserts (issue #3231).
 //!
-//! Arrow's cast builds one 16-byte view per row: it reads the row's key, the
-//! dictionary entry's offsets, and for an entry of 12 bytes or fewer its
-//! bytes, at an offset the key picks. The scan shares one values array per
-//! row-group dictionary across every batch it emits
-//! (`logs_scan::batch::StrValuesCache`), so that per-row read repeats work
-//! the previous batch already did. [`DictionaryViewsCast`] builds the views of
-//! the dictionary's values once per values array and then gathers each row's
-//! view by key, with the same buffers, nulls and view bits the stock cast
-//! produces (`dictionary_views::tests::matches_the_stock_cast`).
+//! Arrow's cast builds one 16-byte view per row from the row's dictionary
+//! entry, reading that entry's offsets and leading bytes at a position the
+//! key picks. The scan shares one values array per row-group dictionary
+//! across the batches it emits (`logs_scan::batch::StrValuesCache`), so that
+//! per-row read repeats work an earlier batch already did.
+//! [`DictionaryViewsCast`] builds the views of a values array once
+//! ([`views_of`]) and then gathers each row's view by key, with the type,
+//! nulls, view bits and data buffers arrow's cast produces
+//! (`tests::matches_the_stock_cast`).
 //!
-//! The views array is built for a values array only once the rows cast over
-//! it reach its length; until then each batch takes the stock cast
-//! ([`Memo::lookup`]). A dictionary larger than the rows that read it is so
-//! never paid for in full, and the build costs at most as many entries as
-//! the stock cast already walked rows over that values array.
+//! A values array's views are built only once the rows cast over it, the
+//! current batch's included, reach its entry count; until then each batch
+//! takes arrow's cast ([`Memo::lookup`],
+//! `tests::large_dictionary_builds_once_rows_reach_its_length`). A dictionary
+//! with more entries than the rows that read it is never built.
+//!
+//! The memo belongs to the expression instance, which every partition of the
+//! aggregate shares; its lock is taken once or twice per batch, never per
+//! row. It keeps at most [`MEMO_ENTRIES`] values arrays (`tests::memo_is_bounded`).
+//! A built entry's views hold the values' data buffer ([`views_of`] appends
+//! it as block 0), so up to that many data buffers can outlive the scan's own
+//! reference to them; the memory pool is not charged for them or for the
+//! 16 bytes per entry the views take.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -51,6 +59,7 @@ pub struct DictionaryViewsCast {
 }
 
 impl DictionaryViewsCast {
+    /// The cast of `expr` with an empty memo.
     pub fn new(expr: Arc<dyn PhysicalExpr>) -> Self {
         DictionaryViewsCast {
             expr,
@@ -185,11 +194,12 @@ struct Memo {
 }
 
 struct Entry {
-    /// The values array, found by its `Arc` identity. Only a `Weak`, so the
-    /// memo does not keep a values array the scan has released resident or
-    /// charged (`StrValuesCache` counts strong references); the `Weak` keeps
-    /// the allocation's address from being reused while the entry exists, so
-    /// a live array at that address is this one.
+    /// The values array, found by its `Arc` identity ([`Memo::position`]).
+    /// Only a `Weak`, so the memo does not count as a holder in
+    /// `StrValuesCache`, which keeps an array while its strong count says
+    /// something outside the cache holds it. The `Weak` keeps the allocation's
+    /// address from being reused while the entry exists, so a live array at
+    /// that address is this one.
     values: Weak<dyn Array>,
     state: State,
 }
