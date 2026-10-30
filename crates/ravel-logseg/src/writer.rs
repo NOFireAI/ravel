@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
 use crate::block::{
-    BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput, write_block,
-    write_block_columnar,
+    BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput, PageChoice,
+    write_block_columnar_with, write_block_with,
 };
 use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
@@ -86,6 +86,9 @@ pub struct RlogConfig {
     /// which is the alphabetical assignment. A `'static` slice keeps the config
     /// `Copy`.
     pub chunk_order: &'static [&'static str],
+    /// How each block picks its i64 and string page encodings (ADR-3492
+    /// decision 1). `Exhaustive` by default; readers decode either.
+    pub page_choice: PageChoice,
 }
 
 impl Default for RlogConfig {
@@ -101,6 +104,7 @@ impl Default for RlogConfig {
             postings_stride: DEFAULT_STRIDE,
             group_target_blocks: 32,
             chunk_order: &[],
+            page_choice: PageChoice::Exhaustive,
         }
     }
 }
@@ -852,7 +856,12 @@ impl RlogWriter {
                 })
                 .collect();
 
-            let out = write_block(block_rows, &plans, self.cfg.zstd_level)?;
+            let out = write_block_with(
+                block_rows,
+                &plans,
+                self.cfg.zstd_level,
+                self.cfg.page_choice,
+            )?;
 
             // POSTINGS: index each row's merged-view values (resource +
             // scope + per-record, the record winning on a key collision),
@@ -1856,7 +1865,7 @@ impl RlogWriter {
                 stat_values: &stat_v,
                 str_dicts: &str_dicts_v,
             };
-            let out = write_block_columnar(&input, self.cfg.zstd_level)?;
+            let out = write_block_columnar_with(&input, self.cfg.zstd_level, self.cfg.page_choice)?;
 
             // POSTINGS over each row's merged-view indexed terms, in its own
             // pass ahead of the timed bloom region below and never inside it,
@@ -3592,6 +3601,9 @@ impl BlocksBuilder {
     /// column. Per-entry overhead (a `Vec<u8>` header and a `u32` in a hash
     /// slot) is not charged and is bounded by that entry count instead.
     ///
+    /// A block that chose a plain page ([`BlockStrValues::plain`]) drops the
+    /// column from the decision for the rest of the group.
+    ///
     /// A value id outside the block's distinct values drops the column from
     /// the decision and is `Corrupted`.
     fn intern(&mut self, block: usize, values: BlockStrValues) -> Result<(), LogSegError> {
@@ -3602,6 +3614,11 @@ impl BlocksBuilder {
         let Some(col) = slot else {
             return Ok(());
         };
+        if values.plain {
+            self.str_bytes -= col.bytes;
+            *slot = None;
+            return Ok(());
+        }
         let mut local = Vec::with_capacity(values.sorted.len());
         for value in values.sorted {
             let next = col.interner.len() as u32;
@@ -4104,6 +4121,7 @@ mod group_dict_decision {
                     column_id,
                     sorted: vec![b"xy".to_vec()],
                     ids: vec![0; ROWS],
+                    plain: false,
                 })
                 .collect(),
         }
@@ -4160,6 +4178,32 @@ mod group_dict_decision {
         assert_eq!(
             encs(&dir, B),
             vec![Enc::DictPage, Enc::DictIds, Enc::DictIds]
+        );
+    }
+
+    /// A block that chose a plain page under `PageChoice::Estimated` drops its
+    /// column from the decision for the whole group, before or after the blocks
+    /// that chose a dictionary page, and frees what the column was charged.
+    #[test]
+    fn a_plain_block_drops_its_column_from_the_decision() {
+        let plain = |mut out: BlockWriteOut| {
+            out.str_values[0] = BlockStrValues {
+                column_id: A,
+                plain: true,
+                ..BlockStrValues::default()
+            };
+            out
+        };
+        let mut b = builder();
+        b.push(block());
+        b.push(plain(block()));
+        b.push(block());
+        assert_eq!((charged(&b, A), b.str_bytes), (None, 122));
+        let (_, _, dir) = b.finish_checked().expect("no fault");
+        assert_eq!(encs(&dir, A), vec![Enc::Plain, Enc::Plain, Enc::Plain]);
+        assert_eq!(
+            encs(&dir, B),
+            vec![Enc::DictPage, Enc::DictIds, Enc::DictIds, Enc::DictIds]
         );
     }
 

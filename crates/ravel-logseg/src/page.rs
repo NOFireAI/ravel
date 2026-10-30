@@ -68,6 +68,8 @@ impl SealedPage {
 /// Passes one encoded page through the envelope, with the same floor and
 /// strictly-smaller rule as [`write_page`].
 pub fn seal_page(enc: Enc, encoded: Vec<u8>, zstd_level: i32) -> SealedPage {
+    #[cfg(test)]
+    SEALS.with(|n| n.set(n.get() + 1));
     let uncomp_len = encoded.len() as u64;
     match compress_if_smaller(&encoded, zstd_level) {
         Some(z) => SealedPage {
@@ -83,6 +85,13 @@ pub fn seal_page(enc: Enc, encoded: Vec<u8>, zstd_level: i32) -> SealedPage {
             uncomp_len,
         },
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pages this thread has sealed, so a test can count the candidates a
+    /// write sealed.
+    pub(crate) static SEALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Seals every candidate and keeps the one with the fewest stored bytes. The
