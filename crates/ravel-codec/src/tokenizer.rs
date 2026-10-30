@@ -5,6 +5,9 @@
 //! identically on the write path (bloom insertion) and the read path (word
 //! match), so the two can never disagree about what a "word" is.
 
+/// Byte cap on a single token (docs/log-segment-format.md constant).
+const TOKEN_MAX_BYTES: usize = 64;
+
 /// Tokens of `text`: lowercase words split on any non-alphanumeric character.
 ///
 /// - split on `!char::is_alphanumeric` (Unicode-aware);
@@ -18,26 +21,56 @@
 ///   64 bytes, measured on the folded characters so a length-changing
 ///   lowercase can neither exceed the cap nor split a codepoint;
 /// - drop empty tokens; keep duplicates (deduplication is the bloom's job).
+///
+/// Allocates one `Vec` per token; [`for_each_token`] yields the same tokens
+/// without allocating.
 pub fn tokens(text: &str) -> Vec<Vec<u8>> {
-    /// Byte cap on a single token (docs/log-segment-format.md constant).
-    const TOKEN_MAX_BYTES: usize = 64;
-
     let mut out = Vec::new();
-    let mut cur = String::new();
-    // `truncated` remembers we have already hit the 64-byte cap for the
-    // current word, so the rest of the word's characters are consumed as
-    // separators-free continuation but not appended.
-    let mut truncated = false;
+    for_each_token(text, |tok| out.push(tok.to_vec()));
+    out
+}
 
-    let mut flush = |cur: &mut String, truncated: &mut bool| {
-        if !cur.is_empty() {
-            out.push(std::mem::take(cur).into_bytes());
-        } else {
-            cur.clear();
+/// Calls `f` with each of [`tokens`]`(text)`, in order, as a byte slice
+/// borrowed from a stack buffer. Allocates nothing.
+///
+/// All-ASCII `text` takes a byte-wise path, where `char::is_alphanumeric`
+/// and `char::to_lowercase` agree with their ASCII forms; any byte at or
+/// above 0x80 sends the whole text through the Unicode path.
+pub fn for_each_token(text: &str, mut f: impl FnMut(&[u8])) {
+    if text.is_ascii() {
+        ascii_tokens(text.as_bytes(), &mut f);
+    } else {
+        unicode_tokens(text, &mut f);
+    }
+}
+
+fn ascii_tokens(text: &[u8], f: &mut impl FnMut(&[u8])) {
+    let mut buf = [0u8; TOKEN_MAX_BYTES];
+    let mut len = 0;
+    for &b in text {
+        if b.is_ascii_alphanumeric() {
+            // Every character is one byte here, so a word past the cap just
+            // stops appending.
+            if len < TOKEN_MAX_BYTES {
+                buf[len] = b.to_ascii_lowercase();
+                len += 1;
+            }
+        } else if len > 0 {
+            f(&buf[..len]);
+            len = 0;
         }
-        *truncated = false;
-    };
+    }
+    if len > 0 {
+        f(&buf[..len]);
+    }
+}
 
+fn unicode_tokens(text: &str, f: &mut impl FnMut(&[u8])) {
+    let mut buf = [0u8; TOKEN_MAX_BYTES];
+    let mut len = 0;
+    // Set once appending the next folded character would pass the cap: the
+    // rest of the word is consumed but not appended.
+    let mut truncated = false;
     for ch in text.chars() {
         if ch.is_alphanumeric() {
             if truncated {
@@ -50,20 +83,25 @@ pub fn tokens(text: &str) -> Vec<Vec<u8>> {
                 if !lc.is_alphanumeric() {
                     continue;
                 }
-                // Appending this folded char must keep the token within the
-                // 64-byte cap on a character boundary.
-                if cur.len() + lc.len_utf8() > TOKEN_MAX_BYTES {
+                let w = lc.len_utf8();
+                if len + w > TOKEN_MAX_BYTES {
                     truncated = true;
                     break;
                 }
-                cur.push(lc);
+                lc.encode_utf8(&mut buf[len..len + w]);
+                len += w;
             }
         } else {
-            flush(&mut cur, &mut truncated);
+            if len > 0 {
+                f(&buf[..len]);
+            }
+            len = 0;
+            truncated = false;
         }
     }
-    flush(&mut cur, &mut truncated);
-    out
+    if len > 0 {
+        f(&buf[..len]);
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +295,96 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The tokenizer as it was before ADR-3492 D4, code unchanged and
+    /// comments removed, kept as the oracle for `tokens_are_unchanged`.
+    fn oracle_tokens(text: &str) -> Vec<Vec<u8>> {
+        /// Byte cap on a single token (docs/log-segment-format.md constant).
+        const TOKEN_MAX_BYTES: usize = 64;
+
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut truncated = false;
+
+        let mut flush = |cur: &mut String, truncated: &mut bool| {
+            if !cur.is_empty() {
+                out.push(std::mem::take(cur).into_bytes());
+            } else {
+                cur.clear();
+            }
+            *truncated = false;
+        };
+
+        for ch in text.chars() {
+            if ch.is_alphanumeric() {
+                if truncated {
+                    continue;
+                }
+                for lc in ch.to_lowercase() {
+                    if !lc.is_alphanumeric() {
+                        continue;
+                    }
+                    if cur.len() + lc.len_utf8() > TOKEN_MAX_BYTES {
+                        truncated = true;
+                        break;
+                    }
+                    cur.push(lc);
+                }
+            } else {
+                flush(&mut cur, &mut truncated);
+            }
+        }
+        flush(&mut cur, &mut truncated);
+        out
+    }
+
+    /// Characters whose case mapping or class is an edge for the fold:
+    /// expanding lowercase (`İ`), non-ASCII letters with ASCII lowercase
+    /// (KELVIN SIGN), multi-byte lowercase (`Α`, `Σ`), titlecase (`ǅ`),
+    /// non-alphanumeric non-ASCII separators and combining marks.
+    const EDGE_CHARS: &[char] = &[
+        '\u{0130}', '\u{212A}', '\u{0391}', '\u{03A3}', '\u{00DF}', '\u{00C9}', '\u{1E9E}',
+        '\u{01C5}', '\u{216B}', '\u{FB00}', '\u{4E16}', '\u{0301}', '\u{0307}', '\u{00B7}',
+        '\u{3000}', '\u{00A0}', '\u{0410}', '\u{FF21}',
+    ];
+
+    /// One run of text: ASCII, mixed-case, punctuation-only, a long word,
+    /// edge characters, or arbitrary Unicode.
+    fn piece() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[ -~]{0,40}",
+            "[A-Za-z0-9]{1,24}",
+            "[ -/:-@\\[-`{-~]{0,16}",
+            "[a-zA-Z0-9]{60,140}",
+            proptest::collection::vec(proptest::sample::select(EDGE_CHARS), 1..80)
+                .prop_map(|cs| cs.into_iter().collect()),
+            ".{0,24}",
+        ]
+    }
+
+    fn text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            "[ -~]{0,300}",
+            proptest::collection::vec(piece(), 0..24).prop_map(|ps| ps.concat()),
+            ".{0,200}",
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// The new tokenizer yields exactly the oracle's tokens for each
+        /// generated input, through both `tokens` and `for_each_token`.
+        #[test]
+        fn tokens_are_unchanged(text in text()) {
+            let want = oracle_tokens(&text);
+            prop_assert_eq!(tokens(&text), want.clone());
+            let mut got = Vec::new();
+            for_each_token(&text, |t| got.push(t.to_vec()));
+            prop_assert_eq!(got, want);
+        }
+    }
 
     proptest! {
         #[test]
