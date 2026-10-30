@@ -10,8 +10,11 @@ use proptest::sample::Index;
 use ravel_logseg::tokenizer::tokens;
 use ravel_logseg::{
     AttrValue, ColumnSelection, ColumnarLogBatch, FieldSel, FieldType, LogRecord, LogStreamId,
-    ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
+    ObjectIdentity, PageChoice, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
 };
+
+#[path = "../benches/common/ingest_shape.rs"]
+mod ingest_shape;
 
 const STREAMS: u8 = 6;
 const TS_MAX: i64 = 400;
@@ -935,4 +938,163 @@ fn chunk_order_prune_channel_prunes_partially() {
         count(PruneEffect::Empty) <= EMPTY_CEIL,
         "empty prunes above the ceiling of {EMPTY_CEIL}: {summary:?}"
     );
+}
+
+// --- page choice (ADR-3492 decision 1) -------------------------------------
+
+/// `corpus` written under `cfg`, through the row path or through the columnar
+/// path in ingest push batches of `ingest_shape::PUSH_BATCH`.
+fn write_batched(cfg: RlogConfig, corpus: &[LogRecord], columnar: bool) -> Vec<u8> {
+    let identity = ObjectIdentity {
+        tenant_hash: [0u8; 16],
+        shard: 0,
+        writer_id: [0u8; 16],
+        writer_epoch: 0,
+        writer_seq: 0,
+    };
+    let mut w = RlogWriter::new(cfg, identity);
+    if columnar {
+        for batch in corpus.chunks(ingest_shape::PUSH_BATCH) {
+            let batch = ColumnarLogBatch::try_from_records(batch).expect("batch");
+            w.push_columnar(batch).expect("push_columnar");
+        }
+    } else {
+        for r in corpus {
+            w.push(r.clone()).expect("push");
+        }
+    }
+    w.finish().expect("finish")
+}
+
+/// Every record an object holds, in the order it stores them, as comparable
+/// keys.
+fn decoded_keys(object: &[u8]) -> Vec<Vec<u8>> {
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(object, &cfg).expect("open");
+    let all = Predicate::TsRange {
+        min_ns: i64::MIN,
+        max_ns: i64::MAX,
+    };
+    let (got, _stats) = reader.scan(&all).expect("scan");
+    got.iter().map(record_key).collect()
+}
+
+/// One ingest flush of the benchmark shape, at the default layout and at
+/// small blocks in row groups of four: under `Estimated` the same input
+/// encodes to the same bytes twice, the row and columnar paths agree byte for
+/// byte under each choice, and the `Estimated` object decodes to exactly the
+/// records the `Exhaustive` one does.
+#[test]
+fn estimated_mode_is_deterministic() {
+    let corpus = ingest_shape::ingest_records(7_500);
+    let small = RlogConfig {
+        block_target_records: 256,
+        group_target_blocks: 4,
+        ..RlogConfig::default()
+    };
+    for base in [RlogConfig::default(), small] {
+        let est = RlogConfig {
+            page_choice: PageChoice::Estimated,
+            ..base
+        };
+        let first = write_batched(est, &corpus, false);
+        assert!(first == write_batched(est, &corpus, false), "Estimated is not repeatable");
+        assert!(first == write_batched(est, &corpus, true), "Estimated row and columnar differ");
+        let exh = write_batched(base, &corpus, false);
+        assert!(exh == write_batched(base, &corpus, true), "Exhaustive row and columnar differ");
+        assert!(first != exh, "the writer ignored page_choice");
+        assert_eq!(decoded_keys(&first), decoded_keys(&exh));
+    }
+}
+
+/// How one generated page column draws its values.
+#[derive(Clone, Copy, Debug)]
+enum PageKind {
+    Constant,
+    Monotonic,
+    Random,
+    SmallRange,
+    LowCardStr,
+    HighCardStr,
+}
+
+fn page_value(kind: PageKind, seed: u64, i: usize) -> AttrValue {
+    let r = (seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        .rotate_left(29);
+    match kind {
+        PageKind::Constant => AttrValue::I64(seed as i64),
+        PageKind::Monotonic => AttrValue::I64((seed as i64 % 1_000_000) + i as i64 * 1_000 + (r % 3) as i64),
+        PageKind::Random => AttrValue::I64(r as i64),
+        PageKind::SmallRange => AttrValue::I64((r % 16) as i64),
+        PageKind::LowCardStr => AttrValue::Str(format!("v{}", r % 4)),
+        PageKind::HighCardStr => AttrValue::Str(format!("{r:016x}")),
+    }
+}
+
+/// A corpus whose attribute columns are each one [`PageKind`], present in
+/// every record or in a seed-chosen share of them, with bodies of either
+/// kind of string.
+fn arb_page_corpus() -> impl Strategy<Value = (Vec<LogRecord>, usize)> {
+    let kind = prop_oneof![
+        Just(PageKind::Constant),
+        Just(PageKind::Monotonic),
+        Just(PageKind::Random),
+        Just(PageKind::SmallRange),
+        Just(PageKind::LowCardStr),
+        Just(PageKind::HighCardStr),
+    ];
+    (
+        1usize..400,
+        proptest::collection::vec((kind, any::<u64>(), 0u8..4), 1..6),
+        any::<bool>(),
+        8usize..80,
+    )
+        .prop_map(|(n, columns, low_card_body, block)| {
+            let corpus = (0..n)
+                .map(|i| {
+                    let attrs = columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, _, sparse))| *sparse == 0 || i % (usize::from(*sparse) + 1) != 0)
+                        .map(|(c, &(kind, seed, _))| (format!("c{c}"), page_value(kind, seed, i)))
+                        .collect();
+                    let body = if low_card_body {
+                        WORDS[i % 3].to_string()
+                    } else {
+                        format!("{} {i}", WORDS[i % WORDS.len()])
+                    };
+                    let stream = (i % usize::from(STREAMS)) as u8;
+                    LogRecord {
+                        attrs,
+                        ..make_record(stream, (i / 3) as i64, body, (i % 30) as u8, Vec::new(), None)
+                    }
+                })
+                .collect();
+            (corpus, block)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// Every `Estimated` object decodes to exactly the records the
+    /// `Exhaustive` object of the same input decodes to, in the same order,
+    /// and the row and columnar paths agree byte for byte under `Estimated`.
+    #[test]
+    fn estimated_objects_decode_identically((corpus, block) in arb_page_corpus()) {
+        let exh = RlogConfig {
+            block_target_records: block,
+            group_target_blocks: 3,
+            ..RlogConfig::default()
+        };
+        let est = RlogConfig { page_choice: PageChoice::Estimated, ..exh };
+        let est_row = write_batched(est, &corpus, false);
+        prop_assert!(est_row == write_batched(est, &corpus, true), "row and columnar differ");
+        let want = decoded_keys(&write_batched(exh, &corpus, false));
+        prop_assert_eq!(decoded_keys(&est_row), want.clone());
+        let mut sorted = want;
+        sorted.sort();
+        prop_assert_eq!(sorted, normalize(corpus));
+    }
 }
