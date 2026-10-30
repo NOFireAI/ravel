@@ -52,7 +52,11 @@ summed charge is inside its budget. Those are the figures at the default
 per-tenant budget: `--catalog-record-cache-max-bytes-per-tenant` raises it,
 and the worst case per actively-queried tenant rises with it. Startup logs the
 budget in force, the entry bound and that worst case on the `catalog record
-caches sized` line. [Caching](caching.md) has the derivation and the sizing.
+caches sized` line. `ravel_catalog_record_cache_held_bytes{cache}` and
+`ravel_catalog_record_cache_entries{cache}` report the bytes each cache
+charges and the entries it holds, summed over tenants; their ratio is the
+measured bytes per entry. [Caching](caching.md) has the derivation and the
+sizing.
 
 Related guides:
 

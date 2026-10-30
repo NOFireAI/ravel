@@ -41,6 +41,7 @@ pub use auth_token_map::{
     remove_tokens_by_tenant, remove_tokens_by_tenant_owned_by, replace_tenant_tokens,
     tenant_for_token, token_hash, upsert_token, upsert_token_owned,
 };
+pub use cache::RecordCacheTotals;
 pub use catalog::Catalog;
 pub use catalog::resolve_rewrite_supersession;
 pub use catalog::{
