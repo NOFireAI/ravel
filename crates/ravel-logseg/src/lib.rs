@@ -47,6 +47,7 @@ mod bloom_coverage_tests;
 // deliberately NOT re-exported: the view is the whole public surface over a
 // decoded block, so decision 4 can change how columns are stored without
 // touching a caller.
+pub use block::PageChoice;
 pub use columnar::{
     AttrColumn, BoolCursor, BytesCursor, ColumnarBlockView, F64BitsCursor, I64Cursor, I64Values,
     StrDictColumn,
