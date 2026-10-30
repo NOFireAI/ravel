@@ -52,11 +52,11 @@ queries is a separate decision record. This is that record.
 
 `--catalog-record-cache-max-bytes-per-tenant <bytes>` sets the byte budget the
 commit-record cache and the L1 compaction cache share per tenant. It replaces
-the 45 MB constant in the clamp. The entry bound is the derived capacity
-clamped to `budget / (900 x 2)` (`RECORD_CACHES_PER_TENANT` = 2), and each
-cache gets at most half the budget: its byte budget is the entry bound times
-900 bytes, which sits up to 899 bytes below half when the clamp binds
-(199,999,800 bytes at 400 MB) and further below when the derivation does.
+the 45 MB constant in the clamp. Each cache gets half, as today
+(`RECORD_CACHES_PER_TENANT` = 2), and the entry bound is the derived capacity
+clamped to `budget / (900 x 2)`. (Corrected by the implementation amendment
+at the end of this file: each cache gets at most half, `--gc-max-flush-lifetime`
+does not lengthen the tail, and only gateway mode refuses the flag.)
 
 - Unset, the budget is 45 MB and every figure is today's.
 - A value below 45 MB is refused at startup, because a lower cap would make
@@ -70,14 +70,8 @@ cache gets at most half the budget: its byte budget is the entry bound times
   the shipped 4 shards and 2 s delay it derives 129,600 entries, so a 400 MB
   budget gives 129,600 entries, not 222,222. Where the derivation under-counts
   the real tail (size-triggered flushes, which its cadence term does not
-  model), the derivation, not the budget, is the binding term.
-  `--gc-max-flush-lifetime` does not lengthen the catalog's tail: it feeds the
-  compactor (`CompactorConfig::max_flush_lifetime_ns`), while the catalog's
-  fold and resolve seal at the compiled-in `server_catalog_config_base`
-  durations and the derivation does not read it.
-- The flag is refused only in `--mode gateway`, which reads no record cache.
-  `--mode maintain` accepts it, because maintain's folds read commit records
-  through the record cache.
+  model, or a `--gc-max-flush-lifetime` above the default), the derivation,
+  not the budget, is the binding term.
 - `--disable-cache` keeps its meaning: the record caches stay at the flat
   10,000-entry floor and the flag is refused beside it.
 
@@ -107,14 +101,15 @@ The ADR-3492 exit run sizes the flag in bytes, not entries. Before the
 measured run, a short run at the decision-8 configuration reads the gauges
 above and takes the commit cache's charged bytes per entry. The budget is the
 peak tail (about 200,000 records) times that figure times 2 caches, plus 25%,
-and never below 400 MB. At the 900-byte planning rate the rule gives 450 MB;
-the 400 MB floor holds a 200,000-record tail at that rate with 11% margin.
-The write-up states the measured bytes per entry, the value set, the
-worst-case memory it allows per tenant, the flush cadence that creates the
-tail, and the per-query `unfolded_records_served_from_cache` figures that show
-whether the cache held the tail. It also states what the flag does not remove:
-the first poll after a process start reads every unfolded record; about one HEAD GET every second
+and never below 400 MB, which is the same sum at the 900-byte planning rate
+with 11% margin. The write-up states the measured bytes per entry, the value
+set, the worst-case memory it allows per tenant, the flush cadence that
+creates the tail, and the per-query `unfolded_records_served_from_cache`
+figures that show whether the cache held the tail. It also states what the flag does not remove: the first poll after a
+process start reads every unfolded record; about one HEAD GET every second
 poll (30 s HEAD cache, 15 s poll); and one LIST page per 1,000 commit keys.
+The sizing arithmetic is corrected by the implementation amendment at the end
+of this file.
 
 ```mermaid
 flowchart LR
@@ -158,3 +153,27 @@ flowchart LR
 - The benchmark's per-query `io` figures (`unfolded_segments_resolved`,
   `unfolded_records_served_from_cache`) become evidence for ADR-1199
   decision 4's gate.
+
+## Amendment (2026-10-30): the implementation amendment (#3513)
+
+<!-- amendment-applies: sections="1. One flag sets the per-tenant record-cache byte budget|3. The benchmark sizes it from the measured tail and says so" pointer="implementation amendment" -->
+
+Building the flag (#3513) corrected four statements in decisions 1 and 3.
+
+- **Each cache gets at most half, not half.** A cache's byte budget is the
+  entry bound times 900 bytes. When the clamp binds, that is up to 899 bytes
+  below half the budget (199,999,800 bytes each at 400 MB); when the
+  derivation binds, it is further below.
+- **`--gc-max-flush-lifetime` does not lengthen the catalog's tail.** It feeds
+  the compactor (`CompactorConfig::max_flush_lifetime_ns`). The server's
+  catalog folds and resolves with the seal durations of
+  `server_catalog_config_base`, `CatalogConfig::default()`, and the capacity
+  derivation does not read the flag. Decision 1's example of an under-counted
+  tail is size-triggered flushes only.
+- **Only `--mode gateway` refuses the flag.** Gateway reads no record cache.
+  `--mode maintain` accepts it, because maintain's folds read commit records
+  through the record cache.
+- **Decision 3's arithmetic.** At the 900-byte planning rate the sizing rule
+  (peak tail times bytes per entry times 2 caches, plus 25%) gives 450 MB for
+  a 200,000-record tail. 400 MB is the floor, not the same sum: it holds that
+  tail at the planning rate with 11% margin.
