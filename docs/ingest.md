@@ -1019,10 +1019,27 @@ under ADR-1642, so this actor does not park on it either) and diverge in
 exactly five places:
 
 - Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
-  with `SegmentWriter`. The flush configures the writer with
-  `PageChoice::Estimated` (ADR-3492 decision 1), and hands a row-major buffer
-  to it as one `ColumnarLogBatch` through `push_columnar` (decision 2), which
-  writes the object byte for byte as pushing the rows one at a time would. They land under the `l` keyspace
+  with `SegmentWriter`. The flush takes the writer's page choice from the
+  ingest setting `rlog_page_choice` (ADR-3492 decision 1): `Estimated` for the
+  server's logs ingest, the default, and `Exhaustive` for `ravel-cli load`,
+  which trades write time for stored bytes. It hands a row-major buffer
+  to the writer as one `ColumnarLogBatch` through `push_columnar` (decision 2), which
+  writes the object byte for byte as pushing the rows one at a time would.
+  The encode runs on the ADR-1702 write gate, sized by the flush's input
+  bytes. Below the gate's inline floor (1 MiB on the server) it is one inline
+  job, sealing every column page serially. At or above the floor it is one
+  permitted job that seals each block's column pages as page jobs (ADR-3492
+  decision 7): the job seals the first page job itself, and each further page
+  job takes its own write-gate permit on the blocking pool through
+  `WriteGate::run_permitted`, so `ravel_cpu_gate_jobs_total{gate="write",site="log_flush"}`
+  counts one job per page job. If the gate has no free permit when a block's
+  page jobs are ready, or the block has a single job (a block under 8 pages
+  is one), the flush seals them serially on its own thread under its own
+  permit and counts one job. The stored bytes are identical either way. A
+  page job that panics or is cancelled fails the flush as the flush's own
+  gated job does (`flush_gate_faults` below), and a strict write is still
+  acknowledged only after the data object and its commit record are stored.
+  Objects land under the `l` keyspace
   (`t/<tenant>/l/l0/...`); commit records under `t/<tenant>/l/c/...`.
   `keys::data_key` and the commit protocol are already
   `Signal`-parameterized, so nothing in `ravel-commit` changed for logs.
@@ -2093,8 +2110,8 @@ Counters recorded today:
   counter. Successful flushes = the six trigger counters minus the four
   `abandoned_*` counters, minus `flush_gate_faults`.
 - `flush_gate_faults`: flush whose encode the ADR-1702 write gate returned no
-  result for: the job panicked, or the runtime cancelled it while shutting
-  down. Nothing is stored and the buffered rows are dropped. Such a flush is
+  result for: the job, or one of a log flush's page jobs, panicked, or the
+  runtime cancelled it while shutting down. Nothing is stored and the buffered rows are dropped. Such a flush is
   a server fault rather than bad input, so it counts here and in no
   `abandoned_*` counter; it is logged at ERROR and its strict waiters get the
   retryable `ShardUnavailable` (503), the answer an encode panic gave when it

@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use common::{TestClock, make_point, span_on_shard, tenant};
 use ravel_commit::rng::SeededRng;
-use ravel_cpu_gate::{CpuGateConfig, InstantClock, JobSize, WriteGate, WriteSite};
+use ravel_cpu_gate::{
+    CpuGateConfig, DEFAULT_WRITE_INLINE_FLOOR_BYTES, InstantClock, JobSize, WriteGate, WriteSite,
+};
 use ravel_ingest::{
     IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, LogIngestRouter,
     LogWriteError, PendingAckBudget, SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
@@ -607,6 +609,52 @@ async fn log_flush_encode_runs_through_the_write_gate() {
             .is_ok()
     })
     .await;
+}
+
+/// ADR-3492 decision 7 reachability: on a gate with the server's 1 MiB write
+/// floor and free permits, a strict log write whose flush is above the floor
+/// has its column pages sealed as page jobs on the gate. The `log_flush` site
+/// counts more than the flush's own job and nothing inline, and the strict
+/// write returns with its commit record stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_above_floor_log_flush_seals_its_pages_as_gate_jobs() {
+    let gate = Arc::new(WriteGate::new(
+        CpuGateConfig {
+            inline_floor_bytes: DEFAULT_WRITE_INLINE_FLOOR_BYTES,
+            ..CpuGateConfig::with_permits(4)
+        },
+        Arc::new(InstantClock::new()),
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let router = LogIngestRouter::new(
+        flush_on_first(),
+        Arc::clone(&store),
+        TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
+    )
+    .with_write_gate(Arc::clone(&gate));
+    let records: Vec<NormalizedLogRecord> = (0..2_000)
+        .map(|i| {
+            let mut record = log_record(&format!("request {i} {}", "x".repeat(600)));
+            record.attrs = vec![
+                ("http.route".to_string(), AttrValue::Str(format!("/r/{}", i % 37))),
+                ("http.status".to_string(), AttrValue::I64(200 + i % 5)),
+                ("peer".to_string(), AttrValue::Str(format!("10.0.0.{}", i % 251))),
+            ];
+            record
+        })
+        .collect();
+    router
+        .write(tenant("acme"), records, WriteMode::Strict, ACK_DEADLINE)
+        .await
+        .expect("the strict write commits");
+    assert_eq!(commit_records(store.as_ref()).await, 1);
+    let (jobs, inline) = counts(&gate, WriteSite::LogFlush);
+    assert_eq!(inline, 0, "the flush is above the 1 MiB floor");
+    assert!(
+        jobs > 1,
+        "the flush's page jobs ran on the gate, got {jobs} job(s)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
