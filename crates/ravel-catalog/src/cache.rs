@@ -419,9 +419,11 @@ impl RecordCache {
         let tenants = self.tenants.lock();
         tenants
             .values()
-            .fold(RecordCacheTotals::default(), |acc, cache| RecordCacheTotals {
-                charged_bytes: acc.charged_bytes.saturating_add(cache.charged_bytes),
-                entries: acc.entries.saturating_add(cache.entries.len() as u64),
+            .fold(RecordCacheTotals::default(), |acc, cache| {
+                RecordCacheTotals {
+                    charged_bytes: acc.charged_bytes.saturating_add(cache.charged_bytes),
+                    entries: acc.entries.saturating_add(cache.entries.len() as u64),
+                }
             })
     }
 
@@ -669,9 +671,11 @@ impl CompactionRecordCache {
         let tenants = self.tenants.lock();
         tenants
             .values()
-            .fold(RecordCacheTotals::default(), |acc, cache| RecordCacheTotals {
-                charged_bytes: acc.charged_bytes.saturating_add(cache.charged_bytes),
-                entries: acc.entries.saturating_add(cache.entries.len() as u64),
+            .fold(RecordCacheTotals::default(), |acc, cache| {
+                RecordCacheTotals {
+                    charged_bytes: acc.charged_bytes.saturating_add(cache.charged_bytes),
+                    entries: acc.entries.saturating_add(cache.entries.len() as u64),
+                }
             })
     }
 

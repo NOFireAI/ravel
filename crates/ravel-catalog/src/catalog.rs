@@ -15579,10 +15579,7 @@ mod resolve_memo_tests {
             "sanity: the record's charge is not the planning rate"
         );
         let commit = catalog.commit_record_cache_totals();
-        assert_eq!(
-            commit.entries,
-            catalog.cache.entry_count(&tenant()) as u64
-        );
+        assert_eq!(commit.entries, catalog.cache.entry_count(&tenant()) as u64);
         assert_eq!(commit.charged_bytes, catalog.cache.charged_bytes(&tenant()));
     }
 

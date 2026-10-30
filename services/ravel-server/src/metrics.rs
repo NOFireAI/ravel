@@ -333,6 +333,9 @@ pub enum Label {
     /// Which catalog decoded-output cache: `part` or `postings`. Shares the
     /// `cache` key with [`Label::Cache`].
     DecodedCache(DecodedCacheKind),
+    /// Which per-tenant record cache: `commit` or `compaction`. Shares the
+    /// `cache` key with [`Label::Cache`].
+    RecordCache(RecordCacheKind),
     CacheTier(CacheTier),
     /// Which access intent a read-cache lookup carried: `interactive`,
     /// `bulk_scan` or `maintenance`. A closed enum owned by `ravel_cache`.
@@ -591,6 +594,25 @@ impl DecodedCacheKind {
     }
 }
 
+/// Which of the catalog's per-tenant record caches (ADR-3513 decision 2) a
+/// `ravel_catalog_record_cache_*` sample belongs to: `commit` is the
+/// commit-record cache, `compaction` the L1 compaction-record cache. Shares the
+/// `cache` key with [`CacheFamily`] on a different family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCacheKind {
+    Commit,
+    Compaction,
+}
+
+impl RecordCacheKind {
+    fn name(self) -> &'static str {
+        match self {
+            RecordCacheKind::Commit => "commit",
+            RecordCacheKind::Compaction => "compaction",
+        }
+    }
+}
+
 /// Which ADR-0046 cache tier a `ravel_cache_*` sample belongs to (#97), the
 /// second, orthogonal `tier=` label alongside `cache=`. Both caches (`fetch`,
 /// `catalog`) may carry a RAM tier and, when `--cache-dir` is set, a local-disk
@@ -689,6 +711,7 @@ impl Label {
             Label::HandBackReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::DecodedCache(_) => "cache",
+            Label::RecordCache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::CacheIntent(_) => "intent",
             Label::MergeMemoryKind(_) => "kind",
@@ -751,6 +774,7 @@ impl Label {
             Label::HandBackReason(reason) => reason.label().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::DecodedCache(kind) => kind.name().to_string(),
+            Label::RecordCache(kind) => kind.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::CacheIntent(intent) => cache_intent_name(*intent).to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -2821,6 +2845,12 @@ pub struct CatalogCountersSnapshot {
     /// Bytes the column-statistics cache holds now, a gauge
     /// ([`ravel_catalog::Catalog::column_stats_cache_held_bytes`]).
     pub column_stats_cache_held_bytes: u64,
+    /// What the commit-record cache holds over every tenant, a gauge pair
+    /// ([`ravel_catalog::Catalog::commit_record_cache_totals`]).
+    pub commit_record_cache: ravel_catalog::RecordCacheTotals,
+    /// What the L1 compaction-record cache holds over every tenant, a gauge
+    /// pair ([`ravel_catalog::Catalog::compaction_record_cache_totals`]).
+    pub compaction_record_cache: ravel_catalog::RecordCacheTotals,
     /// Decompressed body bytes of the column-statistics objects the catalog
     /// decoded ([`ravel_catalog::Catalog::column_stats_decoded_bytes`]).
     pub column_stats_decoded_bytes: u64,
@@ -2871,6 +2901,8 @@ impl Default for CatalogCountersSnapshot {
             column_stats_cache_refusals: 0,
             column_stats_cache_evictions: 0,
             column_stats_cache_held_bytes: 0,
+            commit_record_cache: ravel_catalog::RecordCacheTotals::default(),
+            compaction_record_cache: ravel_catalog::RecordCacheTotals::default(),
             column_stats_decoded_bytes: 0,
             decoded_part_cache_reserved_bytes: 0,
             decoded_postings_cache_reserved_bytes: 0,
@@ -2902,6 +2934,8 @@ impl CatalogCountersSnapshot {
             column_stats_cache_refusals: catalog.column_stats_cache_refusals(),
             column_stats_cache_evictions: catalog.column_stats_cache_evictions(),
             column_stats_cache_held_bytes: catalog.column_stats_cache_held_bytes(),
+            commit_record_cache: catalog.commit_record_cache_totals(),
+            compaction_record_cache: catalog.compaction_record_cache_totals(),
             column_stats_decoded_bytes: catalog.column_stats_decoded_bytes(),
             decoded_part_cache_reserved_bytes: catalog.decoded_part_cache_reserved_bytes(),
             decoded_postings_cache_reserved_bytes: catalog.decoded_postings_cache_reserved_bytes(),
@@ -3057,6 +3091,42 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         &[Label::Mode(mode)],
         snapshot.column_stats_cache_held_bytes,
     );
+
+    let record_caches = [
+        (RecordCacheKind::Commit, snapshot.commit_record_cache),
+        (
+            RecordCacheKind::Compaction,
+            snapshot.compaction_record_cache,
+        ),
+    ];
+    write_header(
+        out,
+        "ravel_catalog_record_cache_held_bytes",
+        "Bytes the commit-record (cache=\"commit\") or L1 compaction-record (cache=\"compaction\") cache charges across every tenant, the figure its per-tenant eviction is bounded by.",
+        "gauge",
+    );
+    for (kind, totals) in record_caches {
+        write_sample(
+            out,
+            "ravel_catalog_record_cache_held_bytes",
+            &[Label::Mode(mode), Label::RecordCache(kind)],
+            totals.charged_bytes,
+        );
+    }
+    write_header(
+        out,
+        "ravel_catalog_record_cache_entries",
+        "Entries the commit-record (cache=\"commit\") or L1 compaction-record (cache=\"compaction\") cache holds across every tenant.",
+        "gauge",
+    );
+    for (kind, totals) in record_caches {
+        write_sample(
+            out,
+            "ravel_catalog_record_cache_entries",
+            &[Label::Mode(mode), Label::RecordCache(kind)],
+            totals.entries,
+        );
+    }
 
     write_header(
         out,
@@ -10297,6 +10367,7 @@ mod tests {
             Label::HandBackReason(HandBackReason::RetiredIndex),
             Label::Cache(CacheFamily::Fetch),
             Label::DecodedCache(DecodedCacheKind::Part),
+            Label::RecordCache(RecordCacheKind::Commit),
             Label::CacheTier(CacheTier::Ram),
             Label::CacheIntent(ravel_cache::AccessIntent::BulkScan),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -10346,6 +10417,7 @@ mod tests {
                 Label::HandBackReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::DecodedCache(_) => "cache",
+                Label::RecordCache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::CacheIntent(_) => "intent",
                 Label::MergeMemoryKind(_) => "kind",
@@ -10429,6 +10501,8 @@ mod tests {
                 "reason",
                 "cache",
                 // DecodedCache (issue #3244) reuses the `cache` key.
+                "cache",
+                // RecordCache (ADR-3513 decision 2) reuses the `cache` key.
                 "cache",
                 "tier",
                 // CacheIntent (ADR-3072 decision 3a) is a new key, for the
@@ -13423,18 +13497,15 @@ mod tests {
     }
 
     /// Publish `segments` metrics flushes for `tenant` in
-    /// [`DECODED_CACHE_SEALED_HOUR`] and fold them into a one-part snapshot.
-    /// Returns the part's declared `entries_uncompressed_len`, the bytes a
-    /// resolve's decode reserves for it, read off the stored object.
-    async fn fold_decoded_cache_part(
+    /// [`DECODED_CACHE_SEALED_HOUR`], one commit record each, unfolded.
+    async fn publish_decoded_cache_segments(
         store: &std::sync::Arc<ravel_object_store::memory::MemoryStore>,
         tenant: ravel_types::TenantHash,
         segments: u64,
-    ) -> u64 {
+    ) {
         use bytes::Bytes;
         use ravel_commit::publish::{self, RetryPolicy};
         use ravel_commit::record::{self, NewCommitRecord};
-        use ravel_object_store::{GetRange, ObjectStoreBackend};
 
         let created =
             (i64::from(DECODED_CACHE_SEALED_HOUR) + 1) * DECODED_CACHE_NS_PER_HOUR - 1_000;
@@ -13470,6 +13541,19 @@ mod tests {
                 .await
                 .expect("publish commit record");
         }
+    }
+
+    /// [`publish_decoded_cache_segments`], then fold them into a one-part
+    /// snapshot. Returns the part's declared `entries_uncompressed_len`, the
+    /// bytes a resolve's decode reserves for it, read off the stored object.
+    async fn fold_decoded_cache_part(
+        store: &std::sync::Arc<ravel_object_store::memory::MemoryStore>,
+        tenant: ravel_types::TenantHash,
+        segments: u64,
+    ) -> u64 {
+        use ravel_object_store::{GetRange, ObjectStoreBackend};
+
+        publish_decoded_cache_segments(store, tenant, segments).await;
         ravel_catalog::Catalog::new(
             std::sync::Arc::clone(store) as _,
             ravel_catalog::CatalogConfig {
@@ -13683,6 +13767,91 @@ mod tests {
                 "ravel_catalog_decoded_cache_memory_evictions_total{mode=\"query\"} 0".to_string()
             ]
         );
+    }
+
+    /// Issue #3513: after a resolve over `RECORDS` unfolded commit records,
+    /// `/metrics` renders the record-cache gauges from the live catalog: the
+    /// commit cache holds `RECORDS` entries charged 896 bytes each (864 for
+    /// the record, 32 for its derivation slot), and the compaction cache,
+    /// which no L1 record reached, renders both families at 0.
+    ///
+    /// Prove-the-test: render `entries * RECORD_CACHE_ENTRY_BYTES` as the held
+    /// bytes and the commit line reads 5400 against 5376.
+    #[tokio::test]
+    async fn record_cache_gauges_render_the_live_catalogs_charged_bytes() {
+        const RECORDS: u64 = 6;
+        let tenant = ravel_types::TenantHash([0x71; 16]);
+        let store = std::sync::Arc::new(ravel_object_store::memory::MemoryStore::new());
+        publish_decoded_cache_segments(&store, tenant, RECORDS).await;
+        let catalog = ravel_catalog::Catalog::new(
+            std::sync::Arc::clone(&store) as _,
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let held = "ravel_catalog_record_cache_held_bytes";
+        let entries = "ravel_catalog_record_cache_entries";
+        let lines = rendered_catalog_lines(&catalog);
+        for family in [held, entries] {
+            assert_eq!(
+                samples_of(&lines, family),
+                vec![
+                    format!("{family}{{mode=\"query\",cache=\"commit\"}} 0"),
+                    format!("{family}{{mode=\"query\",cache=\"compaction\"}} 0"),
+                ]
+            );
+        }
+
+        let snapshot = catalog
+            .resolve(
+                &tenant,
+                Signal::Metrics,
+                decoded_cache_range(),
+                &[],
+                decoded_cache_now_ns(),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), RECORDS as usize);
+
+        let charged = 896 * RECORDS;
+        assert_ne!(
+            charged,
+            RECORDS * ravel_catalog::RECORD_CACHE_ENTRY_BYTES,
+            "the fixture tells charged bytes from the planning rate"
+        );
+        let lines = rendered_catalog_lines(&catalog);
+        assert_eq!(
+            samples_of(&lines, held),
+            vec![
+                format!("{held}{{mode=\"query\",cache=\"commit\"}} {charged}"),
+                format!("{held}{{mode=\"query\",cache=\"compaction\"}} 0"),
+            ]
+        );
+        assert_eq!(
+            samples_of(&lines, entries),
+            vec![
+                format!("{entries}{{mode=\"query\",cache=\"commit\"}} {RECORDS}"),
+                format!("{entries}{{mode=\"query\",cache=\"compaction\"}} 0"),
+            ]
+        );
+        for family in [held, entries] {
+            for header in [
+                format!("# TYPE {family} gauge"),
+                format!("# HELP {family} "),
+            ] {
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|line| line.starts_with(header.as_str()))
+                        .count(),
+                    1,
+                    "exactly one `{header}` line"
+                );
+            }
+        }
     }
 
     /// Issue #3244: one eviction pass on a finite catalog budget reaches the

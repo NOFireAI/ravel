@@ -721,19 +721,23 @@ tail. Three things put a real tail past it:
 - The flush cadence term. It counts the age trigger only, while a shard also
   flushes as soon as its estimated object bytes reach `target_bytes` (8 MiB by
   default).
-- The three unsealed hours, which assume the default seal parameters. An
-  operator can move this term. `--gc-max-flush-lifetime 4h` puts the seal
-  margin at 4h20m, so the oldest unsealed hour can have started 5h20m ago and
-  the tail spans up to 5.34 hours. Three under-counts that by about 1.8x.
+- A fold that runs late. The three unsealed hours assume the catalog's seal
+  parameters, a 1-hour flush lifetime, a 5-minute clock-skew allowance and a
+  15-minute fold safety margin, so an hour seals 1h20m after it ends; it
+  stays in the tail until a fold runs after that.
+
+No server flag moves the seal parameters. `--gc-max-flush-lifetime` feeds the
+compactor (`CompactorConfig::max_flush_lifetime_ns`), not the catalog's fold
+or resolve, and the capacity derivation does not read it either, so it is not
+a lever on this tail.
 
 A tenant over the bound pays a per-record GET on every resolve. That is a
 change: the old cache held a flat 10,000 records whatever they cost. A tenant
 whose records carry typed attribute column statistics now holds fewer records
 than the entry capacity, and pays GETs for the records that it cannot hold.
 The bound trades that hit rate for a memory figure that the eviction path
-enforces. The levers are a coarser
-`--max-flush-delay`, a shorter `--gc-max-flush-lifetime`, or a lower shard
-count. All of them shrink the tail itself. The other lever leaves the tail as
+enforces. The levers are a coarser `--max-flush-delay` or a lower shard
+count. Both shrink the tail itself. The other lever leaves the tail as
 it is and raises the bound: a larger
 `--catalog-record-cache-max-bytes-per-tenant`, paid for in memory per
 actively-queried tenant.
@@ -745,12 +749,23 @@ about 18 MB per actively-queried tenant: a 9 MB byte budget for each of the
 two caches, both enforced. Startup refuses it together with
 `--catalog-record-cache-max-bytes-per-tenant`, whose budget it would override.
 
-Neither cache is exported. The resident-bytes gauge covers the object-byte
-read caches only: `ravel_cache_resident_bytes` is emitted for the tiers of the
-fetch family, and `ravel_cache_max_bytes` for the fetch and catalog byte
-ceilings. No scrape-time figure shows how many bytes the record caches of a
-tenant hold. The numbers above are bounds to budget against. You cannot read
-them back off a running server.
+Two gauges report what the record caches hold, summed over every tenant in
+the process, one sample per cache (`cache="commit"` and
+`cache="compaction"`):
+
+- `ravel_catalog_record_cache_held_bytes{cache}` is the bytes the cache
+  charges, the figure its per-tenant eviction is bounded by. It is the sum of
+  each entry's charge, not the entry count times 900 bytes.
+- `ravel_catalog_record_cache_entries{cache}` is the entries it holds.
+
+Their ratio is the measured bytes per entry. Use it, not the 900-byte planning
+rate, to size `--catalog-record-cache-max-bytes-per-tenant`: the budget to hold
+a tail of N records is about N times the commit cache's measured bytes per
+entry times 2, since each cache gets at most half of it. The gauges sum over
+tenants, so read them while one tenant dominates the caches, or divide by the
+tenants that are resident. They are not the generic read-cache gauges:
+`ravel_cache_resident_bytes` covers the tiers of the fetch family only, and
+`ravel_cache_max_bytes` the fetch and catalog byte ceilings.
 
 ## Background
 
