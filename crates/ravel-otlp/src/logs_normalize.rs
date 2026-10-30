@@ -116,27 +116,44 @@ pub struct LogNormalizeOutput {
 /// [`crate::normalize::normalize_metrics`]'s contract: nothing here panics
 /// for malformed or oversized input, every problem becomes a
 /// [`LogRejection`].
+///
+/// The request is walked once: the resolved-label projection
+/// ([`crate::project_log_resolved_label_bytes`]) is summed during the same
+/// pass that converts the attributes, and once the running sum passes
+/// `max_resolved_label_bytes_per_request` nothing more is built; the rest of
+/// the request is only counted, so the refusal reports the same total a
+/// separate projection would.
 pub fn normalize_logs(
     req: ExportLogsServiceRequest,
     limits: &LogIngestLimits,
     rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> LogNormalizeOutput {
-    let projected = crate::label_projection::project_log_resolved_label_bytes(&req, limits, rules);
-    normalize_logs_projected(req, limits, rules, ingest_ts_ns, projected)
+    normalize_logs_walk(req, limits, rules, ingest_ts_ns, None)
 }
 
 /// [`normalize_logs`] for a caller that already projected `req` with
 /// [`crate::project_log_resolved_label_bytes`] under the same `limits` and
-/// `rules`, so the request is walked once. `projected` is checked against
-/// `max_resolved_label_bytes_per_request` exactly as the plain entry point
-/// checks its own projection.
+/// `rules`, because it must act on the projection before any record is built
+/// (the ingest byte budget charge, ADR-2708 D2). `projected` is checked
+/// against `max_resolved_label_bytes_per_request` before the walk, and the
+/// walk does not project again.
 pub fn normalize_logs_projected(
     req: ExportLogsServiceRequest,
     limits: &LogIngestLimits,
     rules: &TenantRules,
     ingest_ts_ns: i64,
     projected: ProjectedLabelBytes,
+) -> LogNormalizeOutput {
+    normalize_logs_walk(req, limits, rules, ingest_ts_ns, Some(projected))
+}
+
+fn normalize_logs_walk(
+    req: ExportLogsServiceRequest,
+    limits: &LogIngestLimits,
+    rules: &TenantRules,
+    ingest_ts_ns: i64,
+    projected: Option<ProjectedLabelBytes>,
 ) -> LogNormalizeOutput {
     let total_records: usize = req.resource_logs.iter().map(resource_record_count).sum();
     if total_records > limits.max_records_per_request {
@@ -153,43 +170,64 @@ pub fn normalize_logs_projected(
 
     // Every record copies its stream attributes, so attribute bytes grow
     // with records times stream width, which no per-record limit bounds
-    // (ADR-2708 D2). Checked before any record is built.
-    let projected = projected.get();
-    if projected > limits.max_resolved_label_bytes_per_request {
-        return LogNormalizeOutput {
-            records: Vec::new(),
-            rejected: vec![LogRejection::ResolvedLabelBytesExceeded {
-                projected,
-                max: limits.max_resolved_label_bytes_per_request,
-                count: total_records,
-            }],
-            body_conversions: 0,
-            ipcrypt_tally: IpcryptTally::new(),
-        };
+    // (ADR-2708 D2). A given projection is checked before any record is
+    // built; a folded one stops the building as soon as it is exceeded.
+    if let Some(projected) = projected
+        && projected.get() > limits.max_resolved_label_bytes_per_request
+    {
+        return resolved_label_bytes_exceeded(projected.get(), limits, total_records);
     }
 
-    let mut records = Vec::new();
-    let mut rejected = Vec::new();
-    let mut body_conversions = 0;
-    let mut tally = IpcryptTally::new();
-    for rl in &req.resource_logs {
-        normalize_resource(
-            rl,
-            limits,
-            rules,
-            ingest_ts_ns,
-            &mut records,
-            &mut rejected,
-            &mut body_conversions,
-            &mut tally,
-        );
+    let mut walk = LogWalk {
+        limits,
+        rules,
+        ingest_ts_ns,
+        projected: projected.is_none().then_some(0),
+        records: Vec::new(),
+        rejected: Vec::new(),
+        body_conversions: 0,
+        tally: IpcryptTally::new(),
+    };
+    let mut resources = req.resource_logs.into_iter();
+    for rl in resources.by_ref() {
+        walk.resource(rl);
+        if walk.over_budget() {
+            break;
+        }
+    }
+    for rl in resources {
+        walk.charge(crate::label_projection::project_log_resource(
+            &rl, limits, rules,
+        ));
+    }
+    if let Some(projected) = walk.projected
+        && walk.over_budget()
+    {
+        return resolved_label_bytes_exceeded(projected, limits, total_records);
     }
 
     LogNormalizeOutput {
-        records,
-        rejected,
-        body_conversions,
-        ipcrypt_tally: tally,
+        records: walk.records,
+        rejected: walk.rejected,
+        body_conversions: walk.body_conversions,
+        ipcrypt_tally: walk.tally,
+    }
+}
+
+fn resolved_label_bytes_exceeded(
+    projected: usize,
+    limits: &LogIngestLimits,
+    total_records: usize,
+) -> LogNormalizeOutput {
+    LogNormalizeOutput {
+        records: Vec::new(),
+        rejected: vec![LogRejection::ResolvedLabelBytesExceeded {
+            projected,
+            max: limits.max_resolved_label_bytes_per_request,
+            count: total_records,
+        }],
+        body_conversions: 0,
+        ipcrypt_tally: IpcryptTally::new(),
     }
 }
 
@@ -197,235 +235,383 @@ fn resource_record_count(rl: &ResourceLogs) -> usize {
     rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn normalize_resource(
-    rl: &ResourceLogs,
-    limits: &LogIngestLimits,
-    rules: &TenantRules,
+/// One normalize pass over a request it consumes, moving every kept string
+/// out of it. `projected` is `Some` while the pass also sums the request's
+/// projection (each piece charged exactly as
+/// [`crate::project_log_resolved_label_bytes`] charges it); once that sum is
+/// over the limit the pass builds nothing more and only counts.
+struct LogWalk<'a> {
+    limits: &'a LogIngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
-    records: &mut Vec<NormalizedLogRecord>,
-    rejected: &mut Vec<LogRejection>,
-    body_conversions: &mut usize,
-    tally: &mut IpcryptTally,
-) {
-    let resource_record_count = resource_record_count(rl);
-    if resource_record_count == 0 {
-        return;
+    projected: Option<usize>,
+    records: Vec<NormalizedLogRecord>,
+    rejected: Vec<LogRejection>,
+    body_conversions: usize,
+    tally: IpcryptTally,
+}
+
+impl LogWalk<'_> {
+    fn projecting(&self) -> bool {
+        self.projected.is_some()
     }
 
-    let resource_attributes = rl
-        .resource
-        .as_ref()
-        .map(|r| r.attributes.as_slice())
-        .unwrap_or(&[]);
-    if resource_attributes.len() > limits.max_resource_attributes {
-        rejected.push(LogRejection::Grouped {
-            reason: Box::new(LogRejection::TooManyResourceAttributes {
-                count: resource_attributes.len(),
-                max: limits.max_resource_attributes,
-            }),
-            count: resource_record_count,
-        });
-        return;
+    fn charge(&mut self, bytes: usize) {
+        if let Some(total) = &mut self.projected {
+            *total = total.saturating_add(bytes);
+        }
     }
 
-    // A resource attribute that cannot be converted rejects every record
-    // under the resource: resource attributes are part of stream identity,
-    // so admitting the records without it would file them under an identity
-    // that silently differs from the one the sender described. Encryption
-    // (ADR-2993 decision 3) runs inside `convert_attr`, before this identity
-    // is computed below.
-    // The resource's values count once, and only if a record under it is
-    // stored.
-    let mut resource_tally = IpcryptTally::new();
-    let resource_attrs =
-        match convert_attrs(resource_attributes, limits, rules, &mut resource_tally) {
-            Ok(attrs) => attrs,
-            Err(reason) => {
-                rejected.push(LogRejection::Grouped {
-                    reason: Box::new(reason),
-                    count: resource_record_count,
-                });
+    fn over_budget(&self) -> bool {
+        self.projected
+            .is_some_and(|total| total > self.limits.max_resolved_label_bytes_per_request)
+    }
+
+    fn resource(&mut self, rl: ResourceLogs) {
+        let resource_record_count = resource_record_count(&rl);
+        if resource_record_count == 0 {
+            if self.projecting() {
+                self.charge(crate::label_projection::project_log_resource(
+                    &rl,
+                    self.limits,
+                    self.rules,
+                ));
+            }
+            return;
+        }
+
+        let ResourceLogs {
+            resource,
+            scope_logs,
+            ..
+        } = rl;
+        let resource_attributes = resource.map(|r| r.attributes).unwrap_or_default();
+        if resource_attributes.len() > self.limits.max_resource_attributes {
+            self.rejected.push(LogRejection::Grouped {
+                reason: Box::new(LogRejection::TooManyResourceAttributes {
+                    count: resource_attributes.len(),
+                    max: self.limits.max_resource_attributes,
+                }),
+                count: resource_record_count,
+            });
+            return;
+        }
+
+        // A resource attribute that cannot be converted rejects every record
+        // under the resource: resource attributes are part of stream identity,
+        // so admitting the records without it would file them under an
+        // identity that silently differs from the one the sender described.
+        // Encryption (ADR-2993 decision 3) runs inside `convert_attr`, before
+        // this identity is computed below.
+        // The resource's values count once, and only if a record under it is
+        // stored.
+        let mut resource_tally = IpcryptTally::new();
+        let (converted, charges) = convert_attrs(
+            resource_attributes,
+            self.limits,
+            self.rules,
+            &mut resource_tally,
+            self.projecting(),
+        );
+        self.charge(charges.stored);
+        let resource_attrs = match converted {
+            Ok(attrs) if !self.over_budget() => attrs,
+            converted => {
+                if let Err(reason) = converted {
+                    self.rejected.push(LogRejection::Grouped {
+                        reason: Box::new(reason),
+                        count: resource_record_count,
+                    });
+                }
+                self.count_scopes(&scope_logs, charges.encoded);
                 return;
             }
         };
 
-    let stored_before = records.len();
-    for sl in &rl.scope_logs {
-        normalize_scope(
-            sl,
-            &resource_attrs,
-            limits,
-            rules,
-            ingest_ts_ns,
-            records,
-            rejected,
-            body_conversions,
-            tally,
-        );
-    }
-    if records.len() > stored_before {
-        tally.merge(&resource_tally);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn normalize_scope(
-    sl: &ScopeLogs,
-    resource_attrs: &[(String, AttrValue)],
-    limits: &LogIngestLimits,
-    rules: &TenantRules,
-    ingest_ts_ns: i64,
-    records: &mut Vec<NormalizedLogRecord>,
-    rejected: &mut Vec<LogRejection>,
-    body_conversions: &mut usize,
-    tally: &mut IpcryptTally,
-) {
-    let scope_record_count = sl.log_records.len();
-    if scope_record_count == 0 {
-        return;
+        let stored_before = self.records.len();
+        let mut scopes = scope_logs.into_iter();
+        for sl in scopes.by_ref() {
+            self.scope(sl, &resource_attrs, charges.encoded);
+            if self.over_budget() {
+                break;
+            }
+        }
+        self.count_scopes(scopes.as_slice(), charges.encoded);
+        if self.records.len() > stored_before {
+            self.tally.merge(&resource_tally);
+        }
     }
 
-    let scope = sl.scope.as_ref();
-    let scope_name = scope.map(|s| s.name.as_str()).unwrap_or("");
-    let scope_version = scope.map(|s| s.version.as_str()).unwrap_or("");
-    let scope_attributes = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
-
-    if scope_attributes.len() > limits.max_scope_attributes {
-        rejected.push(LogRejection::Grouped {
-            reason: Box::new(LogRejection::TooManyScopeAttributes {
-                count: scope_attributes.len(),
-                max: limits.max_scope_attributes,
-            }),
-            count: scope_record_count,
-        });
-        return;
+    /// Charge scopes the pass does not build.
+    fn count_scopes(&mut self, scopes: &[ScopeLogs], resource_encoded: usize) {
+        if !self.projecting() {
+            return;
+        }
+        for sl in scopes {
+            self.charge(crate::label_projection::project_log_scope(
+                sl,
+                resource_encoded,
+                self.limits,
+                self.rules,
+            ));
+        }
     }
 
-    let mut scope_tally = IpcryptTally::new();
-    let scope_attrs = match convert_attrs(scope_attributes, limits, rules, &mut scope_tally) {
-        Ok(attrs) => attrs,
-        Err(reason) => {
-            rejected.push(LogRejection::Grouped {
-                reason: Box::new(reason),
+    /// Charge records the pass does not build.
+    fn count_records(&mut self, records: &[LogRecord], stream_encoded: usize) {
+        if !self.projecting() {
+            return;
+        }
+        for record in records {
+            self.charge(crate::label_projection::project_log_record(
+                record,
+                stream_encoded,
+                self.limits,
+                self.rules,
+            ));
+        }
+    }
+
+    fn scope(
+        &mut self,
+        sl: ScopeLogs,
+        resource_attrs: &[(String, AttrValue)],
+        resource_encoded: usize,
+    ) {
+        let scope_record_count = sl.log_records.len();
+        if scope_record_count == 0 {
+            self.count_scopes(std::slice::from_ref(&sl), resource_encoded);
+            return;
+        }
+
+        let ScopeLogs {
+            scope, log_records, ..
+        } = sl;
+        let (scope_name, scope_version, scope_attributes) = scope
+            .map(|s| (s.name, s.version, s.attributes))
+            .unwrap_or_default();
+        if scope_attributes.len() > self.limits.max_scope_attributes {
+            self.rejected.push(LogRejection::Grouped {
+                reason: Box::new(LogRejection::TooManyScopeAttributes {
+                    count: scope_attributes.len(),
+                    max: self.limits.max_scope_attributes,
+                }),
                 count: scope_record_count,
             });
             return;
         }
-    };
 
-    // Identity and its preimage are computed once per ScopeLogs, from the
-    // same converted (and, where matched, encrypted) attribute vectors, and
-    // reused for every record below.
-    let stream_id = log_stream_id(resource_attrs, scope_name, scope_version, &scope_attrs);
-    let stream_attrs = stream_attrs_bytes(resource_attrs, scope_name, scope_version, &scope_attrs);
-
-    let stored_before = records.len();
-    for record in &sl.log_records {
-        match normalize_record(
-            record,
-            stream_id,
-            &stream_attrs,
-            limits,
-            rules,
-            ingest_ts_ns,
-            tally,
-        ) {
-            Ok((normalized, dropped_attrs, converted_body)) => {
-                records.push(normalized);
-                rejected.extend(dropped_attrs);
-                if converted_body {
-                    *body_conversions += 1;
+        let mut scope_tally = IpcryptTally::new();
+        let (converted, charges) = convert_attrs(
+            scope_attributes,
+            self.limits,
+            self.rules,
+            &mut scope_tally,
+            self.projecting(),
+        );
+        let stream_encoded = crate::label_projection::log_stream_encoded_len(
+            resource_encoded,
+            scope_name.len(),
+            scope_version.len(),
+            charges.encoded,
+        );
+        self.charge(charges.stored.saturating_add(stream_encoded));
+        let scope_attrs = match converted {
+            Ok(attrs) if !self.over_budget() => attrs,
+            converted => {
+                if let Err(reason) = converted {
+                    self.rejected.push(LogRejection::Grouped {
+                        reason: Box::new(reason),
+                        count: scope_record_count,
+                    });
                 }
+                self.count_records(&log_records, stream_encoded);
+                return;
             }
-            Err(reason) => rejected.push(reason),
+        };
+
+        // Identity and its preimage are computed once per ScopeLogs, from the
+        // same converted (and, where matched, encrypted) attribute vectors, and
+        // reused for every record below.
+        let stream_id = log_stream_id(resource_attrs, &scope_name, &scope_version, &scope_attrs);
+        let mut stream_attrs =
+            stream_attrs_bytes(resource_attrs, &scope_name, &scope_version, &scope_attrs);
+
+        let stored_before = self.records.len();
+        let projecting = self.projecting();
+        let mut records = log_records.into_iter();
+        while let Some(record) = records.next() {
+            let (normalized, charge) = normalize_record(
+                record,
+                stream_id,
+                stream_encoded,
+                self.limits,
+                self.rules,
+                self.ingest_ts_ns,
+                &mut self.tally,
+                projecting,
+            );
+            self.charge(charge);
+            if self.over_budget() {
+                break;
+            }
+            match normalized {
+                Ok((mut normalized, dropped_attrs, converted_body)) => {
+                    // The scope's last record takes the blob; the others copy it.
+                    normalized.stream_attrs = if records.len() == 0 {
+                        std::mem::take(&mut stream_attrs)
+                    } else {
+                        stream_attrs.clone()
+                    };
+                    self.records.push(normalized);
+                    self.rejected.extend(dropped_attrs);
+                    if converted_body {
+                        self.body_conversions += 1;
+                    }
+                }
+                Err(reason) => self.rejected.push(reason),
+            }
         }
-    }
-    if records.len() > stored_before {
-        tally.merge(&scope_tally);
+        self.count_records(records.as_slice(), stream_encoded);
+        if self.records.len() > stored_before {
+            self.tally.merge(&scope_tally);
+        }
     }
 }
 
-/// Normalize one record. `Err` drops the whole record; `Ok`'s second element
-/// carries per-attribute rejections for attributes dropped from an otherwise
-/// admitted record, and its third says whether a structured body was
-/// converted to canonical JSON to admit it.
+/// Normalize one record, moving its strings out. `Err` drops the whole
+/// record; `Ok`'s second element carries per-attribute rejections for
+/// attributes dropped from an otherwise admitted record, and its third says
+/// whether a structured body was converted to canonical JSON to admit it.
+/// The admitted record's `stream_attrs` is left empty for the caller to fill.
+///
+/// The second result is the record's projection charge (its copy of the
+/// `stream_encoded`-byte preimage plus its attributes, as
+/// [`crate::label_projection::project_log_record`] counts it) when
+/// `projecting`, else 0. Its attributes are charged in the loop that converts
+/// them, so they are walked once either way.
 #[allow(clippy::too_many_arguments)]
 fn normalize_record(
-    record: &LogRecord,
+    record: LogRecord,
     stream_id: LogStreamId,
-    stream_attrs: &[u8],
+    stream_encoded: usize,
     limits: &LogIngestLimits,
     rules: &TenantRules,
     ingest_ts_ns: i64,
     tally: &mut IpcryptTally,
-) -> Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogRejection> {
+    projecting: bool,
+) -> (
+    Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogRejection>,
+    usize,
+) {
     if record.attributes.len() > limits.max_attributes_per_record {
-        return Err(LogRejection::TooManyAttributes {
-            count: record.attributes.len(),
-            max: limits.max_attributes_per_record,
-        });
+        return (
+            Err(LogRejection::TooManyAttributes {
+                count: record.attributes.len(),
+                max: limits.max_attributes_per_record,
+            }),
+            0,
+        );
     }
+
+    let LogRecord {
+        time_unix_nano,
+        observed_time_unix_nano,
+        severity_number,
+        severity_text,
+        body,
+        attributes,
+        flags,
+        trace_id,
+        span_id,
+        ..
+    } = record;
+    let unbuilt = |attributes: &[KeyValue], reason: LogRejection| {
+        let charge = if projecting {
+            stream_encoded.saturating_add(crate::label_projection::log_attrs_bytes(
+                attributes, rules,
+            ))
+        } else {
+            0
+        };
+        (Err(reason), charge)
+    };
 
     let NormalizedBody {
         text: body,
         converted: converted_body,
-    } = normalize_body(record.body.as_ref(), limits.max_body_len)?;
+    } = match normalize_body(body, limits.max_body_len) {
+        Ok(body) => body,
+        Err(reason) => return unbuilt(&attributes, reason),
+    };
     if body.len() > limits.max_body_len {
-        return Err(LogRejection::BodyTooLong {
-            len: body.len(),
-            max: limits.max_body_len,
-        });
+        return unbuilt(
+            &attributes,
+            LogRejection::BodyTooLong {
+                len: body.len(),
+                max: limits.max_body_len,
+            },
+        );
     }
 
-    let observed_ts_ns = match to_i64_ns(record.observed_time_unix_nano) {
+    let observed_ts_ns = match to_i64_ns(observed_time_unix_nano) {
         0 => ingest_ts_ns,
         v => v,
     };
     // An OTLP record with neither timestamp set is legal. Fall back to the
     // observed time, then to ingest time, rather than storing a bare zero.
-    let ts_ns = checked_record_ts(
-        match to_i64_ns(record.time_unix_nano) {
+    let ts_ns = match checked_record_ts(
+        match to_i64_ns(time_unix_nano) {
             0 => observed_ts_ns,
             v => v,
         },
         ingest_ts_ns,
         limits,
-    )?;
+    ) {
+        Ok(ts_ns) => ts_ns,
+        Err(reason) => return unbuilt(&attributes, reason),
+    };
 
-    let mut attrs = Vec::with_capacity(record.attributes.len());
+    let mut charge = if projecting { stream_encoded } else { 0 };
+    let mut attrs = Vec::with_capacity(attributes.len());
     let mut dropped = Vec::new();
-    for kv in &record.attributes {
+    for kv in attributes {
+        if projecting {
+            charge = charge.saturating_add(crate::label_projection::log_kv_bytes(&kv, rules));
+        }
         match convert_attr(kv, limits, rules, tally) {
             Ok(attr) => attrs.push(attr),
             Err(reason) => dropped.push(reason),
         }
     }
 
-    Ok((
-        NormalizedLogRecord {
-            stream_id,
-            stream_attrs: stream_attrs.to_vec(),
-            ts_ns,
-            observed_ts_ns,
-            // OTLP defines severity_number over 0..=24. A value outside u8
-            // is a protocol violation with no meaningful severity; it
-            // normalizes to 0 (UNSPECIFIED) rather than truncating into an
-            // unrelated severity the sender never sent.
-            severity_num: u8::try_from(record.severity_number).unwrap_or(0),
-            severity_text: record.severity_text.clone(),
-            body,
-            // A trace or span id whose length does not match exactly is
-            // dropped, never padded or truncated: padding would fabricate an
-            // id that never existed.
-            trace_id: <[u8; 16]>::try_from(record.trace_id.as_slice()).ok(),
-            span_id: <[u8; 8]>::try_from(record.span_id.as_slice()).ok(),
-            flags: record.flags,
-            attrs,
-        },
-        dropped,
-        converted_body,
-    ))
+    (
+        Ok((
+            NormalizedLogRecord {
+                stream_id,
+                stream_attrs: Vec::new(),
+                ts_ns,
+                observed_ts_ns,
+                // OTLP defines severity_number over 0..=24. A value outside u8
+                // is a protocol violation with no meaningful severity; it
+                // normalizes to 0 (UNSPECIFIED) rather than truncating into an
+                // unrelated severity the sender never sent.
+                severity_num: u8::try_from(severity_number).unwrap_or(0),
+                severity_text,
+                body,
+                // A trace or span id whose length does not match exactly is
+                // dropped, never padded or truncated: padding would fabricate
+                // an id that never existed.
+                trace_id: <[u8; 16]>::try_from(trace_id.as_slice()).ok(),
+                span_id: <[u8; 8]>::try_from(span_id.as_slice()).ok(),
+                flags,
+                attrs,
+            },
+            dropped,
+            converted_body,
+        )),
+        charge,
+    )
 }
 
 /// OTLP timestamps are `u64` nanoseconds; real ones fit comfortably in `i64`,
@@ -517,7 +703,7 @@ const BODY_KEY: &str = "body";
 /// returned text against the same limit, which is what bounds the
 /// pass-through arms above.
 fn normalize_body(
-    body: Option<&AnyValue>,
+    body: Option<AnyValue>,
     max_body_len: usize,
 ) -> Result<NormalizedBody, LogRejection> {
     let plain = |text: String| {
@@ -526,16 +712,16 @@ fn normalize_body(
             converted: false,
         })
     };
-    match body.and_then(|v| v.value.as_ref()) {
+    match body.and_then(|v| v.value) {
         None => plain(String::new()),
-        Some(AnyValueVariant::StringValue(s)) => plain(s.clone()),
+        Some(AnyValueVariant::StringValue(s)) => plain(s),
         Some(AnyValueVariant::BoolValue(b)) => plain(b.to_string()),
         Some(AnyValueVariant::IntValue(i)) => plain(i.to_string()),
-        Some(AnyValueVariant::DoubleValue(d)) => plain(format_float(*d)),
+        Some(AnyValueVariant::DoubleValue(d)) => plain(format_float(d)),
         Some(AnyValueVariant::BytesValue(b)) => plain(hex::encode(b)),
-        Some(AnyValueVariant::ArrayValue(_)) | Some(AnyValueVariant::KvlistValue(_)) => {
-            let value =
-                convert_value(BODY_KEY, body, 1).map_err(|_| LogRejection::UnsupportedBodyKind)?;
+        Some(value @ (AnyValueVariant::ArrayValue(_) | AnyValueVariant::KvlistValue(_))) => {
+            let value = convert_variant(BODY_KEY, Some(value), 1)
+                .map_err(|_| LogRejection::UnsupportedBodyKind)?;
             Ok(NormalizedBody {
                 text: canonical_json(&value, max_body_len)?,
                 converted: true,
@@ -788,20 +974,54 @@ fn build_canonical(
 /// for resource and scope attributes, where a dropped attribute would change
 /// stream identity; per-record attributes use [`convert_attr`] directly and
 /// drop only the offending attribute.
+///
+/// When `projecting`, the second result carries the set's two projection
+/// charges, over every attribute including those after a failure, which are
+/// then counted but not converted.
 fn convert_attrs(
-    attributes: &[KeyValue],
+    attributes: Vec<KeyValue>,
     limits: &LogIngestLimits,
     rules: &TenantRules,
     tally: &mut IpcryptTally,
-) -> Result<Vec<(String, AttrValue)>, LogRejection> {
+    projecting: bool,
+) -> (Result<Vec<(String, AttrValue)>, LogRejection>, AttrSetCharges) {
+    let mut charges = AttrSetCharges {
+        stored: 0,
+        encoded: crate::label_projection::encoded_count_len(attributes.len()),
+    };
     // Kept for every record in the group and charged once by the projection
-    // at the per-attribute rate; collecting through `Result` grows the `Vec`.
-    let mut attrs = attributes
-        .iter()
-        .map(|kv| convert_attr(kv, limits, rules, tally))
-        .collect::<Result<Vec<_>, _>>()?;
-    attrs.shrink_to_fit();
-    Ok(attrs)
+    // at the per-attribute rate.
+    let mut attrs = Vec::with_capacity(attributes.len());
+    let mut failed = None;
+    for kv in attributes {
+        if projecting {
+            let (stored, encoded) = crate::label_projection::log_kv_charges(&kv, rules);
+            charges.stored = charges.stored.saturating_add(stored);
+            charges.encoded = charges.encoded.saturating_add(encoded);
+        } else if failed.is_some() {
+            break;
+        }
+        if failed.is_none() {
+            match convert_attr(kv, limits, rules, tally) {
+                Ok(attr) => attrs.push(attr),
+                Err(reason) => failed = Some(reason),
+            }
+        }
+    }
+    let converted = match failed {
+        Some(reason) => Err(reason),
+        None => Ok(attrs),
+    };
+    (converted, charges)
+}
+
+/// A resource's or scope's attribute set as the projection charges it: the
+/// stored copy ([`crate::label_projection::log_attrs_bytes`]) and the
+/// preimage encoding ([`crate::label_projection::encoded_attrs_len`]). Both
+/// are 0 unless the walk is projecting.
+struct AttrSetCharges {
+    stored: usize,
+    encoded: usize,
 }
 
 /// Encrypt a string-valued attribute in place under `rules`' rule for `key`
@@ -839,28 +1059,29 @@ fn apply_ipcrypt_attr(
 /// Convert one attribute. `tally` gets its rule-matched value only on `Ok`:
 /// a dropped attribute stores nothing and counts nothing.
 fn convert_attr(
-    kv: &KeyValue,
+    kv: KeyValue,
     limits: &LogIngestLimits,
     rules: &TenantRules,
     tally: &mut IpcryptTally,
 ) -> Result<(String, AttrValue), LogRejection> {
-    if kv.key.len() > limits.max_attribute_key_len {
+    let KeyValue { key, value, .. } = kv;
+    if key.len() > limits.max_attribute_key_len {
         return Err(LogRejection::AttributeKeyTooLong {
-            len: kv.key.len(),
+            len: key.len(),
             max: limits.max_attribute_key_len,
         });
     }
-    let mut value = convert_value(&kv.key, kv.value.as_ref(), 1)?;
+    let mut value = convert_value(&key, value, 1)?;
     let mut attr_tally = IpcryptTally::new();
-    apply_ipcrypt_attr(rules, &mut attr_tally, &kv.key, &mut value);
+    apply_ipcrypt_attr(rules, &mut attr_tally, &key, &mut value);
     if !attr_value_fits_storage(&value) {
         return Err(if has_container_past_entry_cap(&value) {
             LogRejection::AttributeTooManyEntries {
-                key: kv.key.clone(),
+                key,
                 max: MAX_ATTR_ENTRIES as usize,
             }
         } else {
-            too_deeply_nested(&kv.key)
+            too_deeply_nested(&key)
         });
     }
     let len = attr_value_len(&value);
@@ -871,7 +1092,7 @@ fn convert_attr(
         });
     }
     tally.merge(&attr_tally);
-    Ok((exact_capacity(kv.key.clone()), value))
+    Ok((exact_capacity(key), value))
 }
 
 /// Maximum nesting depth `convert_value` will follow through array and
@@ -968,28 +1189,43 @@ fn has_container_past_entry_cap_at(value: &AttrValue, depth: usize) -> bool {
 /// rule; [`convert_attr`] checks that.
 fn convert_value(
     key: &str,
-    value: Option<&AnyValue>,
+    value: Option<AnyValue>,
+    depth: usize,
+) -> Result<AttrValue, LogRejection> {
+    convert_variant(key, value.and_then(|v| v.value), depth)
+}
+
+/// [`convert_value`] on the value's variant, which it moves strings and bytes
+/// out of.
+fn convert_variant(
+    key: &str,
+    value: Option<AnyValueVariant>,
     depth: usize,
 ) -> Result<AttrValue, LogRejection> {
     if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
         return Err(too_deeply_nested(key));
     }
-    match value.and_then(|v| v.value.as_ref()) {
+    match value {
         None => Err(LogRejection::MissingAttributeValue {
             key: key.to_string(),
         }),
-        Some(AnyValueVariant::StringValue(s)) => Ok(AttrValue::Str(exact_capacity(s.clone()))),
-        Some(AnyValueVariant::BoolValue(b)) => Ok(AttrValue::Bool(*b)),
-        Some(AnyValueVariant::IntValue(i)) => Ok(AttrValue::I64(*i)),
-        Some(AnyValueVariant::DoubleValue(d)) => Ok(AttrValue::F64(*d)),
-        Some(AnyValueVariant::BytesValue(b)) => Ok(AttrValue::Bytes(b.clone())),
+        Some(AnyValueVariant::StringValue(s)) => Ok(AttrValue::Str(exact_capacity(s))),
+        Some(AnyValueVariant::BoolValue(b)) => Ok(AttrValue::Bool(b)),
+        Some(AnyValueVariant::IntValue(i)) => Ok(AttrValue::I64(i)),
+        Some(AnyValueVariant::DoubleValue(d)) => Ok(AttrValue::F64(d)),
+        // Shrunk for the same reason `exact_capacity` shrinks a string: the
+        // projection charges the length.
+        Some(AnyValueVariant::BytesValue(mut b)) => {
+            b.shrink_to_fit();
+            Ok(AttrValue::Bytes(b))
+        }
         // Collecting through `Result` grows the `Vec`; the projection charges
         // each element one slot, so the spare ones are dropped.
         Some(AnyValueVariant::ArrayValue(array)) => {
             let mut items = array
                 .values
-                .iter()
-                .map(|v| convert_value(key, Some(v), depth + 1))
+                .into_iter()
+                .map(|v| convert_variant(key, v.value, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
             items.shrink_to_fit();
             Ok(AttrValue::List(items))
@@ -997,10 +1233,10 @@ fn convert_value(
         Some(AnyValueVariant::KvlistValue(kvlist)) => {
             let mut entries = kvlist
                 .values
-                .iter()
+                .into_iter()
                 .map(|kv| {
-                    convert_value(key, kv.value.as_ref(), depth + 1)
-                        .map(|v| (exact_capacity(kv.key.clone()), v))
+                    convert_value(key, kv.value, depth + 1)
+                        .map(|v| (exact_capacity(kv.key), v))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             entries.shrink_to_fit();
@@ -1485,7 +1721,7 @@ mod tests {
         // Same body, straight at the builder, so the bound is asserted on the
         // text that was actually built rather than inferred from the
         // rejection.
-        let value = convert_value(BODY_KEY, Some(&body), 1).expect("body converts");
+        let value = convert_value(BODY_KEY, Some(body), 1).expect("body converts");
         let mut budget = JsonBudget {
             produced: 0,
             max: limits.max_body_len,
