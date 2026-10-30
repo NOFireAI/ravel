@@ -327,9 +327,30 @@ impl<'a> BytesCursor<'a> {
     /// absent **or** its bytes are not UTF-8. Treating invalid UTF-8 as no value
     /// matches the row path (`String::from_utf8(..).ok()`), which lets a
     /// resource/scope fallback show through for that row.
+    ///
+    /// A plain string column validated at decode ([`validated_text_at`])
+    /// answers without validating the cell again.
+    ///
+    /// [`validated_text_at`]: Self::validated_text_at
     #[inline]
     pub fn str_at(&self, i: usize) -> Option<&'a str> {
-        std::str::from_utf8(self.at(i)?).ok()
+        match self.validated_text_at(i) {
+            Some(text) => text,
+            None => std::str::from_utf8(self.at(i)?).ok(),
+        }
+    }
+
+    /// The cell at surviving row `i` as text, when the column is a plain string
+    /// column whose UTF-8 the decode decided once for every cell (ADR-3326
+    /// decision 5): `Some(Some(text))` for a present cell, `Some(None)` for an
+    /// absent one or an `i` out of range. `None` when the column holds no such
+    /// decision (absent, a dictionary page, fixed-width, or a plain buffer that
+    /// was not all UTF-8), and the caller validates [`at`](Self::at) itself.
+    #[inline]
+    pub fn validated_text_at(&self, i: usize) -> Option<Option<&'a str>> {
+        // An out-of-range row reads as absent, as it does through `at`.
+        let row = self.rows.get(i).copied().unwrap_or(usize::MAX);
+        self.col.as_ref()?.validated_text(row)
     }
 
     /// Whether the block carries this column at all (see
@@ -346,6 +367,18 @@ impl<'a> BytesCursor<'a> {
     /// Whether no row survives.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+}
+
+#[cfg(test)]
+impl<'a> BytesCursor<'a> {
+    /// A cursor over string column `col` at block rows `rows`. Test
+    /// constructor.
+    pub(crate) fn over_str(col: &'a crate::block::StrColumn, rows: &'a [usize]) -> Self {
+        BytesCursor {
+            col: Some(BytesColRef::Str(col)),
+            rows,
+        }
     }
 }
 

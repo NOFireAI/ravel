@@ -407,3 +407,67 @@ async fn decoded_cache_leaves_statement_errors_unchanged() {
         }
     }
 }
+
+/// ADR-3326 decision 5: a cached plain `Str` column keeps the UTF-8
+/// validation its decode did. `p` is a plain page whose cells are all UTF-8,
+/// one per row, 48 over the tenant; `n` is an integer and `ts` a timestamp,
+/// so `p` is the only string column the statement decodes. The cold run
+/// validates every `p` cell once, at decode; each hot run is served `p` from
+/// the cache and validates nothing. Without a cache every run decodes again
+/// and counts 48 again.
+///
+/// Flipped assertion, seen failing: `StrCursor::text_at` ignoring
+/// `validated_text_at` validates every cell a second time in the build, so
+/// the first uncached run reports 96 where 48 is expected.
+#[tokio::test]
+async fn a_cache_hit_on_a_plain_str_column_validates_nothing() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    for seq in 1..=OBJECTS {
+        publish_object(store.as_ref(), &t, seq).await;
+    }
+    let cells = (ROWS_PER_OBJECT * OBJECTS as usize) as u64;
+    let sql = "SELECT ts, p FROM logs WHERE n > 0 ORDER BY ts";
+
+    let uncached = executor(&store, None);
+    for run in 0..2 {
+        let outcome = uncached
+            .execute(t.hash(), &request(sql))
+            .await
+            .expect("uncached statement executes");
+        assert_eq!(outcome.output.num_rows() as u64, cells);
+        assert_eq!(
+            outcome.stats.str_cells_validated, cells,
+            "uncached run {run} decodes and validates every cell"
+        );
+    }
+
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = executor(&store, Some(Arc::clone(&cache)));
+    for run in 0..=HOT_RUNS {
+        let outcome = cached
+            .execute(t.hash(), &request(sql))
+            .await
+            .expect("cached statement executes");
+        assert_eq!(outcome.output.num_rows() as u64, cells);
+        let counters = outcome
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        if run == 0 {
+            assert_eq!(counters.hits, 0, "the cold run decodes");
+            assert_eq!(outcome.stats.str_cells_validated, cells, "cold run");
+        } else {
+            assert_eq!(counters.misses, 0, "hot run {run} is fully served");
+            assert_eq!(
+                outcome.stats.str_cells_validated, 0,
+                "hot run {run} validates nothing"
+            );
+        }
+    }
+}

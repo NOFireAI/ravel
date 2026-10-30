@@ -810,12 +810,16 @@ pub struct SqlStats {
     pub contains_cells_tested: u64,
     /// String cells the successful attempt's logs scans UTF-8 validated, as
     /// two halves. The reader's half is every string dictionary entry it
-    /// validated, once per validation, on either path: the dictionaries of
+    /// validated, once per validation, and every present cell of a plain-page
+    /// `Str` attribute column it decoded and found all UTF-8, on either path:
     /// the columns the scan decodes, which include undeclared attribute
-    /// columns when `attrs` is projected. The columnar build's half is every
-    /// plain-page `Str` cell its declared and per-key `attrs['k']` cursors
-    /// validated. The row path, taken when `attrs` is projected or an erasure
-    /// is pending, validates plain-page cells too but does not count them.
+    /// columns when `attrs` is projected. A column served from the
+    /// decoded-column cache is not decoded and adds nothing (ADR-3326
+    /// decision 5). The columnar build's half is every plain-page `Str` cell
+    /// its declared and per-key `attrs['k']` cursors validated, which happens
+    /// only on a page that is not all UTF-8. The row path, taken when `attrs`
+    /// is projected or an erasure is pending, validates such cells too but
+    /// does not count them.
     /// Read off the scans' `str_cells_validated` counter and summed over every
     /// logs scan in the plan. Zero for a metrics query.
     pub str_cells_validated: u64,

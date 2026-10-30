@@ -1416,11 +1416,13 @@ struct BlockMetrics {
     /// ([`ScanStats::contains_cells_tested`], ADR-2773 contains-arm amendment).
     contains_cells_tested: Count,
     /// String cells this partition UTF-8 validated: the reader's dictionary
-    /// entries on either path ([`ScanStats::str_cells_validated`], undeclared
-    /// columns included when `attrs` is projected) plus every plain-page
-    /// `Str` cell the columnar build's declared and per-key cursors validated
-    /// ([`build_columnar_batches`]). The row path's plain-page validations
-    /// are not counted.
+    /// entries and the cells of the all-UTF-8 plain `Str` pages it decoded, on
+    /// either path ([`ScanStats::str_cells_validated`], undeclared columns
+    /// included when `attrs` is projected), plus every plain-page `Str` cell
+    /// the columnar build's declared and per-key cursors validated
+    /// ([`build_columnar_batches`]), which is only cells of a page not all
+    /// UTF-8. A column served from the decoded-column cache adds nothing. The
+    /// row path's per-cell plain-page validations are not counted.
     str_cells_validated: Count,
     /// String dictionary values arrays this partition's declared `Str` columns
     /// built: one per row group dictionary per scan opening, one per per-block

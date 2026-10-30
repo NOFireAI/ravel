@@ -120,14 +120,16 @@ pub struct ScanStats {
     /// blocks are decoded, like [`Self::pages_decoded`] (ADR-2773, contains-arm
     /// amendment).
     pub contains_cells_tested: u64,
-    /// String dictionary entries this reader UTF-8 validated, once per
-    /// validation: every entry of a dictionary built eagerly, and on the
-    /// survivor-only build of a [`Predicate::Contains`] column only the entries
-    /// that arm had to read as text or a surviving row references. This is
-    /// the reader's part of the count only: plain-page cells are validated by
-    /// the declared `Str` build in `ravel-sql`, which counts them, and are
-    /// never counted here. Grows as blocks are decoded, like
-    /// [`Self::pages_decoded`].
+    /// String cells this reader UTF-8 validated, once per validation: every
+    /// entry of a dictionary built eagerly, on the survivor-only build of a
+    /// [`Predicate::Contains`] column only the entries that arm had to read as
+    /// text or a surviving row references, and every present cell of a
+    /// plain-page `Str` attribute column whose decode found all of its values
+    /// UTF-8 (ADR-3326 decision 5). A column served from the decoded-column
+    /// cache is not decoded and counts nothing. This is the reader's part of
+    /// the count only: a plain page that is not all UTF-8 has its cells
+    /// validated by the declared `Str` build in `ravel-sql`, which counts
+    /// them. Grows as blocks are decoded, like [`Self::pages_decoded`].
     pub str_cells_validated: u64,
 }
 
@@ -9517,7 +9519,9 @@ mod tests {
             /// tested once each across its four blocks, 24 plain cells tested
             /// once each, and the three matching entries, the distinct ones
             /// the surviving rows reference, the only ones validated. Without
-            /// the arm the dictionary is validated whole, once.
+            /// the arm the dictionary is validated whole, once, and so are the
+            /// 24 cells of the plain `u` column, at decode (ADR-3326 decision
+            /// 5); with it, `u` is left to the arm unvalidated.
             #[test]
             fn contains_counters_count_each_test_and_validation_once() {
                 let (obj, cfg) = group_dict_object();
@@ -9554,7 +9558,11 @@ mod tests {
                 let (rows, stats) = run(Predicate::And(Vec::new()));
                 assert_eq!(rows, 24);
                 assert_eq!(stats.contains_cells_tested, 0);
-                assert_eq!(stats.str_cells_validated, 6, "the dictionary, once");
+                assert_eq!(
+                    stats.str_cells_validated,
+                    6 + 24,
+                    "the dictionary and the plain cells, once each"
+                );
             }
 
             /// The counters over per-block dictionaries (tag 7): each block's
