@@ -34,6 +34,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::metrics::v1::{
     AggregationTemporality, Metric, ResourceMetrics, metric::Data as MetricData,
 };
@@ -525,44 +526,129 @@ pub fn project_log_resolved_label_bytes(
     limits: &LogIngestLimits,
     rules: &TenantRules,
 ) -> ProjectedLabelBytes {
-    let mut total = 0usize;
-    for rl in &req.resource_logs {
-        let resource_attributes = rl
-            .resource
-            .as_ref()
-            .map(|r| r.attributes.as_slice())
-            .unwrap_or(&[]);
-        if resource_attributes.len() > limits.max_resource_attributes {
-            continue;
-        }
-        total = total.saturating_add(log_attrs_bytes(resource_attributes, rules));
-        let resource_encoded = encoded_attrs_len(resource_attributes, rules);
-        for sl in &rl.scope_logs {
-            let scope = sl.scope.as_ref();
-            let scope_attributes = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
-            if scope_attributes.len() > limits.max_scope_attributes {
-                continue;
-            }
-            let scope_name = scope.map_or(0, |s| s.name.len());
-            let scope_version = scope.map_or(0, |s| s.version.len());
-            let stream_encoded = resource_encoded
-                .saturating_add(encoded_bytes_len(scope_name))
-                .saturating_add(encoded_bytes_len(scope_version))
-                .saturating_add(encoded_attrs_len(scope_attributes, rules));
-            total = total
-                .saturating_add(log_attrs_bytes(scope_attributes, rules))
-                .saturating_add(stream_encoded);
-            for record in &sl.log_records {
-                if record.attributes.len() > limits.max_attributes_per_record {
-                    continue;
-                }
-                total = total
-                    .saturating_add(stream_encoded)
-                    .saturating_add(log_attrs_bytes(&record.attributes, rules));
-            }
-        }
+    ProjectedLabelBytes(
+        req.resource_logs
+            .iter()
+            .map(|rl| project_log_resource(rl, limits, rules))
+            .fold(0usize, usize::saturating_add),
+    )
+}
+
+/// One resource's share of [`project_log_resolved_label_bytes`]: nothing for
+/// a resource over the attribute limit, else its converted attributes once
+/// plus every scope under it.
+pub(crate) fn project_log_resource(
+    rl: &ResourceLogs,
+    limits: &LogIngestLimits,
+    rules: &TenantRules,
+) -> usize {
+    let resource_attributes = rl
+        .resource
+        .as_ref()
+        .map(|r| r.attributes.as_slice())
+        .unwrap_or(&[]);
+    if resource_attributes.len() > limits.max_resource_attributes {
+        return 0;
     }
-    ProjectedLabelBytes(total)
+    let resource_encoded = encoded_attrs_len(resource_attributes, rules);
+    rl.scope_logs
+        .iter()
+        .map(|sl| project_log_scope(sl, resource_encoded, limits, rules))
+        .fold(
+            log_attrs_bytes(resource_attributes, rules),
+            usize::saturating_add,
+        )
+}
+
+/// One scope's share of [`project_log_resolved_label_bytes`], given its
+/// resource's [`encoded_attrs_len`]: nothing for a scope over the attribute
+/// limit, else its converted attributes and the stream preimage once plus
+/// every record under it.
+pub(crate) fn project_log_scope(
+    sl: &ScopeLogs,
+    resource_encoded: usize,
+    limits: &LogIngestLimits,
+    rules: &TenantRules,
+) -> usize {
+    let scope = sl.scope.as_ref();
+    let scope_attributes = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
+    if scope_attributes.len() > limits.max_scope_attributes {
+        return 0;
+    }
+    let stream_encoded = log_stream_encoded_len(
+        resource_encoded,
+        scope.map_or(0, |s| s.name.len()),
+        scope.map_or(0, |s| s.version.len()),
+        encoded_attrs_len(scope_attributes, rules),
+    );
+    sl.log_records
+        .iter()
+        .map(|record| project_log_record(record, stream_encoded, limits, rules))
+        .fold(
+            log_attrs_bytes(scope_attributes, rules).saturating_add(stream_encoded),
+            usize::saturating_add,
+        )
+}
+
+/// One record's share of [`project_log_resolved_label_bytes`]: nothing for a
+/// record over the attribute limit, else its copy of the stream preimage
+/// (`stream_encoded` bytes) plus its own converted attributes.
+pub(crate) fn project_log_record(
+    record: &LogRecord,
+    stream_encoded: usize,
+    limits: &LogIngestLimits,
+    rules: &TenantRules,
+) -> usize {
+    if record.attributes.len() > limits.max_attributes_per_record {
+        return 0;
+    }
+    stream_encoded.saturating_add(log_attrs_bytes(&record.attributes, rules))
+}
+
+/// Encoded length of a stream preimage from its parts: the resource's and the
+/// scope's [`encoded_attrs_len`] and the scope name and version lengths.
+pub(crate) fn log_stream_encoded_len(
+    resource_encoded: usize,
+    scope_name_len: usize,
+    scope_version_len: usize,
+    scope_encoded: usize,
+) -> usize {
+    resource_encoded
+        .saturating_add(encoded_bytes_len(scope_name_len))
+        .saturating_add(encoded_bytes_len(scope_version_len))
+        .saturating_add(scope_encoded)
+}
+
+/// One attribute's two charges with a single rule lookup: its term in
+/// [`log_attrs_bytes`] and its term in [`encoded_attrs_len`].
+pub(crate) fn log_kv_charges(kv: &KeyValue, rules: &TenantRules) -> (usize, usize) {
+    let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+    (
+        label_bytes(
+            kv.key.len(),
+            log_value_payload(kv.value.as_ref(), 1, matched),
+        ),
+        encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(
+            kv.value.as_ref(),
+            1,
+            matched,
+        )),
+    )
+}
+
+/// One attribute's term in [`log_attrs_bytes`].
+pub(crate) fn log_kv_bytes(kv: &KeyValue, rules: &TenantRules) -> usize {
+    let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+    label_bytes(
+        kv.key.len(),
+        log_value_payload(kv.value.as_ref(), 1, matched),
+    )
+}
+
+/// The entry-count prefix [`encoded_attrs_len`] starts from for `n`
+/// attributes.
+pub(crate) fn encoded_count_len(n: usize) -> usize {
+    uvarint_len(n as u64)
 }
 
 /// Bytes of the LEB128 encoding of `value`.
@@ -572,7 +658,7 @@ fn uvarint_len(value: u64) -> usize {
 }
 
 /// A length-prefixed byte string in the canonical encoding.
-fn encoded_bytes_len(len: usize) -> usize {
+pub(crate) fn encoded_bytes_len(len: usize) -> usize {
     uvarint_len(len as u64).saturating_add(len)
 }
 
@@ -587,7 +673,7 @@ fn encoded_bytes_len(len: usize) -> usize {
 /// is built from attribute values after encryption, so a stream identity
 /// derived from an inflated-length ciphertext must be projected at that
 /// inflated length too.
-fn encoded_attrs_len(attributes: &[KeyValue], rules: &TenantRules) -> usize {
+pub(crate) fn encoded_attrs_len(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
         .map(|kv| {
@@ -649,7 +735,7 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize, matched: bool) -> u
 
 /// Matches [`encoded_attrs_len`]'s raw-key rule lookup for the stored
 /// (non-preimage) copy of the same attributes.
-fn log_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
+pub(crate) fn log_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
         .map(|kv| {
