@@ -240,7 +240,9 @@ What the codebase already guarantees, which bounds the change:
    each writing path gets its own default and an operator surface: ingest
    (default 3, a server flag), compaction and erasure rewrite (default 9, a
    maintain flag), and the bulk loader (a `--zstd-level` flag, default 3).
-   Readers are indifferent to the level.
+   Readers are indifferent to the level. (The logs ingest flush now chooses
+   by estimate instead; see the estimated page choice amendment at the end of
+   this ADR.)
 
 5. **BLOOM records what it covers, and filters are sized exactly.** A tenant
    chooses a bloom scope: `all` (default, today's behaviour), `undeclared`
@@ -677,3 +679,24 @@ at or above the memory target the memory target fires first and no probe
 runs. The `derived_defaults_run_zero_probes_and_close_on_the_memory_target`
 test pins zero probes at a derived target and shows probes at a cap of half
 the target and at a quarter of it.
+
+## Amendment (2026-10-30): the logs ingest flush chooses page encodings by estimate (ADR-3492)
+
+<!-- amendment-applies: sections="Decision" pointer="estimated page choice amendment" -->
+
+Decision 4 had every writing path encode and seal every candidate encoding,
+keeping the smallest stored result. ADR-3492 decision 1 narrows that to the
+writers that keep objects: compaction, erasure rewrite and the bulk loader
+keep this decision's exhaustive choice, unchanged.
+
+The logs ingest flush uses an `Estimated` mode instead. Each page's encoding
+is chosen from statistics of its values: the smallest computed raw size for
+i64 pages, and the `distinct / total <= 0.5` heuristic for string pages. Only
+the chosen candidate is encoded and sealed. The choice is a function of the
+page's values alone, so a given input still yields the same bytes.
+
+Every encoding it can choose is one this decision already lists, so objects
+stay valid RLOG v5 for today's readers, and no format version changes.
+Compaction rewrites ingest objects with the exhaustive choice. The measured
+reason is in ADR-3492: a CPU profile of the ingest path at saturation put
+`write_block` at 27 to 31% of all CPU and compression itself at 3 to 4%.
