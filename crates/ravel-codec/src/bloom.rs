@@ -13,6 +13,8 @@
 
 use std::collections::HashSet;
 
+use foldhash::fast::RandomState;
+
 use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
@@ -125,16 +127,16 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// sizes the filter).
 ///
 /// `finish` takes `self` by value and drains `staged`. `triples` is built
-/// with `HashSet::with_capacity(self.staged.len())` before the drain loop,
-/// which reserves the full bucket array up front, so `staged` and `triples`
-/// are both fully live at once: draining does not roughly halve peak memory.
+/// with capacity `self.staged.len()` before the drain loop, which reserves
+/// the full bucket array up front, so `staged` and `triples` are both fully
+/// live at once: draining does not roughly halve peak memory.
 ///
 /// Per-key cost at that peak, on the same basis for both tables (hashbrown
 /// adds one control byte per slot and keeps the load factor between about
 /// 0.4375 just after a resize and 0.875 just before the next one, so a
 /// slot's real cost is `(value_width + 1) / load_factor`, not the bare
 /// value width):
-/// - `staged: HashSet<Box<[u8]>>` -- each slot holds a `Box<[u8]>` fat
+/// - `staged: HashSet<Box<[u8]>, _>` -- each slot holds a `Box<[u8]>` fat
 ///   pointer (16 bytes: data pointer + length), so the slot itself costs
 ///   `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to 39 bytes. That
 ///   pointer addresses a separate heap allocation for the raw
@@ -142,7 +144,7 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 ///   64-byte token bound `insert` documents below) plus a typical ~16-byte
 ///   allocator header, roughly 84 bytes. Staged cost: roughly 103 to 123
 ///   bytes per distinct key.
-/// - `triples: HashSet<(u64, u64, u64)>` -- the 24-byte tuple lives inline
+/// - `triples: HashSet<(u64, u64, u64), _>` -- the 24-byte tuple lives inline
 ///   in the slot, no separate heap allocation, so the slot costs
 ///   `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57 bytes per
 ///   distinct key.
@@ -157,8 +159,9 @@ pub struct BloomBuilder {
     seed: u64,
     /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
     /// `Box<[u8]>: Borrow<[u8]>`, so a duplicate insert probes without
-    /// allocating.
-    staged: HashSet<Box<[u8]>>,
+    /// allocating. Hashed with foldhash rather than SipHash: dedup runs once
+    /// per inserted token, and the set of keys does not depend on the hasher.
+    staged: HashSet<Box<[u8]>, RandomState>,
     /// Reused `column_id_le || token` buffer for the membership probe, so a
     /// duplicate insert copies bytes but allocates nothing.
     scratch: Vec<u8>,
@@ -168,7 +171,7 @@ impl BloomBuilder {
     pub fn new(seed: u64) -> Self {
         BloomBuilder {
             seed,
-            staged: HashSet::new(),
+            staged: HashSet::default(),
             scratch: Vec::new(),
         }
     }
@@ -184,8 +187,7 @@ impl BloomBuilder {
     /// `token` at or under 64 bytes: `ravel-logseg`'s writer module bounds
     /// whole-value inserts with a private 64-byte const (`EXACT_BLOOM_MAX`,
     /// crates/ravel-logseg/src/writer.rs), and the tokenizer bounds word
-    /// tokens with a private 64-byte const scoped to its own function body
-    /// (`TOKEN_MAX_BYTES` inside `tokenizer::tokens`,
+    /// tokens with a private 64-byte module const (`TOKEN_MAX_BYTES` in
     /// crates/ravel-codec/src/tokenizer.rs) -- neither const is importable
     /// from here. The governing contract is docs/log-segment-format.md,
     /// which states the 64-byte cap normatively (lines 747, 998) and that it
@@ -225,11 +227,12 @@ impl BloomBuilder {
         // Hash each distinct raw key once, then dedup by triple exactly as the
         // old insert-time path did (idempotent for bit-setting, but the
         // distinct-triple count is what sizes the filter). Draining (instead
-        // of borrowing) frees each key's `Box<[u8]>` as it is hashed, but
-        // `with_capacity` below reserves the full table up front, so `staged`
+        // of borrowing) frees each key's `Box<[u8]>` as it is hashed, but the
+        // capacity reserved below covers the full table up front, so `staged`
         // and `triples` are both fully live once the loop starts -- see the
         // struct doc for the measured peak and per-key arithmetic.
-        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
+        let mut triples: HashSet<(u64, u64, u64), RandomState> =
+            HashSet::with_capacity_and_hasher(self.staged.len(), RandomState::default());
         for key in self.staged.drain() {
             let mut col = [0u8; 4];
             col.copy_from_slice(&key[..4]);
@@ -585,6 +588,65 @@ mod proptests {
             b.insert(*col, tok);
         }
         b.finish()
+    }
+
+    /// Word tokens and short exact values of a fixed log corpus over three
+    /// columns, with heavy duplication and enough distinct keys that the
+    /// filter spans several 512-bit blocks.
+    fn fixed_corpus() -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for i in 0..400u32 {
+            let body = format!(
+                "GET /api/v{}/users/{} status={} latency_ms={} Host=Svc-{} İstanbul ΑΒΓ 世界",
+                i % 3,
+                i * 7 % 101,
+                [200, 404, 500][(i % 3) as usize],
+                i * 13 % 257,
+                i % 5
+            );
+            let attr = format!("pod-{}", i % 11);
+            for (col, text) in [(0u32, body.as_str()), (1, attr.as_str()), (2, "OK")] {
+                for tok in crate::tokenizer::tokens(text) {
+                    out.push((col, tok));
+                }
+                if text.len() <= 64 {
+                    out.push((col, text.as_bytes().to_vec()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The fixed corpus's finished bloom bytes equal the oracle builder's
+    /// (power-of-two form) and, in both sizing forms, the length and digest
+    /// pinned from the builder as it was before ADR-3492 D4.
+    #[test]
+    fn bloom_bits_are_unchanged() {
+        let corpus = fixed_corpus();
+        let seed = 0x005e_ed0f_3495;
+        let mut b = BloomBuilder::new(seed);
+        let mut e = BloomBuilder::new(seed);
+        for (col, tok) in &corpus {
+            b.insert(*col, tok);
+            e.insert(*col, tok);
+        }
+        let pow2 = b.finish();
+        let exact = e.finish_exact();
+        assert_eq!(pow2, reference_filter(seed, &corpus));
+        assert_eq!(
+            (pow2.len(), blake3::hash(&pow2).to_hex().to_string()),
+            (
+                523,
+                "ebfa2c194ed26b952b4ec775e213da49cfa6dd67d22a3a7231355837dc893e1b".to_string()
+            )
+        );
+        assert_eq!(
+            (exact.len(), blake3::hash(&exact).to_hex().to_string()),
+            (
+                395,
+                "779c568c38d754bae581481bf0dc1a7be1c7e67dbe49dc42af0e90106dba0975".to_string()
+            )
+        );
     }
 
     proptest! {
