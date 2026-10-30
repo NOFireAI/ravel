@@ -825,7 +825,11 @@ fn rewrite_aggregate(
 /// for `Dictionary(Int32, Utf8)`, and arrow's cast for any other key or value
 /// type.
 fn to_group_key_type(expr: &Arc<dyn PhysicalExpr>, ty: &DataType) -> Arc<dyn PhysicalExpr> {
-    if is_memoized_input(ty) {
+    #[cfg(test)]
+    let memoized = is_memoized_input(ty) && !tests::STOCK_CAST.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let memoized = is_memoized_input(ty);
+    if memoized {
         Arc::new(DictionaryViewsCast::new(Arc::clone(expr)))
     } else {
         Arc::new(CastExpr::new(Arc::clone(expr), GROUP_KEY_TYPE, None))
@@ -910,6 +914,13 @@ mod tests {
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinOn};
     use datafusion::prelude::{SessionConfig, SessionContext};
+
+    thread_local! {
+        /// Plans built on this thread cast group keys with arrow's cast rather
+        /// than [`DictionaryViewsCast`], the baseline the memoized cast is
+        /// compared against.
+        pub(super) static STOCK_CAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     fn dict_type() -> DataType {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
@@ -1077,6 +1088,103 @@ mod tests {
             "+---+---+",
         ];
         assert_eq!(top.lines().collect::<Vec<_>>(), expected);
+    }
+
+    /// A session over `batches` of a `Dictionary(Int32, Utf8)` key `k` and an
+    /// `Int64` `v`, every batch's dictionary sharing one values array, as the
+    /// scan's row-group dictionaries do. The values hold a NULL entry, entries
+    /// of 12 bytes or fewer and longer ones, and the keys NULLs.
+    fn shared_dictionary_context(with_rule: bool) -> SessionContext {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", dict_type(), true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("https://example.test/a/long/path"),
+            Some("short"),
+            None,
+            Some("https://example.test/b/long/path"),
+        ]));
+        let batches = (0..6)
+            .map(|batch| {
+                let keys: Vec<Option<i32>> = (0..8)
+                    .map(|row| (row % 5 != 4).then_some((row * 3 + batch) % 4))
+                    .collect();
+                let keys = DictionaryArray::<Int32Type>::try_new(
+                    keys.into_iter().collect(),
+                    Arc::clone(&values),
+                )
+                .expect("keys fit");
+                let v: Int64Array = (0..8).map(|row| Some(i64::from(row + batch))).collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(keys) as ArrayRef, Arc::new(v) as ArrayRef],
+                )
+                .expect("batch builds")
+            })
+            .collect();
+        let table = MemTable::try_new(schema, vec![batches]).expect("mem table builds");
+        let ctx = context(with_rule);
+        ctx.register_table("t", Arc::new(table))
+            .expect("table registers");
+        ctx
+    }
+
+    /// The memoized cast answers every `DIFFERENTIAL` statement, and a
+    /// `GROUP BY` over batches sharing one dictionary, as arrow's cast did:
+    /// same schema, same rows in the same order. Each plan is checked to hold
+    /// the cast it claims to, so neither half silently runs the other's.
+    #[tokio::test]
+    async fn memoized_cast_answers_as_the_stock_cast() {
+        async fn plan_and_run(ctx: SessionContext, stock: bool, sql: &str) -> (bool, String) {
+            STOCK_CAST.with(|flag| flag.set(stock));
+            let df = ctx.sql(sql).await.expect("query plans");
+            let plan = df
+                .clone()
+                .create_physical_plan()
+                .await
+                .expect("physical plan");
+            STOCK_CAST.with(|flag| flag.set(false));
+            let mut memoized = false;
+            plan.apply(|node| {
+                node.apply_expressions(&mut |expr| {
+                    expr.apply(|sub| {
+                        memoized |= sub.is::<DictionaryViewsCast>();
+                        Ok(TreeNodeRecursion::Continue)
+                    })
+                })?;
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("plan walks");
+            let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                .await
+                .expect("query runs");
+            let table = pretty_format_batches(&batches)
+                .expect("batches format")
+                .to_string();
+            (memoized, table)
+        }
+        let shared = [
+            "SELECT k, count(*) AS c, sum(v) AS s FROM t GROUP BY k ORDER BY k",
+            "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY c DESC, k LIMIT 2",
+        ];
+        let cases = DIFFERENTIAL
+            .iter()
+            .map(|sql| (dict_context as fn(bool) -> SessionContext, *sql))
+            .chain(shared.iter().map(|sql| {
+                (
+                    shared_dictionary_context as fn(bool) -> SessionContext,
+                    *sql,
+                )
+            }));
+        for (fixture, sql) in cases {
+            let (stock_memoized, stock) = plan_and_run(fixture(true), true, sql).await;
+            let (memoized, answer) = plan_and_run(fixture(true), false, sql).await;
+            assert!(!stock_memoized, "the baseline plan casts with arrow: {sql}");
+            assert!(memoized, "the plan casts with DictionaryViewsCast: {sql}");
+            assert_eq!(stock, answer, "{sql}");
+            assert!(answer.lines().count() > 4, "{sql} returned no rows");
+        }
     }
 
     /// A `HAVING` filter is outside the allowlist: the restore projection sits

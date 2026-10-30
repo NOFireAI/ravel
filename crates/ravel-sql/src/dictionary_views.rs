@@ -85,7 +85,15 @@ impl DictionaryViewsCast {
             return stock();
         };
         let rows = dict.len();
-        let views = match self.lock().lookup(dict.values(), rows) {
+        if rows == 0 {
+            // `take` answers no indices with a new empty array, without the
+            // values buffer arrow's cast keeps.
+            return stock();
+        }
+        // Bound first: a guard in the match scrutinee would live through the
+        // arms, and the build arm locks again.
+        let lookup = self.lock().lookup(dict.values(), rows);
+        let views = match lookup {
             Lookup::Built(views) => views,
             Lookup::Stock => return stock(),
             Lookup::Build => {
@@ -93,7 +101,10 @@ impl DictionaryViewsCast {
                 // different dictionary does not wait for this one. Two
                 // partitions racing on one dictionary both build it, and the
                 // memo keeps whichever lands first.
-                let views = views_of(values)?;
+                let Ok(views) = views_of(values) else {
+                    self.lock().refuse(dict.values());
+                    return stock();
+                };
                 self.lock().insert(dict.values(), views)
             }
         };
@@ -106,22 +117,21 @@ impl DictionaryViewsCast {
     }
 }
 
-/// The views of every entry of `values`, a NULL entry as a null with a zero
-/// view, followed by one more null: the entry a NULL key gathers. Each view
-/// is the one arrow's cast makes for that entry, over `values`' own data
-/// buffer as block 0.
+/// The view of every entry of `values`, followed by one null: the entry a
+/// NULL key gathers. Each view is the one arrow's cast makes for that entry,
+/// over `values`' own data buffer as block 0, read from the entry's offsets
+/// whether or not the entry is NULL: arrow's cast takes its output's nulls
+/// from the keys alone, so a NULL entry reads as its bytes, valid
+/// (`dictionary_views::tests::matches_the_stock_cast` generates NULL entries
+/// over non-empty bytes). An entry whose bytes are not UTF-8, which only a
+/// NULL entry of an unchecked array can hold, is refused.
 fn views_of(values: &StringArray) -> DFResult<ArrayRef> {
     let mut builder = StringViewBuilder::with_capacity(values.len() + 1);
     let block = builder.append_block(values.values().clone());
-    let offsets = values.value_offsets();
-    for (idx, window) in offsets.windows(2).enumerate() {
+    for window in values.value_offsets().windows(2) {
         let [start, end] = window else {
             continue;
         };
-        if values.is_null(idx) {
-            builder.append_null();
-            continue;
-        }
         let start = u32::try_from(*start).map_err(offset_error)?;
         let end = u32::try_from(*end).map_err(offset_error)?;
         builder.try_append_view(block, start, end.saturating_sub(start))?;
@@ -188,6 +198,8 @@ enum State {
     /// Rows the stock cast has converted over this values array so far.
     Pending(usize),
     Built(ArrayRef),
+    /// [`views_of`] refused the values; every batch takes the stock cast.
+    Refused,
 }
 
 enum Lookup {
@@ -212,6 +224,7 @@ impl Memo {
         let mut entry = self.entries.remove(at);
         let lookup = match &mut entry.state {
             State::Built(views) => Lookup::Built(Arc::clone(views)),
+            State::Refused => Lookup::Stock,
             State::Pending(seen) => {
                 *seen = seen.saturating_add(rows);
                 if *seen >= entries {
@@ -239,6 +252,14 @@ impl Memo {
         }
         self.push(values, State::Built(Arc::clone(&views)));
         views
+    }
+
+    /// Record that `values` has no views array to build.
+    fn refuse(&mut self, values: &ArrayRef) {
+        if let Some(at) = self.position(values) {
+            self.entries.remove(at);
+        }
+        self.push(values, State::Refused);
     }
 
     fn position(&self, values: &ArrayRef) -> Option<usize> {
@@ -334,6 +355,7 @@ mod tests {
     use super::*;
 
     use datafusion::arrow::array::{DictionaryArray, Int32Array, StringViewArray};
+    use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
     use datafusion::arrow::compute::cast;
     use datafusion::arrow::datatypes::Field;
     use datafusion::physical_expr::expressions::Column;
@@ -403,19 +425,28 @@ mod tests {
         Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::clone(values)).expect("keys fit"))
     }
 
-    fn string() -> impl Strategy<Value = Option<String>> {
-        prop_oneof![
-            1 => Just(None),
-            3 => "[a-c]{0,11}".prop_map(Some),
-            3 => "[a-cé]{12,30}".prop_map(Some),
-        ]
+    /// An entry: whether it is valid, and its bytes, which a NULL entry
+    /// keeps too.
+    fn string() -> impl Strategy<Value = (bool, String)> {
+        (
+            prop::bool::weighted(0.8),
+            prop_oneof!["[a-c]{0,12}", "[a-cé]{13,30}"],
+        )
+    }
+
+    /// `entries` as a values array, NULL entries over their own bytes.
+    fn values_array(entries: &[(bool, String)]) -> StringArray {
+        let data: String = entries.iter().map(|(_, s)| s.as_str()).collect();
+        let offsets = OffsetBuffer::from_lengths(entries.iter().map(|(_, s)| s.len()));
+        let nulls = NullBuffer::from(entries.iter().map(|(valid, _)| *valid).collect::<Vec<_>>());
+        StringArray::new(offsets, Buffer::from(data.into_bytes()), Some(nulls))
     }
 
     /// One dictionary batch: which values array it reads, its keys, and a
     /// slice taken of the dictionary afterwards.
     type Batch = (usize, Vec<Option<u8>>, usize, usize);
 
-    fn case() -> impl Strategy<Value = (usize, Vec<Vec<Option<String>>>, Vec<Batch>)> {
+    fn case() -> impl Strategy<Value = (usize, Vec<Vec<(bool, String)>>, Vec<Batch>)> {
         (1usize..8).prop_flat_map(|entries| {
             (
                 Just(entries),
@@ -446,8 +477,7 @@ mod tests {
                 .iter()
                 .map(|values| {
                     // Sliced by one entry, so the offsets do not start at 0.
-                    let full = StringArray::from(values.clone());
-                    Arc::new(full.slice(1, entries)) as ArrayRef
+                    Arc::new(values_array(values).slice(1, entries)) as ArrayRef
                 })
                 .collect();
             let cast = expr();
