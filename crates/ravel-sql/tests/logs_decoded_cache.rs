@@ -413,12 +413,12 @@ async fn decoded_cache_leaves_statement_errors_unchanged() {
 /// one per row, 48 over the tenant; `n` is an integer and `ts` a timestamp,
 /// so `p` is the only string column the statement decodes. The cold run
 /// validates every `p` cell once, at decode; each hot run is served `p` from
-/// the cache and validates nothing. Without a cache every run decodes again
-/// and counts 48 again.
+/// the cache and validates nothing. Without a cache every run validates the
+/// 48 cells again, per cell in the build.
 ///
 /// Flipped assertion, seen failing: `StrCursor::text_at` ignoring
 /// `validated_text_at` validates every cell a second time in the build, so
-/// the first uncached run reports 96 where 48 is expected.
+/// the cold cached run reports 96 where 48 is expected.
 #[tokio::test]
 async fn a_cache_hit_on_a_plain_str_column_validates_nothing() {
     let t = tenant();
@@ -470,4 +470,79 @@ async fn a_cache_hit_on_a_plain_str_column_validates_nothing() {
             );
         }
     }
+}
+
+/// The row path (an `attrs` projection) never offers a column to the decoded
+/// cache, so its decode validates no plain `Str` page whole: `p` and `c` are
+/// plain pages of 48 cells each and count nothing, cached or not, and the
+/// row path's per-cell validations are not counted, as before ADR-3326
+/// decision 5's decode-time validation. What is left is the reader's
+/// validation of `d`'s dictionary, two entries in each of the two objects,
+/// the same 4 a statement reading `d` alone counts.
+///
+/// Seen failing against validating every decoded plain `Str` attribute page
+/// at decode whatever the path: the uncached run counts the 96 cells of `p`
+/// and `c` on top of the 4.
+#[tokio::test]
+async fn the_row_path_validates_no_plain_page_at_decode() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    for seq in 1..=OBJECTS {
+        publish_object(store.as_ref(), &t, seq).await;
+    }
+    let rows = (ROWS_PER_OBJECT * OBJECTS as usize) as u64;
+    let sql = "SELECT ts, attrs FROM logs WHERE n > 0 ORDER BY ts";
+    let d_sql = "SELECT ts, d FROM logs WHERE n > 0 ORDER BY ts";
+
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    for ex in [executor(&store, None), executor(&store, Some(cache))] {
+        let outcome = ex
+            .execute(t.hash(), &request(sql))
+            .await
+            .expect("attrs statement executes");
+        assert_eq!(outcome.output.num_rows() as u64, rows);
+        assert_eq!(
+            outcome.stats.str_cells_validated, 4,
+            "d's dictionary entries only"
+        );
+    }
+    let outcome = executor(&store, None)
+        .execute(t.hash(), &request(d_sql))
+        .await
+        .expect("d statement executes");
+    assert_eq!(outcome.stats.str_cells_validated, 4);
+}
+
+/// On the columnar path with no decoded cache, a plain `Str` column is
+/// validated per surviving cell in the build, not whole at decode. The
+/// statement's window `[1004, 1010)` keeps rows 4 to 9 of the first object,
+/// six rows spread over its first two blocks of six, so the six surviving `p`
+/// cells are validated, not the twelve the two blocks decode.
+///
+/// Seen failing against validating every decoded plain `Str` attribute page
+/// at decode: the run counts all twelve `p` cells.
+#[tokio::test]
+async fn an_uncached_selective_scan_validates_only_surviving_cells() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    for seq in 1..=OBJECTS {
+        publish_object(store.as_ref(), &t, seq).await;
+    }
+    let sql = "SELECT ts, p FROM logs \
+               WHERE ts >= TIMESTAMP '1970-01-01 00:00:00.000001004' \
+               AND ts < TIMESTAMP '1970-01-01 00:00:00.000001010' ORDER BY ts";
+    let outcome = executor(&store, None)
+        .execute(t.hash(), &request(sql))
+        .await
+        .expect("selective statement executes");
+    assert_eq!(outcome.output.num_rows(), 6);
+    assert_eq!(
+        outcome.stats.str_cells_validated, 6,
+        "the surviving p cells only"
+    );
 }

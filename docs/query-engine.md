@@ -3548,16 +3548,18 @@ and block-level reported independently:
   plain-page cell once. 0 when no such arm was pushed.
 - `strCellsValidated`: string cells the scan UTF-8 validated, in two
   halves. The reader's half is every string dictionary entry it validated,
-  once per validation, and every present cell of a plain-page `Str`
-  attribute column it decoded and found all UTF-8, on either path; it
-  covers the columns the scan decodes, so undeclared attribute columns
-  count when `attrs` is projected. A column served from the decoded-column
-  cache keeps the validation its decode did and adds nothing (ADR-3326
-  decision 5). The columnar build's half is every plain-page `Str` cell its
-  declared and per-key `attrs['k']` cursors validated, which happens only
-  on a page that is not all UTF-8. The row path, taken when `attrs` is
-  projected or an erasure is pending, validates such cells too but does
-  not count them. With a pushed `Contains` arm the reader
+  once per validation, on either path, so undeclared attribute columns'
+  dictionaries count when `attrs` is projected; and, on the columnar path
+  with a decoded-column cache attached, every present cell of a plain-page
+  `Str` attribute column it decoded on a cache miss (and so offers to the
+  cache) and found all UTF-8. A column served from the decoded-column cache
+  keeps the validation its decode did and adds nothing (ADR-3326 decision
+  5). The columnar build's half is every plain-page `Str` cell of a
+  surviving row its declared and per-key `attrs['k']` cursors validated:
+  every such cell when no cache is attached, and with a cache only cells of
+  a page that is not all UTF-8. The row path, taken when `attrs` is
+  projected or an erasure is pending, validates no plain page at decode and
+  validates its cells per row without counting them. With a pushed `Contains` arm the reader
   validates only the dictionary entries the arm read as text or a kept row
   references, and the build never validates a row the arm dropped, so a
   pushed arm can lower this count.

@@ -124,12 +124,15 @@ pub struct ScanStats {
     /// entry of a dictionary built eagerly, on the survivor-only build of a
     /// [`Predicate::Contains`] column only the entries that arm had to read as
     /// text or a surviving row references, and every present cell of a
-    /// plain-page `Str` attribute column whose decode found all of its values
-    /// UTF-8 (ADR-3326 decision 5). A column served from the decoded-column
-    /// cache is not decoded and counts nothing. This is the reader's part of
-    /// the count only: a plain page that is not all UTF-8 has its cells
+    /// plain-page `Str` attribute column the columnar exit decoded on a
+    /// decoded-column cache miss and found all UTF-8 (ADR-3326 decision 5).
+    /// A column served from the decoded-column cache is not decoded and
+    /// counts nothing. This is the reader's part of the count only: any other
+    /// plain page (the row path, the columnar exit with no cache attached, or
+    /// a page that is not all UTF-8) has the cells of its surviving rows
     /// validated by the declared `Str` build in `ravel-sql`, which counts
-    /// them. Grows as blocks are decoded, like [`Self::pages_decoded`].
+    /// them; the row path's per-cell validations are not counted. Grows as
+    /// blocks are decoded, like [`Self::pages_decoded`].
     pub str_cells_validated: u64,
 }
 
@@ -1500,7 +1503,10 @@ impl BlockScan {
     /// cache (ADR-3326 decision 1): an eligible column (projected, not
     /// deferred by a Contains arm) found there is seeded into the block and
     /// its pages are neither read nor decoded; a missed one is offered to the
-    /// cache after the decode, before any survivor narrowing.
+    /// cache after the decode, before any survivor narrowing. Only a missed
+    /// plain `Str` attribute column is UTF-8 validated at decode, since the
+    /// cache keeps that validation for every later hit (ADR-3326 decision 5);
+    /// every other plain column is validated per cell by its reader.
     fn decode_block<S: ByteSource + ?Sized>(
         &mut self,
         object_bytes: &S,
@@ -1568,6 +1574,7 @@ impl BlockScan {
             &dict_pages,
             &mut self.dicts,
             &self.deferred,
+            &missed,
             &cached,
             &self.plans,
             self.columns.as_ref(),
@@ -1711,6 +1718,7 @@ pub(crate) fn decode_v4_block(
         dicts,
         &[],
         &[],
+        &[],
         plans,
         columns,
     )
@@ -1820,7 +1828,10 @@ pub(crate) fn dict_page_decodes() -> u64 {
 /// A dictionary, row group or per-block, of a column in `deferred` is left
 /// [unvalidated](DictValues::unvalidated) for the scan's survivor-only build;
 /// every other one is validated in full and counted in the block's
-/// [`DecodedBlock::str_cells_validated`].
+/// [`DecodedBlock::str_cells_validated`]. A plain `Str` attribute page is
+/// validated at decode, and counted there, only when its column is in
+/// `validate`: the columns the columnar exit will offer to the decoded-column
+/// cache.
 #[allow(clippy::too_many_arguments)]
 fn decode_v4_block_with<'s>(
     page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,
@@ -1830,6 +1841,7 @@ fn decode_v4_block_with<'s>(
     dict_pages: &[PageLoc],
     dicts: &mut DictCache,
     deferred: &[u32],
+    validate: &[u32],
     cached: &[(u32, CachedColumn)],
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
@@ -1923,6 +1935,7 @@ fn decode_v4_block_with<'s>(
         &page_bytes,
         &dicts,
         deferred,
+        validate,
         cached,
         plans,
         counters,
@@ -9519,9 +9532,11 @@ mod tests {
             /// tested once each across its four blocks, 24 plain cells tested
             /// once each, and the three matching entries, the distinct ones
             /// the surviving rows reference, the only ones validated. Without
-            /// the arm the dictionary is validated whole, once, and so are the
-            /// 24 cells of the plain `u` column, at decode (ADR-3326 decision
-            /// 5); with it, `u` is left to the arm unvalidated.
+            /// the arm the dictionary is validated whole, once; the 24 cells
+            /// of the plain `u` column are not validated at decode, since
+            /// this scan has no decoded-column cache to offer `u` to, and are
+            /// left to whoever reads them. With the arm, `u` is left to the
+            /// arm unvalidated.
             #[test]
             fn contains_counters_count_each_test_and_validation_once() {
                 let (obj, cfg) = group_dict_object();
@@ -9559,9 +9574,8 @@ mod tests {
                 assert_eq!(rows, 24);
                 assert_eq!(stats.contains_cells_tested, 0);
                 assert_eq!(
-                    stats.str_cells_validated,
-                    6 + 24,
-                    "the dictionary and the plain cells, once each"
+                    stats.str_cells_validated, 6,
+                    "the dictionary once; the plain cells are not the decode's"
                 );
             }
 
