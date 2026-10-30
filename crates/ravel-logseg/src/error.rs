@@ -91,8 +91,11 @@ pub enum LogSegError {
     InvalidRowOrder(String),
     /// A [`crate::block::PageEncodeExecutor`] handed back results that are not
     /// exactly one per job it was given (an index missing, repeated or out of
-    /// range), or reported a failure of its own. The writer refuses the block
-    /// rather than assemble pages it cannot place in staging order.
+    /// range, a result from another block's job, or one whose columns differ
+    /// from its job's), or reported a failure of its own. Also the writer's
+    /// own check that a block encoded through jobs staged no page outside
+    /// them. The writer refuses the block rather than assemble pages it
+    /// cannot place in staging order.
     #[error("page encode: {0}")]
     PageEncode(String),
     #[error("io: {0}")]
