@@ -46,8 +46,7 @@ use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::rng::RngSource;
 use ravel_logseg::{
-    ColumnarLogBatch, DynCells, LogRecord, LogSegError, ObjectIdentity, PageChoice, RlogConfig,
-    RlogWriter,
+    ColumnarLogBatch, DynCells, LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -407,15 +406,16 @@ pub fn est_log_records_object_bytes(records: &[NormalizedLogRecord]) -> usize {
     records.iter().map(est_record_object_bytes).sum()
 }
 
-/// The writer configuration of an ingest flush. The flush estimates each
-/// page's encoding instead of sealing every candidate (ADR-3492 decision 1);
-/// every other RLOG writer keeps the exhaustive default.
+/// The writer configuration of an ingest flush. The page choice comes from
+/// [`IngestConfig::rlog_page_choice`]: the server's logs ingest flush estimates
+/// each page's encoding, the bulk loader seals every candidate (ADR-3492
+/// decision 1).
 fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
     RlogConfig {
         zstd_level: config.rlog_zstd_level.get(),
         group_target_blocks: config.rlog_group_target_blocks.get(),
         chunk_order: config.rlog_chunk_order.get(),
-        page_choice: PageChoice::Estimated,
+        page_choice: config.rlog_page_choice,
         ..RlogConfig::default()
     }
 }
@@ -3027,7 +3027,7 @@ mod tests {
 
     use ravel_commit::rng::RngSource;
     use ravel_commit::{keys, record};
-    use ravel_logseg::{Predicate, RlogReader, stream_attrs_bytes};
+    use ravel_logseg::{PageChoice, Predicate, RlogReader, stream_attrs_bytes};
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
@@ -3392,6 +3392,21 @@ mod tests {
         assert_eq!(cfg.block_target_records, default.block_target_records);
         assert_eq!(cfg.block_max_bytes, default.block_max_bytes);
         assert_eq!(cfg.max_dynamic_columns, default.max_dynamic_columns);
+    }
+
+    /// ADR-3492 decision 1: a config that asks for the exhaustive page choice,
+    /// as the bulk loader's does, builds a flush writer that seals every
+    /// candidate.
+    #[test]
+    fn the_flush_writer_follows_the_configured_page_choice() {
+        let config = IngestConfig {
+            rlog_page_choice: PageChoice::Exhaustive,
+            ..flush_on_first()
+        };
+        assert_eq!(
+            flush_rlog_config(&config).page_choice,
+            PageChoice::Exhaustive
+        );
     }
 
     /// ADR-3492 decision 5: the shard buffers a write at the estimate the

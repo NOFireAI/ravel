@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use ravel_logseg::PageChoice;
+
 use crate::budget::IngestByteBudgetLimit;
 use crate::metrics::FlushTrigger;
 
@@ -816,6 +818,12 @@ pub struct IngestConfig {
     /// remaining columns in alphabetical order. Empty by default. Metrics and
     /// span flushes do not read it.
     pub rlog_chunk_order: RlogChunkOrder,
+    /// How each RLOG object a log flush writes picks its page encodings
+    /// (ADR-3492 decision 1). [`PageChoice::Estimated`] by default, the
+    /// server's logs ingest flush; the bulk loader sets
+    /// [`PageChoice::Exhaustive`], the writer default, since it trades write
+    /// time for stored bytes. Metrics and span flushes do not read it.
+    pub rlog_page_choice: PageChoice,
     /// Ceiling on pending strict-mode acks a `submit` may hold outstanding at
     /// once (ADR-2793 decision 4; [`crate::PendingAckBudget`]). It is
     /// process-wide only when the metrics, log, and span routers share one
@@ -885,6 +893,7 @@ impl Default for IngestConfig {
             rlog_zstd_level: RlogZstdLevel::DEFAULT,
             rlog_group_target_blocks: RlogGroupTargetBlocks::DEFAULT,
             rlog_chunk_order: RlogChunkOrder::DEFAULT,
+            rlog_page_choice: PageChoice::Estimated,
             max_pending_strict_acks: 8_192,
         }
     }

@@ -5156,3 +5156,36 @@ fn shell_word_quotes_what_a_shell_would_rewrite() {
     assert_eq!(shell_word("it's"), "'it'\\''s'");
     assert_eq!(shell_word(""), "''");
 }
+
+/// ADR-3492 decision 1: the loader's router config keeps the exhaustive page
+/// choice, which the shard flush hands its RLOG writer, while the default the
+/// server's logs ingest builds on estimates. The writer levers carry through.
+#[test]
+fn the_loader_config_builds_an_exhaustive_flush_writer() {
+    let base = build_ingest_config(2, 1, 4, None);
+    assert_eq!(base.rlog_page_choice, ravel_logseg::PageChoice::Estimated);
+    let zstd_level = RlogZstdLevel::new(19).expect("level 19");
+    let group_target_blocks = RlogGroupTargetBlocks::new(3).expect("3 blocks");
+    let config = log_load_ingest_config(
+        base,
+        zstd_level,
+        group_target_blocks,
+        RlogChunkOrder::DEFAULT,
+    );
+    assert_eq!(
+        config.rlog_page_choice,
+        ravel_logseg::PageChoice::Exhaustive
+    );
+    assert_eq!(config.rlog_zstd_level, zstd_level);
+    assert_eq!(config.rlog_group_target_blocks, group_target_blocks);
+    assert_eq!(config.rlog_chunk_order, RlogChunkOrder::DEFAULT);
+    assert_eq!(
+        IngestConfig {
+            rlog_page_choice: base.rlog_page_choice,
+            rlog_zstd_level: base.rlog_zstd_level,
+            rlog_group_target_blocks: base.rlog_group_target_blocks,
+            ..config
+        },
+        base
+    );
+}
