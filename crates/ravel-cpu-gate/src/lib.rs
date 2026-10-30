@@ -5,7 +5,11 @@
 //! closure and is released only when the job returns, so a caller that stops
 //! waiting cannot free a permit while its job still holds a core. A job whose
 //! size is below the gate's inline floor runs on the calling thread and takes
-//! no permit (decision 4).
+//! no permit (decision 4). [`CpuGate::run_permitted`] skips that size check
+//! and always takes a permit, for a job split out of a larger unit that was
+//! itself at or above the floor. [`CpuGate::run_claimed`] is the same with
+//! the job taken from a caller's queue once the permit is held; a waiter that
+//! finds nothing to take releases the permit unused and counts nothing.
 //!
 //! Cancellation (decision 5): a waiter dropped before it holds a permit never
 //! runs its job. A job that has started runs to completion, because a bulk
@@ -192,6 +196,17 @@ impl<S: GateSite> CpuGate<S> {
         self.counters.running.load(Ordering::Acquire)
     }
 
+    /// Whether a job of `size` runs inline under [`CpuGate::run`].
+    pub fn runs_inline(&self, size: JobSize) -> bool {
+        self.config.runs_inline(size)
+    }
+
+    /// Permits no job holds right now. A snapshot: another caller can take
+    /// one before this caller acts on it.
+    pub fn free_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     /// Waiters queued for a permit right now.
     pub fn queued(&self) -> u64 {
         self.counters.queued.load(Ordering::Acquire)
@@ -209,16 +224,57 @@ impl<S: GateSite> CpuGate<S> {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let site_index = site.index();
-        let site_counters = self.counters.sites.get(site_index);
         if self.config.runs_inline(size) {
-            if let Some(counters) = site_counters {
+            if let Some(counters) = self.counters.sites.get(site.index()) {
                 counters.inline.fetch_add(1, Ordering::Relaxed);
             }
             return std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                 .map_err(|_| CpuGateError::Panicked);
         }
+        self.run_permitted(site, job).await
+    }
 
+    /// Runs `job` for `site` on the blocking pool once a permit is free,
+    /// whatever its size: the unit [`CpuGate::run`] sends through the gate
+    /// at or above the floor. For a job whose caller already decided, on a
+    /// larger unit it belongs to, that the work leaves the async worker
+    /// (ADR-1702, the parallel page encode amendment). It counts as a job at
+    /// `site`, never as inline.
+    pub async fn run_permitted<F, R>(&self, site: S, job: F) -> Result<R, CpuGateError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (permit, waited) = self.acquire().await?;
+        self.record_wait(waited);
+        self.run_holding(site, permit, job).await
+    }
+
+    /// [`CpuGate::run_permitted`] for work taken from a shared queue only
+    /// once a permit is held: `claim` runs on the calling task as soon as the
+    /// permit is granted. When it returns `None` the permit is released at
+    /// once, nothing runs on the blocking pool, and the call returns
+    /// `Ok(None)` having counted nothing: no job at `site`, no wait, no run.
+    /// A claimed job is counted exactly as [`CpuGate::run_permitted`] counts
+    /// its job. [`CpuGateError::Closed`] is returned only before `claim` is
+    /// called; the other errors only after it returned a job.
+    pub async fn run_claimed<C, F, R>(&self, site: S, claim: C) -> Result<Option<R>, CpuGateError>
+    where
+        C: FnOnce() -> Option<F>,
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (permit, waited) = self.acquire().await?;
+        let Some(job) = claim() else {
+            return Ok(None);
+        };
+        self.record_wait(waited);
+        self.run_holding(site, permit, job).await.map(Some)
+    }
+
+    /// Waits for a permit, counted on `queued` while waiting, and returns it
+    /// with the nanoseconds waited.
+    async fn acquire(&self) -> Result<(OwnedSemaphorePermit, u64), CpuGateError> {
         let wait_started = self.clock.now_nanos();
         let queued = QueuedGuard::enter(&self.counters);
         let permit = Arc::clone(&self.semaphore)
@@ -226,11 +282,30 @@ impl<S: GateSite> CpuGate<S> {
             .await
             .map_err(|_| CpuGateError::Closed)?;
         drop(queued);
-        let waited = self.clock.now_nanos().saturating_sub(wait_started);
+        Ok((permit, self.clock.now_nanos().saturating_sub(wait_started)))
+    }
+
+    fn record_wait(&self, waited: u64) {
         self.counters
             .wait_nanos_sum
             .fetch_add(waited, Ordering::Relaxed);
         self.counters.wait_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Runs `job` on the blocking pool under `permit`, counted as a job at
+    /// `site`.
+    async fn run_holding<F, R>(
+        &self,
+        site: S,
+        permit: OwnedSemaphorePermit,
+        job: F,
+    ) -> Result<R, CpuGateError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let site_index = site.index();
+        let site_counters = self.counters.sites.get(site_index);
         if let Some(counters) = site_counters {
             counters.jobs.fetch_add(1, Ordering::Relaxed);
         }
