@@ -66,6 +66,7 @@ mod ddl;
 mod ddl_cost;
 mod declared;
 mod dedup;
+mod dictionary_views;
 #[cfg(feature = "flight-sql")]
 pub mod distributed;
 #[cfg(feature = "flight-sql")]
@@ -151,6 +152,7 @@ pub use ddl_cost::{
 pub use declared::{
     DeclaredColumn, DeclaredColumnSource, DeclaredType, KeyIndexDeclaration, StaticDeclaredColumns,
 };
+pub use dictionary_views::DictionaryViewsCast;
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
     DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, SliceTlsDialCounter,

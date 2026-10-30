@@ -45,10 +45,20 @@
 //! offsets in one values buffer, so it moves the panic rather than removing
 //! it.
 //!
-//! Both casts are cheap. Arrow special-cases `Dictionary(_, Utf8)` to
-//! `Utf8View` (`arrow_cast::cast::dictionary::dictionary_cast`) by reusing the
-//! dictionary's values buffer and building views over it, with no string data
-//! copied. The cast back runs on the batches the topmost carried operator
+//! The cast to views copies no string data: arrow's
+//! `Dictionary(_, Utf8)` to `Utf8View` cast
+//! (`arrow_cast::cast::dictionary::dictionary_cast`) reuses the dictionary's
+//! values buffer and builds views over it. It is not cheap: it builds one view
+//! per row, reading each row's dictionary entry at an offset its key picks,
+//! and the v0.28.0 profile measured it at 8.5 % of ClickBench q34 and q35
+//! (`GROUP BY URL`) and about 1.03 s of the 38.7 s hot sum across statements
+//! (#3231 comment 6525280440). A `Dictionary(Int32, Utf8)` key, the type a
+//! declared `Str` column has, is therefore cast by
+//! [`DictionaryViewsCast`] ([`to_group_key_type`]), which builds the views of
+//! each dictionary's values once and gathers each row's view by key, with the
+//! output arrow's cast makes
+//! (`dictionary_views::tests::matches_the_stock_cast`). The cast back runs on
+//! the batches the topmost carried operator
 //! emits, one batch at a time, so the `Utf8` values buffer it packs is bounded
 //! by the rows of one such batch. Under `ORDER BY <aggregate> ... LIMIT k`,
 //! when every sort key that reads the group key is the bare column, the
@@ -210,6 +220,8 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, Partitioning, ReplaceChildrenOptions,
 };
+
+use crate::dictionary_views::{DictionaryViewsCast, is_memoized_input};
 
 /// The in-memory type a dictionary-encoded string group key is grouped as.
 /// The operators between the aggregate and the restore projection see it too,
@@ -778,8 +790,7 @@ fn rewrite_aggregate(
     for (expr, name) in group_by.expr() {
         let ty = expr.data_type(&input_schema)?;
         if !ordered && is_dictionary_string(&ty) {
-            let cast = CastExpr::new(Arc::clone(expr), GROUP_KEY_TYPE, None);
-            exprs.push((Arc::new(cast) as Arc<dyn PhysicalExpr>, name.clone()));
+            exprs.push((to_group_key_type(expr, &ty), name.clone()));
             cast_any = true;
         } else {
             exprs.push((Arc::clone(expr), name.clone()));
@@ -807,6 +818,18 @@ fn rewrite_aggregate(
     )?
     .with_limit_options(agg.limit_options());
     Ok(Arc::new(rebuilt))
+}
+
+/// `expr`, of the dictionary string type `ty`, cast to [`GROUP_KEY_TYPE`]:
+/// through [`DictionaryViewsCast`], which memoizes each dictionary's views,
+/// for `Dictionary(Int32, Utf8)`, and arrow's cast for any other key or value
+/// type.
+fn to_group_key_type(expr: &Arc<dyn PhysicalExpr>, ty: &DataType) -> Arc<dyn PhysicalExpr> {
+    if is_memoized_input(ty) {
+        Arc::new(DictionaryViewsCast::new(Arc::clone(expr)))
+    } else {
+        Arc::new(CastExpr::new(Arc::clone(expr), GROUP_KEY_TYPE, None))
+    }
 }
 
 /// True when at least one group column of `declared_schema` no longer matches
