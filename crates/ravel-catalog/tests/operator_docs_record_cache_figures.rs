@@ -277,7 +277,7 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
         &caching,
         &format!("So the worst case is {budget_mb} MB per actively-queried tenant"),
         &marker_budget,
-        2,
+        3,
         "the per-tenant memory budget",
     );
     assert_doc_states(
@@ -288,9 +288,80 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
              100 of them is {hundred_tenant_gb} GB worst case,"
         ),
         &marker_budget,
-        2,
+        3,
         "the per-tenant memory budget (operator sizing line)",
     );
+    assert_doc_states(
+        CACHING_GUIDE,
+        &caching,
+        &format!(
+            "| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `{budget}` ({budget_mb} MB) |"
+        ),
+        &marker_budget,
+        3,
+        "the record-cache budget flag's default (flag table row)",
+    );
+    // ADR-3513: the flag's budget becomes an entry cap by dividing by one
+    // entry in each of the two caches. The guide states that divisor three
+    // times: the flag row, the derivation and the budgeting section.
+    let pair_bytes = entry_bytes * caches_per_tenant;
+    let marker_pair = format!("{} bytes", with_commas(pair_bytes));
+    for needle in [
+        format!("capped at the budget divided by {marker_pair}"),
+        format!(
+            "default per-tenant budget divided by {marker_pair}, one {entry_bytes}-byte entry \
+             in each of the two caches"
+        ),
+        format!("less the remainder of its division by {marker_pair}"),
+    ] {
+        assert_doc_states(
+            CACHING_GUIDE,
+            &caching,
+            &needle,
+            &marker_pair,
+            3,
+            "the bytes one entry costs across both record caches",
+        );
+    }
+    // The raised-budget example where the derived capacity, not the budget's
+    // cap, binds: one shard at the 2-second cadence under 400 MB.
+    let raised_budget: u64 = 400_000_000;
+    let one_shard_entries = u64::try_from(ravel_catalog::derive_cache_capacity_per_tenant_within(
+        1,
+        std::time::Duration::from_secs(2),
+        raised_budget,
+    ))
+    .expect("entry count fits u64");
+    let one_shard_mb = format_mb(one_shard_entries * pair_bytes);
+    let one_shard_str = with_commas(one_shard_entries);
+    let raised_budget_mb = format_mb(raised_budget);
+    let one_shard_needle = format!(
+        "cadence derives {one_shard_str} entries, {one_shard_mb} MB at a {raised_budget_mb} MB \
+         budget"
+    );
+    for (marker, quantity) in [
+        (
+            one_shard_str.clone(),
+            "the one-shard entry count under a raised budget",
+        ),
+        (
+            format!("{one_shard_mb} MB"),
+            "the one-shard worst case under a raised budget",
+        ),
+        (
+            format!("{raised_budget_mb} MB"),
+            "the raised-budget example",
+        ),
+    ] {
+        assert_doc_states(
+            CACHING_GUIDE,
+            &caching,
+            &one_shard_needle,
+            &marker,
+            1,
+            quantity,
+        );
+    }
     assert_doc_states(
         CACHING_GUIDE,
         &caching,
