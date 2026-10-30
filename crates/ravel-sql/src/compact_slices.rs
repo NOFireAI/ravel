@@ -111,6 +111,36 @@
 //! `_ => children_in_full` fallback over-counts a ListView, LargeListView,
 //! RunEndEncoded or Union column, so a batch carrying one tends to pass
 //! through uncopied; its values stay correct.
+//!
+//! # The TopK pre-filter
+//!
+//! When the exec's nearest consumer is a `SortExec` with `fetch = Some(k)`
+//! (a TopK), reached through `ProjectionExec` and fetch-less
+//! `CoalescePartitionsExec` nodes only, the rule hands the exec the sort's
+//! ordering, mapped through the projections onto the aggregate's output
+//! columns, and `k` (`TopKPrefilter::above`, called from `rewrite`). The
+//! exec then sorts each batch of more than `k` rows by that ordering with
+//! `lexsort_to_indices` limited to `k`, takes those rows, and compacts the
+//! `k`-row result as above (`prefilter_batch`), so it copies `k` rows per
+//! batch instead of the whole batch
+//! (`the_topk_prefilter_copies_only_k_rows_per_batch`). Any other consumer,
+//! any other node between them, and a sort key that is not a bare column of
+//! the aggregate's output after the mapping leave the exec as described
+//! above (`the_topk_prefilter_engages_only_under_a_topk_through_projections`).
+//!
+//! The answer is unchanged: a row outside its own batch's top `k` has `k`
+//! rows ahead of it in the same batch, and those reach the same TopK, so it
+//! cannot be in the TopK's result. When several rows tie with the `k`-th
+//! value, which of them survive may differ from the plan without the
+//! pre-filter, as SQL allows for a `LIMIT` under a non-unique ordering
+//! (`prop_topk_prefilter_keeps_the_topk_answer`). The TopK still sees only
+//! batches that own their buffers: a taken batch goes through the same
+//! compaction, since `take` of a byte-view or Dictionary column keeps the
+//! source buffers (`the_topk_prefilter_copies_only_k_rows_per_batch`). A
+//! `GROUP BY ... ORDER BY count DESC LIMIT 10` statement plans the
+//! pre-filter through the production session
+//! (`the_q34_shape_plans_the_topk_prefilter_and_answers_the_same` in
+//! `tests/compact_slices.rs`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -120,15 +150,16 @@ use datafusion::arrow::array::{
     OffsetSizeTrait, StructArray, new_empty_array,
 };
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
-use datafusion::arrow::compute::{cast, concat};
-use datafusion::arrow::datatypes::{ByteViewType, DataType, FieldRef};
+use datafusion::arrow::compute::{cast, concat, lexsort_to_indices, take_record_batch};
+use datafusion::arrow::datatypes::{ByteViewType, DataType, FieldRef, Schema};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::Result as DFResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{Partitioning, PhysicalExpr};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, Partitioning, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -173,7 +204,7 @@ impl PhysicalOptimizerRule for CompactSlices {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        rewrite(plan, false)
+        rewrite(plan, false, None)
     }
 
     fn name(&self) -> &str {
@@ -223,8 +254,14 @@ fn passes_batches_through(node: &Arc<dyn ExecutionPlan>) -> bool {
 /// Rewrite `node` and its subtree. `charged_above` is whether the nearest
 /// ancestor that is not a pass-through is a consumer that charges by
 /// capacity, on the input this node feeds, which is the only thing the
-/// decision at an aggregate depends on.
-fn rewrite(node: Arc<dyn ExecutionPlan>, charged_above: bool) -> DFResult<Arc<dyn ExecutionPlan>> {
+/// decision at an aggregate depends on. `topk_above` is the TopK this node's
+/// output reaches through projections and fetch-less partition merges, its
+/// ordering in this node's output columns.
+fn rewrite(
+    node: Arc<dyn ExecutionPlan>,
+    charged_above: bool,
+    topk_above: Option<TopKPrefilter>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
     let charged_below = if charges_by_capacity(&node) {
         true
     } else if passes_batches_through(&node) {
@@ -232,13 +269,14 @@ fn rewrite(node: Arc<dyn ExecutionPlan>, charged_above: bool) -> DFResult<Arc<dy
     } else {
         false
     };
+    let topk_below = TopKPrefilter::above(&node, topk_above.as_ref());
 
     let children = node.children();
     let mut rewritten = Vec::with_capacity(children.len());
     let mut changed = false;
     for (index, child) in children.into_iter().enumerate() {
         let charged = charged_below || join_charges_child(&node, index);
-        let new_child = rewrite(Arc::clone(child), charged)?;
+        let new_child = rewrite(Arc::clone(child), charged, topk_below.clone())?;
         changed |= !Arc::ptr_eq(child, &new_child);
         rewritten.push(new_child);
     }
@@ -252,9 +290,91 @@ fn rewrite(node: Arc<dyn ExecutionPlan>, charged_above: bool) -> DFResult<Arc<dy
     };
 
     if charged_above && node.is::<AggregateExec>() {
-        return Ok(Arc::new(CompactSlicesExec::new(node)));
+        let topk = topk_above.filter(|topk| topk.fits(&node.schema()));
+        return Ok(Arc::new(CompactSlicesExec::new(node).with_topk(topk)));
     }
     Ok(node)
+}
+
+/// The ordering and fetch of the TopK an exec's output reaches, in the
+/// exec's input columns. See the module docs.
+#[derive(Clone, Debug)]
+pub struct TopKPrefilter {
+    ordering: LexOrdering,
+    fetch: usize,
+}
+
+impl TopKPrefilter {
+    /// The TopK `node`'s children feed, given the one `node`'s own output
+    /// feeds: a `SortExec` with a fetch starts one, a `ProjectionExec` maps
+    /// it onto its input, a fetch-less `CoalescePartitionsExec` forwards it,
+    /// and every other node ends it.
+    fn above(node: &Arc<dyn ExecutionPlan>, topk_above: Option<&TopKPrefilter>) -> Option<Self> {
+        if let Some(sort) = node.downcast_ref::<SortExec>() {
+            return sort.fetch().map(|fetch| TopKPrefilter {
+                ordering: sort.expr().clone(),
+                fetch,
+            });
+        }
+        if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+            return topk_above?.through_projection(projection);
+        }
+        if let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>()
+            && coalesce.fetch().is_none()
+        {
+            return topk_above.cloned();
+        }
+        None
+    }
+
+    /// This ordering in `projection`'s input columns, when every sort key is
+    /// a column the projection passes through as a bare column.
+    fn through_projection(&self, projection: &ProjectionExec) -> Option<Self> {
+        let exprs = projection.expr();
+        let mapped = self
+            .ordering
+            .iter()
+            .map(|sort| {
+                let column = sort.expr.downcast_ref::<Column>()?;
+                let source = exprs.get(column.index())?;
+                if source.alias != column.name() {
+                    return None;
+                }
+                let input = source.expr.downcast_ref::<Column>()?;
+                Some(PhysicalSortExpr::new(
+                    Arc::new(input.clone()) as Arc<dyn PhysicalExpr>,
+                    sort.options,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(TopKPrefilter {
+            ordering: LexOrdering::new(mapped)?,
+            fetch: self.fetch,
+        })
+    }
+
+    /// True when every sort key is a bare column of `schema`, by index and
+    /// name.
+    fn fits(&self, schema: &Schema) -> bool {
+        self.ordering.iter().all(|sort| {
+            sort.expr.downcast_ref::<Column>().is_some_and(|column| {
+                schema
+                    .fields()
+                    .get(column.index())
+                    .is_some_and(|field| field.name() == column.name())
+            })
+        })
+    }
+
+    /// The sort keys, in the exec's input columns.
+    pub fn ordering(&self) -> &LexOrdering {
+        &self.ordering
+    }
+
+    /// The TopK's `k`.
+    pub fn fetch(&self) -> usize {
+        self.fetch
+    }
 }
 
 /// A pass-through whose stream gives every sliced batch buffers of its own.
@@ -262,6 +382,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>, charged_above: bool) -> DFResult<Arc<dy
 /// docs.
 pub struct CompactSlicesExec {
     input: Arc<dyn ExecutionPlan>,
+    topk: Option<TopKPrefilter>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -279,6 +400,8 @@ struct CompactMetrics {
     /// Batches whose charge was already within the factor and went through
     /// untouched.
     passed_through_batches: Count,
+    /// Rows the TopK pre-filter dropped before compaction.
+    topk_dropped_rows: Count,
 }
 
 impl CompactMetrics {
@@ -288,6 +411,7 @@ impl CompactMetrics {
             compacted_batches: MetricBuilder::new(metrics).counter("compacted_batches", partition),
             passed_through_batches: MetricBuilder::new(metrics)
                 .counter("passed_through_batches", partition),
+            topk_dropped_rows: MetricBuilder::new(metrics).counter("topk_dropped_rows", partition),
         }
     }
 }
@@ -303,9 +427,24 @@ impl CompactSlicesExec {
         ));
         CompactSlicesExec {
             input,
+            topk: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Pre-filter each batch to its own top rows for the TopK above (see the
+    /// module docs). A `topk` whose sort keys are not bare columns of the
+    /// input is dropped.
+    pub fn with_topk(mut self, topk: Option<TopKPrefilter>) -> Self {
+        let schema = self.input.schema();
+        self.topk = topk.filter(|topk| topk.fits(&schema));
+        self
+    }
+
+    /// The TopK pre-filter, when the rule found one above.
+    pub fn topk(&self) -> Option<&TopKPrefilter> {
+        self.topk.as_ref()
     }
 
     /// The plan this exec passes through.
@@ -323,9 +462,14 @@ impl fmt::Debug for CompactSlicesExec {
 impl DisplayAs for CompactSlicesExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "CompactSlicesExec")
-            }
+            DisplayFormatType::Default | DisplayFormatType::Verbose => match &self.topk {
+                Some(topk) => write!(
+                    f,
+                    "CompactSlicesExec: topk=[{}], fetch={}",
+                    topk.ordering, topk.fetch
+                ),
+                None => write!(f, "CompactSlicesExec"),
+            },
             DisplayFormatType::TreeRender => Ok(()),
         }
     }
@@ -369,7 +513,9 @@ impl ExecutionPlan for CompactSlicesExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(CompactSlicesExec::new(children.swap_remove(0))))
+        Ok(Arc::new(
+            CompactSlicesExec::new(children.swap_remove(0)).with_topk(self.topk.clone()),
+        ))
     }
 
     fn execute(
@@ -380,7 +526,16 @@ impl ExecutionPlan for CompactSlicesExec {
         let input = self.input.execute(partition, context)?;
         let schema = input.schema();
         let metrics = CompactMetrics::new(&self.metrics, partition);
-        let stream = input.map(move |batch| batch.and_then(|batch| compact_batch(batch, &metrics)));
+        let topk = self.topk.clone();
+        let stream = input.map(move |batch| {
+            batch.and_then(|batch| {
+                let batch = match &topk {
+                    Some(topk) => prefilter_batch(batch, topk, &metrics)?,
+                    None => batch,
+                };
+                compact_batch(batch, &metrics)
+            })
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
@@ -568,6 +723,33 @@ fn referenced_view_bytes<T: ByteViewType + ?Sized>(array: &GenericByteViewArray<
         .fold(0usize, usize::saturating_add)
 }
 
+/// `batch`'s own top `topk.fetch` rows by `topk.ordering`, in that order, or
+/// `batch` itself when it has no more rows than that. A sort key arrow cannot
+/// sort leaves `batch` whole: the TopK above sorts it as it would without
+/// the pre-filter.
+fn prefilter_batch(
+    batch: RecordBatch,
+    topk: &TopKPrefilter,
+    metrics: &CompactMetrics,
+) -> DFResult<RecordBatch> {
+    if batch.num_rows() <= topk.fetch {
+        return Ok(batch);
+    }
+    let columns = topk
+        .ordering
+        .iter()
+        .map(|sort| sort.evaluate_to_sort_column(&batch))
+        .collect::<DFResult<Vec<_>>>()?;
+    let Ok(indices) = lexsort_to_indices(&columns, Some(topk.fetch)) else {
+        return Ok(batch);
+    };
+    let taken = take_record_batch(&batch, &indices)?;
+    metrics
+        .topk_dropped_rows
+        .add(batch.num_rows().saturating_sub(taken.num_rows()));
+    Ok(taken)
+}
+
 /// Return `batch` with buffers of its own when its charge is more than
 /// [`COMPACT_ABOVE_FACTOR`] times the bytes it references, and `batch` itself
 /// otherwise.
@@ -682,7 +864,7 @@ mod tests {
 
     use datafusion::arrow::array::{
         BooleanArray, DictionaryArray, Int32Array, Int64Array, ListArray, MapBuilder, NullArray,
-        StringArray, StringBuilder, StringViewArray,
+        StringArray, StringBuilder, StringViewArray, UInt32Array,
     };
     use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
     use datafusion::arrow::compute::{SortOptions, concat_batches};
@@ -698,6 +880,7 @@ mod tests {
     use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::{collect, displayable};
+    use proptest::prelude::*;
 
     /// Rows per batch in the sliced-batch tests, and the number of pieces
     /// the batch is cut into.
@@ -1744,6 +1927,403 @@ mod tests {
                 .expect("hash join"),
             );
             assert_eq!(execs_above_the_aggregate(plan), (0, false), "{side:?}");
+        }
+    }
+
+    // ----- the TopK pre-filter -----
+
+    /// Run `batches` (one partition) through a `CompactSlicesExec` carrying
+    /// `topk` and return the exec and what came out.
+    async fn run_with_topk(
+        batches: Vec<RecordBatch>,
+        topk: TopKPrefilter,
+    ) -> (Arc<CompactSlicesExec>, Vec<RecordBatch>) {
+        let schema = batches.first().expect("a batch").schema();
+        let source = MemorySourceConfig::try_new_exec(&[batches], schema, None).expect("source");
+        let exec = Arc::new(CompactSlicesExec::new(source).with_topk(Some(topk)));
+        assert!(exec.topk().is_some(), "the pre-filter fits the input");
+        let out = collect(
+            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            Arc::new(TaskContext::default()),
+        )
+        .await
+        .expect("collect");
+        (exec, out)
+    }
+
+    /// Every piece comes out as its own top `K` rows by `v DESC`, charged
+    /// less than its share of the whole batch, and the bytes compacted per piece are at most those of `K`
+    /// rows; a piece of fewer than `K` rows comes out whole. The same pieces
+    /// through the exec without the pre-filter copy every row, which the last
+    /// assertions show breaks the `K`-row bound.
+    ///
+    /// FLIP: make `prefilter_batch` return `Ok(batch)` first and the
+    /// row-count assertion fails with 100 against 7.
+    #[tokio::test]
+    async fn the_topk_prefilter_copies_only_k_rows_per_batch() {
+        const K: usize = 7;
+        const SHORT: usize = 3;
+        let whole = batch_of(ROWS);
+        let mut pieces = pieces_of(&whole);
+        pieces.push(whole.slice(0, SHORT));
+        let piece_rows = ROWS / PIECES;
+        let k_rows_bytes = referenced_bytes(&whole.slice(0, K)).expect("sized");
+        let whole_charged = whole.get_array_memory_size();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            col("v", &schema()).expect("v"),
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        )])
+        .expect("one sort key");
+        let topk = TopKPrefilter { ordering, fetch: K };
+
+        let (exec, out) = run_with_topk(pieces.clone(), topk).await;
+        assert_eq!(out.len(), pieces.len());
+        let mut copied_total = 0usize;
+        for (piece, kept) in pieces.iter().zip(&out) {
+            let rows = piece.num_rows();
+            assert_eq!(kept.num_rows(), K.min(rows), "rows taken");
+            let top: Vec<u32> = (rows.saturating_sub(K)..rows)
+                .rev()
+                .map(|i| i as u32)
+                .collect();
+            let expected = if rows > K {
+                take_record_batch(piece, &UInt32Array::from(top)).expect("take")
+            } else {
+                piece.clone()
+            };
+            assert_eq!(kept, &expected, "the piece's own top rows by v DESC");
+            let referenced = referenced_bytes(kept).expect("sized");
+            assert!(
+                referenced <= k_rows_bytes,
+                "{referenced} bytes compacted, {k_rows_bytes} in {K} rows"
+            );
+            let charged = kept.get_array_memory_size();
+            assert!(
+                charged < whole_charged / PIECES,
+                "the kept rows no longer pin the whole batch: {charged} charged, \
+                 {whole_charged} for the whole batch"
+            );
+            copied_total += referenced;
+        }
+        assert_eq!(metric(&exec, "compacted_batches"), pieces.len());
+        assert_eq!(metric(&exec, "copied_bytes"), copied_total);
+        assert!(metric(&exec, "copied_bytes") <= pieces.len() * k_rows_bytes);
+        assert_eq!(
+            metric(&exec, "topk_dropped_rows"),
+            PIECES * (piece_rows - K)
+        );
+
+        let (plain, plain_out) = run(pieces.clone()).await;
+        assert!(
+            plain_out
+                .iter()
+                .zip(&pieces)
+                .all(|(out, piece)| out.num_rows() == piece.num_rows()),
+            "without the pre-filter every row is kept"
+        );
+        assert!(
+            metric(&plain, "copied_bytes") > pieces.len() * k_rows_bytes,
+            "without the pre-filter the exec copies more than {K} rows per piece"
+        );
+    }
+
+    /// One pre-filter sort key: its input column's index and name, and its
+    /// options.
+    type PlacedKey = (usize, String, SortOptions);
+
+    /// The pre-filter the rule gave the one exec in `plan`, as its keys and
+    /// fetch, or `None`.
+    fn placed_topk(plan: Arc<dyn ExecutionPlan>) -> Option<(Vec<PlacedKey>, usize)> {
+        fn find(node: &Arc<dyn ExecutionPlan>) -> Option<&CompactSlicesExec> {
+            if let Some(exec) = node.downcast_ref::<CompactSlicesExec>() {
+                return Some(exec);
+            }
+            node.children().into_iter().find_map(find)
+        }
+        let optimized = optimize(plan);
+        let text = plan_text(&optimized);
+        let exec = find(&optimized).unwrap_or_else(|| panic!("an exec:\n{text}"));
+        let topk = exec.topk()?;
+        let keys = topk
+            .ordering()
+            .iter()
+            .map(|sort| {
+                let column = sort.expr.downcast_ref::<Column>().expect("a column");
+                (column.index(), column.name().to_string(), sort.options)
+            })
+            .collect();
+        Some((keys, topk.fetch()))
+    }
+
+    const COUNT_DESC: SortOptions = SortOptions {
+        descending: true,
+        nulls_first: false,
+    };
+
+    /// `count(v) AS c, k` over `input`: the alias and the reordering a
+    /// `SELECT k, count(*) AS c ... ORDER BY c` projection carries.
+    fn project_count_as_c(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        Arc::new(
+            ProjectionExec::try_new(
+                vec![
+                    (col("count(v)", &schema).expect("count"), "c".to_string()),
+                    (col("k", &schema).expect("k"), "k".to_string()),
+                ],
+                input,
+            )
+            .expect("projection"),
+        )
+    }
+
+    /// `count(v) + 1 AS c, k` over `input`: a sort key the exec cannot
+    /// evaluate as a bare input column.
+    fn project_count_plus_one_as_c(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        let plus_one = binary(
+            col("count(v)", &schema).expect("count"),
+            Operator::Plus,
+            lit(1i64),
+            &schema,
+        )
+        .expect("plus");
+        Arc::new(
+            ProjectionExec::try_new(
+                vec![
+                    (plus_one, "c".to_string()),
+                    (col("k", &schema).expect("k"), "k".to_string()),
+                ],
+                input,
+            )
+            .expect("projection"),
+        )
+    }
+
+    fn sort_by_c(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            col("c", &schema).expect("c"),
+            COUNT_DESC,
+        )])
+        .expect("one sort key");
+        Arc::new(SortExec::new(ordering, input).with_fetch(fetch))
+    }
+
+    /// The pre-filter engages for a TopK reached through projections and a
+    /// fetch-less `CoalescePartitionsExec` (q33's chain, pinned in
+    /// `tests/bounded_topk_aggregate.rs`), its key mapped from the alias `c`
+    /// at index 0 to the aggregate's `count(v)` at index 1. It does not
+    /// engage under a `FilterExec` or a round-robin repartition between
+    /// them, under a sort with no fetch, or for a sort key the projection
+    /// computes.
+    ///
+    /// FLIP: make the closing `None` of `TopKPrefilter::above` read
+    /// `topk_above.cloned()` and the "a filter between" assertion fails with
+    /// the mapped pre-filter against `None`; delete its `ProjectionExec` arm
+    /// and the "sort, coalesce, projection" assertion fails with `None`.
+    #[test]
+    fn the_topk_prefilter_engages_only_under_a_topk_through_projections() {
+        let mapped = Some((vec![(1, "count(v)".to_string(), COUNT_DESC)], 10));
+
+        let q34_shape = sort_by_c(
+            Arc::new(CoalescePartitionsExec::new(project_count_as_c(
+                partial_then_final(scan(4)),
+            ))),
+            Some(10),
+        );
+        assert_eq!(placed_topk(q34_shape), mapped, "sort, coalesce, projection");
+
+        let direct = sort_by_c(project_count_as_c(partial_then_final(scan(4))), Some(10));
+        assert_eq!(placed_topk(direct), mapped, "sort, projection");
+
+        let through_filter = sort_by_c(
+            project_count_as_c(having_count_above_one(partial_then_final(scan(4)))),
+            Some(10),
+        );
+        assert_eq!(placed_topk(through_filter), None, "a filter between");
+
+        assert_eq!(
+            placed_topk(q29_plan()),
+            None,
+            "a filter and a repartition between"
+        );
+
+        let no_fetch = sort_by_c(project_count_as_c(partial_then_final(scan(4))), None);
+        assert_eq!(placed_topk(no_fetch), None, "a sort with no fetch");
+
+        let computed = sort_by_c(
+            project_count_plus_one_as_c(partial_then_final(scan(4))),
+            Some(10),
+        );
+        assert_eq!(placed_topk(computed), None, "a computed sort key");
+    }
+
+    // ----- exactness -----
+
+    /// One generated aggregate-output row: a nullable Int64 key, a nullable
+    /// Utf8 key, and a unique id.
+    type Row = (Option<i64>, Option<String>, i64);
+
+    fn exactness_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]))
+    }
+
+    fn rows_to_batch(rows: &[Row]) -> RecordBatch {
+        RecordBatch::try_new(
+            exactness_schema(),
+            vec![
+                Arc::new(rows.iter().map(|r| r.0).collect::<Int64Array>()) as ArrayRef,
+                Arc::new(rows.iter().map(|r| r.1.clone()).collect::<StringArray>()),
+                Arc::new(rows.iter().map(|r| Some(r.2)).collect::<Int64Array>()),
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn batch_to_rows(batch: &RecordBatch) -> Vec<Row> {
+        let a = batch.column(0).as_primitive::<Int64Type>();
+        let b = batch.column(1).as_string::<i32>();
+        let id = batch.column(2).as_primitive::<Int64Type>();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    a.is_valid(i).then(|| a.value(i)),
+                    b.is_valid(i).then(|| b.value(i).to_string()),
+                    id.value(i),
+                )
+            })
+            .collect()
+    }
+
+    /// The TopK's answer over `batches` with or without the pre-filter, and
+    /// the rows the pre-filter dropped.
+    fn topk_answer(
+        batches: &[RecordBatch],
+        ordering: &LexOrdering,
+        fetch: usize,
+        prefilter: bool,
+    ) -> (Vec<Row>, usize) {
+        let source =
+            MemorySourceConfig::try_new_exec(&[batches.to_vec()], exactness_schema(), None)
+                .expect("source");
+        let topk = prefilter.then(|| TopKPrefilter {
+            ordering: ordering.clone(),
+            fetch,
+        });
+        let exec = Arc::new(CompactSlicesExec::new(source).with_topk(topk));
+        assert_eq!(exec.topk().is_some(), prefilter);
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(
+                ordering.clone(),
+                Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            )
+            .with_fetch(Some(fetch)),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let out = runtime
+            .block_on(collect(sort, Arc::new(TaskContext::default())))
+            .expect("collect");
+        let rows = out.iter().flat_map(batch_to_rows).collect();
+        (rows, metric(&exec, "topk_dropped_rows"))
+    }
+
+    fn row_strategy() -> impl Strategy<Value = (Option<i64>, Option<String>)> {
+        (
+            prop::option::weighted(0.8, -3i64..4),
+            prop::option::weighted(0.8, prop::sample::select(vec!["x", "y", "z"])),
+        )
+            .prop_map(|(a, b)| (a, b.map(str::to_string)))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The TopK's answer with the pre-filter equals its answer without:
+        /// the same sort-key sequence always, the same rows when the `k`-th
+        /// key is not tied with a row left out, and only input rows
+        /// otherwise. Keys are drawn from a few values, so ties and nulls are
+        /// common; `k` runs past the input's row count.
+        ///
+        /// FLIP (a): in `prefilter_batch`, evaluate each key as
+        /// `PhysicalSortExpr::new(Arc::clone(&sort.expr), SortOptions {
+        /// descending: false, ..sort.options })` and the sort-key sequence
+        /// assertion fails, shrunk to one `a DESC NULLS FIRST` key with
+        /// `fetch = 6` over five nulls, 0 and 1 (0 kept, 1 expected). FLIP
+        /// (b): use `SortOptions { nulls_first: !sort.options.nulls_first,
+        /// ..sort.options }` there instead and it fails, shrunk to one
+        /// `a ASC NULLS LAST` key with `fetch = 1` over null, 0, null (null
+        /// kept, 0 expected). Both cases are the checked-in seeds.
+        #[test]
+        fn prop_topk_prefilter_keeps_the_topk_answer(
+            batches in prop::collection::vec(prop::collection::vec(row_strategy(), 0..12), 1..6),
+            two_keys in any::<bool>(),
+            options in prop::collection::vec((any::<bool>(), any::<bool>()), 2),
+            fetch in 1usize..48,
+        ) {
+            let mut next_id = 0i64;
+            let input: Vec<Vec<Row>> = batches
+                .into_iter()
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(a, b)| {
+                            next_id += 1;
+                            (a, b, next_id)
+                        })
+                        .collect()
+                })
+                .collect();
+            let record_batches: Vec<RecordBatch> = input.iter().map(|rows| rows_to_batch(rows)).collect();
+            let schema = exactness_schema();
+            let keys = if two_keys { vec!["a", "b"] } else { vec!["a"] };
+            let ordering = LexOrdering::new(keys.iter().zip(&options).map(|(name, (descending, nulls_first))| {
+                PhysicalSortExpr::new(
+                    col(name, &schema).expect("key"),
+                    SortOptions { descending: *descending, nulls_first: *nulls_first },
+                )
+            }))
+            .expect("a sort key");
+            let key_of = |row: &Row| (row.0, if two_keys { row.1.clone() } else { None });
+
+            let (with, dropped) = topk_answer(&record_batches, &ordering, fetch, true);
+            let (without, _) = topk_answer(&record_batches, &ordering, fetch, false);
+            let all: Vec<Row> = input.iter().flatten().cloned().collect();
+            let expected_dropped: usize = input.iter().map(|rows| rows.len().saturating_sub(fetch)).sum();
+            prop_assert_eq!(dropped, expected_dropped, "the pre-filter fired");
+            prop_assert_eq!(with.len(), fetch.min(all.len()));
+            prop_assert_eq!(
+                with.iter().map(key_of).collect::<Vec<_>>(),
+                without.iter().map(key_of).collect::<Vec<_>>(),
+                "the sort-key sequence"
+            );
+            for row in &with {
+                prop_assert!(all.contains(row), "{:?} is an input row", row);
+            }
+            let mut ids: Vec<i64> = with.iter().map(|row| row.2).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            prop_assert_eq!(ids.len(), with.len(), "no row twice");
+            if let Some(last) = without.last() {
+                let kth = key_of(last);
+                let in_input = all.iter().filter(|row| key_of(row) == kth).count();
+                let in_answer = without.iter().filter(|row| key_of(row) == kth).count();
+                if in_input == in_answer {
+                    let mut with_sorted = with.clone();
+                    let mut without_sorted = without.clone();
+                    with_sorted.sort();
+                    without_sorted.sort();
+                    prop_assert_eq!(with_sorted, without_sorted, "the same rows");
+                }
+            }
         }
     }
 }

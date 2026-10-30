@@ -1696,6 +1696,20 @@ run without the exec is refused with the spill-disabled error and the run
 with it answers. The sort and merge edges are pinned by placement (the
 rule's unit tests).
 
+Under a TopK the exec copies less. When the nearest consumer above it is a
+`SortExec` with `fetch = k`, reached through `ProjectionExec`s that pass the
+sort keys as bare columns and a `CoalescePartitionsExec` with no fetch, the
+rule hands the exec the sort's ordering and `k`
+(`CompactSlicesExec::with_topk`). Each batch of more than `k` rows is then
+cut to its own top `k` rows by that ordering before it is compacted. A row
+outside its batch's top `k` cannot be in the global top `k`, so the answer is
+the same, except that at a tie on the k-th value the tied row that survives
+may differ, as SQL allows. The plan shows `topk=[...], fetch=k` on the exec,
+and its `topk_dropped_rows` metric counts the rows cut. This is pinned by
+`the_topk_prefilter_engages_only_under_a_topk_through_projections`,
+`prop_topk_prefilter_keeps_the_topk_answer` and
+`the_q34_shape_plans_the_topk_prefilter_and_answers_the_same`.
+
 `AggregateExec::execute_typed` still falls back to the legacy
 `GroupedHashAggregateStream` for every shape it has not migrated: a
 single-stage aggregate that carries a limit, such as `SELECT DISTINCT ...
