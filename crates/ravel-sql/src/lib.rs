@@ -99,6 +99,7 @@ mod parquet;
 mod provider;
 mod pushdown;
 pub mod redact;
+mod regexp_replace_udf;
 mod rlog_attrs;
 mod scan;
 #[cfg(test)]
