@@ -61,7 +61,7 @@ pub use config::{
     DEFAULT_PROTECTION_HORIZON_NS, DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
     DEFAULT_SNAPSHOT_CACHE_PARTS, MAX_CACHE_CAPACITY_PER_TENANT, MAX_RECORD_CACHE_BYTES_PER_TENANT,
     MAX_RESOLVE_GET_CONCURRENCY, RECORD_CACHE_ENTRY_BYTES, RECORD_CACHES_PER_TENANT,
-    derive_cache_capacity_per_tenant,
+    derive_cache_capacity_per_tenant, derive_cache_capacity_per_tenant_within,
 };
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
 pub use declared_stats::{

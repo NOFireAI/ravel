@@ -176,8 +176,10 @@ pub const MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;
 /// its fetched records until its include pass ends, `resolve_get_concurrency`
 /// buckets at a time, per concurrent resolve. The levers for it are a
 /// coarser `max_flush_delay` or fewer shards, both of which shrink the tail
-/// itself; raising the ceiling is a code change today, since no flag
-/// exposes it.
+/// itself, or a larger per-tenant byte budget
+/// ([`derive_cache_capacity_per_tenant_within`], exposed by `ravel-server`'s
+/// `--catalog-record-cache-max-bytes-per-tenant`), which raises this ceiling
+/// for that deployment.
 pub const MAX_CACHE_CAPACITY_PER_TENANT: usize = (MAX_RECORD_CACHE_BYTES_PER_TENANT
     / (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT))
     as usize;
@@ -277,7 +279,37 @@ pub const RECORD_CACHES_PER_TENANT: u64 = 2;
 /// a deployment configuring a zero flush delay is already rejected elsewhere
 /// (`ravel-server`'s `Cli::validate`), so this is defense in depth, not a
 /// path exercised in practice.
+///
+/// This is [`derive_cache_capacity_per_tenant_within`] at the default
+/// [`MAX_RECORD_CACHE_BYTES_PER_TENANT`] budget.
 pub fn derive_cache_capacity_per_tenant(shards: u32, max_flush_delay: Duration) -> usize {
+    derive_cache_capacity_per_tenant_within(
+        shards,
+        max_flush_delay,
+        MAX_RECORD_CACHE_BYTES_PER_TENANT,
+    )
+}
+
+/// [`derive_cache_capacity_per_tenant`] under a per-tenant byte budget other
+/// than [`MAX_RECORD_CACHE_BYTES_PER_TENANT`] (ADR-3513). The derived value is
+/// clamped into `DEFAULT_CACHE_CAPACITY_PER_TENANT ..= budget_bytes /
+/// (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT)`, so each of the two
+/// caches gets a byte budget of `capacity * RECORD_CACHE_ENTRY_BYTES`, at most
+/// half of `budget_bytes`. At the default budget the ceiling is
+/// [`MAX_CACHE_CAPACITY_PER_TENANT`] and every value is unchanged.
+///
+/// The floor wins over the budget: a budget too small to hold the floor in
+/// both caches (below 18 MB) returns [`DEFAULT_CACHE_CAPACITY_PER_TENANT`]
+/// rather than panicking. `ravel-server` refuses a budget below
+/// [`MAX_RECORD_CACHE_BYTES_PER_TENANT`] before it gets here.
+pub fn derive_cache_capacity_per_tenant_within(
+    shards: u32,
+    max_flush_delay: Duration,
+    budget_bytes: u64,
+) -> usize {
+    let floor = DEFAULT_CACHE_CAPACITY_PER_TENANT as u64;
+    let ceiling =
+        (budget_bytes / (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT)).max(floor);
     let flush_secs = max_flush_delay.as_secs_f64();
     let flushes_per_hour: u64 = if flush_secs > 0.0 {
         (3_600.0 / flush_secs).ceil() as u64
@@ -288,12 +320,10 @@ pub fn derive_cache_capacity_per_tenant(shards: u32, max_flush_delay: Duration) 
         .saturating_mul(SIGNAL_STREAMS)
         .saturating_mul(flushes_per_hour)
         .saturating_mul(HOT_REGION_HOURS)
-        .clamp(
-            DEFAULT_CACHE_CAPACITY_PER_TENANT as u64,
-            MAX_CACHE_CAPACITY_PER_TENANT as u64,
-        );
+        .clamp(floor, ceiling);
     usize::try_from(derived).unwrap_or(usize::MAX)
 }
+
 /// Default `max_flush_lifetime`: 1 hour, in nanoseconds. The GC interlock
 /// (ADR-0010 §11) forbids publishing a commit record after this long past
 /// its ingest hour's end; the seal watermark relies on that bound (ADR-0020).
@@ -879,6 +909,134 @@ mod tests {
             "the capped capacity is exactly the 45 MB per-tenant budget"
         );
         assert_eq!(MAX_RECORD_CACHE_BYTES_PER_TENANT, 45_000_000);
+    }
+
+    /// The derivation as it stood before the budget became a parameter,
+    /// written out independently so the comparison below is not the new
+    /// function compared with itself.
+    fn derivation_before_the_budget_parameter(shards: u32, max_flush_delay: Duration) -> usize {
+        let flush_secs = max_flush_delay.as_secs_f64();
+        let flushes_per_hour: u64 = if flush_secs > 0.0 {
+            (3_600.0 / flush_secs).ceil() as u64
+        } else {
+            u64::MAX
+        };
+        let derived = u64::from(shards)
+            .saturating_mul(SIGNAL_STREAMS)
+            .saturating_mul(flushes_per_hour)
+            .saturating_mul(HOT_REGION_HOURS)
+            .clamp(10_000, 25_000);
+        usize::try_from(derived).unwrap_or(usize::MAX)
+    }
+
+    /// At the default 45 MB budget the budgeted derivation returns exactly
+    /// what the derivation returned before the budget became a parameter,
+    /// across shard counts and flush delays that land on the floor, in
+    /// between, and on the cap.
+    #[test]
+    fn derive_within_the_default_budget_matches_the_old_derivation() {
+        let delays = [
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_millis(2_600),
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(3_600),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for shards in [0, 1, 2, 3, 4, 8, 16, 64, 256, u32::MAX] {
+            for delay in delays {
+                let old = derivation_before_the_budget_parameter(shards, delay);
+                assert_eq!(
+                    derive_cache_capacity_per_tenant_within(
+                        shards,
+                        delay,
+                        MAX_RECORD_CACHE_BYTES_PER_TENANT
+                    ),
+                    old,
+                    "shards {shards}, delay {delay:?}"
+                );
+                assert_eq!(
+                    derive_cache_capacity_per_tenant(shards, delay),
+                    old,
+                    "shards {shards}, delay {delay:?}"
+                );
+                seen.insert(old);
+            }
+        }
+        assert!(seen.contains(&10_000), "the spread reaches the floor");
+        assert!(seen.contains(&25_000), "the spread reaches the cap");
+        assert!(
+            seen.iter().any(|v| *v > 10_000 && *v < 25_000),
+            "the spread reaches a value between floor and cap: {seen:?}"
+        );
+    }
+
+    /// ADR-3513's worked figure: a 400 MB budget at 2 shards and a 100 ms
+    /// flush delay. Uncapped that derives `2 * 6 * 36_000 * 3 = 1_296_000`
+    /// entries; the budget caps it at `400_000_000 / (900 * 2) = 222_222`,
+    /// which gives each of the two caches a byte budget of `222_222 * 900 =
+    /// 199_999_800` bytes, the half of the budget less the 200-byte
+    /// remainder of the entry division.
+    #[test]
+    fn a_400_mb_budget_at_2_shards_and_100_ms_holds_222_222_entries() {
+        let capacity =
+            derive_cache_capacity_per_tenant_within(2, Duration::from_millis(100), 400_000_000);
+        assert_eq!(capacity, 222_222);
+
+        let config = CatalogConfig {
+            cache_capacity_per_tenant: capacity,
+            ..CatalogConfig::default()
+        };
+        assert_eq!(config.commit_cache_max_bytes_per_tenant(), 199_999_800);
+        assert_eq!(config.compaction_cache_max_bytes_per_tenant(), 199_999_800);
+        let half = 400_000_000 / RECORD_CACHES_PER_TENANT;
+        assert!(config.commit_cache_max_bytes_per_tenant() <= half);
+        assert!(half - config.commit_cache_max_bytes_per_tenant() < RECORD_CACHE_ENTRY_BYTES);
+    }
+
+    /// A larger budget only raises the ceiling: a derivation below the
+    /// default cap, and one on the floor, are unchanged by it.
+    #[test]
+    fn a_larger_budget_moves_only_the_ceiling() {
+        assert_eq!(
+            derive_cache_capacity_per_tenant_within(1, Duration::from_secs(4), 400_000_000),
+            16_200
+        );
+        assert_eq!(
+            derive_cache_capacity_per_tenant_within(1, Duration::from_secs(3_600), 400_000_000),
+            DEFAULT_CACHE_CAPACITY_PER_TENANT
+        );
+        assert_eq!(
+            derive_cache_capacity_per_tenant_within(4, Duration::from_secs(2), 400_000_000),
+            129_600,
+            "the shipped defaults' uncapped derivation fits inside 400 MB"
+        );
+    }
+
+    /// The floor holds whatever the budget: a budget below the 18 MB the floor
+    /// costs in both caches, zero included, returns the floor rather than
+    /// panicking on an inverted clamp.
+    #[test]
+    fn derive_within_never_goes_below_the_floor() {
+        for budget in [0, 1, 17_999_999, 18_000_000, 18_000_001] {
+            for (shards, delay) in [(1, Duration::from_secs(3_600)), (64, Duration::ZERO)] {
+                assert_eq!(
+                    derive_cache_capacity_per_tenant_within(shards, delay, budget),
+                    DEFAULT_CACHE_CAPACITY_PER_TENANT,
+                    "budget {budget}, shards {shards}, delay {delay:?}"
+                );
+            }
+        }
+        assert_eq!(
+            derive_cache_capacity_per_tenant_within(1, Duration::from_secs(3_600), u64::MAX),
+            DEFAULT_CACHE_CAPACITY_PER_TENANT
+        );
     }
 
     /// The clamp cannot invert: the cap sits above the floor.

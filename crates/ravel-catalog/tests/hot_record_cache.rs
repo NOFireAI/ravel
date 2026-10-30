@@ -673,3 +673,63 @@ async fn a_multi_signal_tenant_resolves_its_unsealed_tail_without_record_gets() 
         );
     }
 }
+
+/// ADR-3513: the per-tenant byte budget is what decides how much of an
+/// unsealed tail past the default 25,000-entry cap stays resident. The tail is
+/// 27,000 records, 2,000 past the cap.
+///
+/// A budget of `27_000 * 900 * 2 = 48_600_000` bytes derives a 27,000-entry
+/// bound at one shard and the shipped 2-second cadence, so the whole tail fits
+/// and the repeat resolve issues no record GET. At the default 45 MB budget
+/// the same derivation is the 25,000-entry cap, and the repeat resolve
+/// fetches exactly the 2,000 records the bound could not hold. Both catalogs
+/// resolve one published tail, each through its own counting wrapper.
+#[tokio::test]
+async fn a_budget_that_holds_the_tail_keeps_the_saving_the_default_budget_loses() {
+    const RECORD_COUNT: u64 = 27_000;
+    const HOLDING_BUDGET: u64 = RECORD_COUNT
+        * ravel_catalog::RECORD_CACHE_ENTRY_BYTES
+        * ravel_catalog::RECORD_CACHES_PER_TENANT;
+    let delay = std::time::Duration::from_secs(2);
+
+    let holding = ravel_catalog::derive_cache_capacity_per_tenant_within(1, delay, HOLDING_BUDGET);
+    assert_eq!(holding as u64, RECORD_COUNT, "the budget holds the whole tail");
+    let default_bound = ravel_catalog::derive_cache_capacity_per_tenant_within(
+        1,
+        delay,
+        ravel_catalog::MAX_RECORD_CACHE_BYTES_PER_TENANT,
+    );
+    assert_eq!(default_bound, 25_000, "the default budget binds at the cap");
+
+    let inner = Arc::new(MemoryStore::new());
+    publish_many(inner.as_ref(), Signal::Metrics, HOUR_A, RECORD_COUNT).await;
+
+    for (bound, repeat_gets) in [
+        (holding, 0),
+        (default_bound, RECORD_COUNT - default_bound as u64),
+    ] {
+        let (store, calls) = CountingStore::new(inner.clone());
+        let catalog = Catalog::new(store, config(bound)).expect("catalog");
+
+        let first = resolve(&catalog).await.expect("first resolve");
+        assert_eq!(
+            calls.record_get_count() as u64,
+            RECORD_COUNT,
+            "a cold resolve at bound {bound} GETs each record exactly once"
+        );
+        calls.reset();
+
+        let second = resolve(&catalog).await.expect("second resolve");
+        assert_eq!(
+            calls.record_get_count() as u64,
+            repeat_gets,
+            "the repeat resolve at bound {bound} over a {RECORD_COUNT}-record tail"
+        );
+        assert_eq!(
+            calls.max_gets_per_key(),
+            if repeat_gets == 0 { 0 } else { 1 },
+            "no record is fetched twice in one resolve"
+        );
+        assert_eq!(first, second, "the bound changes cost, never the snapshot");
+    }
+}
