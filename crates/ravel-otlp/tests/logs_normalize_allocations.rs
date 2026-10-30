@@ -11,9 +11,8 @@
 //! a record still allocates is its own attribute `Vec` and its copy of the
 //! stream's attribute blob (`NormalizedLogRecord::stream_attrs` is a `Vec<u8>`
 //! per record, so it cannot be shared yet): two allocations per record,
-//! whatever the attribute count. The last record of a scope takes the blob the
-//! scope built rather than copying it, which is why the measurement differences
-//! two request sizes under one scope instead of dividing a total.
+//! whatever the attribute count. The measurement differences two request
+//! sizes under one scope, so the per-request and per-scope allocations cancel.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

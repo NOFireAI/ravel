@@ -520,9 +520,7 @@ fn project_memo_run<'a>(
 /// encoded length plus each record attribute's key, value payload and
 /// [`RESOLVED_LABEL_OVERHEAD_BYTES`]; plus, once per resource and once per
 /// scope, the converted attributes and the preimage the records copy from.
-/// No run collapsing: the log normalizer copies for every record but a
-/// scope's last, which takes the scope's own preimage, so this over-counts by
-/// one preimage per scope.
+/// No run collapsing: the log normalizer copies for every record.
 pub fn project_log_resolved_label_bytes(
     req: &ExportLogsServiceRequest,
     limits: &LogIngestLimits,

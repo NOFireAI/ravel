@@ -434,7 +434,7 @@ impl LogWalk<'_> {
         // same converted (and, where matched, encrypted) attribute vectors, and
         // reused for every record below.
         let stream_id = log_stream_id(resource_attrs, &scope_name, &scope_version, &scope_attrs);
-        let mut stream_attrs =
+        let stream_attrs =
             stream_attrs_bytes(resource_attrs, &scope_name, &scope_version, &scope_attrs);
 
         let stored_before = self.records.len();
@@ -457,12 +457,7 @@ impl LogWalk<'_> {
             }
             match normalized {
                 Ok((mut normalized, dropped_attrs, converted_body)) => {
-                    // The scope's last record takes the blob; the others copy it.
-                    normalized.stream_attrs = if records.len() == 0 {
-                        std::mem::take(&mut stream_attrs)
-                    } else {
-                        stream_attrs.clone()
-                    };
+                    normalized.stream_attrs = stream_attrs.clone();
                     self.records.push(normalized);
                     self.rejected.extend(dropped_attrs);
                     if converted_body {

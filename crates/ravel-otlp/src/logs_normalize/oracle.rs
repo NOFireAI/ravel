@@ -761,8 +761,8 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4096))]
 
-        /// Moving values out of the request, sharing the scope's blob and
-        /// folding the projection into the pass change nothing a caller sees:
+        /// Moving values out of the request and folding the projection into
+        /// the pass change nothing a caller sees:
         /// both entry points produce exactly the oracle's records, refusals,
         /// body-conversion count and IPCrypt tally, and the projection the
         /// server charges is the oracle's.
