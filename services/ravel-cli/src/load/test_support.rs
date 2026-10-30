@@ -394,7 +394,7 @@ pub(super) async fn decoded_records(store: &dyn ObjectStoreBackend) -> Vec<Strin
 pub(super) fn to_logrecord(r: &NormalizedLogRecord) -> ravel_logseg::LogRecord {
     ravel_logseg::LogRecord {
         stream_id: r.stream_id,
-        stream_attrs: r.stream_attrs.clone(),
+        stream_attrs: r.stream_attrs.to_vec(),
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
         severity_num: r.severity_num,

@@ -63,7 +63,7 @@ fn norm_record(resource: &[(&str, &str)], ts_ns: i64, body: &str) -> NormalizedL
     let stream_attrs = stream_attrs_bytes(&res, "scope", "", &scope_attrs);
     NormalizedLogRecord {
         stream_id,
-        stream_attrs,
+        stream_attrs: stream_attrs.into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,
@@ -417,7 +417,7 @@ async fn partial_failure_recovers_the_surviving_shards_token() {
 fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: r.stream_id,
-        stream_attrs: r.stream_attrs.clone(),
+        stream_attrs: r.stream_attrs.to_vec(),
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
         severity_num: r.severity_num,

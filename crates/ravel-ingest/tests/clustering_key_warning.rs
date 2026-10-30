@@ -79,7 +79,7 @@ fn record(ts_ns: i64) -> NormalizedLogRecord {
     )];
     NormalizedLogRecord {
         stream_id: log_stream_id(&res, "scope", "", &[]),
-        stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "", &[]),
+        stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "", &[]).into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,

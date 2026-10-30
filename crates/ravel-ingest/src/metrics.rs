@@ -85,7 +85,7 @@ pub enum FlushTrigger {
     /// `max_flush_delay` constant.
     AgeAdaptive,
     /// Buffer below a non-zero `idle_flush_byte_floor` aged past the
-    /// sub-floor hold, `max_flush_lifetime` less one `flush_tick`, the hold
+    /// sub-floor hold, `max_flush_lifetime` less one `effective_flush_tick()`, the hold
     /// tier of ADR-1737. Raised by all three shard actors.
     AgeFloor,
     /// A strict-arrival write opened the flush inside its own write handler,
@@ -117,7 +117,7 @@ pub struct IngestMetrics {
     flushes_by_age_adaptive: AtomicU64,
     /// Flushes opened because a tenant buffer below a non-zero
     /// `idle_flush_byte_floor` aged past the sub-floor hold,
-    /// `max_flush_lifetime` less one `flush_tick` (ADR-1737 decision 6). Zero
+    /// `max_flush_lifetime` less one `effective_flush_tick()` (ADR-1737 decision 6). Zero
     /// while the floor is 0. Attempt-time, same as `flushes_by_size`.
     flushes_by_age_floor: AtomicU64,
     /// Flushes opened by a strict-arrival write ([`FlushTrigger::Arrival`],

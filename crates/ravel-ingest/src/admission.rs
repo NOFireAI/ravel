@@ -784,7 +784,7 @@ impl AdmissionController {
             // `admit_series`.
             let cap = state.fleet_max_active_streams;
             let usage = state.usage.entry(Signal::Logs).or_default();
-            admit_batch(&mut state.streams, candidate_streams, cap, usage)
+            admit_batch_per_id(&mut state.streams, candidate_streams, cap, usage)
         })
     }
 
@@ -1063,6 +1063,42 @@ fn admit_batch<T: Eq + Hash + Copy>(
     let mut out = IdentityAdmission::default();
     for id in candidates {
         if set.admit(id, cap) {
+            usage.series_admitted_total += 1;
+            out.admitted.push(id);
+        } else {
+            usage.series_rejected_cap_total += 1;
+            out.rejected.push(id);
+        }
+    }
+    out
+}
+
+/// [`admit_batch`] deciding each distinct id once (ADR-0051 section 1,
+/// ADR-3492 decision 5): a log request carries one candidate per record, its
+/// records grouped in runs by stream. Within one batch `active_count` only
+/// grows and an admitted id is in `current`, so a later occurrence of an id
+/// gets its first occurrence's outcome; replaying that outcome leaves every
+/// candidate's result, the counters and the set exactly as [`admit_batch`]
+/// leaves them. `series_admitted_total` still counts candidates.
+fn admit_batch_per_id<T: Eq + Hash + Copy>(
+    set: &mut EpochIdSet<T>,
+    candidates: impl IntoIterator<Item = T>,
+    cap: CountLimit,
+    usage: &mut SignalUsage,
+) -> IdentityAdmission<T> {
+    let mut out = IdentityAdmission::default();
+    let mut decided: HashMap<T, bool> = HashMap::new();
+    let mut run: Option<(T, bool)> = None;
+    for id in candidates {
+        let admitted = match run {
+            Some((last, admitted)) if last == id => admitted,
+            _ => {
+                let admitted = *decided.entry(id).or_insert_with(|| set.admit(id, cap));
+                run = Some((id, admitted));
+                admitted
+            }
+        };
+        if admitted {
             usage.series_admitted_total += 1;
             out.admitted.push(id);
         } else {
@@ -1608,5 +1644,137 @@ mod tests {
             row.bytes_admitted_total, 0,
             "nothing is admitted when the charge is rejected"
         );
+    }
+
+    /// A set at `now_ns` 0 holding `current` and `previous`, with the active
+    /// count a rotation and later admissions leave: their union's size.
+    fn populated_set(current: &[u8], previous: &[u8]) -> EpochIdSet<LogStreamId> {
+        let mut set = EpochIdSet::new(0);
+        set.current = current.iter().copied().map(stream).collect();
+        set.previous = previous.iter().copied().map(stream).collect();
+        set.active_count = set.current.union(&set.previous).count() as u64;
+        set
+    }
+
+    type AdmissionState = (
+        IdentityAdmission<LogStreamId>,
+        u64,
+        u64,
+        Vec<LogStreamId>,
+        Vec<LogStreamId>,
+        u64,
+        u64,
+    );
+
+    /// Everything one admission leaves behind: per-candidate outcomes, both
+    /// counters, both generations sorted, the active count and the created
+    /// total.
+    fn admission_state(
+        admit: fn(
+            &mut EpochIdSet<LogStreamId>,
+            Vec<LogStreamId>,
+            CountLimit,
+            &mut SignalUsage,
+        ) -> IdentityAdmission<LogStreamId>,
+        mut set: EpochIdSet<LogStreamId>,
+        candidates: Vec<LogStreamId>,
+        cap: CountLimit,
+    ) -> AdmissionState {
+        let mut usage = SignalUsage::default();
+        let out = admit(&mut set, candidates, cap, &mut usage);
+        let sorted = |ids: &HashSet<LogStreamId>| {
+            let mut ids: Vec<_> = ids.iter().copied().collect();
+            ids.sort();
+            ids
+        };
+        (
+            out,
+            usage.series_admitted_total,
+            usage.series_rejected_cap_total,
+            sorted(&set.current),
+            sorted(&set.previous),
+            set.active_count,
+            set.created_total,
+        )
+    }
+
+    fn per_record(
+        set: &mut EpochIdSet<LogStreamId>,
+        candidates: Vec<LogStreamId>,
+        cap: CountLimit,
+        usage: &mut SignalUsage,
+    ) -> IdentityAdmission<LogStreamId> {
+        admit_batch(set, candidates, cap, usage)
+    }
+
+    fn per_stream(
+        set: &mut EpochIdSet<LogStreamId>,
+        candidates: Vec<LogStreamId>,
+        cap: CountLimit,
+        usage: &mut SignalUsage,
+    ) -> IdentityAdmission<LogStreamId> {
+        admit_batch_per_id(set, candidates, cap, usage)
+    }
+
+    /// ADR-3492 decision 5, a mixed request one slot below the cap: the first
+    /// new stream takes the slot and keeps it for its later records, the
+    /// second new stream is refused for every record, an active stream is
+    /// admitted throughout, and both counters count records.
+    #[test]
+    fn per_stream_admission_at_the_cap_keeps_each_records_outcome() {
+        let set = populated_set(&[1], &[2]);
+        let candidates: Vec<LogStreamId> =
+            [7, 7, 8, 2, 8, 1, 7, 2].into_iter().map(stream).collect();
+        let cap = CountLimit::Bounded(3);
+        let grouped = admission_state(per_stream, set, candidates.clone(), cap);
+        let (out, admitted_total, rejected_total, current, previous, active, created) =
+            grouped.clone();
+        assert_eq!(
+            out.admitted,
+            [7, 7, 2, 1, 7, 2]
+                .into_iter()
+                .map(stream)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(out.rejected, vec![stream(8), stream(8)]);
+        assert_eq!((admitted_total, rejected_total), (6, 2));
+        assert_eq!(current, vec![stream(1), stream(2), stream(7)]);
+        assert_eq!(previous, vec![stream(2)]);
+        assert_eq!((active, created), (3, 1));
+        assert_eq!(
+            grouped,
+            admission_state(per_record, populated_set(&[1], &[2]), candidates, cap)
+        );
+    }
+
+    proptest::proptest! {
+        /// ADR-3492 decision 5: deciding once per distinct stream gives every
+        /// record the outcome per-record admission gives it, with the same
+        /// counters and the same set afterwards, for requests of interleaved
+        /// stream runs against caps below, at and above the active count.
+        #[test]
+        fn per_stream_admission_matches_per_record_admission(
+            current in proptest::collection::vec(0u8..10, 0..6),
+            previous in proptest::collection::vec(0u8..10, 0..6),
+            runs in proptest::collection::vec((0u8..10, 1usize..4), 0..16),
+            cap_offset in -2i64..=3,
+            unlimited in proptest::bool::weighted(0.1),
+        ) {
+            let set = || populated_set(&current, &previous);
+            let active = set().active_count as i64;
+            let cap = if unlimited {
+                CountLimit::Unlimited
+            } else {
+                CountLimit::Bounded((active + cap_offset).max(0) as u64)
+            };
+            let candidates: Vec<LogStreamId> = runs
+                .iter()
+                .flat_map(|&(id, len)| std::iter::repeat_n(stream(id), len))
+                .collect();
+            proptest::prop_assert_eq!(
+                admission_state(per_stream, set(), candidates.clone(), cap),
+                admission_state(per_record, set(), candidates, cap)
+            );
+        }
     }
 }

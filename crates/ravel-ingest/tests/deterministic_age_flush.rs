@@ -320,7 +320,7 @@ fn log_record(seq: u64) -> NormalizedLogRecord {
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
     NormalizedLogRecord {
         stream_id: log_stream_id(&resource, "scope", "", &scope_attrs),
-        stream_attrs: stream_attrs_bytes(&resource, "scope", "", &scope_attrs),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "", &scope_attrs).into(),
         ts_ns: unit_ts(seq),
         observed_ts_ns: unit_ts(seq),
         severity_num: 9,

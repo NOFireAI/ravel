@@ -320,7 +320,7 @@ fn normalize_record(
     Ok((
         NormalizedLogRecord {
             stream_id,
-            stream_attrs: stream_attrs.to_vec(),
+            stream_attrs: stream_attrs.into(),
             ts_ns,
             observed_ts_ns,
             severity_num: u8::try_from(record.severity_number).unwrap_or(0),
@@ -737,7 +737,7 @@ mod tests {
             .map(|r| {
                 (
                     r.stream_id,
-                    r.stream_attrs.clone(),
+                    r.stream_attrs.to_vec(),
                     r.ts_ns,
                     r.observed_ts_ns,
                     r.severity_num,

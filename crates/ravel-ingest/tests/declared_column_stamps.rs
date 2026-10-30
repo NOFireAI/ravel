@@ -97,7 +97,7 @@ fn record_on(
     let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs);
     NormalizedLogRecord {
         stream_id,
-        stream_attrs,
+        stream_attrs: stream_attrs.into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,
@@ -139,7 +139,7 @@ fn record_on_scoped(
     let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs);
     NormalizedLogRecord {
         stream_id,
-        stream_attrs,
+        stream_attrs: stream_attrs.into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,

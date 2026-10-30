@@ -1291,7 +1291,7 @@ fn stream_record(
     let scope = to_attrs(scope_attrs);
     NormalizedLogRecord {
         stream_id: log_stream_id(&res, "scope-lib", "1.0", &scope),
-        stream_attrs: stream_attrs_bytes(&res, "scope-lib", "1.0", &scope),
+        stream_attrs: stream_attrs_bytes(&res, "scope-lib", "1.0", &scope).into(),
         ts_ns,
         observed_ts_ns: ts_ns,
         severity_num: 9,

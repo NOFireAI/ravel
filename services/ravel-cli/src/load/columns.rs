@@ -226,7 +226,7 @@ pub(super) fn build_record(
 
     Ok(NormalizedLogRecord {
         stream_id,
-        stream_attrs,
+        stream_attrs: stream_attrs.into(),
         ts_ns: raw_ts,
         observed_ts_ns: raw_ts,
         severity_num,

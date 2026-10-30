@@ -45,6 +45,11 @@ pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = ravel_rspan::footer::VERSION;
 /// Nanoseconds per hour, the unit `ingest_hour_bucket` counts in.
 pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+/// The shortest flush tick a short `max_flush_delay` derives (ADR-3492
+/// decision 6): [`IngestConfig::effective_flush_tick`] never goes below it on
+/// account of the delay.
+pub const FLUSH_TICK_FLOOR: Duration = Duration::from_millis(25);
+
 /// `d` in nanoseconds, saturating at `i64::MAX`. `as i64` would wrap a
 /// duration past about 292 years to a negative count, which every threshold
 /// comparison then reads as already elapsed, and every deadline built from it
@@ -475,27 +480,31 @@ pub(crate) fn size_trigger_fires(
 /// strict-mode waiter and under `min_flush_bytes` of object, shared by the
 /// metrics, log, and span shard actors (ADR-1737 decision 2). Below a non-zero
 /// `idle_flush_byte_floor` the buffer waits for the sub-floor hold, one
-/// `flush_tick` short of `max_flush_lifetime`; otherwise it waits for
+/// [`IngestConfig::effective_flush_tick`] short of `max_flush_lifetime`;
+/// otherwise it waits for
 /// `max_flush_delay_idle`. `flush_est_bytes` is the same object-bytes estimate
 /// the caller compared against `min_flush_bytes`, so a buffer moves up a tier
 /// as rows arrive and a trickle that reaches the floor flushes on the idle
 /// clock measured from its oldest row.
 ///
-/// The tick is subtracted because the age check runs on a `flush_tick`, not at
-/// the instant the threshold is crossed, so a buffer whose threshold is `T`
-/// opens its flush at an age of up to `T + flush_tick`. Holding the tick back
+/// The tick is subtracted because the age check runs on that tick, not at the
+/// instant the threshold is crossed, so a buffer whose threshold is `T` opens
+/// its flush at an age of up to `T` plus one tick. The tick follows
+/// `max_flush_delay` (ADR-3492 decision 6), so a shorter delay lengthens the
+/// hold: at the 25 ms floor it is 175 ms longer than at the shipped 2 s
+/// delay's 200 ms tick. Holding the tick back
 /// keeps the worst buffer age at flush open at exactly `max_flush_lifetime`,
 /// which is the figure ADR-0052's
 /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS = 2` is derived from
-/// (ADR-1737 decision 3 as amended). It saturates at zero, so a `flush_tick`
-/// at or above `max_flush_lifetime` gives a hold of zero rather than wrapping.
+/// (ADR-1737 decision 3 as amended). It saturates at zero, so a tick at or
+/// above `max_flush_lifetime` gives a hold of zero rather than wrapping.
 pub(crate) fn idle_age_threshold(
     flush_est_bytes: usize,
     config: &IngestConfig,
 ) -> (i64, FlushTrigger) {
     if config.idle_flush_byte_floor > 0 && flush_est_bytes < config.idle_flush_byte_floor {
         let lifetime_ns = duration_nanos_saturating(config.max_flush_lifetime);
-        let tick_ns = duration_nanos_saturating(config.flush_tick);
+        let tick_ns = duration_nanos_saturating(config.effective_flush_tick());
         (
             lifetime_ns.saturating_sub(tick_ns).max(0),
             FlushTrigger::AgeFloor,
@@ -652,8 +661,11 @@ pub struct IngestConfig {
     pub target_bytes: usize,
     /// Flush a tenant's buffer once its oldest point is at least this old.
     pub max_flush_delay: Duration,
-    /// Interval on which each shard actor checks buffered ages against
-    /// `max_flush_delay`.
+    /// The longest interval on which each shard actor checks buffered ages
+    /// against `max_flush_delay`. The actors tick at
+    /// [`IngestConfig::effective_flush_tick`], which is this value or a
+    /// quarter of `max_flush_delay` (no less than [`FLUSH_TICK_FLOOR`]),
+    /// whichever is shorter (ADR-3492 decision 6).
     pub flush_tick: Duration,
     /// Age threshold applied instead of `max_flush_delay` when a buffer has
     /// no strict-mode waiter and holds fewer than `min_flush_bytes`
@@ -673,7 +685,8 @@ pub struct IngestConfig {
     /// Opt-in third age tier (ADR-1737). When non-zero, a buffer with no
     /// strict-mode waiter whose flush would write fewer than this many object
     /// bytes waits for the sub-floor hold, `max_flush_lifetime` less one
-    /// `flush_tick`, instead of `max_flush_delay_idle` before its age trigger
+    /// [`IngestConfig::effective_flush_tick`], instead of
+    /// `max_flush_delay_idle` before its age trigger
     /// fires, and that flush is counted as [`FlushTrigger::AgeFloor`]. Read by
     /// the metrics, log, and span actors against the same object-bytes
     /// estimate as `min_flush_bytes`. The tick the hold gives up is the one
@@ -993,7 +1006,7 @@ impl IngestConfig {
 
     /// The largest age any buffer reaches before its flush trigger fires when
     /// no deferral intervenes, leaving out the sub-floor hold, plus one
-    /// `flush_tick`: the largest of `max_flush_delay` (the fast clock),
+    /// [`Self::effective_flush_tick`]: the largest of `max_flush_delay` (the fast clock),
     /// `max_flush_delay_idle` (the idle clock of a buffered-mode buffer with no
     /// strict waiter), and, with `adaptive_flush_delay` on, the metrics actor's
     /// adaptive corridor ceiling at its widest (`strict_visibility_budget_ns`
@@ -1014,7 +1027,18 @@ impl IngestConfig {
                 .saturating_sub(duration_nanos_saturating(self.put_retry_base_delay));
             threshold_ns = threshold_ns.max(widest_ns);
         }
-        threshold_ns.saturating_add(duration_nanos_saturating(self.flush_tick))
+        threshold_ns.saturating_add(duration_nanos_saturating(self.effective_flush_tick()))
+    }
+
+    /// The interval each shard actor checks buffered ages on (ADR-3492
+    /// decision 6): `min(flush_tick, max_flush_delay / 4)`, where the quarter
+    /// delay is raised to [`FLUSH_TICK_FLOOR`] when it falls below it. At the
+    /// shipped 200 ms `flush_tick` that is `min(200 ms, max_flush_delay / 4)`
+    /// with a 25 ms floor: 200 ms at the shipped 2 s delay, 25 ms at 100 ms.
+    /// A `flush_tick` configured below the floor is used as is.
+    pub fn effective_flush_tick(&self) -> Duration {
+        self.flush_tick
+            .min((self.max_flush_delay / 4).max(FLUSH_TICK_FLOOR))
     }
 
     /// How long a refused flush trigger may stay deferred before its shard
@@ -1259,6 +1283,7 @@ mod tests {
         assert_eq!(cfg.target_bytes, 8 * 1024 * 1024);
         assert_eq!(cfg.max_flush_delay, Duration::from_secs(2));
         assert_eq!(cfg.flush_tick, Duration::from_millis(200));
+        assert_eq!(cfg.effective_flush_tick(), Duration::from_millis(200));
         assert_eq!(cfg.max_flush_delay_idle, Duration::from_secs(40));
         assert_eq!(cfg.min_flush_bytes, 256 * 1024);
         assert_eq!(cfg.idle_flush_byte_floor, 0);
@@ -1419,12 +1444,14 @@ mod tests {
             ..shipped
         };
         assert_eq!(lifetime.flush_deferral_cap_ns(), 0);
+        // A tick past the delay's quarter is cut to it (ADR-3492 decision 6):
+        // 500 ms at the shipped 2 s delay.
         let tick = IngestConfig {
             flush_tick: millennium,
             ..shipped
         };
-        assert_eq!(tick.flush_trigger_age_bound_ns(), i64::MAX);
-        assert_eq!(tick.flush_deferral_cap_ns(), 0);
+        assert_eq!(tick.flush_trigger_age_bound_ns(), 40_500_000_000);
+        assert_eq!(tick.flush_deferral_cap_ns(), 3_559_500_000_000);
         let wide_retry = IngestConfig {
             adaptive_flush_delay: true,
             put_retry_base_delay: millennium,
@@ -1440,8 +1467,10 @@ mod tests {
     /// nanosecond past the lifetime.
     ///
     /// Guards: `duration_nanos_saturating(config.max_flush_lifetime)` and
-    /// `duration_nanos_saturating(config.flush_tick)` in
-    /// `idle_age_threshold`'s floor branch, one assertion each.
+    /// `duration_nanos_saturating(config.effective_flush_tick())` in
+    /// `idle_age_threshold`'s floor branch, one assertion each. The tick
+    /// follows `max_flush_delay` (ADR-3492 decision 6), so each case sets the
+    /// delay that leaves its `flush_tick` in force.
     #[test]
     fn a_sub_floor_hold_saturates_a_lifetime_or_tick_past_i64_nanos() {
         let past = Duration::from_nanos(u64::MAX);
@@ -1452,6 +1481,7 @@ mod tests {
         let lifetime = IngestConfig {
             max_flush_lifetime: past,
             flush_tick: Duration::from_secs(1),
+            max_flush_delay: Duration::from_secs(4),
             ..floored
         };
         assert_eq!(
@@ -1459,10 +1489,67 @@ mod tests {
             (i64::MAX - 1_000_000_000, FlushTrigger::AgeFloor)
         );
         let tick = IngestConfig {
-            flush_tick: past,
+            flush_tick: Duration::MAX,
+            max_flush_delay: Duration::MAX,
             ..floored
         };
         assert_eq!(idle_age_threshold(0, &tick), (0, FlushTrigger::AgeFloor));
+    }
+
+    /// ADR-3492 decision 6: the tick is `min(200 ms, max_flush_delay / 4)` at
+    /// the shipped `flush_tick`, never below 25 ms on account of the delay, so
+    /// the sub-floor hold (`max_flush_lifetime` less one tick) lengthens as the
+    /// delay shortens and is unchanged at the shipped 2 s delay.
+    #[test]
+    fn the_flush_tick_follows_the_flush_delay() {
+        let floored = IngestConfig {
+            idle_flush_byte_floor: 64 * 1024,
+            ..IngestConfig::default()
+        };
+        let lifetime_ns = floored.max_flush_lifetime.as_nanos() as i64;
+        for (delay_ms, tick_us) in [
+            (2_000, 200_000),
+            (800, 200_000),
+            (400, 100_000),
+            (250, 62_500),
+            (100, 25_000),
+            (40, 25_000),
+            (1, 25_000),
+        ] {
+            let config = IngestConfig {
+                max_flush_delay: Duration::from_millis(delay_ms),
+                ..floored
+            };
+            let tick = config.effective_flush_tick();
+            let expected = Duration::from_micros(tick_us);
+            assert_eq!(tick, expected, "{delay_ms} ms delay");
+            assert_eq!(
+                idle_age_threshold(0, &config),
+                (
+                    lifetime_ns - expected.as_nanos() as i64,
+                    FlushTrigger::AgeFloor
+                ),
+                "{delay_ms} ms delay"
+            );
+        }
+        let shipped_hold = idle_age_threshold(0, &floored).0;
+        assert_eq!(shipped_hold, 3_599_800_000_000);
+        let short = IngestConfig {
+            max_flush_delay: Duration::from_millis(100),
+            ..floored
+        };
+        assert_eq!(idle_age_threshold(0, &short).0 - shipped_hold, 175_000_000);
+        // A configured tick below the floor is used as is.
+        let fine = IngestConfig {
+            flush_tick: Duration::from_millis(10),
+            max_flush_delay: Duration::from_millis(100),
+            ..floored
+        };
+        assert_eq!(fine.effective_flush_tick(), Duration::from_millis(10));
+        assert_eq!(
+            short.flush_trigger_age_bound_ns(),
+            40_000_000_000 + 25_000_000
+        );
     }
 
     #[test]

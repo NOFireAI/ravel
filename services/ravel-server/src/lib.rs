@@ -2165,10 +2165,11 @@ impl std::fmt::Display for FlushCadenceError {
                  deferral cap at 0: FLUSH_BOUND_SLACK_HOURS ({} h) less max_flush_lifetime \
                  ({:?}) less the flush trigger age bound ({} ns: the largest of \
                  --max-flush-delay, --max-flush-delay-idle and, with --adaptive-flush-delay, \
-                 the adaptive ceiling, plus one flush_tick of {:?}) is not positive. A shard \
-                 whose flush queue filled would refuse every write from the first deferred \
-                 trigger (ADR-1642 deferral cap amendment). Lower --max-flush-delay-idle so \
-                 that it plus max_flush_lifetime plus one flush_tick stays below \
+                 the adaptive ceiling, plus one flush tick of {:?}, which is min(200 ms, \
+                 --max-flush-delay / 4) and at least 25 ms) is not positive. A shard whose \
+                 flush queue filled would refuse every write from the first deferred trigger \
+                 (ADR-1642 deferral cap amendment). Lower --max-flush-delay-idle so that it \
+                 plus max_flush_lifetime plus one flush tick stays below \
                  FLUSH_BOUND_SLACK_HOURS.",
                 max_flush_delay_idle,
                 max_flush_delay,
@@ -2285,10 +2286,53 @@ pub(crate) fn validate_flush_deferral_cap(
             adaptive_flush_delay,
             max_flush_lifetime: ingest.max_flush_lifetime,
             flush_trigger_age_bound_ns: ingest.flush_trigger_age_bound_ns(),
-            flush_tick: ingest.flush_tick,
+            flush_tick: ingest.effective_flush_tick(),
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod flush_tick_bound_tests {
+    use super::*;
+
+    /// ADR-3492 decision 6: the refusal reports the tick the actors run at,
+    /// which follows `--max-flush-delay`, and states the rule that sets it.
+    #[test]
+    fn the_deferral_cap_refusal_states_the_flush_tick_bound() {
+        for (delay, tick) in [
+            (Duration::from_secs(2), Duration::from_millis(200)),
+            (Duration::from_millis(400), Duration::from_millis(100)),
+            (Duration::from_millis(100), Duration::from_millis(25)),
+        ] {
+            let Err(err) = validate_flush_deferral_cap(delay, Duration::from_secs(3600), false)
+            else {
+                panic!("a 3600 s idle delay leaves no deferral cap");
+            };
+            let FlushCadenceError::ZeroFlushDeferralCap {
+                flush_tick,
+                flush_trigger_age_bound_ns,
+                ..
+            } = err
+            else {
+                panic!("expected ZeroFlushDeferralCap, got {err}");
+            };
+            assert_eq!(flush_tick, tick, "{delay:?}");
+            assert_eq!(
+                flush_trigger_age_bound_ns,
+                3_600_000_000_000 + tick.as_nanos() as i64,
+                "{delay:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "plus one flush tick of {tick:?}, which is min(200 ms, \
+                     --max-flush-delay / 4) and at least 25 ms)"
+                )),
+                "{msg}"
+            );
+        }
+    }
 }
 
 /// The refusal text for one [`IngestConfigError`], with the advice naming the
@@ -5628,7 +5672,7 @@ mod ingest_readiness_tests {
             }
             return NormalizedLogRecord {
                 stream_id,
-                stream_attrs: stream_attrs_bytes(&res, "scope", "", &scope_attrs),
+                stream_attrs: stream_attrs_bytes(&res, "scope", "", &scope_attrs).into(),
                 ts_ns,
                 observed_ts_ns: ts_ns,
                 severity_num: 9,

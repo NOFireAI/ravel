@@ -1305,7 +1305,8 @@ impl ShardActor {
         // starve the age check of a quiet tenant sharing the actor, matching
         // the old `tokio::time::interval` with `MissedTickBehavior::Delay`.
         let clock = Arc::clone(&self.clock);
-        let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
+        let flush_tick_ns =
+            i64::try_from(self.config.effective_flush_tick().as_nanos()).unwrap_or(i64::MAX);
         let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
         loop {
             let until_ns = next_tick_ns.saturating_sub(clock.now_ns()).max(0);
@@ -1783,7 +1784,7 @@ impl ShardActor {
     /// already justifies a PUT on the fast age clock; anything else is idle
     /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
     /// section 7), or, below a non-zero `idle_flush_byte_floor`, for the
-    /// sub-floor hold, `max_flush_lifetime` less one `flush_tick` (ADR-1737,
+    /// sub-floor hold, `max_flush_lifetime` less one `effective_flush_tick()` (ADR-1737,
     /// [`idle_age_threshold`]). "Worth a PUT"
     /// is a claim about the object, so this reads the
     /// object-bytes estimate, not the buffered-memory charge (issue #1305).
@@ -3629,7 +3630,7 @@ mod tests {
         // lifetime it reserves.
         let shipped = IngestConfig::default();
         let shipped_lifetime_ns = shipped.max_flush_lifetime.as_nanos() as i64;
-        let tick_ns = shipped.flush_tick.as_nanos() as i64;
+        let tick_ns = shipped.effective_flush_tick().as_nanos() as i64;
         let bound_ns = shipped.flush_trigger_age_bound_ns();
         assert_eq!(
             bound_ns,
@@ -3801,7 +3802,7 @@ mod tests {
     }
 
     /// The cap boundary on a live actor: a strict write that arrives one
-    /// `flush_tick` before the oldest deferral reaches the cap is accepted and
+    /// `effective_flush_tick()` before the oldest deferral reaches the cap is accepted and
     /// buffered, and one that arrives at the cap is refused. The first write
     /// reaches the shard actor, so it fails if `refuse_at_deferral_cap` refuses
     /// whenever any buffer is deferred, whatever the cap.
@@ -3813,7 +3814,7 @@ mod tests {
         // The parked flush's 4000 s lifetime outlasts the jump to the cap.
         let config = one_permit_one_queue(Duration::from_secs(4000));
         let cap_ns = config.flush_deferral_cap_ns();
-        let tick_ns = config.flush_tick.as_nanos() as i64;
+        let tick_ns = config.effective_flush_tick().as_nanos() as i64;
         let router = Arc::new(
             IngestRouter::new(
                 config,

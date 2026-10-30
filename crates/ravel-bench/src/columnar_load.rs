@@ -272,7 +272,7 @@ pub fn decode_corpus(parquet_bytes: &[u8]) -> Result<Vec<NormalizedLogRecord>, C
         .collect();
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
     let stream_id = log_stream_id(&res, "bench", "", &scope_attrs);
-    let stream_attrs = stream_attrs_bytes(&res, "bench", "", &scope_attrs);
+    let stream_attrs: Arc<[u8]> = stream_attrs_bytes(&res, "bench", "", &scope_attrs).into();
 
     let mut records = Vec::new();
     for batch in reader {
@@ -354,7 +354,7 @@ pub fn decode_corpus(parquet_bytes: &[u8]) -> Result<Vec<NormalizedLogRecord>, C
 fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: r.stream_id,
-        stream_attrs: r.stream_attrs.clone(),
+        stream_attrs: r.stream_attrs.to_vec(),
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
         severity_num: r.severity_num,
