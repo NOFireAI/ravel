@@ -13,6 +13,7 @@ use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dict_values::{DictValues, Validity};
 use crate::encoding::{
@@ -189,12 +190,19 @@ struct StagedPage {
     page: SealedPage,
 }
 
-/// A block's pages in staging order, each sealed as it is staged.
+/// A block's page descriptors, their stored bytes concatenated in descriptor
+/// order, and its string columns in dictionary shape.
+type StagedPages = (Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>);
+
+/// A block's pages in staging order, each sealed as it is staged, or, when
+/// `deferred` is set, each column's input copied out for a page encode job
+/// that runs the same staging call later ([`OwnedColumn::encode`]).
 struct Stager {
     pages: Vec<StagedPage>,
     str_values: Vec<BlockStrValues>,
     zstd_level: i32,
     choice: PageChoice,
+    deferred: Option<Vec<OwnedColumn>>,
 }
 
 impl Stager {
@@ -204,6 +212,28 @@ impl Stager {
             str_values: Vec::new(),
             zstd_level,
             choice,
+            deferred: None,
+        }
+    }
+
+    fn deferring(zstd_level: i32, choice: PageChoice) -> Self {
+        Stager {
+            deferred: Some(Vec::new()),
+            ..Stager::new(zstd_level, choice)
+        }
+    }
+
+    /// In deferred mode, records the column for a later encode. A
+    /// wholly-absent column is dropped here, as staging would drop it.
+    fn defer(&mut self, column_id: u32, present: &[bool], input: impl FnOnce() -> OwnedInput) {
+        if let Some(deferred) = self.deferred.as_mut()
+            && present.iter().any(|&p| p)
+        {
+            deferred.push(OwnedColumn {
+                column_id,
+                present: present.to_vec(),
+                input: input(),
+            });
         }
     }
 
@@ -234,11 +264,17 @@ impl Stager {
 
     /// A value page with a single encoding (bitmap, f64, fixed-width).
     fn single(&mut self, column_id: u32, present: &[bool], enc: Enc, bytes: Vec<u8>) {
+        if self.deferred.is_some() {
+            return self.defer(column_id, present, || OwnedInput::Encoded(enc, bytes));
+        }
         self.column(column_id, present, |level| seal_page(enc, bytes, level));
     }
 
     /// An i64 value page, picked as [`PageChoice`] says.
     fn i64(&mut self, column_id: u32, present: &[bool], values: &[i64]) {
+        if self.deferred.is_some() {
+            return self.defer(column_id, present, || OwnedInput::I64(values.to_vec()));
+        }
         match self.choice {
             PageChoice::Exhaustive => self.column(column_id, present, |level| {
                 stored_winner(i64_candidates(values), level)
@@ -268,6 +304,11 @@ impl Stager {
 
     /// A string value page, picked as [`PageChoice`] says.
     fn strings(&mut self, column_id: u32, present: &[bool], values: &[&[u8]]) {
+        if self.deferred.is_some() {
+            return self.defer(column_id, present, || {
+                OwnedInput::Strings(OwnedStrings::new(values.iter().copied()))
+            });
+        }
         match self.choice {
             PageChoice::Exhaustive => {
                 self.string_shape(column_id, present, string_shape(values));
@@ -281,6 +322,9 @@ impl Stager {
 
     /// [`Stager::strings`] for a column already in dictionary shape.
     fn dict_strings(&mut self, column_id: u32, present: &[bool], dict: &[&[u8]], ids: &[u32]) {
+        if self.deferred.is_some() {
+            return self.defer(column_id, present, || compact_dict(dict, ids));
+        }
         match self.choice {
             PageChoice::Exhaustive => {
                 self.string_shape(column_id, present, string_dict_shape(dict, ids));
@@ -351,7 +395,7 @@ impl Stager {
     }
 
     /// Lays the sealed pages out in staging order.
-    fn finish(self) -> (Vec<PageDesc>, Vec<u8>, Vec<BlockStrValues>) {
+    fn finish(self) -> StagedPages {
         let mut payload = Vec::new();
         let descs = self
             .pages
@@ -367,6 +411,406 @@ impl Stager {
 fn stored_winner(candidates: Vec<(Enc, Vec<u8>)>, zstd_level: i32) -> SealedPage {
     smallest_stored(candidates, zstd_level)
         .unwrap_or_else(|| seal_page(Enc::Plain, Vec::new(), zstd_level))
+}
+
+/// Byte strings in one buffer, `ends[i]` the end offset of value `i`.
+#[derive(Debug)]
+struct OwnedStrings {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl OwnedStrings {
+    fn new<'a>(values: impl Iterator<Item = &'a [u8]>) -> Self {
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        for v in values {
+            bytes.extend_from_slice(v);
+            ends.push(bytes.len());
+        }
+        OwnedStrings { bytes, ends }
+    }
+
+    fn slices(&self) -> Vec<&[u8]> {
+        let mut start = 0;
+        self.ends
+            .iter()
+            .map(|&end| {
+                let v = &self.bytes[start..end];
+                start = end;
+                v
+            })
+            .collect()
+    }
+}
+
+/// A deferred column's input: what the [`Stager`] call that stages it reads.
+#[derive(Debug)]
+enum OwnedInput {
+    Encoded(Enc, Vec<u8>),
+    I64(Vec<i64>),
+    Strings(OwnedStrings),
+    DictStrings { dict: OwnedStrings, ids: Vec<u32> },
+}
+
+/// A dictionary-shaped column reduced to the entries its ids reference, so a
+/// job copies one block's distinct values rather than an object-wide
+/// dictionary. Both string paths derive the page and the [`StrShape`] from the
+/// per-row value sequence alone, which this preserves.
+fn compact_dict(dict: &[&[u8]], ids: &[u32]) -> OwnedInput {
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let ids = ids
+        .iter()
+        .map(|&id| {
+            *remap.entry(id).or_insert_with(|| {
+                kept.push(dict[id as usize]);
+                (kept.len() - 1) as u32
+            })
+        })
+        .collect();
+    OwnedInput::DictStrings {
+        dict: OwnedStrings::new(kept.into_iter()),
+        ids,
+    }
+}
+
+/// One column of a block, owning its input, awaiting its page encode.
+#[derive(Debug)]
+struct OwnedColumn {
+    column_id: u32,
+    present: Vec<bool>,
+    input: OwnedInput,
+}
+
+impl OwnedColumn {
+    /// Pages this column stages: its value page, after a presence bitmap page
+    /// when it is partially present.
+    fn page_count(&self) -> usize {
+        if self.present.iter().all(|&p| p) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Seals this column's pages through the same [`Stager`] call a serial
+    /// encode makes for it.
+    fn encode(self, zstd_level: i32, choice: PageChoice) -> ColumnPages {
+        let mut s = Stager::new(zstd_level, choice);
+        let OwnedColumn {
+            column_id: cid,
+            present,
+            input,
+        } = self;
+        match input {
+            OwnedInput::Encoded(enc, bytes) => s.single(cid, &present, enc, bytes),
+            OwnedInput::I64(values) => s.i64(cid, &present, &values),
+            OwnedInput::Strings(values) => s.strings(cid, &present, &values.slices()),
+            OwnedInput::DictStrings { dict, ids } => {
+                s.dict_strings(cid, &present, &dict.slices(), &ids);
+            }
+        }
+        ColumnPages {
+            column_id: cid,
+            pages: s.pages.into_iter().map(|p| p.page).collect(),
+            str_values: s.str_values,
+        }
+    }
+}
+
+/// One column's sealed pages, in staging order, and its entry for the row
+/// group dictionary decision, if it stages one.
+#[derive(Debug)]
+struct ColumnPages {
+    column_id: u32,
+    pages: Vec<SealedPage>,
+    str_values: Vec<BlockStrValues>,
+}
+
+/// Fewest column pages a block must stage before its encode is split into one
+/// job per column. Every block stages at least seven value pages (`ts`,
+/// `observed_ts`, `stream_ref`, `severity_num`, `flags`, `severity_text` and
+/// `body`), so a block with no optional or dynamic column stays one job and
+/// pays no per-job overhead for columns too few to spread (ADR-3492 decision
+/// 7).
+pub const PAGE_JOB_FLOOR: usize = 8;
+
+/// One block's page encode work, owning every input it reads: a block below
+/// [`PAGE_JOB_FLOOR`] is one job holding all its columns, a block at or above
+/// it one job per column. Run it with [`PageEncodeJob::run`] on any thread.
+#[derive(Debug)]
+pub struct PageEncodeJob {
+    block: u64,
+    index: usize,
+    columns: Vec<OwnedColumn>,
+    zstd_level: i32,
+    choice: PageChoice,
+}
+
+impl PageEncodeJob {
+    /// Seals this job's pages, as a serial encode would seal them.
+    pub fn run(self) -> PageEncodeDone {
+        let (zstd_level, choice) = (self.zstd_level, self.choice);
+        PageEncodeDone {
+            block: self.block,
+            index: self.index,
+            columns: self
+                .columns
+                .into_iter()
+                .map(|c| c.encode(zstd_level, choice))
+                .collect(),
+        }
+    }
+
+    /// This job's position among its block's jobs, in staging order.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The column pages this job seals.
+    pub fn page_count(&self) -> usize {
+        self.columns.iter().map(OwnedColumn::page_count).sum()
+    }
+}
+
+/// A finished [`PageEncodeJob`]. It remembers which block and job it came
+/// from, and each column it sealed, so an executor may return results in any
+/// order and a result handed to the wrong block is refused.
+#[derive(Debug)]
+pub struct PageEncodeDone {
+    block: u64,
+    index: usize,
+    columns: Vec<ColumnPages>,
+}
+
+/// Runs a block's page encode jobs, on whatever threads the caller chooses,
+/// and returns one [`PageEncodeDone`] per job in any order. The writer places
+/// the pages in its own staging order, so the object's bytes do not depend on
+/// the executor. A closure `FnMut(Vec<PageEncodeJob>) -> Result<Vec<PageEncodeDone>,
+/// LogSegError>` is an executor.
+pub trait PageEncodeExecutor {
+    fn execute(&mut self, jobs: Vec<PageEncodeJob>) -> Result<Vec<PageEncodeDone>, LogSegError>;
+}
+
+impl<F> PageEncodeExecutor for F
+where
+    F: FnMut(Vec<PageEncodeJob>) -> Result<Vec<PageEncodeDone>, LogSegError>,
+{
+    fn execute(&mut self, jobs: Vec<PageEncodeJob>) -> Result<Vec<PageEncodeDone>, LogSegError> {
+        self(jobs)
+    }
+}
+
+/// Source of [`JobSet::block`]: unique per block within the process, so two
+/// writers sharing one executor cannot pass each other's results either.
+static NEXT_BLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// What a block's jobs encode, recorded as [`page_jobs`] builds them:
+/// `columns[i]` is job `i`'s column ids in staging order.
+#[derive(Debug)]
+struct JobSet {
+    block: u64,
+    columns: Vec<Vec<u32>>,
+}
+
+/// Splits a block's deferred columns into jobs, in staging order.
+fn page_jobs(
+    columns: Vec<OwnedColumn>,
+    zstd_level: i32,
+    choice: PageChoice,
+) -> (Vec<PageEncodeJob>, JobSet) {
+    let block = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
+    let pages: usize = columns.iter().map(OwnedColumn::page_count).sum();
+    let groups: Vec<Vec<OwnedColumn>> = if pages < PAGE_JOB_FLOOR {
+        vec![columns]
+    } else {
+        columns.into_iter().map(|c| vec![c]).collect()
+    };
+    let expected = JobSet {
+        block,
+        columns: groups
+            .iter()
+            .map(|g| g.iter().map(|c| c.column_id).collect())
+            .collect(),
+    };
+    let jobs = groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, columns)| PageEncodeJob {
+            block,
+            index,
+            columns,
+            zstd_level,
+            choice,
+        })
+        .collect();
+    (jobs, expected)
+}
+
+/// Lays the results of `expected`'s jobs out in job order, which is staging
+/// order: the same descriptors, payload and row group dictionary entries
+/// [`Stager::finish`] produces for a serial encode. Refuses unless there is
+/// exactly one result per job, each from this block and carrying the columns
+/// its job was built with.
+fn assemble_pages(
+    expected: &JobSet,
+    done: Vec<PageEncodeDone>,
+) -> Result<StagedPages, LogSegError> {
+    let jobs = expected.columns.len();
+    if done.len() != jobs {
+        return Err(LogSegError::PageEncode(format!(
+            "{} results for {jobs} jobs",
+            done.len()
+        )));
+    }
+    let mut slots: Vec<Option<Vec<ColumnPages>>> = (0..jobs).map(|_| None).collect();
+    for d in done {
+        if d.block != expected.block {
+            return Err(LogSegError::PageEncode(format!(
+                "result of block {} job {} handed to block {}",
+                d.block, d.index, expected.block
+            )));
+        }
+        let (Some(slot), Some(want)) = (slots.get_mut(d.index), expected.columns.get(d.index))
+        else {
+            return Err(LogSegError::PageEncode(format!(
+                "job index {} out of range for {jobs} jobs",
+                d.index
+            )));
+        };
+        if slot.is_some() {
+            return Err(LogSegError::PageEncode(format!(
+                "job {} returned twice",
+                d.index
+            )));
+        }
+        if !d
+            .columns
+            .iter()
+            .map(|c| c.column_id)
+            .eq(want.iter().copied())
+        {
+            return Err(LogSegError::PageEncode(format!(
+                "job {} returned columns {:?}, built with {want:?}",
+                d.index,
+                d.columns.iter().map(|c| c.column_id).collect::<Vec<_>>()
+            )));
+        }
+        *slot = Some(d.columns);
+    }
+    let mut payload = Vec::new();
+    let mut descs = Vec::new();
+    let mut str_values = Vec::new();
+    for (index, columns) in slots.into_iter().enumerate() {
+        let columns = columns
+            .ok_or_else(|| LogSegError::PageEncode(format!("job {index} never returned")))?;
+        for c in columns {
+            for page in &c.pages {
+                descs.push(page.append(&mut payload, c.column_id));
+            }
+            str_values.extend(c.str_values);
+        }
+    }
+    Ok((descs, payload, str_values))
+}
+
+/// How the writer encodes a block's pages: sealed as they are staged, or as
+/// jobs handed to a caller's executor.
+pub(crate) enum BlockEncoder<'e> {
+    Inline,
+    Jobs(&'e mut dyn PageEncodeExecutor),
+}
+
+impl BlockEncoder<'_> {
+    /// [`write_block_with`] through this encoder.
+    pub(crate) fn rows(
+        &mut self,
+        rows: &[ResolvedRow],
+        plans: &[ColumnPlan],
+        zstd_level: i32,
+        choice: PageChoice,
+    ) -> Result<BlockWriteOut, LogSegError> {
+        self.encode(zstd_level, choice, |pages| stage_rows(rows, plans, pages))
+    }
+
+    /// [`write_block_columnar_with`] through this encoder.
+    pub(crate) fn columnar(
+        &mut self,
+        input: &ColumnarBlockInput<'_>,
+        zstd_level: i32,
+        choice: PageChoice,
+    ) -> Result<BlockWriteOut, LogSegError> {
+        self.encode(zstd_level, choice, |pages| stage_columnar(input, pages))
+    }
+
+    fn encode(
+        &mut self,
+        zstd_level: i32,
+        choice: PageChoice,
+        stage: impl FnOnce(&mut Stager) -> Result<BlockMeta, LogSegError>,
+    ) -> Result<BlockWriteOut, LogSegError> {
+        match self {
+            BlockEncoder::Inline => {
+                let mut pages = Stager::new(zstd_level, choice);
+                let meta = stage(&mut pages)?;
+                Ok(meta.with_pages(pages.finish()))
+            }
+            BlockEncoder::Jobs(executor) => {
+                let mut pages = Stager::deferring(zstd_level, choice);
+                let meta = stage(&mut pages)?;
+                let (jobs, expected) = deferred_jobs(pages)?;
+                let done = executor.execute(jobs)?;
+                Ok(meta.with_pages(assemble_pages(&expected, done)?))
+            }
+        }
+    }
+}
+
+/// A deferring [`Stager`]'s columns as jobs. Refuses a stager that sealed a
+/// page or a dictionary entry itself, which no job would carry.
+fn deferred_jobs(pages: Stager) -> Result<(Vec<PageEncodeJob>, JobSet), LogSegError> {
+    let Stager {
+        pages,
+        str_values,
+        zstd_level,
+        choice,
+        deferred,
+    } = pages;
+    if !pages.is_empty() || !str_values.is_empty() {
+        return Err(LogSegError::PageEncode(format!(
+            "{} pages and {} dictionary entries staged outside the jobs",
+            pages.len(),
+            str_values.len()
+        )));
+    }
+    Ok(page_jobs(deferred.unwrap_or_default(), zstd_level, choice))
+}
+
+/// Everything a block's [`BlockWriteOut`] carries besides its pages.
+struct BlockMeta {
+    record_count: u32,
+    stats: Vec<NumStat>,
+    min_ts: i64,
+    max_ts: i64,
+    min_stream_ref: u32,
+    max_stream_ref: u32,
+}
+
+impl BlockMeta {
+    fn with_pages(self, (descs, payload, str_values): StagedPages) -> BlockWriteOut {
+        BlockWriteOut {
+            descs,
+            payload,
+            record_count: self.record_count,
+            stats: self.stats,
+            min_ts: self.min_ts,
+            max_ts: self.max_ts,
+            min_stream_ref: self.min_stream_ref,
+            max_stream_ref: self.max_stream_ref,
+            str_values,
+        }
+    }
 }
 
 /// i64 min/max stat over the contributing values (two's-complement bits).
@@ -507,11 +951,19 @@ pub fn write_block_with(
     zstd_level: i32,
     choice: PageChoice,
 ) -> Result<BlockWriteOut, LogSegError> {
+    BlockEncoder::Inline.rows(rows, plans, zstd_level, choice)
+}
+
+/// Stages `rows`' pages in [`write_block`]'s column order.
+fn stage_rows(
+    rows: &[ResolvedRow],
+    plans: &[ColumnPlan],
+    pages: &mut Stager,
+) -> Result<BlockMeta, LogSegError> {
     if rows.is_empty() {
         return Err(LogSegError::Corrupted("empty block".into()));
     }
     let n = rows.len();
-    let mut pages = Stager::new(zstd_level, choice);
     let mut stats: Vec<NumStat> = Vec::new();
 
     // Fixed always-present integer columns.
@@ -637,23 +1089,13 @@ pub fn write_block_with(
         }
     }
 
-    let (descs, payload, str_values) = pages.finish();
-
-    let min_ts = ts.iter().copied().min().unwrap_or(0);
-    let max_ts = ts.iter().copied().max().unwrap_or(0);
-    let min_stream_ref = rows.iter().map(|r| r.stream_ref).min().unwrap_or(0);
-    let max_stream_ref = rows.iter().map(|r| r.stream_ref).max().unwrap_or(0);
-
-    Ok(BlockWriteOut {
-        descs,
-        payload,
+    Ok(BlockMeta {
         record_count: n as u32,
         stats,
-        min_ts,
-        max_ts,
-        min_stream_ref,
-        max_stream_ref,
-        str_values,
+        min_ts: ts.iter().copied().min().unwrap_or(0),
+        max_ts: ts.iter().copied().max().unwrap_or(0),
+        min_stream_ref: rows.iter().map(|r| r.stream_ref).min().unwrap_or(0),
+        max_stream_ref: rows.iter().map(|r| r.stream_ref).max().unwrap_or(0),
     })
 }
 
@@ -752,11 +1194,18 @@ pub fn write_block_columnar_with(
     zstd_level: i32,
     choice: PageChoice,
 ) -> Result<BlockWriteOut, LogSegError> {
+    BlockEncoder::Inline.columnar(input, zstd_level, choice)
+}
+
+/// Stages `input`'s pages in [`write_block`]'s column order.
+fn stage_columnar(
+    input: &ColumnarBlockInput<'_>,
+    pages: &mut Stager,
+) -> Result<BlockMeta, LogSegError> {
     let n = input.n;
     if n == 0 {
         return Err(LogSegError::Corrupted("empty block".into()));
     }
-    let mut pages = Stager::new(zstd_level, choice);
     let mut stats: Vec<NumStat> = Vec::new();
 
     // Fixed always-present integer columns.
@@ -868,23 +1317,13 @@ pub fn write_block_columnar_with(
         }
     }
 
-    let (descs, payload, str_values) = pages.finish();
-
-    let min_ts = input.ts.iter().copied().min().unwrap_or(0);
-    let max_ts = input.ts.iter().copied().max().unwrap_or(0);
-    let min_stream_ref = input.stream_ref.iter().copied().min().unwrap_or(0);
-    let max_stream_ref = input.stream_ref.iter().copied().max().unwrap_or(0);
-
-    Ok(BlockWriteOut {
-        descs,
-        payload,
+    Ok(BlockMeta {
         record_count: n as u32,
         stats,
-        min_ts,
-        max_ts,
-        min_stream_ref,
-        max_stream_ref,
-        str_values,
+        min_ts: input.ts.iter().copied().min().unwrap_or(0),
+        max_ts: input.ts.iter().copied().max().unwrap_or(0),
+        min_stream_ref: input.stream_ref.iter().copied().min().unwrap_or(0),
+        max_stream_ref: input.stream_ref.iter().copied().max().unwrap_or(0),
     })
 }
 
@@ -4075,5 +4514,172 @@ mod tests {
                 "column {cid}"
             );
         }
+    }
+
+    /// The row group re-lays pages column-major, so an object cannot tell
+    /// staging order from any other order of a block's column jobs. This pins
+    /// the block itself: results handed back last job first assemble into the
+    /// descriptors, payload and string values the inline encode stages.
+    #[test]
+    fn jobs_returned_in_reverse_assemble_in_staging_order() {
+        let (rows, plans) = choice_rows();
+        for choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            let inline = BlockEncoder::Inline
+                .rows(&rows, &plans, 3, choice)
+                .expect("inline");
+            let mut calls = Vec::new();
+            let mut reverse = |jobs: Vec<PageEncodeJob>| -> Result<_, LogSegError> {
+                calls.push(jobs.len());
+                Ok(jobs.into_iter().rev().map(PageEncodeJob::run).collect())
+            };
+            let jobs = BlockEncoder::Jobs(&mut reverse)
+                .rows(&rows, &plans, 3, choice)
+                .expect("jobs");
+            assert_eq!(calls, [10], "one job per staged column");
+            assert_eq!(jobs.descs, inline.descs, "{choice:?}");
+            assert!(jobs.payload == inline.payload, "{choice:?}");
+            assert_eq!(jobs.str_values, inline.str_values, "{choice:?}");
+            assert_eq!(jobs.record_count, inline.record_count);
+        }
+    }
+
+    /// A block's rows staged for jobs, as [`BlockEncoder::Jobs`] stages them.
+    fn staged_jobs(
+        rows: &[ResolvedRow],
+        plans: &[ColumnPlan],
+        choice: PageChoice,
+    ) -> (Vec<PageEncodeJob>, JobSet) {
+        let mut pages = Stager::deferring(3, choice);
+        stage_rows(rows, plans, &mut pages).expect("stage");
+        deferred_jobs(pages).expect("jobs")
+    }
+
+    /// A result of job `index` of `block` sealing one plain page per column.
+    fn done(block: u64, index: usize, columns: &[u32]) -> PageEncodeDone {
+        PageEncodeDone {
+            block,
+            index,
+            columns: columns
+                .iter()
+                .map(|&column_id| ColumnPages {
+                    column_id,
+                    pages: vec![seal_page(Enc::Plain, vec![column_id as u8], 3)],
+                    str_values: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn two_jobs() -> JobSet {
+        JobSet {
+            block: 7,
+            columns: vec![vec![1], vec![2]],
+        }
+    }
+
+    fn assert_refused(result: Result<StagedPages, LogSegError>, reason: &str) {
+        match result {
+            Err(LogSegError::PageEncode(m)) => assert!(m.contains(reason), "{m}"),
+            Err(other) => panic!("expected PageEncode ({reason}), got {other}"),
+            Ok(_) => panic!("assembled, expected PageEncode ({reason})"),
+        }
+    }
+
+    #[test]
+    fn results_of_another_block_with_the_same_jobs_are_refused() {
+        let (rows, plans) = choice_rows();
+        let (jobs_a, _) = staged_jobs(&rows, &plans, PageChoice::Exhaustive);
+        let (jobs_b, set_b) = staged_jobs(&rows, &plans, PageChoice::Exhaustive);
+        assert_eq!(jobs_a.len(), jobs_b.len());
+        let done_a: Vec<_> = jobs_a.into_iter().map(PageEncodeJob::run).collect();
+        assert_refused(assemble_pages(&set_b, done_a), "handed to block");
+
+        let inline = BlockEncoder::Inline
+            .rows(&rows, &plans, 3, PageChoice::Exhaustive)
+            .expect("inline");
+        let mut done_b: Vec<_> = jobs_b.into_iter().map(PageEncodeJob::run).collect();
+        done_b.rotate_left(3);
+        done_b.swap(0, 5);
+        let (descs, payload, str_values) = assemble_pages(&set_b, done_b).expect("assemble");
+        assert_eq!(descs, inline.descs);
+        assert!(payload == inline.payload);
+        assert_eq!(str_values, inline.str_values);
+    }
+
+    #[test]
+    fn result_with_other_columns_than_its_job_is_refused() {
+        assert_refused(
+            assemble_pages(&two_jobs(), vec![done(7, 0, &[2]), done(7, 1, &[1])]),
+            "job 0 returned columns [2], built with [1]",
+        );
+        assert_refused(
+            assemble_pages(&two_jobs(), vec![done(7, 0, &[1]), done(7, 1, &[2, 3])]),
+            "job 1 returned columns [2, 3], built with [2]",
+        );
+    }
+
+    #[test]
+    fn synthetic_results_in_any_order_assemble_in_job_order() {
+        let (descs, payload, _) =
+            assemble_pages(&two_jobs(), vec![done(7, 1, &[2]), done(7, 0, &[1])])
+                .expect("assemble");
+        assert_eq!(descs.len(), 2);
+        assert_eq!(payload.len(), descs.iter().map(|d| d.len as usize).sum());
+        let first = descs.first().expect("desc");
+        let from_job_0 = done(7, 0, &[1]);
+        let page = &from_job_0.columns.first().expect("column").pages;
+        let mut want = Vec::new();
+        let want_desc = page.first().expect("page").append(&mut want, 1);
+        assert_eq!(*first, want_desc);
+        assert!(payload.starts_with(&want));
+    }
+
+    #[test]
+    fn duplicated_job_index_is_refused() {
+        assert_refused(
+            assemble_pages(&two_jobs(), vec![done(7, 0, &[1]), done(7, 0, &[1])]),
+            "job 0 returned twice",
+        );
+    }
+
+    #[test]
+    fn job_index_past_the_end_is_refused() {
+        assert_refused(
+            assemble_pages(&two_jobs(), vec![done(7, 0, &[1]), done(7, 2, &[2])]),
+            "job index 2 out of range for 2 jobs",
+        );
+    }
+
+    #[test]
+    fn extra_result_is_refused() {
+        assert_refused(
+            assemble_pages(
+                &two_jobs(),
+                vec![done(7, 0, &[1]), done(7, 1, &[2]), done(7, 1, &[2])],
+            ),
+            "3 results for 2 jobs",
+        );
+    }
+
+    #[test]
+    fn pages_staged_outside_the_jobs_are_refused() {
+        let mut pages = Stager::deferring(3, PageChoice::Exhaustive);
+        pages.pages.push(StagedPage {
+            column_id: 1,
+            page: seal_page(Enc::Plain, vec![1], 3),
+        });
+        let refused = deferred_jobs(pages).map(|_| ());
+        assert!(
+            matches!(&refused, Err(LogSegError::PageEncode(m)) if m.contains("1 pages and 0 dictionary entries")),
+            "{refused:?}"
+        );
+
+        let mut pages = Stager::deferring(3, PageChoice::Exhaustive);
+        pages.str_values.push(BlockStrValues::default());
+        let refused = deferred_jobs(pages).map(|_| ());
+        assert!(
+            matches!(&refused, Err(LogSegError::PageEncode(m)) if m.contains("0 pages and 1 dictionary entries")),
+            "{refused:?}"
+        );
     }
 }
