@@ -125,11 +125,13 @@ pub struct ScanStats {
     /// [`Predicate::Contains`] column only the entries that arm had to read as
     /// text or a surviving row references, and every present cell of a
     /// plain-page `Str` attribute column the columnar exit decoded on a
-    /// decoded-column cache miss and found all UTF-8 (ADR-3326 decision 5).
-    /// A column served from the decoded-column cache is not decoded and
-    /// counts nothing. This is the reader's part of the count only: any other
-    /// plain page (the row path, the columnar exit with no cache attached, or
-    /// a page that is not all UTF-8) has the cells of its surviving rows
+    /// decoded-column cache miss, that the cache will admit
+    /// (`DecodedColumnCache::would_admit`), and found all UTF-8 (ADR-3326
+    /// decision 5). A column served from the decoded-column cache is not
+    /// decoded and counts nothing. This is the reader's part of the count
+    /// only: any other plain page (the row path, the columnar exit with no
+    /// cache attached, a non-interactive first touch the cache answers with a
+    /// ghost record, or a page that is not all UTF-8) has the cells of its surviving rows
     /// validated by the declared `Str` build in `ravel-sql`, which counts
     /// them; the row path's per-cell validations are not counted. Grows as
     /// blocks are decoded, like [`Self::pages_decoded`].
@@ -1845,8 +1847,8 @@ pub(crate) fn dict_page_decodes() -> u64 {
 /// every other one is validated in full and counted in the block's
 /// [`DecodedBlock::str_cells_validated`]. A plain `Str` attribute page is
 /// validated at decode, and counted there, only when its column is in
-/// `validate`: the columns the columnar exit will offer to the decoded-column
-/// cache.
+/// `validate`: the missed columns the columnar exit's decoded-column cache
+/// will admit (`DecodedColumnCache::would_admit`).
 #[allow(clippy::too_many_arguments)]
 fn decode_v4_block_with<'s>(
     page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,

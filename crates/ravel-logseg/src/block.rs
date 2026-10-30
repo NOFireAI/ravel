@@ -2235,9 +2235,8 @@ impl DecodedBlock {
     /// String cells this decode UTF-8 validated: the entries of a per-block
     /// dictionary (tag 7) it built, the present cells of each plain-page `Str`
     /// attribute column it was asked to validate and found all UTF-8
-    /// ([`PlainColumn::validate_text`]; the reader asks only for a column it
-    /// offers to the decoded-column cache),
-    /// plus whatever the caller added for the row group dictionaries it built
+    /// ([`PlainColumn::validate_text`]; the reader asks only for a column the
+    /// decoded-column cache will admit when it is offered), plus whatever the caller added for the row group dictionaries it built
     /// ([`Self::add_str_cells_validated`]).
     pub(crate) fn str_cells_validated(&self) -> u64 {
         self.str_cells_validated
