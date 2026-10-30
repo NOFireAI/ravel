@@ -491,12 +491,12 @@ pub(super) async fn load_with_drain_reflush_period(
     // derived target is read off that batch's estimate.
     let build_router = |target_bytes: usize| {
         Arc::new(LogIngestRouter::new(
-            IngestConfig {
-                rlog_zstd_level: zstd_level,
-                rlog_group_target_blocks: group_target_blocks,
-                rlog_chunk_order: chunk_order,
-                ..build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay)
-            },
+            log_load_ingest_config(
+                build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
+                zstd_level,
+                group_target_blocks,
+                chunk_order,
+            ),
             Arc::clone(&store),
             Arc::clone(&clock),
             Arc::new(PendingAckBudget::new(0)),
@@ -2079,6 +2079,24 @@ fn shard_skew_warning(distinct_shards: usize, shards: u32) -> Option<String> {
          file regions instead of one contiguous run; the mapping's [[resource_attribute]] \
          choice is the other lever, since it determines what shard_for_log hashes on."
     ))
+}
+
+/// The log loader's router config: `base` with the RLOG writer levers set.
+/// The loader keeps the exhaustive page choice (ADR-3492 decision 1); only the
+/// server's logs ingest flush estimates.
+fn log_load_ingest_config(
+    base: IngestConfig,
+    zstd_level: RlogZstdLevel,
+    group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
+) -> IngestConfig {
+    IngestConfig {
+        rlog_zstd_level: zstd_level,
+        rlog_group_target_blocks: group_target_blocks,
+        rlog_chunk_order: chunk_order,
+        rlog_page_choice: ravel_logseg::PageChoice::Exhaustive,
+        ..base
+    }
 }
 
 #[cfg(test)]
