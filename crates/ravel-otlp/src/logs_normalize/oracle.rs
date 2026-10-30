@@ -480,11 +480,11 @@ mod tests {
 
     fn key() -> impl Strategy<Value = String> {
         prop_oneof![
-            Just("k"),
-            Just(RULED_KEY),
-            Just("svc"),
-            Just(""),
-            Just("key.past.twelve.bytes"),
+            1 => Just("k"),
+            3 => Just(RULED_KEY),
+            1 => Just("svc"),
+            1 => Just(""),
+            1 => Just("key.past.twelve.bytes"),
         ]
         .prop_map(String::from)
     }
@@ -502,20 +502,20 @@ mod tests {
 
     fn leaf() -> impl Strategy<Value = Option<AnyValueVariant>> {
         prop_oneof![
-            Just(None),
-            text().prop_map(|s| Some(AnyValueVariant::StringValue(s))),
-            any::<bool>().prop_map(|b| Some(AnyValueVariant::BoolValue(b))),
-            any::<i64>().prop_map(|i| Some(AnyValueVariant::IntValue(i))),
-            prop_oneof![
+            1 => Just(None),
+            6 => text().prop_map(|s| Some(AnyValueVariant::StringValue(s))),
+            1 => any::<bool>().prop_map(|b| Some(AnyValueVariant::BoolValue(b))),
+            1 => any::<i64>().prop_map(|i| Some(AnyValueVariant::IntValue(i))),
+            1 => prop_oneof![
                 any::<f64>(),
                 Just(f64::NAN),
                 Just(-0.0),
                 Just(f64::INFINITY)
             ]
             .prop_map(|d| Some(AnyValueVariant::DoubleValue(d))),
-            proptest::collection::vec(any::<u8>(), 0..4)
+            1 => proptest::collection::vec(any::<u8>(), 0..4)
                 .prop_map(|b| Some(AnyValueVariant::BytesValue(b))),
-            any::<i32>().prop_map(|i| Some(AnyValueVariant::StringValueStrindex(i))),
+            1 => any::<i32>().prop_map(|i| Some(AnyValueVariant::StringValueStrindex(i))),
         ]
     }
 
@@ -566,18 +566,22 @@ mod tests {
     fn timestamp() -> impl Strategy<Value = u64> {
         let now = INGEST_TS_NS as u64;
         prop_oneof![
-            Just(0),
-            Just(now),
-            Just(now - 1),
-            Just(now - 3 * HOUR_NS),
-            Just(now + HOUR_NS),
-            Just(u64::MAX),
+            1 => Just(0),
+            4 => Just(now),
+            1 => Just(now - 1),
+            1 => Just(now - 3 * HOUR_NS),
+            1 => Just(now + HOUR_NS),
+            1 => Just(u64::MAX),
         ]
     }
 
     fn record() -> impl Strategy<Value = LogRecord> {
         (
-            any_value(),
+            prop_oneof![
+                2 => Just(None),
+                2 => text().prop_map(|s| Some(AnyValue { value: Some(AnyValueVariant::StringValue(s)) })),
+                1 => any_value(),
+            ],
             attributes(6),
             prop_oneof![Just(""), Just("INFO"), Just("a longer severity text")],
             prop_oneof![0..25i32, any::<i32>()],
@@ -615,7 +619,7 @@ mod tests {
                     attributes(4),
                 ),
             ),
-            proptest::collection::vec(record(), 0..4),
+            proptest::collection::vec(record(), 0..5),
         )
             .prop_map(|(scope, log_records)| ScopeLogs {
                 scope: scope.map(|(name, version, attributes)| InstrumentationScope {
@@ -649,26 +653,32 @@ mod tests {
     }
 
     /// Limits small enough that every per-attribute, per-scope, per-resource
-    /// and request-wide refusal is reachable from [`request`].
-    fn limits() -> impl Strategy<Value = LogIngestLimits> {
+    /// and request-wide refusal is reachable from [`request`]. The second
+    /// value, when present, is the fraction of the request's own projection
+    /// to set `max_resolved_label_bytes_per_request` to, so the point where a
+    /// folded projection passes the limit falls anywhere in the walk.
+    fn limits() -> impl Strategy<Value = (LogIngestLimits, Option<f64>)> {
         (
             prop_oneof![3 => Just(100_000usize), 1 => 0..10usize],
-            prop_oneof![Just(65_536usize), 0..40usize],
-            prop_oneof![2 => Just(usize::MAX), 1 => 0..4_000usize],
+            prop_oneof![3 => Just(65_536usize), 1 => 0..40usize],
+            prop_oneof![1 => Just(None), 2 => (0.0..1.1f64).prop_map(Some)],
         )
-            .prop_map(
-                |(max_records, max_body_len, max_resolved)| LogIngestLimits {
-                    max_records_per_request: max_records,
-                    max_attributes_per_record: 4,
-                    max_attribute_key_len: 12,
-                    max_attribute_value_len: 24,
-                    max_body_len,
-                    max_resource_attributes: 3,
-                    max_scope_attributes: 2,
-                    max_resolved_label_bytes_per_request: max_resolved,
-                    ..LogIngestLimits::default()
-                },
-            )
+            .prop_map(|(max_records, max_body_len, resolved_fraction)| {
+                (
+                    LogIngestLimits {
+                        max_records_per_request: max_records,
+                        max_attributes_per_record: 4,
+                        max_attribute_key_len: 12,
+                        max_attribute_value_len: 24,
+                        max_body_len,
+                        max_resource_attributes: 3,
+                        max_scope_attributes: 2,
+                        max_resolved_label_bytes_per_request: usize::MAX,
+                        ..LogIngestLimits::default()
+                    },
+                    resolved_fraction,
+                )
+            })
     }
 
     /// An attribute value with each float as its bit pattern, so a NaN
@@ -744,7 +754,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(1024))]
+        #![proptest_config(ProptestConfig::with_cases(4096))]
 
         /// Moving values out of the request, sharing the scope's blob and
         /// folding the projection into the pass change nothing a caller sees:
@@ -754,10 +764,14 @@ mod tests {
         #[test]
         fn normalize_output_is_unchanged(
             req in request(),
-            limits in limits(),
+            (mut limits, resolved_fraction) in limits(),
             ruled in any::<bool>(),
         ) {
             let rules = if ruled { rules_on(&[RULED_KEY]) } else { TenantRules::none() };
+            if let Some(fraction) = resolved_fraction {
+                limits.max_resolved_label_bytes_per_request =
+                    (project(&req, &limits, &rules) as f64 * fraction) as usize;
+            }
             let projected =
                 crate::label_projection::project_log_resolved_label_bytes(&req, &limits, &rules);
             prop_assert_eq!(projected.get(), project(&req, &limits, &rules));
