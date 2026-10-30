@@ -551,6 +551,11 @@ impl PageEncodeJob {
         }
     }
 
+    /// This job's position among its block's jobs, in column order.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     /// The column pages this job seals.
     pub fn page_count(&self) -> usize {
         self.columns.iter().map(OwnedColumn::page_count).sum()
@@ -4430,6 +4435,33 @@ mod tests {
                 exh.str_col_fused(cid),
                 "column {cid}"
             );
+        }
+    }
+
+    /// The row group re-lays pages column-major, so an object cannot tell
+    /// staging order from any other order of a block's column jobs. This pins
+    /// the block itself: results handed back last job first assemble into the
+    /// descriptors, payload and string values the inline encode stages.
+    #[test]
+    fn jobs_returned_in_reverse_assemble_in_staging_order() {
+        let (rows, plans) = choice_rows();
+        for choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            let inline = BlockEncoder::Inline
+                .rows(&rows, &plans, 3, choice)
+                .expect("inline");
+            let mut calls = Vec::new();
+            let mut reverse = |jobs: Vec<PageEncodeJob>| -> Result<_, LogSegError> {
+                calls.push(jobs.len());
+                Ok(jobs.into_iter().rev().map(PageEncodeJob::run).collect())
+            };
+            let jobs = BlockEncoder::Jobs(&mut reverse)
+                .rows(&rows, &plans, 3, choice)
+                .expect("jobs");
+            assert_eq!(calls, [10], "one job per staged column");
+            assert_eq!(jobs.descs, inline.descs, "{choice:?}");
+            assert!(jobs.payload == inline.payload, "{choice:?}");
+            assert_eq!(jobs.str_values, inline.str_values, "{choice:?}");
+            assert_eq!(jobs.record_count, inline.record_count);
         }
     }
 }

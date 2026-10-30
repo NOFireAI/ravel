@@ -21,6 +21,9 @@ use ravel_logseg::{
     RlogWriter, read_section, stream_attrs_bytes,
 };
 
+#[path = "../benches/common/page_pool.rs"]
+mod page_pool;
+
 fn fixed_identity() -> ObjectIdentity {
     ObjectIdentity {
         tenant_hash: [0xB2; 16],
@@ -173,6 +176,25 @@ fn matches_golden_fixture() {
         "the fixture's repeated `INFO` and `GET` strings stay on per-block pages"
     );
     assert_eq!(dir.block_count(), 1);
+}
+
+/// The golden input through the parallel page encode (ADR-3492 decision 7):
+/// four threads, results returned out of job order, the same fixture bytes.
+#[test]
+fn parallel_page_encode_matches_golden_fixture() {
+    let mut pool = page_pool::ScopedPool::new(4);
+    let mut w = RlogWriter::new(RlogConfig::default(), fixed_identity());
+    for rec in golden_records() {
+        w.push(rec).expect("push record");
+    }
+    let written = w.finish_on(&mut pool).expect("finish_on");
+    let fixture: &[u8] = include_bytes!("fixtures/golden_rlog_v5.bin");
+    assert!(
+        written.as_slice() == fixture,
+        "parallel page encode diverged from the golden fixture"
+    );
+    assert_eq!(pool.split_calls, 1);
+    assert_eq!(pool.out_of_order_calls, 1);
 }
 
 #[test]

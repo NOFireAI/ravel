@@ -2932,6 +2932,22 @@ fn emit_view(
     }
 }
 
+/// A test-only handle on the writer's bloom text insert, used by the
+/// allocation pin (`tests/bloom_insert_alloc_pin.rs`), which has to drive the
+/// insert alone: the block encode around it allocates by construction.
+///
+/// Not part of the crate's supported API.
+#[doc(hidden)]
+pub mod bloom_probe {
+    use crate::bloom::BloomBuilder;
+
+    /// Inserts `bytes`' word tokens, and its exact bytes when short, into
+    /// `builder` under `column_id`, as the writer does for every block.
+    pub fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
+        super::insert_text(builder, column_id, bytes);
+    }
+}
+
 /// A test- and bench-only handle on the per-record declared-column stat stamp,
 /// used by the allocation pin (`tests/stamp_alloc_pin.rs`) and the stamp
 /// benchmark (`benches/stamp_declared.rs`). Both have to drive the stamp alone:
