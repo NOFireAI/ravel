@@ -300,6 +300,10 @@ path = "tests/conformance.rs"
 name = "differential"
 path = "tests/differential.rs"
 
+[[test]]
+name = "logs_count_get_attribution"
+path = "tests/logs_count_get_attribution.rs"
+
 # Each installs a `#[global_allocator]`, and a binary can have one.
 # group_by_reservation_lag is also run by name.
 [[test]]
