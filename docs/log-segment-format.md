@@ -722,9 +722,10 @@ picks among the candidate encodings of a page in one of two ways, set by
 Under either choice the object is a function of the records written and the
 writer configuration (no hash-map iteration order reaches the bytes), and
 the row-major and columnar write paths produce the same bytes. Which writers
-use which: the logs ingest flush selects `Estimated` once ADR-3492 decision 1
-is wired into it, and writes `Exhaustive` until then; compaction, the
-erasure rewrite and `ravel-cli load` write `Exhaustive`. Readers are
+use which: the server's logs ingest flush writes `Estimated` (the ingest
+setting `rlog_page_choice`, whose default is `Estimated`); `ravel-cli load`
+writes through the same flush but sets `Exhaustive`; compaction and the
+erasure rewrite write `Exhaustive`. Readers are
 unaffected: an object decodes the same way whichever choice wrote it.
 
 **Parallel page encode (ADR-3492 decision 7).** `RlogWriter::finish_on`
