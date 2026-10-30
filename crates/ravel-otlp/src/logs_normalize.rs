@@ -1276,6 +1276,9 @@ fn attr_value_len(value: &AttrValue) -> usize {
 }
 
 #[cfg(test)]
+mod oracle;
+
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
