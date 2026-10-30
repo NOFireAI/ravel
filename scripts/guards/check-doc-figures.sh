@@ -155,7 +155,7 @@ floor_share = floor * entry_bytes
 # considered and states the figure nowhere, which is the only way a later
 # addition of that figure to that doc fails here instead of going unpinned.
 EXPECTED_PAIRS = [
-    (f"{scaled(budget, MB)} MB", {"docs/guides/caching.md": 2, "docs/guides/operations.md": 1, "docs/catalog-and-mvcc.md": 1}),
+    (f"{scaled(budget, MB)} MB", {"docs/guides/caching.md": 3, "docs/guides/operations.md": 1, "docs/catalog-and-mvcc.md": 1}),
     (f"{scaled(budget // caches, MB)} MB", {"docs/guides/caching.md": 1, "docs/guides/operations.md": 1, "docs/catalog-and-mvcc.md": 2}),
     (f"{scaled(floor_share, MB)} MB", {"docs/guides/caching.md": 1, "docs/catalog-and-mvcc.md": 1}),
     (f"{scaled(floor_share * caches, MB)} MB", {"docs/guides/caching.md": 3, "docs/catalog-and-mvcc.md": 0}),
