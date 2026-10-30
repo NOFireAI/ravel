@@ -261,10 +261,15 @@ impl RegexpReplaceUdf {
 
         let compiled = self.compiled(pattern, flags)?;
         let replacement = regex_replace_posix_groups(replacement);
+        // A clone shares the compiled program but gets its own search-cache
+        // pool, so each partition's invocation searches on its own pool instead
+        // of every thread but one contending for the cached regex's pool per row.
+        let re = compiled.re.clone();
+        let short = self.short_extract(&compiled, &replacement).cloned();
         let mut replacer = Replacer {
-            re: &compiled.re,
-            short: self
-                .short_extract(&compiled, &replacement)
+            re: &re,
+            short: short
+                .as_ref()
                 .map(|short| (short, short.capture_locations())),
             limit: compiled.limit,
             replacement: &replacement,
@@ -356,8 +361,8 @@ fn build_short_extract_regex(pattern: &str, on_compile: impl FnOnce()) -> Option
     (re.captures_len() == 2).then_some(re)
 }
 
-/// The built-in's `OptimizedRegex` for one invocation; the capture locations
-/// are per invocation because the shared regex is used from many partitions.
+/// The built-in's `OptimizedRegex` for one invocation, over that invocation's
+/// clones of the cached regexes; the capture locations are per invocation too.
 struct Replacer<'a> {
     re: &'a Regex,
     short: Option<(&'a Regex, CaptureLocations)>,
