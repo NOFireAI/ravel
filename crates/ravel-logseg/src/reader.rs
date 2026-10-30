@@ -1504,9 +1504,12 @@ impl BlockScan {
     /// deferred by a Contains arm) found there is seeded into the block and
     /// its pages are neither read nor decoded; a missed one is offered to the
     /// cache after the decode, before any survivor narrowing. Only a missed
-    /// plain `Str` attribute column is UTF-8 validated at decode, since the
-    /// cache keeps that validation for every later hit (ADR-3326 decision 5);
-    /// every other plain column is validated per cell by its reader.
+    /// plain `Str` attribute column the cache would admit
+    /// ([`would_admit`](crate::decoded_cache::DecodedColumnCache::would_admit))
+    /// is UTF-8 validated at decode, since the cache keeps that validation for
+    /// every later hit (ADR-3326 decision 5); every other plain column, a
+    /// non-interactive first touch included, is validated per cell by its
+    /// reader.
     fn decode_block<S: ByteSource + ?Sized>(
         &mut self,
         object_bytes: &S,
@@ -1566,6 +1569,18 @@ impl BlockScan {
                 }
             }
         }
+        let validate: Vec<u32> = match cache {
+            Some(attach) => missed
+                .iter()
+                .copied()
+                .filter(|&cid| {
+                    attach
+                        .cache
+                        .would_admit(&attach.key(loc.block_index, cid), attach.intent)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let mut decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
@@ -1574,7 +1589,7 @@ impl BlockScan {
             &dict_pages,
             &mut self.dicts,
             &self.deferred,
-            &missed,
+            &validate,
             &cached,
             &self.plans,
             self.columns.as_ref(),
