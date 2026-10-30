@@ -297,8 +297,9 @@ fn cell_text(bytes: &[u8]) -> Option<&str> {
 ///
 /// On a dictionary page every entry's UTF-8 was decided once, when the reader
 /// decoded the dictionary ([`DictValues`]), so a row's presence is its key plus
-/// that entry's validity bit and costs no validation. A plain page whose
-/// values the decode found all UTF-8 is read the same way, as a slice of the
+/// that entry's validity bit and costs no validation. A plain page the decode
+/// validated (only one decoded for the decoded-column cache) and found all
+/// UTF-8 is read the same way, as a slice of the
 /// validated buffer ([`BytesCursor::validated_text_at`]), so a decoded-cache
 /// hit validates nothing (ADR-3326 decision 5). Any other plain page validates
 /// the cell on each [`text_at`](Self::text_at) call, so a caller that needs
@@ -4365,17 +4366,30 @@ mod tests {
 
     /// [`build_columnar_batches`] run twice over one decoded `block` (the
     /// second build reads the retained decoded column, as a decoded-cache hit
-    /// does), projecting the declared `Str` column `KEY`: the cells the
-    /// reader's decode validated, then per build the value it added to its
+    /// does), projecting the declared `Str` column `KEY`, with a decoded-column
+    /// cache attached to the scan when `cached`: the cells the reader's decode
+    /// validated, then per build the value it added to its
     /// `str_cells_validated` counter, the [`cell_text`] validations it ran,
     /// and the column's cells.
-    fn count_two_builds(block: &Block) -> (u64, [Build; 2]) {
+    fn count_two_builds(block: &Block, cached: bool) -> (u64, [Build; 2]) {
+        use ravel_logseg::decoded_cache::{
+            DecodedCacheAttach, DecodedCacheCounters, DecodedColumnCache,
+        };
         let cfg = cfg();
         let obj = encode(block, &cfg);
         let reader = RlogReader::new(&obj, &cfg).expect("open");
         let mut scan = reader
             .scan_blocks(&window(block), &[], &ColumnSelection::all())
             .expect("scan");
+        if cached {
+            scan.attach_decoded_cache(DecodedCacheAttach {
+                cache: Arc::new(DecodedColumnCache::new(1 << 20, None)),
+                tenant: [7; 16],
+                object: [9; 32],
+                intent: ravel_types::accounting::AccessIntent::Interactive,
+                counters: Arc::new(DecodedCacheCounters::default()),
+            });
+        }
         let view = scan
             .next_block_columnar(&obj)
             .expect("columnar exit")
@@ -4410,38 +4424,46 @@ mod tests {
         (scan.stats().str_cells_validated, builds)
     }
 
-    /// ADR-3326 decision 5: a plain `Str` page whose cells are all UTF-8 is
-    /// validated once, by the decode, which counts every present cell (6 of
-    /// 8 rows) beside the block's two dictionary entries; the builds that read it, the first and the one reading the
-    /// retained column, validate and count nothing. A page with one
-    /// non-UTF-8 cell is left to per-cell validation as before: the decode
-    /// counts none of its cells and each build counts its 4 surviving present cells.
+    /// The block `a_plain_page_validated_at_decode_is_not_validated_again`
+    /// and `a_plain_page_with_no_cache_is_validated_per_surviving_cell`
+    /// read: eight rows of the plain `Str` column `KEY`, six present, with
+    /// row 3 holding `bad`; the scan window keeps rows 1 to 6, whose four
+    /// present cells are the survivors.
+    fn plain_rows(bad: &[u8]) -> Block {
+        fixed_block(
+            &[FieldType::Str],
+            vec![
+                vec![str_value(b"r0")],
+                vec![str_value(b"r1")],
+                vec![None],
+                vec![str_value(bad)],
+                vec![str_value("r4é".as_bytes())],
+                vec![None],
+                vec![str_value(b"")],
+                vec![str_value(b"r7")],
+            ],
+            1,
+            6,
+        )
+    }
+
+    /// ADR-3326 decision 5: with a decoded-column cache attached, a plain
+    /// `Str` page whose cells are all UTF-8 is validated once, by the decode
+    /// on the cache miss, which counts every present cell (6 of 8 rows)
+    /// beside the block's two dictionary entries; the builds that read it,
+    /// the first and the one reading the retained column, validate and count
+    /// nothing. A page with one non-UTF-8 cell is left to per-cell
+    /// validation as before: the decode counts none of its cells and each
+    /// build counts its 4 surviving present cells.
     ///
     /// Flipped assertion, seen failing: `StrCursor::text_at` ignoring
     /// `validated_text_at` makes each build of the UTF-8 page report
     /// `(4, 4, ..)` where `(0, 0, ..)` is expected.
     #[test]
     fn a_plain_page_validated_at_decode_is_not_validated_again() {
-        let rows = |bad: &[u8]| {
-            fixed_block(
-                &[FieldType::Str],
-                vec![
-                    vec![str_value(b"r0")],
-                    vec![str_value(b"r1")],
-                    vec![None],
-                    vec![str_value(bad)],
-                    vec![str_value("r4é".as_bytes())],
-                    vec![None],
-                    vec![str_value(b"")],
-                    vec![str_value(b"r7")],
-                ],
-                1,
-                6,
-            )
-        };
         let s = |v: &str| Some(v.to_string());
 
-        let (decoded, builds) = count_two_builds(&rows(b"r3"));
+        let (decoded, builds) = count_two_builds(&plain_rows(b"r3"), true);
         // The `body` and `severity_text` pages are one-entry dictionaries,
         // whose entries the reader counts too: 2 of the reader's count.
         assert_eq!(
@@ -4455,9 +4477,30 @@ mod tests {
             assert_eq!(got, cells);
         }
 
-        let (decoded, builds) = count_two_builds(&rows(&[b'r', 0xff]));
+        let (decoded, builds) = count_two_builds(&plain_rows(&[b'r', 0xff]), true);
         assert_eq!(decoded, 2, "a page that is not all UTF-8 is not validated");
         let cells = vec![s("r1"), None, None, s("r4é"), None, s("")];
+        for (counted, ran, got) in builds {
+            assert_eq!((counted, ran), (4, 4), "one per surviving present cell");
+            assert_eq!(got, cells);
+        }
+    }
+
+    /// With no decoded-column cache attached, the decode keeps a plain `Str`
+    /// page raw however its bytes read, since nothing would keep a whole-page
+    /// validation for a later read: the decode counts only the two
+    /// dictionary entries, and each build validates and counts the 4 present
+    /// cells of the surviving rows 1 to 6, not the page's 6.
+    ///
+    /// Seen failing against validating every decoded plain `Str` attribute
+    /// page whatever the scan does with it: the decode reports `6 + 2` where
+    /// 2 is expected, and each build `(0, 0)` where `(4, 4)` is.
+    #[test]
+    fn a_plain_page_with_no_cache_is_validated_per_surviving_cell() {
+        let s = |v: &str| Some(v.to_string());
+        let (decoded, builds) = count_two_builds(&plain_rows(b"r3"), false);
+        assert_eq!(decoded, 2, "the decode validates no plain cell");
+        let cells = vec![s("r1"), None, s("r3"), s("r4é"), None, s("")];
         for (counted, ran, got) in builds {
             assert_eq!((counted, ran), (4, 4), "one per surviving present cell");
             assert_eq!(got, cells);

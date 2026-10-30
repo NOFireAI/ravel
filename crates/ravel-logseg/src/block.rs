@@ -2234,7 +2234,9 @@ impl DecodedBlock {
 
     /// String cells this decode UTF-8 validated: the entries of a per-block
     /// dictionary (tag 7) it built, the present cells of each plain-page `Str`
-    /// attribute column it found all UTF-8 ([`PlainColumn::validate_text`]),
+    /// attribute column it was asked to validate and found all UTF-8
+    /// ([`PlainColumn::validate_text`]; the reader asks only for a column it
+    /// offers to the decoded-column cache),
     /// plus whatever the caller added for the row group dictionaries it built
     /// ([`Self::add_str_cells_validated`]).
     pub(crate) fn str_cells_validated(&self) -> u64 {
@@ -2594,6 +2596,7 @@ pub fn read_block_pages(
         &[],
         &[],
         &[],
+        &[],
         plans,
         counters,
     )
@@ -2624,6 +2627,7 @@ pub fn read_block_pages_with_dicts(
         &shared,
         &[],
         &[],
+        &[],
         plans,
         counters,
     )
@@ -2631,7 +2635,8 @@ pub fn read_block_pages_with_dicts(
 
 /// [`read_block_pages_with_dicts`] over dictionaries already built, which the
 /// block shares rather than copies (ADR-2773 decision D3). A per-block
-/// dictionary of a column in `deferred` is left unvalidated
+/// dictionary of a column in `deferred` is left unvalidated, and a plain
+/// `Str` attribute page of a column in `validate` is validated at decode
 /// ([`decode_columns`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_block_pages_with_shared_dicts(
@@ -2640,6 +2645,7 @@ pub(crate) fn read_block_pages_with_shared_dicts(
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &Arc<DictValues>)],
     deferred: &[u32],
+    validate: &[u32],
     cached: &[(u32, CachedColumn)],
     plans: &[ColumnPlan],
     counters: PageCounters,
@@ -2674,6 +2680,7 @@ pub(crate) fn read_block_pages_with_shared_dicts(
         page_bytes,
         dicts,
         deferred,
+        validate,
         cached,
         plans,
         counters,
@@ -2730,6 +2737,9 @@ fn referenced_i64(
 /// left out of the result exactly as an absent column would be. A per-block
 /// dictionary (tag 7) of a column in `deferred` is left
 /// [unvalidated](DictValues::unvalidated) for the scan's survivor-only build.
+/// A plain page of a `Str` attribute column in `validate` is UTF-8 validated
+/// here ([`PlainColumn::validate_text`]); every other plain page keeps its raw
+/// buffer and its reader validates the cells it reads.
 /// A column in `cached` is installed as given; the caller leaves its pages
 /// unread.
 #[allow(clippy::too_many_arguments)]
@@ -2739,6 +2749,7 @@ fn decode_columns(
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &Arc<DictValues>)],
     deferred: &[u32],
+    validate: &[u32],
     cached: &[(u32, CachedColumn)],
     plans: &[ColumnPlan],
     counters: PageCounters,
@@ -2870,14 +2881,14 @@ fn decode_columns(
                 } else if enc == Enc::Plain {
                     let col =
                         PlainColumn::decode(encoded, &present, present_count, PLAIN_VALUES_MAX)?;
-                    // A `Str` attribute's cells are read as text, so their
-                    // UTF-8 is decided once here and kept with the column
-                    // (ADR-3326 decision 5). A column a `Contains` arm tests is
-                    // left as it is, as its dictionary would be.
-                    let text = plans
-                        .iter()
-                        .any(|p| p.column_id == column_id && p.ty == FieldType::Str)
-                        && !deferred.contains(&column_id);
+                    // A `Str` attribute column the caller will offer to the
+                    // decoded-column cache has its UTF-8 decided once here and
+                    // kept with the column (ADR-3326 decision 5). Any other
+                    // column is validated per cell by whoever reads it.
+                    let text = validate.contains(&column_id)
+                        && plans
+                            .iter()
+                            .any(|p| p.column_id == column_id && p.ty == FieldType::Str);
                     let col = if text {
                         let col = col.validate_text();
                         if col.text_validated() {

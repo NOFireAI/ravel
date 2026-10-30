@@ -702,9 +702,21 @@ when the dictionary is built). For plain columns it was not: the cached
 `PlainColumn` held raw bytes, and the columnar build validated every cell
 it read with `std::str::from_utf8`, on a hit as on a miss (#3231).
 
-A plain page of a `Str` attribute column that no `Contains` arm tests is
-now validated once at decode (`PlainColumn::validate_text`,
-`crates/ravel-logseg/src/block.rs`). When the whole values buffer is UTF-8
+A plain page of a `Str` attribute column that the columnar exit decodes on
+a cache miss, and so offers to the cache after the decode, is now validated
+once at decode (`PlainColumn::validate_text`,
+`crates/ravel-logseg/src/block.rs`; the set is the reader's `missed` list in
+`BlockScan::decode_block`, `crates/ravel-logseg/src/reader.rs`). A column a
+`Contains` arm tests is never in that list. No other decode validates a plain
+page whole, since nothing would keep that validation for a later read: the
+row path, the columnar exit with no cache attached, and a column not offered
+to the cache keep the raw buffer, and the build validates the cells of the
+surviving rows one by one as before
+(`the_row_path_validates_no_plain_page_at_decode` and
+`an_uncached_selective_scan_validates_only_surviving_cells` in
+`crates/ravel-sql/tests/logs_decoded_cache.rs`,
+`a_plain_page_with_no_cache_is_validated_per_surviving_cell` in
+`crates/ravel-sql/src/logs_scan/batch.rs`). When the whole values buffer is UTF-8
 and every cell offset is a character boundary, the buffer is kept as a
 `String`, so every cell is UTF-8 and a read is a slice with a boundary
 check (`PlainColumn::text`). `StrCursor::text_at` in
@@ -728,3 +740,12 @@ still validate on a hit, cell by cell as before:
   a property test against per-cell `from_utf8`);
 - `body` and `severity_text`, which the columnar build reads through
   `view_str`, and which this change does not validate at decode.
+
+A `Str` attribute column a `Contains` arm defers is neither validated at
+decode nor cached (`BlockScan::decode_block` skips a deferred column before
+the cache lookup), so the cells of its surviving rows are validated in the
+build, as before (`decoded_cache_serves_identical_rows_and_never_caches_contains_column`
+pins that it is never cached;
+`pushed_like_matches_the_unpushed_scan_and_counts_its_cells` in
+`crates/ravel-sql/src/logs_provider.rs` pins the kept rows' cells as the
+validated count).
