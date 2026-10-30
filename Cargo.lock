@@ -4734,7 +4734,9 @@ version = "0.28.0"
 dependencies = [
  "blake3",
  "crc32c",
+ "foldhash 0.2.0",
  "proptest",
+ "stats_alloc",
  "thiserror",
  "zstd",
 ]

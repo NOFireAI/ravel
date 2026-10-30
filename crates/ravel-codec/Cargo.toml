@@ -11,9 +11,16 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 zstd = { workspace = true }
+# BloomBuilder's dedup sets. Already in Cargo.lock through hashbrown, so this
+# adds no package to the build graph.
+foldhash = "0.2.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
+# The tokenizer allocation pin (tests/tokenizer_alloc_pin.rs). Pinned to the
+# 0.1.10 the other crates' allocation tests use; the workspace forbids
+# `unsafe_code`, so a hand-rolled counting allocator will not compile.
+stats_alloc = "0.1.10"
 
 [lints]
 workspace = true
