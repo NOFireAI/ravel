@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::cache::{
     CachedCommit, CompactionRecordCache, DecodedCaches, HeadCache, L0Derived, PartCache,
-    PostingsCache, RecordCache,
+    PostingsCache, RecordCache, RecordCacheTotals,
 };
 use crate::column_stats_resolve::{
     self, ColumnStatsRequest, LoadColumnStatsError, LoadedColumnStats, PartColumnStats,
@@ -2229,6 +2229,24 @@ impl Catalog {
         self.column_stats_cache
             .as_ref()
             .map_or(0, ColumnStatsCache::held_bytes)
+    }
+
+    /// What the commit-record cache holds summed over every tenant (issue
+    /// #3513): the charged bytes its eviction is bounded by, per tenant, at
+    /// [`CatalogConfig::commit_cache_max_bytes_per_tenant`], and its entry
+    /// count. Their ratio is the measured bytes per entry. `ravel-server`
+    /// exports both on `/metrics` as `ravel_catalog_record_cache_held_bytes`
+    /// and `ravel_catalog_record_cache_entries` with `cache="commit"`.
+    pub fn commit_record_cache_totals(&self) -> RecordCacheTotals {
+        self.cache.totals()
+    }
+
+    /// [`Catalog::commit_record_cache_totals`] for the L1 compaction-record
+    /// cache, bounded per tenant at
+    /// [`CatalogConfig::compaction_cache_max_bytes_per_tenant`]; exported with
+    /// `cache="compaction"`.
+    pub fn compaction_record_cache_totals(&self) -> RecordCacheTotals {
+        self.compaction_cache.totals()
     }
 
     /// Cumulative decompressed body bytes of the column-statistics objects
@@ -11524,6 +11542,39 @@ mod tests {
         }
     }
 
+    /// Issue #3513: a catalog that resolves N commit records reports N entries
+    /// and the cache's charged bytes on the commit-record totals `/metrics`
+    /// exports. Each of the fixture's entries is charged 896 bytes (864 for the
+    /// record, 32 for its derivation slot), so a total computed as entries
+    /// times the 900-byte planning rate reads 9,000 and fails.
+    #[tokio::test]
+    async fn commit_record_cache_totals_report_resolved_records_at_their_charge() {
+        const RECORDS: u64 = 10;
+        let store = Arc::new(MemoryStore::new());
+        let (range, now_ns) = publish_record_grid(&store, 1, 1, RECORDS, 500_000).await;
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        assert_eq!(
+            catalog.commit_record_cache_totals(),
+            RecordCacheTotals::default()
+        );
+
+        let snapshot = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), RECORDS as usize);
+
+        let totals = catalog.commit_record_cache_totals();
+        assert_eq!(totals.entries, RECORDS);
+        assert_eq!(totals.charged_bytes, catalog.cache.charged_bytes(&tenant()));
+        assert_eq!(totals.charged_bytes, 896 * RECORDS);
+        assert_eq!(
+            catalog.compaction_record_cache_totals(),
+            RecordCacheTotals::default(),
+            "no compaction record was resolved"
+        );
+    }
+
     /// Issue #2752: a commit-record GET that fails during the prewarm surfaces
     /// as the typed store error, and the include pass does not read the record
     /// again: every record key is attempted at most once.
@@ -15373,25 +15424,18 @@ mod resolve_memo_tests {
         assert_refs_equal(&fetched, &fresh, "unlisted token, uncached catalog");
     }
 
-    /// (a') The same agreement through the compaction-aware include path: a
-    /// compaction record in one bucket names two of its L0 records as inputs,
-    /// so the bucket's other L0 records are included by
-    /// `process_bucket`'s compaction branch rather than the no-compaction
-    /// fast path. Warm resolves and an uncached catalog return the cold refs
-    /// field for field, and the warm resolves derive nothing.
-    #[tokio::test]
-    async fn warm_and_cold_resolves_agree_through_the_compaction_path() {
-        let (store, records) = fixture(RECORDS).await;
+    /// Publish an L1 compaction record in shard 0's `HOUR` bucket that names
+    /// the bucket's first two L0 records as inputs, and return those inputs.
+    async fn publish_bucket_compaction<'a>(
+        store: &MemoryStore,
+        records: &'a [CommitRecord],
+    ) -> Vec<&'a CommitRecord> {
         let inputs: Vec<&CommitRecord> = records
             .iter()
             .filter(|record| record.shard == 0 && record.ingest_hour_bucket == HOUR)
             .take(2)
             .collect();
         assert_eq!(inputs.len(), 2);
-        let bucket_l0s = records
-            .iter()
-            .filter(|record| record.shard == 0 && record.ingest_hour_bucket == HOUR)
-            .count() as u64;
         let compaction = CompactionRecord {
             format_version: 1,
             tenant_hash: tenant().0.to_vec(),
@@ -15434,6 +15478,23 @@ mod resolve_memo_tests {
             )
             .await
             .expect("put compaction record");
+        inputs
+    }
+
+    /// (a') The same agreement through the compaction-aware include path: a
+    /// compaction record in one bucket names two of its L0 records as inputs,
+    /// so the bucket's other L0 records are included by
+    /// `process_bucket`'s compaction branch rather than the no-compaction
+    /// fast path. Warm resolves and an uncached catalog return the cold refs
+    /// field for field, and the warm resolves derive nothing.
+    #[tokio::test]
+    async fn warm_and_cold_resolves_agree_through_the_compaction_path() {
+        let (store, records) = fixture(RECORDS).await;
+        let inputs = publish_bucket_compaction(&store, &records).await;
+        let bucket_l0s = records
+            .iter()
+            .filter(|record| record.shard == 0 && record.ingest_hour_bucket == HOUR)
+            .count() as u64;
 
         let (range, now) = window();
         let catalog = Catalog::new(store.clone(), config()).expect("catalog");
@@ -15485,6 +15546,44 @@ mod resolve_memo_tests {
             .await
             .expect("uncached resolve");
         assert_refs_equal(&cold, &fresh, "compaction path, uncached catalog");
+    }
+
+    /// Issue #3513: resolving through an L1 compaction record moves the
+    /// compaction-record totals to that one entry at the cache's charge, and
+    /// the commit-record totals count every L0 record the resolve cached.
+    #[tokio::test]
+    async fn compaction_record_cache_totals_move_when_an_l1_record_is_cached() {
+        let (store, records) = fixture(RECORDS).await;
+        publish_bucket_compaction(&store, &records).await;
+        let (range, now) = window();
+        let catalog = Catalog::new(store, config()).expect("catalog");
+        assert_eq!(
+            catalog.compaction_record_cache_totals(),
+            RecordCacheTotals::default()
+        );
+
+        catalog
+            .resolve(&tenant(), SIGNAL, range, &[], now)
+            .await
+            .expect("resolve");
+
+        let compaction = catalog.compaction_record_cache_totals();
+        assert_eq!(compaction.entries, 1);
+        assert_eq!(
+            compaction.charged_bytes,
+            catalog.compaction_cache.charged_bytes(&tenant())
+        );
+        assert_ne!(
+            compaction.charged_bytes,
+            crate::config::RECORD_CACHE_ENTRY_BYTES,
+            "sanity: the record's charge is not the planning rate"
+        );
+        let commit = catalog.commit_record_cache_totals();
+        assert_eq!(
+            commit.entries,
+            catalog.cache.entry_count(&tenant()) as u64
+        );
+        assert_eq!(commit.charged_bytes, catalog.cache.charged_bytes(&tenant()));
     }
 
     /// (b) Each record's ref is derived exactly once across one cold and N

@@ -276,6 +276,17 @@ fn commit_entry_admitted_bytes(key: &str, record: &CommitRecord) -> u64 {
     commit_entry_resident_bytes(key, record) + L0_DERIVED_SLOT_BYTES
 }
 
+/// What a record cache holds summed over every tenant in the process: the
+/// charged residency its eviction is bounded by, and its entry count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordCacheTotals {
+    /// Summed charged bytes, the figure each tenant's eviction holds inside
+    /// its byte budget.
+    pub charged_bytes: u64,
+    /// Summed resident entries.
+    pub entries: u64,
+}
+
 /// Decoded-record cache, partitioned by tenant. Process-wide: one `Catalog`
 /// is built per process and held for its lifetime, so an entry admitted by one
 /// resolve is served to every later resolve over the same object key, which is
@@ -400,6 +411,18 @@ impl RecordCache {
             cache.charged_bytes = cache.charged_bytes.saturating_sub(dropped);
             cache.by_use.retain(|_, k| !k.starts_with(prefix));
         }
+    }
+
+    /// Charged residency and entry count summed over every tenant, the
+    /// figures `/metrics` reports for this cache.
+    pub(crate) fn totals(&self) -> RecordCacheTotals {
+        let tenants = self.tenants.lock();
+        tenants
+            .values()
+            .fold(RecordCacheTotals::default(), |acc, cache| RecordCacheTotals {
+                charged_bytes: acc.charged_bytes.saturating_add(cache.charged_bytes),
+                entries: acc.entries.saturating_add(cache.entries.len() as u64),
+            })
     }
 
     /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
@@ -638,6 +661,18 @@ impl CompactionRecordCache {
             .lock()
             .get(tenant)
             .map_or(0, |cache| cache.entries.len())
+    }
+
+    /// Charged residency and entry count summed over every tenant, the
+    /// figures `/metrics` reports for this cache.
+    pub(crate) fn totals(&self) -> RecordCacheTotals {
+        let tenants = self.tenants.lock();
+        tenants
+            .values()
+            .fold(RecordCacheTotals::default(), |acc, cache| RecordCacheTotals {
+                charged_bytes: acc.charged_bytes.saturating_add(cache.charged_bytes),
+                entries: acc.entries.saturating_add(cache.entries.len() as u64),
+            })
     }
 
     /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
@@ -2237,6 +2272,75 @@ mod tests {
             "the entry cap binds when the entries are small"
         );
         assert_eq!(cache.charged_bytes(&tenant), 3 * charge);
+    }
+
+    /// Issue #3513: each cache's totals are the charged bytes and entry counts
+    /// summed over every tenant, the figures the eviction bound reads, not the
+    /// entry count times the 900-byte planning rate. The fixture records carry
+    /// declared column statistics or compaction inputs, so no entry is charged
+    /// 900 bytes.
+    #[test]
+    fn record_cache_totals_sum_charged_bytes_and_entries_over_tenants() {
+        let commits = RecordCache::default();
+        let compactions = CompactionRecordCache::default();
+        assert_eq!(commits.totals(), RecordCacheTotals::default());
+        assert_eq!(compactions.totals(), RecordCacheTotals::default());
+
+        let a = TenantHash([31; 16]);
+        let b = TenantHash([32; 16]);
+        for (tenant, count) in [(a, 3), (b, 2)] {
+            for i in 0..count {
+                commits.insert(
+                    tenant,
+                    format!("k{i}"),
+                    Arc::new(record_with_declared_columns(tenant.0, 0, 4)),
+                    1,
+                    10,
+                    UNBOUNDED_BYTES,
+                );
+            }
+        }
+        compactions.insert(
+            b,
+            "c0".to_string(),
+            Arc::new(compaction_record(b.0, 7)),
+            1,
+            10,
+            UNBOUNDED_BYTES,
+        );
+
+        let commit_bytes = commits.charged_bytes(&a) + commits.charged_bytes(&b);
+        assert_ne!(
+            commit_bytes,
+            5 * crate::config::RECORD_CACHE_ENTRY_BYTES,
+            "sanity: the fixture's charge is not the planning rate"
+        );
+        assert_eq!(
+            commits.totals(),
+            RecordCacheTotals {
+                charged_bytes: commit_bytes,
+                entries: 5,
+            }
+        );
+        let compaction_bytes = compactions.charged_bytes(&b);
+        assert_ne!(compaction_bytes, crate::config::RECORD_CACHE_ENTRY_BYTES);
+        assert_eq!(
+            compactions.totals(),
+            RecordCacheTotals {
+                charged_bytes: compaction_bytes,
+                entries: 1,
+            }
+        );
+
+        assert!(commits.evict_tenant(&a));
+        assert_eq!(
+            commits.totals(),
+            RecordCacheTotals {
+                charged_bytes: commits.charged_bytes(&b),
+                entries: 2,
+            },
+            "an evicted tenant leaves the totals"
+        );
     }
 
     /// `cache_capacity_per_tenant == 0` resolves to a `0` budget, and nothing
