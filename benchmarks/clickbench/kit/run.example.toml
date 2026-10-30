@@ -105,6 +105,16 @@ audit_mode = "off"
 # against bands taken before the sampler existed.
 # healthz_phases = ["benchmark", "concurrent"]
 
+# Optional: whether fetch.sh enforces the band file's box speed band (arm B's
+# load user CPU over arm A's, box_speed_min_ratio to box_speed_max_ratio in
+# bands/rlog.toml). Default true: a ratio outside the band prints INVALID and
+# fetch.sh exits 5, since the boxes ran at different speeds. Each arm's loader
+# is built from its own SHA, so a change to the loader that is expected to
+# move the load's CPU by more than the band must be declared here as false:
+# the row is then printed as REPORT and never invalidates the run. check-run
+# refuses a value that is not true or false.
+# box_speed_band = true
+
 # Optional phase keys, each shown at its default. launch.sh writes any left out
 # into the run.toml it uploads, at its default, and check-run refuses a value
 # of the wrong type, naming the key.

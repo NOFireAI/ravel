@@ -72,8 +72,15 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
   relative BANDS A.json B.json [RUN_TOML]
                                refuse two arms that are not comparable, else
                                evaluate the lane's relative bands, print the
-                               table, exit 1 on a miss; without RUN_TOML the
-                               arms' extra server flags must be equal
+                               table, exit 1 on a miss and 5 when the box
+                               speed band calls the run INVALID (every row is
+                               still printed); without RUN_TOML the arms'
+                               extra server flags must be equal and the box
+                               speed band is enforced
+  box-speed LOAD_TIME          print the box_speed provenance stamp read from
+                               the load step's /usr/bin/time output; a
+                               missing or unparsable figure is null with a
+                               reason
   memory-gap BANDS A.json A.tgz B.json B.tgz RUN_TOML
                                judge ADR-1170's memory gap (allocated minus
                                the unique tracked bytes) on arm B's gated ok
@@ -149,11 +156,18 @@ LANE_BANDS = {
 OPTIONAL_LANE_BANDS = {
     "rlog": {
         "relative": ("healthz_p99_max_ratio_4318", "healthz_p99_max_ratio_4319",
-                     "adr1170_gap_max_bytes", "adr1170_gap_share_above_max"),
+                     "adr1170_gap_max_bytes", "adr1170_gap_share_above_max",
+                     "box_speed_min_ratio", "box_speed_max_ratio"),
         "absolute": ("healthz_p99_ms_max_4318", "healthz_p99_ms_max_4319"),
     },
 }
 HEALTHZ_PORTS = ("4318", "4319")
+# The relative box speed band's keys, lower and upper bound on arm B's load
+# user CPU over arm A's; both or neither.
+BOX_SPEED_KEYS = ("box_speed_min_ratio", "box_speed_max_ratio")
+# kit.py relative's exit, and fetch.sh's, when the box speed band calls the
+# run invalid: distinct from 1 (a band missed) and 2 (a refusal).
+EXIT_INVALID = 5
 # The phases run.toml's healthz_phases may name for the /healthz sampler; the
 # default samples both.
 HEALTHZ_PHASES = ("benchmark", "concurrent")
@@ -177,13 +191,14 @@ RUN_DEFAULTS = (
     ("perf_record", False),
 )
 # Read by box/run.sh (band_sections through query_timeout_s, server_flags_a,
-# server_flags_b, healthz_phases and the RUN_DEFAULTS keys) or launch.sh
-# (band_sections, ami through key_name) when present.
+# server_flags_b, healthz_phases and the RUN_DEFAULTS keys), launch.sh
+# (band_sections, ami through key_name) or fetch.sh (box_speed_band) when
+# present.
 RUN_OPTIONAL = (
     "band_sections", "window_hours", "audit_text", "expected_statements",
     "fold_min_entry_ratio", "query_timeout_s", "ami", "subnet",
     "security_group", "key_name", "server_flags_a", "server_flags_b",
-    "healthz_phases",
+    "healthz_phases", "box_speed_band",
 ) + tuple(k for k, _ in RUN_DEFAULTS)
 # Extra ravel-server flags per arm, appended by box/run.sh after the flags
 # KIT_SET_FLAGS names; an entry repeating one of those is refused.
@@ -481,6 +496,9 @@ def check_run(path):
                 if f == kit_flag or f.startswith(kit_flag + "="):
                     raise Refusal("run.toml %s: %s repeats %s, which the kit sets itself"
                                   % (path, key, kit_flag))
+    if not isinstance(data.get("box_speed_band", True), bool):
+        raise Refusal("run.toml %s: box_speed_band must be true or false, got %r"
+                      % (path, data["box_speed_band"]))
     sampled = healthz_phases(data)
     if (not isinstance(sampled, list) or len(set(map(str, sampled))) != len(sampled)
             or any(p not in HEALTHZ_PHASES for p in sampled)):
@@ -670,6 +688,15 @@ def check_bands(lane, path, sections=None):
     if malformed:
         raise Refusal("band file %s: %s must be a number of at least 0"
                       % (path, ", ".join(malformed)))
+    rel = data.get("relative", {})
+    speed = [rel.get(k) for k in BOX_SPEED_KEYS]
+    if sum(1 for v in speed if _num(v)) == 1:
+        raise Refusal("band file %s: set both of relative.%s or neither"
+                      % (path, " and relative.".join(BOX_SPEED_KEYS)))
+    if all(_num(v) for v in speed) and not 0 < speed[0] <= 1 <= speed[1]:
+        raise Refusal("band file %s: relative.box_speed_min_ratio must be above 0 and at most "
+                      "1, and relative.box_speed_max_ratio at least 1, got %r and %r"
+                      % (path, speed[0], speed[1]))
     for name in COUNT_BAND_KEYS:
         table, key = name.rsplit(".", 1)
         if key not in schema.get(table, ()):
@@ -874,21 +901,99 @@ def declared_flags(run_toml):
     return (arm_extra_flags(data, "A"), arm_extra_flags(data, "B"))
 
 
+def box_speed_enforced(run_toml):
+    return run_toml is None or check_run(run_toml).get("box_speed_band", True)
+
+
 def _qs(ids):
     return " ".join(sid.split("_", 1)[0] for sid in sorted(ids))
 
 
-def relative_bands(path, a, b, declared=None):
+def box_speed_stamp(path):
+    """The box_speed provenance stamp from the load step's /usr/bin/time
+    output (run.sh's format `wall=%e rss_kb=%M user=%U sys=%S`): each figure
+    is null when the file is missing or does not hold it exactly once as a
+    number, and reason then says why."""
+    stamp = {"basis": "load_user_cpu_s", "load_user_cpu_s": None, "load_wall_s": None,
+             "reason": None}
+    try:
+        text = open(path).read()
+    except (OSError, IOError) as e:
+        stamp["reason"] = "no load.time: %s" % e
+        return stamp
+    reasons = []
+    for key, field in (("user", "load_user_cpu_s"), ("wall", "load_wall_s")):
+        found = re.findall(r"(?:^|\s)%s=(\S*)" % key, text)
+        if len(found) != 1:
+            reasons.append("load.time carries %s= %d times, not once" % (key, len(found)))
+            continue
+        try:
+            v = float(found[0])
+        except ValueError:
+            v = None
+        if not _num(v) or v < 0:
+            reasons.append("load.time %s=%r is not a number of seconds" % (key, found[0]))
+            continue
+        stamp[field] = v
+    if reasons:
+        stamp["reason"] = "; ".join(reasons)
+    return stamp
+
+
+def _box_cpu(report):
+    """An arm's load user CPU seconds, else None and why."""
+    stamp = report["provenance"].get("box_speed")
+    if not isinstance(stamp, dict):
+        return None, "no box_speed stamp"
+    v = stamp.get("load_user_cpu_s")
+    if not _num(v) or v <= 0:
+        return None, "load_user_cpu_s is %r (%s)" % (v, stamp.get("reason") or "no reason given")
+    return v, ""
+
+
+def box_speed_relative(rel, a, b, enforced=True):
+    """Arm B's load user CPU over arm A's, inside [box_speed_min_ratio,
+    box_speed_max_ratio]. Both arms load the same rows, so outside it the
+    boxes ran at different speeds and the verdict is invalid, not a miss;
+    with ENFORCED false (run.toml box_speed_band = false) it is report. A
+    missing stamp on either arm is inconclusive."""
+    lo, hi = (rel.get(k) for k in BOX_SPEED_KEYS)
+    if not (_num(lo) and _num(hi)):
+        return []
+    label = "box_speed load_user_cpu_s B / A"
+    bound = "%g..%g" % (lo, hi)
+    va, why_a = _box_cpu(a)
+    vb, why_b = _box_cpu(b)
+    if va is None or vb is None:
+        why = "; ".join("arm %s: %s" % (arm, w) for arm, w in (("A", why_a), ("B", why_b)) if w)
+        return [_row("relative", label, None, bound, "inconclusive", why)]
+    ratio = vb / va
+    notes = ["A %.1f s, B %.1f s" % (va, vb)]
+    if a["provenance"]["git_sha"] != b["provenance"]["git_sha"]:
+        notes.append("the loader differs between arms (built from each arm's sha)")
+    if lo <= ratio <= hi:
+        verdict = "pass"
+    elif enforced:
+        verdict = "invalid"
+        notes.append("box speeds differ: re-run, do not read the bands")
+    else:
+        verdict = "report"
+        notes.append("outside the band; run.toml box_speed_band = false makes it report-only")
+    return [_row("relative", label, ratio, bound, verdict, "; ".join(notes))]
+
+
+def relative_bands(path, a, b, declared=None, box_speed_band=True):
     """Arm B judged against arm A, over the statements both arms answered. A
     statement A answered and B did not is a miss of its own, and so is a
     both-answered set smaller than min_both_answered, an arm that answered
-    nothing, or a statement whose row count differs between the arms."""
+    nothing, or a statement whose row count differs between the arms. The box
+    speed row comes first: an invalid one qualifies every row after it."""
     check_comparable(a, b, declared)
     sections = a["provenance"]["band_sections"]
     if "relative" not in sections:
         return []
     rel = check_bands(lane_of(path), path, sections)["relative"]
-    out = []
+    out = box_speed_relative(rel, a, b, box_speed_band)
 
     def add(*args, **kw):
         out.append(_row("relative", *args, **kw))
@@ -2171,9 +2276,17 @@ def main(argv):
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
         elif cmd == "relative" and len(args) in (3, 4):
             a, b = validate(args[1]), validate(args[2])
-            rows = relative_bands(args[0], a, b, declared_flags(args[3] if len(args) == 4 else None))
+            run_toml = args[3] if len(args) == 4 else None
+            rows = relative_bands(args[0], a, b, declared_flags(run_toml),
+                                  box_speed_enforced(run_toml))
             print_table(rows, "B vs A")
+            if any(r["verdict"] == "invalid" for r in rows):
+                print("kit: run INVALID: the box speed band failed, so the boxes ran at "
+                      "different speeds; re-run, do not read the bands", file=sys.stderr)
+                return EXIT_INVALID
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
+        elif cmd == "box-speed" and len(args) == 1:
+            print(json.dumps(box_speed_stamp(args[0]), sort_keys=True))
         elif cmd == "memory-gap" and len(args) == 6:
             rows = memory_gap(*args)
             print_table(rows, "B")

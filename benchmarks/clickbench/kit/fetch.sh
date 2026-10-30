@@ -10,6 +10,22 @@
 # absolute band table followed by every lane's relative bands, arm B against
 # arm A, when run.toml's band_sections selected them:
 #
+#   box speed           first: arm B's load user CPU seconds over arm A's
+#                       (provenance.box_speed, stamped by box/run.sh from the
+#                       load step's /usr/bin/time) inside
+#                       [relative.box_speed_min_ratio,
+#                       relative.box_speed_max_ratio]. Both arms load the same
+#                       rows, so outside it the boxes differ in speed and the
+#                       row is INVALID, not a miss: every other row still
+#                       prints, and fetch exits 5. INCONCLUSIVE when either
+#                       arm has no stamp (a results.json from before it
+#                       existed) or a null figure. The note says when the arms'
+#                       SHAs differ, since each arm's loader is built from its
+#                       own SHA; a loader change expected to move the load's
+#                       CPU by more than the band is declared with run.toml's
+#                       box_speed_band = false, which prints the row as REPORT
+#                       and never invalidates. Only when the band file sets
+#                       both keys to numbers
 #   pooled error rate   the benchmark phase's calls only, at most A's +
 #                       relative.error_pooled_max_delta; a wrong-answer call
 #                       counts as an error
@@ -60,7 +76,7 @@
 # Written for bash 3.2 (macOS /bin/bash).
 #
 # Exit codes:
-#   0   both arms DONE and every band passed or was inconclusive
+#   0   both arms DONE and every band passed, was inconclusive or was REPORT
 #   1   a band missed, absolute on either arm or relative
 #   2   an arm wrote FAILED (its content is printed), a results.json or
 #       in/run.toml is missing, a results.json is malformed, or the arms are
@@ -69,6 +85,9 @@
 #   4   S3 unreachable: --unreachable-tries consecutive polls failed (default
 #       3), or a download failed with an error other than a missing key
 #       (a 403 and a missing bucket included)
+#   5   box speeds differ: the box speed band was INVALID. Re-run, do not read
+#       the bands; this takes precedence over 1, since a miss on boxes of
+#       different speed says nothing about the binary
 #   64  bad usage
 set -uo pipefail
 
@@ -257,6 +276,7 @@ download in/run.toml "$OUT_DIR/run.toml" || code=$?
 kit_py comparable "$OUT_DIR/run.toml" "$OUT_DIR/A/results.json" "$OUT_DIR/B/results.json" || exit 2
 
 miss=0
+invalid=0
 echo "VERDICT      ARM      BAND                                           VALUE          BOUND"
 for arm in A B; do
   code=0
@@ -275,6 +295,7 @@ for band in "$OUT_DIR"/kit/bands/*.toml; do
   case "$code" in
     0) ;;
     1) miss=1 ;;
+    5) invalid=1 ;;
     *) exit 2 ;;
   esac
   code=0
@@ -289,6 +310,10 @@ done
 kit_py concurrent-detail "$OUT_DIR/kit/bands" "$OUT_DIR/A/results.json" "$OUT_DIR/A/evidence.tgz" \
   "$OUT_DIR/B/results.json" "$OUT_DIR/B/evidence.tgz" "$OUT_DIR/run.toml" \
   || echo "fetch: warning: could not print the concurrent errors by statement (see above); the band verdict stands" >&2
+if [ "$invalid" = 1 ]; then
+  echo "fetch: run INVALID: box speeds differ (the box speed band above); re-run, do not read the bands; results under $OUT_DIR" >&2
+  exit 5
+fi
 if [ "$miss" = 1 ]; then
   echo "fetch: at least one band MISSED; results under $OUT_DIR" >&2
   exit 1

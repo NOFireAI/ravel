@@ -26,7 +26,10 @@
 #               rows_expected and an "objects written" figure, the fold must
 #               report seal_through_hour and an entry_count of at least
 #               fold_min_entry_ratio (default 0.8) of that figure, and its
-#               figures are stamped
+#               figures are stamped; the load's /usr/bin/time figures go to
+#               load.time, and its user CPU and wall seconds are stamped as
+#               box_speed (kit.py box-speed: null with a reason when
+#               load.time lacks one), which fetch.sh's box speed band reads
 #   verify      the corpus's q01, SELECT COUNT(*) FROM logs, once through the
 #               benchmark's endpoint and window; its one cell must equal
 #               rows_expected, and the three counts are stamped as row_count
@@ -1423,6 +1426,8 @@ write_stamps() {
   printf '{"before_load": %s, "after_load": %s}\n' \
     "$(json_num "$(cat "$KIT/object-counts/before-load" 2>/dev/null)")" \
     "$(json_num "$(cat "$KIT/object-counts/after-load" 2>/dev/null)")" >"$STAMPS/object_counts"
+  # The load's user CPU, which fetch.sh's box speed band compares across arms.
+  kit_py box-speed "$KIT/load.time" >"$STAMPS/box_speed" || return 1
 }
 
 write_results() {
