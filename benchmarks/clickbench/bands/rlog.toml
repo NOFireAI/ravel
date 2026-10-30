@@ -5,9 +5,9 @@
 # The kit's lib/kit.py reads this file and refuses a missing key, a key it does
 # not know and a removed key, each named. run.toml's band_sections selects which
 # sections a run is judged by; a placeholder value is refused only in a selected
-# section. The healthz_* and adr1170_* keys are the exception: each may be left
-# out or left a placeholder in any section, and the band is then skipped, so
-# they are opt-in.
+# section. The healthz_*, adr1170_* and box_speed_* keys are the exception:
+# each may be left out or left a placeholder in any section, and the band is
+# then skipped, so they are opt-in.
 #
 # Hot is a statement's best of its second and third tries (min_ms) and cold
 # its first try (cold_ms), the figures the runbook's analyse.py sums.
@@ -59,6 +59,25 @@ hot_statement_floor_s = 0.2
 # own, named.
 hot_sum_max_ratio = 1.05
 cold_sum_max_ratio = 1.05
+# Optional: the box speed band, checked before any other relative band. Arm
+# B's load user CPU seconds over arm A's (provenance.box_speed, stamped by
+# box/run.sh from the load step's /usr/bin/time; kit.py box_speed_stamp) must
+# lie in [box_speed_min_ratio, box_speed_max_ratio]. Both arms load the same
+# rows, so a ratio outside it says the boxes ran at different speeds: the row
+# is INVALID and fetch.sh exits 5 (kit.py box_speed_relative; cases "box
+# speed" in kit/kit.test.sh). A missing stamp on either arm is inconclusive.
+# run.toml's box_speed_band = false makes the row report-only, for a run whose
+# loader change is expected to move the load's CPU by more than this band.
+# Set both or neither; a placeholder or a missing key skips the band.
+# Basis: issue #3490 and #3486 comment 6513957016: five boxes running the
+# same binary loaded with 5,974 to 6,092 s of user CPU (a spread of 1.020,
+# inside the band whichever two are paired), and the slow box, whose hot sum
+# read 54.67 s where others read 48.79 to 49.28 s, used 6,367 s, 1.045 to
+# 1.066 times theirs. 1.05 refuses the slow box paired with any box that
+# loaded in under 6,064 s (6,367 / 1.05), the fastest included; paired with
+# the slowest, 6,092 s, it reads 1.045 and passes.
+box_speed_min_ratio = 0.95
+box_speed_max_ratio = 1.05
 # Optional: GET /healthz latency on port 4318 (the query listener) and 4319
 # (the health listener), sampled every 250 ms with a 2 s client timeout during
 # the benchmark phase and each concurrent round (those run.toml's

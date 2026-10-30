@@ -791,6 +791,32 @@ a run whose arm B ran no concurrent phase, or whose `healthz_phases` leaves
 are optional: either left out or left a placeholder skips the band with a
 printed line. `bands/rlog.toml` sets them to 2 GiB and 0.0.
 
+Each arm stamps its box's speed: `box/run.sh` writes the load step's
+`/usr/bin/time` figures to `load.time` and `kit.py box-speed` reads them
+into `provenance.box_speed`, `{"basis": "load_user_cpu_s",
+"load_user_cpu_s": <s>, "load_wall_s": <s>, "reason": null}`. A
+`load.time` that is missing, or that holds a figure other than exactly once
+as a number, stamps that figure null with the reason (kit.test.sh case "box
+speed: kit.py box-speed records null with a reason ..."). Both arms load the
+same rows, so the load's user CPU measures the box, not the query path. The
+band file's `box_speed_min_ratio` and `box_speed_max_ratio` bound arm B's
+figure over arm A's, and `fetch.sh` prints that row first. Outside the band
+the verdict is `INVALID`, not `MISS`: every other row still prints so the
+run can be read for what it measured, and `fetch.sh` exits 5, "box speeds
+differ: re-run, do not read the bands", ahead of any miss (cases "box speed:
+ratio 1.066 is INVALID ..." and "... 0.940 ..."). An arm without the stamp
+(a `results.json` from before it existed) or with a null figure prints the
+row `INCONCLUSIVE` and leaves the exit to the other bands. When the arms ran
+different SHAs the row's note says the loader differs between them, since
+each arm builds `ravel-cli` from its own SHA; a run whose loader change is
+expected to move the load's CPU by more than the band declares
+`box_speed_band = false` in `run.toml`, and the row then prints `REPORT` and
+never invalidates the run. Like the healthz keys, both band keys are
+optional, and set together or not at all; `bands/rlog.toml` sets 0.95 and
+1.05 on the basis of #3486 comment 6513957016 (issue #3490): five boxes
+running one binary loaded with 5,974 to 6,092 s of user CPU, and the slow box
+behind the v0.28.0 clearing miss used 6,367 s, 1.045 to 1.066 times theirs.
+
 `run.toml` may give one arm extra server flags: `server_flags_a` and
 `server_flags_b`, each an array of strings, appended after the flags the kit
 sets and stamped in that arm's `provenance.server_flags.extra_flags`.
@@ -1280,8 +1306,10 @@ a miss writes `DONE` with `bands=miss`. `benchmarks/clickbench/kit/fetch.sh
 single aws call over 90 s), downloads `results.json` and `evidence.tgz`, prints
 each arm's absolute bands and then arm B's relative bands against arm A, and
 exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
-3 on timeout and 4 when S3 is unreachable or a download fails with anything
-but a missing key (a 403 and a missing bucket included). Two arms whose
+3 on timeout, 4 when S3 is unreachable or a download fails with anything
+but a missing key (a 403 and a missing bucket included), and 5 when the box
+speed band (section 8) reads `INVALID`: the two boxes ran at different
+speeds, so re-run rather than read the bands. Two arms whose
 dataset, mapping or corpus digest, `hardware.cpu`, RustFS version, audit mode, query window length
 (`window_hours`), kit-set server flags, extra server flags or resolved server
 settings differ, or that were judged by different band sections, are not

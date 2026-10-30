@@ -611,6 +611,12 @@ concurrency_error_ratio_ceiling = 0.01' \
 band_case unknown 's/^qps_min_ratio = /qps_min_ratoi = /' 'unknown key(s) relative.qps_min_ratoi for lane rlog'
 # Catches: a band file with a required key absent judged anyway.
 band_case missing '/^cold_sum_max_ratio = /d' 'missing required key(s) relative.cold_sum_max_ratio'
+# Catches: a box speed band with one bound silently skipped, or one whose
+# bounds exclude a ratio of 1, so two identical boxes would read INVALID.
+band_case "lone box_speed_min_ratio" '/^box_speed_max_ratio = /d' \
+  'set both of relative.box_speed_min_ratio and relative.box_speed_max_ratio or neither'
+band_case "box_speed_min_ratio above 1" 's/^box_speed_min_ratio = .*/box_speed_min_ratio = 1.1/' \
+  'relative.box_speed_min_ratio must be above 0 and at most 1, and relative.box_speed_max_ratio at least 1, got 1.1 and 1.05'
 
 # run_case NAME SED WANT: kit.py check-run on a copy of the run.toml edited by
 # SED must exit 2 with WANT in its message.
@@ -659,6 +665,10 @@ run_case "a zero q29_probe_runs" 's/^shards = /q29_probe_runs = 0\n&/' \
   'q29_probe_runs must be a whole number of at least 1, got 0'
 run_case "a string perf_record" 's/^shards = /perf_record = "true"\n&/' \
   "perf_record must be true or false, got 'true'"
+# Catches: box_speed_band read by truthiness, so "no" would leave the band
+# enforced or "false" as a string switch it off.
+run_case "a string box_speed_band" 's/^shards = /box_speed_band = "false"\n&/' \
+  "box_speed_band must be true or false, got 'false'"
 
 # Catches: an arm's extra server flags overriding a flag the kit sets, so the
 # arms differ by a setting nobody declared, in either spelling of the flag.
@@ -972,8 +982,20 @@ drop_caches() {
   echo 3 >"$DROP_CACHES_FILE"
 }
 # GNU time is not on every CI image; run.sh's own do_load and do_compact run
-# with only the timing wrapper replaced.
-timed() { shift 2; "$@"; }
+# with only the timing wrapper replaced. It writes load.time as GNU time would
+# with run.sh's format, or DRIVER_LOAD_TIME's text in its place; "none" writes
+# no file.
+timed() {
+  local file="$1" code=0
+  shift 2
+  "$@" || code=$?
+  case "${file##*/}:${DRIVER_LOAD_TIME:-}" in
+    load.time:none) ;;
+    load.time:*)
+      printf '%s\n' "${DRIVER_LOAD_TIME:-wall=1500.25 rss_kb=4000000 user=6000.50 sys=120.75}" >"$file" ;;
+  esac
+  return "$code"
+}
 eval "real_run_query() $(declare -f run_query | tail -n +2)"
 run_query() {
   echo "$*" >>"$STUB_DIR/run_query-calls"
@@ -1050,8 +1072,11 @@ for k in ("provenance", "entries", "skipped", "failed", "totals", "error_pooled"
 for k in ("git_sha", "binary", "arm", "tenant", "server", "server_logs", "server_settings",
           "band_sections", "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
           "corpus_digest", "server_flags", "audit_mode", "burst_balance", "fold", "object_counts",
-          "query_window", "row_count"):
+          "query_window", "row_count", "box_speed"):
     want(k in p, "provenance." + k)
+want(p.get("box_speed") == {"basis": "load_user_cpu_s", "load_user_cpu_s": 6000.5,
+                            "load_wall_s": 1500.25, "reason": None},
+     "box_speed stamp %r" % p.get("box_speed"))
 rc = p.get("row_count") or {}
 want(rc.get("rows_expected") == 99997497 and rc.get("load_rows_written") == 99997497
      and rc.get("count_star") == 99997497 and rc.get("statement") == "q01_count_all", "row_count stamp %r" % rc)
@@ -1626,6 +1651,47 @@ else
   fail "no objects written" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
 fi
 rm -rf "$OUT_A"
+
+# Catches: a load.time without its user= figure stamped as a number (0, or
+# the sys= figure) instead of null with a reason, or failing the box: the
+# stamp only feeds fetch.sh's box speed band, which reads null as
+# inconclusive.
+code=0
+run_box A box-nouser 'DRIVER_LOAD_TIME=wall=1500.25 rss_kb=4000000 sys=120.75' || code=$?
+nouser="$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["provenance"]["box_speed"], sort_keys=True))' \
+  "$OUT_A/results.json" 2>&1)"
+if [ "$code" = 0 ] && grep -q '^DONE ' "$OUT_A/DONE" 2>/dev/null \
+  && [ "$nouser" = '{"basis": "load_user_cpu_s", "load_user_cpu_s": null, "load_wall_s": 1500.25, "reason": "load.time carries user= 0 times, not once"}' ]; then
+  pass "box speed: a load.time without user= stamps load_user_cpu_s null with a reason and the box still ends DONE"
+else
+  fail "box speed stamp without user=" "exit $code, stamp $nouser, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: kit.py box-speed inventing a figure from a load.time that is
+# missing, names user= twice (a GNU time line appended to an old file), or
+# holds something that is not a number of seconds.
+bs_bad=""
+printf 'wall=10.5 user=abc sys=1\n' >"$TMP/load-abc.time"
+printf 'wall=10.5 user=9.0 sys=1\nwall=11.5 user=9.5 sys=1\n' >"$TMP/load-twice.time"
+for c in "missing|$TMP/no-such-load.time|null|null|no load.time: " \
+  "abc|$TMP/load-abc.time|null|10.5|load.time user='abc' is not a number of seconds" \
+  "twice|$TMP/load-twice.time|null|null|load.time carries user= 2 times, not once; load.time carries wall= 2 times, not once"; do
+  IFS='|' read -r name file user wall reason <<EOF
+$c
+EOF
+  got="$(python3 "$KIT_SRC/lib/kit.py" box-speed "$file" 2>&1)" || bs_bad="$bs_bad $name:exit"
+  python3 -c 'import json, sys
+s = json.loads(sys.argv[1])
+ok = (s["basis"] == "load_user_cpu_s" and json.dumps(s["load_user_cpu_s"]) == sys.argv[2]
+      and json.dumps(s["load_wall_s"]) == sys.argv[3] and s["reason"].startswith(sys.argv[4]))
+sys.exit(0 if ok else 1)' "$got" "$user" "$wall" "$reason" 2>/dev/null || bs_bad="$bs_bad $name:$got"
+done
+if [ -z "$bs_bad" ]; then
+  pass "box speed: kit.py box-speed records null with a reason for a missing, unparsable or repeated figure"
+else
+  fail "box-speed parse" "$bs_bad"
+fi
 
 # Catches: a RustFS binary that unpacks and installs but cannot run (the gnu
 # build on an older glibc) left to fail later as a store that never answers.
@@ -2692,6 +2758,146 @@ if [ "$code" = 3 ] && grep -q 'no marker from both arms within 2 s' "$TMP/fetch-
   pass "no marker within --timeout exits 3"
 else
   fail "timeout" "exit $code: $(tail -n 2 "$TMP/fetch-pending.err")"
+fi
+
+# --- box speed band -----------------------------------------------------------
+
+# SPEED_PY: a python edit helper for edit_arm. speed(r, user) stamps the arm's
+# load at USER seconds of user CPU; nospeed(r) removes the stamp, as a
+# results.json from before it existed has none.
+SPEED_PY='
+def speed(r, user):
+    r["provenance"]["box_speed"] = {"basis": "load_user_cpu_s", "load_user_cpu_s": user,
+                                    "load_wall_s": 1500.0, "reason": None}
+def nospeed(r):
+    del r["provenance"]["box_speed"]
+'
+SPEED_ROW='box_speed load_user_cpu_s B / A'
+
+# Catches: the box speed band not judged on a normal run, or judged against
+# the wrong bound: both arms loaded with 6000.5 s, ratio 1.000.
+if grep -q "^PASS  *B vs A  *$SPEED_ROW  *1.000  *0.95..1.05  *A 6000.5 s, B 6000.5 s; the loader differs between arms (built from each arm's sha)$" "$TMP/fetch-pass.out" \
+  && [ "$(grep -c 'box_speed' "$TMP/fetch-pass.out")" = 1 ]; then
+  pass "box speed: two arms with the same load CPU pass, printed once at ratio 1.000"
+else
+  fail "box speed pass" "$(grep box_speed "$TMP/fetch-pass.out")"
+fi
+
+# Catches: a band edge read as outside it: 1.049 and 0.951 both pass.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-speed-a" "$SPEED_PY"'
+speed(r, 6000.0)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-hi" "$SPEED_PY"'
+speed(r, 6294.0)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-lo" "$SPEED_PY"'
+speed(r, 5706.0)'
+relative speed-hi "$TMP/fixture-speed-a" "$TMP/fixture-speed-hi"
+hi="$code"
+relative speed-lo "$TMP/fixture-speed-a" "$TMP/fixture-speed-lo"
+if [ "$hi" = 0 ] && grep -q "^PASS  *B vs A  *$SPEED_ROW  *1.049  *0.95..1.05  *A 6000.0 s, B 6294.0 s;" "$TMP/rel-speed-hi.out" \
+  && [ "$code" = 0 ] && grep -q "^PASS  *B vs A  *$SPEED_ROW  *0.951  *0.95..1.05  *A 6000.0 s, B 5706.0 s;" "$TMP/rel-speed-lo.out"; then
+  pass "box speed: ratios 1.049 and 0.951 are inside the band and pass"
+else
+  fail "box speed edges" "exits $hi/$code: $(grep box_speed "$TMP/rel-speed-hi.out" "$TMP/rel-speed-lo.out") $(head -c 300 "$TMP/rel-speed-hi.err")"
+fi
+
+# speed_invalid NAME B_USER RATIO: fetch over arm A at 6000.0 s and arm B at
+# B_USER s must print the box speed row INVALID at RATIO, still print every
+# other row the passing run printed, and exit 5 with the invalid summary.
+speed_invalid() {
+  local name="$1" user="$2" ratio="$3"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-$name-b" "$SPEED_PY"'
+speed(r, '"$user"')'
+  fixture "run-$name" "$TMP/fixture-speed-a" "$TMP/fixture-$name-b"
+  fetch "$name" "run-$name" --timeout 30
+  if [ "$code" = 5 ] \
+    && grep -q "^INVALID  *B vs A  *$SPEED_ROW  *$ratio  *0.95..1.05  *A 6000.0 s, B $user s; the loader differs between arms (built from each arm's sha); box speeds differ: re-run, do not read the bands$" "$TMP/fetch-$name.out" \
+    && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-$name.out" \
+    && [ "$(grep -cE '^(PASS|MISS|INCONCLUSIVE|INVALID|REPORT) ' "$TMP/fetch-$name.out")" \
+      = "$(grep -cE '^(PASS|MISS|INCONCLUSIVE|INVALID|REPORT) ' "$TMP/fetch-pass.out")" ] \
+    && grep -q '^fetch: run INVALID: box speeds differ (the box speed band above); re-run, do not read the bands' "$TMP/fetch-$name.err" \
+    && ! grep -q 'every band passed' "$TMP/fetch-$name.err"; then
+    pass "box speed: ratio $ratio is INVALID, every other row still prints, and fetch exits 5"
+  else
+    fail "box speed $name" "exit $code: $(grep box_speed "$TMP/fetch-$name.out") $(tail -n 2 "$TMP/fetch-$name.err")"
+  fi
+}
+# Catches: arm B on a slow box (the #3486 outlier against the fastest of the
+# same-binary boxes) read as a regression of B's binary (a MISS, exit 1).
+speed_invalid speed-bslow 6396.0 1.066
+# Catches: a one-sided band that only checks B slower than A: arm A on the
+# slow box makes B look fast, which is just as much a box difference.
+speed_invalid speed-aslow 5640.0 0.940
+
+# Catches: a band miss taking precedence over INVALID: q01 misses as well,
+# and the exit is still 5, with the miss row printed.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-both-b" "$SPEED_PY"'
+speed(r, 6396.0)
+r["entries"][0]["min_ms"] = 750.0'
+fixture run-speed-both "$TMP/fixture-speed-a" "$TMP/fixture-speed-both-b"
+fetch speed-both run-speed-both --timeout 30
+if [ "$code" = 5 ] && grep -q "^INVALID  *B vs A  *$SPEED_ROW  *1.066  " "$TMP/fetch-speed-both.out" \
+  && grep -q '^MISS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-speed-both.out" \
+  && ! grep -q 'at least one band MISSED' "$TMP/fetch-speed-both.err"; then
+  pass "box speed: an INVALID run that also misses a band exits 5, printing the miss"
+else
+  fail "box speed invalid and miss" "exit $code: $(grep -v '^PASS' "$TMP/fetch-speed-both.out" | head -n 4)"
+fi
+
+# Catches: an old results.json without the stamp crashing the relative step
+# or invalidating the run: the row is INCONCLUSIVE and the exit is whatever
+# the other bands give, 0 here and 1 with q01 missing.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-old-b" "$SPEED_PY"'
+nospeed(r)'
+fixture run-speed-old "$TMP/fixture-speed-a" "$TMP/fixture-speed-old-b"
+fetch speed-old run-speed-old --timeout 30
+old="$code"
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-speed-old-a" "$SPEED_PY"'
+nospeed(r)'
+relative speed-old-miss "$TMP/fixture-speed-old-a" "$TMP/fixture-rel-b"
+if [ "$old" = 0 ] && grep -q "^INCONCLUSIVE  *B vs A  *$SPEED_ROW  *None  *0.95..1.05  *arm B: no box_speed stamp$" "$TMP/fetch-speed-old.out" \
+  && grep -q 'every band passed or was inconclusive' "$TMP/fetch-speed-old.err" \
+  && [ "$code" = 1 ] && grep -q "^INCONCLUSIVE  *B vs A  *$SPEED_ROW  *None  *0.95..1.05  *arm A: no box_speed stamp$" "$TMP/rel-speed-old-miss.out" \
+  && grep -q '^MISS  *B vs A  *q01 hot_s' "$TMP/rel-speed-old-miss.out"; then
+  pass "box speed: a stamp missing on one arm is INCONCLUSIVE and the other bands decide the exit"
+else
+  fail "box speed missing stamp" "exits $old/$code: $(grep box_speed "$TMP/fetch-speed-old.out" "$TMP/rel-speed-old-miss.out") $(tail -n 3 "$TMP/fetch-speed-old.err")"
+fi
+
+# Catches: a null figure (a load.time without user=) read as 0 and divided
+# by, or as a box difference.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-null-b" "$SPEED_PY"'
+speed(r, None)
+r["provenance"]["box_speed"]["reason"] = "load.time carries user= 0 times, not once"'
+relative speed-null "$TMP/fixture-speed-a" "$TMP/fixture-speed-null-b"
+if [ "$code" = 0 ] && grep -q "^INCONCLUSIVE  *B vs A  *$SPEED_ROW  *None  *0.95..1.05  *arm B: load_user_cpu_s is None (load.time carries user= 0 times, not once)$" "$TMP/rel-speed-null.out"; then
+  pass "box speed: a null load_user_cpu_s is INCONCLUSIVE, quoting its reason"
+else
+  fail "box speed null" "exit $code: $(grep box_speed "$TMP/rel-speed-null.out") $(head -c 300 "$TMP/rel-speed-null.err")"
+fi
+
+# Catches: box_speed_band = false ignored (still INVALID), or turning the row
+# off altogether so the ratio is not printed.
+flags_fixture run-speed-off "$TMP/fixture-speed-a" "$TMP/fixture-speed-bslow-b" \
+  's/^shards = /box_speed_band = false\n&/'
+fetch speed-off run-speed-off --timeout 30
+if [ "$code" = 0 ] \
+  && grep -q "^REPORT  *B vs A  *$SPEED_ROW  *1.066  *0.95..1.05  *A 6000.0 s, B 6396.0 s; the loader differs between arms (built from each arm's sha); outside the band; run.toml box_speed_band = false makes it report-only$" "$TMP/fetch-speed-off.out" \
+  && ! grep -q 'INVALID' "$TMP/fetch-speed-off.out" "$TMP/fetch-speed-off.err"; then
+  pass "box speed: box_speed_band = false prints ratio 1.066 as REPORT and does not invalidate the run"
+else
+  fail "box speed off" "exit $code: $(grep box_speed "$TMP/fetch-speed-off.out") $(tail -n 2 "$TMP/fetch-speed-off.err")"
+fi
+
+# Catches: the loader note printed when both arms ran the same SHA (an A/A
+# run), where the loader is the same binary.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-speed-aa-b" "$SPEED_PY"'
+speed(r, 6396.0)
+r["provenance"]["git_sha"] = "'"$SHA_A"'"'
+relative speed-aa "$TMP/fixture-speed-a" "$TMP/fixture-speed-aa-b"
+if [ "$code" = 5 ] && grep -q "^INVALID  *B vs A  *$SPEED_ROW  *1.066  *0.95..1.05  *A 6000.0 s, B 6396.0 s; box speeds differ: re-run, do not read the bands$" "$TMP/rel-speed-aa.out"; then
+  pass "box speed: an A/A pair at 1.066 is INVALID without the loader note"
+else
+  fail "box speed A/A" "exit $code: $(grep box_speed "$TMP/rel-speed-aa.out") $(head -c 300 "$TMP/rel-speed-aa.err")"
 fi
 
 # --- concurrent, q29_probe and perf phases ----------------------------------
