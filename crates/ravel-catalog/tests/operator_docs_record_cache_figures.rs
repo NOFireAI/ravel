@@ -323,6 +323,45 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
             "the bytes one entry costs across both record caches",
         );
     }
+    // The raised-budget example where the derived capacity, not the budget's
+    // cap, binds: one shard at the 2-second cadence under 400 MB.
+    let raised_budget: u64 = 400_000_000;
+    let one_shard_entries = u64::try_from(ravel_catalog::derive_cache_capacity_per_tenant_within(
+        1,
+        std::time::Duration::from_secs(2),
+        raised_budget,
+    ))
+    .expect("entry count fits u64");
+    let one_shard_mb = format_mb(one_shard_entries * pair_bytes);
+    let one_shard_str = with_commas(one_shard_entries);
+    let raised_budget_mb = format_mb(raised_budget);
+    let one_shard_needle = format!(
+        "cadence derives {one_shard_str} entries, {one_shard_mb} MB at a {raised_budget_mb} MB \
+         budget"
+    );
+    for (marker, quantity) in [
+        (
+            one_shard_str.clone(),
+            "the one-shard entry count under a raised budget",
+        ),
+        (
+            format!("{one_shard_mb} MB"),
+            "the one-shard worst case under a raised budget",
+        ),
+        (
+            format!("{raised_budget_mb} MB"),
+            "the raised-budget example",
+        ),
+    ] {
+        assert_doc_states(
+            CACHING_GUIDE,
+            &caching,
+            &one_shard_needle,
+            &marker,
+            1,
+            quantity,
+        );
+    }
     assert_doc_states(
         CACHING_GUIDE,
         &caching,

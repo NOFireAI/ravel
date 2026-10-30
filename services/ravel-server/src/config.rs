@@ -2818,10 +2818,10 @@ pub struct Cli {
     /// `--cache-max-bytes`, `--catalog-cache-max-bytes` or
     /// `--column-stats-cache-max-bytes`, so budget host memory for it
     /// separately, times the number of tenants queried concurrently
-    /// (ADR-3513). Each cache gets half of it. The per-tenant entry bound is
-    /// the capacity derived from `--shards` and `--max-flush-delay`, held
-    /// between the 10,000-entry floor and this budget divided by 1,800 bytes
-    /// (900 bytes per entry in each of the two caches), and each cache is
+    /// (ADR-3513). Each cache gets at most half of it. The per-tenant entry
+    /// bound is the capacity derived from `--shards` and `--max-flush-delay`,
+    /// held between the 10,000-entry floor and this budget divided by 1,800
+    /// bytes (900 bytes per entry in each of the two caches), and each cache is
     /// held to that bound times 900 bytes. So the worst case for one
     /// actively-queried tenant is at most this figure, both halves enforced
     /// in bytes: 45 MB unset, 400 MB at `400000000`.
