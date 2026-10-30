@@ -2082,19 +2082,6 @@ impl SegmentFetcher {
         .await
     }
 
-    /// Decides whether a sparse (SERIES_META-absent) v5 object takes the
-    /// catalog-probe path, returning the four catalog section ranges to fetch
-    /// when it does. `None` means fall back to the whole-object decode.
-    ///
-    /// Qualifies when all hold:
-    /// - the object carries both sparse sections (SERIES_IDX +
-    ///   SERIES_META_CHUNKS); a malformed footer missing either falls back,
-    ///   where `decode_catalog_v5` surfaces the same typed error it always did;
-    /// - `matchers` is non-empty. An empty matcher matches every series, so the
-    ///   query wants all pages anyway; a single whole-object GET beats one
-    ///   catalog GET plus a page GET spanning the whole object;
-    /// - the object is at least [`SPARSE_PROBE_MIN_OBJECT_SIZE`], so the page
-    ///   bytes skipped outweigh the extra selective page-range round trips.
     /// The ranges [`decode_selected`](Self::decode_selected) fetches for an
     /// object's catalog, branch for branch: LABEL_DICT, SERIES_IDS and
     /// SERIES_META when the object carries SERIES_META, the four sparse
@@ -2132,6 +2119,19 @@ impl SegmentFetcher {
         }
     }
 
+    /// Decides whether a sparse (SERIES_META-absent) v5 object takes the
+    /// catalog-probe path, returning the four catalog section ranges to fetch
+    /// when it does. `None` means fall back to the whole-object decode.
+    ///
+    /// Qualifies when all hold:
+    /// - the object carries both sparse sections (SERIES_IDX +
+    ///   SERIES_META_CHUNKS); a malformed footer missing either falls back,
+    ///   where `decode_catalog_v5` surfaces the same typed error it always did;
+    /// - `matchers` is non-empty. An empty matcher matches every series, so the
+    ///   query wants all pages anyway; a single whole-object GET beats one
+    ///   catalog GET plus a page GET spanning the whole object;
+    /// - the object is at least [`SPARSE_PROBE_MIN_OBJECT_SIZE`], so the page
+    ///   bytes skipped outweigh the extra selective page-range round trips.
     fn sparse_probe_qualifies(
         &self,
         footer: &Footer,
