@@ -28,7 +28,7 @@ sample was taken per arm:
 |---|---|---|---|
 | Stored rate | 78.5k lines/s, ~101 us CPU/line | 85.8k lines/s, ~92 us CPU/line (n=1, 5 min after the first arm; the bucket grew between them) | measured 2026-10-30 |
 | Flush encode, `RlogWriter::build_object` | 64.5% | 57.9% | measured 2026-10-30 |
-| `block::write_block` (self) | 26.7% (15.3%) | 31.2% (18.3%) | measured 2026-10-30 |
+| `block::write_block`, inclusive (self) | 26.7% (15.3%) | 31.2% (18.3%) | measured 2026-10-30 |
 | `rlog_codec::string_shape` | 6.5% | 6.9% | measured 2026-10-30 |
 | zstd compression | 3.3% | 4.0% | measured 2026-10-30 |
 | Text index, `writer::insert_text` | 13.3% | under 2% | measured 2026-10-30 |
@@ -160,10 +160,19 @@ paths produce byte-identical output, which is ADR-0109 decision 7.
 ### D3. Decode and normalize stop copying strings
 
 **D3a.** `normalize_logs_projected` consumes the request and moves values out
-of it instead of cloning them:
+of it instead of cloning them. Two further steps follow:
 
-- the per-stream attribute blob is shared, not copied into every record;
-- the label-projection walk is folded into the normalize pass.
+- the per-stream attribute blob is shared, not copied into every record.
+  `NormalizedLogRecord` is built in ravel-ingest, so this lands with D5's
+  ravel-ingest change, not with the ravel-otlp move;
+- the label-projection walk is folded into the normalize pass where nothing
+  charges the projection first. The server keeps projecting before it
+  normalizes, because ADR-2708 decision 2 bounds each OTLP request by its
+  projected resolved-label bytes, and the server refuses an oversized
+  request before any record is built (`label_charge_allocations` pins
+  that).
+  Folding it there needs that decision amended, and only after the shared
+  blob stops per-record memory growing with stream width.
 
 The OTLP gRPC logs path uses the same tonic types and the same normalize, so
 it gets the change unchanged.
@@ -226,7 +235,8 @@ series. The floor therefore applies to the flush as a whole, as it does
 today: a flush at or above the floor dispatches its page jobs to the
 blocking pool, and each page job takes one write-gate permit, whatever its
 own size. A flush below the floor stays one inline job. The gate still
-bounds total encode concurrency. The flush assembles the sealed pages in
+bounds total encode concurrency. This amends ADR-1702 decision 4 for the logs
+ingest flush only; the amendment is in ADR-1702 itself. The flush assembles the sealed pages in
 the column order the writer uses today, so the object's bytes are identical to
 a serial encode. A test pins that equality on the benchmark's shape and on the
 golden corpus.
@@ -278,9 +288,13 @@ has about 145k to 170k of capacity at the default permit count, above the
 120k target, so the strict row is then bound by CPU.
 
 150k lines/s on 8 vCPU allows at most about 53 us of CPU per line, about 47%
-below today. D1 to D6 target 30 to 35%, which predicts a CPU-bound strict
-ceiling of about 120-135k. Closing the rest to 150k needs the further cuts
-that D2 and D3b give, if they measure, and whatever D0 finds behind the GETs.
+below today. D1 to D6 target 30 to 35% at bloom scope `all`, the scope the
+exit uses: from 101 us, that is 66 to 71 us per line, a CPU-bound ceiling of
+about 113k to 122k. At the 30% end that misses the 115k exit by about 2%. In
+that case the epic stays open and the next cuts are D2 and D3b, each adopted
+only if it measures cheaper; neither the exit nor the bloom scope is
+relaxed to close the gap. Reaching 150k needs those further cuts and whatever
+D0 finds behind the GETs.
 
 The two objects written per flush (data, then commit record) stay sequential
 under the commit protocol (ADR-0002). Fewer than about 20 objects/s at this
@@ -357,7 +371,8 @@ flowchart LR
 ## Consequences
 
 - No persistent format changes and no format version changes. ADR-2135
-  decision 4 is amended for the ingest writer only.
+  decision 4 is amended for the ingest writer only. ADR-1702 decision 4 is
+  amended for the logs ingest flush only (D7).
 - `Estimated` ingest objects can be up to 10% larger, by the exit bound, until
   compaction rewrites them. D0 confirms that compaction runs on the benchmark
   deployment.
