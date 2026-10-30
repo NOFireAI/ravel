@@ -2219,7 +2219,10 @@ mod tests {
             "one permitted job per page job"
         );
         let snapshot = free.snapshot();
-        assert_eq!((snapshot.wait_count, snapshot.run_count), (page_jobs, page_jobs));
+        assert_eq!(
+            (snapshot.wait_count, snapshot.run_count),
+            (page_jobs, page_jobs)
+        );
         assert_eq!((snapshot.running, snapshot.queued), (0, 0));
 
         // Two permits, one parked on an unrelated job: the flush takes the

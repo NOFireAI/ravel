@@ -239,7 +239,8 @@ bounds total encode concurrency. This amends ADR-1702 decision 4 for the logs
 ingest flush only; the amendment is in ADR-1702 itself. The flush assembles the sealed pages in
 the column order the writer uses today, so the object's bytes are identical to
 a serial encode (corrected in the D7 measurement amendment below: page order
-within a column is what keeps the bytes identical). A test pins that equality
+within each column and a row-group dictionary decision made once per column
+keep the bytes identical, not column order). A test pins that equality
 on the benchmark's shape and on the golden corpus.
 
 Two cases fall back to the serial single-job encode:

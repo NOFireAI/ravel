@@ -637,9 +637,15 @@ async fn an_above_floor_log_flush_seals_its_pages_as_gate_jobs() {
         .map(|i| {
             let mut record = log_record(&format!("request {i} {}", "x".repeat(600)));
             record.attrs = vec![
-                ("http.route".to_string(), AttrValue::Str(format!("/r/{}", i % 37))),
+                (
+                    "http.route".to_string(),
+                    AttrValue::Str(format!("/r/{}", i % 37)),
+                ),
                 ("http.status".to_string(), AttrValue::I64(200 + i % 5)),
-                ("peer".to_string(), AttrValue::Str(format!("10.0.0.{}", i % 251))),
+                (
+                    "peer".to_string(),
+                    AttrValue::Str(format!("10.0.0.{}", i % 251)),
+                ),
             ];
             record
         })

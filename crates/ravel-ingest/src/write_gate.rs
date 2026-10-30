@@ -282,9 +282,7 @@ impl PageEncodeExecutor for GatedPageEncode {
             })
             .collect();
         let mut done: Vec<PageEncodeDone> = own.into_iter().map(PageEncodeJob::run).collect();
-        let joined = self
-            .runtime
-            .block_on(futures::future::join_all(dispatched));
+        let joined = self.runtime.block_on(futures::future::join_all(dispatched));
         for result in joined {
             let err = match result {
                 Ok(Ok(page)) => {

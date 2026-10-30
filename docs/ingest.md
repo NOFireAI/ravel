@@ -1026,7 +1026,7 @@ exactly five places:
   to the writer as one `ColumnarLogBatch` through `push_columnar` (decision 2), which
   writes the object byte for byte as pushing the rows one at a time would.
   The encode runs on the ADR-1702 write gate, sized by the flush's input
-  bytes. Below the gate's inline floor (1 MiB on the server) it is one inline
+  bytes. Below the gate's inline floor (1 MiB by default on the server) it is one inline
   job, sealing every column page serially. At or above the floor it is one
   permitted job that seals each block's column pages as page jobs (ADR-3492
   decision 7): the job seals the first page job itself, and each further page
