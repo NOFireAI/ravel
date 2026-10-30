@@ -16,6 +16,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/refused_addr.rs"]
+mod refused_addr;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -124,15 +127,10 @@ async fn publish_series(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_
         .expect("publish");
 }
 
-/// An address bound then immediately released: a connection to it is refused, so
-/// a remote pointed here is unavailable at query time.
-async fn dead_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind dead");
-    let addr = listener.local_addr().expect("dead local addr");
-    drop(listener);
-    addr.to_string()
+/// An address whose connections are refused, so a remote pointed here is
+/// unavailable at query time.
+fn dead_endpoint() -> String {
+    refused_addr::refused_addr().to_string()
 }
 
 /// A `Federation` over one unavailable remote cluster with `skip_unavailable =
@@ -176,7 +174,7 @@ async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &Ten
     .expect("catalog");
     let mut tokens = std::collections::HashMap::new();
     tokens.insert(TOKEN.to_string(), tenant.clone());
-    let federation = Arc::new(dead_federation("west", &dead_endpoint().await));
+    let federation = Arc::new(dead_federation("west", &dead_endpoint()));
 
     let app_state = build_app_state(
         catalog,

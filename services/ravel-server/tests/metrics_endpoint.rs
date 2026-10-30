@@ -610,11 +610,7 @@ async fn metrics_render_get_unverified_and_control_plane_counters() {
     assert_eq!(served.load(Ordering::Relaxed), 3);
     assert_eq!(served_bytes.load(Ordering::Relaxed), 568);
 
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let closed_base = format!("http://{}", closed.local_addr().expect("addr"));
-    drop(closed);
+    let closed_base = format!("http://{}", refused_addr::refused_addr());
     s3_store_on(closed_base, &metrics)
         .bucket_protection_report(&BucketProtectionParams::default())
         .await;
@@ -1686,6 +1682,9 @@ async fn drain_overrun_and_residue_families_render() {
 
 #[path = "support/strict_flush.rs"]
 mod strict_flush;
+
+#[path = "support/refused_addr.rs"]
+mod refused_addr;
 
 fn spawn_strict_export(
     server: &strict_flush::PolicyServer,

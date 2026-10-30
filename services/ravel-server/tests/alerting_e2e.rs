@@ -10,6 +10,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/refused_addr.rs"]
+mod refused_addr;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
@@ -1452,16 +1455,11 @@ async fn a_rule_removed_from_config_never_repeats() {
 
 // --- Partial federated coverage freezes a rule (ADR-0071 amendment) --------
 
-/// An address that was bound then immediately released: a connection to it is
-/// refused, so a remote pointed here is unavailable at evaluation time. Same
-/// device `federation_e2e.rs` uses for its dead-cluster cases.
-async fn dead_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind dead");
-    let addr = listener.local_addr().expect("dead local addr");
-    drop(listener);
-    addr.to_string()
+/// An address whose connections are refused, so a remote pointed here is
+/// unavailable at evaluation time. Same device `federation_e2e.rs` uses for its
+/// dead-cluster cases.
+fn dead_endpoint() -> String {
+    refused_addr::refused_addr().to_string()
 }
 
 /// An evaluator whose PromQL engine federates to one `skip_unavailable = true`
@@ -1477,7 +1475,7 @@ async fn evaluator_with_dead_remote(
     clock: TestClock,
     rules: Vec<Rule>,
 ) -> AlertEvaluator {
-    let endpoint = dead_endpoint().await;
+    let endpoint = dead_endpoint();
     let cluster_config = RemoteClusterConfig {
         name: "west".to_string(),
         endpoint: endpoint.clone(),
