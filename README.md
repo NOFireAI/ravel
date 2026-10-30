@@ -387,8 +387,10 @@ an AI agent host query your telemetry.
   different payload under the same id is refused.
 - **One turn at a time.** The handler runs the accepted messages in order.
   A turn's state, result and events become visible together.
-- **Durable steps.** A handler calls tools through steps. A completed step
-  replays from its record when the turn runs again. Each tool declares what
+- **Durable steps.** A handler calls tools through steps. The server records
+  each step, and a completed step replays from its record when the turn runs
+  again. The TypeScript SDK does not use these records yet (see the limits
+  under [Running it](#running-it)). Each tool declares what
   happens when an attempt's outcome is unknown: run it again
   (`at_least_once`), rely on the provider's idempotency (`provider_idempotency`),
   or block until an operator decides (`manual`).
@@ -495,10 +497,12 @@ route with its body and status codes.
 
 ### Running it
 
-The published `ravel-server` image is built with the `agents` feature. The
+The `ravel-server` image built from `main` includes the `agents` feature. The
 routes mount only when the server also runs with `--agents`, in
-`--mode all` or `--mode query`. The `CHANGELOG.md` section of a release says
-whether its image carries the feature.
+`--mode all` or `--mode query`. The quickstart pins `0.27.0`, which predates
+the feature, so the quickstart server refuses `--agents` (see the
+[support matrix note](#what-works)). An image gains the feature from the
+first release whose `CHANGELOG.md` section lists agents.
 
 Know these limits before you put agents in production:
 
@@ -507,6 +511,9 @@ Know these limits before you put agents in production:
   conversation, and not a key that receives messages forever.
 - No route destroys an agent in this release. An agent at a cap stays
   there, so send new work to a new key.
+- The TypeScript SDK keeps steps in the worker's memory. When a worker
+  process stops in the middle of a turn, its completed steps are lost with
+  it, so the next worker can run those tools again.
 - With several server processes on one tenant, a message can wait for a
   sweep before a worker on another process sees it. At 10,000 agents that
   wait can reach 26 minutes. One process has no such wait.
