@@ -14,9 +14,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
+#[cfg(doc)]
+use crate::block::PageEncodeJob;
 use crate::block::{
-    BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput, PageChoice,
-    write_block_columnar_with, write_block_with,
+    BlockEncoder, BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput,
+    PageChoice, PageEncodeExecutor,
 };
 use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
@@ -42,7 +44,7 @@ use crate::rlog_bloom::encode_rlog_bloom_section;
 use crate::rlog_codec::{MAX_DICT_ENTRIES, encode_dict_ids, encode_dict_page};
 use crate::skip_index::{Level0Entry, SkipIndex};
 use crate::stream_dir::{BorrowedStreamEntry, StreamDir};
-use crate::tokenizer::tokens;
+use crate::tokenizer::for_each_token;
 
 /// Writer configuration and format constants (docs/log-segment-format.md).
 #[derive(Clone, Copy, Debug)]
@@ -398,7 +400,25 @@ impl RlogWriter {
     /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
     pub fn finish_with_stats(self) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         let layout = self.layout();
-        self.build(0, Vec::new(), 0, layout)
+        self.build(0, Vec::new(), 0, layout, BlockEncoder::Inline)
+    }
+
+    /// Like [`RlogWriter::finish`], but each block's column pages are sealed by
+    /// [`PageEncodeJob`]s handed to `executor`, once per block (ADR-3492
+    /// decision 7). The object's bytes equal [`RlogWriter::finish`]'s whatever
+    /// threads the executor uses and whatever order it returns results in.
+    pub fn finish_on(self, executor: &mut dyn PageEncodeExecutor) -> Result<Vec<u8>, LogSegError> {
+        self.finish_with_stats_on(executor).map(|(bytes, _)| bytes)
+    }
+
+    /// Like [`RlogWriter::finish_with_stats`], with the page encode of
+    /// [`RlogWriter::finish_on`].
+    pub fn finish_with_stats_on(
+        self,
+        executor: &mut dyn PageEncodeExecutor,
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        let layout = self.layout();
+        self.build(0, Vec::new(), 0, layout, BlockEncoder::Jobs(executor))
     }
 
     /// The row-group layout this writer's configuration asks for.
@@ -419,6 +439,7 @@ impl RlogWriter {
         input_set_hash: Vec<u8>,
         part_index: u32,
         layout: Layout,
+        encoder: BlockEncoder<'_>,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         // A config whose dynamic-column budget could assign an id past the
         // decoder's cap writes objects that cannot be read back. Refuse it here,
@@ -433,9 +454,16 @@ impl RlogWriter {
         }
         let cluster = cluster_order(self.sort_descriptor.as_ref(), self.clustering_generation)?;
         if !self.batches.is_empty() {
-            return self.build_object_columnar(level, input_set_hash, part_index, layout, cluster);
+            return self.build_object_columnar(
+                level,
+                input_set_hash,
+                part_index,
+                layout,
+                cluster,
+                encoder,
+            );
         }
-        self.build_object(level, input_set_hash, part_index, layout, cluster)
+        self.build_object(level, input_set_hash, part_index, layout, cluster, encoder)
     }
 
     /// Produces the whole object as an L1 compacted part, stamping the caller's
@@ -471,7 +499,13 @@ impl RlogWriter {
         part_index: u32,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         let layout = self.layout();
-        self.build(level, input_set_hash, part_index, layout)
+        self.build(
+            level,
+            input_set_hash,
+            part_index,
+            layout,
+            BlockEncoder::Inline,
+        )
     }
 
     /// The shared object-building pipeline behind [`RlogWriter::finish`] and
@@ -486,6 +520,7 @@ impl RlogWriter {
         part_index: u32,
         layout: Layout,
         cluster: Option<ClusterOrder>,
+        mut encoder: BlockEncoder<'_>,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         if self.records.is_empty() {
             return Err(LogSegError::LimitExceeded("empty object".into()));
@@ -856,7 +891,7 @@ impl RlogWriter {
                 })
                 .collect();
 
-            let out = write_block_with(
+            let out = encoder.rows(
                 block_rows,
                 &plans,
                 self.cfg.zstd_level,
@@ -1182,6 +1217,7 @@ impl RlogWriter {
         part_index: u32,
         layout: Layout,
         cluster: Option<ClusterOrder>,
+        mut encoder: BlockEncoder<'_>,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         let batches = &self.batches;
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
@@ -1865,7 +1901,7 @@ impl RlogWriter {
                 stat_values: &stat_v,
                 str_dicts: &str_dicts_v,
             };
-            let out = write_block_columnar_with(&input, self.cfg.zstd_level, self.cfg.page_choice)?;
+            let out = encoder.columnar(&input, self.cfg.zstd_level, self.cfg.page_choice)?;
 
             // POSTINGS over each row's merged-view indexed terms, in its own
             // pass ahead of the timed bloom region below and never inside it,
@@ -2896,6 +2932,22 @@ fn emit_view(
     }
 }
 
+/// A test-only handle on the writer's bloom text insert, used by the
+/// allocation pin (`tests/bloom_insert_alloc_pin.rs`), which has to drive the
+/// insert alone: the block encode around it allocates by construction.
+///
+/// Not part of the crate's supported API.
+#[doc(hidden)]
+pub mod bloom_probe {
+    use crate::bloom::BloomBuilder;
+
+    /// Inserts `bytes`' word tokens, and its exact bytes when short, into
+    /// `builder` under `column_id`, as the writer does for every block.
+    pub fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
+        super::insert_text(builder, column_id, bytes);
+    }
+}
+
 /// A test- and bench-only handle on the per-record declared-column stat stamp,
 /// used by the allocation pin (`tests/stamp_alloc_pin.rs`) and the stamp
 /// benchmark (`benches/stamp_declared.rs`). Both have to drive the stamp alone:
@@ -3171,9 +3223,7 @@ fn row_estimate(row: &ResolvedRow) -> usize {
 /// bloom, all scoped to `column_id`.
 fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
     if let Ok(s) = std::str::from_utf8(bytes) {
-        for tok in tokens(s) {
-            builder.insert(column_id, &tok);
-        }
+        for_each_token(s, |tok| builder.insert(column_id, tok));
     }
     if bytes.len() <= EXACT_BLOOM_MAX {
         builder.insert(column_id, bytes);

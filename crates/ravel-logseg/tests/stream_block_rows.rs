@@ -144,6 +144,7 @@ fn variant(e: &LogSegError) -> &'static str {
         LogSegError::MalformedColumnarBatch(_) => "MalformedColumnarBatch",
         LogSegError::InvalidSortDescriptor(_) => "InvalidSortDescriptor",
         LogSegError::InvalidRowOrder(_) => "InvalidRowOrder",
+        LogSegError::PageEncode(_) => "PageEncode",
         LogSegError::Io(_) => "Io",
     }
 }

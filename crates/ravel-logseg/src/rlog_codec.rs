@@ -400,23 +400,6 @@ fn gcd_plan(values: &[i64], stats: &I64Stats) -> Option<(Vec<i64>, I64Stats, Enc
     Some((quotients, inner, inner_enc, len))
 }
 
-/// Exact encoded length of every candidate [`i64_candidates`] returns for
-/// `values`, in the same order, computed without encoding any of them.
-pub fn i64_raw_sizes(values: &[i64]) -> Vec<(Enc, u64)> {
-    let Some(stats) = i64_stats(values, true) else {
-        return vec![(Enc::Plain, 0)];
-    };
-    let mut out: Vec<(Enc, u64)> = SIX
-        .iter()
-        .zip(stats.sizes)
-        .filter_map(|(enc, size)| size.map(|s| (*enc, s)))
-        .collect();
-    if let Some((_, _, _, len)) = gcd_plan(values, &stats) {
-        out.push((Enc::GcdI64, len));
-    }
-    out
-}
-
 /// Encodes one of the [`SIX`] candidates, `None` when it does not apply.
 fn encode_six(enc: Enc, values: &[i64], min: i64, max: i64) -> Option<Vec<u8>> {
     match enc {
@@ -834,6 +817,23 @@ mod tests {
     use super::*;
     use crate::encoding::{encode_strings, encode_strings_dict};
     use proptest::prelude::*;
+
+    /// Exact encoded length of every candidate [`i64_candidates`] returns for
+    /// `values`, in the same order, computed without encoding any of them.
+    fn i64_raw_sizes(values: &[i64]) -> Vec<(Enc, u64)> {
+        let Some(stats) = i64_stats(values, true) else {
+            return vec![(Enc::Plain, 0)];
+        };
+        let mut out: Vec<(Enc, u64)> = SIX
+            .iter()
+            .zip(stats.sizes)
+            .filter_map(|(enc, size)| size.map(|s| (*enc, s)))
+            .collect();
+        if let Some((_, _, _, len)) = gcd_plan(values, &stats) {
+            out.push((Enc::GcdI64, len));
+        }
+        out
+    }
 
     /// The pre-envelope pick among the first six candidates, which must be
     /// exactly `encode_i64`'s output.
