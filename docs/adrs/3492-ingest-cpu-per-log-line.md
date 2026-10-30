@@ -367,8 +367,10 @@ flowchart LR
   100 ms (D8). Objects written go from about 16/s to about 20/s, each a little
   under 0.6 MB at 150k lines/s. Today's 250 ms row is predicted at about
   87-98k even after the CPU work.
-- D7 makes a flush's encode latency independent of its line count, up to the
-  gate's permits. A burst of flushes still competes for the same permits as
-  today.
+- D7 divides a flush's encode latency by the number of permits the flush
+  gets, at most its page count. Latency still grows with the lines per
+  flush: larger flushes (fewer shards, longer delays) need the encode
+  latency checked again. A burst of flushes still competes for the same
+  permits as today.
 - D3b, if adopted, adds vendored OTLP protos that must be re-vendored when
   upstream changes them.
