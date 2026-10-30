@@ -456,7 +456,10 @@ mod tests {
     /// slice taken of the dictionary afterwards.
     type Batch = (usize, Vec<Option<u8>>, usize, usize);
 
-    fn case() -> impl Strategy<Value = (usize, Vec<Vec<(bool, String)>>, Vec<Batch>)> {
+    /// Entries per values array, the values arrays, and the batches.
+    type Case = (usize, Vec<Vec<(bool, String)>>, Vec<Batch>);
+
+    fn case() -> impl Strategy<Value = Case> {
         (1usize..8).prop_flat_map(|entries| {
             (
                 Just(entries),
