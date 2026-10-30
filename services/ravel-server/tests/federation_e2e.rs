@@ -40,6 +40,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/refused_addr.rs"]
+mod refused_addr;
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -371,15 +374,10 @@ async fn spawn_remote(
     }
 }
 
-/// An address that was bound then immediately released: a connection to it is
-/// refused, so a remote pointed here is unavailable at query time.
-async fn dead_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind dead");
-    let addr = listener.local_addr().expect("dead local addr");
-    drop(listener);
-    addr.to_string()
+/// An address whose connections are refused, so a remote pointed here is
+/// unavailable at query time.
+fn dead_endpoint() -> String {
+    refused_addr::refused_addr().to_string()
 }
 
 /// Build a coordinator-side [`RemoteCluster`] dialed by the production
@@ -500,7 +498,7 @@ async fn federated_series_discovery_returns_union_and_warns_on_skip() {
     let east = spawn_remote(east_store, OPERATOR_CRED, &acme).await;
 
     // A dead cluster "west", skip_unavailable=true.
-    let west_endpoint = dead_endpoint().await;
+    let west_endpoint = dead_endpoint();
 
     let clusters = vec![
         make_remote_cluster(
@@ -726,7 +724,7 @@ async fn federated_query_marks_skipped_cluster_in_warnings() {
     let east = spawn_remote(east_store, OPERATOR_CRED, &acme).await;
 
     // A dead cluster "west", also skip_unavailable=true.
-    let west_endpoint = dead_endpoint().await;
+    let west_endpoint = dead_endpoint();
 
     let clusters = vec![
         make_remote_cluster(
