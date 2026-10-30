@@ -1,7 +1,8 @@
 //! The parallel column-page encode (ADR-3492 decision 7): an object written
 //! through `RlogWriter::finish_on` with a multi-threaded executor that returns
-//! results out of order is byte-identical to `RlogWriter::finish`, on both
-//! writer paths and under both page choices.
+//! results out of order is byte-identical to `RlogWriter::finish`, through
+//! rows, plain columnar batches and dictionary-shaped columnar batches, and
+//! under both page choices.
 #![allow(clippy::expect_used)]
 
 use proptest::prelude::*;
@@ -35,18 +36,37 @@ fn identity() -> ObjectIdentity {
     }
 }
 
-/// A writer holding `records`, through the row path or in columnar batches of
-/// `batch` records.
-fn writer(cfg: RlogConfig, records: &[LogRecord], columnar: bool, batch: usize) -> RlogWriter {
+/// How a writer receives its records.
+#[derive(Clone, Copy, Debug)]
+enum Path {
+    Rows,
+    /// Columnar batches with plain string columns.
+    Columnar,
+    /// Columnar batches whose string columns arrive dictionary-shaped, so the
+    /// writer encodes them from one object-wide dictionary per column.
+    Dictionaries,
+}
+
+const PATHS: [Path; 3] = [Path::Rows, Path::Columnar, Path::Dictionaries];
+
+/// A writer holding `records`, through `path`, in columnar batches of `batch`
+/// records.
+fn writer(cfg: RlogConfig, records: &[LogRecord], path: Path, batch: usize) -> RlogWriter {
     let mut w = RlogWriter::new(cfg, identity());
-    if columnar {
-        for chunk in records.chunks(batch.max(1)) {
-            let b = ColumnarLogBatch::try_from_records(chunk).expect("batch");
-            w.push_columnar(b).expect("push_columnar");
+    match path {
+        Path::Rows => {
+            for r in records {
+                w.push(r.clone()).expect("push");
+            }
         }
-    } else {
-        for r in records {
-            w.push(r.clone()).expect("push");
+        Path::Columnar | Path::Dictionaries => {
+            for chunk in records.chunks(batch.max(1)) {
+                let mut b = ColumnarLogBatch::try_from_records(chunk).expect("batch");
+                if matches!(path, Path::Dictionaries) {
+                    b = b.with_dictionaries();
+                }
+                w.push_columnar(b).expect("push_columnar");
+            }
         }
     }
     w
@@ -56,14 +76,12 @@ fn writer(cfg: RlogConfig, records: &[LogRecord], columnar: bool, batch: usize) 
 fn both(
     cfg: RlogConfig,
     records: &[LogRecord],
-    columnar: bool,
+    path: Path,
     batch: usize,
     pool: &mut ScopedPool,
 ) -> (Vec<u8>, Vec<u8>) {
-    let serial = writer(cfg, records, columnar, batch)
-        .finish()
-        .expect("finish");
-    let parallel = writer(cfg, records, columnar, batch)
+    let serial = writer(cfg, records, path, batch).finish().expect("finish");
+    let parallel = writer(cfg, records, path, batch)
         .finish_on(pool)
         .expect("finish_on");
     (serial, parallel)
@@ -93,16 +111,16 @@ fn dict_pages(object: &[u8]) -> usize {
 fn ingest_shape_flush_is_byte_identical() {
     let records = ingest_records(7_500);
     for choice in CHOICES {
-        for columnar in [false, true] {
+        for path in PATHS {
             let cfg = RlogConfig {
                 page_choice: choice,
                 ..RlogConfig::default()
             };
             let mut pool = ScopedPool::new(THREADS);
-            let (serial, parallel) = both(cfg, &records, columnar, PUSH_BATCH, &mut pool);
+            let (serial, parallel) = both(cfg, &records, path, PUSH_BATCH, &mut pool);
             assert!(
                 serial == parallel,
-                "{choice:?} columnar={columnar}: parallel encode differs from finish"
+                "{choice:?} {path:?}: parallel encode differs from finish"
             );
             assert_eq!(pool.split_calls, 1, "one block, split into column jobs");
             assert_eq!(
@@ -120,7 +138,7 @@ fn ingest_shape_flush_is_byte_identical() {
 fn multi_block_row_groups_are_byte_identical() {
     let records = ingest_records(7_500);
     for choice in CHOICES {
-        for columnar in [false, true] {
+        for path in PATHS {
             let cfg = RlogConfig {
                 page_choice: choice,
                 block_target_records: 1_000,
@@ -128,14 +146,14 @@ fn multi_block_row_groups_are_byte_identical() {
                 ..RlogConfig::default()
             };
             let mut pool = ScopedPool::new(THREADS);
-            let (serial, parallel) = both(cfg, &records, columnar, PUSH_BATCH, &mut pool);
+            let (serial, parallel) = both(cfg, &records, path, PUSH_BATCH, &mut pool);
             assert!(
                 dict_pages(&serial) > 0,
                 "{choice:?}: no row group dictionary"
             );
             assert!(
                 serial == parallel,
-                "{choice:?} columnar={columnar}: parallel encode differs from finish"
+                "{choice:?} {path:?}: parallel encode differs from finish"
             );
             assert_eq!(pool.split_calls, 8, "eight blocks, each split");
             assert!(
@@ -143,6 +161,96 @@ fn multi_block_row_groups_are_byte_identical() {
                 "no block came back out of order"
             );
         }
+    }
+}
+
+/// Record `i` of `n`, pushed in descending `ts` order. `window` changes every
+/// 40 records, so a 100-record block references four of its 25 values; the
+/// object-wide dictionary interns them in push order, which the block sees
+/// reversed and which is neither the block's first-seen order nor sorted.
+fn dictionary_record(i: usize, n: usize) -> LogRecord {
+    let mut attrs = vec![
+        (
+            "window".to_string(),
+            AttrValue::Str(format!("w{:02}", i / 40)),
+        ),
+        (
+            "level".to_string(),
+            AttrValue::Str(["warn", "debug", "fatal", "info", "error"][i * 7 / 3 % 5].to_string()),
+        ),
+        (
+            "request".to_string(),
+            AttrValue::Str(format!("req-{:05}", i * 7_919 % 100_000)),
+        ),
+        (
+            "payload".to_string(),
+            AttrValue::Bytes(vec![(i % 4) as u8, (i / 100) as u8]),
+        ),
+        ("count".to_string(), AttrValue::I64((i % 13) as i64)),
+    ];
+    if !i.is_multiple_of(3) {
+        attrs.push(("tenant".to_string(), AttrValue::Str(format!("t{}", i % 11))));
+    }
+    LogRecord {
+        ts_ns: ((n - i) * 10) as i64,
+        observed_ts_ns: ((n - i) * 10) as i64,
+        attrs,
+        ..narrow_record(0)
+    }
+}
+
+/// Dictionary-shaped string columns, a block's job holding only the
+/// dictionary entries its rows reference: every block drops most entries of
+/// each column's object-wide dictionary and renumbers the rest, low-
+/// and high-cardinality, fully and partly present, Str and Bytes.
+#[test]
+fn dictionary_columns_are_byte_identical() {
+    const N: usize = 1_000;
+    const BLOCK: usize = 100;
+    let records: Vec<LogRecord> = (0..N).map(|i| dictionary_record(i, N)).collect();
+
+    let mut by_ts: Vec<&LogRecord> = records.iter().collect();
+    by_ts.sort_by_key(|r| r.ts_ns);
+    let window = |r: &LogRecord| match &r.attrs[0].1 {
+        AttrValue::Str(w) => w.clone(),
+        other => panic!("window is {other:?}"),
+    };
+    let all: std::collections::HashSet<_> = records.iter().map(window).collect();
+    for block in by_ts.chunks(BLOCK) {
+        let used: std::collections::HashSet<_> = block.iter().map(|r| window(r)).collect();
+        assert!(
+            used.len() < all.len() / 4,
+            "a block references {} of {} window values",
+            used.len(),
+            all.len()
+        );
+    }
+
+    for choice in CHOICES {
+        let cfg = RlogConfig {
+            page_choice: choice,
+            block_target_records: BLOCK,
+            group_target_blocks: 3,
+            ..RlogConfig::default()
+        };
+        let mut pool = ScopedPool::new(THREADS);
+        let (serial, parallel) = both(cfg, &records, Path::Dictionaries, 64, &mut pool);
+        let rows = writer(cfg, &records, Path::Rows, 64)
+            .finish()
+            .expect("finish");
+        assert!(
+            serial == rows,
+            "{choice:?}: dictionary input differs from rows"
+        );
+        assert!(
+            serial == parallel,
+            "{choice:?}: parallel encode differs from finish"
+        );
+        assert_eq!(pool.split_calls, N / BLOCK, "every block split");
+        assert!(
+            pool.out_of_order_calls > 0,
+            "no block came back out of order"
+        );
     }
 }
 
@@ -216,7 +324,7 @@ proptest! {
         group in 1usize..5,
         batch in 1usize..80,
         estimated in any::<bool>(),
-        columnar in any::<bool>(),
+        path in proptest::sample::select(PATHS.to_vec()),
     ) {
         let cfg = RlogConfig {
             page_choice: if estimated { PageChoice::Estimated } else { PageChoice::Exhaustive },
@@ -225,7 +333,7 @@ proptest! {
             ..RlogConfig::default()
         };
         let mut pool = ScopedPool::new(THREADS);
-        let (serial, parallel) = both(cfg, &records, columnar, batch, &mut pool);
+        let (serial, parallel) = both(cfg, &records, path, batch, &mut pool);
         prop_assert!(serial == parallel, "parallel encode differs from finish");
     }
 }
