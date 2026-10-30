@@ -234,7 +234,8 @@ that floor, so page jobs submitted one by one would all run inline and in
 series. The floor therefore applies to the flush as a whole, as it does
 today: a flush at or above the floor dispatches its page jobs to the
 blocking pool, and each page job takes one write-gate permit, whatever its
-own size. A flush below the floor stays one inline job. The gate still
+own size (as built, the flush's own job seals page jobs under its permit and
+only page tasks take one each; see the D7 measurement amendment). A flush below the floor stays one inline job. The gate still
 bounds total encode concurrency. This amends ADR-1702 decision 4 for the logs
 ingest flush only; the amendment is in ADR-1702 itself. The flush assembles the sealed pages in
 the column order the writer uses today, so the object's bytes are identical to
@@ -290,7 +291,7 @@ CPU work alone takes **buffered** acks to about 120k, but **strict 250 ms**
 only to about 87-98k: the 250 ms age and two sequential PUTs use most of the
 budget. At a 100 ms delay the ack path stops binding. With 2 shards and D7 it
 has about 145k to 170k of capacity at the default permit count (the D7
-measurement amendment below puts it at about 130k), above the
+measurement amendment below puts it at about 130k at most), above the
 120k target, so the strict row is then bound by CPU.
 
 150k lines/s on 8 vCPU allows at most about 53 us of CPU per line, about 47%
@@ -415,6 +416,14 @@ serial: staging the records, the row-group dictionary decision and the
 object's assembly run on the flush's own thread, and only sealing column
 pages splits into jobs.
 
+The 169.9 ms is the bench's wall time with the page jobs on its own 4-thread
+pool. The executor as built may seal them over fewer threads: the flush's
+thread plus at most permits − 1 page tasks, fewer when other gate jobs hold
+permits, and the 2 shards can flush on the same tick and split the permits.
+The figures below therefore assume the bench's 4 threads, and for the code as
+built they are optimistic: about 0.49 s is a floor on the ack and about 130k
+an upper estimate of capacity.
+
 The D8 row of "What strict acks can reach" is therefore:
 
 - ack about 0.49 s: about 92 ms age wait, plus 169.9 ms encode, plus about
@@ -457,16 +466,35 @@ wait on the gate longer than the serial encode, is not estimated. The rule
 is: if the write gate has no free permit when a block's page jobs are ready,
 or the block has a single job, the flush seals them serially on its own
 thread under its own permit. A block below `PAGE_JOB_FLOOR` (8 pages,
-crates/ravel-logseg/src/block.rs) is a single job. A flush therefore never
-waits for a permit while it holds one, so page jobs cannot deadlock the gate.
+crates/ravel-logseg/src/block.rs) is a single job.
+
+Otherwise the block's page jobs go into a shared queue. The flush's thread,
+which already holds its permit, takes jobs from the queue and seals them
+until it is empty. Alongside it the flush spawns one page task per further
+job, at most as many as the gate had free permits when the jobs were ready,
+and each asks the gate for a permit. A page task that gets one takes the next
+job from the queue and seals it on the blocking pool; one that finds the
+queue empty releases its permit at once without work. Once the queue is
+empty the flush waits only for the jobs page tasks took, each of which
+already holds its own permit. The flush therefore never waits for a permit,
+and no page job waits for a permit while the flush's thread could seal it,
+so page jobs cannot deadlock the gate. The writer places each result at its
+job index, whoever sealed it.
 
 **How the gate counts it.** A flush below the write gate's inline floor counts
 one `ravel_cpu_gate_inline_total` at the `log_flush` site and takes no
-permit. At or above the floor, the flush's own permitted job seals the first
-page job, and each further page job takes its own permit through
-`WriteGate::run_permitted`. A flush with free permits therefore counts one
-`ravel_cpu_gate_jobs_total` per page job, and one wait and one run each. The
-fallback counts one job. `log_flush_gate_counts_what_ran` pins all three.
+permit. At or above the floor, the flush's own job counts one
+`ravel_cpu_gate_jobs_total`, however many page jobs it seals. Page tasks ask
+for their permit through `WriteGate::run_claimed`, which takes the job from
+the queue only once the permit is held. A page task that took a job counts
+one job, one wait and one run; one that found the queue empty counts none of
+the three. A flush with free permits therefore counts one job plus one per
+page job a page task sealed, and the serial fallback counts one job.
+`log_flush_gate_counts_what_ran` pins the three cases,
+`a_flush_seals_its_pages_while_its_page_tasks_wait_for_a_permit` pins a flush
+sealing every page job while its page task waits behind another job's
+permit, and `run_claimed_counts_only_claimed_jobs` (crates/ravel-cpu-gate)
+pins that an empty claim counts nothing.
 
 **Acknowledgement is unchanged.** The data PUT and the commit record follow
 the encode as before. A strict write returns only after both are stored

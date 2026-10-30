@@ -1028,14 +1028,20 @@ exactly five places:
   The encode runs on the ADR-1702 write gate, sized by the flush's input
   bytes. Below the gate's inline floor (1 MiB by default on the server) it is one inline
   job, sealing every column page serially. At or above the floor it is one
-  permitted job that seals each block's column pages as page jobs (ADR-3492
-  decision 7): the job seals the first page job itself, and each further page
-  job takes its own write-gate permit on the blocking pool through
-  `WriteGate::run_permitted`, so `ravel_cpu_gate_jobs_total{gate="write",site="log_flush"}`
-  counts one job per page job. If the gate has no free permit when a block's
-  page jobs are ready, or the block has a single job (a block under 8 pages
-  is one), the flush seals them serially on its own thread under its own
-  permit and counts one job. The stored bytes are identical either way. A
+  permitted job that splits each block's column pages into page jobs
+  (ADR-3492 decision 7). The page jobs go into a shared queue, and the
+  flush's job takes them from it and seals them under its own permit until
+  the queue is empty. Alongside it, page tasks on the blocking pool, one per
+  further page job and at most the gate's free permits, each ask for a
+  write-gate permit through `WriteGate::run_claimed`; one that gets a permit
+  takes the next page job and seals it, and one that finds the queue empty
+  releases the permit without work. So
+  `ravel_cpu_gate_jobs_total{gate="write",site="log_flush"}` counts the
+  flush's job plus one per page job a page task sealed; a page task that
+  found the queue empty counts no job, wait or run. If the gate has no free
+  permit when a block's page jobs are ready, or the block has a single job (a
+  block under 8 pages is one), no page task starts and the flush seals them
+  serially on its own thread. The stored bytes are identical either way. A
   page job that panics or is cancelled fails the flush as the flush's own
   gated job does (`flush_gate_faults` below), and a strict write is still
   acknowledged only after the data object and its commit record are stored.

@@ -975,15 +975,20 @@ impl LogFlushCtx {
         // the object, so they stay held through the permit wait and the encode
         // whether or not this task is still waiting. The wait is bounded by the
         // flush's deadline, as its store calls are. At or above the gate's
-        // inline floor the job seals its column pages as page jobs on the gate
+        // inline floor the job seals its column page jobs under its own permit
+        // while page tasks that get a free permit seal others in parallel
         // (ADR-3492 decision 7); below it, serially as one inline job.
         let encode = self
             .write_gate
             .encode_pages(WriteSite::LogFlush, input_bytes, move |pages| {
                 // Encode: RLOG serialization only (RlogWriter push + finish),
-                // excluding the indexed-field and layout resolution above, the
-                // permit wait and the object-store PUT below. The content hash
-                // is taken in the same job, after the stage closes.
+                // excluding the indexed-field and layout resolution above, this
+                // job's own permit wait and the object-store PUT below. With
+                // page tasks it includes the wait for page jobs they took, from
+                // the blocking-pool handoff to the sealed page, but never a
+                // page task's permit wait, which ends before it takes a job.
+                // The content hash is taken in the same job, after the stage
+                // closes.
                 #[cfg(feature = "stage-timing")]
                 let encode_start = std::time::Instant::now();
                 let mut writer = RlogWriter::new(rlog_config, identity)

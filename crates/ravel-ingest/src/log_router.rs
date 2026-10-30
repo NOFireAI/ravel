@@ -1924,18 +1924,17 @@ mod tests {
 
     /// ADR-1702 task 9: an RLOG flush encoded on the write gate stores the same
     /// bytes as one encoded inline. Two routers share one pinned clock and one
-    /// seed, as in the row/columnar anchor above; only one has the gate. No
-    /// flush ran inline and the gate's `log_flush` count is at least the
-    /// number of shards the records span, one flush each, so the gated router
-    /// really encoded every object there. How many page jobs each flush split
-    /// off depends on which permits were free when its pages were ready
-    /// (ADR-3492 decision 7), so the count is a floor here;
-    /// `log_flush_gate_counts_what_ran` pins it on one shard.
+    /// seed, as in the row/columnar anchor above; only one has the gate. The
+    /// gate has one permit, so each flush's own job holds it, finds no free
+    /// permit for page tasks and seals its pages itself (ADR-3492 decision
+    /// 7). The `log_flush` site then counts exactly one job, one wait and one
+    /// run per shard the records span, one flush each, and nothing inline, so
+    /// every object the gated router stored went through the gate.
     #[tokio::test]
     async fn gated_log_flush_stores_the_same_objects_as_inline() {
         let seed = 0x00C0_FFEE_u64;
         let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
-        let gate = floor_zero_write_gate();
+        let gate = write_gate_with(1, 0);
         let routers = [None, Some(Arc::clone(&gate))].map(|gate| {
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
             let router = LogIngestRouter::with_rng(
@@ -1976,18 +1975,23 @@ mod tests {
             stored[0], stored[1],
             "the gated encode must store byte-identical objects"
         );
-        let site = gate
-            .snapshot()
-            .sites
-            .into_iter()
-            .find(|s| s.site == ravel_cpu_gate::WriteSite::LogFlush)
-            .expect("log_flush site");
-        assert_eq!(site.inline, 0);
-        assert!(
-            site.jobs >= shards.len() as u64,
-            "{} log_flush jobs for {} shards",
-            site.jobs,
-            shards.len()
+        let shards = shards.len() as u64;
+        assert_eq!(
+            log_flush_counts(&gate),
+            (shards, 0),
+            "one gated job per shard flush"
+        );
+        let snapshot = gate.snapshot();
+        assert_eq!((snapshot.wait_count, snapshot.run_count), (shards, shards));
+        assert_eq!(
+            routers[1]
+                .1
+                .write_gate
+                .page_probe()
+                .task_claimed
+                .load(Ordering::SeqCst),
+            0,
+            "no page task ran beside a flush holding the only permit"
         );
     }
 
@@ -2067,6 +2071,8 @@ mod tests {
         ObjectIdentity, PAGE_JOB_FLOOR, PageChoice, PageEncodeJob, RlogConfig, RlogWriter,
     };
 
+    use crate::write_gate::PageProbe;
+
     fn write_gate_with(permits: usize, inline_floor_bytes: u64) -> Arc<WriteGate> {
         Arc::new(WriteGate::new(
             CpuGateConfig {
@@ -2086,14 +2092,10 @@ mod tests {
             .map_or((0, 0), |s| (s.jobs, s.inline))
     }
 
-    /// The page jobs a writer hands its executor for `records`, counted by a
-    /// serial executor outside the router. Every record fits one block.
-    fn page_job_count(records: &[NormalizedLogRecord], choice: PageChoice) -> u64 {
+    /// A writer with `config` holding `records`.
+    fn writer_for(records: &[NormalizedLogRecord], config: RlogConfig) -> RlogWriter {
         let mut writer = RlogWriter::new(
-            RlogConfig {
-                page_choice: choice,
-                ..RlogConfig::default()
-            },
+            config,
             ObjectIdentity {
                 tenant_hash: [0; 16],
                 shard: 0,
@@ -2106,13 +2108,43 @@ mod tests {
         writer
             .push_columnar(ColumnarLogBatch::from_records(&rows))
             .expect("push");
-        let mut jobs = 0u64;
+        writer
+    }
+
+    /// The page jobs a writer with `config` hands its executor for `records`,
+    /// one entry per block, counted by a serial executor outside the router.
+    fn page_jobs_per_block(records: &[NormalizedLogRecord], config: RlogConfig) -> Vec<u64> {
+        let mut per_block = Vec::new();
         let mut count = |batch: Vec<PageEncodeJob>| -> Result<_, LogSegError> {
-            jobs += batch.len() as u64;
+            per_block.push(batch.len() as u64);
             Ok(batch.into_iter().map(PageEncodeJob::run).collect())
         };
-        writer.finish_on(&mut count).expect("finish");
-        jobs
+        writer_for(records, config)
+            .finish_on(&mut count)
+            .expect("finish");
+        per_block
+    }
+
+    /// [`page_jobs_per_block`] for a router flush's config. Every record fits
+    /// one block.
+    fn page_job_count(records: &[NormalizedLogRecord], choice: PageChoice) -> u64 {
+        let per_block = page_jobs_per_block(
+            records,
+            RlogConfig {
+                page_choice: choice,
+                ..RlogConfig::default()
+            },
+        );
+        assert_eq!(per_block.len(), 1, "one block");
+        per_block[0]
+    }
+
+    /// `(flush_sealed, task_claimed)` from a slot's page probe.
+    fn sealed_by(probe: &PageProbe) -> (u64, u64) {
+        (
+            probe.flush_sealed.load(Ordering::SeqCst),
+            probe.task_claimed.load(Ordering::SeqCst),
+        )
     }
 
     /// One shard and `choice`, buffering until `flush_all`.
@@ -2125,13 +2157,15 @@ mod tests {
     }
 
     /// Writes `records` to a one-shard router (on `gate` when given), flushes
-    /// once and returns every stored object. Same seed and pinned clock on
+    /// once and returns every stored object with the router's page probe,
+    /// which `steer` sets up before the write. Same seed and pinned clock on
     /// every call, so two calls store the same keys.
     async fn flush_once(
         gate: Option<Arc<WriteGate>>,
         choice: PageChoice,
         records: Vec<NormalizedLogRecord>,
-    ) -> Vec<(String, Vec<u8>)> {
+        steer: impl FnOnce(&PageProbe),
+    ) -> (Vec<(String, Vec<u8>)>, Arc<PageProbe>) {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = LogIngestRouter::with_rng(
             one_shard(choice),
@@ -2145,6 +2179,8 @@ mod tests {
             Some(gate) => router.with_write_gate(gate),
             None => router,
         };
+        let probe = router.write_gate.page_probe();
+        steer(&probe);
         router
             .write(
                 TenantId::new("acme"),
@@ -2155,14 +2191,20 @@ mod tests {
             .await
             .expect("buffered write enqueues");
         router.flush_all().await;
-        collect_objects(store.as_ref()).await
+        (collect_objects(store.as_ref()).await, probe)
+    }
+
+    fn task_first(probe: &PageProbe) {
+        probe.task_first.store(true, Ordering::SeqCst);
     }
 
     /// A flush above the floor whose page jobs ran on the write gate stores
     /// the same data object and commit record, byte for byte, as the serial
-    /// encode of a router with no gate, for both page choices. The gate's
-    /// `log_flush` job count equals the writer's page-job count, so the
-    /// gated flush really split its pages.
+    /// encode of a router with no gate, for both page choices. Every page job
+    /// was sealed once, by the flush thread or by a page task, at least one
+    /// by a page task, so the gated flush really split its pages; the gate's
+    /// `log_flush` count is the flush's own job plus one per page task that
+    /// took a job.
     #[tokio::test]
     async fn parallel_page_encode_stores_the_same_objects_as_serial() {
         for choice in [PageChoice::Estimated, PageChoice::Exhaustive] {
@@ -2172,24 +2214,159 @@ mod tests {
                 page_jobs >= PAGE_JOB_FLOOR as u64,
                 "{choice:?}: the block must split, got {page_jobs} jobs"
             );
-            let serial = flush_once(None, choice, records.clone()).await;
+            let (serial, _) = flush_once(None, choice, records.clone(), |_| {}).await;
             let gate = write_gate_with(4, 0);
-            let parallel = flush_once(Some(Arc::clone(&gate)), choice, records).await;
+            let (parallel, probe) =
+                flush_once(Some(Arc::clone(&gate)), choice, records, task_first).await;
             assert_eq!(serial.len(), 2, "one data object and one commit record");
             assert_eq!(
                 serial, parallel,
                 "{choice:?}: the parallel page encode must store byte-identical objects"
             );
-            assert_eq!(log_flush_counts(&gate), (page_jobs, 0), "{choice:?}");
+            let (flush_sealed, task_claimed) = sealed_by(&probe);
+            assert_eq!(flush_sealed + task_claimed, page_jobs, "{choice:?}");
+            assert!(task_claimed >= 1, "{choice:?}: a page task sealed a job");
+            assert_eq!(log_flush_counts(&gate), (1 + task_claimed, 0), "{choice:?}");
+        }
+    }
+
+    /// The flush thread seals its block's page jobs itself while its page
+    /// tasks wait for a permit, rather than holding its own permit idle until
+    /// they get one. Two permits, so one page task is spawned; just before it
+    /// is, an unrelated job takes the other permit and keeps it until the
+    /// flush has returned or a 10 s bound passes. The flush returns while
+    /// that job still holds the permit (the job was released by the test,
+    /// not by the bound), the flush thread sealed every page job and no page
+    /// task took one, and the gate counts one `log_flush` job. The page task
+    /// that got the permit afterwards found the queue empty and counted
+    /// nothing: the gate's waits and runs are the flush's and the unrelated
+    /// job's.
+    #[tokio::test]
+    async fn a_flush_seals_its_pages_while_its_page_tasks_wait_for_a_permit() {
+        let choice = PageChoice::Estimated;
+        let records = diverse_records();
+        let page_jobs = page_job_count(&records, choice);
+        assert!(page_jobs >= PAGE_JOB_FLOOR as u64);
+        let (serial, _) = flush_once(None, choice, records.clone(), |_| {}).await;
+
+        let gate = write_gate_with(2, 0);
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (blocker_tx, blocker_rx) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let blocker_gate = Arc::clone(&gate);
+        let take_the_free_permit = move || {
+            let blocker = runtime.spawn(async move {
+                blocker_gate
+                    .run_permitted(WriteSite::OtapDecode, move || {
+                        let _ = started_tx.send(());
+                        parked.recv_timeout(Duration::from_secs(10))
+                    })
+                    .await
+            });
+            let _ = blocker_tx.send(blocker);
+            started_rx.recv().expect("the unrelated job starts");
+        };
+        let (stored, probe) = flush_once(Some(Arc::clone(&gate)), choice, records, |probe| {
+            *probe
+                .before_page_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Box::new(take_the_free_permit));
+        })
+        .await;
+        drop(release);
+        let parked = blocker_rx
+            .await
+            .expect("the flush split its block")
+            .await
+            .expect("blocker task")
+            .expect("the unrelated job ran");
+        assert_eq!(
+            parked,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the flush returned while the unrelated job held the other permit"
+        );
+        assert_eq!(stored, serial);
+        assert_eq!(
+            sealed_by(&probe),
+            (page_jobs, 0),
+            "the flush thread sealed every page job"
+        );
+        while gate.queued() != 0 || gate.free_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(log_flush_counts(&gate), (1, 0));
+        let snapshot = gate.snapshot();
+        assert_eq!((snapshot.wait_count, snapshot.run_count), (2, 2));
+    }
+
+    /// A flush whose writer seals more than one block runs every block
+    /// through the gated executor and stores the serial encode's bytes. With
+    /// four permits each block that splits has at least one page job sealed
+    /// by a page task, every page job of every block is sealed once, and the
+    /// `log_flush` count is the flush's own job plus one per page task that
+    /// took a job. With one permit every block falls back to the flush
+    /// thread, and the count is the flush's job alone.
+    #[tokio::test]
+    async fn a_multi_block_flush_through_the_gated_executor_matches_serial() {
+        let records = diverse_records();
+        let config = RlogConfig {
+            block_target_records: 16,
+            ..RlogConfig::default()
+        };
+        let per_block = page_jobs_per_block(&records, config);
+        let total: u64 = per_block.iter().sum();
+        let split_blocks = per_block.iter().filter(|&&jobs| jobs >= 2).count() as u64;
+        assert!(per_block.len() >= 2, "more than one block: {per_block:?}");
+        assert!(
+            split_blocks >= 2,
+            "more than one split block: {per_block:?}"
+        );
+        let serial = writer_for(&records, config)
+            .finish()
+            .expect("serial finish");
+
+        for (permits, steer) in [(4, task_first as fn(&PageProbe)), (1, |_: &PageProbe| {})] {
+            let gate = write_gate_with(permits, 0);
+            let slot = WriteGateSlot::default();
+            slot.set(Arc::clone(&gate));
+            let probe = slot.page_probe();
+            steer(&probe);
+            let writer = writer_for(&records, config);
+            let gated = slot
+                .encode_pages(WriteSite::LogFlush, 1, move |pages| match pages {
+                    Some(pages) => writer.finish_on(pages),
+                    None => writer.finish(),
+                })
+                .await
+                .expect("gate runs the flush")
+                .expect("gated finish");
+            assert_eq!(gated, serial, "{permits} permits");
+            let (flush_sealed, task_claimed) = sealed_by(&probe);
+            assert_eq!(flush_sealed + task_claimed, total, "{permits} permits");
+            if permits == 1 {
+                assert_eq!(task_claimed, 0);
+            } else {
+                assert!(
+                    task_claimed >= split_blocks,
+                    "{task_claimed} page task jobs over {split_blocks} split blocks"
+                );
+            }
+            assert_eq!(
+                log_flush_counts(&gate),
+                (1 + task_claimed, 0),
+                "{permits} permits"
+            );
         }
     }
 
     /// The gate counts what ran, for the three ways a log flush can encode:
     ///
     /// - below the inline floor, one inline job and no permit;
-    /// - at or above it with free permits, one permitted job per page job:
-    ///   the flush's own job seals the first page job and each of the others
-    ///   takes its own permit;
+    /// - at or above it with free permits, the flush's own permitted job plus
+    ///   one per page task that took a page job under its own permit; the
+    ///   flush thread sealed the rest;
     /// - at or above it with no free permit once the flush holds its own (the
     ///   serial fallback), one permitted job that seals every page.
     ///
@@ -2201,28 +2378,36 @@ mod tests {
         let records = diverse_records();
         let page_jobs = page_job_count(&records, choice);
         assert!(page_jobs >= PAGE_JOB_FLOOR as u64);
-        let serial = flush_once(None, choice, records.clone()).await;
+        let (serial, _) = flush_once(None, choice, records.clone(), |_| {}).await;
 
         let below = write_gate_with(4, u64::MAX);
-        let stored = flush_once(Some(Arc::clone(&below)), choice, records.clone()).await;
+        let (stored, probe) =
+            flush_once(Some(Arc::clone(&below)), choice, records.clone(), |_| {}).await;
         assert_eq!(stored, serial);
         assert_eq!(log_flush_counts(&below), (0, 1), "below the floor");
+        assert_eq!(
+            sealed_by(&probe),
+            (0, 0),
+            "no gated executor below the floor"
+        );
         let snapshot = below.snapshot();
         assert_eq!((snapshot.wait_count, snapshot.run_count), (0, 0));
 
         let free = write_gate_with(4, 0);
-        let stored = flush_once(Some(Arc::clone(&free)), choice, records.clone()).await;
+        let (stored, probe) =
+            flush_once(Some(Arc::clone(&free)), choice, records.clone(), task_first).await;
         assert_eq!(stored, serial);
+        let (flush_sealed, task_claimed) = sealed_by(&probe);
+        assert_eq!(flush_sealed + task_claimed, page_jobs);
+        assert!(task_claimed >= 1);
+        let jobs = 1 + task_claimed;
         assert_eq!(
             log_flush_counts(&free),
-            (page_jobs, 0),
-            "one permitted job per page job"
+            (jobs, 0),
+            "the flush's job and one per page task that took a job"
         );
         let snapshot = free.snapshot();
-        assert_eq!(
-            (snapshot.wait_count, snapshot.run_count),
-            (page_jobs, page_jobs)
-        );
+        assert_eq!((snapshot.wait_count, snapshot.run_count), (jobs, jobs));
         assert_eq!((snapshot.running, snapshot.queued), (0, 0));
 
         // Two permits, one parked on an unrelated job: the flush takes the
@@ -2240,9 +2425,10 @@ mod tests {
         while busy.running() != 1 {
             tokio::task::yield_now().await;
         }
-        let stored = flush_once(Some(Arc::clone(&busy)), choice, records).await;
+        let (stored, probe) = flush_once(Some(Arc::clone(&busy)), choice, records, |_| {}).await;
         assert_eq!(stored, serial);
         assert_eq!(log_flush_counts(&busy), (1, 0), "the serial fallback");
+        assert_eq!(sealed_by(&probe), (page_jobs, 0));
         drop(release);
         blocker
             .await
@@ -2260,8 +2446,9 @@ mod tests {
     /// gated job failing does: the strict write gets the retryable
     /// `ShardUnavailable`, nothing is stored, `flush_gate_faults` moves by one
     /// and no abandoned_* counter moves, and the next write commits. The
-    /// panic is in a page job the flush dispatched, which the `log_flush` job
-    /// count shows: one per page job, the failed one included.
+    /// panic is in a page job a page task took, which the `log_flush` job
+    /// count shows: the flush's job plus one per page task that took a job,
+    /// the failed one included.
     #[tokio::test]
     async fn a_failed_page_job_fails_the_flush_retryably() {
         let records = diverse_records();
@@ -2279,7 +2466,9 @@ mod tests {
             Arc::new(PendingAckBudget::new(0)),
         )
         .with_write_gate(Arc::clone(&gate));
-        router.write_gate.panic_next_page_job();
+        let probe = router.write_gate.page_probe();
+        probe.panic_next.store(true, Ordering::SeqCst);
+        task_first(&probe);
         let err = router
             .write(
                 TenantId::new("acme"),
@@ -2294,7 +2483,10 @@ mod tests {
             "expected ShardUnavailable, got {err:?}"
         );
         assert!(collect_objects(store.as_ref()).await.is_empty());
-        assert_eq!(log_flush_counts(&gate), (page_jobs, 0));
+        assert!(!probe.panic_next.load(Ordering::SeqCst), "the panic fired");
+        let (flush_sealed, task_claimed) = sealed_by(&probe);
+        assert_eq!(flush_sealed + task_claimed, page_jobs);
+        assert_eq!(log_flush_counts(&gate), (1 + task_claimed, 0));
         let snapshot = router.metrics.snapshot();
         assert_eq!(
             (
@@ -2316,7 +2508,9 @@ mod tests {
             .await
             .expect("the shard survives and the next write commits");
         assert_eq!(router.metrics.snapshot().flush_gate_faults, 1);
-        assert_eq!(log_flush_counts(&gate), (2 * page_jobs, 0));
+        let (flush_sealed, task_claimed) = sealed_by(&probe);
+        assert_eq!(flush_sealed + task_claimed, 2 * page_jobs);
+        assert_eq!(log_flush_counts(&gate), (2 + task_claimed, 0));
     }
 
     /// A strict write whose flush split its pages on the gate still returns
@@ -2344,6 +2538,8 @@ mod tests {
             )
             .with_write_gate(Arc::clone(&gate)),
         );
+        let probe = router.write_gate.page_probe();
+        task_first(&probe);
         let writer = Arc::clone(&router);
         let write = tokio::spawn(async move {
             writer
@@ -2370,7 +2566,10 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 1, "only the data object is stored: {keys:?}");
         assert!(keys[0].contains("/l0/"), "{keys:?}");
-        assert_eq!(log_flush_counts(&gate), (page_jobs, 0));
+        let (flush_sealed, task_claimed) = sealed_by(&probe);
+        assert_eq!(flush_sealed + task_claimed, page_jobs);
+        assert!(task_claimed >= 1, "the flush split its pages");
+        assert_eq!(log_flush_counts(&gate), (1 + task_claimed, 0));
 
         let ids = held.held();
         assert_eq!(ids.len(), 1);
