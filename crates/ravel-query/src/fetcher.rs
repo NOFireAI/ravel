@@ -181,6 +181,20 @@ fn retained_catalog_len(entries: &[SeriesEntryV4]) -> u64 {
         .fold(0, u64::saturating_add)
 }
 
+/// One object's contribution to a series listing
+/// ([`SegmentFetcher::list_series_phase_accounted`]).
+pub(crate) enum ListedObject {
+    /// Every series id the object holds was already seen by the listing, so
+    /// its catalog was not decoded.
+    AllSeen,
+    /// `ids` is every series id the object holds, matched or not; `entries`
+    /// are the series matching the listing's matchers.
+    Decoded {
+        ids: Vec<SeriesId>,
+        entries: Vec<SeriesEntry>,
+    },
+}
+
 /// The series a catalog decode selected, and the reservation charging the
 /// decoded catalog to the memory budget (ADR-1702 decision 6) for as long as
 /// they are held. Derefs to the entries. `None` holds nothing: a decode that
@@ -2920,6 +2934,67 @@ impl SegmentFetcher {
         // returned `Vec<SeriesEntry>` has no slot to carry it further.
         let (entries, _reservation) = selected.into_parts();
         Ok(entries.into_iter().map(|e| e.entry).collect())
+    }
+
+    /// A series listing's read of one object. SERIES_IDS is read and decoded
+    /// first; when `all_seen` holds for the object's ids, no catalog section
+    /// is read or decoded and the object adds nothing to the listing.
+    /// Otherwise the catalog is decoded exactly as
+    /// [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
+    /// decodes it. The SERIES_IDS GET is recorded under the probe phase.
+    pub(crate) async fn list_series_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+        all_seen: &(dyn Fn(&[SeriesId]) -> bool + Sync),
+    ) -> Result<ListedObject, FetchError> {
+        let (footer, total_size, suffix_etag, mut regions) = self
+            .open_segment(tenant_hash, seg_ref, accounting.plan())
+            .await?;
+        let key = seg_ref.data_object_key.as_str();
+        let (si_off, si_len) = section_range(&footer, SECTION_SERIES_IDS).ok_or_else(|| {
+            corrupt(
+                key,
+                ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
+            )
+        })?;
+        self.ensure_ranges(
+            seg_ref,
+            tenant_hash,
+            &suffix_etag,
+            &[(si_off, si_off + si_len)],
+            1,
+            &mut regions,
+            accounting.probe(),
+        )
+        .await?;
+        let stored = regions
+            .slice(si_off, si_len)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let ids = ravel_segment::decode_series_ids(&footer, &stored, self.limits)
+            .map_err(|source| corrupt(key, source))?;
+        if all_seen(&ids) {
+            return Ok(ListedObject::AllSeen);
+        }
+        let selected = self
+            .decode_selected(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+                accounting.probe(),
+            )
+            .await?;
+        let (entries, _reservation) = selected.into_parts();
+        Ok(ListedObject::Decoded {
+            ids,
+            entries: entries.into_iter().map(|e| e.entry).collect(),
+        })
     }
 
     /// Fetches and decodes the scalar samples of every series in this segment

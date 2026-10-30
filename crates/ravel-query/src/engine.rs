@@ -2997,18 +2997,28 @@ impl QueryEngine {
     ) -> Result<SeriesFold, QueryError> {
         let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
+        let mut fold = SeriesFold::new(Arc::clone(&self.memory_budget), self.config.max_series);
+        let seen = fold.seen();
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
             .map(|seg_ref| {
                 let fetcher = self.fetcher.clone();
                 let matchers = Arc::clone(&matchers);
                 let accounting = accounting.clone();
+                let seen = Arc::clone(&seen);
                 async move {
+                    let all_seen = move |ids: &[SeriesId]| {
+                        let seen = seen
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        ids.iter().all(|id| seen.contains(id))
+                    };
                     fetcher
-                        .fetch_series_phase_accounted(
+                        .list_series_phase_accounted(
                             tenant_hash,
                             &seg_ref,
                             matchers.as_slice(),
                             &accounting,
+                            &all_seen,
                         )
                         .await
                 }
@@ -3020,7 +3030,6 @@ impl QueryEngine {
         // windowed predicate erases only some samples and leaves the series
         // enumerable (see `erasure::retain_series_entries`). No-op when empty.
         let erasure = snapshot_erasure_predicates(snapshot);
-        let mut fold = SeriesFold::new(Arc::clone(&self.memory_budget), self.config.max_series);
         // Short-circuit the same way as `fetch_all_samples_and_histograms`:
         // the bytes-scanned budget is checked once per completed segment
         // fetch, so a labels/series query whose matchers resolve to zero
@@ -3028,7 +3037,7 @@ impl QueryEngine {
         // Returning early drops the stream and cancels the remaining in-flight
         // fetches.
         while let Some(r) = stream.next().await {
-            let mut entries = r?;
+            let listed = r?;
             if let Some(err) = bytes_scanned_exceeded(
                 accounting.snapshot().pooled().total_s3_bytes(),
                 max_bytes_scanned,
@@ -3041,6 +3050,10 @@ impl QueryEngine {
             ) {
                 return Err(err);
             }
+            let crate::fetcher::ListedObject::Decoded { ids, mut entries } = listed else {
+                continue;
+            };
+            fold.mark_seen(ids)?;
             crate::erasure::retain_series_entries(&mut entries, &erasure);
             fold.absorb(
                 entries
@@ -3058,21 +3071,72 @@ impl QueryEngine {
 /// copy per object. The retained copies are charged to the memory budget as
 /// they are added, so a listing the budget cannot hold is refused against the
 /// budget instead of running the host down to its memory floor.
+///
+/// The fold also keeps every series id a decoded object held, matched or not.
+/// A series id is canonical over its labels, so the matchers and a windowless
+/// erasure predicate give it the same verdict in every object: an object whose
+/// ids have all been seen adds nothing, and the fetch tasks read [`seen`]
+/// to skip its catalog decode.
+///
+/// [`seen`]: SeriesFold::seen
 struct SeriesFold {
     by_id: HashMap<SeriesId, LabelSet>,
+    seen: Arc<std::sync::RwLock<HashSet<SeriesId>>>,
     max_series: usize,
     budget: Arc<ravel_memory::MemoryBudget>,
     reservations: Vec<ravel_memory::Reservation>,
 }
 
+/// The bytes one seen series id is charged: the id and the hash set's own
+/// overhead for it, taken as the same again.
+const SEEN_SERIES_LEN: u64 = 2 * std::mem::size_of::<SeriesId>() as u64;
+
 impl SeriesFold {
     fn new(budget: Arc<ravel_memory::MemoryBudget>, max_series: usize) -> Self {
         Self {
             by_id: HashMap::new(),
+            seen: Arc::new(std::sync::RwLock::new(HashSet::new())),
             max_series,
             budget,
             reservations: Vec::new(),
         }
+    }
+
+    /// The series ids seen so far, shared with the fetch tasks.
+    fn seen(&self) -> Arc<std::sync::RwLock<HashSet<SeriesId>>> {
+        Arc::clone(&self.seen)
+    }
+
+    /// Records every id a decoded object held and reserves
+    /// [`SEEN_SERIES_LEN`] for each one not seen before. A refused
+    /// reservation is [`FetchError::FetchMemoryExhausted`], as in
+    /// [`absorb`](Self::absorb).
+    fn mark_seen(&mut self, ids: Vec<SeriesId>) -> Result<(), QueryError> {
+        let added = {
+            let mut seen = self
+                .seen
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ids.into_iter().filter(|id| seen.insert(*id)).count() as u64
+        };
+        self.reserve(added.saturating_mul(SEEN_SERIES_LEN))
+    }
+
+    fn reserve(&mut self, bytes: u64) -> Result<(), QueryError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let reservation =
+            self.budget
+                .reserve(bytes)
+                .map_err(|e| FetchError::FetchMemoryExhausted {
+                    requested: e.requested,
+                    reserved: e.reserved,
+                    limit: e.limit,
+                    cause: e.cause,
+                })?;
+        self.reservations.push(reservation);
+        Ok(())
     }
 
     /// Adds every series not already held, refusing with
@@ -3099,19 +3163,7 @@ impl SeriesFold {
             added = added.saturating_add(retained_series_len(&labels));
             self.by_id.insert(series_id, labels);
         }
-        if added > 0 {
-            let reservation =
-                self.budget
-                    .reserve(added)
-                    .map_err(|e| FetchError::FetchMemoryExhausted {
-                        requested: e.requested,
-                        reserved: e.reserved,
-                        limit: e.limit,
-                        cause: e.cause,
-                    })?;
-            self.reservations.push(reservation);
-        }
-        Ok(())
+        self.reserve(added)
     }
 
     /// The bytes this fold holds reserved.
@@ -7690,16 +7742,36 @@ mod prefetch_tests {
         Result<Vec<(SeriesId, LabelSet)>, QueryError>,
         Arc<ravel_memory::MemoryBudget>,
     ) {
+        let objects = (1..=LISTING_SEGMENTS)
+            .map(|seq| {
+                let prefix = if distinct {
+                    format!("{seq}-")
+                } else {
+                    String::new()
+                };
+                padded_ids(&prefix, LISTING_SERIES)
+            })
+            .collect();
+        let (listed, budget, _) = list_objects(objects, &[name_matcher("m")]).await;
+        (listed, budget)
+    }
+
+    /// Lists `matchers` over one object per entry of `objects`, each holding
+    /// the series `id` label values it names under metric `m`, published in
+    /// order and fetched one at a time against a `LISTING_BUDGET` memory
+    /// budget. Also returns how many label sets the fetcher materialized.
+    async fn list_objects(
+        objects: Vec<Vec<String>>,
+        matchers: &[LabelMatcher],
+    ) -> (
+        Result<Vec<(SeriesId, LabelSet)>, QueryError>,
+        Arc<ravel_memory::MemoryBudget>,
+        u64,
+    ) {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
         let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
-        for seq in 1..=LISTING_SEGMENTS {
-            let prefix = if distinct {
-                format!("{seq}-")
-            } else {
-                String::new()
-            };
-            let ids = padded_ids(&prefix, LISTING_SERIES);
+        for (seq, ids) in (1u64..).zip(&objects) {
             let series = ids
                 .iter()
                 .map(|id| {
@@ -7736,7 +7808,7 @@ mod prefetch_tests {
         let listed = eng
             .resolve_series(
                 tenant_hash,
-                &[name_matcher("m")],
+                matchers,
                 TimeRange {
                     start_ns: BASE_NS - 60 * NS_PER_MIN,
                     end_ns: BASE_NS,
@@ -7747,7 +7819,7 @@ mod prefetch_tests {
             )
             .await
             .map(|(series, _)| series);
-        (listed, budget)
+        (listed, budget, eng.fetcher.label_sets_materialized())
     }
 
     /// Issue #3434: a series listing holds one copy of each series however
@@ -7800,6 +7872,83 @@ mod prefetch_tests {
             0,
             "a refused listing releases what it held"
         );
+    }
+
+    /// Issue #3481: once every series an object holds has been seen, the
+    /// listing skips that object's catalog. Forty objects repeat the same
+    /// fifty series and only the first one's labels are materialized; a
+    /// listing that decodes every object materializes 2,000.
+    #[tokio::test]
+    async fn a_series_listing_skips_an_object_whose_series_it_has_seen() {
+        let objects = vec![padded_ids("", LISTING_SERIES); LISTING_SEGMENTS as usize];
+        let (listed, _, materialized) = list_objects(objects, &[name_matcher("m")]).await;
+        assert_eq!(listed.expect("listing answers").len(), LISTING_SERIES);
+        assert_eq!(materialized, LISTING_SERIES as u64);
+    }
+
+    /// Issue #3481: an object holding one series not yet seen is decoded,
+    /// whatever else it holds. The second object repeats the first and is
+    /// skipped; the third adds one series and is decoded, so the listing
+    /// answers fifty-one series from 50 + 51 materialized label sets. Skipping
+    /// an object because some of its series were seen would drop the new one.
+    #[tokio::test]
+    async fn a_series_listing_decodes_an_object_holding_one_unseen_series() {
+        let base = padded_ids("", LISTING_SERIES);
+        let mut grown = base.clone();
+        grown.push("new".to_string());
+        let (listed, _, materialized) =
+            list_objects(vec![base.clone(), base, grown], &[name_matcher("m")]).await;
+        let series = listed.expect("listing answers");
+        assert_eq!(series.len(), LISTING_SERIES + 1);
+        assert!(
+            series
+                .iter()
+                .any(|(_, labels)| labels.get("id") == Some("new")),
+            "the unseen series is listed"
+        );
+        assert_eq!(materialized, 2 * LISTING_SERIES as u64 + 1);
+    }
+
+    /// Issue #3481: the seen set holds the series a matcher rejected too, so
+    /// an object of series that do not all match is still skipped once seen.
+    /// Half of each object's fifty ids end in 0 to 4 and match; the regex
+    /// matcher materializes all fifty of a decoded object, so the listing
+    /// materializes fifty. Keying the skip on the matched series alone never
+    /// skips these objects and materializes 2,000.
+    #[tokio::test]
+    async fn a_series_listing_skips_an_object_whose_unmatched_series_it_has_seen() {
+        let objects = vec![padded_ids("", LISTING_SERIES); LISTING_SEGMENTS as usize];
+        let matchers = [
+            name_matcher("m"),
+            LabelMatcher::regex("id", ".*[0-4]").expect("valid regex"),
+        ];
+        let (listed, _, materialized) = list_objects(objects, &matchers).await;
+        assert_eq!(listed.expect("listing answers").len(), LISTING_SERIES / 2);
+        assert_eq!(materialized, LISTING_SERIES as u64);
+    }
+
+    /// The seen set's charge: each id is reserved once, at `SEEN_SERIES_LEN`,
+    /// however many objects carry it, and released with the fold.
+    #[test]
+    fn a_series_fold_charges_each_seen_id_once() {
+        let ids: Vec<SeriesId> = padded_batch(&padded_ids("", LISTING_SERIES))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        for _ in 0..8 {
+            fold.mark_seen(ids.clone()).expect("fifty ids fit");
+        }
+        let one_copy = LISTING_SERIES as u64 * SEEN_SERIES_LEN;
+        assert_eq!(fold.charged(), one_copy);
+        assert_eq!(budget.reserved(), one_copy);
+        assert_eq!(
+            fold.seen().read().expect("unpoisoned").len(),
+            LISTING_SERIES
+        );
+        drop(fold);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// The fold's exact charge: the same fifty series absorbed eight times
