@@ -54,7 +54,7 @@ encodings, building row structures and copying strings:
   columnar writer writes byte-identical objects (ADR-0109 decision 7). It
   exists for columnar input, and nothing prevents the OTLP flush from using it.
 - **The tokenizer allocates per token.** It allocates a `Vec` per token and
-  deduplicates through SipHash (`tokenizer.rs:21`, `bloom.rs:69`).
+  deduplicates through SipHash (`tokenizer.rs:21`, `bloom.rs:161, 196`).
 - **Normalize clones what it owns.** prost decodes every string into an owned
   `String`. `normalize_logs_projected` owns the request but clones each value
   again (`logs_normalize.rs:416, 531, 874, 980`), and copies the
@@ -128,8 +128,11 @@ Under `Estimated`:
   priority order.
 - **String pages.** The candidate that the `distinct / total <= 0.5`
   heuristic ranks first is encoded and sealed alone.
-- **Dictionary ids.** The distinct count and the dictionary ids come from a
-  hash map, not a sort.
+- **Distinct count.** The distinct count that feeds the heuristic comes from
+  a hash map over the page's values, not a sort of every row. When
+  dictionary wins, its entries are still sorted ascending by byte value, as
+  `docs/log-segment-format.md` requires for tag 7, but the sort runs over the
+  distinct values only.
 - **Row-group dictionary.** The pass that seals it again is skipped for
   columns whose block choice was plain.
 
@@ -203,17 +206,27 @@ record. Two things stay as they are:
 ### D6. The flush tick follows the flush delay
 
 The shard's flush tick becomes `min(200 ms, max_flush_delay / 4)`, with a
-25 ms floor. Startup validation states the new bound, and the ADR-1737
-sub-floor hold, which is derived from the tick, shortens with it. At the
-shipped 2 s delay the tick stays at 200 ms.
+25 ms floor. Startup validation states the new bound. The ADR-1737
+sub-floor hold is `max_flush_lifetime` less one `flush_tick`, so a shorter
+tick makes it longer: at a 25 ms tick it is 175 ms longer than today. At the
+shipped 2 s delay the tick stays at 200 ms and the hold is unchanged.
 
 ### D7. A flush encodes its column pages in parallel
 
 A logs flush is one write-gate job today, so its encode latency is serial in
 the number of lines it holds. With fewer shards each flush holds more lines.
 To keep that encode time short, a flush encodes the column pages of a block as
-separate jobs. Each job takes its own write-gate permit (ADR-1702), so the gate
-still bounds total encode concurrency. The flush assembles the sealed pages in
+separate jobs.
+
+Today a write-gate job below the gate's inline floor (1 MiB for the server's
+write gate) runs on the caller's thread and never takes a permit
+(ADR-1702 decision 4). Each column page of a 7.5k-line flush is far below
+that floor, so page jobs submitted one by one would all run inline and in
+series. The floor therefore applies to the flush as a whole, as it does
+today: a flush at or above the floor dispatches its page jobs to the
+blocking pool, and each page job takes one write-gate permit, whatever its
+own size. A flush below the floor stays one inline job. The gate still
+bounds total encode concurrency. The flush assembles the sealed pages in
 the column order the writer uses today, so the object's bytes are identical to
 a serial encode. A test pins that equality on the benchmark's shape and on the
 golden corpus.
@@ -255,13 +268,14 @@ gate job.
 | aged, 250 ms delay, 8 shards | about 284 ms + 112 ms + 260 ms = **about 0.66 s** | **about 98k** | predicted, same basis |
 | arrival, 8 shards | flush cycle c = 0.17 / (1 - 120k x 30 us / 8) = about 0.31 s; ack about 1.5c plus tail = **about 0.55 s** | **about 116k** | predicted, same basis |
 | aged, 100 ms delay, 8 shards | about 114 ms + 45 ms + 260 ms = **about 0.42 s** | about 150k, with about 80 objects/s written | predicted, same basis |
-| **aged, 100 ms delay, 2 shards, tick 25 ms, D7 (D8, chosen)** | wait for the slower of 2 shards' age about 92 ms; encode 7.5k lines over the gate's permits about 45 ms (225 ms serial); two PUTs on the slower of 2 about 230 ms: **about 0.37 s** | **ack-path capacity about 170k, at 20 objects/s** | predicted, same basis |
+| **aged, 100 ms delay, 2 shards, tick 25 ms, D7 (D8, chosen)** | wait for the slower of 2 shards' age about 92 ms; encode 7.5k lines (225 ms serial) over the write gate's default 4 permits on 8 vCPU: about 56 ms when one flush has the gate, about 112 ms when both shards flush on the same tick and split it; two PUTs on the slower of 2 about 230 ms: **about 0.38 to 0.43 s** | **ack-path capacity about 145k to 170k, at 20 objects/s** | predicted, same basis |
 | aged, 100 ms delay, 1 shard | about 0.35 s | not viable: the single shard actor would need about 1.2 s/s, scaling the measured 0.14 s/s per shard at about 70k | predicted from the shard on-actor time measured 2026-10-29 |
 
 CPU work alone takes **buffered** acks to about 120k, but **strict 250 ms**
 only to about 87-98k: the 250 ms age and two sequential PUTs use most of the
 budget. At a 100 ms delay the ack path stops binding. With 2 shards and D7 it
-has about 170k of capacity, so the strict row is then bound by CPU.
+has about 145k to 170k of capacity at the default permit count, above the
+120k target, so the strict row is then bound by CPU.
 
 150k lines/s on 8 vCPU allows at most about 53 us of CPU per line, about 47%
 below today. D1 to D6 target 30 to 35%, which predicts a CPU-bound strict
@@ -327,8 +341,9 @@ flowchart LR
 4. **More shards, or the arrival policy, for the strict row.**
    - **8 shards at 100 ms:** predicted about 150k, but at 80 objects/s, 4x
      D8's PUT count.
-   - **Arrival with 8 shards:** predicted about 116k, with about 50
-     objects/s.
+   - **Arrival with 8 shards:** predicted about 116k, with about 26
+     objects/s (8 shards over the 0.31 s flush cycle) and as many commit
+     records.
 
    D8 reaches more ack-path capacity with fewer objects, because D7 removes
    the encode latency that made fewer shards slow.
