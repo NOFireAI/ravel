@@ -1080,10 +1080,13 @@ mod tests {
             ),
             (any::<i64>(), proptest::collection::vec(0i64..20, 1..300)).prop_map(|(b, steps)| {
                 let mut t = b;
-                steps.iter().map(|s| {
-                    t = t.wrapping_add(1_000 + s);
-                    t
-                }).collect()
+                steps
+                    .iter()
+                    .map(|s| {
+                        t = t.wrapping_add(1_000 + s);
+                        t
+                    })
+                    .collect()
             }),
             (
                 any::<i64>(),
@@ -1129,7 +1132,12 @@ mod tests {
         assert_eq!(enc, expected);
         for (other, b) in i64_candidates(vals) {
             if other != enc {
-                assert!(bytes.len() < b.len(), "{enc:?} {} vs {other:?} {}", bytes.len(), b.len());
+                assert!(
+                    bytes.len() < b.len(),
+                    "{enc:?} {} vs {other:?} {}",
+                    bytes.len(),
+                    b.len()
+                );
             }
         }
     }

@@ -109,13 +109,26 @@ fn check_sizes(flush: usize, records: &[LogRecord]) {
     for (k, &(name, choice)) in CHOICES.iter().enumerate() {
         let row = encode_rows(records.to_vec(), choice);
         let columnar = encode_columnar(records.to_vec(), choice);
-        assert!(row == columnar, "{flush} records, {name}: row and columnar bytes differ");
-        println!("ingest_shape/{flush} stored_bytes row_{name}={} columnar_{name}={}", row.len(), columnar.len());
+        assert!(
+            row == columnar,
+            "{flush} records, {name}: row and columnar bytes differ"
+        );
+        println!(
+            "ingest_shape/{flush} stored_bytes row_{name}={} columnar_{name}={}",
+            row.len(),
+            columnar.len()
+        );
         sizes[k] = row.len();
     }
     let growth = sizes[1] as f64 / sizes[0] as f64 - 1.0;
-    println!("ingest_shape/{flush} estimated_vs_exhaustive={:+.3}%", growth * 100.0);
-    assert!(growth <= MAX_ESTIMATED_GROWTH, "{flush} records: Estimated grows {growth:.4}");
+    println!(
+        "ingest_shape/{flush} estimated_vs_exhaustive={:+.3}%",
+        growth * 100.0
+    );
+    assert!(
+        growth <= MAX_ESTIMATED_GROWTH,
+        "{flush} records: Estimated grows {growth:.4}"
+    );
 }
 
 fn bench_ingest_shape(c: &mut Criterion) {

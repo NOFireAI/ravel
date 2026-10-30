@@ -20,6 +20,17 @@ pub const STREAMS: usize = 50;
 
 const METHODS: [&str; 5] = ["GET", "POST", "PUT", "DELETE", "PATCH"];
 const SEVERITIES: [(u8, &str); 4] = [(5, "DEBUG"), (9, "INFO"), (13, "WARN"), (17, "ERROR")];
+const SEVERITY_MIX: [usize; 10] = [1, 1, 1, 1, 1, 1, 0, 2, 2, 3];
+const RESOURCES: [&str; 4] = ["orders", "users", "carts", "items"];
+const STATUSES: [i64; 10] = [200, 200, 200, 201, 204, 301, 400, 404, 500, 503];
+const REGIONS: [&str; 6] = [
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-south-1",
+    "eu-central-1",
+    "sa-east-1",
+];
 const ERRORS: [&str; 8] = [
     "timeout",
     "connection_reset",
@@ -71,6 +82,17 @@ fn i(name: &str, value: i64) -> (String, AttrValue) {
     (name.to_string(), AttrValue::I64(value))
 }
 
+/// An access-log line of at least 100 bytes.
+fn body(method: &str, route: &str, status: i64, duration_us: i64, user: u64, req: &str) -> String {
+    let mut body = format!(
+        "{method} {route} completed status={status} in {duration_us}us user=u{user:04} req={req}"
+    );
+    while body.len() < 100 {
+        body.push_str(" ok");
+    }
+    body
+}
+
 /// The first `n` records of the stream of arrivals, in push order. Record
 /// timestamps rise by about 1.3 ms per record with sub-microsecond jitter;
 /// each record belongs to one of [`STREAMS`] streams, skewed so a few streams
@@ -84,48 +106,66 @@ pub fn ingest_records(n: usize) -> Vec<LogRecord> {
             let skew = r(0) % 1_000;
             let stream = ((skew * skew) / 20_000) as usize % STREAMS;
             let ts = base_ts + k as i64 * 1_300_000 + (r(1) % 900) as i64;
-            let (sev_num, sev_text) = SEVERITIES[[1, 1, 1, 1, 1, 1, 0, 2, 2, 3][(r(2) % 10) as usize]];
+            let (sev_num, sev_text) = SEVERITIES[SEVERITY_MIX[(r(2) % 10) as usize]];
             let method = METHODS[(r(3) % 5) as usize];
-            let route = format!("/api/v2/{}/{}", ["orders", "users", "carts", "items"][(r(4) % 4) as usize], r(5) % 10);
-            let status = [200i64, 200, 200, 201, 204, 301, 400, 404, 500, 503][(r(6) % 10) as usize];
+            let route = format!("/api/v2/{}/{}", RESOURCES[(r(4) % 4) as usize], r(5) % 10);
+            let status = STATUSES[(r(6) % 10) as usize];
             let duration_us = (r(7) % 250_000) as i64;
             let user = r(8) % 2_000;
             let request_id = format!("{:016x}{:016x}", r(9), r(10));
-            let mut body = format!(
-                "{method} {route} completed status={status} in {duration_us}us user=u{user:04} req={}",
-                &request_id[..16]
-            );
-            while body.len() < 100 {
-                body.push_str(" ok");
-            }
+            let body = body(method, &route, status, duration_us, user, &request_id[..16]);
             let mut attrs = vec![
                 s("http.method", method.to_string()),
                 s("http.route", route),
                 s("http.scheme", "https".to_string()),
-                s("http.flavor", ["1.1", "2"][(r(11) % 2) as usize].to_string()),
-                s("http.user_agent", format!("client/{}.{} (os-{})", r(12) % 5, r(13) % 20, r(14) % 6)),
-                s("net.peer.name", format!("10.{}.{}.{}", r(15) % 4, r(16) % 16, r(17) % 64)),
+                s(
+                    "http.flavor",
+                    ["1.1", "2"][(r(11) % 2) as usize].to_string(),
+                ),
+                s(
+                    "http.user_agent",
+                    format!("client/{}.{} (os-{})", r(12) % 5, r(13) % 20, r(14) % 6),
+                ),
+                s(
+                    "net.peer.name",
+                    format!("10.{}.{}.{}", r(15) % 4, r(16) % 16, r(17) % 64),
+                ),
                 s("user.id", format!("u{user:04}")),
                 s("session.id", format!("sess-{:08x}", r(18) % 5_000)),
                 s("request.id", request_id),
                 s("tenant.id", format!("tenant-{}", r(19) % 100)),
-                s("cloud.region", ["us-east-1", "us-west-2", "eu-west-1", "ap-south-1", "eu-central-1", "sa-east-1"][(r(20) % 6) as usize].to_string()),
+                s("cloud.region", REGIONS[(r(20) % 6) as usize].to_string()),
                 s("cloud.availability_zone", format!("az-{}", r(21) % 12)),
-                s("deployment.environment", ["prod", "staging"][(r(22) % 8 / 7) as usize].to_string()),
+                s(
+                    "deployment.environment",
+                    ["prod", "staging"][(r(22) % 8 / 7) as usize].to_string(),
+                ),
                 s("service.version", format!("1.{}.{}", r(23) % 3, r(24) % 4)),
                 s("log.logger", format!("com.example.{}", r(25) % 30)),
                 s("thread.name", format!("worker-{}", r(26) % 64)),
                 s("code.function", format!("handle_{}", r(27) % 150)),
-                s("code.filepath", format!("src/handlers/mod_{}.rs", r(28) % 200)),
+                s(
+                    "code.filepath",
+                    format!("src/handlers/mod_{}.rs", r(28) % 200),
+                ),
                 s("feature.flag", format!("flag-{}", r(29) % 20)),
                 s("messaging.destination", format!("queue-{}", r(30) % 16)),
-                s("db.system", ["postgresql", "redis", "none"][(r(31) % 3) as usize].to_string()),
-                s("trace.sampled", ["true", "false"][(r(32) % 4 / 3) as usize].to_string()),
+                s(
+                    "db.system",
+                    ["postgresql", "redis", "none"][(r(31) % 3) as usize].to_string(),
+                ),
+                s(
+                    "trace.sampled",
+                    ["true", "false"][(r(32) % 4 / 3) as usize].to_string(),
+                ),
                 i("http.status_code", status),
                 i("http.request_content_length", (r(33) % 64_000) as i64),
                 i("http.response_content_length", (r(34) % 512_000) as i64),
                 i("duration_us", duration_us),
-                i("net.peer.port", [443i64, 8443, 5432, 6379][(r(35) % 4) as usize]),
+                i(
+                    "net.peer.port",
+                    [443i64, 8443, 5432, 6379][(r(35) % 4) as usize],
+                ),
                 i("thread.id", (r(36) % 64) as i64),
                 i("code.lineno", (r(37) % 1_000) as i64),
                 i("process.pid", 1_000 + stream as i64),
@@ -142,7 +182,10 @@ pub fn ingest_records(n: usize) -> Vec<LogRecord> {
                 attrs.push(s("error.type", ERRORS[(r(44) % 8) as usize].to_string()));
             }
             if r(45) % 10 < 3 {
-                attrs.push(s("db.statement", format!("SELECT * FROM t{} WHERE id = $1", r(46) % 100)));
+                attrs.push(s(
+                    "db.statement",
+                    format!("SELECT * FROM t{} WHERE id = $1", r(46) % 100),
+                ));
             }
             let (stream_id, stream_attrs) = streams[stream].clone();
             LogRecord {

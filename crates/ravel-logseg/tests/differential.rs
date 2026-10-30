@@ -998,10 +998,19 @@ fn estimated_mode_is_deterministic() {
             ..base
         };
         let first = write_batched(est, &corpus, false);
-        assert!(first == write_batched(est, &corpus, false), "Estimated is not repeatable");
-        assert!(first == write_batched(est, &corpus, true), "Estimated row and columnar differ");
+        assert!(
+            first == write_batched(est, &corpus, false),
+            "Estimated is not repeatable"
+        );
+        assert!(
+            first == write_batched(est, &corpus, true),
+            "Estimated row and columnar differ"
+        );
         let exh = write_batched(base, &corpus, false);
-        assert!(exh == write_batched(base, &corpus, true), "Exhaustive row and columnar differ");
+        assert!(
+            exh == write_batched(base, &corpus, true),
+            "Exhaustive row and columnar differ"
+        );
         assert!(first != exh, "the writer ignored page_choice");
         assert_eq!(decoded_keys(&first), decoded_keys(&exh));
     }
@@ -1024,7 +1033,9 @@ fn page_value(kind: PageKind, seed: u64, i: usize) -> AttrValue {
         .rotate_left(29);
     match kind {
         PageKind::Constant => AttrValue::I64(seed as i64),
-        PageKind::Monotonic => AttrValue::I64((seed as i64 % 1_000_000) + i as i64 * 1_000 + (r % 3) as i64),
+        PageKind::Monotonic => {
+            AttrValue::I64((seed as i64 % 1_000_000) + i as i64 * 1_000 + (r % 3) as i64)
+        }
         PageKind::Random => AttrValue::I64(r as i64),
         PageKind::SmallRange => AttrValue::I64((r % 16) as i64),
         PageKind::LowCardStr => AttrValue::Str(format!("v{}", r % 4)),
@@ -1056,7 +1067,9 @@ fn arb_page_corpus() -> impl Strategy<Value = (Vec<LogRecord>, usize)> {
                     let attrs = columns
                         .iter()
                         .enumerate()
-                        .filter(|(_, (_, _, sparse))| *sparse == 0 || i % (usize::from(*sparse) + 1) != 0)
+                        .filter(|(_, (_, _, sparse))| {
+                            *sparse == 0 || i % (usize::from(*sparse) + 1) != 0
+                        })
                         .map(|(c, &(kind, seed, _))| (format!("c{c}"), page_value(kind, seed, i)))
                         .collect();
                     let body = if low_card_body {
@@ -1067,7 +1080,14 @@ fn arb_page_corpus() -> impl Strategy<Value = (Vec<LogRecord>, usize)> {
                     let stream = (i % usize::from(STREAMS)) as u8;
                     LogRecord {
                         attrs,
-                        ..make_record(stream, (i / 3) as i64, body, (i % 30) as u8, Vec::new(), None)
+                        ..make_record(
+                            stream,
+                            (i / 3) as i64,
+                            body,
+                            (i % 30) as u8,
+                            Vec::new(),
+                            None,
+                        )
                     }
                 })
                 .collect();

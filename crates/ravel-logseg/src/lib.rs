@@ -47,6 +47,7 @@ mod bloom_coverage_tests;
 // deliberately NOT re-exported: the view is the whole public surface over a
 // decoded block, so decision 4 can change how columns are stored without
 // touching a caller.
+pub use block::PageChoice;
 pub use columnar::{
     AttrColumn, BoolCursor, BytesCursor, ColumnarBlockView, F64BitsCursor, I64Cursor, I64Values,
     StrDictColumn,
@@ -72,7 +73,6 @@ pub use record::{
     attr_value_fits_storage, stream_attrs_bytes,
 };
 pub use source::{ByteSource, SparseObject};
-pub use block::PageChoice;
 pub use writer::{BloomScope, ObjectIdentity, RlogConfig, RlogWriter};
 
 // Re-exported for callers building records; these are the ravel-types identity

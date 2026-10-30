@@ -27,8 +27,8 @@ use crate::record::{
     SPAN_ID_WIDTH, TRACE_ID_WIDTH,
 };
 use crate::rlog_codec::{
-    StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64_into, encode_column_ref,
-    dict_strings_page, i64_candidates, i64_estimated, plain_strings_page, shape_candidates,
+    StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64_into, dict_strings_page,
+    encode_column_ref, i64_candidates, i64_estimated, plain_strings_page, shape_candidates,
     string_dict_shape, string_dict_shape_if_dict, string_shape, string_shape_if_dict,
 };
 use crate::varint::get_uvarint;
@@ -4003,8 +4003,16 @@ mod tests {
                 if i % 2 == 0 {
                     put(&mut r, 10, ColumnValue::I64(i % 16));
                 }
-                put(&mut r, 11, ColumnValue::Str(format!("svc-{}", i % 4).into_bytes()));
-                put(&mut r, 12, ColumnValue::Str(format!("req-{i:08}").into_bytes()));
+                put(
+                    &mut r,
+                    11,
+                    ColumnValue::Str(format!("svc-{}", i % 4).into_bytes()),
+                );
+                put(
+                    &mut r,
+                    12,
+                    ColumnValue::Str(format!("req-{i:08}").into_bytes()),
+                );
                 r
             })
             .collect();
@@ -4020,29 +4028,52 @@ mod tests {
     #[test]
     fn estimated_seals_one_candidate_per_page() {
         let (rows, plans) = choice_rows();
-        let (est, seals) = sealed_by(|| {
-            write_block_with(&rows, &plans, 3, PageChoice::Estimated).expect("write")
-        });
+        let (est, seals) =
+            sealed_by(|| write_block_with(&rows, &plans, 3, PageChoice::Estimated).expect("write"));
         assert_eq!(seals, est.descs.len() as u64);
         let (exh, seals) = sealed_by(|| {
             write_block_with(&rows, &plans, 3, PageChoice::Exhaustive).expect("write")
         });
-        assert!(seals > exh.descs.len() as u64, "{seals} seals for {} pages", exh.descs.len());
+        assert!(
+            seals > exh.descs.len() as u64,
+            "{seals} seals for {} pages",
+            exh.descs.len()
+        );
 
-        let plain: Vec<(u32, bool)> = est.str_values.iter().map(|v| (v.column_id, v.plain)).collect();
+        let plain: Vec<(u32, bool)> = est
+            .str_values
+            .iter()
+            .map(|v| (v.column_id, v.plain))
+            .collect();
         assert_eq!(
             plain,
-            [(COL_SEVERITY_TEXT, false), (COL_BODY, true), (11, false), (12, true)]
+            [
+                (COL_SEVERITY_TEXT, false),
+                (COL_BODY, true),
+                (11, false),
+                (12, true)
+            ]
         );
         assert!(exh.str_values.iter().all(|v| !v.plain));
 
         let est = decode_out(&est, &plans, None).expect("decode");
         let exh = decode_out(&exh, &plans, None).expect("decode");
-        for cid in [COL_TS, COL_OBSERVED_TS, COL_STREAM_REF, COL_SEVERITY_NUM, COL_FLAGS, 10] {
+        for cid in [
+            COL_TS,
+            COL_OBSERVED_TS,
+            COL_STREAM_REF,
+            COL_SEVERITY_NUM,
+            COL_FLAGS,
+            10,
+        ] {
             assert_eq!(est.i64_col(cid), exh.i64_col(cid), "column {cid}");
         }
         for cid in [COL_SEVERITY_TEXT, COL_BODY, 11, 12] {
-            assert_eq!(est.str_col_fused(cid), exh.str_col_fused(cid), "column {cid}");
+            assert_eq!(
+                est.str_col_fused(cid),
+                exh.str_col_fused(cid),
+                "column {cid}"
+            );
         }
     }
 }

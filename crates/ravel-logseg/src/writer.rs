@@ -856,7 +856,12 @@ impl RlogWriter {
                 })
                 .collect();
 
-            let out = write_block_with(block_rows, &plans, self.cfg.zstd_level, self.cfg.page_choice)?;
+            let out = write_block_with(
+                block_rows,
+                &plans,
+                self.cfg.zstd_level,
+                self.cfg.page_choice,
+            )?;
 
             // POSTINGS: index each row's merged-view values (resource +
             // scope + per-record, the record winning on a key collision),
