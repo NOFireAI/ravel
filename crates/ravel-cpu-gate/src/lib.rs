@@ -5,7 +5,9 @@
 //! closure and is released only when the job returns, so a caller that stops
 //! waiting cannot free a permit while its job still holds a core. A job whose
 //! size is below the gate's inline floor runs on the calling thread and takes
-//! no permit (decision 4).
+//! no permit (decision 4). [`CpuGate::run_permitted`] skips that size check
+//! and always takes a permit, for a job split out of a larger unit that was
+//! itself at or above the floor.
 //!
 //! Cancellation (decision 5): a waiter dropped before it holds a permit never
 //! runs its job. A job that has started runs to completion, because a bulk
@@ -192,6 +194,17 @@ impl<S: GateSite> CpuGate<S> {
         self.counters.running.load(Ordering::Acquire)
     }
 
+    /// Whether a job of `size` runs inline under [`CpuGate::run`].
+    pub fn runs_inline(&self, size: JobSize) -> bool {
+        self.config.runs_inline(size)
+    }
+
+    /// Permits no job holds right now. A snapshot: another caller can take
+    /// one before this caller acts on it.
+    pub fn free_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     /// Waiters queued for a permit right now.
     pub fn queued(&self) -> u64 {
         self.counters.queued.load(Ordering::Acquire)
@@ -209,16 +222,29 @@ impl<S: GateSite> CpuGate<S> {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let site_index = site.index();
-        let site_counters = self.counters.sites.get(site_index);
         if self.config.runs_inline(size) {
-            if let Some(counters) = site_counters {
+            if let Some(counters) = self.counters.sites.get(site.index()) {
                 counters.inline.fetch_add(1, Ordering::Relaxed);
             }
             return std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                 .map_err(|_| CpuGateError::Panicked);
         }
+        self.run_permitted(site, job).await
+    }
 
+    /// Runs `job` for `site` on the blocking pool once a permit is free,
+    /// whatever its size: the unit [`CpuGate::run`] sends through the gate
+    /// at or above the floor. For a job whose caller already decided, on a
+    /// larger unit it belongs to, that the work leaves the async worker
+    /// (ADR-1702, the parallel page encode amendment). It counts as a job at
+    /// `site`, never as inline.
+    pub async fn run_permitted<F, R>(&self, site: S, job: F) -> Result<R, CpuGateError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let site_index = site.index();
+        let site_counters = self.counters.sites.get(site_index);
         let wait_started = self.clock.now_nanos();
         let queued = QueuedGuard::enter(&self.counters);
         let permit = Arc::clone(&self.semaphore)

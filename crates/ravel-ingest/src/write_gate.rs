@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
 
 use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
+use ravel_logseg::{LogSegError, PageEncodeDone, PageEncodeExecutor, PageEncodeJob};
 
 /// The `Abandoned` message for a flush whose lifetime ended before its gated
 /// encode returned.
@@ -74,6 +75,10 @@ pub(crate) struct WriteGateSlot {
     /// does for a job the runtime cancelled.
     #[cfg(test)]
     fail_next: Arc<std::sync::Mutex<Option<CpuGateError>>>,
+    /// Makes the next flush that splits its pages panic in one page job it
+    /// dispatched to the gate.
+    #[cfg(test)]
+    page_job_panic: Arc<std::sync::Mutex<bool>>,
 }
 
 impl WriteGateSlot {
@@ -161,5 +166,140 @@ impl WriteGateSlot {
             }
         };
         gate.run(site, JobSize::Bytes(input_bytes), job).await
+    }
+
+    /// [`Self::encode`] for an encode that can split its column pages into
+    /// jobs (ADR-3492 decision 7; ADR-1702, the parallel page encode
+    /// amendment). `job` gets `None` when the flush runs inline (no gate, or
+    /// `input_bytes` below the gate's floor) and seals its pages serially, as
+    /// before. At or above the floor it gets a [`GatedPageEncode`] for the
+    /// writer's `finish_on`: the flush's own job holds one permit, and each
+    /// further page job takes one more on the blocking pool.
+    ///
+    /// A page job the gate could not run fails the flush with that gate
+    /// error, as the flush's own job failing on the gate does, and drops the
+    /// result `job` built.
+    pub(crate) async fn encode_pages<F, R>(
+        &self,
+        site: WriteSite,
+        input_bytes: u64,
+        job: F,
+    ) -> Result<R, CpuGateError>
+    where
+        F: FnOnce(Option<&mut dyn PageEncodeExecutor>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let pages = self
+            .get()
+            .filter(|gate| !gate.runs_inline(JobSize::Bytes(input_bytes)))
+            .map(|gate| GatedPageEncode {
+                gate,
+                runtime: tokio::runtime::Handle::current(),
+                site,
+                fault: None,
+                #[cfg(test)]
+                panic_job: self.take_page_job_panic(),
+            });
+        let encoded = self
+            .encode(site, input_bytes, move || match pages {
+                None => Ok(job(None)),
+                Some(mut pages) => {
+                    let out = job(Some(&mut pages));
+                    match pages.fault {
+                        Some(err) => Err(err),
+                        None => Ok(out),
+                    }
+                }
+            })
+            .await;
+        encoded.and_then(|out| out)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_page_job(&self) {
+        *self
+            .page_job_panic
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+
+    #[cfg(test)]
+    fn take_page_job_panic(&self) -> bool {
+        std::mem::take(
+            &mut *self
+                .page_job_panic
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+/// Runs a block's page encode jobs on the write gate, from inside a flush's
+/// own gated job on the blocking pool.
+///
+/// Serial fallback: a block with one job, or one whose jobs are ready while
+/// the gate has no free permit, is sealed on the flush's own thread under the
+/// flush's own permit, so a flush never waits on the gate for its pages while
+/// holding a permit no page job can use. Otherwise every job but the first
+/// goes to the gate through [`WriteGate::run_permitted`], one permit each,
+/// the first is sealed on the flush's thread meanwhile, and the flush then
+/// waits for the rest. Results return in job order; the writer places them by
+/// job index either way.
+pub(crate) struct GatedPageEncode {
+    gate: Arc<WriteGate>,
+    runtime: tokio::runtime::Handle,
+    site: WriteSite,
+    /// The first gate error a page job returned.
+    fault: Option<CpuGateError>,
+    /// Makes the last dispatched page job of the next split block panic.
+    #[cfg(test)]
+    panic_job: bool,
+}
+
+impl PageEncodeExecutor for GatedPageEncode {
+    fn execute(&mut self, jobs: Vec<PageEncodeJob>) -> Result<Vec<PageEncodeDone>, LogSegError> {
+        if jobs.len() < 2 || self.gate.free_permits() == 0 {
+            return Ok(jobs.into_iter().map(PageEncodeJob::run).collect());
+        }
+        #[cfg(test)]
+        let panic_index = std::mem::take(&mut self.panic_job).then_some(jobs.len() - 1);
+        let mut jobs = jobs.into_iter();
+        let own = jobs.next();
+        let dispatched: Vec<_> = jobs
+            .map(|job| {
+                let gate = Arc::clone(&self.gate);
+                let site = self.site;
+                #[cfg(test)]
+                let panic = panic_index == Some(job.index());
+                self.runtime.spawn(async move {
+                    gate.run_permitted(site, move || {
+                        #[cfg(test)]
+                        assert!(!panic, "injected page job panic");
+                        job.run()
+                    })
+                    .await
+                })
+            })
+            .collect();
+        let mut done: Vec<PageEncodeDone> = own.into_iter().map(PageEncodeJob::run).collect();
+        let joined = self
+            .runtime
+            .block_on(futures::future::join_all(dispatched));
+        for result in joined {
+            let err = match result {
+                Ok(Ok(page)) => {
+                    done.push(page);
+                    continue;
+                }
+                Ok(Err(err)) => err,
+                Err(join) if join.is_panic() => CpuGateError::Panicked,
+                Err(_) => CpuGateError::Cancelled,
+            };
+            self.fault.get_or_insert(err);
+        }
+        match self.fault {
+            Some(err) => Err(LogSegError::PageEncode(format!("page job: {err}"))),
+            None => Ok(done),
+        }
     }
 }

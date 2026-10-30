@@ -974,10 +974,12 @@ impl LogFlushCtx {
         // The job takes the byte charges with the payload and returns them with
         // the object, so they stay held through the permit wait and the encode
         // whether or not this task is still waiting. The wait is bounded by the
-        // flush's deadline, as its store calls are.
+        // flush's deadline, as its store calls are. At or above the gate's
+        // inline floor the job seals its column pages as page jobs on the gate
+        // (ADR-3492 decision 7); below it, serially as one inline job.
         let encode = self
             .write_gate
-            .encode(WriteSite::LogFlush, input_bytes, move || {
+            .encode_pages(WriteSite::LogFlush, input_bytes, move |pages| {
                 // Encode: RLOG serialization only (RlogWriter push + finish),
                 // excluding the indexed-field and layout resolution above, the
                 // permit wait and the object-store PUT below. The content hash
@@ -998,8 +1000,13 @@ impl LogFlushCtx {
                         .try_for_each(|batch| writer.push_columnar(batch))
                         .map_err(RlogEncodeError::Push),
                 };
-                let finish_result = push_result
-                    .and_then(|()| writer.finish_with_stats().map_err(RlogEncodeError::Finish));
+                let finish_result = push_result.and_then(|()| {
+                    match pages {
+                        Some(pages) => writer.finish_with_stats_on(pages),
+                        None => writer.finish_with_stats(),
+                    }
+                    .map_err(RlogEncodeError::Finish)
+                });
                 // `Encode` closes here, immediately after `finish_with_stats`
                 // returns: the hash below and the bloom-sample fold and
                 // `record_postings` after the job are bookkeeping on an
