@@ -1595,9 +1595,36 @@ const PLAIN_VALUES_MAX: usize = crate::columnar_batch::VAR_BYTES_MAX;
 /// absent row's span is empty and its presence bit unset, so it reads `None`
 /// while a present empty string reads `Some(&[])`.
 pub(crate) struct PlainColumn {
-    values: Vec<u8>,
+    values: PlainValues,
     offsets: Vec<u32>,
     present: Validity,
+}
+
+/// A plain column's values buffer. `Text` when the decode checked that the
+/// whole buffer is UTF-8 and that every offset is a char boundary
+/// ([`PlainColumn::validate_text`]), so every cell is UTF-8 and
+/// [`PlainColumn::text`] is a slice and a boundary check; otherwise `Raw`,
+/// and a reader validates the cell it reads, as [`DictValues`] does for a
+/// dictionary.
+enum PlainValues {
+    Text(String),
+    Raw(Vec<u8>),
+}
+
+impl PlainValues {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            PlainValues::Text(s) => s.as_bytes(),
+            PlainValues::Raw(raw) => raw,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            PlainValues::Text(s) => s.capacity(),
+            PlainValues::Raw(raw) => raw.capacity(),
+        }
+    }
 }
 
 impl PlainColumn {
@@ -1655,9 +1682,61 @@ impl PlainColumn {
             )));
         }
         Ok(PlainColumn {
-            values: blob.to_vec(),
+            values: PlainValues::Raw(blob.to_vec()),
             offsets,
             present: bits,
+        })
+    }
+
+    /// The column with its UTF-8 decided once (ADR-3326 decision 5): `Text`
+    /// when the whole buffer is UTF-8 and every offset is a char boundary,
+    /// which together make every cell UTF-8. A buffer that is UTF-8 with an
+    /// offset inside a character stays `Raw`, since such a span can be empty
+    /// (a valid cell) and `str::get` would refuse it. Moves the buffer; never
+    /// copies it.
+    fn validate_text(self) -> Self {
+        let PlainColumn {
+            values,
+            offsets,
+            present,
+        } = self;
+        let values = match values {
+            PlainValues::Raw(raw) => match String::from_utf8(raw) {
+                Ok(s) if offsets.iter().all(|&o| s.is_char_boundary(o as usize)) => {
+                    PlainValues::Text(s)
+                }
+                Ok(s) => PlainValues::Raw(s.into_bytes()),
+                Err(e) => PlainValues::Raw(e.into_bytes()),
+            },
+            text @ PlainValues::Text(_) => text,
+        };
+        PlainColumn {
+            values,
+            offsets,
+            present,
+        }
+    }
+
+    /// Whether [`validate_text`](Self::validate_text) found every cell UTF-8,
+    /// so [`text`](Self::text) answers for every row.
+    pub(crate) fn text_validated(&self) -> bool {
+        matches!(self.values, PlainValues::Text(_))
+    }
+
+    /// The text at block row `row` from the decode's validation: `Some(None)`
+    /// when the row is absent, `None` when the column was not validated
+    /// ([`text_validated`](Self::text_validated) is false) and the caller
+    /// must validate the cell itself.
+    pub(crate) fn text(&self, row: usize) -> Option<Option<&str>> {
+        let PlainValues::Text(s) = &self.values else {
+            return None;
+        };
+        if !self.present.get(row) {
+            return Some(None);
+        }
+        Some(match self.offsets.get(row..row.saturating_add(2)) {
+            Some(&[start, end]) => s.get(start as usize..end as usize),
+            _ => None,
         })
     }
 
@@ -1688,7 +1767,7 @@ impl PlainColumn {
             return None;
         }
         match *self.offsets.get(row..row.checked_add(2)?)? {
-            [start, end] => self.values.get(start as usize..end as usize),
+            [start, end] => self.values.bytes().get(start as usize..end as usize),
             _ => None,
         }
     }
@@ -1700,13 +1779,14 @@ impl PlainColumn {
             .enumerate()
             .filter(|&(row, _)| self.present.get(row))
             .filter_map(|(_, span)| match *span {
-                [start, end] => self.values.get(start as usize..end as usize),
+                [start, end] => self.values.bytes().get(start as usize..end as usize),
                 _ => None,
             })
     }
 
     /// The values buffer, the offsets and the presence bitmap, at their
-    /// capacities.
+    /// capacities. The validated form holds the same buffer as a `String`, so
+    /// validation adds nothing to the charge.
     fn heap_bytes(&self) -> usize {
         self.values.capacity()
             + self.offsets.capacity() * std::mem::size_of::<u32>()
@@ -2049,6 +2129,16 @@ impl<'a> BytesColRef<'a> {
             BytesColRef::Fixed(v) => v.get(row)?.as_deref(),
         }
     }
+
+    /// The text at block row `row` as the decode validated it
+    /// ([`PlainColumn::text`]); `None` for any column whose plain values were
+    /// not validated at decode.
+    pub(crate) fn validated_text(&self, row: usize) -> Option<Option<&'a str>> {
+        match self {
+            BytesColRef::Str(StrColumn::Plain(p)) => p.text(row),
+            _ => None,
+        }
+    }
 }
 
 /// A decoded block: per-column, per-row values. Every column vector has length
@@ -2142,9 +2232,11 @@ impl DecodedBlock {
         self.int_values_buffers
     }
 
-    /// String dictionary entries this decode UTF-8 validated building a
-    /// per-block dictionary (tag 7), plus whatever the caller added for the
-    /// row group dictionaries it built ([`Self::add_str_cells_validated`]).
+    /// String cells this decode UTF-8 validated: the entries of a per-block
+    /// dictionary (tag 7) it built, the present cells of each plain-page `Str`
+    /// attribute column it found all UTF-8 ([`PlainColumn::validate_text`]),
+    /// plus whatever the caller added for the row group dictionaries it built
+    /// ([`Self::add_str_cells_validated`]).
     pub(crate) fn str_cells_validated(&self) -> u64 {
         self.str_cells_validated
     }
@@ -2776,12 +2868,26 @@ fn decode_columns(
                     let ids = decode_dict_ids(encoded, present_count, dict.len())?;
                     StrColumn::Dict(DictColumn::new(Arc::clone(dict), &present, ids, true)?)
                 } else if enc == Enc::Plain {
-                    StrColumn::Plain(Arc::new(PlainColumn::decode(
-                        encoded,
-                        &present,
-                        present_count,
-                        PLAIN_VALUES_MAX,
-                    )?))
+                    let col =
+                        PlainColumn::decode(encoded, &present, present_count, PLAIN_VALUES_MAX)?;
+                    // A `Str` attribute's cells are read as text, so their
+                    // UTF-8 is decided once here and kept with the column
+                    // (ADR-3326 decision 5). A column a `Contains` arm tests is
+                    // left as it is, as its dictionary would be.
+                    let text = plans
+                        .iter()
+                        .any(|p| p.column_id == column_id && p.ty == FieldType::Str)
+                        && !deferred.contains(&column_id);
+                    let col = if text {
+                        let col = col.validate_text();
+                        if col.text_validated() {
+                            out.str_cells_validated += present_count as u64;
+                        }
+                        col
+                    } else {
+                        col
+                    };
+                    StrColumn::Plain(Arc::new(col))
                 } else if enc == Enc::Dict {
                     // The codec decodes an `Enc::Dict` page to the dictionary
                     // form only.
@@ -3856,6 +3962,120 @@ mod tests {
         }
     }
 
+    /// A plain column whose values are all UTF-8 on char boundaries is
+    /// validated once and read as slices; a buffer that is UTF-8 as a whole
+    /// but puts a cell boundary inside a character, and one with a non-UTF-8
+    /// cell, stay raw and read each cell as its own validation decides, so
+    /// the empty cell inside `é` reads `Some("")` and the valid cells of the
+    /// broken buffer still read as text. The charge is the same buffer's
+    /// either way.
+    #[test]
+    fn plain_text_is_validated_once_and_falls_back_per_cell() {
+        let text = |cells: &[Option<&[u8]>]| {
+            let owned: Vec<Option<Vec<u8>>> = cells.iter().map(|c| c.map(<[u8]>::to_vec)).collect();
+            let raw = PlainColumn::from_cells(&owned).expect("plain column");
+            let raw_bytes = raw.heap_bytes();
+            let col = raw.validate_text();
+            assert_eq!(col.heap_bytes(), raw_bytes, "validation adds no charge");
+            let rows: Vec<usize> = (0..=cells.len()).collect();
+            let str_col = StrColumn::Plain(Arc::new(col));
+            let cursor = crate::columnar::BytesCursor::over_str(&str_col, &rows);
+            let read: Vec<Option<String>> = (0..=cells.len())
+                .map(|i| cursor.str_at(i).map(str::to_string))
+                .collect();
+            let StrColumn::Plain(col) = &str_col else {
+                unreachable!("built as plain")
+            };
+            (col.text_validated(), read)
+        };
+        let s = |v: &str| Some(v.to_string());
+
+        let (validated, read) = text(&[Some(b"ab"), None, Some("é€".as_bytes()), Some(b"")]);
+        assert!(validated);
+        assert_eq!(read, vec![s("ab"), None, s("é€"), s(""), None]);
+
+        // `é` is c3 a9: the cells c3, "" and a9 make a buffer that is UTF-8
+        // whole, with two boundaries inside the character.
+        let (validated, read) = text(&[Some(&[0xc3]), Some(b""), Some(&[0xa9]), Some(b"z")]);
+        assert!(!validated, "a boundary inside a character is not validated");
+        assert_eq!(read, vec![None, s(""), None, s("z"), None]);
+
+        let (validated, read) = text(&[Some(b"ok"), Some(&[b'r', 0xff]), None, Some(b"")]);
+        assert!(!validated, "a non-UTF-8 cell leaves the buffer raw");
+        assert_eq!(read, vec![s("ok"), None, None, s(""), None]);
+    }
+
+    mod plain_text_proptest {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::sample::Index;
+
+        /// Plain columns that mix valid UTF-8, invalid bytes, empty cells,
+        /// absent rows, and cell boundaries inside multi-byte characters: a
+        /// multi-byte string, maybe one stray byte at 0x80..=0xff inserted,
+        /// cut at arbitrary byte positions (a doubled cut is an empty cell
+        /// there), with absent rows interleaved.
+        fn plain_cells() -> impl Strategy<Value = Vec<Option<Vec<u8>>>> {
+            (
+                "[aé€😀]{0,12}",
+                proptest::option::of((any::<Index>(), 0x80u8..=0xff)),
+                proptest::collection::vec((any::<Index>(), any::<bool>()), 0..6),
+                proptest::collection::vec(any::<Index>(), 0..3),
+            )
+                .prop_map(|(text, stray, cuts, absent)| {
+                    let mut bytes = text.into_bytes();
+                    if let Some((at, b)) = stray {
+                        bytes.insert(at.index(bytes.len() + 1), b);
+                    }
+                    let mut points = vec![0];
+                    for (at, twice) in cuts {
+                        let p = at.index(bytes.len() + 1);
+                        points.push(p);
+                        if twice {
+                            points.push(p);
+                        }
+                    }
+                    points.push(bytes.len());
+                    points.sort_unstable();
+                    let mut cells: Vec<Option<Vec<u8>>> = points
+                        .windows(2)
+                        .map(|w| Some(bytes[w[0]..w[1]].to_vec()))
+                        .collect();
+                    for at in absent {
+                        cells.insert(at.index(cells.len() + 1), None);
+                    }
+                    cells
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            /// Every cell read through the decode-time validation equals the
+            /// per-cell validation it replaces: the same text, or the same
+            /// absence for an absent row, a non-UTF-8 cell, or a row out of
+            /// range.
+            #[test]
+            fn validated_text_reads_as_per_cell_validation(cells in plain_cells()) {
+                let col = PlainColumn::from_cells(&cells).expect("plain column").validate_text();
+                let rows: Vec<usize> = (0..cells.len()).collect();
+                let str_col = StrColumn::Plain(Arc::new(col));
+                let cursor = crate::columnar::BytesCursor::over_str(&str_col, &rows);
+                for i in 0..=cells.len() {
+                    let want = cells
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .and_then(|c| String::from_utf8(c).ok());
+                    prop_assert_eq!(cursor.str_at(i).map(str::to_string), want.clone(), "row {}", i);
+                    if let Some(text) = cursor.validated_text_at(i) {
+                        prop_assert_eq!(text.map(str::to_string), want, "row {}", i);
+                    }
+                }
+            }
+        }
+    }
+
     mod column_id_set_proptest {
         use super::*;
         use proptest::prelude::*;
@@ -4304,7 +4524,7 @@ mod tests {
             panic!("column 10 is a plain page");
         };
         assert!(Arc::ptr_eq(a, b));
-        assert_eq!(a.values.as_ptr(), b.values.as_ptr());
+        assert_eq!(a.values.bytes().as_ptr(), b.values.bytes().as_ptr());
         assert_eq!(a.offsets.as_ptr(), b.offsets.as_ptr());
     }
 

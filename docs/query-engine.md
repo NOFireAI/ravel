@@ -3562,12 +3562,16 @@ and block-level reported independently:
   plain-page cell once. 0 when no such arm was pushed.
 - `strCellsValidated`: string cells the scan UTF-8 validated, in two
   halves. The reader's half is every string dictionary entry it validated,
-  once per validation, on either path; it covers the columns the scan
-  decodes, so undeclared attribute columns count when `attrs` is projected.
-  The columnar build's half is every plain-page `Str` cell its declared
-  and per-key `attrs['k']` cursors validated. The row path, taken when
-  `attrs` is projected or an erasure is pending, validates plain-page cells
-  too but does not count them. With a pushed `Contains` arm the reader
+  once per validation, and every present cell of a plain-page `Str`
+  attribute column it decoded and found all UTF-8, on either path; it
+  covers the columns the scan decodes, so undeclared attribute columns
+  count when `attrs` is projected. A column served from the decoded-column
+  cache keeps the validation its decode did and adds nothing (ADR-3326
+  decision 5). The columnar build's half is every plain-page `Str` cell its
+  declared and per-key `attrs['k']` cursors validated, which happens only
+  on a page that is not all UTF-8. The row path, taken when `attrs` is
+  projected or an erasure is pending, validates such cells too but does
+  not count them. With a pushed `Contains` arm the reader
   validates only the dictionary entries the arm read as text or a kept row
   references, and the build never validates a row the arm dropped, so a
   pushed arm can lower this count.

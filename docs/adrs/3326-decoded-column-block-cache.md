@@ -311,7 +311,8 @@ anything is built (Measurement).
 - A property test asserts that a cached column equals a fresh decode, bit
   for bit, for every column kind and layout.
 - A cached column's UTF-8 validation state is part of the entry, so a hit
-  validates nothing again. `str_cells_validated` therefore counts
+  validates nothing again (narrowed to the columns it holds for by the
+  validation-state amendment below). `str_cells_validated` therefore counts
   validation work done by this statement. A hot try served from the cache
   reports fewer cells than the cold try that filled it. The counter
   documentation says so, and the differential test asserts results and
@@ -690,3 +691,40 @@ The help text and flag reference rows for `--sql-max-query-bytes` and
 `--sql-tenant-max-bytes`, `docs/guides/operations/configuration.md`,
 `docs/guides/query.md` and `docs/query-engine.md` state this, and ADR-0088
 carries an amendment pointing here.
+
+## Amendment (2026-10-30): which cached string columns keep their validation
+
+<!-- amendment-applies: sections="5. Answers do not change" pointer="validation-state amendment" -->
+
+Decision 5 says a cached column's validation state is part of the entry.
+For dictionary columns that was already so (`DictValues`, validated once
+when the dictionary is built). For plain columns it was not: the cached
+`PlainColumn` held raw bytes, and the columnar build validated every cell
+it read with `std::str::from_utf8`, on a hit as on a miss (#3231).
+
+A plain page of a `Str` attribute column that no `Contains` arm tests is
+now validated once at decode (`PlainColumn::validate_text`,
+`crates/ravel-logseg/src/block.rs`). When the whole values buffer is UTF-8
+and every cell offset is a character boundary, the buffer is kept as a
+`String`, so every cell is UTF-8 and a read is a slice with a boundary
+check (`PlainColumn::text`). `StrCursor::text_at` in
+`crates/ravel-sql/src/logs_scan/batch.rs` reads that slice through
+`BytesCursor::validated_text_at` and validates nothing. The decode counts
+the column's present cells in `str_cells_validated`, and a hit, which does
+not decode, adds nothing: `a_cache_hit_on_a_plain_str_column_validates_nothing`
+in `crates/ravel-sql/tests/logs_decoded_cache.rs` pins 48 on the cold run
+and 0 on each hot run. The `String` is the same allocation the raw buffer
+was, so the entry's charge does not change
+(`plain_text_is_validated_once_and_falls_back_per_cell` asserts equal
+`heap_bytes` before and after validation).
+
+The sentence holds for those columns only. These cached string columns
+still validate on a hit, cell by cell as before:
+
+- a `Str` attribute page whose buffer fails that check, either because a
+  cell is not UTF-8 or because a cell offset falls inside a character. Its
+  cells read exactly as before, a non-UTF-8 cell as absent so the
+  resource/scope fallback applies (`validated_text_reads_as_per_cell_validation`,
+  a property test against per-cell `from_utf8`);
+- `body` and `severity_text`, which the columnar build reads through
+  `view_str`, and which this change does not validate at decode.
