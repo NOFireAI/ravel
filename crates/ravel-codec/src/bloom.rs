@@ -623,7 +623,7 @@ mod proptests {
     #[test]
     fn bloom_bits_are_unchanged() {
         let corpus = fixed_corpus();
-        let seed = 0x5eed_0f_3495;
+        let seed = 0x005e_ed0f_3495;
         let mut b = BloomBuilder::new(seed);
         let mut e = BloomBuilder::new(seed);
         for (col, tok) in &corpus {

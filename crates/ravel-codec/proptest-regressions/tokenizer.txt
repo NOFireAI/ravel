@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1d23458ab8cbb00026db21584c8dcd1aa47d51a465ce54ae13b548a89ba969c2 # shrinks to text = "İ"
+cc 8f5e09307e7cf000cd856ffda3a6a21e304c3ae4885fed9f7469f1685b6c9355 # shrinks to text = "İ"
