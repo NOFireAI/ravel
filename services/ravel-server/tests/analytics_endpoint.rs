@@ -12,6 +12,9 @@
 #[path = "support/fragment_tls.rs"]
 mod fragment_tls;
 
+#[path = "support/refused_addr.rs"]
+mod refused_addr;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -812,16 +815,11 @@ async fn analytics_submits_one_audit_event_per_executed_query() {
 const DEAD_CLUSTER: &str = "west";
 const GATE_OPERATOR_CRED: &str = "operator-west-credential";
 
-/// An address bound then immediately released: a connection to it is refused,
-/// so a remote pointed here is unavailable at query time (the same technique
-/// `federation_handler_warnings.rs` uses).
-async fn dead_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind dead");
-    let addr = listener.local_addr().expect("dead local addr");
-    drop(listener);
-    addr.to_string()
+/// An address whose connections are refused, so a remote pointed here is
+/// unavailable at query time (the same technique `federation_handler_warnings.rs`
+/// uses).
+fn dead_endpoint() -> String {
+    refused_addr::refused_addr().to_string()
 }
 
 /// A `Federation` over one unavailable remote cluster that opted into
@@ -870,7 +868,7 @@ async fn federated_app(metric: &str, samples: &[(i64, f64)]) -> Router {
     .await;
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
-    let federation = Arc::new(dead_federation(DEAD_CLUSTER, &dead_endpoint().await));
+    let federation = Arc::new(dead_federation(DEAD_CLUSTER, &dead_endpoint()));
     let engine =
         QueryEngine::new(catalog, store, EngineConfig::default()).with_federation(federation);
     router(AnalyticsState {
