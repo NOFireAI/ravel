@@ -1285,6 +1285,25 @@ pub(crate) fn parse_series_ids_v2(bytes: &[u8]) -> Result<Vec<[u8; 16]>, Segment
     Ok(out)
 }
 
+/// Decodes an object's SERIES_IDS section on its own, from the section's
+/// stored bytes: crc-verified and decompressed by [`decode_section_bytes`],
+/// then parsed by [`parse_series_ids_v2`]. A series listing reads it before
+/// the catalog to tell whether the object holds any series it has not yet
+/// seen, without decoding a label.
+pub fn decode_series_ids(
+    footer: &Footer,
+    series_ids_stored: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesId>, SegmentError> {
+    let section = find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    let bytes = decode_section_bytes(section, series_ids_stored, limits)?;
+    Ok(parse_series_ids_v2(&bytes)?
+        .into_iter()
+        .map(SeriesId)
+        .collect())
+}
+
 /// Reads SERIES_META's `count: u32`, `schema_count: u32`, and the schema
 /// dictionary (docs/segment-format.md v2 amendment), returning `count` and
 /// the decoded schemas. Each schema's `name_ord` sequence is validated to

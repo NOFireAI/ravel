@@ -1228,6 +1228,21 @@ map is handed to the endpoint. The endpoint's merge of several selectors'
 series (`resolve_matched_series` in `http/service.rs`) and the response it
 renders are not charged, and `max_series` does not bound that merged set.
 
+**Objects a discovery read skips.** The same reads also keep the id of every
+series a decoded object held, matched or not, and charge 32 bytes per id to
+the budget (`SEEN_SERIES_LEN` in `engine.rs`). Before an object's catalog
+is decoded, its SERIES_IDS section is read on its own. When every id in it
+was already seen, the rest of the catalog is not decoded, and not fetched
+unless the object's first read already held it, because the object adds
+nothing: a series id is canonical over its labels, so the
+matchers and a windowless erasure predicate give it the same verdict in every
+object. This turns a read over many objects that repeat the same series into
+roughly one catalog decode per series. It does not help an object that adds
+even one new series: that object's whole catalog is decoded. An object that
+is decoded costs one more range GET than before when its SERIES_IDS section
+was not in the first read. Objects fetched concurrently can each be decoded
+before any of them is recorded as seen.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
