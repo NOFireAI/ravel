@@ -188,7 +188,7 @@ fn dictionary_record(i: usize, n: usize) -> LogRecord {
         ),
         ("count".to_string(), AttrValue::I64((i % 13) as i64)),
     ];
-    if i % 3 != 0 {
+    if !i.is_multiple_of(3) {
         attrs.push(("tenant".to_string(), AttrValue::Str(format!("t{}", i % 11))));
     }
     LogRecord {
@@ -238,7 +238,10 @@ fn dictionary_columns_are_byte_identical() {
         let rows = writer(cfg, &records, Path::Rows, 64)
             .finish()
             .expect("finish");
-        assert!(serial == rows, "{choice:?}: dictionary input differs from rows");
+        assert!(
+            serial == rows,
+            "{choice:?}: dictionary input differs from rows"
+        );
         assert!(
             serial == parallel,
             "{choice:?}: parallel encode differs from finish"
@@ -251,7 +254,7 @@ fn dictionary_columns_are_byte_identical() {
     }
 }
 
-const WORDS: &[&str] =&["alpha", "beta", "gamma", "delta", "", "epsilon"];
+const WORDS: &[&str] = &["alpha", "beta", "gamma", "delta", "", "epsilon"];
 const NAMES: &[&str] = &["svc", "env", "code", "dur", "flag", "blob", "host", "path"];
 
 fn stream_id(n: u8) -> LogStreamId {
