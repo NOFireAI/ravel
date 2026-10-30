@@ -1095,12 +1095,18 @@ both rules for one caller, the logs ingest flush:
 
 - The floor applies to the flush as a whole. A flush below the write gate's
   floor stays one inline job, as before.
-- A flush at or above the floor encodes the column pages of a block as
-  separate jobs on the blocking pool. Each page job takes one write-gate
-  permit, whatever its own size, so the gate still bounds total encode
-  concurrency.
-- The flush assembles the sealed pages in the writer's column order, so the
-  object's bytes equal a serial encode.
+- A flush at or above the floor splits a block's column pages into page
+  jobs. The flush's thread seals page jobs under the permit its own job
+  already holds, and page tasks on the blocking pool seal the rest, each
+  under one write-gate permit of its own, whatever the job's size. A page
+  task takes a job only once its permit is held (`CpuGate::run_claimed`) and
+  releases the permit unused if the flush's thread has sealed every job
+  first. Every page job is sealed under a held permit, so the gate still
+  bounds total encode concurrency.
+- The object's bytes equal a serial encode because each column's pages keep
+  their order within the column and the row-group dictionary decision is
+  made once per column, after the pages are sealed. Which thread sealed a
+  page job, and in what order the jobs finished, does not reach the object.
 
 The dispatch-cost argument behind "never a single page" is about 4096 pages
 per block on the read path. A logs flush block has one page per column, tens

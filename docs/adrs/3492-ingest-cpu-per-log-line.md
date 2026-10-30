@@ -234,12 +234,15 @@ that floor, so page jobs submitted one by one would all run inline and in
 series. The floor therefore applies to the flush as a whole, as it does
 today: a flush at or above the floor dispatches its page jobs to the
 blocking pool, and each page job takes one write-gate permit, whatever its
-own size. A flush below the floor stays one inline job. The gate still
+own size (as built, the flush's own job seals page jobs under its permit and
+only page tasks take one each; see the D7 measurement amendment). A flush below the floor stays one inline job. The gate still
 bounds total encode concurrency. This amends ADR-1702 decision 4 for the logs
 ingest flush only; the amendment is in ADR-1702 itself. The flush assembles the sealed pages in
 the column order the writer uses today, so the object's bytes are identical to
-a serial encode. A test pins that equality on the benchmark's shape and on the
-golden corpus.
+a serial encode (corrected in the D7 measurement amendment below: page order
+within each column and a row-group dictionary decision made once per column
+keep the bytes identical, not column order). A test pins that equality
+on the benchmark's shape and on the golden corpus.
 
 Two cases fall back to the serial single-job encode:
 
@@ -247,6 +250,9 @@ Two cases fall back to the serial single-job encode:
   the code;
 - a flush that would wait on the gate for longer than the serial encode would
   take.
+
+The fallback as built, and what D7 measured, are in the D7 measurement
+amendment below.
 
 ### D8. The benchmark runs 2 shards at a 100 ms flush delay
 
@@ -278,13 +284,14 @@ gate job.
 | aged, 250 ms delay, 8 shards | about 284 ms + 112 ms + 260 ms = **about 0.66 s** | **about 98k** | predicted, same basis |
 | arrival, 8 shards | flush cycle c = 0.17 / (1 - 120k x 30 us / 8) = about 0.31 s; ack about 1.5c plus tail = **about 0.55 s** | **about 116k** | predicted, same basis |
 | aged, 100 ms delay, 8 shards | about 114 ms + 45 ms + 260 ms = **about 0.42 s** | about 150k, with about 80 objects/s written | predicted, same basis |
-| **aged, 100 ms delay, 2 shards, tick 25 ms, D7 (D8, chosen)** | wait for the slower of 2 shards' age about 92 ms; encode 7.5k lines (225 ms serial) over the write gate's default 4 permits on 8 vCPU: about 56 ms when one flush has the gate, about 112 ms when both shards flush on the same tick and split it; two PUTs on the slower of 2 about 230 ms: **about 0.38 to 0.43 s** | **ack-path capacity about 145k to 170k, at 20 objects/s** | predicted, same basis |
+| **aged, 100 ms delay, 2 shards, tick 25 ms, D7 (D8, chosen)** | wait for the slower of 2 shards' age about 92 ms; encode 7.5k lines (225 ms serial) over the write gate's default 4 permits on 8 vCPU: about 56 ms when one flush has the gate, about 112 ms when both shards flush on the same tick and split it; two PUTs on the slower of 2 about 230 ms: **about 0.38 to 0.43 s** | **ack-path capacity about 145k to 170k, at 20 objects/s** (measured lower; see the D7 measurement amendment) | predicted, same basis |
 | aged, 100 ms delay, 1 shard | about 0.35 s | not viable: the single shard actor would need about 1.2 s/s, scaling the measured 0.14 s/s per shard at about 70k | predicted from the shard on-actor time measured 2026-10-29 |
 
 CPU work alone takes **buffered** acks to about 120k, but **strict 250 ms**
 only to about 87-98k: the 250 ms age and two sequential PUTs use most of the
 budget. At a 100 ms delay the ack path stops binding. With 2 shards and D7 it
-has about 145k to 170k of capacity at the default permit count, above the
+has about 145k to 170k of capacity at the default permit count (the D7
+measurement amendment below puts it at about 130k at most), above the
 120k target, so the strict row is then bound by CPU.
 
 150k lines/s on 8 vCPU allows at most about 53 us of CPU per line, about 47%
@@ -315,7 +322,8 @@ protocol, so it needs its own ADR and is out of scope here.
   rate on the #3476 setup for 10 minutes, interleaved against the previous
   image (at least 3 alternations). Each check is pre-registered on #3492.
 - **Byte-identical parallel encode.** D7's equality with the serial encode is
-  pinned by a test.
+  pinned by a test. Which orders that equality rests on, and the tests that
+  pin it through the ingest flush, are in the D7 measurement amendment.
 - **Exit.** At bloom scope `all`, in the upstream ingest test on the same
   hardware:
   - Ravel stores **at least 115k lines/s buffered**;
@@ -383,9 +391,114 @@ flowchart LR
   under 0.6 MB at 150k lines/s. Today's 250 ms row is predicted at about
   87-98k even after the CPU work.
 - D7 divides a flush's encode latency by the number of permits the flush
-  gets, at most its page count. Latency still grows with the lines per
+  gets, at most its page count. Measured, it cuts much less, because most of
+  a flush stays serial (D7 measurement amendment). Latency still grows with the lines per
   flush: larger flushes (fewer shards, longer delays) need the encode
   latency checked again. A burst of flushes still competes for the same
   permits as today.
 - D3b, if adopted, adds vendored OTLP protos that must be re-vendored when
   upstream changes them.
+
+## Amendment (2026-10-30): the D7 measurement amendment (#3499, #3508)
+
+<!-- amendment-applies: sections="D7. A flush encodes its column pages in parallel|What strict acks can reach|Verification and exit criteria|Consequences" pointer="D7 measurement amendment" -->
+<!-- amendment-supersedes: phrase="column order the writer uses today" pointer="D7 measurement amendment" -->
+<!-- amendment-supersedes: phrase="145k to 170k" pointer="D7 measurement amendment" -->
+
+D7 is built (#3499). This amendment records what it measured, corrects why
+its bytes equal a serial encode, and states the serial fallback as built.
+
+**What it measured.** The `ingest_shape` group of the `logseg_encode` bench
+(#3508) measured the 7.5k-record flush at 181.7 ms serial and 169.9 ms with
+its column pages on 4 threads. #3508 puts the cut at 8 to 12%; this pair
+alone is 11.8 ms, 6.5%. The cut is small because most of a flush stays
+serial: staging the records, the row-group dictionary decision and the
+object's assembly run on the flush's own thread, and only sealing column
+pages splits into jobs.
+
+The 169.9 ms is the bench's wall time with the page jobs on its own 4-thread
+pool. The executor as built may seal them over fewer threads: the flush's
+thread plus at most permits − 1 page tasks, fewer when other gate jobs hold
+permits, and the 2 shards can flush on the same tick and split the permits.
+The figures below therefore assume the bench's 4 threads, and for the code as
+built they are optimistic: about 0.49 s is a floor on the ack and about 130k
+an upper estimate of capacity.
+
+The D8 row of "What strict acks can reach" is therefore:
+
+- ack about 0.49 s: about 92 ms age wait, plus 169.9 ms encode, plus about
+  230 ms for the two PUTs (491.9 ms);
+- ack-path capacity about 130k lines/s (64,000 ÷ 0.492 s), not 145k to 170k;
+- without D7, about 0.50 s (503.7 ms with the 181.7 ms serial encode) and
+  about 127k lines/s.
+
+Both clear the 115k strict exit, and both stay above the CPU-bound ceiling of
+about 113k to 122k, so the strict row is still bound by CPU. D8 stands: its
+gain over the 250 ms rows comes from the 100 ms delay and the 2 shards, not
+from D7. The 225 ms serial encode the row assumed is also above the measured
+181.7 ms.
+
+**Why the bytes are identical.** D7 says the flush assembles the sealed pages
+in the writer's column order. That order is not what keeps the bytes equal.
+When a row group is written, the writer gathers every block's page
+descriptors into a map keyed by column id and lays the chunks out in
+ascending column id order, and each chunk's pages in ascending block order
+(`flush_group` in crates/ravel-logseg/src/writer.rs). The order in which page
+jobs finish, or in which the executor returns
+them, never reaches the object. Two things do:
+
+- the order of a column's pages within its chunk. The writer places each
+  job's result at its job index and each page in the order its job sealed it;
+- the row-group dictionary decision. It runs once per column per row group,
+  on the flush's thread after the pages are sealed, over the group's sorted
+  string values, so splitting the seal into jobs cannot change it.
+
+The ingest test `parallel_page_encode_stores_the_same_objects_as_serial`
+(crates/ravel-ingest/src/log_router.rs) flushes the same records through the
+gated parallel encode and the serial encode, under both page choices, and
+compares the stored objects byte for byte. Reversing a column's pages within
+its chunk fails it. An assembler that ignores the job index and lays results
+out in the order the executor returned them, with that order reversed, still
+passes. That is the evidence that column-order assembly is not the mechanism.
+
+**The serial fallback as built.** D7's second fallback, a flush that would
+wait on the gate longer than the serial encode, is not estimated. The rule
+is: if the write gate has no free permit when a block's page jobs are ready,
+or the block has a single job, the flush seals them serially on its own
+thread under its own permit. A block below `PAGE_JOB_FLOOR` (8 pages,
+crates/ravel-logseg/src/block.rs) is a single job.
+
+Otherwise the block's page jobs go into a shared queue. The flush's thread,
+which already holds its permit, takes jobs from the queue and seals them
+until it is empty. Alongside it the flush spawns one page task per further
+job, at most as many as the gate had free permits when the jobs were ready,
+and each asks the gate for a permit. A page task that gets one takes the next
+job from the queue and seals it on the blocking pool; one that finds the
+queue empty releases its permit at once without work. Once the queue is
+empty the flush waits only for the jobs page tasks took, each of which
+already holds its own permit. The flush therefore never waits for a permit,
+and no page job waits for a permit while the flush's thread could seal it,
+so page jobs cannot deadlock the gate. The writer places each result at its
+job index, whoever sealed it.
+
+**How the gate counts it.** A flush below the write gate's inline floor counts
+one `ravel_cpu_gate_inline_total` at the `log_flush` site and takes no
+permit. At or above the floor, the flush's own job counts one
+`ravel_cpu_gate_jobs_total`, however many page jobs it seals. Page tasks ask
+for their permit through `WriteGate::run_claimed`, which takes the job from
+the queue only once the permit is held. A page task that took a job counts
+one job, one wait and one run; one that found the queue empty counts none of
+the three. A flush with free permits therefore counts one job plus one per
+page job a page task sealed, and the serial fallback counts one job.
+`log_flush_gate_counts_what_ran` pins the three cases,
+`a_flush_seals_its_pages_while_its_page_tasks_wait_for_a_permit` pins a flush
+sealing every page job while its page task waits behind another job's
+permit, and `run_claimed_counts_only_claimed_jobs` (crates/ravel-cpu-gate)
+pins that an empty claim counts nothing.
+
+**Acknowledgement is unchanged.** The data PUT and the commit record follow
+the encode as before. A strict write returns only after both are stored
+(`strict_ack_waits_for_the_commit_of_a_parallel_encoded_flush`). A page job
+that panics or is cancelled on the gate fails its flush the way the flush's
+own gated job does: the retryable `ShardUnavailable`, `flush_gate_faults`,
+and no `abandoned_*` counter (`a_failed_page_job_fails_the_flush_retryably`).

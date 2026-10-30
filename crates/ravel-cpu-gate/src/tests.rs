@@ -357,6 +357,151 @@ fn job_below_the_floor_runs_inline_and_counts_as_inline() {
     );
 }
 
+/// `run_permitted` ignores the floor: a job far below it still leaves the
+/// calling thread, holds a permit while it runs, queues while the permits are
+/// taken, and counts as a job at its site, never as inline. `run` on the same
+/// gate keeps its floor, and `runs_inline` reports the choice `run` makes.
+#[test]
+fn run_permitted_takes_a_permit_whatever_the_size() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running permitted jobs"),
+        || {
+            current_thread_runtime().block_on(async {
+                let gate = Arc::new(CpuGate::<WriteSite>::new(
+                    CpuGateConfig::with_permits(1),
+                    Arc::new(InstantClock::new()),
+                ));
+                assert!(gate.runs_inline(JobSize::Bytes(0)));
+                assert!(!gate.runs_inline(JobSize::Bytes(DEFAULT_INLINE_FLOOR_BYTES)));
+                assert_eq!(gate.free_permits(), 1);
+
+                let caller = std::thread::current().id();
+                let (began_tx, mut began_rx) = unbounded_channel();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+                let first_gate = Arc::clone(&gate);
+                let first = tokio::spawn(async move {
+                    first_gate
+                        .run_permitted(WriteSite::LogFlush, move || {
+                            let on = std::thread::current().id();
+                            let _ = began_tx.send(0);
+                            let _ = release_rx.recv();
+                            on
+                        })
+                        .await
+                });
+                assert_eq!(began_rx.recv().await, Some(0));
+                assert_eq!(gate.running(), 1);
+                assert_eq!(gate.free_permits(), 0, "the running job holds the permit");
+
+                let second_gate = Arc::clone(&gate);
+                let second = tokio::spawn(async move {
+                    second_gate
+                        .run_permitted(WriteSite::LogFlush, || std::thread::current().id())
+                        .await
+                });
+                while gate.queued() != 1 {
+                    tokio::task::yield_now().await;
+                }
+                drop(release_tx);
+                assert_ne!(first.await.unwrap().unwrap(), caller);
+                assert_ne!(second.await.unwrap().unwrap(), caller);
+                assert_eq!(gate.free_permits(), 1);
+
+                let inline = gate
+                    .run(WriteSite::LogFlush, JobSize::Bytes(0), || {
+                        std::thread::current().id()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(inline, caller, "run keeps its floor");
+
+                let snapshot = gate.snapshot();
+                let site = snapshot.sites[WriteSite::LogFlush.index()];
+                assert_eq!((site.jobs, site.inline), (2, 1));
+                assert_eq!(snapshot.wait_count, 2);
+                assert_eq!(snapshot.run_count, 2);
+            });
+        },
+    );
+}
+
+/// `run_claimed` calls its claim only once it holds a permit. A claim that
+/// finds nothing releases the permit at once and counts nothing: no job, no
+/// wait, no run, nothing inline. A claim that returns a job runs it on the
+/// blocking pool, counted as `run_permitted` counts it.
+#[test]
+fn run_claimed_counts_only_claimed_jobs() {
+    run_with_watchdog(
+        WATCHDOG,
+        || format!("test hung for {WATCHDOG:?} running claimed jobs"),
+        || {
+            current_thread_runtime().block_on(async {
+                let gate = floorless_gate::<WriteSite>(1);
+                let (began_tx, mut began_rx) = unbounded_channel();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+                let parked = tokio::spawn({
+                    let gate = Arc::clone(&gate);
+                    async move {
+                        gate.run_permitted(
+                            WriteSite::OtapDecode,
+                            parked_job(0, began_tx, release_rx),
+                        )
+                        .await
+                    }
+                });
+                assert_eq!(began_rx.recv().await, Some(0));
+
+                let claimed_while_held = Arc::new(AtomicBool::new(false));
+                let empty = tokio::spawn({
+                    let gate = Arc::clone(&gate);
+                    let claimed_while_held = Arc::clone(&claimed_while_held);
+                    async move {
+                        gate.run_claimed(WriteSite::LogFlush, || {
+                            claimed_while_held.store(gate.free_permits() == 0, Ordering::SeqCst);
+                            None::<fn() -> u32>
+                        })
+                        .await
+                    }
+                });
+                while gate.queued() != 1 {
+                    tokio::task::yield_now().await;
+                }
+                drop(release_tx);
+                assert_eq!(parked.await.unwrap().unwrap(), 0);
+                assert_eq!(empty.await.unwrap().unwrap(), None);
+                assert!(
+                    claimed_while_held.load(Ordering::SeqCst),
+                    "the claim runs while the permit is held"
+                );
+                assert_eq!(gate.free_permits(), 1, "the unused permit is released");
+                let snapshot = gate.snapshot();
+                let site = snapshot.sites[WriteSite::LogFlush.index()];
+                assert_eq!((site.jobs, site.inline), (0, 0), "an empty claim is no job");
+                assert_eq!(
+                    (snapshot.wait_count, snapshot.run_count),
+                    (1, 1),
+                    "only the parked job's wait and run"
+                );
+
+                let caller = std::thread::current().id();
+                let ran = gate
+                    .run_claimed(WriteSite::LogFlush, || Some(|| std::thread::current().id()))
+                    .await
+                    .unwrap()
+                    .expect("a claimed job runs");
+                assert_ne!(ran, caller, "a claimed job leaves the calling thread");
+                let snapshot = gate.snapshot();
+                let site = snapshot.sites[WriteSite::LogFlush.index()];
+                assert_eq!((site.jobs, site.inline), (1, 0));
+                assert_eq!((snapshot.wait_count, snapshot.run_count), (2, 2));
+                assert_eq!((snapshot.running, snapshot.queued), (0, 0));
+                assert_eq!(gate.free_permits(), 1);
+            });
+        },
+    );
+}
+
 /// The gate reports the byte floor it was built with. `with_permits` builds
 /// it with the 256 KiB codec floor the read gate keeps; the write gate's
 /// default is 1 MiB.
