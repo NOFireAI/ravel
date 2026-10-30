@@ -119,7 +119,9 @@ pub struct LogNormalizeOutput {
 ///
 /// The request is walked once: the resolved-label projection
 /// ([`crate::project_log_resolved_label_bytes`]) is summed during the same
-/// pass that converts the attributes, and once the running sum passes
+/// pass that converts the attributes, each attribute charged in the loop that
+/// converts it (a nested array or kvlist value is still recursed once to
+/// measure and once to convert), and once the running sum passes
 /// `max_resolved_label_bytes_per_request` nothing more is built; the rest of
 /// the request is only counted, so the refusal reports the same total a
 /// separate projection would.
@@ -1013,8 +1015,8 @@ fn convert_attrs(
 
 /// A resource's or scope's attribute set as the projection charges it: the
 /// stored copy ([`crate::label_projection::log_attrs_bytes`]) and the
-/// preimage encoding ([`crate::label_projection::encoded_attrs_len`]). Both
-/// are 0 unless the walk is projecting.
+/// preimage encoding ([`crate::label_projection::encoded_attrs_len`]). Only
+/// summed when the walk is projecting.
 struct AttrSetCharges {
     stored: usize,
     encoded: usize,

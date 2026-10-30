@@ -10,8 +10,8 @@
 //! string values, severity text, body) is moved out of it, never copied. What
 //! a record still allocates is its own attribute `Vec` and its copy of the
 //! stream's attribute blob (`NormalizedLogRecord::stream_attrs` is a `Vec<u8>`
-//! per record, so it cannot be shared yet): two allocations per record,
-//! whatever the attribute count. The measurement differences two request
+//! per record, so it cannot be shared yet): two allocations per record. The
+//! measurement differences two request
 //! sizes under one scope, so the per-request and per-scope allocations cancel.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
