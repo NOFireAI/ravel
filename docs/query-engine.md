@@ -1230,18 +1230,19 @@ renders are not charged, and `max_series` does not bound that merged set.
 
 **Objects a discovery read skips.** The same reads also keep the id of every
 series a decoded object held, matched or not, and charge 32 bytes per id to
-the budget (`SEEN_SERIES_LEN` in `engine.rs`). Before an object's catalog
-is decoded, its SERIES_IDS section is read on its own. When every id in it
-was already seen, the rest of the catalog is not decoded, and not fetched
-unless the object's first read already held it, because the object adds
-nothing: a series id is canonical over its labels, so the
-matchers and a windowless erasure predicate give it the same verdict in every
-object. This turns a read over many objects that repeat the same series into
-roughly one catalog decode per series. It does not help an object that adds
-even one new series: that object's whole catalog is decoded. An object that
-is decoded costs one more range GET than before when its SERIES_IDS section
-was not in the first read. Objects fetched concurrently can each be decoded
-before any of them is recorded as seen.
+the budget (`SEEN_SERIES_LEN` in `engine.rs`). An object's catalog sections
+are fetched in the same single GET as before, and its SERIES_IDS section is
+decoded first. When every id in it was already seen, the rest of the catalog
+is not decoded, because the object adds nothing: a series id is canonical
+over its labels, so the matchers and a windowless erasure predicate give it
+the same verdict in every object. The skip saves CPU, not requests or bytes.
+A read over many objects that repeat the same series then decodes roughly
+one catalog per object that introduces a new series. It does not help an
+object that adds even one new series: that object's whole catalog is
+decoded. Objects fetched concurrently can each be decoded before any of them
+is recorded as seen. A skipped object adds nothing to the query's
+`seriesMatched`, so on these reads it counts roughly the distinct matched
+series rather than one per object that holds each.
 
 ## Endpoints (Prometheus compatibility subset)
 
