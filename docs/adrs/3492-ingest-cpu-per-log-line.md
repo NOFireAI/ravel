@@ -1,6 +1,6 @@
 # ADR-3492: Cut logs ingest CPU per line for 120k lines/s on 8 vCPU
 
-- Status: Proposed (2026-10-30)
+- Status: Accepted (2026-10-30)
 - Date: 2026-10-30
 - Refs: #3492, #3476, #1507, ADR-0002, ADR-0070, ADR-0109, ADR-1702, ADR-1737, ADR-2135, ADR-3456
 
