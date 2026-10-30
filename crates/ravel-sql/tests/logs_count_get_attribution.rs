@@ -15,9 +15,10 @@
 //! figures, not the attribution. The server builds its catalog with
 //! provisioning enforcement, which adds one GET of the tenant's provisioning
 //! record to a cold query, so the server's cold poll is N + 2 where this test
-//! pins N + 1. Both queries here run inside one catalog HEAD cache lifetime
-//! (30 s); at the harness's 15 s interval about every other poll re-reads
-//! the HEAD, about half a GET per poll.
+//! pins N + 1. And the test freezes the catalog's monotonic clock, so its HEAD
+//! cache (30 s TTL) never expires between the two queries, however long the
+//! first one takes; in production, at the harness's 15 s interval, about every
+//! other poll re-reads the HEAD, about half a GET per poll.
 //!
 //! Arms:
 //! - N = 100, 1,000 and 5,000 at the shipped commit-record cache bound
@@ -358,6 +359,23 @@ fn request() -> SqlRequest {
     }
 }
 
+/// A monotonic clock stopped at zero, so no catalog HEAD cache entry expires
+/// between the two queries of an arm.
+struct FrozenMono;
+
+impl ravel_cpu_gate::MonotonicClock for FrozenMono {
+    fn now_nanos(&self) -> u64 {
+        0
+    }
+}
+
+/// A catalog over `store` whose HEAD cache ages on [`FrozenMono`].
+fn frozen_catalog(store: &Arc<dyn ObjectStoreBackend>, config: CatalogConfig) -> Catalog {
+    Catalog::new(Arc::clone(store), config)
+        .expect("catalog")
+        .with_monotonic_clock(Arc::new(FrozenMono))
+}
+
 fn catalog_config(cache_entries: usize) -> CatalogConfig {
     CatalogConfig {
         cache_capacity_per_tenant: cache_entries,
@@ -433,8 +451,7 @@ async fn run_arm(arm: &Arm) -> [RunGets; 2] {
     if arm.fold {
         // A separate catalog, as the maintain role's fold is a separate
         // process: the query executor below starts with cold caches.
-        let folder =
-            Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("fold catalog");
+        let folder = frozen_catalog(&store, CatalogConfig::default());
         let report = folder
             .fold(
                 &tid.hash(),
@@ -455,9 +472,7 @@ async fn run_arm(arm: &Arm) -> [RunGets; 2] {
         assert_eq!(report.entry_count, arm.n, "{}: folded entries", arm.label);
     }
 
-    let catalog = Arc::new(
-        Catalog::new(Arc::clone(&store), catalog_config(arm.cache_entries)).expect("catalog"),
-    );
+    let catalog = Arc::new(frozen_catalog(&store, catalog_config(arm.cache_entries)));
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(&store)),

@@ -74,6 +74,8 @@ mod logs_contains_fetch_bytes;
 mod logs_contains_route;
 #[path = "logs_count_from_stats.rs"]
 mod logs_count_from_stats;
+#[path = "logs_count_get_attribution.rs"]
+mod logs_count_get_attribution;
 #[path = "logs_declared_columns.rs"]
 mod logs_declared_columns;
 #[path = "logs_declared_minmax_from_stamps.rs"]
