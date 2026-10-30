@@ -2461,7 +2461,9 @@ least-recently-used under `commit_cache_max_bytes_per_tenant`,
 `CompactionRecordCache` evicts by insertion order under
 `compaction_cache_max_bytes_per_tenant`. The two budgets are equal shares of
 the same per-tenant figure (22.5 MB each at the 25,000-entry cap, 45 MB
-together). `PartCache` and `PostingsCache` are bounded by their entry count
+together) at the default; `ravel-server`'s
+`--catalog-record-cache-max-bytes-per-tenant` raises that figure, and the
+entry cap with it (ADR-3513). `PartCache` and `PostingsCache` are bounded by their entry count
 alone and evict by insertion order. `HeadCache` additionally carries a
 process-wide capacity bound (`head_cache_capacity`, default 10,000 (tenant,
 signal) entries, FIFO eviction). An entry recording a

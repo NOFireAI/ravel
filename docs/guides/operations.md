@@ -48,8 +48,11 @@ the carved read-cache shares. Both halves are enforced in bytes, 22.5 MB each:
 neither a commit record nor a compaction record has a bounded size (each
 carries a repeated field the format does not cap), so each cache charges every
 entry an estimate of the live heap it holds and evicts until the tenant's
-summed charge is inside its budget. [Caching](caching.md) has the derivation
-and the sizing.
+summed charge is inside its budget. Those are the figures at the default
+per-tenant budget: `--catalog-record-cache-max-bytes-per-tenant` raises it,
+and the worst case per actively-queried tenant rises with it. Startup logs the
+budget in force, the entry bound and that worst case on the `catalog record
+caches sized` line. [Caching](caching.md) has the derivation and the sizing.
 
 Related guides:
 
