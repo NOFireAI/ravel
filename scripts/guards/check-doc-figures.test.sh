@@ -33,9 +33,10 @@ pub const MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;
 pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
 RS
 
-  # caching.md: 45 MB x2, 22.5 MB x1, 9 MB x1, 18 MB x3, 4.5 GB x1,
+  # caching.md: 45 MB x3, 22.5 MB x1, 9 MB x1, 18 MB x3, 4.5 GB x1,
   # 3.7 GB x1, 10,000 x3 (plus one excluded), 25,000 x1.
   cat >"${dir}/docs/guides/caching.md" <<'MD'
+| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `45000000` (45 MB) |
 Capacity is floored at 10,000 entries and capped at 25,000.
 A byte budget of `capacity x 900 bytes`, 22.5 MB per tenant at the cap.
 So the worst case is 45 MB per actively-queried tenant.
@@ -126,6 +127,7 @@ check "a drifted --disable-cache help is a finding" "${t}" 1 "disable-cache long
 # mid-phrase must stay clean.
 t="$(new_tree rewrapped)"
 printf '%s\n' \
+  '| `--catalog-record-cache-max-bytes-per-tenant <bytes>` | `45000000` (45 MB) |' \
   'Capacity is floored at' '10,000 entries and capped at' '25,000.' \
   'A byte budget of `capacity x 900 bytes`, 22.5' 'MB per tenant at the cap.' \
   'So the worst case is 45 MB per actively-queried tenant.' \
