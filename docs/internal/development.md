@@ -24,7 +24,7 @@ generated OTLP export, and queries it back by commit token
 One capability difference to keep in mind: the published image is built with
 `--features sql,flight-sql,otap,agents`, so `POST /api/v1/sql` and Flight SQL
 work in the compose quickstart and `--otap` is accepted there. The image adds
-`agents` after `0.27.0`, the release the compose quickstart pins, so `--agents`
+`agents` after `0.28.0`, the release the compose quickstart pins, so `--agents`
 is accepted in the quickstart only once the pin moves to a release whose
 `CHANGELOG.md` section lists agents.
 `make demo` builds the default feature set and enables none of the four, so
