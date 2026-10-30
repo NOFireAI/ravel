@@ -7,8 +7,8 @@
 //! across the batches it emits (`logs_scan::batch::StrValuesCache`), so that
 //! per-row read repeats work an earlier batch already did.
 //! [`DictionaryViewsCast`] builds the views of a values array once
-//! ([`views_of`]) and then gathers each row's view by key, with the type,
-//! nulls, view bits and data buffers arrow's cast produces
+//! ([`views_of`]) and then gathers each row's view by key ([`gather`]), with
+//! the type, nulls, view bits and data buffers arrow's cast produces
 //! (`tests::matches_the_stock_cast`).
 //!
 //! A values array's views are built only once the rows cast over it, the
@@ -20,19 +20,32 @@
 //! The memo belongs to the expression instance, which every partition of the
 //! aggregate shares; its lock is taken once or twice per batch, never per
 //! row. It keeps at most [`MEMO_ENTRIES`] values arrays (`tests::memo_is_bounded`).
-//! A built entry's views hold the values' data buffer ([`views_of`] appends
-//! it as block 0), so up to that many data buffers can outlive the scan's own
-//! reference to them; the memory pool is not charged for them or for the
-//! 16 bytes per entry the views take.
+//!
+//! Memory: an entry holds no buffer of its values array. It keeps a `Weak` to
+//! the array and the 16-byte views as a plain `u128` buffer ([`State::Built`]);
+//! each batch's output takes the data buffer from the batch's own values
+//! array ([`gather`]), so the output holds it exactly as long as arrow's cast
+//! output would, and the scan's reservation for those bytes stays truthful
+//! (`tests::built_entry_does_not_hold_the_values_buffers`). An entry whose
+//! values array is gone is purged on the next lookup
+//! (`tests::dead_entry_is_purged_and_rebuilt`). The views themselves are not
+//! charged to the memory pool: this expression is built by a physical
+//! optimizer rule, which has no `TaskContext`, and `PhysicalExpr::evaluate`
+//! receives only the batch, so no pool is reachable from here. They are capped
+//! instead: a values array whose views would exceed [`MEMO_VIEW_BYTES`] is
+//! never memoized ([`Memo::lookup`], `tests::over_the_cap_is_not_memoized`),
+//! so one expression instance holds at most `MEMO_ENTRIES * MEMO_VIEW_BYTES`
+//! (4 MiB) of views.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, StringArray, StringViewBuilder, UInt32Array,
+    Array, ArrayRef, AsArray, Int32Array, StringArray, StringViewArray, StringViewBuilder,
+    UInt32Array,
 };
-use datafusion::arrow::buffer::ScalarBuffer;
+use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Int32Type, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -43,6 +56,10 @@ use datafusion::physical_expr::PhysicalExpr;
 /// How many values arrays one expression keeps an entry for, built or not.
 /// The least recently used entry leaves first.
 pub(crate) const MEMO_ENTRIES: usize = 4;
+
+/// The most bytes of views one entry may hold: a values array with more than
+/// `MEMO_VIEW_BYTES / 16 - 1` entries (65,535) is never memoized.
+pub(crate) const MEMO_VIEW_BYTES: usize = 1 << 20;
 
 /// The type this cast reads with its memo; any other input takes the stock
 /// cast.
@@ -117,8 +134,7 @@ impl DictionaryViewsCast {
                 self.lock().insert(dict.values(), views)
             }
         };
-        let indices = gather_indices(dict.keys(), values.len())?;
-        Ok(take(views.as_ref(), &indices, None)?)
+        gather(&views, values, dict.keys())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Memo> {
@@ -126,15 +142,18 @@ impl DictionaryViewsCast {
     }
 }
 
-/// The view of every entry of `values`, followed by one null: the entry a
-/// NULL key gathers. Each view is the one arrow's cast makes for that entry,
-/// over `values`' own data buffer as block 0, read from the entry's offsets
-/// whether or not the entry is NULL: arrow's cast takes its output's nulls
-/// from the keys alone, so a NULL entry reads as its bytes, valid
+/// The view of every entry of `values`, followed by one zero view: the entry
+/// a NULL key gathers, the view arrow's cast writes for a NULL row. Each view
+/// is the one arrow's cast makes for that entry, over `values`' own data
+/// buffer as block 0, read from the entry's offsets whether or not the entry
+/// is NULL: arrow's cast takes its output's nulls from the keys alone, so a
+/// NULL entry reads as its bytes, valid
 /// (`dictionary_views::tests::matches_the_stock_cast` generates NULL entries
 /// over non-empty bytes). An entry whose bytes are not UTF-8, which only a
-/// NULL entry of an unchecked array can hold, is refused.
-fn views_of(values: &StringArray) -> DFResult<ArrayRef> {
+/// NULL entry of an unchecked array can hold, is refused. Only the views are
+/// returned: the builder's array, which holds the data buffer, is dropped
+/// here.
+fn views_of(values: &StringArray) -> DFResult<ScalarBuffer<u128>> {
     let mut builder = StringViewBuilder::with_capacity(values.len() + 1);
     let block = builder.append_block(values.values().clone());
     for window in values.value_offsets().windows(2) {
@@ -146,7 +165,50 @@ fn views_of(values: &StringArray) -> DFResult<ArrayRef> {
         builder.try_append_view(block, start, end.saturating_sub(start))?;
     }
     builder.append_null();
-    Ok(Arc::new(builder.finish()))
+    let (views, _buffers, _nulls) = builder.finish().into_parts();
+    Ok(views)
+}
+
+/// The stock cast's output for a dictionary of `keys` over `values`, from
+/// `views`, which [`views_of`] built for `values`. The data buffer is
+/// `values`' own, taken from the batch, so the output holds it exactly as
+/// long as the stock cast's output would.
+///
+/// The safe constructor validates the views it is given, so the cheaper side
+/// is validated: the dictionary's views, gathered by `take`, when the batch
+/// has more rows than the dictionary has entries; else the gathered rows.
+fn gather(
+    views: &ScalarBuffer<u128>,
+    values: &StringArray,
+    keys: &Int32Array,
+) -> DFResult<ArrayRef> {
+    let entries = values.len();
+    let data = vec![values.values().clone()];
+    let indices = gather_indices(keys, entries)?;
+    if keys.len() > entries {
+        let mut valid = vec![true; entries];
+        valid.push(false);
+        let nulls = NullBuffer::new(BooleanBuffer::from(valid));
+        let source = StringViewArray::try_new(views.clone(), data, Some(nulls))?;
+        return Ok(take(&source, &indices, None)?);
+    }
+    let rows: Vec<u128> = indices
+        .values()
+        .iter()
+        .map(|&index| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| views.get(index))
+                .copied()
+                .ok_or_else(|| offset_error(format!("view {index} of {}", views.len())))
+        })
+        .collect::<DFResult<_>>()?;
+    let nulls = keys.nulls().filter(|nulls| nulls.null_count() > 0).cloned();
+    Ok(Arc::new(StringViewArray::try_new(
+        ScalarBuffer::from(rows),
+        data,
+        nulls,
+    )?))
 }
 
 fn offset_error<E: fmt::Display>(err: E) -> DataFusionError {
@@ -155,10 +217,7 @@ fn offset_error<E: fmt::Display>(err: E) -> DataFusionError {
 
 /// Each row's index into the views [`views_of`] built for a dictionary of
 /// `entries` values: its key, or `entries`, the trailing null, for a NULL key.
-fn gather_indices(
-    keys: &datafusion::arrow::array::Int32Array,
-    entries: usize,
-) -> DFResult<UInt32Array> {
+fn gather_indices(keys: &Int32Array, entries: usize) -> DFResult<UInt32Array> {
     let null_entry = u32::try_from(entries).map_err(offset_error)?;
     let in_range = |key: i32| {
         u32::try_from(key)
@@ -207,13 +266,14 @@ struct Entry {
 enum State {
     /// Rows the stock cast has converted over this values array so far.
     Pending(usize),
-    Built(ArrayRef),
+    /// The values' views ([`views_of`]): bits only, no buffer of the values.
+    Built(ScalarBuffer<u128>),
     /// [`views_of`] refused the values; every batch takes the stock cast.
     Refused,
 }
 
 enum Lookup {
-    Built(ArrayRef),
+    Built(ScalarBuffer<u128>),
     Build,
     Stock,
 }
@@ -221,9 +281,15 @@ enum Lookup {
 impl Memo {
     /// What to do for a batch of `rows` over `values`: gather from its built
     /// views, build them now, or take the stock cast. The views are built once
-    /// the rows cast over `values`, this batch's included, reach its length.
+    /// the rows cast over `values`, this batch's included, reach its length,
+    /// and never when they would exceed [`MEMO_VIEW_BYTES`]. Entries whose
+    /// values array is gone are purged first.
     fn lookup(&mut self, values: &ArrayRef, rows: usize) -> Lookup {
+        self.purge();
         let entries = values.len();
+        if entries.saturating_add(1).saturating_mul(16) > MEMO_VIEW_BYTES {
+            return Lookup::Stock;
+        }
         let Some(at) = self.position(values) else {
             if rows >= entries {
                 return Lookup::Build;
@@ -233,7 +299,7 @@ impl Memo {
         };
         let mut entry = self.entries.remove(at);
         let lookup = match &mut entry.state {
-            State::Built(views) => Lookup::Built(Arc::clone(views)),
+            State::Built(views) => Lookup::Built(views.clone()),
             State::Refused => Lookup::Stock,
             State::Pending(seen) => {
                 *seen = seen.saturating_add(rows);
@@ -250,17 +316,17 @@ impl Memo {
 
     /// Record `views`, built for `values`, and return the views to gather
     /// from: an entry another caller built first wins.
-    fn insert(&mut self, values: &ArrayRef, views: ArrayRef) -> ArrayRef {
+    fn insert(&mut self, values: &ArrayRef, views: ScalarBuffer<u128>) -> ScalarBuffer<u128> {
         if let Some(at) = self.position(values)
             && let State::Built(existing) = &self.entries[at].state
         {
-            return Arc::clone(existing);
+            return existing.clone();
         }
         self.builds += 1;
         if let Some(at) = self.position(values) {
             self.entries.remove(at);
         }
-        self.push(values, State::Built(Arc::clone(&views)));
+        self.push(values, State::Built(views.clone()));
         views
     }
 
@@ -272,15 +338,23 @@ impl Memo {
         self.push(values, State::Refused);
     }
 
+    /// The entry for `values`: its `Weak` upgrades, to this very array.
     fn position(&self, values: &ArrayRef) -> Option<usize> {
         self.entries.iter().position(|entry| {
-            std::ptr::addr_eq(entry.values.as_ptr(), Arc::as_ptr(values))
-                && entry.values.strong_count() > 0
+            entry
+                .values
+                .upgrade()
+                .is_some_and(|live| Arc::ptr_eq(&live, values))
         })
     }
 
-    fn push(&mut self, values: &ArrayRef, state: State) {
+    /// Drop every entry whose values array is gone.
+    fn purge(&mut self) {
         self.entries.retain(|entry| entry.values.strong_count() > 0);
+    }
+
+    fn push(&mut self, values: &ArrayRef, state: State) {
+        self.purge();
         if self.entries.len() >= MEMO_ENTRIES {
             self.entries.remove(0);
         }
@@ -561,6 +635,83 @@ mod tests {
         let input = dictionary(&[Some(0)], &arrays[0]);
         assert_stock(&input, &eval(&cast, &input));
         assert_eq!(cast.builds(), MEMO_ENTRIES + 2);
+    }
+
+    /// A values array over `data`: "x" and a string past the inline length.
+    fn two_entries(data: &Buffer) -> ArrayRef {
+        let offsets =
+            OffsetBuffer::new(vec![0, 1, i32::try_from(data.len()).expect("small")].into());
+        Arc::new(StringArray::new(offsets, data.clone(), None))
+    }
+
+    /// A built entry holds none of the values' buffers: once the test drops
+    /// the values array and every array cast over it, its data buffer is
+    /// freed, and a new values array still answers like the stock cast.
+    #[test]
+    fn built_entry_does_not_hold_the_values_buffers() {
+        let probe = Buffer::from(b"xa long string past twelve".to_vec());
+        let values = two_entries(&probe);
+        let cast = expr();
+        let input = dictionary(&[Some(1), Some(0), None], &values);
+        let output = eval(&cast, &input);
+        assert_stock(&input, &output);
+        assert_eq!(cast.builds(), 1);
+        drop((output, input, values));
+        assert_eq!(probe.strong_count(), 1, "only the probe holds the data");
+
+        let next = Buffer::from(b"ya different string past twelve".to_vec());
+        let values = two_entries(&next);
+        let input = dictionary(&[Some(0), Some(1), Some(1)], &values);
+        assert_stock(&input, &eval(&cast, &input));
+        assert_eq!(cast.builds(), 2);
+    }
+
+    /// An entry whose values array is gone is purged by the next lookup, and a
+    /// new values array of the same length builds its own views rather than
+    /// gathering the dead entry's.
+    #[test]
+    fn dead_entry_is_purged_and_rebuilt() {
+        let cast = expr();
+        let first = two_entries(&Buffer::from(b"xa long string past twelve".to_vec()));
+        let input = dictionary(&[Some(1), Some(0)], &first);
+        assert_stock(&input, &eval(&cast, &input));
+        drop((input, first));
+        assert_eq!(cast.lock().entries.len(), 1, "not purged before a lookup");
+
+        let second = two_entries(&Buffer::from(b"za string of other bytes!!".to_vec()));
+        let input = dictionary(&[Some(1), Some(0), Some(1)], &second);
+        let output = eval(&cast, &input);
+        assert_stock(&input, &output);
+        assert_eq!(
+            output.as_string_view().value(0),
+            "a string of other bytes!!"
+        );
+        assert_eq!(cast.builds(), 2);
+        let memo = cast.lock();
+        assert_eq!(memo.entries.len(), 1, "the dead entry is purged");
+        assert!(memo.position(&second).is_some());
+    }
+
+    /// A values array whose views would exceed `MEMO_VIEW_BYTES` gets no
+    /// entry and takes the stock cast; one entry fewer is memoized.
+    #[test]
+    fn over_the_cap_is_not_memoized() {
+        let at_cap = MEMO_VIEW_BYTES / 16 - 1;
+        let cast = expr();
+        for entries in [at_cap + 1, at_cap] {
+            let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+                (0..entries).map(|i| format!("value number {i}")),
+            ));
+            let keys: Int32Array = (0..entries)
+                .map(|i| i32::try_from(entries - 1 - i).ok())
+                .collect();
+            let input: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(keys, Arc::clone(&values)).expect("keys fit"),
+            );
+            assert_stock(&input, &eval(&cast, &input));
+        }
+        assert_eq!(cast.builds(), 1, "only the array at the cap is built");
+        assert_eq!(cast.lock().entries.len(), 1);
     }
 
     /// Inputs this cast does not memoize take the stock cast unchanged.
