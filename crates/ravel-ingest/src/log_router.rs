@@ -1924,9 +1924,13 @@ mod tests {
 
     /// ADR-1702 task 9: an RLOG flush encoded on the write gate stores the same
     /// bytes as one encoded inline. Two routers share one pinned clock and one
-    /// seed, as in the row/columnar anchor above; only one has the gate. The
-    /// gate's `log_flush` count equals the number of shards the records span,
-    /// one flush each, so the gated router really encoded every object there.
+    /// seed, as in the row/columnar anchor above; only one has the gate. No
+    /// flush ran inline and the gate's `log_flush` count is at least the
+    /// number of shards the records span, one flush each, so the gated router
+    /// really encoded every object there. How many page jobs each flush split
+    /// off depends on which permits were free when its pages were ready
+    /// (ADR-3492 decision 7), so the count is a floor here;
+    /// `log_flush_gate_counts_what_ran` pins it on one shard.
     #[tokio::test]
     async fn gated_log_flush_stores_the_same_objects_as_inline() {
         let seed = 0x00C0_FFEE_u64;
@@ -1978,7 +1982,13 @@ mod tests {
             .into_iter()
             .find(|s| s.site == ravel_cpu_gate::WriteSite::LogFlush)
             .expect("log_flush site");
-        assert_eq!((site.jobs, site.inline), (shards.len() as u64, 0));
+        assert_eq!(site.inline, 0);
+        assert!(
+            site.jobs >= shards.len() as u64,
+            "{} log_flush jobs for {} shards",
+            site.jobs,
+            shards.len()
+        );
     }
 
     /// A gated encode that panics, or that the gate cancels, fails its flush
@@ -2048,6 +2058,327 @@ mod tests {
                 .expect("the shard survives and the next write commits");
             assert_eq!(router.metrics.snapshot().flush_gate_faults, 1);
         }
+    }
+
+    // ---- ADR-3492 decision 7: parallel column-page encode ----
+
+    use ravel_cpu_gate::{CpuGateConfig, InstantClock, JobSize, WriteSite};
+    use ravel_logseg::{
+        ObjectIdentity, PAGE_JOB_FLOOR, PageChoice, PageEncodeJob, RlogConfig, RlogWriter,
+    };
+
+    fn write_gate_with(permits: usize, inline_floor_bytes: u64) -> Arc<WriteGate> {
+        Arc::new(WriteGate::new(
+            CpuGateConfig {
+                inline_floor_bytes,
+                ..CpuGateConfig::with_permits(permits)
+            },
+            Arc::new(InstantClock::new()),
+        ))
+    }
+
+    /// `(jobs, inline)` at the log flush site.
+    fn log_flush_counts(gate: &WriteGate) -> (u64, u64) {
+        gate.snapshot()
+            .sites
+            .iter()
+            .find(|s| s.site == WriteSite::LogFlush)
+            .map_or((0, 0), |s| (s.jobs, s.inline))
+    }
+
+    /// The page jobs a writer hands its executor for `records`, counted by a
+    /// serial executor outside the router. Every record fits one block.
+    fn page_job_count(records: &[NormalizedLogRecord], choice: PageChoice) -> u64 {
+        let mut writer = RlogWriter::new(
+            RlogConfig {
+                page_choice: choice,
+                ..RlogConfig::default()
+            },
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        let rows: Vec<LogRecord> = records.iter().map(to_logrecord).collect();
+        writer
+            .push_columnar(ColumnarLogBatch::from_records(&rows))
+            .expect("push");
+        let mut jobs = 0u64;
+        let mut count = |batch: Vec<PageEncodeJob>| -> Result<_, LogSegError> {
+            jobs += batch.len() as u64;
+            Ok(batch.into_iter().map(PageEncodeJob::run).collect())
+        };
+        writer.finish_on(&mut count).expect("finish");
+        jobs
+    }
+
+    /// One shard and `choice`, buffering until `flush_all`.
+    fn one_shard(choice: PageChoice) -> IngestConfig {
+        IngestConfig {
+            shard_count: 1,
+            rlog_page_choice: choice,
+            ..buffer_all()
+        }
+    }
+
+    /// Writes `records` to a one-shard router (on `gate` when given), flushes
+    /// once and returns every stored object. Same seed and pinned clock on
+    /// every call, so two calls store the same keys.
+    async fn flush_once(
+        gate: Option<Arc<WriteGate>>,
+        choice: PageChoice,
+        records: Vec<NormalizedLogRecord>,
+    ) -> Vec<(String, Vec<u8>)> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = LogIngestRouter::with_rng(
+            one_shard(choice),
+            Arc::clone(&store),
+            Arc::new(FixedClock(1_700_000_000_000_000_000)),
+            overlay(),
+            Arc::new(SeededRng::new(0x00C0_FFEE)),
+            Arc::new(PendingAckBudget::new(0)),
+        );
+        let router = match gate {
+            Some(gate) => router.with_write_gate(gate),
+            None => router,
+        };
+        router
+            .write(
+                TenantId::new("acme"),
+                records,
+                WriteMode::Buffered,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("buffered write enqueues");
+        router.flush_all().await;
+        collect_objects(store.as_ref()).await
+    }
+
+    /// A flush above the floor whose page jobs ran on the write gate stores
+    /// the same data object and commit record, byte for byte, as the serial
+    /// encode of a router with no gate, for both page choices. The gate's
+    /// `log_flush` job count equals the writer's page-job count, so the
+    /// gated flush really split its pages.
+    #[tokio::test]
+    async fn parallel_page_encode_stores_the_same_objects_as_serial() {
+        for choice in [PageChoice::Estimated, PageChoice::Exhaustive] {
+            let records = diverse_records();
+            let page_jobs = page_job_count(&records, choice);
+            assert!(
+                page_jobs >= PAGE_JOB_FLOOR as u64,
+                "{choice:?}: the block must split, got {page_jobs} jobs"
+            );
+            let serial = flush_once(None, choice, records.clone()).await;
+            let gate = write_gate_with(4, 0);
+            let parallel = flush_once(Some(Arc::clone(&gate)), choice, records).await;
+            assert_eq!(serial.len(), 2, "one data object and one commit record");
+            assert_eq!(
+                serial, parallel,
+                "{choice:?}: the parallel page encode must store byte-identical objects"
+            );
+            assert_eq!(log_flush_counts(&gate), (page_jobs, 0), "{choice:?}");
+        }
+    }
+
+    /// The gate counts what ran, for the three ways a log flush can encode:
+    ///
+    /// - below the inline floor, one inline job and no permit;
+    /// - at or above it with free permits, one permitted job per page job:
+    ///   the flush's own job seals the first page job and each of the others
+    ///   takes its own permit;
+    /// - at or above it with no free permit once the flush holds its own (the
+    ///   serial fallback), one permitted job that seals every page.
+    ///
+    /// The wait and run counts move with the permitted jobs and nothing else,
+    /// and every arm stores the serial encode's bytes.
+    #[tokio::test]
+    async fn log_flush_gate_counts_what_ran() {
+        let choice = PageChoice::Estimated;
+        let records = diverse_records();
+        let page_jobs = page_job_count(&records, choice);
+        assert!(page_jobs >= PAGE_JOB_FLOOR as u64);
+        let serial = flush_once(None, choice, records.clone()).await;
+
+        let below = write_gate_with(4, u64::MAX);
+        let stored = flush_once(Some(Arc::clone(&below)), choice, records.clone()).await;
+        assert_eq!(stored, serial);
+        assert_eq!(log_flush_counts(&below), (0, 1), "below the floor");
+        let snapshot = below.snapshot();
+        assert_eq!((snapshot.wait_count, snapshot.run_count), (0, 0));
+
+        let free = write_gate_with(4, 0);
+        let stored = flush_once(Some(Arc::clone(&free)), choice, records.clone()).await;
+        assert_eq!(stored, serial);
+        assert_eq!(
+            log_flush_counts(&free),
+            (page_jobs, 0),
+            "one permitted job per page job"
+        );
+        let snapshot = free.snapshot();
+        assert_eq!((snapshot.wait_count, snapshot.run_count), (page_jobs, page_jobs));
+        assert_eq!((snapshot.running, snapshot.queued), (0, 0));
+
+        // Two permits, one parked on an unrelated job: the flush takes the
+        // other, so its page jobs find no free permit and run serially.
+        let busy = write_gate_with(2, 0);
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let blocker_gate = Arc::clone(&busy);
+        let blocker = tokio::spawn(async move {
+            blocker_gate
+                .run(WriteSite::OtapDecode, JobSize::Bytes(0), move || {
+                    let _ = parked.recv();
+                })
+                .await
+        });
+        while busy.running() != 1 {
+            tokio::task::yield_now().await;
+        }
+        let stored = flush_once(Some(Arc::clone(&busy)), choice, records).await;
+        assert_eq!(stored, serial);
+        assert_eq!(log_flush_counts(&busy), (1, 0), "the serial fallback");
+        drop(release);
+        blocker
+            .await
+            .expect("blocker task")
+            .expect("parked job runs");
+        let snapshot = busy.snapshot();
+        assert_eq!(
+            (snapshot.wait_count, snapshot.run_count),
+            (2, 2),
+            "the parked job and the flush's own job"
+        );
+    }
+
+    /// A page job that fails on the gate fails its flush as the flush's own
+    /// gated job failing does: the strict write gets the retryable
+    /// `ShardUnavailable`, nothing is stored, `flush_gate_faults` moves by one
+    /// and no abandoned_* counter moves, and the next write commits. The
+    /// panic is in a page job the flush dispatched, which the `log_flush` job
+    /// count shows: one per page job, the failed one included.
+    #[tokio::test]
+    async fn a_failed_page_job_fails_the_flush_retryably() {
+        let records = diverse_records();
+        let page_jobs = page_job_count(&records, PageChoice::Estimated);
+        let gate = write_gate_with(4, 0);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = LogIngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            Arc::clone(&store),
+            Arc::new(FixedClock(1_700_000_000_000_000_000)),
+            Arc::new(PendingAckBudget::new(0)),
+        )
+        .with_write_gate(Arc::clone(&gate));
+        router.write_gate.panic_next_page_job();
+        let err = router
+            .write(
+                TenantId::new("acme"),
+                records.clone(),
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a failed page job fails the write");
+        assert!(
+            matches!(err, LogWriteError::ShardUnavailable),
+            "expected ShardUnavailable, got {err:?}"
+        );
+        assert!(collect_objects(store.as_ref()).await.is_empty());
+        assert_eq!(log_flush_counts(&gate), (page_jobs, 0));
+        let snapshot = router.metrics.snapshot();
+        assert_eq!(
+            (
+                snapshot.abandoned_input_rejected,
+                snapshot.abandoned_retry_exhausted,
+                snapshot.abandoned_queue_deadline,
+                snapshot.abandoned_hour_bound,
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(snapshot.flush_gate_faults, 1);
+        router
+            .write(
+                TenantId::new("acme"),
+                records,
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("the shard survives and the next write commits");
+        assert_eq!(router.metrics.snapshot().flush_gate_faults, 1);
+        assert_eq!(log_flush_counts(&gate), (2 * page_jobs, 0));
+    }
+
+    /// A strict write whose flush split its pages on the gate still returns
+    /// only after the flush's data object and commit record are stored
+    /// (docs/consistency-model.md): with the commit record's PUT held, the
+    /// data object is in the store and the write has not returned.
+    #[tokio::test]
+    async fn strict_ack_waits_for_the_commit_of_a_parallel_encoded_flush() {
+        let records = diverse_records();
+        let page_jobs = page_job_count(&records, PageChoice::Estimated);
+        let gate = write_gate_with(4, 0);
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let held = fault.hold(Op::Put, Some("/c/".to_string()), Occurrence::Nth(1));
+        let router = Arc::new(
+            LogIngestRouter::new(
+                IngestConfig {
+                    shard_count: 1,
+                    target_bytes: 1,
+                    ..IngestConfig::default()
+                },
+                Arc::clone(&store),
+                Arc::new(FixedClock(1_700_000_000_000_000_000)),
+                Arc::new(PendingAckBudget::new(0)),
+            )
+            .with_write_gate(Arc::clone(&gate)),
+        );
+        let writer = Arc::clone(&router);
+        let write = tokio::spawn(async move {
+            writer
+                .write(
+                    TenantId::new("acme"),
+                    records,
+                    WriteMode::Strict,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        held.wait_until_held(1).await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !write.is_finished(),
+            "a strict write must not return before its commit record is stored"
+        );
+        let keys: Vec<String> = collect_objects(store.as_ref())
+            .await
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys.len(), 1, "only the data object is stored: {keys:?}");
+        assert!(keys[0].contains("/l0/"), "{keys:?}");
+        assert_eq!(log_flush_counts(&gate), (page_jobs, 0));
+
+        let ids = held.held();
+        assert_eq!(ids.len(), 1);
+        held.release(ids[0]);
+        write
+            .await
+            .expect("write task")
+            .expect("the strict write succeeds once the commit record is stored");
+        let objects = collect_objects(store.as_ref()).await;
+        assert_eq!(objects.len(), 2);
+        assert!(objects.iter().any(|(key, _)| key.contains("/c/")));
     }
 
     /// The row/columnar byte-identity anchor above, for a keyed tenant: a
