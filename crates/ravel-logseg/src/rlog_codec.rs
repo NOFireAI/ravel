@@ -15,10 +15,12 @@
 //! decoder here treats its input as untrusted and returns
 //! [`LogSegError::Corrupted`] on any violation.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::encoding::{Enc, decode_i64, decode_i64_into, encode_i64};
 use crate::error::LogSegError;
 use crate::record::{COL_OBSERVED_TS, COL_TS};
-use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
+use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint, zigzag_encode};
 use ravel_codec::error::CodecError;
 
 // ---------------------------------------------------------------------------
@@ -272,6 +274,198 @@ pub fn i64_candidates(values: &[i64]) -> Vec<(Enc, Vec<u8>)> {
 }
 
 // ---------------------------------------------------------------------------
+// Estimated choice (ADR-3492 decision 1)
+// ---------------------------------------------------------------------------
+
+fn uvarint_len(v: u64) -> u64 {
+    u64::from((64 - (v | 1).leading_zeros()).div_ceil(7))
+}
+
+fn ivarint_len(v: i64) -> u64 {
+    uvarint_len(zigzag_encode(v))
+}
+
+/// The six `encode_i64` candidates, in the priority order of
+/// [`i64_candidates`].
+const SIX: [Enc; 6] = [
+    Enc::Constant,
+    Enc::Rle,
+    Enc::Plain,
+    Enc::DeltaZigzag,
+    Enc::DoubleDelta,
+    Enc::ForBitpack,
+];
+
+/// One pass over a non-empty i64 page: its bounds, the GCD of its offsets from
+/// the minimum (0 when every value is equal, and left at 1 once it reaches 1),
+/// and the exact encoded length of each of the [`SIX`] candidates, `None`
+/// where one does not apply.
+struct I64Stats {
+    min: i64,
+    max: i64,
+    gcd: u64,
+    sizes: [Option<u64>; 6],
+}
+
+fn i64_stats(values: &[i64], with_gcd: bool) -> Option<I64Stats> {
+    let (&first, rest) = values.split_first()?;
+    let (mut min, mut max) = (first, first);
+    let mut plain = ivarint_len(first);
+    let (mut runs, mut rle_body, mut run_val, mut run_len) = (0u64, 0u64, first, 1u64);
+    let mut delta = Some(ivarint_len(first));
+    let mut double_delta = Some(ivarint_len(first));
+    let (mut prev, mut prev_delta) = (first, None::<i64>);
+    let mut gcd = 0u64;
+    for &v in rest {
+        min = min.min(v);
+        max = max.max(v);
+        plain += ivarint_len(v);
+        if v == run_val {
+            run_len += 1;
+        } else {
+            runs += 1;
+            rle_body += ivarint_len(run_val) + uvarint_len(run_len);
+            (run_val, run_len) = (v, 1);
+        }
+        match v.checked_sub(prev) {
+            Some(d) => {
+                delta = delta.map(|s| s + ivarint_len(d));
+                let step = match prev_delta {
+                    None => Some(ivarint_len(d)),
+                    Some(pd) => d.checked_sub(pd).map(ivarint_len),
+                };
+                double_delta = double_delta.zip(step).map(|(s, x)| s + x);
+                prev_delta = Some(d);
+            }
+            None => (delta, double_delta) = (None, None),
+        }
+        if with_gcd && gcd != 1 {
+            // Offsets from any one value generate the same divisor as offsets
+            // from the minimum, and the distance between two i64s fits u64.
+            gcd = gcd_u64(gcd, v.abs_diff(first));
+        }
+        prev = v;
+    }
+    runs += 1;
+    rle_body += ivarint_len(run_val) + uvarint_len(run_len);
+    let n = values.len() as u64;
+    let width = u64::from(width_for((max as u64).wrapping_sub(min as u64)));
+    Some(I64Stats {
+        min,
+        max,
+        gcd,
+        sizes: [
+            (min == max).then(|| ivarint_len(min)),
+            Some(uvarint_len(runs) + rle_body),
+            Some(plain),
+            delta,
+            double_delta,
+            Some(ivarint_len(min) + 1 + (n * width).div_ceil(8)),
+        ],
+    })
+}
+
+impl I64Stats {
+    /// The smallest applicable candidate and its length, the earlier one on a
+    /// tie.
+    fn smallest(&self) -> Option<(Enc, u64)> {
+        let mut best: Option<(Enc, u64)> = None;
+        for (enc, size) in SIX.iter().zip(self.sizes) {
+            if let Some(s) = size
+                && best.is_none_or(|(_, b)| s < b)
+            {
+                best = Some((*enc, s));
+            }
+        }
+        best
+    }
+}
+
+/// The GCD i64 plan for a page with these stats, when the candidate applies:
+/// the quotients, their own stats, and the tag 10 page's exact length.
+fn gcd_plan(values: &[i64], stats: &I64Stats) -> Option<(Vec<i64>, I64Stats, Enc, u64)> {
+    if stats.gcd < 2 {
+        return None;
+    }
+    let g = stats.gcd;
+    let base = stats.min as u64;
+    // A quotient is at most u64::MAX / 2, so it always fits i64.
+    let quotients: Vec<i64> = values
+        .iter()
+        .map(|&v| ((v as u64).wrapping_sub(base) / g) as i64)
+        .collect();
+    let inner = i64_stats(&quotients, false)?;
+    let (inner_enc, inner_len) = inner.smallest()?;
+    let len = uvarint_len(g) + ivarint_len(stats.min) + 1 + inner_len;
+    Some((quotients, inner, inner_enc, len))
+}
+
+/// Exact encoded length of every candidate [`i64_candidates`] returns for
+/// `values`, in the same order, computed without encoding any of them.
+pub fn i64_raw_sizes(values: &[i64]) -> Vec<(Enc, u64)> {
+    let Some(stats) = i64_stats(values, true) else {
+        return vec![(Enc::Plain, 0)];
+    };
+    let mut out: Vec<(Enc, u64)> = SIX
+        .iter()
+        .zip(stats.sizes)
+        .filter_map(|(enc, size)| size.map(|s| (*enc, s)))
+        .collect();
+    if let Some((_, _, _, len)) = gcd_plan(values, &stats) {
+        out.push((Enc::GcdI64, len));
+    }
+    out
+}
+
+/// Encodes one of the [`SIX`] candidates, `None` when it does not apply.
+fn encode_six(enc: Enc, values: &[i64], min: i64, max: i64) -> Option<Vec<u8>> {
+    match enc {
+        Enc::Constant => {
+            let mut b = Vec::new();
+            put_ivarint(&mut b, min);
+            Some(b)
+        }
+        Enc::Rle => Some(enc_rle_i64(values)),
+        Enc::Plain => Some(enc_plain_i64(values)),
+        Enc::DeltaZigzag => enc_delta_i64(values),
+        Enc::DoubleDelta => enc_double_delta_i64(values),
+        Enc::ForBitpack => Some(enc_for_i64(values, min, max)),
+        _ => None,
+    }
+}
+
+/// The `Estimated` choice for an i64 page (ADR-3492 decision 1): the candidate
+/// of [`i64_candidates`] with the smallest encoded length, the earlier one on
+/// a tie, found from the page's statistics and encoded alone. Its bytes are
+/// that candidate's bytes in [`i64_candidates`].
+pub fn i64_estimated(values: &[i64]) -> (Enc, Vec<u8>) {
+    let fallback = || (Enc::Plain, enc_plain_i64(values));
+    let Some(stats) = i64_stats(values, true) else {
+        return fallback();
+    };
+    let Some((enc, len)) = stats.smallest() else {
+        return fallback();
+    };
+    if let Some((quotients, inner, inner_enc, gcd_len)) = gcd_plan(values, &stats)
+        && gcd_len < len
+    {
+        let Some(body) = encode_six(inner_enc, &quotients, inner.min, inner.max) else {
+            return fallback();
+        };
+        let mut out = Vec::with_capacity(body.len() + 21);
+        put_uvarint(&mut out, stats.gcd);
+        put_ivarint(&mut out, stats.min);
+        out.push(inner_enc.to_u8());
+        out.extend_from_slice(&body);
+        return (Enc::GcdI64, out);
+    }
+    match encode_six(enc, values, stats.min, stats.max) {
+        Some(b) => (enc, b),
+        None => fallback(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Column reference (tag 11)
 // ---------------------------------------------------------------------------
 
@@ -422,6 +616,77 @@ pub fn shape_candidates(shape: &StrShape<'_>) -> Vec<(Enc, Vec<u8>)> {
     let dict = enc_dict_strings(&shape.sorted, &shape.ids);
     let plain = enc_plain_strings(shape.ids.iter().map(|&i| shape.sorted[i as usize]));
     ordered_string_candidates(shape.sorted.len(), shape.ids.len(), dict, plain)
+}
+
+/// The `Estimated` choice for a string page (ADR-3492 decision 1): the
+/// [`StrShape`] of `values` when the dictionary heuristic ranks the dictionary
+/// candidate first, `None` when it ranks plain first. Distinct values are
+/// found with a hash map that gives up once they pass half the page, and only
+/// the distinct values are sorted, so the shape equals [`string_shape`].
+pub fn string_shape_if_dict<'a>(values: &[&'a [u8]]) -> Option<StrShape<'a>> {
+    let limit = values.len() / 2;
+    let mut index: HashMap<&[u8], u32> = HashMap::new();
+    let mut first_seen: Vec<&'a [u8]> = Vec::new();
+    let mut seen_ids: Vec<u32> = Vec::with_capacity(values.len());
+    for &v in values {
+        let next = first_seen.len() as u32;
+        let id = *index.entry(v).or_insert_with(|| {
+            first_seen.push(v);
+            next
+        });
+        if first_seen.len() > limit {
+            return None;
+        }
+        seen_ids.push(id);
+    }
+    if !dict_is_worth_it(first_seen.len(), values.len()) {
+        return None;
+    }
+    let mut order: Vec<u32> = (0..first_seen.len() as u32).collect();
+    order.sort_unstable_by(|&a, &b| first_seen[a as usize].cmp(first_seen[b as usize]));
+    let mut rank = vec![0u64; first_seen.len()];
+    for (pos, &id) in order.iter().enumerate() {
+        rank[id as usize] = pos as u64;
+    }
+    Some(StrShape {
+        sorted: order.iter().map(|&id| first_seen[id as usize]).collect(),
+        ids: seen_ids.iter().map(|&id| rank[id as usize]).collect(),
+    })
+}
+
+/// [`string_shape_if_dict`] for a column already in dictionary shape, as
+/// [`string_dict_shape`] reads it.
+pub fn string_dict_shape_if_dict<'a>(
+    dict: &[&'a [u8]],
+    present_ids: &[u32],
+) -> Option<StrShape<'a>> {
+    let limit = present_ids.len() / 2;
+    let mut referenced = vec![false; dict.len()];
+    let mut distinct: HashSet<&[u8]> = HashSet::new();
+    for &id in present_ids {
+        let i = id as usize;
+        if !referenced[i] {
+            referenced[i] = true;
+            distinct.insert(dict[i]);
+            if distinct.len() > limit {
+                return None;
+            }
+        }
+    }
+    if !dict_is_worth_it(distinct.len(), present_ids.len()) {
+        return None;
+    }
+    Some(string_dict_shape(dict, present_ids))
+}
+
+/// The dictionary candidate's bytes for a page of `shape`.
+pub fn dict_strings_page(shape: &StrShape<'_>) -> Vec<u8> {
+    enc_dict_strings(&shape.sorted, &shape.ids)
+}
+
+/// The plain candidate's bytes for a page of `values`, in row order.
+pub fn plain_strings_page<'a>(values: impl Iterator<Item = &'a [u8]> + Clone) -> Vec<u8> {
+    enc_plain_strings(values)
 }
 
 /// Both string candidates for one page, dictionary and plain. The one

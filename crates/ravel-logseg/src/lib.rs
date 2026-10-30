@@ -72,6 +72,7 @@ pub use record::{
     attr_value_fits_storage, stream_attrs_bytes,
 };
 pub use source::{ByteSource, SparseObject};
+pub use block::PageChoice;
 pub use writer::{BloomScope, ObjectIdentity, RlogConfig, RlogWriter};
 
 // Re-exported for callers building records; these are the ravel-types identity

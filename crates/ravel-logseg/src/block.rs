@@ -28,7 +28,8 @@ use crate::record::{
 };
 use crate::rlog_codec::{
     StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64_into, encode_column_ref,
-    i64_candidates, shape_candidates, string_dict_shape, string_shape,
+    dict_strings_page, i64_candidates, i64_estimated, plain_strings_page, shape_candidates,
+    string_dict_shape, string_dict_shape_if_dict, string_shape, string_shape_if_dict,
 };
 use crate::varint::get_uvarint;
 
@@ -162,6 +163,24 @@ pub struct BlockStrValues {
     pub sorted: Vec<Vec<u8>>,
     /// Per present value in row order, its index into `sorted`.
     pub ids: Vec<u32>,
+    /// The block chose a plain page under [`PageChoice::Estimated`]: `sorted`
+    /// and `ids` are empty and the column keeps its per-block pages for the
+    /// whole row group.
+    pub plain: bool,
+}
+
+/// How a block picks each i64 and string page's encoding (ADR-3492 decision
+/// 1). Readers decode either output the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PageChoice {
+    /// Seal every candidate and keep the one with the fewest stored bytes.
+    #[default]
+    Exhaustive,
+    /// Seal one candidate: for i64 pages, the smallest by encoded length,
+    /// computed from one pass of statistics; for string pages, the one the
+    /// dictionary heuristic ranks first. The row group dictionary decision
+    /// skips a string column any of whose blocks chose plain.
+    Estimated,
 }
 
 /// One page staged for a column, already through the compression envelope.
@@ -175,14 +194,16 @@ struct Stager {
     pages: Vec<StagedPage>,
     str_values: Vec<BlockStrValues>,
     zstd_level: i32,
+    choice: PageChoice,
 }
 
 impl Stager {
-    fn new(zstd_level: i32) -> Self {
+    fn new(zstd_level: i32, choice: PageChoice) -> Self {
         Stager {
             pages: Vec::new(),
             str_values: Vec::new(),
             zstd_level,
+            choice,
         }
     }
 
@@ -216,11 +237,17 @@ impl Stager {
         self.column(column_id, present, |level| seal_page(enc, bytes, level));
     }
 
-    /// An i64 value page: the candidate with the smallest stored size.
+    /// An i64 value page, picked as [`PageChoice`] says.
     fn i64(&mut self, column_id: u32, present: &[bool], values: &[i64]) {
-        self.column(column_id, present, |level| {
-            stored_winner(i64_candidates(values), level)
-        });
+        match self.choice {
+            PageChoice::Exhaustive => self.column(column_id, present, |level| {
+                stored_winner(i64_candidates(values), level)
+            }),
+            PageChoice::Estimated => self.column(column_id, present, |level| {
+                let (enc, bytes) = i64_estimated(values);
+                seal_page(enc, bytes, level)
+            }),
+        }
     }
 
     /// `observed_ts`: a reference to `ts` when the two are equal row for row
@@ -239,13 +266,38 @@ impl Stager {
         }
     }
 
-    /// A string value page: dictionary or plain, whichever stores smaller.
+    /// A string value page, picked as [`PageChoice`] says.
     fn strings(&mut self, column_id: u32, present: &[bool], values: &[&[u8]]) {
-        self.string_shape(column_id, present, string_shape(values));
+        match self.choice {
+            PageChoice::Exhaustive => {
+                self.string_shape(column_id, present, string_shape(values));
+            }
+            PageChoice::Estimated => match string_shape_if_dict(values) {
+                Some(shape) => self.estimated_dict(column_id, present, shape),
+                None => self.estimated_plain(column_id, present, values.iter().copied()),
+            },
+        }
     }
 
-    /// A string value page from values already reduced to `shape`, recorded
-    /// for the row group dictionary decision too.
+    /// [`Stager::strings`] for a column already in dictionary shape.
+    fn dict_strings(&mut self, column_id: u32, present: &[bool], dict: &[&[u8]], ids: &[u32]) {
+        match self.choice {
+            PageChoice::Exhaustive => {
+                self.string_shape(column_id, present, string_dict_shape(dict, ids));
+            }
+            PageChoice::Estimated => match string_dict_shape_if_dict(dict, ids) {
+                Some(shape) => self.estimated_dict(column_id, present, shape),
+                None => {
+                    let values = ids.iter().map(|&id| dict[id as usize]);
+                    self.estimated_plain(column_id, present, values);
+                }
+            },
+        }
+    }
+
+    /// A string value page from values already reduced to `shape`: the
+    /// candidate with the smallest stored size, recorded for the row group
+    /// dictionary decision too.
     fn string_shape(&mut self, column_id: u32, present: &[bool], shape: StrShape<'_>) {
         if !present.iter().any(|&p| p) {
             return;
@@ -253,10 +305,48 @@ impl Stager {
         self.column(column_id, present, |level| {
             stored_winner(shape_candidates(&shape), level)
         });
+        self.push_str_values(column_id, &shape);
+    }
+
+    /// An `Estimated` dictionary page, recorded for the row group dictionary
+    /// decision too.
+    fn estimated_dict(&mut self, column_id: u32, present: &[bool], shape: StrShape<'_>) {
+        if !present.iter().any(|&p| p) {
+            return;
+        }
+        self.column(column_id, present, |level| {
+            seal_page(Enc::Dict, dict_strings_page(&shape), level)
+        });
+        self.push_str_values(column_id, &shape);
+    }
+
+    /// An `Estimated` plain page. The row group dictionary decision is told
+    /// only that this block chose plain.
+    fn estimated_plain<'a>(
+        &mut self,
+        column_id: u32,
+        present: &[bool],
+        values: impl Iterator<Item = &'a [u8]> + Clone,
+    ) {
+        if !present.iter().any(|&p| p) {
+            return;
+        }
+        self.column(column_id, present, |level| {
+            seal_page(Enc::Plain, plain_strings_page(values), level)
+        });
+        self.str_values.push(BlockStrValues {
+            column_id,
+            plain: true,
+            ..BlockStrValues::default()
+        });
+    }
+
+    fn push_str_values(&mut self, column_id: u32, shape: &StrShape<'_>) {
         self.str_values.push(BlockStrValues {
             column_id,
             sorted: shape.sorted.iter().map(|v| v.to_vec()).collect(),
             ids: shape.ids.iter().map(|&i| i as u32).collect(),
+            plain: false,
         });
     }
 
@@ -407,11 +497,21 @@ pub fn write_block(
     plans: &[ColumnPlan],
     zstd_level: i32,
 ) -> Result<BlockWriteOut, LogSegError> {
+    write_block_with(rows, plans, zstd_level, PageChoice::Exhaustive)
+}
+
+/// [`write_block`] with each i64 and string page picked as `choice` says.
+pub fn write_block_with(
+    rows: &[ResolvedRow],
+    plans: &[ColumnPlan],
+    zstd_level: i32,
+    choice: PageChoice,
+) -> Result<BlockWriteOut, LogSegError> {
     if rows.is_empty() {
         return Err(LogSegError::Corrupted("empty block".into()));
     }
     let n = rows.len();
-    let mut pages = Stager::new(zstd_level);
+    let mut pages = Stager::new(zstd_level, choice);
     let mut stats: Vec<NumStat> = Vec::new();
 
     // Fixed always-present integer columns.
@@ -642,11 +742,21 @@ pub fn write_block_columnar(
     input: &ColumnarBlockInput<'_>,
     zstd_level: i32,
 ) -> Result<BlockWriteOut, LogSegError> {
+    write_block_columnar_with(input, zstd_level, PageChoice::Exhaustive)
+}
+
+/// [`write_block_columnar`] with each i64 and string page picked as `choice`
+/// says. Byte-identical to [`write_block_with`] over the same rows and choice.
+pub fn write_block_columnar_with(
+    input: &ColumnarBlockInput<'_>,
+    zstd_level: i32,
+    choice: PageChoice,
+) -> Result<BlockWriteOut, LogSegError> {
     let n = input.n;
     if n == 0 {
         return Err(LogSegError::Corrupted("empty block".into()));
     }
-    let mut pages = Stager::new(zstd_level);
+    let mut pages = Stager::new(zstd_level, choice);
     let mut stats: Vec<NumStat> = Vec::new();
 
     // Fixed always-present integer columns.
@@ -741,7 +851,7 @@ pub fn write_block_columnar(
                     let dpresent: Vec<bool> = dp.ids.iter().map(Option::is_some).collect();
                     let present_ids: Vec<u32> = dp.ids.iter().filter_map(|x| *x).collect();
                     let dref: Vec<&[u8]> = dp.dict.iter().map(Vec::as_slice).collect();
-                    pages.string_shape(cid, &dpresent, string_dict_shape(&dref, &present_ids));
+                    pages.dict_strings(cid, &dpresent, &dref, &present_ids);
                 } else {
                     let vv: Vec<&[u8]> = vals
                         .iter()
