@@ -16,8 +16,8 @@ use ravel_logseg::{MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use super::{
-    BODY_KEY, LogNormalizeOutput, MAX_ATTRIBUTE_NESTING_DEPTH, NormalizedBody,
-    NormalizedLogRecord, apply_ipcrypt_attr, attr_value_len, canonical_json, checked_record_ts,
+    BODY_KEY, LogNormalizeOutput, MAX_ATTRIBUTE_NESTING_DEPTH, NormalizedBody, NormalizedLogRecord,
+    apply_ipcrypt_attr, attr_value_len, canonical_json, checked_record_ts,
     has_container_past_entry_cap, to_i64_ns, too_deeply_nested,
 };
 use crate::label_projection::{
@@ -725,7 +725,12 @@ mod tests {
     /// Every field of the output, floats by bit pattern.
     fn comparable(
         out: &LogNormalizeOutput,
-    ) -> (Vec<ComparableRecord>, Vec<LogRejection>, usize, IpcryptTally) {
+    ) -> (
+        Vec<ComparableRecord>,
+        Vec<LogRejection>,
+        usize,
+        IpcryptTally,
+    ) {
         let records = out
             .records
             .iter()

@@ -65,7 +65,9 @@ pub struct LogIngestLimits {
     /// Upper bound on the attribute bytes normalization would build for one
     /// request (ADR-2708 D2), projected by
     /// [`crate::project_log_resolved_label_bytes`] before any record is
-    /// built: every record carries its own copy of its resource and scope
+    /// built, or by [`crate::logs_normalize::normalize_logs`] during its one
+    /// pass, which builds nothing more once the sum passes this limit: every
+    /// record carries its own copy of its resource and scope
     /// attributes, so this grows with records times stream attributes, which
     /// no per-record limit bounds. A request whose projection exceeds it is
     /// rejected whole. Default 256 MiB.

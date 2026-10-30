@@ -117,9 +117,7 @@ fn allocations(entry: Entry, records: usize) -> (usize, usize) {
     let projected = project_log_resolved_label_bytes(&req, &limits, &rules);
     let region = Region::new(&INSTRUMENTED_SYSTEM);
     let out = match entry {
-        Entry::Projected => {
-            normalize_logs_projected(req, &limits, &rules, INGEST_TS_NS, projected)
-        }
+        Entry::Projected => normalize_logs_projected(req, &limits, &rules, INGEST_TS_NS, projected),
         Entry::Plain => normalize_logs(req, &limits, &rules, INGEST_TS_NS),
     };
     let change = region.change();

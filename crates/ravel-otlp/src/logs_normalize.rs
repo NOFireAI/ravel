@@ -479,6 +479,8 @@ impl LogWalk<'_> {
     }
 }
 
+type RecordOutcome = Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogRejection>;
+
 /// Normalize one record, moving its strings out. `Err` drops the whole
 /// record; `Ok`'s second element carries per-attribute rejections for
 /// attributes dropped from an otherwise admitted record, and its third says
@@ -500,10 +502,7 @@ fn normalize_record(
     ingest_ts_ns: i64,
     tally: &mut IpcryptTally,
     projecting: bool,
-) -> (
-    Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogRejection>,
-    usize,
-) {
+) -> (RecordOutcome, usize) {
     if record.attributes.len() > limits.max_attributes_per_record {
         return (
             Err(LogRejection::TooManyAttributes {
@@ -528,9 +527,8 @@ fn normalize_record(
     } = record;
     let unbuilt = |attributes: &[KeyValue], reason: LogRejection| {
         let charge = if projecting {
-            stream_encoded.saturating_add(crate::label_projection::log_attrs_bytes(
-                attributes, rules,
-            ))
+            stream_encoded
+                .saturating_add(crate::label_projection::log_attrs_bytes(attributes, rules))
         } else {
             0
         };
@@ -984,7 +982,10 @@ fn convert_attrs(
     rules: &TenantRules,
     tally: &mut IpcryptTally,
     projecting: bool,
-) -> (Result<Vec<(String, AttrValue)>, LogRejection>, AttrSetCharges) {
+) -> (
+    Result<Vec<(String, AttrValue)>, LogRejection>,
+    AttrSetCharges,
+) {
     let mut charges = AttrSetCharges {
         stored: 0,
         encoded: crate::label_projection::encoded_count_len(attributes.len()),
@@ -1235,8 +1236,7 @@ fn convert_variant(
                 .values
                 .into_iter()
                 .map(|kv| {
-                    convert_value(key, kv.value, depth + 1)
-                        .map(|v| (exact_capacity(kv.key), v))
+                    convert_value(key, kv.value, depth + 1).map(|v| (exact_capacity(kv.key), v))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             entries.shrink_to_fit();
