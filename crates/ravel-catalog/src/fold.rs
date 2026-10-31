@@ -20,6 +20,7 @@ use futures::stream::{self, StreamExt};
 use ravel_codec::key_idx::{KeyIdxFieldEntries, KeyType, decode_key_idx};
 use ravel_commit::keys::{self, BucketEntry, KeyError};
 use ravel_commit::signal;
+use ravel_memory::Reservation;
 use ravel_object_store::{
     GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum,
     Version, list_all,
@@ -504,6 +505,11 @@ type ShardListing = (u32, String, Vec<String>);
 /// One `(shard, hour)` bucket's discovered keys during the parallel bucket
 /// discovery: `(shard, hour, keys)` (ADR-0063 section 3).
 type BucketListing = (u32, u32, Vec<ObjectMeta>);
+
+/// A decoded snapshot part's entries and the reservation that charges their
+/// decoded body to the catalog's memory budget, held together until the
+/// entries drop.
+pub(crate) type ChargedEntries = (Vec<SnapshotEntry>, Reservation);
 
 fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
     (
@@ -1901,7 +1907,7 @@ impl Catalog {
             // `held_open_probe_cache` holds the parts the held-open pre-check
             // already read, keyed by part object key, so the main load below
             // reads each part once per fold. Empty on every other path.
-            let mut held_open_probe_cache: HashMap<String, Vec<SnapshotEntry>> = HashMap::new();
+            let mut held_open_probe_cache: HashMap<String, ChargedEntries> = HashMap::new();
             let (watermark_hour, held_listings) = match (advance_to, held_open, &head_state) {
                 (Some(target), _, _) => (target, None),
                 (None, Some(held), HeadState::Valid { head, .. }) => {
@@ -1939,23 +1945,56 @@ impl Catalog {
                 }
             };
 
-            let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
-                HeadState::Valid { head, .. } => match self
-                    .load_previous_entries(head, &held_open_probe_cache, &mut counters)
-                    .await
-                {
-                    Ok(entries) => {
-                        let buckets =
-                            incremental_buckets(&generations, head.watermark_hour, watermark_hour);
-                        let previous_entries_len = entries.len();
-                        (entries, buckets, false, previous_entries_len)
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            tenant = %tenant.to_hex(),
-                            "previous snapshot part unreadable, rebuilding from commit layout"
-                        );
+            // `_previous_charge` holds the previous parts' decode
+            // reservations for the rest of this attempt, as long as `entries`
+            // holds what they charge for.
+            let (mut entries, buckets, rebuilt, previous_entries_len, _previous_charge) =
+                match &head_state {
+                    HeadState::Valid { head, .. } => match self
+                        .load_previous_entries(head, &mut held_open_probe_cache, &mut counters)
+                        .await
+                    {
+                        Ok((entries, previous_charge)) => {
+                            let buckets = incremental_buckets(
+                                &generations,
+                                head.watermark_hour,
+                                watermark_hour,
+                            );
+                            let previous_entries_len = entries.len();
+                            (
+                                entries,
+                                buckets,
+                                false,
+                                previous_entries_len,
+                                previous_charge,
+                            )
+                        }
+                        // A refused decode reservation fails this fold tick; the
+                        // next tick retries. Rebuilding instead would fetch and
+                        // decode every commit record the HEAD covers, holding more
+                        // memory than the one part that was just refused.
+                        Err(CatalogError::MemoryExhausted(exhausted)) => {
+                            return Err(CatalogError::MemoryExhausted(exhausted));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                "previous snapshot part unreadable, rebuilding from commit layout"
+                            );
+                            let buckets = self
+                                .discover_buckets(
+                                    tenant,
+                                    signal,
+                                    &generations,
+                                    watermark_hour,
+                                    &mut counters,
+                                )
+                                .await?;
+                            (Vec::new(), buckets, true, 0, Vec::new())
+                        }
+                    },
+                    HeadState::Absent | HeadState::Corrupt { .. } => {
                         let buckets = self
                             .discover_buckets(
                                 tenant,
@@ -1965,32 +2004,19 @@ impl Catalog {
                                 &mut counters,
                             )
                             .await?;
-                        (Vec::new(), buckets, true, 0)
+                        (Vec::new(), buckets, true, 0, Vec::new())
                     }
-                },
-                HeadState::Absent | HeadState::Corrupt { .. } => {
-                    let buckets = self
-                        .discover_buckets(
-                            tenant,
-                            signal,
-                            &generations,
-                            watermark_hour,
-                            &mut counters,
-                        )
-                        .await?;
-                    (Vec::new(), buckets, true, 0)
-                }
-                // A newer-format HEAD is not rebuildable (ADR-0066 decision
-                // 2): rebuilding a single-part HEAD here would CAS-overwrite
-                // whatever the newer format carries. Fail loudly so the
-                // operator sees this process is too old for this HEAD, rather
-                // than falling into the `Corrupt`/`Absent` rebuild path.
-                HeadState::UnsupportedVersion { format_version, .. } => {
-                    return Err(CatalogError::UnsupportedHeadVersion {
-                        format_version: *format_version,
-                    });
-                }
-            };
+                    // A newer-format HEAD is not rebuildable (ADR-0066 decision
+                    // 2): rebuilding a single-part HEAD here would CAS-overwrite
+                    // whatever the newer format carries. Fail loudly so the
+                    // operator sees this process is too old for this HEAD, rather
+                    // than falling into the `Corrupt`/`Absent` rebuild path.
+                    HeadState::UnsupportedVersion { format_version, .. } => {
+                        return Err(CatalogError::UnsupportedHeadVersion {
+                            format_version: *format_version,
+                        });
+                    }
+                };
 
             // The old watermark the reconcile pass anchors its window to,
             // present ONLY for an incremental fold from a trusted HEAD. Absent
@@ -3234,36 +3260,49 @@ impl Catalog {
 
     /// Load and validate every part HEAD names, verifying each part's bytes
     /// against its recorded blake3 before trusting its entries. Any
-    /// failure (GET error, hash mismatch, decode error) is returned to the
-    /// caller, which falls back to a full rebuild.
+    /// failure (GET error, hash mismatch, decode error, refused decode
+    /// reservation) is returned to the caller, which fails the fold on a
+    /// refused reservation and falls back to a full rebuild on anything else.
+    ///
+    /// Returns the entries together with every part's decode reservation; the
+    /// caller holds the reservations for as long as it holds the entries.
     ///
     /// `probe_cache` holds the parts a held-open fold's
     /// `held_open_has_unfolded` pre-check already read, keyed by part object
-    /// key, so each part is read once per fold. Empty on every other path.
+    /// key, so each part is read once per fold. Each one used here is moved
+    /// out of it, reservation included. Empty on every other path.
     async fn load_previous_entries(
         &self,
         head: &SnapshotHead,
-        probe_cache: &HashMap<String, Vec<SnapshotEntry>>,
+        probe_cache: &mut HashMap<String, ChargedEntries>,
         counters: &mut RequestCounters,
-    ) -> Result<Vec<SnapshotEntry>, CatalogError> {
+    ) -> Result<(Vec<SnapshotEntry>, Vec<Reservation>), CatalogError> {
         let mut entries = Vec::new();
+        let mut reservations = Vec::with_capacity(head.parts.len());
         for part_ref in &head.parts {
-            if let Some(cached) = probe_cache.get(&part_ref.key) {
-                entries.extend(cached.iter().cloned());
-                continue;
-            }
-            entries.extend(self.load_part_entries(part_ref, counters).await?);
+            let (part_entries, reservation) = match probe_cache.remove(&part_ref.key) {
+                Some(cached) => cached,
+                None => self.load_part_entries(part_ref, counters).await?,
+            };
+            entries.extend(part_entries);
+            reservations.push(reservation);
         }
-        Ok(entries)
+        Ok((entries, reservations))
     }
 
     /// Load one part HEAD names, verifying its bytes against the recorded
     /// blake3 before decoding them.
+    ///
+    /// The decoded entry body is charged to the catalog's memory budget
+    /// before the decode (ADR-1170, the catalog decode charge amendment), the
+    /// same way the resolve path charges a part: the returned reservation
+    /// holds `entries_uncompressed_len` until the caller drops it. A refusal
+    /// is [`CatalogError::MemoryExhausted`].
     pub(crate) async fn load_part_entries(
         &self,
         part_ref: &SnapshotPartRef,
         counters: &mut RequestCounters,
-    ) -> Result<Vec<SnapshotEntry>, CatalogError> {
+    ) -> Result<ChargedEntries, CatalogError> {
         let got = self.store().get(&part_ref.key, GetRange::Full).await?;
         counters.get_requests += 1;
         let digest = blake3::hash(&got.data);
@@ -3275,8 +3314,14 @@ impl Catalog {
                 actual: digest.to_hex().to_string(),
             });
         }
-        let decoded = snapshot_format::decode_part(&got.data, &PartLimits::default())?;
-        Ok(decoded.entries)
+        let limits = PartLimits::default();
+        let header = snapshot_format::decode_part_header(&got.data)?;
+        let reservation = self.reserve_decoded(
+            header.entries_uncompressed_len,
+            limits.max_snapshot_part_bytes,
+        )?;
+        let decoded = snapshot_format::decode_part(&got.data, &limits)?;
+        Ok((decoded.entries, reservation))
     }
 
     /// Whether the held-open hours `held` (see [`held_open_hours`]) list a
@@ -3285,19 +3330,20 @@ impl Catalog {
     /// the parts whose hour range meets `held`, and none at all when the
     /// listings name no commit record. A part that cannot be read answers
     /// true, so the caller takes the full fold path, whose own load of the
-    /// same part fails and rebuilds.
+    /// same part fails and rebuilds, or fails the fold when the failure is a
+    /// refused decode reservation.
     ///
-    /// Also returns every part read here, keyed by part object key, so
-    /// `load_previous_entries` does not read it again this fold. A part that
-    /// fails here is not cached; the main load reads it again and rebuilds on
-    /// the same failure.
+    /// Also returns every part read here with its decode reservation, keyed
+    /// by part object key, so `load_previous_entries` does not read it again
+    /// this fold. A part that fails here is not cached; the main load reads it
+    /// again and answers the same failure the same way.
     async fn held_open_has_unfolded(
         &self,
         head: &SnapshotHead,
         held: (u32, u32),
         listings: &[BucketListing],
         counters: &mut RequestCounters,
-    ) -> (bool, HashMap<String, Vec<SnapshotEntry>>) {
+    ) -> (bool, HashMap<String, ChargedEntries>) {
         let names_a_commit = listings.iter().any(|(_, _, listing)| {
             listing.iter().any(|meta| {
                 matches!(
@@ -3310,21 +3356,22 @@ impl Catalog {
             return (false, HashMap::new());
         }
         let mut folded: HashSet<EntryIdentity> = HashSet::new();
-        let mut loaded: HashMap<String, Vec<SnapshotEntry>> = HashMap::new();
+        let mut loaded: HashMap<String, ChargedEntries> = HashMap::new();
         for part_ref in head
             .parts
             .iter()
             .filter(|part| part.min_hour <= held.1 && part.watermark_hour >= held.0)
         {
             match self.load_part_entries(part_ref, counters).await {
-                Ok(entries) => {
+                Ok(charged) => {
                     folded.extend(
-                        entries
+                        charged
+                            .0
                             .iter()
                             .filter(|entry| (held.0..=held.1).contains(&entry.ingest_hour_bucket))
                             .map(entry_identity),
                     );
-                    loaded.insert(part_ref.key.clone(), entries);
+                    loaded.insert(part_ref.key.clone(), charged);
                 }
                 Err(_) => return (true, loaded),
             }
