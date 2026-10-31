@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 7a1739b932054a19a89d1927a08cea46fa48012016ea751a02f54639d4d658be # shrinks to batches = [[(None, None), (Some(0), None), (None, None)]], two_keys = false, options = [(false, false), (false, false)], fetch = 1
 cc 2f3e205526253eb9e07468a2c187c6a12988a19d211484c5954cba5254eaa2a8 # shrinks to batches = [[(None, None), (None, None), (None, None), (None, None), (None, None), (Some(0), None), (Some(1), None)]], two_keys = false, options = [(true, true), (false, false)], fetch = 6
+cc 6ba63315466c6accd55660457053d3035ee9be357661f2844cebbc9edfb37d17 # shrinks to key_type = Float64, batches = [[(Some(0), None), (Some(0), None), (Some(0), None), (Some(2), None), (Some(0), None), (Some(0), None), (Some(11), None)]], two_keys = false, options = [(true, false), (false, false)], fetch = 1
+cc 648db55e5d925c7ba9516e38a5306beb424282a9e096106f57e12181396d9679 # shrinks to key_type = Float64, batches = [[(None, None), (None, None), (None, None), (None, None), (Some(0), None), (None, None), (None, None), (Some(11), Some(0))]], two_keys = true, options = [(false, true), (false, false)], fetch = 7
