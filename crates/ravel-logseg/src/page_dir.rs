@@ -174,11 +174,12 @@ impl std::fmt::Debug for PageDir {
 
 /// Per group, per column chunk, where each block's run of pages starts.
 ///
-/// Memory: one `(u32, u32)` per (column chunk, block) plus one more per chunk,
-/// that is `8 * (block_count + 1)` bytes for each chunk of a group, plus a
-/// `Vec` header per group and a page count and box per chunk. A chunk the
-/// index cannot describe (see [`ChunkRuns::build`]) keeps no runs and is
-/// scanned.
+/// Memory: one [`Run`] (12 bytes) per distinct block that has a page in a
+/// chunk, so never more entries than the chunk has pages, whatever the
+/// group's declared `block_count` (`index_tests::index_size_follows_the_pages_not_the_block_count`),
+/// plus a `Vec` header per group and a page count, end and box per chunk. A
+/// chunk the index cannot describe (see [`ChunkRuns::build`]) keeps no runs
+/// and is scanned.
 #[derive(Clone, Default)]
 struct BlockIndex {
     groups: Vec<GroupIndex>,
@@ -197,12 +198,24 @@ struct ChunkIndex {
     runs: Option<ChunkRuns>,
 }
 
-/// `starts[b]` is `(index of block b's first page, that page's offset relative
-/// to the chunk's offset)`; `starts[block_count]` is `(page count, chunk
-/// length)`, so block `b`'s pages are `starts[b].0..starts[b + 1].0`.
+/// One block's run of pages in a chunk: the block, the index of its first
+/// page, and that page's offset relative to the chunk's offset.
+#[derive(Clone, Copy)]
+struct Run {
+    block: u32,
+    first: u32,
+    rel: u32,
+}
+
+/// `runs` holds one [`Run`] per block with a page in the chunk, ascending by
+/// block; a block's pages end where the next run starts, or at `end`.
 #[derive(Clone)]
 struct ChunkRuns {
-    starts: Box<[(u32, u32)]>,
+    runs: Box<[Run]>,
+    /// Index of the first page after the dictionary page, if any.
+    lead: u32,
+    /// `(page count, chunk length)`.
+    end: (u32, u32),
 }
 
 impl ChunkRuns {
@@ -211,6 +224,10 @@ impl ChunkRuns {
     /// the group and the blocks non-decreasing. `None` for any other chunk,
     /// or one whose page count, length, or absolute end does not fit, and the
     /// lookups scan that chunk exactly as they did before the index.
+    ///
+    /// Nothing here is sized by `block_count`: `runs` grows by one entry per
+    /// page that starts a new block, so it holds at most the chunk's page
+    /// count.
     fn build(chunk: &ChunkEntry, block_count: u32) -> Option<Self> {
         let lead = usize::from(chunk.dict_page().is_some());
         let pages = chunk.pages.get(lead..)?;
@@ -219,28 +236,48 @@ impl ChunkRuns {
             total = total.checked_add(p.len)?;
         }
         chunk.offset.checked_add(total)?;
-        u32::try_from(total).ok()?;
-        u32::try_from(chunk.pages.len()).ok()?;
-        let mut starts = Vec::with_capacity(block_count as usize + 1);
-        let mut i = lead;
+        let total = u32::try_from(total).ok()?;
+        let count = u32::try_from(chunk.pages.len()).ok()?;
+        let mut runs: Vec<Run> = Vec::new();
         let mut rel = chunk.pages.get(..lead)?.iter().map(|p| p.len).sum::<u64>();
-        let mut prev = 0u32;
-        for p in pages {
-            if p.enc == Enc::DictPage || p.block >= block_count || p.block < prev {
+        for (i, p) in pages.iter().enumerate() {
+            if p.enc == Enc::DictPage || p.block >= block_count {
                 return None;
             }
-            prev = p.block;
-        }
-        for b in 0..=block_count {
-            starts.push((u32::try_from(i).ok()?, u32::try_from(rel).ok()?));
-            while let Some(p) = chunk.pages.get(i).filter(|p| p.block == b) {
-                rel += p.len;
-                i += 1;
+            match runs.last() {
+                Some(r) if p.block < r.block => return None,
+                Some(r) if p.block == r.block => {}
+                _ => runs.push(Run {
+                    block: p.block,
+                    first: u32::try_from(lead + i).ok()?,
+                    rel: u32::try_from(rel).ok()?,
+                }),
             }
+            rel += p.len;
         }
         Some(ChunkRuns {
-            starts: starts.into_boxed_slice(),
+            runs: runs.into_boxed_slice(),
+            lead: u32::try_from(lead).ok()?,
+            end: (count, total),
         })
+    }
+
+    /// Where block `within`'s run starts and ends, by binary search over the
+    /// runs: `(first, end, offset of first)`, an empty range at the position
+    /// the block's pages would take when it has none.
+    fn bounds(&self, within: u32) -> (u32, u32, u32) {
+        let k = self.runs.partition_point(|r| {
+            probe();
+            r.block < within
+        });
+        let next = |k: usize| self.runs.get(k).map_or(self.end, |r| (r.first, r.rel));
+        match self.runs.get(k) {
+            Some(r) if r.block == within => (r.first, next(k + 1).0, r.rel),
+            _ => {
+                let (at, rel) = next(k);
+                (at, at, rel)
+            }
+        }
     }
 
     /// Block `within`'s pages in `chunk`: `(first, end, offset of first
@@ -249,11 +286,9 @@ impl ChunkRuns {
     /// a run read from an index that no longer matches the chunk is `None`
     /// rather than a wrong slice; the caller then scans the chunk.
     fn run(&self, chunk: &ChunkEntry, within: u32) -> Option<(usize, usize, u64)> {
-        let b = within as usize;
-        let (s, rel) = *self.starts.get(b)?;
-        let (e, _) = *self.starts.get(b + 1)?;
+        let (s, e, rel) = self.bounds(within);
         let (s, e) = (s as usize, e as usize);
-        let lead = self.starts.first()?.0 as usize;
+        let lead = self.lead as usize;
         let run = chunk.pages.get(s..e)?;
         visit(run.len());
         if run
@@ -298,6 +333,18 @@ impl BlockIndex {
         }
     }
 
+    /// Run entries held across every chunk, the figure the index's memory
+    /// grows with.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.groups
+            .iter()
+            .flat_map(|g| &g.chunks)
+            .filter_map(|c| c.runs.as_ref())
+            .map(|r| r.runs.len())
+            .sum()
+    }
+
     /// The runs of chunk `ci` of group `gi`, when the index still describes
     /// `group` (same block count, chunk count, and the chunk's page count).
     fn runs(&self, gi: usize, group: &GroupEntry, ci: usize) -> Option<&ChunkRuns> {
@@ -324,6 +371,20 @@ fn visit(n: usize) {
 
 #[cfg(not(test))]
 fn visit(_: usize) {}
+
+#[cfg(test)]
+thread_local! {
+    /// Index entries a lookup's binary search compared, for the cost tests.
+    static RUNS_PROBED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn probe() {
+    RUNS_PROBED.with(|v| v.set(v.get() + 1));
+}
+
+#[cfg(not(test))]
+fn probe() {}
 
 /// Block `within`'s pages in `chunk` by walking every page of it, the lookup
 /// for a chunk [`BlockIndex`] does not describe. `None` when an offset
@@ -397,7 +458,9 @@ impl PageDir {
     ///
     /// This is on the scan's per-block path, so a chunk is sliced through
     /// [`BlockIndex`] to the block's run of pages rather than walked: the cost
-    /// is the pages returned plus at most two per chunk
+    /// is the pages returned plus at most two per chunk, and a binary search
+    /// of at most `floor(log2(runs)) + 2` index entries per chunk, `runs`
+    /// being the chunk's blocks that have pages
     /// (`index_tests::block_pages_visits_only_the_blocks_run`), and the result is
     /// the full scan's, page for page (`index_tests::index_matches_the_scan`).
     pub fn block_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
@@ -1824,8 +1887,24 @@ mod index_tests {
             .map(|c| c.pages.len() as u64)
             .sum();
         assert!(group_pages > 300, "group holds {group_pages} pages");
+        let probe_bound: u64 = dir.index.groups[0]
+            .chunks
+            .iter()
+            .filter_map(|c| c.runs.as_ref())
+            .map(|r| match r.runs.len() {
+                0 => 0,
+                n => u64::from(usize::BITS - n.leading_zeros()) + 1,
+            })
+            .sum();
+        // floor(log2(runs)) + 2 per chunk: 8 for each of the three chunks with
+        // 64 runs, 6 for 22 runs, 7 for 42 and for 32, 5 for 10, and 0 for
+        // the empty chunk.
+        assert_eq!(probe_bound, 8 * 3 + 6 + 7 + 5 + 7, "probe bound");
         for b in 0..64 {
+            RUNS_PROBED.with(|v| v.set(0));
             let (pages, cost) = visited(|| dir.block_pages(b).expect("block"));
+            let probes = RUNS_PROBED.with(|v| v.get());
+            assert!(probes <= probe_bound, "block {b}: probed {probes}");
             let bound = pages.len() as u64 + 2 * chunks;
             assert!(cost <= bound, "block {b}: visited {cost}, bound {bound}");
 
@@ -1861,10 +1940,10 @@ mod index_tests {
         };
         let plain = |b| entry(b, Enc::Plain, 5, b);
         // Block 1's second page sits after block 2's.
-        let dir = chunk(vec![plain(0), plain(1), plain(2), plain(1)]);
-        assert_eq!(dir.block_pages(1).expect("block 1").len(), 2);
+        let unordered = chunk(vec![plain(0), plain(1), plain(2), plain(1)]);
+        assert_eq!(unordered.block_pages(1).expect("block 1").len(), 2);
         // A page past the group, mid-chunk.
-        let dir = chunk(vec![plain(0), plain(7), plain(1), plain(2)]);
+        let past = chunk(vec![plain(0), plain(7), plain(1), plain(2)]);
         // A dictionary page that is not the first.
         let late = chunk(vec![
             plain(0),
@@ -1876,7 +1955,7 @@ mod index_tests {
         let mut over = chunk(vec![plain(0), plain(1), plain(2)]);
         over.groups[0].chunks[0].offset = u64::MAX - 12;
         over.reindex();
-        for d in [&dir, &late, &over] {
+        for d in [&unordered, &past, &late, &over] {
             for b in 0..4 {
                 assert_eq!(d.block_pages(b), scan_block_pages(d, b), "block {b}");
                 assert_eq!(d.block_dict_pages(b), scan_block_dict_pages(d, b));
@@ -1887,6 +1966,61 @@ mod index_tests {
             ));
         }
         assert_eq!(over.block_pages(0), None);
+    }
+
+    /// A group declaring `MAX_BLOCKS` blocks with `chunks` chunks of one page
+    /// each, encoded without building an index.
+    fn huge_group_bytes(chunks: u32) -> (Vec<GroupEntry>, Vec<u8>) {
+        let groups = vec![GroupEntry {
+            first_block: 0,
+            block_count: u32::try_from(MAX_BLOCKS).expect("MAX_BLOCKS fits u32"),
+            chunks: (0..chunks)
+                .map(|c| ChunkEntry {
+                    column_id: c,
+                    offset: u64::from(c) * 5,
+                    pages: vec![entry(0, Enc::Plain, 5, c)],
+                })
+                .collect(),
+        }];
+        let bytes = PageDir {
+            groups: groups.clone(),
+            index: BlockIndex::default(),
+        }
+        .encode();
+        (groups, bytes)
+    }
+
+    /// A PAGE_DIR declaring `MAX_BLOCKS` blocks in a group with one page
+    /// decodes to the same directory as before the index, and the index holds
+    /// one entry for that page, not one per declared block.
+    #[test]
+    fn index_size_follows_the_pages_not_the_block_count() {
+        let (groups, bytes) = huge_group_bytes(1);
+        assert!(bytes.len() < 32, "section is {} bytes", bytes.len());
+        let dir = PageDir::decode(&bytes).expect("decode admits it");
+        assert_eq!(dir.groups, groups);
+        assert_eq!(dir.index.entries(), 1);
+        let last = u32::try_from(MAX_BLOCKS - 1).expect("fits");
+        for b in [0, 1, last / 2, last] {
+            assert_eq!(dir.block_pages(b), scan_block_pages(&dir, b), "block {b}");
+            assert_eq!(dir.block_dict_pages(b), scan_block_dict_pages(&dir, b));
+        }
+    }
+
+    /// The same with many one-page chunks: the index holds one entry per page
+    /// (`pages + chunks` is the bound; this shape meets `pages`).
+    #[test]
+    fn index_size_follows_the_pages_across_many_chunks() {
+        let (groups, bytes) = huge_group_bytes(4096);
+        let dir = PageDir::decode(&bytes).expect("decode admits it");
+        assert_eq!(dir.groups, groups);
+        let pages: usize = dir.groups[0].chunks.iter().map(|c| c.pages.len()).sum();
+        assert_eq!(pages, 4096);
+        assert_eq!(dir.index.entries(), pages);
+        assert!(dir.index.entries() <= pages + dir.groups[0].chunks.len());
+        for b in [0, 1, 2] {
+            assert_eq!(dir.block_pages(b), scan_block_pages(&dir, b), "block {b}");
+        }
     }
 
     /// An index left behind by an edit that changes a group's or chunk's shape
