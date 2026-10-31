@@ -1076,6 +1076,50 @@ because it exceeds its object-store request budget.
 the rule with its expression, threshold and state-by-state behaviour, the
 arithmetic behind the 4800, and the two limits on what the gauge can see.
 
+### Catalog fold refused by the memory budget
+
+**Symptom.** `RavelCatalogFoldFailing` fires, and the fold logs this line at
+`warn` for one tenant on every tick:
+
+```text
+catalog fold failed; the index degrades to listing until a later fold succeeds
+  tenant=<hex> signal=<signal> error=catalog decode refused: memory exhausted:
+  requested <N> bytes, <R> of <L> byte limit already reserved
+```
+
+`RavelCatalogFoldStalled` can stay quiet while this happens. Its expression
+takes the freshest fold per signal, so the other tenants keep it under the
+threshold.
+
+**Cause.** A fold re-reads the tenant's previous snapshot parts and its
+previous postings object. Before it decodes each one, it reserves the
+object's declared decoded size against the process memory budget. It holds
+those reservations until the fold attempt ends. When the budget refuses one,
+that tenant's fold tick fails, the HEAD stays where it was, and the next tick
+tries again. The fold does not rebuild from the commit layout instead,
+because a rebuild reads more than the decode that was refused. Each part is
+at most 256 MiB, but the parts of one tenant are charged together.
+
+Two cases give the same line:
+
+- The budget was busy. Queries or other folds held most of it at that
+  moment. A later tick gets through, and the failures stop on their own.
+- The tenant's previous parts do not fit the budget at all. `<N>` plus the
+  share of `<R>` that the same fold already holds is more than `<L>`, every
+  tick, even when the process is idle. The tenant's fold never succeeds until
+  the budget grows.
+
+**Confirm.** Read `ravel_catalog_fold_failures_total` for the signal, and the
+log line above for the tenant. If the same tenant fails on consecutive ticks
+while query load is low, it is the second case.
+
+**Action.** For the second case, raise `--memory-budget-bytes` on the
+processes that fold that tenant, or give them more memory. The budget is
+derived from host or cgroup memory when the flag is not set (see
+[Process memory budget](configuration.md#process-memory-budget)). Until a
+fold succeeds, queries for the tenant still read its data through listing,
+and the unsealed span grows as it does for a stalled fold.
+
 ### Scrub cursor stuck
 
 **Symptom.** `ravel_scrub_cursor_position` stuck near 0 for longer than the
