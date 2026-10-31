@@ -212,8 +212,10 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_clock_lag_refused_total` | Flushes refused because the writer's flush-open clock reading lagged the object store's observed clock (the latest response `Date` the store adapter saw) by more than the five-minute clock-skew allowance. Strict waiters get the retryable 503 and the buffer goes back for the next trigger. Nothing is written. A rising figure means this host's clock runs behind the store's and, without the refusal, publishes into an ingest hour the fold can already have sealed: fix the host clock. See [the writer clock-lag alert](#the-writer-clock-lag-alert). |
 | `ravel_ingest_clock_lag_unchecked_total` | Flush-open attempts that found no store-clock observation yet, so the lag check did not run and the flush proceeded unchecked. Cumulative and never reset: the attempts a process makes before its first store response stay in the total, so the signal is a figure still growing past the process's first minute, which is a wiring defect against a store that reports a clock. A `MemoryStore`-backed process reports none, so there it grows by design. |
 | `ravel_ingest_clock_lag_bypassed_at_shutdown_total` | Flush-open attempts on a `Shutdown` or channel-close drain that found a lagging reading and went on with the lag check bypassed, rather than strand rows buffered mode had already acknowledged. It counts the bypass, not the publication: the monotonic floor still applies on those passes. Those rows can land in an ingest hour the fold has sealed, invisible to token-less reads until a catalog HEAD rebuild. Each bypass also logs at WARN naming the measured lag. A nonzero figure means a writer was shut down with a lagging clock: fix the host clock, and rebuild the HEAD if a token-less read is missing the rows. |
+| `ravel_ingest_flush_phase_seconds` | Logs flush latency histogram by `phase`, one observation per flush per phase it reached: `permit_wait` (flush share and `--max-inflight-flushes` permit), `resolve` (indexed-field and layout resolve), `encode` (the CPU-gate wait plus the RLOG encode; `ravel_cpu_gate_wait_seconds` gives the gate's share), `data_put` and `commit_publish` (retries included), `commit_build`, and `total` (spawn of the flush task to the end of its ack fan-out, on every exit). A failed step still records; the steps after it do not. See the ingest guide's [logs latency histograms](../ingest.md#logs-latency-histograms). |
+| `ravel_ingest_strict_ack_seconds` | Logs strict-write acknowledgement latency histogram by `phase`: `queued` (per strict waiter, from the shard actor taking its write to the spawn of its flush), `request` (per strict request, from submit to the last shard ack, or to the ack deadline), and `shard_skew` (per strict request that reached more than one shard, first shard ack to last). `request` is roughly `queued` plus the slowest shard's flush `total` plus routing. |
 
-Three families carry fewer signals. The missing samples are structurally
+Several families carry fewer signals. The missing samples are structurally
 absent, not zero:
 
 | Family | Series it carries | Reason |
@@ -222,6 +224,7 @@ absent, not zero:
 | `ravel_ingest_idempotency_lookup_failures_total` | Only `signal="logs"` and `signal="spans"`. | Metrics requests take no idempotency key. |
 | The two exemplar families | Only `signal="metrics"`. | Exemplars ride on metric points. |
 | `ravel_ingest_flushes_by_age_adaptive_total` | Only `signal="metrics"`. | The adaptive-delay corridor is a metrics-pipeline feature. |
+| `ravel_ingest_flush_phase_seconds`, `ravel_ingest_strict_ack_seconds` | Only `signal="logs"`, every phase from zero. | Only the logs pipeline records the phase histograms. |
 
 These families render for all three signals, so a logs-only or spans-only
 process still renders a real (possibly zero) sample for each:

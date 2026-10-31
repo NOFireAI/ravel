@@ -6153,7 +6153,7 @@ mod tests {
         rig.task.await.expect("actor ends");
 
         let mut buf = LogTenantBuf::default();
-        buf.waiters.push(oneshot::channel().0);
+        buf.push_waiter(oneshot::channel().0, 0);
         assert_eq!(
             HandBackRig::idle_actor(config).age_threshold_ns(&buf),
             (i64::MAX, FlushTrigger::Age)
