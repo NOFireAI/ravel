@@ -151,11 +151,17 @@ export interface ServeOptions {
   /** Cap on the doubling pauses after abandoned turns and failed polls. Default 30 s. */
   readonly maxBackoffMs?: number;
   /**
-   * The lease length the coordinator grants, its `lease_ms`; the wire does
-   * not carry it. A turn whose renewals have all failed for this long since
-   * the last grant the worker saw answered is aborted with `LeaseExpired`.
-   * Set it to the server's value; a longer one lets a turn run past its
-   * lease. Default 30 s, the server's default.
+   * The lease length the coordinator grants: the server's agents lease,
+   * `lease_ms` in its agents settings (`AgentsConfig::lease_ms`, 30 s). The
+   * wire does not carry it (#3568 tracks adding it, which retires this
+   * option). A turn whose renewals have all failed for this long since the
+   * last grant the worker saw answered is aborted with `LeaseExpired`, and a
+   * step it starts afterwards sends nothing. That abort lands before the
+   * server's grace lets another worker take the turn over only when this is
+   * no longer than the server's lease; a longer one lets a turn run past its
+   * lease. An integer from 1000 to 2147483647; any other value rejects
+   * {@link serveAgents} with {@link InvalidWorkerOption} before it sends
+   * anything. Default 30 s, the server's default.
    */
   readonly leaseMs?: number;
   /** Observes every turn the worker finishes or abandons. */
@@ -172,6 +178,32 @@ export interface ServeOptions {
    * what it threw.
    */
   readonly onError?: (error: unknown) => void;
+}
+
+/** The bounds of {@link ServeOptions.leaseMs}: one second, and the longest delay a timer takes. */
+export const MIN_LEASE_MS = 1_000;
+export const MAX_LEASE_MS = 2_147_483_647;
+
+/** A {@link ServeOptions} value the worker refuses to start with. */
+export class InvalidWorkerOption extends RangeError {
+  override readonly name = "InvalidWorkerOption";
+
+  constructor(
+    readonly option: string,
+    message: string,
+  ) {
+    super(`serveAgents: ${option} ${message}`);
+  }
+}
+
+function checkLeaseMs(leaseMs: number): number {
+  if (!Number.isInteger(leaseMs) || leaseMs < MIN_LEASE_MS || leaseMs > MAX_LEASE_MS) {
+    throw new InvalidWorkerOption(
+      "leaseMs",
+      `must be an integer from ${String(MIN_LEASE_MS)} to ${String(MAX_LEASE_MS)}, got ${String(leaseMs)}`,
+    );
+  }
+  return leaseMs;
 }
 
 export interface WorkerHandle {
@@ -192,9 +224,11 @@ const POLL_RETRY_MS = 50;
 /**
  * Poll `transport` for turns of `agents` and run each to a commit until
  * closed. Without `workerId` it registers first and polls under the id the
- * coordinator minted.
+ * coordinator minted. Rejects with {@link InvalidWorkerOption} before any
+ * request for an option out of range.
  */
 export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
+  const leaseMs = checkLeaseMs(options.leaseMs ?? DEFAULT_LEASE_MS);
   const agents = new Map(options.agents.map((a) => [a.name, a]));
   const handlers = options.agents.flatMap((agent) =>
     Object.keys(agent.messages).map((handler) => ({
@@ -208,7 +242,6 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
   const waitMs = Math.min(options.pollWaitMs ?? 20_000, 20_000);
   const abandonDelayMs = options.abandonDelayMs ?? 250;
   const maxBackoffMs = options.maxBackoffMs ?? 30_000;
-  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const abandonDelays = new OperationBackoffs(abandonDelayMs, maxBackoffMs);
   const pollRetryDelay = new Backoff(POLL_RETRY_MS, maxBackoffMs);
   const abandonPause = (report: Extract<TurnReport, { outcome: "abandoned" }>): number =>
