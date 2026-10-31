@@ -275,7 +275,8 @@ it after its revert, so admission stays CLOCK and the intent rule).
   callers (`crates/ravel-maintain/src/rlog.rs:2265`,
   `crates/ravel-logseg/src/ranged.rs:717`). A pinned test asserts the
   scan's charge for a block with one cached column and one fresh column.
-  Charged once means once on the process budget: the per-query and
+  Charged once means once on the process budget (narrowed for the values
+  array by the zero-copy values amendment below): the per-query and
   per-tenant ceilings do not count served columns (see the tenant-ceiling
   amendment below).
 - **The reservation travels with the bytes.** It is owned by the shared
@@ -1190,6 +1191,7 @@ serving pull request, built on main.)
 
 <!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|4. Entries are charged to the shared memory budget and give way to queries|5. Answers do not change|Alternatives considered|Amendment (2026-10-30): which cached string columns keep their validation" pointer="zero-copy values amendment" -->
 <!-- amendment-supersedes: phrase="or Arrow value populates an entry, and nothing after step 2 reads from one" pointer="zero-copy values amendment" -->
+<!-- amendment-supersedes: phrase="Charged once means once on the process budget" pointer="zero-copy values amendment" -->
 
 This is the separate amendment that the LIKE-deferred amendment's
 out-of-scope list asks for (option (e2), Arrow-ready string values kept
@@ -1213,8 +1215,9 @@ copies nothing. Step 4 then rebuilds the column as Arrow on every call.
 - **Dictionary pages.** `dict_values_array` (`batch.rs:778`) copies the
   whole dictionary text once per dictionary per scan. URL and SearchPhrase
   dictionaries are per block, so that is about one copy per block:
-  13,086 to 13,132 per timed call of the hit set H defined under
-  Measurement (measured 2026-10-31, abe2a B).
+  13,086 to 13,132 per timed call of the statements in H that read a
+  dictionary-page string column (H is defined under Measurement; the
+  `strDictValuesBuilt` row there lists them), measured 2026-10-31, abe2a B.
 - **Size.** `build_str_block` is 3.28 s of the 38.69 s hot sum, weighted
   by hot wall (measured 2026-10-30, prof028): 2.13 s in the plain
   SearchPhrase statements and 1.15 s in the dictionary-page statements.
@@ -1229,7 +1232,9 @@ This amendment makes six decisions.
    over the entry's own validated buffers.**
    - **Plain.** `PlainColumn` gains a memo slot,
      `OnceLock<Arc<dyn ValuesMemo>>`. `ValuesMemo` is a trait that
-     `ravel-logseg` defines and `ravel-sql` implements. It has two methods:
+     `ravel-logseg` defines and `ravel-sql` implements, with `Send + Sync`
+     as supertraits: the cache is shared across tasks, so `PlainColumn`
+     must stay `Send + Sync`. It has two methods:
      `held_outside(&self) -> bool`, true while any holder beyond the memo
      itself shares one of its buffers, and `as_any(&self) -> &dyn Any`,
      through which `ravel-sql` gets its own type back. `ravel-sql` fills the
@@ -1384,8 +1389,8 @@ its 5.295 GB entry set, a second time, and push q28, q34 and q35 from
 geomeans over 43 statements from `predict.out` (predicted). The hot-wall
 estimate assumes wall tracks CPU for statements at or above 0.3 s and
 gains half as much below that (inference).
-- The whole lever, both pull requests: 2.02 to 2.41 s; CPU geomean 0.922
-  to 0.936 on ClickBench's hit pattern, 0.928 to 0.941 on the `cpuab`
+- The whole lever, both pull requests: 2.02 to 2.41 s; CPU geomean 0.923
+  to 0.937 on ClickBench's hit pattern, 0.928 to 0.941 on the `cpuab`
   loop's; hot-wall geomean 0.932 to 0.944 and 0.937 to 0.948 on the same
   two bases (the whole-lever table below shows the arithmetic). The rule
   is judged on the `cpuab` basis, since that is what the paired run
@@ -1450,7 +1455,7 @@ pull request, except the q06 row, which does not gate.
 | CPU geomean, all 43 | 0.935 to 0.960 | above 0.975 | predicted 0.939 to 0.952, `cpuab` hit pattern |
 | Hot wall geomean, all 43 | 0.94 to 0.965 | above 0.98 | predicted 0.948 to 0.959, `cpuab` hit pattern; the band reaches past 0.95 |
 | Every other statement, hot wall | 0.95 to 1.05 | above 1.10 | predicted 1.00; a statement under 0.3 s whose server CPU B/A is within 1.03 is read as noise (q20 read 1.095 in abe1, measured 2026-10-31) |
-| `strDictValuesBuilt` per timed call, the statements of H that A builds about once per block (q13 to q19, q26, q32, q34, q35) | at most 1% of A | above 10% of A | predicted about 0; A is 13,086 to 13,132, measured 2026-10-31 |
+| `strDictValuesBuilt` per timed call, the statements of H that A builds about once per block (q13 to q15, q17 to q19, q26, q32, q34, q35; q16 reads no string column) | at most 1% of A | above 10% of A | predicted about 0; A is 13,086 to 13,132, measured 2026-10-31 |
 | `strCellsValidated` per timed call, H | equal to A per statement (0 on q13 to q19, q25 to q27, q32) | any other value | predicted: each memo builds once, on the call that admits its entry (this amendment's decision 6), which in the loop is the untimed warm call |
 | `strCellsValidated` per timed call, P | at least A, and B minus A at most the cells of the entries that call admits | under A, or above that bound | predicted: a missed block is admitted and its memo built on the same call, so it counts twice there, as on try 1 under the restart protocol |
 | Decoded-cache hits and misses per call | within 1% of A per statement | outside 2% | predicted: the memo changes no admission |
