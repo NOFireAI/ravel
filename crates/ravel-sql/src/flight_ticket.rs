@@ -4141,7 +4141,9 @@ mod tests {
             ("logs", Some(sample_logs_pushdown())),
             ("key-equals", Some(key_equals_pushdown())),
         ];
-        let expected: [(TicketSurface, bool, [Result<u8, FlightTicketError>; 4]); 4] = [
+        // The version written, or the refusal, for each pushdown above.
+        type Outcomes = [Result<u8, FlightTicketError>; 4];
+        let expected: [(TicketSurface, bool, Outcomes); 4] = [
             (Client, false, [Ok(8), Ok(9), Ok(9), Err(KeyEqualsOnClient)]),
             (
                 Client,
