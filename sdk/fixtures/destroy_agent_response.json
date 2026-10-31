@@ -1,0 +1,12 @@
+{
+  "agent_id": "19cd0e6876991314c1b6dbd8bd129297",
+  "incarnation": 1,
+  "destroyed": true,
+  "abandoned": {
+    "inputs": 2,
+    "active_turn": true,
+    "effects_in_doubt": 1,
+    "effects_authorized": 0,
+    "timers_scheduled": 1
+  }
+}

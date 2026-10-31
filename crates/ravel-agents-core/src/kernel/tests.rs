@@ -712,6 +712,83 @@ fn a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation() {
 }
 
 #[test]
+fn a_tombstone_changes_only_the_lifecycle_and_the_root_revision() {
+    // Two queued inputs (the second behind the active turn's), one effect
+    // authorized without a result, one in doubt and one scheduled timer.
+    let mut sim = Sim::started();
+    sim.run(&enqueue_cmd(sim.head(), "r2", b"p2"));
+    sim.run(&Command::ScheduleTimer(ScheduleTimer {
+        fence: inc_fence(sim.head()),
+        timer: TimerSpec {
+            timer_key: "remind".to_string(),
+            due_unix_ns: sim.now + 5 * SECOND,
+            handler: "h".to_string(),
+            payload: None,
+        },
+    }));
+    let Reply::IntentCommitted { effect_id: ping } = sim.run(&commit_intent_cmd(
+        sim.head(),
+        "ping",
+        RecoveryPolicy::AtLeastOnce,
+    )) else {
+        panic!("intent not committed");
+    };
+    let Reply::IntentCommitted { effect_id: charge } = sim.run(&commit_intent_cmd(
+        sim.head(),
+        "charge",
+        RecoveryPolicy::Manual,
+    )) else {
+        panic!("intent not committed");
+    };
+    let owner = Authority::Owner(owner_fence(sim.head()));
+    sim.run(&authorize_cmd(owner.clone(), ping, 1));
+    sim.run(&authorize_cmd(owner.clone(), charge, 1));
+    let Reply::Blocked(_) = sim.run(&authorize_cmd(owner, charge, 2)) else {
+        panic!("a second manual attempt must block");
+    };
+    let old = sim.head().clone();
+    let status = |id: Id128| {
+        old.effects
+            .iter()
+            .find(|e| e.effect_id == id)
+            .expect("effect")
+            .status
+    };
+    assert_eq!(status(ping), EffectStatus::Authorized);
+    assert_eq!(status(charge), EffectStatus::InDoubt);
+
+    let transition = sim
+        .step(&Command::Tombstone(Tombstone {
+            fence: inc_fence(&old),
+        }))
+        .expect("tombstone");
+    let Transition::Publish {
+        head,
+        effects,
+        reply,
+    } = transition
+    else {
+        panic!("the tombstone did not publish");
+    };
+    assert_eq!(reply, Reply::Tombstoned);
+    assert!(effects.is_empty(), "{effects:?}");
+    let mut expected = old.clone();
+    expected.lifecycle = Lifecycle::Tombstoned;
+    expected.root_revision = old.root_revision + 1;
+    assert_eq!(head, expected);
+    assert_eq!(
+        crate::wire::AbandonedCounts::from_head(&head, head.inbox_depth()),
+        crate::wire::AbandonedCounts {
+            inputs: 2,
+            active_turn: true,
+            effects_in_doubt: 1,
+            effects_authorized: 1,
+            timers_scheduled: 1,
+        }
+    );
+}
+
+#[test]
 fn logical_caps_and_the_byte_cap_are_typed() {
     let mut sim = Sim::with_limits(Limits {
         max_mailbox_depth: 1,
