@@ -988,6 +988,9 @@ async fn destroy_renders_the_response_and_needs_a_token() {
     assert!(stderr.contains("--token"), "{stderr}");
     assert!(missing.stdout.is_empty());
 
+    // A scripted server answering with the golden fixture stands in for
+    // ravel-server's destroy route; its own end-to-end test drives the real
+    // route.
     let seen: Seen = Arc::default();
     let app = Router::new()
         .route(
