@@ -1200,7 +1200,8 @@ copies nothing. Step 4 then rebuilds the column as Arrow on every call.
 - **Dictionary pages.** `dict_values_array` (`batch.rs:778`) copies the
   whole dictionary text once per dictionary per scan. URL and SearchPhrase
   dictionaries are per block, so that is about one copy per block:
-  13,086 to 13,132 per fully hit call (measured 2026-10-31, abe2a B).
+  13,086 to 13,132 per timed call of the hit set H defined under
+  Measurement (measured 2026-10-31, abe2a B).
 - **Size.** `build_str_block` is 3.28 s of the 38.69 s hot sum, weighted
   by hot wall (measured 2026-10-30, prof028): 2.13 s in the plain
   SearchPhrase statements and 1.15 s in the dictionary-page statements.
@@ -1214,9 +1215,20 @@ This amendment makes six decisions.
 1. **An entry's string column keeps one Arrow values array, zero-copy
    over the entry's own validated buffers.**
    - **Plain.** `PlainColumn` gains a memo slot,
-     `OnceLock<Arc<dyn Any + Send + Sync>>`, so `ravel-logseg` takes no
-     Arrow dependency. `ravel-sql` fills it with the block's `StringArray`
-     the first time step 4 takes the fast path below. Arrow `Utf8` takes
+     `OnceLock<Arc<dyn ValuesMemo>>`. `ValuesMemo` is a trait that
+     `ravel-logseg` defines and `ravel-sql` implements. It has two methods:
+     `held_outside(&self) -> bool`, true while any holder beyond the memo
+     itself shares one of its buffers, and `as_any(&self) -> &dyn Any`,
+     through which `ravel-sql` gets its own type back. `ravel-sql` fills the
+     slot with the block's `StringArray` the first time step 4 takes the
+     fast path below.
+     The pressure pass needs `held_outside` (this amendment's decision 5).
+     A bare `dyn Any` could not answer it: the counts live in Arrow's
+     `Buffer`, which `ravel-logseg` cannot name, and `bytes::Bytes` exposes
+     no count. `ravel-logseg` depends on no Arrow crate today
+     (`crates/ravel-logseg/Cargo.toml`), and the trait keeps it so: the
+     storage crate needs one yes or no from the memo, and an Arrow upgrade
+     then never touches the crate that reads the on-disk format. Arrow `Utf8` takes
      `i32` offsets and the column holds `u32`; up to `i32::MAX` the bits are
      the same.
    - **Dictionary.** `DictValues` gains the same slot, and
@@ -1234,7 +1246,7 @@ This amendment makes six decisions.
      The dictionary rows of the bands below assume per-block dictionaries.
      That is measured for the statements in the `strDictValuesBuilt` row,
      about one build per block, and assumed for q37 to q40 (inference).
-   - **Why decision 1's exclusion is narrowed, not dropped.** The array
+   - **Why ADR decision 1's exclusion is narrowed, not dropped.** The array
      covers the whole block, before survivors, and is a pure function of
      (object, block, column). The declared-column list decides only whether
      step 4 builds it, not what it holds. Narrowed and survivor-only values
@@ -1296,20 +1308,22 @@ This amendment makes six decisions.
      `cast/dictionary.rs:136`). Under an exception, `evict_for_pressure`
      counts an entry as held only while `Arc::strong_count(&slot.entry) > 1`
      (`decoded_cache.rs:361`). It would report those bytes as freed while
-     the host still holds them. Decision 4 forbids that false free, because
-     it would admit a reservation the host has no room for. The only bound
-     an exception could state is whatever downstream operators keep, which
-     no counter reports.
-     Moving the reservation keeps decision 4's sentence true as written.
-   - **The pressure pass reads the memo's buffers.** The cell's own count
-     does not move when a batch takes the array: a clone of the array, a
-     batch holding it, and the view cast each clone a `Buffer`, which
-     shares the `Bytes` and not its owner. `Buffer::strong_count`
-     (arrow-buffer 59.3.0, `buffer/immutable.rs:124`) does move. An entry
-     counts as held while its entry `Arc` is shared, as today, or while any
-     of its memo's buffers has a count above the memo's own reference. An
-     evicted entry whose buffers a batch still holds frees nothing until
-     that batch drops.
+     the host still holds them. ADR decision 4 forbids that false free,
+     because it would admit a reservation the host has no room for. The
+     only bound an exception could state is whatever downstream operators
+     keep, which no counter reports.
+     Moving the reservation keeps ADR decision 4's sentence true as written.
+   - **The pressure pass asks the memo.** The cell's own count does not
+     move when a batch takes the array: a clone of the array, a batch
+     holding it, and the view cast each clone a `Buffer`, which shares the
+     `Bytes` and not its owner. `Buffer::strong_count` (arrow-buffer
+     59.3.0, `buffer/immutable.rs:124`) does move. `ravel-sql`'s
+     `held_outside` returns true when any of the memo's buffers (values,
+     offsets, nulls) has a count above 1, the memo's own reference.
+     `evict_for_pressure` counts an entry as held while its entry `Arc` is
+     shared, as today, or while its column's memo, if filled, says
+     `held_outside`. An evicted entry whose buffers a batch still holds
+     frees nothing until that batch drops.
    - **The test moves with it.**
      `the_reservation_is_released_by_the_last_handle_not_by_eviction`
      (`decoded_cache.rs:870`) moves to the cell. It gains a case where an
@@ -1319,26 +1333,28 @@ This amendment makes six decisions.
      (`batch.rs:424`, `:568`). ADR-1170 pool accounting and the
      tenant-ceiling amendment do not move. Those bytes are then counted
      twice on the process budget while a scan holds the array: by the
-     entry and by the scan. This narrows decision 4's "a hit is charged
+     entry and by the scan. This narrows ADR decision 4's "a hit is charged
      once" for the values array only. It errs high, and the total is
      today's: today the scan holds a copy of the same size beside the
      entry.
 
 6. **Building the memo counts as validation.** `try_new` is UTF-8
    validation that the statement does, and `str_cells_validated` counts
-   validation work done by this statement (decision 5). A plain build adds
-   the block's rows, which are all present on the fast path. A dictionary
-   build adds the entries it validates. Each entry builds once, so a call
-   after the build counts 0, as a hit does today. Two things change from
-   the validation-state amendment's text, which now points here:
-   - a hit can count, once, when it is the first call to build the
-     entry's memo: a bulk scan's admitting call, or an entry admitted by a
-     scan whose block a filter narrowed;
-   - a cold try validates each admitted plain column twice, once in
-     `PlainColumn::validate_text` and once in `try_new`.
+   validation work done by this statement (ADR decision 5). A plain build
+   adds the block's rows, which are all present on the fast path. A
+   dictionary build adds the entries it validates. Each entry builds once.
+   The build normally lands on the call that admits the entry, the same
+   call whose step 4 first reads it, so later calls count 0, as a hit does
+   today. Two things change from the validation-state amendment's text,
+   which now points here:
+   - the admitting call validates each admitted plain column twice, once
+     in `PlainColumn::validate_text` and once in `try_new`;
+   - a hit can count, once, when the admitting call never built the memo:
+     a scan whose block a filter narrowed takes the loop, so the entry's
+     first unnarrowed hit builds it.
 
-   Not counting it would need decision 5 narrowed, and the counter would
-   then hide CPU the statement spends.
+   Not counting it would need ADR decision 5 narrowed, and the counter
+   would then hide CPU the statement spends.
 
 **Memory.** The memo shares the entry's buffers. Its own cost is the array
 struct and the `Buffer` and `Bytes` headers, about 200 to 500 B per entry
@@ -1356,7 +1372,11 @@ geomeans over 43 statements from `predict.out` (predicted). The hot-wall
 estimate assumes wall tracks CPU for statements at or above 0.3 s and
 gains half as much below that (inference).
 - The whole lever, both pull requests: 2.02 to 2.41 s; CPU geomean 0.922
-  to 0.936; hot-wall geomean 0.932 to 0.944, which meets the 0.95 rule.
+  to 0.936 on ClickBench's hit pattern, 0.928 to 0.941 on the `cpuab`
+  loop's; hot-wall geomean 0.932 to 0.944 and 0.937 to 0.948 on the same
+  two bases (the whole-lever table below shows the arithmetic). The rule
+  is judged on the `cpuab` basis, since that is what the paired run
+  measures. Its upper end, 0.948, meets the rule with little margin.
 - The first pull request alone: 1.71 to 2.10 s; CPU geomean 0.934 to
   0.948 on ClickBench's hit pattern, 0.939 to 0.952 on the `cpuab` loop's;
   hot-wall geomean 0.943 to 0.955 and 0.948 to 0.959 on the same two
@@ -1385,8 +1405,14 @@ gains half as much below that (inference).
 
 **Measurement.** Paired `cpuab` (A B B A B A A B) on one c6a.4xlarge at an
 8 GB cap. For the first pull request, A is current main and B is A with
-it. In that loop q13 to q19, q25 to q27 and q32 hit fully, q06 never hits
-SearchPhrase, and q31 and q29 hit in part (measured 2026-10-31, abe2a B).
+it. The rows below use three statement sets from the loop's hit pattern
+(measured 2026-10-31, abe2a B):
+- **H, fully hit:** q11 to q19, q25 to q28, q32, q34, q35 and q37 to q40.
+  Every timed call hits every cached column it reads. q16 reads no string
+  column, so the lever cannot move it.
+- **P, partly hit:** q29 and q31.
+- **q06:** never hits SearchPhrase.
+
 The bands are copied to #3326 before launch. A miss on any row stops that
 pull request, except the q06 row, which does not gate.
 
@@ -1407,12 +1433,13 @@ pull request, except the q06 row, which does not gate.
 | q34, q35 server CPU | 0.93 to 0.97 | above 0.99 | predicted 0.949 to 0.950 |
 | q37 to q40 server CPU geomean | 0.88 to 0.96 | above 0.99 | predicted 0.869 to 0.961 each |
 | q11, q12, q29 server CPU | 0.96 to 1.01 | above 1.03 | predicted 0.978 to 0.986 |
-| Fully hit target set CPU geomean (q11 to q15, q17 to q19, q25 to q28, q32, q34, q35, q37 to q40) | 0.86 to 0.91 | above 0.94 | predicted 0.873 to 0.900 |
+| H less q16, server CPU geomean | 0.86 to 0.91 | above 0.94 | predicted 0.873 to 0.900 |
 | CPU geomean, all 43 | 0.935 to 0.960 | above 0.975 | predicted 0.939 to 0.952, `cpuab` hit pattern |
 | Hot wall geomean, all 43 | 0.94 to 0.965 | above 0.98 | predicted 0.948 to 0.959, `cpuab` hit pattern; the band reaches past 0.95 |
 | Every other statement, hot wall | 0.95 to 1.05 | above 1.10 | predicted 1.00; a statement under 0.3 s whose server CPU B/A is within 1.03 is read as noise (q20 read 1.095 in abe1, measured 2026-10-31) |
-| `strDictValuesBuilt` per fully hit timed call, q13 to q19, q26, q32, q34, q35 | at most 1% of A | above 10% of A | predicted about 0; A is 13,086 to 13,132, measured 2026-10-31 |
-| `strCellsValidated` per fully hit timed call | equal to A per statement (0 on q13 to q19, q25 to q27, q32) | any other value | predicted: the memo builds once per entry, in the warm call (decision 6 above) |
+| `strDictValuesBuilt` per timed call, the statements of H that A builds about once per block (q13 to q19, q26, q32, q34, q35) | at most 1% of A | above 10% of A | predicted about 0; A is 13,086 to 13,132, measured 2026-10-31 |
+| `strCellsValidated` per timed call, H | equal to A per statement (0 on q13 to q19, q25 to q27, q32) | any other value | predicted: each memo builds once, on the call that admits its entry (this amendment's decision 6), which in the loop is the untimed warm call |
+| `strCellsValidated` per timed call, P | at least A, and B minus A at most the cells of the entries that call admits | under A, or above that bound | predicted: a missed block is admitted and its memo built on the same call, so it counts twice there, as on try 1 under the restart protocol |
 | Decoded-cache hits and misses per call | within 1% of A per statement | outside 2% | predicted: the memo changes no admission |
 | Decoded-cache `residentBytes` at the end of the loop | 1.000 to 1.01 | above 1.02 | predicted: a constant per entry; higher means the memo copied |
 | `peakIntermediateBytes` per statement | at most 1.05 | above 1.10 | predicted: higher means a memo array stayed charged until the scan ended |
@@ -1420,9 +1447,24 @@ pull request, except the q06 row, which does not gate.
 | Answers | equal except q18 and q25 | any other difference | q18 and q25 differ between arms on main today, measured 2026-10-31 (abe2a, abe1) |
 | Errors | none | any | predicted |
 
-Passing the hot-wall row does not meet the program's 0.95 rule, since the
-band reaches past it. The rule is judged on the product of the two pull
-requests' hot-wall geomeans, against the lever's 0.932 to 0.944. If the
+A statement whose entries an earlier, narrowed scan admitted builds each
+memo on its first unnarrowed hit (this amendment's decision 6). Its first
+such call counts B minus A equal to the cells of those memos. Its later
+calls count as A. In the loop that first call is the untimed warm call, so
+its timed rows are H's.
+
+Passing the first pull request's hot-wall row does not meet the program's
+0.95 rule, since that band reaches past it. The rule is judged on the whole lever, the product
+of the two pull requests' hot-wall B/A, on the `cpuab` basis:
+
+| Whole lever figure, product of the two B/A readouts | Band | Miss | Basis |
+|---|---|---|---|
+| Hot wall geomean, all 43, `cpuab` hit pattern (the 0.95 rule) | 0.93 to 0.95 | above 0.95 | predicted 0.937 to 0.948: the first pull request's 0.948 x 0.9889 = 0.937 and 0.959 x 0.9889 = 0.948, where 0.9889 is the second's CPU geomean on this hit pattern (`predict.out`) |
+| Hot wall geomean, all 43, ClickBench hit pattern | not judged | none: the paired run does not measure this pattern | predicted 0.932 to 0.944: 0.943 x 0.9884 = 0.932 and 0.955 x 0.9884 = 0.944, with the second's CPU geomean on this hit pattern |
+
+Both hot-wall rows take the second pull request's CPU geomean as its
+hot-wall ratio. Its statements, q11, q12 and q28, run at 0.33 s or more,
+where the estimate takes wall to track CPU (inference). If the `cpuab`
 product is above 0.95, the lever has missed the rule, and the second
 readout says so.
 
