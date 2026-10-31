@@ -12,13 +12,21 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use ravel_agents_runtime::UNKNOWN_OUTCOME_RETRIES;
 use ravel_commit::{keys, record};
 use ravel_logseg::{AttrValue, LogRecord, Predicate, RlogConfig, RlogReader};
 use ravel_maintain::QUERY_AUDIT_SHARD;
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError, list_all,
+};
 use ravel_server::config::AgentsConfig;
 use ravel_server::{FoldTaskConfig, Mode, QueryBudgets, ServerConfig};
 use ravel_tenant_resolve::{Principal, StaticBearerTokenResolver};
@@ -381,9 +389,14 @@ fn attr<'a>(row: &'a LogRecord, key: &str) -> Option<&'a str> {
         })
 }
 
-/// Every `kind=agents_reconcile` record in the tenant's audit shard (the
-/// read `audit_pipeline_installed.rs::query_audit_records` does).
+/// Every `kind=agents_reconcile` record in the tenant's audit shard.
 async fn reconcile_audit_records(store: &dyn ObjectStoreBackend) -> Vec<LogRecord> {
+    audit_records(store, "agents_reconcile").await
+}
+
+/// Every record of `kind` in the tenant's audit shard (the read
+/// `audit_pipeline_installed.rs::query_audit_records` does).
+async fn audit_records(store: &dyn ObjectStoreBackend, kind: &str) -> Vec<LogRecord> {
     let tenant_hash = TenantId::new(TENANT).hash();
     let prefix = keys::commit_shard_prefix(&tenant_hash, Signal::Audit, QUERY_AUDIT_SHARD)
         .expect("audit commit prefix");
@@ -404,7 +417,7 @@ async fn reconcile_audit_records(store: &dyn ObjectStoreBackend) -> Vec<LogRecor
         let reader = RlogReader::new(object.data.as_ref(), &cfg).expect("rlog reader");
         let (rows, _stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
         for row in rows {
-            if attr(&row, "kind") == Some("agents_reconcile") {
+            if attr(&row, "kind") == Some(kind) {
                 out.push(row);
             }
         }
@@ -1299,5 +1312,507 @@ async fn a_reconcile_retry_is_handed_to_the_owner_after_a_takeover() {
         )
         .await;
     assert_eq!(committed["status"], json!("completed"));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The `mode="all"` sample of `name`.
+fn counter(scrape: &str, name: &str) -> u64 {
+    value(scrape, name, "mode=\"all\"")
+}
+
+/// Every sample of `name` summed, whatever its labels.
+fn total(scrape: &str, name: &str) -> u64 {
+    scrape
+        .lines()
+        .filter(|line| line.starts_with(&format!("{name}{{")))
+        .map(|line| {
+            line.rsplit(' ')
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .expect("integer sample")
+        })
+        .sum()
+}
+
+/// Scrape until the `mode="all"` sample of `name` reaches `want`, so the
+/// next request is ordered after a state the server reports.
+async fn wait_for_counter(api: &Api, name: &str, want: u64) {
+    for _ in 0..2_000 {
+        if counter(&api.scrape().await, name) >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{name} never reached {want}");
+}
+
+/// A timer due long after any test ends, so nothing fires it.
+const FAR_DUE_UNIX_NS: &str = "4102444800000000000";
+
+async fn schedule_far_timer(api: &Api, key: &str) {
+    api.ok(
+        CLIENT,
+        "timers",
+        &json!({
+            "agent": agent_keyed(key),
+            "timer_key": "remind",
+            "due_unix_ns": FAR_DUE_UNIX_NS,
+            "handler": "place",
+            "payload": {},
+        }),
+    )
+    .await;
+}
+
+fn destroy_body(key: &str, incarnation: Option<u64>) -> Value {
+    match incarnation {
+        Some(n) => json!({"agent": agent_keyed(key), "incarnation": n}),
+        None => json!({"agent": agent_keyed(key)}),
+    }
+}
+
+fn assert_agent_gone(what: &str, status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::NOT_FOUND, "{what}: {body}");
+    assert_eq!(body["code"], json!("agent_gone"), "{what}: {body}");
+}
+
+/// The destroy acceptance path (ADR-3331, destroy amendment). Worker A holds
+/// the lease on input 1 of two, has attempt 1 of a `manual` effect
+/// authorized, and a timer is scheduled. Only `agents_admin` may destroy.
+/// The destroy answers what it abandoned, publishes one HEAD CAS, wakes a
+/// result long poll already parked on input 1, and leaves every handle and
+/// route on the agent `agent_gone`: A's heartbeat, its effect result, its
+/// commit, the operation, its result, the state and a reconcile of the
+/// authorized effect. A second destroy is `destroyed: false` with the same
+/// counts and is not audited; the one `agents_destroy` record carries the
+/// response's counts. A create under the same key starts incarnation 2,
+/// with fresh state and an empty mailbox, and the old handle stays gone.
+#[tokio::test]
+async fn destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let key = "o-destroy";
+    let (operation, assigned) = begin_on(&api, key).await;
+    api.ok(
+        CLIENT,
+        "send",
+        &json!({"agent": agent_keyed(key), "handler": "place", "request_id": "req-2", "payload": {"sku": "B-2"}}),
+    )
+    .await;
+    let (status, stepped) = step(&api, &assigned, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{stepped}");
+    assert_eq!(stepped["attempt"], json!(1));
+    let effect = stepped["effect"].as_str().expect("effect").to_string();
+    schedule_far_timer(&api, key).await;
+
+    let waiter = {
+        let api = api.clone();
+        let operation = operation.clone();
+        tokio::spawn(async move {
+            api.get(
+                CLIENT,
+                &format!("result?operation={operation}&wait_ms=15000"),
+            )
+            .await
+        })
+    };
+    wait_for_counter(&api, "ravel_agents_result_waits_total", 1).await;
+    let before = api.scrape().await;
+    assert_eq!(counter(&before, "ravel_agents_result_wakes_total"), 0);
+
+    for token in [CLIENT, WORKER, PLAIN] {
+        let (status, refused) = api.post(token, "destroy", &destroy_body(key, None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{token}: {refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("requires the agents_admin capability"),
+            "{token}: {refused}"
+        );
+    }
+    let destroyed = api.ok(ADMIN, "destroy", &destroy_body(key, None)).await;
+    let agent_id = destroyed["agent_id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let abandoned = json!({
+        "inputs": 2,
+        "active_turn": true,
+        "effects_in_doubt": 0,
+        "effects_authorized": 1,
+        "timers_scheduled": 1,
+    });
+    assert_eq!(
+        destroyed,
+        json!({
+            "agent_id": agent_id,
+            "incarnation": 1,
+            "destroyed": true,
+            "abandoned": abandoned,
+        })
+    );
+    let after = api.scrape().await;
+    let publish = "phase=\"publish\"";
+    assert_eq!(
+        value(&after, "ravel_agents_store_cas_total", publish)
+            - value(&before, "ravel_agents_store_cas_total", publish),
+        1,
+        "the tombstone is the destroy's only HEAD publication"
+    );
+
+    // The parked long poll ends inside its request, woken by the destroy
+    // rather than by its periodic HEAD re-read or its deadline.
+    let (status, waited) = waiter.await.expect("waiter joins");
+    assert_agent_gone("parked result", status, &waited);
+    let woken = api.scrape().await;
+    assert_eq!(counter(&woken, "ravel_agents_result_wakes_total"), 1);
+    assert_eq!(
+        counter(&woken, "ravel_agents_result_wait_expiries_total"),
+        0
+    );
+
+    let (status, refused) = api
+        .post(
+            WORKER,
+            "worker/heartbeat",
+            &json!({"lease": assigned["lease"]}),
+        )
+        .await;
+    assert_agent_gone("heartbeat", status, &refused);
+    let (status, refused) = complete(&api, &effect, 1, json!({"cents": 900})).await;
+    assert_agent_gone("effect result", status, &refused);
+    let (status, refused) = api
+        .post(
+            WORKER,
+            "worker/commit",
+            &commit_body(&assigned, json!({"total_cents": 900})),
+        )
+        .await;
+    assert_agent_gone("commit", status, &refused);
+    let (status, refused) = api
+        .get(CLIENT, &format!("operation?operation={operation}"))
+        .await;
+    assert_agent_gone("operation", status, &refused);
+    let (status, refused) = api
+        .get(CLIENT, &format!("result?operation={operation}&wait_ms=0"))
+        .await;
+    assert_agent_gone("result", status, &refused);
+    let (status, refused) = api
+        .get(CLIENT, &format!("state?kind=order&key={key}"))
+        .await;
+    assert_agent_gone("state", status, &refused);
+    let (status, refused) = api
+        .post(
+            ADMIN,
+            "reconcile",
+            &json!({"effect": effect, "attempt": 1, "decision": "retry"}),
+        )
+        .await;
+    assert_agent_gone("reconcile", status, &refused);
+
+    let again = api.ok(ADMIN, "destroy", &destroy_body(key, None)).await;
+    assert_eq!(
+        again,
+        json!({
+            "agent_id": agent_id,
+            "incarnation": 1,
+            "destroyed": false,
+            "abandoned": abandoned,
+        })
+    );
+
+    let records = audit_records(store.as_ref(), "agents_destroy").await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let row = &records[0];
+    assert_eq!(
+        attr(row, "agents.tenant"),
+        Some(TenantId::new(TENANT).hash().to_hex().as_str())
+    );
+    assert_eq!(attr(row, "agents.principal.tenant"), Some(TENANT));
+    assert_eq!(
+        attr(row, "agents.principal.capabilities"),
+        Some("agents_admin")
+    );
+    assert_eq!(attr(row, "agents.agent_id"), Some(agent_id.as_str()));
+    assert_eq!(attr(row, "agents.incarnation"), Some("1"));
+    // The record's counts are read before the tombstone CAS and the
+    // response's from the HEAD it was applied to; nothing writes between.
+    for (field, want) in [
+        ("inputs", "2"),
+        ("active_turn", "true"),
+        ("effects_in_doubt", "0"),
+        ("effects_authorized", "1"),
+        ("timers_scheduled", "1"),
+    ] {
+        assert_eq!(
+            attr(row, &format!("agents.abandoned.{field}")),
+            Some(want),
+            "{field}"
+        );
+        assert_eq!(abandoned[field].to_string(), want, "{field}");
+    }
+
+    let recreated = api
+        .ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
+        .await;
+    assert_eq!(
+        recreated,
+        json!({"agent_id": agent_id, "incarnation": 2, "created": true})
+    );
+    let (status, refused) = api
+        .get(CLIENT, &format!("operation?operation={operation}"))
+        .await;
+    assert_agent_gone("old operation after recreate", status, &refused);
+    let state = api
+        .ok_get(CLIENT, &format!("state?kind=order&key={key}"))
+        .await;
+    assert_eq!(state["incarnation"], json!(2), "{state}");
+    assert_eq!(state["state_version"], json!(0), "{state}");
+    assert!(state.get("mailbox").is_none(), "{state}");
+    assert!(state.get("active_turn").is_none(), "{state}");
+    let sent = api
+        .ok(
+            CLIENT,
+            "send",
+            &json!({"agent": agent_keyed(key), "handler": "place", "request_id": "req-1", "payload": {"sku": "A-1"}}),
+        )
+        .await;
+    assert_eq!(sent["accept_seq"], json!(1), "{sent}");
+    assert_eq!(sent["duplicate"], json!(false), "{sent}");
+    assert_ne!(sent["operation"], json!(operation));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A destroy of an agent that never existed, or pinned to an incarnation
+/// that is no longer current, is `agent_gone`, writes nothing and is not
+/// audited; the current incarnation stays active.
+#[tokio::test]
+async fn destroy_of_an_unknown_agent_or_a_stale_incarnation_is_agent_gone_and_not_audited() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+
+    let before = api.scrape().await;
+    let (status, refused) = api
+        .post(ADMIN, "destroy", &destroy_body("never-created", None))
+        .await;
+    assert_agent_gone("unknown agent", status, &refused);
+    let after = api.scrape().await;
+    for name in [
+        "ravel_agents_store_puts_total",
+        "ravel_agents_store_cas_total",
+    ] {
+        assert_eq!(total(&after, name), total(&before, name), "{name}");
+    }
+    assert!(
+        audit_records(store.as_ref(), "agents_destroy")
+            .await
+            .is_empty()
+    );
+
+    let key = "o-stale";
+    api.ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
+        .await;
+    let first = api.ok(ADMIN, "destroy", &destroy_body(key, None)).await;
+    assert_eq!(first["destroyed"], json!(true), "{first}");
+    let recreated = api
+        .ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
+        .await;
+    assert_eq!(recreated["incarnation"], json!(2), "{recreated}");
+    assert_eq!(
+        audit_records(store.as_ref(), "agents_destroy").await.len(),
+        1
+    );
+
+    let before = api.scrape().await;
+    let (status, refused) = api
+        .post(ADMIN, "destroy", &destroy_body(key, Some(1)))
+        .await;
+    assert_agent_gone("stale incarnation", status, &refused);
+    assert_eq!(refused["ids"]["incarnation"], json!(1), "{refused}");
+    let after = api.scrape().await;
+    for name in [
+        "ravel_agents_store_puts_total",
+        "ravel_agents_store_cas_total",
+    ] {
+        assert_eq!(total(&after, name), total(&before, name), "{name}");
+    }
+    assert_eq!(
+        audit_records(store.as_ref(), "agents_destroy").await.len(),
+        1
+    );
+    let state = api
+        .ok_get(CLIENT, &format!("state?kind=order&key={key}"))
+        .await;
+    assert_eq!(state["incarnation"], json!(2), "{state}");
+
+    let second = api.ok(ADMIN, "destroy", &destroy_body(key, Some(2))).await;
+    assert_eq!(second["incarnation"], json!(2), "{second}");
+    assert_eq!(second["destroyed"], json!(true), "{second}");
+    assert_eq!(
+        audit_records(store.as_ref(), "agents_destroy").await.len(),
+        2
+    );
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A memory store whose next HEAD writes, once armed, go through a
+/// `FaultStore` rule that answers each with `fault`: `DuplicateDelivery`
+/// applies the write and loses its acknowledgement, `Timeout` never reaches
+/// the store. Either way the writer cannot tell whether it landed. Every
+/// other request goes straight to the memory store.
+struct LoseNextHeadAck {
+    faults: Arc<FaultStore<MemoryStore>>,
+    armed: AtomicU64,
+}
+
+impl LoseNextHeadAck {
+    fn new(fault: ScriptedFault) -> Arc<Self> {
+        let plan =
+            FaultPlan::empty().with_rule(Rule::new(Op::Put, fault).with_key_contains("/head"));
+        Arc::new(LoseNextHeadAck {
+            faults: Arc::new(FaultStore::new(MemoryStore::new(), plan)),
+            armed: AtomicU64::new(0),
+        })
+    }
+
+    /// Lose the acknowledgement of the next `writes` HEAD writes.
+    fn arm(&self, writes: u64) {
+        self.armed.store(writes, Ordering::SeqCst);
+    }
+
+    fn lost(&self, kind: FaultKind) -> u64 {
+        self.faults.fault_count(Op::Put, kind)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for LoseNextHeadAck {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        let lose = key.ends_with("/head")
+            && self
+                .armed
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+        if lose {
+            self.faults.put(key, data, opts).await
+        } else {
+            self.faults.inner().put(key, data, opts).await
+        }
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.faults.inner().get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.faults.inner().head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.faults.inner().list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.faults.inner().list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.faults.inner().delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.faults.inner().capabilities()
+    }
+}
+
+/// A destroy whose tombstone CAS applied but whose acknowledgement was lost
+/// is `outcome_unknown` with retry hint `backoff` (it mints no operation
+/// handle to resolve) and names the incarnation it read. Retrying the same
+/// destroy pinned to that incarnation answers `destroyed: false`, and only
+/// the first attempt is audited.
+#[tokio::test]
+async fn a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false() {
+    let faulty = LoseNextHeadAck::new(ScriptedFault::DuplicateDelivery);
+    let store: Arc<dyn ObjectStoreBackend> = faulty.clone();
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let key = "o-lost";
+    api.ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
+        .await;
+
+    faulty.arm(1);
+    let (status, unknown) = api.post(ADMIN, "destroy", &destroy_body(key, None)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{unknown}");
+    assert_eq!(unknown["code"], json!("outcome_unknown"), "{unknown}");
+    assert_eq!(unknown["retry"], json!("backoff"), "{unknown}");
+    assert_eq!(unknown["ids"]["incarnation"], json!(1), "{unknown}");
+    assert_eq!(faulty.lost(FaultKind::DuplicateDelivery), 1);
+
+    let pinned = unknown["ids"]["incarnation"].as_u64().expect("incarnation");
+    let settled = api
+        .ok(ADMIN, "destroy", &destroy_body(key, Some(pinned)))
+        .await;
+    assert_eq!(settled["destroyed"], json!(false), "{settled}");
+    assert_eq!(settled["incarnation"], json!(1), "{settled}");
+    let (status, refused) = api
+        .get(CLIENT, &format!("state?kind=order&key={key}"))
+        .await;
+    assert_agent_gone("state", status, &refused);
+    assert_eq!(
+        audit_records(store.as_ref(), "agents_destroy").await.len(),
+        1
+    );
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The runtime runs a reconcile whose HEAD write has an unknown outcome
+/// again, up to `UNKNOWN_OUTCOME_RETRIES` times, and a run that finds the
+/// decision applied answers it. When every run times out the route answers
+/// `outcome_unknown` with retry hint `reconcile`: the same decision again
+/// settles it. Each run of the route audits before it writes, so the retry
+/// is a second record.
+#[tokio::test]
+async fn a_reconcile_whose_head_write_times_out_answers_the_reconcile_hint() {
+    let faulty = LoseNextHeadAck::new(ScriptedFault::Timeout);
+    let store: Arc<dyn ObjectStoreBackend> = faulty.clone();
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let (_, assigned_a) = begin_on(&api, "o-lost-reconcile").await;
+    let (status, a_step) = step(&api, &assigned_a, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let assigned_b = take_over(&api, &assigned_a).await;
+    let (status, refused) = step(&api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("effect_in_doubt"));
+
+    let reconcile = json!({
+        "effect": effect,
+        "attempt": 1,
+        "decision": "record_result",
+        "result": {"cents": 1500},
+    });
+    let writes = u64::from(UNKNOWN_OUTCOME_RETRIES) + 1;
+    faulty.arm(writes);
+    let (status, unknown) = api.post(ADMIN, "reconcile", &reconcile).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{unknown}");
+    assert_eq!(unknown["code"], json!("outcome_unknown"), "{unknown}");
+    assert_eq!(unknown["retry"], json!("reconcile"), "{unknown}");
+    assert_eq!(faulty.lost(FaultKind::Timeout), writes);
+
+    let settled = api.ok(ADMIN, "reconcile", &reconcile).await;
+    assert_eq!(settled["status"], json!("completed"), "{settled}");
+    assert_eq!(
+        inspect(&api, &effect).await["result"],
+        json!({"cents": 1500})
+    );
+    assert_eq!(reconcile_audit_records(store.as_ref()).await.len(), 2);
     running.shutdown().await.expect("clean shutdown");
 }

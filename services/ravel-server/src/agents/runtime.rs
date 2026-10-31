@@ -236,6 +236,12 @@ impl EvidenceIndex {
         self.entries.lock().remove(&(agent, effect_id));
     }
 
+    /// Drop what the index names for every effect of `agent`, once a destroy
+    /// leaves nothing that could reconcile them.
+    pub fn forget_agent(&self, agent: AgentId) {
+        self.entries.lock().retain(|(a, _), _| *a != agent);
+    }
+
     /// Effects the index names.
     pub fn len(&self) -> usize {
         self.entries.lock().len()
@@ -942,6 +948,22 @@ mod tests {
         assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
         index.record(agent(1), id(u128::MAX - 1), 1, result);
         assert_eq!(index.len(), MAX_EVIDENCE_EFFECTS);
+    }
+
+    /// Forgetting an agent drops every effect it names and nothing another
+    /// agent's effects hold.
+    #[test]
+    fn forgetting_an_agent_drops_only_its_effects() {
+        let index = index(MAX_EVIDENCE_EFFECTS);
+        let result = ObjectRef::of(b"late");
+        index.record(agent(0), id(1), 1, result);
+        index.record(agent(0), id(2), 1, result);
+        index.record(agent(1), id(3), 1, result);
+        index.forget_agent(agent(0));
+        assert!(index.of(agent(0), id(1)).is_empty());
+        assert!(index.of(agent(0), id(2)).is_empty());
+        assert_eq!(index.of(agent(1), id(3)), vec![(1, result)]);
+        assert_eq!(index.len(), 1);
     }
 
     /// A result the index does not list counts once, whether the index is
