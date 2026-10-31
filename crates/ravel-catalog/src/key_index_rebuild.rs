@@ -408,7 +408,9 @@ impl Catalog {
             let part = target.part;
             attempt.parts += 1;
             attempt.part_gets += 1;
-            let entries = self.load_part_entries(&part, &mut counters).await?;
+            // The part's decode reservation is held until this iteration
+            // drops `entries`; a refusal interrupts the run.
+            let (entries, _part_charge) = self.load_part_entries(&part, &mut counters).await?;
             let part_blake3: [u8; 32] =
                 part.blake3
                     .as_slice()
@@ -1442,6 +1444,66 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// Issue #3320: the rebuild charges a part's decoded entry body to the
+    /// catalog's memory budget before decoding it, and a refused reservation
+    /// stops the run with the typed `Interrupted` error carrying
+    /// `MemoryExhausted`, publishing nothing. Fixture: one batch of two parts
+    /// under a budget one byte short of the first part's declared
+    /// `entries_uncompressed_len`.
+    ///
+    /// FLIP: drop the `reserve_decoded` call in `Catalog::load_part_entries`
+    /// and the rebuild succeeds, so `expect_err` panics.
+    #[tokio::test]
+    async fn a_refused_part_reservation_interrupts_the_rebuild() {
+        let inner = recording_store();
+        two_entry_parts(&inner, 2).await;
+        let before = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let part = inner
+            .inner
+            .get(&before.parts[0].key, GetRange::Full)
+            .await
+            .expect("first part present")
+            .data;
+        let declared = crate::snapshot_format::decode_part_header(&part)
+            .expect("part header decodes")
+            .entries_uncompressed_len;
+        assert!(declared > 0, "the fixture part has a body to charge");
+        assert!(
+            declared <= crate::snapshot_format::PartLimits::default().max_snapshot_part_bytes,
+            "the decoder would admit this body, so only the budget can refuse it"
+        );
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let catalog = off_catalog(inner.clone(), 2).with_memory_budget(budget.clone());
+        inner.clear();
+        let err = catalog
+            .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
+            .await
+            .expect_err("a refused part reservation must interrupt the rebuild");
+        let KeyIndexRebuildError::Interrupted { source, report } = &err else {
+            panic!("expected Interrupted, got {err:?}");
+        };
+        match source {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared);
+                assert_eq!(exhausted.reserved, 0);
+                assert_eq!(exhausted.limit, declared - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            (report.parts_rebuilt, report.attempt_count),
+            (0, 0),
+            "{report:?}"
+        );
+        assert_eq!(budget.reserved(), 0, "nothing stays charged");
+        assert!(
+            !inner.puts().iter().any(|key| key.ends_with("/HEAD")),
+            "{:?}",
+            inner.puts()
+        );
+        assert_eq!(read_signal_head(inner.as_ref(), Signal::Logs).await, before);
     }
 
     /// For a declared field the rebuild's leaf is the fold's leaf: the same
