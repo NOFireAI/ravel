@@ -120,6 +120,14 @@ class OutsideDiff(unittest.TestCase):
         self.assertEqual(verdict, "Request changes")
         self.assertEqual(sum(1 for r in all_rows if r["outside_diff"]), 3)
 
+    def test_outside_diff_findings_are_summed_over_every_review_at_head(self):
+        first = {"body": "Findings outside the diff:\n- a.rs:1 (major): one\n"}
+        latest = {"body": "Approve: fine.\n\nFindings:\n- nit, b.rs:2 - small\n"}
+        verdict, rows = cli.head_review_findings([first, latest])
+        self.assertEqual(verdict, "Approve")
+        self.assertEqual([(r["where"], r["outside_diff"]) for r in rows],
+                         [("b.rs:2", False), ("a.rs:1", True)])
+
     def test_the_count_matches_the_shared_jq_filter(self):
         jq = shutil.which("jq")
         if not jq:

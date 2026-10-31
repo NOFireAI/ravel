@@ -277,6 +277,19 @@ def review_body_findings(body):
     return verdict, rows + outside_diff_findings(body)
 
 
+def head_review_findings(at_head):
+    """Verdict and summary bullets from the latest review at head, plus the
+    outside-the-diff findings of EVERY review at head, which is what
+    scripts/lib/fleet-review-outside-diff.jq sums."""
+    if not at_head:
+        return "", []
+    verdict, rows = review_body_findings(at_head[-1].get("body"))
+    rows = [r for r in rows if not r["outside_diff"]]
+    for r in at_head:
+        rows.extend(outside_diff_findings(r.get("body")))
+    return verdict, rows
+
+
 def bot_reviews(n):
     return [r for r in gh_json(["api", "--paginate", f"repos/{repo_slug()}/pulls/{n}/reviews"]) or []
             if BOT in (r.get("user") or {}).get("login", "")]
@@ -295,7 +308,7 @@ def pr_state(n):
     sev = {}
     for f in findings:
         sev[f["severity"]] = sev.get(f["severity"], 0) + 1
-    verdict, body_rows = review_body_findings(at_head[-1].get("body") if at_head else "")
+    verdict, body_rows = head_review_findings(at_head)
     return {
         "number": view["number"], "state": view["state"], "title": view["title"],
         "head": head, "head_ref": view["headRefName"], "base": view["baseRefName"],
@@ -348,7 +361,7 @@ def cmd_pr_findings(a):
         rows = [r for r in rows if not r["replied"]]
     reviews = bot_reviews(a.number)
     at_head = [r for r in reviews if r.get("commit_id") == head]
-    verdict, body_rows = review_body_findings(at_head[-1].get("body") if at_head else "")
+    verdict, body_rows = head_review_findings(at_head)
     o.data = {"head": head, "inline": rows, "verdict": verdict, "body": body_rows,
               "review_at_head": bool(at_head)}
     o.text(f"head={head[:9]} review@head={'yes' if at_head else 'no'} verdict={verdict or '-'} "
@@ -764,24 +777,39 @@ def mcp_call(tool, arguments, timeout=300):
     env = dict(os.environ)
     env.update(srv.get("env") or {})
     p = subprocess.Popen([srv["command"]] + list(srv.get("args") or []), stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=0,
                          cwd=ROOT)
+    fd = p.stdout.fileno()
+    pending = bytearray()
 
     def send(obj):
-        p.stdin.write(json.dumps(obj) + "\n")
+        p.stdin.write((json.dumps(obj) + "\n").encode())
         p.stdin.flush()
 
     deadline = time.monotonic() + timeout
+
+    def next_line():
+        # Lines are split out of our own buffer before the pipe is polled, so
+        # a reply that arrived with an earlier line is never waited for again.
+        while b"\n" not in pending:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                raise OutcomeUnknown(f"{tool}: no answer from the MCP server within {timeout}s")
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return None
+            pending.extend(chunk)
+        i = pending.index(b"\n")
+        line = bytes(pending[:i])
+        del pending[:i + 1]
+        return line.decode(errors="replace")
 
     def recv(want_id):
         # Skip notifications and log lines until the response with our id,
         # giving up at the deadline so the caller's bookkeeping still runs.
         while True:
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([p.stdout], [], [], left)[0]:
-                raise OutcomeUnknown(f"{tool}: no answer from the MCP server within {timeout}s")
-            line = p.stdout.readline()
-            if not line:
+            line = next_line()
+            if line is None:
                 return None
             try:
                 msg = json.loads(line)
@@ -873,21 +901,28 @@ def cmd_dispatch(a):
     task = m.group(1) if m.re is not UUID else m.group(0)
     watch = re.search(r"https?://\S+/watch\?token=[A-Za-z0-9._-]+", text)
     watch_file = ""
+    watch_error = ""
     if watch:
         path = Path(tempfile.gettempdir()) / f"agent-cli-{os.getuid()}" / "watch" / f"{task}.url"
-        write_secret(path, watch.group(0))
-        watch_file = str(path)
+        # The task is running: a failure here must not skip the ledger records.
+        try:
+            write_secret(path, watch.group(0))
+            watch_file = str(path)
+        except (OSError, CliError) as e:
+            watch_error = str(e)
     rec_rc, _, rec_err = run(["scripts/fleet-dispatch-intent.sh", "record", str(a.epic), nonce, task])
     orch_rc, _, orch_err = run(["scripts/epic-orchestrator.sh", "record", str(a.epic), "task-dispatched",
                                 f"ticket={a.ticket}", f"task={task}", f"ref={ref_sha}"])
     o = Out(a.json)
     o.data = {"task": task, "ref": ref_sha, "watch_file": watch_file, "nonce": nonce,
-              "record_rc": rec_rc, "orchestrator_rc": orch_rc}
+              "record_rc": rec_rc, "orchestrator_rc": orch_rc, "watch_error": watch_error}
     o.text(f"task={task} ref={ref_sha[:9]} watch={watch_file or '-'}")
     if rec_rc or orch_rc:
         o.text(f"  WARN record rc={rec_rc} {last_line(rec_err)} orchestrator rc={orch_rc} {last_line(orch_err)}")
+    if watch_error:
+        o.text(f"  WARN watch file not written ({watch_error}); agent-cli task {task} --wait polls instead")
     o.emit()
-    return 0 if not (rec_rc or orch_rc) else 1
+    return 0 if not (rec_rc or orch_rc or watch_error) else 1
 
 
 # ---------------------------------------------------------------- local checks
