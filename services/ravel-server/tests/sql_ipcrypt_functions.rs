@@ -130,6 +130,7 @@ fn principals() -> HashMap<String, Principal> {
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             },
         );
     }

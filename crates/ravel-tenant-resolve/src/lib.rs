@@ -9,6 +9,7 @@
 
 use axum::http::HeaderMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -42,13 +43,24 @@ pub enum TenantSuffixError {
     #[error("the capability list after ';' is empty or has an empty entry")]
     EmptyCapability,
     #[error(
-        "unknown capability after ';', expected ddl, ipcrypt, agents, agents_worker or agents_admin"
+        "unknown capability after ';', expected ddl, ipcrypt, agents, agents_worker, agents_admin \
+         or subject=LABEL"
     )]
     UnknownCapability,
     #[error("a capability after ';' is named more than once")]
     DuplicateCapability,
     #[error("the tenant before the capability list itself ends in a ';' capability list")]
     CapabilityInTenant,
+    #[error("subject after ';' takes a label, written subject=LABEL")]
+    SubjectWithoutLabel,
+    #[error("the subject=LABEL entry after ';' has an empty label")]
+    EmptySubjectLabel,
+    #[error("the subject=LABEL entry after ';' has a label longer than 64 bytes")]
+    SubjectLabelTooLong,
+    #[error("the subject=LABEL entry after ';' has a label byte outside A-Z a-z 0-9 . _ @ + -")]
+    SubjectLabelCharset,
+    #[error("the subject=LABEL entry after ';' appears more than once")]
+    DuplicateSubject,
 }
 
 /// The capabilities a static token's `;`-suffix grants.
@@ -70,39 +82,93 @@ pub struct TokenCapabilities {
 /// Every word a `;`-suffix may name.
 const CAPABILITY_WORDS: [&str; 5] = ["ddl", "ipcrypt", "agents", "agents_worker", "agents_admin"];
 
+/// The key of the one `subject=LABEL` entry a `;`-suffix may hold (ADR-3541
+/// decision 3).
+const SUBJECT_ENTRY: &str = "subject";
+
+/// The longest static subject label, in bytes (ADR-3541 decision 3).
+pub const SUBJECT_LABEL_MAX_BYTES: usize = 64;
+
+/// Parses the label of a `subject=LABEL` suffix entry into a [`Subject`] with
+/// [`SubjectSource::StaticToken`]. A label is 1 to
+/// [`SUBJECT_LABEL_MAX_BYTES`] bytes drawn from `A-Z a-z 0-9 . _ @ + -`
+/// (ADR-3541 decision 3), a strict subset of the [`Subject`] bound, so a comma,
+/// semicolon, space or `=` cannot appear in one. The error names the rule and
+/// never the label.
+pub fn parse_subject_label(label: &str) -> Result<Subject, TenantSuffixError> {
+    if label.is_empty() {
+        return Err(TenantSuffixError::EmptySubjectLabel);
+    }
+    if label.len() > SUBJECT_LABEL_MAX_BYTES {
+        return Err(TenantSuffixError::SubjectLabelTooLong);
+    }
+    if !label
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'+' | b'-'))
+    {
+        return Err(TenantSuffixError::SubjectLabelCharset);
+    }
+    Subject::new(SubjectSource::StaticToken, label)
+        .map_err(|_| TenantSuffixError::SubjectLabelCharset)
+}
+
 /// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`. The
 /// suffix after it is a comma-separated capability list drawn from `ddl`
 /// (ADR-2040 decision 4), `ipcrypt` (ADR-2993 decision 6), and `agents`,
 /// `agents_worker` and `agents_admin` (ADR-3331 decision 9), each at most
 /// once and the list never empty, so `acme;ddl`, `acme;ipcrypt` and
-/// `acme;ddl,ipcrypt` all name tenant `acme`. A tenant with no `;` is returned
-/// unchanged with no capability. An unknown word (matching is case-sensitive),
-/// a repeated one, an empty list or entry, or an empty tenant before the `;`
-/// is a [`TenantSuffixError`], so a typo refuses startup instead of silently
-/// granting nothing or naming an empty tenant. So is a tenant whose own last
-/// `;` segment names a capability (`acme;ddl;ipcrypt`), which would otherwise
-/// name tenant `acme;ddl` rather than `acme`.
+/// `acme;ddl,ipcrypt` all name tenant `acme`. The list may also hold one
+/// `subject=LABEL` entry anywhere in it, beside or instead of the words
+/// (ADR-3541 decision 3), parsed by [`parse_subject_label`] and returned as
+/// the third element. A tenant with no `;` is returned unchanged with no
+/// capability and no subject. An unknown word (matching is case-sensitive),
+/// a repeated one, an empty list or entry, a bad or repeated `subject=` entry,
+/// or an empty tenant before the `;` is a [`TenantSuffixError`], so a typo
+/// refuses startup instead of silently granting nothing or naming an empty
+/// tenant. So is a tenant whose own last `;` segment names a capability or a
+/// subject entry (`acme;ddl;ipcrypt`, `acme;subject=al;ce`), which would
+/// otherwise name tenant `acme;ddl` rather than `acme`.
 ///
 /// `ravel-server` and `ravel-ingest-router` both call it, so the two accept
-/// and refuse the same spellings. The router discards the capabilities, as it
-/// never routes a request differently by them.
-pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), TenantSuffixError> {
+/// and refuse the same spellings. The router discards the capabilities and
+/// the subject, as it never routes a request differently by them.
+pub fn split_tenant_suffix(
+    raw: &str,
+) -> Result<(&str, TokenCapabilities, Option<Subject>), TenantSuffixError> {
     let Some(idx) = raw.rfind(';') else {
-        return Ok((raw, TokenCapabilities::default()));
+        return Ok((raw, TokenCapabilities::default(), None));
     };
     let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
     if tenant.is_empty() {
         return Err(TenantSuffixError::EmptyTenant);
     }
     if let Some(tenant_idx) = tenant.rfind(';')
-        && tenant[tenant_idx + 1..]
-            .split(',')
-            .any(|word| CAPABILITY_WORDS.contains(&word))
+        && tenant[tenant_idx + 1..].split(',').any(|word| {
+            CAPABILITY_WORDS.contains(&word)
+                || word == SUBJECT_ENTRY
+                || word
+                    .strip_prefix(SUBJECT_ENTRY)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
     {
         return Err(TenantSuffixError::CapabilityInTenant);
     }
     let mut caps = TokenCapabilities::default();
+    let mut subject = None;
     for word in suffix.split(',') {
+        if word == SUBJECT_ENTRY {
+            return Err(TenantSuffixError::SubjectWithoutLabel);
+        }
+        if let Some(label) = word
+            .strip_prefix(SUBJECT_ENTRY)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if subject.is_some() {
+                return Err(TenantSuffixError::DuplicateSubject);
+            }
+            subject = Some(parse_subject_label(label)?);
+            continue;
+        }
         let slot = match word {
             "" => return Err(TenantSuffixError::EmptyCapability),
             "ddl" => &mut caps.ddl,
@@ -117,7 +183,7 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), Tenan
         }
         *slot = true;
     }
-    Ok((tenant, caps))
+    Ok((tenant, caps, subject))
 }
 
 /// A resolved caller identity: the tenant a request is attributed to and the
@@ -136,6 +202,18 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), Tenan
 ///   complete effects (ADR-3331 decision 9). It does not imply `agents`.
 /// - `agents_admin`: may run Ravel Agents reconciliation (ADR-3331 decision
 ///   9). It implies neither of the other two.
+///
+/// `subject` names who, within the tenant, the credential belongs to
+/// (ADR-3541 decision 1). It is attribution only and grants nothing: no
+/// capability field depends on it (`a_subject_grants_nothing`), and outside
+/// this crate's tests no code reads the field; the one comparison that sees it
+/// is the whole-principal equality in `ravel-server`'s
+/// `Cli::parse_tenant_pairs` duplicate-token check. It is `None` unless a
+/// source produced one: a static token's `subject=LABEL` entry
+/// ([`split_tenant_suffix`]) or the claim
+/// [`OidcResolver::with_subject_claim`] names.
+/// [`DevHeaderTenantResolver`] never sets one
+/// (`the_dev_header_resolver_never_sets_a_subject`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub tenant: TenantId,
@@ -144,10 +222,197 @@ pub struct Principal {
     pub agents: bool,
     pub agents_worker: bool,
     pub agents_admin: bool,
+    pub subject: Option<Subject>,
+}
+
+/// Where a [`Subject`] came from (ADR-3541 decision 1). A static label `alice`
+/// and an OIDC `sub` of `alice` are different claims made by different
+/// parties, so the source travels with the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubjectSource {
+    /// A `subject=LABEL` entry on a static bearer token.
+    StaticToken,
+    /// The claim [`OidcResolver::with_subject_claim`] names.
+    Oidc,
+    /// A proxy-forwarded mTLS subject header. Declared for ADR-3541's mTLS
+    /// source; no resolver produces it yet.
+    Mtls,
+}
+
+impl SubjectSource {
+    /// Every source, in the order [`SubjectDropCounters::snapshot`] reports.
+    pub const ALL: [SubjectSource; 3] = [
+        SubjectSource::StaticToken,
+        SubjectSource::Oidc,
+        SubjectSource::Mtls,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubjectSource::StaticToken => "static_token",
+            SubjectSource::Oidc => "oidc",
+            SubjectSource::Mtls => "mtls",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            SubjectSource::StaticToken => 0,
+            SubjectSource::Oidc => 1,
+            SubjectSource::Mtls => 2,
+        }
+    }
+}
+
+/// The longest subject, in bytes: the OIDC bound on `sub` (ADR-3541 decision
+/// 1).
+pub const SUBJECT_MAX_BYTES: usize = 255;
+
+/// A value [`Subject::new`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SubjectError {
+    #[error("the subject is empty")]
+    Empty,
+    #[error("the subject is {len} bytes, longer than the 255-byte bound")]
+    TooLong { len: usize },
+    #[error("the subject holds byte {byte:#04x}, outside printable non-space ASCII")]
+    Charset { byte: u8 },
+}
+
+impl SubjectError {
+    /// The drop reason a source records when it leaves a subject absent for
+    /// this error.
+    pub fn drop_reason(self) -> SubjectDropReason {
+        match self {
+            SubjectError::Empty => SubjectDropReason::Empty,
+            SubjectError::TooLong { .. } => SubjectDropReason::TooLong,
+            SubjectError::Charset { .. } => SubjectDropReason::Charset,
+        }
+    }
+}
+
+/// Who, within a tenant, a credential belongs to (ADR-3541 decision 1): 1 to
+/// [`SUBJECT_MAX_BYTES`] bytes, every byte in `0x21..=0x7E`, together with
+/// its [`SubjectSource`]. [`Subject::new`] is the only constructor, so a
+/// `Subject` always holds a value inside that bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
+    value: String,
+    source: SubjectSource,
+}
+
+impl Subject {
+    /// Refuses a value that is empty, longer than [`SUBJECT_MAX_BYTES`] bytes,
+    /// or holds a byte outside printable non-space ASCII
+    /// (`a_subject_outside_the_length_or_charset_bound_is_refused`). Length is
+    /// counted in bytes and checked before the charset.
+    pub fn new(source: SubjectSource, value: impl Into<String>) -> Result<Subject, SubjectError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(SubjectError::Empty);
+        }
+        if value.len() > SUBJECT_MAX_BYTES {
+            return Err(SubjectError::TooLong { len: value.len() });
+        }
+        if let Some(&byte) = value
+            .as_bytes()
+            .iter()
+            .find(|b| !(0x21..=0x7E).contains(*b))
+        {
+            return Err(SubjectError::Charset { byte });
+        }
+        Ok(Subject { value, source })
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn source(&self) -> SubjectSource {
+        self.source
+    }
+}
+
+/// Why a source left a subject absent (ADR-3541 decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubjectDropReason {
+    /// The configured claim is not in the verified claim set.
+    Missing,
+    /// The claim is present but not a JSON string.
+    NotString,
+    /// [`SubjectError::Empty`].
+    Empty,
+    /// [`SubjectError::TooLong`].
+    TooLong,
+    /// [`SubjectError::Charset`].
+    Charset,
+}
+
+impl SubjectDropReason {
+    /// Every reason, in the order [`SubjectDropCounters::snapshot`] reports.
+    pub const ALL: [SubjectDropReason; 5] = [
+        SubjectDropReason::Missing,
+        SubjectDropReason::NotString,
+        SubjectDropReason::Empty,
+        SubjectDropReason::TooLong,
+        SubjectDropReason::Charset,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubjectDropReason::Missing => "missing",
+            SubjectDropReason::NotString => "not_string",
+            SubjectDropReason::Empty => "empty",
+            SubjectDropReason::TooLong => "too_long",
+            SubjectDropReason::Charset => "charset",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            SubjectDropReason::Missing => 0,
+            SubjectDropReason::NotString => 1,
+            SubjectDropReason::Empty => 2,
+            SubjectDropReason::TooLong => 3,
+            SubjectDropReason::Charset => 4,
+        }
+    }
+}
+
+/// Counts of subjects a source dropped to absent, keyed by source and reason,
+/// behind `ravel_auth_subject_dropped_total{source,reason}` (ADR-3541
+/// decision 3).
+#[derive(Debug, Default)]
+pub struct SubjectDropCounters {
+    counts: [[AtomicU64; SubjectDropReason::ALL.len()]; SubjectSource::ALL.len()],
+}
+
+impl SubjectDropCounters {
+    pub fn record(&self, source: SubjectSource, reason: SubjectDropReason) {
+        self.counts[source.index()][reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Every (source, reason) pair with its count, zeros included, sources in
+    /// [`SubjectSource::ALL`] order and reasons in [`SubjectDropReason::ALL`]
+    /// order within each source.
+    pub fn snapshot(&self) -> Vec<(SubjectSource, SubjectDropReason, u64)> {
+        SubjectSource::ALL
+            .iter()
+            .flat_map(|&source| {
+                SubjectDropReason::ALL.iter().map(move |&reason| {
+                    (
+                        source,
+                        reason,
+                        self.counts[source.index()][reason.index()].load(Ordering::Relaxed),
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 impl Principal {
-    /// A principal for `tenant` holding no capability.
+    /// A principal for `tenant` holding no capability and no subject.
     pub fn tenant_only(tenant: TenantId) -> Self {
         Principal {
             tenant,
@@ -156,6 +421,7 @@ impl Principal {
             agents: false,
             agents_worker: false,
             agents_admin: false,
+            subject: None,
         }
     }
 }
@@ -539,6 +805,7 @@ pub struct OidcResolver {
     agents_claim: Option<String>,
     agents_worker_claim: Option<String>,
     agents_admin_claim: Option<String>,
+    subject_claim: Option<(String, Arc<SubjectDropCounters>)>,
 }
 
 impl OidcResolver {
@@ -572,6 +839,7 @@ impl OidcResolver {
             agents_claim: None,
             agents_worker_claim: None,
             agents_admin_claim: None,
+            subject_claim: None,
         }
     }
 
@@ -615,6 +883,23 @@ impl OidcResolver {
     /// [`with_ddl_claim`](Self::with_ddl_claim) reads its claim.
     pub fn with_agents_admin_claim(mut self, agents_admin_claim: impl Into<String>) -> Self {
         self.agents_admin_claim = Some(agents_admin_claim.into());
+        self
+    }
+
+    /// Configure the claim whose value becomes the principal's subject, with
+    /// [`SubjectSource::Oidc`] (ADR-3541 decision 3). The claim is read from
+    /// the verified claim set only, as the tenant claim is. A claim that is
+    /// missing, not a JSON string, or outside the [`Subject`] bound leaves the
+    /// subject `None`, records the reason in `drops`, and still resolves the
+    /// principal
+    /// (`the_oidc_subject_claim_sets_the_subject_and_a_missing_or_non_string_claim_leaves_it_absent`).
+    /// With no claim configured (the default) no subject is read.
+    pub fn with_subject_claim(
+        mut self,
+        claim: impl Into<String>,
+        drops: Arc<SubjectDropCounters>,
+    ) -> Self {
+        self.subject_claim = Some((claim.into(), drops));
         self
     }
 
@@ -695,8 +980,20 @@ impl TenantResolver for OidcResolver {
             agents: granted(&self.agents_claim),
             agents_worker: granted(&self.agents_worker_claim),
             agents_admin: granted(&self.agents_admin_claim),
+            subject: self.subject_claim.as_ref().and_then(|(claim, drops)| {
+                oidc_subject(claims.get(claim))
+                    .inspect_err(|&reason| drops.record(SubjectSource::Oidc, reason))
+                    .ok()
+            }),
         })
     }
+}
+
+/// The subject a verified claim value names, or why it names none.
+fn oidc_subject(value: Option<&serde_json::Value>) -> Result<Subject, SubjectDropReason> {
+    let value = value.ok_or(SubjectDropReason::Missing)?;
+    let value = value.as_str().ok_or(SubjectDropReason::NotString)?;
+    Subject::new(SubjectSource::Oidc, value).map_err(SubjectError::drop_reason)
 }
 
 // --- mTLS (proxy-forwarded client certificate) tenant resolution ------------
@@ -840,15 +1137,15 @@ mod tests {
     fn split_tenant_suffix_agents_words_grant_only_their_own_capability() {
         assert_eq!(
             split_tenant_suffix("acme;agents").unwrap(),
-            ("acme", AGENTS)
+            ("acme", AGENTS, None)
         );
         assert_eq!(
             split_tenant_suffix("acme;agents_worker").unwrap(),
-            ("acme", AGENTS_WORKER)
+            ("acme", AGENTS_WORKER, None)
         );
         assert_eq!(
             split_tenant_suffix("acme;agents_admin").unwrap(),
-            ("acme", AGENTS_ADMIN)
+            ("acme", AGENTS_ADMIN, None)
         );
     }
 
@@ -856,11 +1153,11 @@ mod tests {
     fn split_tenant_suffix_every_word_combines_in_any_order() {
         assert_eq!(
             split_tenant_suffix("acme;ddl,ipcrypt,agents,agents_worker,agents_admin").unwrap(),
-            ("acme", ALL)
+            ("acme", ALL, None)
         );
         assert_eq!(
             split_tenant_suffix("acme;agents_admin,agents_worker,agents,ipcrypt,ddl").unwrap(),
-            ("acme", ALL)
+            ("acme", ALL, None)
         );
     }
 
@@ -890,19 +1187,22 @@ mod tests {
 
     #[test]
     fn split_tenant_suffix_no_semicolon_is_unchanged_no_capability() {
-        assert_eq!(split_tenant_suffix("acme").unwrap(), ("acme", NONE));
+        assert_eq!(split_tenant_suffix("acme").unwrap(), ("acme", NONE, None));
     }
 
     #[test]
     fn split_tenant_suffix_ddl_grants_capability() {
-        assert_eq!(split_tenant_suffix("acme;ddl").unwrap(), ("acme", DDL));
+        assert_eq!(
+            split_tenant_suffix("acme;ddl").unwrap(),
+            ("acme", DDL, None)
+        );
     }
 
     #[test]
     fn split_tenant_suffix_ipcrypt_grants_capability() {
         assert_eq!(
             split_tenant_suffix("acme;ipcrypt").unwrap(),
-            ("acme", IPCRYPT)
+            ("acme", IPCRYPT, None)
         );
     }
 
@@ -910,11 +1210,11 @@ mod tests {
     fn split_tenant_suffix_capability_list_grants_both_in_either_order() {
         assert_eq!(
             split_tenant_suffix("acme;ddl,ipcrypt").unwrap(),
-            ("acme", BOTH)
+            ("acme", BOTH, None)
         );
         assert_eq!(
             split_tenant_suffix("acme;ipcrypt,ddl").unwrap(),
-            ("acme", BOTH)
+            ("acme", BOTH, None)
         );
     }
 
@@ -922,7 +1222,7 @@ mod tests {
     fn split_tenant_suffix_splits_on_the_last_semicolon() {
         assert_eq!(
             split_tenant_suffix("ac;me;ipcrypt").unwrap(),
-            ("ac;me", IPCRYPT)
+            ("ac;me", IPCRYPT, None)
         );
     }
 
@@ -1294,6 +1594,7 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             })
         );
 
@@ -1521,6 +1822,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
 
@@ -1535,6 +1837,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             },
         )]));
         assert_eq!(
@@ -1548,6 +1851,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
 
@@ -1566,6 +1870,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
 
@@ -1655,6 +1960,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
     }
@@ -1680,6 +1986,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             agents: false,
             agents_worker: false,
             agents_admin: false,
+            subject: None,
         };
         let granted = Principal {
             tenant: TenantId::new("acme"),
@@ -1688,6 +1995,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             agents: false,
             agents_worker: false,
             agents_admin: false,
+            subject: None,
         };
         let first_denies = FallbackResolver::new(vec![
             Arc::new(Fixed(denied.clone())),
@@ -1757,6 +2065,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
         assert_eq!(
@@ -1774,6 +2083,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
         // The ddl claim does not grant ipcrypt.
@@ -1820,6 +2130,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: true,
                 agents_admin: false,
+                subject: None,
             }
         );
         assert_eq!(
@@ -1831,6 +2142,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: true,
                 agents_worker: false,
                 agents_admin: false,
+                subject: None,
             }
         );
         assert_eq!(
@@ -1842,6 +2154,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 agents: false,
                 agents_worker: false,
                 agents_admin: true,
+                subject: None,
             }
         );
         // A missing claim, a non-boolean claim, or no configured claim name:
@@ -1876,5 +2189,288 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             ),
             none
         );
+    }
+
+    /// ADR-3541 decision 3: one `subject=LABEL` entry rides beside or instead
+    /// of the capability words, and every malformed entry refuses with an
+    /// error that names neither the label nor the tenant.
+    #[test]
+    fn a_subject_entry_in_the_token_suffix_sets_the_subject_and_a_bad_label_refuses() {
+        let (tenant, caps, subject) =
+            split_tenant_suffix("acme;agents_admin,subject=alice").expect("parses");
+        assert_eq!((tenant, caps), ("acme", AGENTS_ADMIN));
+        let subject = subject.expect("the entry sets a subject");
+        assert_eq!(subject.value(), "alice");
+        assert_eq!(subject.source(), SubjectSource::StaticToken);
+
+        let (tenant, caps, subject) =
+            split_tenant_suffix("acme;subject=bob@example.com").expect("parses");
+        assert_eq!((tenant, caps), ("acme", NONE));
+        let subject = subject.expect("the entry sets a subject");
+        assert_eq!(subject.value(), "bob@example.com");
+        assert_eq!(subject.source(), SubjectSource::StaticToken);
+
+        let long_label = "k".repeat(SUBJECT_LABEL_MAX_BYTES + 1);
+        let long_raw = format!("acme;subject={long_label}");
+        let cases: [(&str, TenantSuffixError, &[&str]); 8] = [
+            (
+                "acme;subject=a,subject=b",
+                TenantSuffixError::DuplicateSubject,
+                &["subject=a", "subject=b"],
+            ),
+            (
+                "acme;subject=alpha1,subject=bravo2",
+                TenantSuffixError::DuplicateSubject,
+                &["alpha1", "bravo2"],
+            ),
+            ("acme;subject=", TenantSuffixError::EmptySubjectLabel, &[]),
+            (
+                "acme;subject=al ice",
+                TenantSuffixError::SubjectLabelCharset,
+                &["al ice"],
+            ),
+            (
+                "acme;subject=al!ce",
+                TenantSuffixError::SubjectLabelCharset,
+                &["al!ce"],
+            ),
+            (
+                "acme;subject=al;ce",
+                TenantSuffixError::CapabilityInTenant,
+                &["al;ce", "subject=al"],
+            ),
+            ("acme;subject", TenantSuffixError::SubjectWithoutLabel, &[]),
+            (&long_raw, TenantSuffixError::SubjectLabelTooLong, &["kkkk"]),
+        ];
+        for (raw, want, needles) in cases {
+            let err = split_tenant_suffix(raw).expect_err(raw);
+            assert_eq!(err, want, "{raw}");
+            let message = err.to_string();
+            for needle in needles.iter().chain(&["acme"]) {
+                assert!(
+                    !message.contains(needle),
+                    "{raw}: the message names {needle:?}: {message}"
+                );
+            }
+        }
+        assert_eq!(long_label.len(), 65);
+        assert_eq!(
+            parse_subject_label(&"k".repeat(SUBJECT_LABEL_MAX_BYTES))
+                .expect("64 bytes fit")
+                .value()
+                .len(),
+            64
+        );
+    }
+
+    /// ADR-3541 decision 3: the configured claim is read from the verified
+    /// claim set only; a bad value drops to absent, counts once under its
+    /// reason, and the request still authenticates.
+    #[test]
+    fn the_oidc_subject_claim_sets_the_subject_and_a_missing_or_non_string_claim_leaves_it_absent()
+    {
+        let only = |reason: SubjectDropReason| -> Vec<(SubjectSource, SubjectDropReason, u64)> {
+            SubjectSource::ALL
+                .iter()
+                .flat_map(|&source| {
+                    SubjectDropReason::ALL.iter().map(move |&r| {
+                        let count = u64::from(source == SubjectSource::Oidc && r == reason);
+                        (source, r, count)
+                    })
+                })
+                .collect()
+        };
+        let no_drops = || SubjectDropCounters::default().snapshot();
+
+        // A sub the bound accepts becomes the subject.
+        let drops = Arc::new(SubjectDropCounters::default());
+        let oidc =
+            resolver(cache_with(&jwks_with(KID))).with_subject_claim("sub", Arc::clone(&drops));
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
+        let principal = oidc.resolve_principal(&bearer(&token)).expect("resolves");
+        assert_eq!(principal.tenant, TenantId::new("acme"));
+        let subject = principal.subject.expect("sub sets the subject");
+        assert_eq!(subject.value(), "user-123");
+        assert_eq!(subject.source(), SubjectSource::Oidc);
+        assert_eq!(drops.snapshot(), no_drops());
+
+        // The same claims signed under a key the cache does not hold: no
+        // principal at all, so nothing is read from the unverified token.
+        let forged = sign_es256(&claims(Some("acme"), 3600), KID, OTHER_EC_PRIV_PEM);
+        assert!(oidc.resolve_principal(&bearer(&forged)).is_err());
+        assert_eq!(drops.snapshot(), no_drops());
+
+        // jsonwebtoken itself rejects a token whose `sub` is an array before
+        // any claim is read, so the array case runs under a claim it does not
+        // validate.
+        let mut c = claims(Some("acme"), 3600);
+        c["sub"] = serde_json::json!(["user-123"]);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        assert!(oidc.resolve_principal(&bearer(&token)).is_err());
+        assert_eq!(drops.snapshot(), no_drops());
+
+        let cases: [(&str, Option<serde_json::Value>, SubjectDropReason); 6] = [
+            ("sub", None, SubjectDropReason::Missing),
+            (
+                "sub",
+                Some(serde_json::json!(123)),
+                SubjectDropReason::NotString,
+            ),
+            (
+                "email",
+                Some(serde_json::json!(["user-123"])),
+                SubjectDropReason::NotString,
+            ),
+            ("sub", Some(serde_json::json!("")), SubjectDropReason::Empty),
+            (
+                "sub",
+                Some(serde_json::json!("u".repeat(SUBJECT_MAX_BYTES + 1))),
+                SubjectDropReason::TooLong,
+            ),
+            (
+                "sub",
+                Some(serde_json::json!("user 123")),
+                SubjectDropReason::Charset,
+            ),
+        ];
+        for (claim, value, reason) in cases {
+            let drops = Arc::new(SubjectDropCounters::default());
+            let oidc =
+                resolver(cache_with(&jwks_with(KID))).with_subject_claim(claim, Arc::clone(&drops));
+            let mut c = claims(Some("acme"), 3600);
+            match value {
+                Some(value) => c[claim] = value,
+                None => {
+                    c.as_object_mut().expect("an object").remove(claim);
+                }
+            }
+            let token = sign_es256(&c, KID, EC_PRIV_PEM);
+            let principal = oidc
+                .resolve_principal(&bearer(&token))
+                .expect("a dropped subject still authenticates");
+            assert_eq!(principal.tenant, TenantId::new("acme"), "{reason:?}");
+            assert_eq!(principal.subject, None, "{reason:?}");
+            assert_eq!(drops.snapshot(), only(reason), "{reason:?}");
+        }
+
+        // No claim configured: a token carrying sub resolves with no subject
+        // and nothing is counted.
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
+        let principal = resolver(cache_with(&jwks_with(KID)))
+            .resolve_principal(&bearer(&token))
+            .expect("resolves");
+        assert_eq!(principal.subject, None);
+        assert_eq!(drops.snapshot(), no_drops());
+    }
+
+    /// ADR-3541 decision 1: 1 to 255 bytes, every byte in `0x21..=0x7E`.
+    #[test]
+    fn a_subject_outside_the_length_or_charset_bound_is_refused() {
+        let new = |value: &str| Subject::new(SubjectSource::Oidc, value);
+        assert_eq!(new(""), Err(SubjectError::Empty));
+        assert_eq!(
+            new(&"a".repeat(256)),
+            Err(SubjectError::TooLong { len: 256 })
+        );
+        // 255 characters but 256 bytes: the bound counts bytes.
+        let wide = format!("{}é", "a".repeat(253));
+        assert_eq!(wide.chars().count(), 254);
+        assert_eq!(
+            new(&format!("a{wide}")),
+            Err(SubjectError::TooLong { len: 256 })
+        );
+        assert_eq!(new("al ice"), Err(SubjectError::Charset { byte: 0x20 }));
+        assert_eq!(new("al\tice"), Err(SubjectError::Charset { byte: 0x09 }));
+        assert_eq!(
+            new("al\u{7f}ice"),
+            Err(SubjectError::Charset { byte: 0x7F })
+        );
+        assert_eq!(new("alé"), Err(SubjectError::Charset { byte: 0xC3 }));
+
+        let max = "a".repeat(SUBJECT_MAX_BYTES);
+        assert_eq!(new(&max).expect("255 bytes fit").value(), max);
+        let printable: String = (0x21u8..=0x7E).map(char::from).collect();
+        let subject = new(&printable).expect("every printable byte fits");
+        assert_eq!(subject.value(), printable);
+        assert_eq!(subject.source(), SubjectSource::Oidc);
+    }
+
+    /// ADR-3541 decision 1: a subject is attribution only. Two principals
+    /// that differ only in subject hold the same capabilities, and
+    /// FallbackResolver forwards the matching resolver's subject unchanged.
+    #[test]
+    fn a_subject_grants_nothing() {
+        let subject = parse_subject_label("alice").expect("a valid label");
+        for caps in [
+            NONE,
+            DDL,
+            IPCRYPT,
+            BOTH,
+            AGENTS,
+            AGENTS_WORKER,
+            AGENTS_ADMIN,
+            ALL,
+        ] {
+            let without = Principal {
+                tenant: TenantId::new("acme"),
+                ddl: caps.ddl,
+                ipcrypt: caps.ipcrypt,
+                agents: caps.agents,
+                agents_worker: caps.agents_worker,
+                agents_admin: caps.agents_admin,
+                subject: None,
+            };
+            let with = Principal {
+                subject: Some(subject.clone()),
+                ..without.clone()
+            };
+            assert_ne!(with, without);
+            assert_eq!(
+                (
+                    with.ddl,
+                    with.ipcrypt,
+                    with.agents,
+                    with.agents_worker,
+                    with.agents_admin
+                ),
+                (
+                    without.ddl,
+                    without.ipcrypt,
+                    without.agents,
+                    without.agents_worker,
+                    without.agents_admin
+                ),
+            );
+        }
+
+        let configured = Principal {
+            subject: Some(subject),
+            ..Principal::tenant_only(TenantId::new("acme"))
+        };
+        let fallback = FallbackResolver::new(vec![
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            Arc::new(StaticBearerTokenResolver::with_principals(HashMap::from([
+                ("tok".to_string(), configured.clone()),
+            ]))),
+        ]);
+        assert_eq!(
+            fallback
+                .resolve_principal(&static_bearer("tok"))
+                .expect("resolves"),
+            configured
+        );
+    }
+
+    /// ADR-3541 decision 4: no resolver reads a caller-supplied subject.
+    #[test]
+    fn the_dev_header_resolver_never_sets_a_subject() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ravel-tenant", "acme".parse().expect("valid header"));
+        headers.insert("x-ravel-subject", "alice".parse().expect("valid header"));
+        let principal = DevHeaderTenantResolver::default()
+            .resolve_principal(&headers)
+            .expect("resolves");
+        assert_eq!(principal, Principal::tenant_only(TenantId::new("acme")));
+        assert_eq!(principal.subject, None);
     }
 }
