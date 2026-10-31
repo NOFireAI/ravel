@@ -370,13 +370,16 @@ one tenant are not told apart in the audit record.
 
 After a 500 `outcome_unknown` from reconcile. The server could not tell
 whether its own write took effect, so it hands the attempt to nobody.
-An attempt that reads `authorized` in
+An effect whose `status` reads `authorized` in
 `GET /api/v1/agents/effects/{effect}` does not tell you whether any process
-holds it: another reconcile's process may, or none may. Either way it is
-dispatched at most once
+holds the attempt: another reconcile's process may, or none may. Either way
+the attempt is dispatched at most once
 (`concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`).
 Wait for the owner's next step. If the effect then reads `in_doubt` again,
-nothing ran the attempt; reconcile again
+the attempt may or may not have run: a process that held it may have
+dispatched it to a worker that lost the turn before reporting. Treat it as
+any effect in doubt: check the outside system, then `record_result` if the
+tool ran or `retry` if it did not
 (`a_reconcile_authorization_with_a_lost_ack_is_not_handed_over_and_latches_in_doubt_again`).
 
 Worked example, with `EFF` the effect id from `blocked_effect`:

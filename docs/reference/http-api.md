@@ -598,13 +598,14 @@ another server process serves the step, the attempt reads as lost and a
 `manual` effect is back in doubt, so reconcile it again. For the same
 reason a repeated `retry` is answered as applied only while that process
 holds the hand-over unclaimed. A reconcile that answers 500
-`outcome_unknown` hands its attempt to no process. The attempt may still
-read `authorized` in `GET /api/v1/agents/effects/{effect}` whether or not
-another reconcile's process holds it, and it is dispatched at most once
-either way
-(`concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`);
-if the effect is in doubt again after the owner's next step, nothing ran it,
-so reconcile it again
+`outcome_unknown` hands its attempt to no process. The effect's `status`
+may still read `authorized` in `GET /api/v1/agents/effects/{effect}`
+whether or not another reconcile's process holds the attempt, and the
+attempt is dispatched at most once either way
+(`concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`).
+If the effect is in doubt again after the owner's next step, the attempt
+may have run, so resolve it as any effect in doubt; the operations guide's
+"Reconciling an effect in doubt" has the procedure
 (`a_reconcile_authorization_with_a_lost_ack_is_not_handed_over_and_latches_in_doubt_again`).
 A `retry` naming the attempt before one a
 worker's own step authorized, such as an `at_least_once` attempt raised
