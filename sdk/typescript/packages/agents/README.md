@@ -407,9 +407,12 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   aborts the handler's `ctx.signal` at the expiry and abandons the turn the
   same way, with `LeaseExpired`. A `ctx.step` the handler calls after either
   abort, or whose record is answered after it, rejects with the abort's
-  reason: it sends no step record, runs no tool and reports no effect
-  result, so a handler that never reads `ctx.signal` still cannot start an
-  effect on a turn another worker may own. The worker measures that expiry
+  reason: it sends no step record and runs no tool, so a handler that never
+  reads `ctx.signal` still cannot start an effect on a turn another worker
+  may own. A tool already running when the abort lands, and that returns,
+  still has its result reported, so a takeover replays it rather than
+  running the effect again; a tool that throws after the abort reports
+  nothing. The worker measures that expiry
   on its own timers: `leaseMs` (a `serveAgents` option, default 30 s) from
   the moment it received the assignment, or sent the last renewal that was
   answered, since neither answer carries the lease length and its wall clock
@@ -439,6 +442,8 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   refuses leaseMs %d at startup with InvalidWorkerOption`, `a step called
   after the lease expired is refused locally and never reaches the server`,
   `a lease that expires while the step's record is in flight runs no tool`,
+  `a tool that finishes after the lease expired still reports its result,
+  and nothing else is sent`,
   `renews a third of the lease left, and never faster than the floor`
   (`worker/renew.test.ts`),
   `renews once at assignment, sends nothing while a tool runs, and no

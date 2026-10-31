@@ -231,7 +231,9 @@ server. Its tests are in `transport/http.test.ts`.
   aborts the handler's signal at the expiry and abandons the turn without a
   commit, with `LeaseExpired`. A step the handler calls after either abort,
   or whose record is answered after it, rejects with the abort's reason and
-  sends no step record, runs no tool and reports no effect result. The
+  sends no step record and runs no tool. A tool already running at the
+  abort that returns still has its result reported, so a takeover replays
+  it rather than running the effect again. The
   worker measures the expiry on its own timers, `leaseMs` (a `serveAgents`
   option, default 30000) after it received the assignment or sent the last
   renewal that was answered, because no answer carries the lease length and
@@ -256,7 +258,9 @@ server. Its tests are in `transport/http.test.ts`.
   default`, `serveAgents refuses leaseMs %d at startup with
   InvalidWorkerOption`, `a step called after the lease expired is refused
   locally and never reaches the server`, `a lease that expires while the
-  step's record is in flight runs no tool` (`worker/renew.test.ts`),
+  step's record is in flight runs no tool`, `a tool that finishes after the
+  lease expired still reports its result, and nothing else is sent`
+  (`worker/renew.test.ts`),
   `renews once at assignment, sends nothing while a tool runs, and no
   heartbeat before a step`.
 - There is no `journal` option: steps and effect results are recorded on
