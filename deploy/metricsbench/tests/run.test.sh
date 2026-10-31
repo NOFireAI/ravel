@@ -559,7 +559,7 @@ expect_rc q 70
 expect_err "q: message names step ingest and the row" "step ingest failed: metricsbench_ingest exited 1: mimir: read-back failed"
 expect_err "q: message says the run went on as a diagnostic" "the run went on as a diagnostic"
 check "q: stamps name step ingest, status failed, exit 70" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed" and j("stamps.json")["exit_code"] == 70'
-check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["up","qualify","image","ready","sampler","capture","provenance","fold-state","query","validate","memory"]'
+check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","capture","provenance","fold-state","query","validate","memory"]'
 check "q: nothing failed after ingest" 'j("stamps.json")["failed_after_ingest"] == []'
 check "q: Mimir readiness line stamped as not matching" 'j("stamps.json")["mimir_readiness"].startswith("ingest read-back for mimir did not match")'
 expect_log "q: query run as a diagnostic" "--diagnostic-after-failed-ingest"
