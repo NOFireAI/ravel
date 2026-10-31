@@ -1109,7 +1109,10 @@ async fn a_destroy_refusal_prints_the_incarnation_to_pin_the_retry_to() {
     assert!(text.stdout.is_empty());
 
     let json = run(true).await.expect("join");
-    assert!(!json.status.success(), "a refusal exits non-zero under --json");
+    assert!(
+        !json.status.success(),
+        "a refusal exits non-zero under --json"
+    );
     let body: ravel_agents_core::wire::ErrorBody =
         serde_json::from_slice(&json.stdout).expect("stdout is the error body JSON");
     assert_eq!(body.ids.incarnation, Some(7));

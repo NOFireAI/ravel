@@ -430,11 +430,11 @@ How to verify:
 `ravel-cli agents reconcile` posts the same body with the admin token
 (`reconcile_posts_the_decision_with_the_admin_token`). A refusal exits
 non-zero and its stderr line names the ids the error carries after the retry
-hint, for example `agents request refused: effect_in_doubt (...), retry
-reconcile; ids: agent_id=AGENT_ID, effect_id=EFF`. The effect is
-`effect_id` there; the error carries no attempt, so retry with the
-`--attempt` you sent. With `--json` the error body itself is printed on
-stdout.
+hint, for example `agents request refused: CODE (REASON), retry HINT; ids:
+agent_id=AGENT_ID, effect_id=EFF_ID`, where `EFF_ID` is the effect's id
+rather than the handle you passed. The error carries no attempt; the attempt
+in question is the `--attempt` you sent. With `--json` the error body itself
+is printed on stdout.
 
 ## Destroying an agent
 
