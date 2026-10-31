@@ -505,10 +505,15 @@ than passing for "no pull request open".
   own heading as context, not a refusal: a held draft once blocked two
   epics' tickets for a day, #2749), 64 on usage, including a `--paths`
   entry that does not parse or is empty after trimming, and 69 when the
-  question could not be asked (a pull request's files and patches or its
-  merge base could not be fetched, or the base ref does not resolve, among
-  others). A `--paths` entry (and so a `DISPATCH_PATHS` entry) takes one
-  of three forms: `path`, the whole file, where any change the pull
+  question could not be asked (an OPEN, non-draft pull request's files and
+  patches or its merge base could not be fetched, or the base ref does not
+  resolve, among others). Only a question that can change the verdict may
+  refuse: a draft, merged or closed pull request is matched against every
+  entry as the whole file, its merge base is never asked for, and a files
+  list it could not read is a NOTE (#3463: a merged pull request whose base
+  branch was deleted made the compare endpoint 404 and refused every
+  dispatch over its files). A `--paths` entry (and so a `DISPATCH_PATHS`
+  entry) takes one of three forms: `path`, the whole file, where any change the pull
   request makes to it collides; `path:L10-L80`, a base line range, which
   collides only when one of the pull request's patch hunks for that file
   changes a base line inside it; and `path#symbol`, a definition on the
