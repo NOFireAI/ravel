@@ -2207,7 +2207,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
 
         let long_label = "k".repeat(SUBJECT_LABEL_MAX_BYTES + 1);
         let long_raw = format!("acme;subject={long_label}");
-        let cases: [(&str, TenantSuffixError, &[&str]); 7] = [
+        let cases: [(&str, TenantSuffixError, &[&str]); 8] = [
             (
                 "acme;subject=a,subject=b",
                 TenantSuffixError::DuplicateSubject,
@@ -2223,6 +2223,11 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 "acme;subject=al ice",
                 TenantSuffixError::SubjectLabelCharset,
                 &["al ice"],
+            ),
+            (
+                "acme;subject=al!ce",
+                TenantSuffixError::SubjectLabelCharset,
+                &["al!ce"],
             ),
             (
                 "acme;subject=al;ce",
