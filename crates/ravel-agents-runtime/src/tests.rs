@@ -1656,3 +1656,54 @@ async fn a_coordinator_that_did_not_serve_the_destroy_stops_offering_the_agent_a
         "the sweep does not load a tombstoned root"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_tombstoned_root_with_an_open_turn_unloads_on_a_coordinator_that_did_not_serve_the_destroy()
+ {
+    use ravel_agents_core::head::Lifecycle;
+
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator(&store, &clock, 200);
+    let id = id_of("o-1");
+    create(&c2, "o-1").await;
+    send(&c2, "o-1", "r-1", json!(1)).await;
+    let w = worker(&c2, "v1");
+    poll_now(&c2, &w, "v1").await.expect("leased");
+    assert_eq!(
+        (c2.metrics().agents_loaded, c2.metrics().turns_active),
+        (1, 1)
+    );
+    assert!(
+        c1.destroy(&agent_ref("o-1"), None)
+            .await
+            .expect("destroy")
+            .destroyed
+    );
+
+    // c2's takeover of the expired lease is refused and reloads the root.
+    clock.advance_ms(past_lease_and_grace());
+    assert!(poll_now(&c2, &w, "v1").await.is_none());
+    let cached = c2.cached(&id).expect("reloaded");
+    assert_eq!(cached.lifecycle, Lifecycle::Tombstoned);
+    assert!(cached.active_turn.is_some());
+    assert_eq!(
+        (c2.metrics().agents_loaded, c2.metrics().turns_active),
+        (1, 1)
+    );
+
+    // Each pass reads the root again, inside the idle window of the last.
+    for _ in 0..4 {
+        clock.advance_ms(IDLE_MS / 2);
+        let pass = c2.sweep_once(store.tenant()).await.expect("sweep");
+        assert_eq!(pass.head_gets, 1, "the pass read the tombstoned root");
+        assert!(c2.cached(&id).is_some());
+    }
+    assert_eq!(c2.unload_idle(), 1);
+    assert!(c2.cached(&id).is_none());
+    assert_eq!(
+        (c2.metrics().agents_loaded, c2.metrics().turns_active),
+        (0, 0)
+    );
+}

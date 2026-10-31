@@ -366,8 +366,17 @@ reaches another process, the effect reads in doubt again; reconcile it again
 (`manual_latches_in_doubt_after_a_coordinator_restart_and_is_never_redispatched`).
 A takeover by a new worker on the same process keeps the hand-over
 (`a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`). Two admins of
-one tenant are not told apart in the audit record, so agree on one person per
-effect.
+one tenant are not told apart in the audit record.
+
+After a 500 `outcome_unknown` from reconcile. The server could not tell
+whether its own write took effect, so it hands the attempt to nobody.
+Read `GET /api/v1/agents/effects/{effect}`. If the attempt reads
+`authorized`, another reconcile's server holds it and the owner's next step
+dispatches it there, at most once
+(`concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`).
+If after the owner's next step the effect reads `in_doubt` again, no server
+held the attempt and nothing ran it; reconcile again
+(`a_reconcile_authorization_with_a_lost_ack_is_not_handed_over_and_latches_in_doubt_again`).
 
 Worked example, with `EFF` the effect id from `blocked_effect`:
 
