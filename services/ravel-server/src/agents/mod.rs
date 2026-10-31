@@ -102,6 +102,7 @@ pub const ROUTES: &[(&str, &str, Capability)] = &[
     ("GET", "/api/v1/agents/effects/{effect}", Capability::Agents),
     ("POST", "/api/v1/agents/reconcile", Capability::AgentsAdmin),
     ("POST", "/api/v1/agents/sweep", Capability::AgentsAdmin),
+    ("POST", "/api/v1/agents/destroy", Capability::AgentsAdmin),
 ];
 
 /// The agents settings a process runs with: its mode and the resolved
@@ -358,6 +359,7 @@ fn mounted() -> Vec<(&'static str, &'static str, MethodRouter<routes::Api>)> {
         ),
         ("POST", "/api/v1/agents/reconcile", post(routes::reconcile)),
         ("POST", "/api/v1/agents/sweep", post(routes::sweep)),
+        ("POST", "/api/v1/agents/destroy", post(routes::destroy)),
     ]
 }
 
@@ -521,7 +523,7 @@ mod tests {
             let needle = format!("requires the {} capability", capability.name());
             assert!(text.contains(&needle), "{method} {path}: {text}");
         }
-        assert_eq!(seen, [15, 7, 2], "routes per capability");
+        assert_eq!(seen, [15, 7, 3], "routes per capability");
     }
 
     /// The inspector page is the embedded file, served as HTML under a

@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
+use ravel_agents_core::error::{AgentError, ErrorKind, RetryHint, SafeIds};
 use ravel_agents_core::head::{
     Cancellation, EffectRecord, EffectStatus, Head, InboxEntry, InputSource, Lifecycle, StepRecord,
     TurnBlock,
@@ -31,16 +31,17 @@ use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::pages::{ListKind, Need, receipt_fingerprint};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    ActiveTurnBody, AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest, CallResponse,
-    CancelRequest, CancelTimerRequest, CreateAgentRequest, CursorExpiredBody, CursorRestart,
-    EffectAttemptBody, EffectBody, EffectCompleteRequest, EffectCompleteResponse,
-    EffectEvidenceBody, EffectFailRequest, EffectInspectResponse, EffectsResponse, ErrorBody,
-    EventBody, EventsRequest, EventsResponse, InputSourceBody, MailboxEntryBody, OperationResponse,
-    OperationStatus, ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest,
-    ResolveResponse, ResultBody, ResultResponse, SafeIdsBody, SendRequest, StateResponse, StepBody,
-    StepRecordRequest, StepRecordResponse, SweepResponse, TimerBody, TimerRequest, TimersResponse,
-    UsageBody, WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
-    WorkerPollRequest, WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
+    AbandonedCounts, ActiveTurnBody, AgentRef, AttemptState, CURSOR_EXPIRED_CODE, CallRequest,
+    CallResponse, CancelRequest, CancelTimerRequest, CreateAgentRequest, CursorExpiredBody,
+    CursorRestart, DestroyAgentRequest, DestroyAgentResponse, EffectAttemptBody, EffectBody,
+    EffectCompleteRequest, EffectCompleteResponse, EffectEvidenceBody, EffectFailRequest,
+    EffectInspectResponse, EffectsResponse, ErrorBody, EventBody, EventsRequest, EventsResponse,
+    InputSourceBody, MailboxEntryBody, OperationResponse, OperationStatus, ReconcileDecision,
+    ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse, ResultBody,
+    ResultResponse, SafeIdsBody, SendRequest, StateResponse, StepBody, StepRecordRequest,
+    StepRecordResponse, SweepResponse, TimerBody, TimerRequest, TimersResponse, UsageBody,
+    WorkerCommitRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse, WorkerPollRequest,
+    WorkerPollResponse, WorkerRegisterRequest, WorkerRegisterResponse,
 };
 use ravel_agents_runtime::{EffectRef, EffectResult, EffectSettled, StepProgress, StepSpec};
 use ravel_agents_store::{Clock, HeadState, SystemClock};
@@ -51,7 +52,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::audit::{ReconcileAction, agents_reconcile_audit_event};
+use super::audit::{ReconcileAction, agents_destroy_audit_event, agents_reconcile_audit_event};
 use super::runtime::{
     AgentsRuntime, LONG_POLL_CAP_MS, Lane, ResultWaitCounters, TenantAgents, WorkerDispatcher,
 };
@@ -86,7 +87,7 @@ pub enum Capability {
     Agents,
     /// Worker routes.
     AgentsWorker,
-    /// Operator routes: reconcile and sweep.
+    /// Operator routes: reconcile, sweep and destroy.
     AgentsAdmin,
 }
 
@@ -116,6 +117,10 @@ pub(super) enum Refusal {
     /// shared error shape: no agent error kind describes either.
     Auth(ServiceError),
     Agent(AgentError),
+    /// An agents error answered with another retry hint than its kind's: an
+    /// `outcome_unknown` from a route with no operation handle to resolve
+    /// ([`unknown_outcome_hint`]).
+    Hinted(AgentError, RetryHint),
     /// An `events` cursor below the retained window (410).
     CursorExpired(Box<CursorExpiredBody>),
 }
@@ -131,6 +136,11 @@ impl IntoResponse for Refusal {
         match self {
             Refusal::Auth(error) => error.into_response(),
             Refusal::Agent(error) => agent_error(&error),
+            Refusal::Hinted(error, hint) => {
+                let mut body = ErrorBody::from(&error);
+                body.retry = hint.code().to_string();
+                (error_status(error.kind), Json(body)).into_response()
+            }
             Refusal::CursorExpired(body) => (StatusCode::GONE, Json(*body)).into_response(),
         }
     }
@@ -140,7 +150,11 @@ type Reply<T> = Result<Json<T>, Refusal>;
 
 /// The one mapping from a typed agents error to an HTTP response.
 pub(super) fn agent_error(error: &AgentError) -> Response {
-    let status = match error.kind {
+    (error_status(error.kind), Json(ErrorBody::from(error))).into_response()
+}
+
+fn error_status(kind: ErrorKind) -> StatusCode {
+    match kind {
         ErrorKind::AgentGone => StatusCode::NOT_FOUND,
         ErrorKind::IdempotencyConflict
         | ErrorKind::OwnershipLost
@@ -152,8 +166,20 @@ pub(super) fn agent_error(error: &AgentError) -> Response {
         ErrorKind::BudgetExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorKind::StoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::UnsupportedFormat => StatusCode::UNPROCESSABLE_ENTITY,
-    };
-    (status, Json(ErrorBody::from(error))).into_response()
+    }
+}
+
+/// `outcome_unknown` answered with `hint` instead of `resolve_operation`,
+/// for an admin route that mints no operation handle; every other error
+/// keeps its kind's hint.
+fn unknown_outcome_hint(hint: RetryHint) -> impl Fn(AgentError) -> Refusal {
+    move |error| {
+        if error.kind == ErrorKind::OutcomeUnknown {
+            Refusal::Hinted(error, hint)
+        } else {
+            Refusal::Agent(error)
+        }
+    }
 }
 
 fn refusal(kind: ErrorKind, ids: SafeIds, reason: &'static str) -> Refusal {
@@ -625,6 +651,111 @@ pub(super) async fn sweep(State(api): State<Api>, req: Request<Body>) -> Respons
     run.await.into_response()
 }
 
+/// Tombstone an agent's current incarnation (ADR-3331, destroy amendment).
+///
+/// HEAD is read here rather than through [`read_head`], which answers
+/// `agent_gone` for a tombstoned HEAD: a repeat destroy is answered 200 with
+/// `destroyed: false` from that HEAD, with no write and no audit record. An
+/// absent HEAD and a pinned `incarnation` that is not current are
+/// `agent_gone` with nothing written and nothing audited.
+///
+/// A destroy that will change HEAD is audited first, with the `abandoned`
+/// counts of the HEAD read here; a refused submission refuses the destroy
+/// with nothing changed. The coordinator's destroy is pinned to the
+/// incarnation the record names. The response's counts come from the HEAD
+/// the tombstone was applied to (`DestroyOutcome::head`; the store re-reads
+/// HEAD on every publish attempt), so a write landing between the read and
+/// the CAS shows in the response and not in the record, and the response is
+/// the authoritative figure. After the coordinator's destroy, and after an
+/// unknown write outcome too, the tenant's evidence entries for the agent
+/// are forgotten and its result waiters notified, so a wait in flight
+/// re-reads HEAD and ends `agent_gone`.
+pub(super) async fn destroy(State(api): State<Api>, req: Request<Body>) -> Response {
+    let run = async move {
+        let (call, body) = api
+            .admit_body::<DestroyAgentRequest>(req, Capability::AgentsAdmin, Lane::Activation)
+            .await?;
+        let agent = parse_agent(&body.agent)?;
+        let head = match call.tenant.store.read_head_shallow(&agent).await? {
+            HeadState::Present { head, .. } => head,
+            HeadState::Absent => {
+                return Err(refusal(
+                    ErrorKind::AgentGone,
+                    ids_for(&agent),
+                    "agent does not exist",
+                ));
+            }
+            HeadState::Unsupported { .. } => {
+                return Err(refusal(
+                    ErrorKind::UnsupportedFormat,
+                    ids_for(&agent),
+                    "HEAD format version is newer than this release",
+                ));
+            }
+        };
+        let incarnation = head.incarnation;
+        if let Some(pinned) = body.incarnation.filter(|pinned| *pinned != incarnation) {
+            return Err(refusal(
+                ErrorKind::AgentGone,
+                SafeIds {
+                    incarnation: Some(pinned),
+                    ..ids_for(&agent)
+                },
+                "destroy names an incarnation that is not current",
+            ));
+        }
+        let read = AbandonedCounts::from_head(&head, head.inbox_depth());
+        if head.lifecycle == Lifecycle::Tombstoned {
+            return Ok(Json(DestroyAgentResponse {
+                agent_id: agent.to_hex(),
+                incarnation,
+                destroyed: false,
+                abandoned: read,
+            }));
+        }
+        let event = agents_destroy_audit_event(
+            &call.principal.tenant.hash(),
+            SystemClock.now_unix_ns(),
+            &call.principal,
+            &agent.to_hex(),
+            incarnation,
+            &read,
+        );
+        if let Err(error) = api.audit.submit(event).await {
+            tracing::warn!(error = %error, "agents destroy audit record was not written");
+            return Err(refusal(
+                ErrorKind::StoreUnavailable,
+                ids_for(&agent),
+                "the destroy audit record could not be written; nothing was changed",
+            ));
+        }
+        let destroyed = call
+            .tenant
+            .coordinator
+            .destroy(&body.agent, Some(incarnation))
+            .await;
+        let may_have_applied = match &destroyed {
+            Ok(_) => true,
+            Err(error) => error.kind == ErrorKind::OutcomeUnknown,
+        };
+        if may_have_applied {
+            call.tenant.evidence.forget_agent(agent);
+            call.tenant.changed.notify_waiters();
+        }
+        let out = destroyed.map_err(|mut error| {
+            error.ids.incarnation = Some(incarnation);
+            unknown_outcome_hint(RetryHint::Backoff)(error)
+        })?;
+        Ok::<_, Refusal>(Json(DestroyAgentResponse {
+            agent_id: out.agent_id.to_hex(),
+            incarnation: out.incarnation,
+            destroyed: out.destroyed,
+            abandoned: AbandonedCounts::from_head(&out.head, out.head.inbox_depth()),
+        }))
+    };
+    run.await.into_response()
+}
+
 /// The inspector page (ADR-3331 decision 11). It carries no tenant data: the
 /// page reads state, timers, effects and events through the routes above with
 /// the token its user enters. The policy forbids every origin but this one,
@@ -1059,14 +1190,16 @@ pub(super) async fn reconcile(State(api): State<Api>, req: Request<Body>) -> Res
                 call.tenant
                     .coordinator
                     .reconcile_attach(&effect, &result)
-                    .await?;
+                    .await
+                    .map_err(unknown_outcome_hint(RetryHint::Reconcile))?;
             }
             ReconcileDecision::Retry => {
                 let next = body.attempt.checked_add(1).ok_or_else(not_in_doubt)?;
                 call.tenant
                     .coordinator
                     .reconcile_authorize(&effect, next)
-                    .await?;
+                    .await
+                    .map_err(unknown_outcome_hint(RetryHint::Reconcile))?;
             }
         }
         call.tenant.changed.notify_waiters();
