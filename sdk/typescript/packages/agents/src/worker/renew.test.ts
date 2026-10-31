@@ -39,6 +39,8 @@ let handlerMs = HANDLER_MS;
 let beforeStepMs = 0;
 /** How long the `charge` tool runs, ignoring its signal. */
 let chargeMs = 0;
+/** Whether the `charge` tool throws once it has run instead of returning. */
+let chargeThrows = false;
 const signals: AbortSignal[] = [];
 /** The fake clock at each abort of a handler's signal. */
 const abortedAt: number[] = [];
@@ -55,6 +57,7 @@ const charge = defineTool({
   run: async () => {
     toolRunAt.push(Date.now());
     await after(chargeMs);
+    if (chargeThrows) throw new Error("card declined");
     return {};
   },
 });
@@ -114,6 +117,8 @@ interface Leasing {
   readonly recordMs?: number;
   /** The handler the turn runs. */
   readonly handler?: string;
+  /** Whether the coordinator answers an effect's result as late, already journaled as completed. */
+  readonly late?: boolean;
 }
 
 const after = (ms: number): Promise<void> =>
@@ -126,16 +131,18 @@ const after = (ms: number): Promise<void> =>
  * rejects with `beats[n]` (or `beats(n)`) when that is set. Like the server,
  * it refuses a commit once the clock passes the last expiry plus `GRACE_MS`,
  * since a poll by another worker would have taken the turn over by then. A
- * step is journaled with no result, which authorizes an attempt.
+ * step is journaled with no result, which authorizes an attempt. `sent`
+ * logs every call the turn makes, in order, with the fake clock.
  */
 function leasingTransport(
   beats: (Error | undefined)[] | ((n: number) => Error | undefined) = [],
-  { leaseMs = LEASE_MS, answerMs = 0, recordMs = 0, handler = "think" }: Leasing = {},
+  { leaseMs = LEASE_MS, answerMs = 0, recordMs = 0, handler = "think", late = false }: Leasing = {},
 ) {
   const heartbeatAt: number[] = [];
   const commitAt: number[] = [];
   const recordStepAt: number[] = [];
   const effectAt: number[] = [];
+  const sent: [string, number][] = [];
   let polled = false;
   let expiresMs = 0;
   const transport: Transport = {
@@ -143,6 +150,7 @@ function leasingTransport(
     heartbeat: async () => {
       const n = heartbeatAt.length;
       heartbeatAt.push(Date.now());
+      sent.push(["heartbeat", Date.now()]);
       const refusal = typeof beats === "function" ? beats(n) : beats[n];
       if (refusal === undefined) expiresMs = Date.now() + leaseMs;
       const granted = expiresMs;
@@ -164,19 +172,23 @@ function leasingTransport(
     },
     recordStep: async () => {
       recordStepAt.push(Date.now());
+      sent.push(["recordStep", Date.now()]);
       await after(recordMs);
       return startedStep;
     },
     completeEffect: (request) => {
       effectAt.push(Date.now());
-      return Promise.resolve({ effect: request.effect, status: "completed", late: false });
+      sent.push(["completeEffect", Date.now()]);
+      return Promise.resolve({ effect: request.effect, status: "completed", late });
     },
     failEffect: () => {
       effectAt.push(Date.now());
+      sent.push(["failEffect", Date.now()]);
       return Promise.reject(new Error("unused"));
     },
     commit: (request) => {
       commitAt.push(Date.now());
+      sent.push(["commit", Date.now()]);
       if (Date.now() > expiresMs + GRACE_MS) {
         return Promise.reject(new OwnershipLost("the turn was taken over after its lease and grace ran out"));
       }
@@ -189,7 +201,7 @@ function leasingTransport(
       });
     },
   };
-  return { transport, heartbeatAt, commitAt, recordStepAt, effectAt };
+  return { transport, heartbeatAt, commitAt, recordStepAt, effectAt, sent };
 }
 
 /**
@@ -421,6 +433,51 @@ describe("a step after the turn aborted", () => {
       expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
     } finally {
       chargeMs = 0;
+    }
+  });
+
+  it("a late result after the abort sends nothing more", async () => {
+    // As above, but the coordinator answers the result as late: another
+    // worker's attempt already completed the effect. Inside the lease the
+    // worker would read the journal back for that result; after the abort it
+    // sends nothing more.
+    beforeStepMs = LEASE_MS - 1_000;
+    chargeMs = 2_000;
+    try {
+      const { transport, sent } = leasingTransport(() => unavailable, { handler: "charge", late: true });
+      const reports = await serveFor(transport);
+      expect(abortedAt).toEqual([LEASE_MS]);
+      expect(toolRunAt).toEqual([LEASE_MS - 1_000]);
+      expect(sent.filter(([, at]) => at >= LEASE_MS)).toEqual([["completeEffect", LEASE_MS + 1_000]]);
+      expect(stepErrors).toHaveLength(1);
+      expect(stepErrors[0]).toBeInstanceOf(LeaseExpired);
+      expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+    } finally {
+      chargeMs = 0;
+    }
+  });
+
+  it("a tool that throws after the abort reports no failure", async () => {
+    // The tool starts at 5 s, inside the 6 s lease, and throws at 7 s, after
+    // the expiry. Its error says nothing about whether the effect happened,
+    // so no failEffect is sent and the step rejects with the abort's reason.
+    beforeStepMs = LEASE_MS - 1_000;
+    chargeMs = 2_000;
+    chargeThrows = true;
+    try {
+      const { transport, sent, effectAt } = leasingTransport(() => unavailable, { handler: "charge" });
+      const reports = await serveFor(transport);
+      expect(abortedAt).toEqual([LEASE_MS]);
+      expect(toolRunAt).toEqual([LEASE_MS - 1_000]);
+      expect(sent.filter(([call]) => call === "failEffect")).toEqual([]);
+      expect(sent.filter(([, at]) => at >= LEASE_MS)).toEqual([]);
+      expect(effectAt).toEqual([]);
+      expect(stepErrors).toHaveLength(1);
+      expect(stepErrors[0]).toBeInstanceOf(LeaseExpired);
+      expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+    } finally {
+      chargeMs = 0;
+      chargeThrows = false;
     }
   });
 
