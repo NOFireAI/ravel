@@ -215,9 +215,7 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
         ticket: fixture.count(TICKET),
       },
       effects: await journal.effects(operationId),
-      // The server reads a never-committed agent's state as null, which the
-      // client's type does not admit.
-      answered: (state.state as { answered: number } | null)?.answered ?? 0,
+      answered: state.state?.answered ?? 0,
       inDoubt,
       recoveryMs,
     };
