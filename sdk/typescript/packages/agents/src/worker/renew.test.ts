@@ -4,14 +4,29 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { AgentGone, OutcomeUnknown, OwnershipLost } from "../errors.js";
-import { decodeWire, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
-import { defineAgent, handlerDigest, serveAgents, type Transport, type TurnReport } from "./index.js";
+import { defineTool } from "../tools/index.js";
+import { decodeWire, StepRecordResponse, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
+import {
+  DEFAULT_LEASE_MS,
+  defineAgent,
+  handlerDigest,
+  InvalidWorkerOption,
+  serveAgents,
+  type ServeOptions,
+  type Transport,
+  type TurnReport,
+} from "./index.js";
 import { LeaseExpired, MIN_RENEW_INTERVAL_MS, renewInterval } from "./runner.js";
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../fixtures");
 const pollFixture = JSON.parse(readFileSync(resolve(fixtureDir, "worker_poll_response.json"), "utf8")) as {
   assignment: Record<string, unknown> & { lease: Record<string, unknown> };
 };
+/** A step journaled with no result: the answer authorizes an attempt. */
+const startedStep = decodeWire(
+  StepRecordResponse,
+  JSON.parse(readFileSync(resolve(fixtureDir, "step_record_response.json"), "utf8")),
+);
 
 /** The scripted coordinator's lease and grace: a turn idle past 8 s is taken over. */
 const LEASE_MS = 6_000;
@@ -19,9 +34,30 @@ const GRACE_MS = 2_000;
 /** How long the handler runs: longer than the lease plus its grace. */
 const HANDLER_MS = 9_000;
 
+let handlerMs = HANDLER_MS;
+/** How long the `charge` handler works without a step, ignoring its signal, before its step. */
+let beforeStepMs = 0;
+/** How long the `charge` tool runs, ignoring its signal. */
+let chargeMs = 0;
 const signals: AbortSignal[] = [];
 /** The fake clock at each abort of a handler's signal. */
 const abortedAt: number[] = [];
+/** The fake clock at each run of the `charge` tool, and what each step rejected with. */
+const toolRunAt: number[] = [];
+const stepErrors: unknown[] = [];
+
+const charge = defineTool({
+  name: "card.charge",
+  version: "1",
+  input: z.object({}),
+  output: z.object({}),
+  recovery: "at_least_once",
+  run: async () => {
+    toolRunAt.push(Date.now());
+    await after(chargeMs);
+    return {};
+  },
+});
 
 const agent = defineAgent({
   name: "order",
@@ -36,19 +72,31 @@ const agent = defineAgent({
       handler: async (ctx) => {
         signals.push(ctx.signal);
         ctx.signal.addEventListener("abort", () => abortedAt.push(Date.now()));
-        await new Promise((done) => setTimeout(done, HANDLER_MS));
+        await new Promise((done) => setTimeout(done, handlerMs));
+        return null;
+      },
+    }),
+    // Works past the lease without looking at its signal, then runs a step.
+    charge: message({
+      payload: z.unknown(),
+      result: z.null(),
+      handler: async (ctx) => {
+        signals.push(ctx.signal);
+        ctx.signal.addEventListener("abort", () => abortedAt.push(Date.now()));
+        await new Promise((done) => setTimeout(done, beforeStepMs));
+        await ctx.step("charge", charge, {}).catch((error: unknown) => stepErrors.push(error));
         return null;
       },
     }),
   }),
 });
 
-function assignment(): TurnAssignment {
+function assignment(handler: string): TurnAssignment {
   const body = {
     assignment: {
       ...pollFixture.assignment,
-      handler: "think",
-      lease: { ...pollFixture.assignment.lease, handler_digest: handlerDigest(agent, "think") },
+      handler,
+      lease: { ...pollFixture.assignment.lease, handler_digest: handlerDigest(agent, handler) },
       steps: [],
     },
   };
@@ -57,36 +105,56 @@ function assignment(): TurnAssignment {
   return decoded;
 }
 
+interface Leasing {
+  /** The coordinator's lease. */
+  readonly leaseMs?: number;
+  /** How long each heartbeat's answer travels back after the coordinator processed it. */
+  readonly answerMs?: number;
+  /** How long a step record's answer takes. */
+  readonly recordMs?: number;
+  /** The handler the turn runs. */
+  readonly handler?: string;
+}
+
+const after = (ms: number): Promise<void> =>
+  ms === 0 ? Promise.resolve() : new Promise((done) => setTimeout(done, ms));
+
 /**
  * A coordinator that leases one turn at its first poll for `leaseMs` and
- * renews it by `leaseMs` past the fake clock on each heartbeat. The n-th
- * heartbeat rejects with `beats[n]` (or `beats(n)`) when that is set. Like the server, it
- * refuses a commit once the clock passes the last expiry plus `GRACE_MS`,
- * since a poll by another worker would have taken the turn over by then.
+ * renews it by `leaseMs` past the fake clock on each heartbeat, counted from
+ * when it processed the request, as the server does. The n-th heartbeat
+ * rejects with `beats[n]` (or `beats(n)`) when that is set. Like the server,
+ * it refuses a commit once the clock passes the last expiry plus `GRACE_MS`,
+ * since a poll by another worker would have taken the turn over by then. A
+ * step is journaled with no result, which authorizes an attempt.
  */
 function leasingTransport(
   beats: (Error | undefined)[] | ((n: number) => Error | undefined) = [],
-  leaseMs = LEASE_MS,
+  { leaseMs = LEASE_MS, answerMs = 0, recordMs = 0, handler = "think" }: Leasing = {},
 ) {
   const heartbeatAt: number[] = [];
   const commitAt: number[] = [];
+  const recordStepAt: number[] = [];
+  const effectAt: number[] = [];
   let polled = false;
   let expiresMs = 0;
   const transport: Transport = {
     register: () => Promise.resolve({ worker_id: "w-0000000000000001" }),
-    heartbeat: () => {
+    heartbeat: async () => {
       const n = heartbeatAt.length;
       heartbeatAt.push(Date.now());
       const refusal = typeof beats === "function" ? beats(n) : beats[n];
-      if (refusal !== undefined) return Promise.reject(refusal);
-      expiresMs = Date.now() + leaseMs;
-      return Promise.resolve({ lease_expires_unix_ns: BigInt(expiresMs) * 1_000_000n });
+      if (refusal === undefined) expiresMs = Date.now() + leaseMs;
+      const granted = expiresMs;
+      await after(answerMs);
+      if (refusal !== undefined) throw refusal;
+      return { lease_expires_unix_ns: BigInt(granted) * 1_000_000n };
     },
     poll: (_request, signal) => {
       if (!polled) {
         polled = true;
         expiresMs = Date.now() + leaseMs;
-        return Promise.resolve({ assignment: assignment() });
+        return Promise.resolve({ assignment: assignment(handler) });
       }
       return new Promise((done) => {
         signal.addEventListener("abort", () => {
@@ -94,9 +162,19 @@ function leasingTransport(
         });
       });
     },
-    recordStep: () => Promise.reject(new Error("unused")),
-    completeEffect: () => Promise.reject(new Error("unused")),
-    failEffect: () => Promise.reject(new Error("unused")),
+    recordStep: async () => {
+      recordStepAt.push(Date.now());
+      await after(recordMs);
+      return startedStep;
+    },
+    completeEffect: (request) => {
+      effectAt.push(Date.now());
+      return Promise.resolve({ effect: request.effect, status: "completed", late: false });
+    },
+    failEffect: () => {
+      effectAt.push(Date.now());
+      return Promise.reject(new Error("unused"));
+    },
     commit: (request) => {
       commitAt.push(Date.now());
       if (Date.now() > expiresMs + GRACE_MS) {
@@ -111,27 +189,34 @@ function leasingTransport(
       });
     },
   };
-  return { transport, heartbeatAt, commitAt };
+  return { transport, heartbeatAt, commitAt, recordStepAt, effectAt };
 }
 
 /**
- * Serve `transport` under fake timers from time 0 for 20 s, with the worker
- * told the coordinator's lease is `leaseMs`, and report each turn.
+ * Serve `transport` under fake timers from time 0 for `serveMs`, with the
+ * worker told the coordinator's lease is `leaseMs` (left unset when `null`),
+ * and report each turn.
  */
-async function serveFor(transport: Transport, leaseMs = LEASE_MS): Promise<TurnReport[]> {
+async function serveFor(
+  transport: Transport,
+  leaseMs: number | null = LEASE_MS,
+  serveMs = 20_000,
+): Promise<TurnReport[]> {
   vi.useFakeTimers({ now: 0 });
   signals.length = 0;
   abortedAt.length = 0;
+  toolRunAt.length = 0;
+  stepErrors.length = 0;
   try {
     const reports: TurnReport[] = [];
-    const worker = await serveAgents({
+    const options: ServeOptions = {
       transport,
       agents: [agent],
       workerId: "w-0000000000000001",
-      leaseMs,
       onTurn: (report) => reports.push(report),
-    });
-    await vi.advanceTimersByTimeAsync(20_000);
+    };
+    const worker = await serveAgents(leaseMs === null ? options : { ...options, leaseMs });
+    await vi.advanceTimersByTimeAsync(serveMs);
     await worker.close();
     return reports;
   } finally {
@@ -196,7 +281,7 @@ describe("lease renewal", () => {
     "renewals that keep failing past the lease abort the turn and send no commit (lease %i ms)",
     async (leaseMs) => {
       const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
-      const { transport, heartbeatAt, commitAt } = leasingTransport(() => unavailable, leaseMs);
+      const { transport, heartbeatAt, commitAt } = leasingTransport(() => unavailable, { leaseMs });
       const reports = await serveFor(transport, leaseMs);
       // No answer ever names an expiry, so renewals run at the 1 s floor from
       // assignment until the lease the poll granted at 0 s runs out.
@@ -214,15 +299,140 @@ describe("lease renewal", () => {
     },
   );
 
-  it("an answered renewal restarts the lease the worker measures", async () => {
+  it("an answered renewal restarts the lease the worker measures from its sending", async () => {
     const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
-    // Answered at 0 s and 2 s, then failing: the lease runs out 6 s after
-    // the answer at 2 s, not 6 s after the assignment.
-    const { transport, commitAt } = leasingTransport((n) => (n < 2 ? undefined : unavailable));
+    // Each answer travels 500 ms. Sent at 0 s and answered at 0.5 s, then
+    // sent a third of the 5.5 s left later, at 2.333 s, and answered at
+    // 2.833 s; every later one fails. The coordinator counted the last grant
+    // from 2.333 s, when it processed the request, so the lease runs out at
+    // 8.333 s: 6 s after that renewal was sent, not after its answer came
+    // back, nor after the assignment.
+    const { transport, heartbeatAt, commitAt } = leasingTransport((n) => (n < 2 ? undefined : unavailable), {
+      answerMs: 500,
+    });
     const reports = await serveFor(transport);
-    expect(abortedAt).toEqual([2_000 + LEASE_MS]);
+    expect(heartbeatAt.slice(0, 2)).toEqual([0, 2_333]);
+    expect(abortedAt).toEqual([2_333 + LEASE_MS]);
     expect(signals[0]?.reason).toBeInstanceOf(LeaseExpired);
     expect(commitAt).toEqual([]);
     expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+  });
+
+  it("leaseMs left unset aborts at the 30 s default", async () => {
+    handlerMs = 40_000;
+    try {
+      const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
+      const { transport, commitAt } = leasingTransport(() => unavailable, { leaseMs: 30_000 });
+      const reports = await serveFor(transport, null, 45_000);
+      expect(abortedAt).toEqual([30_000]);
+      expect(signals[0]?.reason).toBeInstanceOf(LeaseExpired);
+      expect(commitAt).toEqual([]);
+      expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+      expect(DEFAULT_LEASE_MS).toBe(30_000);
+    } finally {
+      handlerMs = HANDLER_MS;
+    }
+  });
+
+  it.each([999, 0, -1, 1_500.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648])(
+    "serveAgents refuses leaseMs %d at startup with InvalidWorkerOption",
+    async (leaseMs) => {
+      const { transport } = leasingTransport();
+      const register = vi.spyOn(transport, "register");
+      const poll = vi.spyOn(transport, "poll");
+      const refused = await serveAgents({ transport, agents: [agent], leaseMs }).then(
+        (worker) => worker.close(),
+        (error: unknown) => error,
+      );
+      expect(refused).toBeInstanceOf(InvalidWorkerOption);
+      expect(refused).toMatchObject({ option: "leaseMs" });
+      // Refused before any request, never at turn time.
+      expect(register).not.toHaveBeenCalled();
+      expect(poll).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([1_000, 2_147_483_647])("serveAgents accepts leaseMs %d", async (leaseMs) => {
+    const { transport } = leasingTransport();
+    const worker = await serveAgents({ transport, agents: [agent], workerId: "w-0000000000000001", leaseMs });
+    await worker.close();
+  });
+});
+
+describe("a step after the turn aborted", () => {
+  const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
+
+  it("a step called after the lease expired is refused locally and never reaches the server", async () => {
+    // The handler works until 7 s, past the 6 s lease, without looking at
+    // its signal, then runs a step.
+    beforeStepMs = LEASE_MS + 1_000;
+    const { transport, commitAt, recordStepAt, effectAt } = leasingTransport(() => unavailable, {
+      handler: "charge",
+    });
+    const reports = await serveFor(transport);
+    expect(abortedAt).toEqual([LEASE_MS]);
+    expect(recordStepAt.filter((at) => at >= LEASE_MS)).toEqual([]);
+    expect(recordStepAt).toEqual([]);
+    expect(toolRunAt).toEqual([]);
+    expect(effectAt).toEqual([]);
+    expect(commitAt).toEqual([]);
+    expect(stepErrors).toHaveLength(1);
+    expect(stepErrors[0]).toBeInstanceOf(LeaseExpired);
+    expect(stepErrors[0]).toBe(signals[0]?.reason);
+    expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+  });
+
+  it("a lease that expires while the step's record is in flight runs no tool", async () => {
+    // The step is recorded at 5 s, inside the 6 s lease, and its answer
+    // comes back at 7 s, after the expiry.
+    beforeStepMs = LEASE_MS - 1_000;
+    const { transport, commitAt, recordStepAt, effectAt } = leasingTransport(() => unavailable, {
+      handler: "charge",
+      recordMs: 2_000,
+    });
+    const reports = await serveFor(transport);
+    expect(abortedAt).toEqual([LEASE_MS]);
+    expect(recordStepAt).toEqual([LEASE_MS - 1_000]);
+    expect(toolRunAt).toEqual([]);
+    expect(effectAt).toEqual([]);
+    expect(commitAt).toEqual([]);
+    expect(stepErrors).toHaveLength(1);
+    expect(stepErrors[0]).toBeInstanceOf(LeaseExpired);
+    expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+  });
+
+  it("a tool that finishes after the lease expired still reports its result, and nothing else is sent", async () => {
+    // The step is recorded and its tool started at 5 s, inside the 6 s
+    // lease; the tool ignores its signal and finishes at 7 s. The effect
+    // happened, so its result is reported for a takeover to replay rather
+    // than run again; the turn still sends no commit.
+    beforeStepMs = LEASE_MS - 1_000;
+    chargeMs = 2_000;
+    try {
+      const { transport, commitAt, recordStepAt, effectAt } = leasingTransport(() => unavailable, {
+        handler: "charge",
+      });
+      const reports = await serveFor(transport);
+      expect(abortedAt).toEqual([LEASE_MS]);
+      expect(recordStepAt).toEqual([LEASE_MS - 1_000]);
+      expect(toolRunAt).toEqual([LEASE_MS - 1_000]);
+      expect(effectAt).toEqual([LEASE_MS + 1_000]);
+      expect(commitAt).toEqual([]);
+      expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+    } finally {
+      chargeMs = 0;
+    }
+  });
+
+  it("a step inside the lease runs its tool and the turn commits", async () => {
+    beforeStepMs = 1_000;
+    const { transport, commitAt, recordStepAt, effectAt } = leasingTransport([], { handler: "charge" });
+    const reports = await serveFor(transport);
+    expect(recordStepAt).toEqual([1_000]);
+    expect(toolRunAt).toEqual([1_000]);
+    expect(effectAt).toEqual([1_000]);
+    expect(stepErrors).toEqual([]);
+    expect(commitAt).toEqual([1_000]);
+    expect(reports.map((r) => r.outcome)).toEqual(["committed"]);
   });
 });

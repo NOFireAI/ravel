@@ -405,13 +405,28 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   at the next tick, and one inside the lease never aborts, commits or fails
   the turn by itself. When renewals have failed past the lease, the worker
   aborts the handler's `ctx.signal` at the expiry and abandons the turn the
-  same way, with `LeaseExpired`, before the server's grace lets another
-  worker take it over. The worker measures that expiry on its own timers:
-  `leaseMs` (a `serveAgents` option, default 30 s) from the moment it
-  received the assignment or the last answered renewal, since neither answer
-  carries the lease length and its wall clock may be skewed from the
-  server's. Set `leaseMs` to the server's `lease_ms` (30 s, with a 10 s
-  grace, by default: the agents runtime's `RuntimeConfig::default`). The
+  same way, with `LeaseExpired`. A `ctx.step` the handler calls after either
+  abort, or whose record is answered after it, rejects with the abort's
+  reason: it sends no step record and runs no tool, so a handler that never
+  reads `ctx.signal` still cannot start an effect on a turn another worker
+  may own. A tool already running when the abort lands, and that returns,
+  still has its result reported, so a takeover replays it rather than
+  running the effect again; a tool that throws after the abort reports
+  nothing. The worker measures that expiry
+  on its own timers: `leaseMs` (a `serveAgents` option, default 30 s) from
+  the moment it received the assignment, or sent the last renewal that was
+  answered, since neither answer carries the lease length and its wall clock
+  may be skewed from the server's. The server counts a renewal's lease from
+  when it processed the request, which is no earlier than the sending. So
+  the abort lands before the server's grace lets another worker take the
+  turn over only when `leaseMs` is no longer than the server's agents lease,
+  `lease_ms` in its agents settings (`AgentsConfig::lease_ms` in
+  `services/ravel-server/src/config.rs`, 30 s with a 10 s
+  `heartbeat_grace_ms` by default); a longer `leaseMs` lets a turn run past
+  its lease. Issue #3568 tracks carrying the lease length on the wire, which
+  would remove the option. `leaseMs` must be an integer from 1000 to
+  2147483647: any other value rejects `serveAgents` with
+  `InvalidWorkerOption` before it sends a request. The
   interval is read against the worker's clock, so a clock ahead of the
   server's renews at the 1 s floor.
   The server keeps renewals in the memory of the coordinator that answered
@@ -422,8 +437,14 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   refused renewal aborts the turn and nothing is committed`, `a transient
   renewal failure inside the lease does not abort the turn`, `renewals that
   keep failing past the lease abort the turn and send no commit`, `an
-  answered renewal restarts the lease the worker measures`, `renews a third
-  of the lease left, and never faster than the floor`
+  answered renewal restarts the lease the worker measures from its
+  sending`, `leaseMs left unset aborts at the 30 s default`, `serveAgents
+  refuses leaseMs %d at startup with InvalidWorkerOption`, `a step called
+  after the lease expired is refused locally and never reaches the server`,
+  `a lease that expires while the step's record is in flight runs no tool`,
+  `a tool that finishes after the lease expired still reports its result,
+  and nothing else is sent`,
+  `renews a third of the lease left, and never faster than the floor`
   (`worker/renew.test.ts`),
   `renews once at assignment, sends nothing while a tool runs, and no
   heartbeat before a step` (`transport/http.test.ts`).
