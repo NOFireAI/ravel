@@ -17,11 +17,11 @@ use std::time::Duration;
 use ravel_agents_core::error::{ErrorKind, RetryHint};
 use ravel_agents_core::wire::{
     AgentRef, CallRequest, CallResponse, CancelRequest, CancelResponse, CancelTimerRequest,
-    CancelTimerResponse, CreateAgentRequest, CreateAgentResponse, EffectInspectResponse,
-    EffectsResponse, ErrorBody, EventsRequest, EventsResponse, OperationResponse,
-    ReconcileDecision, ReconcileRequest, ReconcileResponse, ResolveRequest, ResolveResponse,
-    ResultResponse, SafeIdsBody, SendRequest, SendResponse, StateResponse, TimerRequest,
-    TimerResponse,
+    CancelTimerResponse, CreateAgentRequest, CreateAgentResponse, DestroyAgentRequest,
+    DestroyAgentResponse, EffectInspectResponse, EffectsResponse, ErrorBody, EventsRequest,
+    EventsResponse, OperationResponse, ReconcileDecision, ReconcileRequest, ReconcileResponse,
+    ResolveRequest, ResolveResponse, ResultResponse, SafeIdsBody, SendRequest, SendResponse,
+    StateResponse, TimerRequest, TimerResponse,
 };
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
@@ -484,6 +484,21 @@ impl AgentsClient {
             .await
     }
 
+    /// Tombstone the agent's current incarnation, or `incarnation` when it is
+    /// given; needs a token with `agents_admin`. A 404 `agent_gone` means no
+    /// such agent, or the pinned incarnation is not the current one.
+    pub async fn destroy(
+        &self,
+        agent: &AgentRef,
+        incarnation: Option<u64>,
+    ) -> Result<DestroyAgentResponse, ClientError> {
+        let body = DestroyAgentRequest {
+            agent: agent.clone(),
+            incarnation,
+        };
+        self.post("destroy", &body, DEFAULT_TIMEOUT).await
+    }
+
     /// `POST /api/v1/agents/timers`. The server does not mount the timer
     /// routes in this release, so this ends in [`ClientError::NotServed`]
     /// there.
@@ -905,6 +920,63 @@ mod tests {
             seen[5].body,
             json!({"effect": "e/1", "attempt": 1, "decision": "record_result", "result": {"ticket": "T-1"}})
         );
+    }
+
+    fn fixture(name: &str) -> String {
+        let path = format!(
+            "{}/../../sdk/fixtures/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).expect("fixture reads")
+    }
+
+    #[tokio::test]
+    async fn destroy_posts_the_agent_and_decodes_the_response() {
+        let response = fixture("destroy_agent_response");
+        let server = TestServer::start_raw(vec![
+            (200, response.clone()),
+            (200, response),
+            (404, error_body("agent_gone", "never").to_string()),
+        ])
+        .await;
+        let client = server.client();
+        let order = AgentRef {
+            kind: "order".to_string(),
+            key: "o-1".to_string(),
+        };
+        let out = client.destroy(&order, Some(1)).await.expect("destroy");
+        assert!(out.destroyed);
+        assert_eq!(out.agent_id, "19cd0e6876991314c1b6dbd8bd129297");
+        assert_eq!(out.incarnation, 1);
+        assert_eq!(out.abandoned.inputs, 2);
+        assert!(out.abandoned.active_turn);
+        assert_eq!(out.abandoned.effects_in_doubt, 1);
+        assert_eq!(out.abandoned.effects_authorized, 0);
+        assert_eq!(out.abandoned.timers_scheduled, 1);
+        client.destroy(&order, None).await.expect("destroy");
+        let err = client
+            .destroy(&order, Some(7))
+            .await
+            .expect_err("agent_gone is an error");
+        assert_eq!(err.kind(), Some(ErrorKind::AgentGone));
+        assert_eq!(err.retry(), Some(RetryHint::Never));
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 3);
+        for s in &seen {
+            assert_eq!(s.method, "POST");
+            assert_eq!(s.path, "/api/v1/agents/destroy");
+            assert_eq!(s.auth, "Bearer tok");
+        }
+        let request: Value =
+            serde_json::from_str(&fixture("destroy_agent_request")).expect("fixture is JSON");
+        assert_eq!(seen[0].body, request);
+        assert_eq!(
+            seen[1].body,
+            json!({"agent": {"kind": "order", "key": "o-1"}})
+        );
+        assert!(seen[1].body.get("incarnation").is_none());
+        assert_eq!(seen[2].body["incarnation"], 7);
     }
 
     #[tokio::test]
