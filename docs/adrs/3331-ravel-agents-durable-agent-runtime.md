@@ -950,7 +950,9 @@ precondition row stays `IncarnationMatches, HeadBelowByteCap` with no
 page needs.
 
 **The incarnation fence does the rest.** Every command except `Create`
-and `Tombstone` runs `check_active` and `check_incarnation` first, so after
+runs `check_incarnation`, which runs `check_active`, before anything else
+(`Tombstone` first answers a HEAD already tombstoned at that incarnation
+with `AlreadyTombstoned`), so after
 the tombstone every handle minted under that incarnation answers
 `AgentGone` (HTTP 404, retry `never`): operation handles on `operation`,
 `result`, `cancel` and `events`; step and effect handles on `worker/step`,
@@ -1001,6 +1003,8 @@ publication rule orders it against anything in flight:
   answers `AlreadyTombstoned`, which the route reports as 200 with
   `destroyed: false` and the same `abandoned` counts, writing nothing and
   auditing nothing, the way a repeated reconcile is answered from HEAD.
+  The route therefore reads HEAD without the routes' `read_head` helper,
+  which answers `agent_gone` for a tombstoned HEAD.
 - `incarnation` pinned in the request and not current. `agent_gone`,
   nothing written: an operator who typed the destroy against incarnation
   `n` must not tombstone the `n + 1` a colleague just created. Omitted, the
@@ -1016,15 +1020,31 @@ agent from its loaded set, forgets its lease, prunes its open attempts and
 reconcile hand-overs, forgets its evidence entries and notifies the
 tenant's result waiters. Another process serving the same tenant learns
 of the tombstone on its next HEAD read, and its loaded root is a cache
-(decision 6: only the fence revokes; the cache chooses when to look). The
-dispatch scan skips a loaded root whose lifecycle is not `Active`, so a
-destroyed agent with queued inputs is not offered to every poll until it
-unloads.
+(decision 6: only the fence revokes; the cache chooses when to look).
+Today that cache never lets go of a destroyed agent with queued inputs:
+`Coordinator::candidates` and `Coordinator::offer` test no lifecycle, and
+`unload_idle` keeps any root with inbox entries, so every poll the agent
+wins would end in `agent_gone` from `BeginTurn`, without end. This
+amendment changes the runtime in three places: `candidates` and `offer`
+skip a root whose lifecycle is not `Active`; `unload_idle` drops a
+non-active root whatever its inbox holds; and an `agent_gone` answer to
+`BeginTurn` replaces the loaded root with the HEAD that refused it. A
+process that did not serve the destroy therefore offers the agent at most
+once more, to the first poll whose `BeginTurn` reads the tombstone, and
+the sweep's next load of the agent skips it. Two runtime tests pin this:
+one for the coordinator that served the destroy, and one for a second
+coordinator on the same store that did not.
 
 **Audit.** A destroy that changes HEAD writes one `kind=agents_destroy`
 record to the tenant's audit shard before the CAS, naming the tenant, the
 agent id, the incarnation destroyed, the caller's tenant and capabilities,
-and the `abandoned` counts. The order is the one reconcile uses: in
+and the `abandoned` counts as the route read them before the CAS. Those
+can differ from the response's counts, which come from the HEAD the
+tombstone was applied to: a send, an authorization or a timer that lands
+between the route's read and the winning CAS attempt changes them, since
+`AgentStore::publish` re-reads HEAD on every attempt. The response is the
+authoritative count; the audit record states the operator's intent and
+what HEAD held when it was formed. The order is the one reconcile uses: in
 required audit mode a refused submission refuses the destroy with
 `store_unavailable` and nothing changes; the cost is a record for a
 destroy whose CAS then lost, which names an intent that did not apply. A
@@ -1038,7 +1058,7 @@ class of decision as reconcile, which is why the operator guide keeps
 
 **Surfaces.** `ravel-agents-client::AgentsClient::destroy(agent,
 incarnation)`; `ravel-cli agents destroy --kind K --key KEY
-[--incarnation N] --server URL --token T [--json]`, through the client so
+[--incarnation N] --url URL --token T [--json]`, through the client so
 the destroy is audited, with the same shape as `agents reconcile`; the
 TypeScript client's `agent(kind, key).destroy({ incarnation? })`, which
 needs the configured token to hold `agents_admin`. No MCP tool: the MCP
@@ -1174,6 +1194,7 @@ it:
   both orders, with the loser's re-read refused `AgentGone` and no result
   in a tombstoned HEAD.
 - runtime `a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll`
+- runtime `a_coordinator_that_did_not_serve_the_destroy_stops_offering_the_agent_after_one_refused_begin_turn`
   and `a_hint_of_a_destroyed_incarnation_fires_nothing_and_is_deleted`.
 - server `audit::tests::the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`;
   `every_route_refuses_a_token_lacking_its_capability` covers the new row
