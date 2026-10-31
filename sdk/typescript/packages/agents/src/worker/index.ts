@@ -42,8 +42,8 @@ export {
 } from "../transport/http.js";
 /**
  * @deprecated No transport uses an in-process journal any more; the server
- * records steps and effects. Exported until the example scenario stops
- * importing it (#3532).
+ * records steps and effects. Only its own test imports it; it stays
+ * exported for callers that already do, and a later release removes it.
  */
 export {
   type JournalLateResult,

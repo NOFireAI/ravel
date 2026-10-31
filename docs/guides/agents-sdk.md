@@ -202,8 +202,9 @@ reconciles an effect left in doubt by a worker killed with SIGKILL, and
 two` (`e2e/destroy.test.ts`) destroys an agent whose worker holds the turn:
 the worker abandons it with `AgentGone` and sends no commit, a second
 destroy answers `destroyed: false` with the same abandoned counts, and
-`create` starts incarnation 2 under the same agent id. Both are sent once
-and never retried, so a lost answer is `OutcomeUnknown`: read
+`create` starts incarnation 2 under the same agent id. The client's
+`reconcile` and `destroy` are sent once and never retried, so a lost answer
+is `OutcomeUnknown`: read
 `client.effect(handle)` or the agent to learn whether it landed. Tests:
 `reconcile is sent once: a network failure is OutcomeUnknown with no second
 request`, `destroy is sent once: an untyped 503 is OutcomeUnknown with no
