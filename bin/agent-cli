@@ -200,14 +200,17 @@ def classify_findings(comments, head, all_commits=False):
             continue
         if BOT not in (c.get("user") or {}).get("login", ""):
             continue
-        if not all_commits and c.get("commit_id") != head:
+        # GitHub moves commit_id forward to a newer head when the commented
+        # line is unchanged; original_commit_id is the commit the review saw.
+        made_on = c.get("original_commit_id") or c.get("commit_id")
+        if not all_commits and made_on != head:
             continue
         rows.append({
             "id": c.get("id"),
             "severity": severity(c.get("body")),
             "path": c.get("path"),
             "line": c.get("line") or c.get("original_line"),
-            "commit": (c.get("commit_id") or "")[:9],
+            "commit": (made_on or "")[:9],
             "replied": c.get("id") in replied,
             "summary": first_sentence(c.get("body")),
         })
