@@ -541,6 +541,19 @@ Settle an effect in doubt through the server: attach the result the operator con
 | `--url` |  | `http://127.0.0.1:4318` | The server's HTTP root |
 | `<EFFECT>` |  |  | The effect handle, as `agents effects` or `agents operation` prints it |
 
+### agents destroy
+
+Destroy an agent through the server: tombstone its current incarnation and print what the tombstone abandoned. Needs a token with the agents_admin capability
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--incarnation` |  |  | Destroy only if this is the current incarnation; otherwise the server answers agent_gone and nothing is destroyed. Omitted, the current incarnation is destroyed |
+| `--json` |  |  | Print the `destroy` route's body as JSON |
+| `--key` |  |  | The agent's key |
+| `--kind` |  |  | The agent's kind |
+| `--token` | `RAVEL_AGENTS_TOKEN` |  | Bearer token with agents_admin |
+| `--url` |  | `http://127.0.0.1:4318` | The server's HTTP root |
+
 ## tenancy
 
 Inspect the bucket's tenant-hash scheme marker (ADR-0050 section 3)
