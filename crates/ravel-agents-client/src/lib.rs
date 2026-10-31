@@ -61,11 +61,56 @@ pub struct AgentFailure {
     pub retry_code: String,
     pub reason: String,
     pub ids: SafeIdsBody,
+    /// The lifetime cap a `budget_exceeded` or `mailbox_full` refusal hit.
+    pub cap: Option<String>,
+}
+
+impl AgentFailure {
+    /// The [`ErrorBody`] the server sent.
+    pub fn body(&self) -> ErrorBody {
+        ErrorBody {
+            code: self.code.clone(),
+            retry: self.retry_code.clone(),
+            reason: self.reason.clone(),
+            ids: self.ids.clone(),
+            cap: self.cap.clone(),
+        }
+    }
+}
+
+/// `; ids: name=value, ...` for the ids the refusal carries, in wire field
+/// order; empty when it carries none.
+fn ids_suffix(ids: &SafeIdsBody) -> String {
+    let incarnation = ids.incarnation.map(|n| n.to_string());
+    let named = [
+        ("agent_id", ids.agent_id.as_deref()),
+        ("incarnation", incarnation.as_deref()),
+        ("operation", ids.operation.as_deref()),
+        ("turn_id", ids.turn_id.as_deref()),
+        ("step_id", ids.step_id.as_deref()),
+        ("effect_id", ids.effect_id.as_deref()),
+        ("timer_id", ids.timer_id.as_deref()),
+    ];
+    let present: Vec<String> = named
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
+        .collect();
+    if present.is_empty() {
+        String::new()
+    } else {
+        format!("; ids: {}", present.join(", "))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("agents request refused: {} ({}), retry {}", .0.code, .0.reason, .0.retry_code)]
+    #[error(
+        "agents request refused: {} ({}), retry {}{}",
+        .0.code,
+        .0.reason,
+        .0.retry_code,
+        ids_suffix(&.0.ids)
+    )]
     Agent(Box<AgentFailure>),
     #[error("agents request unauthorized: {message}")]
     Unauthorized { message: String },
@@ -154,6 +199,7 @@ fn error_from(status: StatusCode, path: &str, body: &str) -> ClientError {
             retry_code: error.retry,
             reason: error.reason,
             ids: error.ids,
+            cap: error.cap,
         }));
     }
     if status == StatusCode::NOT_FOUND {
@@ -670,6 +716,40 @@ mod tests {
             assert_eq!(failure.reason, "why");
             assert_eq!(failure.ids.agent_id.as_deref(), Some("ab"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_ids_it_carries_after_the_retry_hint() {
+        let server = TestServer::start(vec![
+            (
+                500,
+                json!({"code": "outcome_unknown", "retry": "backoff", "reason": "why",
+                    "ids": {"agent_id": "ab", "incarnation": 7}}),
+            ),
+            (
+                500,
+                json!({"code": "outcome_unknown", "retry": "backoff", "reason": "why", "ids": {}}),
+            ),
+        ])
+        .await;
+        let with_ids = server.client().operation("op").await.expect_err("refused");
+        assert_eq!(
+            with_ids.to_string(),
+            "agents request refused: outcome_unknown (why), retry backoff; ids: agent_id=ab, incarnation=7"
+        );
+        let ClientError::Agent(failure) = &with_ids else {
+            panic!("not an agent failure: {with_ids:?}");
+        };
+        assert_eq!(
+            serde_json::to_value(failure.body()).expect("body"),
+            json!({"code": "outcome_unknown", "retry": "backoff", "reason": "why",
+                "ids": {"agent_id": "ab", "incarnation": 7}})
+        );
+        let without = server.client().operation("op").await.expect_err("refused");
+        assert_eq!(
+            without.to_string(),
+            "agents request refused: outcome_unknown (why), retry backoff"
+        );
     }
 
     #[tokio::test]

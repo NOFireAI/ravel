@@ -428,7 +428,13 @@ How to verify:
   raised).
 
 `ravel-cli agents reconcile` posts the same body with the admin token
-(`reconcile_posts_the_decision_with_the_admin_token`).
+(`reconcile_posts_the_decision_with_the_admin_token`). A refusal exits
+non-zero and its stderr line names the ids the error carries after the retry
+hint, for example `agents request refused: CODE (REASON), retry HINT; ids:
+agent_id=AGENT_ID, effect_id=EFF_ID`, where `EFF_ID` is the effect's id
+rather than the handle you passed. The error carries no attempt; the attempt
+in question is the `--attempt` you sent. With `--json` the error body itself
+is printed on stdout.
 
 ## Destroying an agent
 
@@ -492,6 +498,12 @@ Repeats and refusals:
   `incarnation` from the error's `ids.incarnation`. If the first write
   landed, the retry answers 200 with `destroyed` false
   (`a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false`).
+  `ravel-cli agents destroy` exits non-zero and prints the ids at the end
+  of its stderr line, so pass the `incarnation=N` from `agents request
+  refused: outcome_unknown (...), retry backoff; ids: agent_id=AGENT_ID,
+  incarnation=N` as `--incarnation N`. With `--json` the error body is
+  printed on stdout and `ids.incarnation` is in it
+  (`a_destroy_refusal_prints_the_incarnation_to_pin_the_retry_to`).
 - A token without `agents_admin` gets 403 "requires the agents_admin
   capability".
 
