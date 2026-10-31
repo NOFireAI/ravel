@@ -171,7 +171,9 @@ HEAD bytes never repeat and the S3 ETag token cannot alias two states. A
 HEAD is never deleted. `destroy` sets `tombstoned`; `create` on a
 tombstoned agent bumps the incarnation in the same HEAD, and every handle
 (operation id, effect id, step id, timer id) carries the incarnation it was
-minted under, so a stale handle is refused by a typed `AgentGone`.
+minted under, so a stale handle is refused by a typed `AgentGone`. The
+route that issues `destroy`, and what the tombstone leaves in HEAD, are in
+the destroy amendment below.
 
 HEAD is written with a CRC32C upload checksum as the catalog fold does.
 HEAD bytes are capped at 256 KiB and a command that would exceed the cap
@@ -322,7 +324,8 @@ coordinators).
   a `Mode::Agents` is deferred.
 - Two new capabilities on `Principal`: `agents` (client operations) and
   `agents_worker` (worker registration, turn commits, effect completion),
-  plus `agents_admin` (reconciliation), each granted by the static token
+  plus `agents_admin` (reconciliation, the sweep and destroy; see the
+  destroy amendment below), each granted by the static token
   suffix and an OIDC claim flag through the existing chain
   (`crates/ravel-tenant-resolve/src/lib.rs:54-134`,
   `services/ravel-server/src/tenant.rs:124-200`). Tenant resolution runs
@@ -340,7 +343,8 @@ coordinators).
   result, resolve, cancel, state, events (bounded pages with a durable
   cursor), timers, effects, reconcile, worker poll, worker commit, effect
   complete, plus `GET /api/v1/agents/inspector`, a single embedded page
-  served under the feature.
+  served under the feature. `POST /api/v1/agents/destroy` joins the table
+  under `agents_admin` (see the destroy amendment below).
 - Health: the coordinator contributes readiness through the
   `IngestHealth` seam; `/metrics` gains one `render_agents_families`
   call fed by a snapshot struct owned by the runtime crate, so later
@@ -390,14 +394,16 @@ idempotency key. This amends ADR-1374 D2 (read-only catalog) and D7
 The `mcp` feature gains the gates and CI lane it lacks (#2502) in the
 same epic, because the agents tools cannot be gated by a lane that does
 not exist. The combined `tools/list` must stay under the existing
-24,576-byte budget; the task that adds the catalog measures it.
+24,576-byte budget; the task that adds the catalog measures it. The
+catalog gains no destroy tool (see the destroy amendment below).
 
 ### 11. Developer experience
 
 - `ravel-cli agents`: `dev` (starts the RustFS compose stack if not
   healthy, waits for the bucket, runs `store qualify`, starts the server
   with `--agents` and a dev token, prints the scaffold command), `scaffold`,
-  `list`, `inspect`, `operation`, `events`, `effects`, `reconcile`. Read
+  `list`, `inspect`, `operation`, `events`, `effects`, `reconcile`, and
+  `destroy` (see the destroy amendment below). Read
   commands read the store directly like every other `ravel-cli` command;
   commands that need a running server use `ravel-agents-client`, which
   brings `reqwest` to `ravel-cli` as a new direct dependency. Every
@@ -886,3 +892,303 @@ per agent per process start, at about 520 GETs per full-history agent at
 the default backlog. Nothing rate-limits this. The stable event id is the
 deduplication key, as decision 12 says, and `docs/agents.md` gives the
 query.
+
+## Amendment (2026-10-31): destroy is served, and a tombstone changes one field (issue #3478)
+
+<!-- amendment-applies: sections="3. The HEAD record|9. Server integration and authorization|10. MCP tools|11. Developer experience" pointer="destroy amendment" -->
+
+### Context
+
+Decision 3 says `destroy` sets `tombstoned` and `create` on a tombstoned
+agent bumps the incarnation. The kernel has the command
+(`Kernel::tombstone`, `Command::Tombstone`), the store executes it, the
+TLA+ model has `Destroy` and `Recreate`, and three tests pin the pair
+(`a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`,
+`every_fenced_command_refuses_a_stale_fence`,
+`create_on_a_tombstoned_agent_bumps_the_incarnation`). Nothing a client or
+an operator can reach issues it: no row of the `ROUTES` table, no
+`ravel-cli agents` command, no `ravel-agents-client` method, no SDK call
+and no MCP tool. The index-page amendment above closes with the
+consequence: an agent at its receipt cap (the 1,025th message per
+incarnation at the defaults) or at a 32,768-entry list cap "refuses new
+work for good: this release gives an operator no way to trim any of the
+three lists". The only workaround is a new key, and the capped agent's
+HEAD and objects stay in the bucket (live garbage collection is out of
+scope, decision 2).
+
+This amendment makes destroy reachable and defines what it does to
+everything a live agent can hold. It adds no HEAD field, no object kind
+and no key, so no frozen format moves.
+
+### Decision
+
+**The route.** `POST /api/v1/agents/destroy` joins the `ROUTES` table
+under `agents_admin`, on the activation lane, mounted on both listeners
+like every other agents route. The request is
+`DestroyAgentRequest { agent: AgentRef, incarnation: Option<u64> }`; the
+response is
+`DestroyAgentResponse { agent_id, incarnation, destroyed: bool, abandoned }`,
+where `abandoned` counts what the tombstone left behind:
+`{ inputs, active_turn: bool, effects_in_doubt, effects_authorized,
+timers_scheduled }`, read from the HEAD the tombstone was applied to.
+Status codes: 200, 401, 403, 404, 413, 422, 500, 503. The wire types live
+in `ravel-agents-core::wire` with golden fixtures `destroy_agent_request`
+and `destroy_agent_response` in `sdk/fixtures/`, paired by the SDK's
+`WIRE_FIXTURES` in the same change, since the SDK test refuses a fixture
+without a schema.
+
+**The kernel command is unchanged.** `Command::Tombstone` stays a
+one-field transition: `lifecycle` becomes `Tombstoned`, `root_revision`
+advances, and nothing else in HEAD moves. No input is settled, no result is
+written, no effect is failed, no timer is cancelled, no page is sealed and
+no event is appended. The reason is the byte cap: destroy exists for agents
+at a cap, and a tombstone that wrote results, events or a lifecycle event
+would be refused `BudgetExceeded` exactly there.
+`the_lifecycle_commands_publish_at_the_byte_cap` already pins that the
+tombstone and the recreate publish at the cap, and the tombstone's
+precondition row stays `IncarnationMatches, HeadBelowByteCap` with no
+page needs.
+
+**The incarnation fence does the rest.** Every command except `Create`
+and `Tombstone` runs `check_active` and `check_incarnation` first, so after
+the tombstone every handle minted under that incarnation answers
+`AgentGone` (HTTP 404, retry `never`): operation handles on `operation`,
+`result`, `cancel` and `events`; step and effect handles on `worker/step`,
+`worker/effects/complete`, `worker/effects/fail`, `effects/{effect}` and
+`reconcile`; timer handles on `timers/cancel`; the lease on
+`worker/heartbeat` and `worker/commit`. `AgentStore::resolve` refuses a
+handle whose HEAD is tombstoned the same way. That is the defined error
+the issue asks for, and it is the error the old handles already answer
+after a recreate, so a client learns nothing new.
+
+Case by case, for an agent destroyed at incarnation `n`:
+
+| What the agent held | At destroy | Afterwards |
+|---|---|---|
+| Queued inputs (inbox) | stay in HEAD, never consumed; counted in `abandoned.inputs` | their handles answer `agent_gone`; a `call` or `result` wait in flight ends with `agent_gone` because the handler notifies the tenant's waiters and the wait re-reads HEAD |
+| The active turn and its lease | stay in HEAD; `abandoned.active_turn` is true; no epoch bump | the owner's next heartbeat, step, effect report or commit answers `agent_gone`; the worker abandons the turn without retry; handler code already running finishes on its own, as a pause past the lease does (decision 6) |
+| Effects in doubt, and attempts authorized without a result | stay in the journal; counted in `abandoned.effects_in_doubt` and `abandoned.effects_authorized` | `reconcile` answers `agent_gone`; a late result for the old incarnation answers `agent_gone` and is not kept as evidence (the evidence index drops the agent's entries, since nothing can reconcile them) |
+| Scheduled timers | stay `Scheduled`; counted in `abandoned.timers_scheduled` | the sweep's `fire_due` returns at once for a non-active HEAD and `armed_in` is false, so the next pass deletes the agent's wake hints and fires nothing; a timer id carries its incarnation, so a stale hint never fires on incarnation `n+1` |
+| Steps, receipts, results, events, pages | stay in HEAD and in `o/` | unreadable through the routes (`state`, `timers`, `effects`, `events` answer `agent_gone`); `ravel-cli agents list` shows the agent as `tombstoned`; the bytes stay in the bucket under the frozen key layout until a later garbage collection |
+| The `_dir` entry | stays | a recreate writes it again with `CreateIfAbsent`, which meets the existing entry |
+| The projection | unchanged: the committed history of incarnation `n` was projected as it was committed, and a tombstone appends no event | the projector's cursor resets on the next root of incarnation `n+1`; event ids and trace ids carry the incarnation, so the new history never collides with the old |
+
+**A later create under the same key** is decision 3 as written:
+`Reply::Created { incarnation: n + 1 }`, the epoch kept, the owner cleared,
+every list and the index empty, `timer_generation` 0. Its handles are new
+and the old ones answer `agent_gone`. The `state` route, the inspector and
+`ravel-cli agents inspect` then show incarnation `n + 1` with no history.
+
+**Concurrency.** Destroy is a CAS on HEAD like every command, so the
+publication rule orders it against anything in flight:
+
+- Destroy against a worker commit. Whichever CAS lands first wins. Commit
+  first: the result is in HEAD and the destroy that follows tombstones a
+  HEAD that holds it; the result is then unreadable through the routes
+  like the rest of the history, which is accepted (destroy is an operator
+  action, and nothing is lost from the bucket). Destroy first: the commit's
+  bounded re-read runs `check_active` and fails `agent_gone`; the worker
+  abandons. No interleaving writes a result into a tombstoned HEAD.
+- Destroy while a lease is held. The lease is in-memory state of the
+  process that granted it and `owner_id` and `epoch` in HEAD. Destroy does
+  not advance the epoch: `check_incarnation` runs before `check_owner` in
+  every owner-fenced command, so the incarnation is the stronger fence and
+  an epoch bump would add a write for nothing.
+- Destroy against a concurrent create. A create on an active HEAD is
+  `Exists` and writes nothing, so the pair can only serialise as destroy
+  then create (incarnation `n + 1`) or create-noop then destroy.
+- Two destroys. The second finds `Tombstoned` at the same incarnation and
+  answers `AlreadyTombstoned`, which the route reports as 200 with
+  `destroyed: false` and the same `abandoned` counts, writing nothing and
+  auditing nothing, the way a repeated reconcile is answered from HEAD.
+- `incarnation` pinned in the request and not current. `agent_gone`,
+  nothing written: an operator who typed the destroy against incarnation
+  `n` must not tombstone the `n + 1` a colleague just created. Omitted, the
+  route destroys the current incarnation.
+- The agent does not exist (no HEAD). `agent_gone`, nothing written, not
+  audited: the kernel's `apply` on an absent HEAD refuses every command but
+  `Create`.
+- The agent's HEAD is a newer format. `unsupported_format`, as every write
+  route answers; a version this build cannot read is never CAS-written.
+
+**Runtime state.** The coordinator that serves the destroy drops the
+agent from its loaded set, forgets its lease, prunes its open attempts and
+reconcile hand-overs, forgets its evidence entries and notifies the
+tenant's result waiters. Another process serving the same tenant learns
+of the tombstone on its next HEAD read, and its loaded root is a cache
+(decision 6: only the fence revokes; the cache chooses when to look). The
+dispatch scan skips a loaded root whose lifecycle is not `Active`, so a
+destroyed agent with queued inputs is not offered to every poll until it
+unloads.
+
+**Audit.** A destroy that changes HEAD writes one `kind=agents_destroy`
+record to the tenant's audit shard before the CAS, naming the tenant, the
+agent id, the incarnation destroyed, the caller's tenant and capabilities,
+and the `abandoned` counts. The order is the one reconcile uses: in
+required audit mode a refused submission refuses the destroy with
+`store_unavailable` and nothing changes; the cost is a record for a
+destroy whose CAS then lost, which names an intent that did not apply. A
+repeat, a non-existent agent and a pinned incarnation that is not current
+write no record, since they change nothing.
+
+**Capability.** `agents_admin`, not `agents`. Destroy discards inputs the
+sender was acknowledged for and abandons effects in doubt; it is the same
+class of decision as reconcile, which is why the operator guide keeps
+`agents_admin` off application and worker tokens.
+
+**Surfaces.** `ravel-agents-client::AgentsClient::destroy(agent,
+incarnation)`; `ravel-cli agents destroy --kind K --key KEY
+[--incarnation N] --server URL --token T [--json]`, through the client so
+the destroy is audited, with the same shape as `agents reconcile`; the
+TypeScript client's `agent(kind, key).destroy({ incarnation? })`, which
+needs the configured token to hold `agents_admin`. No MCP tool: the MCP
+catalog's agents tools (decision 10) run under the `agents` capability of
+the resolved principal and have no admin capability model, and a tool that
+discards work does not belong in a catalog an AI agent calls.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent
+    Absent --> Active_n: create (incarnation n, _dir entry first)
+    Active_n --> Active_n: send, poll, commit, timers, reconcile (CAS, fenced on incarnation and epoch)
+    Active_n --> Tombstoned_n: destroy (one field, audited first)
+    Tombstoned_n --> Tombstoned_n: destroy again (AlreadyTombstoned, no write, no audit)
+    Tombstoned_n --> Active_n1: create (incarnation n+1, epoch kept, lists empty)
+    Active_n1 --> Active_n1: handles of n answer agent_gone
+    note right of Tombstoned_n
+        inbox, active turn, journal, timers, pages stay as they were
+        every fenced command answers agent_gone
+        sweep deletes the wake hints and fires nothing
+    end note
+```
+
+```mermaid
+sequenceDiagram
+    participant W as Worker (lease, epoch e)
+    participant S as ravel-server
+    participant A as Audit shard
+    participant H as HEAD (CAS)
+    participant O as Operator (agents_admin)
+    W->>S: worker/step (tool ran, result pending)
+    O->>S: POST destroy {kind, key}
+    S->>H: GET HEAD (incarnation n, active turn, effect authorized)
+    S->>A: agents_destroy record (before the CAS)
+    A-->>S: written
+    S->>H: CAS lifecycle = Tombstoned, rev+1
+    H-->>S: Ok
+    S-->>O: 200 destroyed=true abandoned={inputs, active_turn, ...}
+    W->>S: worker/effects/complete (attempt 1)
+    S->>H: GET HEAD, check_active
+    S-->>W: 404 agent_gone (not kept as evidence)
+    W->>S: worker/commit
+    S-->>W: 404 agent_gone, the worker abandons the turn
+```
+
+### Rejected alternatives
+
+- **Settle what the agent holds at destroy**: write a `Cancelled` result
+  for every queued input, fail every effect in doubt, cancel every timer
+  and append a lifecycle event. Lost: each of those grows HEAD or seals a
+  page, and the agents destroy exists for are at a cap, where the kernel
+  refuses that growth `BudgetExceeded`. The incarnation fence already gives
+  every old handle one defined answer, and the `abandoned` counts make the
+  drop visible instead of hiding it in a result list nobody can read.
+- **Refuse destroy while a turn is active, a lease is held or an effect is
+  in doubt.** Lost: an operator at a cap cannot clear the block first,
+  because `reconcile` with `record_result` writes a result and is refused
+  at the byte cap; and a lease holder is fenced by the CAS whatever the
+  route does. The refusal would protect nothing and strand the agent.
+- **Advance the epoch in the same CAS**, takeover-style, to revoke the
+  lease. Lost: `check_incarnation` runs before `check_owner`, so the
+  incarnation is already the stronger fence, and a recreate keeps the
+  epoch anyway; the extra field change buys nothing.
+- **Destroy under the `agents` capability.** Lost: it discards accepted
+  work and abandons effects in doubt, which is the decision class
+  `agents_admin` was introduced for; application tokens hold `agents`.
+- **Delete HEAD and the agent's objects.** Lost twice over: the original
+  rejected alternative (a recreated HEAD with the same bytes carries the
+  same ETag and a stale CAS could land), and live garbage collection is
+  out of scope for this release with a frozen key layout.
+- **Keep a late result for a destroyed incarnation as evidence.** Lost:
+  the evidence index exists so a reconcile can attach the result, and no
+  reconcile can reach a tombstoned incarnation; keeping entries nobody can
+  settle fills a bounded index with dead rows.
+- **Audit after the CAS.** Lost for the reason reconcile audits before: a
+  crash or a refused submission between the two leaves a destroyed agent
+  with no record, which is the case the audit exists for.
+- **Record the destroy as an event in the agent's history** instead of, or
+  beside, the audit record. Lost: at the byte cap it cannot be written,
+  and the history of a tombstoned incarnation is unreadable through the
+  routes anyway. The audit shard is the durable record.
+- **An MCP `ravel_agent_destroy` tool.** Lost: decision 10's catalog has
+  no admin capability model, and a destructive tool does not belong in a
+  catalog an AI agent calls on its own.
+- **A `--force` flag for a destroy with a lease held.** Lost: there is no
+  non-force mode to contrast it with; destroy always lands under CAS, and
+  a flag that changes nothing teaches operators the wrong model.
+
+### Consequences
+
+- An operator can retire a capped agent and reuse its key. The
+  `abandoned` counts in the response and the audit record say what was
+  dropped, so a destroy is never silent about accepted work.
+- A destroyed incarnation's HEAD, pages and objects stay in the bucket,
+  listed as `tombstoned` by `ravel-cli agents list`, until garbage
+  collection exists. A tenant that destroys and recreates often grows its
+  `ag/` prefix; the objects are already counted in the store's byte
+  figures.
+- Every client that holds a handle, lease or effect of a destroyed
+  incarnation sees `agent_gone` and must treat it as terminal (retry
+  `never`), which the SDK runner does by abandoning the turn.
+- The `agents_admin` capability now covers a third route; the operator
+  guide's capability table, the HTTP API reference, the storage spec's
+  guarantee rows ("Destroy tombstones" moves from "kernel and store only"
+  to shipped, the lifetime-limit row loses "no route destroys an agent")
+  and the README limitation list change in the commits that ship each
+  surface.
+- Nothing in `proto/`, the key layout or the HEAD format changes. A later
+  decision that wants a per-agent destroy record in the store needs a HEAD
+  field and a format version, and is not taken here.
+
+### Tests
+
+Already pinned, and unchanged by this amendment: kernel
+`a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`
+(tombstone, repeat, old handles refused, recreate at `n + 1` with the
+epoch kept and empty lists), `every_fenced_command_refuses_a_stale_fence`
+(every fenced command on a tombstoned root answers `AgentGone`),
+`the_lifecycle_commands_publish_at_the_byte_cap` (tombstone and recreate
+publish at the cap); store `create_on_a_tombstoned_agent_bumps_the_incarnation`
+(one CAS, the `_dir` entry kept); sim reference
+`recreate_after_destroy_refuses_the_old_handle`; TLA+ `Destroy` and
+`Recreate` rows in `formal/tla/agents/traceability.md`.
+
+New tests the delivering tasks add, each named so the matrix can cite
+it:
+
+- kernel `a_tombstone_changes_only_the_lifecycle_and_the_root_revision`:
+  the HEAD after a tombstone equals the HEAD before it in every field but
+  those two, with queued inputs, an active turn, an authorized effect, an
+  effect in doubt and a scheduled timer present.
+- store `a_destroy_racing_a_commit_lands_in_cas_order_and_the_loser_is_agent_gone`:
+  both orders, with the loser's re-read refused `AgentGone` and no result
+  in a tombstoned HEAD.
+- runtime `a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll`
+  and `a_hint_of_a_destroyed_incarnation_fires_nothing_and_is_deleted`.
+- server `audit::tests::the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`;
+  `every_route_refuses_a_token_lacking_its_capability` covers the new row
+  by reading the table.
+- e2e `destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`
+  in `agents_effects_e2e.rs` (which reads the audit shard): a client token
+  is 403; the worker holding the lease gets 404 on heartbeat, effect
+  completion and commit; `operation`, `result` and `state` answer 404; the
+  repeat answers `destroyed: false` and writes no second record; the audit
+  shard holds exactly one `agents_destroy` record; `create` answers
+  incarnation 2 with `created: true` and the old operation handle stays
+  404. Also `destroy_of_an_unknown_agent_or_a_stale_incarnation_is_agent_gone_and_not_audited`.
+- client `ravel_agents_client::tests::destroy_posts_the_agent_and_decodes_the_response`;
+  CLI `agents_commands::destroy_renders_the_response_and_needs_a_token`.
+- SDK `client.test.ts` "destroy posts kind, key and incarnation and decodes
+  destroyed and abandoned"; e2e `e2e/destroy.test.ts` "destroy fences a
+  worker holding a lease and a recreate starts incarnation two", against a
+  real server.
