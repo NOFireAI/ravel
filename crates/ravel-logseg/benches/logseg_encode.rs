@@ -16,10 +16,24 @@
 //! writers and the threaded encode agree byte for byte under each choice and
 //! `Estimated` stores at most [`MAX_ESTIMATED_GROWTH`] more than `Exhaustive`
 //! (ADR-3492, exit criteria).
+//!
+//! The `ingest_convert` group times only the conversion of one 7,500-record
+//! flush buffer of that shape, held as the ingest shard holds it (each
+//! stream's records sharing one `stream_attrs` blob), into its columnar batch:
+//! `records` copies each row into an owned [`LogRecord`] and calls
+//! `try_from_records`, the flush before #3557; `rows` calls `try_from_rows` on
+//! the buffered rows in place. Both arms drop their input inside the timing,
+//! as the flush does. Before timing, the run fails unless the two batches are
+//! equal.
 #![allow(clippy::expect_used)]
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use ravel_logseg::{ColumnarLogBatch, LogRecord, PageChoice, RlogWriter};
+use ravel_logseg::{
+    AttrValue, ColumnarLogBatch, LogRecord, LogRowRef, LogStreamId, PageChoice, RlogWriter,
+};
 
 #[path = "common/mod.rs"]
 mod support;
@@ -210,5 +224,107 @@ fn bench_ingest_shape(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_logseg_encode, bench_ingest_shape);
+/// Records in the flush buffer `ingest_convert` converts.
+const CONVERT_FLUSH: usize = 7_500;
+
+/// A buffered row as the ingest shard holds it: `rec.stream_attrs` is empty
+/// and every record of a stream shares `stream_attrs`.
+#[derive(Clone)]
+struct BufferedRow {
+    stream_attrs: Arc<[u8]>,
+    rec: LogRecord,
+}
+
+impl LogRowRef for BufferedRow {
+    fn stream_id(&self) -> LogStreamId {
+        self.rec.stream_id
+    }
+    fn stream_attrs(&self) -> &[u8] {
+        &self.stream_attrs
+    }
+    fn ts_ns(&self) -> i64 {
+        self.rec.ts_ns
+    }
+    fn observed_ts_ns(&self) -> i64 {
+        self.rec.observed_ts_ns
+    }
+    fn severity_num(&self) -> u8 {
+        self.rec.severity_num
+    }
+    fn flags(&self) -> u32 {
+        self.rec.flags
+    }
+    fn severity_text(&self) -> &str {
+        &self.rec.severity_text
+    }
+    fn body(&self) -> &str {
+        &self.rec.body
+    }
+    fn trace_id(&self) -> Option<&[u8; 16]> {
+        self.rec.trace_id.as_ref()
+    }
+    fn span_id(&self) -> Option<&[u8; 8]> {
+        self.rec.span_id.as_ref()
+    }
+    fn attrs(&self) -> &[(String, AttrValue)] {
+        &self.rec.attrs
+    }
+}
+
+fn buffered_rows(records: Vec<LogRecord>) -> Vec<BufferedRow> {
+    let mut blobs: HashMap<LogStreamId, Arc<[u8]>> = HashMap::new();
+    records
+        .into_iter()
+        .map(|mut rec| {
+            let blob = std::mem::take(&mut rec.stream_attrs);
+            let stream_attrs =
+                Arc::clone(blobs.entry(rec.stream_id).or_insert_with(|| blob.into()));
+            BufferedRow { stream_attrs, rec }
+        })
+        .collect()
+}
+
+/// The flush's conversion before #3557: each buffered row moved into an owned
+/// [`LogRecord`], its stream blob copied.
+fn convert_records(rows: Vec<BufferedRow>) -> ColumnarLogBatch {
+    let records: Vec<LogRecord> = rows
+        .into_iter()
+        .map(|row| LogRecord {
+            stream_attrs: row.stream_attrs.to_vec(),
+            ..row.rec
+        })
+        .collect();
+    ColumnarLogBatch::try_from_records(&records).expect("batch")
+}
+
+/// The flush's conversion after #3557: the batch built from the buffered rows
+/// in place, which are then dropped, as `flush_rows_batch` drops them.
+fn convert_rows(rows: Vec<BufferedRow>) -> ColumnarLogBatch {
+    ColumnarLogBatch::try_from_rows(&rows).expect("batch")
+}
+
+fn bench_ingest_convert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingest_convert");
+    group.sample_size(20);
+    let rows = buffered_rows(ingest_records(CONVERT_FLUSH));
+    assert!(
+        convert_records(rows.clone()) == ColumnarLogBatch::try_from_rows(&rows).expect("batch"),
+        "the two conversions build different batches"
+    );
+    group.throughput(Throughput::Elements(CONVERT_FLUSH as u64));
+    group.bench_function(format!("{CONVERT_FLUSH}/records"), |b| {
+        b.iter_batched(|| rows.clone(), convert_records, BatchSize::LargeInput);
+    });
+    group.bench_function(format!("{CONVERT_FLUSH}/rows"), |b| {
+        b.iter_batched(|| rows.clone(), convert_rows, BatchSize::LargeInput);
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_logseg_encode,
+    bench_ingest_shape,
+    bench_ingest_convert
+);
 criterion_main!(benches);

@@ -423,7 +423,10 @@ fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
 
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; the only copy is the
-/// shared `stream_attrs` blob, which `LogRecord` owns per record.
+/// shared `stream_attrs` blob, which `LogRecord` owns per record. The flush
+/// builds its batch from the records in place; the hand-back conversion
+/// ([`take_rows_as_batch`]) still uses this, since it must give the records
+/// back by value when the build refuses.
 fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: rec.stream_id,
@@ -441,16 +444,11 @@ fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
 }
 
 /// Row-major records as the one columnar batch
-/// `ColumnarLogBatch::try_from_records` builds from them, or its refusal of a
+/// `ColumnarLogBatch::try_from_rows` builds from them, or its refusal of a
 /// value that would take a column past its byte limit.
 fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> Result<ColumnarLogBatch, LogWriteError> {
-    ColumnarLogBatch::try_from_records(
-        &records
-            .into_iter()
-            .map(to_logseg_record)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
+    ColumnarLogBatch::try_from_rows(&records)
+        .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
 }
 
 /// A row buffer's flush input as one columnar batch (ADR-3492 decision 2).
@@ -462,13 +460,7 @@ fn flush_rows_batch(
     records: Vec<NormalizedLogRecord>,
 ) -> Result<ColumnarLogBatch, RlogEncodeError> {
     check_stream_attrs(&records).map_err(RlogEncodeError::Finish)?;
-    ColumnarLogBatch::try_from_records(
-        &records
-            .into_iter()
-            .map(to_logseg_record)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(RlogEncodeError::Push)
+    ColumnarLogBatch::try_from_rows(&records).map_err(RlogEncodeError::Push)
 }
 
 /// The row writer's stream-directory check, with its message: the first
@@ -3128,6 +3120,16 @@ impl LogShardActor {
     }
 }
 
+/// The ADR-3492 benchmark's record shape, shared with ravel-logseg's bench
+/// and differential test so the flush test encodes the same records.
+#[cfg(test)]
+#[path = "../.."]
+mod bench_corpus {
+    #[path = "ravel-logseg/benches/common/ingest_shape.rs"]
+    #[allow(dead_code)]
+    pub mod ingest_shape;
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -3647,6 +3649,116 @@ mod tests {
                     row.len(),
                 );
             }
+        }
+    }
+
+    /// ADR-3492 decision 2 (#3557): the flush builds its batch from the
+    /// buffered records in place, and for the benchmark's ingest shape (7,500
+    /// records over 50 streams, each stream's records sharing one blob as the
+    /// buffer holds them) its object is the row writer's, byte for byte, under
+    /// either page choice.
+    #[test]
+    fn the_columnar_flush_writes_the_row_writers_bytes_for_the_ingest_shape() {
+        let mut blobs: HashMap<LogStreamId, Arc<[u8]>> = HashMap::new();
+        let records: Vec<NormalizedLogRecord> = bench_corpus::ingest_shape::ingest_records(7_500)
+            .into_iter()
+            .map(|rec| {
+                let mut norm = from_logseg_record(rec);
+                norm.stream_attrs = Arc::clone(
+                    blobs
+                        .entry(norm.stream_id)
+                        .or_insert_with(|| Arc::clone(&norm.stream_attrs)),
+                );
+                norm
+            })
+            .collect();
+        assert_eq!(blobs.len(), bench_corpus::ingest_shape::STREAMS);
+        for page_choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            let cfg = RlogConfig {
+                page_choice,
+                ..flush_rlog_config(&IngestConfig::default())
+            };
+            let row = row_written(cfg, None, records.clone());
+            let flushed = flush_written(cfg, None, records.clone());
+            assert!(
+                row == flushed,
+                "{page_choice:?}: the flush's object differs from the row writer's \
+                 ({} and {} bytes)",
+                flushed.len(),
+                row.len(),
+            );
+        }
+    }
+
+    /// #3557: normalize gives each `ScopeLogs` its own `stream_attrs` blob, so
+    /// two `ScopeLogs` with the same resource and scope buffer one stream id
+    /// under two equal, separately allocated blobs. The flush's object for
+    /// that shape is the row writer's, byte for byte.
+    #[test]
+    fn the_columnar_flush_writes_the_row_writers_bytes_for_two_scope_logs_sharing_a_stream() {
+        let res = [("service.name", "api")];
+        let with = |mut r: NormalizedLogRecord, attrs: Vec<(&str, AttrValue)>, traced: bool| {
+            r.attrs = attrs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+            if traced {
+                r.trace_id = Some([r.ts_ns as u8; 16]);
+                r.span_id = Some([r.ts_ns as u8; 8]);
+            }
+            r
+        };
+        let route = |v: &str| AttrValue::Str(v.to_owned());
+        // One blob per ScopeLogs, as normalize allocates them.
+        let first_scope = norm_record(&res, "lib", 1, "a");
+        let second_scope = norm_record(&res, "lib", 3, "c");
+        let other_stream = norm_record(&[("service.name", "db")], "lib", 5, "e");
+        let mut second_scope_next = second_scope.clone();
+        second_scope_next.ts_ns = 4;
+        second_scope_next.observed_ts_ns = 4;
+        let mut first_scope_next = first_scope.clone();
+        first_scope_next.ts_ns = 2;
+        first_scope_next.observed_ts_ns = 2;
+        let records = vec![
+            with(
+                first_scope,
+                vec![("route", route("/a")), ("code", AttrValue::I64(200))],
+                true,
+            ),
+            with(
+                first_scope_next,
+                vec![("code", AttrValue::I64(404)), ("route", route("/b"))],
+                false,
+            ),
+            with(
+                second_scope,
+                vec![
+                    ("code", route("x")),
+                    ("code", AttrValue::I64(500)),
+                    ("code", AttrValue::I64(501)),
+                ],
+                false,
+            ),
+            with(second_scope_next, Vec::new(), true),
+            with(other_stream, vec![("zone", route("eu"))], false),
+        ];
+        assert_eq!(records[0].stream_id, records[2].stream_id);
+        assert!(!Arc::ptr_eq(
+            &records[0].stream_attrs,
+            &records[2].stream_attrs
+        ));
+        assert_ne!(records[0].stream_id, records[4].stream_id);
+        for page_choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            let cfg = RlogConfig {
+                page_choice,
+                ..flush_rlog_config(&IngestConfig::default())
+            };
+            let row = row_written(cfg, None, records.clone());
+            let flushed = flush_written(cfg, None, records.clone());
+            assert!(
+                row == flushed,
+                "{page_choice:?}: the flush's object differs from the row writer's \
+                 ({} and {} bytes)",
+                flushed.len(),
+                row.len(),
+            );
         }
     }
 
