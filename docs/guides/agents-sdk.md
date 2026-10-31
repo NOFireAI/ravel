@@ -226,16 +226,24 @@ server. Its tests are in `transport/http.test.ts`.
   left by the last answered expiry, never sooner than 1 s apart, until the
   commit is sent. A renewal refused with `OwnershipLost` or `AgentGone`
   aborts the handler's signal and abandons the turn without a commit; any
-  other failure is retried at the next tick. So a turn is lost only when a
-  renewal is refused, or when renewals fail for longer than the lease plus
-  its grace. The agents runtime's `RuntimeConfig::default` sets `lease_ms`
-  to 30000 and `heartbeat_grace_ms` to 10000. Renewals live in the memory
+  other failure is retried at the next tick, and one inside the lease does
+  not abort the turn. Once renewals have failed past the lease, the worker
+  aborts the handler's signal at the expiry and abandons the turn without a
+  commit, with `LeaseExpired`, before the server's grace lets another
+  worker take it over. It measures the expiry on its own timers, `leaseMs`
+  (a `serveAgents` option, default 30000) after it received the assignment
+  or the last answered renewal, because no answer carries the lease length
+  and the two wall clocks may disagree; set it to the server's `lease_ms`.
+  The agents runtime's `RuntimeConfig::default` sets `lease_ms` to 30000
+  and `heartbeat_grace_ms` to 10000. Renewals live in the memory
   of the coordinator that answered them, so with two coordinators a worker
   polling the other one can still take a turn over once the lease and grace
   run out after its takeover. Tests: `a turn longer than the lease renews
   it in the background and commits`, `a refused renewal aborts the turn
-  and nothing is committed`, `a transient renewal failure is retried at
-  the next tick` (`worker/renew.test.ts`), `renews once at assignment,
+  and nothing is committed`, `a transient renewal failure inside the lease
+  does not abort the turn`, `renewals that keep failing past the lease abort
+  the turn and send no commit`, `an answered renewal restarts the lease the
+  worker measures` (`worker/renew.test.ts`), `renews once at assignment,
   sends nothing while a tool runs, and no heartbeat before a step`.
 - There is no `journal` option: steps and effect results are recorded on
   the server. Test: `takes no journal option: steps and effect results are
