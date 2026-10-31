@@ -345,6 +345,60 @@ async fn metrics_render_abandoned_hour_bound_family_per_signal() {
     }
 }
 
+/// Issue #3533: the logs flush-phase and strict-ack histograms reach the real
+/// `/metrics` body of a started server with a logs router, declared once as
+/// histograms, with every phase series present for `signal="logs"` before any
+/// write and none for the other signals.
+#[tokio::test]
+async fn metrics_render_logs_latency_histograms_per_phase() {
+    let running = start_test_server(Mode::Gateway, u64::MAX, false).await;
+    let body = scrape(&running).await;
+    let families = [
+        (
+            "ravel_ingest_flush_phase_seconds",
+            &[
+                "permit_wait",
+                "resolve",
+                "encode",
+                "data_put",
+                "commit_build",
+                "commit_publish",
+                "total",
+            ][..],
+        ),
+        (
+            "ravel_ingest_strict_ack_seconds",
+            &["queued", "request", "shard_skew"][..],
+        ),
+    ];
+    for (family, phases) in families {
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} histogram\n"))
+                .count(),
+            1,
+            "{family} must be declared once as a histogram:\n{body}"
+        );
+        for phase in phases {
+            let labels = format!("{{mode=\"gateway\",signal=\"logs\",phase=\"{phase}\"");
+            for line in [
+                format!("{family}_bucket{labels},le=\"+Inf\"}} 0\n"),
+                format!("{family}_count{labels}}} 0\n"),
+            ] {
+                assert_eq!(body.matches(&line).count(), 1, "missing {line:?}:\n{body}");
+            }
+        }
+        for signal in ["metrics", "spans"] {
+            assert!(
+                !body.contains(&format!(
+                    "{family}_count{{mode=\"gateway\",signal=\"{signal}\""
+                )),
+                "{family} is logs only:\n{body}"
+            );
+        }
+    }
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// ADR-1702: a flush whose write gate encode returns no result drops its rows
 /// without dying or abandoning, and `ravel_ingest_flush_gate_faults_total` is
 /// the only signal it leaves. One declaration and one zero sample per ingest
