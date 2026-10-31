@@ -48,9 +48,9 @@ export interface HttpTransportOptions {
   /** Defaults to the global `fetch`. */
   readonly fetch?: typeof fetch;
   /**
-   * @deprecated Ignored since steps and effect results are recorded on the
-   * server; passing one logs a warning once per process. This option will be
-   * removed.
+   * @deprecated The HTTP transport ignores it, since steps and effect
+   * results are recorded on the server; passing one logs a warning once per
+   * process. This option will be removed.
    */
   readonly journal?: unknown;
 }
