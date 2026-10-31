@@ -205,7 +205,9 @@ pub fn split_tenant_suffix(
 ///
 /// `subject` names who, within the tenant, the credential belongs to
 /// (ADR-3541 decision 1). It is attribution only and grants nothing: no
-/// capability field depends on it (`a_subject_grants_nothing`), and outside
+/// capability field depends on it, so one OIDC token resolves to the same
+/// capabilities whether or not its subject claim is read
+/// (`a_subject_grants_nothing`), and outside
 /// this crate's tests no code reads the field; the one comparison that sees it
 /// is the whole-principal equality in `ravel-server`'s
 /// `Cli::parse_tenant_pairs` duplicate-token check. It is `None` unless a
@@ -2353,14 +2355,14 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             assert_eq!(drops.snapshot(), only(reason), "{reason:?}");
         }
 
-        // No claim configured: a token carrying sub resolves with no subject
-        // and nothing is counted.
+        // No claim configured: a token carrying sub resolves with no subject.
+        // There is nothing to count against: a resolver without a subject
+        // claim holds no drop counters.
         let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
         let principal = resolver(cache_with(&jwks_with(KID)))
             .resolve_principal(&bearer(&token))
             .expect("resolves");
         assert_eq!(principal.subject, None);
-        assert_eq!(drops.snapshot(), no_drops());
     }
 
     /// ADR-3541 decision 1: 1 to 255 bytes, every byte in `0x21..=0x7E`.
@@ -2395,54 +2397,59 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
         assert_eq!(subject.source(), SubjectSource::Oidc);
     }
 
-    /// ADR-3541 decision 1: a subject is attribution only. Two principals
-    /// that differ only in subject hold the same capabilities, and
+    /// ADR-3541 decision 1: a subject is attribution only. One OIDC token,
+    /// resolved by a resolver that reads its subject claim and by one that
+    /// does not, yields the same five capabilities for every combination of
+    /// capability claims; only the first principal has a subject.
     /// FallbackResolver forwards the matching resolver's subject unchanged.
     #[test]
     fn a_subject_grants_nothing() {
-        let subject = parse_subject_label("alice").expect("a valid label");
-        for caps in [
-            NONE,
-            DDL,
-            IPCRYPT,
-            BOTH,
-            AGENTS,
-            AGENTS_WORKER,
-            AGENTS_ADMIN,
-            ALL,
-        ] {
-            let without = Principal {
-                tenant: TenantId::new("acme"),
-                ddl: caps.ddl,
-                ipcrypt: caps.ipcrypt,
-                agents: caps.agents,
-                agents_worker: caps.agents_worker,
-                agents_admin: caps.agents_admin,
-                subject: None,
-            };
-            let with = Principal {
-                subject: Some(subject.clone()),
-                ..without.clone()
-            };
-            assert_ne!(with, without);
-            assert_eq!(
-                (
-                    with.ddl,
-                    with.ipcrypt,
-                    with.agents,
-                    with.agents_worker,
-                    with.agents_admin
-                ),
-                (
-                    without.ddl,
-                    without.ipcrypt,
-                    without.agents,
-                    without.agents_worker,
-                    without.agents_admin
-                ),
-            );
-        }
+        let configured_resolver = || {
+            resolver(cache_with(&jwks_with(KID)))
+                .with_ddl_claim("can_ddl")
+                .with_ipcrypt_claim("can_ipcrypt")
+                .with_agents_claim("can_agents")
+                .with_agents_worker_claim("can_agents_worker")
+                .with_agents_admin_claim("can_agents_admin")
+        };
+        let drops = Arc::new(SubjectDropCounters::default());
+        let with_subject = configured_resolver().with_subject_claim("sub", Arc::clone(&drops));
+        let without_subject = configured_resolver();
+        let caps = |p: &Principal| (p.ddl, p.ipcrypt, p.agents, p.agents_worker, p.agents_admin);
 
+        for mask in 0u8..32 {
+            let want = (
+                mask & 1 != 0,
+                mask & 2 != 0,
+                mask & 4 != 0,
+                mask & 8 != 0,
+                mask & 16 != 0,
+            );
+            let mut c = claims(Some("acme"), 3600);
+            c["can_ddl"] = serde_json::json!(want.0);
+            c["can_ipcrypt"] = serde_json::json!(want.1);
+            c["can_agents"] = serde_json::json!(want.2);
+            c["can_agents_worker"] = serde_json::json!(want.3);
+            c["can_agents_admin"] = serde_json::json!(want.4);
+            let token = sign_es256(&c, KID, EC_PRIV_PEM);
+
+            let with = with_subject
+                .resolve_principal(&bearer(&token))
+                .expect("resolves with the subject claim");
+            let without = without_subject
+                .resolve_principal(&bearer(&token))
+                .expect("resolves without the subject claim");
+            assert_eq!(caps(&with), want, "mask {mask:#07b}");
+            assert_eq!(caps(&without), want, "mask {mask:#07b}");
+            let subject = with.subject.as_ref().expect("sub sets the subject");
+            assert_eq!(subject.value(), "user-123");
+            assert_eq!(subject.source(), SubjectSource::Oidc);
+            assert_eq!(without.subject, None, "mask {mask:#07b}");
+            assert_eq!(with.tenant, without.tenant, "mask {mask:#07b}");
+        }
+        assert_eq!(drops.snapshot(), SubjectDropCounters::default().snapshot());
+
+        let subject = parse_subject_label("alice").expect("a valid label");
         let configured = Principal {
             subject: Some(subject),
             ..Principal::tenant_only(TenantId::new("acme"))
