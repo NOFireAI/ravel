@@ -48,7 +48,16 @@
 //! Both casts are cheap. Arrow special-cases `Dictionary(_, Utf8)` to
 //! `Utf8View` (`arrow_cast::cast::dictionary::dictionary_cast`) by reusing the
 //! dictionary's values buffer and building views over it, with no string data
-//! copied. The cast back runs on the batches the topmost carried operator
+//! copied. That special case takes a row's nulls from its key alone: a valid
+//! key over a NULL dictionary entry becomes a valid view of the entry slot's
+//! bytes, usually `""`, and would group apart from the NULL group (issue
+//! #3521; `the_property_rejects_keys_only_and_empty_as_null_conversions` pins
+//! that cast's answer). So the cast in reads its input through
+//! [`NullEntriesAsNullKeys`], which nulls every key whose entry is NULL first
+//! (`prop_group_key_views_keep_logical_nulls`); the cast back, from
+//! `Utf8View`, takes each row's nulls from the views, so it neither loses nor
+//! invents one (`prop_session_group_by_matches_logical_values` reads the
+//! restored column). The cast back runs on the batches the topmost carried operator
 //! emits, one batch at a time, so the `Utf8` values buffer it packs is bounded
 //! by the rows of one such batch. Under `ORDER BY <aggregate> ... LIMIT k`,
 //! when every sort key that reads the group key is the bare column, the
@@ -189,10 +198,15 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::array::{
+    Array, ArrayRef, DictionaryArray, PrimitiveArray, downcast_dictionary_array,
+};
+use datafusion::arrow::datatypes::{ArrowDictionaryKeyType, DataType, FieldRef, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{JoinSide, Result as DFResult};
+use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, DynamicFilterPhysicalExpr};
 use datafusion::physical_expr::utils::collect_columns;
@@ -778,8 +792,7 @@ fn rewrite_aggregate(
     for (expr, name) in group_by.expr() {
         let ty = expr.data_type(&input_schema)?;
         if !ordered && is_dictionary_string(&ty) {
-            let cast = CastExpr::new(Arc::clone(expr), GROUP_KEY_TYPE, None);
-            exprs.push((Arc::new(cast) as Arc<dyn PhysicalExpr>, name.clone()));
+            exprs.push((group_key_as_view(Arc::clone(expr)), name.clone()));
             cast_any = true;
         } else {
             exprs.push((Arc::clone(expr), name.clone()));
@@ -807,6 +820,120 @@ fn rewrite_aggregate(
     )?
     .with_limit_options(agg.limit_options());
     Ok(Arc::new(rebuilt))
+}
+
+/// The dictionary-string group key `expr` as the `Utf8View` the aggregate
+/// groups on, NULL wherever the dictionary is logically NULL.
+fn group_key_as_view(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+    let keys = Arc::new(NullEntriesAsNullKeys::new(expr));
+    Arc::new(CastExpr::new(keys, GROUP_KEY_TYPE, None))
+}
+
+/// A dictionary-string group key with every key whose dictionary entry is NULL
+/// made NULL itself, so the row's nulls are the dictionary's logical nulls (key
+/// NULL or entry NULL). The rule wraps the key in this below its cast to
+/// `Utf8View`, which reads nulls from the keys only.
+///
+/// The work is one pass over the keys against the entries' validity bits
+/// (`DictionaryArray::logical_nulls`), with no string read, and none at all
+/// when no entry is NULL. Anything other than a dictionary array passes
+/// through.
+#[derive(Debug, Eq)]
+struct NullEntriesAsNullKeys {
+    arg: Arc<dyn PhysicalExpr>,
+}
+
+impl PartialEq for NullEntriesAsNullKeys {
+    fn eq(&self, other: &Self) -> bool {
+        self.arg.eq(&other.arg)
+    }
+}
+
+impl std::hash::Hash for NullEntriesAsNullKeys {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.arg.hash(state);
+    }
+}
+
+impl NullEntriesAsNullKeys {
+    fn new(arg: Arc<dyn PhysicalExpr>) -> Self {
+        NullEntriesAsNullKeys { arg }
+    }
+}
+
+impl std::fmt::Display for NullEntriesAsNullKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "null_entries_as_null_keys({})", self.arg)
+    }
+}
+
+impl PhysicalExpr for NullEntriesAsNullKeys {
+    fn data_type(&self, input_schema: &Schema) -> DFResult<DataType> {
+        self.arg.data_type(input_schema)
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> DFResult<bool> {
+        self.arg.nullable(input_schema)
+    }
+
+    fn return_field(&self, input_schema: &Schema) -> DFResult<FieldRef> {
+        self.arg.return_field(input_schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        Ok(match self.arg.evaluate(batch)? {
+            ColumnarValue::Array(array) => ColumnarValue::Array(null_entries_as_null_keys(array)?),
+            scalar @ ColumnarValue::Scalar(_) => scalar,
+        })
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        let [arg] = <[_; 1]>::try_from(children).map_err(|children| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "null_entries_as_null_keys takes one child, got {}",
+                children.len()
+            ))
+        })?;
+        Ok(Arc::new(NullEntriesAsNullKeys::new(arg)))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.arg.fmt_sql(f)
+    }
+}
+
+/// `array` with the keys of a dictionary array nulled wherever their entry is
+/// NULL; any other array, and a dictionary with no NULL entry, unchanged.
+fn null_entries_as_null_keys(array: ArrayRef) -> DFResult<ArrayRef> {
+    let any = array.as_ref();
+    downcast_dictionary_array! {
+        any => {
+            if any.values().logical_null_count() == 0 {
+                return Ok(array);
+            }
+            keyed_by_logical_nulls(any)
+        }
+        _ => Ok(array),
+    }
+}
+
+/// `dict` over keys whose nulls are its logical nulls.
+fn keyed_by_logical_nulls<K: ArrowDictionaryKeyType>(
+    dict: &DictionaryArray<K>,
+) -> DFResult<ArrayRef> {
+    let keys = PrimitiveArray::<K>::new(dict.keys().values().clone(), dict.logical_nulls())
+        .with_data_type(dict.keys().data_type().clone());
+    Ok(Arc::new(DictionaryArray::try_new(
+        keys,
+        Arc::clone(dict.values()),
+    )?))
 }
 
 /// True when at least one group column of `declared_schema` no longer matches
@@ -1397,5 +1524,427 @@ mod tests {
         }
         // No projection was inserted above the aggregate: the rule declined.
         assert_eq!(plan.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    // --- NULL dictionary entries (issue #3521) ------------------------------
+
+    /// One group key's rows as `(value, count)`, sorted, NULL first. Two groups
+    /// with the same value stay two entries.
+    type Groups = Vec<(Option<String>, i64)>;
+
+    /// A `Dictionary(Int32, Utf8)` whose entries are `entries`, a `None` entry
+    /// NULL over the slot bytes `slots` gives it (so a NULL entry can sit over
+    /// `""` or over real bytes), keyed by `keys`.
+    fn null_entry_dictionary(
+        entries: &[Option<&str>],
+        slots: &[&str],
+        keys: &[Option<i32>],
+    ) -> DictionaryArray<Int32Type> {
+        use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let bytes: Vec<&str> = entries
+            .iter()
+            .zip(slots)
+            .map(|(entry, slot)| entry.unwrap_or(slot))
+            .collect();
+        let values = StringArray::try_new(
+            OffsetBuffer::from_lengths(bytes.iter().map(|b| b.len())),
+            Buffer::from(bytes.concat().into_bytes()),
+            Some(NullBuffer::from_iter(entries.iter().map(Option::is_some))),
+        )
+        .expect("values build");
+        DictionaryArray::try_new(
+            datafusion::arrow::array::Int32Array::from(keys.to_vec()),
+            Arc::new(values),
+        )
+        .expect("dictionary builds")
+    }
+
+    /// Each row of `dict` as its logical value: NULL when its key is NULL or
+    /// its entry is.
+    fn logical_rows(dict: &DictionaryArray<Int32Type>) -> Vec<Option<String>> {
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 values");
+        dict.keys()
+            .iter()
+            .map(|key| {
+                let at = usize::try_from(key?).ok()?;
+                values.is_valid(at).then(|| values.value(at).to_owned())
+            })
+            .collect()
+    }
+
+    fn group_rows(rows: impl IntoIterator<Item = Option<String>>) -> Groups {
+        let mut counts = std::collections::BTreeMap::<Option<String>, i64>::new();
+        for row in rows {
+            *counts.entry(row).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    /// A session built by `crate::session::build_session`, as `/api/v1/sql`
+    /// builds one, with `batch` registered as `t` beside the empty `logs`
+    /// table.
+    fn ravel_session(batch: RecordBatch) -> SessionContext {
+        use crate::session::{SessionTable, SpillDecision, build_session};
+
+        let config = crate::SqlConfig::default();
+        let (pool, _) = config.query_pool(
+            crate::memory::TenantMemoryAccountant::new(1 << 30),
+            ravel_types::accounting::QueryAccounting::new(),
+        );
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let logs = crate::LogsTableProvider::new(
+            ravel_catalog::Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store),
+            ravel_query::PhaseAccounting::new(),
+        );
+        let ctx = build_session(
+            &config,
+            pool,
+            SessionTable::Logs(Arc::new(logs)),
+            false,
+            SpillDecision::Disabled,
+            &crate::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
+        )
+        .expect("session builds");
+        ctx.register_batch("t", batch).expect("table registers");
+        ctx
+    }
+
+    /// `batch` with `k` as its one column.
+    fn key_batch(dict: DictionaryArray<Int32Type>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", dict_type(), true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).expect("batch builds")
+    }
+
+    /// `SELECT k, count(*) FROM t GROUP BY k` in `ctx`, as [`Groups`]. The
+    /// key column is read through arrow's `take`-based cast to `Utf8`, which
+    /// keeps a NULL entry NULL, so what is read is what the client receives.
+    async fn session_groups(ctx: &SessionContext, sql: &str) -> Groups {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("query plans")
+            .collect()
+            .await
+            .expect("query runs");
+        let mut groups = Groups::new();
+        for batch in &batches {
+            let keys = datafusion::arrow::compute::cast(batch.column(0), &DataType::Utf8)
+                .expect("key reads as Utf8");
+            let keys = keys
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 keys");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 counts");
+            for row in 0..batch.num_rows() {
+                groups.push((
+                    keys.is_valid(row).then(|| keys.value(row).to_owned()),
+                    counts.value(row),
+                ));
+            }
+        }
+        groups.sort();
+        groups
+    }
+
+    /// The fixture of [`a_null_dictionary_entry_groups_with_null`]: entries
+    /// `api`, NULL over `""`, `""`, `worker`, NULL over `zz`.
+    const ENTRIES: [Option<&str>; 5] = [Some("api"), None, Some(""), Some("worker"), None];
+    const SLOTS: [&str; 5] = ["", "", "", "", "zz"];
+
+    /// 4 rows `api`, 5 over the NULL entry with empty slot bytes, 3 genuine
+    /// `""`, 2 `worker`, 3 NULL keys and 2 over the NULL entry whose slot
+    /// holds `zz`: 17 rows, 10 of them logically NULL.
+    fn null_entry_fixture() -> DictionaryArray<Int32Type> {
+        let mut keys = Vec::new();
+        for (key, rows) in [
+            (Some(0), 4),
+            (Some(1), 5),
+            (Some(2), 3),
+            (Some(3), 2),
+            (None, 3),
+            (Some(4), 2),
+        ] {
+            keys.extend(std::iter::repeat_n(key, rows));
+        }
+        null_entry_dictionary(&ENTRIES, &SLOTS, &keys)
+    }
+
+    /// Issue #3521's reproduction through the session `/api/v1/sql` builds,
+    /// over a hand-built batch: a row whose key is valid but whose dictionary
+    /// entry is NULL groups with the NULL keys, and `""` counts only the
+    /// genuine empty strings.
+    ///
+    /// Before the fix the grouped answer was `[(NULL, 3), ("", 8), ("api",
+    /// 4), ("worker", 2), ("zz", 2)]`: arrow's dictionary-to-view cast read
+    /// nulls from the keys only, so the five rows over the NULL entry with an
+    /// empty slot joined `""` and the two over the `zz` slot formed a group
+    /// of their own.
+    #[tokio::test]
+    async fn a_null_dictionary_entry_groups_with_null() {
+        let dict = null_entry_fixture();
+        let ctx = ravel_session(key_batch(dict.clone()));
+        let want: Groups = vec![
+            (None, 10),
+            (Some(String::new()), 3),
+            (Some("api".to_owned()), 4),
+            (Some("worker".to_owned()), 2),
+        ];
+        assert_eq!(group_rows(logical_rows(&dict)), want, "the reference");
+
+        let grouped = "SELECT k, count(*) AS c FROM t GROUP BY k";
+        let plan = ctx
+            .sql(grouped)
+            .await
+            .expect("query plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let mut aggregates = Vec::new();
+        collect_aggregates(&plan, &mut aggregates);
+        assert!(
+            !aggregates.is_empty()
+                && aggregates
+                    .iter()
+                    .all(|agg| agg.schema().field(0).data_type() == &DataType::Utf8View),
+            "the session groups on views: {}",
+            show(&plan)
+        );
+        assert_eq!(session_groups(&ctx, grouped).await, want);
+
+        // The same key under a two-level `COUNT(DISTINCT ..)` and under a
+        // TopK on the key.
+        assert_eq!(
+            session_groups(
+                &ctx,
+                "SELECT k, count(DISTINCT k) AS u FROM t GROUP BY k ORDER BY k"
+            )
+            .await,
+            vec![
+                (None, 0),
+                (Some(String::new()), 1),
+                (Some("api".to_owned()), 1),
+                (Some("worker".to_owned()), 1),
+            ]
+        );
+        assert_eq!(
+            session_groups(
+                &ctx,
+                "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY k NULLS FIRST LIMIT 2"
+            )
+            .await,
+            vec![(None, 10), (Some(String::new()), 3)]
+        );
+
+        let scalar = |sql: &'static str| {
+            let ctx = &ctx;
+            async move {
+                let batches = ctx
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .collect()
+                    .await
+                    .expect("query runs");
+                let [batch] = batches.as_slice() else {
+                    panic!("one batch: {batches:?}");
+                };
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .value(0)
+            }
+        };
+        assert_eq!(scalar("SELECT count(*) FROM t WHERE k IS NULL").await, 10);
+        assert_eq!(scalar("SELECT count(DISTINCT k) FROM t").await, 3);
+    }
+
+    /// A generated dictionary: entries over `[ab]{0,2}` (so `""` and duplicate
+    /// entries recur), each NULL with probability 0.3 over slot bytes `""`,
+    /// `z` or `zz`; and up to 40 keys, each NULL with probability 0.15.
+    fn generated_dictionary()
+    -> impl proptest::strategy::Strategy<Value = DictionaryArray<Int32Type>> {
+        use proptest::prelude::*;
+
+        prop::collection::vec((prop::option::weighted(0.7, "[ab]{0,2}"), "z{0,2}"), 1..6)
+            .prop_flat_map(|entries| {
+                let n = i32::try_from(entries.len()).expect("few entries");
+                (
+                    Just(entries),
+                    prop::collection::vec(prop::option::weighted(0.85, 0..n), 0..40),
+                )
+            })
+            .prop_map(|(entries, keys)| {
+                let values: Vec<Option<&str>> = entries.iter().map(|(e, _)| e.as_deref()).collect();
+                let slots: Vec<&str> = entries.iter().map(|(_, s)| s.as_str()).collect();
+                null_entry_dictionary(&values, &slots, &keys)
+            })
+    }
+
+    /// The groups an aggregate forms over `views`, the group key as
+    /// `to_views` hands it to the aggregate.
+    fn view_groups(views: &ArrayRef) -> Groups {
+        let views = views
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+            .expect("Utf8View");
+        group_rows(views.iter().map(|v| v.map(str::to_owned)))
+    }
+
+    /// The property both tests below check: the groups formed over `to_views`
+    /// of `dict` are the groups of `dict`'s logical values.
+    fn keeps_logical_nulls(
+        to_views: &dyn Fn(&DictionaryArray<Int32Type>) -> ArrayRef,
+        dict: &DictionaryArray<Int32Type>,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let got = view_groups(&to_views(dict));
+        let want = group_rows(logical_rows(dict));
+        proptest::prop_assert_eq!(got, want, "over {:?}", dict);
+        Ok(())
+    }
+
+    /// The rule's own group-key expression, [`group_key_as_view`], evaluated.
+    fn rule_views(dict: &DictionaryArray<Int32Type>) -> ArrayRef {
+        let batch = key_batch(dict.clone());
+        group_key_as_view(Arc::new(Column::new("k", 0)))
+            .evaluate(&batch)
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .expect("the group key evaluates")
+    }
+
+    /// Arrow's cast alone, what the rule ran before issue #3521: nulls from
+    /// the keys only.
+    fn keys_only_views(dict: &DictionaryArray<Int32Type>) -> ArrayRef {
+        datafusion::arrow::compute::cast(dict, &GROUP_KEY_TYPE).expect("cast")
+    }
+
+    /// A conversion that confuses `""` with NULL: every row whose view is
+    /// empty is NULL.
+    fn empty_as_null_views(dict: &DictionaryArray<Int32Type>) -> ArrayRef {
+        let views = keys_only_views(dict);
+        let views = views
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+            .expect("Utf8View");
+        Arc::new(
+            views
+                .iter()
+                .map(|v| v.filter(|s| !s.is_empty()))
+                .collect::<datafusion::arrow::array::StringViewArray>(),
+        )
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+
+        /// The rule's group-key expression keeps every logically NULL row
+        /// NULL and every genuine `""` a value.
+        #[test]
+        fn prop_group_key_views_keep_logical_nulls(dict in generated_dictionary()) {
+            keeps_logical_nulls(&rule_views, &dict)?;
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        /// `GROUP BY k` through the session, rule installed, equals the groups
+        /// of the input's logical values.
+        #[test]
+        fn prop_session_group_by_matches_logical_values(dict in generated_dictionary()) {
+            let want = group_rows(logical_rows(&dict));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let got = runtime.block_on(async {
+                let ctx = ravel_session(key_batch(dict.clone()));
+                session_groups(&ctx, "SELECT k, count(*) AS c FROM t GROUP BY k").await
+            });
+            proptest::prop_assert_eq!(got, want, "over {:?}", dict);
+        }
+    }
+
+    /// A dictionary with no NULL entry, NULL keys or not, comes back as the
+    /// same array; one with a NULL entry comes back keyed NULL there and
+    /// nowhere else, over the same values.
+    #[test]
+    fn null_entries_as_null_keys_touches_only_dictionaries_with_null_entries() {
+        let clean: ArrayRef = Arc::new(null_entry_dictionary(
+            &[Some("a"), Some("")],
+            &["", ""],
+            &[Some(0), None, Some(1)],
+        ));
+        let same = null_entries_as_null_keys(Arc::clone(&clean)).expect("passes through");
+        assert!(Arc::ptr_eq(&clean, &same));
+
+        let dict = null_entry_fixture();
+        let nulled = null_entries_as_null_keys(Arc::new(dict.clone())).expect("re-keys");
+        let nulled = nulled
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("still a dictionary");
+        assert!(Arc::ptr_eq(nulled.values(), dict.values()));
+        assert_eq!(nulled.keys().null_count(), 10);
+        assert_eq!(logical_rows(nulled), logical_rows(&dict));
+    }
+
+    /// `keeps_logical_nulls`, the property above, finds a counterexample
+    /// against the two wrong conversions: the keys-only cast the rule used
+    /// before issue #3521, and one that nulls every empty view.
+    #[test]
+    fn the_property_rejects_keys_only_and_empty_as_null_conversions() {
+        use proptest::test_runner::TestRunner;
+
+        type Conversion = fn(&DictionaryArray<Int32Type>) -> ArrayRef;
+        let wrong: [(&str, Conversion); 2] = [
+            ("keys only", keys_only_views),
+            ("empty as NULL", empty_as_null_views),
+        ];
+        for (name, to_views) in wrong {
+            let outcome = TestRunner::default().run(&generated_dictionary(), |dict| {
+                keeps_logical_nulls(&to_views, &dict)
+            });
+            assert!(outcome.is_err(), "{name}: the property found no failure");
+        }
+        // The fixed fixture separates the three as well.
+        let dict = null_entry_fixture();
+        assert!(keeps_logical_nulls(&rule_views, &dict).is_ok());
+        assert_eq!(
+            view_groups(&keys_only_views(&dict)),
+            vec![
+                (None, 3),
+                (Some(String::new()), 8),
+                (Some("api".to_owned()), 4),
+                (Some("worker".to_owned()), 2),
+                (Some("zz".to_owned()), 2),
+            ]
+        );
+        assert_eq!(
+            view_groups(&empty_as_null_views(&dict)),
+            vec![
+                (None, 11),
+                (Some("api".to_owned()), 4),
+                (Some("worker".to_owned()), 2),
+                (Some("zz".to_owned()), 2),
+            ]
+        );
     }
 }

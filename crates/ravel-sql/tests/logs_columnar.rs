@@ -2066,7 +2066,7 @@ pub(crate) fn str_column_id(obj: &[u8], cfg: RlogConfig, key: &str) -> u32 {
 }
 
 /// The encodings PAGE_DIR records for `column_id`'s pages in `obj`, in order.
-fn column_page_encs(obj: &[u8], cfg: RlogConfig, column_id: u32) -> Vec<Enc> {
+pub(crate) fn column_page_encs(obj: &[u8], cfg: RlogConfig, column_id: u32) -> Vec<Enc> {
     let footer = open_footer(obj).expect("open footer");
     let desc = *footer.section(kind::PAGE_DIR).expect("a PAGE_DIR section");
     let bytes = read_section(obj, &desc, &cfg).expect("read PAGE_DIR");
