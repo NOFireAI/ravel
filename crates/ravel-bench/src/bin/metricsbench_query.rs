@@ -15,7 +15,8 @@
 //! ([`ravel_bench::metrics_query::bind_diagnostic`]): the report carries
 //! `run_verdict: "failed"` and `failed_bands`, is checked by
 //! [`ravel_bench::report_schema::validate_diagnostic`], and is refused by
-//! `validate` everywhere else.
+//! `validate` everywhere else. A failed row on the Prometheus oracle refuses
+//! the diagnostic too, since every engine is classified against it.
 //!
 //! Exit codes: 0 the report (and any sidecar) was written; 64 a usage error (an `--engine`
 //! value that does not parse); 65 the inputs cannot bind a run or the run is
@@ -98,12 +99,14 @@ struct Args {
     /// after the report. Not part of the report.
     #[arg(long)]
     diagnostics: Option<PathBuf>,
-    /// Query a run whose ingest verification failed, as a diagnostic: a row
-    /// whose read-back failed or that carries a `row_failure` is queried, a
-    /// stalled row's or failed replay's engine is left out, and the report says `run_verdict: "failed"` with every failure in
+    /// Query a run whose ingest verification failed, as a diagnostic: a
+    /// comparator row whose read-back failed or that carries a `row_failure`
+    /// is queried, a stalled row's or failed replay's engine is left out, and
+    /// the report says `run_verdict: "failed"` with every failure in
     /// `failed_bands`, so `metricsbench_report validate` refuses it.
     /// Without this flag such an ingest report is refused (exit 65); with it,
-    /// an ingest report with no failed row is refused.
+    /// an ingest report with no failed row, or one whose failed row is the
+    /// Prometheus oracle's, is refused (exit 65).
     #[arg(long)]
     diagnostic_after_failed_ingest: bool,
 }

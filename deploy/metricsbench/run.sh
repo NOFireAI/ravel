@@ -63,8 +63,11 @@
 #               failed (failed_step) and the run goes on through every later
 #               step as a diagnostic: query gets
 #               --diagnostic-after-failed-ingest, validate must refuse the
-#               report it writes, a later step's failure is listed in
-#               failed_after_ingest, and the run exits 70 naming ingest.
+#               report it writes, and the run exits 70 naming ingest. A
+#               later step that fails is listed in failed_after_ingest and
+#               ends the run there, with the same exit; that includes query
+#               itself, which refuses when the failed row is the Prometheus
+#               oracle's (no report.json, no validate or memory step).
 #               Any other ingest failure stops the run
 #   mimir-readiness  the ingest row for mimir read back what it accepted
 #               (after a failed ingest verification, stamped and not checked)
@@ -910,7 +913,11 @@ fail_step() {
 # failed_after_ingest lists the later ones that failed.
 fail_after_ingest() {
   FAILED_STEP="ingest"
-  say "step ingest failed: ${INGEST_FAILURE}; the run went on as a diagnostic, report.json is not a result"
+  if [ -s "${out_dir}/report.json" ]; then
+    say "step ingest failed: ${INGEST_FAILURE}; the run went on as a diagnostic, report.json is not a result"
+  else
+    say "step ingest failed: ${INGEST_FAILURE}; the run went on as a diagnostic and wrote no report.json"
+  fi
   exit "$EXIT_STEP"
 }
 
