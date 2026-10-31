@@ -306,3 +306,246 @@ fn new_cells(ty: FieldType, limit: usize) -> DynCells {
     }
     cells
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// A buffered row that shares its stream blob, the shape the ingest
+    /// buffer holds, so the generic path is checked over a type that is not
+    /// [`LogRecord`].
+    struct SharedRow {
+        blob: Arc<[u8]>,
+        rec: LogRecord,
+    }
+
+    impl LogRowRef for SharedRow {
+        fn stream_id(&self) -> LogStreamId {
+            self.rec.stream_id
+        }
+        fn stream_attrs(&self) -> &[u8] {
+            &self.blob
+        }
+        fn ts_ns(&self) -> i64 {
+            self.rec.ts_ns
+        }
+        fn observed_ts_ns(&self) -> i64 {
+            self.rec.observed_ts_ns
+        }
+        fn severity_num(&self) -> u8 {
+            self.rec.severity_num
+        }
+        fn flags(&self) -> u32 {
+            self.rec.flags
+        }
+        fn severity_text(&self) -> &str {
+            &self.rec.severity_text
+        }
+        fn body(&self) -> &str {
+            &self.rec.body
+        }
+        fn trace_id(&self) -> Option<&[u8; 16]> {
+            self.rec.trace_id.as_ref()
+        }
+        fn span_id(&self) -> Option<&[u8; 8]> {
+            self.rec.span_id.as_ref()
+        }
+        fn attrs(&self) -> &[(String, AttrValue)] {
+            &self.rec.attrs
+        }
+    }
+
+    /// Few names, so a row often repeats one, with the same type or another.
+    const NAMES: [&str; 6] = ["a", "b", "ab", "b2", "http.method", "late"];
+
+    fn leaf() -> impl Strategy<Value = AttrValue> {
+        prop_oneof![
+            "[a-z]{0,6}".prop_map(AttrValue::Str),
+            (-3i64..3).prop_map(AttrValue::I64),
+            prop::sample::select(vec![0.0f64, -0.0, 1.5, -2.25]).prop_map(AttrValue::F64),
+            any::<bool>().prop_map(AttrValue::Bool),
+            prop::collection::vec(any::<u8>(), 0..5).prop_map(AttrValue::Bytes),
+        ]
+    }
+
+    fn value() -> impl Strategy<Value = AttrValue> {
+        prop_oneof![
+            6 => leaf(),
+            1 => prop::collection::vec(leaf(), 0..3).prop_map(AttrValue::List),
+            1 => prop::collection::vec(("[a-c]", leaf()), 0..3).prop_map(AttrValue::Map),
+        ]
+    }
+
+    fn attr() -> impl Strategy<Value = (String, AttrValue)> {
+        (prop::sample::select(NAMES.to_vec()), value()).prop_map(|(k, v)| (k.to_owned(), v))
+    }
+
+    /// One row: a stream out of a few (ids repeat), one of two blobs for it
+    /// (the first one seen must win), and 0..8 attributes in any order.
+    fn row() -> impl Strategy<Value = (u8, bool, LogRecord)> {
+        (
+            0u8..6,
+            any::<bool>(),
+            any::<i64>(),
+            any::<u8>(),
+            "[A-Z]{0,4}",
+            "[a-z ]{0,12}",
+            prop::option::of(any::<[u8; 16]>()),
+            prop::option::of(any::<[u8; 8]>()),
+            any::<u32>(),
+            prop::collection::vec(attr(), 0..8),
+        )
+            .prop_map(
+                |(stream, alt_blob, ts, sev, sev_text, body, trace, span, flags, attrs)| {
+                    let blob = vec![stream, u8::from(alt_blob)];
+                    let rec = LogRecord {
+                        stream_id: LogStreamId([stream.wrapping_mul(37); 16]),
+                        stream_attrs: blob,
+                        ts_ns: ts,
+                        observed_ts_ns: ts.wrapping_add(1),
+                        severity_num: sev,
+                        severity_text: sev_text,
+                        body,
+                        trace_id: trace,
+                        span_id: span,
+                        flags,
+                        attrs,
+                    };
+                    (stream, alt_blob, rec)
+                },
+            )
+    }
+
+    /// Rows whose "late" attribute appears only after the first third, so a
+    /// column first seen deep in the batch pads its validity.
+    fn rows() -> impl Strategy<Value = Vec<LogRecord>> {
+        prop::collection::vec(row(), 0..40).prop_map(|rows| {
+            let third = rows.len() / 3;
+            rows.into_iter()
+                .enumerate()
+                .map(|(i, (_, _, mut rec))| {
+                    if i < third {
+                        rec.attrs.retain(|(k, _)| k != "late");
+                    }
+                    rec
+                })
+                .collect()
+        })
+    }
+
+    fn assert_matches_reference(records: &[LogRecord], limit: usize) {
+        let (want, want_err) = ColumnarLogBatch::build_from_records_reference(records, limit);
+        let (got, got_err) = ColumnarLogBatch::build_from_rows(records, limit);
+        assert_eq!(got, want, "LogRecord rows");
+        assert_eq!(
+            got_err.as_ref().map(|e| format!("{e:?}")),
+            want_err.as_ref().map(|e| format!("{e:?}")),
+            "LogRecord refusal"
+        );
+
+        let shared: Vec<SharedRow> = records
+            .iter()
+            .map(|r| SharedRow {
+                blob: r.stream_attrs.clone().into(),
+                rec: r.clone(),
+            })
+            .collect();
+        let (got, got_err) = ColumnarLogBatch::build_from_rows(&shared, limit);
+        assert_eq!(got, want, "shared-blob rows");
+        assert_eq!(
+            got_err.as_ref().map(|e| format!("{e:?}")),
+            want_err.as_ref().map(|e| format!("{e:?}")),
+            "shared-blob refusal"
+        );
+        match want_err {
+            None => {
+                let built = ColumnarLogBatch::try_from_rows_with_limit(&shared, limit)
+                    .expect("the reference built this batch");
+                assert_eq!(built, want);
+            }
+            Some(e) => {
+                let refused = ColumnarLogBatch::try_from_rows_with_limit(&shared, limit)
+                    .expect_err("the reference refused this batch");
+                assert_eq!(format!("{refused:?}"), format!("{e:?}"));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn rows_build_the_reference_batch(records in rows()) {
+            assert_matches_reference(&records, VAR_BYTES_MAX);
+        }
+
+        #[test]
+        fn rows_refuse_where_the_reference_refuses(records in rows(), limit in 0usize..24) {
+            assert_matches_reference(&records, limit);
+        }
+    }
+
+    fn rec(stream: u8, attrs: &[(&str, AttrValue)]) -> LogRecord {
+        LogRecord {
+            stream_id: LogStreamId([stream; 16]),
+            stream_attrs: vec![stream],
+            ts_ns: 0,
+            observed_ts_ns: 0,
+            severity_num: 0,
+            severity_text: String::new(),
+            body: String::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_same_type_repeat_is_residual_and_another_type_is_a_column() {
+        let s = |v: &str| AttrValue::Str(v.to_owned());
+        let records = [rec(
+            1,
+            &[("k", s("x")), ("k", AttrValue::I64(1)), ("k", s("y"))],
+        )];
+        let batch = ColumnarLogBatch::try_from_rows(&records).expect("batch");
+        let cols: Vec<(&str, FieldType)> = batch
+            .dyn_columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.field_type))
+            .collect();
+        assert_eq!(cols, [("k", FieldType::Str), ("k", FieldType::I64)]);
+        assert_eq!(batch.residual_attrs[0], [("k".to_owned(), s("y"))]);
+    }
+
+    #[test]
+    fn columns_are_ordered_by_name_then_type_not_first_appearance() {
+        let records = [
+            rec(1, &[("z", AttrValue::Bool(true)), ("z", AttrValue::I64(1))]),
+            rec(2, &[("a", AttrValue::I64(2))]),
+        ];
+        let batch = ColumnarLogBatch::try_from_rows(&records).expect("batch");
+        let cols: Vec<(&str, FieldType)> = batch
+            .dyn_columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.field_type))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                ("a", FieldType::I64),
+                ("z", FieldType::I64),
+                ("z", FieldType::Bool)
+            ]
+        );
+        assert_matches_reference(&records, VAR_BYTES_MAX);
+    }
+}

@@ -3118,6 +3118,16 @@ impl LogShardActor {
     }
 }
 
+/// The ADR-3492 benchmark's record shape, shared with ravel-logseg's bench
+/// and differential test so the flush test encodes the same records.
+#[cfg(test)]
+#[path = "../.."]
+mod bench_corpus {
+    #[path = "ravel-logseg/benches/common/ingest_shape.rs"]
+    #[allow(dead_code)]
+    pub mod ingest_shape;
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -3637,6 +3647,44 @@ mod tests {
                     row.len(),
                 );
             }
+        }
+    }
+
+    /// ADR-3492 decision 2 (#3557): the flush builds its batch from the
+    /// buffered records in place, and for the benchmark's ingest shape (7,500
+    /// records over 50 streams, each stream's records sharing one blob as the
+    /// buffer holds them) its object is the row writer's, byte for byte, under
+    /// either page choice.
+    #[test]
+    fn the_columnar_flush_writes_the_row_writers_bytes_for_the_ingest_shape() {
+        let mut blobs: HashMap<LogStreamId, Arc<[u8]>> = HashMap::new();
+        let records: Vec<NormalizedLogRecord> = bench_corpus::ingest_shape::ingest_records(7_500)
+            .into_iter()
+            .map(|rec| {
+                let mut norm = from_logseg_record(rec);
+                norm.stream_attrs = Arc::clone(
+                    blobs
+                        .entry(norm.stream_id)
+                        .or_insert_with(|| Arc::clone(&norm.stream_attrs)),
+                );
+                norm
+            })
+            .collect();
+        assert_eq!(blobs.len(), bench_corpus::ingest_shape::STREAMS);
+        for page_choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            let cfg = RlogConfig {
+                page_choice,
+                ..flush_rlog_config(&IngestConfig::default())
+            };
+            let row = row_written(cfg, None, records.clone());
+            let flushed = flush_written(cfg, None, records.clone());
+            assert!(
+                row == flushed,
+                "{page_choice:?}: the flush's object differs from the row writer's \
+                 ({} and {} bytes)",
+                flushed.len(),
+                row.len(),
+            );
         }
     }
 
