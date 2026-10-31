@@ -3,8 +3,9 @@
  * step, effect and reconcile routes. No transport consults it: the HTTP
  * transport records steps on the server and the fake coordinator keeps its
  * own. Only its own test imports it; it stays exported, deprecated, for
- * callers that already do, and a later release removes it. {@link MemoryStepJournal} keeps it in process
- * memory; it is not durable and replaces no server state.
+ * callers that already do, and a later release removes it.
+ * {@link MemoryStepJournal} keeps it in process memory; it is not durable
+ * and replaces no server state.
  */
 import { EffectInDoubt, NonDeterministicReplay, UnsupportedFormat } from "../errors.js";
 import { effectId, stepId } from "../identity.js";
