@@ -38,6 +38,7 @@ import {
   CreateAgentResponse,
   type EffectCompleteRequest,
   type EffectCompleteResponse,
+  type EffectFailRequest,
   type EffectState,
   type EventBody,
   encodeWire,
@@ -54,6 +55,8 @@ import {
   SendResponse,
   StateResponse,
   type StepBody,
+  type StepRecordRequest,
+  type StepRecordResponse,
   TERMINAL_STATUSES,
   type TurnLease,
   type WorkerCommitRequest,
@@ -65,13 +68,7 @@ import {
   type WorkerRegisterResponse,
 } from "../wire/index.js";
 import { handlerDigest, serveAgents, type TurnReport, type WorkerHandle } from "../worker/index.js";
-import type {
-  EffectFailRequest,
-  PolledTurn,
-  StepRecordRequest,
-  StepRecordResponse,
-  Transport,
-} from "../worker/transport.js";
+import type { PolledTurn, Transport } from "../worker/transport.js";
 
 type Json = z.output<typeof SendRequest>["payload"];
 
@@ -107,7 +104,8 @@ interface AgentRecord {
   readonly key: string;
   readonly incarnation: number;
   stateVersion: number;
-  state: Json;
+  /** Null until the agent's first committed turn, as the server answers. */
+  state: Json | null;
   epoch: number;
   nextAcceptSeq: number;
   readonly events: EventBody[];
@@ -311,7 +309,7 @@ export class FakeCoordinator implements Transport {
       key,
       incarnation: 1,
       stateVersion: 0,
-      state: definition.initialState as Json,
+      state: null,
       epoch: 0,
       nextAcceptSeq: 1,
       events: [],

@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { gate, type Gate } from "../test-util.js";
@@ -5,6 +8,7 @@ import { createTestHarness, type TestHarness } from "../testing/index.js";
 import { ERROR_CODES } from "../wire/errors.js";
 import { defineAgent } from "../worker/index.js";
 import {
+  type AnyAgentDefinition,
   createClient,
   Forbidden,
   IdempotencyConflict,
@@ -250,5 +254,135 @@ describe("client", () => {
     expect(seen[0]?.init.body).toBe(
       '{"agent":{"kind":"greeter","key":"g-1"},"handler":"greet","request_id":"r-9","payload":{"name":"a"}}',
     );
+  });
+});
+
+const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../fixtures");
+function readFixture(name: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(resolve(fixtureDir, name), "utf8")) as Record<string, unknown>;
+}
+
+interface Seen {
+  readonly url: string;
+  readonly method: string | undefined;
+  readonly body: unknown;
+}
+
+/** A client over a fetch that records each request and answers from `answer`. */
+function scripted(answer: () => Response | Error) {
+  const seen: Seen[] = [];
+  const client = createClient({
+    url: "http://x.invalid/",
+    token: "t",
+    retryDelayMs: 1,
+    fetch: (url, init = {}) => {
+      seen.push({
+        url: url instanceof Request ? url.url : url.toString(),
+        method: init.method,
+        body: typeof init.body === "string" ? JSON.parse(init.body) : undefined,
+      });
+      const a = answer();
+      return a instanceof Error ? Promise.reject(a) : Promise.resolve(a);
+    },
+  });
+  return { client, seen };
+}
+
+const json = (body: unknown, status = 200) => () => new Response(JSON.stringify(body), { status });
+
+describe("client effects, reconcile and destroy", () => {
+  it("reconcile is sent once: a network failure is OutcomeUnknown with no second request", async () => {
+    const { client, seen } = scripted(() => new TypeError("fetch failed"));
+    const request = readFixture("reconcile_request.json") as never;
+    await expect(client.reconcile(request)).rejects.toBeInstanceOf(OutcomeUnknown);
+    expect(seen).toHaveLength(1);
+  });
+
+  it("destroy is sent once: an untyped 503 is OutcomeUnknown with no second request", async () => {
+    const { client, seen } = scripted(() => new Response("unavailable", { status: 503 }));
+    await expect(client.agent<AnyAgentDefinition>("order", "o-1").destroy({ incarnation: 1 })).rejects.toBeInstanceOf(OutcomeUnknown);
+    expect(seen).toHaveLength(1);
+  });
+
+  it("effects lists the agent's effects from /api/v1/agents/effects", async () => {
+    const fixture = readFixture("effects_response.json");
+    const { client, seen } = scripted(json(fixture));
+    expect(await client.agent<AnyAgentDefinition>("order", "o-1").effects()).toEqual(fixture.effects);
+    expect(seen).toEqual([{ url: "http://x.invalid/api/v1/agents/effects?kind=order&key=o-1", method: "GET", body: undefined }]);
+  });
+
+  it("effect inspects a handle at /api/v1/agents/effects/{effect}", async () => {
+    const fixture = readFixture("effect_inspect_response.json");
+    const handle = fixture.effect as string;
+    const { client, seen } = scripted(json(fixture));
+    expect(await client.effect(handle)).toEqual(fixture);
+    expect(seen).toEqual([{ url: `http://x.invalid/api/v1/agents/effects/${handle}`, method: "GET", body: undefined }]);
+  });
+
+  it("reconcile posts the decision to /api/v1/agents/reconcile", async () => {
+    const fixture = readFixture("reconcile_request.json") as { effect: string; attempt: number; result: { charge_id: string } };
+    const response = readFixture("reconcile_response.json");
+    const { client, seen } = scripted(json(response));
+    const recorded = await client.reconcile({
+      effect: fixture.effect,
+      attempt: fixture.attempt,
+      decision: "record_result",
+      result: fixture.result,
+    });
+    expect(recorded).toEqual(response);
+    await client.reconcile({ effect: fixture.effect, attempt: 2, decision: "retry" });
+    expect(seen.map((s) => [s.method, s.url])).toEqual([
+      ["POST", "http://x.invalid/api/v1/agents/reconcile"],
+      ["POST", "http://x.invalid/api/v1/agents/reconcile"],
+    ]);
+    expect(seen[0]?.body).toEqual(fixture);
+    expect(seen[1]?.body).toEqual({ effect: fixture.effect, attempt: 2, decision: "retry" });
+  });
+
+  it("destroy posts kind, key and incarnation and decodes destroyed and abandoned", async () => {
+    const { client, seen } = scripted(json(readFixture("destroy_agent_response.json")));
+    const o1 = client.agent<AnyAgentDefinition>("order", "o-1");
+    const destroyed = await o1.destroy({ incarnation: 1 });
+    expect(destroyed.agent_id).toBe("19cd0e6876991314c1b6dbd8bd129297");
+    expect(destroyed.incarnation).toBe(1);
+    expect(destroyed.destroyed).toBe(true);
+    expect(destroyed.abandoned.inputs).toBe(2);
+    expect(destroyed.abandoned.active_turn).toBe(true);
+    expect(destroyed.abandoned.effects_in_doubt).toBe(1);
+    expect(destroyed.abandoned.effects_authorized).toBe(0);
+    expect(destroyed.abandoned.timers_scheduled).toBe(1);
+    await o1.destroy();
+    expect(seen.map((s) => [s.method, s.url])).toEqual([
+      ["POST", "http://x.invalid/api/v1/agents/destroy"],
+      ["POST", "http://x.invalid/api/v1/agents/destroy"],
+    ]);
+    expect(seen[0]?.body).toEqual(readFixture("destroy_agent_request.json"));
+    expect(seen[1]?.body).toEqual({ agent: { kind: "order", key: "o-1" } });
+    expect(seen[1]?.body).not.toHaveProperty("incarnation");
+  });
+
+  it("state decodes null for an agent that has never committed", async () => {
+    const { client, seen } = scripted(json(readFixture("state_response_uncommitted.json")));
+    expect(await client.agent<AnyAgentDefinition>("order", "o-1").state()).toEqual({
+      agentId: "19cd0e6876991314c1b6dbd8bd129297",
+      incarnation: 1,
+      stateVersion: 0,
+      state: null,
+    });
+    expect(seen[0]?.url).toBe("http://x.invalid/api/v1/agents/state?kind=order&key=o-1");
+  });
+
+  it("state is null before the first commit, in the harness and against the state_response_uncommitted fixture", async () => {
+    const h = start();
+    const agent = h.agent(greeter, "g-1");
+    // The agent exists once its first input is accepted; its turn is held before the commit.
+    const op = await agent.send("slow", {});
+    expect(await agent.state()).toMatchObject({ stateVersion: 0, state: null });
+    hold.open();
+    await op.result();
+    expect(await agent.state()).toMatchObject({ stateVersion: 1, state: { count: 0 } });
+
+    const { client } = scripted(json(readFixture("state_response_uncommitted.json")));
+    expect((await client.agent<typeof greeter>("greeter", "g-1").state()).state).toBeNull();
   });
 });

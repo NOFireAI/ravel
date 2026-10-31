@@ -14,10 +14,13 @@ The SDK runs against the in-process fake coordinator in
   golden fixtures in `sdk/fixtures/` are written by the Rust side).
   `createClient` maps a 401 or 403 to `Forbidden`.
 - `createHttpTransport` (`@ravel/agents/worker`) is the `Transport` that
-  `serveAgents` uses against a server. The SDK does not call the server's
-  step or effect routes yet, so steps go to an in-memory step journal (see
-  "Wire gaps").
-  Its behaviour is pinned under "HTTP transport" below.
+  `serveAgents` uses against a server. It records every step and effect
+  result through the server's `worker/step`, `worker/effects/complete` and
+  `worker/effects/fail` routes, so the server holds the step journal. Its
+  behaviour is pinned under "HTTP transport" below.
+- `createClient` reads an agent's effects (`effects`) and one effect
+  (`effect`), records an in-doubt effect's outcome (`reconcile`) and
+  destroys an agent (`destroy`); see "Client" below.
 - The end-to-end tests in `e2e/` start a built `ravel-server` and kill a
   worker inside a step (see "End-to-end tests").
 - The only way in is the package's own exports; nothing in Ravel imports
@@ -278,6 +281,11 @@ Worker and steps (`src/worker/`):
   answered with UnsupportedFormat is retried and the next poll runs its
   turn`, `a transient OutcomeUnknown poll is retried after a doubling pause
   and the next poll runs its turn` (`serve.test.ts`).
+- `AgentGone` from any coordinator call in a turn (step record, effect
+  result or commit) ends the turn as abandoned with that error, as
+  `OwnershipLost` does: the commit is attempted once and never retried, and
+  the worker keeps polling. Test: `agent_gone at commit abandons the turn
+  without retry` (`serve.test.ts`).
 
 Unless a test file is named, the tests above are in `steps.test.ts`.
 
@@ -322,6 +330,35 @@ Client (`src/client/`):
   event seq, so a different page size resumes without duplicates` and `a
   terminal operation's events end at the first page past it, not at an
   empty page`.
+- `agent.state()` answers `state: null` for an agent that has never
+  committed a turn, and `AgentState<S>.state` is typed `S | null`. Tests:
+  `state decodes null for an agent that has never committed`, `state is
+  null before the first commit, in the harness and against the
+  state_response_uncommitted fixture`.
+- `agent.effects()` lists the agent's effects (`GET /api/v1/agents/effects`)
+  and `client.effect(handle)` inspects one effect by its handle, with its
+  attempts and the evidence of late results (`GET
+  /api/v1/agents/effects/{effect}`). Tests: `effects lists the agent's
+  effects from /api/v1/agents/effects`, `effect inspects a handle at
+  /api/v1/agents/effects/{effect}`.
+- `client.reconcile(request)` posts an operator's decision on an in-doubt
+  effect, `retry` or `record_result`, to `/api/v1/agents/reconcile`. Test:
+  `reconcile posts the decision to /api/v1/agents/reconcile`.
+- `agent.destroy({ incarnation })` posts the agent's kind and key, and the
+  incarnation only when one is given, to `/api/v1/agents/destroy`, and
+  answers whether it destroyed the agent and what the destruction
+  abandoned. The server's destroy route is added under #3478; the request
+  and answer follow the `destroy_agent_request` and
+  `destroy_agent_response` fixtures. Test: `destroy posts kind, key and
+  incarnation and decodes destroyed and abandoned`.
+- `reconcile` and `destroy` are sent once, never retried: a network failure
+  or an untyped 5xx is `OutcomeUnknown`, and the caller reads the effect or
+  the agent to learn whether it landed. Tests: `reconcile is sent once: a
+  network failure is OutcomeUnknown with no second request`, `destroy is
+  sent once: an untyped 503 is OutcomeUnknown with no second request`.
+
+Unless a test file is named, the client tests above are in
+`client.test.ts`.
 
 HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
 
@@ -339,17 +376,29 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
 - A response whose body fails mid-read is `OutcomeUnknown`, like a request
   with no answer. Test: `maps a response body that fails mid-read to
   OutcomeUnknown`.
-- The transport holds a polled turn's step scope until the runner releases
-  the turn, committed or abandoned, so a long-running worker keeps none for
-  turns it gave up. Test: `an abandoned turn leaves no scope behind`.
-- A step heartbeats the lease before it is journaled, and is refused for a
-  fenced lease or a turn the transport never polled. Tests: `heartbeats the
-  lease before journaling a step and derives ids from incarnation and
-  accept_seq`, `refuses a step for a fenced lease without touching the
-  journal`, `refuses a step for a turn it never polled`.
-- That per-step heartbeat is the only one in a turn: nothing is sent while a
-  tool runs. Test: `heartbeats once before each step and sends nothing while
-  a tool runs`.
+- `recordStep` posts the step to `worker/step` and returns the server's
+  record, a started step with its effect and attempt or a recorded result
+  to replay; no heartbeat goes before it. Test: `recordStep posts
+  worker/step and replays a step from the server's record`.
+- A tool's result or error is posted to `worker/effects/complete` or
+  `worker/effects/fail` with its effect and attempt, and the tool runs
+  under the effect id and attempt the server's record named. Tests:
+  `completeEffect and failEffect post to their routes with effect, attempt
+  and result or error`, `uses the tool's effect id and attempt from the
+  server's step record`.
+- A failed commit while an attempt has no result is refused by the server's
+  409 `effect_in_doubt`, which maps to `EffectInDoubt` with the body's ids;
+  the transport sends the commit and builds no error of its own. Test: `a
+  failed commit is answered by the server's 409 effect_in_doubt, not built
+  by the client`.
+- A 404 `agent_gone` from any worker route maps to `AgentGone`, whose
+  `retry` is `never`. Test: `agent_gone from a worker route is AgentGone
+  with retry never`.
+- The transport does nothing about the lease during a long tool run: no
+  heartbeat is sent while a tool runs or before a step, so a tool run, or
+  handler code between two steps, longer than the 30 s lease loses the turn
+  to another worker. Test: `sends nothing while a tool runs, and no
+  heartbeat before a step`.
 - A 401 or 403 in the server's plain body maps to `Forbidden` with its
   status. Test: `maps the plain %i body to Forbidden with its status`.
 - The server polls an agent that has never committed with a null state and
@@ -394,6 +443,16 @@ instead of retrying. Every other poll failure is retried, including an
 answered with UnsupportedFormat is retried and the next poll runs its
 turn`, `a transient OutcomeUnknown poll is retried after a doubling pause
 and the next poll runs its turn` (`serve.test.ts`).
+
+`AgentGone` is HTTP 404 with `retry` `never`. A worker route answers it for
+a lease or effect of a destroyed agent's incarnation, and the worker
+abandons the turn without retry (tests: `agent_gone from a worker route is AgentGone with
+retry never`, `http.test.ts`; `agent_gone at commit abandons the turn
+without retry`, `serve.test.ts`). `reconcile` and `destroy` are the two
+client calls sent once rather than retried, so a lost answer is
+`OutcomeUnknown` (tests: `reconcile is sent once: a network failure is
+OutcomeUnknown with no second request`, `destroy is sent once: an untyped
+503 is OutcomeUnknown with no second request`).
 
 An unknown code, or a 2xx body that does not match its schema, reads as
 `UnsupportedFormat` (test: `an unknown error code or an off-schema response
@@ -456,6 +515,10 @@ What the fake honours:
   events and dead-letters after its attempts. Test: `a failing handler
   publishes neither state nor events, and dead-letters after its attempts`
   (`worker/steps.test.ts`).
+- State: the fake answers `state: null` for an agent until its first
+  committed turn, as the server does. Test: `state is null before the first
+  commit, in the harness and against the state_response_uncommitted
+  fixture` (`client/client.test.ts`).
 - Time: `advanceTime(ms)` moves the fake's clock, and the next lease
   records the moved time. Test: `leases carry the recorded time and seed,
   and heartbeats extend a held lease only` (`testing/transport.test.ts`).
@@ -494,31 +557,6 @@ the handler behaves under replay; it says nothing about what Ravel persists.
 The wire contract this package was written against has gaps, filled
 provisionally on the SDK side:
 
-- Unused routes: the server serves `worker/step`,
-  `worker/effects/complete`, `worker/effects/fail`, `effects` and the
-  `agents_admin` reconcile route, but `createHttpTransport` does not call
-  them yet. Until it does, `createHttpTransport` serves `recordStep`, `completeEffect` and
-  `failEffect` from a `MemoryStepJournal`, which lives in one process and
-  is lost with it. This is why the end-to-end kill is an in-process abort.
-  Tests: `authorizes a new attempt at an unsettled at_least_once step and
-  replays a settled one`, `puts an unsettled manual step in doubt until a
-  reconcile records its result`, `hands a reconciled retry out exactly
-  once` (`http.test.ts`). Pairing each step with its effect record on the
-  server, so the SDK can drop the in-memory journal, is tracked in #3416.
-- While an SDK step is in doubt the server reports the operation as
-  `running`, because the step lives only in the SDK's journal and the server
-  holds no effect record for it (asserted in
-  `worker killed inside a manual step blocks as EffectInDoubt in the
-  in-memory journal until reconciled there`, `e2e/recover.test.ts`).
-- Over `createHttpTransport` the lease is heartbeated only before each step
-  (see "HTTP transport" above), so a single tool run, or the handler code
-  between two steps, longer than the 30 s lease loses the turn to another
-  worker.
-- `agent.state()` answers `state: null` for an agent that has never
-  committed, which its type `S` does not admit. The golden
-  `worker_poll_response` fixture carries a non-null state at
-  `base_state_version` 0, while the server polls such an agent with a null
-  one.
 - The wire `StepState` has only `started` and `completed`, so a failed step
   would read as `started` on the wire.
 - A handler pin on the wire (`HandlerPinBody`) names the handler, version
@@ -568,9 +606,11 @@ Each test kills worker A inside a step, after the tool's side effect and
 before its result is recorded, resends under the same request id, and
 lets worker B take the turn over. The server shows that the resend
 resolves to the same operation id, that a second worker takes the turn
-over, and that the turn commits once. Step replay, effect attempts and the
-`EffectInDoubt` block come from the SDK's in-memory step journal (see
-"Wire gaps"), and the test titles say so:
+over, and that the turn commits once. These tests were written while step
+replay, effect attempts and the `EffectInDoubt` block came from an
+in-memory step journal in the SDK, and their titles still say so;
+`createHttpTransport` no longer consults that journal, and #3532 moves the
+tests onto the server's step and effect routes:
 
 - `worker killed inside an at_least_once step recovers the same operation
   on restart, replaying steps from the in-memory journal`: the resend

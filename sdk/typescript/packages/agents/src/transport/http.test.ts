@@ -4,26 +4,33 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  AgentGone,
   EffectInDoubt,
   Forbidden,
-  IncompatibleHandler,
-  NonDeterministicReplay,
   OutcomeUnknown,
   OwnershipLost,
   RavelAgentsError,
   StoreUnavailable,
   UnsupportedFormat,
 } from "../errors.js";
-import { effectId, stepId } from "../identity.js";
 import { defineTool } from "../tools/index.js";
 import { gate, until } from "../test-util.js";
-import { decodeWire, heldLease, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
-import { defineAgent, handlerDigest, runTurn, serveAgents, type TurnReport } from "../worker/index.js";
-import type { StepRecordRequest } from "../worker/transport.js";
-import { createHttpTransport, MAX_POLL_WAIT_MS, MemoryStepJournal } from "./http.js";
+import {
+  decodeWire,
+  EffectCompleteRequest,
+  EffectFailRequest,
+  heldLease,
+  StepRecordRequest,
+  WorkerPollResponse,
+} from "../wire/index.js";
+import { defineAgent, handlerDigest, serveAgents, type TurnReport } from "../worker/index.js";
+import { createHttpTransport, MAX_POLL_WAIT_MS } from "./http.js";
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../fixtures");
-const pollFixture = JSON.parse(readFileSync(resolve(fixtureDir, "worker_poll_response.json"), "utf8")) as {
+function readFixture(name: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(resolve(fixtureDir, name), "utf8")) as Record<string, unknown>;
+}
+const pollFixture = readFixture("worker_poll_response.json") as {
   assignment: Record<string, unknown> & { lease: Record<string, unknown>; steps: unknown[] };
 };
 
@@ -202,203 +209,91 @@ describe("HttpTransport error mapping", () => {
 });
 
 describe("HttpTransport steps", () => {
-  async function polledTransport(heartbeat: () => Answer) {
-    const fake = transportWith((route) =>
-      route === "poll" ? { status: 200, body: pollFixture } : route === "heartbeat" ? heartbeat() : { status: 404 },
-    );
-    const polled = await fake.transport.poll({ worker_id: "w", handlers: [], wait_ms: 1 }, new AbortController().signal);
-    const lease = heldLease(polled?.assignment.lease ?? fail());
-    const request: StepRecordRequest = {
-      lease,
-      step_key: "charge",
-      tool_name: "pay.charge",
-      tool_version: "1",
-      policy: "at_least_once",
-      input_hash: "00".repeat(32),
-    };
-    return { ...fake, request, assignment: polled?.assignment ?? fail() };
-  }
+  const stepRequest = readFixture("step_record_request.json");
+  const stepResponse = readFixture("step_record_response.json") as { step: Record<string, unknown> };
 
-  it("heartbeats the lease before journaling a step and derives ids from incarnation and accept_seq", async () => {
-    const { transport, sent, request, assignment } = await polledTransport(() => ({
-      status: 200,
-      body: { lease_expires_unix_ns: "1" },
-    }));
-    const record = await transport.recordStep(request);
-    expect(sent.map((s) => s.url.slice(s.url.lastIndexOf("/") + 1))).toEqual(["poll", "heartbeat"]);
-    expect(record.step.step_id).toBe(stepId(assignment.lease.incarnation, assignment.accept_seq, "charge"));
-    expect(record.effect).toBe(effectId(assignment.lease.incarnation, assignment.accept_seq, "charge"));
-    expect(record.attempt).toBe(1);
+  it("recordStep posts worker/step and replays a step from the server's record", async () => {
+    const completed = { ...stepResponse, step: { ...stepResponse.step, status: "completed", output: { cents: 250 } } };
+    const answers = [stepResponse, completed];
+    // A heartbeat would be answered, so only the request list shows one was sent.
+    const { transport, sent } = transportWith((route) =>
+      route === "step"
+        ? { status: 200, body: answers.shift() }
+        : route === "heartbeat"
+          ? { status: 200, body: { lease_expires_unix_ns: "1" } }
+          : { status: 404 },
+    );
+    const request = decodeWire(StepRecordRequest, stepRequest);
+    const first = await transport.recordStep(request);
+    expect(first.step.status).toBe("started");
+    expect(first.attempt).toBe(1);
+    const second = await transport.recordStep(request);
+    expect(second.step.status).toBe("completed");
+    expect(second.step.output).toEqual({ cents: 250 });
+    expect(sent.map((s) => s.url)).toEqual([
+      "http://ravel.test/api/v1/agents/worker/step",
+      "http://ravel.test/api/v1/agents/worker/step",
+    ]);
+    expect(sent[0]?.body).toEqual(stepRequest);
   });
 
-  it("refuses a step for a fenced lease without touching the journal", async () => {
-    const { transport, request, assignment } = await polledTransport(() => ({
+  it("a failed commit is answered by the server's 409 effect_in_doubt, not built by the client", async () => {
+    const { transport, sent } = transportWith(() => ({
       status: 409,
-      body: { code: "ownership_lost", retry: "never", reason: "taken over", ids: {} },
-    }));
-    expect(await caught(transport.recordStep(request))).toBeInstanceOf(OwnershipLost);
-    expect(await transport.journal.effects(assignment.operation)).toEqual([]);
-  });
-
-  it("refuses a step for a turn it never polled", async () => {
-    const { transport } = transportWith(() => ({ status: 200, body: { lease_expires_unix_ns: "1" } }));
-    const error = await caught(
-      transport.recordStep({
-        lease: LEASE,
-        step_key: "k",
-        tool_name: "t",
-        tool_version: "1",
-        policy: "manual",
-        input_hash: "",
-      }),
-    );
-    expect(error).toBeInstanceOf(UnsupportedFormat);
-  });
-
-  it("an abandoned turn leaves no scope behind", async () => {
-    const killer = new AbortController();
-    const ticket = defineTool({
-      name: "desk.ticket",
-      version: "1",
-      input: z.object({}),
-      output: z.object({}),
-      recovery: "manual",
-      run: () => {
-        killer.abort(new Error("worker killed inside the step"));
-        return new Promise<never>(() => undefined);
+      body: {
+        code: "effect_in_doubt",
+        retry: "reconcile",
+        reason: "an authorized attempt has no result",
+        ids: { turn_id: "t-1", step_id: "s-1", effect_id: "e-1" },
       },
-    });
-    const agent = defineAgent({
-      name: "order",
-      version: "1.0.0",
-      state: z.unknown(),
-      initialState: null,
-      messages: (message) => ({
-        place: message({ payload: z.unknown(), result: z.object({}), handler: (ctx) => ctx.step("ticket", ticket, {}) }),
-      }),
-    });
-    const agents = new Map([[agent.name, agent]]);
-    const ours = { ...pollFixture, assignment: { ...pollFixture.assignment, lease: { ...pollFixture.assignment.lease, handler_digest: handlerDigest(agent, "place") }, steps: [] } };
-    let next: unknown = ours;
-    const { transport, sent } = transportWith((route) => {
-      if (route === "poll") return { status: 200, body: next };
-      if (route === "heartbeat") return { status: 200, body: { lease_expires_unix_ns: "1" } };
-      return { status: 404 };
-    });
-    const poll = () => transport.poll({ worker_id: "w", handlers: [], wait_ms: 1 }, new AbortController().signal);
-    /** recordStep for `lease` must be refused as never polled, with no request sent. */
-    const scopeGone = async (lease: StepRecordRequest["lease"]) => {
-      const before = sent.length;
-      const error = await caught(
-        transport.recordStep({ lease, step_key: "ticket", tool_name: "desk.ticket", tool_version: "1", policy: "manual", input_hash: "" }),
-      );
-      expect(error).toBeInstanceOf(UnsupportedFormat);
-      expect((error as Error).message).toMatch(/was not polled through this transport/);
-      expect(sent.length).toBe(before);
-    };
-
-    // Abandoned because the worker stopped mid-tool.
-    const killed = (await poll()) ?? fail();
-    const stopped = await runTurn(killed, agents, transport, killer.signal);
-    expect(stopped.outcome).toBe("abandoned");
-    await scopeGone(heldLease(killed.assignment.lease));
-
-    // Re-polled, the manual step's attempt has no result: blocked in doubt.
-    const replayed = (await poll()) ?? fail();
-    const blocked = await runTurn(replayed, agents, transport, new AbortController().signal);
-    expect(blocked.outcome === "abandoned" && blocked.error).toBeInstanceOf(EffectInDoubt);
-    await scopeGone(heldLease(replayed.assignment.lease));
-
-    // A handler digest this worker does not have: abandoned before any step.
-    next = pollFixture;
-    const foreign = (await poll()) ?? fail();
-    const incompatible = await runTurn(foreign, agents, transport, new AbortController().signal);
-    expect(incompatible.outcome === "abandoned" && incompatible.error).toBeInstanceOf(IncompatibleHandler);
-    await scopeGone(heldLease(foreign.assignment.lease));
+    }));
+    const error = await caught(transport.commit({ lease: LEASE, outcome: "failed", error: "boom", terminal: false }));
+    expect(error).toBeInstanceOf(EffectInDoubt);
+    expect((error as EffectInDoubt).ids).toEqual({ turnId: "t-1", stepId: "s-1", effectId: "e-1" });
+    expect(sent.map((s) => s.url)).toEqual(["http://ravel.test/api/v1/agents/worker/commit"]);
   });
 
-  it("refuses a failed commit while an authorized attempt has no result, and sends it once settled", async () => {
-    const { transport, sent, request } = await polledTransport(() => ({ status: 200, body: { lease_expires_unix_ns: "1" } }));
-    const record = await transport.recordStep(request);
-    const failed = { lease: request.lease, outcome: "failed", error: "boom", terminal: false } as const;
-    expect(await caught(transport.commit(failed))).toBeInstanceOf(EffectInDoubt);
-    expect(sent.some((s) => s.url.endsWith("/commit"))).toBe(false);
-    await transport.failEffect({ effect: record.effect, attempt: record.attempt, error: "boom" });
-    // The 404 answer shows the commit reached the wire.
-    expect(await caught(transport.commit(failed))).toBeInstanceOf(UnsupportedFormat);
-    expect(sent.filter((s) => s.url.endsWith("/commit"))).toHaveLength(1);
-  });
-});
-
-describe("MemoryStepJournal", () => {
-  const scope = { agentId: "a", incarnation: 1, operation: "op", acceptSeq: 3, turnId: "t" };
-  const step = (policy: "at_least_once" | "manual", inputHash = "h") => ({
-    scope,
-    stepKey: "k",
-    toolName: "tool",
-    toolVersion: "1",
-    policy,
-    inputHash,
+  it("completeEffect and failEffect post to their routes with effect, attempt and result or error", async () => {
+    const completeRequest = readFixture("effect_complete_request.json");
+    const failRequest = readFixture("effect_fail_request.json");
+    const completeResponse = readFixture("effect_complete_response.json");
+    const { transport, sent } = transportWith(() => ({ status: 200, body: completeResponse }));
+    expect(await transport.completeEffect(decodeWire(EffectCompleteRequest, completeRequest))).toEqual(completeResponse);
+    expect(await transport.failEffect(decodeWire(EffectFailRequest, failRequest))).toEqual(completeResponse);
+    expect(sent.map((s) => s.url)).toEqual([
+      "http://ravel.test/api/v1/agents/worker/effects/complete",
+      "http://ravel.test/api/v1/agents/worker/effects/fail",
+    ]);
+    expect(sent.map((s) => s.body)).toEqual([completeRequest, failRequest]);
   });
 
-  it("authorizes a new attempt at an unsettled at_least_once step and replays a settled one", async () => {
-    const journal = new MemoryStepJournal();
-    const first = await journal.recordStep(step("at_least_once"));
-    const second = await journal.recordStep(step("at_least_once"));
-    expect([first.attempt, second.attempt]).toEqual([1, 2]);
-    expect(second.effect).toBe(first.effect);
-    expect(await journal.settle({ effect: first.effect, attempt: 1, result: { output: 1 } })).toEqual({
-      effect: first.effect,
-      status: "authorized",
-      late: true,
-    });
-    await journal.settle({ effect: first.effect, attempt: 2, result: { output: 2 } });
-    const replay = await journal.recordStep(step("at_least_once"));
-    expect(replay.step.status).toBe("completed");
-    expect(replay.step.output).toBe(2);
-    expect(replay.attempt).toBe(2);
-    expect(journal.evidence).toEqual([{ effect: first.effect, attempt: 1, result: { output: 1 } }]);
-  });
-
-  it("refuses a reused step key with a different input hash", async () => {
-    const journal = new MemoryStepJournal();
-    await journal.recordStep(step("at_least_once"));
-    expect(await caught(journal.recordStep(step("at_least_once", "other")))).toBeInstanceOf(NonDeterministicReplay);
-  });
-
-  it("puts an unsettled manual step in doubt until a reconcile records its result", async () => {
-    const journal = new MemoryStepJournal();
-    const first = await journal.recordStep(step("manual"));
-    expect(await caught(journal.recordStep(step("manual")))).toBeInstanceOf(EffectInDoubt);
-    expect(await caught(journal.recordStep(step("manual")))).toBeInstanceOf(EffectInDoubt);
-    expect((await journal.effects("op")).map((e) => e.status)).toEqual(["in_doubt"]);
-    expect(
-      await journal.reconcile({ effect: first.effect, attempt: 1, decision: "record_result", result: { ok: true } }),
-    ).toEqual({ effect: first.effect, status: "completed", attempt: 1 });
-    const replay = await journal.recordStep(step("manual"));
-    expect(replay.step.status).toBe("completed");
-    expect(replay.step.output).toEqual({ ok: true });
-  });
-
-  it("hands a reconciled retry out exactly once", async () => {
-    const journal = new MemoryStepJournal();
-    const first = await journal.recordStep(step("manual"));
-    await caught(journal.recordStep(step("manual")));
-    expect(await journal.reconcile({ effect: first.effect, attempt: 1, decision: "retry" })).toEqual({
-      effect: first.effect,
-      status: "authorized",
-      attempt: 2,
-    });
-    expect((await journal.recordStep(step("manual"))).attempt).toBe(2);
-    expect(await caught(journal.recordStep(step("manual")))).toBeInstanceOf(EffectInDoubt);
-  });
-
-  it("refuses a reconcile of an effect that is not in doubt", async () => {
-    const journal = new MemoryStepJournal();
-    const first = await journal.recordStep(step("manual"));
-    expect(await caught(journal.reconcile({ effect: first.effect, attempt: 1, decision: "retry" }))).toBeInstanceOf(
-      UnsupportedFormat,
-    );
+  it("agent_gone from a worker route is AgentGone with retry never", async () => {
+    const { transport, sent } = transportWith(() => ({
+      status: 404,
+      body: { code: "agent_gone", retry: "never", reason: "agent destroyed", ids: { agent_id: "a-1", incarnation: 1 } },
+    }));
+    const request = decodeWire(StepRecordRequest, stepRequest);
+    const effect = { effect: "e-1", attempt: 1 };
+    const calls: Promise<unknown>[] = [
+      transport.heartbeat({ lease: LEASE }),
+      transport.recordStep(request),
+      transport.completeEffect({ ...effect, result: { ok: true } }),
+      transport.failEffect({ ...effect, error: "boom" }),
+      transport.commit({ lease: LEASE, outcome: "failed", error: "x", terminal: false }),
+    ];
+    for (const call of calls) {
+      const error = await caught(call);
+      expect(error).toBeInstanceOf(AgentGone);
+      expect((error as AgentGone).retry).toBe("never");
+      expect((error as AgentGone).message).toBe("agent destroyed");
+    }
+    expect(sent.map((s) => s.url.slice(s.url.indexOf("/worker/") + "/worker/".length))).toEqual([
+      "heartbeat",
+      "step",
+      "effects/complete",
+      "effects/fail",
+      "commit",
+    ]);
   });
 });
 
@@ -484,7 +379,27 @@ describe("serveAgents over HttpTransport", () => {
     expect(committed.commit.error).toMatch(/^state does not parse/);
   });
 
-  it("uses the tool's effect id and attempt from the journal", async () => {
+  /** Answers worker/step with a started record for `effect` at `attempt`, effects/* with its settlement. */
+  function stepAnswers(effect: string, attempt: number) {
+    return (route: string, body: unknown): Answer | undefined => {
+      if (route === "step") {
+        const request = body as { step_key: string; tool_name: string; tool_version: string; input_hash: string };
+        return {
+          status: 200,
+          body: {
+            step: { step_id: "0".repeat(32), ...request, status: "started", output: null },
+            effect,
+            attempt,
+            failure: null,
+          },
+        };
+      }
+      if (route === "complete" || route === "fail") return { status: 200, body: { effect, status: "completed", late: false } };
+      return undefined;
+    };
+  }
+
+  it("uses the tool's effect id and attempt from the server's step record", async () => {
     const seen: { effectId: string; attempt: number }[] = [];
     const charge = defineTool({
       name: "pay.charge",
@@ -514,13 +429,15 @@ describe("serveAgents over HttpTransport", () => {
     const assignment = { ...pollFixture.assignment, lease, steps: [] };
     let served = false;
     const reports: TurnReport[] = [];
-    const { fetch } = fakeFetch((route) => {
+    const steps = stepAnswers("e-from-server", 3);
+    const { fetch, sent } = fakeFetch((route, body) => {
       if (route === "poll") {
         if (served) return { status: 200, body: { assignment: null } };
         served = true;
         return { status: 200, body: { assignment } };
       }
-      if (route === "heartbeat") return { status: 200, body: { lease_expires_unix_ns: "1" } };
+      const step = steps(route, body);
+      if (step !== undefined) return step;
       return {
         status: 200,
         body: { operation: pollFixture.assignment.operation, status: "completed", state_version: 1, rebased: false, effects: [] },
@@ -540,12 +457,13 @@ describe("serveAgents over HttpTransport", () => {
     } finally {
       await worker.close();
     }
-    const decoded: TurnAssignment = decodeWire(WorkerPollResponse, { assignment }).assignment ?? fail();
-    expect(seen).toEqual([{ effectId: effectId(decoded.lease.incarnation, decoded.accept_seq, "charge"), attempt: 1 }]);
-    expect((await transport.journal.effects(decoded.operation)).map((e) => e.status)).toEqual(["completed"]);
+    expect(reports[0]?.outcome).toBe("committed");
+    expect(seen).toEqual([{ effectId: "e-from-server", attempt: 3 }]);
+    const completed = sent.find((s) => s.url.endsWith("/worker/effects/complete"));
+    expect(completed?.body).toEqual({ effect: "e-from-server", attempt: 3, result: { ok: true } });
   });
 
-  it("heartbeats once before each step and sends nothing while a tool runs", async () => {
+  it("sends nothing while a tool runs, and no heartbeat before a step", async () => {
     const held = gate();
     let running = 0;
     const tool = (name: string, hold: boolean) =>
@@ -583,13 +501,15 @@ describe("serveAgents over HttpTransport", () => {
     const assignment = { ...pollFixture.assignment, lease, steps: [] };
     let served = false;
     const reports: TurnReport[] = [];
-    const { fetch, sent } = fakeFetch((route) => {
+    const steps = stepAnswers("e-1", 1);
+    const { fetch, sent } = fakeFetch((route, body) => {
       if (route === "poll") {
         if (served) return { status: 200, body: { assignment: null } };
         served = true;
         return { status: 200, body: { assignment } };
       }
-      if (route === "heartbeat") return { status: 200, body: { lease_expires_unix_ns: "1" } };
+      const step = steps(route, body);
+      if (step !== undefined) return step;
       return {
         status: 200,
         body: { operation: pollFixture.assignment.operation, status: "completed", state_version: 1, rebased: false, effects: [] },
@@ -607,7 +527,7 @@ describe("serveAgents over HttpTransport", () => {
       await until(() => running === 1);
       const atStart = routes();
       await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(atStart).toEqual(["poll", "heartbeat"]);
+      expect(atStart).toEqual(["poll", "step"]);
       expect(routes()).toEqual(atStart);
       held.open();
       await until(() => reports.length === 1);
@@ -615,6 +535,6 @@ describe("serveAgents over HttpTransport", () => {
       await worker.close();
     }
     expect(reports[0]?.outcome).toBe("committed");
-    expect(routes().slice(0, 4)).toEqual(["poll", "heartbeat", "heartbeat", "commit"]);
+    expect(routes().slice(0, 6)).toEqual(["poll", "step", "complete", "step", "complete", "commit"]);
   });
 });

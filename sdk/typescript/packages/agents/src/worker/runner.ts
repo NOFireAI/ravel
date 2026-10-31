@@ -4,6 +4,7 @@
  */
 import type { z } from "zod";
 import {
+  AgentGone,
   ConcurrentStepError,
   EffectInDoubt,
   IncompatibleHandler,
@@ -257,9 +258,13 @@ class Turn<S> {
           { ids: this.ids({ stepKey: key, stepId: recorded.step_id }) },
         );
         // The coordinator holds the journal and blocks the operation on the
-        // same check; the runner refuses locally whatever it answers.
-        await this.transport.recordStep(request).catch(() => undefined);
-        this.block(error);
+        // same check; the runner refuses locally whatever it answers, unless
+        // the agent is gone, which ends the turn for every reason at once.
+        const refused = await this.transport.recordStep(request).then(
+          () => undefined,
+          (cause: unknown) => cause,
+        );
+        this.block(refused instanceof AgentGone ? refused : error);
       }
       if (recorded.status === "completed") return tool.output.parse(recorded.output);
     }
@@ -331,22 +336,11 @@ class TerminalFailure extends Error {
 
 /**
  * Run one leased turn to a commit, or to an abandonment that leaves it for the
- * coordinator. Either way the turn is released from the transport.
+ * coordinator. A refusal from any coordinator call, `OwnershipLost` and
+ * `AgentGone` among them, abandons the turn with that error: the commit is
+ * attempted at most once and never retried here.
  */
 export async function runTurn(
-  polled: PolledTurn,
-  agents: ReadonlyMap<string, AnyAgentDefinition>,
-  transport: Transport,
-  signal: AbortSignal,
-): Promise<TurnReport> {
-  try {
-    return await runLeasedTurn(polled, agents, transport, signal);
-  } finally {
-    transport.release?.(polled.assignment.lease.turn_id);
-  }
-}
-
-async function runLeasedTurn(
   polled: PolledTurn,
   agents: ReadonlyMap<string, AnyAgentDefinition>,
   transport: Transport,

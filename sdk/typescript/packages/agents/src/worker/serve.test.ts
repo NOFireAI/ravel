@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { EffectInDoubt, Forbidden, OutcomeUnknown, StoreUnavailable, UnsupportedFormat } from "../errors.js";
+import { AgentGone, EffectInDoubt, Forbidden, OutcomeUnknown, StoreUnavailable, UnsupportedFormat } from "../errors.js";
 import { defineTool } from "../tools/index.js";
 import { decodeWire, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
 import { Backoff, OperationBackoffs } from "./backoff.js";
@@ -235,6 +235,38 @@ describe("worker backoff", () => {
       // 250; op-a stays at 1000; op-b's commit pauses nothing and leaves
       // op-a at the cap.
       expect(polledAt).toEqual([0, 250, 750, 1_750, 2_000, 3_000, 3_000, 4_000]);
+    });
+  });
+});
+
+describe("worker agent_gone", () => {
+  it("agent_gone at commit abandons the turn without retry", async () => {
+    await withFakeClock(async () => {
+      const { transport, polledAt } = scriptedTransport(["pass", "pass"]);
+      const gone = new AgentGone("agent destroyed");
+      const commits: string[] = [];
+      const commit = transport.commit.bind(transport);
+      transport.commit = (request) => {
+        commits.push(request.lease.turn_id);
+        return commits.length === 1 ? Promise.reject(gone) : commit(request);
+      };
+      const reports: TurnReport[] = [];
+      const worker = await serveAgents({
+        transport,
+        agents: [agent],
+        workerId: "w-0000000000000001",
+        abandonDelayMs: 250,
+        onTurn: (report) => reports.push(report),
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await worker.close();
+      const [first, second] = reports;
+      expect(first?.outcome).toBe("abandoned");
+      expect(first?.outcome === "abandoned" && first.error).toBe(gone);
+      // One commit for the abandoned turn and one for the next poll's turn: no retry.
+      expect(commits).toHaveLength(2);
+      expect(second?.outcome).toBe("committed");
+      expect(polledAt).toEqual([0, 250, 250]);
     });
   });
 });
