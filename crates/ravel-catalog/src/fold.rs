@@ -6119,8 +6119,8 @@ pub(crate) mod tests {
     /// memory pressure, and charges nothing.
     ///
     /// FLIP: move the `tenant_hash` comparison in `Catalog::load_part_entries`
-    /// below its `reserve_decoded` call and the fold fails with
-    /// `MemoryExhausted` instead, so the `tenant_hash` match panics.
+    /// below its `reserve_decoded` call, or delete it, and the fold fails with
+    /// `MemoryExhausted` instead, so `assert_foreign_part_error` panics.
     #[tokio::test]
     async fn a_foreign_tenant_hash_on_a_part_is_reported_before_the_part_reservation() {
         assert_foreign_previous_part_fails_the_fold(Some(0)).await;
