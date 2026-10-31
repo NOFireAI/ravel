@@ -2003,8 +2003,9 @@ mod tests {
     /// process memory budget refuses fails that tenant's fold with the typed
     /// `CatalogError::MemoryExhausted`, logs it, and leaves the HEAD where it
     /// was; once the held memory is released, the next tick folds. The budget
-    /// holds a reservation that leaves one byte less room than the postings
-    /// body declares, so the refusal names the exact figures.
+    /// holds a reservation that leaves room for the previous snapshot part's
+    /// decode charge (issue #3320) and one byte less than the postings body
+    /// declares on top of it, so the refusal names the exact figures.
     ///
     /// FLIP: build `budgeted` without `.with_memory_budget(...)` and the first
     /// tick folds, so the `report.failed` assertion fails with `[]` against
@@ -2067,11 +2068,24 @@ mod tests {
         .header
         .body_uncompressed_len;
         assert!(declared > 0, "the postings have a body to charge");
+        let mut part_declared = 0;
+        for part in &head.parts {
+            let part_bytes = store
+                .get(&part.key, GetRange::Full)
+                .await
+                .expect("part present")
+                .data;
+            part_declared +=
+                ravel_catalog::decode_part(&part_bytes, &ravel_catalog::PartLimits::default())
+                    .expect("part decodes")
+                    .header
+                    .entries_uncompressed_len;
+        }
 
         publish_metric_segment(store.as_ref(), &tenant_id, 2, 11).await;
         const LIMIT: u64 = 1 << 30;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(LIMIT));
-        let held_bytes = LIMIT - (declared - 1);
+        let held_bytes = LIMIT - part_declared - (declared - 1);
         let held = budget.reserve(held_bytes).expect("room for the held bytes");
         let budgeted = Catalog::new(store.clone(), config)
             .expect("catalog builds")
@@ -2089,7 +2103,7 @@ mod tests {
         let expected =
             ravel_catalog::CatalogError::MemoryExhausted(ravel_memory::MemoryExhausted {
                 requested: declared,
-                reserved: held_bytes,
+                reserved: held_bytes + part_declared,
                 limit: LIMIT,
                 cause: ravel_memory::ExhaustionCause::Accounted,
             })
@@ -2098,7 +2112,8 @@ mod tests {
             expected,
             format!(
                 "catalog decode refused: memory exhausted: requested {declared} bytes, \
-                 {held_bytes} of {LIMIT} byte limit already reserved"
+                 {} of {LIMIT} byte limit already reserved",
+                held_bytes + part_declared
             )
         );
         assert_eq!(*captured.0.lock(), vec![expected]);
@@ -2107,7 +2122,11 @@ mod tests {
             head_before,
             "a refused fold publishes no HEAD"
         );
-        assert_eq!(budget.reserved(), held_bytes, "the refusal charged nothing");
+        assert_eq!(
+            budget.reserved(),
+            held_bytes,
+            "the refusal released the part charge and charged nothing"
+        );
         assert_eq!(
             budgeted.decode_reserve_retries(),
             0,
