@@ -395,11 +395,32 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
 - A 404 `agent_gone` from any worker route maps to `AgentGone`, whose
   `retry` is `never`. Test: `agent_gone from a worker route is AgentGone
   with retry never`.
-- The transport does nothing about the lease during a long tool run: no
-  heartbeat is sent while a tool runs or before a step, so a tool run, or
-  handler code between two steps, longer than the 30 s lease loses the turn
-  to another worker. Test: `sends nothing while a tool runs, and no
-  heartbeat before a step`.
+- The worker renews the lease in the background while a turn runs: one
+  `worker/heartbeat` when the turn is assigned, then one each third of the
+  lease left by the last answered expiry (never sooner than 1 s apart), one
+  at a time, until the commit is sent or the turn is abandoned. No
+  heartbeat goes before a step. A renewal refused with `OwnershipLost` or
+  `AgentGone` aborts the handler's `ctx.signal` and abandons the turn
+  without a commit or a retry; any other failure, such as a 503, is retried
+  at the next tick and never commits or fails the turn by itself. So a turn
+  is lost only when a renewal is refused, or when renewals fail for longer
+  than the lease plus its grace (30 s and 10 s by default: the agents
+  runtime's `RuntimeConfig::default`). The interval is read against the
+  worker's clock, so a clock ahead of the server's renews at the 1 s floor.
+  The server keeps renewals in the memory of the coordinator that answered
+  them: with two coordinators, a worker polling the other one can still take
+  the turn over once the lease and grace run out after the takeover that
+  started it (`crates/ravel-agents-runtime/src/ownership.rs`). Tests: `a
+  turn longer than the lease renews it in the background and commits`, `a
+  refused renewal aborts the turn and nothing is committed`, `a transient
+  renewal failure is retried at the next tick`, `renews a third of the
+  lease left, and never faster than the floor` (`worker/renew.test.ts`),
+  `renews once at assignment, sends nothing while a tool runs, and no
+  heartbeat before a step` (`transport/http.test.ts`).
+- The `journal` option of `createHttpTransport` is deprecated and ignored,
+  since the server records steps and effect results; passing one logs a
+  warning once per process, and the option will be removed. Test: `warns
+  once when passed the deprecated journal option and otherwise ignores it`.
 - A 401 or 403 in the server's plain body maps to `Forbidden` with its
   status. Test: `maps the plain %i body to Forbidden with its status`.
 - The server polls an agent that has never committed with a null state and
