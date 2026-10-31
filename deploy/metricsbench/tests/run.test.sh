@@ -580,7 +580,7 @@ check "q2: Mimir readiness still checked" '"mimir-readiness" in j("stamps.json")
 
 # --- q3: a failed read-back and an --rss-band breach ------------------------------
 mapfile -t args < <(full_args "${TMP}/q3/out")
-STUB_INGEST_READBACK_FAIL=prometheus STUB_MEM_ravel_server=2GiB run_case q3 "${args[@]}" \
+STUB_INGEST_READBACK_FAIL=victoriametrics STUB_MEM_ravel_server=2GiB run_case q3 "${args[@]}" \
   --rss-band ravel-server:0:1073741824
 expect_rc q3 70
 check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"]'

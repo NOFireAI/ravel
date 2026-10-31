@@ -858,10 +858,16 @@ report-level `geomean_ms`: decision 6 rules out one figure across engines.
 
 **Failed run verdict.** A report `metricsbench_query` writes with
 `--diagnostic-after-failed-ingest` carries `run_verdict: "failed"` and a
-non-empty `failed_bands`, one entry per failed ingest row: `band` (6 for a
-read-back, the accepted-set check; `null` for a stall, which is not a
-numbered band), `check` (`readback` or `stall`), `system` and `reason`
-(`report_schema::FailedBand`). Such a report is a diagnostic of a failed
+non-empty `failed_bands`, one entry per failed ingest row: `check`, `band`,
+`system` and `reason` (`report_schema::FailedBand`). `check` is `readback`
+(the row's read-back failed, was refused or did not match; `band` 6, the
+accepted-set check), `stall` (the stall ceiling stopped the row), `ingest`
+(a check the row failed after its replay closed, once an earlier row had
+failed; `band` 4 or 6, or `null` for a diverged stream or nothing accepted)
+or `replay` (the row's replay failed other than by a stall, once an earlier
+row had failed). A stall and a failed replay carry `band: null`, since
+neither is a numbered band. Any of these on the Prometheus row refuses the
+diagnostic too, because every other engine is classified against it. Such a report is a diagnostic of a failed
 run and never a result: `validate` refuses it with "report is a diagnostic
 of a failed run, never a result", followed by the verdict and every failed
 band, and `render` refuses it the same way, so the verdict and the failed

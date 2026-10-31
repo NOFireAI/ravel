@@ -1089,9 +1089,8 @@ mod tests {
         SystemIngestResult::buffered_http_row(system, "http://x/api/v1/write", "test", ingest)
     }
 
-    /// Without an in-process row, two portable rows whose expected digests
-    /// differ still fail band 6; only the comparison with an in-process
-    /// scalar digest is skipped.
+    /// A band 6 failure across rows, after an earlier row failed, is recorded
+    /// on the row it names and leaves the other rows untouched.
     #[test]
     fn band6_across_rows_after_a_failure_is_recorded_on_the_named_row() {
         let mut rows = vec![
@@ -1111,6 +1110,9 @@ mod tests {
         assert!(rows[..2].iter().all(|r| r.row_failure.is_none()));
     }
 
+    /// Without an in-process row, two portable rows whose expected digests
+    /// differ still fail band 6; only the comparison with an in-process
+    /// scalar digest is skipped.
     #[test]
     fn portable_rows_still_cross_check_without_the_in_process_row() {
         let prometheus = portable_row("prometheus", "aa");
