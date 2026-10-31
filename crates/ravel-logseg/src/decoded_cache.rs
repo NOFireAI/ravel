@@ -26,10 +26,12 @@
 //! (`the_gate_refuses_a_less_used_newcomer_and_ties`); victims evicted before
 //! it stay evicted. A refused admission leaves a ghost record carrying the
 //! newcomer's count, under any intent, and an admission releases the key's
-//! ghost record under any intent (`a_gate_refusal_leaves_a_ghost_record_an_admission_releases`).
-//! Counts are halved when the lookups since the last halving reach
-//! [`aging_window`] (`counts_halve_when_lookups_reach_the_aging_window`).
-//! The pressure evictor ignores counts.
+//! ghost record under any intent
+//! (`a_gate_refusal_leaves_a_ghost_record_an_admission_releases`). Counts are
+//! halved when the lookups since the last halving reach [`aging_window`]
+//! (`counts_halve_when_lookups_reach_the_aging_window`). The pressure evictor
+//! ignores counts
+//! (`the_pressure_evictor_frees_the_shortfall_plus_slack_whatever_the_counts`).
 //!
 //! Each entry holds a reservation on the process [`MemoryBudget`], taken
 //! best effort and only when it leaves [`admission_margin`] unreserved
