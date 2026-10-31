@@ -38,6 +38,9 @@ sample was taken per arm:
 | libc memcpy, self, flat profile | about 15.5% | not split | measured 2026-10-30 |
 | jemalloc, self, flat profile | about 10% | not split | measured 2026-10-30 |
 
+This profile predates D1 to D7; the profile of the code as built is in the
+2026-10-31 baseline amendment.
+
 At 100% of 8 vCPU, 120k lines/s allows at most 66 us of CPU per line. That is
 about 35% below today's. The cost is not in compression. It is in choosing
 encodings, building row structures and copying strings:
@@ -156,6 +159,10 @@ measured both with and without D1.
 
 `tests/differential.rs` gains a case at that shape. It asserts that the two
 paths produce byte-identical output, which is ADR-0109 decision 7.
+
+D2 is built: the OTLP flush runs the columnar writer. What the conversion
+costs as built, and the cuts that follow, are in the 2026-10-31 baseline
+amendment.
 
 ### D3. Decode and normalize stop copying strings
 
@@ -276,7 +283,8 @@ the GCS class A rate of about $0.005 per 1,000 PUTs.
 The harness's 64,000 lines in flight mean throughput is 64,000 lines ÷ ack
 time, so 120k lines/s needs an ack of at most 0.53 s. The prediction below
 assumes D1 to D6 bring flush encode to about 30 us per line. Each flush is one
-gate job.
+gate job. The strict ack as measured, split by phase, is in the 2026-10-31
+baseline amendment.
 
 | Configuration | Predicted ack | Predicted strict lines/s | Basis |
 |---|---|---|---|
@@ -502,3 +510,94 @@ the encode as before. A strict write returns only after both are stored
 that panics or is cancelled on the gate fails its flush the way the flush's
 own gated job does: the retryable `ShardUnavailable`, `flush_gate_faults`,
 and no `abandoned_*` counter (`a_failed_page_job_fails_the_flush_retryably`).
+
+## Amendment (2026-10-31): the 2026-10-31 baseline amendment (#3533, #3557)
+
+<!-- amendment-applies: sections="Context|D2. The OTLP flush uses the columnar writer, if it measures cheaper|What strict acks can reach" pointer="2026-10-31 baseline amendment" -->
+
+D1 to D8 are built. This amendment records where the CPU and the strict ack
+go in the code as built, and the order of the next cuts. It changes no
+decision above; each cut below is adopted on the same rule as D2 and D3b,
+only if it measures cheaper at the benchmark's shape.
+
+**Where the exit stands.** Exit run 2 (comment 6543661594, upstream ramp, 2
+shards, 100 ms, 8 write-gate permits) missed both rows: buffered best 30-min
+112,226 lines/s, strict 99,296, against 115k. Buffered was CPU-bound at its
+best window (7.0 to 7.95 busy cores of 8). Strict had idle CPU and no queue
+inside Ravel; its ack was the limit.
+
+**The strict ack, split.** Measured with the phase histograms #3533 added
+(`ravel_ingest_strict_ack_seconds`, `ravel_ingest_flush_phase_seconds`), at a
+fixed 100k lines/s on main 7726a95ea, 15-minute means over 43,022 requests
+and 8,853 flushes (comment 6548202905):
+
+| Phase | Mean | p90 | Source |
+|---|---|---|---|
+| `request`, submit to the last shard ack | 558 ms | 941 ms | comment 6548202905 |
+| `queued`, waiter to its flush's spawn | 54 ms | 145 ms | comment 6548202905 |
+| flush `total` | 447 ms | 819 ms | comment 6548202905 |
+| `encode`, gate wait plus RLOG encode | 313 ms | 470 ms | comment 6548202905 |
+| `data_put` / `commit_publish` | 70 / 62 ms | 97 / 95 ms | comment 6548202905 |
+| `shard_skew`, first shard ack to last | 60 ms | 150 ms | comment 6548202905 |
+| `permit_wait`, `resolve`, `commit_build` | about 0 | about 0 | comment 6548202905 |
+
+Encode is 56% of the ack, for about 9.7k lines per flush, with the write
+gate's wait per job at zero: it is CPU in the flush, not contention. The two
+PUTs are 132 ms together, so the ack-path figures in "What strict acks can
+reach" overstated the store share and understated the encode. About 0.11 s
+per request falls outside `request`, in decode, normalize and admission ahead
+of the router (32 workers ÷ 47.8 requests per second is a 0.67 s cycle).
+Both rows are therefore bound by the same CPU, and cutting it raises strict
+through the ack and buffered through throughput.
+
+**Where the CPU goes.** A `perf` profile of the buffered instance at the same
+fixed 100k (100,043 lines/s stored, 5.16 busy cores, about 51 us per line;
+the Stage 0 method; comment 6548202905), inclusive shares:
+
+| Path | Share | Source |
+|---|---|---|
+| flush on the write gate | 62.4% | comment 6548202905 |
+| columnar writer, `build_object_columnar` | 44.8% | comment 6548202905 |
+| text index: `insert_text` with bloom insert, plus bloom finish | 11.0% + 2.4% | comment 6548202905 |
+| rows to a columnar batch at flush time, `flush_rows_batch` | 16.6% | comment 6548202905 |
+| of which `ColumnarLogBatch::build_from_records` | 14.0% | comment 6548202905 |
+| OTLP handler, decode and normalize | 29.8% | comment 6548202905 |
+| prost `KeyValue` merge / string merge / `from_utf8` | 14.1% / 8.4% / 5.1% | comment 6548202905 |
+| Vec regrowth (`do_rallocx`, `finish_grow`), overlapping | about 13% | comment 6548202905 |
+| SipHash in logseg maps | about 5% | comment 6548202905 |
+
+D2 is built as `rows_to_batch` into the columnar writer, but the shard still
+buffers row structs and converts them at flush: the conversion copies each
+record's stream blob, allocates a set per row and clones each attribute name
+twice. That is the largest single share left and is on the strict ack path.
+
+**The next cuts, in order.** Each is its own pull request, measured on the
+bench at the benchmark's shape against its base, and adopted only if it is
+cheaper:
+
+1. (a1, #3557) build the flush's columnar batch from the buffered rows without
+   those copies, producing an equal batch. If it falls short, (a2) normalizes
+   OTLP straight into a columnar batch and buffers it on the shard's existing
+   columnar path, which needs a router entry that takes the request's
+   pending-ack permit and per-row admission over stream refs.
+2. (b) reserve and reuse buffers so the request and flush paths stop
+   regrowing vectors.
+3. (c) a faster hasher for in-memory maps. A persisted hash, such as the bloom
+   hash, is a frozen format and stays as it is.
+4. (d) zero-copy OTLP decode, which is D3b.
+
+The text index (about 13%) is left out: a cheaper index changes what queries
+can use, so it needs its own decision.
+
+**Overload costs throughput.** With both instances buffered at a fixed 140k
+lines/s, above the ceiling (comment 6548202905), stored throughput fell to
+about 91k on the 100 ms instance against 100k at 100k offered. Over 90% of
+flushes were size-triggered at about 27k lines with buffers at the 4 GiB
+ingest budget, encode per line rose from about 33 us to about 80 us, flushes
+waited about 8 s for a flush permit, and the write gate's run time plus the
+tokio workers' busy time came to about 14 seconds per second on 8 vCPU. That
+is the decline the exit runs showed above each row's ceiling. It is tracked
+separately from the cuts above: keep the write gate from oversubscribing the
+cores the request path needs, or refuse load before buffers reach that
+regime. The same run is why the flush-delay A/B it carried answers nothing:
+the delay is not what fires a size-triggered flush.
