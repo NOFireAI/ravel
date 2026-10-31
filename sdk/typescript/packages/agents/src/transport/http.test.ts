@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   AgentGone,
@@ -24,7 +24,7 @@ import {
   WorkerPollResponse,
 } from "../wire/index.js";
 import { defineAgent, handlerDigest, serveAgents, type TurnReport } from "../worker/index.js";
-import { createHttpTransport, MAX_POLL_WAIT_MS } from "./http.js";
+import { createHttpTransport, HttpTransport, MAX_POLL_WAIT_MS } from "./http.js";
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../fixtures");
 function readFixture(name: string): Record<string, unknown> {
@@ -118,25 +118,11 @@ describe("HttpTransport requests", () => {
     expect(polled?.assignment.lease.random_seed).toBe("8f8d1b06b1618bd08db0300dbba36423");
   });
 
-  it("warns once when passed the deprecated journal option and otherwise ignores it", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    try {
-      const { fetch, sent } = fakeFetch(() => ({ status: 200, body: { lease_expires_unix_ns: "1767225630000000000" } }));
-      const journal = { recordStep: () => Promise.reject(new Error("the journal must not be called")) };
-      const first = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal });
-      const second = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal });
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(String(warn.mock.calls[0]?.[0])).toMatch(/journal option is deprecated and ignored/);
-      await first.heartbeat({ lease: LEASE });
-      await second.heartbeat({ lease: LEASE });
-      expect(sent.map((s) => [s.url, s.body])).toEqual([
-        ["http://ravel.test/api/v1/agents/worker/heartbeat", { lease: LEASE }],
-        ["http://ravel.test/api/v1/agents/worker/heartbeat", { lease: LEASE }],
-      ]);
-      expect(warn).toHaveBeenCalledTimes(1);
-    } finally {
-      warn.mockRestore();
-    }
+  it("takes no journal option: steps and effect results are recorded on the server", () => {
+    const { fetch } = fakeFetch(() => ({ status: 200, body: {} }));
+    // @ts-expect-error the journal option was removed
+    const transport = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal: {} });
+    expect(transport).toBeInstanceOf(HttpTransport);
   });
 
   it("rejects with the abort reason when the poll is aborted", async () => {

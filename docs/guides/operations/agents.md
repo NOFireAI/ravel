@@ -324,12 +324,14 @@ The [storage spec](../../agents.md#clocks) has the detail.
 ## Reconciling an effect in doubt
 
 This runbook covers effects a worker records through `worker/step`. The
-TypeScript SDK in this release does not call that route: it keeps steps in
-the worker's own memory. Its in-doubt steps do not appear on the effects
-route, in the inspector or to reconcile, and the server reports the
-operation as running (the deferred SDK row in the
-[storage spec](../../agents.md#guarantees-and-limitations);
-[SDK guide](../agents-sdk.md)).
+TypeScript SDK records every step through that route, so its in-doubt steps
+appear on the effects route, in the inspector and to reconcile like any
+other, and the operation reads `blocked`. The SDK's client reconciles with
+an `agents_admin` token (`client.reconcile`); the SDK end-to-end test
+`worker killed inside a manual step blocks as EffectInDoubt until the admin
+reconcile route is called through the client` kills a worker process inside
+a `manual` step and reconciles it that way
+([SDK guide](../agents-sdk.md)).
 
 A step with the `manual` policy whose worker died after the tool may have run
 goes in doubt, and its turn blocks until an operator decides

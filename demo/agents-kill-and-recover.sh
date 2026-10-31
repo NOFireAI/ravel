@@ -10,17 +10,20 @@
 #                  tool's side effect and before its result is recorded. The
 #                  client resends under the same request id, a second worker
 #                  takes the turn over once the first worker's lease lapses,
-#                  replays the journaled `kb.search` step without running it,
-#                  and runs `kb.draft` again under the same effect id.
+#                  replays the recorded `kb.search` step without running it,
+#                  and runs `kb.draft` again under the same effect id as the
+#                  server's attempt 2.
 #   manual         the worker is killed inside the `desk.ticket` step. The
-#                  second worker does not run the ticket tool again: the turn
-#                  blocks with EffectInDoubt until the operator reconciles the
-#                  effect with the ticket the killed run filed.
+#                  second worker does not run the ticket tool again: the
+#                  server blocks the turn with EffectInDoubt until the admin
+#                  token reconciles the effect, through the client, with the
+#                  ticket the killed run filed.
 #
-# The kill is an abort of the worker inside the driver process, not a process
-# kill: the step journal is the SDK's provisional in-memory one until the
-# server mounts its step and effect routes, so both workers share it in one
-# process. See sdk/typescript/packages/agents/README.md, "Wire gaps".
+# The first worker is a separate node process that the driver sends SIGKILL
+# while it is inside the step. Steps and effect results are recorded on the
+# server, so the second worker, in the driver's process, replays what the
+# server holds and nothing the killed process had in memory. Effect states
+# and the blocked status are read back from the server.
 #
 # Every figure the driver prints is asserted here against an exact value or a
 # stated band; a figure missing, printed twice, or outside its band exits 1.
@@ -42,6 +45,7 @@ SERVER_BIN="${RAVEL_SERVER_BIN:-${CARGO_TARGET_DIR:-$repo_root/target}/debug/rav
 # credentials anywhere else.
 CLIENT_TOKEN="demo-agents"
 WORKER_TOKEN="demo-worker"
+ADMIN_TOKEN="demo-admin"
 
 READY_TIMEOUT_SECONDS="${RAVEL_AGENTS_DEMO_READY_TIMEOUT_SECONDS:-60}"
 
@@ -127,6 +131,7 @@ log "starting ravel-server --agents on $HTTP_ADDR ($STORE store)"
   --listen-http "$HTTP_ADDR" --listen-grpc "$GRPC_ADDR" \
   --tenant-token "$CLIENT_TOKEN=demo;agents" \
   --tenant-token "$WORKER_TOKEN=demo;agents_worker" \
+  --tenant-token "$ADMIN_TOKEN=demo;agents_admin" \
   >"$work_dir/server.log" 2>&1 &
 server_pid=$!
 
@@ -149,7 +154,7 @@ run_driver() {
   (
     cd "$sdk_dir"
     RAVEL_URL="$base" RAVEL_AGENTS_TOKEN="$CLIENT_TOKEN" RAVEL_WORKER_TOKEN="$WORKER_TOKEN" \
-      node --experimental-transform-types --disable-warning=ExperimentalWarning \
+      RAVEL_ADMIN_TOKEN="$ADMIN_TOKEN" node --experimental-transform-types --disable-warning=ExperimentalWarning \
       --import ./examples/ts-hooks.js examples/assistant/kill-and-recover.ts "$policy"
   ) >"$out" || code=$?
   (( code == 0 )) || fail "the $policy driver exited $code"
@@ -198,13 +203,16 @@ alo="$work_dir/at_least_once.out"
 run_driver at_least_once "$alo"
 expect_operation "$alo"
 alo_operation=$operation_id
-expect "$alo" RETRIED_SAME_OPERATION true
+expect "$alo" OP_SAME true
 expect "$alo" WORKERS_DIFFER true
+expect "$alo" WORKER_A_SIGNAL SIGKILL
 expect "$alo" SEARCH_RUNS 1
 expect "$alo" DRAFT_RUNS 2
 expect "$alo" TICKET_RUNS 0
 expect "$alo" DRAFT_EFFECTS_DISTINCT 1
-expect "$alo" DRAFT_ATTEMPTS 1,2
+expect "$alo" DRAFT_CALL_ATTEMPTS 1,2
+expect "$alo" DRAFT_ATTEMPTS 2
+expect "$alo" TICKET_ATTEMPTS ""
 expect "$alo" EFFECT_STATES kb.search:completed,kb.draft:completed
 expect "$alo" RESULT_ERROR none
 expect "$alo" RESULT_ARTICLES kb-2,kb-3
@@ -212,6 +220,9 @@ expect "$alo" RESULT_TICKET null
 expect "$alo" RESULT_ANSWER "$ANSWER"
 expect "$alo" ANSWERED 1
 expect "$alo" IN_DOUBT_ERROR none
+expect "$alo" TICKET_RUNS_BEFORE_RECONCILE none
+expect "$alo" STATUS_IN_DOUBT none
+expect "$alo" BLOCKED_EFFECT_IS_TICKET false
 expect_band "$alo" RECOVERY_MS "$RECOVERY_MS_MIN" "$RECOVERY_MS_MAX"
 
 log "scenario manual: kill inside desk.ticket"
@@ -221,15 +232,19 @@ expect_operation "$man"
 man_operation=$operation_id
 [[ "$man_operation" != "$alo_operation" ]] ||
   fail "manual OPERATION_ID=$man_operation, expected a different operation from at_least_once's"
-expect "$man" RETRIED_SAME_OPERATION true
+expect "$man" OP_SAME true
 expect "$man" WORKERS_DIFFER true
+expect "$man" WORKER_A_SIGNAL SIGKILL
 expect "$man" IN_DOUBT_ERROR EffectInDoubt
-expect "$man" IN_DOUBT_TICKET_RUNS 1
-# No server route reports a blocked operation until the effect routes land.
-expect "$man" IN_DOUBT_SERVER_STATUS running
+expect "$man" TICKET_RUNS_BEFORE_RECONCILE 1
+expect "$man" STATUS_IN_DOUBT blocked
+expect "$man" BLOCKED_EFFECT_IS_TICKET true
 expect "$man" SEARCH_RUNS 1
 expect "$man" DRAFT_RUNS 1
 expect "$man" TICKET_RUNS 1
+expect "$man" DRAFT_EFFECTS_DISTINCT 1
+expect "$man" DRAFT_CALL_ATTEMPTS 1
+expect "$man" DRAFT_ATTEMPTS 1
 expect "$man" TICKET_ATTEMPTS 1
 expect "$man" EFFECT_STATES kb.search:completed,kb.draft:completed,desk.ticket:completed
 expect "$man" RESULT_ERROR none

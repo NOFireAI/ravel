@@ -87,9 +87,9 @@ You need node 22.15 or later 22.x and a checkout of this repository.
    `checkout` to a new order, and prints the operation id, the line and the
    total. No test runs `npm start`; the SDK's end-to-end test
    `worker killed inside an at_least_once step recovers the same operation
-   on restart, replaying steps from the in-memory journal`
-   (`sdk/typescript/packages/agents/e2e/recover.test.ts`) drives the same
-   client and worker calls against a built server.
+   on restart` (`sdk/typescript/packages/agents/e2e/recover.test.ts`)
+   drives the same client and worker calls against a built server, with the
+   first worker in a child process killed with SIGKILL inside a step.
 
 After changing a payload or result schema, `npm run contract` regenerates
 the client types. The generated test `contract.ts is the generator's output
@@ -191,11 +191,18 @@ lists the agent's effects from /api/v1/agents/effects`, `effect inspects a
 handle at /api/v1/agents/effects/{effect}` (`client/client.test.ts`).
 `client.reconcile(request)` records an operator's decision on an in-doubt
 effect, and `agent.destroy({ incarnation })` destroys an agent, pinned to
-an incarnation when one is given; both need a token holding `agents_admin`.
-The server does not serve the destroy route yet; the client follows the
-wire fixtures for it. Tests: `reconcile
+an incarnation when one is given; both need a token holding `agents_admin`,
+and a token without it is refused with `Forbidden`. Tests: `reconcile
 posts the decision to /api/v1/agents/reconcile`, `destroy posts kind, key
-and incarnation and decodes destroyed and abandoned`. Both are sent once
+and incarnation and decodes destroyed and abandoned`. Against a built
+server, the end-to-end test `worker killed inside a manual step blocks as
+EffectInDoubt until the admin reconcile route is called through the client`
+reconciles an effect left in doubt by a worker killed with SIGKILL, and
+`destroy fences a worker holding a lease and a recreate starts incarnation
+two` (`e2e/destroy.test.ts`) destroys an agent whose worker holds the turn:
+the worker abandons it with `AgentGone` and sends no commit, a second
+destroy answers `destroyed: false` with the same abandoned counts, and
+`create` starts incarnation 2 under the same agent id. Both are sent once
 and never retried, so a lost answer is `OutcomeUnknown`: read
 `client.effect(handle)` or the agent to learn whether it landed. Tests:
 `reconcile is sent once: a network failure is OutcomeUnknown with no second
@@ -229,9 +236,9 @@ server. Its tests are in `transport/http.test.ts`.
   and nothing is committed`, `a transient renewal failure is retried at
   the next tick` (`worker/renew.test.ts`), `renews once at assignment,
   sends nothing while a tool runs, and no heartbeat before a step`.
-- The `journal` option is deprecated and ignored, and logs a warning once
-  per process; it will be removed. Test: `warns once when passed the
-  deprecated journal option and otherwise ignores it`.
+- There is no `journal` option: steps and effect results are recorded on
+  the server. Test: `takes no journal option: steps and effect results are
+  recorded on the server`.
 - An untyped 5xx, a request with no answer, or a body that fails mid-read
   is `OutcomeUnknown`. Tests: `maps an untyped 5xx and a request with no
   answer to OutcomeUnknown`, `maps a response body that fails mid-read to
