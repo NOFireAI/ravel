@@ -57,9 +57,7 @@ pub enum TenantSuffixError {
     EmptySubjectLabel,
     #[error("the subject=LABEL entry after ';' has a label longer than 64 bytes")]
     SubjectLabelTooLong,
-    #[error(
-        "the subject=LABEL entry after ';' has a label byte outside A-Z a-z 0-9 . _ @ + -"
-    )]
+    #[error("the subject=LABEL entry after ';' has a label byte outside A-Z a-z 0-9 . _ @ + -")]
     SubjectLabelCharset,
     #[error("the subject=LABEL entry after ';' appears more than once")]
     DuplicateSubject,
@@ -311,7 +309,11 @@ impl Subject {
         if value.len() > SUBJECT_MAX_BYTES {
             return Err(SubjectError::TooLong { len: value.len() });
         }
-        if let Some(&byte) = value.as_bytes().iter().find(|b| !(0x21..=0x7E).contains(*b)) {
+        if let Some(&byte) = value
+            .as_bytes()
+            .iter()
+            .find(|b| !(0x21..=0x7E).contains(*b))
+        {
             return Err(SubjectError::Charset { byte });
         }
         Ok(Subject { value, source })
@@ -1185,7 +1187,10 @@ mod tests {
 
     #[test]
     fn split_tenant_suffix_ddl_grants_capability() {
-        assert_eq!(split_tenant_suffix("acme;ddl").unwrap(), ("acme", DDL, None));
+        assert_eq!(
+            split_tenant_suffix("acme;ddl").unwrap(),
+            ("acme", DDL, None)
+        );
     }
 
     #[test]
@@ -2179,5 +2184,283 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             ),
             none
         );
+    }
+
+    /// ADR-3541 decision 3: one `subject=LABEL` entry rides beside or instead
+    /// of the capability words, and every malformed entry refuses with an
+    /// error that names neither the label nor the tenant.
+    #[test]
+    fn a_subject_entry_in_the_token_suffix_sets_the_subject_and_a_bad_label_refuses() {
+        let (tenant, caps, subject) =
+            split_tenant_suffix("acme;agents_admin,subject=alice").expect("parses");
+        assert_eq!((tenant, caps), ("acme", AGENTS_ADMIN));
+        let subject = subject.expect("the entry sets a subject");
+        assert_eq!(subject.value(), "alice");
+        assert_eq!(subject.source(), SubjectSource::StaticToken);
+
+        let (tenant, caps, subject) =
+            split_tenant_suffix("acme;subject=bob@example.com").expect("parses");
+        assert_eq!((tenant, caps), ("acme", NONE));
+        let subject = subject.expect("the entry sets a subject");
+        assert_eq!(subject.value(), "bob@example.com");
+        assert_eq!(subject.source(), SubjectSource::StaticToken);
+
+        let long_label = "k".repeat(SUBJECT_LABEL_MAX_BYTES + 1);
+        let long_raw = format!("acme;subject={long_label}");
+        let cases: [(&str, TenantSuffixError, &[&str]); 7] = [
+            (
+                "acme;subject=a,subject=b",
+                TenantSuffixError::DuplicateSubject,
+                &["subject=a", "subject=b"],
+            ),
+            (
+                "acme;subject=alpha1,subject=bravo2",
+                TenantSuffixError::DuplicateSubject,
+                &["alpha1", "bravo2"],
+            ),
+            ("acme;subject=", TenantSuffixError::EmptySubjectLabel, &[]),
+            (
+                "acme;subject=al ice",
+                TenantSuffixError::SubjectLabelCharset,
+                &["al ice"],
+            ),
+            (
+                "acme;subject=al;ce",
+                TenantSuffixError::CapabilityInTenant,
+                &["al;ce", "subject=al"],
+            ),
+            ("acme;subject", TenantSuffixError::SubjectWithoutLabel, &[]),
+            (&long_raw, TenantSuffixError::SubjectLabelTooLong, &["kkkk"]),
+        ];
+        for (raw, want, needles) in cases {
+            let err = split_tenant_suffix(raw).expect_err(raw);
+            assert_eq!(err, want, "{raw}");
+            let message = err.to_string();
+            for needle in needles.iter().chain(&["acme"]) {
+                assert!(
+                    !message.contains(needle),
+                    "{raw}: the message names {needle:?}: {message}"
+                );
+            }
+        }
+        assert_eq!(long_label.len(), 65);
+        assert_eq!(
+            parse_subject_label(&"k".repeat(SUBJECT_LABEL_MAX_BYTES))
+                .expect("64 bytes fit")
+                .value()
+                .len(),
+            64
+        );
+    }
+
+    /// ADR-3541 decision 3: the configured claim is read from the verified
+    /// claim set only; a bad value drops to absent, counts once under its
+    /// reason, and the request still authenticates.
+    #[test]
+    fn the_oidc_subject_claim_sets_the_subject_and_a_missing_or_non_string_claim_leaves_it_absent()
+    {
+        let only = |reason: SubjectDropReason| -> Vec<(SubjectSource, SubjectDropReason, u64)> {
+            SubjectSource::ALL
+                .iter()
+                .flat_map(|&source| {
+                    SubjectDropReason::ALL.iter().map(move |&r| {
+                        let count = u64::from(source == SubjectSource::Oidc && r == reason);
+                        (source, r, count)
+                    })
+                })
+                .collect()
+        };
+        let no_drops = || SubjectDropCounters::default().snapshot();
+
+        // A sub the bound accepts becomes the subject.
+        let drops = Arc::new(SubjectDropCounters::default());
+        let oidc =
+            resolver(cache_with(&jwks_with(KID))).with_subject_claim("sub", Arc::clone(&drops));
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
+        let principal = oidc.resolve_principal(&bearer(&token)).expect("resolves");
+        assert_eq!(principal.tenant, TenantId::new("acme"));
+        let subject = principal.subject.expect("sub sets the subject");
+        assert_eq!(subject.value(), "user-123");
+        assert_eq!(subject.source(), SubjectSource::Oidc);
+        assert_eq!(drops.snapshot(), no_drops());
+
+        // The same claims signed under a key the cache does not hold: no
+        // principal at all, so nothing is read from the unverified token.
+        let forged = sign_es256(&claims(Some("acme"), 3600), KID, OTHER_EC_PRIV_PEM);
+        assert!(oidc.resolve_principal(&bearer(&forged)).is_err());
+        assert_eq!(drops.snapshot(), no_drops());
+
+        // jsonwebtoken itself rejects a token whose `sub` is an array before
+        // any claim is read, so the array case runs under a claim it does not
+        // validate.
+        let mut c = claims(Some("acme"), 3600);
+        c["sub"] = serde_json::json!(["user-123"]);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        assert!(oidc.resolve_principal(&bearer(&token)).is_err());
+        assert_eq!(drops.snapshot(), no_drops());
+
+        let cases: [(&str, Option<serde_json::Value>, SubjectDropReason); 6] = [
+            ("sub", None, SubjectDropReason::Missing),
+            (
+                "sub",
+                Some(serde_json::json!(123)),
+                SubjectDropReason::NotString,
+            ),
+            (
+                "email",
+                Some(serde_json::json!(["user-123"])),
+                SubjectDropReason::NotString,
+            ),
+            ("sub", Some(serde_json::json!("")), SubjectDropReason::Empty),
+            (
+                "sub",
+                Some(serde_json::json!("u".repeat(SUBJECT_MAX_BYTES + 1))),
+                SubjectDropReason::TooLong,
+            ),
+            (
+                "sub",
+                Some(serde_json::json!("user 123")),
+                SubjectDropReason::Charset,
+            ),
+        ];
+        for (claim, value, reason) in cases {
+            let drops = Arc::new(SubjectDropCounters::default());
+            let oidc =
+                resolver(cache_with(&jwks_with(KID))).with_subject_claim(claim, Arc::clone(&drops));
+            let mut c = claims(Some("acme"), 3600);
+            match value {
+                Some(value) => c[claim] = value,
+                None => {
+                    c.as_object_mut().expect("an object").remove(claim);
+                }
+            }
+            let token = sign_es256(&c, KID, EC_PRIV_PEM);
+            let principal = oidc
+                .resolve_principal(&bearer(&token))
+                .expect("a dropped subject still authenticates");
+            assert_eq!(principal.tenant, TenantId::new("acme"), "{reason:?}");
+            assert_eq!(principal.subject, None, "{reason:?}");
+            assert_eq!(drops.snapshot(), only(reason), "{reason:?}");
+        }
+
+        // No claim configured: a token carrying sub resolves with no subject
+        // and nothing is counted.
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
+        let principal = resolver(cache_with(&jwks_with(KID)))
+            .resolve_principal(&bearer(&token))
+            .expect("resolves");
+        assert_eq!(principal.subject, None);
+        assert_eq!(drops.snapshot(), no_drops());
+    }
+
+    /// ADR-3541 decision 1: 1 to 255 bytes, every byte in `0x21..=0x7E`.
+    #[test]
+    fn a_subject_outside_the_length_or_charset_bound_is_refused() {
+        let new = |value: &str| Subject::new(SubjectSource::Oidc, value);
+        assert_eq!(new(""), Err(SubjectError::Empty));
+        assert_eq!(
+            new(&"a".repeat(256)),
+            Err(SubjectError::TooLong { len: 256 })
+        );
+        // 255 characters but 256 bytes: the bound counts bytes.
+        let wide = format!("{}é", "a".repeat(253));
+        assert_eq!(wide.chars().count(), 254);
+        assert_eq!(
+            new(&format!("a{wide}")),
+            Err(SubjectError::TooLong { len: 256 })
+        );
+        assert_eq!(new("al ice"), Err(SubjectError::Charset { byte: 0x20 }));
+        assert_eq!(new("al\tice"), Err(SubjectError::Charset { byte: 0x09 }));
+        assert_eq!(
+            new("al\u{7f}ice"),
+            Err(SubjectError::Charset { byte: 0x7F })
+        );
+        assert_eq!(new("alé"), Err(SubjectError::Charset { byte: 0xC3 }));
+
+        let max = "a".repeat(SUBJECT_MAX_BYTES);
+        assert_eq!(new(&max).expect("255 bytes fit").value(), max);
+        let printable: String = (0x21u8..=0x7E).map(char::from).collect();
+        let subject = new(&printable).expect("every printable byte fits");
+        assert_eq!(subject.value(), printable);
+        assert_eq!(subject.source(), SubjectSource::Oidc);
+    }
+
+    /// ADR-3541 decision 1: a subject is attribution only. Two principals
+    /// that differ only in subject hold the same capabilities, and
+    /// FallbackResolver forwards the matching resolver's subject unchanged.
+    #[test]
+    fn a_subject_grants_nothing() {
+        let subject = parse_subject_label("alice").expect("a valid label");
+        for caps in [
+            NONE,
+            DDL,
+            IPCRYPT,
+            BOTH,
+            AGENTS,
+            AGENTS_WORKER,
+            AGENTS_ADMIN,
+            ALL,
+        ] {
+            let without = Principal {
+                tenant: TenantId::new("acme"),
+                ddl: caps.ddl,
+                ipcrypt: caps.ipcrypt,
+                agents: caps.agents,
+                agents_worker: caps.agents_worker,
+                agents_admin: caps.agents_admin,
+                subject: None,
+            };
+            let with = Principal {
+                subject: Some(subject.clone()),
+                ..without.clone()
+            };
+            assert_ne!(with, without);
+            assert_eq!(
+                (
+                    with.ddl,
+                    with.ipcrypt,
+                    with.agents,
+                    with.agents_worker,
+                    with.agents_admin
+                ),
+                (
+                    without.ddl,
+                    without.ipcrypt,
+                    without.agents,
+                    without.agents_worker,
+                    without.agents_admin
+                ),
+            );
+        }
+
+        let configured = Principal {
+            subject: Some(subject),
+            ..Principal::tenant_only(TenantId::new("acme"))
+        };
+        let fallback = FallbackResolver::new(vec![
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            Arc::new(StaticBearerTokenResolver::with_principals(HashMap::from([
+                ("tok".to_string(), configured.clone()),
+            ]))),
+        ]);
+        assert_eq!(
+            fallback
+                .resolve_principal(&static_bearer("tok"))
+                .expect("resolves"),
+            configured
+        );
+    }
+
+    /// ADR-3541 decision 4: no resolver reads a caller-supplied subject.
+    #[test]
+    fn the_dev_header_resolver_never_sets_a_subject() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ravel-tenant", "acme".parse().expect("valid header"));
+        headers.insert("x-ravel-subject", "alice".parse().expect("valid header"));
+        let principal = DevHeaderTenantResolver::default()
+            .resolve_principal(&headers)
+            .expect("resolves");
+        assert_eq!(principal, Principal::tenant_only(TenantId::new("acme")));
+        assert_eq!(principal.subject, None);
     }
 }
