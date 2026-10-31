@@ -471,6 +471,11 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 route's `incarnation`) so that a destroy sent late cannot end an incarnation
 someone created since.
 
+`ravel-cli agents destroy --kind K --key KEY --incarnation N --url URL
+--token T` posts the same body with the admin token and prints the
+abandoned counts, or the response itself with `--json`
+(`destroy_renders_the_response_and_needs_a_token`).
+
 Repeats and refusals:
 
 - Destroying an agent that is already destroyed answers 200 with

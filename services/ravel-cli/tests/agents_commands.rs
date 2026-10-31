@@ -1,8 +1,8 @@
 //! `ravel-cli agents` (ADR-3331 decision 11, issue #3355). The read commands
 //! run in-process against a `MemoryStore` seeded through `AgentStore`, with no
 //! server anywhere in the test; `dev` runs against a recording host so the
-//! order of its side effects is observable; `reconcile` runs against a
-//! loopback axum server that records what the client sent.
+//! order of its side effects is observable; `reconcile` and `destroy` run
+//! against a loopback axum server that records what the client sent.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
