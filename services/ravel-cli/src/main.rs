@@ -192,8 +192,8 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // The agents reads open HEAD and its objects under
         // `t/<tenant_hash>/ag/` from their `--tenant`. `dev` and `scaffold`
         // address no tenant prefix themselves (dev's `store qualify` child
-        // runs its own gate), and `reconcile` leaves the hashing to the
-        // server it calls.
+        // runs its own gate), and `reconcile` and `destroy` leave the
+        // hashing to the server they call.
         Command::Agents { command } => match command {
             AgentsCommand::List { .. }
             | AgentsCommand::Inspect { .. }
@@ -352,8 +352,9 @@ fn command_is_write(command: &Command) -> bool {
         | Command::Cache { .. }
         // `inspect cstat` and `inspect kidx` only read the named object.
         | Command::Inspect { .. } => false,
-        // The agents reads only read. `reconcile` writes through the server,
-        // which owns the bucket's write gate; `scaffold` writes local files.
+        // The agents reads only read. `reconcile` and `destroy` write
+        // through the server, which owns the bucket's write gate; `scaffold`
+        // writes local files.
         // `dev` writes nothing to the bucket itself: `store qualify` runs in
         // a child process, and the server it starts owns its own writes.
         Command::Agents { command } => match command {
