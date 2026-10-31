@@ -5422,20 +5422,19 @@ pub(crate) mod tests {
     /// and `isolation_breaches()` reads 0.
     #[tokio::test]
     async fn a_foreign_tenant_hash_on_the_previous_postings_fails_the_fold() {
-        assert_foreign_previous_postings_fail_the_fold(None, true).await;
+        assert_foreign_previous_postings_fail_the_fold(false, true).await;
     }
 
     /// The tenant check runs before the decode reservation: under a budget
-    /// with no room at all the fold still reports the breach, not memory
-    /// pressure.
+    /// with room for the previous part's charge and none at all for the
+    /// postings the fold still reports the breach, not memory pressure.
     ///
     /// FLIP: move the `tenant_hash` match below the `reserve_decoded` call in
     /// `load_previous_postings` and the fold fails with `MemoryExhausted`
     /// instead.
     #[tokio::test]
     async fn a_foreign_tenant_hash_is_reported_before_the_postings_reservation() {
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
-        assert_foreign_previous_postings_fail_the_fold(Some(budget), true).await;
+        assert_foreign_previous_postings_fail_the_fold(true, true).await;
     }
 
     /// The tenant check runs before the part-binding check: a foreign object
@@ -5447,22 +5446,30 @@ pub(crate) mod tests {
     /// `expect_err` panics.
     #[tokio::test]
     async fn a_foreign_tenant_hash_is_reported_before_the_part_binding_degrade() {
-        assert_foreign_previous_postings_fail_the_fold(None, false).await;
+        assert_foreign_previous_postings_fail_the_fold(false, false).await;
     }
 
     /// Re-point the fixture HEAD at a copy of its postings naming another
     /// tenant, bound to the HEAD's own part hashes or to hashes it does not
-    /// carry, then fold again under `budget` (unlimited when `None`) and assert
-    /// the fold fails with the `tenant_hash` mismatch and one counted breach.
+    /// carry, then fold again and assert the fold fails with the
+    /// `tenant_hash` mismatch and one counted breach. With `parts_only_budget`
+    /// the fold runs under a budget of exactly the previous parts' declared
+    /// lengths, which the part loads fill and the postings reservation finds
+    /// no room in; otherwise the budget is unlimited.
     async fn assert_foreign_previous_postings_fail_the_fold(
-        budget: Option<Arc<ravel_memory::MemoryBudget>>,
+        parts_only_budget: bool,
         bind_to_head_parts: bool,
     ) {
         let store = Arc::new(MemoryStore::new());
         let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
-        let catalog = match budget {
-            Some(budget) => catalog.with_memory_budget(budget),
-            None => catalog,
+        let catalog = if parts_only_budget {
+            let mut parts_declared = 0;
+            for part in &head.parts {
+                parts_declared += part_declared_len(&store, &part.key).await;
+            }
+            catalog.with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(parts_declared)))
+        } else {
+            catalog
         };
         let part_blake3: Vec<[u8; 32]> = head
             .parts
@@ -5533,9 +5540,19 @@ pub(crate) mod tests {
     /// every segment's names, which holds more memory than the one postings
     /// decode that was just refused.
     ///
+    /// The previous snapshot part is charged too (issue #3320) and its
+    /// reservation is still held when the postings reserve, since the fold
+    /// still holds the part's entries; the budget leaves room for the part
+    /// and one byte less than the postings on top of it, so the refusal
+    /// names the part's charge as already reserved.
+    ///
     /// FLIP: restore the `Err(err) => { warn!(...); return Ok(None) }` arm
     /// around `reserve_decoded` in `load_previous_postings` and the second fold
-    /// succeeds, so `expect_err` panics.
+    /// succeeds, so `expect_err` panics. FLIP: drop `_previous_charge` from
+    /// the tuple `load_previous_entries`'s result is bound to in
+    /// `fold_with_refold_request` (bind it to `_` instead) and the part's
+    /// reservation is released before the postings reserve, so the second
+    /// fold succeeds and `expect_err` panics.
     #[tokio::test]
     async fn a_refused_postings_reservation_fails_the_fold() {
         let store = Arc::new(MemoryStore::new());
@@ -5548,9 +5565,13 @@ pub(crate) mod tests {
             declared <= config(1).max_postings_bytes,
             "the decoder would admit this body, so only the budget can refuse it"
         );
+        assert_eq!(head.parts.len(), 1, "one previous part");
+        let part_declared = part_declared_len(&store, &head.parts[0].key).await;
         drop(head);
 
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(
+            part_declared + declared - 1,
+        ));
         let catalog = catalog.with_memory_budget(budget.clone());
         let now_2 = now_at_seal(12);
         publish_real_segment(
@@ -5570,6 +5591,144 @@ pub(crate) mod tests {
         match err {
             CatalogError::MemoryExhausted(exhausted) => {
                 assert_eq!(exhausted.requested, declared);
+                assert_eq!(exhausted.reserved, part_declared);
+                assert_eq!(exhausted.limit, part_declared + declared - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused reservation charges nothing"
+        );
+    }
+
+    /// The declared `entries_uncompressed_len` of the snapshot part at `key`,
+    /// what `Catalog::load_part_entries` reserves before decoding it. Asserts
+    /// it is non-zero and within the decode ceiling, so only a budget can
+    /// refuse it.
+    async fn part_declared_len(store: &MemoryStore, key: &str) -> u64 {
+        let part = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let declared = snapshot_format::decode_part_header(&part)
+            .expect("part header decodes")
+            .entries_uncompressed_len;
+        assert!(declared > 0, "the fixture part has a body to charge");
+        assert!(
+            declared <= PartLimits::default().max_snapshot_part_bytes,
+            "the decoder would admit this body, so only the budget can refuse it"
+        );
+        assert!(
+            declared != part.len() as u64,
+            "the stored and declared lengths differ, so a charge of either is told apart"
+        );
+        declared
+    }
+
+    /// The metrics HEAD's stored bytes.
+    async fn metrics_head_bytes(store: &MemoryStore) -> Bytes {
+        store
+            .get(&head_object_key(&tenant(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("head present")
+            .data
+    }
+
+    const PREVIOUS_PART_WRITER: Uuid = Uuid::from_u128(0x3320_0001);
+    const NEXT_PART_WRITER: Uuid = Uuid::from_u128(0x3320_0002);
+    const FIRST_FOLDER: Uuid = Uuid::from_u128(0x3320_0011);
+    const SECOND_FOLDER: Uuid = Uuid::from_u128(0x3320_0012);
+
+    /// Fold one hour-10 segment into a one-part HEAD on `inner` through a
+    /// catalog with no budget, then publish an hour-12 segment the next fold
+    /// folds in incrementally from that part. Returns the part's declared
+    /// entry body length. Fixed writer and folder ids, so two stores given
+    /// the same calls hold byte-identical HEADs.
+    async fn previous_part_baseline(inner: &Arc<MemoryStore>) -> u64 {
+        let catalog = Catalog::new(inner.clone(), config(1)).expect("catalog");
+        publish_segment(
+            inner,
+            0,
+            PREVIOUS_PART_WRITER,
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                FIRST_FOLDER,
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "the first fold builds HEAD from the layout");
+        let head = read_metrics_head(inner).await;
+        assert_eq!(head.parts.len(), 1, "one previous part");
+        let declared = part_declared_len(inner, &head.parts[0].key).await;
+        publish_segment(
+            inner,
+            0,
+            NEXT_PART_WRITER,
+            2,
+            12,
+            now_at_seal(12) - NS_PER_HOUR,
+        )
+        .await;
+        declared
+    }
+
+    /// The fold `previous_part_baseline` sets up: incremental, from its HEAD.
+    async fn fold_after_previous_part(catalog: &Catalog) -> Result<FoldReport, CatalogError> {
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                SECOND_FOLDER,
+                now_at_seal(12),
+                &[],
+                None,
+            )
+            .await
+    }
+
+    /// Issue #3320: the fold charges its decode of a previous snapshot part
+    /// to the catalog's memory budget before decoding it, reserving the
+    /// part's declared `entries_uncompressed_len` (not its stored length),
+    /// and a refusal fails that fold tick with the typed error rather than
+    /// rebuilding from the commit layout, which would fetch and decode every
+    /// commit record HEAD covers. HEAD is left as it was and the store sees no
+    /// LIST: the refused fold reads HEAD and the part and stops.
+    ///
+    /// FLIP: drop the `reserve_decoded` call in `Catalog::load_part_entries`
+    /// and the fold succeeds, so `expect_err` panics. FLIP: delete the
+    /// `Err(CatalogError::MemoryExhausted(exhausted)) => return ...` arm after
+    /// `load_previous_entries` in `fold_with_refold_request` and the refusal
+    /// falls into the rebuild, which succeeds, so `expect_err` panics.
+    #[tokio::test]
+    async fn a_refused_previous_part_reservation_fails_the_fold() {
+        let inner = Arc::new(MemoryStore::new());
+        let declared = previous_part_baseline(&inner).await;
+        let head_before = metrics_head_bytes(&inner).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let err = fold_after_previous_part(&catalog)
+            .await
+            .expect_err("a refused previous part reservation must fail the fold");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared);
                 assert_eq!(exhausted.reserved, 0);
                 assert_eq!(exhausted.limit, declared - 1);
             }
@@ -5579,6 +5738,235 @@ pub(crate) mod tests {
             budget.reserved(),
             0,
             "a refused reservation charges nothing"
+        );
+        assert_eq!(
+            metrics_head_bytes(&inner).await,
+            head_before,
+            "the refused fold publishes no HEAD"
+        );
+        assert_eq!(list_calls(&store), 0, "no commit-layout re-listing ran");
+    }
+
+    /// Issue #3320: a refused previous-part reservation leaves nothing behind
+    /// that the next fold tick trips over. Fixture: a budget with room for the
+    /// part, and a reservation held by someone else that leaves one byte too
+    /// few; once that reservation drops, the same catalog's next fold of the
+    /// same tenant succeeds incrementally and writes the HEAD a store folded
+    /// with no budget at all writes, byte for byte, and returns every byte it
+    /// charged.
+    ///
+    /// FLIP: delete the `Err(CatalogError::MemoryExhausted(exhausted)) =>
+    /// return ...` arm after `load_previous_entries` in
+    /// `fold_with_refold_request` and the first fold rebuilds and succeeds, so
+    /// `expect_err` panics. FLIP: drop the `reserve_decoded` call in
+    /// `Catalog::load_part_entries` and the same `expect_err` panics.
+    #[tokio::test]
+    async fn the_next_fold_tick_retries_after_a_refused_previous_part() {
+        let control = Arc::new(MemoryStore::new());
+        previous_part_baseline(&control).await;
+        let control_catalog = Catalog::new(control.clone(), config(1)).expect("catalog");
+        let controlled = fold_after_previous_part(&control_catalog)
+            .await
+            .expect("the control fold");
+        assert!(!controlled.rebuilt, "the control fold is incremental");
+
+        let inner = Arc::new(MemoryStore::new());
+        let declared = previous_part_baseline(&inner).await;
+        let head_before = metrics_head_bytes(&inner).await;
+        let limit = 64 * declared;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = Catalog::new(inner.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let pressure = budget
+            .reserve(limit - declared + 1)
+            .expect("the competing reservation fits");
+        let err = fold_after_previous_part(&catalog)
+            .await
+            .expect_err("the first tick is refused");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared);
+                assert_eq!(exhausted.reserved, limit - declared + 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(metrics_head_bytes(&inner).await, head_before);
+        drop(pressure);
+        assert_eq!(budget.reserved(), 0, "the refused tick holds nothing");
+
+        let retried = fold_after_previous_part(&catalog)
+            .await
+            .expect("the next tick folds");
+        assert!(!retried.rebuilt, "the retry is incremental: {retried:?}");
+        assert_eq!(retried.entry_count, controlled.entry_count);
+        assert_eq!(
+            metrics_head_bytes(&inner).await,
+            metrics_head_bytes(&control).await,
+            "the retried fold writes the HEAD an unrefused fold writes"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the fold returns every byte it charged"
+        );
+    }
+
+    /// Issue #3320: a previous part's charge is held for as long as the fold
+    /// holds the part's entries, not only across its decode. Fixture: two
+    /// previous parts (`snapshot_part_max_entries = 1`, one hour each) under a
+    /// budget of the two declared lengths together less one byte, so each fits
+    /// alone and the pair does not. The fold reserves the parts in HEAD order,
+    /// so the refusal is on the second part with exactly the first part's
+    /// declared length already reserved: that `reserved` figure is what a
+    /// reservation dropped right after the first decode cannot produce, since
+    /// it would read 0 and the second reservation would fit.
+    /// `a_refused_postings_reservation_fails_the_fold` pins the rest of the
+    /// span, a part charge still held when the postings reserve later on.
+    ///
+    /// FLIP: in `Catalog::load_previous_entries`, drop each `reservation`
+    /// instead of pushing it onto `reservations`, and the fold succeeds, so
+    /// `expect_err` panics.
+    #[tokio::test]
+    async fn the_previous_part_charge_is_held_while_the_entries_are_resident() {
+        let inner = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            snapshot_part_max_entries: 1,
+            ..config(1)
+        };
+        let unbudgeted = Catalog::new(inner.clone(), cfg.clone()).expect("catalog");
+        publish_segment(
+            &inner,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+        publish_segment(
+            &inner,
+            0,
+            Uuid::new_v4(),
+            2,
+            11,
+            now_at_seal(11) - NS_PER_HOUR,
+        )
+        .await;
+        unbudgeted
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        let head = read_metrics_head(&inner).await;
+        assert_eq!(head.parts.len(), 2, "one part per hour under a cap of 1");
+        let first = part_declared_len(&inner, &head.parts[0].key).await;
+        let second = part_declared_len(&inner, &head.parts[1].key).await;
+        publish_segment(
+            &inner,
+            0,
+            Uuid::new_v4(),
+            3,
+            13,
+            now_at_seal(13) - NS_PER_HOUR,
+        )
+        .await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(first + second - 1));
+        let catalog = Catalog::new(inner.clone(), cfg)
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+                None,
+            )
+            .await
+            .expect_err("the second part does not fit beside the first");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, second);
+                assert_eq!(exhausted.reserved, first, "the first part is still charged");
+                assert_eq!(exhausted.limit, first + second - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the failed fold releases the first part"
+        );
+    }
+
+    /// Issue #3320: the held-open pre-check (`held_open_has_unfolded`) loads
+    /// a part through the same charged load; its refusal sends the fold down
+    /// the full path, whose own load is refused the same way and fails the
+    /// fold, rather than rebuilding. The only LISTs are the pre-check's
+    /// re-listing of the three held-open hours.
+    ///
+    /// FLIP: delete the `Err(CatalogError::MemoryExhausted(exhausted)) =>
+    /// return ...` arm after `load_previous_entries` in
+    /// `fold_with_refold_request` and the fold rebuilds and succeeds, so
+    /// `expect_err` panics.
+    #[tokio::test]
+    async fn a_refused_held_open_probe_fails_the_fold_without_a_rebuild() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let unbudgeted = Catalog::new(inner.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+        publish_segment(&inner, 0, Uuid::new_v4(), 1, H, now).await;
+        let sealed = fold_sealing(&unbudgeted, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+        let head = read_metrics_head(&inner).await;
+        assert_eq!(head.parts.len(), 1, "one previous part");
+        let declared = part_declared_len(&inner, &head.parts[0].key).await;
+        let head_before = metrics_head_bytes(&inner).await;
+        publish_segment(&inner, 0, Uuid::new_v4(), 2, H, now + 1).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert_eq!(catalog.margin_watermark_hour(later), Some(H - 3));
+        let err = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                None,
+            )
+            .await
+            .expect_err("a refused held-open part load must fail the fold");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared);
+                assert_eq!(exhausted.reserved, 0);
+                assert_eq!(exhausted.limit, declared - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(metrics_head_bytes(&inner).await, head_before);
+        assert_eq!(
+            list_calls(&store),
+            3,
+            "only the held-open hours H-2..=H are listed, once each"
         );
     }
 
