@@ -1887,9 +1887,15 @@ mod tests {
     /// 1.000), and at least 0.40 under an interactive scan (model 0.486,
     /// CLOCK 0.000). No test-only switch turns the gate off, so the CLOCK
     /// figure is the model's and is not rerun here.
+    ///
+    /// The aging window is ten lookups per slot and ghost record, above the
+    /// 65,536 floor: 10,000 slots and 20,000 ghost records under a bulk-scan
+    /// scan halve every 300,000 lookups, and 20,000 of each under an
+    /// interactive scan every 400,000. Twenty rounds of 40,000 lookups put
+    /// at least one halving inside the reported rounds of both variants.
     #[test]
     fn trace_b_keeps_the_interactive_set_through_a_scan() {
-        const ROUNDS: usize = 10;
+        const ROUNDS: usize = 20;
         for (scan, band) in [
             (AccessIntent::BulkScan, 0.90),
             (AccessIntent::Interactive, 0.40),
@@ -1911,6 +1917,11 @@ mod tests {
                 min >= band,
                 "{scan:?} scan: W retained {min:.3} on some round, band at least {band}"
             );
+            let window = match scan {
+                AccessIntent::Interactive => 400_000,
+                _ => 300_000,
+            };
+            assert_eq!(t.halvings.first(), Some(&window), "{scan:?} scan");
         }
     }
 
@@ -1918,6 +1929,10 @@ mod tests {
     /// first pass of B at a 0.90 hit share is at most 13 (model 12). k = 4
     /// and k = 30 (model 6 and 9) are reported, not asserted. No test-only
     /// switch turns the gate off, so CLOCK's 3 passes are the model's.
+    ///
+    /// A's 15,000 slots set a 150,000-lookup aging window, so A's counts
+    /// halve during its reads for k = 15 and 30, and every variant halves
+    /// again while B displaces A.
     #[test]
     fn trace_e_a_shifted_working_set_displaces_a_stale_one() {
         const MAX_PASSES: usize = 25;
@@ -1931,6 +1946,15 @@ mod tests {
                 t.lookups,
                 t.halvings,
                 t.cache.process_counters(),
+            );
+            assert!(
+                t.halvings.first().is_some_and(|&l| l > 1 << 16),
+                "k = {k}: the window, not its floor, sets the cadence"
+            );
+            let b_starts = k as u64 * 15_000;
+            assert!(
+                t.halvings.iter().any(|&l| l > b_starts),
+                "k = {k}: counts halve while B is read"
             );
             first.push((k, pass));
         }
