@@ -205,10 +205,15 @@ pub fn split_tenant_suffix(
 ///
 /// `subject` names who, within the tenant, the credential belongs to
 /// (ADR-3541 decision 1). It is attribution only and grants nothing: no
-/// capability field depends on it (`a_subject_grants_nothing`), and nothing
-/// in the workspace reads it yet. It is `None` unless a source produced one: a
-/// static token's `subject=LABEL` entry ([`split_tenant_suffix`]) or the claim
+/// capability field depends on it (`a_subject_grants_nothing`), and outside
+/// this crate's tests no code reads the field; the one comparison that sees it
+/// is the whole-principal equality in `ravel-server`'s
+/// `Cli::parse_tenant_pairs` duplicate-token check. It is `None` unless a
+/// source produced one: a static token's `subject=LABEL` entry
+/// ([`split_tenant_suffix`]) or the claim
 /// [`OidcResolver::with_subject_claim`] names.
+/// [`DevHeaderTenantResolver`] never sets one
+/// (`the_dev_header_resolver_never_sets_a_subject`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub tenant: TenantId,

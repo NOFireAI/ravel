@@ -6902,14 +6902,16 @@ impl Cli {
             if token.is_empty() || tenant_raw.is_empty() {
                 anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
             }
-            let (tenant, capabilities, subject) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
-                .map_err(|e: ravel_tenant_resolve::TenantSuffixError| {
-                    anyhow::anyhow!(
-                        "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
+            let (tenant, capabilities, subject) = ravel_tenant_resolve::split_tenant_suffix(
+                tenant_raw,
+            )
+            .map_err(|e: ravel_tenant_resolve::TenantSuffixError| {
+                anyhow::anyhow!(
+                    "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
                          CAPABILITIES a comma-separated list of ddl, ipcrypt, agents, \
                          agents_worker and agents_admin"
-                    )
-                })?;
+                )
+            })?;
             let principal = Principal {
                 tenant: TenantId::new(tenant),
                 ddl: capabilities.ddl,
