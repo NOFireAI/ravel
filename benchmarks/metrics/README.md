@@ -997,10 +997,12 @@ that fails is not written and the exit is 70.
 **Diagnostic after a failed ingest.** `--diagnostic-after-failed-ingest`,
 which `deploy/metricsbench/run.sh` passes only after an ingest whose
 read-back failed or that stalled, binds such an ingest report instead of
-refusing it (`metrics_query::bind_diagnostic`). A row whose read-back failed
-is queried, and so is a row carrying a `row_failure`; an engine whose row
-stalled or is listed under `failed_replays` is left out
-(`metricsbench_query::a_row_failure_or_failed_replay_does_not_bind`), and every failure is
+refusing it (`metrics_query::bind_diagnostic`). A comparator row whose
+read-back failed is queried, and so is one carrying a `row_failure`; a
+comparator whose row stalled or is listed under `failed_replays` is left out
+(`metricsbench_query::a_row_failure_or_failed_replay_does_not_bind`). Any of
+these four on the Prometheus row refuses the diagnostic, since every other
+engine is classified against it, and no report is written. Otherwise every failure is
 recorded in the report's `failed_bands` with `run_verdict: "failed"` (see
 "Failed run verdict" under "Report schema version 3"). The report is checked
 by `report_schema::validate_diagnostic`, which applies every rule `validate`
