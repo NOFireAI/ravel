@@ -2484,8 +2484,9 @@ fn render_logs_latency_families(
         "Logs flush latency by phase, logs only, one observation per flush per phase reached, \
          on the injected clock. permit_wait: the wait for the tenant's flush share and the \
          shard's max_inflight_flushes permit. resolve: the tenant's indexed-field and layout \
-         resolve. encode: the write gate encode, which includes the CPU-gate wait (read \
-         ravel_cpu_gate_wait_seconds for the gate's share) and the RLOG encode. data_put: the \
+         resolve. encode: the write gate encode, the CPU-gate wait and the RLOG encode together \
+         (ravel_cpu_gate_wait_seconds pools every write-gate site, so it does not split this \
+         phase). data_put: the \
          data object PUT, retries included. commit_build: the commit record build and its \
          declared-column stamps. commit_publish: the commit record publish, retries included. \
          total: from the flush task's spawn to the end of its ack fan-out, on every exit. A \
