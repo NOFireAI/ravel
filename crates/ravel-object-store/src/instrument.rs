@@ -301,8 +301,10 @@ pub const LATENCY_BUCKET_COUNT: usize = LATENCY_BUCKET_BOUNDS_MICROS.len() + 1;
 
 /// The bucket a duration falls in. Sub-microsecond durations truncate to 0us
 /// and land in bucket 0; anything past the last bound lands in the overflow
-/// bucket (`LATENCY_BUCKET_COUNT - 1`).
-fn latency_bucket(elapsed_nanos: u64) -> usize {
+/// bucket (`LATENCY_BUCKET_COUNT - 1`). Public so other histograms on the
+/// same fixed bounds (the logs ingest phase histograms) select buckets the
+/// same way.
+pub fn latency_bucket(elapsed_nanos: u64) -> usize {
     let micros = elapsed_nanos / 1_000;
     LATENCY_BUCKET_BOUNDS_MICROS
         .iter()
