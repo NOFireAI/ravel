@@ -3565,13 +3565,15 @@ and block-level reported independently:
   once per validation, on either path, so undeclared attribute columns'
   dictionaries count when `attrs` is projected; and, on the columnar path
   with a decoded-column cache attached, every present cell of a plain-page
-  `Str` attribute column it decoded on a cache miss (and so offers to the
-  cache) and found all UTF-8. A column served from the decoded-column cache
-  keeps the validation its decode did and adds nothing (ADR-3326 decision
-  5). The columnar build's half is every plain-page `Str` cell of a
-  surviving row its declared and per-key `attrs['k']` cursors validated:
-  every such cell when no cache is attached, and with a cache only cells of
-  a page that is not all UTF-8. The row path, taken when `attrs` is
+  `Str` attribute column it decoded on a cache miss that the cache will
+  admit (an interactive statement, or a bulk-scan or maintenance statement
+  on its second touch of the block) and found all UTF-8. A column served
+  from the decoded-column cache keeps the validation its decode did and adds
+  nothing (ADR-3326 decision 5). The columnar build's half is every
+  plain-page `Str` cell of a surviving row its declared and per-key
+  `attrs['k']` cursors validated: every such cell of a page the decode did
+  not validate (no cache attached, a miss the cache will not admit, such as
+  a bulk scan's first touch, or a page that is not all UTF-8). The row path, taken when `attrs` is
   projected or an erasure is pending, validates no plain page at decode and
   validates its cells per row without counting them. With a pushed `Contains` arm the reader
   validates only the dictionary entries the arm read as text or a kept row
