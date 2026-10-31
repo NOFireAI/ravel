@@ -1418,11 +1418,13 @@ struct BlockMetrics {
     /// String cells this partition UTF-8 validated: the reader's dictionary
     /// entries on either path (undeclared columns included when `attrs` is
     /// projected) and the cells of the all-UTF-8 plain `Str` pages its
-    /// columnar exit decoded on a decoded-cache miss
-    /// ([`ScanStats::str_cells_validated`]), plus every plain-page `Str` cell
-    /// of a surviving row the columnar build's declared and per-key cursors
-    /// validated ([`build_columnar_batches`]): every such cell with no cache
-    /// attached, only cells of a page not all UTF-8 with one. A column served
+    /// columnar exit decoded on a decoded-cache miss for a column the cache
+    /// will admit ([`ScanStats::str_cells_validated`]), plus every plain-page
+    /// `Str` cell of a surviving row the columnar build's declared and per-key
+    /// cursors validated ([`build_columnar_batches`]): every cell of a page
+    /// not validated at decode, which is every page with no cache attached
+    /// and, with one, a page not all UTF-8 or a non-interactive first touch
+    /// the cache did not admit. A column served
     /// from the decoded-column cache adds nothing. The row path's per-cell
     /// plain-page validations are not counted.
     str_cells_validated: Count,

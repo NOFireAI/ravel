@@ -125,14 +125,16 @@ pub struct ScanStats {
     /// [`Predicate::Contains`] column only the entries that arm had to read as
     /// text or a surviving row references, and every present cell of a
     /// plain-page `Str` attribute column the columnar exit decoded on a
-    /// decoded-column cache miss and found all UTF-8 (ADR-3326 decision 5).
-    /// A column served from the decoded-column cache is not decoded and
-    /// counts nothing. This is the reader's part of the count only: any other
-    /// plain page (the row path, the columnar exit with no cache attached, or
-    /// a page that is not all UTF-8) has the cells of its surviving rows
-    /// validated by the declared `Str` build in `ravel-sql`, which counts
-    /// them; the row path's per-cell validations are not counted. Grows as
-    /// blocks are decoded, like [`Self::pages_decoded`].
+    /// decoded-column cache miss, that the cache will admit
+    /// (`DecodedColumnCache::would_admit`), and found all UTF-8 (ADR-3326
+    /// decision 5). A column served from the decoded-column cache is not
+    /// decoded and counts nothing. This is the reader's part of the count
+    /// only: any other plain page (the row path, the columnar exit with no
+    /// cache attached, a non-interactive first touch the cache answers with a
+    /// ghost record, or a page that is not all UTF-8) has the cells of its
+    /// surviving rows validated by the declared `Str` build in `ravel-sql`,
+    /// which counts them; the row path's per-cell validations are not
+    /// counted. Grows as blocks are decoded, like [`Self::pages_decoded`].
     pub str_cells_validated: u64,
 }
 
@@ -1504,9 +1506,12 @@ impl BlockScan {
     /// deferred by a Contains arm) found there is seeded into the block and
     /// its pages are neither read nor decoded; a missed one is offered to the
     /// cache after the decode, before any survivor narrowing. Only a missed
-    /// plain `Str` attribute column is UTF-8 validated at decode, since the
-    /// cache keeps that validation for every later hit (ADR-3326 decision 5);
-    /// every other plain column is validated per cell by its reader.
+    /// plain `Str` attribute column the cache would admit
+    /// ([`would_admit`](crate::decoded_cache::DecodedColumnCache::would_admit))
+    /// is UTF-8 validated at decode, since the cache keeps that validation for
+    /// every later hit (ADR-3326 decision 5); every other plain column, a
+    /// non-interactive first touch included, is validated per cell by its
+    /// reader.
     fn decode_block<S: ByteSource + ?Sized>(
         &mut self,
         object_bytes: &S,
@@ -1566,6 +1571,18 @@ impl BlockScan {
                 }
             }
         }
+        let validate: Vec<u32> = match cache {
+            Some(attach) => missed
+                .iter()
+                .copied()
+                .filter(|&cid| {
+                    attach
+                        .cache
+                        .would_admit(&attach.key(loc.block_index, cid), attach.intent)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let mut decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
@@ -1574,7 +1591,7 @@ impl BlockScan {
             &dict_pages,
             &mut self.dicts,
             &self.deferred,
-            &missed,
+            &validate,
             &cached,
             &self.plans,
             self.columns.as_ref(),
@@ -1830,8 +1847,8 @@ pub(crate) fn dict_page_decodes() -> u64 {
 /// every other one is validated in full and counted in the block's
 /// [`DecodedBlock::str_cells_validated`]. A plain `Str` attribute page is
 /// validated at decode, and counted there, only when its column is in
-/// `validate`: the columns the columnar exit will offer to the decoded-column
-/// cache.
+/// `validate`: the missed columns the columnar exit's decoded-column cache
+/// will admit (`DecodedColumnCache::would_admit`).
 #[allow(clippy::too_many_arguments)]
 fn decode_v4_block_with<'s>(
     page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,

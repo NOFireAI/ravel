@@ -703,20 +703,33 @@ when the dictionary is built). For plain columns it was not: the cached
 it read with `std::str::from_utf8`, on a hit as on a miss (#3231).
 
 A plain page of a `Str` attribute column that the columnar exit decodes on
-a cache miss, and so offers to the cache after the decode, is now validated
-once at decode (`PlainColumn::validate_text`,
-`crates/ravel-logseg/src/block.rs`; the set is the reader's `missed` list in
-`BlockScan::decode_block`, `crates/ravel-logseg/src/reader.rs`). A column a
-`Contains` arm tests is never in that list. No other decode validates a plain
-page whole, since nothing would keep that validation for a later read: the
-row path, the columnar exit with no cache attached, and a column not offered
-to the cache keep the raw buffer, and the build validates the cells of the
-surviving rows one by one as before
+a cache miss, and that the cache will admit when it is offered after the
+decode, is now validated once at decode (`PlainColumn::validate_text`,
+`crates/ravel-logseg/src/block.rs`). The set is the reader's `missed` list in
+`BlockScan::decode_block`, `crates/ravel-logseg/src/reader.rs`, narrowed to
+the columns `DecodedColumnCache::would_admit` accepts: under an interactive
+intent every missed column, under any other intent only a column whose key
+holds a ghost record, the second touch. `would_admit` reads the same
+`Inner::intent_admits` check `offer` applies and changes no ghost record
+(`would_admit_agrees_with_offer_and_changes_nothing` in
+`crates/ravel-logseg/src/decoded_cache.rs`). A column a `Contains` arm tests
+is never in the `missed` list. No other decode validates a plain page whole,
+since nothing would keep that validation for a later read: the row path, the
+columnar exit with no cache attached, a column not offered to the cache, and
+a bulk-scan or maintenance first touch, which the cache answers with a ghost
+record and does not admit, keep the raw buffer, and the build validates the
+cells of the surviving rows one by one as before
 (`the_row_path_validates_no_plain_page_at_decode` and
 `an_uncached_selective_scan_validates_only_surviving_cells` in
 `crates/ravel-sql/tests/logs_decoded_cache.rs`,
-`a_plain_page_with_no_cache_is_validated_per_surviving_cell` in
-`crates/ravel-sql/src/logs_scan/batch.rs`). When the whole values buffer is UTF-8
+`a_plain_page_with_no_cache_is_validated_per_surviving_cell` and
+`a_bulk_scan_first_miss_is_validated_per_surviving_cell` in
+`crates/ravel-sql/src/logs_scan/batch.rs`; the last pins a bulk scan's first
+touch at 2 decode-time validations and 4 per build, its second at 8 and 0,
+and its hit at 0). A size, budget or concurrent-admission refusal in `offer`
+can still leave a column validated at decode and not admitted; its
+validation is then spent on this read alone, as it was for every missed
+column before. When the whole values buffer is UTF-8
 and every cell offset is a character boundary, the buffer is kept as a
 `String`, so every cell is UTF-8 and a read is a slice with a boundary
 check (`PlainColumn::text`). `StrCursor::text_at` in
