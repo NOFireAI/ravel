@@ -25,8 +25,8 @@ use ravel_agents_core::identity::{AgentId, Hash256, agent_id};
 use ravel_agents_core::kernel::DerivedIds;
 use ravel_agents_core::keys::{AgentKey, AgentKind};
 use ravel_agents_core::wire::{
-    EffectsResponse, EventsResponse, OperationResponse, OperationStatus, ReconcileRequest,
-    ReconcileResponse, StateResponse, UsageBody,
+    DestroyAgentResponse, EffectsResponse, EventsResponse, OperationResponse, OperationStatus,
+    ReconcileRequest, ReconcileResponse, StateResponse, UsageBody,
 };
 use ravel_agents_store::{AgentStore, Clock, HeadState, StoreLimits};
 use ravel_cli::agents::{
@@ -915,5 +915,133 @@ async fn reconcile_posts_the_decision_with_the_admin_token() {
             "{attach:?} {authorize}"
         );
     }
+    server.abort();
+}
+
+fn destroy_fixture() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../sdk/fixtures/destroy_agent_response.json"
+    );
+    std::fs::read_to_string(path).expect("fixture reads")
+}
+
+fn run_destroy(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+        .args(["agents", "destroy"])
+        .args(args)
+        .env_remove("RAVEL_AGENTS_TOKEN")
+        .output()
+        .expect("run ravel-cli")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_renders_the_response_and_needs_a_token() {
+    let fixture: DestroyAgentResponse =
+        serde_json::from_str(&destroy_fixture()).expect("fixture decodes");
+    assert_eq!(
+        agents::render_destroy(&fixture),
+        "agent 19cd0e6876991314c1b6dbd8bd129297 incarnation 1 destroyed\n\
+         abandoned: inputs 2, active turn yes, effects in doubt 1, effects authorized 0, timers scheduled 1\n"
+    );
+    let repeated = DestroyAgentResponse {
+        destroyed: false,
+        ..fixture.clone()
+    };
+    assert!(
+        agents::render_destroy(&repeated).starts_with(
+            "agent 19cd0e6876991314c1b6dbd8bd129297 incarnation 1 already destroyed\n"
+        ),
+        "{}",
+        agents::render_destroy(&repeated)
+    );
+
+    // Port 1 on loopback answers nothing: a request sent there would be a
+    // transport error, not InvalidAgent.
+    let unroutable =
+        ravel_agents_client::AgentsClient::new("http://127.0.0.1:1", "tok".to_string())
+            .expect("client");
+    for (kind, key) in [("", "o-1"), ("order", "")] {
+        let err = agents::destroy(&unroutable, kind, key, None)
+            .await
+            .expect_err("an invalid agent is refused");
+        assert!(
+            matches!(err, AgentsCliError::InvalidAgent),
+            "{kind:?} {key:?}: {err:?}"
+        );
+    }
+
+    let missing = tokio::task::spawn_blocking(|| {
+        run_destroy(&[
+            "--kind",
+            "order",
+            "--key",
+            "o-1",
+            "--url",
+            "http://127.0.0.1:1",
+        ])
+    })
+    .await
+    .expect("join");
+    assert_eq!(missing.status.code(), Some(2), "clap usage error");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("--token"), "{stderr}");
+    assert!(missing.stdout.is_empty());
+
+    let seen: Seen = Arc::default();
+    let app = Router::new()
+        .route(
+            "/api/v1/agents/destroy",
+            post(
+                |State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    seen.lock().expect("seen").push((auth, body));
+                    ([("content-type", "application/json")], destroy_fixture())
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let url = format!("http://{addr}");
+    let printed = tokio::task::spawn_blocking(move || {
+        run_destroy(&[
+            "--kind",
+            "order",
+            "--key",
+            "o-1",
+            "--incarnation",
+            "1",
+            "--url",
+            &url,
+            "--token",
+            "admin-tok",
+            "--json",
+        ])
+    })
+    .await
+    .expect("join");
+    assert!(
+        printed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let round: DestroyAgentResponse =
+        serde_json::from_slice(&printed.stdout).expect("stdout is the response JSON");
+    assert_eq!(round, fixture);
+    let seen = seen.lock().expect("seen").clone();
+    assert_eq!(
+        seen,
+        [(
+            Some("Bearer admin-tok".to_string()),
+            json!({"agent": {"kind": "order", "key": "o-1"}, "incarnation": 1})
+        )]
+    );
     server.abort();
 }
