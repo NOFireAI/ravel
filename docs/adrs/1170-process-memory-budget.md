@@ -1697,8 +1697,14 @@ catalog on its default unlimited budget. The catalog's snapshot-part and
 name-postings decodes on the resolve path, its column-statistics loads, and
 the fold's decode of a tenant's previous postings object each reserve their
 declared uncompressed length against that one number before they decode.
-The fold's decode of the previous snapshot part is not charged
-(`load_previous_entries` in `crates/ravel-catalog/src/fold.rs`).
+The fold's decode of each previous snapshot part is charged the same way
+(issue #3320): `load_part_entries` in `crates/ravel-catalog/src/fold.rs`
+reserves the part's declared `entries_uncompressed_len` before it decodes
+the part, and the fold holds that reservation for the rest of the fold
+attempt, as long as it holds the decoded entries. A refusal fails that
+tenant's fold tick with `MemoryExhausted` instead of rebuilding from the
+commit layout, and the next tick retries. The key-index rebuild loads parts
+through the same function and is charged the same way.
 
 The measurement it rests on: on the ClickBench hits tenant, folded, at 10
 concurrent connections (issue #3244 comment 6423368682), the decoded part

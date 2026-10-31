@@ -1970,9 +1970,9 @@ impl Catalog {
                             )
                         }
                         // A refused decode reservation fails this fold tick; the
-                        // next tick retries. Rebuilding instead would fetch and
-                        // decode every commit record the HEAD covers, holding more
-                        // memory than the one part that was just refused.
+                        // next tick retries. Rebuilding instead would re-list
+                        // and re-read every hour the HEAD covers, far more than
+                        // the one part that was just refused.
                         Err(CatalogError::MemoryExhausted(exhausted)) => {
                             return Err(CatalogError::MemoryExhausted(exhausted));
                         }
@@ -5703,9 +5703,9 @@ pub(crate) mod tests {
     /// to the catalog's memory budget before decoding it, reserving the
     /// part's declared `entries_uncompressed_len` (not its stored length),
     /// and a refusal fails that fold tick with the typed error rather than
-    /// rebuilding from the commit layout, which would fetch and decode every
-    /// commit record HEAD covers. HEAD is left as it was and the store sees no
-    /// LIST: the refused fold reads HEAD and the part and stops.
+    /// rebuilding from the commit layout, which would re-list and re-read
+    /// every hour HEAD covers. HEAD is left as it was and the store sees no
+    /// LIST, which the rebuild's layout discovery would issue.
     ///
     /// FLIP: drop the `reserve_decoded` call in `Catalog::load_part_entries`
     /// and the fold succeeds, so `expect_err` panics. FLIP: delete the
@@ -5834,7 +5834,7 @@ pub(crate) mod tests {
             snapshot_part_max_entries: 1,
             ..config(1)
         };
-        let unbudgeted = Catalog::new(inner.clone(), cfg.clone()).expect("catalog");
+        let unbudgeted = Catalog::new(inner.clone(), cfg).expect("catalog");
         publish_segment(
             &inner,
             0,
