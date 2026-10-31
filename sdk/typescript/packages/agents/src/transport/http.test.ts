@@ -215,8 +215,13 @@ describe("HttpTransport steps", () => {
   it("recordStep posts worker/step and replays a step from the server's record", async () => {
     const completed = { ...stepResponse, step: { ...stepResponse.step, status: "completed", output: { cents: 250 } } };
     const answers = [stepResponse, completed];
+    // A heartbeat would be answered, so only the request list shows one was sent.
     const { transport, sent } = transportWith((route) =>
-      route === "step" ? { status: 200, body: answers.shift() } : { status: 404 },
+      route === "step"
+        ? { status: 200, body: answers.shift() }
+        : route === "heartbeat"
+          ? { status: 200, body: { lease_expires_unix_ns: "1" } }
+          : { status: 404 },
     );
     const request = decodeWire(StepRecordRequest, stepRequest);
     const first = await transport.recordStep(request);
