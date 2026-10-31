@@ -2708,7 +2708,11 @@ that key section, so it is a slice-surface version and never a client one. A
 slice ticket whose block carries no key stays version 9. Each surface decodes
 its own set: the client surface versions 8, 9 and 10, the slice surface 8, 9
 and 11. A version 11 ticket on the client surface is refused as an
-unsupported version, as a version 10 ticket is on the slice surface. The
+unsupported version, as a version 10 ticket is on the slice surface. Each
+surface mints only its own set: `FlightTicket::encode_for_surface`, which
+`SqlTicketKeys` and the coordinator's slice client mint through, refuses a
+version 10 ticket for the slice surface as `SignalGroupsOnSlice` and a
+version 11 ticket for the client surface as `KeyEqualsOnClient`. The
 version moves because
 the coordinator that mints a ticket and the worker that redeems it can run
 different builds during a rolling upgrade, and the worker has to be able to

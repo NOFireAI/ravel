@@ -197,6 +197,14 @@
 //! 10. The slice surface's own newer version is 11, the pushdown block with
 //! a logs key section; the client surface refuses it in turn.
 //!
+//! Each surface's version set holds at mint as well as at decode:
+//! [`FlightTicket::encode_for_surface`], which [`SqlTicketKeys`] and the
+//! coordinator's slice client mint through, refuses a ticket whose version
+//! the surface does not decode, a version 10 ticket on the slice surface as
+//! [`FlightTicketError::SignalGroupsOnSlice`] and a version 11 ticket on the
+//! client surface as [`FlightTicketError::KeyEqualsOnClient`].
+//! [`FlightTicket::encode_with_pushdown`] names no surface and checks none.
+//!
 //! # Integrity: a keyed MAC, not a checksum
 //!
 //! [`FlightTicket::encode`] and [`FlightTicket::decode`] both take a
@@ -360,9 +368,9 @@
 //!   worker's plan probes KEY_IDX with (ADR-2707 decision 5, issue #2762).
 //!   Written only when the block carries at least one; every other slice
 //!   ticket keeps version 8 or 9. Version 11 is a slice-surface version: it
-//!   follows 9's layout, not 10's, so the slice surface decodes 8, 9 and 11
-//!   and the client surface 8, 9 and 10. A version 9 worker refuses a
-//!   version 11 ticket on its version byte.
+//!   follows 9's layout, not 10's, so the slice surface decodes and mints 8,
+//!   9 and 11 and the client surface 8, 9 and 10. A version 9 worker refuses
+//!   a version 11 ticket on its version byte.
 //!
 //! Every layout change bumps the byte, even though a ticket is ephemeral,
 //! because the build that mints a ticket and the build that redeems it can
@@ -418,6 +426,15 @@ pub(crate) const VERSION_KEY_EQUALS: u8 = 11;
 const CLIENT_VERSIONS: &[u8] = &[VERSION, VERSION_PUSHDOWN, VERSION_GROUPS];
 /// The versions the slice surface decodes. Version 10 is a client ticket.
 const SLICE_VERSIONS: &[u8] = &[VERSION, VERSION_PUSHDOWN, VERSION_KEY_EQUALS];
+
+/// The versions `surface` decodes, and so the versions it mints.
+fn surface_versions(surface: TicketSurface) -> &'static [u8] {
+    match surface {
+        TicketSurface::Client => CLIENT_VERSIONS,
+        TicketSurface::Slice => SLICE_VERSIONS,
+    }
+}
+
 /// Every version this codec decodes when no surface is named.
 const ALL_VERSIONS: &[u8] = &[
     VERSION,
@@ -642,9 +659,8 @@ impl SqlTicketKeys {
         }
     }
 
-    /// Sign `ticket` for `surface` with its mint key. A ticket carrying signal
-    /// groups is refused on the slice surface
-    /// ([`FlightTicketError::SignalGroupsOnSlice`]).
+    /// Sign `ticket` for `surface` with its mint key, refusing a ticket the
+    /// surface would refuse at decode ([`FlightTicket::encode_for_surface`]).
     pub fn encode(
         &self,
         ticket: &FlightTicket,
@@ -661,10 +677,7 @@ impl SqlTicketKeys {
         surface: TicketSurface,
         pushdown: Option<&SlicePushdown>,
     ) -> Result<Vec<u8>, FlightTicketError> {
-        if surface == TicketSurface::Slice && !ticket.signal_groups.is_empty() {
-            return Err(FlightTicketError::SignalGroupsOnSlice);
-        }
-        ticket.encode_with_pushdown(self.mint_key(surface), pushdown)
+        ticket.encode_for_surface(self.mint_key(surface), surface, pushdown)
     }
 
     /// Decode `bytes` as a `surface` ticket, accepting a MAC under any of that
@@ -690,10 +703,7 @@ impl SqlTicketKeys {
         bytes: &[u8],
         surface: TicketSurface,
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
-        let accepted = match surface {
-            TicketSurface::Client => CLIENT_VERSIONS,
-            TicketSurface::Slice => SLICE_VERSIONS,
-        };
+        let accepted = surface_versions(surface);
         for key in self.keys(surface) {
             match FlightTicket::decode_accepting(bytes, key, accepted) {
                 Err(FlightTicketError::MacMismatch) => continue,
@@ -979,9 +989,46 @@ impl FlightTicket {
         self.encode_with_pushdown(key, None)
     }
 
+    /// The version byte [`Self::encode_with_pushdown`] writes for this ticket
+    /// and `pushdown`.
+    fn wire_version(&self, pushdown: Option<&SlicePushdown>) -> u8 {
+        match pushdown {
+            _ if !self.signal_groups.is_empty() => VERSION_GROUPS,
+            Some(p) if p.carries_key_equals() => VERSION_KEY_EQUALS,
+            Some(_) => VERSION_PUSHDOWN,
+            None => VERSION,
+        }
+    }
+
+    /// [`Self::encode_with_pushdown`] for `surface`: a ticket whose version
+    /// `surface` does not decode is refused here, at mint, with the reason
+    /// rather than at the redeeming process's decode. A ticket carrying signal
+    /// groups (version 10) on the slice surface is
+    /// [`FlightTicketError::SignalGroupsOnSlice`]; a pushdown with exact-key
+    /// equalities (version 11) on the client surface is
+    /// [`FlightTicketError::KeyEqualsOnClient`].
+    pub fn encode_for_surface(
+        &self,
+        key: &TicketKey,
+        surface: TicketSurface,
+        pushdown: Option<&SlicePushdown>,
+    ) -> Result<Vec<u8>, FlightTicketError> {
+        let version = self.wire_version(pushdown);
+        if !surface_versions(surface).contains(&version) {
+            return Err(match version {
+                VERSION_GROUPS => FlightTicketError::SignalGroupsOnSlice,
+                VERSION_KEY_EQUALS => FlightTicketError::KeyEqualsOnClient,
+                other => FlightTicketError::UnsupportedVersion(other),
+            });
+        }
+        self.encode_with_pushdown(key, pushdown)
+    }
+
     /// [`Self::encode`], plus the coordinator's scan pushdown for a
     /// distributed slice as the optional trailing block the module doc
     /// describes. `None` produces exactly the bytes [`Self::encode`] does.
+    /// This names no surface and so checks none; a minting process uses
+    /// [`Self::encode_for_surface`] or [`SqlTicketKeys`].
     pub fn encode_with_pushdown(
         &self,
         key: &TicketKey,
@@ -1012,12 +1059,7 @@ impl FlightTicket {
 
         let mut buf = Vec::with_capacity(MIN_ENCODED_LEN + self.statement.len());
         buf.extend_from_slice(&MAGIC);
-        buf.push(match pushdown {
-            _ if grouped => VERSION_GROUPS,
-            Some(p) if p.carries_key_equals() => VERSION_KEY_EQUALS,
-            Some(_) => VERSION_PUSHDOWN,
-            None => VERSION,
-        });
+        buf.push(self.wire_version(pushdown));
         buf.extend_from_slice(&self.tenant.0);
         buf.extend_from_slice(&self.now_ns.to_le_bytes());
         buf.extend_from_slice(&self.deadline_ns.to_le_bytes());
@@ -1516,6 +1558,10 @@ pub enum FlightTicketError {
     /// which never carries one.
     #[error("a slice ticket cannot carry signal groups")]
     SignalGroupsOnSlice,
+    /// A ticket whose slice pushdown carries exact-key equalities (version
+    /// 11) was minted for the client surface, which never decodes one.
+    #[error("a client ticket cannot carry a pushdown with exact-key equalities")]
+    KeyEqualsOnClient,
     /// A version 10 ticket carried fewer than two signal groups.
     #[error("ticket carries {0} signal groups; a grouped ticket carries at least two")]
     TooFewSignalGroups(usize),
@@ -3845,9 +3891,10 @@ mod tests {
     }
 
     /// Version 11 is a slice-surface version. A key-equals ticket signed
-    /// under the client key, so the MAC verifies, is refused on the client
-    /// surface by its version byte, never read under version 10's grouped
-    /// layout; the same ticket signed for the slice surface decodes there.
+    /// under the client key by the surfaceless encoder (the keyring refuses
+    /// to mint it), so the MAC verifies, is refused on the client surface by
+    /// its version byte, never read under version 10's grouped layout; the
+    /// same ticket minted for the slice surface decodes there.
     #[test]
     fn a_version_11_ticket_on_the_client_surface_is_wrong_surface() {
         let keys = SqlTicketKeys::from_file_keys([b"file-key".as_slice()]).expect("one key");
@@ -3855,8 +3902,8 @@ mod tests {
         let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
         logs.key_equals = sample_key_equals();
         let pushdown = SlicePushdown::logs(&logs);
-        let client = keys
-            .encode_with_pushdown(&ticket, TicketSurface::Client, Some(&pushdown))
+        let client = ticket
+            .encode_with_pushdown(keys.mint_key(TicketSurface::Client), Some(&pushdown))
             .expect("encode");
         assert_eq!(client[4], 11);
         assert_eq!(
@@ -4034,6 +4081,113 @@ mod tests {
             keys.encode(&grouped_ticket(), TicketSurface::Slice),
             Err(FlightTicketError::SignalGroupsOnSlice)
         );
+    }
+
+    /// A logs pushdown carrying exact-key equalities: a version 11 block.
+    fn key_equals_pushdown() -> SlicePushdown {
+        let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
+        logs.key_equals = sample_key_equals();
+        SlicePushdown::logs(&logs)
+    }
+
+    /// The client surface refuses at mint the version 11 ticket it refuses at
+    /// decode, with a typed reason.
+    ///
+    /// FLIP: the mint before #3103, which refused only signal groups on the
+    /// slice surface, signs this ticket, and the client decode then refuses
+    /// it as `UnsupportedVersion(11)`.
+    #[test]
+    fn the_client_surface_refuses_to_mint_a_key_equals_pushdown() {
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let pushdown = key_equals_pushdown();
+        assert_eq!(
+            keys.encode_with_pushdown(&sample_ticket(), TicketSurface::Client, Some(&pushdown)),
+            Err(FlightTicketError::KeyEqualsOnClient)
+        );
+        assert_eq!(
+            sample_ticket().encode_for_surface(
+                keys.mint_key(TicketSurface::Client),
+                TicketSurface::Client,
+                Some(&pushdown)
+            ),
+            Err(FlightTicketError::KeyEqualsOnClient)
+        );
+    }
+
+    /// Each surface mints exactly the tickets it decodes. Over every surface,
+    /// ticket shape (flat pins, signal groups) and pushdown (none, a spans
+    /// block, a logs block, a logs block with exact-key equalities), the mint
+    /// either refuses with the expected typed error or writes the expected
+    /// version, and every ticket it writes decodes on its own surface with
+    /// its pushdown. The client surface mints and decodes a version 9
+    /// pushdown; the slice surface mints 9 and 11 and refuses groups.
+    ///
+    /// FLIP: a mint check that refuses every client pushdown fails the client
+    /// rows for the spans and logs blocks; a check on `carries_key_equals`
+    /// alone, rather than on the version the ticket encodes to, refuses the
+    /// grouped ticket with a key-equals block on the client as
+    /// `KeyEqualsOnClient`, though that ticket encodes to version 10, which
+    /// the client decodes, and it is the encoder's
+    /// `SignalGroupsWithPushdown` that refuses it.
+    #[test]
+    fn each_surface_mints_exactly_the_versions_it_decodes() {
+        use FlightTicketError::{KeyEqualsOnClient, SignalGroupsOnSlice, SignalGroupsWithPushdown};
+        use TicketSurface::{Client, Slice};
+
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let pushdowns = [
+            ("none", None),
+            ("spans", Some(sample_spans_pushdown())),
+            ("logs", Some(sample_logs_pushdown())),
+            ("key-equals", Some(key_equals_pushdown())),
+        ];
+        let expected: [(TicketSurface, bool, [Result<u8, FlightTicketError>; 4]); 4] = [
+            (Client, false, [Ok(8), Ok(9), Ok(9), Err(KeyEqualsOnClient)]),
+            (
+                Client,
+                true,
+                [
+                    Ok(10),
+                    Err(SignalGroupsWithPushdown),
+                    Err(SignalGroupsWithPushdown),
+                    Err(SignalGroupsWithPushdown),
+                ],
+            ),
+            (Slice, false, [Ok(8), Ok(9), Ok(9), Ok(11)]),
+            (
+                Slice,
+                true,
+                [
+                    Err(SignalGroupsOnSlice),
+                    Err(SignalGroupsOnSlice),
+                    Err(SignalGroupsOnSlice),
+                    Err(SignalGroupsOnSlice),
+                ],
+            ),
+        ];
+        for (surface, grouped, outcomes) in expected {
+            let ticket = if grouped {
+                grouped_ticket()
+            } else {
+                sample_ticket()
+            };
+            for ((name, pushdown), outcome) in pushdowns.iter().zip(outcomes) {
+                let case = format!("{surface:?} grouped={grouped} pushdown={name}");
+                let minted = keys.encode_with_pushdown(&ticket, surface, pushdown.as_ref());
+                match outcome {
+                    Err(err) => assert_eq!(minted, Err(err), "{case}"),
+                    Ok(version) => {
+                        let bytes = minted.expect(&case);
+                        assert_eq!(bytes[4], version, "{case}");
+                        assert!(surface_versions(surface).contains(&version), "{case}");
+                        let (decoded, decoded_pushdown) =
+                            keys.decode_with_pushdown(&bytes, surface).expect(&case);
+                        assert_eq!(decoded, ticket, "{case}");
+                        assert_eq!(decoded_pushdown, *pushdown, "{case}");
+                    }
+                }
+            }
+        }
     }
 
     /// The tags are the wire contract: samples 1, logs 2, spans 3, alerts 4,
