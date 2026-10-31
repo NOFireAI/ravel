@@ -1816,3 +1816,47 @@ async fn a_reconcile_whose_head_write_times_out_answers_the_reconcile_hint() {
     assert_eq!(reconcile_audit_records(store.as_ref()).await.len(), 2);
     running.shutdown().await.expect("clean shutdown");
 }
+
+/// A destroy whose audit record cannot be written (every audit data write
+/// is refused, so the required-mode pipeline answers the submission with an
+/// error) is `store_unavailable` and changes nothing: no HEAD publication,
+/// the agent still active in incarnation 1, and no record.
+#[tokio::test]
+async fn a_destroy_whose_audit_record_is_refused_leaves_the_agent_active() {
+    let audit_data = format!("t/{}/u/l0/", TenantId::new(TENANT).hash().to_hex());
+    let faults = Arc::new(FaultStore::new(
+        MemoryStore::new(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("refused".to_string()))
+                .with_key_contains(audit_data),
+        ),
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let key = "o-unaudited";
+    api.ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
+        .await;
+
+    let before = api.scrape().await;
+    let (status, refused) = api.post(ADMIN, "destroy", &destroy_body(key, None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert_eq!(refused["code"], json!("store_unavailable"), "{refused}");
+    assert!(faults.fault_count(Op::Put, FaultKind::Permanent) >= 1);
+    let after = api.scrape().await;
+    let publish = "phase=\"publish\"";
+    assert_eq!(
+        value(&after, "ravel_agents_store_cas_total", publish),
+        value(&before, "ravel_agents_store_cas_total", publish)
+    );
+    let state = api
+        .ok_get(CLIENT, &format!("state?kind=order&key={key}"))
+        .await;
+    assert_eq!(state["incarnation"], json!(1), "{state}");
+    assert!(
+        audit_records(store.as_ref(), "agents_destroy")
+            .await
+            .is_empty()
+    );
+    running.shutdown().await.expect("clean shutdown");
+}
