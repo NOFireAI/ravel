@@ -17,12 +17,19 @@ import {
   CancelResponse,
   CreateAgentRequest,
   CreateAgentResponse,
+  DestroyAgentRequest,
+  DestroyAgentResponse,
+  type EffectBody,
+  EffectInspectResponse,
+  EffectsResponse,
   encodeWire,
   ErrorBody,
   EventsRequest,
   EventsResponse,
   OperationResponse,
   type OperationStatus,
+  ReconcileRequest,
+  ReconcileResponse,
   ResolveRequest,
   ResolveResponse,
   type ResultBody,
@@ -41,7 +48,20 @@ export type {
   PayloadOf,
   ResultOf,
 } from "../types.js";
-export type { OperationStatus } from "../wire/index.js";
+export type {
+  AbandonedCounts,
+  AttemptState,
+  DestroyAgentResponse,
+  EffectAttemptBody,
+  EffectBody,
+  EffectEvidenceBody,
+  EffectInspectResponse,
+  EffectState,
+  OperationStatus,
+  Policy,
+  ReconcileRequest,
+  ReconcileResponse,
+} from "../wire/index.js";
 
 /** The longest `wait_ms` the server honours on one result or call request. */
 const MAX_WAIT_MS = 20_000;
@@ -65,6 +85,11 @@ export interface RequestOptions {
   readonly signal?: AbortSignal;
   /** Past the deadline the call throws `OutcomeUnknown` carrying the handle. */
   readonly deadlineMs?: number;
+}
+
+export interface DestroyOptions extends RequestOptions {
+  /** Pin the incarnation to destroy; absent destroys the current one. */
+  readonly incarnation?: number;
 }
 
 export interface SendOptions extends RequestOptions {
@@ -139,7 +164,8 @@ export interface AgentState<S> {
   readonly agentId: string;
   readonly incarnation: number;
   readonly stateVersion: number;
-  readonly state: S;
+  /** Null for an agent that has never committed a turn. */
+  readonly state: S | null;
 }
 
 export interface AgentClient<A extends AnyAgentDefinition> {
@@ -160,6 +186,18 @@ export interface AgentClient<A extends AnyAgentDefinition> {
   ): Promise<ResultOf<A, K>>;
   operation<K extends MessageNames<A>>(handler: K, operationId: string): OperationHandle<ResultOf<A, K>>;
   state(options?: RequestOptions): Promise<AgentState<z.output<A["state"]>>>;
+  /** The agent's effect journal, one entry per step's effect. */
+  effects(options?: RequestOptions): Promise<EffectBody[]>;
+  /**
+   * Tombstone the agent: its handles, leases and effects answer `AgentGone`
+   * from then on, and nothing it holds is settled or cancelled. Pass
+   * `incarnation` to pin it. Needs a token holding `agents_admin`. `AgentGone`
+   * here means there is no such agent, or the pinned incarnation is not the
+   * current one. Sent once and never retried: a resend without `incarnation`
+   * could tombstone an incarnation created in between, so a lost answer is
+   * `OutcomeUnknown` and the caller reads `state()` before deciding again.
+   */
+  destroy(options?: DestroyOptions): Promise<DestroyAgentResponse>;
 }
 
 export interface RavelAgentsClient {
@@ -169,6 +207,17 @@ export interface RavelAgentsClient {
    * compile time.
    */
   agent<A extends AnyAgentDefinition = never>(kind: A["name"], key: string): AgentClient<A>;
+  /** Inspect one effect by its effect handle: its attempts, result and evidence. */
+  effect(handle: string, options?: RequestOptions): Promise<EffectInspectResponse>;
+  /**
+   * Settle an effect in doubt, named by its effect handle: `record_result`
+   * attaches a result, `retry` authorizes another attempt. Needs a token
+   * holding `agents_admin`. Sent once and never retried, because a resend
+   * that reaches another server process answers `OwnershipLost` for a
+   * decision that applied: after `OutcomeUnknown`, read `effect(handle)`
+   * before deciding again.
+   */
+  reconcile(request: ReconcileRequest, options?: RequestOptions): Promise<ReconcileResponse>;
 }
 
 interface Deadline {
@@ -248,9 +297,10 @@ export function createClient(options: ClientOptions): RavelAgentsClient {
   const retryDelayMs = options.retryDelayMs ?? 100;
 
   /**
-   * One request, retried on a network failure, an untyped 5xx, or a typed
-   * error whose retry hint is `backoff`. The body is serialized once, so
-   * every attempt sends the same bytes under the same request id.
+   * One request, retried up to `maxRetries` times on a network failure, an
+   * untyped 5xx, or a typed error whose retry hint is `backoff`. The body is
+   * serialized once, so every attempt sends the same bytes under the same
+   * request id.
    */
   async function exchange<S extends z.ZodType>(
     method: "GET" | "POST",
@@ -259,10 +309,11 @@ export function createClient(options: ClientOptions): RavelAgentsClient {
     body: string | undefined,
     schema: S,
     signal: AbortSignal,
+    maxRetries: number = retries,
   ): Promise<z.output<S>> {
     const url = `${base}${API}/${route}${query === undefined ? "" : `?${new URLSearchParams(query).toString()}`}`;
     let last: unknown;
-    for (let attempt = 0; attempt <= retries; attempt += 1) {
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       if (attempt > 0) await sleep(retryDelayMs * 2 ** (attempt - 1), signal);
       let response: Response;
       try {
@@ -514,11 +565,38 @@ export function createClient(options: ClientOptions): RavelAgentsClient {
             agentId: r.agent_id,
             incarnation: r.incarnation,
             stateVersion: r.state_version,
-            state: r.state as z.output<A["state"]>,
+            // The wire carries JSON; the agent's schema typed it when it committed.
+            state: r.state as z.output<A["state"]> | null,
           };
+        }),
+      effects: (request) =>
+        bounded(request, undefined, async (signal) => {
+          const r = await exchange("GET", "effects", { kind, key }, undefined, EffectsResponse, signal);
+          return r.effects;
+        }),
+      destroy: (request) =>
+        bounded(request, undefined, (signal) => {
+          const body = JSON.stringify(
+            encodeWire(DestroyAgentRequest, {
+              agent: ref,
+              ...(request?.incarnation === undefined ? {} : { incarnation: request.incarnation }),
+            }),
+          );
+          return exchange("POST", "destroy", undefined, body, DestroyAgentResponse, signal, 0);
         }),
     };
   }
 
-  return { agent };
+  return {
+    agent,
+    effect: (handle, request) =>
+      bounded(request, undefined, (signal) =>
+        exchange("GET", `effects/${encodeURIComponent(handle)}`, undefined, undefined, EffectInspectResponse, signal),
+      ),
+    reconcile: (decision, request) =>
+      bounded(request, undefined, (signal) => {
+        const body = JSON.stringify(encodeWire(ReconcileRequest, decision));
+        return exchange("POST", "reconcile", undefined, body, ReconcileResponse, signal, 0);
+      }),
+  };
 }
