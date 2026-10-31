@@ -511,6 +511,18 @@ type BucketListing = (u32, u32, Vec<ObjectMeta>);
 /// entries drop.
 pub(crate) type ChargedEntries = (Vec<SnapshotEntry>, Reservation);
 
+/// Whether `err` is `Catalog::load_part_entries` refusing a part whose header
+/// names another tenant, the one load failure that is an isolation breach.
+fn is_foreign_part(err: &CatalogError) -> bool {
+    matches!(
+        err,
+        CatalogError::FieldMismatch {
+            field: "tenant_hash",
+            ..
+        }
+    )
+}
+
 fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
     (
         entry.ingest_hour_bucket,
@@ -1917,8 +1929,8 @@ impl Catalog {
                         .await?;
                     counters.list_requests += held_buckets.len() as u64;
                     let (has_unfolded, probe_cache) = self
-                        .held_open_has_unfolded(head, held, &listings, &mut counters)
-                        .await;
+                        .held_open_has_unfolded(tenant, head, held, &listings, &mut counters)
+                        .await?;
                     held_open_probe_cache = probe_cache;
                     // A quiet held range returns before the full snapshot
                     // load, unless a refold request is queued: the targeted
@@ -1951,7 +1963,12 @@ impl Catalog {
             let (mut entries, buckets, rebuilt, previous_entries_len, _previous_charge) =
                 match &head_state {
                     HeadState::Valid { head, .. } => match self
-                        .load_previous_entries(head, &mut held_open_probe_cache, &mut counters)
+                        .load_previous_entries(
+                            tenant,
+                            head,
+                            &mut held_open_probe_cache,
+                            &mut counters,
+                        )
                         .await
                     {
                         Ok((entries, previous_charge)) => {
@@ -1976,6 +1993,10 @@ impl Catalog {
                         Err(CatalogError::MemoryExhausted(exhausted)) => {
                             return Err(CatalogError::MemoryExhausted(exhausted));
                         }
+                        // A part naming another tenant is an isolation breach
+                        // (ADR-0050 §2), which a rebuild would leave unreported,
+                        // the same answer `load_previous_postings` gives.
+                        Err(err) if is_foreign_part(&err) => return Err(err),
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
@@ -3260,9 +3281,10 @@ impl Catalog {
 
     /// Load and validate every part HEAD names, verifying each part's bytes
     /// against its recorded blake3 before trusting its entries. Any
-    /// failure (GET error, hash mismatch, decode error, refused decode
-    /// reservation) is returned to the caller, which fails the fold on a
-    /// refused reservation and falls back to a full rebuild on anything else.
+    /// failure (GET error, hash mismatch, a part naming another tenant, decode
+    /// error, refused decode reservation) is returned to the caller, which
+    /// fails the fold on a foreign part or a refused reservation and falls
+    /// back to a full rebuild on anything else.
     ///
     /// Returns the entries together with every part's decode reservation; the
     /// caller holds the reservations for as long as it holds the entries.
@@ -3273,6 +3295,7 @@ impl Catalog {
     /// out of it, reservation included. Empty on every other path.
     async fn load_previous_entries(
         &self,
+        tenant: &TenantHash,
         head: &SnapshotHead,
         probe_cache: &mut HashMap<String, ChargedEntries>,
         counters: &mut RequestCounters,
@@ -3282,7 +3305,7 @@ impl Catalog {
         for part_ref in &head.parts {
             let (part_entries, reservation) = match probe_cache.remove(&part_ref.key) {
                 Some(cached) => cached,
-                None => self.load_part_entries(part_ref, counters).await?,
+                None => self.load_part_entries(tenant, part_ref, counters).await?,
             };
             entries.extend(part_entries);
             reservations.push(reservation);
@@ -3293,6 +3316,10 @@ impl Catalog {
     /// Load one part HEAD names, verifying its bytes against the recorded
     /// blake3 before decoding them.
     ///
+    /// A part whose header names a tenant other than `tenant` is an isolation
+    /// breach (ADR-0050 §2): it is counted and returned as a `tenant_hash`
+    /// [`CatalogError::FieldMismatch`], before anything is reserved.
+    ///
     /// The decoded entry body is charged to the catalog's memory budget
     /// before the decode (ADR-1170, the catalog decode charge amendment), the
     /// same way the resolve path charges a part: the returned reservation
@@ -3300,6 +3327,7 @@ impl Catalog {
     /// is [`CatalogError::MemoryExhausted`].
     pub(crate) async fn load_part_entries(
         &self,
+        tenant: &TenantHash,
         part_ref: &SnapshotPartRef,
         counters: &mut RequestCounters,
     ) -> Result<ChargedEntries, CatalogError> {
@@ -3316,6 +3344,20 @@ impl Catalog {
         }
         let limits = PartLimits::default();
         let header = snapshot_format::decode_part_header(&got.data)?;
+        // ADR-0050 §2, before the reservation below, exactly as
+        // `snapshot_resolve` checks a part: the HEAD's blake3 binds the bytes
+        // to the HEAD, and only the header's tenant_hash binds them to the
+        // tenant. Checked any later, a budget with no room would refuse first
+        // and report memory pressure where a cross-tenant part was.
+        if header.tenant_hash.as_slice() != tenant.0.as_slice() {
+            self.record_isolation_breach();
+            return Err(CatalogError::FieldMismatch {
+                key: part_ref.key.clone(),
+                field: "tenant_hash",
+                expected: tenant.to_hex(),
+                actual: hex::encode(&header.tenant_hash),
+            });
+        }
         let reservation = self.reserve_decoded(
             header.entries_uncompressed_len,
             limits.max_snapshot_part_bytes,
@@ -3331,7 +3373,9 @@ impl Catalog {
     /// listings name no commit record. A part that cannot be read answers
     /// true, so the caller takes the full fold path, whose own load of the
     /// same part fails and rebuilds, or fails the fold when the failure is a
-    /// refused decode reservation.
+    /// refused decode reservation. A part naming another tenant is returned
+    /// as the error instead, failing the fold here, so the breach is counted
+    /// once rather than again by the main load.
     ///
     /// Also returns every part read here with its decode reservation, keyed
     /// by part object key, so `load_previous_entries` does not read it again
@@ -3339,11 +3383,12 @@ impl Catalog {
     /// again and answers the same failure the same way.
     async fn held_open_has_unfolded(
         &self,
+        tenant: &TenantHash,
         head: &SnapshotHead,
         held: (u32, u32),
         listings: &[BucketListing],
         counters: &mut RequestCounters,
-    ) -> (bool, HashMap<String, ChargedEntries>) {
+    ) -> Result<(bool, HashMap<String, ChargedEntries>), CatalogError> {
         let names_a_commit = listings.iter().any(|(_, _, listing)| {
             listing.iter().any(|meta| {
                 matches!(
@@ -3353,7 +3398,7 @@ impl Catalog {
             })
         });
         if !names_a_commit {
-            return (false, HashMap::new());
+            return Ok((false, HashMap::new()));
         }
         let mut folded: HashSet<EntryIdentity> = HashSet::new();
         let mut loaded: HashMap<String, ChargedEntries> = HashMap::new();
@@ -3362,7 +3407,7 @@ impl Catalog {
             .iter()
             .filter(|part| part.min_hour <= held.1 && part.watermark_hour >= held.0)
         {
-            match self.load_part_entries(part_ref, counters).await {
+            match self.load_part_entries(tenant, part_ref, counters).await {
                 Ok(charged) => {
                     folded.extend(
                         charged
@@ -3373,13 +3418,14 @@ impl Catalog {
                     );
                     loaded.insert(part_ref.key.clone(), charged);
                 }
-                Err(_) => return (true, loaded),
+                Err(err) if is_foreign_part(&err) => return Err(err),
+                Err(_) => return Ok((true, loaded)),
             }
         }
         let has_unfolded = listings
             .iter()
             .any(|(_, _, listing)| lists_an_unfolded_commit(listing, |id| folded.contains(id)));
-        (has_unfolded, loaded)
+        Ok((has_unfolded, loaded))
     }
 
     /// Load and verify the previous fold's postings object before trusting
@@ -5962,6 +6008,211 @@ pub(crate) mod tests {
             other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
         }
         assert_eq!(budget.reserved(), 0);
+        assert_eq!(metrics_head_bytes(&inner).await, head_before);
+        assert_eq!(
+            list_calls(&store),
+            3,
+            "only the held-open hours H-2..=H are listed, once each"
+        );
+    }
+
+    const FOREIGN_TENANT: [u8; 16] = [0xff; 16];
+
+    /// Rewrite part `index` of `signal`'s HEAD as the same entries under
+    /// [`FOREIGN_TENANT`], re-stamping the part ref's blake3 and size, and PUT
+    /// both, so the HEAD's blake3 check passes and only the part header's
+    /// tenant binding can reject the part. Returns the part's key.
+    pub(crate) async fn repoint_head_at_foreign_part(
+        store: &dyn ObjectStoreBackend,
+        signal: Signal,
+        index: usize,
+    ) -> String {
+        assert_ne!(FOREIGN_TENANT, tenant().0, "the fixture tenant differs");
+        let mut head = read_signal_head(store, signal).await;
+        let key = head.parts[index].key.clone();
+        let original = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let decoded = snapshot_format::decode_part(&original, &PartLimits::default())
+            .expect("the fixture part decodes");
+        let header = &decoded.header;
+        let foreign = snapshot_format::encode_part_ranged(
+            FOREIGN_TENANT,
+            header.signal,
+            header.shard_count,
+            header.min_hour,
+            header.watermark_hour,
+            &decoded.entries,
+        )
+        .expect("re-encode the fixture part for a foreign tenant");
+        let foreign_header =
+            snapshot_format::decode_part_header(&foreign).expect("foreign header decodes");
+        assert_eq!(foreign_header.tenant_hash, FOREIGN_TENANT.to_vec());
+        assert_eq!(
+            foreign_header.entries_uncompressed_len, header.entries_uncompressed_len,
+            "only the tenant differs, so the part's charge is unchanged"
+        );
+        let part_ref = &mut head.parts[index];
+        part_ref.blake3 = blake3::hash(&foreign).as_bytes().to_vec();
+        part_ref.size = foreign.len() as u64;
+        store
+            .put(&key, Bytes::from(foreign), PutOptions::default())
+            .await
+            .expect("put the foreign part");
+        let head_bytes = snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the re-pointed HEAD");
+        key
+    }
+
+    /// Assert `err` is the `tenant_hash` mismatch `load_part_entries` returns
+    /// for the foreign part at `key`, the error the resolve path returns for
+    /// the same part.
+    pub(crate) fn assert_foreign_part_error(err: &CatalogError, key: &str) {
+        match err {
+            CatalogError::FieldMismatch {
+                key: got_key,
+                field,
+                expected,
+                actual,
+            } => {
+                assert_eq!(*field, "tenant_hash");
+                assert_eq!(got_key, key);
+                assert_eq!(*expected, tenant().to_hex());
+                assert_eq!(*actual, hex::encode(FOREIGN_TENANT));
+            }
+            other => panic!("expected a tenant_hash FieldMismatch, got {other:?}"),
+        }
+    }
+
+    /// Issue #3539, ADR-0050 §2: the fold's load of a previous snapshot part
+    /// checks the part header's `tenant_hash`, as the resolve path and
+    /// `load_previous_postings` do, and a part naming another tenant fails the
+    /// fold as a counted isolation breach rather than a rebuild from the
+    /// commit layout that would leave it unreported. HEAD is left as it was
+    /// and the store sees no LIST, which the rebuild's layout discovery would
+    /// issue.
+    ///
+    /// FLIP: delete the `tenant_hash` comparison in
+    /// `Catalog::load_part_entries` and the second fold succeeds, so
+    /// `expect_err` panics. FLIP: delete the `Err(err) if
+    /// is_foreign_part(&err) => return Err(err)` arm after
+    /// `load_previous_entries` in `fold_with_refold_request` and the breach
+    /// falls into the rebuild, which succeeds, so `expect_err` panics. FLIP:
+    /// drop the `record_isolation_breach` call in `load_part_entries` and
+    /// `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_on_a_previous_part_fails_the_fold() {
+        assert_foreign_previous_part_fails_the_fold(None).await;
+    }
+
+    /// The part's tenant check runs before its decode reservation: under a
+    /// budget with no room at all the fold still reports the breach, not
+    /// memory pressure, and charges nothing.
+    ///
+    /// FLIP: move the `tenant_hash` comparison in `Catalog::load_part_entries`
+    /// below its `reserve_decoded` call, or delete it, and the fold fails with
+    /// `MemoryExhausted` instead, so `assert_foreign_part_error` panics.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_on_a_part_is_reported_before_the_part_reservation() {
+        assert_foreign_previous_part_fails_the_fold(Some(0)).await;
+    }
+
+    /// `previous_part_baseline`, with its one part re-pointed at a foreign
+    /// copy, folded again under a budget of `budget` bytes (unlimited when
+    /// `None`): the fold fails with the part's `tenant_hash` mismatch and one
+    /// counted breach, leaves HEAD as it was, LISTs nothing and holds no
+    /// charge.
+    async fn assert_foreign_previous_part_fails_the_fold(budget: Option<u64>) {
+        let inner = Arc::new(MemoryStore::new());
+        previous_part_baseline(&inner).await;
+        let part_key = repoint_head_at_foreign_part(inner.as_ref(), Signal::Metrics, 0).await;
+        let head_before = metrics_head_bytes(&inner).await;
+
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let budget = budget.map(|limit| Arc::new(ravel_memory::MemoryBudget::new(limit)));
+        let catalog = match &budget {
+            Some(budget) => catalog.with_memory_budget(budget.clone()),
+            None => catalog,
+        };
+        let err = fold_after_previous_part(&catalog)
+            .await
+            .expect_err("a previous part naming another tenant must fail the fold");
+        assert_foreign_part_error(&err, &part_key);
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the breach is counted once, not swallowed by a rebuild"
+        );
+        assert_eq!(
+            metrics_head_bytes(&inner).await,
+            head_before,
+            "the failed fold publishes no HEAD"
+        );
+        assert_eq!(list_calls(&store), 0, "no commit-layout re-listing ran");
+        if let Some(budget) = budget {
+            assert_eq!(budget.reserved(), 0, "the breach charges nothing");
+        }
+    }
+
+    /// Issue #3539: the held-open pre-check (`held_open_has_unfolded`) loads
+    /// a part through the same checked load, and a part naming another tenant
+    /// fails the fold from there, counted once: the main load never reads the
+    /// part again to count it a second time. The only LISTs are the
+    /// pre-check's re-listing of the three held-open hours.
+    ///
+    /// FLIP: delete the `tenant_hash` comparison in
+    /// `Catalog::load_part_entries` and the fold succeeds, so `expect_err`
+    /// panics. FLIP: delete the `Err(err) if is_foreign_part(&err) => return
+    /// Err(err)` arm in `held_open_has_unfolded` and the probe's breach sends
+    /// the fold down the full path, whose load counts it again, so
+    /// `isolation_breaches()` reads 2.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_on_a_held_open_part_fails_the_fold_once() {
+        const H: u32 = 480_000;
+        let inner = Arc::new(MemoryStore::new());
+        let unbudgeted = Catalog::new(inner.clone(), config(1)).expect("catalog");
+        let now = now_inside(H);
+        publish_segment(&inner, 0, Uuid::new_v4(), 1, H, now).await;
+        let sealed = fold_sealing(&unbudgeted, now, Some(H)).await;
+        assert_eq!(sealed.watermark_hour, Some(H), "{sealed:?}");
+        assert_eq!(read_metrics_head(&inner).await.parts.len(), 1);
+        let part_key = repoint_head_at_foreign_part(inner.as_ref(), Signal::Metrics, 0).await;
+        let head_before = metrics_head_bytes(&inner).await;
+        publish_segment(&inner, 0, Uuid::new_v4(), 2, H, now + 1).await;
+
+        let store = Arc::new(InstrumentedStore::new(inner.clone()));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let later = now + 5 * 60 * 1_000_000_000;
+        assert_eq!(catalog.margin_watermark_hour(later), Some(H - 3));
+        let err = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                None,
+            )
+            .await
+            .expect_err("a held-open part naming another tenant must fail the fold");
+        assert_foreign_part_error(&err, &part_key);
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the probe's breach is the only one counted"
+        );
         assert_eq!(metrics_head_bytes(&inner).await, head_before);
         assert_eq!(
             list_calls(&store),
