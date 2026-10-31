@@ -1310,17 +1310,31 @@ is the text before the LAST `;`. Each capability is absent by default.
 `acme;ddl,agents,agents_worker` all name tenant `acme`, each granting the
 capabilities it lists.
 
-- A name other than the five above, a name listed twice, an empty list or
-  list entry, or an empty tenant before the `;` refuses startup. Matching is
-  exact: `AGENTS`, `agent` and `agents-worker` are refused. The error names
-  the flag position or the line number in the token file, never the text of
-  the pair.
+The list may also hold one `subject=LABEL` entry, beside or instead of the
+capability words. It names who, within the tenant, the token belongs to. The
+label is 1 to 64 bytes drawn from `A-Z a-z 0-9 . _ @ + -`, and the entry
+appears at most once. `acme;ddl,subject=alice` names tenant `acme`, grants
+`ddl`, and carries subject `alice`; `acme;subject=alice` names tenant `acme`
+with subject `alice` and no capability. A subject grants nothing. It is not a
+secret: it is meant for audit records only, and the agents and query audit
+records carry it once the server records it. This release records it
+nowhere.
+
+- A name other than the five above and `subject=LABEL`, a name listed twice,
+  a second `subject=` entry, a `subject` entry with no label or with a label
+  outside the bound, an empty list or list entry, or an empty tenant before
+  the `;` refuses startup. Matching is exact: `AGENTS`, `agent` and
+  `agents-worker` are refused. The error names the flag position or the line
+  number in the token file, never the text of the pair.
+- A tenant whose own last `;` segment holds a capability word, `subject` or a
+  `subject=` entry refuses startup: `acme;subject=x;ddl` is refused rather
+  than naming tenant `acme;subject=x`.
 - A tenant with no `;` is unchanged and carries no capability.
 - [Background](#background) links the decisions behind this.
 
 `ravel-ingest-router` accepts the same `--tenant-token` spelling and strips
 the capability list, so it routes `acme;ddl,ipcrypt,agents` by the tenant
-`acme`. It never grants a capability.
+`acme`. It never grants a capability and never records a subject.
 
 Tokens in the durable `sys/auth` map cannot carry a capability. The map is
 read without suffix parsing, so an entry written as `acme;ddl` names a tenant

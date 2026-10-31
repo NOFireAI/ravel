@@ -112,9 +112,12 @@ pub struct Cli {
     // --- Canonical-tenant resolver chain (only used under that key source) ----
     /// Repeatable `token=tenant` pair for the static bearer resolver. The
     /// tenant may carry a trailing capability list (`;ddl`, `;ipcrypt` or
-    /// `;ddl,ipcrypt`; ADR-2040 decision 4, ADR-2993 decision 6), accepted for
-    /// parity with `ravel-server`'s `--tenant-token`, but stripped here: this
-    /// router routes by the bare tenant and never grants a capability.
+    /// `;ddl,ipcrypt`; ADR-2040 decision 4, ADR-2993 decision 6) and one
+    /// `subject=LABEL` entry (1 to 64 bytes from `A-Z a-z 0-9 . _ @ + -`, at
+    /// most once; ADR-3541 decision 3), accepted for parity with
+    /// `ravel-server`'s `--tenant-token`, but stripped here: this router
+    /// routes by the bare tenant, never grants a capability and never records
+    /// the subject.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 

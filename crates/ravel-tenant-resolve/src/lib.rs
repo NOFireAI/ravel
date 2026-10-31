@@ -127,7 +127,9 @@ pub fn parse_subject_label(label: &str) -> Result<Subject, TenantSuffixError> {
 /// refuses startup instead of silently granting nothing or naming an empty
 /// tenant. So is a tenant whose own last `;` segment names a capability or a
 /// subject entry (`acme;ddl;ipcrypt`, `acme;subject=al;ce`), which would
-/// otherwise name tenant `acme;ddl` rather than `acme`.
+/// otherwise name tenant `acme;ddl` rather than `acme`. A tenant segment that
+/// is `subject` or starts with `subject=` counts as a subject entry, so
+/// `acme;subject=x;ddl` refuses rather than naming tenant `acme;subject=x`.
 ///
 /// `ravel-server` and `ravel-ingest-router` both call it, so the two accept
 /// and refuse the same spellings. The router discards the capabilities and
@@ -381,9 +383,9 @@ impl SubjectDropReason {
     }
 }
 
-/// Counts of subjects a source dropped to absent, keyed by source and reason,
-/// behind `ravel_auth_subject_dropped_total{source,reason}` (ADR-3541
-/// decision 3).
+/// Counts of subjects a source dropped to absent, keyed by source and reason
+/// (ADR-3541 decision 3). Nothing exports them yet: the server exports them as
+/// `ravel_auth_subject_dropped_total{source,reason}` in T2 (#3576).
 #[derive(Debug, Default)]
 pub struct SubjectDropCounters {
     counts: [[AtomicU64; SubjectDropReason::ALL.len()]; SubjectSource::ALL.len()],
