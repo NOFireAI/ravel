@@ -1480,6 +1480,113 @@ mod tests {
         ));
     }
 
+    /// ADR-3492 decision 2 (#3557): the columnar batch the OTLP flush builds
+    /// from normalized records in place, through this crate's `LogRowRef`
+    /// impl, writes the row writer's object byte for byte, here for a request
+    /// whose two `ScopeLogs` share a stream through two separate blobs.
+    #[test]
+    fn normalized_records_write_the_row_writers_object_through_try_from_rows() {
+        use ravel_logseg::{ColumnarLogBatch, ObjectIdentity, RlogConfig, RlogWriter};
+
+        let traced = |mut r: LogRecord, n: u8| {
+            r.trace_id = vec![n; 16];
+            r.span_id = vec![n; 8];
+            r
+        };
+        let rec = |attrs: Vec<KeyValue>, ts: u64| {
+            record(
+                Some(any(AnyValueVariant::StringValue(format!("line {ts}")))),
+                attrs,
+                ts,
+            )
+        };
+        let code = |n: i64| kv("code", AnyValueVariant::IntValue(n));
+        let out = normalize(request(vec![
+            resource_logs(
+                vec![string_kv("service.name", "api")],
+                vec![
+                    scope_logs(
+                        "lib",
+                        "1.0",
+                        vec![
+                            traced(rec(vec![string_kv("route", "/a"), code(200)], 1), 1),
+                            rec(vec![code(404), string_kv("route", "/b")], 2),
+                        ],
+                    ),
+                    scope_logs(
+                        "lib",
+                        "1.0",
+                        vec![
+                            rec(vec![string_kv("code", "x"), code(500), code(501)], 3),
+                            traced(rec(vec![], 4), 2),
+                        ],
+                    ),
+                ],
+            ),
+            resource_logs(
+                vec![string_kv("service.name", "db")],
+                vec![scope_logs(
+                    "lib",
+                    "1.0",
+                    vec![rec(vec![string_kv("zone", "eu")], 5)],
+                )],
+            ),
+        ]));
+        let records = out.records;
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[0].stream_id, records[2].stream_id);
+        assert!(!Arc::ptr_eq(
+            &records[0].stream_attrs,
+            &records[2].stream_attrs
+        ));
+        assert_ne!(records[0].stream_id, records[4].stream_id);
+
+        let identity = ObjectIdentity {
+            tenant_hash: [3; 16],
+            shard: 1,
+            writer_id: [7; 16],
+            writer_epoch: 2,
+            writer_seq: 11,
+        };
+        let owned: Vec<ravel_logseg::LogRecord> = records
+            .iter()
+            .map(|r| ravel_logseg::LogRecord {
+                stream_id: r.stream_id,
+                stream_attrs: r.stream_attrs.to_vec(),
+                ts_ns: r.ts_ns,
+                observed_ts_ns: r.observed_ts_ns,
+                severity_num: r.severity_num,
+                severity_text: r.severity_text.clone(),
+                body: r.body.clone(),
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                flags: r.flags,
+                attrs: r.attrs.clone(),
+            })
+            .collect();
+        let mut row_writer = RlogWriter::new(RlogConfig::default(), identity);
+        for r in owned.clone() {
+            row_writer.push(r).expect("row push");
+        }
+        let row = row_writer.finish().expect("row finish");
+
+        let batch = ColumnarLogBatch::try_from_rows(&records).expect("batch");
+        assert_eq!(
+            batch,
+            ColumnarLogBatch::try_from_records(&owned).expect("records batch")
+        );
+        assert_eq!(batch.residual_attrs[2].len(), 1, "the second code=501");
+        let mut columnar_writer = RlogWriter::new(RlogConfig::default(), identity);
+        columnar_writer.push_columnar(batch).expect("columnar push");
+        let columnar = columnar_writer.finish().expect("columnar finish");
+        assert!(
+            row == columnar,
+            "the columnar object differs from the row writer's ({} and {} bytes)",
+            columnar.len(),
+            row.len()
+        );
+    }
+
     #[test]
     fn different_scope_names_produce_different_stream_ids() {
         let rec = || {
