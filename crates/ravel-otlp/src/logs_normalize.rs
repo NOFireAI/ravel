@@ -57,7 +57,9 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use ravel_ipcrypt::render::RenderOutcome;
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_ipcrypt::tally::IpcryptTally;
-use ravel_logseg::{MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes};
+use ravel_logseg::{
+    LogRowRef, MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes,
+};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
@@ -91,6 +93,45 @@ pub struct NormalizedLogRecord {
     pub span_id: Option<[u8; 8]>,
     pub flags: u32,
     pub attrs: Vec<(String, AttrValue)>,
+}
+
+/// Lets the flush build its columnar batch from the buffered records
+/// directly, reading the shared `stream_attrs` blob in place (ADR-3492
+/// decision 2).
+impl LogRowRef for NormalizedLogRecord {
+    fn stream_id(&self) -> LogStreamId {
+        self.stream_id
+    }
+    fn stream_attrs(&self) -> &[u8] {
+        &self.stream_attrs
+    }
+    fn ts_ns(&self) -> i64 {
+        self.ts_ns
+    }
+    fn observed_ts_ns(&self) -> i64 {
+        self.observed_ts_ns
+    }
+    fn severity_num(&self) -> u8 {
+        self.severity_num
+    }
+    fn flags(&self) -> u32 {
+        self.flags
+    }
+    fn severity_text(&self) -> &str {
+        &self.severity_text
+    }
+    fn body(&self) -> &str {
+        &self.body
+    }
+    fn trace_id(&self) -> Option<&[u8; 16]> {
+        self.trace_id.as_ref()
+    }
+    fn span_id(&self) -> Option<&[u8; 8]> {
+        self.span_id.as_ref()
+    }
+    fn attrs(&self) -> &[(String, AttrValue)] {
+        &self.attrs
+    }
 }
 
 /// Result of normalizing one `ExportLogsServiceRequest`.

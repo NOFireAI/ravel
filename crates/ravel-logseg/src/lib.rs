@@ -15,6 +15,7 @@
 pub mod block;
 pub mod columnar;
 pub mod columnar_batch;
+pub mod columnar_rows;
 pub mod columns;
 pub mod decoded_cache;
 pub mod dict_values;
@@ -56,6 +57,7 @@ pub use columnar_batch::{
     Bitmap, BytesCells, ColumnarLogBatch, DynCells, DynColumn, StrColumnDict, VAR_BYTES_MAX,
     VarBytes,
 };
+pub use columnar_rows::LogRowRef;
 pub use columns::ColumnSelection;
 pub use dict_values::{DictValues, Validity};
 pub use error::LogSegError;

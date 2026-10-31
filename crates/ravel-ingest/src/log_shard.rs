@@ -423,7 +423,8 @@ fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
 
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; the only copy is the
-/// shared `stream_attrs` blob, which `LogRecord` owns per record.
+/// shared `stream_attrs` blob, which `LogRecord` owns per record. The flush
+/// does not use it: it builds its batch from the records in place.
 fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: rec.stream_id,
@@ -441,16 +442,11 @@ fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
 }
 
 /// Row-major records as the one columnar batch
-/// `ColumnarLogBatch::try_from_records` builds from them, or its refusal of a
+/// `ColumnarLogBatch::try_from_rows` builds from them, or its refusal of a
 /// value that would take a column past its byte limit.
 fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> Result<ColumnarLogBatch, LogWriteError> {
-    ColumnarLogBatch::try_from_records(
-        &records
-            .into_iter()
-            .map(to_logseg_record)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
+    ColumnarLogBatch::try_from_rows(&records)
+        .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))
 }
 
 /// A row buffer's flush input as one columnar batch (ADR-3492 decision 2).
@@ -462,13 +458,7 @@ fn flush_rows_batch(
     records: Vec<NormalizedLogRecord>,
 ) -> Result<ColumnarLogBatch, RlogEncodeError> {
     check_stream_attrs(&records).map_err(RlogEncodeError::Finish)?;
-    ColumnarLogBatch::try_from_records(
-        &records
-            .into_iter()
-            .map(to_logseg_record)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(RlogEncodeError::Push)
+    ColumnarLogBatch::try_from_rows(&records).map_err(RlogEncodeError::Push)
 }
 
 /// The row writer's stream-directory check, with its message: the first
