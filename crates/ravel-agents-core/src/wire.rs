@@ -197,9 +197,10 @@ impl AbandonedCounts {
     /// The counts of `head`. `queued_inputs` is the inbox depth with sealed
     /// pages included, which HEAD's open page alone does not hold; the
     /// caller reads it the way the `state` route reads the mailbox, or from
-    /// [`Head::inbox_depth`]. Effects are never paged, and a sealed timer
-    /// page never holds a scheduled timer ([`crate::pages::seal_index`]), so
-    /// the other counts are complete from HEAD's inline lists.
+    /// [`Head::inbox_depth`]. Effects are never paged, and scheduled timers
+    /// are counted by [`Head::scheduled_timers`], which adds the index's
+    /// count for unloaded pages, so the other counts are complete from a
+    /// shallow HEAD.
     pub fn from_head(head: &Head, queued_inputs: u64) -> AbandonedCounts {
         let effects = |status: EffectStatus| -> u64 {
             head.effects.iter().filter(|e| e.status == status).count() as u64
@@ -209,11 +210,7 @@ impl AbandonedCounts {
             active_turn: head.active_turn.is_some(),
             effects_in_doubt: effects(EffectStatus::InDoubt),
             effects_authorized: effects(EffectStatus::Authorized),
-            timers_scheduled: head
-                .timers
-                .iter()
-                .filter(|t| t.status == TimerStatus::Scheduled)
-                .count() as u64,
+            timers_scheduled: head.scheduled_timers(),
         }
     }
 }
