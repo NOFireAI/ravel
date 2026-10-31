@@ -2341,13 +2341,24 @@ breach, never a silently dropped or served key. Both this and the HEAD/
 postings tenant_hash checks above increment
 `ravel_catalog_isolation_breach_total`, and so do the fold's tenant_hash
 checks on a tenant's previous postings object and previous snapshot parts.
+Every other reader of a snapshot part checks the part header's tenant_hash
+after the GET and before the decode, and counts a mismatch the same way: the
+key-index rebuild (through the fold's part load), and
+`verify_seal_divergence`, `snapshot_coverage` and `load_covering_postings`,
+which take the `Catalog` whose counter they bump beside the store they read
+through. The scrub passes the server's own catalog, so its breaches reach
+`/metrics`; the scrub's covering-postings load does not count a mismatch on
+the postings object itself. The CLI's `catalog verify`, key-index rebuild and
+the load's coverage check run in a process that renders no `/metrics`, so a
+breach there surfaces as the command's error.
 The counter is rendered at `/metrics` beside the
 existing `ravel_catalog_interlock_violations_total` and
 `ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
 (default alert rule: docs/guides/operations.md). Unlike those two, which
 tally a harmless-overlap anomaly the query still resolves past, every
-increment of the isolation-breach counter corresponds to a failed query or
-a failed fold tick.
+increment of the isolation-breach counter corresponds to a failed query, a
+failed fold tick, or a failed scrub tick (its postings tier and
+seal-divergence check skipped for that tenant and signal).
 
 The fold's own liveness is exported beside those counters, from the same
 `Catalog`: `ravel_catalog_fold_cycles_total`,

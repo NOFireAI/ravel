@@ -163,6 +163,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ravel_catalog::{Catalog, LoadPostingsError, SealDivergenceError};
 use ravel_commit::keys;
 use ravel_maintain::read_gate::MaintainReadGate;
 use ravel_maintain::worker_set::MaintainMembership;
@@ -461,9 +462,14 @@ pub fn check_spawnable(period: Duration) -> Result<(), SpawnError> {
 /// Every timestamp the loop reads (the live-set read, cursor stamps and rotation
 /// planning) comes from `clock`. A zero `period` is refused with
 /// [`SpawnError::ZeroScrubPeriod`].
+///
+/// `catalog` is the server's own catalog, the one `/metrics` renders: a
+/// snapshot part with another tenant's `tenant_hash` (ADR-0050 §2) is counted
+/// on its isolation-breach counter. Every read still goes through `store`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
+    catalog: Arc<Catalog>,
     restrict: Vec<TenantHash>,
     period: Duration,
     shard_count: u32,
@@ -520,6 +526,7 @@ pub fn spawn(
                 });
             run_cycle_on_gate(
                 store.as_ref(),
+                catalog.as_ref(),
                 restrict.as_deref(),
                 shard_count,
                 period_secs,
@@ -549,6 +556,7 @@ pub fn spawn(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cycle(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
     restrict: Option<&[TenantHash]>,
     shard_count: u32,
     period_secs: u64,
@@ -561,6 +569,7 @@ pub async fn run_cycle(
 ) {
     run_cycle_on_gate(
         store,
+        catalog,
         restrict,
         shard_count,
         period_secs,
@@ -579,6 +588,7 @@ pub async fn run_cycle(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cycle_on_gate(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
     restrict: Option<&[TenantHash]>,
     shard_count: u32,
     period_secs: u64,
@@ -629,9 +639,11 @@ pub async fn run_cycle_on_gate(
             // callee returns `Err` on a non-`NotFound` failure rather than
             // `Ok(None)`, so the two cases arrive here distinguishably even
             // though both end as `None` for the tick. A `tenant_hash`-binding
-            // breach (ADR-0050 §2) is logged and likewise degrades to `None`
-            // for this tick, never wedging the
-            // content and structural tiers that do not depend on postings.
+            // breach (ADR-0050 §2) on the postings object or a snapshot part
+            // is logged and likewise degrades to `None` for this tick, never
+            // wedging the content and structural tiers that do not depend on
+            // postings; a foreign part is also counted on `catalog`'s
+            // isolation-breach counter by the load itself.
             let scan_shards = scan_shards(store, tenant, signal, shard_count).await;
 
             // Ownership gate (ADR-0065 decision 2): scrub's per-shard rotation
@@ -653,13 +665,18 @@ pub async fn run_cycle_on_gate(
                 continue;
             }
 
-            let covering = match ravel_catalog::load_covering_postings(store, tenant, signal).await
+            let mut foreign_part = false;
+            let covering = match ravel_catalog::load_covering_postings(
+                store, catalog, tenant, signal,
+            )
+            .await
             {
                 Ok(loaded) => loaded,
                 // error!, not warn!: this is the same class of fault as the
                 // fold's `.cstat`/`.npost` reuse failures, which log at error,
                 // and a permission fault here recurs every tick.
                 Err(err) => {
+                    foreign_part = matches!(err, LoadPostingsError::PartTenantHashMismatch { .. });
                     tracing::error!(
                         tenant = %tenant.to_hex(), signal = ?signal, error = %err,
                         "scrub: covering-postings load failed; postings tier skipped this tick, retried"
@@ -697,8 +714,11 @@ pub async fn run_cycle_on_gate(
             // Gated on ownership of shard 0 (ADR-0065 decision 2), like the
             // maintain idempotency-marker sweep: the single owner of shard 0
             // runs the whole-signal check so replicas do not double-pay it.
-            if worker.owns_unit(live_set, tenant, signal, 0) {
-                run_seal_divergence_tick(store, tenant, signal, metrics).await;
+            // A foreign part the postings load already counted is skipped
+            // here: the check reads the same parts and would count the same
+            // breach a second time.
+            if worker.owns_unit(live_set, tenant, signal, 0) && !foreign_part {
+                run_seal_divergence_tick(store, catalog, tenant, signal, metrics).await;
             }
         }
     }
@@ -716,14 +736,17 @@ pub async fn run_cycle_on_gate(
 /// surviving sealed commit record is the expected shape once retention deletes a
 /// folded record. An absent HEAD (nothing folded yet) is normal, not a fault. A
 /// read or decode failure is logged and skipped for this tick, never counted as
-/// an anomaly (a transient store error must not read as seal loss).
+/// an anomaly (a transient store error must not read as seal loss). A snapshot
+/// part naming another tenant (ADR-0050 §2) is logged at `error!` and verifies
+/// nothing; `verify_seal_divergence` has already counted it on `catalog`.
 async fn run_seal_divergence_tick(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
     tenant: &TenantHash,
     signal: Signal,
     metrics: &ScrubMetrics,
 ) {
-    match ravel_catalog::verify_seal_divergence(store, tenant, signal).await {
+    match ravel_catalog::verify_seal_divergence(store, catalog, tenant, signal).await {
         Ok(Some(report)) => {
             if !report.missing.is_empty() {
                 tracing::error!(
@@ -745,6 +768,13 @@ async fn run_seal_divergence_tick(
         Ok(None) => {
             // No HEAD yet for this (tenant, signal): nothing folded, nothing to
             // verify. Normal, not a fault.
+        }
+        Err(err @ SealDivergenceError::PartTenantHashMismatch { .. }) => {
+            tracing::error!(
+                tenant = %tenant.to_hex(), signal = ?signal, error = %err,
+                "scrub: seal-divergence check read a snapshot part bound to another tenant \
+                 (isolation breach); nothing verified this tick"
+            );
         }
         Err(err) => {
             tracing::warn!(
@@ -2193,6 +2223,7 @@ mod tests {
         let alive_before = metrics.num_alive_tasks();
         let err = spawn(
             store,
+            Arc::new(scrub_catalog()),
             Vec::new(),
             Duration::ZERO,
             1,
@@ -2346,6 +2377,7 @@ mod tests {
         // one tick.
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2391,6 +2423,7 @@ mod tests {
         let worker = solo_worker();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2441,6 +2474,7 @@ mod tests {
         let worker = solo_worker();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2475,6 +2509,7 @@ mod tests {
         // fraction of the corpus, so a rotation takes multiple ticks.
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             100,
@@ -2496,6 +2531,7 @@ mod tests {
         for _ in 0..10 {
             run_cycle(
                 &store,
+                &scrub_catalog(),
                 None,
                 1,
                 100,
@@ -2528,6 +2564,7 @@ mod tests {
         let worker = solo_worker();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             4,
             1,
@@ -2583,6 +2620,16 @@ mod tests {
             .expect("fold produces a HEAD with postings");
     }
 
+    /// A catalog over its own empty store: the scrub reads through the store
+    /// it is given and uses the catalog only for its isolation-breach counter.
+    fn scrub_catalog() -> ravel_catalog::Catalog {
+        ravel_catalog::Catalog::new(
+            Arc::new(MemoryStore::new()),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog")
+    }
+
     /// A clean folded snapshot: `run_shard_tick` loads the real covering
     /// postings and passes `Some(covering)` to `scrub_one_object`, but the
     /// postings accurately describe the segment, so no disagreement is recorded.
@@ -2600,6 +2647,7 @@ mod tests {
         let worker = solo_worker();
         run_cycle(
             store.as_ref(),
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2693,6 +2741,7 @@ mod tests {
         let worker = solo_worker();
         run_cycle(
             store.as_ref(),
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2715,6 +2764,120 @@ mod tests {
             0,
             "the segment data is untouched: no checksum mismatch"
         );
+    }
+
+    /// Rewrite the HEAD's first part as the same entries under another
+    /// tenant's `tenant_hash`, re-stamping the part ref (and the postings
+    /// ref's copy of its blake3), and PUT both. `drop_postings` removes the
+    /// HEAD's postings ref so only the seal-divergence tier reads the part.
+    async fn repoint_first_part_at_foreign_tenant(store: &MemoryStore, drop_postings: bool) {
+        let foreign_tenant = [0xff; 16];
+        assert_ne!(foreign_tenant, tenant().hash().0);
+        let head_key = head_key_for(&tenant().hash());
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head present")
+            .data;
+        let mut head = ravel_catalog::decode_head(&head_bytes).expect("decode head");
+        let part_key = head.parts[0].key.clone();
+        let part = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let decoded = ravel_catalog::decode_part(&part, &ravel_catalog::PartLimits::default())
+            .expect("the fixture part decodes");
+        let foreign = ravel_catalog::encode_part(
+            foreign_tenant,
+            decoded.header.signal,
+            decoded.header.shard_count,
+            decoded.header.watermark_hour,
+            &decoded.entries,
+        )
+        .expect("re-encode the part for a foreign tenant");
+        let foreign_blake3 = blake3::hash(&foreign).as_bytes().to_vec();
+        head.parts[0].blake3 = foreign_blake3.clone();
+        head.parts[0].size = foreign.len() as u64;
+        if drop_postings {
+            head.postings = None;
+        } else if let Some(postings) = head.postings.as_mut() {
+            postings.part_blake3[0] = foreign_blake3;
+        }
+        store
+            .put(&part_key, Bytes::from(foreign), PutOptions::default())
+            .await
+            .expect("put the foreign part");
+        let rewritten = ravel_catalog::encode_head(&head).expect("re-encode head");
+        store
+            .put(&head_key, Bytes::from(rewritten), PutOptions::default())
+            .await
+            .expect("overwrite head");
+    }
+
+    /// One scrub cycle over a snapshot holding a foreign part, returning the
+    /// isolation-breach count `/metrics` renders for the catalog the cycle was
+    /// handed, and the scrub's own metrics.
+    async fn scrub_foreign_part_breaches(drop_postings: bool) -> (u64, ScrubMetrics) {
+        let store = Arc::new(MemoryStore::new());
+        publish_segment(store.as_ref(), 1, &["cpu", "mem"]).await;
+        fold(store.clone(), 500_003 * NS_PER_HOUR).await;
+        repoint_first_part_at_foreign_tenant(store.as_ref(), drop_postings).await;
+
+        let catalog = scrub_catalog();
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+        run_cycle(
+            store.as_ref(),
+            &catalog,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+            None,
+            &WallClock,
+        )
+        .await;
+        let rendered = crate::metrics::CatalogCountersSnapshot::from_catalog(&catalog);
+        (rendered.isolation_breaches, metrics)
+    }
+
+    /// ADR-0050 §2: a snapshot part bound to another tenant is reported by the
+    /// scrub's covering-postings load and counted exactly once on the catalog
+    /// the scrub was handed, the one the server's `/metrics` renders, even
+    /// though the seal-divergence tier reads the same part on the same tick.
+    ///
+    /// FLIP: delete the part `tenant_hash` comparison in
+    /// `load_covering_postings` and in `read_snapshot_entries` and the count
+    /// is 0. FLIP: drop the `&& !foreign_part` guard on the seal-divergence
+    /// tier and the same breach is counted twice. FLIP: hand
+    /// `load_covering_postings` and `verify_seal_divergence` a catalog other
+    /// than the one `run_cycle` received and the count is 0.
+    #[tokio::test]
+    async fn foreign_part_counted_once_on_the_rendered_catalog() {
+        let (breaches, metrics) = scrub_foreign_part_breaches(false).await;
+        assert_eq!(breaches, 1, "one foreign part, one counted breach");
+        assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
+        assert_eq!(metrics.seal_divergence_missing(Signal::Metrics), 0);
+        assert_eq!(metrics.seal_divergence_mismatched(Signal::Metrics), 0);
+    }
+
+    /// The seal-divergence tier reports a foreign part on its own when the
+    /// HEAD carries no postings ref, so the covering-postings load never reads
+    /// the parts. Nothing is counted as a divergence.
+    ///
+    /// FLIP: delete the `tenant_hash` comparison in `read_snapshot_entries`
+    /// and the count is 0. FLIP: hand `verify_seal_divergence` a catalog other
+    /// than the one `run_cycle` received and the count is 0.
+    #[tokio::test]
+    async fn foreign_part_without_postings_counted_by_seal_divergence_tier() {
+        let (breaches, metrics) = scrub_foreign_part_breaches(true).await;
+        assert_eq!(breaches, 1, "one foreign part, one counted breach");
+        assert_eq!(metrics.seal_divergence_missing(Signal::Metrics), 0);
+        assert_eq!(metrics.seal_divergence_mismatched(Signal::Metrics), 0);
     }
 
     /// Compaction parts join the scrub corpus tagged by their own level
@@ -2782,6 +2945,7 @@ mod tests {
         // at both levels.
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2810,6 +2974,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2949,6 +3114,7 @@ mod tests {
         // clean at every level.
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -2979,6 +3145,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3164,6 +3331,7 @@ mod tests {
         // tick is clean at every level whatever the filter admits.
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3194,6 +3362,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3383,6 +3552,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3412,6 +3582,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3434,6 +3605,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3818,6 +3990,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3847,6 +4020,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -3869,6 +4043,7 @@ mod tests {
         let metrics = ScrubMetrics::default();
         run_cycle(
             &store,
+            &scrub_catalog(),
             None,
             1,
             1,
@@ -5468,6 +5643,7 @@ mod tests {
         for cycle in 1..=2u64 {
             run_cycle(
                 &store,
+                &scrub_catalog(),
                 None,
                 1,
                 2,
@@ -5510,9 +5686,10 @@ mod tests {
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
         let live_set = worker.solo_live_set();
+        let catalog = scrub_catalog();
         let cycle = || {
             run_cycle(
-                &store, None, 1, 2, 1, &metrics, &worker, &live_set, None, &WallClock,
+                &store, &catalog, None, 1, 2, 1, &metrics, &worker, &live_set, None, &WallClock,
             )
         };
         cycle().await;

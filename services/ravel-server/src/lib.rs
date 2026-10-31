@@ -4753,6 +4753,9 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             // Background class (ADR-0070): at-rest scrubbing is the same
             // deferred class as compaction/retention/sweep.
             store_background.clone(),
+            // The catalog `/metrics` renders: a foreign snapshot part the scrub
+            // reads counts on its isolation-breach counter (ADR-0050 §2).
+            catalog.clone(),
             config.fold_tenants.clone(),
             config.scrub_period,
             config.shard_count,

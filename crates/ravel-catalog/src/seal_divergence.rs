@@ -38,8 +38,11 @@ use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
+use crate::Catalog;
 use crate::error::CatalogError;
-use crate::snapshot_format::{PartLimits, SnapshotFormatError, decode_head, decode_part};
+use crate::snapshot_format::{
+    PartLimits, SnapshotFormatError, decode_head, decode_part, decode_part_header,
+};
 
 /// Entry identity, the dedup key:
 /// `(shard, ingest_hour_bucket, writer_id, writer_epoch, writer_seq)`. The same
@@ -125,6 +128,19 @@ pub enum SealDivergenceError {
     },
     #[error("part {key} has a malformed writer_id entry")]
     PartWriterId { key: String },
+    /// A part the HEAD references declares another tenant's `tenant_hash` in
+    /// its header (ADR-0050 §2 isolation breach), counted on the catalog's
+    /// isolation-breach counter before it is returned. Never a divergence and
+    /// never a transient read failure.
+    #[error(
+        "part {key} declares tenant_hash {actual}, expected {expected} \
+         (ADR-0050 §2 isolation breach)"
+    )]
+    PartTenantHashMismatch {
+        key: String,
+        expected: String,
+        actual: String,
+    },
     #[error("failed to build shard prefix: {source}")]
     ShardPrefix {
         #[source]
@@ -197,8 +213,15 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// read/decode failure of the objects the comparison needs -- including a
 /// non-`NotFound` HEAD GET failure (issue #1976) -- never the presence of a
 /// divergence.
+///
+/// Every read goes through `store`; `catalog` supplies only the
+/// isolation-breach counter a part with another tenant's `tenant_hash`
+/// increments ([`SealDivergenceError::PartTenantHashMismatch`]). The scrub
+/// passes its background-class store beside the server's own catalog, so the
+/// counter it bumps is the one `/metrics` renders.
 pub async fn verify_seal_divergence(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Option<SealDivergenceReport>, SealDivergenceError> {
@@ -245,7 +268,7 @@ pub async fn verify_seal_divergence(
         level0: snapshot_entries,
         entry_count: snapshot_entry_count,
         ..
-    } = read_snapshot_entries(store, &head).await?;
+    } = read_snapshot_entries(store, catalog, tenant_hash, &head).await?;
 
     // Re-list every sealed commit record directly from the store (the ground
     // truth), decoded into the same identity shape.
@@ -363,9 +386,14 @@ struct SnapshotEntries {
 }
 
 /// GET and decode every part `head` references. A part that cannot be fetched
-/// or decoded is an error, never an empty part.
+/// or decoded is an error, never an empty part. A part whose header declares a
+/// `tenant_hash` other than `tenant` is counted on `catalog`'s isolation-breach
+/// counter and returned as [`SealDivergenceError::PartTenantHashMismatch`]
+/// before its entries are decoded.
 async fn read_snapshot_entries(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
+    tenant: &TenantHash,
     head: &SnapshotHead,
 ) -> Result<SnapshotEntries, SealDivergenceError> {
     let limits = PartLimits::default();
@@ -384,6 +412,19 @@ async fn read_snapshot_entries(
                 source,
             })?;
         entries.parts_read += 1;
+        let header =
+            decode_part_header(&got.data).map_err(|source| SealDivergenceError::PartCorrupt {
+                key: part_ref.key.clone(),
+                source,
+            })?;
+        if header.tenant_hash.as_slice() != tenant.0.as_slice() {
+            catalog.record_isolation_breach();
+            return Err(SealDivergenceError::PartTenantHashMismatch {
+                key: part_ref.key.clone(),
+                expected: tenant.to_hex(),
+                actual: hex::encode(&header.tenant_hash),
+            });
+        }
         let decoded =
             decode_part(&got.data, &limits).map_err(|source| SealDivergenceError::PartCorrupt {
                 key: part_ref.key.clone(),
@@ -522,9 +563,13 @@ pub struct SnapshotCoverage {
 /// identity found in no level-0 entry is its `(shard, hour)` bucket listed and
 /// its compaction and rewrite records fetched, never the tenant's whole commit
 /// history. A HEAD or part that cannot be fetched or decoded is an `Err`; an
-/// absent HEAD covers nothing.
+/// absent HEAD covers nothing. A part with another tenant's `tenant_hash` is
+/// counted on `catalog` and is an `Err`
+/// ([`SealDivergenceError::PartTenantHashMismatch`]); reads go through `store`
+/// only.
 pub async fn snapshot_coverage(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
     tenant_hash: &TenantHash,
     signal: Signal,
     identities: &[EntryIdentity],
@@ -544,7 +589,7 @@ pub async fn snapshot_coverage(
     };
     let head = decode_head(&head_bytes)
         .map_err(|source| SealDivergenceError::HeadCorrupt { key, source })?;
-    let snapshot = read_snapshot_entries(store, &head).await?;
+    let snapshot = read_snapshot_entries(store, catalog, tenant_hash, &head).await?;
     let mut coverage = SnapshotCoverage {
         watermark_hour: Some(head.watermark_hour),
         parts_read: snapshot.parts_read,
@@ -641,7 +686,7 @@ fn dedup_in_order(ids: &mut Vec<EntryIdentity>) {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
 
@@ -859,6 +904,151 @@ mod tests {
             .expect("fold");
     }
 
+    /// A catalog over its own empty store, for a reader that needs one only
+    /// for its isolation-breach counter.
+    pub(crate) fn reader_catalog() -> Catalog {
+        Catalog::new(
+            Arc::new(MemoryStore::new()),
+            crate::CatalogConfig::default(),
+        )
+        .expect("catalog")
+    }
+
+    pub(crate) const FOREIGN_TENANT: [u8; 16] = [0xff; 16];
+
+    /// Rewrite part `index` of `(tenant, signal)`'s HEAD as the same entries
+    /// under [`FOREIGN_TENANT`], re-stamping the part ref's blake3 and size,
+    /// and PUT both, so only the part header's tenant binding differs. Returns
+    /// the part's key.
+    pub(crate) async fn repoint_part_at_foreign_tenant(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        index: usize,
+    ) -> String {
+        assert_ne!(FOREIGN_TENANT, tenant.0, "the fixture tenant differs");
+        let head_object = head_key(tenant, signal);
+        let got = store.get(&head_object, GetRange::Full).await.expect("HEAD");
+        let mut head = decode_head(&got.data).expect("HEAD decodes");
+        let key = head.parts[index].key.clone();
+        let original = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let decoded =
+            decode_part(&original, &PartLimits::default()).expect("the fixture part decodes");
+        let header = &decoded.header;
+        let foreign = crate::snapshot_format::encode_part_ranged(
+            FOREIGN_TENANT,
+            header.signal,
+            header.shard_count,
+            header.min_hour,
+            header.watermark_hour,
+            &decoded.entries,
+        )
+        .expect("re-encode the fixture part for a foreign tenant");
+        let foreign_header = decode_part_header(&foreign).expect("foreign header decodes");
+        assert_eq!(foreign_header.tenant_hash, FOREIGN_TENANT.to_vec());
+        assert_eq!(
+            foreign_header.entries_uncompressed_len, header.entries_uncompressed_len,
+            "only the tenant differs, so the part's declared length is unchanged"
+        );
+        let foreign_blake3 = blake3::hash(&foreign).as_bytes().to_vec();
+        let part_ref = &mut head.parts[index];
+        part_ref.blake3 = foreign_blake3.clone();
+        part_ref.size = foreign.len() as u64;
+        // The postings ref must name the same part hashes as the HEAD; the
+        // postings object itself stays bound to the original part.
+        if let Some(postings) = head.postings.as_mut() {
+            postings.part_blake3[index] = foreign_blake3;
+        }
+        store
+            .put(&key, Bytes::from(foreign), PutOptions::default())
+            .await
+            .expect("put the foreign part");
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(&head_object, Bytes::from(head_bytes), PutOptions::default())
+            .await
+            .expect("put the re-pointed HEAD");
+        key
+    }
+
+    /// Assert `err` is the part tenant_hash mismatch for the foreign part at
+    /// `key` of `tenant`.
+    fn assert_foreign_part(err: &SealDivergenceError, key: &str, tenant: &str) {
+        match err {
+            SealDivergenceError::PartTenantHashMismatch {
+                key: got_key,
+                expected,
+                actual,
+            } => {
+                assert_eq!(got_key, key);
+                assert_eq!(*expected, TenantId::new(tenant).hash().to_hex());
+                assert_eq!(*actual, hex::encode(FOREIGN_TENANT));
+            }
+            other => panic!("expected PartTenantHashMismatch, got {other:?}"),
+        }
+    }
+
+    /// ADR-0050 §2: a snapshot part whose header names another tenant fails
+    /// `verify_seal_divergence` with the typed breach, counted once on the
+    /// catalog passed in.
+    ///
+    /// FLIP: delete the `tenant_hash` comparison in `read_snapshot_entries`
+    /// and the foreign part decodes into a clean report, so `expect_err`
+    /// panics. FLIP: drop its `record_isolation_breach` call, or bump the
+    /// counter on any catalog but the one passed in, and the count stays 0.
+    #[tokio::test]
+    async fn foreign_part_fails_verify_as_counted_breach() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "foreign-part-verify";
+        let now = 600_000 * NS_PER_HOUR;
+        publish_segment(store.as_ref(), tenant, 1, now - SEALED_AGE_NS).await;
+        fold(store.clone(), tenant, now).await;
+        let tenant_hash = TenantId::new(tenant).hash();
+        let key =
+            repoint_part_at_foreign_tenant(store.as_ref(), &tenant_hash, Signal::Metrics, 0).await;
+
+        let catalog = reader_catalog();
+        let err = verify_seal_divergence(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics)
+            .await
+            .expect_err("a foreign part must fail the verify");
+        assert_foreign_part(&err, &key, tenant);
+        assert_eq!(catalog.isolation_breaches(), 1, "one breach, counted once");
+    }
+
+    /// ADR-0050 §2: `snapshot_coverage` fails on a foreign part the same way,
+    /// so a load's coverage check never reads another tenant's entries as its
+    /// own.
+    ///
+    /// FLIP: delete the `tenant_hash` comparison in `read_snapshot_entries`
+    /// and the commit reads as covered, so `expect_err` panics. FLIP: drop its
+    /// `record_isolation_breach` call and the count stays 0.
+    #[tokio::test]
+    async fn foreign_part_fails_coverage_as_counted_breach() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "foreign-part-coverage";
+        let now = 600_000 * NS_PER_HOUR;
+        let rec = publish_segment(store.as_ref(), tenant, 1, now - SEALED_AGE_NS).await;
+        fold(store.clone(), tenant, now).await;
+        let key = repoint_part_at_foreign_tenant(
+            store.as_ref(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+            0,
+        )
+        .await;
+
+        let catalog = reader_catalog();
+        let err = coverage_on(store.as_ref(), &catalog, tenant, &[identity(&rec)])
+            .await
+            .expect_err("a foreign part must fail the coverage check");
+        assert_foreign_part(&err, &key, tenant);
+        assert_eq!(catalog.isolation_breaches(), 1, "one breach, counted once");
+    }
+
     #[tokio::test]
     async fn clean_snapshot_reports_no_divergence() {
         let store = Arc::new(MemoryStore::new());
@@ -871,6 +1061,7 @@ mod tests {
 
         let report = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new(tenant).hash(),
             Signal::Metrics,
         )
@@ -910,9 +1101,14 @@ mod tests {
         );
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let err = verify_seal_divergence(&faulty, &TenantId::new(tenant).hash(), Signal::Metrics)
-            .await
-            .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
+        let err = verify_seal_divergence(
+            &faulty,
+            &reader_catalog(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
         match err {
             SealDivergenceError::HeadFetch { key: err_key, .. } => {
                 assert_eq!(err_key, key, "error names the failing key");
@@ -943,10 +1139,14 @@ mod tests {
             .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(key));
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let report =
-            verify_seal_divergence(&faulty, &TenantId::new(tenant).hash(), Signal::Metrics)
-                .await
-                .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
+        let report = verify_seal_divergence(
+            &faulty,
+            &reader_catalog(),
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
         assert!(report.is_none());
         assert!(
             faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
@@ -974,6 +1174,7 @@ mod tests {
 
         let report = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new(tenant).hash(),
             Signal::Metrics,
         )
@@ -1024,6 +1225,7 @@ mod tests {
 
         let report = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new(tenant).hash(),
             Signal::Metrics,
         )
@@ -1066,10 +1268,15 @@ mod tests {
         let key = keys::commit_key_for_record(&uncompacted_l0).expect("commit key");
         store.delete(&key).await.expect("delete record");
 
-        let report = verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
-            .await
-            .expect("no read error")
-            .expect("HEAD present");
+        let report = verify_seal_divergence(
+            store.as_ref(),
+            &reader_catalog(),
+            &tenant_hash,
+            Signal::Metrics,
+        )
+        .await
+        .expect("no read error")
+        .expect("HEAD present");
         assert!(
             !report.has_divergence(),
             "orphaned entries must never count as a divergence"
@@ -1110,12 +1317,17 @@ mod tests {
         fold(store.clone(), tenant, now).await;
 
         let tenant_hash = TenantId::new(tenant).hash();
-        let err = verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
-            .await
-            .expect_err(
-                "a compaction record whose input_set_hash disagrees with its own \
+        let err = verify_seal_divergence(
+            store.as_ref(),
+            &reader_catalog(),
+            &tenant_hash,
+            Signal::Metrics,
+        )
+        .await
+        .expect_err(
+            "a compaction record whose input_set_hash disagrees with its own \
                          inputs must be a hard error, not a divergence result",
-            );
+        );
         match &err {
             SealDivergenceError::CompactionInputSetHashMismatch {
                 key,
@@ -1148,6 +1360,7 @@ mod tests {
 
         let report = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new(tenant).hash(),
             Signal::Metrics,
         )
@@ -1182,6 +1395,7 @@ mod tests {
 
         let err = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new(tenant).hash(),
             Signal::Metrics,
         )
@@ -1201,6 +1415,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let report = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new("empty").hash(),
             Signal::Metrics,
         )
@@ -1225,6 +1440,7 @@ mod tests {
 
         let report = verify_seal_divergence(
             store.as_ref(),
+            &reader_catalog(),
             &TenantId::new(tenant).hash(),
             Signal::Metrics,
         )
@@ -1260,10 +1476,15 @@ mod tests {
             }
         }
 
-        let report = verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
-            .await
-            .expect("no read error")
-            .expect("HEAD present");
+        let report = verify_seal_divergence(
+            store.as_ref(),
+            &reader_catalog(),
+            &tenant_hash,
+            Signal::Metrics,
+        )
+        .await
+        .expect("no read error")
+        .expect("HEAD present");
         assert!(
             !report.has_divergence(),
             "orphaned entries must never count as a divergence"
@@ -1285,9 +1506,14 @@ mod tests {
             )
             .await
             .expect("seed corrupt HEAD");
-        let err = verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
-            .await
-            .expect_err("a corrupt HEAD must be a typed read error");
+        let err = verify_seal_divergence(
+            store.as_ref(),
+            &reader_catalog(),
+            &tenant_hash,
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a corrupt HEAD must be a typed read error");
         assert!(matches!(err, SealDivergenceError::HeadCorrupt { .. }));
     }
 
@@ -1306,7 +1532,23 @@ mod tests {
         tenant: &str,
         ids: &[EntryIdentity],
     ) -> Result<SnapshotCoverage, SealDivergenceError> {
-        snapshot_coverage(store, &TenantId::new(tenant).hash(), Signal::Metrics, ids).await
+        coverage_on(store, &reader_catalog(), tenant, ids).await
+    }
+
+    async fn coverage_on(
+        store: &dyn ObjectStoreBackend,
+        catalog: &Catalog,
+        tenant: &str,
+        ids: &[EntryIdentity],
+    ) -> Result<SnapshotCoverage, SealDivergenceError> {
+        snapshot_coverage(
+            store,
+            catalog,
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+            ids,
+        )
+        .await
     }
 
     /// The first part key the tenant's HEAD references.

@@ -860,6 +860,7 @@ async fn a_seal_landing_mid_load_is_folded_by_the_loads_own_fold() {
 
     let coverage = ravel_catalog::snapshot_coverage(
         inner.as_ref(),
+        &Catalog::new(Arc::clone(&inner), CatalogConfig::default()).expect("catalog"),
         &TenantId::new(TENANT).hash(),
         ravel_types::Signal::Logs,
         &identities(&report.tokens),
@@ -921,6 +922,7 @@ async fn a_seal_landing_mid_load_inside_one_hour_is_folded_by_the_loads_own_fold
 
     let coverage = ravel_catalog::snapshot_coverage(
         inner.as_ref(),
+        &Catalog::new(Arc::clone(&inner), CatalogConfig::default()).expect("catalog"),
         &TenantId::new(TENANT).hash(),
         ravel_types::Signal::Logs,
         &identities(&report.tokens),
@@ -994,6 +996,7 @@ async fn a_seal_after_the_last_commit_leaves_a_no_op_fold_that_succeeds() {
 
     let coverage = ravel_catalog::snapshot_coverage(
         inner.as_ref(),
+        &Catalog::new(Arc::clone(&inner), CatalogConfig::default()).expect("catalog"),
         &TenantId::new(TENANT).hash(),
         ravel_types::Signal::Logs,
         &identities(&report.tokens),

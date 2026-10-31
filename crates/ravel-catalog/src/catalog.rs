@@ -1572,16 +1572,16 @@ impl Catalog {
     }
 
     /// Count of hard isolation-breach failures observed across this
-    /// catalog's lifetime (ADR-0050 §2): a HEAD/postings tenant_hash
-    /// mismatch or an out-of-prefix listing result. See
+    /// catalog's lifetime (ADR-0050 §2): a HEAD, snapshot part or postings
+    /// tenant_hash mismatch or an out-of-prefix listing result. See
     /// docs/catalog-and-mvcc.md.
     pub fn isolation_breaches(&self) -> u64 {
         self.isolation_breaches.load(Ordering::Relaxed)
     }
 
-    /// `pub(crate)`: lets `snapshot_resolve` (ADR-0050 §2) bump the
-    /// isolation-breach counter from its own `impl Catalog` block before
-    /// returning the hard `CatalogError::FieldMismatch`.
+    /// `pub(crate)`: lets `snapshot_resolve` (ADR-0050 §2), the fold, and the
+    /// snapshot-part readers in `seal_divergence` and `covering_postings` bump
+    /// the isolation-breach counter before returning their hard error.
     pub(crate) fn record_isolation_breach(&self) {
         self.isolation_breaches.fetch_add(1, Ordering::Relaxed);
     }

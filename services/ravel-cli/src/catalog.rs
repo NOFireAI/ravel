@@ -1008,9 +1008,14 @@ pub async fn verify(
     // The comparison itself lives in `ravel-catalog` (ADR-0059 decision 2) so
     // the scheduled scrubber and this CLI share one implementation. This
     // command keeps its own presentation: the `println!` report and the nonzero
-    // exit (via `anyhow::bail!`) on a real divergence.
+    // exit (via `anyhow::bail!`) on a real divergence. The catalog supplies
+    // only the isolation-breach counter a foreign snapshot part bumps; this
+    // process renders no `/metrics`, so that breach surfaces as the returned
+    // error.
+    let catalog = ravel_catalog::Catalog::new(store.clone(), CatalogConfig::default())?;
     let report = match ravel_catalog::verify_seal_divergence(
         store.as_ref(),
+        &catalog,
         &tenant_hash,
         signal.to_signal(),
     )
