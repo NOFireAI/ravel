@@ -655,7 +655,9 @@ pub(super) async fn sweep(State(api): State<Api>, req: Request<Body>) -> Respons
 ///
 /// HEAD is read here rather than through [`read_head`], which answers
 /// `agent_gone` for a tombstoned HEAD: a repeat destroy is answered 200 with
-/// `destroyed: false` from that HEAD, with no write and no audit record. An
+/// `destroyed: false` from that HEAD, with no write and no audit record, and
+/// forgets the tenant's evidence entries for the agent, since a repeat is how
+/// a caller settles an unknown outcome and the tombstone is now known. An
 /// absent HEAD and a pinned `incarnation` that is not current are
 /// `agent_gone` with nothing written and nothing audited.
 ///
@@ -666,10 +668,11 @@ pub(super) async fn sweep(State(api): State<Api>, req: Request<Body>) -> Respons
 /// the tombstone was applied to (`DestroyOutcome::head`; the store re-reads
 /// HEAD on every publish attempt), so a write landing between the read and
 /// the CAS shows in the response and not in the record, and the response is
-/// the authoritative figure. After the coordinator's destroy, and after an
-/// unknown write outcome too, the tenant's evidence entries for the agent
-/// are forgotten and its result waiters notified, so a wait in flight
-/// re-reads HEAD and ends `agent_gone`.
+/// the authoritative figure. After the coordinator's destroy the tenant's
+/// evidence entries for the agent are forgotten and its result waiters
+/// notified, so a wait in flight re-reads HEAD and ends `agent_gone`. After
+/// an unknown write outcome the waiters are notified and the evidence is
+/// kept.
 pub(super) async fn destroy(State(api): State<Api>, req: Request<Body>) -> Response {
     let run = async move {
         let (call, body) = api
@@ -706,6 +709,7 @@ pub(super) async fn destroy(State(api): State<Api>, req: Request<Body>) -> Respo
         }
         let read = AbandonedCounts::from_head(&head, head.inbox_depth());
         if head.lifecycle == Lifecycle::Tombstoned {
+            call.tenant.evidence.forget_agent(agent);
             return Ok(Json(DestroyAgentResponse {
                 agent_id: agent.to_hex(),
                 incarnation,
