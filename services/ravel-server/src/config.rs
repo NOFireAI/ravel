@@ -877,15 +877,25 @@ pub struct Cli {
     /// (tenant-scoped DDL), `ipcrypt` (the IPCrypt SQL functions), `agents`,
     /// `agents_worker` and `agents_admin` (the Ravel Agents client, worker and
     /// admin roles under `/api/v1/agents`), each at most once: `acme;ddl`, `acme;ipcrypt` and
-    /// `acme;ddl,ipcrypt,agents` all name tenant `acme`. Any other suffix
-    /// fails startup.
+    /// `acme;ddl,ipcrypt,agents` all name tenant `acme`. The list may also
+    /// hold one `subject=LABEL` entry, at most once, beside or instead of the
+    /// capability words, with a label of 1 to 64 bytes from
+    /// `A-Z a-z 0-9 . _ @ + -`: `acme;ddl,subject=alice` names tenant `acme`
+    /// with subject `alice`. A subject grants nothing, is recorded in audit
+    /// records only, and is not a secret. Any other suffix fails startup, and
+    /// so does a tenant whose own last `;` segment holds a capability word,
+    /// `subject` or a `subject=` entry: `acme;subject=x;ddl` refuses rather
+    /// than naming tenant `acme;subject=x`.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
     /// File holding `TOKEN=TENANT` pairs for the static bearer map, one per
     /// line, so a token never has to sit in argv or a process listing. Blank
     /// lines and `#` comment lines are ignored; every other line is split on
-    /// the first `=`, exactly like `--tenant-token`, so a token containing
+    /// the first `=`, exactly like `--tenant-token`, and its tenant takes the
+    /// same `;` suffix: the capability words and one `subject=LABEL` entry
+    /// (1 to 64 bytes from `A-Z a-z 0-9 . _ @ + -`, at most once; recorded in
+    /// audit records only, and not a secret). A token containing
     /// `=` is mis-parsed the same way in both sources (see the CRD docs
     /// warning in `services/ravel-operator/src/crd.rs`). A leading UTF-8 byte
     /// order mark is stripped before parsing. Mutually exclusive with
