@@ -410,7 +410,8 @@ impl Catalog {
             attempt.part_gets += 1;
             // The part's decode reservation is held until this iteration
             // drops `entries`; a refusal interrupts the run.
-            let (entries, _part_charge) = self.load_part_entries(&part, &mut counters).await?;
+            let (entries, _part_charge) =
+                self.load_part_entries(tenant, &part, &mut counters).await?;
             let part_blake3: [u8; 32] =
                 part.blake3
                     .as_slice()
