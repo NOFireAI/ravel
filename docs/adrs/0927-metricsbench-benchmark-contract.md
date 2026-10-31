@@ -1000,7 +1000,8 @@ small ranged GET, and the same main's cold sum at 342.7 s on RustFS against
 Decision: the portable stack's local object store is s3s-fs, the
 file-system backend of the s3s project. The binary is the
 `s3s-fs-0.17.0-ravel.1` release of the `NOFireAI/s3s` fork, checked against
-that release's SHA256SUMS, the same build the ClickBench entry runs. It keeps
+that release's SHA256SUMS, the same build the ClickBench entry runs (the
+portable stack now runs `ravel.2`; see the TCP_NODELAY amendment below). It keeps
 RustFS's resource envelope, one CPU and 2 GiB, so the store implementation is
 the only thing that changes, and both Ravel and Mimir use it. The envelope
 and the binary's checksum are disclosed beside the other frozen settings.
@@ -1073,3 +1074,31 @@ cardinality read-back: at about 15,000 objects the series listing is
 refused by the host memory floor on both the default and this setting
 (#3434), and until that is fixed the row's cardinality result is a
 refusal, and #3433's series count stays untested.
+
+## Amendment (2026-11-01): the portable stack's s3s-fs build sets TCP_NODELAY
+
+<!-- amendment-supersedes: phrase="the same build the ClickBench entry runs" pointer="TCP_NODELAY amendment" -->
+
+Context. `s3s-fs-0.17.0-ravel.1` served every connection with Nagle on. A
+response it writes as a head and then a body holds the body until the
+client acknowledges the head, and ravel-server, on Linux, delays that
+acknowledgement by 40 ms. On the `ci` stack every query that touched
+storage took about 50 ms. With delayed ACKs turned off in ravel-server's
+network namespace, the same queries took 9.3 to 9.6 ms. A capture of the
+store's port showed one 40.4 to 41.0 ms stall per query, each after a
+204-byte segment from s3s-fs. Issue #3561 holds the pre-registration and the
+measurements.
+
+Decision: the portable stack runs `s3s-fs-0.17.0-ravel.2` of the
+`NOFireAI/s3s` fork. It is `ravel.1` plus one commit that sets `TCP_NODELAY`
+on every accepted connection, built by the fork's release workflow and
+checked against that release's SHA256SUMS. The envelope, one CPU and 2 GiB,
+does not change.
+
+Consequences. The ClickBench entry keeps `ravel.1` until its owner decides
+otherwise, so the two benchmarks no longer run the same s3s-fs build. Ravel
+figures measured on `ravel.1` are not compared with figures measured on
+`ravel.2`; each run's provenance records the store release and its sha256.
+Comparator rows are affected too, since Mimir writes to the same store, and
+are re-measured on `ravel.2` like Ravel's. Decision 10 is unchanged: only
+the real-S3 lane produces publishable Ravel performance and cost figures.

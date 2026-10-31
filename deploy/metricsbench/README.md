@@ -30,10 +30,15 @@ exits).
 ### The object store
 
 The stack's S3 endpoint is s3s-fs, the file-system backend of the s3s project,
-at the `s3s-fs-0.17.0-ravel.1` release of the `NOFireAI/s3s` fork (ADR-0927
-amendment 2026-10-29). It replaced RustFS, which sat at its one-CPU cap while
-ravel-server idled, so the store bounded the Ravel row. Figures measured on
-RustFS are not compared with figures measured on s3s-fs.
+at the `s3s-fs-0.17.0-ravel.2` release of the `NOFireAI/s3s` fork (ADR-0927
+amendments 2026-10-29 and 2026-11-01). It replaced RustFS, which sat at its
+one-CPU cap while ravel-server idled, so the store bounded the Ravel row.
+Figures measured on RustFS are not compared with figures measured on s3s-fs.
+`ravel.2` is `ravel.1` plus `TCP_NODELAY` on every accepted connection:
+`ravel.1` held each response's body until the client acknowledged its head,
+which added a 40 ms delayed-ACK stall to every query that touched storage.
+Figures measured on `ravel.1` are not compared with figures measured on
+`ravel.2`. The ClickBench entry still runs `ravel.1`.
 
 No image carries the binary. `run.sh`'s `fetch-s3s-fs` step downloads the
 release asset for the Docker engine's arch (`s3s-fs-linux-x86_64` or
@@ -53,8 +58,8 @@ pinned values:
 
 | Asset arch | sha256 |
 |---|---|
-| `x86_64` | `0ac5480b51389c1913f9645d0e1ff2ff1dfdd3a44bb396a7cb74c5e91176c01f` |
-| `aarch64` | `6d5d47a9823e62a36a7ce4b702886ba0e474557084dae877998015ffdc6717ad` |
+| `x86_64` | `159464c7e5a3b5658c1d3fb890b0ec6db0b3bdf40812832a25886a1af2c165ce` |
+| `aarch64` | `631494fbf5508e7694b4e941c2049cd89cb58feb838eb03bdbb3dc998c60772c` |
 
 The binary is linked against glibc and runs on the same
 `gcr.io/distroless/cc-debian12:nonroot` digest the root `Dockerfile` builds

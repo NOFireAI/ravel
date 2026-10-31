@@ -230,7 +230,7 @@ services:
   # publishable lane requires real S3.
   #
   # The binary is not in an image: run.sh's fetch_s3s_fs step downloads the
-  # s3s-fs-0.17.0-ravel.1 release asset for the host arch, refuses it unless
+  # s3s-fs-0.17.0-ravel.2 release asset for the host arch, refuses it unless
   # its sha256 equals the constant run.sh carries, and exports its path as
   # S3S_FS_BIN, which is bind-mounted read-only below. The pin guard
   # (tests/every_comparator_pins_an_image_digest.sh, category 7) fails if
