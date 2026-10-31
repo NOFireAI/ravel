@@ -132,6 +132,7 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | GET | `/api/v1/agents/effects/{effect}` | none | JSON: the `effects` entry plus `step_key`, `result_attempt`, `result`, `failure` (present only when the result is a tool failure), `attempts` (each `attempt`, `status`), `evidence` (each `attempt`, `result`, and `failure` when the report was one) | 200, 401, 403, 404, 422, 503 | Yes, `agents` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/reconcile` | JSON: `effect`, `attempt`, `decision` (`record_result` with `result`, or `retry`) | JSON: `effect`, `status`, `attempt` | 200, 401, 403, 404, 409, 413, 422, 500, 503 | Yes, `agents_admin` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 | POST | `/api/v1/agents/sweep` | none | JSON: `wake_list_pages`, `dir_list_pages`, `head_gets`, `hints_read`, `hints_deleted`, `timers_fired`, `agents_loaded`, `dir_entries_repaired` | 200, 401, 403, 500, 503 | Yes, `agents_admin` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
+| POST | `/api/v1/agents/destroy` | JSON: `agent` (`kind`, `key`), optional `incarnation` | JSON: `agent_id`, `incarnation`, `destroyed`, `abandoned` (`inputs`, `active_turn`, `effects_in_doubt`, `effects_authorized`, `timers_scheduled`) | 200, 401, 403, 404, 413, 422, 500, 503 | Yes, `agents_admin` | `all`, `query`, only with `--agents`; also on the mTLS listener | `agents` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
 
@@ -391,16 +392,18 @@ The `/api/v1/agents` routes are behind the
 its own tenant resolver, and the tenant always comes from the credential,
 never from the request (`agents_e2e::capabilities_are_enforced_on_both_listeners`).
 Client routes need the principal's `agents` capability, worker routes its
-`agents_worker` capability, and `reconcile` and `sweep` its `agents_admin`
-capability. Every handler admits its capability before anything else, and a
-credential without it gets 403 with a body naming the capability: the
-server's route table carries each route's capability, and
+`agents_worker` capability, and `reconcile`, `sweep` and `destroy` its
+`agents_admin` capability. Every handler admits its capability before
+anything else, and a credential without it gets 403 with a body naming the
+capability: the server's route table carries each route's capability, and
 `agents::tests::every_route_refuses_a_token_lacking_its_capability` sends
 every route in it a token holding every capability but that one
 (end to end: `agents_e2e::capabilities_are_enforced_on_both_listeners` for
 `agents` and `agents_worker`,
-`agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`
-and `agents_timers_e2e::sweep_route_counts_match_the_store_and_needs_agents_admin`
+`agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`,
+`agents_timers_e2e::sweep_route_counts_match_the_store_and_needs_agents_admin`
+and
+`agents_effects_e2e::destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`
 for `agents_admin`). The router answers 404 for any path outside the table
 above (`agents_e2e::a_path_outside_the_route_table_is_404`).
 
@@ -426,6 +429,8 @@ answers a send past the receipt cap 413 with `cap` `receipts`).
 | `idempotency_conflict`, `ownership_lost`, `incompatible_handler`, `non_deterministic_replay` | 409 | `never` |
 | `effect_in_doubt` | 409 | `reconcile` |
 | `outcome_unknown`; resolve by `request_id` before resending (`agents_e2e::resolve_after_a_lost_send_ack_returns_the_same_operation`) | 500 | `resolve_operation` |
+| `outcome_unknown` from `reconcile`, which mints no operation handle: send the same decision again; once the decision has taken effect a repeat answers the same body (`agents_effects_e2e::a_reconcile_whose_head_write_times_out_answers_the_reconcile_hint`) | 500 | `reconcile` |
+| `outcome_unknown` from `destroy`, which mints no operation handle, with `ids.incarnation` the incarnation it read: send the same destroy again naming that `incarnation` (`agents_effects_e2e::a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false`) | 500 | `backoff` |
 | `mailbox_full` | 429 | `backoff` |
 | `budget_exceeded`, including a body past the router's limit (`agents_e2e::send_over_the_body_limit_is_413_with_a_typed_body`) | 413 | `never` |
 | `store_unavailable`, including the admission refusal `agents admission limit reached` | 503 | `backoff` |
@@ -624,6 +629,52 @@ Under `--audit-mode best-effort` the pipeline reports a failed write as
 written, so the reconcile proceeds without its record. A reconcile that
 repeats a decision already taken writes no second record
 (`agents_effects_e2e::a_reconcile_retry_hands_the_new_attempt_to_the_owners_next_step`).
+
+**Destroy.** `destroy` tombstones the agent's current incarnation in one
+HEAD write and answers what the tombstone abandoned: `inputs` is the
+accepted inputs never consumed, the active turn's input among them while a
+turn runs; `active_turn` whether a turn was open; `effects_in_doubt` and
+`effects_authorized` the effects in each state; `timers_scheduled` the
+timers still scheduled. After it, every route that names the agent or a
+handle minted under that incarnation answers 404 `agent_gone`: `state`,
+`operation`, `result`, `reconcile`, and the lease holder's
+`worker/heartbeat`, effect result and `worker/commit`. A `result` parked on
+one of the agent's operations ends inside its request with `agent_gone`,
+woken by the destroy rather than by its deadline
+(`agents_effects_e2e::destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`).
+Destroying an agent that is already tombstoned answers 200 with
+`destroyed` false and the counts of the tombstoned HEAD, writes nothing and
+writes no audit record (the same test). An agent that never existed, and an
+`incarnation` that is not the current one, are 404 `agent_gone` with
+nothing written and nothing audited; the refusal names the pinned
+incarnation in `ids.incarnation`
+(`agents_effects_e2e::destroy_of_an_unknown_agent_or_a_stale_incarnation_is_agent_gone_and_not_audited`).
+`create` on a destroyed agent starts incarnation 2 with an empty mailbox,
+receipt list and state; a handle from incarnation 1 stays `agent_gone`, and
+a `request_id` used in incarnation 1 is accepted as new (the first test).
+Before the tombstone write the server submits one audit record with `kind`
+`agents_destroy` to the audit pipeline, naming the agent id, the
+incarnation and the `abandoned` counts as it read them
+(`audit::tests::the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`).
+The `agents_destroy` record names the caller's tenant and capabilities. A
+principal carries no subject, so two admins of one tenant are not told
+apart, as for reconcile. The response's counts come from the HEAD the
+tombstone was applied to, so a write landing between the read and the
+tombstone shows in the response and not in the record. Without
+`--audit-mode` no record is written. Under `--audit-mode required` a failed
+audit write refuses the destroy with 503 `store_unavailable` and the agent
+stays active in its incarnation
+(`agents_effects_e2e::a_destroy_whose_audit_record_is_refused_leaves_the_agent_active`);
+under `--audit-mode best-effort` the pipeline reports a failed write as
+written, so the destroy proceeds without its record. A destroy whose
+tombstone write has an unknown outcome is 500 `outcome_unknown` with retry
+`backoff` and the incarnation it read in `ids.incarnation`. Send the same
+destroy again with that `incarnation`: if the first write landed, the
+retry answers 200 with `destroyed` false, and the one audit record is the
+first attempt's
+(`agents_effects_e2e::a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false`).
+Pinning the incarnation keeps the retry from destroying an incarnation a
+`create` started in between.
 
 ### Query status codes
 
