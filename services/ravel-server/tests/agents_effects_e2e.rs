@@ -1737,15 +1737,59 @@ impl ObjectStoreBackend for LoseNextHeadAck {
 /// handle to resolve) and names the incarnation it read. Retrying the same
 /// destroy pinned to that incarnation answers `destroyed: false`, and only
 /// the first attempt is audited.
+///
+/// The retry is where the tombstone is known to have landed, so it forgets
+/// the agent's evidence. No route reads the evidence index of a tombstoned
+/// agent, so the index's one slot shows it: o-lost's late result holds the
+/// slot through the unknown outcome, and after the retry o-other's late
+/// result is listed in it rather than counted dropped.
 #[tokio::test]
 async fn a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false() {
     let faulty = LoseNextHeadAck::new(ScriptedFault::DuplicateDelivery);
     let store: Arc<dyn ObjectStoreBackend> = faulty.clone();
-    let running = start_server(store.clone()).await;
+    let running = start_server_with(
+        store.clone(),
+        AgentsConfig {
+            max_evidence_effects: 1,
+            ..agents_config()
+        },
+    )
+    .await;
     let api = Api::public(&running);
+    let dropped = |scrape: &str| {
+        value(
+            scrape,
+            "ravel_agents_evidence_dropped_total",
+            "mode=\"all\"",
+        )
+    };
     let key = "o-lost";
-    api.ok(CLIENT, "create", &json!({"agent": agent_keyed(key)}))
-        .await;
+
+    // Both turns are begun before one lease expiry, so the two takeover
+    // polls hand exactly these two turns to two new workers, and each
+    // effect's attempt 2 is open when its attempt 1 reports late.
+    let mut effects = Vec::new();
+    for agent in [key, "o-other"] {
+        let (_, a) = begin_on(&api, agent).await;
+        let (status, a_step) = step(&api, &a, "at_least_once").await;
+        assert_eq!(status, StatusCode::OK, "{a_step}");
+        effects.push(a_step["effect"].as_str().expect("effect").to_string());
+    }
+    tokio::time::sleep(Duration::from_millis(2 * (LEASE_MS + GRACE_MS))).await;
+    for _ in 0..2 {
+        let worker_b = register(&api).await;
+        let b = poll(&api, &worker_b, 2_000).await;
+        let (status, b_step) = step(&api, &b, "at_least_once").await;
+        assert_eq!(status, StatusCode::OK, "{b_step}");
+        assert_eq!(b_step["attempt"], json!(2), "{b_step}");
+    }
+    let (lost_effect, other_effect) = (&effects[0], &effects[1]);
+    let (_, late) = complete(&api, lost_effect, 1, json!({"cents": 1100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    assert_eq!(
+        inspect(&api, lost_effect).await["evidence"],
+        json!([{"attempt": 1, "result": {"cents": 1100}}])
+    );
 
     faulty.arm(1);
     let (status, unknown) = api.post(ADMIN, "destroy", &destroy_body(key, None)).await;
@@ -1765,10 +1809,84 @@ async fn a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_
         .get(CLIENT, &format!("state?kind=order&key={key}"))
         .await;
     assert_agent_gone("state", status, &refused);
+    let (status, refused) = api
+        .get(CLIENT, &format!("effects?kind=order&key={key}"))
+        .await;
+    assert_agent_gone("effects", status, &refused);
     assert_eq!(
         audit_records(store.as_ref(), "agents_destroy").await.len(),
         1
     );
+
+    let (_, late) = complete(&api, other_effect, 1, json!({"cents": 2100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    assert_eq!(
+        dropped(&api.scrape().await),
+        0,
+        "o-lost's evidence was forgotten, so o-other's result takes the slot"
+    );
+    assert_eq!(
+        inspect(&api, other_effect).await["evidence"],
+        json!([{"attempt": 1, "result": {"cents": 2100}}])
+    );
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A destroy whose tombstone write times out is `outcome_unknown` with retry
+/// hint `backoff`, and the agent may still be active, so the evidence an
+/// operator needs to reconcile its effect in doubt is kept: the agent's
+/// state still reads, and inspect still lists the late result.
+#[tokio::test]
+async fn a_destroy_whose_head_write_times_out_keeps_the_effect_evidence() {
+    let faulty = LoseNextHeadAck::new(ScriptedFault::Timeout);
+    let store: Arc<dyn ObjectStoreBackend> = faulty.clone();
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let key = "o-timed-out";
+
+    // A `manual` effect reconciled to attempt 2, attempt 1's result late,
+    // and the effect in doubt again under a third owner.
+    let (_, a) = begin_on(&api, key).await;
+    let (status, a_step) = step(&api, &a, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let b = take_over(&api, &a).await;
+    let (_, refused) = step(&api, &b, "manual").await;
+    assert_eq!(refused["code"], json!("effect_in_doubt"), "{refused}");
+    api.ok(
+        ADMIN,
+        "reconcile",
+        &json!({"effect": effect, "attempt": 1, "decision": "retry"}),
+    )
+    .await;
+    let (_, handed) = step(&api, &b, "manual").await;
+    assert_eq!(handed["attempt"], json!(2), "{handed}");
+    let (_, late) = complete(&api, &effect, 1, json!({"cents": 3100})).await;
+    assert_eq!(late["late"], json!(true), "{late}");
+    let c = take_over(&api, &b).await;
+    let (_, refused) = step(&api, &c, "manual").await;
+    assert_eq!(refused["code"], json!("effect_in_doubt"), "{refused}");
+
+    faulty.arm(1);
+    let (status, unknown) = api.post(ADMIN, "destroy", &destroy_body(key, None)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{unknown}");
+    assert_eq!(unknown["code"], json!("outcome_unknown"), "{unknown}");
+    assert_eq!(unknown["retry"], json!("backoff"), "{unknown}");
+    assert_eq!(unknown["ids"]["incarnation"], json!(1), "{unknown}");
+    assert_eq!(faulty.lost(FaultKind::Timeout), 1);
+
+    let state = api
+        .ok_get(CLIENT, &format!("state?kind=order&key={key}"))
+        .await;
+    assert_eq!(state["incarnation"], json!(1), "{state}");
+    let inspected = inspect(&api, &effect).await;
+    assert_eq!(inspected["status"], json!("in_doubt"), "{inspected}");
+    let evidence = inspected["evidence"].as_array().expect("evidence");
+    assert_eq!(evidence.len(), 1, "{inspected}");
+    let entry = evidence[0].as_object().expect("evidence entry");
+    assert_eq!(entry.len(), 2, "attempt and result only: {inspected}");
+    assert_eq!(entry["attempt"], json!(1), "{inspected}");
+    assert_eq!(entry["result"], json!({"cents": 3100}), "{inspected}");
     running.shutdown().await.expect("clean shutdown");
 }
 
