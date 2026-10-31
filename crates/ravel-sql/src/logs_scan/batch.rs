@@ -3008,6 +3008,9 @@ mod tests {
     use proptest::strategy::ValueTree;
     use proptest::test_runner::TestRunner;
     use ravel_logseg::block::{ColumnPlan, write_block};
+    use ravel_logseg::decoded_cache::{
+        DecodedCacheAttach, DecodedCacheCounters, DecodedCacheSnapshot, DecodedColumnCache,
+    };
     use ravel_logseg::field_dir::FieldDir;
     use ravel_logseg::footer::{
         COMP_NONE, LogFooter, SectionDesc, kind, open as open_footer, write_footer_and_trailer,
@@ -3017,6 +3020,7 @@ mod tests {
     use ravel_logseg::skip_index::SkipIndex;
     use ravel_logseg::writer::BlocksBuilder;
     use ravel_logseg::{ObjectIdentity, RlogConfig, RlogReader, RlogWriter};
+    use ravel_types::accounting::AccessIntent;
 
     const KEY: &str = "k";
     const STREAMS: usize = 3;
@@ -4198,9 +4202,10 @@ mod tests {
         );
 
         // Plain page, `Str` and `I64` occurrences: every row has a `Str` cell,
-        // rows 0..=3 an `I64` one that wins over it. Rows 1..=6 survive. Row
-        // 7's cell is not UTF-8, so the decode leaves the page to per-cell
-        // validation.
+        // rows 0..=3 an `I64` one that wins over it. Rows 1..=6 survive, and
+        // row 7's cell, outside them, is not UTF-8. `count_str_build` attaches
+        // no cache, so the decode leaves the page raw and the build validates
+        // the surviving cells.
         let multi = fixed_block(
             &[FieldType::Str, FieldType::I64],
             (0..8)
@@ -4372,22 +4377,33 @@ mod tests {
     /// `str_cells_validated` counter, the [`cell_text`] validations it ran,
     /// and the column's cells.
     fn count_two_builds(block: &Block, cached: bool) -> (u64, [Build; 2]) {
-        use ravel_logseg::decoded_cache::{
-            DecodedCacheAttach, DecodedCacheCounters, DecodedColumnCache,
-        };
+        let cache = cached.then(|| Arc::new(DecodedColumnCache::new(1 << 20, None)));
+        let (decoded, builds, _) =
+            count_two_builds_through(block, cache.as_ref(), AccessIntent::Interactive);
+        (decoded, builds)
+    }
+
+    /// [`count_two_builds`] over one scan with `cache`, when given, attached
+    /// under `intent`; also returns the scan's decoded-cache counters.
+    fn count_two_builds_through(
+        block: &Block,
+        cache: Option<&Arc<DecodedColumnCache>>,
+        intent: AccessIntent,
+    ) -> (u64, [Build; 2], DecodedCacheSnapshot) {
         let cfg = cfg();
         let obj = encode(block, &cfg);
         let reader = RlogReader::new(&obj, &cfg).expect("open");
         let mut scan = reader
             .scan_blocks(&window(block), &[], &ColumnSelection::all())
             .expect("scan");
-        if cached {
+        let counters = Arc::new(DecodedCacheCounters::default());
+        if let Some(cache) = cache {
             scan.attach_decoded_cache(DecodedCacheAttach {
-                cache: Arc::new(DecodedColumnCache::new(1 << 20, None)),
+                cache: Arc::clone(cache),
                 tenant: [7; 16],
                 object: [9; 32],
-                intent: ravel_types::accounting::AccessIntent::Interactive,
-                counters: Arc::new(DecodedCacheCounters::default()),
+                intent,
+                counters: Arc::clone(&counters),
             });
         }
         let view = scan
@@ -4421,7 +4437,11 @@ mod tests {
             (counter.value(), validations() - before, cells)
         };
         let builds = [build(), build()];
-        (scan.stats().str_cells_validated, builds)
+        (
+            scan.stats().str_cells_validated,
+            builds,
+            counters.snapshot(),
+        )
     }
 
     /// The block `a_plain_page_validated_at_decode_is_not_validated_again`
@@ -4506,6 +4526,68 @@ mod tests {
             assert_eq!(got, cells);
         }
     }
+
+    /// A bulk scan's first miss is not admitted (the cache records a ghost
+    /// key instead), so its decode keeps the plain `Str` page raw: the decode
+    /// counts only the two dictionary entries and each build the 4 surviving
+    /// present cells. The second scan of the same block finds the ghost
+    /// record, so its decode validates the page's 6 present cells beside the
+    /// 2 entries, the cache admits every missed column, and the builds count
+    /// nothing. The third is served from the cache and counts nothing at all.
+    ///
+    /// Seen failing against validating every missed column at decode (the
+    /// `validate` set being the reader's whole `missed` list in
+    /// `BlockScan::decode_block`): the first scan's decode reports `6 + 2`
+    /// where 2 is expected.
+    #[test]
+    fn a_bulk_scan_first_miss_is_validated_per_surviving_cell() {
+        let s = |v: &str| Some(v.to_string());
+        let block = plain_rows(b"r3");
+        let cells = vec![s("r1"), None, s("r3"), s("r4é"), None, s("")];
+        let cache = Arc::new(DecodedColumnCache::new(1 << 20, None));
+        let bulk = AccessIntent::BulkScan;
+
+        let (decoded, builds, first) = count_two_builds_through(&block, Some(&cache), bulk);
+        assert_eq!(decoded, 2, "the first touch validates no plain cell");
+        for (counted, ran, got) in builds {
+            assert_eq!((counted, ran), (4, 4), "one per surviving present cell");
+            assert_eq!(got, cells);
+        }
+        assert_eq!((first.hits, first.admissions, first.ghost_hits), (0, 0, 0));
+        assert_eq!(first.misses, COLUMNS_DECODED);
+        assert!(cache.is_empty(), "a first bulk touch admits nothing");
+
+        let (decoded, builds, second) = count_two_builds_through(&block, Some(&cache), bulk);
+        assert_eq!(decoded, 6 + 2, "the second touch validates at decode");
+        for (counted, ran, got) in builds {
+            assert_eq!((counted, ran), (0, 0), "a validated page is read as is");
+            assert_eq!(got, cells);
+        }
+        assert_eq!(
+            (
+                second.hits,
+                second.misses,
+                second.ghost_hits,
+                second.admissions
+            ),
+            (0, COLUMNS_DECODED, COLUMNS_DECODED, COLUMNS_DECODED)
+        );
+
+        let (decoded, builds, third) = count_two_builds_through(&block, Some(&cache), bulk);
+        assert_eq!(decoded, 0, "a hit decodes nothing");
+        for (counted, ran, got) in builds {
+            assert_eq!((counted, ran), (0, 0), "the cached validation holds");
+            assert_eq!(got, cells);
+        }
+        assert_eq!(
+            (third.hits, third.misses, third.admissions),
+            (COLUMNS_DECODED, 0, 0)
+        );
+    }
+
+    /// Columns of [`plain_rows`]'s one block the scan looks up, decodes on a
+    /// miss and offers to the cache: every column the block holds a page for.
+    const COLUMNS_DECODED: u64 = 8;
 
     // --- StrValuesCache pool charge (issue #3181) ---------------------------
 

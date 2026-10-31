@@ -174,6 +174,15 @@ struct Inner {
 }
 
 impl Inner {
+    /// The admission rule by intent (ADR-3326 decision 3): an interactive
+    /// statement admits on first decode, any other on the touch after its
+    /// ghost record.
+    fn intent_admits(&self, key: &DecodedKey, intent: AccessIntent) -> bool {
+        intent == AccessIntent::Interactive || self.ghost.contains_key(key)
+    }
+}
+
+impl Inner {
     /// Takes slot `i` out of the index. The entry is returned rather than
     /// dropped so the caller can drop it after releasing the lock.
     fn remove(&mut self, i: usize) -> Option<Arc<DecodedEntry>> {
@@ -428,6 +437,16 @@ impl DecodedColumnCache {
         found
     }
 
+    /// Whether an [`offer`](Self::offer) of `key` under `intent` would pass
+    /// the intent rule now: an interactive intent, or any other intent whose
+    /// key holds a ghost record. Reads the same [`Inner::intent_admits`] check
+    /// `offer` applies and changes nothing, so the ghost record stays for the
+    /// offer to spend. A size, budget or concurrent-admission refusal in
+    /// `offer` can still turn a `true` into no admission.
+    pub(crate) fn would_admit(&self, key: &DecodedKey, intent: AccessIntent) -> bool {
+        self.lock().intent_admits(key, intent)
+    }
+
     /// Offers a freshly decoded column for admission under `intent`'s rule,
     /// returning the admitted entry so the caller can hold it for as long as
     /// it uses the column.
@@ -448,7 +467,7 @@ impl DecodedColumnCache {
             if inner.index.contains_key(&key) {
                 return None;
             }
-            if intent != AccessIntent::Interactive && !inner.ghost.contains_key(&key) {
+            if !inner.intent_admits(&key, intent) {
                 self.record_ghost(&mut inner, key, bytes);
                 return None;
             }
@@ -676,6 +695,54 @@ mod tests {
         assert!(cache.lookup(&key(0, 1), 9, &c).is_none());
         let s = c.snapshot();
         assert_eq!((s.hits, s.misses), (0, 1));
+    }
+
+    /// `would_admit` answers exactly what the following `offer` does, for
+    /// every intent with and without a ghost record, and asking does not
+    /// record, consume or change a ghost record: asked twice before the
+    /// first touch, a non-interactive key still needs that touch.
+    #[test]
+    fn would_admit_agrees_with_offer_and_changes_nothing() {
+        for intent in [
+            AccessIntent::Interactive,
+            AccessIntent::BulkScan,
+            AccessIntent::Maintenance,
+        ] {
+            let cache = DecodedColumnCache::new(1 << 20, None);
+            let c = DecodedCacheCounters::default();
+            let v = col(8);
+            let interactive = intent == AccessIntent::Interactive;
+
+            // No ghost record.
+            assert_eq!(cache.would_admit(&key(0, 1), intent), interactive);
+            assert_eq!(cache.would_admit(&key(0, 1), intent), interactive);
+            let admitted = cache.offer(key(0, 1), &v, intent, &c).is_some();
+            assert_eq!(admitted, interactive, "{intent:?} without a ghost");
+            assert_eq!(c.snapshot().ghost_hits, 0);
+
+            // The refused first touch left a ghost record.
+            if !interactive {
+                assert!(cache.would_admit(&key(0, 1), intent));
+                assert!(cache.would_admit(&key(0, 1), intent));
+                assert_eq!(c.snapshot().ghost_hits, 0, "asking spends nothing");
+                assert!(
+                    cache.offer(key(0, 1), &v, intent, &c).is_some(),
+                    "{intent:?} with a ghost"
+                );
+                let s = c.snapshot();
+                assert_eq!((s.ghost_hits, s.admissions), (1, 1));
+            }
+
+            // An interactive offer on a key with a ghost record admits too.
+            let other = DecodedColumnCache::new(1 << 20, None);
+            assert!(
+                other
+                    .offer(key(1, 1), &v, AccessIntent::BulkScan, &c)
+                    .is_none()
+            );
+            assert!(other.would_admit(&key(1, 1), intent));
+            assert!(other.offer(key(1, 1), &v, intent, &c).is_some());
+        }
     }
 
     #[test]
