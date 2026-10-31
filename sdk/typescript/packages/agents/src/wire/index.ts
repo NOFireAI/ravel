@@ -59,6 +59,31 @@ export const CreateAgentResponse = z.object({
 });
 export type CreateAgentResponse = z.output<typeof CreateAgentResponse>;
 
+/** `POST /api/v1/agents/destroy`; `incarnation`, when set, must be current. */
+export const DestroyAgentRequest = z.object({
+  agent: AgentRef,
+  incarnation: U64.optional(),
+});
+export type DestroyAgentRequest = z.output<typeof DestroyAgentRequest>;
+
+/** What the tombstone left in HEAD; nothing in it is settled or cancelled. */
+export const AbandonedCounts = z.object({
+  inputs: U64,
+  active_turn: z.boolean(),
+  effects_in_doubt: U64,
+  effects_authorized: U64,
+  timers_scheduled: U64,
+});
+export type AbandonedCounts = z.output<typeof AbandonedCounts>;
+
+export const DestroyAgentResponse = z.object({
+  agent_id: z.string(),
+  incarnation: U64,
+  destroyed: z.boolean(),
+  abandoned: AbandonedCounts,
+});
+export type DestroyAgentResponse = z.output<typeof DestroyAgentResponse>;
+
 export const SendRequest = z.object({
   agent: AgentRef,
   handler: z.string(),
@@ -183,7 +208,8 @@ export const StateResponse = z.object({
   incarnation: U64,
   state_version: U64,
   content_type: z.string(),
-  state: Json,
+  /** Null until the agent's first committed turn. */
+  state: Json.nullable(),
   active_turn: ActiveTurnBody.optional(),
   mailbox: z.array(MailboxEntryBody).optional(),
   usage: UsageBody.optional(),
@@ -396,7 +422,8 @@ export const TurnAssignment = z.object({
   operation: z.string(),
   accept_seq: U64,
   handler: z.string(),
-  state: Json,
+  /** Null until the agent's first committed turn. */
+  state: Json.nullable(),
   payload: Json,
   steps: z.array(StepBody),
 });
@@ -558,6 +585,8 @@ export const WIRE_FIXTURES = {
   create_agent_request: CreateAgentRequest,
   create_agent_response: CreateAgentResponse,
   cursor_expired: CursorExpiredBody,
+  destroy_agent_request: DestroyAgentRequest,
+  destroy_agent_response: DestroyAgentResponse,
   effect_complete_request: EffectCompleteRequest,
   effect_complete_response: EffectCompleteResponse,
   effect_fail_request: EffectFailRequest,
@@ -581,6 +610,7 @@ export const WIRE_FIXTURES = {
   send_response: SendResponse,
   state_response: StateResponse,
   state_response_active: StateResponse,
+  state_response_uncommitted: StateResponse,
   step_record_request: StepRecordRequest,
   step_record_response: StepRecordResponse,
   sweep_response: SweepResponse,

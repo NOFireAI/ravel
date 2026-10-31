@@ -128,6 +128,28 @@ fn samples() -> Vec<Sample> {
             },
         ),
         sample(
+            "destroy_agent_request",
+            DestroyAgentRequest {
+                agent: agent(),
+                incarnation: Some(1),
+            },
+        ),
+        sample(
+            "destroy_agent_response",
+            DestroyAgentResponse {
+                agent_id: agent_id().to_hex(),
+                incarnation: 1,
+                destroyed: true,
+                abandoned: AbandonedCounts {
+                    inputs: 2,
+                    active_turn: true,
+                    effects_in_doubt: 1,
+                    effects_authorized: 0,
+                    timers_scheduled: 1,
+                },
+            },
+        ),
+        sample(
             "send_request",
             SendRequest {
                 agent: agent(),
@@ -231,6 +253,19 @@ fn samples() -> Vec<Sample> {
                 state_version: 3,
                 content_type: "application/json".to_string(),
                 state: json!({"items": ["A-1"], "paid": false}),
+                active_turn: None,
+                mailbox: Vec::new(),
+                usage: None,
+            },
+        ),
+        sample(
+            "state_response_uncommitted",
+            StateResponse {
+                agent_id: agent_id().to_hex(),
+                incarnation: 1,
+                state_version: 0,
+                content_type: "application/json".to_string(),
+                state: json!(null),
                 active_turn: None,
                 mailbox: Vec::new(),
                 usage: None,
@@ -536,7 +571,7 @@ fn samples() -> Vec<Sample> {
                         operation: operation(),
                         accept_seq: 1,
                         handler: "place".to_string(),
-                        state: json!({"items": []}),
+                        state: json!(null),
                         payload: json!({"sku": "A-1", "qty": 2}),
                         steps: vec![StepBody {
                             step_id: identity::step_id(1, 1, "price").to_hex(),

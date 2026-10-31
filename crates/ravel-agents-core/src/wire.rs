@@ -37,7 +37,7 @@ mod unix_ns {
 }
 
 use crate::error::{AgentError, SafeIds};
-use crate::head::{EffectStatus, RecoveryPolicy, ResultStatus, StepStatus, TimerStatus};
+use crate::head::{EffectStatus, Head, RecoveryPolicy, ResultStatus, StepStatus, TimerStatus};
 use crate::kernel::{Limits, Usage};
 use crate::state::OperationState;
 
@@ -158,6 +158,75 @@ pub struct CreateAgentResponse {
     pub incarnation: u64,
     /// False when the agent already existed in this incarnation.
     pub created: bool,
+}
+
+/// `POST /api/v1/agents/destroy` (ADR-3331, destroy amendment): tombstone
+/// the agent's current incarnation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DestroyAgentRequest {
+    pub agent: AgentRef,
+    /// The incarnation the caller means to destroy. When set and not the
+    /// current one the destroy is `agent_gone` and writes nothing, so a
+    /// destroy typed against incarnation `n` never tombstones `n + 1`
+    /// (`Coordinator::destroy` in ravel-agents-runtime). Omitted, the
+    /// current incarnation is destroyed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<u64>,
+}
+
+/// What a tombstone left in HEAD, read from the HEAD it was applied to. The
+/// tombstone changes only the lifecycle and the root revision
+/// (`kernel::tests::a_tombstone_changes_only_the_lifecycle_and_the_root_revision`),
+/// so these counts are the same before and after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AbandonedCounts {
+    /// Accepted inputs never consumed, sealed inbox pages included; the
+    /// active turn's input is one of them while a turn runs.
+    pub inputs: u64,
+    /// Whether a turn was open.
+    pub active_turn: bool,
+    /// Effects whose last attempt is in doubt.
+    pub effects_in_doubt: u64,
+    /// Effects with an attempt authorized and no result.
+    pub effects_authorized: u64,
+    /// Timers still scheduled.
+    pub timers_scheduled: u64,
+}
+
+impl AbandonedCounts {
+    /// The counts of `head`. `queued_inputs` is the inbox depth with sealed
+    /// pages included, which HEAD's open page alone does not hold; the
+    /// caller reads it the way the `state` route reads the mailbox, or from
+    /// [`Head::inbox_depth`]. Effects are never paged, and a sealed timer
+    /// page never holds a scheduled timer ([`crate::pages::seal_index`]), so
+    /// the other counts are complete from HEAD's inline lists.
+    pub fn from_head(head: &Head, queued_inputs: u64) -> AbandonedCounts {
+        let effects = |status: EffectStatus| -> u64 {
+            head.effects.iter().filter(|e| e.status == status).count() as u64
+        };
+        AbandonedCounts {
+            inputs: queued_inputs,
+            active_turn: head.active_turn.is_some(),
+            effects_in_doubt: effects(EffectStatus::InDoubt),
+            effects_authorized: effects(EffectStatus::Authorized),
+            timers_scheduled: head
+                .timers
+                .iter()
+                .filter(|t| t.status == TimerStatus::Scheduled)
+                .count() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DestroyAgentResponse {
+    pub agent_id: String,
+    /// The incarnation that is now tombstoned.
+    pub incarnation: u64,
+    /// False when HEAD was already tombstoned at this incarnation; nothing
+    /// was written and `abandoned` is read from that HEAD.
+    pub destroyed: bool,
+    pub abandoned: AbandonedCounts,
 }
 
 /// `POST /api/v1/agents/send`

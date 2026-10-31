@@ -20,9 +20,7 @@
     "operation": "djE6b3A6MTljZDBlNjg3Njk5MTMxNGMxYjZkYmQ4YmQxMjkyOTc6MTox",
     "accept_seq": 1,
     "handler": "place",
-    "state": {
-      "items": []
-    },
+    "state": null,
     "payload": {
       "qty": 2,
       "sku": "A-1"

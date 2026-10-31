@@ -74,6 +74,20 @@ describe("wire fixtures", () => {
     expect(() => wire.encodeWire(wire.ResultResponse, { ...decoded, result })).toThrow(z.ZodError);
   });
 
+  it("state is null until the first committed turn", () => {
+    const poll = wire.decodeWire(
+      wire.WorkerPollResponse,
+      JSON.parse(read("worker_poll_response")),
+    );
+    expect(poll.assignment?.state).toBeNull();
+    const state = wire.decodeWire(
+      wire.StateResponse,
+      JSON.parse(read("state_response_uncommitted")),
+    );
+    expect(state.state).toBeNull();
+    expect(state.state_version).toBe(0);
+  });
+
   it("a u64 counter past the safe-integer range is refused, not rounded", () => {
     const body = JSON.parse(read("send_response")) as Record<string, unknown>;
     body.accept_seq = 2 ** 53;

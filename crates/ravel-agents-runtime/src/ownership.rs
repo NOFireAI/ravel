@@ -32,7 +32,7 @@ use std::sync::atomic::Ordering;
 use parking_lot::Mutex;
 use ravel_agents_core::command::{Command, OwnerFence, Takeover};
 use ravel_agents_core::error::{AgentError, ErrorKind};
-use ravel_agents_core::head::Head;
+use ravel_agents_core::head::{Head, Lifecycle};
 use ravel_agents_core::identity::{AgentId, agent_id};
 use ravel_agents_core::kernel::Reply;
 use ravel_agents_core::wire::{AgentRef, TurnLease};
@@ -93,6 +93,11 @@ impl LeaseTable {
 
     pub(crate) fn forget(&self, agent: &AgentId) {
         self.0.lock().remove(agent);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds(&self, agent: &AgentId) -> bool {
+        self.0.lock().contains_key(agent)
     }
 }
 
@@ -249,10 +254,16 @@ impl Coordinator {
     /// Returns the new expiry. The renewal is visible to this coordinator
     /// only: HEAD's lease hint is not advanced, so another coordinator still
     /// takes the agent over `lease_ms + heartbeat_grace_ms` after the
-    /// takeover that granted the lease (see the module doc).
+    /// takeover that granted the lease (see the module doc). A HEAD whose
+    /// lifecycle is not `Active` is `AgentGone` and renews nothing, the
+    /// answer the owner's commit gets from the kernel
+    /// (`tests::a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll`).
     pub async fn heartbeat(&self, lease: &TurnLease) -> Result<i64, AgentError> {
         let (agent, fence) = fence_from_lease(lease)?;
         let head = self.reload(&agent).await?;
+        if head.lifecycle != Lifecycle::Active {
+            return Err(refused(&agent, ErrorKind::AgentGone, "agent is tombstoned"));
+        }
         let holds = head.incarnation == fence.owner.incarnation
             && head.owner_id == fence.owner.owner_id
             && head.epoch == fence.owner.epoch
