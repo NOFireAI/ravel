@@ -3061,6 +3061,7 @@ impl QueryEngine {
                     .map(|entry| (entry.series_id, entry.labels)),
             )?;
         }
+        fold.drop_seen();
         Ok(fold)
     }
 }
@@ -3077,13 +3078,14 @@ impl QueryEngine {
 /// erasure predicate give it the same verdict in every object: an object whose
 /// ids have all been seen adds nothing, and the fetch tasks read [`seen`]
 /// to skip its catalog decode. The seen set only saves work, so a budget that
-/// cannot hold it ends the skip instead of the listing.
+/// cannot hold it ends the skip instead of the listing, and it is released
+/// once the local fetch ends.
 ///
 /// [`seen`]: SeriesFold::seen
 struct SeriesFold {
     by_id: HashMap<SeriesId, LabelSet>,
     seen: Arc<std::sync::RwLock<HashSet<SeriesId>>>,
-    /// False once the budget refused the seen set: ids are no longer recorded.
+    /// False once the seen set was dropped: ids are no longer recorded.
     tracking_seen: bool,
     max_series: usize,
     budget: Arc<ravel_memory::MemoryBudget>,
@@ -3114,11 +3116,12 @@ impl SeriesFold {
     }
 
     /// Records every id a decoded object held and reserves
-    /// [`SEEN_SERIES_LEN`] for each one not seen before. The seen set may
-    /// hold at most half the budget's limit, so it never starves the fetches
-    /// it exists to save. Past that, or when the budget refuses the
-    /// reservation, the set is emptied, its reservations are released, and no
-    /// later id is recorded, so every remaining object is decoded.
+    /// [`SEEN_SERIES_LEN`] for each one not seen before. The reservation is
+    /// admitted only while the whole budget, every holder counted, stays at
+    /// or under half its limit, so all seen sets together hold at most half
+    /// the budget however many listings run. A refused reservation counts no
+    /// refusal and evicts nothing; the set is dropped as by
+    /// [`drop_seen`](Self::drop_seen), so every remaining object is decoded.
     fn mark_seen(&mut self, ids: Vec<SeriesId>) {
         if !self.tracking_seen {
             return;
@@ -3132,24 +3135,25 @@ impl SeriesFold {
             return;
         }
         let charge = added.saturating_mul(SEEN_SERIES_LEN);
-        let held: u64 = self
-            .seen_reservations
-            .iter()
-            .map(ravel_memory::Reservation::size)
-            .sum();
-        let reservation = if held.saturating_add(charge) <= self.budget.limit() / 2 {
-            self.budget.reserve(charge).ok()
-        } else {
-            None
-        };
-        match reservation {
-            Some(reservation) => self.seen_reservations.push(reservation),
-            None => {
-                *seen = HashSet::new();
-                self.seen_reservations.clear();
-                self.tracking_seen = false;
+        let headroom = self.budget.limit() / 2;
+        match self.budget.reserve_best_effort_keeping(charge, headroom) {
+            Ok(reservation) => self.seen_reservations.push(reservation),
+            Err(_) => {
+                drop(seen);
+                self.drop_seen();
             }
         }
+    }
+
+    /// Empties the seen set, releases its reservations, and stops recording
+    /// ids.
+    fn drop_seen(&mut self) {
+        *self
+            .seen
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HashSet::new();
+        self.seen_reservations.clear();
+        self.tracking_seen = false;
     }
 
     fn reserve(&mut self, bytes: u64) -> Result<(), QueryError> {
@@ -7814,41 +7818,9 @@ mod prefetch_tests {
     ) {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
-        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
-        for (seq, ids) in (1u64..).zip(&objects) {
-            let series = ids
-                .iter()
-                .map(|id| {
-                    (
-                        id.as_str(),
-                        vec![Sample {
-                            ts_ns: BASE_NS - NS_PER_MIN,
-                            value: 1.0,
-                        }],
-                    )
-                })
-                .collect();
-            publish_metric_segment_multi(
-                &store,
-                tenant_hash,
-                seq,
-                "m",
-                series,
-                hour_bucket,
-                BASE_NS,
-            )
-            .await;
-        }
+        publish_listing_objects(&store, tenant_hash, &objects).await;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(budget_bytes));
-        let eng = engine_with_config(
-            store,
-            EngineConfig {
-                promql_fetch_fanout: Some(1),
-                deadline: Duration::from_secs(60),
-                ..EngineConfig::default()
-            },
-        )
-        .with_memory_budget(Arc::clone(&budget));
+        let eng = listing_engine(store, &budget);
         let listed = eng
             .resolve_series(
                 tenant_hash,
@@ -7864,6 +7836,56 @@ mod prefetch_tests {
             .await
             .map(|(series, _)| series);
         (listed, budget, eng.fetcher.label_sets_materialized())
+    }
+
+    /// An engine that fetches one object at a time against `budget`.
+    fn listing_engine(
+        store: Arc<MemoryStore>,
+        budget: &Arc<ravel_memory::MemoryBudget>,
+    ) -> QueryEngine {
+        engine_with_config(
+            store,
+            EngineConfig {
+                promql_fetch_fanout: Some(1),
+                deadline: Duration::from_secs(60),
+                ..EngineConfig::default()
+            },
+        )
+        .with_memory_budget(Arc::clone(budget))
+    }
+
+    /// Publishes one metrics object per entry of `objects`, holding the series
+    /// whose `id` label values it names under metric `m`, in order.
+    async fn publish_listing_objects(
+        store: &Arc<MemoryStore>,
+        tenant_hash: TenantHash,
+        objects: &[Vec<String>],
+    ) {
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        for (seq, ids) in (1u64..).zip(objects) {
+            let series = ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.as_str(),
+                        vec![Sample {
+                            ts_ns: BASE_NS - NS_PER_MIN,
+                            value: 1.0,
+                        }],
+                    )
+                })
+                .collect();
+            publish_metric_segment_multi(
+                store,
+                tenant_hash,
+                seq,
+                "m",
+                series,
+                hour_bucket,
+                BASE_NS,
+            )
+            .await;
+        }
     }
 
     /// Issue #3434: a series listing holds one copy of each series however
@@ -7995,11 +8017,11 @@ mod prefetch_tests {
         assert_eq!(budget.reserved(), 0);
     }
 
-    /// The seen set ends the skip, not the listing, once it would pass half
-    /// the budget's limit: the set is emptied, its charge released, and no
-    /// later id is recorded, even one that would fit. The fold still absorbs
-    /// series. Twenty-five ids (800 bytes) fit under a 1,599-byte half; fifty
-    /// do not.
+    /// The seen set ends the skip, not the listing, once it would take the
+    /// budget past half its limit: the set is emptied, its charge released,
+    /// and no later id is recorded, even one that would fit. The fold still
+    /// absorbs series. Twenty-five ids (800 bytes) fit under a 1,599-byte
+    /// half; fifty do not.
     #[test]
     fn a_series_fold_drops_its_seen_set_past_half_the_budget() {
         let batch = padded_batch(&padded_ids("", LISTING_SERIES));
@@ -8026,23 +8048,26 @@ mod prefetch_tests {
         assert_eq!(fold.into_series().len(), 1);
     }
 
-    /// A budget that refuses the seen set's reservation, though the set is
-    /// under half its limit, drops the set the same way instead of failing:
-    /// another holder leaves 700 bytes free and twenty-five ids ask for 800.
+    /// A budget another holder already fills past half drops the seen set the
+    /// same way, though the set's own 800 bytes are far under half: the
+    /// half is of the whole budget, not of this set. The refused charge
+    /// counts no refusal, since nothing failed.
     #[test]
-    fn a_series_fold_drops_its_seen_set_when_the_budget_refuses_it() {
+    fn a_series_fold_drops_its_seen_set_when_the_budget_is_half_held() {
         let ids: Vec<SeriesId> = padded_batch(&padded_ids("", LISTING_SERIES))
             .into_iter()
             .map(|(id, _)| id)
             .collect();
         let limit = 4 * LISTING_SERIES as u64 * SEEN_SERIES_LEN;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
-        let other = budget.reserve(limit - 700).expect("another holder");
+        let other = budget.reserve(limit / 2).expect("another holder");
         let mut fold = SeriesFold::new(Arc::clone(&budget), usize::MAX);
         fold.mark_seen(ids[..LISTING_SERIES / 2].to_vec());
         assert!(fold.seen().read().expect("unpoisoned").is_empty());
         assert_eq!(fold.charged(), 0);
-        assert_eq!(budget.accounted_refusals(), 1);
+        assert_eq!(budget.reserved(), limit / 2);
+        assert_eq!(budget.accounted_refusals(), 0);
+        assert_eq!(budget.gate_refusals(), 0);
         drop(other);
         fold.mark_seen(ids[..1].to_vec());
         assert!(
@@ -8050,6 +8075,95 @@ mod prefetch_tests {
             "no id is recorded once the set is dropped"
         );
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Two listings' seen sets share one half of the budget, not one half
+    /// each: the second set's 1,600 bytes would take the 6,398-byte budget's
+    /// 1,600 already held to 3,200, past its 3,199-byte half, so it is
+    /// dropped while the first keeps its set.
+    #[test]
+    fn two_series_folds_share_half_the_budget() {
+        let first_ids: Vec<SeriesId> = padded_batch(&padded_ids("a-", LISTING_SERIES))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let second_ids: Vec<SeriesId> = padded_batch(&padded_ids("b-", LISTING_SERIES))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let one_set = LISTING_SERIES as u64 * SEEN_SERIES_LEN;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * one_set - 2));
+        let mut first = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        let mut second = SeriesFold::new(Arc::clone(&budget), usize::MAX);
+        first.mark_seen(first_ids);
+        second.mark_seen(second_ids);
+        assert_eq!(first.charged(), one_set);
+        assert_eq!(
+            first.seen().read().expect("unpoisoned").len(),
+            LISTING_SERIES
+        );
+        assert_eq!(second.charged(), 0);
+        assert!(second.seen().read().expect("unpoisoned").is_empty());
+        assert_eq!(budget.reserved(), one_set);
+        assert_eq!(budget.accounted_refusals(), 0);
+    }
+
+    /// A series fetch releases its seen set when it returns, so the charge
+    /// is not held while federated series join the fold: the fold then
+    /// holds the matched series' charge alone.
+    #[tokio::test]
+    async fn a_series_fetch_releases_its_seen_set_when_it_returns() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let objects: Vec<Vec<String>> = (1..=4)
+            .map(|seq| padded_ids(&format!("{seq}-"), LISTING_SERIES))
+            .collect();
+        let wanted = objects[0][0].clone();
+        publish_listing_objects(&store, tenant_hash, &objects).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let eng = listing_engine(Arc::clone(&store), &budget);
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog = Catalog::new(backend, CatalogConfig::default()).expect("catalog");
+        let (snapshot, _origins, _generations) = catalog
+            .resolve_pruned_with_generations(
+                &tenant_hash,
+                Signal::Metrics,
+                TimeRange {
+                    start_ns: BASE_NS - 60 * NS_PER_MIN,
+                    end_ns: BASE_NS,
+                },
+                &[],
+                BASE_NS,
+                None,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot.segments.len(), objects.len());
+        let matchers = [
+            name_matcher("m"),
+            LabelMatcher {
+                name: "id".to_string(),
+                op: MatchOp::Eq,
+                value: wanted,
+            },
+        ];
+        let fold = eng
+            .fetch_all_series(
+                tenant_hash,
+                &snapshot,
+                &matchers,
+                &PhaseAccounting::new(),
+                ByteLimit::Unlimited,
+                RequestBudget::from(eng.config.max_s3_requests),
+            )
+            .await
+            .expect("the listing answers");
+        assert!(fold.seen().read().expect("unpoisoned").is_empty());
+        assert_eq!(fold.by_id.len(), 1);
+        let matched: u64 = fold.by_id.values().map(retained_series_len).sum();
+        assert_eq!(fold.charged(), matched);
+        assert_eq!(budget.reserved(), matched);
     }
 
     /// Issue #3481: a selective listing over a tenant whose distinct series
@@ -8078,6 +8192,7 @@ mod prefetch_tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].1.get("id"), Some(wanted.as_str()));
         assert_eq!(budget.accounted_refusals(), 0);
+        assert_eq!(budget.gate_refusals(), 0);
         assert_eq!(budget.reserved(), 0);
     }
 
