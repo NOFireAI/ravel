@@ -48,7 +48,7 @@ export interface HttpTransportOptions {
   /** Defaults to the global `fetch`. */
   readonly fetch?: typeof fetch;
   /**
-   * @deprecated Ignored: steps and effect results are recorded on the server.
+   * Ignored: steps and effect results are recorded on the server.
    * Accepted so callers written against the in-memory journal still compile.
    */
   readonly journal?: unknown;

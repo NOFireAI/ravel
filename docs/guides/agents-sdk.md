@@ -191,8 +191,9 @@ lists the agent's effects from /api/v1/agents/effects`, `effect inspects a
 handle at /api/v1/agents/effects/{effect}` (`client/client.test.ts`).
 `client.reconcile(request)` records an operator's decision on an in-doubt
 effect, and `agent.destroy({ incarnation })` destroys an agent, pinned to
-an incarnation when one is given; both need a token holding `agents_admin`,
-and the server's destroy route is added under #3478. Tests: `reconcile
+an incarnation when one is given; both need a token holding `agents_admin`.
+The server does not serve the destroy route yet; the client follows the
+wire fixtures for it. Tests: `reconcile
 posts the decision to /api/v1/agents/reconcile`, `destroy posts kind, key
 and incarnation and decodes destroyed and abandoned`. Both are sent once
 and never retried, so a lost answer is `OutcomeUnknown`: read
