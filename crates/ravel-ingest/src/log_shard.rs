@@ -77,6 +77,7 @@ use crate::generation::{
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
+use crate::log_latency::{FlushPhase, StrictAckPhase, elapsed_ns};
 use crate::log_metrics::LogIngestMetrics;
 use crate::log_router::partition_columnar;
 use crate::metrics::FlushTrigger;
@@ -553,6 +554,11 @@ struct LogTenantBuf {
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
     waiters: Vec<LogAck>,
+    /// Parallel to `waiters`: the actor's arrival reading for the write that
+    /// registered each one, the start of its `queued` span (issue #3533).
+    /// Changed only through [`LogTenantBuf::push_waiter`] and
+    /// [`LogTenantBuf::take_waiters`], so the two stay the same length.
+    waiter_registered_ns: Vec<i64>,
     /// Global ingest-byte-budget charges (ADR-0069) for every request whose
     /// records this buffer holds. Dropped -- refunding the bytes -- when the
     /// buffer flushes (or its flush fails), never before.
@@ -577,6 +583,18 @@ struct LogTenantBuf {
 }
 
 impl LogTenantBuf {
+    fn push_waiter(&mut self, ack: LogAck, registered_ns: i64) {
+        self.waiters.push(ack);
+        self.waiter_registered_ns.push(registered_ns);
+    }
+
+    /// Takes every waiter out of a buffer that stays live, with its
+    /// registration reading, so a later flush neither re-acks nor re-times it.
+    fn take_waiters(&mut self) -> Vec<LogAck> {
+        self.waiter_registered_ns.clear();
+        std::mem::take(&mut self.waiters)
+    }
+
     /// Merges records that are already admitted and charged: records handed
     /// back to this shard, or records a failed hand-back send returned.
     fn absorb(
@@ -770,7 +788,14 @@ struct LogFlushCtx {
     stage_timings: Arc<LogStageTimings>,
     /// The ADR-1702 write gate the encode runs on, shared with the router.
     write_gate: WriteGateSlot,
+    /// Runs inside the permit-wait, encode and commit-build brackets, so a test
+    /// can advance its clock within a phase that makes no store call.
+    #[cfg(test)]
+    phase_hook: std::sync::OnceLock<PhaseHook>,
 }
+
+#[cfg(test)]
+type PhaseHook = Arc<dyn Fn(FlushPhase) + Send + Sync>;
 
 /// What a log flush's encode job hands back to the flush task: the RLOG bytes
 /// with their writer stats and blake3 hash, and the byte charges the job held
@@ -930,6 +955,10 @@ impl LogFlushCtx {
         // A stale-cache/failed-read/validation fallback is degraded, never fatal:
         // it counts the visibility metric and proceeds on the last-known-good or
         // CLI-only list, never failing the flush closed (ADR-0079 Safety).
+        //
+        // The clock readings from here on bracket the flush phases (issue
+        // #3533) and feed nothing but those histograms.
+        let resolve_start_ns = self.clock.now_ns();
         let indexed_fields = match self
             .indexed_fields
             .fields_for_cached(&tenant_hash, flush_open_ns)
@@ -965,6 +994,10 @@ impl LogFlushCtx {
                 WriterLayout::unkeyed()
             }
         };
+        self.metrics.record_flush_phase(
+            FlushPhase::Resolve,
+            elapsed_ns(resolve_start_ns, self.clock.now_ns()),
+        );
         let declared_columns: Vec<(String, u32)> = typed_columns
             .into_iter()
             .map(|col| (col.key, declared_type_tag(col.ty)))
@@ -978,9 +1011,16 @@ impl LogFlushCtx {
         // inline floor the job seals its column page jobs under its own permit
         // while page tasks that get a free permit seal others in parallel
         // (ADR-3492 decision 7); below it, serially as one inline job.
+        #[cfg(test)]
+        let phase_hook = self.phase_hook.get().cloned();
+        let encode_start_ns = self.clock.now_ns();
         let encode = self
             .write_gate
             .encode_pages(WriteSite::LogFlush, input_bytes, move |pages| {
+                #[cfg(test)]
+                if let Some(hook) = phase_hook {
+                    hook(FlushPhase::Encode);
+                }
                 // Encode: RLOG serialization only (RlogWriter push + finish),
                 // excluding the indexed-field and layout resolution above, this
                 // job's own permit wait and the object-store PUT below. With
@@ -1031,7 +1071,12 @@ impl LogFlushCtx {
                     encode_elapsed,
                 }
             });
-        let encoded = match self.bound_to_deadline(deadline_ns, encode).await {
+        let encode_outcome = self.bound_to_deadline(deadline_ns, encode).await;
+        self.metrics.record_flush_phase(
+            FlushPhase::Encode,
+            elapsed_ns(encode_start_ns, self.clock.now_ns()),
+        );
+        let encoded = match encode_outcome {
             Some(Ok(encoded)) => encoded,
             Some(Err(err)) => {
                 // Gate fault: see `GATE_DEADLINE_MESSAGE`.
@@ -1115,10 +1160,15 @@ impl LogFlushCtx {
             }
         };
 
-        if !self
+        let data_put_start_ns = self.clock.now_ns();
+        let data_put = self
             .put_data_object_with_retry(&data_key, data.clone(), deadline_ns)
-            .await
-        {
+            .await;
+        self.metrics.record_flush_phase(
+            FlushPhase::DataPut,
+            elapsed_ns(data_put_start_ns, self.clock.now_ns()),
+        );
+        if !data_put {
             self.metrics.record_abandoned_retry_exhausted();
             self.ack_waiters(
                 waiters,
@@ -1129,7 +1179,10 @@ impl LogFlushCtx {
             return;
         }
 
-        let mut record = match record::build(NewCommitRecord {
+        let commit_build_start_ns = self.clock.now_ns();
+        #[cfg(test)]
+        self.on_phase(FlushPhase::CommitBuild);
+        let built = record::build(NewCommitRecord {
             tenant_hash,
             signal: Signal::Logs,
             shard: self.shard,
@@ -1147,7 +1200,28 @@ impl LogFlushCtx {
             segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
             created_unix_ns: flush_open_ns,
             ingest_hour_bucket,
-        }) {
+        })
+        .map(|mut record| {
+            // ADR-0873 wave 5a: stamp the accumulated declared-column extrema
+            // onto the commit record beside `sample_count`, against the same row
+            // count. `build_stamps` gates on the {I64, BOOL} allowlist and
+            // derives every `null_count` as `sample_count - non_null`, so no
+            // stamp it emits is one this flush's own reader would drop (decision
+            // 3). An empty declared set or an empty stamp list leaves the field
+            // absent, the legal default.
+            if !declared_columns.is_empty() {
+                let stamps = declared_stats.build_stamps(&declared_columns, record.sample_count);
+                if !stamps.is_empty() {
+                    ravel_commit::declared_stats::stamp_commit_record(&mut record, &stamps);
+                }
+            }
+            record
+        });
+        self.metrics.record_flush_phase(
+            FlushPhase::CommitBuild,
+            elapsed_ns(commit_build_start_ns, self.clock.now_ns()),
+        );
+        let record = match built {
             Ok(r) => r,
             Err(e) => {
                 self.metrics.record_abandoned_input_rejected();
@@ -1156,20 +1230,13 @@ impl LogFlushCtx {
             }
         };
 
-        // ADR-0873 wave 5a: stamp the accumulated declared-column extrema onto
-        // the commit record beside `sample_count`, against the same row count.
-        // `build_stamps` gates on the {I64, BOOL} allowlist and derives every
-        // `null_count` as `sample_count - non_null`, so no stamp it emits is one
-        // this flush's own reader would drop (decision 3). An empty declared set
-        // or an empty stamp list leaves the field absent, the legal default.
-        if !declared_columns.is_empty() {
-            let stamps = declared_stats.build_stamps(&declared_columns, record.sample_count);
-            if !stamps.is_empty() {
-                ravel_commit::declared_stats::stamp_commit_record(&mut record, &stamps);
-            }
-        }
-
-        match self.publish_with_retry(&record, deadline_ns).await {
+        let publish_start_ns = self.clock.now_ns();
+        let published = self.publish_with_retry(&record, deadline_ns).await;
+        self.metrics.record_flush_phase(
+            FlushPhase::CommitPublish,
+            elapsed_ns(publish_start_ns, self.clock.now_ns()),
+        );
+        match published {
             Some(token) => {
                 // Both PUTs landed: attribute this flush's PUT cost to the
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
@@ -1194,6 +1261,13 @@ impl LogFlushCtx {
     /// result: `waiters` was moved out of this flush's `LogTenantBuf` at pin
     /// time and never merged with another flush's, so there is no other waiter
     /// list this call could reach.
+    #[cfg(test)]
+    fn on_phase(&self, phase: FlushPhase) {
+        if let Some(hook) = self.phase_hook.get() {
+            hook(phase);
+        }
+    }
+
     fn ack_waiters(&self, waiters: Vec<LogAck>, result: Result<CommitToken, LogWriteError>) {
         let ok = result.is_ok();
         self.metrics.record_acks(waiters.len(), ok);
@@ -1503,6 +1577,8 @@ impl LogShardActor {
             #[cfg(feature = "stage-timing")]
             stage_timings,
             write_gate,
+            #[cfg(test)]
+            phase_hook: std::sync::OnceLock::new(),
         });
         LogShardActor {
             shard,
@@ -1701,7 +1777,7 @@ impl LogShardActor {
             buf.charges.push(charge);
         }
         if let Some(ack) = ack {
-            buf.waiters.push(ack);
+            buf.push_waiter(ack, arrival_ns);
         }
         self.metrics
             .record_buffered(bytes_added as u64, records_len);
@@ -1827,7 +1903,7 @@ impl LogShardActor {
             }
         }
 
-        let waiters = std::mem::take(&mut buf.waiters);
+        let waiters = buf.take_waiters();
         self.ctx.ack_waiters(
             waiters,
             Err(LogWriteError::Abandoned(reason.abandoned_message().into())),
@@ -2038,7 +2114,7 @@ impl LogShardActor {
             buf.charges.push(charge);
         }
         if let Some(ack) = ack {
-            buf.waiters.push(ack);
+            buf.push_waiter(ack, arrival_ns);
         }
         self.metrics
             .record_buffered(bytes_added as u64, records_len);
@@ -2565,7 +2641,7 @@ impl LogShardActor {
             // past the cap, so the answer is the outcome-unknown `Abandoned`
             // (503), and a client retry stores them twice: logs have no
             // query-time dedup.
-            let waiters = std::mem::take(&mut buf.waiters);
+            let waiters = buf.take_waiters();
             self.ctx.ack_waiters(
                 waiters,
                 Err(LogWriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
@@ -2647,7 +2723,7 @@ impl LogShardActor {
                 // 503 re-enqueues records this buffer still holds; logs do not dedup
                 // at query time, so the retry can duplicate a record, which is the
                 // at-least-once contract strict mode already carries on any retry.
-                let waiters = std::mem::take(&mut buf.waiters);
+                let waiters = buf.take_waiters();
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::Abandoned(msg)));
                 self.tenants.insert(tenant, buf);
@@ -2690,7 +2766,7 @@ impl LogShardActor {
             {
                 // This flush opens at or past the cap, so, as on the deferral
                 // path, no strict waiter is acknowledged from it.
-                let waiters = std::mem::take(&mut buf.waiters);
+                let waiters = buf.take_waiters();
                 self.ctx.ack_waiters(
                     waiters,
                     Err(LogWriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
@@ -2855,6 +2931,7 @@ impl LogShardActor {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
+            waiter_registered_ns,
             charges,
             declared_stats,
             ..
@@ -2960,72 +3037,92 @@ impl LogShardActor {
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
         let shard = self.shard;
+        // Issue #3533: the spawn reading closes every carried waiter's `queued`
+        // span and opens the flush's `total`, which the task records on
+        // whichever exit it takes.
+        let spawn_ns = self.clock.now_ns();
+        for registered_ns in waiter_registered_ns {
+            self.metrics.record_strict_ack_phase(
+                StrictAckPhase::Queued,
+                elapsed_ns(registered_ns, spawn_ns),
+            );
+        }
         self.flushes.spawn(async move {
             let _guard = guard;
-            let slot = slot;
-            let mut pinned = pinned;
-            // Issue #1739 part 2: a flush whose flush-open deadline already
-            // elapsed while it sat in the spawn queue must not take a permit only
-            // to fail the deadline check inside `run_flush` and waste the slot.
-            // Check the pinned flush-open deadline here, before the acquire; if
-            // it has passed, abandon in the queue with no permit taken. In normal
-            // operation the deadline is a full `max_flush_lifetime` ahead of
-            // flush-open, so this fires only when this task is scheduled
-            // pathologically late.
-            if ctx
-                .bound_to_deadline(pinned.deadline_ns, std::future::ready(()))
-                .await
-                .is_none()
-            {
-                ctx.abandon_in_queue(pinned);
-                return;
-            }
-            // Wait for a flush permit here, off the actor. At the bound this task
-            // parks; the actor does not. The wait is this shard's
-            // `flush_permit_wait_ns` (issue #865), measured on the injected clock
-            // and no longer subtracted from any on-actor figure because it is no
-            // longer on-actor time. It is the figure that says whether
-            // `max_inflight_flushes` is the binding window on a bulk load (issue
-            // #800): it stays at zero unless a shard is actually asked for a
-            // second concurrent flush.
-            let permit_wait_start_ns = clock.now_ns();
-            // The tenant's share permit is taken first (ADR-2708 D3).
-            let permit = match slot.acquire(&semaphore).await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    panic!("ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}")
-                }
-            };
-            let permit_wait_ns = clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
-            metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
-            let _permit = permit;
-            // Issue #1739 part 1: re-derive the abandonment deadline from the
-            // moment the permit is granted, not from flush-open. A flush that
-            // queued behind a stalled prefix must get its full
-            // `max_flush_lifetime` for its own store calls; pinning at flush-open
-            // spent that budget in the queue and dropped already-acked buffered
-            // rows with no PUT. The re-derived value only ever moves the deadline
-            // later (grant is at or after open), so it never shortens a flush's
-            // store budget.
-            //
-            // ADR-2708 D3 clamps it to the pinned hour's end plus
-            // `max_flush_lifetime` and abandons a flush granted past that bound
-            // without a PUT. The hour is not re-pinned.
-            pinned.deadline_ns = match grant_deadline_ns(
-                clock.now_ns(),
-                pinned.ingest_hour_bucket,
-                ctx.config.max_flush_lifetime,
-            ) {
-                Some(deadline_ns) => deadline_ns,
-                None => {
-                    ctx.abandon_hour_bound(pinned);
+            let flush = async {
+                let slot = slot;
+                let mut pinned = pinned;
+                // Issue #1739 part 2: a flush whose flush-open deadline already
+                // elapsed while it sat in the spawn queue must not take a permit only
+                // to fail the deadline check inside `run_flush` and waste the slot.
+                // Check the pinned flush-open deadline here, before the acquire; if
+                // it has passed, abandon in the queue with no permit taken. In normal
+                // operation the deadline is a full `max_flush_lifetime` ahead of
+                // flush-open, so this fires only when this task is scheduled
+                // pathologically late.
+                if ctx
+                    .bound_to_deadline(pinned.deadline_ns, std::future::ready(()))
+                    .await
+                    .is_none()
+                {
+                    ctx.abandon_in_queue(pinned);
                     return;
                 }
+                // Wait for a flush permit here, off the actor. At the bound this task
+                // parks; the actor does not. The wait is this shard's
+                // `flush_permit_wait_ns` (issue #865), measured on the injected clock
+                // and no longer subtracted from any on-actor figure because it is no
+                // longer on-actor time. It is the figure that says whether
+                // `max_inflight_flushes` is the binding window on a bulk load (issue
+                // #800): it stays at zero unless a shard is actually asked for a
+                // second concurrent flush.
+                let permit_wait_start_ns = clock.now_ns();
+                #[cfg(test)]
+                ctx.on_phase(FlushPhase::PermitWait);
+                // The tenant's share permit is taken first (ADR-2708 D3).
+                let permit = match slot.acquire(&semaphore).await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        panic!(
+                            "ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}"
+                        )
+                    }
+                };
+                let permit_wait_ns =
+                    clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
+                metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
+                metrics.record_flush_phase(FlushPhase::PermitWait, permit_wait_ns);
+                let _permit = permit;
+                // Issue #1739 part 1: re-derive the abandonment deadline from the
+                // moment the permit is granted, not from flush-open. A flush that
+                // queued behind a stalled prefix must get its full
+                // `max_flush_lifetime` for its own store calls; pinning at flush-open
+                // spent that budget in the queue and dropped already-acked buffered
+                // rows with no PUT. The re-derived value only ever moves the deadline
+                // later (grant is at or after open), so it never shortens a flush's
+                // store budget.
+                //
+                // ADR-2708 D3 clamps it to the pinned hour's end plus
+                // `max_flush_lifetime` and abandons a flush granted past that bound
+                // without a PUT. The hour is not re-pinned.
+                pinned.deadline_ns = match grant_deadline_ns(
+                    clock.now_ns(),
+                    pinned.ingest_hour_bucket,
+                    ctx.config.max_flush_lifetime,
+                ) {
+                    Some(deadline_ns) => deadline_ns,
+                    None => {
+                        ctx.abandon_hour_bound(pinned);
+                        return;
+                    }
+                };
+                let started_ns = clock.now_ns();
+                ctx.run_flush(pinned).await;
+                let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+                metrics.record_shard_off_actor_ns(shard, off_actor_ns);
             };
-            let started_ns = clock.now_ns();
-            ctx.run_flush(pinned).await;
-            let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-            metrics.record_shard_off_actor_ns(shard, off_actor_ns);
+            flush.await;
+            metrics.record_flush_phase(FlushPhase::Total, elapsed_ns(spawn_ns, clock.now_ns()));
         });
         self.record_queued_flushes();
     }
@@ -3147,7 +3244,17 @@ mod tests {
         }
 
         fn spawn_with_store(config: IngestConfig, store: Arc<dyn ObjectStoreBackend>) -> Self {
-            let clock = TestClock::new(BASE_NS);
+            Self::spawn_on_clock(config, store, TestClock::new(BASE_NS), None)
+        }
+
+        /// [`Self::spawn_with_store`] on a caller's clock, with `phase_hook`
+        /// run inside the flush phases that make no store call.
+        fn spawn_on_clock(
+            config: IngestConfig,
+            store: Arc<dyn ObjectStoreBackend>,
+            clock: Arc<TestClock>,
+            phase_hook: Option<PhaseHook>,
+        ) -> Self {
             let metrics = Arc::new(LogIngestMetrics::default());
             let (tx, rx) = mpsc::channel(64);
             let actor = LogShardActor::new(
@@ -3170,6 +3277,9 @@ mod tests {
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
+            if let Some(hook) = phase_hook {
+                let _ = actor.ctx.phase_hook.set(hook);
+            }
             let task = tokio::spawn(actor.run());
             Harness {
                 tx,
@@ -6043,7 +6153,7 @@ mod tests {
         rig.task.await.expect("actor ends");
 
         let mut buf = LogTenantBuf::default();
-        buf.waiters.push(oneshot::channel().0);
+        buf.push_waiter(oneshot::channel().0, 0);
         assert_eq!(
             HandBackRig::idle_actor(config).age_threshold_ns(&buf),
             (i64::MAX, FlushTrigger::Age)
@@ -6330,6 +6440,212 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(records, original);
+    }
+
+    /// Advances the test clock by a fixed amount inside every GET or PUT whose
+    /// key contains a given substring, so a store-bound flush phase takes an
+    /// exact injected-clock duration.
+    struct AdvancingStore {
+        inner: MemoryStore,
+        clock: Arc<TestClock>,
+        get_advances: Vec<(&'static str, i64)>,
+        put_advances: Vec<(&'static str, i64)>,
+    }
+
+    impl AdvancingStore {
+        fn advance_for(&self, rules: &[(&'static str, i64)], key: &str) {
+            for (pattern, delta_ns) in rules {
+                if key.contains(pattern) {
+                    self.clock.advance_ns(*delta_ns);
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for AdvancingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.advance_for(&self.put_advances, key);
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.advance_for(&self.get_advances, key);
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Sends one strict single-record write and returns its ack.
+    async fn strict_write_one(h: &Harness) -> Result<CommitToken, LogWriteError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            arrival: false,
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        ack_rx.await.expect("ack sender not dropped")
+    }
+
+    /// Issue #3533: each flush phase records exactly the injected-clock time
+    /// spent inside it. The store advances the clock inside the config GET
+    /// (resolve), the data PUT and the commit PUT; the phase hook advances it
+    /// inside the permit wait, the encode job and the commit build. Every
+    /// duration is distinct, so a phase charged with its neighbour's time
+    /// fails, and `total` is their exact sum because nothing advances the
+    /// clock between phases.
+    #[tokio::test]
+    async fn flush_phases_are_measured_on_the_injected_clock() {
+        const PERMIT_WAIT: i64 = 1_000_000;
+        const RESOLVE: i64 = 2_000_000;
+        const ENCODE: i64 = 3_000_000;
+        const DATA_PUT: i64 = 5_000_000;
+        const COMMIT_BUILD: i64 = 7_000_000;
+        const COMMIT_PUBLISH: i64 = 11_000_000;
+
+        let clock = TestClock::new(BASE_NS);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(AdvancingStore {
+            inner: MemoryStore::new(),
+            clock: Arc::clone(&clock),
+            get_advances: vec![("/config", RESOLVE)],
+            put_advances: vec![("/l/l0/", DATA_PUT), ("/l/c/", COMMIT_PUBLISH)],
+        });
+        let hook_clock = Arc::clone(&clock);
+        let hook: PhaseHook = Arc::new(move |phase| {
+            let delta_ns = match phase {
+                FlushPhase::PermitWait => PERMIT_WAIT,
+                FlushPhase::Encode => ENCODE,
+                FlushPhase::CommitBuild => COMMIT_BUILD,
+                _ => 0,
+            };
+            hook_clock.advance_ns(delta_ns);
+        });
+        let h = Harness::spawn_on_clock(flush_on_first(), store, clock, Some(hook));
+        let metrics = Arc::clone(&h.metrics);
+
+        strict_write_one(&h).await.expect("strict write commits");
+        // `total` is recorded after the ack fan-out, when the flush task
+        // returns; shutdown joins it.
+        h.shutdown().await;
+
+        let latency = metrics.snapshot().latency;
+        let expected = [
+            (FlushPhase::PermitWait, PERMIT_WAIT),
+            (FlushPhase::Resolve, RESOLVE),
+            (FlushPhase::Encode, ENCODE),
+            (FlushPhase::DataPut, DATA_PUT),
+            (FlushPhase::CommitBuild, COMMIT_BUILD),
+            (FlushPhase::CommitPublish, COMMIT_PUBLISH),
+            (
+                FlushPhase::Total,
+                PERMIT_WAIT + RESOLVE + ENCODE + DATA_PUT + COMMIT_BUILD + COMMIT_PUBLISH,
+            ),
+        ];
+        for (phase, ns) in expected {
+            let histogram = latency.flush(phase);
+            assert_eq!(histogram.count(), 1, "{} count", phase.name());
+            assert_eq!(histogram.sum_ns, ns as u64, "{} sum", phase.name());
+        }
+        let queued = latency.strict_ack(StrictAckPhase::Queued);
+        assert_eq!(queued.count(), 1, "one strict waiter rode the flush");
+        assert_eq!(
+            queued.sum_ns, 0,
+            "nothing advanced the clock between the write and the spawn"
+        );
+    }
+
+    /// Issue #3533: a data PUT that fails permanently still records the
+    /// `data_put` step that failed, records neither commit phase it never
+    /// reached, and records `total` on the early exit.
+    #[tokio::test]
+    async fn an_early_error_flush_records_its_failed_step_and_total() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("data refused".into()))
+                .with_key_contains("/l0/"),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(flush_on_first(), store);
+        let metrics = Arc::clone(&h.metrics);
+
+        let err = strict_write_one(&h)
+            .await
+            .expect_err("a refused data PUT abandons the flush");
+        assert!(matches!(err, LogWriteError::Abandoned(_)));
+        h.shutdown().await;
+
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Permanent),
+            1,
+            "the data PUT fault fired once, with no retry"
+        );
+        let latency = metrics.snapshot().latency;
+        let counts: Vec<(&str, u64)> = FlushPhase::ALL
+            .into_iter()
+            .map(|phase| (phase.name(), latency.flush(phase).count()))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("permit_wait", 1),
+                ("resolve", 1),
+                ("encode", 1),
+                ("data_put", 1),
+                ("commit_build", 0),
+                ("commit_publish", 0),
+                ("total", 1),
+            ]
+        );
     }
 }
 

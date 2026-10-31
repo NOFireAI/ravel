@@ -20,6 +20,7 @@ mod indexed_fields;
 mod lifecycle;
 mod log_declared_stats;
 mod log_error;
+mod log_latency;
 mod log_metrics;
 mod log_router;
 mod log_shard;
@@ -72,6 +73,7 @@ pub use lifecycle::{
     overlay_admission_limits, refresh_tenant_limits_once,
 };
 pub use log_error::LogWriteError;
+pub use log_latency::{FlushPhase, LatencyHistogramSnapshot, LogLatencySnapshot, StrictAckPhase};
 pub use log_metrics::{FlushTriggerMix, LogIngestMetrics, LogIngestMetricsSnapshot};
 pub use log_router::{
     LogIndexedFields, LogIngestRouter, LogSubmitted, LogWriteReceipt, NoIndexedFields,
