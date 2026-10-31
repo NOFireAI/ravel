@@ -544,8 +544,7 @@ impl Coordinator {
     /// (`tests::reconcile_is_idempotent_and_audited_once`,
     /// `tests::a_reconciled_attempt_survives_a_takeover_before_the_next_step`). Answers `true`
     /// when this call's own HEAD write published the authorization; only
-    /// then is the attempt handed over, and an existing hand-over record for
-    /// the same incarnation and attempt is kept as it is. Idempotent: a
+    /// then is the attempt handed over. Idempotent: a
     /// repeat for an attempt already authorized answers `false` and hands
     /// nothing over.
     ///

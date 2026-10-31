@@ -370,12 +370,13 @@ one tenant are not told apart in the audit record.
 
 After a 500 `outcome_unknown` from reconcile. The server could not tell
 whether its own write took effect, so it hands the attempt to nobody.
-Read `GET /api/v1/agents/effects/{effect}`. If the attempt reads
-`authorized`, another reconcile's server holds it and the owner's next step
-dispatches it there, at most once
+An attempt that reads `authorized` in
+`GET /api/v1/agents/effects/{effect}` does not tell you whether any process
+holds it: another reconcile's process may, or none may. Either way it is
+dispatched at most once
 (`concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`).
-If after the owner's next step the effect reads `in_doubt` again, no server
-held the attempt and nothing ran it; reconcile again
+Wait for the owner's next step. If the effect then reads `in_doubt` again,
+nothing ran the attempt; reconcile again
 (`a_reconcile_authorization_with_a_lost_ack_is_not_handed_over_and_latches_in_doubt_again`).
 
 Worked example, with `EFF` the effect id from `blocked_effect`:
