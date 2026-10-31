@@ -205,6 +205,7 @@ pub(crate) fn elapsed_ns(start_ns: i64, end_ns: i64) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use ravel_object_store::instrument::LATENCY_BUCKET_BOUNDS_MICROS;
 

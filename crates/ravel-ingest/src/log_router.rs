@@ -718,18 +718,17 @@ impl LogIngestRouter {
             let result = rx.await;
             (result, clock.now_ns())
         });
-        let joined = match tokio::time::timeout(ack_deadline, futures::future::join_all(stamped))
-            .await
-        {
-            Ok(joined) => joined,
-            Err(_) => {
-                self.metrics.record_strict_ack_phase(
-                    StrictAckPhase::Request,
-                    elapsed_ns(submitted_ns, self.clock.now_ns()),
-                );
-                return Err(LogWriteError::AckTimeout);
-            }
-        };
+        let joined =
+            match tokio::time::timeout(ack_deadline, futures::future::join_all(stamped)).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    self.metrics.record_strict_ack_phase(
+                        StrictAckPhase::Request,
+                        elapsed_ns(submitted_ns, self.clock.now_ns()),
+                    );
+                    return Err(LogWriteError::AckTimeout);
+                }
+            };
         let first_ack_ns = joined.iter().map(|(_, at)| *at).min();
         let last_ack_ns = joined.iter().map(|(_, at)| *at).max();
         if let Some(last_ack_ns) = last_ack_ns {

@@ -3083,10 +3083,13 @@ impl LogShardActor {
                 let permit = match slot.acquire(&semaphore).await {
                     Ok(permit) => permit,
                     Err(_) => {
-                        panic!("ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}")
+                        panic!(
+                            "ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}"
+                        )
                     }
                 };
-                let permit_wait_ns = clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
+                let permit_wait_ns =
+                    clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
                 metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
                 metrics.record_flush_phase(FlushPhase::PermitWait, permit_wait_ns);
                 let _permit = permit;
