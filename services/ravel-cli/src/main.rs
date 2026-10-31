@@ -2848,7 +2848,11 @@ async fn run_agents(
             let choice =
                 agents::ReconcileChoice::parse(attach_result.as_deref(), authorize_attempt)?;
             let client = ravel_agents_client::AgentsClient::new(&url, token)?;
-            let out = agents::reconcile(&client, &effect, attempt, choice).await?;
+            let out = agents::emit_refusal(
+                stdout,
+                json,
+                agents::reconcile(&client, &effect, attempt, choice).await,
+            )?;
             agents::emit(stdout, json, &out, agents::render_reconcile)
         }
         AgentsCommand::Destroy {
@@ -2860,7 +2864,11 @@ async fn run_agents(
             json,
         } => {
             let client = ravel_agents_client::AgentsClient::new(&url, token)?;
-            let out = agents::destroy(&client, &kind, &key, incarnation).await?;
+            let out = agents::emit_refusal(
+                stdout,
+                json,
+                agents::destroy(&client, &kind, &key, incarnation).await,
+            )?;
             agents::emit(stdout, json, &out, agents::render_destroy)
         }
     }

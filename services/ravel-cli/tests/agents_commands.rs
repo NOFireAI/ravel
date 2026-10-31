@@ -1048,3 +1048,73 @@ async fn destroy_renders_the_response_and_needs_a_token() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_destroy_refusal_prints_the_incarnation_to_pin_the_retry_to() {
+    let refusal = json!({
+        "code": "outcome_unknown",
+        "retry": "backoff",
+        "reason": "the tombstone write did not settle",
+        "ids": {"agent_id": "19cd0e6876991314c1b6dbd8bd129297", "incarnation": 7}
+    });
+    let app = Router::new().route(
+        "/api/v1/agents/destroy",
+        post({
+            let refusal = refusal.clone();
+            move || async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(refusal.clone()),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let url = format!("http://{addr}");
+
+    let run = |json: bool| {
+        let url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec![
+                "--kind",
+                "order",
+                "--key",
+                "o-1",
+                "--url",
+                &url,
+                "--token",
+                "admin-tok",
+            ];
+            if json {
+                args.push("--json");
+            }
+            run_destroy(&args)
+        })
+    };
+
+    let text = run(false).await.expect("join");
+    assert!(!text.status.success(), "a refusal exits non-zero");
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        stderr.contains(
+            "agents request refused: outcome_unknown (the tombstone write did not settle), \
+             retry backoff; ids: agent_id=19cd0e6876991314c1b6dbd8bd129297, incarnation=7"
+        ),
+        "{stderr}"
+    );
+    assert!(text.stdout.is_empty());
+
+    let json = run(true).await.expect("join");
+    assert!(!json.status.success(), "a refusal exits non-zero under --json");
+    let body: ravel_agents_core::wire::ErrorBody =
+        serde_json::from_slice(&json.stdout).expect("stdout is the error body JSON");
+    assert_eq!(body.ids.incarnation, Some(7));
+    assert_eq!(serde_json::to_value(&body).expect("value"), refusal);
+    let stderr = String::from_utf8_lossy(&json.stderr);
+    assert!(stderr.contains("incarnation=7"), "{stderr}");
+    server.abort();
+}
