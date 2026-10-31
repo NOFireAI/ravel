@@ -242,16 +242,6 @@ pub enum SqlError {
     )]
     CommitTokenOnParquetStatement,
 
-    /// A table-qualified `min_commit_token` reached a path that carries plain
-    /// tokens only: a Flight SQL ticket, or a statement surface other than
-    /// the HTTP SQL statement path. Refused before any catalog resolve. The
-    /// text names no server state; HTTP 400.
-    #[error(
-        "a table-qualified min_commit_token is accepted only on the HTTP SQL \
-         statement endpoint; send the token without its table qualifier"
-    )]
-    QualifiedCommitTokenUnsupported,
-
     /// The query names more than [`crate::MAX_STATEMENT_TABLE_NAMES`]
     /// distinct base tables besides the five signal tables. Each could be a
     /// Parquet table, which only a LIST of its manifest prefix tells, so this
@@ -597,7 +587,6 @@ impl SqlError {
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenQualifierNotRead { .. }
             | SqlError::CommitTokenOnParquetStatement
-            | SqlError::QualifiedCommitTokenUnsupported
             | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, the same class as the segment/sample
@@ -670,8 +659,7 @@ impl SqlError {
             | SqlError::TicketPinsOneSignal
             | SqlError::PinnedSignalsMismatch { .. }
             | SqlError::CommitTokenNeedsQualifier { .. }
-            | SqlError::CommitTokenOnParquetStatement
-            | SqlError::QualifiedCommitTokenUnsupported => self.to_string(),
+            | SqlError::CommitTokenOnParquetStatement => self.to_string(),
             // Safe to echo: the fixed table names, plus the caller's own
             // qualifier cut to 64 bytes.
             SqlError::CommitTokenQualifierNotRead { .. } => self.to_string(),
@@ -2082,15 +2070,6 @@ mod tests {
         assert_eq!(err.client_message(), err.to_string());
         assert!(err.client_message().contains("min_commit_token"), "{err}");
         assert!(err.client_message().contains("reads none of them"), "{err}");
-        assert_redacted(&err.client_message());
-    }
-
-    #[test]
-    fn a_qualified_token_off_the_http_path_is_a_bad_request() {
-        let err = SqlError::QualifiedCommitTokenUnsupported;
-        assert_eq!(err.class(), ErrorClass::BadRequest);
-        assert_eq!(err.client_message(), err.to_string());
-        assert!(err.client_message().contains("table-qualified"), "{err}");
         assert_redacted(&err.client_message());
     }
 

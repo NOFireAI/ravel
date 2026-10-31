@@ -4062,8 +4062,10 @@ impl ravel_sql::FlightAuth for TokenAuth {
     fn min_commit_tokens(
         &self,
         _metadata: &tonic::metadata::MetadataMap,
-    ) -> Result<Vec<ravel_types::CommitToken>, tonic::Status> {
-        Ok(vec![self.token.clone()])
+    ) -> Result<Vec<ravel_sql::MinCommitToken>, tonic::Status> {
+        Ok(vec![ravel_sql::MinCommitToken::unqualified(
+            self.token.clone(),
+        )])
     }
 }
 
@@ -4072,8 +4074,9 @@ impl ravel_sql::FlightAuth for TokenAuth {
 /// before either store is read; the same token on a statement naming one
 /// signal table beside the Parquet table bounds that table and runs.
 ///
-/// FLIP: dropping the check in `resolve_pinned_lanes` lets the Parquet-only
-/// statement mint a ticket.
+/// FLIP: dropping the Parquet-only check from `admit_http_tokens`, which
+/// `resolve_pinned_lanes` applies, lets the Parquet-only statement mint a
+/// ticket.
 #[cfg(feature = "flight-sql")]
 #[tokio::test]
 async fn a_commit_token_on_a_parquet_only_flight_statement_is_refused() {

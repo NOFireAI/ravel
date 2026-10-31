@@ -44,7 +44,7 @@
 
 use std::time::Duration;
 
-use ravel_types::{CommitToken, TenantHash, TimeRange};
+use ravel_types::{TenantHash, TimeRange};
 use tonic::{Status, metadata::MetadataMap};
 
 use crate::error::{ErrorClass, SqlError};
@@ -67,7 +67,7 @@ const NS_PER_SEC: f64 = 1_000_000_000.0;
 pub(super) fn sql_request(
     sql: String,
     metadata: &MetadataMap,
-    min_tokens: Vec<CommitToken>,
+    min_tokens: Vec<MinCommitToken>,
     now_ns: i64,
     config: &super::FlightSqlConfig,
 ) -> Result<SqlRequest, Status> {
@@ -103,8 +103,7 @@ pub(super) fn sql_request(
     Ok(SqlRequest {
         sql,
         window: TimeRange { start_ns, end_ns },
-        // Flight metadata carries plain tokens only; each is unqualified.
-        min_tokens: min_tokens.into_iter().map(MinCommitToken::from).collect(),
+        min_tokens,
         now_ns,
         deadline,
         row_window: false,
@@ -114,6 +113,29 @@ pub(super) fn sql_request(
         // pins it into the ticket for `DoGet`.
         budgets: None,
     })
+}
+
+/// Parse every `key` entry of `metadata`, in the order given, with
+/// [`MinCommitToken::parse`], the parse the HTTP `min_commit_token` parameter
+/// goes through: `<token>` or `<table>:<token>`. Zero entries yield an empty
+/// vector. A value that is not ASCII or does not parse is `INVALID_ARGUMENT`,
+/// quoting the caller's own value and the parse error, and no token of the
+/// request is applied.
+pub fn min_commit_tokens_from_metadata(
+    metadata: &MetadataMap,
+    key: &str,
+) -> Result<Vec<MinCommitToken>, Status> {
+    metadata
+        .get_all(key)
+        .iter()
+        .map(|value| {
+            let raw = value
+                .to_str()
+                .map_err(|_| Status::invalid_argument(format!("invalid {key}")))?;
+            MinCommitToken::parse(raw)
+                .map_err(|err| Status::invalid_argument(format!("invalid {key}: {raw:?}: {err}")))
+        })
+        .collect()
 }
 
 /// Read one optional float-seconds metadata value.

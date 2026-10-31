@@ -28,9 +28,9 @@ use ravel_ingest::Clock;
 use ravel_query::http::TenantResolver;
 use ravel_sql::{
     DistributedFlightConfig, FlightAuth, FlightClock, FlightListenerRole, FlightSqlConfig,
-    RavelFlightSqlService, SliceRejectCounters, SqlTicketKeys,
+    MinCommitToken, RavelFlightSqlService, SliceRejectCounters, SqlTicketKeys,
 };
-use ravel_types::{CommitToken, TenantHash};
+use ravel_types::TenantHash;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 
@@ -56,7 +56,7 @@ impl FlightAuth for ResolverFlightAuth {
         flight_auth::resolve_tenant(self.tenant_resolver.as_ref(), metadata)
     }
 
-    fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
+    fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<MinCommitToken>, Status> {
         flight_auth::min_commit_tokens(metadata)
     }
 }

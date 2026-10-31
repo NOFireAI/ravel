@@ -30,10 +30,11 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
-    FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
+    FlightAuth, FlightClock, FlightSqlConfig, MinCommitToken, RavelFlightSqlService, SqlConfig,
+    SqlExecutor,
 };
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
-use ravel_types::{CommitToken, TenantHash, TenantId};
+use ravel_types::{TenantHash, TenantId};
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Status};
 
@@ -41,6 +42,10 @@ use super::{Fixture, NOW_NS, SegSpec, SeriesSpec, full_window};
 
 /// The metadata key the harness carries the tenant credential in.
 pub const TOKEN_KEY: &str = "authorization";
+
+/// The metadata key the harness carries `min_commit_token` values in, the
+/// deployment's key (services/ravel-server `flight_auth::MIN_COMMIT_TOKEN_KEY`).
+pub const MIN_COMMIT_TOKEN_KEY: &str = "x-ravel-min-commit-token";
 
 // ---------------------------------------------------------------------------
 // Test doubles for the two traits the deployment owns
@@ -74,8 +79,8 @@ impl FlightAuth for TestAuth {
             .ok_or_else(|| Status::unauthenticated("invalid or missing tenant credentials"))
     }
 
-    fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
-        Ok(Vec::new())
+    fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<MinCommitToken>, Status> {
+        ravel_sql::flight::min_commit_tokens_from_metadata(metadata, MIN_COMMIT_TOKEN_KEY)
     }
 }
 
@@ -189,7 +194,20 @@ impl Harness {
 
     /// `GetFlightInfo` for `sql` as `token`, over the fixture's full window.
     pub async fn get_flight_info(&self, token: &str, sql: &str) -> Result<Ticket, Status> {
-        let info = self.get_flight_info_full(token, sql).await?;
+        self.get_flight_info_with_tokens(token, sql, &[]).await
+    }
+
+    /// [`Self::get_flight_info`] carrying one [`MIN_COMMIT_TOKEN_KEY`] entry
+    /// per value of `min_commit_tokens`, in order, as a client sends them.
+    pub async fn get_flight_info_with_tokens(
+        &self,
+        token: &str,
+        sql: &str,
+        min_commit_tokens: &[&str],
+    ) -> Result<Ticket, Status> {
+        let info = self
+            .get_flight_info_inner(token, sql, min_commit_tokens)
+            .await?;
         let endpoint = info.endpoint.first().expect("one endpoint");
         Ok(endpoint.ticket.clone().expect("endpoint carries a ticket"))
     }
@@ -201,8 +219,23 @@ impl Harness {
         token: &str,
         sql: &str,
     ) -> Result<arrow_flight::FlightInfo, Status> {
+        self.get_flight_info_inner(token, sql, &[]).await
+    }
+
+    async fn get_flight_info_inner(
+        &self,
+        token: &str,
+        sql: &str,
+        min_commit_tokens: &[&str],
+    ) -> Result<arrow_flight::FlightInfo, Status> {
         let mut request = Request::new(FlightDescriptor::new_cmd(sql.as_bytes().to_vec()));
         insert(request.metadata_mut(), TOKEN_KEY, token);
+        for value in min_commit_tokens {
+            request.metadata_mut().append(
+                MIN_COMMIT_TOKEN_KEY,
+                value.parse().expect("ascii metadata value"),
+            );
+        }
         window_metadata(request.metadata_mut());
 
         Ok(self
