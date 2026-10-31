@@ -385,11 +385,11 @@ mod tests {
         (prop::sample::select(NAMES.to_vec()), value()).prop_map(|(k, v)| (k.to_owned(), v))
     }
 
-    /// One row: a stream out of a few (ids repeat), one of two blobs for it
+    /// One row: a stream out of sixteen (ids repeat), one of two blobs for it
     /// (the first one seen must win), and 0..8 attributes in any order.
     fn row() -> impl Strategy<Value = (u8, bool, LogRecord)> {
         (
-            0u8..6,
+            0u8..16,
             any::<bool>(),
             any::<i64>(),
             any::<u8>(),

@@ -424,7 +424,9 @@ fn flush_rlog_config(config: &IngestConfig) -> RlogConfig {
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; the only copy is the
 /// shared `stream_attrs` blob, which `LogRecord` owns per record. The flush
-/// does not use it: it builds its batch from the records in place.
+/// builds its batch from the records in place; the hand-back conversion
+/// ([`take_rows_as_batch`]) still uses this, since it must give the records
+/// back by value when the build refuses.
 fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     LogRecord {
         stream_id: rec.stream_id,
@@ -3671,6 +3673,78 @@ mod tests {
             })
             .collect();
         assert_eq!(blobs.len(), bench_corpus::ingest_shape::STREAMS);
+        for page_choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
+            let cfg = RlogConfig {
+                page_choice,
+                ..flush_rlog_config(&IngestConfig::default())
+            };
+            let row = row_written(cfg, None, records.clone());
+            let flushed = flush_written(cfg, None, records.clone());
+            assert!(
+                row == flushed,
+                "{page_choice:?}: the flush's object differs from the row writer's \
+                 ({} and {} bytes)",
+                flushed.len(),
+                row.len(),
+            );
+        }
+    }
+
+    /// #3557: normalize gives each `ScopeLogs` its own `stream_attrs` blob, so
+    /// two `ScopeLogs` with the same resource and scope buffer one stream id
+    /// under two equal, separately allocated blobs. The flush's object for
+    /// that shape is the row writer's, byte for byte.
+    #[test]
+    fn the_columnar_flush_writes_the_row_writers_bytes_for_two_scope_logs_sharing_a_stream() {
+        let res = [("service.name", "api")];
+        let with = |mut r: NormalizedLogRecord, attrs: Vec<(&str, AttrValue)>, traced: bool| {
+            r.attrs = attrs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+            if traced {
+                r.trace_id = Some([r.ts_ns as u8; 16]);
+                r.span_id = Some([r.ts_ns as u8; 8]);
+            }
+            r
+        };
+        let route = |v: &str| AttrValue::Str(v.to_owned());
+        // One blob per ScopeLogs, as normalize allocates them.
+        let first_scope = norm_record(&res, "lib", 1, "a");
+        let second_scope = norm_record(&res, "lib", 3, "c");
+        let other_stream = norm_record(&[("service.name", "db")], "lib", 5, "e");
+        let mut second_scope_next = second_scope.clone();
+        second_scope_next.ts_ns = 4;
+        second_scope_next.observed_ts_ns = 4;
+        let mut first_scope_next = first_scope.clone();
+        first_scope_next.ts_ns = 2;
+        first_scope_next.observed_ts_ns = 2;
+        let records = vec![
+            with(
+                first_scope,
+                vec![("route", route("/a")), ("code", AttrValue::I64(200))],
+                true,
+            ),
+            with(
+                first_scope_next,
+                vec![("code", AttrValue::I64(404)), ("route", route("/b"))],
+                false,
+            ),
+            with(
+                second_scope,
+                vec![
+                    ("code", route("x")),
+                    ("code", AttrValue::I64(500)),
+                    ("code", AttrValue::I64(501)),
+                ],
+                false,
+            ),
+            with(second_scope_next, Vec::new(), true),
+            with(other_stream, vec![("zone", route("eu"))], false),
+        ];
+        assert_eq!(records[0].stream_id, records[2].stream_id);
+        assert!(!Arc::ptr_eq(
+            &records[0].stream_attrs,
+            &records[2].stream_attrs
+        ));
+        assert_ne!(records[0].stream_id, records[4].stream_id);
         for page_choice in [PageChoice::Exhaustive, PageChoice::Estimated] {
             let cfg = RlogConfig {
                 page_choice,
