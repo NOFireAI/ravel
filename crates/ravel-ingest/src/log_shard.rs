@@ -1257,10 +1257,6 @@ impl LogFlushCtx {
         }
     }
 
-    /// Acks exactly this flush's own waiters with exactly this flush's own
-    /// result: `waiters` was moved out of this flush's `LogTenantBuf` at pin
-    /// time and never merged with another flush's, so there is no other waiter
-    /// list this call could reach.
     #[cfg(test)]
     fn on_phase(&self, phase: FlushPhase) {
         if let Some(hook) = self.phase_hook.get() {
@@ -1268,6 +1264,10 @@ impl LogFlushCtx {
         }
     }
 
+    /// Acks exactly this flush's own waiters with exactly this flush's own
+    /// result: `waiters` was moved out of this flush's `LogTenantBuf` at pin
+    /// time and never merged with another flush's, so there is no other waiter
+    /// list this call could reach.
     fn ack_waiters(&self, waiters: Vec<LogAck>, result: Result<CommitToken, LogWriteError>) {
         let ok = result.is_ok();
         self.metrics.record_acks(waiters.len(), ok);
