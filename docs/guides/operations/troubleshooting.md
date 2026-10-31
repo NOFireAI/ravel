@@ -1329,23 +1329,26 @@ counted here.
 **Symptom.** `increase(ravel_catalog_isolation_breach_total[5m]) > 0`
 
 **Cause.** A cross-tenant key-layout or hashing fault. Either a tenant-hash
-mismatch occurred on a catalog HEAD or index object, or a resolve listing
-returned a key that does not begin with the prefix of the requesting tenant.
+mismatch occurred on a catalog HEAD, snapshot part or index object, or a
+resolve listing returned a key that does not begin with the prefix of the
+requesting tenant.
 
 **Confirm.** The counter, labeled by mode, on `/metrics`. Every increment
-corresponds to a query that already failed with an explicit isolation-fault
-error, so the client saw it too.
+corresponds to a query or a fold tick that already failed with an explicit
+isolation-fault error. A failed query reached the client; a failed fold tick
+left that tenant's HEAD where it was.
 
-**Action.** Escalate immediately. Every increment is a failed query and a real
-isolation fault. The two anomaly counters rendered beside it are different:
-they tally an overlap that the query resolves past.
+**Action.** Escalate immediately. Every increment is a failed query or fold
+tick and a real isolation fault. The two anomaly counters rendered beside it
+are different: they tally an overlap that the query resolves past.
 
 Coverage is not complete, so a zero reading is not proof of isolation:
 
 - A mismatch on a commit or compaction record fails its query and does not
   increment this counter.
-- The tenant hash of a snapshot part is not checked against the requester at
-  all.
+- The query path and the fold check a snapshot part's tenant hash. The
+  seal-divergence verify and the scrub's covering-postings load read parts
+  without that check.
 
 ### Shutdown lost acknowledged rows
 

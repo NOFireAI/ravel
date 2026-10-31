@@ -2339,12 +2339,15 @@ the same hard `CatalogError::FieldMismatch` as a tenant_hash mismatch): a
 backend or key-layout bug that hands back a foreign key is an isolation
 breach, never a silently dropped or served key. Both this and the HEAD/
 postings tenant_hash checks above increment
-`ravel_catalog_isolation_breach_total`, rendered at `/metrics` beside the
+`ravel_catalog_isolation_breach_total`, and so do the fold's tenant_hash
+checks on a tenant's previous postings object and previous snapshot parts.
+The counter is rendered at `/metrics` beside the
 existing `ravel_catalog_interlock_violations_total` and
 `ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
 (default alert rule: docs/guides/operations.md). Unlike those two, which
 tally a harmless-overlap anomaly the query still resolves past, every
-increment of the isolation-breach counter corresponds to a failed query.
+increment of the isolation-breach counter corresponds to a failed query or
+a failed fold tick.
 
 The fold's own liveness is exported beside those counters, from the same
 `Catalog`: `ravel_catalog_fold_cycles_total`,
