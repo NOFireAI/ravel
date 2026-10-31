@@ -489,12 +489,13 @@ impl Cli {
                 // decision 6) is stripped here rather than kept: this router
                 // runs no SQL, so it never needs a capability, only the bare
                 // tenant it must route by.
-                let (tenant, _capabilities) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
-                    .map_err(|e| {
+                let (tenant, _capabilities, _subject) =
+                    ravel_tenant_resolve::split_tenant_suffix(tenant_raw).map_err(|e| {
                         anyhow::anyhow!(
                             "--tenant-token (position {}) has an invalid tenant ({e}), expected \
                              TENANT or TENANT;CAPABILITIES with CAPABILITIES a comma-separated \
-                             list of ddl and ipcrypt",
+                             list of ddl, ipcrypt, agents, agents_worker and agents_admin, which \
+                             may also hold one subject=LABEL entry",
                             i + 1
                         )
                     })?;
