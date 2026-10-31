@@ -597,7 +597,13 @@ answered the reconcile: if that process restarts before the step, or
 another server process serves the step, the attempt reads as lost and a
 `manual` effect is back in doubt, so reconcile it again. For the same
 reason a repeated `retry` is answered as applied only while that process
-holds the hand-over unclaimed. A `retry` naming the attempt before one a
+holds the hand-over unclaimed. A reconcile that answers 500
+`outcome_unknown` hands its attempt to no process: if
+`GET /api/v1/agents/effects/{effect}` reads the attempt `authorized`,
+another reconcile's process holds it, and if the effect is in doubt again
+after the owner's next step, reconcile it again
+(`concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`).
+A `retry` naming the attempt before one a
 worker's own step authorized, such as an `at_least_once` attempt raised
 after a takeover, is 409 `ownership_lost` and writes no audit record
 (`agents_effects_e2e::a_reconcile_retry_of_an_attempt_a_takeover_raised_is_ownership_lost`).
