@@ -6909,7 +6909,8 @@ impl Cli {
                 anyhow::anyhow!(
                     "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
                          CAPABILITIES a comma-separated list of ddl, ipcrypt, agents, \
-                         agents_worker and agents_admin"
+                         agents_worker and agents_admin, which may also hold one \
+                         subject=LABEL entry"
                 )
             })?;
             let principal = Principal {
@@ -6921,14 +6922,14 @@ impl Cli {
                 agents_admin: capabilities.agents_admin,
                 subject,
             };
-            // A token repeated with a different tenant or capability would
-            // otherwise resolve by flag or line order. An identical repeat
-            // is harmless.
+            // A token repeated with a different tenant, capability or
+            // subject would otherwise resolve by flag or line order. An
+            // identical repeat is harmless.
             if let Some(existing) = map.get(token) {
                 if *existing != principal {
                     let first = origins.get(token).map(String::as_str).unwrap_or("?");
                     anyhow::bail!(
-                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant or capability"
+                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant, capability or subject"
                     );
                 }
                 return Ok(());
@@ -20569,13 +20570,14 @@ mod tests {
 
     /// Every refusal path (argv and file; bad suffix, empty tenant, missing
     /// `=`, conflicting duplicate) names the source position and echoes
-    /// neither the token nor the tenant. The token and tenant are distinctive
-    /// strings checked separately, so an implementation that echoes only the
-    /// token (or only the tenant) fails, which a whole-pair check would miss.
+    /// neither the token, the tenant nor a subject label. Each is a
+    /// distinctive string checked separately, so an implementation that
+    /// echoes only one of them fails, which a whole-pair check would miss.
     #[test]
     fn tenant_token_refusals_never_echo_token_or_tenant() {
         const TOKEN: &str = "TOKSECRET9f3c";
         const TENANT: &str = "TENSECRET7a1d";
+        const LABEL: &str = "LABSECRET4e2b";
         let bad_pairs = [
             format!("{TOKEN}={TENANT};DDL"),
             format!("{TOKEN}={TENANT};admin"),
@@ -20588,6 +20590,8 @@ mod tests {
             format!("{TOKEN}=;"),
             format!("{TOKEN}="),
             format!("{TOKEN}{TENANT}"),
+            format!("{TOKEN}={TENANT};subject={LABEL},subject={LABEL}"),
+            format!("{TOKEN}={TENANT};ddl,subject={LABEL}!"),
         ];
         let assert_no_echo = |msg: &str, what: &str| {
             assert!(!msg.contains(TOKEN), "{what}: message echoes token: {msg}");
@@ -20595,6 +20599,7 @@ mod tests {
                 !msg.contains(TENANT),
                 "{what}: message echoes tenant: {msg}"
             );
+            assert!(!msg.contains(LABEL), "{what}: message echoes label: {msg}");
         };
         for bad in &bad_pairs {
             let err = match cli(&["--tenant-token", bad]).parse_tenant_principals() {
@@ -20622,9 +20627,16 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("line 1"), "file: must name the line: {msg}");
             assert_no_echo(&msg, "file");
+            if bad.contains("subject=") {
+                assert!(
+                    msg.contains("may also hold one subject=LABEL entry"),
+                    "a bad subject entry names the accepted form: {msg}"
+                );
+            }
         }
 
-        // Conflicting duplicates: different tenant, and different capability.
+        // Conflicting duplicates: different tenant, different capability, and
+        // different subject.
         let file = tempfile::NamedTempFile::new().expect("temp token file");
         std::fs::write(file.path(), format!("{TOKEN}=other\n")).expect("write");
         let path = file.path().to_str().expect("utf8 path").to_string();
@@ -20635,6 +20647,14 @@ mod tests {
             (
                 format!("{TOKEN}={TENANT};ddl"),
                 format!("{TOKEN}={TENANT};ddl,ipcrypt"),
+            ),
+            (
+                format!("{TOKEN}={TENANT}"),
+                format!("{TOKEN}={TENANT};subject={LABEL}"),
+            ),
+            (
+                format!("{TOKEN}={TENANT};ddl,subject={LABEL}"),
+                format!("{TOKEN}={TENANT};ddl,subject=other"),
             ),
         ] {
             let err = match cli(&["--tenant-token", &first, "--tenant-token", &second])
@@ -20647,6 +20667,10 @@ mod tests {
             assert!(
                 msg.contains("position 1") && msg.contains("position 2"),
                 "duplicate refusal must name both positions: {msg}"
+            );
+            assert!(
+                msg.contains("with a different tenant, capability or subject"),
+                "duplicate refusal names what may differ: {msg}"
             );
             assert_no_echo(&msg, "argv duplicate");
         }
