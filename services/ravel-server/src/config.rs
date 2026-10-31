@@ -6902,7 +6902,7 @@ impl Cli {
             if token.is_empty() || tenant_raw.is_empty() {
                 anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
             }
-            let (tenant, capabilities) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
+            let (tenant, capabilities, subject) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
                 .map_err(|e: ravel_tenant_resolve::TenantSuffixError| {
                     anyhow::anyhow!(
                         "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
@@ -6917,6 +6917,7 @@ impl Cli {
                 agents: capabilities.agents,
                 agents_worker: capabilities.agents_worker,
                 agents_admin: capabilities.agents_admin,
+                subject,
             };
             // A token repeated with a different tenant or capability would
             // otherwise resolve by flag or line order. An identical repeat
@@ -20544,6 +20545,7 @@ mod tests {
                         agents: false,
                         agents_worker: false,
                         agents_admin: false,
+                        subject: None,
                     }),
                     "{token}"
                 );
