@@ -15,6 +15,22 @@
 //! first decode, any other intent on a second touch through a ghost key list
 //! whose window spans the cap in bytes. Eviction is CLOCK weighted by bytes.
 //!
+//! Admission that needs an eviction is also gated on frequency (the
+//! LIKE-deferred amendment, decision 1). Every resident slot and ghost record
+//! carries an access count, a `u8` saturating at [`MAX_COUNT`], which a
+//! columnar lookup adds one to: a hit to the slot, a miss to the key's ghost
+//! record if it has one. An admitted entry starts at its ghost record's count,
+//! or 1. When an offer has to evict, the first unreferenced victim the CLOCK
+//! hand reaches whose count is at least the newcomer's ends the walk and
+//! refuses the admission, so ties refuse
+//! (`the_gate_refuses_a_less_used_newcomer_and_ties`); victims evicted before
+//! it stay evicted. A refused admission leaves a ghost record carrying the
+//! newcomer's count, under any intent, and an admission releases the key's
+//! ghost record under any intent (`a_gate_refusal_leaves_a_ghost_record_an_admission_releases`).
+//! Counts are halved when the lookups since the last halving reach
+//! [`aging_window`] (`counts_halve_when_lookups_reach_the_aging_window`).
+//! The pressure evictor ignores counts.
+//!
 //! Each entry holds a reservation on the process [`MemoryBudget`], taken
 //! best effort and only when it leaves [`admission_margin`] unreserved
 //! (decision 4). The reservation lives in the [`DecodedEntry`] itself, not in
@@ -44,6 +60,17 @@ use crate::block::CachedColumn;
 /// The decoded layout entries are stored in. Bumped when the decoder's output
 /// shape for a column kind changes, so an entry of the old shape never hits.
 pub const LAYOUT_TAG: u8 = 0;
+
+/// The saturation point of a slot's or ghost record's access count.
+pub const MAX_COUNT: u8 = 15;
+
+/// The lookups after which every count is halved, for a cache holding
+/// `records` slots plus ghost records: ten per record, at least 65,536
+/// (TinyLFU's reset).
+#[must_use]
+pub fn aging_window(records: usize) -> u64 {
+    (records as u64).saturating_mul(10).max(1 << 16)
+}
 
 /// One entry's identity (ADR-3326 decision 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -93,6 +120,7 @@ pub struct DecodedCacheCounters {
     evictions: AtomicU64,
     ghost_hits: AtomicU64,
     margin_skips: AtomicU64,
+    frequency_refusals: AtomicU64,
 }
 
 /// A point-in-time copy of [`DecodedCacheCounters`].
@@ -106,6 +134,9 @@ pub struct DecodedCacheSnapshot {
     /// Admissions skipped because the reservation would have left the budget
     /// under [`admission_margin`], though its limit would have admitted it.
     pub margin_skips: u64,
+    /// Admissions refused because an eviction would have removed an entry
+    /// accessed at least as often as the newcomer.
+    pub frequency_refusals: u64,
 }
 
 /// The unreserved bytes an admission must leave on a budget of `limit`, and
@@ -127,6 +158,9 @@ impl DecodedCacheSnapshot {
             evictions: self.evictions.saturating_add(other.evictions),
             ghost_hits: self.ghost_hits.saturating_add(other.ghost_hits),
             margin_skips: self.margin_skips.saturating_add(other.margin_skips),
+            frequency_refusals: self
+                .frequency_refusals
+                .saturating_add(other.frequency_refusals),
         }
     }
 }
@@ -140,6 +174,7 @@ impl DecodedCacheCounters {
             evictions: self.evictions.load(Ordering::Relaxed),
             ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
             margin_skips: self.margin_skips.load(Ordering::Relaxed),
+            frequency_refusals: self.frequency_refusals.load(Ordering::Relaxed),
         }
     }
 
@@ -152,6 +187,17 @@ struct Slot {
     key: DecodedKey,
     entry: Arc<DecodedEntry>,
     referenced: bool,
+    count: u8,
+}
+
+/// A key the cache does not hold but has seen: a non-interactive first touch
+/// or a gate refusal.
+struct Ghost {
+    /// The generation it was recorded at, so a FIFO entry superseded by a
+    /// later record of the same key does not remove that later record.
+    generation: u64,
+    bytes: u64,
+    count: u8,
 }
 
 #[derive(Default)]
@@ -161,13 +207,12 @@ struct Inner {
     free: Vec<usize>,
     hand: usize,
     resident: u64,
-    /// Ghost keys of first touches by a non-interactive statement, each with
-    /// the generation it was recorded at so a FIFO entry superseded by a later
-    /// record of the same key does not remove that later record.
-    ghost: HashMap<DecodedKey, (u64, u64)>,
+    ghost: HashMap<DecodedKey, Ghost>,
     ghost_fifo: VecDeque<(DecodedKey, u64)>,
     ghost_bytes: u64,
     ghost_gen: u64,
+    /// Lookups since counts were last halved.
+    lookups_since_aging: u64,
     column_hits: HashMap<u32, u64>,
     process: DecodedCacheSnapshot,
     expired_drops: u64,
@@ -179,6 +224,34 @@ impl Inner {
     /// ghost record.
     fn intent_admits(&self, key: &DecodedKey, intent: AccessIntent) -> bool {
         intent == AccessIntent::Interactive || self.ghost.contains_key(key)
+    }
+
+    /// The count an admission of `key` starts at: its ghost record's, or 1.
+    fn newcomer_count(&self, key: &DecodedKey) -> u8 {
+        self.ghost.get(key).map_or(1, |g| g.count)
+    }
+
+    /// Counts one lookup towards the aging window and halves every count
+    /// once the window is reached.
+    fn age(&mut self) {
+        self.lookups_since_aging += 1;
+        if self.lookups_since_aging < aging_window(self.index.len() + self.ghost.len()) {
+            return;
+        }
+        self.lookups_since_aging = 0;
+        for slot in self.slots.iter_mut().flatten() {
+            slot.count /= 2;
+        }
+        for ghost in self.ghost.values_mut() {
+            ghost.count /= 2;
+        }
+    }
+
+    /// Releases `key`'s ghost record and its bytes, if it has one.
+    fn release_ghost(&mut self, key: &DecodedKey) {
+        if let Some(g) = self.ghost.remove(key) {
+            self.ghost_bytes = self.ghost_bytes.saturating_sub(g.bytes);
+        }
     }
 }
 
@@ -221,6 +294,10 @@ pub struct DecodedColumnCache {
     inner: Mutex<Inner>,
     pressure_evictions: AtomicU64,
     pressure_freed_bytes: AtomicU64,
+    /// Run once between the reservation and the second lock of the next
+    /// offer, so a test can admit entries in that window.
+    #[cfg(test)]
+    between_locks: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl std::fmt::Debug for DecodedColumnCache {
@@ -253,6 +330,8 @@ impl DecodedColumnCache {
             inner: Mutex::new(Inner::default()),
             pressure_evictions: AtomicU64::new(0),
             pressure_freed_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            between_locks: Mutex::new(None),
         }
     }
 
@@ -298,6 +377,34 @@ impl DecodedColumnCache {
             evictions: self.pressure_evictions.load(Ordering::Relaxed),
             freed_bytes: self.pressure_freed_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    /// The access count of `key`'s slot.
+    #[cfg(test)]
+    pub(crate) fn count_of(&self, key: &DecodedKey) -> Option<u8> {
+        let inner = self.lock();
+        let i = *inner.index.get(key)?;
+        inner.slots.get(i)?.as_ref().map(|s| s.count)
+    }
+
+    /// The access count and bytes of `key`'s ghost record.
+    #[cfg(test)]
+    pub(crate) fn ghost_of(&self, key: &DecodedKey) -> Option<(u8, u64)> {
+        self.lock().ghost.get(key).map(|g| (g.count, g.bytes))
+    }
+
+    /// Bytes the ghost records hold.
+    #[cfg(test)]
+    pub(crate) fn ghost_bytes(&self) -> u64 {
+        self.lock().ghost_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_between_locks(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .between_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
     }
 
     #[cfg(test)]
@@ -395,7 +502,8 @@ impl DecodedColumnCache {
         freed
     }
 
-    /// The entry for `key`, marking it referenced for CLOCK. `rows` is the
+    /// The entry for `key`, marking it referenced for CLOCK and adding one to
+    /// its access count, or on a miss to its ghost record's. `rows` is the
     /// block's record count; an entry of another length is not served. An
     /// entry past the age bound is dropped and reads as a miss.
     pub(crate) fn lookup(
@@ -420,9 +528,16 @@ impl DecodedColumnCache {
                     && s.entry.col.rows() == rows
                 {
                     s.referenced = true;
+                    s.count = s.count.saturating_add(1).min(MAX_COUNT);
                     found = Some(Arc::clone(&s.entry));
                 }
             }
+            if found.is_none()
+                && let Some(g) = inner.ghost.get_mut(key)
+            {
+                g.count = g.count.saturating_add(1).min(MAX_COUNT);
+            }
+            inner.age();
             if found.is_some() {
                 inner.process.hits += 1;
                 *inner.column_hits.entry(key.column).or_insert(0) += 1;
@@ -441,8 +556,9 @@ impl DecodedColumnCache {
     /// the intent rule now: an interactive intent, or any other intent whose
     /// key holds a ghost record. Reads the same [`Inner::intent_admits`] check
     /// `offer` applies and changes nothing, so the ghost record stays for the
-    /// offer to spend. A size, budget or concurrent-admission refusal in
-    /// `offer` can still turn a `true` into no admission.
+    /// offer to spend. A size, frequency-gate, budget or concurrent-admission
+    /// refusal in `offer` can still turn a `true` into no admission: the gate
+    /// is not mirrored here (the LIKE-deferred amendment, decision 1).
     pub(crate) fn would_admit(&self, key: &DecodedKey, intent: AccessIntent) -> bool {
         self.lock().intent_admits(key, intent)
     }
@@ -450,6 +566,14 @@ impl DecodedColumnCache {
     /// Offers a freshly decoded column for admission under `intent`'s rule,
     /// returning the admitted entry so the caller can hold it for as long as
     /// it uses the column.
+    ///
+    /// The checks run in the LIKE-deferred amendment's order: the size check,
+    /// the intent rule, the frequency gate during eviction, the reservation
+    /// with the headroom margin, and the gate again during the eviction after
+    /// the reservation. A gate refusal at either eviction leaves the key's
+    /// ghost record and the ghost-hit counters as they were before the offer
+    /// (`a_second_eviction_refusal_leaves_the_ghost_record_and_ghost_hits`),
+    /// or records one carrying the newcomer's count when the key had none.
     pub(crate) fn offer(
         &self,
         key: DecodedKey,
@@ -468,10 +592,14 @@ impl DecodedColumnCache {
                 return None;
             }
             if !inner.intent_admits(&key, intent) {
-                self.record_ghost(&mut inner, key, bytes);
+                self.record_ghost(&mut inner, key, bytes, 1);
                 return None;
             }
-            self.evict_for(&mut inner, bytes, &mut evicted, counters);
+            let newcomer = inner.newcomer_count(&key);
+            if !self.evict_for(&mut inner, bytes, newcomer, &mut evicted, counters) {
+                self.refuse_by_frequency(&mut inner, key, bytes, newcomer, counters);
+                return None;
+            }
         }
         // Evicted entries release their reservations here, before the new
         // entry reserves, so the cache at its cap can swap one entry for
@@ -502,6 +630,18 @@ impl DecodedColumnCache {
             None => None,
         };
 
+        #[cfg(test)]
+        {
+            let hook = self
+                .between_locks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
         let mut evicted = Vec::new();
         let admitted = {
             let mut inner = self.lock();
@@ -509,19 +649,21 @@ impl DecodedColumnCache {
                 // Admitted concurrently; `reservation` drops with this frame.
                 return None;
             }
-            // The reservation succeeded: the touch is spent either way now,
-            // so the ghost record (if the FIFO hasn't already dropped it) is
-            // released and the hit counted here, not when the ghost was
-            // merely found.
+            // Entries admitted between the two locks may have refilled the cap.
+            let newcomer = inner.newcomer_count(&key);
+            if !self.evict_for(&mut inner, bytes, newcomer, &mut evicted, counters) {
+                self.refuse_by_frequency(&mut inner, key, bytes, newcomer, counters);
+                return None;
+            }
+            // The touch is spent only now that nothing can refuse it: the
+            // ghost record (if the FIFO hasn't already dropped it) is
+            // released under every intent, and a non-interactive second
+            // touch is counted.
+            inner.release_ghost(&key);
             if intent != AccessIntent::Interactive {
-                if let Some((_, ghost_bytes)) = inner.ghost.remove(&key) {
-                    inner.ghost_bytes = inner.ghost_bytes.saturating_sub(ghost_bytes);
-                }
                 inner.process.ghost_hits += 1;
                 DecodedCacheCounters::bump(&counters.ghost_hits, 1);
             }
-            // Entries admitted between the two locks may have refilled the cap.
-            self.evict_for(&mut inner, bytes, &mut evicted, counters);
             let entry = Arc::new(DecodedEntry {
                 col: col.clone(),
                 bytes,
@@ -532,6 +674,7 @@ impl DecodedColumnCache {
                 key,
                 entry: Arc::clone(&entry),
                 referenced: false,
+                count: newcomer,
             };
             let idx = match inner.free.pop() {
                 Some(i) => {
@@ -553,48 +696,84 @@ impl DecodedColumnCache {
         Some(admitted)
     }
 
-    /// Evicts until `bytes` more fit under the cap and counts the evictions.
+    /// Evicts until `bytes` more fit under the cap, gated on a newcomer of
+    /// access count `newcomer`, and counts the evictions. Returns whether the
+    /// newcomer now fits.
     fn evict_for(
         &self,
         inner: &mut Inner,
         bytes: u64,
+        newcomer: u8,
         evicted: &mut Vec<Arc<DecodedEntry>>,
         counters: &DecodedCacheCounters,
-    ) {
+    ) -> bool {
         let before = evicted.len();
-        Self::evict_until(inner, self.max_bytes.saturating_sub(bytes), evicted);
+        let fits = Self::evict_until(
+            inner,
+            self.max_bytes.saturating_sub(bytes),
+            newcomer,
+            evicted,
+        );
         let n = (evicted.len() - before) as u64;
         inner.process.evictions += n;
         DecodedCacheCounters::bump(&counters.evictions, n);
+        fits
     }
 
-    fn record_ghost(&self, inner: &mut Inner, key: DecodedKey, bytes: u64) {
+    /// Counts a gate refusal and leaves a ghost record carrying the
+    /// newcomer's count, unless the key already holds one.
+    fn refuse_by_frequency(
+        &self,
+        inner: &mut Inner,
+        key: DecodedKey,
+        bytes: u64,
+        newcomer: u8,
+        counters: &DecodedCacheCounters,
+    ) {
+        self.record_ghost(inner, key, bytes, newcomer);
+        inner.process.frequency_refusals += 1;
+        DecodedCacheCounters::bump(&counters.frequency_refusals, 1);
+    }
+
+    fn record_ghost(&self, inner: &mut Inner, key: DecodedKey, bytes: u64, count: u8) {
         if inner.ghost.contains_key(&key) {
             return;
         }
         inner.ghost_gen += 1;
         let generation = inner.ghost_gen;
-        inner.ghost.insert(key, (generation, bytes));
+        inner.ghost.insert(
+            key,
+            Ghost {
+                generation,
+                bytes,
+                count,
+            },
+        );
         inner.ghost_fifo.push_back((key, generation));
         inner.ghost_bytes += bytes;
         while inner.ghost_bytes > self.max_bytes {
             let Some((old, g)) = inner.ghost_fifo.pop_front() else {
                 break;
             };
-            if inner.ghost.get(&old).is_some_and(|(cur, _)| *cur == g)
-                && let Some((_, b)) = inner.ghost.remove(&old)
-            {
-                inner.ghost_bytes = inner.ghost_bytes.saturating_sub(b);
+            if inner.ghost.get(&old).is_some_and(|cur| cur.generation == g) {
+                inner.release_ghost(&old);
             }
         }
     }
 
-    /// CLOCK: sweep the hand, clearing reference bits and evicting entries
-    /// whose bit is already clear, until resident bytes are at most `target`.
-    /// Evicted entries go to `evicted` for the caller to drop outside the
-    /// lock; one a scan still holds keeps its reservation until that scan
-    /// lets go.
-    fn evict_until(inner: &mut Inner, target: u64, evicted: &mut Vec<Arc<DecodedEntry>>) {
+    /// CLOCK with the frequency gate: sweep the hand, clearing reference
+    /// bits and evicting entries whose bit is already clear, until resident
+    /// bytes are at most `target`. An unreferenced entry whose access count
+    /// is at least `newcomer` ends the walk and the result is `false`; what
+    /// the walk evicted and cleared before it stays so. Evicted entries go to
+    /// `evicted` for the caller to drop outside the lock; one a scan still
+    /// holds keeps its reservation until that scan lets go.
+    fn evict_until(
+        inner: &mut Inner,
+        target: u64,
+        newcomer: u8,
+        evicted: &mut Vec<Arc<DecodedEntry>>,
+    ) -> bool {
         while inner.resident > target && !inner.index.is_empty() {
             let n = inner.slots.len();
             let i = inner.hand % n;
@@ -606,10 +785,14 @@ impl DecodedColumnCache {
                 slot.referenced = false;
                 continue;
             }
+            if slot.count >= newcomer {
+                return false;
+            }
             if let Some(entry) = inner.remove(i) {
                 evicted.push(entry);
             }
         }
+        true
     }
 }
 
@@ -672,6 +855,17 @@ mod tests {
         }
     }
 
+    /// Gives fresh key `k` a ghost record of access count `count`: a
+    /// bulk-scan first touch records it at 1 and each missed lookup adds one.
+    fn ghost_with_count(cache: &DecodedColumnCache, k: DecodedKey, v: &CachedColumn, count: u8) {
+        let c = DecodedCacheCounters::default();
+        assert!(cache.offer(k, v, AccessIntent::BulkScan, &c).is_none());
+        for _ in 1..count {
+            assert!(cache.lookup(&k, v.rows(), &c).is_none());
+        }
+        assert_eq!(cache.ghost_of(&k).map(|(n, _)| n), Some(count));
+    }
+
     #[test]
     fn interactive_admits_on_first_decode_and_hit_shares_the_buffers() {
         let cache = DecodedColumnCache::new(1 << 20, None);
@@ -698,7 +892,8 @@ mod tests {
     }
 
     /// `would_admit` answers exactly what the following `offer` does, for
-    /// every intent with and without a ghost record, and asking does not
+    /// every intent with and without a ghost record, while the newcomer fits
+    /// without an eviction (the frequency gate is not mirrored), and asking does not
     /// record, consume or change a ghost record: asked twice before the
     /// first touch, a non-interactive key still needs that touch.
     #[test]
@@ -842,6 +1037,8 @@ mod tests {
         cache.offer(key(0, 1), &v, AccessIntent::Interactive, &c);
         cache.offer(key(1, 1), &v, AccessIntent::Interactive, &c);
         assert!(cache.lookup(&key(0, 1), 8, &c).is_some());
+        // Outranks block 1's count of 1, so the frequency gate lets it in.
+        ghost_with_count(&cache, key(2, 1), &v, 2);
         cache.offer(key(2, 1), &v, AccessIntent::Interactive, &c);
         assert!(cache.resident_bytes() <= bytes * 2);
         assert!(cache.lookup(&key(0, 1), 8, &c).is_some());
@@ -879,7 +1076,9 @@ mod tests {
         drop(v);
         assert_eq!(budget.reserved(), bytes);
 
-        // Admitting a second entry evicts the first from the index.
+        // Admitting a second entry, which outranks the first, evicts the
+        // first from the index.
+        ghost_with_count(&cache, key(1, 1), &col(8), 2);
         let second = cache
             .offer(key(1, 1), &col(8), AccessIntent::Interactive, &c)
             .expect("admitted");
@@ -1175,6 +1374,7 @@ mod tests {
         assert_eq!(cache.resident_bytes(), cap);
         assert_eq!(budget.reserved(), cap + unrelated);
 
+        ghost_with_count(&cache, key(100, 1), &col(64), 2);
         let admitted = cache.offer(key(100, 1), &col(64), AccessIntent::Interactive, &c);
         assert!(admitted.is_some(), "the swap is admitted");
         let s = c.snapshot();
@@ -1227,5 +1427,294 @@ mod tests {
         cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The frequency gate (the LIKE-deferred amendment, decision 1): with
+    /// every victim at count 2, a newcomer at 1 is refused and counted, one
+    /// at 2 is refused too (ties refuse), and one at 3 evicts a victim and is
+    /// admitted at its ghost record's count.
+    ///
+    /// FLIP: compare `slot.count > newcomer` in `evict_until` and the tie at
+    /// block 3 is admitted: the second `is_none` fails.
+    #[test]
+    fn the_gate_refuses_a_less_used_newcomer_and_ties() {
+        let v = col(8);
+        let b = v.heap_bytes() as u64;
+        let cache = DecodedColumnCache::new(2 * b, None);
+        let c = DecodedCacheCounters::default();
+        for k in 0..2 {
+            assert!(
+                cache
+                    .offer(key(k, 1), &v, AccessIntent::Interactive, &c)
+                    .is_some()
+            );
+            assert!(cache.lookup(&key(k, 1), 8, &c).is_some());
+            assert_eq!(cache.count_of(&key(k, 1)), Some(2));
+        }
+
+        assert!(
+            cache
+                .offer(key(2, 1), &v, AccessIntent::Interactive, &c)
+                .is_none(),
+            "count 1 against 2"
+        );
+        let s = c.snapshot();
+        assert_eq!((s.frequency_refusals, s.evictions, s.admissions), (1, 0, 2));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.ghost_of(&key(2, 1)), Some((1, b)));
+
+        ghost_with_count(&cache, key(3, 1), &v, 2);
+        assert!(
+            cache
+                .offer(key(3, 1), &v, AccessIntent::Interactive, &c)
+                .is_none(),
+            "a tie refuses"
+        );
+        let s = c.snapshot();
+        assert_eq!((s.frequency_refusals, s.evictions, s.admissions), (2, 0, 2));
+        assert_eq!(cache.ghost_of(&key(3, 1)), Some((2, b)), "unchanged");
+
+        ghost_with_count(&cache, key(4, 1), &v, 3);
+        assert!(
+            cache
+                .offer(key(4, 1), &v, AccessIntent::Interactive, &c)
+                .is_some(),
+            "count 3 against 2"
+        );
+        let s = c.snapshot();
+        assert_eq!((s.frequency_refusals, s.evictions, s.admissions), (2, 1, 3));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.count_of(&key(4, 1)), Some(3));
+        assert_eq!(cache.ghost_of(&key(4, 1)), None);
+        assert_eq!(cache.process_counters().frequency_refusals, 2);
+    }
+
+    /// A loop over six keys through a cache that holds four keeps the four it
+    /// admitted first: the second and third passes hit exactly blocks 0 to 3.
+    /// CLOCK alone, which admits every miss, hits nothing on any pass of this
+    /// loop, since each admission evicts the entry the loop reaches next.
+    ///
+    /// FLIP: return `true` from `evict_until` without the count comparison
+    /// (CLOCK as before the gate) and the hits per pass read `[0, 0, 0]`.
+    #[test]
+    fn an_over_cap_loop_keeps_a_stable_subset() {
+        let v = col(8);
+        let b = v.heap_bytes() as u64;
+        let cache = DecodedColumnCache::new(4 * b, None);
+        let mut passes = Vec::new();
+        for _ in 0..3 {
+            let c = DecodedCacheCounters::default();
+            let mut hit = Vec::new();
+            for k in 0..6 {
+                if cache.lookup(&key(k, 1), 8, &c).is_some() {
+                    hit.push(k);
+                } else {
+                    drop(cache.offer(key(k, 1), &v, AccessIntent::Interactive, &c));
+                }
+            }
+            let s = c.snapshot();
+            passes.push((hit, s.hits, s.admissions, s.evictions, s.frequency_refusals));
+        }
+        assert_eq!(
+            passes,
+            vec![
+                (vec![], 0, 4, 0, 2),
+                (vec![0, 1, 2, 3], 4, 0, 0, 2),
+                (vec![0, 1, 2, 3], 4, 0, 0, 2),
+            ]
+        );
+    }
+
+    /// A gate refusal under an interactive intent leaves a ghost record
+    /// carrying the newcomer's count and bytes; missed lookups add to it, and
+    /// the interactive admission it then earns starts at that count and
+    /// releases the record and its bytes. Only a non-interactive admission is
+    /// a ghost hit.
+    ///
+    /// FLIP: release the ghost record only when `intent != Interactive` (as
+    /// before the amendment) and the record, count 3 and `b` bytes, is still
+    /// there after the admission.
+    #[test]
+    fn a_gate_refusal_leaves_a_ghost_record_an_admission_releases() {
+        let v = col(8);
+        let b = v.heap_bytes() as u64;
+        let cache = DecodedColumnCache::new(b, None);
+        let c = DecodedCacheCounters::default();
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::Interactive, &c)
+                .is_some()
+        );
+        assert!(cache.lookup(&key(0, 1), 8, &c).is_some());
+
+        assert!(
+            cache
+                .offer(key(1, 1), &v, AccessIntent::Interactive, &c)
+                .is_none()
+        );
+        assert_eq!(cache.ghost_of(&key(1, 1)), Some((1, b)));
+        assert_eq!(cache.ghost_bytes(), b);
+
+        for _ in 0..2 {
+            assert!(cache.lookup(&key(1, 1), 8, &c).is_none());
+        }
+        assert_eq!(cache.ghost_of(&key(1, 1)), Some((3, b)));
+        assert!(
+            cache
+                .offer(key(1, 1), &v, AccessIntent::Interactive, &c)
+                .is_some()
+        );
+        assert_eq!(cache.count_of(&key(1, 1)), Some(3));
+        assert_eq!(cache.ghost_of(&key(1, 1)), None);
+        assert_eq!(cache.ghost_bytes(), 0);
+        let s = c.snapshot();
+        assert_eq!(
+            (
+                s.admissions,
+                s.evictions,
+                s.frequency_refusals,
+                s.ghost_hits
+            ),
+            (2, 1, 1, 0)
+        );
+    }
+
+    /// The amendment's required case: a bulk-scan second touch passes the
+    /// first eviction and reserves, then entries admitted between the two
+    /// locks refill the cap with counts the newcomer only ties. The second
+    /// eviction refuses: the ghost record keeps its count, `ghost_hits` stays
+    /// 0 and the reservation is dropped. A later touch that out-counts the
+    /// residents still admits on that record.
+    ///
+    /// FLIP: move `release_ghost` and the `ghost_hits` bump in `offer` above
+    /// the second `evict_for` and the refusal reads `ghost_hits` 1 and a
+    /// fresh record of count 1.
+    #[test]
+    fn a_second_eviction_refusal_leaves_the_ghost_record_and_ghost_hits() {
+        let v = col(8);
+        let b = v.heap_bytes() as u64;
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = Arc::new(DecodedColumnCache::new(2 * b, Some(Arc::clone(&budget))));
+        let other = DecodedCacheCounters::default();
+        assert!(
+            cache
+                .offer(key(9, 1), &v, AccessIntent::Interactive, &other)
+                .is_some()
+        );
+        ghost_with_count(&cache, key(0, 1), &v, 2);
+
+        let between = Arc::downgrade(&cache);
+        cache.run_between_locks(Box::new(move || {
+            let Some(cache) = between.upgrade() else {
+                return;
+            };
+            let c = DecodedCacheCounters::default();
+            drop(cache.offer(key(8, 1), &col(8), AccessIntent::Interactive, &c));
+            for k in [8, 9] {
+                assert!(cache.lookup(&key(k, 1), 8, &c).is_some());
+            }
+        }));
+
+        let c = DecodedCacheCounters::default();
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::BulkScan, &c)
+                .is_none()
+        );
+        let s = c.snapshot();
+        assert_eq!(
+            (
+                s.admissions,
+                s.evictions,
+                s.frequency_refusals,
+                s.ghost_hits
+            ),
+            (0, 0, 1, 0)
+        );
+        assert_eq!(cache.process_counters().ghost_hits, 0);
+        assert_eq!(cache.ghost_of(&key(0, 1)), Some((2, b)));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(budget.reserved(), 2 * b, "the reservation was dropped");
+
+        assert!(cache.lookup(&key(0, 1), 8, &c).is_none());
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::BulkScan, &c)
+                .is_some()
+        );
+        let s = c.snapshot();
+        assert_eq!(
+            (s.admissions, s.frequency_refusals, s.ghost_hits),
+            (1, 1, 1)
+        );
+        assert_eq!(cache.count_of(&key(0, 1)), Some(3));
+        assert_eq!(cache.ghost_of(&key(0, 1)), None);
+    }
+
+    /// Counts saturate at 15 and every count, on slots and on ghost records,
+    /// halves on exactly the lookup that reaches the aging window: 65,536
+    /// lookups for a cache of two records.
+    ///
+    /// FLIP: halve when `lookups_since_aging` exceeds the window rather than
+    /// reaches it and the counts read 15 and 3 after the 65,536th lookup.
+    #[test]
+    fn counts_halve_when_lookups_reach_the_aging_window() {
+        assert_eq!(aging_window(2), 65_536);
+        assert_eq!(aging_window(10_000), 100_000);
+        let v = col(8);
+        let cache = DecodedColumnCache::new(1 << 20, None);
+        let c = DecodedCacheCounters::default();
+        assert!(
+            cache
+                .offer(key(0, 1), &v, AccessIntent::Interactive, &c)
+                .is_some()
+        );
+        for _ in 0..20 {
+            assert!(cache.lookup(&key(0, 1), 8, &c).is_some());
+        }
+        ghost_with_count(&cache, key(1, 1), &v, 3);
+        assert_eq!(cache.count_of(&key(0, 1)), Some(MAX_COUNT));
+
+        // 22 lookups so far; 65,513 more on an absent key make 65,535.
+        for _ in 0..65_513 {
+            assert!(cache.lookup(&key(99, 1), 8, &c).is_none());
+        }
+        assert_eq!(cache.count_of(&key(0, 1)), Some(15));
+        assert_eq!(cache.ghost_of(&key(1, 1)).map(|(n, _)| n), Some(3));
+
+        assert!(cache.lookup(&key(99, 1), 8, &c).is_none());
+        assert_eq!(cache.count_of(&key(0, 1)), Some(7));
+        assert_eq!(cache.ghost_of(&key(1, 1)).map(|(n, _)| n), Some(1));
+
+        assert!(cache.lookup(&key(99, 1), 8, &c).is_none());
+        assert_eq!(cache.count_of(&key(0, 1)), Some(7), "the window restarts");
+    }
+
+    /// The pressure evictor ignores counts: asked for a shortfall of two
+    /// entries plus one entry of slack, it frees exactly three entries at
+    /// the saturated count, which the gate would never let an admission
+    /// evict.
+    #[test]
+    fn the_pressure_evictor_frees_the_shortfall_plus_slack_whatever_the_counts() {
+        let v = col(8);
+        let b = v.heap_bytes() as u64;
+        let cache = DecodedColumnCache::new(8 * b, None);
+        let c = DecodedCacheCounters::default();
+        for k in 0..8 {
+            assert!(
+                cache
+                    .offer(key(k, 1), &v, AccessIntent::Interactive, &c)
+                    .is_some()
+            );
+            for _ in 0..20 {
+                assert!(cache.lookup(&key(k, 1), 8, &c).is_some());
+            }
+            assert_eq!(cache.count_of(&key(k, 1)), Some(MAX_COUNT));
+        }
+        let freed = cache.evict_for_pressure(2 * b + b, b, ExhaustionCause::Accounted);
+        assert_eq!(freed, 3 * b);
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.resident_bytes(), 5 * b);
+        assert_eq!(c.snapshot().frequency_refusals, 0);
     }
 }
