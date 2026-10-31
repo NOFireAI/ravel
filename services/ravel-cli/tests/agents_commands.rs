@@ -843,30 +843,61 @@ fn scaffold_runs_the_sdk_generator_and_refuses_a_non_empty_dir_before_spawning()
 
 type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;
 
+/// The effect handle [`reconcile_route`] refuses with [`reconcile_refusal`].
+const REFUSED_EFFECT: &str = "eff-refused";
+
+fn reconcile_refusal() -> Value {
+    json!({
+        "code": "outcome_unknown",
+        "retry": "backoff",
+        "reason": "the decision write did not settle",
+        "ids": {"agent_id": "19cd0e6876991314c1b6dbd8bd129297", "effect_id": "eff-refused"}
+    })
+}
+
 async fn reconcile_route(
     State(seen): State<Seen>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Json<ReconcileResponse> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let request: ReconcileRequest = serde_json::from_value(body.clone()).expect("request");
     seen.lock().expect("seen").push((auth, body));
+    if request.effect == REFUSED_EFFECT {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(reconcile_refusal()),
+        )
+            .into_response();
+    }
     Json(ReconcileResponse {
         effect: request.effect,
         status: ravel_agents_core::wire::EffectState::Authorized,
         attempt: request.attempt + 1,
     })
+    .into_response()
 }
 
-#[tokio::test]
+fn run_reconcile(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+        .args(["agents", "reconcile"])
+        .args(args)
+        .env_remove("RAVEL_AGENTS_TOKEN")
+        .output()
+        .expect("run ravel-cli")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconcile_posts_the_decision_with_the_admin_token() {
     let seen: Seen = Arc::default();
     let app = Router::new()
         .route("/api/v1/agents/reconcile", post(reconcile_route))
         .with_state(seen.clone());
+    let requests = seen.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -908,6 +939,53 @@ async fn reconcile_posts_the_decision_with_the_admin_token() {
         second.decision,
         ravel_agents_core::wire::ReconcileDecision::Retry
     );
+
+    let url = format!("http://{addr}");
+    let run = |json: bool| {
+        let url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec![
+                REFUSED_EFFECT,
+                "--attempt",
+                "1",
+                "--authorize-attempt",
+                "--url",
+                &url,
+                "--token",
+                "admin-tok",
+            ];
+            if json {
+                args.push("--json");
+            }
+            run_reconcile(&args)
+        })
+    };
+    let ids_line = "agents request refused: outcome_unknown (the decision write did not settle), \
+                    retry backoff; ids: agent_id=19cd0e6876991314c1b6dbd8bd129297, \
+                    effect_id=eff-refused";
+
+    let text = run(false).await.expect("join");
+    assert_eq!(text.status.code(), Some(1), "a refusal exits non-zero");
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(stderr.contains(ids_line), "{stderr}");
+    assert!(text.stdout.is_empty());
+
+    let json = run(true).await.expect("join");
+    assert_eq!(
+        json.status.code(),
+        Some(1),
+        "a refusal exits non-zero under --json"
+    );
+    let body: ravel_agents_core::wire::ErrorBody =
+        serde_json::from_slice(&json.stdout).expect("stdout is the error body JSON");
+    assert_eq!(body.ids.effect_id.as_deref(), Some(REFUSED_EFFECT));
+    assert_eq!(
+        serde_json::to_value(&body).expect("value"),
+        reconcile_refusal()
+    );
+    let stderr = String::from_utf8_lossy(&json.stderr);
+    assert!(stderr.contains(ids_line), "{stderr}");
+    assert_eq!(requests.lock().expect("seen").len(), 4);
 
     for (attach, authorize) in [(None, false), (Some("{}"), true), (Some("not json"), false)] {
         assert!(
