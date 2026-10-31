@@ -5260,6 +5260,28 @@ the flag.
   intent (`BulkScan`, `Maintenance`) admits on the second touch, through a
   ghost list of keys spanning the cap in bytes. Eviction is CLOCK, weighted
   by entry bytes.
+- Frequency gate (ADR-3326, LIKE-deferred amendment, decision 1): every
+  entry and ghost record carries an access count, saturating at 15, that each
+  columnar lookup adds one to (a hit to the entry, a miss to the key's ghost
+  record). An admitted entry starts at its ghost record's count, or 1. When
+  an admission has to evict, the first unreferenced entry the CLOCK hand
+  reaches with a count at least the newcomer's refuses it, so ties refuse
+  (`the_gate_refuses_a_less_used_newcomer_and_ties`). A refused newcomer
+  leaves a ghost record carrying its count under any intent, and an admission
+  releases its key's ghost record and its bytes under any intent
+  (`a_gate_refusal_leaves_a_ghost_record_an_admission_releases`). A refusal
+  at the eviction after the reservation drops the reservation and leaves the
+  ghost record and `ghostHits` as they were
+  (`a_second_eviction_refusal_leaves_the_ghost_record_and_ghost_hits`). A
+  repeated scan larger than the cap therefore keeps a stable subset resident
+  instead of evicting the entries just ahead of it
+  (`an_over_cap_loop_keeps_a_stable_subset`). Counts halve every
+  `max(65,536, 10 x (entries + ghost records))` lookups
+  (`counts_halve_when_lookups_reach_the_aging_window`). A statement whose set
+  fits under the cap never meets the gate
+  (`decoded_cache_stats_appear_once_when_enabled_and_never_at_zero` reads
+  `frequencyRefusals` 0), and the pressure evictor below ignores counts
+  (`the_pressure_evictor_frees_the_shortfall_plus_slack_whatever_the_counts`).
 - Age: an entry older than `ravel-cache`'s `DEFAULT_MAX_ENTRY_AGE_NS` (23 h)
   is dropped at its first access after expiry, and an hourly sweep
   (`DEFAULT_SWEEP_INTERVAL_NS`) drops the rest. The clock is injected.
@@ -5289,11 +5311,14 @@ the flag.
 
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
 once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
-`marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`.
+`marginSkips`, `frequencyRefusals`, `pressureEvictions`, `pressureFreedBytes`,
+`residentBytes`. `frequencyRefusals` counts admissions the frequency gate
+refused.
 `/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes` and
 `_entries` as gauges and `_hits_total`, `_misses_total`, `_admissions_total`,
 `_evictions_total`, `_ghost_hits_total`, `_margin_skips_total`,
-`_pressure_evictions_total` and `_expired_drops_total` as counters (eight);
+`_frequency_refusals_total`, `_pressure_evictions_total` and
+`_expired_drops_total` as counters (nine);
 none of these families appears at `0`.
 
 ## SQL over spans (the `spans` table, ADR-0045)
