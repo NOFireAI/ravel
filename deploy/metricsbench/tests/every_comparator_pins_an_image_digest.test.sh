@@ -379,10 +379,11 @@ mutate "${d}/deploy/metricsbench/run.sh" \
 check "s3s_second_download fails the single-download check" "${d}" 1 \
   "fetch_s3s_fs downloads other than once"
 
-# A changed constant is not the pinned one.
+# A changed constant is not the pinned one. The pattern takes whatever four
+# characters the pin starts with, so re-pinning cannot turn this into a no-op.
 d="$(new_tree s3s_constant_changed)"
 mutate "${d}/deploy/metricsbench/run.sh" \
-  's/^S3S_FS_SHA256_AARCH64="6d5d/S3S_FS_SHA256_AARCH64="0000/'
+  's/^S3S_FS_SHA256_AARCH64="[0-9a-f]\{4\}/S3S_FS_SHA256_AARCH64="zzzz/'
 check "s3s_constant_changed fails naming the pin" "${d}" 1 \
   "found 1 s3s-fs sha256 constants, expected exactly 2"
 
