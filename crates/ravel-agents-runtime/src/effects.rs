@@ -109,8 +109,8 @@ use ravel_agents_core::command::{
 };
 use ravel_agents_core::error::{AgentError, ErrorKind};
 use ravel_agents_core::head::{
-    Cancellation, EffectRecord, EffectStatus, Head, ObjectRef, RecoveryPolicy, StepRecord,
-    StepStatus,
+    Cancellation, EffectRecord, EffectStatus, Head, Lifecycle, ObjectRef, RecoveryPolicy,
+    StepRecord, StepStatus,
 };
 use ravel_agents_core::identity::{AgentId, Hash256, Id128, effect_id};
 use ravel_agents_core::kernel::Reply;
@@ -373,7 +373,11 @@ impl Coordinator {
         let attempt = match (&journal.effect, handed) {
             (Some(effect), Some(handed)) => {
                 if let Err(err) = self.refuse_stale_hand_over(&agent, &fence).await {
-                    self.release_reconciled(&agent, effect.effect_id, handed);
+                    if err.kind == ErrorKind::AgentGone {
+                        self.drop_reconciled(&agent, effect.effect_id, &handed);
+                    } else {
+                        self.release_reconciled(&agent, effect.effect_id, handed);
+                    }
                     return Err(err);
                 }
                 (effect.effect_id, effect.attempt)
@@ -593,31 +597,42 @@ impl Coordinator {
                 "reconciliation answered with something other than an attempt",
             ));
         };
-        // The retry read HEAD after the unknown outcome; the attempt is this
-        // call's when the effect now holds the attempt after the one this call
-        // started from, authorized. That also implies the effect was in doubt
-        // before: a replay started from `attempt` itself.
-        let landed_unacknowledged = retried
-            && journaled(&out.head, effect).is_ok_and(|now| {
-                now.status == EffectStatus::Authorized
-                    && Some(now.attempt) == record.attempt.checked_add(1)
-                    && now.attempt == attempt
-            });
-        if !out.published && !landed_unacknowledged {
+        if !out.published {
+            // After an unknown outcome the retry finds the attempt authorized
+            // whoever wrote it: another reconcile starting from the same HEAD
+            // writes the same bytes, so nothing here says it was this call.
+            let landed = retried
+                && journaled(&out.head, effect).is_ok_and(|now| {
+                    now.status == EffectStatus::Authorized && now.attempt == attempt
+                });
+            if landed {
+                return Err(refused(
+                    &effect.agent,
+                    ErrorKind::OutcomeUnknown,
+                    "the attempt's authorization landed but cannot be attributed to this call; it was not handed over here",
+                ));
+            }
             return Ok(false);
         }
         if let Some(accept_seq) = effect_input(&out.head, &record) {
-            self.open_attempts.lock().insert(
-                (effect.agent, effect.effect_id),
-                OpenAttempt {
-                    owner_id: out.head.owner_id.clone(),
-                    epoch: out.head.epoch,
-                    incarnation: out.head.incarnation,
-                    accept_seq,
-                    attempt,
-                    reconciled: true,
-                },
-            );
+            let mut attempts = self.open_attempts.lock();
+            let key = (effect.agent, effect.effect_id);
+            let held = attempts.get(&key).is_some_and(|open| {
+                open.incarnation == out.head.incarnation && open.attempt == attempt
+            });
+            if !held {
+                attempts.insert(
+                    key,
+                    OpenAttempt {
+                        owner_id: out.head.owner_id.clone(),
+                        epoch: out.head.epoch,
+                        incarnation: out.head.incarnation,
+                        accept_seq,
+                        attempt,
+                        reconciled: true,
+                    },
+                );
+            }
         }
         Ok(true)
     }
@@ -693,6 +708,19 @@ impl Coordinator {
             None => {
                 attempts.insert((*agent, effect_id), handed);
             }
+        }
+    }
+
+    /// Forget a claimed reconciled attempt whose agent is gone: no step and
+    /// no reconcile can reach its incarnation again. A record for another
+    /// attempt is newer and kept.
+    fn drop_reconciled(&self, agent: &AgentId, effect_id: Id128, handed: &OpenAttempt) {
+        let mut attempts = self.open_attempts.lock();
+        if attempts
+            .get(&(*agent, effect_id))
+            .is_some_and(|open| open.incarnation == handed.incarnation && open.attempt == handed.attempt)
+        {
+            attempts.remove(&(*agent, effect_id));
         }
     }
 
@@ -870,6 +898,13 @@ impl Coordinator {
         fence: &TurnFence,
     ) -> Result<(), AgentError> {
         let head = self.reload(agent).await?;
+        if head.lifecycle != Lifecycle::Active {
+            return Err(refused(
+                agent,
+                ErrorKind::AgentGone,
+                "the agent was destroyed before the handed-over attempt was dispatched",
+            ));
+        }
         if head.incarnation != fence.owner.incarnation
             || head.owner_id != fence.owner.owner_id
             || head.epoch != fence.owner.epoch
