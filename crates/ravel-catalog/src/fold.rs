@@ -6027,8 +6027,25 @@ pub(crate) mod tests {
         signal: Signal,
         index: usize,
     ) -> String {
-        assert_ne!(FOREIGN_TENANT, tenant().0, "the fixture tenant differs");
-        let mut head = read_signal_head(store, signal).await;
+        repoint_tenant_head_at_foreign_part(store, &tenant(), signal, index).await
+    }
+
+    /// [`repoint_head_at_foreign_part`] for `owner`'s HEAD rather than the
+    /// fixture tenant's.
+    pub(crate) async fn repoint_tenant_head_at_foreign_part(
+        store: &dyn ObjectStoreBackend,
+        owner: &TenantHash,
+        signal: Signal,
+        index: usize,
+    ) -> String {
+        assert_ne!(FOREIGN_TENANT, owner.0, "the owning tenant differs");
+        let head_key = head_object_key(owner, signal);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let mut head = snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
         let key = head.parts[index].key.clone();
         let original = store
             .get(&key, GetRange::Full)
@@ -6057,20 +6074,28 @@ pub(crate) mod tests {
         let part_ref = &mut head.parts[index];
         part_ref.blake3 = blake3::hash(&foreign).as_bytes().to_vec();
         part_ref.size = foreign.len() as u64;
+        let restamped = part_ref.blake3.clone();
+        // A HEAD's postings ref repeats each part's blake3; the postings object
+        // itself keeps the old binding, so it no longer decodes against this
+        // part.
+        if let Some(postings) = head.postings.as_mut() {
+            postings.part_blake3[index] = restamped;
+        }
         store
             .put(&key, Bytes::from(foreign), PutOptions::default())
             .await
             .expect("put the foreign part");
         let head_bytes = snapshot_format::encode_head(&head).expect("encode head");
         store
-            .put(
-                &head_object_key(&tenant(), signal),
-                Bytes::from(head_bytes),
-                PutOptions::default(),
-            )
+            .put(&head_key, Bytes::from(head_bytes), PutOptions::default())
             .await
             .expect("put the re-pointed HEAD");
         key
+    }
+
+    /// The hex of the tenant [`repoint_tenant_head_at_foreign_part`] stamps.
+    pub(crate) fn foreign_tenant_hex() -> String {
+        hex::encode(FOREIGN_TENANT)
     }
 
     /// Assert `err` is the `tenant_hash` mismatch `load_part_entries` returns

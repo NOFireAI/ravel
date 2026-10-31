@@ -1334,21 +1334,30 @@ resolve listing returned a key that does not begin with the prefix of the
 requesting tenant.
 
 **Confirm.** The counter, labeled by mode, on `/metrics`. Every increment
-corresponds to a query or a fold tick that already failed with an explicit
-isolation-fault error. A failed query reached the client; a failed fold tick
-left that tenant's HEAD where it was.
+corresponds to a query, a fold tick or a scrub tick that already failed with
+an explicit isolation-fault error. A failed query reached the client; a failed
+fold tick left that tenant's HEAD where it was; a failed scrub tick logged the
+part at `error` and skipped that check for the tick, so a foreign part counts
+again on every scrub tick until it is fixed. The command-line readers,
+`ravel-cli catalog verify`, `ravel-cli catalog fold --rebuild-key-index` and
+the coverage check of `ravel-cli load`, fail with the same error and a
+non-zero exit; they count in their own process, which serves no `/metrics`.
 
-**Action.** Escalate immediately. Every increment is a failed query or fold
-tick and a real isolation fault. The two anomaly counters rendered beside it
-are different: they tally an overlap that the query resolves past.
+**Action.** Escalate immediately. Every increment is a failed query, fold
+tick or scrub tick and a real isolation fault. The two anomaly counters
+rendered beside it are different: they tally an overlap that the query
+resolves past.
 
 Coverage is not complete, so a zero reading is not proof of isolation:
 
 - A mismatch on a commit or compaction record fails its query and does not
   increment this counter.
-- The query path and the fold check a snapshot part's tenant hash. The
-  seal-divergence verify and the scrub's covering-postings load read parts
-  without that check.
+- Every reader of a snapshot part checks its tenant hash: the query path,
+  the fold, the key-index rebuild, the scrub's covering-postings load and
+  seal-divergence check, `ravel-cli catalog verify` and the coverage check of
+  `ravel-cli load`. The scrub's covering-postings load does not count a
+  tenant-hash mismatch on the postings object itself: it logs it at `error`
+  and skips the postings check for the tick.
 
 ### Shutdown lost acknowledged rows
 

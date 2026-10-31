@@ -26,6 +26,7 @@ mod snapshot_format;
 mod snapshot_resolve;
 mod tenant_config;
 pub mod tenant_kms;
+mod tenant_part;
 
 // The five versioned sys/* records this crate owns each export their writer
 // stamp AND the closed read set (MIN..=MAX) their reader accepts. The pair is

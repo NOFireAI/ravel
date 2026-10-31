@@ -2341,13 +2341,26 @@ breach, never a silently dropped or served key. Both this and the HEAD/
 postings tenant_hash checks above increment
 `ravel_catalog_isolation_breach_total`, and so do the fold's tenant_hash
 checks on a tenant's previous postings object and previous snapshot parts.
+Every other snapshot-part reader runs the same check after the GET and
+before the decode, and counts a foreign part on the `Catalog` it was given:
+the key-index rebuild (through the fold's part loader), the scrub's
+covering-postings load (`LoadPostingsError::PartTenantHashMismatch`, a hard
+error rather than a degrade to `None`) and its seal-divergence tier, and
+`verify_seal_divergence` and `snapshot_coverage`
+(`SealDivergenceError::PartTenantMismatch`), which `ravel-cli catalog
+verify` and `ravel-cli load` call. The server hands the scrub its own
+`Catalog`, so a foreign part the scrub reads is counted where `/metrics`
+renders it; the command-line readers count on a `Catalog` of their own and
+report the error as a failed command. A tenant_hash mismatch on the postings
+object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
+is not counted.
 The counter is rendered at `/metrics` beside the
 existing `ravel_catalog_interlock_violations_total` and
 `ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
 (default alert rule: docs/guides/operations.md). Unlike those two, which
 tally a harmless-overlap anomaly the query still resolves past, every
-increment of the isolation-breach counter corresponds to a failed query or
-a failed fold tick.
+increment of the isolation-breach counter corresponds to a failed query, a
+failed fold tick, or a scrub tick that skipped the check reading the part.
 
 The fold's own liveness is exported beside those counters, from the same
 `Catalog`: `ravel_catalog_fold_cycles_total`,
