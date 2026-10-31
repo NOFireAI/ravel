@@ -316,7 +316,6 @@ describe("lease renewal", () => {
   });
 
   it("leaseMs left unset aborts at the 30 s default", async () => {
-    expect(DEFAULT_LEASE_MS).toBe(30_000);
     handlerMs = 40_000;
     try {
       const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
@@ -326,6 +325,7 @@ describe("lease renewal", () => {
       expect(signals[0]?.reason).toBeInstanceOf(LeaseExpired);
       expect(commitAt).toEqual([]);
       expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+      expect(DEFAULT_LEASE_MS).toBe(30_000);
     } finally {
       handlerMs = HANDLER_MS;
     }
@@ -337,9 +337,12 @@ describe("lease renewal", () => {
       const { transport } = leasingTransport();
       const register = vi.spyOn(transport, "register");
       const poll = vi.spyOn(transport, "poll");
-      const started = serveAgents({ transport, agents: [agent], leaseMs });
-      await expect(started).rejects.toBeInstanceOf(InvalidWorkerOption);
-      await expect(started).rejects.toMatchObject({ option: "leaseMs" });
+      const refused = await serveAgents({ transport, agents: [agent], leaseMs }).then(
+        (worker) => worker.close(),
+        (error: unknown) => error,
+      );
+      expect(refused).toBeInstanceOf(InvalidWorkerOption);
+      expect(refused).toMatchObject({ option: "leaseMs" });
       // Refused before any request, never at turn time.
       expect(register).not.toHaveBeenCalled();
       expect(poll).not.toHaveBeenCalled();
