@@ -794,12 +794,12 @@ The revert put `decoded_cache.rs` back to its state before the gate. The
 gate, its `frequency_refusals` counter and its tests are not in the tree.
 The citations to `decoded_cache.rs` lines and gate tests in decision 1
 below describe that reverted change, not the current file. A later
-amendment replaces decision 1 with an admission rule that weighs decode
-cost, and decisions 2 to 4 wait for it. That later amendment is the
-serve-if-fits amendment below: it withdraws decision 1 with no admission
-rule in its place, since the cost-weighted variants lost too, re-decides
-decisions 2 to 4, and replaces decision 6's band tables and the gate column
-of decision 5's table.
+amendment was expected to replace decision 1 with a rule that weighs
+decode cost. That amendment is the serve-if-fits amendment below, and it
+withdraws decision 1 with no admission rule in its place, since the
+cost-weighted variants lost too. It also re-decides decisions 2 to 4 and
+replaces decision 6's band tables and the gate column of decision 5's
+table.
 
 On the v0.28.0 profile run `prof028-20261030T1244Z` (8 GB cap), most of
 the decode left in the hot sum is in the columns a `Contains` arm defers.
@@ -843,7 +843,9 @@ This amendment changes three decisions:
 - decision 5, the `contains_cells_tested` sentence.
 
 Two pull requests deliver it, in order. The first is decision 1 below on
-its own. The second is decisions 2 to 4, stacked on the first.
+its own. The second is decisions 2 to 4, stacked on the first. (The
+serve-if-fits amendment below withdraws decision 1 and makes them one
+serving pull request, built on main.)
 
 1. **An admission that would evict an entry accessed at least as often as
    the newcomer is refused.** This is option (c) of the investigation, and
@@ -1288,19 +1290,27 @@ estimate and pins its error with a test.
 - **Unplanned segments.** A segment at or under `plan_whole_object_bound`
   can open unplanned (`may_skip_plan`, `plan.rs:290-292`;
   `crates/ravel-query/src/log_fetcher.rs:1582-1585`, `:1602-1604`), and the
-  plan pass never reads its directories. A scan with any such segment does
-  not fit. The q21 and q24 lookup bands below miss if that withholds them.
+  plan pass never reads its directories. Whether the scan actually leaves
+  any segment unplanned is the scan-level `skips_sub_bound_plans`
+  (`plan.rs:253-268`): with fewer such segments than partitions, every
+  segment is planned. A scan for which `skips_sub_bound_plans` is true does
+  not fit; one for which it is false is estimated normally. The q21 and
+  q24 lookup bands below miss if this withholds them.
 - **TopK.** The plan keeps blocks a TopK filter later skips (q24's restart
   try 3 scans 9,613 to 11,022 of 13,141 blocks), so q24's estimate runs
   high, the safe side.
 - **Error budget.** q22 sits within 0.2% over the cap, so an estimate more
-  than about 5% low would serve it. q21 sits at 0.86, so one more than about
-  10% high would withhold it. The 0.95 headroom covers the estimate's error
-  only inside those limits. The test decodes a fixture holding every column
-  kind the cache keeps. It asserts the estimate per kind is equal to the
-  summed `heap_bytes` for fixed-width kinds, at least 1.0 for a row group
-  dictionary, and 0.96 to 1.10 for the others. The scan reports its
-  estimate and its verdict in its statistics, and a band row checks q21.
+  than about 5% low would serve it. q21 sits at 0.8625 of the cap, so an
+  estimate more than 1.1014 times its set would withhold it. The 0.95
+  headroom covers the estimate's error only inside those limits. The test
+  decodes a fixture holding every column kind the cache keeps, including a
+  per-block string dictionary shaped like q21's URL. It asserts the
+  estimate per kind is equal to the summed `heap_bytes` for fixed-width
+  kinds, at least 1.0 for a row group dictionary, and 0.96 to 1.08 for the
+  others, which leaves q21 a 2% margin below its withholding point. The
+  scan reports its estimate and its verdict in its statistics. The band
+  row on q21's estimate against its resident bytes decides: if the test
+  passes and that row misses, the pull request stops.
 
 **When the estimate is wrong.** Answers do not depend on it, since a served
 and a decoded deferred column yield the same rows (the LIKE-deferred
@@ -1316,9 +1326,14 @@ amendment, decision 2). Memory stays bounded by the cap and decision 4.
   scans running at once can exceed the cap together, and CLOCK then evicts
   between them as it does for any column on main.
 
-**What the serving pull request also changes.** Two doc comments that the
-LIKE-deferred amendment's decisions 2 and 3 falsify were missing from its
-list:
+**What the serving pull request also changes.** Three doc comments and one
+test that the LIKE-deferred amendment's decisions 2 and 3 falsify were
+missing from its list:
+- `crates/ravel-logseg/src/decoded_cache.rs:4-8`, the module doc: "never
+  with a column a Contains arm defers (its dictionary is narrowed to
+  survivors after decode)". For a fitting scan such a column is read from
+  and filled into the cache, and narrowed into the block's own copy, not
+  the entry.
 - `reader.rs:1504-1514`, on `decode_block`: "an eligible column
   (projected, not deferred by a Contains arm)" and "Only a missed plain
   `Str` attribute column the cache would admit ... is UTF-8 validated at
@@ -1326,6 +1341,12 @@ list:
 - `reader.rs:1779-1783`, on `DictCache`: "its dictionary is never in
   `entries`". A fitting scan's admitted deferred dictionary is in
   `entries`.
+- `decoded_cache_serves_identical_rows_and_never_caches_contains_column`
+  in `crates/ravel-sql/tests/logs_decoded_cache.rs` (its assertion at
+  `:359-364`). Its fixture is far under any cap, so the scan fits and the
+  deferred column is served. The test is split in two: one run on that
+  fixture asserts the column is served with identical rows, and one run
+  with a cap below the fixture's set asserts it is never served.
 
 It also adds a test that a scan over 0.95 of the cap looks up and offers
 no deferred column, and it runs
