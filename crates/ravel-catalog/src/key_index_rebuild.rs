@@ -631,9 +631,9 @@ mod tests {
     use crate::config::CatalogConfig;
     use crate::fold::KEY_INDEX_FOOTER_SUFFIX_LEN;
     use crate::fold::tests::{
-        KIDX_HOUR, USER_ID, config, declare_user_id_key_index, fold_through, kidx_objects, matches,
-        part_ordinals, probe_part, publish_trace_spans, publish_user_id_logs, read_signal_head,
-        tenant,
+        KIDX_HOUR, USER_ID, assert_foreign_part_error, config, declare_user_id_key_index,
+        fold_through, kidx_objects, matches, part_ordinals, probe_part, publish_trace_spans,
+        publish_user_id_logs, read_signal_head, repoint_head_at_foreign_part, tenant,
     };
     use crate::snapshot_format::{KeyIndexLeafProbe, verify_key_index_leaf};
 
@@ -1499,6 +1499,47 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(budget.reserved(), 0, "nothing stays charged");
+        assert!(
+            !inner.puts().iter().any(|key| key.ends_with("/HEAD")),
+            "{:?}",
+            inner.puts()
+        );
+        assert_eq!(read_signal_head(inner.as_ref(), Signal::Logs).await, before);
+    }
+
+    /// Issue #3539, ADR-0050 §2: the rebuild loads a part through the same
+    /// tenant-checked load the fold uses, so a part whose header names another
+    /// tenant stops the run with the typed `Interrupted` error carrying the
+    /// `tenant_hash` mismatch, counts one isolation breach and publishes
+    /// nothing. Fixture: one batch of two parts, the first re-pointed at a
+    /// foreign copy whose blake3 the HEAD carries.
+    ///
+    /// FLIP: delete the `tenant_hash` comparison in
+    /// `Catalog::load_part_entries` and the rebuild succeeds, so `expect_err`
+    /// panics. FLIP: drop its `record_isolation_breach` call and
+    /// `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_on_a_part_interrupts_the_rebuild() {
+        let inner = recording_store();
+        two_entry_parts(&inner, 2).await;
+        let part_key = repoint_head_at_foreign_part(inner.as_ref(), Signal::Logs, 0).await;
+        let before = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let catalog = off_catalog(inner.clone(), 2);
+        inner.clear();
+        let err = catalog
+            .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
+            .await
+            .expect_err("a part naming another tenant must interrupt the rebuild");
+        let KeyIndexRebuildError::Interrupted { source, report } = &err else {
+            panic!("expected Interrupted, got {err:?}");
+        };
+        assert_foreign_part_error(source, &part_key);
+        assert_eq!(catalog.isolation_breaches(), 1, "the breach is counted");
+        assert_eq!(
+            (report.parts_rebuilt, report.attempt_count),
+            (0, 0),
+            "{report:?}"
+        );
         assert!(
             !inner.puts().iter().any(|key| key.ends_with("/HEAD")),
             "{:?}",
