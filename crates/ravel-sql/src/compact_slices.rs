@@ -2662,6 +2662,17 @@ mod tests {
         /// by `AVG(...)`, a Float64), over both NaN signs, two NaN payloads,
         /// both zeros, both infinities and nulls, in every combination of
         /// `descending` and `nulls_first`.
+        ///
+        /// FLIP (a): in `prefilter_batch`, evaluate each key with
+        /// `nulls_first: !sort.options.nulls_first` and the sort-key sequence
+        /// assertion fails, shrunk to `a ASC NULLS LAST, b ASC NULLS LAST`
+        /// with `fetch = 1` over Float64 rows (null, null), (null, null),
+        /// (null, "x") ((null, null) kept, (null, "x") expected). FLIP (b):
+        /// rank a Float64 key by `partial_cmp`, a NaN equal to everything,
+        /// and it fails, shrunk to one `a DESC NULLS LAST` key with
+        /// `fetch = 1` over five NaN and two NaN with the low payload bit set
+        /// (a NaN kept, the payload NaN expected). The (b) cases are the
+        /// checked-in seeds.
         #[test]
         fn prop_topk_prefilter_keeps_the_topk_answer_for_float_keys(
             key_type in prop::sample::select(vec![KeyType::Float64, KeyType::Float32]),
