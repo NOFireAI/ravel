@@ -229,23 +229,34 @@ server. Its tests are in `transport/http.test.ts`.
   other failure is retried at the next tick, and one inside the lease does
   not abort the turn. Once renewals have failed past the lease, the worker
   aborts the handler's signal at the expiry and abandons the turn without a
-  commit, with `LeaseExpired`. A step the handler calls after either abort,
-  or whose record is answered after it, rejects with the abort's reason and
-  sends no step record and runs no tool. A tool already running at the
-  abort that returns still has its result reported, so a takeover replays
-  it rather than running the effect again. The
+  commit, with `LeaseExpired`. A step the handler calls after either abort
+  rejects with the abort's reason and sends no step record. A step whose
+  record was sent inside the lease and answered after the abort has already
+  sent that record: an answer that authorizes an attempt rejects with the
+  abort's reason, and one that comes back completed or failed returns the
+  replayed output or rejects with `StepFailed`. Either way that step runs no
+  tool and reports no effect (test: `a lease that expires while the step's
+  record is in flight runs no tool`). A tool already running at the abort
+  that returns still has its result reported, so a takeover replays it
+  rather than running the effect again; when the server answers that result
+  as late, the worker sends nothing more and the step rejects with the
+  abort's reason. A tool that throws after the abort reports no failure. The
   worker measures the expiry on its own timers, `leaseMs` (a `serveAgents`
   option, default 30000) after it received the assignment or sent the last
   renewal that was answered, because no answer carries the lease length and
   the two wall clocks may disagree. The server counts a renewal's lease from
-  when it processed the request, no earlier than the sending, so the abort
-  lands before the server's grace lets another worker take the turn over
-  only when `leaseMs` is no longer than the server's agents lease, `lease_ms`
-  in its agents settings (`AgentsConfig::lease_ms`, 30000 by default, with a
-  `heartbeat_grace_ms` of 10000; the agents runtime's
-  `RuntimeConfig::default` uses the same two values). Carrying the lease
-  length on the wire, which is tracked as planned work, would remove the
-  option.
+  when it processed the request, no earlier than the sending, and the
+  assignment's lease from when it answered the poll, so the worker's first
+  expiry, counted from when that answer arrived, can trail the server's by
+  the poll answer's travel time. The server's agents lease is fixed at
+  30000 with a grace of 10000 (`DEFAULT_AGENTS_LEASE_MS` and
+  `DEFAULT_AGENTS_HEARTBEAT_GRACE_MS`, which no flag sets; the agents
+  runtime's `RuntimeConfig::default` uses the same two values). Keep
+  `leaseMs` at or below 30000, the server's fixed lease: the abort then
+  lands before the server's grace lets another worker take the turn over,
+  as long as the poll answer travels for less than the grace. Carrying the
+  lease length on the wire, which is tracked as planned work, would remove
+  the option.
   `leaseMs` outside 1000 to 2147483647, or not an integer, rejects
   `serveAgents` with `InvalidWorkerOption` before any request. Renewals
   live in the memory of the coordinator that answered them, so with two
@@ -260,8 +271,9 @@ server. Its tests are in `transport/http.test.ts`.
   InvalidWorkerOption`, `a step called after the lease expired is refused
   locally and never reaches the server`, `a lease that expires while the
   step's record is in flight runs no tool`, `a tool that finishes after the
-  lease expired still reports its result, and nothing else is sent`
-  (`worker/renew.test.ts`),
+  lease expired still reports its result, and nothing else is sent`, `a
+  late result after the abort sends nothing more`, `a tool that throws after
+  the abort reports no failure` (`worker/renew.test.ts`),
   `renews once at assignment, sends nothing while a tool runs, and no
   heartbeat before a step`.
 - There is no `journal` option: steps and effect results are recorded on
