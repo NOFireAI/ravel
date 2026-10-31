@@ -519,11 +519,10 @@ and no `abandoned_*` counter (`a_failed_page_job_fails_the_flush_retryably`).
 D1, D2, D3a's move and shared stream blob, and D4 to D8 are built. D3a's
 fold of the label-projection walk into the normalize pass is not, and stays
 gated on ADR-2708 decision 2; D3b is not built either, and is cut (d) below.
-This
-amendment records where the CPU and the strict ack go in the code as built at
-main 7726a95ea (not current `main`), and the order of the next cuts. It
-changes no decision above; each cut below is adopted on the same rule as D2
-and D3b, only if it measures cheaper at the benchmark's shape.
+This amendment records where the CPU and the strict ack go in the code as
+built at main 7726a95ea (not current `main`), and the order of the next cuts.
+It changes no decision above; each cut below is adopted on the same rule as
+D2 and D3b, only if it measures cheaper at the benchmark's shape.
 
 **Where the exit stands.** Exit run 2 (comment 6543661594, upstream ramp, 2
 shards, 100 ms, 8 write-gate permits) missed both rows: buffered best 30-min
@@ -532,10 +531,10 @@ best window (7.0 to 7.95 busy cores of 8). Strict had idle CPU and no queue
 inside Ravel; its ack was the limit.
 
 Exit run 2, and every measurement in the sections after the table below, ran
-with `--cpu-gate-write-permits 8`,
-not the default of `max(1, cores / 2)`, 4 on 8 vCPU, that D8 and the
-prediction in "What strict acks can reach" assume, so the ack split below
-compares with that prediction at twice its gate width. Exit run 1 (comment
+with `--cpu-gate-write-permits 8`, not the default of `max(1, cores / 2)`, 4
+on 8 vCPU, that D8 and the prediction in "What strict acks can reach" assume,
+so the ack split below compares with that prediction at twice its gate
+width. Exit run 1 (comment
 6540809017) ran the same image, flags, harness and ramp on the same nodes,
 from emptied buckets and a fresh VictoriaLogs volume, with the permit count
 at the default 4; that is the only difference between the two runs. On the
@@ -548,7 +547,11 @@ runs read:
 | strict | 96,971 lines/s | 99,296 lines/s | comments 6540809017, 6543661594 |
 
 Each figure is one run, so the difference carries run-to-run noise that has
-not been measured; the strict row's write gate was never full in either run.
+not been measured. The strict row's write gate was never full in either run:
+`ravel_cpu_gate_running{gate="write"}` read about 3 of 4 permits busy with no
+queue at the 110k to 130k steps of run 1 (comment 6540809017), and 2.5 to 4.1
+of 8 with `ravel_cpu_gate_wait_seconds{gate="write"}` at zero from 11:50 to
+12:25Z in run 2 (comment 6543661594).
 
 **The strict ack, split.** Measured with the phase histograms #3533 added
 (`ravel_ingest_strict_ack_seconds`, `ravel_ingest_flush_phase_seconds`), at a
@@ -601,11 +604,11 @@ the Stage 0 method; comment 6548202905), inclusive shares:
 D2 is built as `flush_rows_batch` into the columnar writer, but the shard
 still buffers row structs and converts them at flush: the conversion copies
 each record's stream blob, allocates a set per row and clones each attribute
-name twice. It is the largest share inside the flush and is on the strict ack
-path. Decode and normalize (29.8%) is larger, but it is spread over prost,
+name twice, and it is on the strict ack path. It goes first because its cut
+is self-contained: it changes no router, server, normalize code or decision.
+Decode and normalize (29.8%) is a larger share, but it is spread over prost,
 normalize and the label projection, and its cut (d) needs D3b's own
-measurement first. The conversion goes first because its cut is
-self-contained: it changes no router, server, normalize code or decision.
+measurement first.
 
 **The next cuts, in order.** Each is its own pull request, measured on the
 bench at the benchmark's shape against its base, and adopted only if it is
