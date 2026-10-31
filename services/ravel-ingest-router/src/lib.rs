@@ -48,6 +48,7 @@ pub(crate) mod clock;
 pub(crate) mod endpoints;
 pub(crate) mod grpc;
 pub(crate) mod key;
+pub(crate) mod listen;
 pub(crate) mod proxy;
 pub(crate) mod router;
 pub(crate) mod select;
@@ -192,7 +193,7 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     // panic as fatal too. When OIDC is off the arm parks forever and never fires,
     // so an HTTP-only router is not torn down for a task that was never spawned.
     tokio::select! {
-        result = axum::serve(listener, proxy::build_app(state)) => {
+        result = axum::serve(listen::nodelay(listener), proxy::build_app(state)) => {
             result?;
         }
         result = serve_optional_grpc(grpc_listener, grpc_app) => {
@@ -242,7 +243,7 @@ async fn serve_optional_grpc(
     app: axum::Router,
 ) -> std::io::Result<()> {
     match listener {
-        Some(listener) => axum::serve(listener, app).await,
+        Some(listener) => axum::serve(listen::nodelay(listener), app).await,
         None => std::future::pending().await,
     }
 }
