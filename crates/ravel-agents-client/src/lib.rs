@@ -752,6 +752,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_refusal_renders_every_id_in_wire_field_order() {
+        let err = ClientError::Agent(Box::new(AgentFailure {
+            status: 500,
+            kind: Some(ErrorKind::OutcomeUnknown),
+            code: "outcome_unknown".to_string(),
+            retry: Some(RetryHint::Backoff),
+            retry_code: "backoff".to_string(),
+            reason: "why".to_string(),
+            ids: SafeIdsBody {
+                agent_id: Some("AG".to_string()),
+                incarnation: Some(3),
+                operation: Some("OP".to_string()),
+                turn_id: Some("TU".to_string()),
+                step_id: Some("ST".to_string()),
+                effect_id: Some("EFF_ID".to_string()),
+                timer_id: Some("TI".to_string()),
+            },
+            cap: None,
+        }));
+        assert_eq!(
+            err.to_string(),
+            "agents request refused: outcome_unknown (why), retry backoff; ids: agent_id=AG, \
+             incarnation=3, operation=OP, turn_id=TU, step_id=ST, effect_id=EFF_ID, timer_id=TI"
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_code_is_kept_verbatim() {
         let server = TestServer::start(vec![(500, error_body("brand_new", "later"))]).await;
