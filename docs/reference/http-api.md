@@ -429,7 +429,7 @@ answers a send past the receipt cap 413 with `cap` `receipts`).
 | `idempotency_conflict`, `ownership_lost`, `incompatible_handler`, `non_deterministic_replay` | 409 | `never` |
 | `effect_in_doubt` | 409 | `reconcile` |
 | `outcome_unknown`; resolve by `request_id` before resending (`agents_e2e::resolve_after_a_lost_send_ack_returns_the_same_operation`) | 500 | `resolve_operation` |
-| `outcome_unknown` from `reconcile`, which mints no operation handle: send the same decision again; once the decision has taken effect a repeat answers the same body (`agents_effects_e2e::a_reconcile_whose_head_write_times_out_answers_the_reconcile_hint`) | 500 | `reconcile` |
+| `outcome_unknown` from `reconcile`, which mints no operation handle. For `record_result`, send the same decision again: a repeat of a decision that took effect answers the same body. For `retry`, do not resend: read `GET /api/v1/agents/effects/{effect}` and follow "Reconciling an effect in doubt" in the operations guide, since no process holds the attempt and a repeated `retry` is refused (`agents_effects_e2e::a_reconcile_whose_head_write_times_out_answers_the_reconcile_hint`) | 500 | `reconcile` |
 | `outcome_unknown` from `destroy`, which mints no operation handle, with `ids.incarnation` the incarnation it read: send the same destroy again naming that `incarnation` (`agents_effects_e2e::a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false`) | 500 | `backoff` |
 | `mailbox_full` | 429 | `backoff` |
 | `budget_exceeded`, including a body past the router's limit (`agents_e2e::send_over_the_body_limit_is_413_with_a_typed_body`) | 413 | `never` |
