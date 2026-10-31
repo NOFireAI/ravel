@@ -3,7 +3,8 @@
 This page is for the person who runs `ravel-server --agents`. It covers the
 budgets and quotas, the capabilities a token needs, where projected history
 goes, what the sweep costs, the clock assumptions, how long one agent can
-live, and how to reconcile an effect that is in doubt. The
+live, how to reconcile an effect that is in doubt, and how to destroy an
+agent. The
 [Ravel Agents guide](../agents.md) introduces the feature for an application
 developer, and the [storage spec](../../agents.md) holds the key layout, the
 wire shapes and the table of every guarantee with its test. Each statement
@@ -18,6 +19,7 @@ below names the test or spec row that backs it.
 - [Several server processes](#several-server-processes)
 - [Clock assumptions](#clock-assumptions)
 - [Reconciling an effect in doubt](#reconciling-an-effect-in-doubt)
+- [Destroying an agent](#destroying-an-agent)
 
 ## Turning it on
 
@@ -93,9 +95,11 @@ generation rather than adding one
 scheduled timer, the limit is about 3,000 distinct timer keys, because those
 timers stay in HEAD (derived from the HEAD byte budget, not pinned by a
 test; past it the refusal names cap `head_bytes`). Nothing trims these
-lists, and no route, CLI command or SDK call destroys an agent in this
-release, so an agent at a cap stays there. Send new work to an agent under a
-new key.
+lists. An agent at a cap stays there until an `agents_admin` caller
+destroys it with `POST /api/v1/agents/destroy` and it is created again
+under a new incarnation, which starts every list empty; see
+[Destroying an agent](#destroying-an-agent). No CLI command or SDK call
+destroys an agent in this release.
 
 Signals, from the earliest to the most direct:
 
@@ -140,13 +144,14 @@ Three capabilities gate the routes
 |---|---|---|
 | `agents` | `create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`, `timers`, `timers/cancel`, `effects`, `effects/{effect}`, `inspector` | applications |
 | `agents_worker` | every `worker/*` route | the worker processes that run handlers |
-| `agents_admin` | `reconcile`, `sweep` | operators |
+| `agents_admin` | `reconcile`, `sweep`, `destroy` | operators |
 
 A token lacking the route's capability gets 403 naming it. Grant them as
 suffixes on a static token, for example `--tenant-token 'TOKEN=acme;agents'`,
 or map OIDC claims with `--oidc-agents-claim`, `--oidc-agents-worker-claim`
 and `--oidc-agents-admin-claim`. Give `agents_admin` to people, and keep it
-off application and worker tokens: it decides what an effect in doubt did.
+off application and worker tokens: it decides what an effect in doubt did,
+and it destroys agents.
 
 Object store grants: the gateway and query roles list, read and write
 `t/*/ag/*` and delete `t/*/ag/_wake/*` only; the maintain role lists and
@@ -423,3 +428,86 @@ How to verify:
 
 `ravel-cli agents reconcile` posts the same body with the admin token
 (`reconcile_posts_the_decision_with_the_admin_token`).
+
+## Destroying an agent
+
+When to use it: an agent has reached a lifetime cap (see
+[Long-lived agents](#long-lived-agents)), or its state is wrong beyond
+repair and the application can start it over. Destroying ends the current
+incarnation; a later `create` under the same kind and key starts a new one
+with nothing carried over.
+
+What it does. `POST /api/v1/agents/destroy` with an `agents_admin` token
+tombstones the agent's HEAD in one write. From then on the agent and every
+handle minted under that incarnation answer 404 `agent_gone`: `state`,
+`operation`, `result` and `reconcile`, and for the worker holding the turn,
+`worker/heartbeat`, effect results and `worker/commit`. A client waiting
+in `result` on one of its operations is answered `agent_gone` at once
+rather than at its deadline
+(`destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`).
+
+What it does not do. It deletes no object: a HEAD is never deleted, and the
+tombstone is a new HEAD state. It does not reach outside systems: a tool
+call a worker already started may still finish there, and its result is
+refused `agent_gone`. Before destroying an agent with effects in doubt or
+authorized, list them with `GET /api/v1/agents/effects?kind=K&key=KEY` and
+check the outside system for each, since nothing will reconcile them
+afterwards.
+
+The answer counts what the tombstone abandoned: `inputs` accepted and never
+consumed (the running turn's input among them), whether a turn was open,
+the effects in doubt and authorized, and the timers still scheduled.
+
+```sh
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"agent":{"kind":"order","key":"o-1"},"incarnation":1}' \
+  http://127.0.0.1:4318/api/v1/agents/destroy
+# {"agent_id":"AGENT_ID","incarnation":1,"destroyed":true,
+#  "abandoned":{"inputs":2,"active_turn":true,"effects_in_doubt":0,
+#               "effects_authorized":1,"timers_scheduled":1}}
+```
+
+`incarnation` is optional. Name the incarnation you inspected (the state
+route's `incarnation`) so that a destroy sent late cannot end an incarnation
+someone created since.
+
+Repeats and refusals:
+
+- Destroying an agent that is already destroyed answers 200 with
+  `destroyed` false and the same counts. Nothing is written and no audit
+  record is added (the same test).
+- An agent that was never created, or an `incarnation` that is not the
+  current one, is 404 `agent_gone`, with the pinned incarnation in
+  `ids.incarnation`. Nothing is written and nothing is audited
+  (`destroy_of_an_unknown_agent_or_a_stale_incarnation_is_agent_gone_and_not_audited`).
+- A 500 `outcome_unknown` with retry `backoff` means the server could not
+  tell whether the tombstone landed. Send the same destroy again with the
+  `incarnation` from the error's `ids.incarnation`. If the first write
+  landed, the retry answers 200 with `destroyed` false
+  (`a_destroy_whose_head_write_is_lost_answers_backoff_and_a_retry_answers_destroyed_false`).
+- A token without `agents_admin` gets 403 "requires the agents_admin
+  capability".
+
+Audit. With `--audit-mode` on, a destroy that tombstones the agent first
+writes one audit record with `kind` `agents_destroy` naming the tenant, the
+agent id, the incarnation, the `abandoned` counts as read before the write
+(fields `agents.abandoned.inputs`, `agents.abandoned.active_turn`,
+`agents.abandoned.effects_in_doubt`, `agents.abandoned.effects_authorized`
+and `agents.abandoned.timers_scheduled`), and the caller under
+`agents.principal.tenant` and `agents.principal.capabilities`
+(`the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`).
+The `agents_destroy` record names the caller's tenant and capabilities. A
+principal carries no subject, so two admins of one tenant are not told
+apart, as for reconcile. In `required` mode a failed audit write refuses
+the destroy with 503 `store_unavailable` and the agent stays active
+(`a_destroy_whose_audit_record_is_refused_leaves_the_agent_active`); in
+`best-effort` mode the destroy goes ahead without its record. Without
+`--audit-mode` no record is written.
+
+Recreate. `POST /api/v1/agents/create` with the same kind and key answers
+`incarnation` 2 and `created` true. The new incarnation starts with no
+state, no mailbox and no receipts, so a `request_id` used before the
+destroy is accepted as a new send; handles from incarnation 1 stay
+`agent_gone`
+(`destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`).
