@@ -104,8 +104,8 @@ routes against a real server, for example
 |---|---|---|
 | 0 Contracts | key layout, HEAD format, typed errors, the `agents` feature and `--agents` flag | yes |
 | 1 Durable kernel | create, send, read, resolve, turn commit, receipts, quotas | yes, over the client routes; the agent-count, state-size and memory quotas are reported but not enforced |
-| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | the worker routes, leases, heartbeats and takeover are served; the SDK's worker connects over them with `createHttpTransport` and keeps its step journal in its own memory, because the SDK does not call the server's step and effect routes yet |
-| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | yes; the TypeScript SDK still journals steps in worker memory |
+| 2 Runtime and SDK | workers, ownership and takeover, turn dispatch, the TypeScript SDK | yes; the SDK's worker connects with `createHttpTransport` and records steps and effect results through the server's step and effect routes |
+| 3 Steps and tools | step journal, effect intents, recovery policies, cancellation | yes, in the TypeScript SDK too |
 | 4 Timers and discovery | timer firing, wake hints, the reconciliation sweep | yes; a send writes no wake hint; see the [operator guide](operations/agents.md#several-server-processes) |
 | 5 Developer experience | `ravel-cli agents`, inspector page, MCP tools, Rust client, projection into logs and traces | yes; MCP tools need a build with `mcp` |
 | 6 Release hardening | paged indexes, benchmarks, operator guide, the feature in the published image | yes; see the [operator guide](operations/agents.md) |
@@ -119,8 +119,8 @@ The SDK lives in `sdk/typescript/packages/agents`; its
 [README](../../sdk/typescript/packages/agents/README.md) shows how to define
 an agent and a tool and drive them through the test harness. It is not
 published. Its worker reaches the worker routes through
-`createHttpTransport`; the SDK does not call the server's step and effect
-routes in this release, so the worker journals steps in its own memory and
-loses them with its process.
+`createHttpTransport`, which records every step and effect result through
+the server's step and effect routes, so a worker that replaces a killed one
+in another process replays the same steps.
 [The SDK guide](agents-sdk.md) takes a first project from a scaffold to a
 run against a server.

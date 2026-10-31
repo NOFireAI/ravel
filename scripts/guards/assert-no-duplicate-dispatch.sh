@@ -62,6 +62,16 @@
 # section with a line in the range. A bare docs/ path names no section and
 # keeps the whole-file rule.
 #
+# Only an OPEN, non-draft pull request can collide, so only such a pull
+# request is compared by line, and only a failure while asking about one
+# refuses (69). A merged, closed or draft pull request is context: it never
+# changes the exit code, so the guard never asks the compare endpoint about
+# it, matches every entry against its files as the whole file, and reports a
+# files list it could not read as a NOTE instead of refusing. A pull request
+# whose base branch was deleted after it merged answers the compare endpoint
+# with a 404, and a lookup that cannot change the verdict must not be able to
+# block a dispatch.
+#
 # Hunks come from the patch field of the same paginated files endpoint, in
 # the same call. A file the pull request renamed matches an entry naming
 # either its old or its new path, and its patch is numbered on the old file.
@@ -105,10 +115,10 @@
 #       files, line ranges or definitions (drafts, merged and closed ones are
 #       listed as context only)
 #   69  the question could not be asked (gh failed after its retries, a pull
-#       request list came back as long as its limit and may be truncated, a
-#       pull request's files and patches or its merge base could not be
-#       fetched, or --base-ref does not resolve); not the same as a clean
-#       answer, and never report it as one
+#       request list came back as long as its limit and may be truncated, an
+#       OPEN, non-draft pull request's files and patches or its merge base
+#       could not be fetched, or --base-ref does not resolve); not the same as
+#       a clean answer, and never report it as one
 set -euo pipefail
 
 issue=""
@@ -182,17 +192,27 @@ fi
 # is retried before the run gives up.
 ask_attempts="${ASK_ATTEMPTS:-3}"
 ask_backoff_s="${ASK_BACKOFF_S:-5}"
+ask_failed_attempts=0
 ask() {
+  try_ask "$@" && return 0
+  echo "assert-no-duplicate-dispatch.sh: '$*' failed ${ask_failed_attempts} times; refusing to report a clean answer" >&2
+  exit 69
+}
+
+# try_ask CMD...: ask's retries, but a final failure prints gh's first error
+# lines to stderr and returns 1 instead of exiting. Only for a question whose
+# answer cannot change the exit code.
+try_ask() {
   local out err attempt=1
   err="$(mktemp)"
   while ! out="$("$@" 2>"${err}")"; do
     # A missing resource fails the same way every time; only a failure that
     # can pass on a second try is worth one.
     if ((attempt >= ask_attempts)) || grep -q 'HTTP 404\|Could not resolve to' "${err}"; then
-      echo "assert-no-duplicate-dispatch.sh: '$*' failed ${attempt} times; refusing to report a clean answer" >&2
+      ask_failed_attempts="${attempt}"
       sed -n '1,3p' "${err}" >&2
       rm -f "${err}"
-      exit 69
+      return 1
     fi
     attempt=$((attempt + 1))
     sleep "$((ask_backoff_s * (attempt - 1)))"
@@ -566,10 +586,26 @@ context_report=""
 files_cap=3000
 while IFS=$'\t' read -r num state pr_base pr_head title; do
   [[ -z "${num}" ]] && continue
+  # Only an OPEN, non-draft pull request can collide. Anything else is context
+  # and must not be able to refuse: it is matched as the whole file and never
+  # asked about its merge base.
+  collidable=0
+  [[ "${state}" == "OPEN" ]] && collidable=1
   # One line per file, a JSON array of its name, its patch (null when the
   # endpoint left the patch out), its name before a rename (null when the
   # pull request did not rename it) and its status.
-  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[] | [.filename, .patch, .previous_filename, .status] | @json')" || exit 69
+  files_jq='.[] | [.filename, .patch, .previous_filename, .status] | @json'
+  if ((collidable)); then
+    files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq "${files_jq}")" || exit 69
+  else
+    files_err="$(mktemp)"
+    if ! files="$(try_ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq "${files_jq}" 2>"${files_err}")"; then
+      echo "NOTE  #${num} [${state}] ${title}: its files could not be read ($(sed -n '1p' "${files_err}")); context only, not compared"
+      rm -f "${files_err}"
+      continue
+    fi
+    rm -f "${files_err}"
+  fi
   shared=""
   nfiles="$(awk 'END { print NR }' <<<"${files}")"
   if ((nfiles >= files_cap)); then
@@ -583,6 +619,10 @@ while IFS=$'\t' read -r num state pr_base pr_head title; do
     [[ -n "${recs}" ]] || continue
     if [[ "${e_mode[i]}" == whole ]]; then
       shared+="${e_label[i]}, "
+      continue
+    fi
+    if ((!collidable)); then
+      shared+="${e_label[i]} (context; compared as the whole file), "
       continue
     fi
     why=""

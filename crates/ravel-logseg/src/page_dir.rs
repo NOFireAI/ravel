@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::block::MAX_PAGES;
 use crate::encoding::Enc;
@@ -144,14 +145,17 @@ pub struct GroupEntry {
 /// Carries an in-memory index of where each block's pages start in each column
 /// chunk ([`BlockIndex`]), so [`Self::block_pages`] and
 /// [`Self::block_dict_pages`] slice a chunk instead of scanning it. Neither
-/// [`Self::new`] nor [`Self::decode`] builds any of it: each chunk's entry is
-/// built on the first lookup that reads that chunk and reused by every later
-/// one (`index_tests::chunk_indexes_are_built_on_first_lookup`,
+/// [`Self::new`] nor [`Self::decode`] builds any of it, and neither does the
+/// first [`Self::block_pages`] lookup that reads a chunk, which scans it: the
+/// chunk's entry is built on its second such lookup and reused by every later
+/// one (`index_tests::chunk_indexes_are_built_on_second_lookup`,
+/// `index_tests::one_lookup_per_chunk_builds_no_index`,
 /// `index_tests::concurrent_lookups_build_each_chunk_once`). A chunk whose
 /// group's block or chunk count, or whose own page count, no longer matches
-/// what the index recorded when it was built is scanned instead ([`BlockIndex::runs`],
-/// `index_tests::a_stale_index_falls_back_to_the_scan`); an in-place edit of
-/// `groups` that keeps every count must be followed by [`Self::reindex`].
+/// what the index recorded when it was built is scanned instead
+/// ([`BlockIndex::runs`], `index_tests::a_stale_index_falls_back_to_the_scan`);
+/// an in-place edit of `groups` that keeps every count must be followed by
+/// [`Self::reindex`].
 #[derive(Clone, Default)]
 pub struct PageDir {
     pub groups: Vec<GroupEntry>,
@@ -176,23 +180,92 @@ impl std::fmt::Debug for PageDir {
     }
 }
 
-/// Per group, per column chunk, where each block's run of pages starts, each
-/// level built on first use: the group table on the directory's first lookup,
-/// a group's chunk table on its first lookup, and a chunk's runs on the first
-/// lookup that reads that chunk ([`Self::runs`]). `OnceLock` keeps it `Send +
-/// Sync` (`index_tests::page_dir_is_send_and_sync`) and makes every later read
-/// a load, with no allocation.
+/// Per group, per column chunk, where each block's run of pages starts.
+/// Nothing is built for a chunk until its second lookup ([`Self::runs`]): the
+/// first is answered by [`scan_chunk_pages`] and only marks the chunk's slot
+/// in `lookups`, so a directory each of whose chunks is looked up once holds
+/// no group table, no chunk table and no runs
+/// (`index_tests::one_lookup_per_chunk_builds_no_index`). The second lookup
+/// builds the group table, the group's chunk table and the chunk's runs, the
+/// tables only if no chunk built them first. `OnceLock` and the atomic slots
+/// keep it `Send + Sync` (`index_tests::page_dir_is_send_and_sync`), the
+/// `OnceLock` builds each chunk once however many threads reach its second
+/// lookup (`index_tests::concurrent_lookups_build_each_chunk_once`), and a
+/// lookup of a chunk whose runs were built reads them through `OnceLock::get`
+/// alone, with no allocation and no write ([`Self::built_runs`]).
 ///
 /// Memory: one [`Run`] (12 bytes) per distinct block that has a page in a
 /// chunk, so never more entries than the chunk has pages, whatever the
-/// group's declared `block_count` (`index_tests::index_size_follows_the_pages_not_the_block_count`),
-/// plus a slot per group of the directory once any lookup ran, a chunk table
-/// per group looked up, and a page count, end and box per chunk built. A
+/// group's declared `block_count`
+/// (`index_tests::index_size_follows_the_pages_not_the_block_count`), plus,
+/// once any lookup ran, one byte per chunk and one `usize` per group in
+/// `lookups`, a slot per group once any chunk was built, a chunk table per
+/// group with a chunk built, and a page count, end and box per chunk built. A
 /// chunk the index cannot describe (see [`ChunkRuns::build`]) keeps no runs
 /// and is scanned.
 #[derive(Clone, Default)]
 struct BlockIndex {
+    lookups: OnceLock<Lookups>,
     groups: OnceLock<Box<[OnceLock<GroupIndex>]>>,
+}
+
+/// Whether each chunk was looked up before, as a count that stops at 1, in
+/// group then chunk order: chunk `ci` of group `gi` is `seen[base[gi] + ci]`,
+/// and group `gi` has `base[gi + 1] - base[gi]` chunks. Sized from the groups
+/// of the first lookup; a chunk outside that shape has no slot and is scanned
+/// (`index_tests::a_stale_index_falls_back_to_the_scan`).
+///
+/// The slots are read and written `Relaxed`: a slot only decides whether a
+/// lookup builds, and the `OnceLock` it builds into orders the build. Two
+/// threads that both read 0 both scan; a lookup that reads 1 was preceded by
+/// another lookup of the chunk, on its own thread or another.
+struct Lookups {
+    base: Box<[usize]>,
+    seen: Box<[AtomicU8]>,
+}
+
+impl Lookups {
+    fn new(groups: &[GroupEntry]) -> Self {
+        let mut base = Vec::with_capacity(groups.len() + 1);
+        let mut at = 0usize;
+        base.push(at);
+        for g in groups {
+            at = at.saturating_add(g.chunks.len());
+            base.push(at);
+        }
+        Lookups {
+            base: base.into_boxed_slice(),
+            seen: (0..at).map(|_| AtomicU8::new(0)).collect(),
+        }
+    }
+
+    /// Records a lookup of chunk `ci` of group `gi`: `Some(true)` when it is
+    /// the chunk's first, `Some(false)` when another came before it, `None`
+    /// when the chunk has no slot.
+    fn first(&self, gi: usize, ci: usize) -> Option<bool> {
+        let start = *self.base.get(gi)?;
+        let end = *self.base.get(gi.checked_add(1)?)?;
+        let at = start.checked_add(ci).filter(|&at| at < end)?;
+        let slot = self.seen.get(at)?;
+        if slot.load(Ordering::Relaxed) >= 1 {
+            return Some(false);
+        }
+        slot.store(1, Ordering::Relaxed);
+        Some(true)
+    }
+}
+
+impl Clone for Lookups {
+    fn clone(&self) -> Self {
+        Lookups {
+            base: self.base.clone(),
+            seen: self
+                .seen
+                .iter()
+                .map(|s| AtomicU8::new(s.load(Ordering::Relaxed)))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -346,17 +419,31 @@ impl BlockIndex {
             .sum()
     }
 
-    /// The runs of chunk `ci` of group `gi` of `groups`, building whatever
-    /// part of the index they need, when the index still describes `group`
-    /// (same block count, chunk count, and the chunk's page count as when that
-    /// part was built).
-    fn runs<'a>(
-        &'a self,
-        groups: &[GroupEntry],
-        gi: usize,
-        group: &GroupEntry,
-        ci: usize,
-    ) -> Option<&'a ChunkRuns> {
+    /// The runs of chunk `ci` of group `gi` of `groups` if they were built,
+    /// and the index still describes the group (same block count, chunk
+    /// count, and the chunk's page count as when that part was built). Reads
+    /// only: nothing is allocated, built or counted.
+    fn built_runs(&self, groups: &[GroupEntry], gi: usize, ci: usize) -> Option<&ChunkRuns> {
+        let group = groups.get(gi)?;
+        let g = self.groups.get()?.get(gi)?.get()?;
+        let c = g.chunks.get(ci)?.get()?;
+        Self::current(group, ci, g, c)
+    }
+
+    /// The runs of chunk `ci` of group `gi` of `groups`, as
+    /// [`Self::built_runs`], counting the lookup when they were not built:
+    /// `None` on the chunk's first lookup, which builds nothing, and on a
+    /// later one the runs, building whatever part of the index they need.
+    fn runs(&self, groups: &[GroupEntry], gi: usize, ci: usize) -> Option<&ChunkRuns> {
+        if let Some(r) = self.built_runs(groups, gi, ci) {
+            return Some(r);
+        }
+        let group = groups.get(gi)?;
+        let chunk = group.chunks.get(ci)?;
+        let lookups = self.lookups.get_or_init(|| Lookups::new(groups));
+        if lookups.first(gi, ci)? {
+            return None;
+        }
         let table = self
             .groups
             .get_or_init(|| groups.iter().map(|_| OnceLock::new()).collect());
@@ -366,7 +453,6 @@ impl BlockIndex {
         });
         (g.block_count == group.block_count && g.chunks.len() == group.chunks.len())
             .then_some(())?;
-        let chunk = group.chunks.get(ci)?;
         let c = g.chunks.get(ci)?.get_or_init(|| {
             built_chunk();
             ChunkIndex {
@@ -374,7 +460,21 @@ impl BlockIndex {
                 runs: ChunkRuns::build(chunk, group.block_count),
             }
         });
-        (c.pages == chunk.pages.len()).then_some(())?;
+        Self::current(group, ci, g, c)
+    }
+
+    /// `c`'s runs when `g` and `c` still describe `group` and its chunk `ci`.
+    fn current<'a>(
+        group: &GroupEntry,
+        ci: usize,
+        g: &GroupIndex,
+        c: &'a ChunkIndex,
+    ) -> Option<&'a ChunkRuns> {
+        let chunk = group.chunks.get(ci)?;
+        (g.block_count == group.block_count
+            && g.chunks.len() == group.chunks.len()
+            && c.pages == chunk.pages.len())
+        .then_some(())?;
         c.runs.as_ref()
     }
 }
@@ -499,11 +599,15 @@ impl PageDir {
     /// [`BlockIndex`] to the block's run of pages rather than walked: the cost
     /// is the pages returned plus at most two per chunk, and a binary search
     /// of at most `floor(log2(runs)) + 2` index entries per chunk, `runs`
-    /// being the chunk's blocks that have pages, once the chunk's runs exist;
-    /// the first lookup reading a chunk builds them with one pass over its
-    /// pages
-    /// (`index_tests::block_pages_visits_only_the_blocks_run`), and the result is
-    /// the full scan's, page for page (`index_tests::index_matches_the_scan`).
+    /// being the chunk's blocks that have pages, once the chunk's runs exist
+    /// (`index_tests::block_pages_visits_only_the_blocks_run`). The first
+    /// lookup reading a chunk scans its pages and builds nothing; the second
+    /// builds its runs in three passes ([`ChunkRuns::build`]: every page for
+    /// the chunk's length, the leading dictionary page for the first run's
+    /// offset, and the pages after it for the runs)
+    /// (`index_tests::chunk_indexes_are_built_on_second_lookup`). The result
+    /// is the full scan's, page for page, on first and later lookups alike
+    /// (`index_tests::index_matches_the_scan`).
     pub fn block_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
         let (gi, within) = self.locate_group(block)?;
         let group = self.groups.get(gi)?;
@@ -511,7 +615,7 @@ impl PageDir {
         for (ci, chunk) in group.chunks.iter().enumerate() {
             let run = self
                 .index
-                .runs(&self.groups, gi, group, ci)
+                .runs(&self.groups, gi, ci)
                 .and_then(|r| r.run(chunk, within));
             let Some((s, e, rel)) = run else {
                 scan_chunk_pages(chunk, within, &mut out)?;
@@ -537,6 +641,12 @@ impl PageDir {
     /// dictionary page and a page for `block`. Offsets are relative to BLOCKS,
     /// as [`Self::block_pages`] returns them. `None` when `block` is outside
     /// the directory.
+    ///
+    /// A chunk is sliced through [`BlockIndex`] only when its runs already
+    /// exist, and scanned otherwise: this lookup neither counts toward nor
+    /// triggers a chunk's build, since the reader calls it right after
+    /// [`Self::block_pages`] for the same block
+    /// (`index_tests::chunk_indexes_are_built_on_second_lookup`).
     pub fn block_dict_pages(&self, block: u32) -> Option<Vec<PageLoc>> {
         let (gi, within) = self.locate_group(block)?;
         let group = self.groups.get(gi)?;
@@ -547,7 +657,7 @@ impl PageDir {
             };
             let has_page = match self
                 .index
-                .runs(&self.groups, gi, group, ci)
+                .built_runs(&self.groups, gi, ci)
                 .and_then(|r| r.run(chunk, within))
             {
                 Some((s, e, _)) => s < e,
@@ -1847,13 +1957,17 @@ mod index_tests {
         /// The index returns exactly what the full scan returned, page for page
         /// and in order, for every block: `None` outside the directory, the
         /// same pages with the same offsets inside it, and the same dictionary
-        /// pages. A directory that round-trips through decode is checked again
-        /// as decode builds it.
+        /// pages. Every block is looked up twice, so both a chunk's first,
+        /// scanned lookup and the lookups through its built runs are compared.
+        /// A directory that round-trips through decode is checked again as
+        /// decode builds it.
         #[test]
         fn index_matches_the_scan(dir in arb_wide_dir()) {
             assert_matches_scan(&dir)?;
+            assert_matches_scan(&dir)?;
             if let Ok(decoded) = PageDir::decode(&dir.encode()) {
                 prop_assert_eq!(&decoded, &dir);
+                assert_matches_scan(&decoded)?;
                 assert_matches_scan(&decoded)?;
             }
         }
@@ -1873,9 +1987,13 @@ mod index_tests {
             prop_assume!(apply(&mut groups, pick, &damage));
             let damaged = PageDir::new(groups);
             assert_matches_scan(&damaged)?;
+            assert_matches_scan(&damaged)?;
             // A swap inside one block's run can leave the shape admissible.
             match PageDir::decode(&damaged.encode()) {
-                Ok(decoded) => assert_matches_scan(&decoded)?,
+                Ok(decoded) => {
+                    assert_matches_scan(&decoded)?;
+                    assert_matches_scan(&decoded)?;
+                }
                 Err(LogSegError::Corrupted(_)) => {}
                 Err(other) => prop_assert!(false, "unexpected error: {other:?}"),
             }
@@ -1891,8 +2009,10 @@ mod index_tests {
         ) {
             let mut dir = dir;
             assert_matches_scan(&dir)?;
+            assert_matches_scan(&dir)?;
             prop_assume!(apply(&mut dir.groups, pick, &damage));
             dir.reindex();
+            assert_matches_scan(&dir)?;
             assert_matches_scan(&dir)?;
         }
     }
@@ -1945,41 +2065,78 @@ mod index_tests {
         (out, CHUNKS_BUILT.with(|v| v.get()))
     }
 
-    /// Decoding builds no chunk index; a lookup builds exactly the chunks it
-    /// reads, and a repeated lookup builds none.
+    /// Over [`decoded_two_groups`] (two groups of seven chunks, 14 in all):
+    /// decoding builds no chunk index, and neither does the first lookup of
+    /// block 70 (block 6 of group 1) nor the dictionary lookup after it. The
+    /// second lookup of block 70 builds the seven chunks of group 1 and no
+    /// chunk table for group 0, and repeating both lookups builds none. A
+    /// sweep of every block then builds group 0's seven, and a second sweep
+    /// none.
     #[test]
-    fn chunk_indexes_are_built_on_first_lookup() {
+    fn chunk_indexes_are_built_on_second_lookup() {
         let (bytes, _) = decoded_two_groups();
         let (dir, n) = built(|| PageDir::decode(&bytes).expect("decode"));
         assert_eq!(n, 0, "decode built {n} chunk indexes");
-        assert_eq!(dir.index.entries(), 0);
+        assert!(dir.index.groups.get().is_none());
 
-        // Block 70 is block 6 of group 1. Its dictionary lookup reads only
-        // the group's two dictionary chunks.
-        let (dicts, n) = built(|| dir.block_dict_pages(70).expect("block"));
-        assert_eq!(n, 2);
-        assert_eq!(Some(dicts), scan_block_dict_pages(&dir, 70));
-        // Its page lookup reads all seven chunks, five of them new.
         let (pages, n) = built(|| dir.block_pages(70).expect("block"));
-        assert_eq!(n, 5);
+        assert_eq!(n, 0, "the first lookup built {n} chunk indexes");
         assert_eq!(Some(pages), scan_block_pages(&dir, 70));
-        // Group 0 is untouched until one of its blocks is looked up.
-        let (_, n) = built(|| dir.block_pages(5).expect("block"));
-        assert_eq!(n, 7);
-        assert_eq!(dir.index.built().count(), 14);
+        let (dicts, n) = built(|| dir.block_dict_pages(70).expect("block"));
+        assert_eq!(n, 0, "the dictionary lookup built {n} chunk indexes");
+        assert_eq!(Some(dicts), scan_block_dict_pages(&dir, 70));
+        assert!(dir.index.groups.get().is_none(), "group table allocated");
+
+        let (pages, n) = built(|| dir.block_pages(70).expect("block"));
+        assert_eq!(n, 7, "the second lookup built {n} chunk indexes");
+        assert_eq!(Some(pages), scan_block_pages(&dir, 70));
+        assert_eq!(dir.index.built().count(), 7);
+        let table = dir.index.groups.get().expect("group table");
+        assert!(table[0].get().is_none(), "group 0 chunk table allocated");
 
         let (_, n) = built(|| {
+            for _ in 0..3 {
+                assert_eq!(dir.block_pages(70), scan_block_pages(&dir, 70));
+                assert_eq!(dir.block_dict_pages(70), scan_block_dict_pages(&dir, 70));
+            }
+        });
+        assert_eq!(n, 0, "repeated lookups built {n} chunk indexes");
+
+        let sweep = || {
             for b in 0..128 {
                 assert_eq!(dir.block_pages(b), scan_block_pages(&dir, b));
                 assert_eq!(dir.block_dict_pages(b), scan_block_dict_pages(&dir, b));
             }
+        };
+        let (_, n) = built(sweep);
+        assert_eq!(n, 7, "the first sweep built {n} chunk indexes");
+        let (_, n) = built(sweep);
+        assert_eq!(n, 0, "the second sweep built {n} chunk indexes");
+        assert_eq!(dir.index.built().count(), 14);
+    }
+
+    /// A directory whose every chunk is looked up once, block 5 and block 70
+    /// of [`decoded_two_groups`] with their dictionary lookups, builds no
+    /// group table and no chunk index, and answers as the scan does.
+    #[test]
+    fn one_lookup_per_chunk_builds_no_index() {
+        let (_, dir) = decoded_two_groups();
+        let (_, n) = built(|| {
+            for b in [5, 70] {
+                assert_eq!(dir.block_pages(b), scan_block_pages(&dir, b));
+                assert_eq!(dir.block_dict_pages(b), scan_block_dict_pages(&dir, b));
+            }
         });
-        assert_eq!(n, 0, "repeated lookups built {n} chunk indexes");
+        assert_eq!(n, 0, "built {n} chunk indexes");
+        assert_eq!(dir.index.entries(), 0);
+        assert_eq!(dir.index.built().count(), 0);
+        assert!(dir.index.groups.get().is_none(), "group table allocated");
     }
 
     /// Threads looking up blocks of one shared directory at once each get the
     /// scan's answer, and each of the 14 chunk indexes is built exactly once
-    /// across all of them.
+    /// across all of them: every chunk is looked up 64 times per thread, so
+    /// each reaches its second lookup, and its `OnceLock` runs one build.
     #[test]
     fn concurrent_lookups_build_each_chunk_once() {
         const THREADS: u32 = 8;
@@ -2028,7 +2185,8 @@ mod index_tests {
             .map(|c| c.pages.len() as u64)
             .sum();
         assert!(group_pages > 300, "group holds {group_pages} pages");
-        // Any lookup of the group builds every chunk's runs.
+        // A second lookup of the group builds every chunk's runs.
+        dir.block_pages(0).expect("block 0");
         dir.block_pages(0).expect("block 0");
         assert_eq!(dir.index.built().count() as u64, chunks);
         let probe_bound: u64 = dir
@@ -2136,8 +2294,8 @@ mod index_tests {
 
     /// A PAGE_DIR declaring `MAX_BLOCKS` blocks in a group with one page
     /// decodes to the same directory as before the index, with no index
-    /// entry, and once looked up the index holds one entry for that page, not
-    /// one per declared block.
+    /// entry, and once its chunk is looked up four times the index holds one
+    /// entry for that page, not one per declared block.
     #[test]
     fn index_size_follows_the_pages_not_the_block_count() {
         let (groups, bytes) = huge_group_bytes(1);
@@ -2153,9 +2311,9 @@ mod index_tests {
         assert_eq!(dir.index.entries(), 1);
     }
 
-    /// The same with many one-page chunks: none after decode, then, once a
-    /// lookup has read every chunk, one entry per page (`pages + chunks` is
-    /// the bound; this shape meets `pages`).
+    /// The same with many one-page chunks: none after decode, then, once
+    /// three lookups have read every chunk, one entry per page (`pages +
+    /// chunks` is the bound; this shape meets `pages`).
     #[test]
     fn index_size_follows_the_pages_across_many_chunks() {
         let (groups, bytes) = huge_group_bytes(4096);

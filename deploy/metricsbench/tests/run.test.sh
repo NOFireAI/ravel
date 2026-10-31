@@ -25,6 +25,10 @@
 #   q2 a row stalls                  -> the same, exit 70 naming ingest
 #   q3 q plus an --rss-band breach   -> exit 70 naming ingest, memory listed in
 #                                       failed_after_ingest
+#   q4 the oracle's read-back fails, -> exit 70 naming ingest at query: query
+#      plus an --rss-band breach        refuses, no report.json, no validate;
+#                                       only query in failed_after_ingest, the
+#                                       breach recorded in memory-summary.json
 #   r  ingest exits non-zero, every  -> exit 70 naming ingest at once, no
 #      row verified                     capture, no query
 #   c  --ravel-image without digest  -> exit 65, nothing started, no stamps
@@ -374,6 +378,12 @@ verdict=""
 for a in "$@"; do
   [ "$a" = "--diagnostic-after-failed-ingest" ] && verdict=',"run_verdict":"failed"'
 done
+# As the real bin does: a diagnostic whose failed row is the Prometheus
+# oracle's is refused, and nothing is written.
+if [ -n "$verdict" ] && [ "${STUB_INGEST_READBACK_FAIL:-}" = prometheus ]; then
+  echo "stub query: the oracle prometheus failed its read-back" >&2
+  exit 65
+fi
 for ((i = 0; i < ${#args[@]}; i++)); do
   [ "${args[$i]}" = "--out" ] && printf '{"stub":"report"%s}\n' "$verdict" >"${args[$((i + 1))]}"
 done
@@ -585,6 +595,26 @@ STUB_INGEST_READBACK_FAIL=victoriametrics STUB_MEM_ravel_server=2GiB run_case q3
 expect_rc q3 70
 check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"]'
 expect_err "q3: the band is still said" "--rss-band ravel-server:0:1073741824 above"
+
+# --- q4: the oracle's read-back fails ----------------------------------------------
+# query refuses a diagnostic whose failed row is Prometheus's, so the run ends at
+# query: no report, no validate, no memory step. The --rss-band breach is still
+# checked on the way out and recorded in memory-summary.json, but it is not
+# listed in failed_after_ingest.
+mapfile -t args < <(full_args "${TMP}/q4/out")
+STUB_INGEST_READBACK_FAIL=prometheus STUB_MEM_ravel_server=2GiB run_case q4 "${args[@]}" \
+  --rss-band ravel-server:0:1073741824
+expect_rc q4 70
+check "q4: stamps name ingest and list only query as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["query"]'
+check "q4: query, validate and memory not done" 'not {"query","validate","memory"} & set(j("stamps.json")["steps_completed"]) and "fold-state" in j("stamps.json")["steps_completed"]'
+expect_log "q4: query run as a diagnostic" "--diagnostic-after-failed-ingest"
+expect_err "q4: message names step query" "step query failed: metricsbench_query exited 65"
+expect_err "q4: message says no report was written" "the run went on as a diagnostic and wrote no report.json"
+expect_no_file q4 report.json
+expect_no_log "q4: validate not run" "metricsbench_report validate"
+expect_file q4 memory-summary.json
+check "q4: the breach is recorded in memory-summary.json" 'j("memory-summary.json")["verdict"] == "band_violated" and [b["verdict"] for b in j("memory-summary.json")["bands"]] == ["above"]'
+expect_log "q4: torn down" " down -v"
 
 # --- r: ingest fails with every row verified ---------------------------------------
 mapfile -t args < <(full_args "${TMP}/r/out")

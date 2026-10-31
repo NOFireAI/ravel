@@ -348,8 +348,9 @@ pub fn bind(
 /// that failed its read-back or carries a `row_failure` is still queried; a
 /// stalled row or a failed replay has no ingest figures and its engine is
 /// left out of the binding. Refused when no row failed
-/// ([`BindError::NoFailedRow`]) and when the oracle stalled or failed its
-/// replay. Band 6 and accounting failures on a row without a `row_failure`
+/// ([`BindError::NoFailedRow`]) and when the failed row is the Prometheus
+/// oracle's, whatever the failure: every other engine is classified against
+/// it. Band 6 and accounting failures on a row without a `row_failure`
 /// refuse as in [`bind`].
 pub fn bind_diagnostic(
     ingest: &MetricsIngestReport,

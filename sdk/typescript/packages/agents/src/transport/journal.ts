@@ -2,9 +2,10 @@
  * An SDK-local step and effect journal from before the server served the
  * step, effect and reconcile routes. No transport consults it: the HTTP
  * transport records steps on the server and the fake coordinator keeps its
- * own. It stays exported, deprecated, until the example scenario stops
- * importing it (#3532). {@link MemoryStepJournal} keeps it in process
- * memory; it is not durable and replaces no server state.
+ * own. Only its own test imports it; it stays exported, deprecated, for
+ * callers that already do, and a later release removes it.
+ * {@link MemoryStepJournal} keeps it in process memory; it is not durable
+ * and replaces no server state.
  */
 import { EffectInDoubt, NonDeterministicReplay, UnsupportedFormat } from "../errors.js";
 import { effectId, stepId } from "../identity.js";

@@ -37,23 +37,24 @@ describe.skipIf(decision.kind !== "run")(
         url: server.url,
         clientToken: TOKENS.client,
         workerToken: TOKENS.worker,
+        adminToken: TOKENS.admin,
         policy,
         key: `e2e-${policy}-${randomUUID()}`,
         requestId: `e2e-request-${randomUUID()}`,
       });
     };
 
-    // The server proves the same operation id, the takeover by a second
-    // worker and the single commit; step replay, effect attempts and the
-    // EffectInDoubt block come from the SDK's in-memory step journal until
-    // the server's step and effect routes are paired (README, "Wire gaps").
-    it("worker killed inside an at_least_once step recovers the same operation on restart, replaying steps from the in-memory journal", async () => {
+    // Worker A is a child process SIGKILLed inside the step, so nothing
+    // worker B replays can come from worker A's memory: the steps, attempts
+    // and the in-doubt block are the server's.
+    it("worker killed inside an at_least_once step recovers the same operation on restart", async () => {
       const run = await scenario("at_least_once");
 
+      expect(run.workerASignal).toBe("SIGKILL");
       expect(run.operationId).toMatch(/\S/);
       expect(run.retriedOperationId).toBe(run.operationId);
       expect(run.workerB).not.toBe(run.workerA);
-      // search was journaled before the kill and is replayed, not rerun; draft
+      // search was recorded before the kill and is replayed, not rerun; draft
       // was killed after its effect and runs again under the same effect id.
       expect(run.counts).toEqual({ search: 1, draft: 2, ticket: 0 });
       const drafts = run.calls.filter((c) => c.tool === "kb.draft");
@@ -69,20 +70,22 @@ describe.skipIf(decision.kind !== "run")(
       expect(run.inDoubt).toBeNull();
     });
 
-    it("worker killed inside a manual step blocks as EffectInDoubt in the in-memory journal until reconciled there", async () => {
+    it("worker killed inside a manual step blocks as EffectInDoubt until the admin reconcile route is called through the client", async () => {
       const run = await scenario("manual");
 
+      expect(run.workerASignal).toBe("SIGKILL");
       expect(run.retriedOperationId).toBe(run.operationId);
+      expect(run.workerB).not.toBe(run.workerA);
       expect(run.inDoubt?.error).toMatch(/^EffectInDoubt: /);
       expect(run.inDoubt?.effect.tool_name).toBe("desk.ticket");
       expect(run.inDoubt?.effect.status).toBe("in_doubt");
       expect(run.inDoubt?.effect.attempt).toBe(1);
+      expect(run.inDoubt?.attempts).toEqual([{ attempt: 1, status: "in_doubt" }]);
+      expect(run.inDoubt?.serverStatus).toBe("blocked");
+      expect(run.inDoubt?.blockedEffect).toBe(run.inDoubt?.effect.effect);
       // The blocked turn never reran the ticket; the reconcile recorded the
       // ticket the killed run filed instead of filing another.
       expect(run.inDoubt?.ticketRunsBeforeReconcile).toBe(1);
-      // No server route reports a blocked operation yet (the step and effect
-      // routes are pending), so the server still reads it as running.
-      expect(run.inDoubt?.serverStatus).toBe("running");
       expect(run.counts).toEqual({ search: 1, draft: 1, ticket: 1 });
       expect(run.resultError).toBeNull();
       expect(run.result).toEqual({ answer: ANSWER, articles: ["kb-2", "kb-3"], ticket: "T-1001" });

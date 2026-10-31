@@ -15,7 +15,7 @@ import type {
   Schema,
 } from "../types.js";
 import { Backoff, OperationBackoffs, pause } from "./backoff.js";
-import { handlerDigest, runTurn, type TurnReport } from "./runner.js";
+import { DEFAULT_LEASE_MS, handlerDigest, runTurn, type TurnReport } from "./runner.js";
 import type { Transport } from "./transport.js";
 
 export type {
@@ -26,7 +26,14 @@ export type {
   MessageDefinition,
 } from "../types.js";
 export { ConcurrentStepError, InvalidStepInput } from "../errors.js";
-export { handlerDigest, runTurn, StepFailed, type TurnReport } from "./runner.js";
+export {
+  DEFAULT_LEASE_MS,
+  handlerDigest,
+  LeaseExpired,
+  runTurn,
+  StepFailed,
+  type TurnReport,
+} from "./runner.js";
 export type {
   EffectFailRequest,
   PolledTurn,
@@ -42,8 +49,8 @@ export {
 } from "../transport/http.js";
 /**
  * @deprecated No transport uses an in-process journal any more; the server
- * records steps and effects. Exported until the example scenario stops
- * importing it (#3532).
+ * records steps and effects. Only its own test imports it; it stays
+ * exported for callers that already do, and a later release removes it.
  */
 export {
   type JournalLateResult,
@@ -143,6 +150,20 @@ export interface ServeOptions {
   readonly abandonDelayMs?: number;
   /** Cap on the doubling pauses after abandoned turns and failed polls. Default 30 s. */
   readonly maxBackoffMs?: number;
+  /**
+   * The lease length the coordinator grants: the server's agents lease,
+   * `lease_ms` in its agents settings (`AgentsConfig::lease_ms`, 30 s). The
+   * wire does not carry it (#3568 tracks adding it, which retires this
+   * option). A turn whose renewals have all failed for this long since the
+   * last grant the worker saw answered is aborted with `LeaseExpired`, and a
+   * step it starts afterwards sends nothing. That abort lands before the
+   * server's grace lets another worker take the turn over only when this is
+   * no longer than the server's lease; a longer one lets a turn run past its
+   * lease. An integer from 1000 to 2147483647; any other value rejects
+   * {@link serveAgents} with {@link InvalidWorkerOption} before it sends
+   * anything. Default 30 s, the server's default.
+   */
+  readonly leaseMs?: number;
   /** Observes every turn the worker finishes or abandons. */
   readonly onTurn?: (report: TurnReport) => void;
   /**
@@ -157,6 +178,32 @@ export interface ServeOptions {
    * what it threw.
    */
   readonly onError?: (error: unknown) => void;
+}
+
+/** The bounds of {@link ServeOptions.leaseMs}: one second, and the longest delay a timer takes. */
+export const MIN_LEASE_MS = 1_000;
+export const MAX_LEASE_MS = 2_147_483_647;
+
+/** A {@link ServeOptions} value the worker refuses to start with. */
+export class InvalidWorkerOption extends RangeError {
+  override readonly name = "InvalidWorkerOption";
+
+  constructor(
+    readonly option: string,
+    message: string,
+  ) {
+    super(`serveAgents: ${option} ${message}`);
+  }
+}
+
+function checkLeaseMs(leaseMs: number): number {
+  if (!Number.isInteger(leaseMs) || leaseMs < MIN_LEASE_MS || leaseMs > MAX_LEASE_MS) {
+    throw new InvalidWorkerOption(
+      "leaseMs",
+      `must be an integer from ${String(MIN_LEASE_MS)} to ${String(MAX_LEASE_MS)}, got ${String(leaseMs)}`,
+    );
+  }
+  return leaseMs;
 }
 
 export interface WorkerHandle {
@@ -177,9 +224,11 @@ const POLL_RETRY_MS = 50;
 /**
  * Poll `transport` for turns of `agents` and run each to a commit until
  * closed. Without `workerId` it registers first and polls under the id the
- * coordinator minted.
+ * coordinator minted. Rejects with {@link InvalidWorkerOption} before any
+ * request for an option out of range.
  */
 export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> {
+  const leaseMs = checkLeaseMs(options.leaseMs ?? DEFAULT_LEASE_MS);
   const agents = new Map(options.agents.map((a) => [a.name, a]));
   const handlers = options.agents.flatMap((agent) =>
     Object.keys(agent.messages).map((handler) => ({
@@ -231,7 +280,7 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
         }
         continue;
       }
-      const report = await runTurn(polled, agents, options.transport, controller.signal);
+      const report = await runTurn(polled, agents, options.transport, controller.signal, leaseMs);
       options.onTurn?.(report);
       if (report.outcome === "committed") {
         abandonDelays.forget(report.operation);

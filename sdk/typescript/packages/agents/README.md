@@ -402,25 +402,68 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   heartbeat goes before a step. A renewal refused with `OwnershipLost` or
   `AgentGone` aborts the handler's `ctx.signal` and abandons the turn
   without a commit or a retry; any other failure, such as a 503, is retried
-  at the next tick and never commits or fails the turn by itself. So a turn
-  is lost only when a renewal is refused, or when renewals fail for longer
-  than the lease plus its grace (30 s and 10 s by default: the agents
-  runtime's `RuntimeConfig::default`). The interval is read against the
-  worker's clock, so a clock ahead of the server's renews at the 1 s floor.
+  at the next tick, and one inside the lease never aborts, commits or fails
+  the turn by itself. When renewals have failed past the lease, the worker
+  aborts the handler's `ctx.signal` at the expiry and abandons the turn the
+  same way, with `LeaseExpired`. A `ctx.step` the handler calls after either
+  abort rejects with the abort's reason and sends no step record, so a
+  handler that never reads `ctx.signal` still cannot start an effect on a
+  turn another worker may own. A step whose record was sent inside the
+  lease and answered after the abort has already sent that record: an
+  answer that authorizes an attempt rejects with the abort's reason, and one
+  that comes back completed or failed returns the replayed output or rejects
+  with `StepFailed`. Either way that step runs no tool and reports no effect
+  (test: `a lease that expires while the step's record is in flight runs no
+  tool`). A tool already running when the abort lands, and that returns,
+  still has its result reported, so a takeover replays it rather than
+  running the effect again; when the server answers that result as late,
+  the worker sends nothing more and the step rejects with the abort's
+  reason. A tool that throws after the abort reports no failure: no
+  `worker/effects/fail` is sent. The worker measures that expiry
+  on its own timers: `leaseMs` (a `serveAgents` option, default 30 s) from
+  the moment it received the assignment, or sent the last renewal that was
+  answered, since neither answer carries the lease length and its wall clock
+  may be skewed from the server's. The server counts a renewal's lease from
+  when it processed the request, which is no earlier than the sending, and
+  the assignment's lease from when it answered the poll, so the worker's
+  first expiry, counted from when that answer arrived, can trail the
+  server's by the poll answer's travel time. The server's agents lease is
+  fixed at 30 s, with a 10 s grace (`DEFAULT_AGENTS_LEASE_MS` and
+  `DEFAULT_AGENTS_HEARTBEAT_GRACE_MS` in
+  `services/ravel-server/src/config.rs`; no flag sets either). Keep
+  `leaseMs` at or below 30000, the server's fixed lease: the abort then
+  lands before the server's grace lets another worker take the turn over,
+  as long as the poll answer travels for less than the grace. A longer
+  `leaseMs` lets a turn run past its lease. Issue #3568 tracks carrying the
+  lease length on the wire, which would remove the option. `leaseMs` must be
+  an integer from 1000 to
+  2147483647: any other value rejects `serveAgents` with
+  `InvalidWorkerOption` before it sends a request. The
+  interval is read against the worker's clock, so a clock ahead of the
+  server's renews at the 1 s floor.
   The server keeps renewals in the memory of the coordinator that answered
   them: with two coordinators, a worker polling the other one can still take
   the turn over once the lease and grace run out after the takeover that
   started it (`crates/ravel-agents-runtime/src/ownership.rs`). Tests: `a
   turn longer than the lease renews it in the background and commits`, `a
   refused renewal aborts the turn and nothing is committed`, `a transient
-  renewal failure is retried at the next tick`, `renews a third of the
-  lease left, and never faster than the floor` (`worker/renew.test.ts`),
+  renewal failure inside the lease does not abort the turn`, `renewals that
+  keep failing past the lease abort the turn and send no commit`, `an
+  answered renewal restarts the lease the worker measures from its
+  sending`, `leaseMs left unset aborts at the 30 s default`, `serveAgents
+  refuses leaseMs %d at startup with InvalidWorkerOption`, `a step called
+  after the lease expired is refused locally and never reaches the server`,
+  `a lease that expires while the step's record is in flight runs no tool`,
+  `a tool that finishes after the lease expired still reports its result,
+  and nothing else is sent`, `a late result after the abort sends nothing
+  more`, `a tool that throws after the abort reports no failure`,
+  `renews a third of the lease left, and never faster than the floor`
+  (`worker/renew.test.ts`),
   `renews once at assignment, sends nothing while a tool runs, and no
   heartbeat before a step` (`transport/http.test.ts`).
-- The `journal` option of `createHttpTransport` is deprecated and ignored,
-  since the server records steps and effect results; passing one logs a
-  warning once per process, and the option will be removed. Test: `warns
-  once when passed the deprecated journal option and otherwise ignores it`.
+- `createHttpTransport` takes no `journal` option, since the server records
+  steps and effect results. Test: `takes no journal option: steps and
+  effect results are recorded on the server`.
 - A 401 or 403 in the server's plain body maps to `Forbidden` with its
   status. Test: `maps the plain %i body to Forbidden with its status`.
 - The server polls an agent that has never committed with a null state and
@@ -604,7 +647,7 @@ provisionally on the SDK side:
 ## End-to-end tests
 
 `npm run test:e2e` (from `sdk/typescript/`) runs `e2e/recover.test.ts`
-against a `ravel-server` it starts itself, with `--agents` on free local
+and `e2e/destroy.test.ts` against a `ravel-server` it starts itself, with `--agents` on free local
 ports. `npm test` never runs it. Build the server first:
 
 ```sh
@@ -616,37 +659,50 @@ The binary is `RAVEL_SERVER_BIN`, else
 under the repository root. The store is `RAVEL_E2E_STORE`: `memory`
 (default, `MemoryStore`) or `rustfs` (the compose RustFS store, which
 needs `docker compose`; the run stops the RustFS container afterwards
-only if it started it). Each test waits out one 30 s lease and its 10 s
-grace before worker B can take the turn over. Tests for the path and
+only if it started it). Each recover test waits out one 30 s lease and its
+10 s grace before worker B can take the turn over. Tests for the path and
 store choice, which need no server and run under `npm test`: `resolves
 the repository root to the directory holding the workspace Cargo.toml`,
 `looks for the server under the repository's target unless told
 otherwise`, `needs docker compose only for the rustfs store`
 (`e2e/plan.unit.test.ts`).
 
-Each test kills worker A inside a step, after the tool's side effect and
-before its result is recorded, resends under the same request id, and
-lets worker B take the turn over. The server shows that the resend
-resolves to the same operation id, that a second worker takes the turn
-over, and that the turn commits once. These tests were written while step
-replay, effect attempts and the `EffectInDoubt` block came from an
-in-memory step journal in the SDK, and their titles still say so;
-`createHttpTransport` no longer consults that journal, and #3532 moves the
-tests onto the server's step and effect routes:
+Each recover test runs worker A as a child process and sends it SIGKILL
+inside a step, after the tool's side effect and before its result is
+recorded, then resends under the same request id and lets worker B, in the
+test's process, take the turn over. Steps and effect results go through the
+server's `worker/step` and `worker/effects/*` routes, and the effects,
+attempts and operation status are read back through the client, so
+everything worker B replays comes from the server:
 
 - `worker killed inside an at_least_once step recovers the same operation
-  on restart, replaying steps from the in-memory journal`: the resend
-  resolves to the same operation id, `kb.search` runs once and is
-  replayed, `kb.draft` runs twice under one effect id (attempts 1 and 2),
+  on restart`: worker A exits by SIGKILL, the resend resolves to the same
+  operation id, `kb.search` runs once and is replayed, `kb.draft` runs
+  twice under one effect id (attempts 1 and 2), the server's effects read
+  `kb.search` completed on attempt 1 and `kb.draft` completed on attempt 2,
   and the operation completes with the drafted answer.
-- `worker killed inside a manual step blocks as EffectInDoubt in the
-  in-memory journal until reconciled there`: worker B abandons the turn
-  with `EffectInDoubt` without running `desk.ticket` again, and the
-  operation completes with ticket `T-1001` once the journal's effect is
-  reconciled with the ticket the killed run filed. The reconcile goes
-  through the journal, not an `agents_admin` route.
+- `worker killed inside a manual step blocks as EffectInDoubt until the
+  admin reconcile route is called through the client`: worker B abandons
+  the turn with `EffectInDoubt` without running `desk.ticket` again; the
+  server shows the effect `in_doubt` with one `in_doubt` attempt and the
+  operation `blocked` on that effect. `client.reconcile` with an
+  `agents_admin` token records the ticket the killed run filed, and the
+  operation completes with ticket `T-1001`.
 
-A missing prerequisite skips both tests and names it, both in a warning at
+`e2e/destroy.test.ts` holds a worker inside `kb.search` and destroys the
+agent through the client with the admin token:
+
+- `destroy fences a worker holding a lease and a recreate starts
+  incarnation two`: the destroy answers `destroyed: true` for incarnation 1
+  with one abandoned input, the active turn and one authorized effect; the
+  held worker, released, abandons its turn with `AgentGone` and sends no
+  commit, and the old operation answers `AgentGone`. A second destroy
+  answers `destroyed: false` with the same counts, and a client token
+  without `agents_admin` is refused with `Forbidden` (403). `create` then
+  starts incarnation 2 under the same agent id, the old operation still
+  answers `AgentGone`, and a new message completes.
+
+A missing prerequisite skips every test and names it, both in a warning at
 the top of the run and in the suite title the verbose reporter prints:
 
 ```
@@ -664,10 +720,15 @@ prerequisite, and fails instead under RAVEL_E2E_REQUIRE=1`, and test:
 
 `demo/agents-kill-and-recover.sh`, from the repository root, starts the
 compose RustFS store (or `MemoryStore` with
-`RAVEL_AGENTS_DEMO_STORE=memory`) and a built `ravel-server --agents`, runs
-the same two scenarios through `examples/assistant/kill-and-recover.ts`,
-asserts each printed figure against an exact value or a stated band, and
-exits 1 on any miss. It needs `npm ci` in `sdk/typescript/` and node 22.15
+`RAVEL_AGENTS_DEMO_STORE=memory`) and a built `ravel-server --agents` with a
+client, a worker and an `agents_admin` development token, runs the same two
+recover scenarios through `examples/assistant/kill-and-recover.ts`, and
+asserts each printed `KEY=VALUE` figure against an exact value or a stated
+band, exiting 1 on any miss: among them `OP_SAME=true`,
+`WORKER_A_SIGNAL=SIGKILL`, `DRAFT_ATTEMPTS=2` (the server's attempt for the
+re-run `kb.draft`), `TICKET_RUNS_BEFORE_RECONCILE=1` and
+`STATUS_IN_DOUBT=blocked`, with `RECOVERY_MS` within [35000, 60000]. Worker
+A is a child process killed with SIGKILL, as in the tests. It needs `npm ci` in `sdk/typescript/` and node 22.15
 or later 22.x: the example's loader hook (`examples/ts-hooks.js`) uses
 `module.registerHooks`, added in Node 22.15.0, which is why the `engines`
 floor in `sdk/typescript/package.json` is 22.15.0. See

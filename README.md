@@ -391,8 +391,7 @@ an AI agent host query your telemetry.
   A turn's state, result and events become visible together.
 - **Durable steps.** A handler calls tools through steps. The server records
   each step, and a completed step replays from its record when the turn runs
-  again. The TypeScript SDK does not use these records yet (see the limits
-  under [Running it](#running-it)). Each tool declares what
+  again, in the TypeScript SDK too. Each tool declares what
   happens when an attempt's outcome is unknown: run it again
   (`at_least_once`), rely on the provider's idempotency (`provider_idempotency`),
   or block until an operator decides (`manual`).
@@ -515,9 +514,10 @@ Know these limits before you put agents in production:
 - An agent at a cap stays there until an operator destroys it with
   `POST /api/v1/agents/destroy` and creates it again; see
   [Destroying an agent](docs/guides/operations/agents.md#destroying-an-agent).
-- The TypeScript SDK keeps steps in the worker's memory. When a worker
-  process stops in the middle of a turn, its completed steps are lost with
-  it, so the next worker can run those tools again.
+- When a worker process dies in the middle of a turn, another worker takes
+  the turn over only once the dead worker's 30 s lease and 10 s grace run
+  out, so the turn waits about 40 s. Its completed steps replay from the
+  server's records.
 - With several server processes on one tenant, a message can wait for a
   sweep before a worker on another process sees it. At 10,000 agents that
   wait can reach 26 minutes. One process has no such wait.

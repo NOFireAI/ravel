@@ -121,7 +121,9 @@ that column: URL 5.29 GB, Title 3.64 GB, SearchPhrase 1.55 GB, Referer
 The hot-geomean ceiling assumes that every statement whose set fits
 loses its whole step 2 share and nothing else changes. q21 to q24 gain
 nothing, because their string columns are Contains-tested (decision 1;
-the LIKE-deferred amendment below makes those columns cacheable).
+the LIKE-deferred amendment below makes those columns cacheable, and the
+serve-if-fits amendment below serves them only for a scan that fits the
+cache: q21 and q24 at 8 GB).
 
 | Budget | Fit, buffer + offsets | Geomean ratio | Fit, today's layout | Geomean ratio | Basis |
 |---|---|---|---|---|---|
@@ -179,7 +181,9 @@ Exclusions, each a property the implementation tests:
   (`reader.rs:1766-1784`, `:1554-1580`), so it is neither cached nor served
   from the cache. Caching a validated copy for later Contains statements
   is a separate decision, not taken here, and taken by the LIKE-deferred
-  amendment below, which serves and admits such a column only validated.
+  amendment below, which serves and admits such a column only validated,
+  and, under the serve-if-fits amendment below, only for a scan that fits
+  the cache.
 - **Narrowed values never populate an entry.** No narrowed, survivor-only
   or Arrow value populates an entry, and nothing after step 2 reads from
   one (narrowed by the zero-copy values amendment below: an entry keeps one
@@ -252,7 +256,8 @@ Eviction is CLOCK over admitted entries, weighted by bytes. Stage 0
 compares this policy with admit-on-first-decode by simulation before
 anything is built (Measurement). An admission that would evict an entry
 accessed at least as often as the newcomer is refused (see the
-LIKE-deferred amendment below).
+LIKE-deferred amendment below; the serve-if-fits amendment below withdraws
+it after its revert, so admission stays CLOCK and the intent rule).
 
 ### 4. Entries are charged to the shared memory budget and give way to queries
 
@@ -442,7 +447,8 @@ work, and the readout names the step that missed.
   bounded by the bytes it frees: the shortfall plus the margin (see the
   evictor-slack amendment below).
 - Contains-tested columns gain nothing from this ADR. Their share of q21
-  to q24 stays (changed by the LIKE-deferred amendment below).
+  to q24 stays (changed by the LIKE-deferred amendment below, and for q21
+  and q24 only under the serve-if-fits amendment below).
 - The `MemoryBudget` hook is new shared machinery and needs its own
   tests for concurrent reservers and for a hook that cannot free enough.
 
@@ -741,7 +747,7 @@ cells of the surviving rows one by one as before
 touch at 2 decode-time validations and 4 per build, its second at 8 and 0,
 and its hit at 0). A size, budget or concurrent-admission refusal in `offer`,
 or a refusal by an admission gate (the LIKE-deferred amendment below
-decides one; it is not on main, see that amendment's status), can still
+decided one, which the serve-if-fits amendment below withdraws), can still
 leave a column validated at decode and not admitted; its
 validation is then spent on this read alone, as it was for every missed
 column before. When the whole values buffer is UTF-8
@@ -798,8 +804,12 @@ The revert put `decoded_cache.rs` back to its state before the gate. The
 gate, its `frequency_refusals` counter and its tests are not in the tree.
 The citations to `decoded_cache.rs` lines and gate tests in decision 1
 below describe that reverted change, not the current file. A later
-amendment replaces decision 1 with an admission rule that weighs decode
-cost, and decisions 2 to 4 wait for it.
+amendment was expected to replace decision 1 with a rule that weighs
+decode cost. That amendment is the serve-if-fits amendment below, and it
+withdraws decision 1 with no admission rule in its place, since the
+cost-weighted variants lost too. It also re-decides decisions 2 to 4 and
+replaces decision 6's band tables and the gate column of decision 5's
+table.
 
 On the v0.28.0 profile run `prof028-20261030T1244Z` (8 GB cap), most of
 the decode left in the hot sum is in the columns a `Contains` arm defers.
@@ -843,11 +853,14 @@ This amendment changes three decisions:
 - decision 5, the `contains_cells_tested` sentence.
 
 Two pull requests deliver it, in order. The first is decision 1 below on
-its own. The second is decisions 2 to 4, stacked on the first.
+its own. The second is decisions 2 to 4, stacked on the first. (The
+serve-if-fits amendment below withdraws decision 1 and makes them one
+serving pull request, built on main.)
 
 1. **An admission that would evict an entry accessed at least as often as
    the newcomer is refused.** This is option (c) of the investigation, and
-   it lands as its own pull request.
+   it lands as its own pull request. The serve-if-fits amendment below
+   withdraws it after its revert.
    - **Counts.** Each resident slot (`Slot`,
      `crates/ravel-logseg/src/decoded_cache.rs:151`) and each ghost record
      (`decoded_cache.rs:167`) carries an access count, a `u8` that saturates
@@ -1499,3 +1512,223 @@ than A (predicted, `predict.out`).
 - **`Utf8View` output.** `StringViewArray::try_new` validates every view,
   which brings per-cell validation back, and it changes the declared `Str`
   schema. Rejected.
+
+## Amendment (2026-10-31): LIKE-deferred columns are served only when the scan fits the cache
+
+<!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|3. Admission lets a statement's later tries hit, and a one-pass scan does not displace a working set|How big the working set is|Consequences|Amendment (2026-10-31): LIKE-deferred columns become cacheable, behind frequency-aware admission" pointer="serve-if-fits amendment" -->
+<!-- amendment-supersedes: phrase="An admission that would evict an entry accessed at least as often as the newcomer is refused" pointer="serve-if-fits amendment" -->
+<!-- amendment-supersedes: phrase="with a rule that weighs decode cost" pointer="serve-if-fits amendment" -->
+
+The LIKE-deferred amendment's frequency gate was reverted after it missed
+its hot bands (#3326 comment 6546999545, and that amendment's status note).
+This amendment replaces that amendment's decision 1 and says how its
+decisions 2 to 4 apply with no gate. The evidence is a model of both
+admission rules, calibrated against the paired and restart runs (#3326
+comment 6548679123, "the model" below). Every figure in this section comes
+from that comment unless it cites another.
+
+**What the model predicts.**
+- **No frequency gate wins on the paired protocol.** Every variant tried
+  costs 0.8% to 5.6% of hot CPU geomean on `cpuab` and is neutral on the
+  restart protocol. The variants are the reverted gate, the gate with ties
+  admitting, counts weighted by decode cost per byte, and the gate on
+  bulk-scan statements only. Held out against the measured paired run, with
+  its high cost case built from arm A's costs only, the reverted gate
+  predicts a CPU geomean of 1.0653 against 1.0628 measured.
+- **Why.** On restart the gate acts only inside `evict_until`, and no
+  restart try is cap-bound. On `cpuab` one server runs every statement.
+  The base columns' counts (re-decoded at 1.7 ns per byte) outrank a
+  count-1 URL newcomer (2.7 ns per byte), even with cost weighting. The
+  paired run rewards recency, which CLOCK already gives.
+- **Serving every deferred column is unsafe.** q22's set is just over the
+  cap: 2.4 MB over in the LIKE-deferred amendment's decision 5 table, about
+  12 MB over in the model. Either way it is within 0.2% of the cap. Served,
+  52,322 of its 52,564 lookups miss on restart try 3, and `cpuab` rep 2 has
+  13,731 misses. q23's base columns start to miss as well. Hot CPU on
+  restart try 3 alone, B/A: q22 1.681, q23 1.141.
+- **Serving only a scan that fits** is predicted at 0.9591 `cpuab` CPU
+  geomean, 0.9587 hot CPU in all three cost cases, and 0.9586 on restart.
+  Per statement, hot CPU: q21 0.393, q24 0.414, every other at most 1.003.
+  The model's rule was "at most the cap". At 8 GB that serves the same
+  statements as decision 2's 0.95 rule, so the figures carry over. At any
+  other cap they must be re-run.
+- **The gate on bulk scans plus serving when it fits** gives hot CPU
+  0.958, but its CPU geomean, 0.9625, is worse than 0.9591, it costs q30,
+  and it adds a mechanism. Not adopted.
+
+**How far the model holds.**
+- **CLOCK (arm A) fails two eviction rows** of its tolerance rule, written
+  before comparing: q29 (model 4,321, measured 6,454 to 6,518) and q31
+  (17,422 against 19,406 to 19,557). Every misses row passes, and so do the
+  round totals and the cumulative counters (within 2% through q33). A
+  32-round out-of-sample check passes every misses row and fails only q29's
+  evictions. The cost predictions use misses only.
+- **The gate (arm B) reproduces in aggregate only.** Its round totals pass
+  the 15% rule. Its per-statement rows fail on q30 to q35, q39 and q41, and
+  are good to about 30%. The cause is unexplained. The withdrawal rests on
+  the measured paired run, not on these rows.
+
+**Decisions.**
+
+1. **The frequency gate is withdrawn.** Admission stays as on main: CLOCK
+   over admitted entries, weighted by bytes, after decision 3's intent rule
+   (`Inner::intent_admits` and `evict_until`,
+   `crates/ravel-logseg/src/decoded_cache.rs:180`, `:597`). The gate's
+   counts, aging, ghost-record changes and `frequency_refusals` counter do
+   not return. The LIKE-deferred amendment's two pull requests become one:
+   the serving pull request, built on main.
+2. **A deferred column is served and admitted only when the scan's whole
+   decoded set is at most 0.95 of the cap.**
+   - The set is every entry the scan would hold: each projected column the
+     cache holds, deferred or not, over every block the plan keeps. The cap
+     is `--decoded-cache-max-bytes`.
+   - When the scan fits, the LIKE-deferred amendment's decisions 2 to 4
+     apply as written. A hit serves the column. A miss the cache will admit
+     is decoded validated and offered. `offer` refuses an unvalidated
+     dictionary.
+   - When it does not fit, its deferred columns take main's path: skipped
+     before the lookup (`crates/ravel-logseg/src/reader.rs:1554`), decoded
+     unvalidated, narrowed, and never offered. Its lookups equal main's.
+   - At 8 GB this serves q21 (0.86 of the cap) and q24 (0.64), and not q22
+     or q23.
+3. **q22 and q23 stay deferred** until the owner decides on a larger cap
+   or a second tier for these columns. q23's set is about 12.5 GB with
+   Title at 3.7 GB (the LIKE-deferred amendment, decision 5). The model
+   allows Title anywhere from about 2 to 3.7 GB, and q23 is over the cap at
+   either end. This reverses
+   the LIKE-deferred amendment's open question on q22, which proposed
+   banding it as fitting.
+
+**The plan-time estimate.** No code on main computes the set. The inputs
+exist before any block is decoded, so the serving pull request adds the
+estimate and pins its error with a test.
+- **When.** The plan pass decodes each planned segment's directories and
+  keeps its surviving block indices (`PlanSegmentResult` and `CarriedDirs`,
+  `crates/ravel-sql/src/logs_scan/plan.rs:238-250`, `:101-111`). Every
+  partition awaits that pass before it decodes (`plan.rs:307`). The verdict
+  is therefore made once per scan, and every partition takes the same path.
+  Only a scan with a `Contains` arm (`reader.rs:2132`) needs one.
+- **Inputs.** PAGE_DIR (`SegmentDirectories`, `reader.rs:192-209`) gives
+  each page's encoding and its length before compression (`PageEntry`,
+  `crates/ravel-logseg/src/page_dir.rs:42-55`). SKIP_IDX gives each block's
+  row count (`Level0Entry::record_count`,
+  `crates/ravel-logseg/src/skip_index.rs:40`).
+- **Target.** The figure is what `offer` charges: `CachedColumn::heap_bytes`
+  (`decoded_cache.rs:460`, `crates/ravel-logseg/src/block.rs:1825`), which
+  counts buffer capacities.
+  - Fixed-width columns: rows times width plus validity, exact.
+  - Plain strings and per-block dictionaries: from the pages' lengths and
+    the row count. Close, not exact.
+  - A row group dictionary: each block is charged the share its keys
+    reference (`block.rs:1513-1526`), which no directory records. The
+    estimate charges each block the whole dictionary, an upper bound, so it
+    can only withhold serving. URL takes the per-block path in ClickBench
+    (the LIKE-deferred amendment, decision 2).
+- **Unplanned segments.** A segment at or under `plan_whole_object_bound`
+  can open unplanned (`may_skip_plan`, `plan.rs:290-292`;
+  `crates/ravel-query/src/log_fetcher.rs:1582-1585`, `:1602-1604`), and the
+  plan pass never reads its directories. Whether the scan actually leaves
+  any segment unplanned is the scan-level `skips_sub_bound_plans`
+  (`plan.rs:253-268`): with fewer such segments than partitions, every
+  segment is planned. A scan for which `skips_sub_bound_plans` is true does
+  not fit; one for which it is false is estimated normally. The q21 and
+  q24 lookup bands below miss if this withholds them.
+- **TopK.** The plan keeps blocks a TopK filter later skips (q24's restart
+  try 3 scans 9,613 to 11,022 of 13,141 blocks), so q24's estimate runs
+  high, the safe side.
+- **Error budget.** q22 sits within 0.2% over the cap, so an estimate more
+  than about 5% low would serve it. q21 sits at 0.8625 of the cap, so an
+  estimate more than 1.1014 times its set would withhold it. The 0.95
+  headroom covers the estimate's error only inside those limits. The test
+  decodes a fixture holding every column kind the cache keeps, including a
+  per-block string dictionary shaped like q21's URL. It asserts the
+  estimate per kind is equal to the summed `heap_bytes` for fixed-width
+  kinds, at least 1.0 for a row group dictionary, and 0.96 to 1.08 for the
+  others, which leaves q21 a 2% margin below its withholding point. The
+  scan reports its estimate and its verdict in its statistics. The band
+  row on q21's estimate against its resident bytes decides: if the test
+  passes and that row misses, the pull request stops.
+
+**When the estimate is wrong.** Answers do not depend on it, since a served
+and a decoded deferred column yield the same rows (the LIKE-deferred
+amendment, decision 2). Memory stays bounded by the cap and decision 4.
+- **Too high:** a scan that fits runs as on main. Nothing regresses, and
+  its gain is lost. The q21 and q24 lookup bands catch it.
+- **Too low, with the set still under the cap:** no effect.
+- **Too low, with the set over the cap:** that scan serves and admits its
+  deferred columns, the thrash above, up to 1.681 B/A on q22's restart
+  try 3. The verdict is not revisited during the scan. The q22 and q23
+  lookup bands catch it.
+- The verdict is per scan and ignores what else is resident. Two fitting
+  scans running at once can exceed the cap together, and CLOCK then evicts
+  between them as it does for any column on main.
+
+**What the serving pull request also changes.** Three doc comments, one
+test and two passages of `docs/query-engine.md` that the LIKE-deferred
+amendment's decisions 2 and 3 falsify were missing from its list:
+- `crates/ravel-logseg/src/decoded_cache.rs:4-8`, the module doc: "never
+  with a column a Contains arm defers (its dictionary is narrowed to
+  survivors after decode)". For a fitting scan such a column is read from
+  and filled into the cache, and narrowed into the block's own copy, not
+  the entry.
+- `reader.rs:1504-1514`, on `decode_block`: "an eligible column
+  (projected, not deferred by a Contains arm)" and "Only a missed plain
+  `Str` attribute column the cache would admit ... is UTF-8 validated at
+  decode". Both hold only for a scan that does not fit.
+- `reader.rs:1779-1783`, on `DictCache`: "its dictionary is never in
+  `entries`". A fitting scan's admitted deferred dictionary is in
+  `entries`.
+- `decoded_cache_serves_identical_rows_and_never_caches_contains_column`
+  in `crates/ravel-sql/tests/logs_decoded_cache.rs` (its assertion at
+  `:359-364`). Its fixture is far under any cap, so the scan fits and the
+  deferred column is served. The test is split in two: one run on that
+  fixture asserts the column is served with identical rows, and one run
+  with a cap below the fixture's set asserts it is never served.
+- `docs/query-engine.md:5261-5262`, the decoded cache section: "A column
+  deferred for a `Contains` arm is never looked up or offered." It holds
+  only for a scan that does not fit, and the sentence says so.
+- `docs/query-engine.md:5294-5296`, which lists every field of the
+  `decodedCache` stats object. The estimate and verdict this amendment
+  reports become two fields: `deferredSetEstimateBytes`, the plan-time
+  estimate, present only for a scan with a `Contains` arm, and
+  `deferredServed`, true when that scan serves its deferred columns. The
+  list names both, and the test that pins the object's fields on the SQL
+  response is updated with them.
+
+It also adds a test that a scan over 0.95 of the cap looks up and offers
+no deferred column, and it runs
+`a_column_cached_by_a_contains_scan_serves_a_later_scan_exactly` on a
+fixture that fits.
+
+**Measurement.** These bands replace the LIKE-deferred amendment's
+decision 6 tables. One `cpuab` box: A is main, B is the change, rounds
+A B B A B A A B, 8 GB cap, the ClickBench entry at 637aaa80a. Each
+statement takes one untimed warm call before its reps, and rep 1 is the
+second call. One restart-protocol box per arm. The bands are copied to
+#3326 before launch, and a miss on any row stops the pull request.
+
+| Serving pull request | Band | Miss | Basis |
+|---|---|---|---|
+| `cpuab` CPU geomean B/A (`readout_pair.py`) | 0.945 to 0.970 | above 0.980 | predicted 0.9591, `evaluate_central.out`, #3326 comment 6548679123 |
+| `cpuab` hot wall geomean B/A | 0.945 to 0.975 | above 0.985 | predicted from the CPU ratio, comment 6548679123 |
+| q21 CPU B/A | 0.35 to 0.50 | above 0.60 | predicted 0.393, comment 6548679123; per-hit saving from #3326 comment 6542227753 |
+| q24 CPU B/A | 0.37 to 0.52 | above 0.62 | predicted 0.414, same basis |
+| q21 rep-1 lookups, B | exactly 39,423 | any other | predicted; A 26,282, measured 2026-10-30 |
+| q24 rep-1 lookups, B | 3 x `blocksScanned` | any other | predicted, comment 6548679123 |
+| q22 and q23 rep-1 lookups, B | 39,423 and 52,564, unchanged | any other | predicted, not served, comment 6548679123 |
+| q21 and q24 rep-1 misses, B | at most 1% of lookups | above 2% | predicted, comment 6548679123 |
+| Every other statement, hot wall B/A | 0.95 to 1.05 | outside | predicted 1.000, comment 6548679123 |
+| Restart hot wall geomean B/A, min of tries 2 and 3 | 0.945 to 0.975 | above 0.985 | predicted from CPU 0.9586, `tryonly.out`, comment 6548679123 |
+| Restart q21 try 3 | 0 misses, 39,423 hits | any miss | predicted, comment 6548679123 |
+| Restart q21 try-1 wall, B minus A (`result.csv`) | 0 to +0.5 s | above +0.6 s | predicted: 0.5 to 1 CPU-s (#3326 comment 6542227753) against 4.3 CPU-s (the model's cost table) |
+| Restart q21, B: plan-time estimate / resident bytes after try 1 | 0.96 to 1.08 | outside | predicted, the test bound above |
+| Restart q24, q25, q27 try 3, B: evictions, and misses against admissions | 0 evictions; misses equal admissions | any eviction, or misses not equal to admissions | measured 2026-10-31: held in 13 of 13 restart runs from 2026-10-29, `spread.out`, comment 6548679123 |
+| Answers equal between arms, q18 and q25 excepted | yes | any other difference | measured 2026-10-31 on the abgate run, comment 6548679123 |
+| Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside: the box is invalid | measured 2026-10-31: 0.9997 on the abgate run; `cpuab` stage, #3231 comment 6433600863 |
+
+The q24, q25 and q27 row bands an invariant, not a count. Their try-3
+misses come from TopK block sets that change per try, not from policy, and
+cost about 25 CPU-ms. Over the 13 runs their means are 76 to 81 with
+standard deviations of 32 to 83. A 20% band at 2 SD would need 18 boxes
+per side for q25, 21 for q27 and about 108 for q24. If a count is needed,
+use 0 to 300 on one box (measured 2026-10-31, n = 13).

@@ -4,29 +4,33 @@
  * the demo (`demo/agents-kill-and-recover.sh`), so both exercise the same
  * path.
  *
- * The kill is an in-process abort, not a process kill: the step journal is
- * the SDK's provisional in-memory one until the server mounts step and effect
- * routes, so worker A and worker B share it inside one process. Worker A is
- * closed from inside the tool, after the tool's side effect happened and
- * before its result is recorded, which is the instant a process kill would
- * leave the effect without a result. The server knows nothing of the abort:
- * it hands the turn to worker B only once worker A's lease expires.
+ * Worker A is a child process (`main.ts --worker <policy>`). It holds the
+ * killed step after the tool's side effect and before `completeEffect`, says
+ * so on stdout, and is sent SIGKILL there. Worker B runs in this process and
+ * takes the turn over once worker A's lease lapses, from the steps and
+ * effects the server recorded. Both workers append their tool calls to one
+ * counters file; the effects are read from the server.
  */
-import { type Assistant, createAssistant, DRAFT, TICKET } from "./assistant.js";
-import { AssistantFixture, type ToolCall } from "./fixture.js";
+import { type ChildProcessByStdio, spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
+import type { Readable } from "node:stream";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { type Assistant, createAssistant, DRAFT, SEARCH, TICKET } from "./assistant.js";
+import { AssistantFixture, readCounters, type ToolCall } from "./fixture.js";
 import { EffectInDoubt } from "@ravel/agents";
-import { createClient } from "@ravel/agents/client";
-import {
-  createHttpTransport,
-  MemoryStepJournal,
-  serveAgents,
-  type TurnReport,
-  type WorkerHandle,
-} from "@ravel/agents/worker";
-
-type EffectBody = Awaited<ReturnType<MemoryStepJournal["effects"]>>[number];
+import { createClient, type EffectAttemptBody, type EffectBody } from "@ravel/agents/client";
+import { createHttpTransport, serveAgents, type TurnReport, type WorkerHandle } from "@ravel/agents/worker";
 
 export type ScenarioPolicy = "at_least_once" | "manual";
+
+/** The tool whose step worker A is killed in, per policy. */
+export const KILLED_TOOL: Readonly<Record<ScenarioPolicy, string>> = {
+  at_least_once: DRAFT,
+  manual: TICKET,
+};
 
 export interface ScenarioOptions {
   readonly url: string;
@@ -34,12 +38,14 @@ export interface ScenarioOptions {
   readonly clientToken: string;
   /** A credential with the `agents_worker` capability. */
   readonly workerToken: string;
-  /** `at_least_once` kills the worker inside the draft step; `manual` inside the ticket step. */
+  /** A credential with the `agents_admin` capability, for the reconcile under `manual`. */
+  readonly adminToken: string;
+  /** `at_least_once` kills worker A inside the draft step; `manual` inside the ticket step. */
   readonly policy: ScenarioPolicy;
   /** The agent key; one per run, so runs against one store do not meet. */
   readonly key: string;
   readonly requestId: string;
-  /** Bound on each wait: the kill, the takeover, the result. */
+  /** Bound on each wait: the child's start, the kill, the takeover, the result. */
   readonly waitMs?: number;
   readonly log?: (line: string) => void;
 }
@@ -50,21 +56,29 @@ export interface ScenarioResult {
   readonly retriedOperationId: string | undefined;
   readonly workerA: string;
   readonly workerB: string;
+  /** The signal worker A's process exited by: `SIGKILL` when the kill landed. */
+  readonly workerASignal: NodeJS.Signals | null;
   /** The operation's result, or null when it did not arrive within `waitMs`. */
   readonly result: { answer: string; articles: string[]; ticket: string | null } | null;
   /** Why `result` is null. */
   readonly resultError: string | null;
+  /** Every tool run by either worker, in order, from the counters file. */
   readonly calls: readonly ToolCall[];
   readonly counts: { readonly search: number; readonly draft: number; readonly ticket: number };
-  /** The journal's effects once the operation completed. */
+  /** The agent's effects as the server lists them once the operation finished. */
   readonly effects: readonly EffectBody[];
   readonly answered: number;
-  /** Set under `manual`: what worker B saw before the reconcile. */
+  /** Set under `manual`: what the server and worker B showed before the reconcile. */
   readonly inDoubt: {
     readonly error: string;
+    /** The ticket effect as the server's effects list showed it. */
     readonly effect: EffectBody;
+    /** The ticket effect's attempts as the server's effect inspect route showed them. */
+    readonly attempts: readonly EffectAttemptBody[];
     /** The server's status for the operation while the effect was in doubt. */
     readonly serverStatus: string;
+    /** The effect the server named as blocking the operation. */
+    readonly blockedEffect: string | null;
     readonly ticketRunsBeforeReconcile: number;
   } | null;
   /** Milliseconds from the kill to the result, mostly worker A's lease running out. */
@@ -72,20 +86,7 @@ export interface ScenarioResult {
 }
 
 const PAYLOAD = { question: "How does a worker recover a step after a crash?" } as const;
-
-async function within<T>(what: string, ms: number, work: Promise<T>): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${what}: not reached within ${String(ms)} ms`));
-    }, ms);
-  });
-  try {
-    return await Promise.race([work, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 async function waitFor(
   what: string,
@@ -100,87 +101,128 @@ async function waitFor(
   }
 }
 
+/** Worker A: `main.ts --worker <policy>` under the same node and loader hook as this process. */
+function spawnWorkerA(options: ScenarioOptions, counters: string): ChildProcessByStdio<null, Readable, Readable> {
+  return spawn(
+    process.execPath,
+    [
+      "--experimental-transform-types",
+      "--disable-warning=ExperimentalWarning",
+      "--import",
+      pathToFileURL(join(HERE, "..", "ts-hooks.js")).href,
+      join(HERE, "main.ts"),
+      "--worker",
+      options.policy,
+    ],
+    {
+      env: {
+        ...process.env,
+        RAVEL_URL: options.url,
+        RAVEL_WORKER_TOKEN: options.workerToken,
+        RAVEL_COUNTERS: counters,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+}
+
 export async function runKillAndRecover(options: ScenarioOptions): Promise<ScenarioResult> {
   const waitMs = options.waitMs ?? 120_000;
   const log = options.log ?? (() => undefined);
-  const fixture = new AssistantFixture();
+  const scratch = mkdtempSync(join(tmpdir(), "ravel-kill-and-recover-"));
+  const counters = join(scratch, "counters.jsonl");
+  const fixture = new AssistantFixture(counters);
   const { assistant, tools } = createAssistant(fixture);
-  const journal = new MemoryStepJournal();
   const client = createClient({ url: options.url, token: options.clientToken });
+  const admin = createClient({ url: options.url, token: options.adminToken });
   const agent = client.agent<Assistant>("assistant", options.key);
   const payload = { ...PAYLOAD, escalate: options.policy === "manual" };
+  const killedTool = KILLED_TOOL[options.policy];
   const workers: WorkerHandle[] = [];
-  // A stopping error on either worker (a refused poll) rejects `stopped`, and
-  // every wait below races it, so the run rejects with that error instead of
-  // running into a deadline.
+  // A stopping error on worker B (a refused poll) or worker A exiting before
+  // it was killed rejects `stopped`, and every wait below races it, so the
+  // run rejects with that error instead of running into a deadline.
   let stop: (error: unknown) => void = () => undefined;
   const stopped = new Promise<never>((_, reject) => {
     stop = reject;
   });
   stopped.catch(() => undefined);
-  const serve = (onTurn?: (report: TurnReport) => void) =>
-    serveAgents({
-      transport: createHttpTransport({ url: options.url, token: options.workerToken, journal }),
-      agents: [assistant],
-      tools,
-      ...(onTurn === undefined ? {} : { onTurn }),
-    }).then((worker) => {
-      workers.push(worker);
-      worker.done.catch(stop);
-      return worker;
+
+  const child = spawnWorkerA(options, counters);
+  let killing = false;
+  const stderr: string[] = [];
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk.toString("utf8")));
+  // `close`, not `exit`: it fires once stdio has closed, so `stderr` holds
+  // everything worker A wrote before it went.
+  const exited = new Promise<NodeJS.Signals | null>((resolve) => {
+    child.once("close", (code, signal) => {
+      if (!killing) {
+        stop(new Error(`worker A exited ${String(signal ?? code)} before it was killed:\n${stderr.join("")}`));
+      }
+      resolve(signal);
     });
+  });
+  let workerA = "";
+  let held = false;
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    const [tag, value] = line.split(" ");
+    if (tag === "WORKER") workerA = value ?? "";
+    if (tag === "HELD") held = true;
+  });
 
   try {
     await agent.create();
-    let killed: Promise<void> | undefined;
-    let killedAt = 0;
-    const workerA = await serve();
-    fixture.interruptAt({
-      tool: options.policy === "manual" ? TICKET : DRAFT,
-      attempt: 1,
-      fire: () => {
-        killedAt = Date.now();
-        killed = workerA.close();
-        return new Error("worker killed inside the step");
-      },
-    });
-    log(`worker A ${workerA.ownerId} serving`);
+    await waitFor("worker A serving", waitMs, () => workerA !== "", stopped);
+    log(`worker A ${workerA} serving as process ${String(child.pid)}`);
 
     const first = await agent.send("ask", payload, { requestId: options.requestId });
     const operationId = first.operationId ?? "";
     log(`sent request ${options.requestId}: operation ${operationId}`);
-    await waitFor("worker A killed inside the step", waitMs, () => killed !== undefined, stopped);
-    await within("worker A closed", waitMs, Promise.race([killed ?? Promise.resolve(), stopped]));
-    log(`worker A killed inside ${options.policy === "manual" ? TICKET : DRAFT} attempt 1`);
+    await waitFor(`worker A inside ${killedTool}`, waitMs, () => held, stopped);
+    killing = true;
+    const killedAt = Date.now();
+    child.kill("SIGKILL");
+    const workerASignal = await exited;
+    log(`worker A killed by ${String(workerASignal)} inside ${killedTool} attempt 1`);
 
     // A client that lost the first answer sends again under the same request id.
     const retried = await agent.send("ask", payload, { requestId: options.requestId });
     log(`resent request ${options.requestId}: operation ${retried.operationId ?? "none"}`);
 
     const reports: TurnReport[] = [];
-    const workerB = await serve((report) => reports.push(report));
+    const workerB = await serveAgents({
+      transport: createHttpTransport({ url: options.url, token: options.workerToken }),
+      agents: [assistant],
+      tools,
+      onTurn: (report) => reports.push(report),
+    });
+    workers.push(workerB);
+    workerB.done.catch(stop);
     log(`worker B ${workerB.ownerId} serving; waiting for worker A's lease to lapse`);
 
     let inDoubt: ScenarioResult["inDoubt"] = null;
     if (options.policy === "manual") {
-      await waitFor(
-        "worker B blocked on the effect in doubt",
-        waitMs,
-        () => reports.some((r) => r.outcome === "abandoned" && r.error instanceof EffectInDoubt),
-        stopped,
-      );
-      const blocked = reports.find((r) => r.outcome === "abandoned" && r.error instanceof EffectInDoubt);
-      const effects = await journal.effects(operationId);
-      const effect = effects.find((e) => e.tool_name === TICKET);
+      const isBlocked = (r: TurnReport) => r.outcome === "abandoned" && r.error instanceof EffectInDoubt;
+      await waitFor("worker B blocked on the effect in doubt", waitMs, () => reports.some(isBlocked), stopped);
+      const blocked = reports.find(isBlocked);
+      const effect = (await agent.effects()).find((e) => e.tool_name === TICKET);
       if (blocked?.outcome !== "abandoned" || effect === undefined) throw new Error("no effect in doubt");
-      const serverStatus = (await first.status()).status;
-      const ticketRunsBeforeReconcile = fixture.count(TICKET);
-      inDoubt = { error: String(blocked.error), effect, serverStatus, ticketRunsBeforeReconcile };
-      log(`worker B blocked: ${inDoubt.error}`);
+      const inspected = await client.effect(effect.effect);
+      const info = await first.status();
+      const ticketCalls = readCounters(counters).filter((c) => c.tool === TICKET);
+      inDoubt = {
+        error: String(blocked.error),
+        effect,
+        attempts: inspected.attempts,
+        serverStatus: info.status,
+        blockedEffect: info.blockedEffect,
+        ticketRunsBeforeReconcile: ticketCalls.length,
+      };
+      log(`worker B blocked: ${inDoubt.error}; the server reads the operation ${info.status}`);
       // The operator looks at the desk, finds the ticket the killed run filed,
       // and records it as the effect's result rather than filing another.
-      const filed = fixture.tickets[0] ?? "";
-      await journal.reconcile({
+      const filed = (ticketCalls[0]?.output as { ticket?: string } | undefined)?.ticket ?? "";
+      await admin.reconcile({
         effect: effect.effect,
         attempt: effect.attempt,
         decision: "record_result",
@@ -201,25 +243,31 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
     ]);
     const recoveryMs = Date.now() - killedAt;
     const state = await agent.state();
+    const calls: ToolCall[] = readCounters(counters).map(({ tool, effectId, attempt }) => ({
+      tool,
+      effectId,
+      attempt,
+    }));
+    const count = (tool: string) => calls.filter((c) => c.tool === tool).length;
     return {
       operationId,
       retriedOperationId: retried.operationId,
-      workerA: workerA.ownerId,
+      workerA,
       workerB: workerB.ownerId,
+      workerASignal,
       result: settled.value,
       resultError: settled.error,
-      calls: [...fixture.calls],
-      counts: {
-        search: fixture.count("kb.search"),
-        draft: fixture.count(DRAFT),
-        ticket: fixture.count(TICKET),
-      },
-      effects: await journal.effects(operationId),
+      calls,
+      counts: { search: count(SEARCH), draft: count(DRAFT), ticket: count(TICKET) },
+      effects: await agent.effects(),
       answered: state.state?.answered ?? 0,
       inDoubt,
       recoveryMs,
     };
   } finally {
+    killing = true;
+    child.kill("SIGKILL");
     await Promise.all(workers.map((w) => w.close()));
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
