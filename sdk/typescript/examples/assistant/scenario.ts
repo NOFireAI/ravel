@@ -152,8 +152,10 @@ export async function runKillAndRecover(options: ScenarioOptions): Promise<Scena
   let killing = false;
   const stderr: string[] = [];
   child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk.toString("utf8")));
+  // `close`, not `exit`: it fires once stdio has closed, so `stderr` holds
+  // everything worker A wrote before it went.
   const exited = new Promise<NodeJS.Signals | null>((resolve) => {
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (!killing) {
         stop(new Error(`worker A exited ${String(signal ?? code)} before it was killed:\n${stderr.join("")}`));
       }
