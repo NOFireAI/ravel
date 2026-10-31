@@ -6,7 +6,7 @@ import { z } from "zod";
 import { AgentGone, OutcomeUnknown, OwnershipLost } from "../errors.js";
 import { decodeWire, WorkerPollResponse, type TurnAssignment } from "../wire/index.js";
 import { defineAgent, handlerDigest, serveAgents, type Transport, type TurnReport } from "./index.js";
-import { MIN_RENEW_INTERVAL_MS, renewInterval } from "./runner.js";
+import { LeaseExpired, MIN_RENEW_INTERVAL_MS, renewInterval } from "./runner.js";
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../fixtures");
 const pollFixture = JSON.parse(readFileSync(resolve(fixtureDir, "worker_poll_response.json"), "utf8")) as {
@@ -20,6 +20,8 @@ const GRACE_MS = 2_000;
 const HANDLER_MS = 9_000;
 
 const signals: AbortSignal[] = [];
+/** The fake clock at each abort of a handler's signal. */
+const abortedAt: number[] = [];
 
 const agent = defineAgent({
   name: "order",
@@ -33,6 +35,7 @@ const agent = defineAgent({
       result: z.null(),
       handler: async (ctx) => {
         signals.push(ctx.signal);
+        ctx.signal.addEventListener("abort", () => abortedAt.push(Date.now()));
         await new Promise((done) => setTimeout(done, HANDLER_MS));
         return null;
       },
@@ -55,13 +58,16 @@ function assignment(): TurnAssignment {
 }
 
 /**
- * A coordinator that leases one turn at its first poll for `LEASE_MS` and
- * renews it by `LEASE_MS` past the fake clock on each heartbeat. The n-th
- * heartbeat rejects with `beats[n]` when that is set. Like the server, it
+ * A coordinator that leases one turn at its first poll for `leaseMs` and
+ * renews it by `leaseMs` past the fake clock on each heartbeat. The n-th
+ * heartbeat rejects with `beats[n]` (or `beats(n)`) when that is set. Like the server, it
  * refuses a commit once the clock passes the last expiry plus `GRACE_MS`,
  * since a poll by another worker would have taken the turn over by then.
  */
-function leasingTransport(beats: (Error | undefined)[] = []) {
+function leasingTransport(
+  beats: (Error | undefined)[] | ((n: number) => Error | undefined) = [],
+  leaseMs = LEASE_MS,
+) {
   const heartbeatAt: number[] = [];
   const commitAt: number[] = [];
   let polled = false;
@@ -71,15 +77,15 @@ function leasingTransport(beats: (Error | undefined)[] = []) {
     heartbeat: () => {
       const n = heartbeatAt.length;
       heartbeatAt.push(Date.now());
-      const refusal = beats[n];
+      const refusal = typeof beats === "function" ? beats(n) : beats[n];
       if (refusal !== undefined) return Promise.reject(refusal);
-      expiresMs = Date.now() + LEASE_MS;
+      expiresMs = Date.now() + leaseMs;
       return Promise.resolve({ lease_expires_unix_ns: BigInt(expiresMs) * 1_000_000n });
     },
     poll: (_request, signal) => {
       if (!polled) {
         polled = true;
-        expiresMs = Date.now() + LEASE_MS;
+        expiresMs = Date.now() + leaseMs;
         return Promise.resolve({ assignment: assignment() });
       }
       return new Promise((done) => {
@@ -108,16 +114,21 @@ function leasingTransport(beats: (Error | undefined)[] = []) {
   return { transport, heartbeatAt, commitAt };
 }
 
-/** Serve `transport` under fake timers from time 0 for 20 s, and report each turn. */
-async function serveFor(transport: Transport): Promise<TurnReport[]> {
+/**
+ * Serve `transport` under fake timers from time 0 for 20 s, with the worker
+ * told the coordinator's lease is `leaseMs`, and report each turn.
+ */
+async function serveFor(transport: Transport, leaseMs = LEASE_MS): Promise<TurnReport[]> {
   vi.useFakeTimers({ now: 0 });
   signals.length = 0;
+  abortedAt.length = 0;
   try {
     const reports: TurnReport[] = [];
     const worker = await serveAgents({
       transport,
       agents: [agent],
       workerId: "w-0000000000000001",
+      leaseMs,
       onTurn: (report) => reports.push(report),
     });
     await vi.advanceTimersByTimeAsync(20_000);
@@ -165,7 +176,7 @@ describe("lease renewal", () => {
     expect(report?.outcome === "abandoned" && report.error).toBe(refusal);
   });
 
-  it("a transient renewal failure is retried at the next tick", async () => {
+  it("a transient renewal failure inside the lease does not abort the turn", async () => {
     const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
     const { transport, heartbeatAt, commitAt } = leasingTransport([undefined, unavailable]);
     const reports = await serveFor(transport);
@@ -175,5 +186,43 @@ describe("lease renewal", () => {
     expect(commitAt).toEqual([HANDLER_MS]);
     expect(reports.map((r) => r.outcome)).toEqual(["committed"]);
     expect(signals[0]?.aborted).toBe(false);
+    expect(abortedAt).toEqual([]);
+  });
+
+  // Two lease lengths, one not a multiple of the 1 s renewal pace: an abort
+  // after a fixed count of failures lands on a whole second and matches
+  // neither, while the expiry tracks the lease.
+  it.each([6_000, 4_500])(
+    "renewals that keep failing past the lease abort the turn and send no commit (lease %i ms)",
+    async (leaseMs) => {
+      const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
+      const { transport, heartbeatAt, commitAt } = leasingTransport(() => unavailable, leaseMs);
+      const reports = await serveFor(transport, leaseMs);
+      // No answer ever names an expiry, so renewals run at the 1 s floor from
+      // assignment until the lease the poll granted at 0 s runs out.
+      expect(heartbeatAt.every((at) => at < leaseMs)).toBe(true);
+      expect(heartbeatAt.length).toBeGreaterThanOrEqual(Math.floor(leaseMs / MIN_RENEW_INTERVAL_MS));
+      expect(signals).toHaveLength(1);
+      expect(abortedAt).toEqual([leaseMs]);
+      expect(signals[0]?.reason).toBeInstanceOf(LeaseExpired);
+      // Nothing was committed at the expiry, nor in the 20 s served after it.
+      expect(commitAt).toEqual([]);
+      expect(reports).toHaveLength(1);
+      const [report] = reports;
+      expect(report?.outcome).toBe("abandoned");
+      expect(report?.outcome === "abandoned" && report.error).toBe(signals[0]?.reason);
+    },
+  );
+
+  it("an answered renewal restarts the lease the worker measures", async () => {
+    const unavailable = new OutcomeUnknown("worker/heartbeat: HTTP 503");
+    // Answered at 0 s and 2 s, then failing: the lease runs out 6 s after
+    // the answer at 2 s, not 6 s after the assignment.
+    const { transport, commitAt } = leasingTransport((n) => (n < 2 ? undefined : unavailable));
+    const reports = await serveFor(transport);
+    expect(abortedAt).toEqual([2_000 + LEASE_MS]);
+    expect(signals[0]?.reason).toBeInstanceOf(LeaseExpired);
+    expect(commitAt).toEqual([]);
+    expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
   });
 });

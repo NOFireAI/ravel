@@ -15,7 +15,7 @@ import type {
   Schema,
 } from "../types.js";
 import { Backoff, OperationBackoffs, pause } from "./backoff.js";
-import { handlerDigest, runTurn, type TurnReport } from "./runner.js";
+import { DEFAULT_LEASE_MS, handlerDigest, runTurn, type TurnReport } from "./runner.js";
 import type { Transport } from "./transport.js";
 
 export type {
@@ -26,7 +26,14 @@ export type {
   MessageDefinition,
 } from "../types.js";
 export { ConcurrentStepError, InvalidStepInput } from "../errors.js";
-export { handlerDigest, runTurn, StepFailed, type TurnReport } from "./runner.js";
+export {
+  DEFAULT_LEASE_MS,
+  handlerDigest,
+  LeaseExpired,
+  runTurn,
+  StepFailed,
+  type TurnReport,
+} from "./runner.js";
 export type {
   EffectFailRequest,
   PolledTurn,
@@ -143,6 +150,14 @@ export interface ServeOptions {
   readonly abandonDelayMs?: number;
   /** Cap on the doubling pauses after abandoned turns and failed polls. Default 30 s. */
   readonly maxBackoffMs?: number;
+  /**
+   * The lease length the coordinator grants, its `lease_ms`; the wire does
+   * not carry it. A turn whose renewals have all failed for this long since
+   * the last grant the worker saw answered is aborted with `LeaseExpired`.
+   * Set it to the server's value; a longer one lets a turn run past its
+   * lease. Default 30 s, the server's default.
+   */
+  readonly leaseMs?: number;
   /** Observes every turn the worker finishes or abandons. */
   readonly onTurn?: (report: TurnReport) => void;
   /**
@@ -193,6 +208,7 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
   const waitMs = Math.min(options.pollWaitMs ?? 20_000, 20_000);
   const abandonDelayMs = options.abandonDelayMs ?? 250;
   const maxBackoffMs = options.maxBackoffMs ?? 30_000;
+  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const abandonDelays = new OperationBackoffs(abandonDelayMs, maxBackoffMs);
   const pollRetryDelay = new Backoff(POLL_RETRY_MS, maxBackoffMs);
   const abandonPause = (report: Extract<TurnReport, { outcome: "abandoned" }>): number =>
@@ -231,7 +247,7 @@ export async function serveAgents(options: ServeOptions): Promise<WorkerHandle> 
         }
         continue;
       }
-      const report = await runTurn(polled, agents, options.transport, controller.signal);
+      const report = await runTurn(polled, agents, options.transport, controller.signal, leaseMs);
       options.onTurn?.(report);
       if (report.outcome === "committed") {
         abandonDelays.forget(report.operation);

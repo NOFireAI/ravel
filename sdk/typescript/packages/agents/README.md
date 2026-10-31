@@ -402,19 +402,29 @@ HTTP transport (`src/transport/http.ts`; tests in `http.test.ts`):
   heartbeat goes before a step. A renewal refused with `OwnershipLost` or
   `AgentGone` aborts the handler's `ctx.signal` and abandons the turn
   without a commit or a retry; any other failure, such as a 503, is retried
-  at the next tick and never commits or fails the turn by itself. So a turn
-  is lost only when a renewal is refused, or when renewals fail for longer
-  than the lease plus its grace (30 s and 10 s by default: the agents
-  runtime's `RuntimeConfig::default`). The interval is read against the
-  worker's clock, so a clock ahead of the server's renews at the 1 s floor.
+  at the next tick, and one inside the lease never aborts, commits or fails
+  the turn by itself. When renewals have failed past the lease, the worker
+  aborts the handler's `ctx.signal` at the expiry and abandons the turn the
+  same way, with `LeaseExpired`, before the server's grace lets another
+  worker take it over. The worker measures that expiry on its own timers:
+  `leaseMs` (a `serveAgents` option, default 30 s) from the moment it
+  received the assignment or the last answered renewal, since neither answer
+  carries the lease length and its wall clock may be skewed from the
+  server's. Set `leaseMs` to the server's `lease_ms` (30 s, with a 10 s
+  grace, by default: the agents runtime's `RuntimeConfig::default`). The
+  interval is read against the worker's clock, so a clock ahead of the
+  server's renews at the 1 s floor.
   The server keeps renewals in the memory of the coordinator that answered
   them: with two coordinators, a worker polling the other one can still take
   the turn over once the lease and grace run out after the takeover that
   started it (`crates/ravel-agents-runtime/src/ownership.rs`). Tests: `a
   turn longer than the lease renews it in the background and commits`, `a
   refused renewal aborts the turn and nothing is committed`, `a transient
-  renewal failure is retried at the next tick`, `renews a third of the
-  lease left, and never faster than the floor` (`worker/renew.test.ts`),
+  renewal failure inside the lease does not abort the turn`, `renewals that
+  keep failing past the lease abort the turn and send no commit`, `an
+  answered renewal restarts the lease the worker measures`, `renews a third
+  of the lease left, and never faster than the floor`
+  (`worker/renew.test.ts`),
   `renews once at assignment, sends nothing while a tool runs, and no
   heartbeat before a step` (`transport/http.test.ts`).
 - `createHttpTransport` takes no `journal` option, since the server records

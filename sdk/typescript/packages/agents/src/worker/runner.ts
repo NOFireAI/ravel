@@ -349,31 +349,78 @@ export function renewInterval(expiresUnixNs: bigint | undefined, nowMs: number):
 }
 
 /**
+ * The lease length a worker assumes the coordinator grants, the server's
+ * default `lease_ms`. Neither a poll nor a heartbeat answer names it.
+ */
+export const DEFAULT_LEASE_MS = 30_000;
+
+/**
+ * The turn's lease ran out with no renewal answered: by the worker's own
+ * monotonic clock, `leaseMs` passed since the last grant it saw (the poll that
+ * handed it the turn, or the last heartbeat answer). Another worker may take
+ * the turn over from here, so the turn is abandoned rather than committed.
+ */
+export class LeaseExpired extends Error {
+  override readonly name = "LeaseExpired";
+
+  constructor(
+    readonly turnId: string,
+    readonly leaseMs: number,
+  ) {
+    super(`lease on turn ${turnId} expired: no renewal answered within ${String(leaseMs)} ms`);
+  }
+}
+
+/**
  * Renew the turn's lease until `stop` aborts: one heartbeat at a time, the
  * first at once, each next one {@link renewInterval} after the last answer.
  * A refusal (`AgentGone`, `OwnershipLost`) aborts `turn` with that error; any
- * other failure is retried at the next interval. Never rejects.
+ * other failure is retried at the next interval. Once `leaseMs` passes after
+ * the assignment or the last answered renewal, measured on the worker's
+ * timers and not against the answered wall-clock expiry, `turn` is aborted
+ * with {@link LeaseExpired}. Never rejects.
  */
 async function renewLease(
   assignment: TurnAssignment,
   transport: Transport,
   turn: AbortController,
   stop: AbortSignal,
+  leaseMs: number,
 ): Promise<void> {
   const request = { lease: heldLease(assignment.lease) };
-  const stopped = (): boolean => stop.aborted;
+  const stopped = (): boolean => stop.aborted || turn.signal.aborted;
+  let expiry: ReturnType<typeof setTimeout> | undefined;
+  const granted = () => {
+    clearTimeout(expiry);
+    expiry = setTimeout(() => {
+      if (!stop.aborted) turn.abort(new LeaseExpired(assignment.lease.turn_id, leaseMs));
+    }, leaseMs);
+  };
+  const disarm = () => {
+    clearTimeout(expiry);
+  };
+  stop.addEventListener("abort", disarm, { once: true });
+  granted();
   let expires: bigint | undefined;
-  while (!stopped()) {
-    try {
-      expires = (await transport.heartbeat(request)).lease_expires_unix_ns;
-    } catch (error) {
-      if (stopped()) return;
-      if (error instanceof AgentGone || error instanceof OwnershipLost) {
-        turn.abort(error);
-        return;
+  try {
+    while (!stopped()) {
+      try {
+        const answer = await transport.heartbeat(request);
+        if (stopped()) return;
+        granted();
+        expires = answer.lease_expires_unix_ns;
+      } catch (error) {
+        if (stopped()) return;
+        if (error instanceof AgentGone || error instanceof OwnershipLost) {
+          turn.abort(error);
+          return;
+        }
       }
+      await pause(renewInterval(expires, Date.now()), stop);
     }
-    await pause(renewInterval(expires, Date.now()), stop);
+  } finally {
+    disarm();
+    stop.removeEventListener("abort", disarm);
   }
 }
 
@@ -388,13 +435,16 @@ class TerminalFailure extends Error {
  * `AgentGone` among them, abandons the turn with that error: the commit is
  * attempted at most once and never retried here. From assignment until the
  * commit is sent the lease is renewed in the background; a refused renewal
- * aborts the handler's signal and abandons the turn with the refusal.
+ * aborts the handler's signal and abandons the turn with the refusal, and so
+ * does a lease that runs out, `leaseMs` after the last grant the worker saw
+ * answered, with {@link LeaseExpired}.
  */
 export async function runTurn(
   polled: PolledTurn,
   agents: ReadonlyMap<string, AnyAgentDefinition>,
   transport: Transport,
   signal: AbortSignal,
+  leaseMs: number = DEFAULT_LEASE_MS,
 ): Promise<TurnReport> {
   const a = polled.assignment;
   const base = { operation: a.operation, turnId: a.lease.turn_id };
@@ -425,7 +475,7 @@ export async function runTurn(
   if (signal.aborted) forward();
   else signal.addEventListener("abort", forward, { once: true });
   const renewal = new AbortController();
-  void renewLease(a, transport, aborter, renewal.signal);
+  void renewLease(a, transport, aborter, renewal.signal, leaseMs);
   try {
     return await settleTurn(polled, agent, message, stateParse, transport, aborter.signal, renewal);
   } finally {
