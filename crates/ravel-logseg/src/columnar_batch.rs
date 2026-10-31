@@ -1056,7 +1056,8 @@ impl ColumnarLogBatch {
     /// takes that column's cell for the row; later same-pair occurrences within
     /// the same record become `residual_attrs`. It does not decide the budget,
     /// the stream directory ordering across batches, or the block layout -- all
-    /// of which the writer owns.
+    /// of which the writer owns. It is [`Self::try_from_rows`] over
+    /// [`LogRecord`]s, the one implementation of this build.
     ///
     /// For callers whose values cannot reach a column's byte limit (tests and
     /// benches). A value that would take its column past [`VAR_BYTES_MAX`]
