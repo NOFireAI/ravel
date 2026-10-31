@@ -255,17 +255,26 @@ impl Coordinator {
     /// only: HEAD's lease hint is not advanced, so another coordinator still
     /// takes the agent over `lease_ms + heartbeat_grace_ms` after the
     /// takeover that granted the lease (see the module doc). A HEAD whose
-    /// lifecycle is not `Active` is `AgentGone` and renews nothing, the
-    /// answer the owner's commit gets from the kernel
+    /// lifecycle is not `Active`, or whose incarnation is not the lease's,
+    /// is `AgentGone` and renews nothing, the answer the owner's commit gets
+    /// from the kernel; a non-active root is also dropped from the loaded
+    /// set
     /// (`tests::a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll`).
     pub async fn heartbeat(&self, lease: &TurnLease) -> Result<i64, AgentError> {
         let (agent, fence) = fence_from_lease(lease)?;
         let head = self.reload(&agent).await?;
         if head.lifecycle != Lifecycle::Active {
+            self.forget_agent(&agent);
             return Err(refused(&agent, ErrorKind::AgentGone, "agent is tombstoned"));
         }
-        let holds = head.incarnation == fence.owner.incarnation
-            && head.owner_id == fence.owner.owner_id
+        if head.incarnation != fence.owner.incarnation {
+            return Err(refused(
+                &agent,
+                ErrorKind::AgentGone,
+                "lease names an earlier incarnation",
+            ));
+        }
+        let holds = head.owner_id == fence.owner.owner_id
             && head.epoch == fence.owner.epoch
             && head
                 .active_turn
