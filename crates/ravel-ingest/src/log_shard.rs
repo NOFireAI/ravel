@@ -3241,7 +3241,17 @@ mod tests {
         }
 
         fn spawn_with_store(config: IngestConfig, store: Arc<dyn ObjectStoreBackend>) -> Self {
-            let clock = TestClock::new(BASE_NS);
+            Self::spawn_on_clock(config, store, TestClock::new(BASE_NS), None)
+        }
+
+        /// [`Self::spawn_with_store`] on a caller's clock, with `phase_hook`
+        /// run inside the flush phases that make no store call.
+        fn spawn_on_clock(
+            config: IngestConfig,
+            store: Arc<dyn ObjectStoreBackend>,
+            clock: Arc<TestClock>,
+            phase_hook: Option<PhaseHook>,
+        ) -> Self {
             let metrics = Arc::new(LogIngestMetrics::default());
             let (tx, rx) = mpsc::channel(64);
             let actor = LogShardActor::new(
@@ -3264,6 +3274,9 @@ mod tests {
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
+            if let Some(hook) = phase_hook {
+                let _ = actor.ctx.phase_hook.set(hook);
+            }
             let task = tokio::spawn(actor.run());
             Harness {
                 tx,
@@ -6424,6 +6437,212 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(records, original);
+    }
+
+    /// Advances the test clock by a fixed amount inside every GET or PUT whose
+    /// key contains a given substring, so a store-bound flush phase takes an
+    /// exact injected-clock duration.
+    struct AdvancingStore {
+        inner: MemoryStore,
+        clock: Arc<TestClock>,
+        get_advances: Vec<(&'static str, i64)>,
+        put_advances: Vec<(&'static str, i64)>,
+    }
+
+    impl AdvancingStore {
+        fn advance_for(&self, rules: &[(&'static str, i64)], key: &str) {
+            for (pattern, delta_ns) in rules {
+                if key.contains(pattern) {
+                    self.clock.advance_ns(*delta_ns);
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for AdvancingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.advance_for(&self.put_advances, key);
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.advance_for(&self.get_advances, key);
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Sends one strict single-record write and returns its ack.
+    async fn strict_write_one(h: &Harness) -> Result<CommitToken, LogWriteError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            arrival: false,
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")].into(),
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        ack_rx.await.expect("ack sender not dropped")
+    }
+
+    /// Issue #3533: each flush phase records exactly the injected-clock time
+    /// spent inside it. The store advances the clock inside the config GET
+    /// (resolve), the data PUT and the commit PUT; the phase hook advances it
+    /// inside the permit wait, the encode job and the commit build. Every
+    /// duration is distinct, so a phase charged with its neighbour's time
+    /// fails, and `total` is their exact sum because nothing advances the
+    /// clock between phases.
+    #[tokio::test]
+    async fn flush_phases_are_measured_on_the_injected_clock() {
+        const PERMIT_WAIT: i64 = 1_000_000;
+        const RESOLVE: i64 = 2_000_000;
+        const ENCODE: i64 = 3_000_000;
+        const DATA_PUT: i64 = 5_000_000;
+        const COMMIT_BUILD: i64 = 7_000_000;
+        const COMMIT_PUBLISH: i64 = 11_000_000;
+
+        let clock = TestClock::new(BASE_NS);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(AdvancingStore {
+            inner: MemoryStore::new(),
+            clock: Arc::clone(&clock),
+            get_advances: vec![("/config", RESOLVE)],
+            put_advances: vec![("/l/l0/", DATA_PUT), ("/l/c/", COMMIT_PUBLISH)],
+        });
+        let hook_clock = Arc::clone(&clock);
+        let hook: PhaseHook = Arc::new(move |phase| {
+            let delta_ns = match phase {
+                FlushPhase::PermitWait => PERMIT_WAIT,
+                FlushPhase::Encode => ENCODE,
+                FlushPhase::CommitBuild => COMMIT_BUILD,
+                _ => 0,
+            };
+            hook_clock.advance_ns(delta_ns);
+        });
+        let h = Harness::spawn_on_clock(flush_on_first(), store, clock, Some(hook));
+        let metrics = Arc::clone(&h.metrics);
+
+        strict_write_one(&h).await.expect("strict write commits");
+        // `total` is recorded after the ack fan-out, when the flush task
+        // returns; shutdown joins it.
+        h.shutdown().await;
+
+        let latency = metrics.snapshot().latency;
+        let expected = [
+            (FlushPhase::PermitWait, PERMIT_WAIT),
+            (FlushPhase::Resolve, RESOLVE),
+            (FlushPhase::Encode, ENCODE),
+            (FlushPhase::DataPut, DATA_PUT),
+            (FlushPhase::CommitBuild, COMMIT_BUILD),
+            (FlushPhase::CommitPublish, COMMIT_PUBLISH),
+            (
+                FlushPhase::Total,
+                PERMIT_WAIT + RESOLVE + ENCODE + DATA_PUT + COMMIT_BUILD + COMMIT_PUBLISH,
+            ),
+        ];
+        for (phase, ns) in expected {
+            let histogram = latency.flush(phase);
+            assert_eq!(histogram.count(), 1, "{} count", phase.name());
+            assert_eq!(histogram.sum_ns, ns as u64, "{} sum", phase.name());
+        }
+        let queued = latency.strict_ack(StrictAckPhase::Queued);
+        assert_eq!(queued.count(), 1, "one strict waiter rode the flush");
+        assert_eq!(
+            queued.sum_ns, 0,
+            "nothing advanced the clock between the write and the spawn"
+        );
+    }
+
+    /// Issue #3533: a data PUT that fails permanently still records the
+    /// `data_put` step that failed, records neither commit phase it never
+    /// reached, and records `total` on the early exit.
+    #[tokio::test]
+    async fn an_early_error_flush_records_its_failed_step_and_total() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("data refused".into()))
+                .with_key_contains("/l0/"),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(flush_on_first(), store);
+        let metrics = Arc::clone(&h.metrics);
+
+        let err = strict_write_one(&h)
+            .await
+            .expect_err("a refused data PUT abandons the flush");
+        assert!(matches!(err, LogWriteError::Abandoned(_)));
+        h.shutdown().await;
+
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Permanent),
+            1,
+            "the data PUT fault fired once, with no retry"
+        );
+        let latency = metrics.snapshot().latency;
+        let counts: Vec<(&str, u64)> = FlushPhase::ALL
+            .into_iter()
+            .map(|phase| (phase.name(), latency.flush(phase).count()))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("permit_wait", 1),
+                ("resolve", 1),
+                ("encode", 1),
+                ("data_put", 1),
+                ("commit_build", 0),
+                ("commit_publish", 0),
+                ("total", 1),
+            ]
+        );
     }
 }
 

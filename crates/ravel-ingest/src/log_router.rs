@@ -3612,4 +3612,55 @@ mod tests {
         );
         assert_same_objects(&objs_ref, &objs_new);
     }
+
+    /// Issue #3533: a strict write records one `request` observation, one
+    /// `shard_skew` observation only when it reached more than one shard, and
+    /// one `queued` observation per strict waiter (one per shard it reached).
+    async fn strict_ack_counts(shard_count: u32) -> (usize, crate::LogLatencySnapshot) {
+        let router = LogIngestRouter::new(
+            IngestConfig {
+                shard_count,
+                target_bytes: 1,
+                max_flush_delay: Duration::from_secs(3600),
+                ..IngestConfig::default()
+            },
+            Arc::new(MemoryStore::new()),
+            Arc::new(FixedClock(1_700_000_000_000_000_000)),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+        );
+        let receipt = router
+            .write(
+                TenantId::new("acme"),
+                diverse_records(),
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("strict write commits");
+        let latency = router.metrics.snapshot().latency;
+        router.shutdown().await;
+        (receipt.tokens.len(), latency)
+    }
+
+    #[tokio::test]
+    async fn a_multi_shard_strict_write_records_request_and_shard_skew() {
+        let (shards, latency) = strict_ack_counts(2).await;
+        assert_eq!(shards, 2, "the records reach both shards");
+        assert_eq!(latency.strict_ack(StrictAckPhase::Request).count(), 1);
+        assert_eq!(latency.strict_ack(StrictAckPhase::ShardSkew).count(), 1);
+        assert_eq!(
+            latency.strict_ack(StrictAckPhase::Queued).count(),
+            2,
+            "one strict waiter per shard"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_shard_strict_write_records_no_shard_skew() {
+        let (shards, latency) = strict_ack_counts(1).await;
+        assert_eq!(shards, 1);
+        assert_eq!(latency.strict_ack(StrictAckPhase::Request).count(), 1);
+        assert_eq!(latency.strict_ack(StrictAckPhase::ShardSkew).count(), 0);
+        assert_eq!(latency.strict_ack(StrictAckPhase::Queued).count(), 1);
+    }
 }
