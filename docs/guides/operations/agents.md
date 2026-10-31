@@ -477,8 +477,8 @@ Repeats and refusals:
   `destroyed` false and the same counts. Nothing is written and no audit
   record is added (the same test).
 - An agent that was never created, or an `incarnation` that is not the
-  current one, is 404 `agent_gone`, with the pinned incarnation in
-  `ids.incarnation`. Nothing is written and nothing is audited
+  current one, is 404 `agent_gone`; for a pinned incarnation, `ids.incarnation`
+  names it. Nothing is written and nothing is audited
   (`destroy_of_an_unknown_agent_or_a_stale_incarnation_is_agent_gone_and_not_audited`).
 - A 500 `outcome_unknown` with retry `backoff` means the server could not
   tell whether the tombstone landed. Send the same destroy again with the
