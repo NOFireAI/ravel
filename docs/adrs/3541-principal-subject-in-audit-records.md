@@ -165,11 +165,18 @@ not.
 is the tenant id, so it carries no information beyond the tenant. A
 subject needs a second forwarded header. `--mtls-subject-header HEADER`,
 valid only with `--mtls-enabled`, names it; unset, the mTLS resolver sets
-no subject. The value is recorded verbatim as the proxy set it (the
-certificate's subject DN in RFC 4514 string form, or the SAN the proxy
-chose; Ravel does not parse it), bounded by the `Subject` rule and dropped
-to absent with the same counter under `source="mtls"` when it fails that
-rule. It is read on the `--mtls-listener` chain only, under exactly the
+no subject. The value is recorded verbatim as the proxy set it, and Ravel
+does not parse it. It is bounded by the `Subject` rule, whose charset has
+no space, and dropped to absent with the same counter under
+`source="mtls"` when it fails that rule. Most certificate subject DNs in
+RFC 4514 form contain a space (`CN=Alice Smith,O=Example Corp`), so the
+proxy must forward a value without one: a SAN such as an email address or
+a URI, or a single CN component that has no space. The flag's help text
+and the configuration guide say so, and a DN forwarded with a space shows
+up as `reason="charset"` on the counter rather than as a subject. The
+charset stays as it is because widening it for one source would widen it
+for every source, and a space is the character most likely to make a
+recorded value ambiguous to a reader. It is read on the `--mtls-listener` chain only, under exactly the
 trust rule of the tenant header: the proxy verifies the certificate and
 strips any client-supplied copy. The public listeners never contain an
 `MtlsResolver`, so the header has no effect there whatever a client sends.
@@ -221,7 +228,8 @@ converted subject to the audit step.
 
 The Flight SQL path has no principal today: `FlightAuth::tenant` returns a
 `TenantHash`, and the trait states only what Flight needs without seeing a
-credential. `FlightAuth` therefore gains a second required method,
+credential. `FlightAuth` (today `tenant` and `min_commit_tokens`, with
+seven implementations) therefore gains a third required method,
 `audit_subject(&self, metadata) -> Option<AuditSubject>`, with no default
 implementation, so every implementation states its answer. The server's
 implementation resolves the principal from the same `DoGet` metadata it
