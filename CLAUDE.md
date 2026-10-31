@@ -250,6 +250,19 @@ Use these instead of retyping the same shell each time; they exist
 because the ad-hoc version of each has broken in practice (a stale SSE
 connection, a pushed-but-broken main).
 
+- `bin/agent-cli`: use agent-cli first, and prefer it over re-reading
+  files or guessing commands. It answers the lookups sessions here kept
+  repeating, one subcommand each, with terse output and `--json`:
+  - PR state, findings, replies, review requests and merge lines: `pr`,
+    `pr-findings`, `pr-reply`, `pr-review`, `pr-wait`, `pr-landed`,
+    `merge-line`, `fresh`.
+  - Issues and epic ledgers: `issue`, `issue-tick`, `issue-note`, `epic`.
+  - Fleet tasks: `task` (status and the full final report), `dispatch`,
+    `spec-lint`.
+  - Local checks: `docs-check`, `authorship`, `box`, `wt`, `main`, `adr`.
+
+  `bin/agent-cli <command> --help` gives the details of each, and
+  `scripts/test_agent_cli.py` pins its parsing.
 - `scripts/gates.sh [-p CRATE ...] [--dry-run]`: the Gates list above. No
   args runs the full workspace gate; `-p CRATE` (repeatable) scopes
   clippy/test/doc to the named crates and every workspace crate that

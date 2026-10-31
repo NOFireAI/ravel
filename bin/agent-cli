@@ -1,0 +1,1192 @@
+#!/usr/bin/env python3
+"""agent-cli: one place for the lookups and commands agent sessions repeat.
+
+Each subcommand replaces a lookup or a multi-step command that sessions in
+this repository kept re-deriving: PR review and CI state, review findings and
+replies, merge lines, epic ledgers, fleet task reports and dispatch, docs
+gates, worktrees, ADR sections and box state. Output is terse and written for
+an agent; --json gives the same data as one JSON object. Exit codes are those
+of the underlying check: 0 clean, 1 a finding, 2 could not answer, 64 usage,
+75 a bounded wait ran out.
+
+Stdlib only. Needs git and gh on PATH; the fleet subcommands read the control
+plane URL and token from FLEET_CP_URL/FLEET_PUBLIC_URL and FLEET_ENQUEUE_TOKEN,
+else ~/.fleet/cp.env, and never print the token.
+"""
+
+import argparse
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BOT = "claude-fleet"
+SEVERITIES = ("blocker", "should_fix", "nit")
+TERMINAL_TASK = {"done", "failed", "canceled", "cancelled", "dead", "error"}
+
+
+class CliError(Exception):
+    """A failure to report as one line, with an exit code."""
+
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def run(cmd, cwd=None, env=None, stdin=None, check=False):
+    """Run a command; return (rc, stdout, stderr). Never raises on rc."""
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
+    try:
+        p = subprocess.run(cmd, cwd=cwd or ROOT, env=full_env, input=stdin,
+                           capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise CliError(f"not found: {cmd[0]} ({e})")
+    if check and p.returncode != 0:
+        raise CliError(f"{' '.join(cmd[:3])} failed rc={p.returncode}: {last_line(p.stderr or p.stdout)}")
+    return p.returncode, p.stdout, p.stderr
+
+
+def last_line(text):
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    return lines[-1].strip() if lines else ""
+
+
+def decode_concat(text):
+    """Decode one JSON value, or the back-to-back arrays gh api --paginate prints."""
+    dec = json.JSONDecoder()
+    values, i, n = [], 0, len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        value, i = dec.raw_decode(text, i)
+        values.append(value)
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    if all(isinstance(v, list) for v in values):
+        return [x for v in values for x in v]
+    return values
+
+
+def gh_json(args):
+    rc, out, err = run(["gh"] + args)
+    if rc != 0:
+        raise CliError(f"gh {' '.join(args[:2])}: {last_line(err) or 'rc=' + str(rc)}")
+    try:
+        return decode_concat(out)
+    except ValueError as e:
+        raise CliError(f"gh {' '.join(args[:2])}: undecodable output ({e})")
+
+
+_REPO = None
+
+
+def repo_slug():
+    global _REPO
+    if _REPO is None:
+        _, url, _ = run(["git", "remote", "get-url", "origin"], check=True)
+        m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?\s*$", url.strip())
+        if not m:
+            raise CliError(f"cannot parse origin url {url.strip()}")
+        _REPO = m.group(1)
+    return _REPO
+
+
+def write_temp(text, suffix=".md"):
+    fd, path = tempfile.mkstemp(prefix="agent-cli-", suffix=suffix)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    return path
+
+
+def read_body_arg(value):
+    """TEXT, '-' for stdin, or @FILE."""
+    if value == "-":
+        return sys.stdin.read()
+    if value.startswith("@"):
+        return Path(value[1:]).read_text()
+    return value
+
+
+class Out:
+    """Collects a JSON object and the terse text lines for it."""
+
+    def __init__(self, as_json):
+        self.as_json = as_json
+        self.data = {}
+        self.lines = []
+
+    def text(self, line):
+        self.lines.append(line)
+
+    def emit(self):
+        if self.as_json:
+            print(json.dumps(self.data, indent=None, sort_keys=True))
+        else:
+            for line in self.lines:
+                print(line)
+
+
+# ---------------------------------------------------------------- PR state
+
+
+def ci_counts(rollup):
+    """Bucket a statusCheckRollup into pass/pending/fail/skip."""
+    counts = {"pass": 0, "pending": 0, "fail": 0, "skip": 0}
+    failing = []
+    for c in rollup or []:
+        if c.get("__typename") == "StatusContext":
+            state = (c.get("state") or "").upper()
+            name = c.get("context", "")
+            if state in ("PENDING", "EXPECTED"):
+                counts["pending"] += 1
+            elif state == "SUCCESS":
+                counts["pass"] += 1
+            else:
+                counts["fail"] += 1
+                failing.append(name)
+            continue
+        name = c.get("name", "")
+        if (c.get("status") or "").upper() != "COMPLETED":
+            counts["pending"] += 1
+            continue
+        concl = (c.get("conclusion") or "").upper()
+        if concl in ("SUCCESS", "NEUTRAL"):
+            counts["pass"] += 1
+        elif concl == "SKIPPED":
+            counts["skip"] += 1
+        else:
+            counts["fail"] += 1
+            failing.append(f"{name}:{concl.lower()}")
+    return counts, failing
+
+
+def severity(body):
+    head = (body or "").lstrip().split(":", 1)[0].strip().lower()
+    return head if head in SEVERITIES else "comment"
+
+
+def first_sentence(body, limit=160):
+    text = (body or "").strip()
+    if ":" in text.split("\n", 1)[0] and severity(text) != "comment":
+        text = text.split(":", 1)[1].strip()
+    text = text.split("\n", 1)[0]
+    return text if len(text) <= limit else text[: limit - 1] + "..."
+
+
+def classify_findings(comments, head, all_commits=False):
+    """Top-level bot findings, each marked replied when anyone answered it."""
+    replied = {c.get("in_reply_to_id") for c in comments
+               if c.get("in_reply_to_id") and BOT not in (c.get("user") or {}).get("login", "")}
+    rows = []
+    for c in comments:
+        if c.get("in_reply_to_id"):
+            continue
+        if BOT not in (c.get("user") or {}).get("login", ""):
+            continue
+        if not all_commits and c.get("commit_id") != head:
+            continue
+        rows.append({
+            "id": c.get("id"),
+            "severity": severity(c.get("body")),
+            "path": c.get("path"),
+            "line": c.get("line") or c.get("original_line"),
+            "commit": (c.get("commit_id") or "")[:9],
+            "replied": c.get("id") in replied,
+            "summary": first_sentence(c.get("body")),
+        })
+    return rows
+
+
+BODY_FINDING = re.compile(r"^\s*-\s*(blocker|should_fix|nit)\s*,\s*(\S+)\s*[—-]\s*(.*)$")
+
+
+def review_body_findings(body):
+    rows = []
+    verdict = ""
+    for line in (body or "").splitlines():
+        s = line.strip()
+        if not verdict and re.match(r"^(Approve|Request changes|Comment)\b", s):
+            verdict = s.split(":", 1)[0]
+        m = BODY_FINDING.match(line)
+        if m:
+            rows.append({"severity": m.group(1), "where": m.group(2), "summary": m.group(3)[:160]})
+    return verdict, rows
+
+
+def bot_reviews(n):
+    return [r for r in gh_json(["api", "--paginate", f"repos/{repo_slug()}/pulls/{n}/reviews"]) or []
+            if BOT in (r.get("user") or {}).get("login", "")]
+
+
+def pr_state(n):
+    view = gh_json(["pr", "view", str(n), "--json",
+                    "number,state,title,headRefOid,headRefName,baseRefName,mergeable,"
+                    "mergeStateStatus,statusCheckRollup,mergeCommit"])
+    head = view["headRefOid"]
+    counts, failing = ci_counts(view.get("statusCheckRollup"))
+    reviews = bot_reviews(n)
+    at_head = [r for r in reviews if r.get("commit_id") == head]
+    comments = gh_json(["api", "--paginate", f"repos/{repo_slug()}/pulls/{n}/comments"]) or []
+    findings = classify_findings(comments, head)
+    sev = {}
+    for f in findings:
+        sev[f["severity"]] = sev.get(f["severity"], 0) + 1
+    verdict, body_rows = review_body_findings(at_head[-1].get("body") if at_head else "")
+    return {
+        "number": view["number"], "state": view["state"], "title": view["title"],
+        "head": head, "head_ref": view["headRefName"], "base": view["baseRefName"],
+        "mergeable": view.get("mergeable"), "merge_state": view.get("mergeStateStatus"),
+        "merge_commit": (view.get("mergeCommit") or {}).get("oid"),
+        "ci": counts, "failing": failing,
+        "review_at_head": at_head[-1].get("state") if at_head else None,
+        "review_verdict": verdict,
+        "reviews_total": len(reviews),
+        "findings_at_head": sev, "body_findings": body_rows,
+        "unreplied_at_head": sum(1 for f in findings if not f["replied"]),
+    }
+
+
+def pr_line(s):
+    ci = s["ci"]
+    sev = ",".join(f"{k}:{v}" for k, v in sorted(s["findings_at_head"].items())) or "0"
+    line = (f"pr {s['number']} {s['state']} head={s['head'][:9]} merge={s['merge_state']} "
+            f"ci={ci['pass']}p/{ci['pending']}w/{ci['fail']}f/{ci['skip']}s "
+            f"review@head={s['review_at_head'] or 'none'}"
+            f"{'(' + s['review_verdict'] + ')' if s['review_verdict'] else ''} "
+            f"findings@head={sev} unreplied={s['unreplied_at_head']}")
+    if s["merge_commit"]:
+        line += f" merged={s['merge_commit'][:9]}"
+    return line
+
+
+def cmd_pr(a):
+    o = Out(a.json)
+    s = pr_state(a.number)
+    o.data = s
+    o.text(pr_line(s))
+    for f in s["failing"]:
+        o.text(f"  fail {f}")
+    for b in s["body_findings"]:
+        o.text(f"  body {b['severity']} {b['where']} {b['summary']}")
+    o.emit()
+    return 0
+
+
+def cmd_pr_findings(a):
+    o = Out(a.json)
+    view = gh_json(["pr", "view", str(a.number), "--json", "headRefOid"])
+    head = view["headRefOid"]
+    comments = gh_json(["api", "--paginate", f"repos/{repo_slug()}/pulls/{a.number}/comments"]) or []
+    rows = classify_findings(comments, head, all_commits=a.all)
+    if a.unreplied:
+        rows = [r for r in rows if not r["replied"]]
+    reviews = bot_reviews(a.number)
+    at_head = [r for r in reviews if r.get("commit_id") == head]
+    verdict, body_rows = review_body_findings(at_head[-1].get("body") if at_head else "")
+    o.data = {"head": head, "inline": rows, "verdict": verdict, "body": body_rows,
+              "review_at_head": bool(at_head)}
+    o.text(f"head={head[:9]} review@head={'yes' if at_head else 'no'} verdict={verdict or '-'} "
+           f"inline={len(rows)} body={len(body_rows)}")
+    for r in rows:
+        mark = "R" if r["replied"] else "-"
+        o.text(f"{r['id']} {mark} {r['severity']} {r['path']}:{r['line']} @{r['commit']} {r['summary']}")
+    for b in body_rows:
+        o.text(f"body {b['severity']} {b['where']} {b['summary']}")
+    o.emit()
+    return 0
+
+
+def cmd_pr_reply(a):
+    o = Out(a.json)
+    body = read_body_arg(a.body)
+    if not body.strip():
+        raise CliError("empty reply body", 64)
+    path = write_temp(body)
+    try:
+        res = gh_json(["api", f"repos/{repo_slug()}/pulls/{a.number}/comments/{a.comment}/replies",
+                       "-F", f"body=@{path}"])
+    finally:
+        os.unlink(path)
+    o.data = {"reply_id": res.get("id"), "in_reply_to": a.comment}
+    o.text(f"replied {res.get('id')} -> {a.comment}")
+    o.emit()
+    return 0
+
+
+def cmd_pr_review(a):
+    o = Out(a.json)
+    path = write_temp("@claude-fleet review\n")
+    try:
+        rc, out, err = run(["gh", "pr", "comment", str(a.number), "--body-file", path])
+    finally:
+        os.unlink(path)
+    if rc != 0:
+        raise CliError(f"gh pr comment: {last_line(err)}")
+    o.data = {"url": out.strip()}
+    o.text(f"review requested {out.strip()}")
+    o.emit()
+    return 0
+
+
+def cmd_pr_wait(a):
+    deadline = time.monotonic() + a.timeout
+    while True:
+        s = pr_state(a.number)
+        settled = s["ci"]["pending"] == 0 and (a.ci_only or s["review_at_head"] is not None)
+        if settled or s["state"] != "OPEN" or time.monotonic() >= deadline:
+            break
+        time.sleep(a.interval)
+    o = Out(a.json)
+    o.data = dict(s, settled=settled)
+    o.text(("settled " if settled else "waiting ") + pr_line(s))
+    o.emit()
+    return 0 if settled or s["state"] != "OPEN" else 75
+
+
+LANDED_Q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
+            "{state mergeCommit{oid} mergeQueueEntry{state position}}}}")
+
+
+def landed_once(n):
+    owner, name = repo_slug().split("/", 1)
+    d = gh_json(["api", "graphql", "-f", f"query={LANDED_Q}", "-F", f"o={owner}", "-F", f"r={name}",
+                 "-F", f"n={n}"])
+    pr = d["data"]["repository"]["pullRequest"]
+    return {"state": pr["state"], "merge_commit": (pr.get("mergeCommit") or {}).get("oid"),
+            "queue": (pr.get("mergeQueueEntry") or {}).get("state"),
+            "position": (pr.get("mergeQueueEntry") or {}).get("position")}
+
+
+def cmd_pr_landed(a):
+    deadline = time.monotonic() + a.wait
+    misses = 0
+    while True:
+        s = landed_once(a.number)
+        if s["state"] == "MERGED" or time.monotonic() >= deadline:
+            break
+        misses = misses + 1 if not s["queue"] else 0
+        if misses >= 2 and a.wait:
+            break
+        time.sleep(a.interval)
+    o = Out(a.json)
+    o.data = s
+    o.text(f"pr {a.number} {s['state']} queue={s['queue'] or 'none'}"
+           f"{' pos=' + str(s['position']) if s['position'] is not None else ''}"
+           f"{' merged=' + s['merge_commit'][:9] if s['merge_commit'] else ''}")
+    o.emit()
+    if s["state"] == "MERGED":
+        return 0
+    if a.wait and not s["queue"]:
+        return 1
+    return 75 if a.wait else 0
+
+
+def cmd_merge_line(a):
+    o = Out(a.json)
+    args = ["scripts/pr-review-status.sh", str(a.number)]
+    if a.confirm_addressed:
+        args.append("--confirm-addressed")
+    env = {"ALLOW_STALE_SHAPE_SITES": "1"} if a.allow_stale_shape_sites else None
+    rc, out, err = run(args, env=env)
+    lines = out.splitlines()
+    merge = next((l.strip().lstrip("-> ").strip() for l in lines if "gh pr merge" in l), "")
+    reasons = [l.strip()[3:] for l in lines if l.strip().startswith("->") and "gh pr merge" not in l]
+    o.data = {"merge_line": merge, "status": lines[0] if lines else "", "notes": reasons, "rc": rc}
+    o.text(merge if merge else "NO MERGE LINE")
+    for r in reasons:
+        o.text("  " + r[:200])
+    o.emit()
+    return 0 if merge else 1
+
+
+def cmd_fresh(a):
+    o = Out(a.json)
+    rc, out, err = run(["scripts/guards/assert-fresh-merge-base.sh", str(a.number)])
+    o.data = {"rc": rc, "fresh": rc == 0, "detail": (out + err).strip().splitlines()[:6]}
+    o.text(f"fresh={rc == 0} rc={rc}")
+    for l in o.data["detail"]:
+        o.text("  " + l[:200])
+    o.emit()
+    return rc
+
+
+# ---------------------------------------------------------------- issues and epics
+
+
+CHECK = re.compile(r"^(\s*-\s*\[)([ xX])(\]\s.*)$")
+
+
+def checklist(body):
+    done = todo = 0
+    for line in (body or "").splitlines():
+        m = CHECK.match(line)
+        if m:
+            if m.group(2) == " ":
+                todo += 1
+            else:
+                done += 1
+    return done, todo
+
+
+def tick_lines(body, patterns, untick=False):
+    out, changed = [], 0
+    want = " " if untick else "x"
+    for line in body.splitlines():
+        m = CHECK.match(line)
+        if m and any(p in line for p in patterns) and m.group(2).lower() != want:
+            line = m.group(1) + want + m.group(3)
+            changed += 1
+        out.append(line)
+    trail = "\n" if body.endswith("\n") else ""
+    return "\n".join(out) + trail, changed
+
+
+def cmd_issue(a):
+    o = Out(a.json)
+    v = gh_json(["issue", "view", str(a.number), "--json",
+                 "number,title,state,assignees,body,comments,labels"])
+    done, todo = checklist(v.get("body"))
+    comments = v.get("comments") or []
+    last = [{"author": (c.get("author") or {}).get("login"), "at": c.get("createdAt"),
+             "first_line": (c.get("body") or "").strip().split("\n", 1)[0][:160]}
+            for c in comments[-a.comments:]] if a.comments else []
+    o.data = {"number": v["number"], "title": v["title"], "state": v["state"],
+              "assignees": [x.get("login") for x in v.get("assignees") or []],
+              "labels": [x.get("name") for x in v.get("labels") or []],
+              "checklist_done": done, "checklist_todo": todo, "comments": len(comments),
+              "last_comments": last}
+    if a.body:
+        o.data["body"] = v.get("body")
+    o.text(f"issue {v['number']} {v['state']} [{done}/{done + todo}] comments={len(comments)} "
+           f"{v['title']}")
+    for c in last:
+        o.text(f"  {c['at']} {c['author']}: {c['first_line']}")
+    if a.body:
+        o.text(v.get("body") or "")
+    o.emit()
+    return 0
+
+
+def cmd_issue_tick(a):
+    o = Out(a.json)
+    v = gh_json(["issue", "view", str(a.number), "--json", "body"])
+    body, changed = tick_lines(v.get("body") or "", a.patterns, a.untick)
+    if changed:
+        path = write_temp(body)
+        try:
+            rc, _, err = run(["gh", "issue", "edit", str(a.number), "--body-file", path])
+        finally:
+            os.unlink(path)
+        if rc != 0:
+            raise CliError(f"gh issue edit: {last_line(err)}")
+        back = gh_json(["issue", "view", str(a.number), "--json", "body"]).get("body") or ""
+        if back.strip() != body.strip():
+            raise CliError("body read back differs from what was written (another writer?)")
+    done, todo = checklist(body)
+    o.data = {"changed": changed, "checklist_done": done, "checklist_todo": todo}
+    o.text(f"changed={changed} [{done}/{done + todo}]")
+    o.emit()
+    return 0 if changed else 1
+
+
+def cmd_issue_note(a):
+    o = Out(a.json)
+    body = read_body_arg(a.body)
+    if not body.strip():
+        raise CliError("empty comment body", 64)
+    path = write_temp(body)
+    try:
+        rc, out, err = run(["gh", "issue", "comment", str(a.number), "--body-file", path])
+    finally:
+        os.unlink(path)
+    if rc != 0:
+        raise CliError(f"gh issue comment: {last_line(err)}")
+    o.data = {"url": out.strip()}
+    o.text(out.strip())
+    o.emit()
+    return 0
+
+
+EPIC_ROW = re.compile(r"^([0-9a-f]{8}-[0-9a-f-]{27})\s+(\S+)\s+(\S+)\s+(.*)$")
+
+
+def parse_epic_status(text):
+    rows = []
+    for line in text.splitlines():
+        m = EPIC_ROW.match(line.strip())
+        if m:
+            rows.append({"task": m.group(1), "start": m.group(2), "result": m.group(3),
+                         "pr": m.group(4).strip()})
+    return rows
+
+
+def cmd_epic(a):
+    o = Out(a.json)
+    args = ["scripts/epic-status.sh", str(a.number)] + (["--fresh"] if a.fresh else [])
+    rc, out, err = run(args)
+    rows = parse_epic_status(out)
+    header = next((l for l in out.splitlines() if l.startswith("==")), "").strip("= ").strip()
+    o.data = {"epic": a.number, "header": header, "tasks": rows, "rc": rc}
+    o.text(header or f"epic {a.number} rc={rc}")
+    for r in rows:
+        o.text(f"  {r['task'][:8]} start={r['start']} result={r['result']} pr={r['pr']}")
+    o.emit()
+    return rc
+
+
+# ---------------------------------------------------------------- fleet
+
+
+def cp_config():
+    url = os.environ.get("FLEET_CP_URL") or os.environ.get("FLEET_PUBLIC_URL")
+    token = os.environ.get("FLEET_ENQUEUE_TOKEN")
+    env_file = Path(os.environ.get("RAVEL_FLEET_CP_ENV", Path.home() / ".fleet" / "cp.env"))
+    if (not url or not token) and env_file.is_file():
+        for line in env_file.read_text().splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip().strip('"').strip("'")
+            if k.strip() in ("FLEET_CP_URL", "FLEET_PUBLIC_URL") and not url:
+                url = v
+            elif k.strip() == "FLEET_ENQUEUE_TOKEN" and not token:
+                token = v
+    if not url or not token:
+        raise CliError("no control-plane URL or token (FLEET_CP_URL/FLEET_PUBLIC_URL, FLEET_ENQUEUE_TOKEN or ~/.fleet/cp.env)")
+    return url.rstrip("/"), token
+
+
+def cp_task(task):
+    url, token = cp_config()
+    req = urllib.request.Request(f"{url}/v1/tasks/{task}", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise CliError(f"control plane HTTP {e.code} for task {task}")
+    except (urllib.error.URLError, OSError) as e:
+        raise CliError(f"control plane unreachable: {e}")
+
+
+def result_diff(task):
+    ref = f"refs/heads/task/{task}/result"
+    local = f"refs/remotes/origin/agent-cli/{task}"
+    rc, _, err = run(["git", "fetch", "-q", "origin", f"+{ref}:{local}"])
+    if rc != 0:
+        return {"error": last_line(err) or "fetch failed"}
+    run(["git", "fetch", "-q", "origin", "main"])
+    _, log, _ = run(["git", "log", "--format=%h %s", f"origin/main..{local}"])
+    _, stat, _ = run(["git", "diff", "--shortstat", f"origin/main...{local}"])
+    _, files, _ = run(["git", "diff", "--name-only", f"origin/main...{local}"])
+    return {"commits": log.strip().splitlines(), "shortstat": stat.strip(),
+            "files": files.strip().splitlines()}
+
+
+def cmd_task(a):
+    deadline = time.monotonic() + a.wait
+    while True:
+        t = cp_task(a.task)
+        status = (t.get("status") or "").lower()
+        if status in TERMINAL_TASK or time.monotonic() >= deadline:
+            break
+        time.sleep(a.interval)
+    results = t.get("results")
+    if isinstance(results, str):
+        # The control plane renders this field as a Python literal, not JSON.
+        try:
+            results = ast.literal_eval(results)
+        except (ValueError, SyntaxError):
+            results = {}
+    commit = (results or {}).get("commit") if isinstance(results, dict) else None
+    report = t.get("result") or ""
+    o = Out(a.json)
+    o.data = {"task": a.task, "status": status, "result_ref": t.get("result_ref") or "",
+              "commit": commit, "report": report if a.full else report[: a.chars]}
+    o.text(f"task {a.task[:8]} {status} ref={'yes' if t.get('result_ref') else 'no'}"
+           f"{' commit=' + commit[:9] if commit else ''}")
+    if a.diff and t.get("result_ref"):
+        d = result_diff(a.task)
+        o.data["diff"] = d
+        o.text(f"  {d.get('shortstat') or d.get('error', '')}")
+        for c in d.get("commits", []):
+            o.text(f"  {c}")
+    if report:
+        o.text("--- report" + ("" if a.full or len(report) <= a.chars else f" (first {a.chars} of {len(report)} chars, --full for all)"))
+        o.text(o.data["report"])
+    o.emit()
+    if status not in TERMINAL_TASK:
+        return 75 if a.wait else 0
+    return 0 if status == "done" else 1
+
+
+SPEC_BAD = [("backtick", re.compile(r"`")), ("dollar-paren", re.compile(r"\$\(")),
+            ("em-dash", re.compile("—"))]
+
+
+def lint_spec_text(text):
+    hits = []
+    for i, line in enumerate(text.splitlines(), 1):
+        for kind, rx in SPEC_BAD:
+            for m in rx.finditer(line):
+                hits.append({"line": i, "col": m.start() + 1, "kind": kind})
+    return hits
+
+
+def cmd_spec_lint(a):
+    o = Out(a.json)
+    report = {}
+    for f in a.files:
+        report[f] = lint_spec_text(Path(f).read_text())
+    o.data = report
+    for f, hits in report.items():
+        o.text(f"{f}: {len(hits)} hit(s)")
+        for h in hits[:20]:
+            o.text(f"  {h['line']}:{h['col']} {h['kind']}")
+    o.emit()
+    return 1 if any(report.values()) else 0
+
+
+def mcp_server():
+    cfg = json.loads((Path.home() / ".claude.json").read_text())
+    found = []
+
+    def walk(d):
+        if isinstance(d, dict):
+            srv = d.get("fleet-dispatch")
+            if isinstance(srv, dict) and "command" in srv:
+                found.append(srv)
+                return
+            for v in d.values():
+                walk(v)
+
+    walk(cfg)
+    if not found:
+        raise CliError("no fleet-dispatch MCP server in ~/.claude.json")
+    return found[0]
+
+
+def mcp_call(tool, arguments):
+    srv = mcp_server()
+    env = dict(os.environ)
+    env.update(srv.get("env") or {})
+    p = subprocess.Popen([srv["command"]] + list(srv.get("args") or []), stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True,
+                         cwd=ROOT)
+
+    def send(obj):
+        p.stdin.write(json.dumps(obj) + "\n")
+        p.stdin.flush()
+
+    def recv(want_id):
+        # Skip notifications and log lines until the response with our id.
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                return None
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("id") == want_id:
+                return msg
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                         "clientInfo": {"name": "agent-cli", "version": "1"}}})
+        recv(1)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": tool, "arguments": arguments}})
+        resp = recv(2)
+    finally:
+        p.terminate()
+    text = ""
+    for part in ((resp or {}).get("result") or {}).get("content") or []:
+        text += part.get("text", "")
+    if (resp or {}).get("error") or ((resp or {}).get("result") or {}).get("isError"):
+        raise CliError(f"{tool} failed: {text[:300] or resp.get('error')}")
+    return text
+
+
+def fresh_main():
+    run(["git", "fetch", "-q", "origin", "main"], check=True)
+    _, sha, _ = run(["git", "rev-parse", "origin/main"], check=True)
+    return sha.strip()
+
+
+def cmd_dispatch(a):
+    spec = Path(a.spec).read_text()
+    hits = lint_spec_text(spec)
+    if hits:
+        raise CliError(f"spec has {len(hits)} forbidden character(s) (first: line {hits[0]['line']} "
+                       f"{hits[0]['kind']}); run agent-cli spec-lint {a.spec}", 1)
+    main_sha = fresh_main()
+    ref_sha = main_sha
+    if a.ref:
+        run(["git", "fetch", "-q", "origin", a.ref], check=True)
+        _, ref_sha, _ = run(["git", "rev-parse", "FETCH_HEAD"], check=True)
+        ref_sha = ref_sha.strip()
+    env = {}
+    if a.paths:
+        env["DISPATCH_PATHS"] = a.paths
+    if a.fix:
+        env["DISPATCH_SKIP_DUPLICATE_CHECK"] = "1"
+    rc, out, err = run(["scripts/fleet-dispatch-intent.sh", "intent", str(a.epic), str(a.ticket), main_sha],
+                       env=env)
+    if rc != 0:
+        raise CliError(f"intent refused rc={rc}: {last_line(err or out)}", rc)
+    nonce = last_line(out)
+    arguments = {"spec": spec, "ref": ref_sha, "model": a.model, "expects_ref": not a.read_only}
+    if a.effort:
+        arguments["effort"] = a.effort
+    if a.label:
+        k, _, v = a.label.partition("=")
+        arguments["label_selector"] = {k: v}
+    try:
+        text = mcp_call("fleet_dispatch", arguments)
+    except CliError:
+        run(["scripts/fleet-dispatch-intent.sh", "failed", str(a.epic), nonce])
+        raise
+    m = re.search(r"Dispatched task ([0-9a-f-]{36})", text)
+    if not m:
+        run(["scripts/fleet-dispatch-intent.sh", "failed", str(a.epic), nonce])
+        raise CliError(f"no task id in dispatch answer: {text[:200]}")
+    task = m.group(1)
+    watch = re.search(r"https?://\S+/watch\?token=[A-Za-z0-9._-]+", text)
+    watch_file = ""
+    if watch:
+        wdir = Path(tempfile.gettempdir()) / "agent-cli" / "watch"
+        wdir.mkdir(parents=True, exist_ok=True)
+        watch_file = str(wdir / f"{task}.url")
+        Path(watch_file).write_text(watch.group(0))
+        os.chmod(watch_file, 0o600)
+    rec_rc, _, rec_err = run(["scripts/fleet-dispatch-intent.sh", "record", str(a.epic), nonce, task])
+    orch_rc, _, orch_err = run(["scripts/epic-orchestrator.sh", "record", str(a.epic), "task-dispatched",
+                                f"ticket={a.ticket}", f"task={task}", f"ref={ref_sha}"])
+    o = Out(a.json)
+    o.data = {"task": task, "ref": ref_sha, "watch_file": watch_file, "nonce": nonce,
+              "record_rc": rec_rc, "orchestrator_rc": orch_rc}
+    o.text(f"task={task} ref={ref_sha[:9]} watch={watch_file or '-'}")
+    if rec_rc or orch_rc:
+        o.text(f"  WARN record rc={rec_rc} {last_line(rec_err)} orchestrator rc={orch_rc} {last_line(orch_err)}")
+    o.emit()
+    return 0 if not (rec_rc or orch_rc) else 1
+
+
+# ---------------------------------------------------------------- local checks
+
+
+DOCS_GATES = [
+    ("check_docs", ["python3", "scripts/check_docs.py"]),
+    ("doc_claims", ["python3", "scripts/check-doc-claims.py"]),
+    ("amendments", ["scripts/guards/check-amendment-integrity.sh"]),
+    ("adr_bands", ["scripts/guards/check-adr-band-sources.sh"]),
+    ("changelog_fragments", ["scripts/changelog-assemble.sh", "--check"]),
+]
+
+
+def cmd_docs_check(a):
+    o = Out(a.json)
+    gates = list(DOCS_GATES) + [("changelog_touched",
+                                 ["scripts/guards/check-changelog-touched.sh", a.base, "HEAD"])]
+    results = []
+    for name, cmd in gates:
+        rc, out, err = run(cmd, cwd=Path.cwd())
+        results.append({"gate": name, "rc": rc, "last": last_line(out + "\n" + err)[:200]})
+    o.data = {"gates": results}
+    for r in results:
+        o.text(f"{'ok  ' if r['rc'] == 0 else 'FAIL'} {r['gate']} rc={r['rc']} {r['last'] if r['rc'] else ''}".rstrip())
+    o.emit()
+    return 0 if all(r["rc"] == 0 for r in results) else 1
+
+
+def cmd_authorship(a):
+    o = Out(a.json)
+    email = a.email
+    if not email:
+        _, email, _ = run(["git", "config", "user.email"], cwd=Path.cwd())
+        email = email.strip()
+    rc, out, err = run(["scripts/guards/assert-clean-authorship.sh", a.ref, email], cwd=Path.cwd())
+    o.data = {"rc": rc, "email": email, "detail": last_line(out + "\n" + err)}
+    o.text(f"authorship {'clean' if rc == 0 else 'FAIL'} rc={rc} {o.data['detail']}")
+    o.emit()
+    return rc
+
+
+def du_kib(path):
+    rc, out, _ = run(["du", "-sk", str(path)], cwd="/")
+    try:
+        return int(out.split()[0]) if rc == 0 else None
+    except (IndexError, ValueError):
+        return None
+
+
+def cmd_box(a):
+    o = Out(a.json)
+    st = os.statvfs(str(ROOT))
+    free_gib = st.f_bavail * st.f_frsize / 2 ** 30
+    load = os.getloadavg()
+    _, ps, _ = run(["ps", "-axo", "comm"], cwd="/")
+    names = [os.path.basename(l.strip()) for l in ps.splitlines()[1:]]
+    builds = {n: names.count(n) for n in ("cargo", "rustc", "ld", "cc", "node", "java") if names.count(n)}
+    executor = Path.home() / ".fleet" / "executor"
+    work = executor / "work"
+    task_dir = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    running = sorted(p.name for p in work.iterdir() if p.is_dir() and task_dir.match(p.name)) \
+        if work.is_dir() else []
+    o.data = {"free_gib": round(free_gib, 1), "load": [round(x, 2) for x in load],
+              "build_procs": builds, "executor_tasks_running": running}
+    if a.du:
+        o.data["executor_cargo_target_gib"] = round((du_kib(executor / "cache" / "cargo-target") or 0) / 2 ** 20, 1)
+        go_cache = Path.home() / "Library" / "Caches" / "go-build"
+        if go_cache.is_dir():
+            o.data["go_build_cache_gib"] = round((du_kib(go_cache) or 0) / 2 ** 20, 1)
+    o.text(f"free={o.data['free_gib']}GiB load={'/'.join(str(x) for x in o.data['load'])} "
+           f"builds={','.join(f'{k}:{v}' for k, v in builds.items()) or 'none'} "
+           f"executor_tasks={','.join(r[:8] for r in running) or 'none'}")
+    if a.du:
+        o.text(f"  executor_target={o.data['executor_cargo_target_gib']}GiB"
+               f"{' go_cache=' + str(o.data['go_build_cache_gib']) + 'GiB' if 'go_build_cache_gib' in o.data else ''}")
+    o.emit()
+    return 0
+
+
+def worktrees():
+    _, out, _ = run(["git", "worktree", "list", "--porcelain"], check=True)
+    rows, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line.strip():
+            if cur:
+                rows.append(cur)
+            cur = {}
+            continue
+        key, _, val = line.partition(" ")
+        if key == "worktree":
+            cur["path"] = val
+        elif key == "HEAD":
+            cur["head"] = val[:9]
+        elif key == "branch":
+            cur["branch"] = val.replace("refs/heads/", "")
+        elif key == "detached":
+            cur["branch"] = "(detached)"
+    return rows
+
+
+def primary_path():
+    _, common, _ = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], check=True)
+    return str(Path(common.strip()).parent)
+
+
+def cmd_wt(a):
+    o = Out(a.json)
+    if a.action == "ls":
+        rows = worktrees()
+        if a.dirty:
+            for r in rows:
+                _, st, _ = run(["git", "-C", r["path"], "status", "--porcelain"], cwd="/")
+                r["dirty"] = len(st.splitlines())
+        o.data = {"worktrees": rows}
+        for r in rows:
+            o.text(f"{r.get('head', '-')} {r.get('branch', '-'):<28} {r['path']}"
+                   f"{' dirty=' + str(r['dirty']) if r.get('dirty') else ''}")
+        o.emit()
+        return 0
+    if a.action == "new":
+        if not a.name:
+            raise CliError("wt new needs NAME", 64)
+        prim = Path(primary_path())
+        path = prim.parent / f"{prim.name}-wt-{a.name}"
+        run(["git", "fetch", "-q", "origin", "main"], check=True)
+        cmd = ["git", "worktree", "add", "-q"]
+        cmd += ["-b", a.branch] if a.branch else ["--detach"]
+        cmd += [str(path), a.ref]
+        run(cmd, check=True)
+        o.data = {"path": str(path), "ref": a.ref, "branch": a.branch}
+        o.text(str(path))
+        o.emit()
+        return 0
+    if a.action == "rm":
+        if not a.name:
+            raise CliError("wt rm needs PATH", 64)
+        path = str(Path(a.name).resolve())
+        if path == primary_path():
+            raise CliError("refusing to remove the primary checkout", 1)
+        cmd = ["git", "worktree", "remove"] + (["--force"] if a.force else []) + [path]
+        run(cmd, check=True)
+        o.data = {"removed": path}
+        o.text(f"removed {path}")
+        o.emit()
+        return 0
+    raise CliError(f"unknown wt action {a.action}", 64)
+
+
+def cmd_main(a):
+    o = Out(a.json)
+    sha = fresh_main()
+    _, info, _ = run(["git", "log", "-1", "--format=%cr|%s", sha])
+    age, _, subj = info.strip().partition("|")
+    o.data = {"sha": sha, "age": age, "subject": subj}
+    o.text(f"main {sha} {age} {subj}")
+    o.emit()
+    return 0
+
+
+HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def adr_headings(text):
+    rows, fence = [], None
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            mark = s[:3]
+            fence = None if fence == mark else (fence or mark)
+            continue
+        if fence:
+            continue
+        m = HEADING.match(line)
+        if m:
+            rows.append({"line": i, "level": len(m.group(1)), "title": m.group(2).strip(),
+                         "amendment": bool(re.search(r"\b(amend|correction)", m.group(2), re.I))})
+    return rows
+
+
+def section_text(text, query):
+    lines = text.splitlines()
+    heads = adr_headings(text)
+    q = query.lower()
+    hit = next((h for h in heads if q in h["title"].lower()), None)
+    if not hit:
+        return None, None
+    end = len(lines)
+    for h in heads:
+        if h["line"] > hit["line"] and h["level"] <= hit["level"]:
+            end = h["line"] - 1
+            break
+    return hit, "\n".join(lines[hit["line"] - 1:end])
+
+
+def cmd_adr(a):
+    o = Out(a.json)
+    ref = a.ref
+    if ref.startswith("origin/") and ref != "origin/main":
+        run(["git", "fetch", "-q", "origin", f"+{ref[7:]}:refs/remotes/{ref}"])
+    elif ref == "origin/main":
+        run(["git", "fetch", "-q", "origin", "main"])
+    _, names, _ = run(["git", "ls-tree", "--name-only", ref, "docs/adrs/"], check=True)
+    num = str(a.number).zfill(4)
+    path = next((n for n in names.splitlines() if Path(n).name.startswith(num + "-")), None)
+    if not path:
+        raise CliError(f"no ADR {num} on {ref}", 1)
+    _, text, _ = run(["git", "show", f"{ref}:{path}"], check=True)
+    status = next((l.split(":", 1)[1].strip() for l in text.splitlines()[:12]
+                   if l.lstrip("- ").lower().startswith("status")), "")
+    heads = adr_headings(text)
+    o.data = {"path": path, "ref": ref, "status": status, "lines": len(text.splitlines()),
+              "headings": heads}
+    if a.section:
+        hit, body = section_text(text, a.section)
+        if not hit:
+            raise CliError(f"no heading matching '{a.section}' in {path}", 1)
+        o.data["section"] = {"title": hit["title"], "line": hit["line"], "text": body}
+        o.text(f"{path}:{hit['line']} {hit['title']}")
+        o.text(body)
+    else:
+        o.text(f"{path} status={status or '-'} lines={o.data['lines']}")
+        for h in heads:
+            if h["level"] <= a.depth:
+                o.text(f"  {h['line']:>5} {'#' * h['level']} {h['title'][:110]}{'  [amendment]' if h['amendment'] else ''}")
+    o.emit()
+    return 0
+
+
+# ---------------------------------------------------------------- parser
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="print one JSON object instead of terse text")
+    p = argparse.ArgumentParser(prog="agent-cli", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    def add(name, func, help_text, desc=None):
+        sp = sub.add_parser(name, parents=[common], help=help_text, description=desc or help_text)
+        sp.set_defaults(func=func)
+        return sp
+
+    sp = add("pr", cmd_pr, "PR state in one line: head, merge state, CI counts, review at head, findings",
+             "One call for what used to be gh pr view + gh pr checks + the reviews and comments "
+             "endpoints. ci=pass/wait/fail/skip; findings@head counts the claude-fleet inline "
+             "comments on the head commit by severity; unreplied counts those nobody answered.")
+    sp.add_argument("number", type=int)
+
+    sp = add("pr-findings", cmd_pr_findings, "claude-fleet findings on a PR: inline comments and review-body bullets",
+             "Lists each top-level claude-fleet inline comment (id, R=replied or -, severity, path:line, "
+             "commit, first sentence) on the head commit, plus the findings bullets of the latest "
+             "review at head. Use the id with pr-reply.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--all", action="store_true", help="include comments on earlier commits")
+    sp.add_argument("--unreplied", action="store_true", help="only comments nobody has answered")
+
+    sp = add("pr-reply", cmd_pr_reply, "reply to one inline review comment, body from TEXT, - (stdin) or @FILE",
+             "Posts through pulls/N/comments/ID/replies with -F body=@file, so backticks in the "
+             "body are never evaluated by a shell.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("comment", type=int)
+    sp.add_argument("body")
+
+    sp = add("pr-review", cmd_pr_review, "post '@claude-fleet review' on a PR (a push never starts one)")
+    sp.add_argument("number", type=int)
+
+    sp = add("pr-wait", cmd_pr_wait, "wait until CI has no pending check and a review exists at head",
+             "Bounded poll (default 540 s, inside the Bash tool's 600 s cap). Exit 0 settled or "
+             "PR not open, 75 when the budget ran out: run it again.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--timeout", type=int, default=540)
+    sp.add_argument("--interval", type=int, default=45)
+    sp.add_argument("--ci-only", action="store_true", help="do not wait for a review at head")
+
+    sp = add("pr-landed", cmd_pr_landed, "merge-queue state, merge commit; --wait polls until merged",
+             "One GraphQL read of state, mergeCommit and mergeQueueEntry. With --wait S, polls until "
+             "MERGED (exit 0), two consecutive reads with no queue entry and not merged (exit 1, "
+             "ejected or never queued), or the budget ends (exit 75).")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--wait", type=int, default=0)
+    sp.add_argument("--interval", type=int, default=60)
+
+    sp = add("merge-line", cmd_merge_line, "the pinned merge command from scripts/pr-review-status.sh, or why there is none",
+             "Runs scripts/pr-review-status.sh and prints only its merge line (with ALLOW_LITERAL_SHA=1 "
+             "already on it) or the notes that withheld it. Exit 1 when there is no line. Pass "
+             "--confirm-addressed only after every inline comment is fixed or answered.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--confirm-addressed", action="store_true")
+    sp.add_argument("--allow-stale-shape-sites", action="store_true",
+                    help="only after checking every shape-guard hit by hand")
+
+    sp = add("fresh", cmd_fresh, "is the PR's merge base current with origin/main (assert-fresh-merge-base.sh)")
+    sp.add_argument("number", type=int)
+
+    sp = add("issue", cmd_issue, "issue state, checklist progress, last comments",
+             "Checklist counts '- [ ]' and '- [x]' lines in the body.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--comments", type=int, default=3, help="how many recent comments to show (default 3)")
+    sp.add_argument("--body", action="store_true", help="also print the body")
+
+    sp = add("issue-tick", cmd_issue_tick, "tick (or --untick) checklist lines containing PATTERN; verifies the read-back",
+             "Rewrites the issue body through --body-file and reads it back; exit 1 when no line changed.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("patterns", nargs="+", metavar="PATTERN")
+    sp.add_argument("--untick", action="store_true")
+
+    sp = add("issue-note", cmd_issue_note, "post an issue comment from TEXT, - (stdin) or @FILE, never through a shell string")
+    sp.add_argument("number", type=int)
+    sp.add_argument("body")
+
+    sp = add("epic", cmd_epic, "epic ledger reconciliation (scripts/epic-status.sh) as rows")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--fresh", action="store_true", help="bypass the 60 s cache")
+
+    sp = add("task", cmd_task, "fleet task status and its full final report from the control plane",
+             "Reads GET /v1/tasks/ID (no transcript needed). --diff fetches the result ref and lists "
+             "its commits and shortstat against origin/main. --wait S polls until terminal (exit 75 "
+             "if it is still running). Exit 1 for a terminal state other than done.")
+    sp.add_argument("task")
+    sp.add_argument("--full", action="store_true", help="print the whole report")
+    sp.add_argument("--chars", type=int, default=1500, help="report characters to print without --full")
+    sp.add_argument("--diff", action="store_true")
+    sp.add_argument("--wait", type=int, default=0)
+    sp.add_argument("--interval", type=int, default=60)
+
+    sp = add("dispatch", cmd_dispatch, "fleet dispatch with the intent, record and ledger steps in one call",
+             "Lints the spec, runs fleet-dispatch-intent.sh intent against a fresh origin/main, calls "
+             "the fleet_dispatch MCP tool, then records the task in the intent comments and the epic "
+             "body. The watch URL (it carries a token) is written to a 0600 file whose path is printed; "
+             "use it with scripts/fleet-watch-loop.sh \"$(cat FILE)\".")
+    sp.add_argument("--epic", type=int, required=True)
+    sp.add_argument("--ticket", type=int, required=True)
+    sp.add_argument("--spec", required=True, help="the full spec file (head plus body)")
+    sp.add_argument("--ref", help="branch to dispatch from (a fix round's result or PR branch); default origin/main")
+    sp.add_argument("--paths", help="predicted files, comma-separated (DISPATCH_PATHS)")
+    sp.add_argument("--fix", action="store_true", help="a fix round on the same ticket (skips the duplicate check)")
+    sp.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    sp.add_argument("--model", default="opus")
+    sp.add_argument("--label", default="arch=amd64", help="label_selector key=value")
+    sp.add_argument("--read-only", action="store_true", help="expects_ref false (a verification task)")
+
+    sp = add("spec-lint", cmd_spec_lint, "find backticks, dollar-paren and em-dashes a fleet spec must not carry")
+    sp.add_argument("files", nargs="+")
+
+    sp = add("docs-check", cmd_docs_check, "run the docs, ADR and changelog gates; one line each",
+             "check_docs.py, check-doc-claims.py, check-amendment-integrity.sh, "
+             "check-adr-band-sources.sh, changelog-assemble.sh --check and "
+             "check-changelog-touched.sh BASE HEAD, in the current directory.")
+    sp.add_argument("--base", default="origin/main")
+
+    sp = add("authorship", cmd_authorship, "assert-clean-authorship.sh on REF (default HEAD) with git config user.email")
+    sp.add_argument("ref", nargs="?", default="HEAD")
+    sp.add_argument("--email")
+
+    sp = add("box", cmd_box, "free disk, load, build processes, running executor tasks; --du sizes the caches")
+    sp.add_argument("--du", action="store_true")
+
+    sp = add("wt", cmd_wt, "worktrees: ls [--dirty] | new NAME [--ref R] [--branch B] | rm PATH [--force]",
+             "new creates <primary>-wt-NAME from a fresh origin/main (detached unless --branch). "
+             "rm refuses the primary checkout.")
+    sp.add_argument("action", choices=["ls", "new", "rm"])
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--ref", default="origin/main")
+    sp.add_argument("--branch")
+    sp.add_argument("--dirty", action="store_true")
+    sp.add_argument("--force", action="store_true")
+
+    add("main", cmd_main, "fetch and print origin/main: full sha, age, subject")
+
+    sp = add("adr", cmd_adr, "ADR path, status and heading outline; --section prints one section",
+             "Reads the ADR from a ref without checking it out (default origin/main; pass "
+             "origin/<branch> for an ADR still on a PR). Amendment headings are marked.")
+    sp.add_argument("number", type=int)
+    sp.add_argument("--section", help="print the first section whose heading contains this text")
+    sp.add_argument("--ref", default="origin/main")
+    sp.add_argument("--depth", type=int, default=3, help="heading levels in the outline (default 3)")
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 64
+    try:
+        return args.func(args)
+    except CliError as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(e), "code": e.code}))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
