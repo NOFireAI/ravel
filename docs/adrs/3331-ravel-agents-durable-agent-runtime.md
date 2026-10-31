@@ -950,10 +950,11 @@ precondition row stays `IncarnationMatches, HeadBelowByteCap` with no
 page needs.
 
 **The incarnation fence does the rest.** Every command except `Create`
-runs `check_incarnation`, which runs `check_active`, before anything else
-(`Tombstone` first answers a HEAD already tombstoned at that incarnation
-with `AlreadyTombstoned`), so after
-the tombstone every handle minted under that incarnation answers
+runs `check_incarnation`, which runs `check_active`, before its other
+per-command checks (`Kernel::apply` runs the string and page checks
+first, so an oversized string still answers `BudgetExceeded`;
+`Tombstone` first answers a HEAD already tombstoned at that incarnation
+with `AlreadyTombstoned`), so after the tombstone every handle minted under that incarnation answers
 `AgentGone` (HTTP 404, retry `never`): operation handles on `operation`,
 `result`, `cancel` and `events`; step and effect handles on `worker/step`,
 `worker/effects/complete`, `worker/effects/fail`, `effects/{effect}` and
@@ -1027,13 +1028,18 @@ Today that cache never lets go of a destroyed agent with queued inputs:
 wins would end in `agent_gone` from `BeginTurn`, without end. This
 amendment changes the runtime in three places: `candidates` and `offer`
 skip a root whose lifecycle is not `Active`; `unload_idle` drops a
-non-active root whatever its inbox holds; and an `agent_gone` answer to
-`BeginTurn` replaces the loaded root with the HEAD that refused it. A
-process that did not serve the destroy therefore offers the agent at most
-once more, to the first poll whose `BeginTurn` reads the tombstone, and
-the sweep's next load of the agent skips it. Two runtime tests pin this:
-one for the coordinator that served the destroy, and one for a second
-coordinator on the same store that did not.
+non-active root whatever its inbox and its active turn hold; and an
+`agent_gone` refusal anywhere on the dispatch path replaces the loaded
+root with the HEAD that refused it and moves the scan on to the next
+candidate instead of failing the poll. The refusal can come from
+`Takeover`, which an unowned agent or one whose lease expired meets
+before any `BeginTurn`, or from `BeginTurn`. A process that did not serve
+the destroy therefore offers the agent at most once more, to the first
+poll whose command reads the tombstone, and the sweep's next load of the
+agent skips it. Two runtime tests pin this: one for the coordinator that
+served the destroy, and one for a second coordinator on the same store
+that did not, with an unowned agent so the refusal comes from
+`Takeover`.
 
 **Audit.** A destroy that changes HEAD writes one `kind=agents_destroy`
 record to the tenant's audit shard before the CAS, naming the tenant, the
@@ -1194,7 +1200,7 @@ it:
   both orders, with the loser's re-read refused `AgentGone` and no result
   in a tombstoned HEAD.
 - runtime `a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll`
-- runtime `a_coordinator_that_did_not_serve_the_destroy_stops_offering_the_agent_after_one_refused_begin_turn`
+- runtime `a_coordinator_that_did_not_serve_the_destroy_stops_offering_the_agent_after_one_refused_dispatch`
   and `a_hint_of_a_destroyed_incarnation_fires_nothing_and_is_deleted`.
 - server `audit::tests::the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`;
   `every_route_refuses_a_token_lacking_its_capability` covers the new row
