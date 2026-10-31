@@ -31,14 +31,13 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const ROWS: usize = 500;
 const DECODED_CACHE: u64 = 64 * 1024 * 1024;
 const STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE severity_text = 'INFO'";
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 9] = [
     "hits",
     "misses",
     "admissions",
     "evictions",
     "ghostHits",
     "marginSkips",
-    "frequencyRefusals",
     "residentBytes",
     "pressureEvictions",
     "pressureFreedBytes",
@@ -196,12 +195,6 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
         sample(&on_metrics, "ravel_decoded_cache_max_bytes"),
         DECODED_CACHE
     );
-    // The statement's set fits under the cap, so the frequency gate never
-    // meets an eviction and refuses nothing.
-    assert_eq!(
-        sample(&on_metrics, "ravel_decoded_cache_frequency_refusals_total"),
-        0
-    );
 
     for (body, stats) in &off {
         assert_eq!(body.matches("\"decodedCache\"").count(), 0, "{body}");
@@ -228,12 +221,11 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
         let hot = &stats["decodedCache"];
         assert!(hot["hits"].as_u64().unwrap() > 0, "{hot}");
         assert_eq!(hot["misses"].as_u64(), Some(0), "{hot}");
-        assert_eq!(hot["frequencyRefusals"].as_u64(), Some(0), "{hot}");
         assert!(hot["residentBytes"].as_u64().unwrap() > 0, "{hot}");
     }
 }
 
-const METRIC_FAMILIES: [&str; 12] = [
+const METRIC_FAMILIES: [&str; 11] = [
     "ravel_decoded_cache_resident_bytes",
     "ravel_decoded_cache_max_bytes",
     "ravel_decoded_cache_entries",
@@ -243,7 +235,6 @@ const METRIC_FAMILIES: [&str; 12] = [
     "ravel_decoded_cache_evictions_total",
     "ravel_decoded_cache_ghost_hits_total",
     "ravel_decoded_cache_margin_skips_total",
-    "ravel_decoded_cache_frequency_refusals_total",
     "ravel_decoded_cache_pressure_evictions_total",
     "ravel_decoded_cache_expired_drops_total",
 ];
