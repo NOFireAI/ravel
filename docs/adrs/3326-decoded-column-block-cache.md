@@ -120,7 +120,8 @@ that column: URL 5.29 GB, Title 3.64 GB, SearchPhrase 1.55 GB, Referer
 
 The hot-geomean ceiling assumes that every statement whose set fits
 loses its whole step 2 share and nothing else changes. q21 to q24 gain
-nothing, because their string columns are Contains-tested (decision 1).
+nothing, because their string columns are Contains-tested (decision 1;
+the LIKE-deferred amendment below makes those columns cacheable).
 
 | Budget | Fit, buffer + offsets | Geomean ratio | Fit, today's layout | Geomean ratio | Basis |
 |---|---|---|---|---|---|
@@ -177,7 +178,8 @@ Exclusions, each a property the implementation tests:
   with its dictionary unvalidated and then narrowed to survivors
   (`reader.rs:1766-1784`, `:1554-1580`), so it is neither cached nor served
   from the cache. Caching a validated copy for later Contains statements
-  is a separate decision, not taken here.
+  is a separate decision, not taken here, and taken by the LIKE-deferred
+  amendment below, which serves and admits such a column only validated.
 - **Narrowed values never populate an entry.** No narrowed, survivor-only
   or Arrow value populates an entry, and nothing after step 2 reads from
   one.
@@ -247,7 +249,9 @@ main queue, and #3323 sized that ghost at 30% of the budget.
 
 Eviction is CLOCK over admitted entries, weighted by bytes. Stage 0
 compares this policy with admit-on-first-decode by simulation before
-anything is built (Measurement).
+anything is built (Measurement). An admission that would evict an entry
+accessed at least as often as the newcomer is refused (see the
+LIKE-deferred amendment below).
 
 ### 4. Entries are charged to the shared memory budget and give way to queries
 
@@ -317,7 +321,8 @@ anything is built (Measurement).
   reports fewer cells than the cold try that filled it. The counter
   documentation says so, and the differential test asserts results and
   errors, not counters. `contains_cells_tested` is unaffected, because
-  Contains-tested columns are not cached.
+  Contains-tested columns are not cached (they are cached under the
+  LIKE-deferred amendment below, which states when the count still holds).
 
 ### 6. Whether the ClickBench entry runs with the cache is an owner decision
 
@@ -432,7 +437,7 @@ work, and the readout names the step that missed.
   bounded by the bytes it frees: the shortfall plus the margin (see the
   evictor-slack amendment below).
 - Contains-tested columns gain nothing from this ADR. Their share of q21
-  to q24 stays.
+  to q24 stays (changed by the LIKE-deferred amendment below).
 - The `MemoryBudget` hook is new shared machinery and needs its own
   tests for concurrent reservers and for a hook that cannot free enough.
 
@@ -726,7 +731,8 @@ cells of the surviving rows one by one as before
 `a_bulk_scan_first_miss_is_validated_per_surviving_cell` in
 `crates/ravel-sql/src/logs_scan/batch.rs`; the last pins a bulk scan's first
 touch at 2 decode-time validations and 4 per build, its second at 8 and 0,
-and its hit at 0). A size, budget or concurrent-admission refusal in `offer`
+and its hit at 0). A size, budget or concurrent-admission refusal in `offer`,
+or a refusal by the frequency gate of the LIKE-deferred amendment below,
 can still leave a column validated at decode and not admitted; its
 validation is then spent on this read alone, as it was for every missed
 column before. When the whole values buffer is UTF-8
@@ -756,9 +762,371 @@ still validate on a hit, cell by cell as before:
 
 A `Str` attribute column a `Contains` arm defers is neither validated at
 decode nor cached (`BlockScan::decode_block` skips a deferred column before
-the cache lookup), so the cells of its surviving rows are validated in the
+the cache lookup; the LIKE-deferred amendment below changes this), so the cells of its surviving rows are validated in the
 build, as before (`decoded_cache_serves_identical_rows_and_never_caches_contains_column`
 pins that it is never cached;
 `pushed_like_matches_the_unpushed_scan_and_counts_its_cells` in
 `crates/ravel-sql/src/logs_provider.rs` pins the kept rows' cells as the
 validated count).
+
+## Amendment (2026-10-31): LIKE-deferred columns become cacheable, behind frequency-aware admission
+
+<!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|3. Admission lets a statement's later tries hit, and a one-pass scan does not displace a working set|5. Answers do not change|How big the working set is|Consequences|Amendment (2026-10-30): which cached string columns keep their validation" pointer="LIKE-deferred amendment" -->
+<!-- amendment-supersedes: phrase="Caching a validated copy for later Contains statements is a separate decision, not taken here" pointer="LIKE-deferred amendment" -->
+<!-- amendment-supersedes: phrase="`contains_cells_tested` is unaffected, because Contains-tested columns are not cached" pointer="LIKE-deferred amendment" -->
+
+On the v0.28.0 profile run `prof028-20261030T1244Z` (8 GB cap), most of
+the decode left in the hot sum is in the columns a `Contains` arm defers.
+q21 to q24 decompress URL, and q23 Title as well, on every call: 4,980 MB
+per hot call for q21 and q22, 8,417 MB for q23 and 3,459 MB for q24. Their
+other columns hit on every hot call. Weighted by hot wall, that is about
+3.0 s of the 38.688 s hot sum. These figures come from an investigation of
+that run (per-call statistics and profile shares; scripts `callstats.py`,
+`decowner.py`, `predict.py` and `clocksim.py`). The admission models below
+come from `gatesim2.py` and `tracesim.py`, with their outputs
+`gatesim2.out` and `tracesim.out`. The investigation is #3326 comment
+6542227753, and the scripts and model outputs are #3326 comment
+6542228107.
+
+On main, `contains_columns` (`crates/ravel-logseg/src/reader.rs:2132`)
+puts each such column in `BlockScan.deferred` (`reader.rs:776`).
+`decode_block` skips it before the cache lookup (`reader.rs:1554`), so it
+is never served and never offered. Its dictionary is built unvalidated
+(`reader.rs:1887-1906`; `crates/ravel-logseg/src/block.rs:2912-2913`) and
+then narrowed to the survivors (`reader.rs:1663`).
+
+Two facts make caching it possible, and a third makes it dangerous.
+- The kernel is already exact over a validated dictionary.
+  `EntryTexts::text_of` answers from the dictionary's own validity bits
+  when `DictValues::validated()` holds, and counts nothing
+  (`crates/ravel-logseg/src/dict_values.rs:329-333`, `:185`).
+- Both builds decide UTF-8 with one function, `validate_entry`
+  (`dict_values.rs:435-438`).
+- An unvalidated dictionary served to a later scan without the arm reads
+  wrong. `DictValues::unvalidated` marks no entry valid
+  (`dict_values.rs:165-180`), and the columnar build reads a key only if
+  `is_valid` holds for it (`crates/ravel-sql/src/logs_scan/batch.rs:328-331`).
+  Every row of such a column would read as absent and take the fallback.
+  `DecodedBlock::cached_column` hands out whatever the block holds
+  (`block.rs:2341`), so removing only the `reader.rs:1554` exclusion would
+  cache exactly that.
+
+This amendment changes three decisions:
+- decision 1, the deferred-column exclusion;
+- decision 3, CLOCK admission;
+- decision 5, the `contains_cells_tested` sentence.
+
+Two pull requests deliver it, in order. The first is decision 1 below on
+its own. The second is decisions 2 to 4, stacked on the first.
+
+1. **An admission that would evict an entry accessed at least as often as
+   the newcomer is refused.** This is option (c) of the investigation, and
+   it lands as its own pull request.
+   - **Counts.** Each resident slot (`Slot`,
+     `crates/ravel-logseg/src/decoded_cache.rs:151`) and each ghost record
+     (`decoded_cache.rs:167`) carries an access count, a `u8` that saturates
+     at 15. Each columnar `lookup` (`decoded_cache.rs:401`) adds one:
+     - a hit adds it to the slot's count;
+     - a miss adds it to the key's ghost record, if the key has one.
+
+     An admitted entry starts at its ghost record's count, or at 1 when it
+     has none.
+   - **Ghost records.** A non-interactive first touch still records one
+     (`decoded_cache.rs:470-473`). So, now, does an admission the gate
+     refuses, under any intent; the record carries the newcomer's count. An
+     entry that leaves the index by CLOCK, pressure or age eviction leaves
+     no record. In the model, ghost records on eviction made q22 and q23
+     slightly worse (`gatesim2.out`). They would also let a bulk-scan
+     re-read admit on its first touch. The ghost window still spans the
+     cap in bytes (`decoded_cache.rs:580`).
+   - **The gate.** When an offer has to evict to fit under the cap,
+     `evict_until` (`decoded_cache.rs:597`) compares each unreferenced
+     victim the hand reaches with the newcomer.
+     - A victim whose count is at least the newcomer's ends the walk and
+       refuses the admission, so ties refuse.
+     - Victims the walk evicted before that stay evicted, and reference
+       bits it cleared stay cleared.
+   - **Aging.** Every count, on slots and on ghost records, is halved when
+     the lookups since the last halving reach 10 times the number of slots
+     plus ghost records, with a floor of 65,536. This is TinyLFU's reset. A
+     ClickBench statement makes at most three lookups per key, so no
+     halving happens inside one statement (model: no halvings for q21 to
+     q24, `gatesim2.out`). A stale set therefore gives way when a newcomer
+     out-counts it or when halving ages it out.
+   - **Order in `offer`** (`decoded_cache.rs:453`):
+     1. the size check;
+     2. the intent rule (`Inner::intent_admits`, `decoded_cache.rs:180`,
+        unchanged);
+     3. decision 4's check;
+     4. the gate, during eviction;
+     5. the reservation with the headroom margin, unchanged.
+
+     The second eviction, after the reservation (`decoded_cache.rs:524`),
+     applies the gate too, and a refusal there drops the reservation. A
+     refusal by the gate spends no ghost touch and counts no ghost hit, as
+     a refused reservation does today
+     (`a_refused_reservation_keeps_the_ghost_record_and_its_hit_uncounted`,
+     `decoded_cache.rs:778`).
+   - **Intents.** The gate acts only after the intent rule passes, and only
+     when admission needs an eviction.
+     - An interactive statement still admits on first decode while the
+       cache has room.
+     - A bulk-scan or maintenance statement still admits only on its
+       second touch.
+     - A statement whose set fits under the cap never meets the gate.
+   - **The pressure evictor ignores counts.** `evict_for_pressure`
+     (`decoded_cache.rs:342`) frees any unreferenced entry no scan holds,
+     as before, so a query's reservation never waits on a count. The
+     admission margin and the evictor's slack are unchanged.
+   - **`would_admit`** (`decoded_cache.rs:446`) stays the intent rule
+     alone. A column validated at decode for admission can still be refused
+     by the gate (see the open questions below). Its agreement with `offer`
+     (`would_admit_agrees_with_offer_and_changes_nothing`,
+     `decoded_cache.rs:705`) now holds only while the newcomer fits without
+     eviction or outranks its victim, and that test is narrowed to say so.
+   - **Metrics.** A `frequency_refusals` counter is exported per statement
+     and per process, beside admissions and margin skips.
+
+   Reason: CLOCK as built admits every miss and evicts the first
+   unreferenced slot, and a new slot enters unreferenced
+   (`decoded_cache.rs:534`). A repeated scan larger than the cap therefore
+   evicts the entries just ahead of its own front. Once decision 2 caches
+   q23's deferred columns, its set is about 12.5 GB against an 8 GB cap.
+   The model puts its try-2 and try-3 hit share at 0.000 under CLOCK, base
+   columns included, and at 0.620 to 0.629 with this gate (decision 5's
+   table). Inference: without the gate q23 would regress, so the gate
+   lands first.
+
+2. **A deferred column with a cache entry is served from it** (option (a)).
+   - `decode_block` looks up a deferred column like any other projected
+     column; the `reader.rs:1554` exclusion goes. A hit seeds the block,
+     and the column's pages are not read.
+   - **The kernel runs over the cached strings.** For a dictionary, an
+     entry's verdict comes from its bytes, plus its validity bit where the
+     verdict and the stream fallback differ (`reader.rs:2574-2596`). For a
+     plain column, a cell's verdict comes from its bytes, plus
+     `from_utf8` where they differ (`reader.rs:2560-2571`). A cached copy
+     holds the same bytes as a fresh decode and the same UTF-8 decision
+     (`validate_entry` on both builds), so the surviving rows are the same
+     rows.
+   - **`contains_cells_tested` stays the same for per-block dictionaries
+     and for row groups served or decoded whole.** The verdict memo is keyed
+     by the identity of the `Arc<DictValues>` (`dict_slot`,
+     `reader.rs:2267-2283`), so each entry is tested once per distinct
+     dictionary the scan meets.
+     - A per-block dictionary is one dictionary per block on either path,
+       so the count equals a cold run's. URL and Title take this path in
+       ClickBench.
+     - For a row group dictionary, a call that serves every block of a
+       group, or decodes every block of it, still meets one dictionary per
+       group. A call that mixes the two within one group meets two and can
+       test an entry twice. Only the counter changes then, not the results.
+     - A plain cell is tested once per present selected cell on either
+       path.
+   - **`str_cells_validated`.** A hit validates nothing, and narrowing a
+     validated dictionary reads its bits and counts nothing
+     (`dict_values.rs:329-333`). Prediction: hot q21 counts 0, against
+     10,138 today.
+   - **Narrowing applies to every deferred column, not only unvalidated
+     ones.** Today `build_survivor_values` skips a validated dictionary
+     (`reader.rs:1675-1677`). It now narrows every deferred dictionary
+     column. Without that, step 4 would build each block's whole URL
+     dictionary (inference from q34, where `dict_values_array` is 2.7% of
+     45 CPU-s). `restrict_to` gives the block its own keys and values and
+     leaves the cached copy alone (`block.rs:1465`;
+     `restrict_to_on_a_shared_column_leaves_the_other_holder_unchanged`,
+     `block.rs:4580`).
+   - **A narrowed served column is charged to the scan.** Narrowing a
+     served column removes its id from the block's served list
+     (`reader.rs:1332`). `resident_charge_bytes`
+     (`crates/ravel-logseg/src/columnar.rs:499`) then charges the narrowed
+     copy, which the entry's reservation does not cover. A test pins the
+     scan's charge for a block whose served deferred column was narrowed.
+
+   Reason: a hit skips the page read, the crc, zstd and the decode. Those
+   are 59.6% to 68.1% of q21 to q24's server CPU (inclusive
+   `decode_v4_block_with`). The kernel, the narrowing and step 4 stay.
+
+3. **On a miss, a deferred column the cache will admit is decoded
+   validated and offered** (option (b)).
+   - **Which columns.** A missed deferred column joins `missed` like any
+     other. The validate set (the missed columns `would_admit` accepts,
+     `reader.rs:1574-1585`) now includes deferred columns, and the deferred
+     list passed to the decode (`reader.rs:1593`) leaves them out.
+   - **How they are decoded.** Their dictionaries are built with
+     `from_entries` on both paths (`reader.rs:1908`, `block.rs:2915-2916`).
+     A plain page is validated whole (`PlainColumn::validate_text`,
+     `block.rs:1697`), as for any other admitted column.
+   - **Row group dictionaries.** `DictCache` keeps validated dictionaries
+     in `entries` and unvalidated ones in `raw` (`reader.rs:1785-1789`). A
+     group whose blocks differ on `would_admit` holds both, each decoded
+     once.
+   - **A deferred column the cache will not admit** keeps today's path: an
+     unvalidated decode, then the survivor-only build. It is still offered,
+     so a bulk-scan first touch records its ghost record, and decision 4's
+     check refuses it before any admission.
+   - **With no cache attached, nothing changes.**
+   - **Cold cost.** Try 1 validates every entry, not only the survivors'.
+     Inference from the investigation: about 5 GB of URL text (8.4 GB of
+     URL and Title for q23), 0.5 to 1 CPU-s per call, under 0.1 s of wall
+     time with 12 or more cores busy. The cold-sum band covers it.
+
+   Reason: decision 2 needs entries, and decision 4 admits only validated
+   ones. Validating only what the cache will keep spends that cost where a
+   later hit pays it back.
+
+4. **`offer` refuses an unvalidated dictionary.** A `CachedColumn::Dict`
+   whose `DictValues::validated()` is false is not admitted. `offer`
+   returns `None`, the scan uses the column for this block as decoded, and
+   an `unvalidated_refusals` counter adds one. The check runs after the
+   intent rule, so a bulk-scan first touch of a raw column still records
+   its ghost record.
+   - **A refusal and a counter, not a typed error or a debug assertion.**
+     The column is correct for the scan that decoded it, so failing that
+     scan would turn a caching defect into a query error. The counter can
+     also be nonzero without a defect: a ghost record that another scan
+     creates between `would_admit` and `offer` makes the intent rule pass
+     on a column decoded raw. A debug assertion would fire on that race.
+     Tests assert the counter is zero only on single-threaded runs.
+   - **Plain columns get no validation-state check.** A raw plain column
+     reads exactly for every reader, which validates each cell it reads
+     (`validated_text_reads_as_per_cell_validation`, `block.rs:4070`). The
+     validation-state amendment keeps raw `body` and `severity_text`
+     columns, and `Str` pages that fail the check, cached on purpose.
+     Refusing them would lose that caching and protect nothing.
+   - **Order keeps narrowed copies out.** `offer` runs before
+     `build_survivor_values` (`reader.rs:1601`, `:1645`). No flag can do
+     this: `DictColumn`'s `narrow` flag also marks every row group
+     dictionary (`block.rs:1353-1356`).
+   - **Tests.**
+     - `offer_refuses_an_unvalidated_dictionary`, in `decoded_cache.rs`,
+       offers one directly. It asserts no entry and one refusal.
+     - `a_column_cached_by_a_contains_scan_serves_a_later_scan_exactly`, in
+       `crates/ravel-sql/tests/logs_decoded_cache.rs`, is the test that pins
+       the guard. It runs a LIKE scan, then a scan of the same column
+       without the arm, served from the cache. It asserts that the second
+       scan's rows equal a cold scan's and that `unvalidated_refusals` is
+       zero. Two mutations must each fail it. Leaving the deferred columns
+       out of decision 3's validate set offers them raw, and the counter
+       goes above zero. Removing the guard as well makes the rows differ.
+     - `a_contains_deferred_column_is_never_cached` (`reader.rs:7076`) is
+       replaced. The new test asserts that the deferred column is served
+       on the second scan and equals a fresh full decode bit for bit, which
+       pins that no narrowed copy was admitted.
+
+5. **Memory is charged as before.** Deferred columns go through the same
+   `lookup` and `offer`. The process-budget charge, the headroom margin,
+   the evictor's slack, the 23 h age bound and the tenant-ceiling rule
+   apply to their entries as to every other entry.
+   - **The ClickBench restart protocol.** The decoded sets in the table
+     below are derived from the run's measured residencies, with Title's
+     entry inferred. q22's set is about 2.4 MB over the cap. The largest
+     set measured today is 6.89 GB (q28, q34 and q35).
+   - **A long-lived server.** The union of the columns that full scans
+     read is about 19.5 GB today and about 23.2 GB with Title. The loop
+     server already churns it through 8 GB (about 2.2 admissions per union
+     entry).
+
+   The table is model output, not measurement: `clocksim.py`, and
+   `gatesim2.py` under decision 1's exact rule, with 16 partitions, three
+   tries, interactive intent and entry sizes from the run, over two seeds.
+
+   | Statement, cap | Decoded set | CLOCK as built: try-2/3 hit share | With the gate: try-2/3 hit share |
+   |---|---|---|---|
+   | q21, 8 GB | 6.90 GB | 1.000 | 1.000 |
+   | q22, 8 GB | 8.002 GB | 0.902 to 0.920 | 0.999 to 1.000 |
+   | q23, 8 GB | about 12.5 GB | 0.000 | 0.620 to 0.629 |
+   | q23, 12 GB | about 12.5 GB | 0.104 to 0.149 | 0.939 to 0.951 |
+   | q24, 8 GB | about 5.2 GB | 1.000 | 1.000 |
+
+   Two production-shaped traces from `tracesim.py` (a model with an 8 GB
+   cap and uniform 400 KB entries):
+   - **Trace B.** A 4 GB interactive working set is read through a 12 GB
+     scan, every round. With a bulk-scan scan, the set is retained 1.000
+     with or without the gate. With an interactive scan, it is retained
+     0.000 under CLOCK and 0.486 with the gate.
+   - **Trace E.** A 6 GB set B replaces a 6 GB set A that was read k
+     times. Under CLOCK, B reaches a 0.90 hit share by its third pass. With
+     the gate it needs 6 passes for k = 4, 12 for k = 15, and 9 for k = 30
+     (halving ages A's saturated counts). This is the gate's cost: a
+     working set that shifts takes longer to displace a stale one.
+
+6. **Measurement.** Each pull request runs under the ClickBench restart
+   protocol, where the hot figure is the smaller of tries 2 and 3. The runs
+   are paired `cpuab` (A B B A B A A B) on one c6a.4xlarge at an 8 GB cap.
+   Each A is the main commit its B is built on: main before the gate for
+   the first pull request, main with the gate for the second. A per-try
+   counter is read on the try the hot figure takes, except where a row
+   names the try. The counter rows hold under this protocol only, not on a
+   long-lived server. Trace B and Trace E run against `DecodedColumnCache`
+   itself. They are scaled in bytes, not in entries: the model's entry and
+   lookup counts, with smaller entries and cap. That keeps the aging
+   window, whose 65,536 floor would otherwise govern, at the model's
+   cadence. The bands are copied to #3326 before launch, and a miss on any
+   row stops that pull request.
+
+   | Gate pull request (decision 1 alone) | Band | Miss | Basis |
+   |---|---|---|---|
+   | Hot geomean, B/A, 43 statements | 0.98 to 1.02 | outside | predicted: no hot try on main is cap-bound |
+   | Every statement, hot wall B/A | 0.95 to 1.05 | above 1.05 | predicted |
+   | Every statement but q33: decoded-cache misses and `frequency_refusals` on try 3 (bulk-scan statements admit on try 2 by design) | 0 | above 0 | predicted; misses measured 2026-10-30: 0 on main |
+   | q33 answers on every B run | yes | any B run refused | predicted |
+   | Trace B, bulk-scan scan: interactive set retained | at least 0.90 | under 0.50 | predicted; model 1.000 |
+   | Trace B, interactive scan: interactive set retained | at least 0.40 | under 0.10 | predicted; model 0.486, CLOCK 0.000 |
+   | Trace E, A read 15 times: first pass of B at a 0.90 hit share | at most 13 | above 20, or never | predicted; model 12 |
+   | Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
+
+   | Serving pull request (decisions 2 to 4), per hot try | Band | Miss | Basis |
+   |---|---|---|---|
+   | q21 decoded-cache hits | exactly 39,423 (3 x 13,141) | any other | predicted; 26,282 on main, measured 2026-10-30 |
+   | q21 decoded-cache misses | 0 | above 0 | predicted |
+   | q21 `decompressedBytes` | 40 to 70 MB | above 200 MB | predicted; 4,980 MB on main, measured 2026-10-30 |
+   | q21 `containsCellsTested` | 36,727,795, unchanged | any change | measured 2026-10-30 |
+   | q21 `strCellsValidated` | 0 | above 0 | predicted; 10,138 on main, measured 2026-10-30 |
+   | q21 hot wall, B/A | 0.35 to 0.55 | above 0.70 | predicted 0.40 |
+   | q21 server CPU, B/A | 0.32 to 0.50 | above 0.65 | predicted 0.39 |
+   | q22 hits / (hits + misses) | at least 0.95 | under 0.85 | predicted; model 0.999 |
+   | q22 hot wall, B/A | 0.35 to 0.60 | above 0.80 | predicted 0.41 |
+   | q23 hits / (hits + misses) | 0.45 to 0.75 | under 0.30 | predicted; model 0.62 |
+   | q23 hot wall, B/A | 0.55 to 0.85 | above 1.00 | predicted 0.64; `predict.py` does not cost the re-decode of the about 38% of base-column accesses the gate refuses, or the full validation of refused deferred blocks (inference: a few hundredths of a second each) |
+   | q24 `decompressedBytes` | under 100 MB | above 500 MB | predicted; 3,459 MB on main, measured 2026-10-30 |
+   | q24 hot wall, B/A | 0.35 to 0.60 | above 0.75 | predicted 0.41 |
+   | Every other statement, hot wall B/A | 0.95 to 1.05 | above 1.10 | predicted |
+   | q33 answers on every B run | yes | any B run refused | predicted |
+   | Hot sum, B/A | 0.90 to 0.95 | above 0.97 | predicted 0.924 |
+   | Hot geomean, B/A | 0.91 to 0.95 | above 0.97 | predicted 0.929, the program's 0.95 rule |
+   | Cold sum, B/A | 0.98 to 1.03 | above 1.05 | predicted about 1.01 |
+   | Query results | identical | any difference | predicted |
+   | Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
+
+   The hot-sum and geomean predictions take q23 at 64% of its full saving
+   (cb028 `predict.py`). The full saving for q21 to q24 is 3.61 s if every
+   deferred entry hits.
+
+**Out of scope.**
+- **Arrow-ready string values kept with the entry** (option (e2), about
+  1.8 s). It caches a step-4 form, which the alternatives rejected, and
+  needs its own amendment.
+- **A larger cap.** The model fits q23 whole at 13 GB, but that is the
+  owner's cap decision. It would first need this ADR's q33 Trace D and the full
+  entry run's QPS and error-ratio rows at that cap.
+- **A decompressed-page cache for deferred columns** (option (d)). It
+  saves about half as much for about the same memory.
+
+**Open questions, each with the answer this amendment proposes.**
+- **Should `would_admit` mirror the gate?** On q23 at 8 GB the gate
+  refuses about 28,000 of 78,846 accesses per hot try in the model
+  (85,116 refusals over three tries). Some are deferred columns that were
+  validated whole and then refused. Proposed: no, in these pull requests.
+  Inference: the waste is under about 0.05 s of wall time, about 36% of
+  the cold validation cost above. The serving pull request's readout
+  reports q23's `strCellsValidated` per hot try, and the change is made
+  only if q23 misses its band.
+- **Is the shift latency acceptable** (Trace E: up to 12 passes against
+  CLOCK's 3)? Proposed: yes. A stale set costs hits for a bounded number
+  of passes, while CLOCK's failure mode loses the whole set for as long as
+  the over-cap scan repeats. The aging window is the setting to shorten if
+  production shows otherwise.
+- **q22 is 2.4 MB over the cap.** Proposed: band it as fitting (0.999 in
+  the model), and read a miss on its hit share as a sizing finding, not as
+  a defect of the gate.
