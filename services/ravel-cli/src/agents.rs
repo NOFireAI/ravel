@@ -25,8 +25,9 @@ use ravel_agents_core::kernel::Usage;
 use ravel_agents_core::keys::{AgentKey, AgentKind, dir_prefix};
 use ravel_agents_core::state::{Handle, HandleItem, OperationState, operation_state};
 use ravel_agents_core::wire::{
-    ActiveTurnBody, EffectBody, EffectsResponse, EventBody, EventsResponse, InputSourceBody,
-    MailboxEntryBody, OperationResponse, ReconcileResponse, StateResponse, UsageBody,
+    ActiveTurnBody, AgentRef, DestroyAgentResponse, EffectBody, EffectsResponse, EventBody,
+    EventsResponse, InputSourceBody, MailboxEntryBody, OperationResponse, ReconcileResponse,
+    StateResponse, UsageBody,
 };
 use ravel_agents_store::{AgentStore, HeadState, StoreLimits};
 use ravel_object_store::ObjectStoreBackend;
@@ -789,6 +790,43 @@ pub fn render_reconcile(out: &ReconcileResponse) -> String {
         out.effect,
         wire_word(&out.status),
         out.attempt
+    )
+}
+
+/// `agents destroy`, through the server. The kind and key are checked the
+/// way [`AgentSelector::resolve`] checks them before any request is sent.
+pub async fn destroy(
+    client: &AgentsClient,
+    kind: &str,
+    key: &str,
+    incarnation: Option<u64>,
+) -> Result<DestroyAgentResponse, AgentsCliError> {
+    AgentKind::new(kind).map_err(|_| AgentsCliError::InvalidAgent)?;
+    AgentKey::new(key).map_err(|_| AgentsCliError::InvalidAgent)?;
+    let agent = AgentRef {
+        kind: kind.to_string(),
+        key: key.to_string(),
+    };
+    Ok(client.destroy(&agent, incarnation).await?)
+}
+
+pub fn render_destroy(out: &DestroyAgentResponse) -> String {
+    let abandoned = &out.abandoned;
+    format!(
+        "agent {} incarnation {} {}\n\
+         abandoned: inputs {}, active turn {}, effects in doubt {}, effects authorized {}, timers scheduled {}\n",
+        out.agent_id,
+        out.incarnation,
+        if out.destroyed {
+            "destroyed"
+        } else {
+            "already destroyed"
+        },
+        abandoned.inputs,
+        if abandoned.active_turn { "yes" } else { "no" },
+        abandoned.effects_in_doubt,
+        abandoned.effects_authorized,
+        abandoned.timers_scheduled,
     )
 }
 
