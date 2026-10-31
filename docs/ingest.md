@@ -2274,7 +2274,9 @@ what no phase covers: task scheduling and the bookkeeping between steps.
   carries it. A waiter answered without a flush, such as one abandoned at the
   deferral cap or on a hand-back, records nothing.
 - `request`: per strict request, from the start of the router's submit to the
-  last shard ack received, or to the expiry of the ack deadline. It records on
+  last shard ack received, or to the expiry of the ack deadline. A shard whose
+  ack channel closes without an answer (as when its actor panics mid-flush) counts as answered at
+  that moment, here and in `shard_skew`. It records on
   success and on error, but not when the caller drops the ack future, and not
   for a submit that itself returns an error, since that write never reaches
   the ack wait.

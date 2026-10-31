@@ -170,7 +170,10 @@ other backend, the three control-plane counters read 0.
 ### Ingest pipelines (`ravel_ingest_*`)
 
 Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
-`spans`. `ravel_ingest_rerouted_flushes_total` also carries `reason`.
+`spans`. `ravel_ingest_rerouted_flushes_total` also carries `reason`, and
+`ravel_ingest_flush_phase_seconds` and `ravel_ingest_strict_ack_seconds` also
+carry `phase`; select one phase before summing either, since their `total` and
+`request` phases already contain the others.
 
 | Metric | Meaning |
 |---|---|
