@@ -5,9 +5,13 @@ Each subcommand replaces a lookup or a multi-step command that sessions in
 this repository kept re-deriving: PR review and CI state, review findings and
 replies, merge lines, epic ledgers, fleet task reports and dispatch, docs
 gates, worktrees, ADR sections and box state. Output is terse and written for
-an agent; --json gives the same data as one JSON object. Exit codes are those
-of the underlying check: 0 clean, 1 a finding, 2 could not answer, 64 usage,
-75 a bounded wait ran out.
+an agent; --json gives the same data as one JSON object, before or after the
+subcommand. Checks (merge-line, fresh, docs-check, authorship, spec-lint,
+issue-tick, task, pr-landed --wait) exit 0 clean, 1 a finding; reporters
+(pr, pr-findings, issue, epic, box, wt, main, adr) exit 0 whenever they could
+answer, so read their output rather than their exit code. Every subcommand
+exits 2 when it could not answer, 64 on usage or an unreadable file, and 75
+when a bounded wait ran out.
 
 Stdlib only. Needs git and gh on PATH; the fleet subcommands read the control
 plane URL and token from FLEET_CP_URL/FLEET_PUBLIC_URL and FLEET_ENQUEUE_TOKEN,
@@ -19,6 +23,8 @@ import ast
 import json
 import os
 import re
+import select
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,7 +35,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BOT = "claude-fleet"
-SEVERITIES = ("blocker", "should_fix", "nit")
+# Every prefix the review bot and the review skill write. Anything else is
+# reported as "unclassified", which counts as actionable, never as chatter.
+SEVERITIES = ("blocking", "blocker", "major", "should_fix", "minor", "nit")
 TERMINAL_TASK = {"done", "failed", "canceled", "cancelled", "dead", "error"}
 
 
@@ -39,6 +47,10 @@ class CliError(Exception):
     def __init__(self, message, code=2):
         super().__init__(message)
         self.code = code
+
+
+class OutcomeUnknown(CliError):
+    """The remote side may or may not have acted (a timeout after sending)."""
 
 
 # ---------------------------------------------------------------- helpers
@@ -179,12 +191,12 @@ def ci_counts(rollup):
 
 def severity(body):
     head = (body or "").lstrip().split(":", 1)[0].strip().lower()
-    return head if head in SEVERITIES else "comment"
+    return head if head in SEVERITIES else "unclassified"
 
 
 def first_sentence(body, limit=160):
     text = (body or "").strip()
-    if ":" in text.split("\n", 1)[0] and severity(text) != "comment":
+    while ":" in text.split("\n", 1)[0] and severity(text) != "unclassified":
         text = text.split(":", 1)[1].strip()
     text = text.split("\n", 1)[0]
     return text if len(text) <= limit else text[: limit - 1] + "..."
@@ -217,10 +229,41 @@ def classify_findings(comments, head, all_commits=False):
     return rows
 
 
-BODY_FINDING = re.compile(r"^\s*-\s*(blocker|should_fix|nit)\s*,\s*(\S+)\s*[—-]\s*(.*)$")
+BODY_FINDING = re.compile(r"^\s*-\s*([a-z_]+)\s*,\s*(\S+)\s*[—-]\s*(.*)$")
+# "- path:line (severity): text" or "- path[:line]: text"; a location may
+# itself contain a colon, so the separator is a colon followed by a space.
+OUTSIDE_BULLET = re.compile(r"^- (\S+)\s+\(([a-z_]+)\):\s*(.*)$|^- (\S+?):\s+(.*)$")
+
+
+def outside_diff_findings(body):
+    """The "Findings outside the diff:" bullets, walked line by line exactly as
+    scripts/lib/fleet-review-outside-diff.jq counts them: the heading opens a
+    block, a blank or indented line keeps it open, any other line closes it.
+    scripts/test_agent_cli.py checks the count against the jq filter."""
+    rows, inblock = [], False
+    for line in (body or "").split("\n"):
+        if line.rstrip() == "Findings outside the diff:":
+            inblock = True
+        elif inblock and line.startswith("- "):
+            m = OUTSIDE_BULLET.match(line)
+            if m and m.group(1):
+                where, sev, text = m.group(1), m.group(2), m.group(3)
+            elif m:
+                where, sev, text = m.group(4), None, m.group(5)
+            else:
+                where, sev, text = "", None, line[2:]
+            rows.append({"severity": sev if sev in SEVERITIES else "unclassified",
+                         "where": where, "summary": text[:160], "outside_diff": True})
+        elif inblock and (not line.strip() or line[:1].isspace()):
+            continue
+        else:
+            inblock = False
+    return rows
 
 
 def review_body_findings(body):
+    """The verdict line, the summary bullets of the "Findings:" list, and every
+    outside-the-diff finding (the ones no inline comment carries)."""
     rows = []
     verdict = ""
     for line in (body or "").splitlines():
@@ -228,9 +271,10 @@ def review_body_findings(body):
         if not verdict and re.match(r"^(Approve|Request changes|Comment)\b", s):
             verdict = s.split(":", 1)[0]
         m = BODY_FINDING.match(line)
-        if m:
-            rows.append({"severity": m.group(1), "where": m.group(2), "summary": m.group(3)[:160]})
-    return verdict, rows
+        if m and m.group(1) in SEVERITIES:
+            rows.append({"severity": m.group(1), "where": m.group(2), "summary": m.group(3)[:160],
+                         "outside_diff": False})
+    return verdict, rows + outside_diff_findings(body)
 
 
 def bot_reviews(n):
@@ -262,6 +306,7 @@ def pr_state(n):
         "review_verdict": verdict,
         "reviews_total": len(reviews),
         "findings_at_head": sev, "body_findings": body_rows,
+        "outside_diff_at_head": sum(1 for b in body_rows if b["outside_diff"]),
         "unreplied_at_head": sum(1 for f in findings if not f["replied"]),
     }
 
@@ -273,7 +318,8 @@ def pr_line(s):
             f"ci={ci['pass']}p/{ci['pending']}w/{ci['fail']}f/{ci['skip']}s "
             f"review@head={s['review_at_head'] or 'none'}"
             f"{'(' + s['review_verdict'] + ')' if s['review_verdict'] else ''} "
-            f"findings@head={sev} unreplied={s['unreplied_at_head']}")
+            f"findings@head={sev} unreplied={s['unreplied_at_head']} "
+            f"outside_diff={s['outside_diff_at_head']}")
     if s["merge_commit"]:
         line += f" merged={s['merge_commit'][:9]}"
     return line
@@ -287,7 +333,7 @@ def cmd_pr(a):
     for f in s["failing"]:
         o.text(f"  fail {f}")
     for b in s["body_findings"]:
-        o.text(f"  body {b['severity']} {b['where']} {b['summary']}")
+        o.text(f"  {'outside' if b['outside_diff'] else 'body'} {b['severity']} {b['where']} {b['summary']}")
     o.emit()
     return 0
 
@@ -311,7 +357,7 @@ def cmd_pr_findings(a):
         mark = "R" if r["replied"] else "-"
         o.text(f"{r['id']} {mark} {r['severity']} {r['path']}:{r['line']} @{r['commit']} {r['summary']}")
     for b in body_rows:
-        o.text(f"body {b['severity']} {b['where']} {b['summary']}")
+        o.text(f"{'outside' if b['outside_diff'] else 'body'} {b['severity']} {b['where']} {b['summary']}")
     o.emit()
     return 0
 
@@ -380,25 +426,28 @@ def landed_once(n):
 def cmd_pr_landed(a):
     deadline = time.monotonic() + a.wait
     misses = 0
+    reason = "once"
     while True:
         s = landed_once(a.number)
-        if s["state"] == "MERGED" or time.monotonic() >= deadline:
+        if s["state"] == "MERGED":
+            reason = "merged"
             break
         misses = misses + 1 if not s["queue"] else 0
-        if misses >= 2 and a.wait:
+        if a.wait and misses >= 2:
+            reason = "not_queued"
+            break
+        if not a.wait or time.monotonic() >= deadline:
+            reason = "deadline" if a.wait else "once"
             break
         time.sleep(a.interval)
+    s["reason"] = reason
     o = Out(a.json)
     o.data = s
     o.text(f"pr {a.number} {s['state']} queue={s['queue'] or 'none'}"
            f"{' pos=' + str(s['position']) if s['position'] is not None else ''}"
            f"{' merged=' + s['merge_commit'][:9] if s['merge_commit'] else ''}")
     o.emit()
-    if s["state"] == "MERGED":
-        return 0
-    if a.wait and not s["queue"]:
-        return 1
-    return 75 if a.wait else 0
+    return {"merged": 0, "not_queued": 1, "deadline": 75, "once": 0}[reason]
 
 
 def cmd_merge_line(a):
@@ -409,12 +458,16 @@ def cmd_merge_line(a):
     env = {"ALLOW_STALE_SHAPE_SITES": "1"} if a.allow_stale_shape_sites else None
     rc, out, err = run(args, env=env)
     lines = out.splitlines()
-    merge = next((l.strip().lstrip("-> ").strip() for l in lines if "gh pr merge" in l), "")
-    reasons = [l.strip()[3:] for l in lines if l.strip().startswith("->") and "gh pr merge" not in l]
-    o.data = {"merge_line": merge, "status": lines[0] if lines else "", "notes": reasons, "rc": rc}
+    merge = next((l.strip()[2:].strip() if l.strip().startswith("->") else l.strip()
+                  for l in lines if "gh pr merge" in l), "")
+    # Keep every line after the status line except the merge line itself: the
+    # unseen-commit list sits on unprefixed lines under its "->" note, and the
+    # note after it tells the reader to check that list.
+    notes = [l.rstrip() for l in lines[1:] if "gh pr merge" not in l and l.strip()]
+    o.data = {"merge_line": merge, "status": lines[0] if lines else "", "notes": notes, "rc": rc}
     o.text(merge if merge else "NO MERGE LINE")
-    for r in reasons:
-        o.text("  " + r[:200])
+    for r in notes:
+        o.text("  " + r.strip()[:220])
     o.emit()
     return 0 if merge else 1
 
@@ -639,16 +692,19 @@ def cmd_task(a):
     return 0 if status == "done" else 1
 
 
-SPEC_BAD = [("backtick", re.compile(r"`")), ("dollar-paren", re.compile(r"\$\(")),
-            ("em-dash", re.compile("—"))]
+# The dispatch service refuses a spec carrying a command substitution, which
+# it detects as any backtick or dollar-paren, with 400 bad request. An em-dash
+# is accepted; it is reported as a style warning only (plain-language rule).
+SPEC_BAD = [("backtick", re.compile(r"`"), True), ("dollar-paren", re.compile(r"\$\("), True),
+            ("em-dash", re.compile("—"), False)]
 
 
 def lint_spec_text(text):
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
-        for kind, rx in SPEC_BAD:
+        for kind, rx, blocking in SPEC_BAD:
             for m in rx.finditer(line):
-                hits.append({"line": i, "col": m.start() + 1, "kind": kind})
+                hits.append({"line": i, "col": m.start() + 1, "kind": kind, "blocking": blocking})
     return hits
 
 
@@ -659,11 +715,29 @@ def cmd_spec_lint(a):
         report[f] = lint_spec_text(Path(f).read_text())
     o.data = report
     for f, hits in report.items():
-        o.text(f"{f}: {len(hits)} hit(s)")
+        blocking = sum(1 for h in hits if h["blocking"])
+        o.text(f"{f}: {blocking} blocking, {len(hits) - blocking} warning")
         for h in hits[:20]:
-            o.text(f"  {h['line']}:{h['col']} {h['kind']}")
+            o.text(f"  {h['line']}:{h['col']} {h['kind']}{'' if h['blocking'] else ' (warning)'}")
     o.emit()
-    return 1 if any(report.values()) else 0
+    return 1 if any(h["blocking"] for hits in report.values() for h in hits) else 0
+
+
+def write_secret(path, text):
+    """Write a token-bearing file readable by its owner only, in a 0700
+    directory this user owns, refusing an existing file or a symlink."""
+    d = path.parent
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+        raise CliError(f"refusing to write a token under {d}: not a directory this user owns")
+    os.chmod(d, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+
+
+UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 
 
 def mcp_server():
@@ -685,7 +759,7 @@ def mcp_server():
     return found[0]
 
 
-def mcp_call(tool, arguments):
+def mcp_call(tool, arguments, timeout=300):
     srv = mcp_server()
     env = dict(os.environ)
     env.update(srv.get("env") or {})
@@ -697,9 +771,15 @@ def mcp_call(tool, arguments):
         p.stdin.write(json.dumps(obj) + "\n")
         p.stdin.flush()
 
+    deadline = time.monotonic() + timeout
+
     def recv(want_id):
-        # Skip notifications and log lines until the response with our id.
+        # Skip notifications and log lines until the response with our id,
+        # giving up at the deadline so the caller's bookkeeping still runs.
         while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([p.stdout], [], [], left)[0]:
+                raise OutcomeUnknown(f"{tool}: no answer from the MCP server within {timeout}s")
             line = p.stdout.readline()
             if not line:
                 return None
@@ -720,7 +800,15 @@ def mcp_call(tool, arguments):
               "params": {"name": tool, "arguments": arguments}})
         resp = recv(2)
     finally:
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
         p.terminate()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
     text = ""
     for part in ((resp or {}).get("result") or {}).get("content") or []:
         text += part.get("text", "")
@@ -737,22 +825,25 @@ def fresh_main():
 
 def cmd_dispatch(a):
     spec = Path(a.spec).read_text()
-    hits = lint_spec_text(spec)
-    if hits:
-        raise CliError(f"spec has {len(hits)} forbidden character(s) (first: line {hits[0]['line']} "
-                       f"{hits[0]['kind']}); run agent-cli spec-lint {a.spec}", 1)
-    main_sha = fresh_main()
-    ref_sha = main_sha
+    blocking = [h for h in lint_spec_text(spec) if h["blocking"]]
+    if blocking and not a.allow_lint:
+        raise CliError(f"spec has {len(blocking)} character(s) the dispatch service refuses (first: line "
+                       f"{blocking[0]['line']} {blocking[0]['kind']}); run agent-cli spec-lint {a.spec}, "
+                       f"or pass --allow-lint if you checked them", 1)
+    ref_sha = fresh_main()
+    env = {}
     if a.ref:
         run(["git", "fetch", "-q", "origin", a.ref], check=True)
         _, ref_sha, _ = run(["git", "rev-parse", "FETCH_HEAD"], check=True)
         ref_sha = ref_sha.strip()
-    env = {}
+        # The intent records the ref actually dispatched; a deliberately older
+        # ref (a result or PR branch) passes the fresh-ref guard by name.
+        env["ALLOW_STALE_REF"] = "1"
     if a.paths:
         env["DISPATCH_PATHS"] = a.paths
     if a.fix:
         env["DISPATCH_SKIP_DUPLICATE_CHECK"] = "1"
-    rc, out, err = run(["scripts/fleet-dispatch-intent.sh", "intent", str(a.epic), str(a.ticket), main_sha],
+    rc, out, err = run(["scripts/fleet-dispatch-intent.sh", "intent", str(a.epic), str(a.ticket), ref_sha],
                        env=env)
     if rc != 0:
         raise CliError(f"intent refused rc={rc}: {last_line(err or out)}", rc)
@@ -765,22 +856,27 @@ def cmd_dispatch(a):
         arguments["label_selector"] = {k: v}
     try:
         text = mcp_call("fleet_dispatch", arguments)
+    except OutcomeUnknown as e:
+        # The task may have been accepted: leave the intent open so a retry
+        # refuses until the ledger is reconciled, rather than dispatch twice.
+        raise CliError(f"{e}; the intent {nonce} is left open. Check the control plane "
+                       f"(agent-cli epic {a.epic}) before dispatching again")
     except CliError:
         run(["scripts/fleet-dispatch-intent.sh", "failed", str(a.epic), nonce])
         raise
-    m = re.search(r"Dispatched task ([0-9a-f-]{36})", text)
+    m = re.search(r"Dispatched task ([0-9a-f-]{36})", text) or UUID.search(text)
     if not m:
-        run(["scripts/fleet-dispatch-intent.sh", "failed", str(a.epic), nonce])
-        raise CliError(f"no task id in dispatch answer: {text[:200]}")
-    task = m.group(1)
+        # The control plane may still have accepted it: keep the intent open
+        # (no "failed" record) so a retry refuses until someone reconciles.
+        raise CliError(f"no task id in the dispatch answer; the intent {nonce} is left open for "
+                       f"reconciliation. Full answer: {text}")
+    task = m.group(1) if m.re is not UUID else m.group(0)
     watch = re.search(r"https?://\S+/watch\?token=[A-Za-z0-9._-]+", text)
     watch_file = ""
     if watch:
-        wdir = Path(tempfile.gettempdir()) / "agent-cli" / "watch"
-        wdir.mkdir(parents=True, exist_ok=True)
-        watch_file = str(wdir / f"{task}.url")
-        Path(watch_file).write_text(watch.group(0))
-        os.chmod(watch_file, 0o600)
+        path = Path(tempfile.gettempdir()) / f"agent-cli-{os.getuid()}" / "watch" / f"{task}.url"
+        write_secret(path, watch.group(0))
+        watch_file = str(path)
     rec_rc, _, rec_err = run(["scripts/fleet-dispatch-intent.sh", "record", str(a.epic), nonce, task])
     orch_rc, _, orch_err = run(["scripts/epic-orchestrator.sh", "record", str(a.epic), "task-dispatched",
                                 f"ticket={a.ticket}", f"task={task}", f"ref={ref_sha}"])
@@ -806,13 +902,21 @@ DOCS_GATES = [
 ]
 
 
+def caller_tree():
+    """The worktree the caller is in (so a check sees that tree, from any of
+    its subdirectories), else the tree this script lives in."""
+    rc, top, _ = run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd())
+    return Path(top.strip()) if rc == 0 and top.strip() else ROOT
+
+
 def cmd_docs_check(a):
     o = Out(a.json)
+    tree = caller_tree()
     gates = list(DOCS_GATES) + [("changelog_touched",
                                  ["scripts/guards/check-changelog-touched.sh", a.base, "HEAD"])]
     results = []
     for name, cmd in gates:
-        rc, out, err = run(cmd, cwd=Path.cwd())
+        rc, out, err = run(cmd, cwd=tree)
         results.append({"gate": name, "rc": rc, "last": last_line(out + "\n" + err)[:200]})
     o.data = {"gates": results}
     for r in results:
@@ -823,11 +927,12 @@ def cmd_docs_check(a):
 
 def cmd_authorship(a):
     o = Out(a.json)
+    tree = caller_tree()
     email = a.email
     if not email:
-        _, email, _ = run(["git", "config", "user.email"], cwd=Path.cwd())
+        _, email, _ = run(["git", "config", "user.email"], cwd=tree)
         email = email.strip()
-    rc, out, err = run(["scripts/guards/assert-clean-authorship.sh", a.ref, email], cwd=Path.cwd())
+    rc, out, err = run(["scripts/guards/assert-clean-authorship.sh", a.ref, email], cwd=tree)
     o.data = {"rc": rc, "email": email, "detail": last_line(out + "\n" + err)}
     o.text(f"authorship {'clean' if rc == 0 else 'FAIL'} rc={rc} {o.data['detail']}")
     o.emit()
@@ -853,21 +958,30 @@ def cmd_box(a):
     executor = Path.home() / ".fleet" / "executor"
     work = executor / "work"
     task_dir = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    # None means "not measured" (no executor on this host, or du failed); it
+    # prints as unknown, never as zero or none.
     running = sorted(p.name for p in work.iterdir() if p.is_dir() and task_dir.match(p.name)) \
-        if work.is_dir() else []
+        if work.is_dir() else None
     o.data = {"free_gib": round(free_gib, 1), "load": [round(x, 2) for x in load],
               "build_procs": builds, "executor_tasks_running": running}
+
+    def gib(kib):
+        return None if kib is None else round(kib / 2 ** 20, 1)
+
+    def show(v, unit=""):
+        return "unknown" if v is None else f"{v}{unit}"
+
     if a.du:
-        o.data["executor_cargo_target_gib"] = round((du_kib(executor / "cache" / "cargo-target") or 0) / 2 ** 20, 1)
+        o.data["executor_cargo_target_gib"] = gib(du_kib(executor / "cache" / "cargo-target"))
         go_cache = Path.home() / "Library" / "Caches" / "go-build"
-        if go_cache.is_dir():
-            o.data["go_build_cache_gib"] = round((du_kib(go_cache) or 0) / 2 ** 20, 1)
+        o.data["go_build_cache_gib"] = gib(du_kib(go_cache)) if go_cache.is_dir() else None
+    tasks = "unknown" if running is None else (",".join(r[:8] for r in running) or "none")
     o.text(f"free={o.data['free_gib']}GiB load={'/'.join(str(x) for x in o.data['load'])} "
            f"builds={','.join(f'{k}:{v}' for k, v in builds.items()) or 'none'} "
-           f"executor_tasks={','.join(r[:8] for r in running) or 'none'}")
+           f"executor_tasks={tasks}")
     if a.du:
-        o.text(f"  executor_target={o.data['executor_cargo_target_gib']}GiB"
-               f"{' go_cache=' + str(o.data['go_build_cache_gib']) + 'GiB' if 'go_build_cache_gib' in o.data else ''}")
+        o.text(f"  executor_target={show(o.data['executor_cargo_target_gib'], 'GiB')} "
+               f"go_cache={show(o.data['go_build_cache_gib'], 'GiB')}")
     o.emit()
     return 0
 
@@ -1025,10 +1139,15 @@ def cmd_adr(a):
 
 
 def build_parser():
+    # --json is accepted before or after the subcommand: the subparser copy
+    # defaults to SUPPRESS, so it never overwrites a value the top level set.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--json", action="store_true", help="print one JSON object instead of terse text")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="print one JSON object instead of terse text")
     p = argparse.ArgumentParser(prog="agent-cli", description=__doc__.split("\n\n")[0],
-                                formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--json", action="store_true", default=False,
+                   help="print one JSON object instead of terse text")
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     def add(name, func, help_text, desc=None):
@@ -1134,6 +1253,8 @@ def build_parser():
     sp.add_argument("--model", default="opus")
     sp.add_argument("--label", default="arch=amd64", help="label_selector key=value")
     sp.add_argument("--read-only", action="store_true", help="expects_ref false (a verification task)")
+    sp.add_argument("--allow-lint", action="store_true",
+                    help="dispatch although spec-lint reports backticks or dollar-paren you have checked")
 
     sp = add("spec-lint", cmd_spec_lint, "find backticks, dollar-paren and em-dashes a fleet spec must not carry")
     sp.add_argument("files", nargs="+")
@@ -1181,12 +1302,14 @@ def main(argv=None):
         return 64
     try:
         return args.func(args)
-    except CliError as e:
+    except (CliError, OSError) as e:
+        # An unreadable file argument is a usage error (64), not a finding (1).
+        code = e.code if isinstance(e, CliError) else 64
         if getattr(args, "json", False):
-            print(json.dumps({"error": str(e), "code": e.code}))
+            print(json.dumps({"error": str(e), "code": code}))
         else:
             print(f"error: {e}", file=sys.stderr)
-        return e.code
+        return code
     except KeyboardInterrupt:
         return 130
 

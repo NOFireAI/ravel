@@ -2,7 +2,10 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import pathlib
+import shutil
+import subprocess
 import unittest
 
 _PATH = pathlib.Path(__file__).resolve().parent.parent / "bin" / "agent-cli"
@@ -80,6 +83,55 @@ class Findings(unittest.TestCase):
                          [("should_fix", "docs/x.md:12", "stale claim"), ("nit", "a.rs:3", "small")])
 
 
+class Severity(unittest.TestCase):
+    def test_every_bot_and_skill_prefix_is_classified_and_anything_else_is_actionable(self):
+        for word in ("blocking", "blocker", "major", "should_fix", "minor", "nit"):
+            self.assertEqual(cli.severity(f"{word}: x"), word)
+        self.assertEqual(cli.severity("looks fine to me"), "unclassified")
+        self.assertEqual(cli.first_sentence("should_fix: should_fix: doubled prefix"), "doubled prefix")
+
+
+OUTSIDE_BODY = """Request changes: two findings outside the diff.
+
+Not checked:
+- the TLA rows
+
+Findings outside the diff:
+- crates/ravel-sql/src/executor.rs:120 (major): the retry drops the error
+  and the continuation line stays inside the block
+
+- docs/ingest.md: the flush cadence paragraph contradicts the code
+
+Findings outside the diff:
+- services/x.rs:9 (blocking): a second block after a 422
+Task 1234 on executor, model claude-opus-5.
+- not a finding: this bullet follows a closing line
+"""
+
+
+class OutsideDiff(unittest.TestCase):
+    def test_bullets_inside_every_block_and_none_outside(self):
+        rows = cli.outside_diff_findings(OUTSIDE_BODY)
+        self.assertEqual([(r["where"], r["severity"]) for r in rows],
+                         [("crates/ravel-sql/src/executor.rs:120", "major"),
+                          ("docs/ingest.md", "unclassified"),
+                          ("services/x.rs:9", "blocking")])
+        verdict, all_rows = cli.review_body_findings(OUTSIDE_BODY)
+        self.assertEqual(verdict, "Request changes")
+        self.assertEqual(sum(1 for r in all_rows if r["outside_diff"]), 3)
+
+    def test_the_count_matches_the_shared_jq_filter(self):
+        jq = shutil.which("jq")
+        if not jq:
+            self.skipTest("jq not installed")
+        filt = pathlib.Path(__file__).resolve().parent / "lib" / "fleet-review-outside-diff.jq"
+        bot = "claude-fleet[bot]"
+        reviews = json.dumps([{"commit_id": "H", "user": {"login": bot}, "body": OUTSIDE_BODY}])
+        out = subprocess.run([jq, "--arg", "sha", "H", "--arg", "bot", bot, "-f", str(filt)],
+                             input=reviews, capture_output=True, text=True, check=True)
+        self.assertEqual(int(out.stdout.strip()), len(cli.outside_diff_findings(OUTSIDE_BODY)))
+
+
 class Checklist(unittest.TestCase):
     BODY = "- [ ] #1 T1: a\n- [x] #2 T2: b\n  - [ ] #3 T3: c\ntext\n"
 
@@ -110,9 +162,9 @@ class EpicStatus(unittest.TestCase):
 class SpecLint(unittest.TestCase):
     def test_each_forbidden_character_is_located(self):
         hits = cli.lint_spec_text("ok\nrun `x` and $(y)\nend — here\n")
-        self.assertEqual([(h["line"], h["col"], h["kind"]) for h in hits],
-                         [(2, 5, "backtick"), (2, 7, "backtick"), (2, 13, "dollar-paren"),
-                          (3, 5, "em-dash")])
+        self.assertEqual([(h["line"], h["col"], h["kind"], h["blocking"]) for h in hits],
+                         [(2, 5, "backtick", True), (2, 7, "backtick", True),
+                          (2, 13, "dollar-paren", True), (3, 5, "em-dash", False)])
 
     def test_a_clean_spec_has_no_hits(self):
         self.assertEqual(cli.lint_spec_text("plain text with $HOME and 'quotes'\n"), [])
@@ -136,6 +188,15 @@ class AdrSections(unittest.TestCase):
 
 
 class Parser(unittest.TestCase):
+    def test_json_before_or_after_the_subcommand_is_honoured(self):
+        parser = cli.build_parser()
+        self.assertTrue(parser.parse_args(["--json", "box"]).json)
+        self.assertTrue(parser.parse_args(["box", "--json"]).json)
+        self.assertFalse(parser.parse_args(["box"]).json)
+
+    def test_a_missing_file_argument_is_a_usage_error_not_a_finding(self):
+        self.assertEqual(cli.main(["spec-lint", "/nonexistent/agent-cli-spec.txt"]), 64)
+
     def test_every_subcommand_has_its_own_help(self):
         parser = cli.build_parser()
         sub = next(a for a in parser._actions if a.dest == "cmd")
