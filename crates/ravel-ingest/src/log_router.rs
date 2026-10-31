@@ -31,6 +31,7 @@ use crate::generation::{
 };
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
+use crate::log_latency::{StrictAckPhase, elapsed_ns};
 use crate::log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 use crate::log_shard::{
     LogShardActor, LogShardMsg, ShardRecords, est_columnar_bytes, est_record_bytes,
@@ -100,6 +101,9 @@ enum LogSubmittedState {
         ack_shards: Vec<u32>,
         ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, LogWriteError>>>,
         ack_deadline: Duration,
+        /// The router clock's reading when submit began, the start of the
+        /// request's `request` span (issue #3533).
+        submitted_ns: i64,
         /// Held until `acks()` resolves, its deadline elapses, or this value
         /// is dropped; never read directly.
         _permit: Option<PendingAckPermit>,
@@ -123,10 +127,11 @@ impl LogSubmitted<'_> {
                 ack_shards,
                 ack_rxs,
                 ack_deadline,
+                submitted_ns,
                 _permit,
             } => {
                 router
-                    .await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
+                    .await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline, submitted_ns)
                     .await
             }
         }
@@ -554,6 +559,7 @@ impl LogIngestRouter {
         ack_deadline: Duration,
         pending_ack: Option<PendingAckPermit>,
     ) -> Result<LogSubmitted<'_>, LogWriteError> {
+        let submitted_ns = self.clock.now_ns();
         if records.is_empty() {
             return Ok(LogSubmitted {
                 router: self,
@@ -681,6 +687,7 @@ impl LogIngestRouter {
                 ack_shards,
                 ack_rxs,
                 ack_deadline,
+                submitted_ns,
                 _permit: permit,
             },
         })
@@ -697,15 +704,46 @@ impl LogIngestRouter {
         ack_shards: Vec<u32>,
         ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, LogWriteError>>>,
         ack_deadline: Duration,
+        submitted_ns: i64,
     ) -> Result<LogWriteReceipt, LogWriteError> {
         // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
         // On a deadline elapse the whole `join_all` future is dropped, so no
         // per-shard ack is observed: `AckTimeout` carries no recovered tokens
         // (a sibling that committed inside the elapsed window is unknowable
         // here, and reporting an unresolved ack as durable would be wrong).
-        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
-            .await
-            .map_err(|_| LogWriteError::AckTimeout)?;
+        // Each ack is stamped on the router clock as it arrives, for the
+        // `request` and `shard_skew` spans (issue #3533).
+        let clock = &self.clock;
+        let stamped = ack_rxs.into_iter().map(|rx| async move {
+            let result = rx.await;
+            (result, clock.now_ns())
+        });
+        let joined =
+            match tokio::time::timeout(ack_deadline, futures::future::join_all(stamped)).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    self.metrics.record_strict_ack_phase(
+                        StrictAckPhase::Request,
+                        elapsed_ns(submitted_ns, self.clock.now_ns()),
+                    );
+                    return Err(LogWriteError::AckTimeout);
+                }
+            };
+        let first_ack_ns = joined.iter().map(|(_, at)| *at).min();
+        let last_ack_ns = joined.iter().map(|(_, at)| *at).max();
+        if let Some(last_ack_ns) = last_ack_ns {
+            self.metrics.record_strict_ack_phase(
+                StrictAckPhase::Request,
+                elapsed_ns(submitted_ns, last_ack_ns),
+            );
+        }
+        if joined.len() > 1
+            && let (Some(first), Some(last)) = (first_ack_ns, last_ack_ns)
+        {
+            self.metrics
+                .record_strict_ack_phase(StrictAckPhase::ShardSkew, elapsed_ns(first, last));
+        }
+        let joined = joined.into_iter().map(|(result, _)| result);
 
         // Every ack resolved. Scan them all: collect every shard that acked a
         // durable commit (issue #296), and record the first failure in shard
@@ -713,7 +751,7 @@ impl LogIngestRouter {
         // effect are exactly what the pre-fix early-return produced. A shard
         // whose ack failed to resolve (`RecvError`: the actor panicked
         // mid-flush) is NOT a durable write and contributes no token.
-        let mut durable = Vec::with_capacity(joined.len());
+        let mut durable = Vec::with_capacity(ack_shards.len());
         let mut first_error: Option<LogWriteError> = None;
         let mut dead_shard: Option<u32> = None;
         for (shard, result) in ack_shards.into_iter().zip(joined) {
@@ -883,6 +921,7 @@ impl LogIngestRouter {
     where
         P: FnOnce(ColumnarLogBatch, u32) -> Result<Vec<(u32, ColumnarLogBatch)>, LogSegError>,
     {
+        let submitted_ns = self.clock.now_ns();
         // Caller-side input rejection, before anything else: a malformed batch
         // must not reach `est_columnar_bytes` (which indexes `stream_attrs` by
         // `stream_refs` with no bound check of its own) or `partition_columnar`,
@@ -996,6 +1035,7 @@ impl LogIngestRouter {
                 ack_shards,
                 ack_rxs,
                 ack_deadline,
+                submitted_ns,
                 _permit: permit,
             },
         })
@@ -3570,5 +3610,56 @@ mod tests {
             "one flush per shard, so each shard's two writes share one object"
         );
         assert_same_objects(&objs_ref, &objs_new);
+    }
+
+    /// Issue #3533: a strict write records one `request` observation, one
+    /// `shard_skew` observation only when it reached more than one shard, and
+    /// one `queued` observation per strict waiter (one per shard it reached).
+    async fn strict_ack_counts(shard_count: u32) -> (usize, crate::LogLatencySnapshot) {
+        let router = LogIngestRouter::new(
+            IngestConfig {
+                shard_count,
+                target_bytes: 1,
+                max_flush_delay: Duration::from_secs(3600),
+                ..IngestConfig::default()
+            },
+            Arc::new(MemoryStore::new()),
+            Arc::new(FixedClock(1_700_000_000_000_000_000)),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+        );
+        let receipt = router
+            .write(
+                TenantId::new("acme"),
+                diverse_records(),
+                WriteMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("strict write commits");
+        let latency = router.metrics.snapshot().latency;
+        router.shutdown().await;
+        (receipt.tokens.len(), latency)
+    }
+
+    #[tokio::test]
+    async fn a_multi_shard_strict_write_records_request_and_shard_skew() {
+        let (shards, latency) = strict_ack_counts(2).await;
+        assert_eq!(shards, 2, "the records reach both shards");
+        assert_eq!(latency.strict_ack(StrictAckPhase::Request).count(), 1);
+        assert_eq!(latency.strict_ack(StrictAckPhase::ShardSkew).count(), 1);
+        assert_eq!(
+            latency.strict_ack(StrictAckPhase::Queued).count(),
+            2,
+            "one strict waiter per shard"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_shard_strict_write_records_no_shard_skew() {
+        let (shards, latency) = strict_ack_counts(1).await;
+        assert_eq!(shards, 1);
+        assert_eq!(latency.strict_ack(StrictAckPhase::Request).count(), 1);
+        assert_eq!(latency.strict_ack(StrictAckPhase::ShardSkew).count(), 0);
+        assert_eq!(latency.strict_ack(StrictAckPhase::Queued).count(), 1);
     }
 }

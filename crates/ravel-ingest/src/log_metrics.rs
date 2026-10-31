@@ -41,6 +41,7 @@ use ravel_types::TenantHash;
 
 use crate::attribution::{TenantCount, TenantPutAttribution, TenantTopK};
 use crate::generation::HandBackReason;
+use crate::log_latency::{FlushPhase, LogLatency, LogLatencySnapshot, StrictAckPhase};
 use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
 
 #[derive(Debug, Default)]
@@ -331,6 +332,9 @@ pub struct LogIngestMetrics {
     /// tracked counts still sum to every unresolved flush recorded. Read via
     /// [`LogIngestMetrics::clustering_key_unresolved_by_tenant`].
     clustering_key_unresolved: TenantTopK,
+    /// Flush-phase and strict-ack-phase latency histograms (issue #3533),
+    /// carried on the snapshot as `latency`.
+    latency: LogLatency,
 }
 
 /// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
@@ -474,6 +478,11 @@ pub struct LogIngestMetricsSnapshot {
     /// limit given to `PendingAckBudget::new`). Cumulative. Same populate-only-
     /// through-the-router caveat as `pending_strict_acks`.
     pub pending_ack_shed: u64,
+    /// The flush-phase and strict-ack-phase histograms (issue #3533), each
+    /// observation an injected-`Clock` difference. See
+    /// [`crate::FlushPhase`] and [`crate::StrictAckPhase`] for what each phase
+    /// spans.
+    pub latency: LogLatencySnapshot,
 }
 
 /// One shard's flush count split by the trigger that opened each flush (issue
@@ -559,6 +568,17 @@ impl LogIngestMetrics {
     /// nor the permit wait that preceded the spawn.
     pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
         self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
+    }
+
+    /// One flush's injected-`Clock` nanoseconds in `phase` (issue #3533).
+    pub(crate) fn record_flush_phase(&self, phase: FlushPhase, elapsed_ns: u64) {
+        self.latency.record_flush(phase, elapsed_ns);
+    }
+
+    /// One strict waiter's or strict request's injected-`Clock` nanoseconds in
+    /// `phase` (issue #3533).
+    pub(crate) fn record_strict_ack_phase(&self, phase: StrictAckPhase, elapsed_ns: u64) {
+        self.latency.record_strict_ack(phase, elapsed_ns);
     }
 
     /// Shard `shard`'s current spawned-but-unreaped flush-task count, the
@@ -1010,6 +1030,7 @@ impl LogIngestMetrics {
             // overwrites both with the router's `PendingAckBudget` figures.
             pending_strict_acks: 0,
             pending_ack_shed: 0,
+            latency: self.latency.snapshot(),
         }
     }
 }

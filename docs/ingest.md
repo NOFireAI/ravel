@@ -2230,6 +2230,64 @@ Counters recorded today:
   `ravel_ingest_pending_strict_acks` and the counter
   `ravel_ingest_pending_ack_shed_total`, both carrying no `signal` label.
 
+### Logs latency histograms
+
+`LogIngestMetrics` also carries fixed-bucket latency histograms for the logs
+pipeline only, read from `LogIngestMetricsSnapshot::latency`. They exist to
+attribute the strict-ack latency of a logs write by phase. Each observation is
+the difference of two readings of the injected `Clock`, so a test that
+advances its clock pins every figure exactly. The buckets are the object
+store's fixed latency bounds (`LATENCY_BUCKET_BOUNDS_MICROS`, 100 us to 5 s
+plus an overflow bucket), selected by the same `latency_bucket`, so the `le`
+values match `ravel_store_latency_seconds`. `services/ravel-server` renders
+two histogram families labelled `{mode, signal="logs", phase}`. Every phase
+series renders from zero, and no `signal="metrics"` or `signal="spans"` series
+exists for either family.
+
+`ravel_ingest_flush_phase_seconds` takes one observation per logs flush for
+each phase the flush reached. In flush order:
+
+- `permit_wait`: the flush task's wait for its tenant's flush share and the
+  shard's `max_inflight_flushes` permit, the same span `flush_permit_wait_ns`
+  sums.
+- `resolve`: the tenant's indexed-field and storage-layout resolve, a config
+  GET on a cache miss.
+- `encode`: the ADR-1702 write-gate encode. The CPU-gate wait and the RLOG
+  encode are one future, so they are one phase; `ravel_cpu_gate_wait_seconds`
+  gives the gate's share.
+- `data_put`: the data object PUT, retries included.
+- `commit_build`: the commit record build and its declared-column stamps.
+- `commit_publish`: the commit record publish, retries included.
+- `total`: from the flush task's spawn on the actor to the task's end, after
+  its ack fan-out, on every exit the task takes, an abandonment in the permit
+  queue or at the hour bound included.
+
+A step that fails still records its phase, and the phases after it record
+nothing, so a phase can count fewer flushes than `total`. `total` also holds
+what no phase covers: task scheduling and the bookkeeping between steps.
+
+`ravel_ingest_strict_ack_seconds` has three phases:
+
+- `queued`: per strict waiter, from the shard actor's arrival reading for the
+  write that registered it (taken when the actor starts handling that write,
+  so it includes merging the write's records) to the spawn of the flush that
+  carries it. A waiter answered without a flush, such as one abandoned at the
+  deferral cap or on a hand-back, records nothing.
+- `request`: per strict request, from the start of the router's submit to the
+  last shard ack received, or to the expiry of the ack deadline. It records on
+  success and on error, but not when the caller drops the ack future, and not
+  for a submit that itself returns an error, since that write never reaches
+  the ack wait.
+- `shard_skew`: per strict request that reached more than one shard and
+  received every ack, from the first shard ack received to the last.
+  Single-shard requests record nothing.
+
+Read them together: `request` is roughly `queued` plus the slowest shard's
+flush `total`, plus routing (the submit up to enqueue, the wait in the shard's
+channel before the actor takes the write, and the ack's way back).
+`shard_skew` is the cost of waiting for every shard: the time the request
+spent after its first shard had already acknowledged.
+
 ### Per-shard skew
 
 To make per-shard ingest skew measurable -- so an argument about shard-actor
@@ -2385,4 +2443,6 @@ Still tracked future work (not yet implemented): a per-tenant dimensioned
 model and per-shard latency histograms -- per-shard buffered bytes/points,
 flush build/put/commit and ack latency distributions; per-tenant
 accepted/rejected points and bytes. Those require a metrics backend that these
-flat atomics and the per-shard maps above do not provide.
+flat atomics and the per-shard maps above do not provide. The logs latency
+histograms above are process-wide, not per shard, and the metrics and span
+pipelines have none.

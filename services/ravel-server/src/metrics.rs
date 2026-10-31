@@ -11,11 +11,11 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-four label keys, twenty-five in a `sql` build:
+//! renders exactly twenty-five label keys:
 //! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
 //! `level`, `reason`, `shard`, `cache`, `tier`, `intent`, `kind`, `outcome`,
 //! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`,
-//! `worker`, `family`, and `variant`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! `worker`, `family`, `variant`, and `phase` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -37,9 +37,10 @@
 //! decision 11 for the CPU gate and tokio runtime families, `family` added by
 //! ADR-1746 for the format-floor families, `variant` added by ADR-2993
 //! decision 3 for the IPCrypt values counter, and `phase` added
-//! by issue #2374 for the SQL DDL store-cost families). The keys come from
-//! forty `Label` variants, forty-three in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and forty-four in a `flight-sql` build,
+//! by issue #2374 for the SQL DDL store-cost families and rendered in every
+//! build since issue #3533 for the logs phase histograms). The keys come from
+//! forty-four `Label` variants, forty-seven in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and forty-eight in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
@@ -51,8 +52,9 @@
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
 //! `MergeMemoryKind`, `DeletedObjectKind` and, in a `sql` build, `DdlKind`
 //! render `kind`, `AlertOutcome`, `IpcryptOutcome` and, in a `sql` build,
-//! `DdlOutcome` render `outcome`, and `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
-//! render `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
+//! `DdlOutcome` render `outcome`, `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
+//! render `site`, and `FlushPhase`, `StrictAckPhase` and, in a `sql` build,
+//! `DdlPhase` render `phase`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
 //! only constructor.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
@@ -93,9 +95,9 @@ use axum::routing::get;
 use ravel_cache::CacheMetricsSnapshot;
 use ravel_catalog::Catalog;
 use ravel_ingest::{
-    AdmissionController, HandBackReason, IngestMetricsSnapshot, IngestRouter,
-    LogIngestMetricsSnapshot, LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter,
-    TenantPutAttribution, TenantUsage,
+    AdmissionController, FlushPhase, HandBackReason, IngestMetricsSnapshot, IngestRouter,
+    LatencyHistogramSnapshot, LogIngestMetricsSnapshot, LogIngestRouter, LogLatencySnapshot,
+    SpanIngestMetricsSnapshot, SpanIngestRouter, StrictAckPhase, TenantPutAttribution, TenantUsage,
 };
 use ravel_maintain::ScrubLevel;
 use ravel_maintain::UnreadableReason;
@@ -478,6 +480,14 @@ pub enum Label {
     /// counts: a closed enum owned by `ravel_agents_core`.
     #[cfg(feature = "agents")]
     AgentsBudgetCap(ravel_agents_core::error::BudgetCap),
+    /// Which logs flush phase a `ravel_ingest_flush_phase_seconds` sample
+    /// measures (issue #3533). A closed enum owned by `ravel_ingest`, which
+    /// also owns the spelling. Shares the `phase` key with `DdlPhase`.
+    FlushPhase(FlushPhase),
+    /// Which strict-ack phase a `ravel_ingest_strict_ack_seconds` sample
+    /// measures: `queued`, `request` or `shard_skew` (issue #3533). Shares the
+    /// `phase` key with `FlushPhase`.
+    StrictAckPhase(StrictAckPhase),
 }
 
 /// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
@@ -751,6 +761,8 @@ impl Label {
             Label::AgentsFillList(_) => "list",
             #[cfg(feature = "agents")]
             Label::AgentsBudgetCap(_) => "cap",
+            Label::FlushPhase(_) => "phase",
+            Label::StrictAckPhase(_) => "phase",
         }
     }
 
@@ -816,6 +828,8 @@ impl Label {
             Label::AgentsFillList(list) => (*list).to_string(),
             #[cfg(feature = "agents")]
             Label::AgentsBudgetCap(cap) => cap.code().to_string(),
+            Label::FlushPhase(phase) => phase.name().to_string(),
+            Label::StrictAckPhase(phase) => phase.name().to_string(),
         }
     }
 
@@ -1391,6 +1405,10 @@ pub struct IngestPipelineSnapshot {
     /// signal, the same as
     /// `flushes_by_arrival`.
     pub arrival_coalesced: u64,
+    /// The flush-phase and strict-ack-phase latency histograms (issue #3533).
+    /// `Some` only for logs, the one pipeline that records them; metrics and
+    /// spans render no sample of either family.
+    pub log_latency: Option<LogLatencySnapshot>,
 }
 
 /// Exemplar admission counters, mirroring
@@ -1509,6 +1527,7 @@ impl IngestPipelineSnapshot {
             active_shard_count: 0,
             flushes_by_arrival: snapshot.flushes_by_arrival,
             arrival_coalesced: snapshot.arrival_coalesced,
+            log_latency: None,
         }
     }
 
@@ -1567,6 +1586,7 @@ impl IngestPipelineSnapshot {
             active_shard_count: 0,
             flushes_by_arrival: snapshot.flushes_by_arrival,
             arrival_coalesced: snapshot.arrival_coalesced,
+            log_latency: Some(snapshot.latency),
         }
     }
 
@@ -1616,6 +1636,7 @@ impl IngestPipelineSnapshot {
             active_shard_count: 0,
             flushes_by_arrival: snapshot.flushes_by_arrival,
             arrival_coalesced: snapshot.arrival_coalesced,
+            log_latency: None,
         }
     }
 }
@@ -2445,6 +2466,103 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             pipeline.clock_lag_bypassed_at_shutdown,
         );
     }
+
+    render_logs_latency_families(out, mode, pipelines);
+}
+
+/// The logs strict-ack latency histograms (issue #3533): one series per phase
+/// for every pipeline carrying `log_latency`, zero-count phases included, so
+/// no series appears mid-run.
+fn render_logs_latency_families(
+    out: &mut String,
+    mode: Mode,
+    pipelines: &[IngestPipelineSnapshot],
+) {
+    write_header(
+        out,
+        "ravel_ingest_flush_phase_seconds",
+        "Logs flush latency by phase, logs only, one observation per flush per phase reached, \
+         on the injected clock. permit_wait: the wait for the tenant's flush share and the \
+         shard's max_inflight_flushes permit. resolve: the tenant's indexed-field and layout \
+         resolve. encode: the write gate encode, which includes the CPU-gate wait (read \
+         ravel_cpu_gate_wait_seconds for the gate's share) and the RLOG encode. data_put: the \
+         data object PUT, retries included. commit_build: the commit record build and its \
+         declared-column stamps. commit_publish: the commit record publish, retries included. \
+         total: from the flush task's spawn to the end of its ack fan-out, on every exit. A \
+         step that fails still records; the steps after it do not.",
+        "histogram",
+    );
+    for pipeline in pipelines {
+        if let Some(latency) = &pipeline.log_latency {
+            for phase in FlushPhase::ALL {
+                write_phase_histogram(
+                    out,
+                    "ravel_ingest_flush_phase_seconds",
+                    &[
+                        Label::Mode(mode),
+                        Label::Signal(pipeline.signal),
+                        Label::FlushPhase(phase),
+                    ],
+                    latency.flush(phase),
+                );
+            }
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_strict_ack_seconds",
+        "Logs strict-write acknowledgement latency by phase, logs only, on the injected clock. \
+         queued: per strict waiter, from the shard actor taking its write to the spawn of the \
+         flush that carries it. request: per strict request, from the router's submit to every \
+         shard's ack received, or to the ack deadline. shard_skew: per strict request that \
+         reached more than one shard, from the first shard ack received to the last.",
+        "histogram",
+    );
+    for pipeline in pipelines {
+        if let Some(latency) = &pipeline.log_latency {
+            for phase in StrictAckPhase::ALL {
+                write_phase_histogram(
+                    out,
+                    "ravel_ingest_strict_ack_seconds",
+                    &[
+                        Label::Mode(mode),
+                        Label::Signal(pipeline.signal),
+                        Label::StrictAckPhase(phase),
+                    ],
+                    latency.strict_ack(phase),
+                );
+            }
+        }
+    }
+}
+
+/// One histogram series on the fixed store latency bounds: a cumulative
+/// `_bucket` per bound plus `+Inf`, `_sum` in seconds, and `_count` read from
+/// the `+Inf` bucket so the two always agree.
+fn write_phase_histogram(
+    out: &mut String,
+    name: &str,
+    labels: &[Label],
+    histogram: &LatencyHistogramSnapshot,
+) {
+    let cumulative = cumulative_buckets(&histogram.buckets);
+    let bucket_name = format!("{name}_bucket");
+    for (i, count) in cumulative.iter().enumerate() {
+        write_histogram_bucket(out, &bucket_name, labels, &bucket_le(i), *count);
+    }
+    write_sample_f64(
+        out,
+        &format!("{name}_sum"),
+        labels,
+        histogram.sum_ns as f64 / 1_000_000_000.0,
+    );
+    write_sample(
+        out,
+        &format!("{name}_count"),
+        labels,
+        cumulative[LATENCY_BUCKET_COUNT - 1],
+    );
 }
 
 /// Per-shard skew figures for one pipeline (ADR-1692 decision 4): every index
@@ -10401,6 +10519,8 @@ mod tests {
             Label::IpcryptVariant(ravel_ipcrypt::policy::Variant::Deterministic),
             Label::IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome::Encrypted),
             Label::WorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject::MissingMac),
+            Label::FlushPhase(FlushPhase::Total),
+            Label::StrictAckPhase(StrictAckPhase::Request),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -10467,6 +10587,8 @@ mod tests {
                 Label::AgentsFillList(_) => "list",
                 #[cfg(feature = "agents")]
                 Label::AgentsBudgetCap(_) => "cap",
+                Label::FlushPhase(_) => "phase",
+                Label::StrictAckPhase(_) => "phase",
             })
             .collect();
         assert_eq!(
@@ -10554,6 +10676,11 @@ mod tests {
                 // WorkerRecordRejectReason (ADR-1918 decision 4) reuses
                 // the `reason` key.
                 "reason",
+                // FlushPhase (issue #3533) puts the `phase` key in the default
+                // build, for the logs flush-phase histogram.
+                "phase",
+                // StrictAckPhase (issue #3533) reuses the `phase` key.
+                "phase",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -10563,18 +10690,18 @@ mod tests {
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
              ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, ADR-2993's \
-             `variant`, and issue #1686's `level` reuse by `ScrubLevel`"
+             `variant`, issue #3533's `phase`, and issue #1686's `level` reuse by `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            42,
-            "exactly 42 label variants every build has, 24 distinct keys (sql adds DdlKind, \
-             DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
+            44,
+            "exactly 44 label variants every build has, 25 distinct keys (sql adds DdlKind, \
+             DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            24,
-            "exactly 24 distinct keys"
+            25,
+            "exactly 25 distinct keys"
         );
     }
 
@@ -12156,6 +12283,111 @@ mod tests {
             "conversion must carry the span pipeline's own permit-wait total, not another \
              pipeline's or a wrong divisor:\n{body}"
         );
+    }
+
+    /// Issue #3533: both logs latency families render as Prometheus
+    /// histograms for the logs pipeline only, one series per phase with every
+    /// bound plus `+Inf`, `_sum` in seconds and `_count`, and carry the exact
+    /// counts of the ingest snapshot through the conversion. Each phase gets a
+    /// distinct count, so a phase rendered from its neighbour's histogram
+    /// fails, and `shard_skew` stays at zero observations to pin that an empty
+    /// phase still renders.
+    #[test]
+    fn log_latency_histograms_survive_conversion_from_ingest_snapshot() {
+        let mut latency = LogLatencySnapshot::default();
+        for (i, phase) in FlushPhase::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                latency.flush_mut(phase).record(2_000_000);
+            }
+        }
+        latency
+            .strict_ack_mut(StrictAckPhase::Queued)
+            .record(3_000_000);
+        latency
+            .strict_ack_mut(StrictAckPhase::Queued)
+            .record(700_000_000);
+        latency
+            .strict_ack_mut(StrictAckPhase::Request)
+            .record(660_000_000);
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                latency,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let mut body = String::new();
+        render_ingest_family(&mut body, Mode::Gateway, &ingest);
+
+        for family in [
+            "ravel_ingest_flush_phase_seconds",
+            "ravel_ingest_strict_ack_seconds",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {family} histogram\n")),
+                "{family} must declare its TYPE as a histogram:\n{body}"
+            );
+            for signal in ["metrics", "spans"] {
+                assert!(
+                    !body.contains(&format!(
+                        "{family}_count{{mode=\"gateway\",signal=\"{signal}\""
+                    )),
+                    "{family} is logs only:\n{body}"
+                );
+            }
+        }
+
+        let mut expected: Vec<(&str, &str, u64, u64)> = FlushPhase::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(i, phase)| {
+                let count = i as u64 + 1;
+                (
+                    "ravel_ingest_flush_phase_seconds",
+                    phase.name(),
+                    count,
+                    count * 2_000_000,
+                )
+            })
+            .collect();
+        expected.push(("ravel_ingest_strict_ack_seconds", "queued", 2, 703_000_000));
+        expected.push(("ravel_ingest_strict_ack_seconds", "request", 1, 660_000_000));
+        expected.push(("ravel_ingest_strict_ack_seconds", "shard_skew", 0, 0));
+        for (family, phase, count, sum_ns) in expected {
+            let labels = format!("{{mode=\"gateway\",signal=\"logs\",phase=\"{phase}\"");
+            let bucket_prefix = format!("{family}_bucket{labels},le=\"");
+            let buckets: Vec<&str> = body
+                .lines()
+                .filter(|line| line.starts_with(&bucket_prefix))
+                .collect();
+            assert_eq!(
+                buckets.len(),
+                LATENCY_BUCKET_COUNT,
+                "{family} {phase}: one bucket per bound plus +Inf:\n{body}"
+            );
+            for (i, bound) in LATENCY_BUCKET_BOUNDS_MICROS.iter().enumerate() {
+                let le = (*bound as f64 / 1_000_000.0).to_string();
+                assert!(
+                    buckets[i].starts_with(&format!("{bucket_prefix}{le}\"}} ")),
+                    "{family} {phase}: bucket {i} must carry le={le}: {}",
+                    buckets[i]
+                );
+            }
+            assert_eq!(
+                buckets[LATENCY_BUCKET_COUNT - 1],
+                format!("{bucket_prefix}+Inf\"}} {count}"),
+            );
+            let sum = (sum_ns as f64 / 1_000_000_000.0).to_string();
+            assert!(
+                body.contains(&format!("{family}_sum{labels}}} {sum}\n")),
+                "{family} {phase}: _sum must be {sum} seconds:\n{body}"
+            );
+            assert!(
+                body.contains(&format!("{family}_count{labels}}} {count}\n")),
+                "{family} {phase}: _count must be {count}:\n{body}"
+            );
+        }
     }
 
     /// Issue #1742: `ravel_ingest_flush_all_residue_tenants_total` must render
