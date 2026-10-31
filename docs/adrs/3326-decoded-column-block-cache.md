@@ -733,8 +733,9 @@ cells of the surviving rows one by one as before
 `crates/ravel-sql/src/logs_scan/batch.rs`; the last pins a bulk scan's first
 touch at 2 decode-time validations and 4 per build, its second at 8 and 0,
 and its hit at 0). A size, budget or concurrent-admission refusal in `offer`,
-or a refusal by the frequency gate of the LIKE-deferred amendment below,
-can still leave a column validated at decode and not admitted; its
+or a refusal by an admission gate (the LIKE-deferred amendment below
+decides one; it is not on main, see that amendment's status), can still
+leave a column validated at decode and not admitted; its
 validation is then spent on this read alone, as it was for every missed
 column before. When the whole values buffer is UTF-8
 and every cell offset is a character boundary, the buffer is kept as a
@@ -775,6 +776,20 @@ validated count).
 <!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|3. Admission lets a statement's later tries hit, and a one-pass scan does not displace a working set|5. Answers do not change|How big the working set is|Consequences|Amendment (2026-10-30): which cached string columns keep their validation" pointer="LIKE-deferred amendment" -->
 <!-- amendment-supersedes: phrase="Caching a validated copy for later Contains statements is a separate decision, not taken here" pointer="LIKE-deferred amendment" -->
 <!-- amendment-supersedes: phrase="`contains_cells_tested` is unaffected, because Contains-tested columns are not cached" pointer="LIKE-deferred amendment" -->
+
+**Status (2026-10-31): decision 1 was reverted, and decisions 2 to 4 are on
+hold.** The gate landed and missed decision 6's hot bands on the paired run
+(#3326 comment 6546999545). Hot wall geomean B/A was 1.0446 against a band
+of 0.98 to 1.02, and q28 was 1.854. When one server process runs all 43
+statements, the 8 GB cache is full. The gate refused 413,347 admissions
+where CLOCK would have evicted, and it weighs access counts alone, so it
+kept blocks that were cheaper to decode again than the ones it refused.
+The revert put `decoded_cache.rs` back to its state before the gate. The
+gate, its `frequency_refusals` counter and its tests are not in the tree.
+The citations to `decoded_cache.rs` lines and gate tests in decision 1
+below describe that reverted change, not the current file. A later
+amendment replaces decision 1 with an admission rule that weighs decode
+cost, and decisions 2 to 4 wait for it.
 
 On the v0.28.0 profile run `prof028-20261030T1244Z` (8 GB cap), most of
 the decode left in the hot sum is in the columns a `Contains` arm defers.
