@@ -863,12 +863,16 @@ mod tests {
     use super::*;
 
     use datafusion::arrow::array::{
-        BooleanArray, DictionaryArray, Int32Array, Int64Array, ListArray, MapBuilder, NullArray,
-        StringArray, StringBuilder, StringViewArray, UInt32Array,
+        BooleanArray, Decimal128Array, DictionaryArray, Float32Array, Float64Array, Int32Array,
+        Int64Array, ListArray, MapBuilder, NullArray, StringArray, StringBuilder, StringViewArray,
+        TimestampNanosecondArray, UInt32Array,
     };
     use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
     use datafusion::arrow::compute::{SortOptions, concat_batches};
-    use datafusion::arrow::datatypes::{Field, Int32Type, Int64Type, Schema, SchemaRef};
+    use datafusion::arrow::datatypes::{
+        Decimal128Type, Field, Float32Type, Float64Type, Int32Type, Int64Type, Schema, SchemaRef,
+        TimeUnit, TimestampNanosecondType,
+    };
     use datafusion::common::{ScalarValue, SplitPoint};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::functions_aggregate::count::count_udaf;
@@ -881,6 +885,7 @@ mod tests {
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::{collect, displayable};
     use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
 
     /// Rows per batch in the sliced-batch tests, and the number of pieces
     /// the batch is cut into.
@@ -2210,9 +2215,22 @@ mod tests {
         fetch: usize,
         prefilter: bool,
     ) -> (Vec<Row>, usize) {
+        let (out, dropped) = topk_batches(batches, ordering, fetch, prefilter);
+        (out.iter().flat_map(batch_to_rows).collect(), dropped)
+    }
+
+    /// The TopK's output batches over `batches` (one partition, at least one
+    /// batch) with or without the pre-filter, and the rows the pre-filter
+    /// dropped.
+    fn topk_batches(
+        batches: &[RecordBatch],
+        ordering: &LexOrdering,
+        fetch: usize,
+        prefilter: bool,
+    ) -> (Vec<RecordBatch>, usize) {
+        let schema = batches.first().expect("a batch").schema();
         let source =
-            MemorySourceConfig::try_new_exec(&[batches.to_vec()], exactness_schema(), None)
-                .expect("source");
+            MemorySourceConfig::try_new_exec(&[batches.to_vec()], schema, None).expect("source");
         let topk = prefilter.then(|| TopKPrefilter {
             ordering: ordering.clone(),
             fetch,
@@ -2233,8 +2251,72 @@ mod tests {
         let out = runtime
             .block_on(collect(sort, Arc::new(TaskContext::default())))
             .expect("collect");
-        let rows = out.iter().flat_map(batch_to_rows).collect();
-        (rows, metric(&exec, "topk_dropped_rows"))
+        (out, metric(&exec, "topk_dropped_rows"))
+    }
+
+    /// The exactness rule over rows of any shape: the TopK's answer `with`
+    /// the pre-filter, which dropped `dropped` rows, against its answer
+    /// `without` over `input`, one inner `Vec` per batch. Both answers have
+    /// the same sort-key sequence (`key_of`) always, `with` holds only input
+    /// rows and none twice (`id_of`), and the two hold the same rows when
+    /// every input row tied with the `k`-th key is in `without`. Rows tied
+    /// with the `k`-th key past the cut may be swapped for each other, as
+    /// SQL allows for a `LIMIT` under a non-unique ordering.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_same_topk_answer<R, K>(
+        input: &[Vec<R>],
+        with: &[R],
+        dropped: usize,
+        without: &[R],
+        fetch: usize,
+        key_of: impl Fn(&R) -> K,
+        id_of: impl Fn(&R) -> i64,
+    ) -> Result<(), TestCaseError>
+    where
+        R: Clone + fmt::Debug + Ord,
+        K: fmt::Debug + PartialEq,
+    {
+        let all: Vec<R> = input.iter().flatten().cloned().collect();
+        let expected_dropped: usize = input
+            .iter()
+            .map(|rows| rows.len().saturating_sub(fetch))
+            .sum();
+        prop_assert_eq!(dropped, expected_dropped, "the pre-filter fired");
+        prop_assert_eq!(with.len(), fetch.min(all.len()));
+        prop_assert_eq!(
+            with.iter().map(&key_of).collect::<Vec<_>>(),
+            without.iter().map(&key_of).collect::<Vec<_>>(),
+            "the sort-key sequence"
+        );
+        for row in with {
+            prop_assert!(all.contains(row), "{:?} is an input row", row);
+        }
+        let mut ids: Vec<i64> = with.iter().map(&id_of).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        prop_assert_eq!(ids.len(), with.len(), "no row twice");
+        if let Some(last) = without.last() {
+            let kth = key_of(last);
+            let in_input = all.iter().filter(|row| key_of(row) == kth).count();
+            let in_answer = without.iter().filter(|row| key_of(row) == kth).count();
+            if in_input == in_answer {
+                let mut with_sorted = with.to_vec();
+                let mut without_sorted = without.to_vec();
+                with_sorted.sort();
+                without_sorted.sort();
+                prop_assert_eq!(with_sorted, without_sorted, "the same rows");
+            }
+        }
+        Ok(())
+    }
+
+    /// The case count of an exactness property: `PROPTEST_CASES` when set,
+    /// `default` otherwise.
+    fn exactness_cases(default: u32) -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|cases| cases.parse().ok())
+            .unwrap_or(default)
     }
 
     fn row_strategy() -> impl Strategy<Value = (Option<i64>, Option<String>)> {
@@ -2246,7 +2328,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(exactness_cases(256)))]
 
         /// The TopK's answer with the pre-filter equals its answer without:
         /// the same sort-key sequence always, the same rows when the `k`-th
@@ -2296,34 +2378,328 @@ mod tests {
 
             let (with, dropped) = topk_answer(&record_batches, &ordering, fetch, true);
             let (without, _) = topk_answer(&record_batches, &ordering, fetch, false);
-            let all: Vec<Row> = input.iter().flatten().cloned().collect();
-            let expected_dropped: usize = input.iter().map(|rows| rows.len().saturating_sub(fetch)).sum();
-            prop_assert_eq!(dropped, expected_dropped, "the pre-filter fired");
-            prop_assert_eq!(with.len(), fetch.min(all.len()));
-            prop_assert_eq!(
-                with.iter().map(key_of).collect::<Vec<_>>(),
-                without.iter().map(key_of).collect::<Vec<_>>(),
-                "the sort-key sequence"
-            );
-            for row in &with {
-                prop_assert!(all.contains(row), "{:?} is an input row", row);
-            }
-            let mut ids: Vec<i64> = with.iter().map(|row| row.2).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            prop_assert_eq!(ids.len(), with.len(), "no row twice");
-            if let Some(last) = without.last() {
-                let kth = key_of(last);
-                let in_input = all.iter().filter(|row| key_of(row) == kth).count();
-                let in_answer = without.iter().filter(|row| key_of(row) == kth).count();
-                if in_input == in_answer {
-                    let mut with_sorted = with.clone();
-                    let mut without_sorted = without.clone();
-                    with_sorted.sort();
-                    without_sorted.sort();
-                    prop_assert_eq!(with_sorted, without_sorted, "the same rows");
+            assert_same_topk_answer(&input, &with, dropped, &without, fetch, key_of, |row| row.2)?;
+        }
+    }
+
+    // ----- exactness over every key type -----
+
+    /// A sort-key type the pre-filter ranks with `lexsort_to_indices` and
+    /// the TopK with its row format.
+    #[derive(Clone, Copy, Debug)]
+    enum KeyType {
+        Float64,
+        Float32,
+        Decimal128,
+        TimestampNs,
+        Boolean,
+        DictionaryUtf8,
+        Utf8View,
+    }
+
+    /// Both signs of NaN, a second NaN payload, both zeros and both
+    /// infinities: every value where a ranking by `partial_cmp` or `==`
+    /// parts from the total order.
+    const F64_KEYS: [f64; 9] = [
+        f64::NAN,
+        -f64::NAN,
+        f64::from_bits(f64::NAN.to_bits() | 1),
+        -0.0,
+        0.0,
+        -1.5,
+        1.5,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    const F32_KEYS: [f32; 9] = [
+        f32::NAN,
+        -f32::NAN,
+        f32::from_bits(f32::NAN.to_bits() | 1),
+        -0.0,
+        0.0,
+        -1.5,
+        1.5,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    /// Decimal128(10, 2) values, its extremes included.
+    const DECIMAL_KEYS: [i128; 7] = [-9_999_999_999, -100, -1, 0, 1, 250, 9_999_999_999];
+    const TIMESTAMP_KEYS: [i64; 6] = [i64::MIN, -1, 0, 1, 1_700_000_000_000_000_000, i64::MAX];
+    const BOOL_KEYS: [bool; 2] = [false, true];
+    /// Dictionary values, ranked as strings; each batch's dictionary holds
+    /// them in a different order, none of them sorted, so ranking by
+    /// dictionary key differs from ranking by value.
+    const DICTIONARY_KEYS: [&str; 4] = ["w", "x", "y", "z"];
+    const DICTIONARY_ORDERS: [[usize; 4]; 3] = [[3, 1, 0, 2], [1, 3, 2, 0], [2, 0, 3, 1]];
+    /// Utf8View values: inlined ones and ones past the 12-byte view prefix
+    /// that differ only after it.
+    const VIEW_KEYS: [&str; 6] = [
+        "",
+        "a",
+        "ab",
+        "a-long-string-past-the-view-prefix-1",
+        "a-long-string-past-the-view-prefix-2",
+        "zz",
+    ];
+    const B_KEYS: [&str; 3] = ["x", "y", "z"];
+
+    impl KeyType {
+        const ALL: [KeyType; 7] = [
+            KeyType::Float64,
+            KeyType::Float32,
+            KeyType::Decimal128,
+            KeyType::TimestampNs,
+            KeyType::Boolean,
+            KeyType::DictionaryUtf8,
+            KeyType::Utf8View,
+        ];
+
+        fn data_type(self) -> DataType {
+            match self {
+                KeyType::Float64 => DataType::Float64,
+                KeyType::Float32 => DataType::Float32,
+                KeyType::Decimal128 => DataType::Decimal128(10, 2),
+                KeyType::TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, None),
+                KeyType::Boolean => DataType::Boolean,
+                KeyType::DictionaryUtf8 => {
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
                 }
+                KeyType::Utf8View => DataType::Utf8View,
             }
+        }
+
+        /// The column of `values`, each an index into this type's domain,
+        /// for the `batch`-th batch.
+        fn column(self, values: &[Option<usize>], batch: usize) -> ArrayRef {
+            fn pick<T: Copy>(values: &[Option<usize>], keys: &[T]) -> Vec<Option<T>> {
+                values
+                    .iter()
+                    .map(|v| v.map(|i| keys[i % keys.len()]))
+                    .collect()
+            }
+            match self {
+                KeyType::Float64 => Arc::new(Float64Array::from(pick(values, &F64_KEYS))),
+                KeyType::Float32 => Arc::new(Float32Array::from(pick(values, &F32_KEYS))),
+                KeyType::Decimal128 => Arc::new(
+                    Decimal128Array::from(pick(values, &DECIMAL_KEYS))
+                        .with_precision_and_scale(10, 2)
+                        .expect("decimal"),
+                ),
+                KeyType::TimestampNs => Arc::new(TimestampNanosecondArray::from(pick(
+                    values,
+                    &TIMESTAMP_KEYS,
+                ))),
+                KeyType::Boolean => Arc::new(BooleanArray::from(pick(values, &BOOL_KEYS))),
+                KeyType::DictionaryUtf8 => {
+                    let order = DICTIONARY_ORDERS[batch % DICTIONARY_ORDERS.len()];
+                    let dictionary: StringArray =
+                        order.iter().map(|&i| Some(DICTIONARY_KEYS[i])).collect();
+                    let positions: Vec<i32> = (0..DICTIONARY_KEYS.len())
+                        .map(|i| {
+                            let at = order.iter().position(|&o| o == i).expect("in the order");
+                            i32::try_from(at).expect("a small key")
+                        })
+                        .collect();
+                    let keys = Int32Array::from(pick(values, &positions));
+                    Arc::new(
+                        DictionaryArray::<Int32Type>::try_new(keys, Arc::new(dictionary))
+                            .expect("dictionary"),
+                    )
+                }
+                KeyType::Utf8View => Arc::new(StringViewArray::from(pick(values, &VIEW_KEYS))),
+            }
+        }
+    }
+
+    /// One sort-key value as the test compares it: a float by its bit
+    /// pattern, so NaN equals itself, its other payloads and sign do not,
+    /// and -0.0 differs from 0.0, as in the total order both rankings use;
+    /// a dictionary value by its string, never its key.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Null,
+        Int(i128),
+        Bits(u64),
+        Bool(bool),
+        Str(String),
+    }
+
+    fn key_at(array: &ArrayRef, i: usize) -> Key {
+        if array.is_null(i) {
+            return Key::Null;
+        }
+        match array.data_type() {
+            DataType::Float64 => Key::Bits(array.as_primitive::<Float64Type>().value(i).to_bits()),
+            DataType::Float32 => Key::Bits(u64::from(
+                array.as_primitive::<Float32Type>().value(i).to_bits(),
+            )),
+            DataType::Decimal128(..) => Key::Int(array.as_primitive::<Decimal128Type>().value(i)),
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => Key::Int(i128::from(
+                array.as_primitive::<TimestampNanosecondType>().value(i),
+            )),
+            DataType::Boolean => Key::Bool(array.as_boolean().value(i)),
+            DataType::Utf8 => Key::Str(array.as_string::<i32>().value(i).to_string()),
+            DataType::Utf8View => Key::Str(array.as_string_view().value(i).to_string()),
+            DataType::Dictionary(..) => {
+                let dictionary = array.as_dictionary::<Int32Type>();
+                let at = usize::try_from(dictionary.keys().value(i)).expect("a key");
+                Key::Str(dictionary.values().as_string::<i32>().value(at).to_string())
+            }
+            other => panic!("no key for {other}"),
+        }
+    }
+
+    /// One aggregate-output row of a typed batch: the `a` key, the Utf8 `b`
+    /// key and the unique id.
+    type TypedRow = (Key, Key, i64);
+
+    fn typed_schema(key_type: KeyType) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", key_type.data_type(), true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]))
+    }
+
+    fn typed_batch_to_rows(batch: &RecordBatch) -> Vec<TypedRow> {
+        let id = batch.column(2).as_primitive::<Int64Type>();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    key_at(batch.column(0), i),
+                    key_at(batch.column(1), i),
+                    id.value(i),
+                )
+            })
+            .collect()
+    }
+
+    /// The exactness rule (`assert_same_topk_answer`) for `a` of `key_type`,
+    /// alone or followed by the Utf8 `b`, over `batches` of domain indices.
+    fn check_typed_topk(
+        key_type: KeyType,
+        batches: Vec<Vec<(Option<usize>, Option<usize>)>>,
+        two_keys: bool,
+        options: &[(bool, bool)],
+        fetch: usize,
+    ) -> Result<(), TestCaseError> {
+        let schema = typed_schema(key_type);
+        let mut next_id = 0i64;
+        let record_batches: Vec<RecordBatch> = batches
+            .iter()
+            .enumerate()
+            .map(|(index, rows)| {
+                let a: Vec<Option<usize>> = rows.iter().map(|row| row.0).collect();
+                let b: StringArray = rows
+                    .iter()
+                    .map(|row| row.1.map(|i| B_KEYS[i % B_KEYS.len()]))
+                    .collect();
+                let id: Int64Array = rows
+                    .iter()
+                    .map(|_| {
+                        next_id += 1;
+                        Some(next_id)
+                    })
+                    .collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![key_type.column(&a, index), Arc::new(b), Arc::new(id)],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let input: Vec<Vec<TypedRow>> = record_batches.iter().map(typed_batch_to_rows).collect();
+        let keys = if two_keys { vec!["a", "b"] } else { vec!["a"] };
+        let ordering = LexOrdering::new(keys.iter().zip(options).map(
+            |(name, (descending, nulls_first))| {
+                PhysicalSortExpr::new(
+                    col(name, &schema).expect("key"),
+                    SortOptions {
+                        descending: *descending,
+                        nulls_first: *nulls_first,
+                    },
+                )
+            },
+        ))
+        .expect("a sort key");
+        let key_of = |row: &TypedRow| {
+            (
+                row.0.clone(),
+                if two_keys { row.1.clone() } else { Key::Null },
+            )
+        };
+        let answer = |prefilter| {
+            let (out, dropped) = topk_batches(&record_batches, &ordering, fetch, prefilter);
+            let rows: Vec<TypedRow> = out.iter().flat_map(typed_batch_to_rows).collect();
+            (rows, dropped)
+        };
+        let (with, dropped) = answer(true);
+        let (without, _) = answer(false);
+        assert_same_topk_answer(&input, &with, dropped, &without, fetch, key_of, |row| row.2)
+    }
+
+    /// Batches of up to 11 rows of domain indices, nullable, drawn from
+    /// small domains so ties across batch boundaries, at the `k`-th row
+    /// included, are common.
+    fn typed_batches_strategy() -> impl Strategy<Value = Vec<Vec<(Option<usize>, Option<usize>)>>> {
+        prop::collection::vec(
+            prop::collection::vec(
+                (
+                    prop::option::weighted(0.8, 0usize..16),
+                    prop::option::weighted(0.8, 0usize..3),
+                ),
+                0..12,
+            ),
+            1..6,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(exactness_cases(2048)))]
+
+        /// `prop_topk_prefilter_keeps_the_topk_answer`'s rule for a Float64
+        /// or Float32 key, alone or followed by a Utf8 key (q28 and q29 rank
+        /// by `AVG(...)`, a Float64), over both NaN signs, two NaN payloads,
+        /// both zeros, both infinities and nulls, in every combination of
+        /// `descending` and `nulls_first`.
+        ///
+        /// FLIP (a): in `prefilter_batch`, evaluate each key with
+        /// `nulls_first: !sort.options.nulls_first` and the sort-key sequence
+        /// assertion fails, shrunk to `a ASC NULLS LAST, b ASC NULLS LAST`
+        /// with `fetch = 1` over Float64 rows (null, null), (null, null),
+        /// (null, "x") ((null, null) kept, (null, "x") expected). FLIP (b):
+        /// rank a Float64 key by `partial_cmp`, a NaN equal to everything,
+        /// and it fails, shrunk to one `a DESC NULLS LAST` key with
+        /// `fetch = 1` over five NaN and two NaN with the low payload bit set
+        /// (a NaN kept, the payload NaN expected). The (b) cases are the
+        /// checked-in seeds.
+        #[test]
+        fn prop_topk_prefilter_keeps_the_topk_answer_for_float_keys(
+            key_type in prop::sample::select(vec![KeyType::Float64, KeyType::Float32]),
+            batches in typed_batches_strategy(),
+            two_keys in any::<bool>(),
+            options in prop::collection::vec((any::<bool>(), any::<bool>()), 2),
+            fetch in 1usize..48,
+        ) {
+            check_typed_topk(key_type, batches, two_keys, &options, fetch)?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(exactness_cases(1024)))]
+
+        /// `prop_topk_prefilter_keeps_the_topk_answer`'s rule for every key
+        /// type in `KeyType::ALL`, alone or followed by a Utf8 key, in every
+        /// combination of `descending` and `nulls_first`.
+        #[test]
+        fn prop_topk_prefilter_keeps_the_topk_answer_for_every_key_type(
+            key_type in prop::sample::select(KeyType::ALL.to_vec()),
+            batches in typed_batches_strategy(),
+            two_keys in any::<bool>(),
+            options in prop::collection::vec((any::<bool>(), any::<bool>()), 2),
+            fetch in 1usize..48,
+        ) {
+            check_typed_topk(key_type, batches, two_keys, &options, fetch)?;
         }
     }
 }
