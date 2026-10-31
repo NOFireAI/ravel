@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   AgentGone,
@@ -116,6 +116,27 @@ describe("HttpTransport requests", () => {
     const polled = await transport.poll({ worker_id: "w", handlers: [], wait_ms: 1 }, new AbortController().signal);
     expect(polled?.assignment.lease.recorded_unix_ns).toBe(1767225600000000000n);
     expect(polled?.assignment.lease.random_seed).toBe("8f8d1b06b1618bd08db0300dbba36423");
+  });
+
+  it("warns once when passed the deprecated journal option and otherwise ignores it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { fetch, sent } = fakeFetch(() => ({ status: 200, body: { lease_expires_unix_ns: "1767225630000000000" } }));
+      const journal = { recordStep: () => Promise.reject(new Error("the journal must not be called")) };
+      const first = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal });
+      const second = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toMatch(/journal option is deprecated and ignored/);
+      await first.heartbeat({ lease: LEASE });
+      await second.heartbeat({ lease: LEASE });
+      expect(sent.map((s) => [s.url, s.body])).toEqual([
+        ["http://ravel.test/api/v1/agents/worker/heartbeat", { lease: LEASE }],
+        ["http://ravel.test/api/v1/agents/worker/heartbeat", { lease: LEASE }],
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("rejects with the abort reason when the poll is aborted", async () => {

@@ -48,11 +48,14 @@ export interface HttpTransportOptions {
   /** Defaults to the global `fetch`. */
   readonly fetch?: typeof fetch;
   /**
-   * Ignored: steps and effect results are recorded on the server.
-   * Accepted so callers written against the in-memory journal still compile.
+   * @deprecated Ignored since steps and effect results are recorded on the
+   * server; passing one logs a warning once per process. This option will be
+   * removed.
    */
   readonly journal?: unknown;
 }
+
+let journalWarned = false;
 
 export class HttpTransport implements Transport {
   private readonly base: string;
@@ -61,6 +64,13 @@ export class HttpTransport implements Transport {
   constructor(private readonly options: HttpTransportOptions) {
     this.base = options.url.replace(/\/+$/, "");
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+    if (options.journal !== undefined && !journalWarned) {
+      journalWarned = true;
+      console.warn(
+        "createHttpTransport: the journal option is deprecated and ignored; " +
+          "the server records steps and effect results. It will be removed.",
+      );
+    }
   }
 
   private async exchange<Req extends z.ZodType, Res extends z.ZodType>(
