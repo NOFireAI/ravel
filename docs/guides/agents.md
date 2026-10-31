@@ -70,13 +70,14 @@ timers are held to. `--agents-max-agents`, `--agents-max-state-bytes` and
 release.
 
 Access is by three capabilities: `agents` for client operations,
-`agents_worker` for workers, and `agents_admin` for reconciliation. A
+`agents_worker` for workers, and `agents_admin` for reconciliation and
+destroying an agent. A
 static token grants them through its suffix (`--tenant-token
 'TOKEN=acme;agents'`), and OIDC through `--oidc-agents-claim`,
 `--oidc-agents-worker-claim` and `--oidc-agents-admin-claim`. Every client
 route requires `agents` and every `worker/` route requires `agents_worker`,
-answering 403 without it. The `reconcile` and `sweep` routes require
-`agents_admin`, answering 403 without it.
+answering 403 without it. The `reconcile`, `sweep` and `destroy` routes
+require `agents_admin`, answering 403 without it.
 
 The runtime stores objects under `t/<tenant>/ag/` in the bucket. The IAM
 templates in [deploy/iam](../../deploy/iam/README.md#ravel-agents-tag) grant
@@ -91,7 +92,7 @@ routes (`create`, `send`, `call`, `operation`, `result`, `resolve`,
 `cancel`, `state`, `events`, `timers`, `effects`), the worker routes
 (`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`,
 `worker/step`, `worker/effects/complete`, `worker/effects/fail`), the admin
-`reconcile` and `sweep` routes, and the inspector, all under
+`reconcile`, `sweep` and `destroy` routes, and the inspector, all under
 `/api/v1/agents/`.
 The [HTTP API reference](../reference/http-api.md#agents-routes) gives each
 route's body and status codes. The server's `agents_e2e` tests run these

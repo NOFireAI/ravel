@@ -146,7 +146,7 @@ records the release that each surface first shipped in.
 | Flight SQL | the same five tables, with the same `samples` limit | `flight-sql` | yes |
 | ES&vert;QL over `POST /api/v1/esql` | logs, as `FROM logs` | `esql` | no |
 | Parquet tables over both SQL surfaces | Parquet files read in place from an S3, GCS or Azure location granted to the tenant (`ravel-cli tenant parquet-grant add`, `ravel-server --parquet-profiles`); described below the matrix | `sql` | yes |
-| Agents API under `/api/v1/agents/`, with `--agents` | none: durable agent state, not a telemetry signal; client routes (`create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`) and worker routes (`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`, `worker/effects/*`), timer, effect, `reconcile` and `sweep` routes; operator guide in [docs/guides/operations/agents.md](docs/guides/operations/agents.md) | `agents` | yes |
+| Agents API under `/api/v1/agents/`, with `--agents` | none: durable agent state, not a telemetry signal; client routes (`create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`) and worker routes (`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`, `worker/effects/*`), timer, effect, and the admin `reconcile`, `sweep` and `destroy` routes; operator guide in [docs/guides/operations/agents.md](docs/guides/operations/agents.md) | `agents` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
@@ -509,11 +509,12 @@ carries Ravel Agents.
 
 Know these limits before you put agents in production:
 
-- An agent accepts at most `--agents-max-receipts` messages in its life,
-  1,024 by default. Use a key with a bounded life, such as one order or one
+- An agent accepts at most `--agents-max-receipts` messages in one
+  incarnation, 1,024 by default. Use a key with a bounded life, such as one order or one
   conversation, and not a key that receives messages forever.
-- No route destroys an agent in this release. An agent at a cap stays
-  there, so send new work to a new key.
+- An agent at a cap stays there until an operator destroys it with
+  `POST /api/v1/agents/destroy` and creates it again; see
+  [Destroying an agent](docs/guides/operations/agents.md#destroying-an-agent).
 - The TypeScript SDK keeps steps in the worker's memory. When a worker
   process stops in the middle of a turn, its completed steps are lost with
   it, so the next worker can run those tools again.

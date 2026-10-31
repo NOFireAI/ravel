@@ -17,8 +17,8 @@ Status: the contracts (`ravel-agents-core`), the publication layer
 the `inspector` page for clients (`agents`); `worker/register`,
 `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`,
 `worker/effects/complete` and `worker/effects/fail` for workers
-(`agents_worker`); and `reconcile` and `sweep` for operators (`agents_admin`), all under
-`/api/v1/agents/` (the
+(`agents_worker`); and `reconcile`, `sweep` and `destroy` for operators
+(`agents_admin`), all under `/api/v1/agents/` (the
 [HTTP API reference](reference/http-api.md#agents-routes) lists them).
 `services/ravel-server/tests/agents_e2e.rs` and
 `services/ravel-server/tests/agents_effects_e2e.rs` drive them through a
@@ -264,7 +264,12 @@ A HEAD is not deleted. `destroy` sets `Tombstoned`; `create` on a tombstoned
 agent bumps `incarnation` in the same HEAD, and a handle from an earlier
 incarnation is refused with `AgentGone` (kernel test
 `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store
-test `create_on_a_tombstoned_agent_bumps_the_incarnation`).
+test `create_on_a_tombstoned_agent_bumps_the_incarnation`). The `destroy`
+route (`agents_admin`) is the only caller of `destroy`; the
+[HTTP API reference](reference/http-api.md#agents-routes) states its
+answers and the
+[operations guide](guides/operations/agents.md#destroying-an-agent) when to
+use it.
 
 ## The publication rule
 
@@ -388,7 +393,11 @@ over `v1:<kind>:<agent_id>:<incarnation>:<item>`, where the kind is `op`,
 `step`, `effect` or `timer`. A token of another version decodes to a typed
 unsupported-version error, not to a malformed one, and each handle has
 exactly one token (`state::tests::unknown_version_is_typed_not_malformed`,
-`a_decoded_token_is_the_canonical_one`, `handles_round_trip`).
+`a_decoded_token_is_the_canonical_one`, `handles_round_trip`). Once its
+incarnation is destroyed a handle answers `AgentGone` from `operation` and
+`result`, and still does after a `create` starts the next incarnation
+(e2e
+`destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`).
 
 ## Typed errors
 
@@ -434,6 +443,17 @@ listed route by route in
 [the HTTP API reference](reference/http-api.md#agents-routes). Their JSON
 forms are pinned by the files in `sdk/fixtures/`, which
 `wire::fixtures::fixtures_match_the_wire_types` regenerates and checks.
+
+Destroy. `destroy` (`agents_admin`) takes `DestroyAgentRequest`, the agent
+and an optional `incarnation` it must still be in, and answers
+`DestroyAgentResponse`: the agent id, the tombstoned incarnation,
+`destroyed` (false when the agent was already tombstoned and nothing was
+written), and `abandoned`, the `AbandonedCounts` of the HEAD the tombstone
+was applied to: unconsumed `inputs`, `active_turn`, `effects_in_doubt`,
+`effects_authorized` and `timers_scheduled`. `timers_scheduled` comes from
+`Head::scheduled_timers`, which counts sealed timer pages, so a shallow
+HEAD read gives every count (e2e
+`destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`).
 
 Fill. `GET /api/v1/agents/state` answers `usage`, the counts behind each
 lifetime cap read from the agent's HEAD as stored: `receipts` against
@@ -813,7 +833,7 @@ the cell. End-to-end tests are in `services/ravel-server/tests/agents_*.rs`.
 | Duplicate send with the same id and hash returns the same handle; a different hash conflicts | shipped | `EnqueueCas`, `RequestIdentityStable` | `senders::same_request_twice_is_a_duplicate`, `senders::same_id_different_payload_conflicts`, `senders::duplicate_and_conflict_across_seeds` | Runtime qualification (`ConsistentReadAfterWrite`) | store `enqueue_with_the_same_request_id_and_hash_returns_the_same_handle`, kernel `retries_are_idempotent_and_conflicts_are_typed` |
 | Concurrent senders each get a distinct accept seq and no send is lost | shipped | `NoLostConcurrentEnqueue`, `MonotonicIdentity` | `senders::competing_senders_take_distinct_accept_seqs`, `senders::competing_senders_across_seeds` | Semantics adapters MUST honor (`ConditionalWriteCasVersion`) | the schedules above against the production store |
 | Mailbox, receipt, timer, index page and HEAD byte caps refuse with a typed error naming the cap, never drop | shipped | kernel `logical_caps_and_the_byte_cap_are_typed` | `errors::full_mailbox_is_refused`, `errors::oversized_payload_is_budget_exceeded` | none: the caps are checked on the decoded HEAD before any write | store `a_full_mailbox_is_refused_before_any_write`, runtime `each_cap_refusal_moves_its_counter_by_exactly_one`; e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` (a send past `max_receipts` is 413 with `cap` `receipts`) |
-| Agent lifetime limit: one incarnation accepts at most `--agents-max-receipts` sends (1,024 by default), and the results, events and timers lists stop at 512 pages of 64 entries each; nothing trims them, and no route destroys an agent in this release, so a capped agent stays capped | shipped (limitation) | kernel `logical_caps_and_the_byte_cap_are_typed`, `head_stays_under_the_cap_with_every_list_at_max_pages` | none: no schedule fills a list to its cap | none: a HEAD-content limit | e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter`; kernel `retries_are_idempotent_and_conflicts_are_typed` (a duplicate uses no receipt); `docs/guides/operations/agents.md`, "Long-lived agents" |
+| Agent lifetime limit: one incarnation accepts at most `--agents-max-receipts` sends (1,024 by default), and the results, events and timers lists stop at 512 pages of 64 entries each; nothing trims them, so an `agents_admin` caller destroys a capped agent and recreates it under a new incarnation, which starts every list empty (e2e `destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`; kernel `the_lifecycle_commands_publish_at_the_byte_cap`, where the tombstone and the recreate both publish from a HEAD at the byte cap) | shipped (limitation) | kernel `logical_caps_and_the_byte_cap_are_typed`, `head_stays_under_the_cap_with_every_list_at_max_pages` | none: no schedule fills a list to its cap | none: a HEAD-content limit | e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter`; kernel `retries_are_idempotent_and_conflicts_are_typed` (a duplicate uses no receipt); `docs/guides/operations/agents.md`, "Long-lived agents" |
 | Receipts and list entries are trimmed or expire, so an agent can live indefinitely | deferred | none: not built | none: not built | none: not built | the lifetime limit row above is what happens instead |
 | Each agent's fill against its lifetime caps, and every cap refusal, is reported | shipped | none: reporting, not protocol | none: the sim asserts no metric | Runtime qualification (`CrossPageListing`): the fill is read on the directory cycle | e2e `a_sweep_cycle_renders_the_fill_families_and_the_refusal_counter` (the four families on `/metrics` and the state route's `usage`); runtime `a_directory_cycle_publishes_the_highest_fill_and_the_near_cap_counts` (the cycle issues one HEAD GET an agent and no other), `the_fill_is_published_only_when_a_directory_cycle_completes` |
 | Bounded paged indexes (format version 2): results, events and timers seal into immutable pages and HEAD stays under 256 KiB | shipped | kernel `head_stays_under_the_cap_with_every_list_at_max_pages` | `workers::one_worker_turn_issues_the_documented_requests` | Semantics adapters MUST honor (`ConditionalWriteCreateIfAbsent` for a page) | Index pages above; e2e `events_page_after_the_durable_cursor_without_duplicates` |
@@ -837,7 +857,7 @@ the cell. End-to-end tests are in `services/ravel-server/tests/agents_*.rs`.
 | A send accepted by one process for an agent another process could serve is found within ceil(N/32) sweep passes at the 5 s interval | shipped (limitation: discovery delay) | `SweepRead`/`SweepFire` (design row, no Rust row) | none: the sim runs one coordinator per schedule except `workers::cold_restart_with_a_second_coordinator` | Runtime qualification (`CrossPageListing`) | `a_bounded_pass_walks_the_directory_in_list_order_across_passes`; `benchmarks/agents/REPORT.md`, "Discovery" (100 agents 11.5 s, 1,000 agents 2.5 min, 10,000 agents 26.0 min); a single process wakes at once (`a_waiting_poll_wakes_on_send_and_the_wait_is_capped`) |
 | A send writes a wake hint so another process finds the agent on its next pass | deferred | `WriteHint` covers timers only | none: not built | none: not built | the discovery row above is what happens instead |
 | A sweep pass is bounded: at most 8 LIST pages and 64 HEAD reads, whatever the number of agents | shipped | `TimerDue` | `timers::a_lost_hint_put_is_delivered_by_the_sweep_within_its_interval` | Runtime qualification (`CrossPageListing`) | `a_bounded_pass_walks_the_directory_in_list_order_across_passes`, `a_poll_issues_no_unbounded_list`, e2e `sweep_route_counts_match_the_store_and_needs_agents_admin`, `the_interval_sweep_runs_a_pass_per_interval_with_no_poll` |
-| Destroy tombstones; recreate bumps the incarnation and refuses old handles | shipped (kernel and store only: no route, CLI command or SDK call destroys an agent in this release) | `Destroy`, `Recreate`, `TenantIncarnationIsolation`, `MonotonicIdentity` | none: no schedule destroys an agent; the reference machine checks it on its own (`recreate_after_destroy_refuses_the_old_handle`) | Semantics adapters MUST honor (`ConditionalWriteCreateIfAbsent`) | kernel `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store `create_on_a_tombstoned_agent_bumps_the_incarnation` |
+| Destroy tombstones; recreate bumps the incarnation and refuses old handles | shipped (the `destroy` route) | `Destroy`, `Recreate`, `TenantIncarnationIsolation`, `MonotonicIdentity` | none: no schedule destroys an agent; the reference machine checks it on its own (`recreate_after_destroy_refuses_the_old_handle`) | Semantics adapters MUST honor (`ConditionalWriteCreateIfAbsent`) | kernel `a_tombstoned_agent_is_gone_until_recreated_under_a_new_incarnation`, store `create_on_a_tombstoned_agent_bumps_the_incarnation`; e2e `destroy_fences_the_lease_holder_audits_once_and_a_recreate_starts_incarnation_two`, `destroy_of_an_unknown_agent_or_a_stale_incarnation_is_agent_gone_and_not_audited` |
 | Kernel sequences keep the HEAD invariants | shipped | kernel `kernel_sequences_keep_the_head_invariants` | every schedule checks the reference machine's invariants after each step | none: in-memory property test | kernel `kernel_sequences_keep_the_head_invariants`; sim `reference_machine_invariants_hold` |
 | The production store and runtime are checked against the independent reference machine under faults | shipped | the reference machine in `ravel-agents-sim` | every schedule module: `effects`, `errors`, `races`, `senders`, `storm`, `timers`, `workers` | Runtime qualification (the sim store models the probed semantics) | `crates/ravel-agents-sim/src/schedules/mod.rs`; `workers::cold_restart_across_seeds`; the gaps the machine cannot express are listed in `crates/ravel-agents-sim/README.md`, "Known gaps" |
 | An applied commit whose acknowledgement was lost, followed by a takeover, can answer `ownership_lost` | shipped (limitation: known false negative) | `CompleteTurnLostResponse` | `workers::lost_commit_ack_then_takeover_is_a_known_false_negative` | Semantics adapters MUST honor (`ConditionalWriteCasVersion`) | the schedule pins it |
