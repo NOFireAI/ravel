@@ -718,7 +718,8 @@ holds a ghost record, the second touch. `would_admit` reads the same
 `Inner::intent_admits` check `offer` applies and changes no ghost record
 (`would_admit_agrees_with_offer_and_changes_nothing` in
 `crates/ravel-logseg/src/decoded_cache.rs`). A column a `Contains` arm tests
-is never in the `missed` list. No other decode validates a plain page whole,
+is never in the `missed` list (until the LIKE-deferred amendment below, whose
+decision 3 puts a missed deferred column there). No other decode validates a plain page whole,
 since nothing would keep that validation for a later read: the row path, the
 columnar exit with no cache attached, a column not offered to the cache, and
 a bulk-scan or maintenance first touch, which the cache answers with a ghost
@@ -833,7 +834,12 @@ its own. The second is decisions 2 to 4, stacked on the first.
      has none.
    - **Ghost records.** A non-interactive first touch still records one
      (`decoded_cache.rs:470-473`). So, now, does an admission the gate
-     refuses, under any intent; the record carries the newcomer's count. An
+     refuses, under any intent; the record carries the newcomer's count.
+     Because an interactive key can now hold a record, an admission releases
+     the key's ghost record and its bytes under every intent, not only a
+     non-interactive one as today (`decoded_cache.rs:516-519`); otherwise a
+     resident key's stale record would hold bytes of the ghost window and
+     push out the records a non-interactive second touch depends on. An
      entry that leaves the index by CLOCK, pressure or age eviction leaves
      no record. In the model, ghost records on eviction made q22 and q23
      slightly worse (`gatesim2.out`). They would also let a bulk-scan
@@ -863,10 +869,16 @@ its own. The second is decisions 2 to 4, stacked on the first.
 
      The second eviction, after the reservation (`decoded_cache.rs:524`),
      applies the gate too, and a refusal there drops the reservation. A
-     refusal by the gate spends no ghost touch and counts no ghost hit, as
-     a refused reservation does today
+     refusal by the gate, at either eviction, leaves the ghost record and
+     the ghost-hit counters as they were before the offer, the outcome a
+     refused reservation already has
      (`a_refused_reservation_keeps_the_ghost_record_and_its_hit_uncounted`,
-     `decoded_cache.rs:778`).
+     `decoded_cache.rs:778`). Today the ghost record is removed and
+     `ghost_hits` counted at `decoded_cache.rs:516-521`, before the second
+     eviction, so the gate PR must move that consumption after the second
+     eviction's gate decision (or restore the record and the counts on a
+     refusal there), and a test must pin a second-eviction refusal leaving
+     both unchanged.
    - **Intents.** The gate acts only after the intent rule passes, and only
      when admission needs an eviction.
      - An interactive statement still admits on first decode while the
@@ -936,12 +948,17 @@ its own. The second is decisions 2 to 4, stacked on the first.
      leaves the cached copy alone (`block.rs:1465`;
      `restrict_to_on_a_shared_column_leaves_the_other_holder_unchanged`,
      `block.rs:4580`).
-   - **A narrowed served column is charged to the scan.** Narrowing a
-     served column removes its id from the block's served list
-     (`reader.rs:1332`). `resident_charge_bytes`
-     (`crates/ravel-logseg/src/columnar.rs:499`) then charges the narrowed
-     copy, which the entry's reservation does not cover. A test pins the
-     scan's charge for a block whose served deferred column was narrowed.
+   - **A narrowed served column is charged to the scan.** No code does
+     this today: `BlockScan.served` is pushed at `reader.rs:1567`, cleared
+     at `reader.rs:1524` and read through the getter at `reader.rs:1332`,
+     and `build_survivor_values` (`reader.rs:1645-1686`) never sees it. The
+     serving PR must remove a narrowed served column's id from the block's
+     served list when it narrows it, so `resident_charge_bytes`
+     (`crates/ravel-logseg/src/columnar.rs:499`), which excludes the served
+     columns, charges the narrowed copy the block now owns and the entry's
+     reservation does not cover. Without it the scan is undercharged by
+     that copy on every such block. A test pins the scan's charge for a
+     block whose served deferred column was narrowed.
 
    Reason: a hit skips the page read, the crc, zstd and the decode. Those
    are 59.6% to 68.1% of q21 to q24's server CPU (inclusive
