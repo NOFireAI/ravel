@@ -734,13 +734,20 @@ pub(super) async fn destroy(State(api): State<Api>, req: Request<Body>) -> Respo
             .coordinator
             .destroy(&body.agent, Some(incarnation))
             .await;
-        let may_have_applied = match &destroyed {
-            Ok(_) => true,
-            Err(error) => error.kind == ErrorKind::OutcomeUnknown,
-        };
-        if may_have_applied {
-            call.tenant.evidence.forget_agent(agent);
-            call.tenant.changed.notify_waiters();
+        // Evidence is dropped only once the tombstone is known to have
+        // landed: after an unknown outcome the agent may still be active, and
+        // an operator reconciling one of its effects needs the late results.
+        // Waking the waiters is harmless either way, so an unknown outcome
+        // still does it.
+        match &destroyed {
+            Ok(_) => {
+                call.tenant.evidence.forget_agent(agent);
+                call.tenant.changed.notify_waiters();
+            }
+            Err(error) if error.kind == ErrorKind::OutcomeUnknown => {
+                call.tenant.changed.notify_waiters();
+            }
+            Err(_) => {}
         }
         let out = destroyed.map_err(|mut error| {
             error.ids.incarnation = Some(incarnation);
