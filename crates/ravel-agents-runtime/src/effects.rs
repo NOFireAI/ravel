@@ -81,15 +81,21 @@
 //! lost and the policy decides (a `manual` effect latches in doubt again).
 //! Each is idempotent, and the kernel appends one audit event to the
 //! effect's turn's event stream for each one that changes HEAD
-//! (`tests::reconcile_is_idempotent_and_audited_once`). One race is not
-//! covered: when another admin's `reconcile_authorize` for the same attempt
-//! lands between this call's read of HEAD and its write, and this call's
-//! write comes back with an unknown outcome, the retry cannot tell the other
-//! admin's authorization from its own. The owner still dispatches the
-//! attempt once. Telling them apart needs a caller identity in
-//! `Authority::Reconcile` or in the audit event, a format change tracked on
-//! issue #3408
+//! (`tests::reconcile_is_idempotent_and_audited_once`).
+//!
+//! A reconcile hands an attempt over only when this call's own HEAD write
+//! was acknowledged. Two reconciles starting from the same HEAD write the
+//! same bytes, so after an unknown outcome HEAD cannot say whose write
+//! landed: the call answers `OutcomeUnknown` and hands nothing over, and the
+//! attempt is dispatched at most once across coordinators
+//! (`tests::concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`,
+//! `tests::a_reconcile_authorization_with_a_lost_ack_is_not_handed_over_and_latches_in_doubt_again`).
+//! A reconcile whose write lost the race with a known outcome answers
+//! `false` and hands nothing over
 //! (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
+//! A claimed hand-over whose agent was destroyed in the meantime is refused
+//! `AgentGone` and dropped, never dispatched
+//! (`tests::a_hand_over_claimed_after_a_destroy_on_another_coordinator_is_not_dispatched`).
 //! The `agents_admin` capability check belongs to the route that calls them.
 //!
 //! A command whose HEAD write outcome is unknown runs again, up to
@@ -109,8 +115,8 @@ use ravel_agents_core::command::{
 };
 use ravel_agents_core::error::{AgentError, ErrorKind};
 use ravel_agents_core::head::{
-    Cancellation, EffectRecord, EffectStatus, Head, ObjectRef, RecoveryPolicy, StepRecord,
-    StepStatus,
+    Cancellation, EffectRecord, EffectStatus, Head, Lifecycle, ObjectRef, RecoveryPolicy,
+    StepRecord, StepStatus,
 };
 use ravel_agents_core::identity::{AgentId, Hash256, Id128, effect_id};
 use ravel_agents_core::kernel::Reply;
@@ -373,7 +379,11 @@ impl Coordinator {
         let attempt = match (&journal.effect, handed) {
             (Some(effect), Some(handed)) => {
                 if let Err(err) = self.refuse_stale_hand_over(&agent, &fence).await {
-                    self.release_reconciled(&agent, effect.effect_id, handed);
+                    if err.kind == ErrorKind::AgentGone {
+                        self.drop_reconciled(&agent, effect.effect_id, &handed);
+                    } else {
+                        self.release_reconciled(&agent, effect.effect_id, handed);
+                    }
                     return Err(err);
                 }
                 (effect.effect_id, effect.attempt)
@@ -533,29 +543,29 @@ impl Coordinator {
     /// dispatches it through its own dispatcher, once
     /// (`tests::reconcile_is_idempotent_and_audited_once`,
     /// `tests::a_reconciled_attempt_survives_a_takeover_before_the_next_step`). Answers `true`
-    /// when this call authorized the attempt. Idempotent: a repeat for an
-    /// attempt already authorized answers `false` and hands nothing over.
-    /// When this call's own write landed and only its acknowledgement was
-    /// lost, the retry finds the attempt authorized one past the effect's
-    /// attempt this call started from, and the attempt is handed over
-    /// (`tests::a_reconcile_authorization_with_a_lost_ack_dispatches_once`).
-    /// When another admin's reconcile of the same attempt landed first and
-    /// this call's write lost the race with a known outcome, this call
-    /// answers `false` and hands nothing over
+    /// when this call's own HEAD write published the authorization; only
+    /// then is the attempt handed over, and an existing hand-over record for
+    /// the same incarnation and attempt is kept as it is. Idempotent: a
+    /// repeat for an attempt already authorized answers `false` and hands
+    /// nothing over.
+    ///
+    /// When this call's write came back with an unknown outcome and the
+    /// retry finds the attempt authorized, the authorization cannot be
+    /// attributed to this call: another reconcile from the same HEAD writes
+    /// the same bytes. The call answers `OutcomeUnknown` and hands nothing
+    /// over, whether its own write landed
+    /// (`tests::a_reconcile_authorization_with_a_lost_ack_is_not_handed_over_and_latches_in_doubt_again`)
+    /// or another coordinator's did, which then holds the hand-over
+    /// (`tests::concurrent_reconciles_on_two_coordinators_dispatch_the_attempt_at_most_once`).
+    /// When another reconcile of the same attempt landed first and this
+    /// call's write lost the race with a known outcome, this call answers
+    /// `false` and hands nothing over
     /// (`tests::a_reconcile_another_admin_landed_first_is_not_dispatched_again`).
     ///
     /// The hand-over is held by this coordinator in memory. A next step
     /// that reaches another coordinator, or a restart in between, finds the
     /// attempt authorized with no record, takes it as lost, and the step's
     /// policy decides (a `manual` effect latches in doubt again).
-    ///
-    /// Not idempotent across admins in one case: when another admin's
-    /// reconcile lands between this call's reload and its write, and this
-    /// call's write comes back `OutcomeUnknown`, the retry reads the other
-    /// admin's attempt as this call's and hands it over too; the owner still
-    /// dispatches it once. Telling the two apart needs a caller identity in
-    /// `Authority::Reconcile` or in the audit event, a format change tracked
-    /// on issue #3408.
     ///
     /// When all [`UNKNOWN_OUTCOME_RETRIES`] retries also come back unknown,
     /// the error is returned and nothing is handed over, even if a write
@@ -593,31 +603,42 @@ impl Coordinator {
                 "reconciliation answered with something other than an attempt",
             ));
         };
-        // The retry read HEAD after the unknown outcome; the attempt is this
-        // call's when the effect now holds the attempt after the one this call
-        // started from, authorized. That also implies the effect was in doubt
-        // before: a replay started from `attempt` itself.
-        let landed_unacknowledged = retried
-            && journaled(&out.head, effect).is_ok_and(|now| {
-                now.status == EffectStatus::Authorized
-                    && Some(now.attempt) == record.attempt.checked_add(1)
-                    && now.attempt == attempt
-            });
-        if !out.published && !landed_unacknowledged {
+        if !out.published {
+            // After an unknown outcome the retry finds the attempt authorized
+            // whoever wrote it: another reconcile starting from the same HEAD
+            // writes the same bytes, so nothing here says it was this call.
+            let landed = retried
+                && journaled(&out.head, effect).is_ok_and(|now| {
+                    now.status == EffectStatus::Authorized && now.attempt == attempt
+                });
+            if landed {
+                return Err(refused(
+                    &effect.agent,
+                    ErrorKind::OutcomeUnknown,
+                    "the attempt's authorization landed but cannot be attributed to this call; it was not handed over here",
+                ));
+            }
             return Ok(false);
         }
         if let Some(accept_seq) = effect_input(&out.head, &record) {
-            self.open_attempts.lock().insert(
-                (effect.agent, effect.effect_id),
-                OpenAttempt {
-                    owner_id: out.head.owner_id.clone(),
-                    epoch: out.head.epoch,
-                    incarnation: out.head.incarnation,
-                    accept_seq,
-                    attempt,
-                    reconciled: true,
-                },
-            );
+            let mut attempts = self.open_attempts.lock();
+            let key = (effect.agent, effect.effect_id);
+            let held = attempts.get(&key).is_some_and(|open| {
+                open.incarnation == out.head.incarnation && open.attempt == attempt
+            });
+            if !held {
+                attempts.insert(
+                    key,
+                    OpenAttempt {
+                        owner_id: out.head.owner_id.clone(),
+                        epoch: out.head.epoch,
+                        incarnation: out.head.incarnation,
+                        accept_seq,
+                        attempt,
+                        reconciled: true,
+                    },
+                );
+            }
         }
         Ok(true)
     }
@@ -693,6 +714,18 @@ impl Coordinator {
             None => {
                 attempts.insert((*agent, effect_id), handed);
             }
+        }
+    }
+
+    /// Forget a claimed reconciled attempt whose agent is gone: no step and
+    /// no reconcile can reach its incarnation again. A record for another
+    /// attempt is newer and kept.
+    fn drop_reconciled(&self, agent: &AgentId, effect_id: Id128, handed: &OpenAttempt) {
+        let mut attempts = self.open_attempts.lock();
+        if attempts.get(&(*agent, effect_id)).is_some_and(|open| {
+            open.incarnation == handed.incarnation && open.attempt == handed.attempt
+        }) {
+            attempts.remove(&(*agent, effect_id));
         }
     }
 
@@ -864,12 +897,22 @@ impl Coordinator {
     /// root, and a step whose turn was taken over after it journaled hands
     /// the attempt back rather than dispatching it to a worker that lost the
     /// turn (`tests::a_hand_over_claimed_by_an_owner_that_lost_the_turn_goes_to_the_new_owner`).
+    /// A HEAD whose lifecycle is not `Active` answers `AgentGone`, and
+    /// `run_step` drops the claim rather than handing it back
+    /// (`tests::a_hand_over_claimed_after_a_destroy_on_another_coordinator_is_not_dispatched`).
     async fn refuse_stale_hand_over(
         &self,
         agent: &AgentId,
         fence: &TurnFence,
     ) -> Result<(), AgentError> {
         let head = self.reload(agent).await?;
+        if head.lifecycle != Lifecycle::Active {
+            return Err(refused(
+                agent,
+                ErrorKind::AgentGone,
+                "the agent was destroyed before the handed-over attempt was dispatched",
+            ));
+        }
         if head.incarnation != fence.owner.incarnation
             || head.owner_id != fence.owner.owner_id
             || head.epoch != fence.owner.epoch
