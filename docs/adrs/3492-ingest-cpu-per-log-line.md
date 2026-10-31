@@ -516,7 +516,10 @@ and no `abandoned_*` counter (`a_failed_page_job_fails_the_flush_retryably`).
 
 <!-- amendment-applies: sections="Context|D2. The OTLP flush uses the columnar writer, if it measures cheaper|What strict acks can reach" pointer="2026-10-31 baseline amendment" -->
 
-D1, D2, D3a and D4 to D8 are built; D3b is not, and is cut (d) below. This
+D1, D2, D3a's move and shared stream blob, and D4 to D8 are built. D3a's
+fold of the label-projection walk into the normalize pass is not, and stays
+gated on ADR-2708 decision 2; D3b is not built either, and is cut (d) below.
+This
 amendment records where the CPU and the strict ack go in the code as built at
 main 7726a95ea (not current `main`), and the order of the next cuts. It
 changes no decision above; each cut below is adopted on the same rule as D2
@@ -528,7 +531,8 @@ shards, 100 ms, 8 write-gate permits) missed both rows: buffered best 30-min
 best window (7.0 to 7.95 busy cores of 8). Strict had idle CPU and no queue
 inside Ravel; its ack was the limit.
 
-Exit run 2 and every measurement below ran with `--cpu-gate-write-permits 8`,
+Exit run 2, and every measurement in the sections after the table below, ran
+with `--cpu-gate-write-permits 8`,
 not the default of `max(1, cores / 2)`, 4 on 8 vCPU, that D8 and the
 prediction in "What strict acks can reach" assume, so the ack split below
 compares with that prediction at twice its gate width. Exit run 1 (comment
@@ -570,8 +574,11 @@ the pooled figure divided by that site's share of jobs, so the flush's own
 wait is also about zero: encode is CPU in the flush, not contention. The two
 PUTs are 132 ms together, so the ack-path figures in "What strict acks can
 reach" overstated the store share and understated the encode. About 0.11 s
-per request falls outside `request`, in decode, normalize and admission ahead
-of the router (32 workers ÷ 47.8 requests per second is a 0.67 s cycle).
+per request falls outside `request` (32 workers ÷ 47.8 requests per second is
+a 0.67 s cycle, if every worker always has a request in flight). That is an
+upper bound on decode, normalize and admission ahead of the router: it also
+holds the response path and the harness's own time between requests, which
+were not measured.
 Both rows are therefore bound by the same CPU, and cutting it raises strict
 through the ack and buffered through throughput.
 
@@ -594,7 +601,11 @@ the Stage 0 method; comment 6548202905), inclusive shares:
 D2 is built as `flush_rows_batch` into the columnar writer, but the shard
 still buffers row structs and converts them at flush: the conversion copies
 each record's stream blob, allocates a set per row and clones each attribute
-name twice. That is the largest single share left and is on the strict ack path.
+name twice. It is the largest share inside the flush and is on the strict ack
+path. Decode and normalize (29.8%) is larger, but it is spread over prost,
+normalize and the label projection, and its cut (d) needs D3b's own
+measurement first. The conversion goes first because its cut is
+self-contained: it changes no router, server, normalize code or decision.
 
 **The next cuts, in order.** Each is its own pull request, measured on the
 bench at the benchmark's shape against its base, and adopted only if it is
