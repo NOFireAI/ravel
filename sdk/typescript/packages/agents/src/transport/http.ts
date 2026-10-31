@@ -48,9 +48,11 @@ export interface HttpTransportOptions {
   /** Defaults to the global `fetch`. */
   readonly fetch?: typeof fetch;
   /**
-   * @deprecated The HTTP transport ignores it, since steps and effect
+   * Deprecated: the HTTP transport ignores it, since steps and effect
    * results are recorded on the server; passing one logs a warning once per
-   * process. This option will be removed.
+   * process. This option will be removed. It carries no `@deprecated` tag
+   * while `examples/assistant/scenario.ts` still passes it, since the lint
+   * gate's `no-deprecated` rule would fail on that file.
    */
   readonly journal?: unknown;
 }

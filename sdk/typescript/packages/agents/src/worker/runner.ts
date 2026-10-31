@@ -361,12 +361,13 @@ async function renewLease(
   stop: AbortSignal,
 ): Promise<void> {
   const request = { lease: heldLease(assignment.lease) };
+  const stopped = (): boolean => stop.aborted;
   let expires: bigint | undefined;
-  while (!stop.aborted) {
+  while (!stopped()) {
     try {
       expires = (await transport.heartbeat(request)).lease_expires_unix_ns;
     } catch (error) {
-      if (stop.aborted) return;
+      if (stopped()) return;
       if (error instanceof AgentGone || error instanceof OwnershipLost) {
         turn.abort(error);
         return;
@@ -445,6 +446,7 @@ async function settleTurn(
 ): Promise<TurnReport> {
   const a = polled.assignment;
   const base = { operation: a.operation, turnId: a.lease.turn_id };
+  const aborted = (): boolean => signal.aborted;
   const turn = new Turn<unknown>(polled, stateParse.success ? stateParse.data : undefined, transport, signal);
   let completed: { output: unknown } | undefined;
   let failure: { error: string; terminal: boolean } | undefined;
@@ -467,10 +469,10 @@ async function settleTurn(
         error instanceof InvalidStepInput,
     };
   }
-  if (signal.aborted) return { outcome: "abandoned", ...base, error: signal.reason };
+  if (aborted()) return { outcome: "abandoned", ...base, error: signal.reason };
   await turn.settled();
   if (turn.blocked !== undefined) return { outcome: "abandoned", ...base, error: turn.blocked.error };
-  if (signal.aborted) return { outcome: "abandoned", ...base, error: signal.reason };
+  if (aborted()) return { outcome: "abandoned", ...base, error: signal.reason };
   renewal.abort();
 
   try {
