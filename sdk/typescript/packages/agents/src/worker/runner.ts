@@ -190,8 +190,19 @@ class Turn<S> {
     throw error;
   }
 
-  /** A coordinator call; its rejection is a refusal and blocks the turn. */
+  /**
+   * Refuse to go on once the turn's signal has aborted, with its reason: past
+   * an expired or refused lease another worker may own the turn, and the
+   * coordinator, which fences only on owner and epoch, would still accept a
+   * step from this one.
+   */
+  private live(): void {
+    if (this.signal.aborted) throw this.signal.reason as Error;
+  }
+
+  /** A coordinator call, never sent once the turn aborted; its rejection is a refusal and blocks the turn. */
   private async coordinator<T>(call: () => Promise<T>): Promise<T> {
+    this.live();
     try {
       return await call();
     } catch (error) {
@@ -236,6 +247,7 @@ class Turn<S> {
     input: z.input<I>,
   ): Promise<z.output<O>> {
     if (this.blocked !== undefined) throw this.blocked.error;
+    this.live();
     const parsed = tool.input.parse(input);
     const inputHash = stepInputHash(tool.name, tool.version, canonicalBytes(jsonForm(parsed)));
     const request: StepRecordRequest = {
@@ -275,6 +287,8 @@ class Turn<S> {
     const started = await this.coordinator(() => this.transport.recordStep(request));
     const replayed = this.replay(key, tool, started);
     if (replayed !== undefined) return replayed.output;
+    // The lease may have run out while the step's record was in flight.
+    this.live();
     const effect = { effect: started.effect, attempt: started.attempt };
     let output: z.output<O>;
     try {
@@ -356,9 +370,10 @@ export const DEFAULT_LEASE_MS = 30_000;
 
 /**
  * The turn's lease ran out with no renewal answered: by the worker's own
- * monotonic clock, `leaseMs` passed since the last grant it saw (the poll that
- * handed it the turn, or the last heartbeat answer). Another worker may take
- * the turn over from here, so the turn is abandoned rather than committed.
+ * timers, `leaseMs` passed since the last grant it saw (the poll answer that
+ * handed it the turn, or the sending of the last heartbeat that was
+ * answered). Another worker may take the turn over from here, so the turn is
+ * abandoned rather than committed.
  */
 export class LeaseExpired extends Error {
   override readonly name = "LeaseExpired";
@@ -376,9 +391,9 @@ export class LeaseExpired extends Error {
  * first at once, each next one {@link renewInterval} after the last answer.
  * A refusal (`AgentGone`, `OwnershipLost`) aborts `turn` with that error; any
  * other failure is retried at the next interval. Once `leaseMs` passes after
- * the assignment or the last answered renewal, measured on the worker's
- * timers and not against the answered wall-clock expiry, `turn` is aborted
- * with {@link LeaseExpired}. Never rejects.
+ * the assignment, or after the last answered renewal was sent, measured on
+ * the worker's timers and not against the answered wall-clock expiry, `turn`
+ * is aborted with {@link LeaseExpired}. Never rejects.
  */
 async function renewLease(
   assignment: TurnAssignment,
@@ -389,27 +404,35 @@ async function renewLease(
 ): Promise<void> {
   const request = { lease: heldLease(assignment.lease) };
   const stopped = (): boolean => stop.aborted || turn.signal.aborted;
-  let expiry: ReturnType<typeof setTimeout> | undefined;
-  const granted = () => {
-    clearTimeout(expiry);
-    expiry = setTimeout(() => {
-      if (!stop.aborted) turn.abort(new LeaseExpired(assignment.lease.turn_id, leaseMs));
-    }, leaseMs);
+  const expire = () => {
+    if (!stop.aborted) turn.abort(new LeaseExpired(assignment.lease.turn_id, leaseMs));
   };
+  const arm = () => setTimeout(expire, leaseMs);
+  // The assignment's lease counts from the poll's answer, since a long poll
+  // is granted at an unknown moment after it was sent. A renewal's counts
+  // from its sending: the coordinator counts it from when it processed the
+  // request, which is no earlier.
+  let expiry = arm();
+  let sent: ReturnType<typeof setTimeout> | undefined;
   const disarm = () => {
     clearTimeout(expiry);
+    clearTimeout(sent);
   };
   stop.addEventListener("abort", disarm, { once: true });
-  granted();
   let expires: bigint | undefined;
   try {
     while (!stopped()) {
+      sent = arm();
       try {
         const answer = await transport.heartbeat(request);
         if (stopped()) return;
-        granted();
+        clearTimeout(expiry);
+        expiry = sent;
+        sent = undefined;
         expires = answer.lease_expires_unix_ns;
       } catch (error) {
+        clearTimeout(sent);
+        sent = undefined;
         if (stopped()) return;
         if (error instanceof AgentGone || error instanceof OwnershipLost) {
           turn.abort(error);
@@ -437,7 +460,8 @@ class TerminalFailure extends Error {
  * commit is sent the lease is renewed in the background; a refused renewal
  * aborts the handler's signal and abandons the turn with the refusal, and so
  * does a lease that runs out, `leaseMs` after the last grant the worker saw
- * answered, with {@link LeaseExpired}.
+ * answered, with {@link LeaseExpired}. A step the handler starts after either
+ * abort rejects with the abort's reason and sends nothing.
  */
 export async function runTurn(
   polled: PolledTurn,
