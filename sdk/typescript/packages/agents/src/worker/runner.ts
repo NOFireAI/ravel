@@ -200,9 +200,8 @@ class Turn<S> {
     if (this.signal.aborted) throw this.signal.reason as Error;
   }
 
-  /** A coordinator call, never sent once the turn aborted; its rejection is a refusal and blocks the turn. */
+  /** A coordinator call; its rejection is a refusal and blocks the turn. */
   private async coordinator<T>(call: () => Promise<T>): Promise<T> {
-    this.live();
     try {
       return await call();
     } catch (error) {
@@ -230,6 +229,7 @@ class Turn<S> {
     status: string,
   ): Promise<z.output<O>> {
     if (status === "completed") {
+      this.live();
       const current = await this.coordinator(() => this.transport.recordStep(request));
       const replayed = this.replay(key, tool, current);
       if (replayed !== undefined) return replayed.output;
@@ -297,12 +297,14 @@ class Turn<S> {
       );
     } catch (error) {
       // An aborted worker's tool error says nothing about the effect.
-      if (this.signal.aborted) throw error;
+      this.live();
       const text = errorText(error);
       const failed = await this.coordinator(() => this.transport.failEffect({ ...effect, error: text }));
       if (failed.late) return this.journaled(key, tool, request, started.effect, failed.status);
       throw new StepFailed(key, text, { cause: error });
     }
+    // A result the tool produced is reported even after an abort: the effect
+    // happened, and a takeover replays the result rather than running it again.
     const done = await this.coordinator(() =>
       this.transport.completeEffect({ ...effect, result: output as StepBody["output"] & {} }),
     );

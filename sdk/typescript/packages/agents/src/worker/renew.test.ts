@@ -37,6 +37,8 @@ const HANDLER_MS = 9_000;
 let handlerMs = HANDLER_MS;
 /** How long the `charge` handler works without a step, ignoring its signal, before its step. */
 let beforeStepMs = 0;
+/** How long the `charge` tool runs, ignoring its signal. */
+let chargeMs = 0;
 const signals: AbortSignal[] = [];
 /** The fake clock at each abort of a handler's signal. */
 const abortedAt: number[] = [];
@@ -50,9 +52,10 @@ const charge = defineTool({
   input: z.object({}),
   output: z.object({}),
   recovery: "at_least_once",
-  run: () => {
+  run: async () => {
     toolRunAt.push(Date.now());
-    return Promise.resolve({});
+    await after(chargeMs);
+    return {};
   },
 });
 
@@ -168,9 +171,9 @@ function leasingTransport(
       effectAt.push(Date.now());
       return Promise.resolve({ effect: request.effect, status: "completed", late: false });
     },
-    failEffect: (request) => {
+    failEffect: () => {
       effectAt.push(Date.now());
-      return Promise.resolve({ effect: request.effect, status: "failed", late: false });
+      return Promise.reject(new Error("unused"));
     },
     commit: (request) => {
       commitAt.push(Date.now());
@@ -396,6 +399,29 @@ describe("a step after the turn aborted", () => {
     expect(stepErrors).toHaveLength(1);
     expect(stepErrors[0]).toBeInstanceOf(LeaseExpired);
     expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+  });
+
+  it("a tool that finishes after the lease expired still reports its result, and nothing else is sent", async () => {
+    // The step is recorded and its tool started at 5 s, inside the 6 s
+    // lease; the tool ignores its signal and finishes at 7 s. The effect
+    // happened, so its result is reported for a takeover to replay rather
+    // than run again; the turn still sends no commit.
+    beforeStepMs = LEASE_MS - 1_000;
+    chargeMs = 2_000;
+    try {
+      const { transport, commitAt, recordStepAt, effectAt } = leasingTransport(() => unavailable, {
+        handler: "charge",
+      });
+      const reports = await serveFor(transport);
+      expect(abortedAt).toEqual([LEASE_MS]);
+      expect(recordStepAt).toEqual([LEASE_MS - 1_000]);
+      expect(toolRunAt).toEqual([LEASE_MS - 1_000]);
+      expect(effectAt).toEqual([LEASE_MS + 1_000]);
+      expect(commitAt).toEqual([]);
+      expect(reports.map((r) => r.outcome)).toEqual(["abandoned"]);
+    } finally {
+      chargeMs = 0;
+    }
   });
 
   it("a step inside the lease runs its tool and the turn commits", async () => {
