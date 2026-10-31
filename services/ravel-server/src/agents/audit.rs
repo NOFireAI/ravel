@@ -62,6 +62,7 @@ fn capabilities(principal: &Principal) -> String {
         agents,
         agents_worker,
         agents_admin,
+        subject: _,
     } = principal;
     [
         (*agents, "agents"),
