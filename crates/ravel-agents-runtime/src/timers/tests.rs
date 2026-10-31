@@ -379,6 +379,22 @@ async fn a_hint_of_a_destroyed_incarnation_fires_nothing_and_is_deleted() {
     let h = head(&r.store, "o-1").await;
     assert_eq!(status(&h, "t"), TimerStatus::Scheduled);
     assert_eq!(tick_inputs(&h), 0);
+
+    // Incarnation 2 starts with no timers, and a pass still past the old
+    // timer's due time fires nothing into it.
+    create(&r.co, "o-1").await;
+    let h = head(&r.store, "o-1").await;
+    assert_eq!(h.incarnation, 2);
+    assert!(h.timers.is_empty());
+    r.now.advance(SEC);
+    assert!(r.now.get() > T0 + 30 * SEC);
+    let before = r.store.counters();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    assert_eq!(r.store.counters().since(&before).publish.cas, 0);
+    assert_eq!(pass.timers_fired, 0);
+    let h = head(&r.store, "o-1").await;
+    assert_eq!(h.incarnation, 2);
+    assert!(h.inbox.is_empty(), "nothing enqueued on incarnation 2");
 }
 
 fn id_of_timer(h: &Head, timer_key: &str) -> ravel_agents_core::identity::Id128 {
