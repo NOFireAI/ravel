@@ -1180,7 +1180,7 @@ serving pull request, built on main.)
 
 <!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|3. Admission lets a statement's later tries hit, and a one-pass scan does not displace a working set|How big the working set is|Consequences|Amendment (2026-10-31): LIKE-deferred columns become cacheable, behind frequency-aware admission" pointer="serve-if-fits amendment" -->
 <!-- amendment-supersedes: phrase="An admission that would evict an entry accessed at least as often as the newcomer is refused" pointer="serve-if-fits amendment" -->
-<!-- amendment-supersedes: phrase="with an admission rule that weighs decode cost" pointer="serve-if-fits amendment" -->
+<!-- amendment-supersedes: phrase="with a rule that weighs decode cost" pointer="serve-if-fits amendment" -->
 
 The LIKE-deferred amendment's frequency gate was reverted after it missed
 its hot bands (#3326 comment 6546999545, and that amendment's status note).
@@ -1326,9 +1326,9 @@ amendment, decision 2). Memory stays bounded by the cap and decision 4.
   scans running at once can exceed the cap together, and CLOCK then evicts
   between them as it does for any column on main.
 
-**What the serving pull request also changes.** Three doc comments and one
-test that the LIKE-deferred amendment's decisions 2 and 3 falsify were
-missing from its list:
+**What the serving pull request also changes.** Three doc comments, one
+test and two passages of `docs/query-engine.md` that the LIKE-deferred
+amendment's decisions 2 and 3 falsify were missing from its list:
 - `crates/ravel-logseg/src/decoded_cache.rs:4-8`, the module doc: "never
   with a column a Contains arm defers (its dictionary is narrowed to
   survivors after decode)". For a fitting scan such a column is read from
@@ -1347,6 +1347,16 @@ missing from its list:
   deferred column is served. The test is split in two: one run on that
   fixture asserts the column is served with identical rows, and one run
   with a cap below the fixture's set asserts it is never served.
+- `docs/query-engine.md:5261-5262`, the decoded cache section: "A column
+  deferred for a `Contains` arm is never looked up or offered." It holds
+  only for a scan that does not fit, and the sentence says so.
+- `docs/query-engine.md:5294-5296`, which lists every field of the
+  `decodedCache` stats object. The estimate and verdict this amendment
+  reports become two fields: `deferredSetEstimateBytes`, the plan-time
+  estimate, present only for a scan with a `Contains` arm, and
+  `deferredServed`, true when that scan serves its deferred columns. The
+  list names both, and the test that pins the object's fields on the SQL
+  response is updated with them.
 
 It also adds a test that a scan over 0.95 of the cap looks up and offers
 no deferred column, and it runs
