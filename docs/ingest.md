@@ -2253,8 +2253,10 @@ each phase the flush reached. In flush order:
 - `resolve`: the tenant's indexed-field and storage-layout resolve, a config
   GET on a cache miss.
 - `encode`: the ADR-1702 write-gate encode. The CPU-gate wait and the RLOG
-  encode are one future, so they are one phase; `ravel_cpu_gate_wait_seconds`
-  gives the gate's share.
+  encode are one future, so they are one phase. `ravel_cpu_gate_wait_seconds`
+  does not split it: that family pools the wait of every write-gate site (the
+  metrics and span flushes, OTAP decode, request decompression), not this
+  flush's alone.
 - `data_put`: the data object PUT, retries included.
 - `commit_build`: the commit record build and its declared-column stamps.
 - `commit_publish`: the commit record publish, retries included.
