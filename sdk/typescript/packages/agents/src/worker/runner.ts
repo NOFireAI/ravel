@@ -10,6 +10,7 @@ import {
   IncompatibleHandler,
   InvalidStepInput,
   NonDeterministicReplay,
+  OwnershipLost,
   type SafeIds,
 } from "../errors.js";
 import { canonicalBytes, derive, jsonForm, stepInputHash, toHex } from "../identity.js";
@@ -27,6 +28,7 @@ import {
   type StepBody,
   type TurnAssignment,
 } from "../wire/index.js";
+import { pause } from "./backoff.js";
 import type { PolledTurn, StepRecordRequest, StepRecordResponse, Transport } from "./transport.js";
 
 /**
@@ -329,6 +331,51 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * The shortest pause between two lease renewals, and the pause before the
+ * first answer names an expiry: a lease at or past its expiry, or a worker
+ * clock ahead of the coordinator's, renews at this pace rather than in a spin.
+ */
+export const MIN_RENEW_INTERVAL_MS = 1_000;
+
+/**
+ * The pause before the next renewal: one third of the lease left at `nowMs`
+ * by the last answered expiry, so two more renewals fit before it runs out.
+ */
+export function renewInterval(expiresUnixNs: bigint | undefined, nowMs: number): number {
+  if (expiresUnixNs === undefined) return MIN_RENEW_INTERVAL_MS;
+  const leftMs = Number(expiresUnixNs / 1_000_000n) - nowMs;
+  return Math.max(MIN_RENEW_INTERVAL_MS, Math.floor(leftMs / 3));
+}
+
+/**
+ * Renew the turn's lease until `stop` aborts: one heartbeat at a time, the
+ * first at once, each next one {@link renewInterval} after the last answer.
+ * A refusal (`AgentGone`, `OwnershipLost`) aborts `turn` with that error; any
+ * other failure is retried at the next interval. Never rejects.
+ */
+async function renewLease(
+  assignment: TurnAssignment,
+  transport: Transport,
+  turn: AbortController,
+  stop: AbortSignal,
+): Promise<void> {
+  const request = { lease: heldLease(assignment.lease) };
+  let expires: bigint | undefined;
+  while (!stop.aborted) {
+    try {
+      expires = (await transport.heartbeat(request)).lease_expires_unix_ns;
+    } catch (error) {
+      if (stop.aborted) return;
+      if (error instanceof AgentGone || error instanceof OwnershipLost) {
+        turn.abort(error);
+        return;
+      }
+    }
+    await pause(renewInterval(expires, Date.now()), stop);
+  }
+}
+
 /** A handler failure a retry cannot fix: the payload, result or state does not parse. */
 class TerminalFailure extends Error {
   override readonly name = "TerminalFailure";
@@ -338,7 +385,9 @@ class TerminalFailure extends Error {
  * Run one leased turn to a commit, or to an abandonment that leaves it for the
  * coordinator. A refusal from any coordinator call, `OwnershipLost` and
  * `AgentGone` among them, abandons the turn with that error: the commit is
- * attempted at most once and never retried here.
+ * attempted at most once and never retried here. From assignment until the
+ * commit is sent the lease is renewed in the background; a refused renewal
+ * aborts the handler's signal and abandons the turn with the refusal.
  */
 export async function runTurn(
   polled: PolledTurn,
@@ -368,6 +417,34 @@ export async function runTurn(
   // polls that turn with a null state; the turn starts from `initialState`.
   const fresh = a.state === null && a.lease.base_state_version === 0;
   const stateParse = agent.state.safeParse(fresh ? agent.initialState : a.state);
+  const aborter = new AbortController();
+  const forward = () => {
+    aborter.abort(signal.reason);
+  };
+  if (signal.aborted) forward();
+  else signal.addEventListener("abort", forward, { once: true });
+  const renewal = new AbortController();
+  void renewLease(a, transport, aborter, renewal.signal);
+  try {
+    return await settleTurn(polled, agent, message, stateParse, transport, aborter.signal, renewal);
+  } finally {
+    renewal.abort();
+    signal.removeEventListener("abort", forward);
+  }
+}
+
+/** The handler run and commit of {@link runTurn}, under the turn's own `signal`. */
+async function settleTurn(
+  polled: PolledTurn,
+  agent: AnyAgentDefinition,
+  message: AnyMessageDefinition,
+  stateParse: ReturnType<z.ZodType["safeParse"]>,
+  transport: Transport,
+  signal: AbortSignal,
+  renewal: AbortController,
+): Promise<TurnReport> {
+  const a = polled.assignment;
+  const base = { operation: a.operation, turnId: a.lease.turn_id };
   const turn = new Turn<unknown>(polled, stateParse.success ? stateParse.data : undefined, transport, signal);
   let completed: { output: unknown } | undefined;
   let failure: { error: string; terminal: boolean } | undefined;
@@ -393,6 +470,8 @@ export async function runTurn(
   if (signal.aborted) return { outcome: "abandoned", ...base, error: signal.reason };
   await turn.settled();
   if (turn.blocked !== undefined) return { outcome: "abandoned", ...base, error: turn.blocked.error };
+  if (signal.aborted) return { outcome: "abandoned", ...base, error: signal.reason };
+  renewal.abort();
 
   try {
     if (completed !== undefined) {

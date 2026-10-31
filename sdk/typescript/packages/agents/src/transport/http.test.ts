@@ -59,6 +59,11 @@ function fakeFetch(answer: (route: string, body: unknown) => Answer) {
   return { sent, fetch: impl };
 }
 
+/** A heartbeat answer renewing the lease for `ms` past the wall clock. */
+function renewed(ms = 30_000): Answer {
+  return { status: 200, body: { lease_expires_unix_ns: String(BigInt(Date.now() + ms) * 1_000_000n) } };
+}
+
 function transportWith(answer: (route: string, body: unknown) => Answer) {
   const fake = fakeFetch(answer);
   const transport = createHttpTransport({ url: "http://ravel.test/", token: "worker-token", fetch: fake.fetch });
@@ -335,6 +340,7 @@ describe("serveAgents over HttpTransport", () => {
         served = true;
         return { status: 200, body: { assignment } };
       }
+      if (route === "heartbeat") return renewed();
       commits.push(body);
       return {
         status: 200,
@@ -436,6 +442,7 @@ describe("serveAgents over HttpTransport", () => {
         served = true;
         return { status: 200, body: { assignment } };
       }
+      if (route === "heartbeat") return renewed();
       const step = steps(route, body);
       if (step !== undefined) return step;
       return {
@@ -463,7 +470,7 @@ describe("serveAgents over HttpTransport", () => {
     expect(completed?.body).toEqual({ effect: "e-from-server", attempt: 3, result: { ok: true } });
   });
 
-  it("sends nothing while a tool runs, and no heartbeat before a step", async () => {
+  it("renews once at assignment, sends nothing while a tool runs, and no heartbeat before a step", async () => {
     const held = gate();
     let running = 0;
     const tool = (name: string, hold: boolean) =>
@@ -508,6 +515,7 @@ describe("serveAgents over HttpTransport", () => {
         served = true;
         return { status: 200, body: { assignment } };
       }
+      if (route === "heartbeat") return renewed();
       const step = steps(route, body);
       if (step !== undefined) return step;
       return {
@@ -515,7 +523,9 @@ describe("serveAgents over HttpTransport", () => {
         body: { operation: pollFixture.assignment.operation, status: "completed", state_version: 1, rebased: false, effects: [] },
       };
     });
-    const routes = () => sent.map((s) => s.url.slice(s.url.lastIndexOf("/") + 1));
+    const all = () => sent.map((s) => s.url.slice(s.url.lastIndexOf("/") + 1));
+    const routes = () => all().filter((route) => route !== "heartbeat");
+    const heartbeats = () => all().filter((route) => route === "heartbeat").length;
     const worker = await serveAgents({
       transport: createHttpTransport({ url: "http://ravel.test", token: "t", fetch }),
       agents: [agent],
@@ -529,6 +539,9 @@ describe("serveAgents over HttpTransport", () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(atStart).toEqual(["poll", "step"]);
       expect(routes()).toEqual(atStart);
+      // The renewal sent at assignment; the next is due a third of the
+      // 30 s lease later, long after this turn.
+      expect(heartbeats()).toBe(1);
       held.open();
       await until(() => reports.length === 1);
     } finally {
