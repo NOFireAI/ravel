@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   AgentGone,
@@ -59,6 +59,11 @@ function fakeFetch(answer: (route: string, body: unknown) => Answer) {
   return { sent, fetch: impl };
 }
 
+/** A heartbeat answer renewing the lease for `ms` past the wall clock. */
+function renewed(ms = 30_000): Answer {
+  return { status: 200, body: { lease_expires_unix_ns: String(BigInt(Date.now() + ms) * 1_000_000n) } };
+}
+
 function transportWith(answer: (route: string, body: unknown) => Answer) {
   const fake = fakeFetch(answer);
   const transport = createHttpTransport({ url: "http://ravel.test/", token: "worker-token", fetch: fake.fetch });
@@ -111,6 +116,27 @@ describe("HttpTransport requests", () => {
     const polled = await transport.poll({ worker_id: "w", handlers: [], wait_ms: 1 }, new AbortController().signal);
     expect(polled?.assignment.lease.recorded_unix_ns).toBe(1767225600000000000n);
     expect(polled?.assignment.lease.random_seed).toBe("8f8d1b06b1618bd08db0300dbba36423");
+  });
+
+  it("warns once when passed the deprecated journal option and otherwise ignores it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { fetch, sent } = fakeFetch(() => ({ status: 200, body: { lease_expires_unix_ns: "1767225630000000000" } }));
+      const journal = { recordStep: () => Promise.reject(new Error("the journal must not be called")) };
+      const first = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal });
+      const second = createHttpTransport({ url: "http://ravel.test", token: "t", fetch, journal });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toMatch(/journal option is deprecated and ignored/);
+      await first.heartbeat({ lease: LEASE });
+      await second.heartbeat({ lease: LEASE });
+      expect(sent.map((s) => [s.url, s.body])).toEqual([
+        ["http://ravel.test/api/v1/agents/worker/heartbeat", { lease: LEASE }],
+        ["http://ravel.test/api/v1/agents/worker/heartbeat", { lease: LEASE }],
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("rejects with the abort reason when the poll is aborted", async () => {
@@ -335,6 +361,7 @@ describe("serveAgents over HttpTransport", () => {
         served = true;
         return { status: 200, body: { assignment } };
       }
+      if (route === "heartbeat") return renewed();
       commits.push(body);
       return {
         status: 200,
@@ -436,6 +463,7 @@ describe("serveAgents over HttpTransport", () => {
         served = true;
         return { status: 200, body: { assignment } };
       }
+      if (route === "heartbeat") return renewed();
       const step = steps(route, body);
       if (step !== undefined) return step;
       return {
@@ -463,7 +491,7 @@ describe("serveAgents over HttpTransport", () => {
     expect(completed?.body).toEqual({ effect: "e-from-server", attempt: 3, result: { ok: true } });
   });
 
-  it("sends nothing while a tool runs, and no heartbeat before a step", async () => {
+  it("renews once at assignment, sends nothing while a tool runs, and no heartbeat before a step", async () => {
     const held = gate();
     let running = 0;
     const tool = (name: string, hold: boolean) =>
@@ -508,6 +536,7 @@ describe("serveAgents over HttpTransport", () => {
         served = true;
         return { status: 200, body: { assignment } };
       }
+      if (route === "heartbeat") return renewed();
       const step = steps(route, body);
       if (step !== undefined) return step;
       return {
@@ -515,7 +544,9 @@ describe("serveAgents over HttpTransport", () => {
         body: { operation: pollFixture.assignment.operation, status: "completed", state_version: 1, rebased: false, effects: [] },
       };
     });
-    const routes = () => sent.map((s) => s.url.slice(s.url.lastIndexOf("/") + 1));
+    const all = () => sent.map((s) => s.url.slice(s.url.lastIndexOf("/") + 1));
+    const routes = () => all().filter((route) => route !== "heartbeat");
+    const heartbeats = () => all().filter((route) => route === "heartbeat").length;
     const worker = await serveAgents({
       transport: createHttpTransport({ url: "http://ravel.test", token: "t", fetch }),
       agents: [agent],
@@ -529,6 +560,9 @@ describe("serveAgents over HttpTransport", () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(atStart).toEqual(["poll", "step"]);
       expect(routes()).toEqual(atStart);
+      // The renewal sent at assignment; the next is due a third of the
+      // 30 s lease later, long after this turn.
+      expect(heartbeats()).toBe(1);
       held.open();
       await until(() => reports.length === 1);
     } finally {

@@ -14,7 +14,7 @@ import type {
   MessageDefinition,
   Schema,
 } from "../types.js";
-import { Backoff, OperationBackoffs } from "./backoff.js";
+import { Backoff, OperationBackoffs, pause } from "./backoff.js";
 import { handlerDigest, runTurn, type TurnReport } from "./runner.js";
 import type { Transport } from "./transport.js";
 
@@ -173,23 +173,6 @@ export interface WorkerHandle {
 
 /** The first pause after a failed poll. */
 const POLL_RETRY_MS = 50;
-
-/** Resolves after `ms`, or as soon as `signal` aborts. */
-function pause(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    const done = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    signal.addEventListener("abort", done, { once: true });
-  });
-}
 
 /**
  * Poll `transport` for turns of `agents` and run each to a commit until

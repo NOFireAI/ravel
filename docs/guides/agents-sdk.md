@@ -213,12 +213,25 @@ server. Its tests are in `transport/http.test.ts`.
 
 - The poll wait is clamped to 20 s. Test: `clamps the poll wait to 20 s and
   leaves a shorter one alone`.
-- The transport does nothing about the lease during a long tool run: it
-  sends no heartbeat while a tool runs or before a step. Test: `sends
-  nothing while a tool runs, and no heartbeat before a step`. So one tool
-  run, or handler code between two steps, that outlasts the server's lease
-  loses the turn to another worker. The lease is 30 s by default: the
-  agents runtime's `RuntimeConfig::default` sets `lease_ms` to 30000.
+- The worker renews the lease in the background while a turn runs: a
+  heartbeat when the turn is assigned, then one each third of the lease
+  left by the last answered expiry, never sooner than 1 s apart, until the
+  commit is sent. A renewal refused with `OwnershipLost` or `AgentGone`
+  aborts the handler's signal and abandons the turn without a commit; any
+  other failure is retried at the next tick. So a turn is lost only when a
+  renewal is refused, or when renewals fail for longer than the lease plus
+  its grace. The agents runtime's `RuntimeConfig::default` sets `lease_ms`
+  to 30000 and `heartbeat_grace_ms` to 10000. Renewals live in the memory
+  of the coordinator that answered them, so with two coordinators a worker
+  polling the other one can still take a turn over once the lease and grace
+  run out after its takeover. Tests: `a turn longer than the lease renews
+  it in the background and commits`, `a refused renewal aborts the turn
+  and nothing is committed`, `a transient renewal failure is retried at
+  the next tick` (`worker/renew.test.ts`), `renews once at assignment,
+  sends nothing while a tool runs, and no heartbeat before a step`.
+- The `journal` option is deprecated and ignored, and logs a warning once
+  per process; it will be removed. Test: `warns once when passed the
+  deprecated journal option and otherwise ignores it`.
 - An untyped 5xx, a request with no answer, or a body that fails mid-read
   is `OutcomeUnknown`. Tests: `maps an untyped 5xx and a request with no
   answer to OutcomeUnknown`, `maps a response body that fails mid-read to
