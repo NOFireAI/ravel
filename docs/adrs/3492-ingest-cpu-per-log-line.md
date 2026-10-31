@@ -38,8 +38,8 @@ sample was taken per arm:
 | libc memcpy, self, flat profile | about 15.5% | not split | measured 2026-10-30 |
 | jemalloc, self, flat profile | about 10% | not split | measured 2026-10-30 |
 
-This profile predates the decisions below; the profile of the code as built is in the
-2026-10-31 baseline amendment.
+This profile predates the decisions below; the profile of the code as built
+is in the 2026-10-31 baseline amendment.
 
 At 100% of 8 vCPU, 120k lines/s allows at most 66 us of CPU per line. That is
 about 35% below today's. The cost is not in compression. It is in choosing
@@ -284,7 +284,8 @@ The harness's 64,000 lines in flight mean throughput is 64,000 lines ÷ ack
 time, so 120k lines/s needs an ack of at most 0.53 s. The prediction below
 assumes D1 to D6 bring flush encode to about 30 us per line. Each flush is one
 gate job. The strict ack as measured, split by phase, is in the 2026-10-31
-baseline amendment.
+baseline amendment, which also records that D2 has since been built, so of
+the two further cuts named below only D3b remains.
 
 | Configuration | Predicted ack | Predicted strict lines/s | Basis |
 |---|---|---|---|
@@ -516,10 +517,10 @@ and no `abandoned_*` counter (`a_failed_page_job_fails_the_flush_retryably`).
 <!-- amendment-applies: sections="Context|D2. The OTLP flush uses the columnar writer, if it measures cheaper|What strict acks can reach" pointer="2026-10-31 baseline amendment" -->
 
 D1, D2, D3a and D4 to D8 are built; D3b is not, and is cut (d) below. This
-amendment records where the CPU and the strict ack go in the code as built
-at main 7726a95ea (not current `main`), and the order of the next cuts. It changes no
-decision above; each cut below is adopted on the same rule as D2 and D3b,
-only if it measures cheaper at the benchmark's shape.
+amendment records where the CPU and the strict ack go in the code as built at
+main 7726a95ea (not current `main`), and the order of the next cuts. It
+changes no decision above; each cut below is adopted on the same rule as D2
+and D3b, only if it measures cheaper at the benchmark's shape.
 
 **Where the exit stands.** Exit run 2 (comment 6543661594, upstream ramp, 2
 shards, 100 ms, 8 write-gate permits) missed both rows: buffered best 30-min
@@ -530,11 +531,20 @@ inside Ravel; its ack was the limit.
 Exit run 2 and every measurement below ran with `--cpu-gate-write-permits 8`,
 not the default of `max(1, cores / 2)`, 4 on 8 vCPU, that D8 and the
 prediction in "What strict acks can reach" assume, so the ack split below
-compares with that prediction at twice its gate width. The run deviated from
-D8 on this flag alone. Exit run 1, at the default 4, stored buffered 102,517
-lines/s and strict 96,971 (comment 6540809017): the extra permits bought the
-buffered row about 10k lines/s and did not move the strict row, whose gate
-was never full.
+compares with that prediction at twice its gate width. Exit run 1 (comment
+6540809017) ran the same image, flags, harness and ramp on the same nodes,
+from emptied buckets and a fresh VictoriaLogs volume, with the permit count
+at the default 4; that is the only difference between the two runs. On the
+same basis, the best 30-minute average of the 1-minute stored rate, the two
+runs read:
+
+| Row | Exit run 1, 4 permits | Exit run 2, 8 permits | Source |
+|---|---|---|---|
+| buffered | 102,517 lines/s | 112,226 lines/s | comments 6540809017, 6543661594 |
+| strict | 96,971 lines/s | 99,296 lines/s | comments 6540809017, 6543661594 |
+
+Each figure is one run, so the difference carries run-to-run noise that has
+not been measured; the strict row's write gate was never full in either run.
 
 **The strict ack, split.** Measured with the phase histograms #3533 added
 (`ravel_ingest_strict_ack_seconds`, `ravel_ingest_flush_phase_seconds`), at a
@@ -581,10 +591,10 @@ the Stage 0 method; comment 6548202905), inclusive shares:
 | Vec regrowth (`do_rallocx`, `finish_grow`), overlapping | about 13% | comment 6548202905 |
 | SipHash in logseg maps | about 5% | comment 6548202905 |
 
-D2 is built as `rows_to_batch` into the columnar writer, but the shard still
-buffers row structs and converts them at flush: the conversion copies each
-record's stream blob, allocates a set per row and clones each attribute name
-twice. That is the largest single share left and is on the strict ack path.
+D2 is built as `flush_rows_batch` into the columnar writer, but the shard
+still buffers row structs and converts them at flush: the conversion copies
+each record's stream blob, allocates a set per row and clones each attribute
+name twice. That is the largest single share left and is on the strict ack path.
 
 **The next cuts, in order.** Each is its own pull request, measured on the
 bench at the benchmark's shape against its base, and adopted only if it is
