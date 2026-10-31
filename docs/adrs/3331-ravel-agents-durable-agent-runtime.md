@@ -959,7 +959,9 @@ with `AlreadyTombstoned`), so after the tombstone every handle minted under that
 `result`, `cancel` and `events`; step and effect handles on `worker/step`,
 `worker/effects/complete`, `worker/effects/fail`, `effects/{effect}` and
 `reconcile`; timer handles on `timers/cancel`; the lease on
-`worker/heartbeat` and `worker/commit`. `AgentStore::resolve` refuses a
+`worker/commit`, and on `worker/heartbeat` through the heartbeat change
+under Runtime state below, since that route issues no kernel command.
+`AgentStore::resolve` refuses a
 handle whose HEAD is tombstoned the same way. That is the defined error
 the issue asks for, and it is the error the old handles already answer
 after a recreate, so a client learns nothing new.
@@ -1026,7 +1028,11 @@ Today that cache never lets go of a destroyed agent with queued inputs:
 `Coordinator::candidates` and `Coordinator::offer` test no lifecycle, and
 `unload_idle` keeps any root with inbox entries, so every poll the agent
 wins would end in `agent_gone` from `BeginTurn`, without end. This
-amendment changes the runtime in three places: `candidates` and `offer`
+amendment changes the runtime in four places: `Coordinator::heartbeat`,
+which runs no kernel command and today tests only the incarnation, owner,
+epoch and turn its reloaded HEAD still carries, answers `agent_gone` for a
+HEAD whose lifecycle is not `Active`, so a heartbeat is fenced like the
+owner's other calls; `candidates` and `offer`
 skip a root whose lifecycle is not `Active`; `unload_idle` drops a
 non-active root whatever its inbox and its active turn hold; and an
 `agent_gone` refusal anywhere on the dispatch path replaces the loaded
