@@ -2,8 +2,10 @@
  * The assistant's local tool fixture: a fixed knowledge base and a ticket
  * desk, both in memory. Nothing here touches the network, reads a clock or
  * draws a random number, so the same question always gets the same answer
- * and a test can count every call.
+ * and a test can count every call. Given a counters file, every call is also
+ * appended to it, so runs in several processes are counted in one place.
  */
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { ToolContext } from "@ravel/agents/tools";
 
 export interface Article {
@@ -37,27 +39,46 @@ export interface ToolCall {
   readonly attempt: number;
 }
 
+/** One line of a counters file: a tool run and what its side effect returned. */
+export interface CountedCall extends ToolCall {
+  readonly output: unknown;
+}
+
 /**
- * Stop the run of `tool` at `attempt` after its side effect happened and
- * before it returns, as a process killed at that instant would. `fire` is
- * called once and returns the error the tool throws.
+ * Hold the run of `tool` at `attempt` after its side effect happened and
+ * before it returns: `onHeld` is called once, and the tool returns when
+ * `release` resolves. A release that never resolves leaves the step open
+ * for a process kill to land in.
  */
-export interface Interrupt {
+export interface Hold {
   readonly tool: string;
   readonly attempt: number;
-  readonly fire: () => Error;
+  readonly release: Promise<void>;
+  readonly onHeld?: (call: ToolCall) => void;
+}
+
+/** The calls appended to `counters`, in order; none when the file does not exist. */
+export function readCounters(counters: string): CountedCall[] {
+  if (!existsSync(counters)) return [];
+  return readFileSync(counters, "utf8")
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as CountedCall);
 }
 
 export class AssistantFixture {
-  /** Every tool run, in order, including runs that were interrupted. */
+  /** Every tool run in this process, in order, including runs that were held. */
   readonly calls: ToolCall[] = [];
   /** Tickets the desk filed, in order. */
   readonly tickets: string[] = [];
-  private interrupts: Interrupt[] = [];
+  private holds: Hold[] = [];
 
-  /** Arm `interrupt`; it fires on the first matching run. */
-  interruptAt(interrupt: Interrupt): void {
-    this.interrupts.push(interrupt);
+  /** `counters`, when set, is a file every call is appended to as one JSON line. */
+  constructor(private readonly counters?: string) {}
+
+  /** Arm `hold`; it applies to the first matching run. */
+  holdAt(hold: Hold): void {
+    this.holds.push(hold);
   }
 
   /** How many times `tool` ran. */
@@ -65,14 +86,19 @@ export class AssistantFixture {
     return this.calls.filter((call) => call.tool === tool).length;
   }
 
-  /** Record the run, perform `effect`, then fire a matching interrupt or return. */
+  /** Record the run, perform `effect`, count it, then wait out a matching hold and return. */
   run<T>(tool: string, ctx: ToolContext, effect: () => T): Promise<T> {
-    this.calls.push({ tool, effectId: ctx.effectId, attempt: ctx.attempt });
+    const call: ToolCall = { tool, effectId: ctx.effectId, attempt: ctx.attempt };
+    this.calls.push(call);
     const value = effect();
-    const index = this.interrupts.findIndex((i) => i.tool === tool && i.attempt === ctx.attempt);
-    const interrupt = index === -1 ? undefined : this.interrupts.splice(index, 1)[0];
-    if (interrupt !== undefined) return Promise.reject(interrupt.fire());
-    return Promise.resolve(value);
+    if (this.counters !== undefined) {
+      appendFileSync(this.counters, `${JSON.stringify({ ...call, output: value })}\n`);
+    }
+    const index = this.holds.findIndex((h) => h.tool === tool && h.attempt === ctx.attempt);
+    const hold = index === -1 ? undefined : this.holds.splice(index, 1)[0];
+    if (hold === undefined) return Promise.resolve(value);
+    hold.onHeld?.(call);
+    return hold.release.then(() => value);
   }
 
   /** Article ids whose keywords appear in `query`, in id order. */
