@@ -43,6 +43,7 @@ pub mod ingest_decode;
 pub mod ingest_mode;
 pub mod ipcrypt;
 pub mod lifecycle_refresh;
+mod listen;
 pub mod logs_ingest;
 pub mod maintain;
 #[cfg(feature = "mcp")]
@@ -4199,7 +4200,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     let http_addr = listener.local_addr()?;
     let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
     let http_task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        axum::serve(listener, http_router)
+        axum::serve(listen::nodelay(listener), http_router)
             .with_graceful_shutdown(async {
                 let _ = http_shutdown_rx.await;
             })
@@ -4492,12 +4493,9 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         let listener = tokio::net::TcpListener::bind(config.listen_grpc).await?;
         let addr = listener.local_addr()?;
         let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            grpc.serve_with_incoming_shutdown(
-                tonic::transport::server::TcpIncoming::from(listener),
-                async {
-                    let _ = rx.await;
-                },
-            )
+            grpc.serve_with_incoming_shutdown(listen::grpc_incoming(listener), async {
+                let _ = rx.await;
+            })
             .await?;
             Ok(())
         });
@@ -4557,12 +4555,9 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             let (tx, rx) = oneshot::channel::<()>();
             let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                 server
-                    .serve_with_incoming_shutdown(
-                        tonic::transport::server::TcpIncoming::from(listener),
-                        async {
-                            let _ = rx.await;
-                        },
-                    )
+                    .serve_with_incoming_shutdown(listen::grpc_incoming(listener), async {
+                        let _ = rx.await;
+                    })
                     .await?;
                 Ok(())
             });
@@ -4652,7 +4647,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         let addr = listener.local_addr()?;
         let (tx, rx) = oneshot::channel::<()>();
         let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            axum::serve(listener, mtls_router)
+            axum::serve(listen::nodelay(listener), mtls_router)
                 .with_graceful_shutdown(async {
                     let _ = rx.await;
                 })

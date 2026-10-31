@@ -224,7 +224,7 @@ async fn serve(
     let listener = tokio::net::TcpListener::from_std(listener)
         .context("failed to register the health listener socket")?;
     let (graceful_tx, graceful_rx) = oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+    let server = axum::serve(crate::listen::nodelay(listener), app).with_graceful_shutdown(async {
         let _ = graceful_rx.await;
     });
     let mut server = std::pin::pin!(server.into_future());
