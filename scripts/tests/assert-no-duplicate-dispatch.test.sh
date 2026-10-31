@@ -104,6 +104,11 @@ case "${sub}" in
         echo "HTTP 502: transient" >&2
         exit 1
       fi
+      # compare-gone-<head>: the base branch was deleted, as GitHub answers.
+      if [[ -f "${STUB_DIR}/compare-gone-${head}" ]]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
       if [[ -f "${STUB_DIR}/mb-${head}" ]]; then
         mb="$(cat "${STUB_DIR}/mb-${head}")"
       else
@@ -996,6 +1001,56 @@ touch "${d}/compare-down-h62"
 out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
 check_eq "a failed merge-base lookup exits 69" "69" "${rc}"
 check_contains "and refuses to call it clean" "refusing to report a clean answer" "${out}"
+# Issue #3463: only an OPEN, non-draft pull request can collide, so only a
+# question about one may refuse. ctx_pr <case> <n> <state> <draft> writes a
+# candidate based on a since-deleted branch, merged or closed inside the
+# window when <state> says so.
+ctx_pr() {
+  local when="null"
+  [[ "$3" != OPEN ]] && when="\"$(iso_days_ago 2)\""
+  printf '[{"number":%s,"title":"old work","state":"%s","isDraft":%s,"body":"","headRefName":"p","baseRefName":"release-base/v0.25.1","headRefOid":"h%s","updatedAt":"2026-09-01T00:00:00Z","mergedAt":%s,"closedAt":%s}]\n' \
+    "$2" "$3" "$4" "$2" "${when}" "${when}" >"$1/prs.json"
+}
+# A merged pull request whose base branch is gone. Wrong: its merge base
+# asked for anyway, so the compare 404 refuses every dispatch over the file
+# (69); the overlap dropped instead of reported as context (no #70 line).
+d="$(new_case ctx_merged_deleted_base)"
+ctx_pr "${d}" 70 MERGED false
+pr_patch "${d}" 70 src/t.rs "${patch_rows[@]}"
+touch "${d}/compare-gone-h70"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "a merged PR on a deleted base branch does not refuse (0)" "0" "${rc}"
+check_contains "and is listed as context" "#70 [MERGED] old work" "${out}"
+check_contains "matched as the whole file" "src/t.rs#A (context; compared as the whole file)" "${out}"
+check_eq "without asking its merge base" "no" "$([[ -e "${d}/calls-compare-h70" ]] && echo yes || echo no)"
+# The same for a draft. Wrong: a draft treated as collidable (69 on the 404).
+d="$(new_case ctx_draft_deleted_base)"
+ctx_pr "${d}" 71 OPEN true
+pr_patch "${d}" 71 src/t.rs "${patch_rows[@]}"
+touch "${d}/compare-gone-h71"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "a draft on a deleted base branch does not refuse (0)" "0" "${rc}"
+check_contains "and is listed as a draft" "#71 [DRAFT]" "${out}"
+check_eq "without asking its merge base" "no" "$([[ -e "${d}/calls-compare-h71" ]] && echo yes || echo no)"
+# An open, ready pull request still refuses on the same 404. Wrong: the fix
+# applied to every candidate, so an open collision reads as clean (0 or 66).
+d="$(new_case open_deleted_base)"
+ctx_pr "${d}" 72 OPEN false
+pr_patch "${d}" 72 src/t.rs "${patch_rows[@]}"
+touch "${d}/compare-gone-h72"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "an open PR whose merge base cannot be read still exits 69" "69" "${rc}"
+check_contains "and refuses to call it clean" "refusing to report a clean answer" "${out}"
+# A merged pull request whose files cannot be read is a NOTE, not a refusal.
+# Wrong: its file list asked with ask() (69, as for an open one in
+# gone_files above).
+d="$(new_case ctx_merged_files_gone)"
+ctx_pr "${d}" 73 MERGED false
+touch "${d}/gone-73"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "a merged PR whose files cannot be read does not refuse (0)" "0" "${rc}"
+check_contains "and says so" "NOTE  #73 [MERGED] old work: its files could not be read (HTTP 404: Not Found); context only, not compared" "${out}"
+check_eq "after exactly one call" "1" "$(wc -l <"${d}/calls-73" | tr -d ' ')"
 # A listing with no head commit cannot ask. Wrong: the compare URL built
 # from empty fields (69, or a lookup of the wrong commits).
 d="$(new_case no_head_oid)"
