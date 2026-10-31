@@ -514,14 +514,24 @@ impl Coordinator {
     }
 
     /// Put an agent whose root has inputs or an active turn into the
-    /// dispatch set. A loaded root is refreshed whatever its lifecycle, so a
-    /// tombstone read here reaches `candidates`; an unloaded root whose
-    /// lifecycle is not `Active` is not loaded, since what it holds was
-    /// abandoned by a destroy.
+    /// dispatch set. A loaded `Active` root is refreshed whatever the read
+    /// lifecycle, so a tombstone read here reaches `candidates`. A loaded
+    /// root that is not `Active`, read again not `Active`, is left alone:
+    /// observing it would count it as touched, and `unload_idle` would never
+    /// drop it
+    /// (`tests::a_tombstoned_root_with_an_open_turn_unloads_on_a_coordinator_that_did_not_serve_the_destroy`).
+    /// An unloaded root whose lifecycle is not `Active` is not loaded, since
+    /// what it holds was abandoned by a destroy.
     fn offer(&self, pass: &mut Pass, agent: &AgentId, head: &Head) {
-        let loaded = self.agents.lock().contains_key(agent);
-        if loaded {
-            self.observe(agent, head);
+        let loaded = self
+            .agents
+            .lock()
+            .get(agent)
+            .map(|l| l.head.lifecycle == Lifecycle::Active);
+        if let Some(active) = loaded {
+            if active || head.lifecycle == Lifecycle::Active {
+                self.observe(agent, head);
+            }
             return;
         }
         if head.lifecycle == Lifecycle::Active && (head.active_turn.is_some() || head.has_inbox()) {
