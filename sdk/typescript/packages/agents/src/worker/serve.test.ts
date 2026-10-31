@@ -245,10 +245,10 @@ describe("worker agent_gone", () => {
       const { transport, polledAt } = scriptedTransport(["pass", "pass"]);
       const gone = new AgentGone("agent destroyed");
       const commits: string[] = [];
-      const committed = transport.commit;
+      const commit = transport.commit.bind(transport);
       transport.commit = (request) => {
         commits.push(request.lease.turn_id);
-        return commits.length === 1 ? Promise.reject(gone) : committed(request);
+        return commits.length === 1 ? Promise.reject(gone) : commit(request);
       };
       const reports: TurnReport[] = [];
       const worker = await serveAgents({

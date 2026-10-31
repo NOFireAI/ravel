@@ -8,6 +8,7 @@ import { createTestHarness, type TestHarness } from "../testing/index.js";
 import { ERROR_CODES } from "../wire/errors.js";
 import { defineAgent } from "../worker/index.js";
 import {
+  type AnyAgentDefinition,
   createClient,
   Forbidden,
   IdempotencyConflict,
@@ -299,14 +300,14 @@ describe("client effects, reconcile and destroy", () => {
 
   it("destroy is sent once: an untyped 503 is OutcomeUnknown with no second request", async () => {
     const { client, seen } = scripted(() => new Response("unavailable", { status: 503 }));
-    await expect(client.agent("order", "o-1").destroy({ incarnation: 1 })).rejects.toBeInstanceOf(OutcomeUnknown);
+    await expect(client.agent<AnyAgentDefinition>("order", "o-1").destroy({ incarnation: 1 })).rejects.toBeInstanceOf(OutcomeUnknown);
     expect(seen).toHaveLength(1);
   });
 
   it("effects lists the agent's effects from /api/v1/agents/effects", async () => {
     const fixture = readFixture("effects_response.json");
     const { client, seen } = scripted(json(fixture));
-    expect(await client.agent("order", "o-1").effects()).toEqual(fixture.effects);
+    expect(await client.agent<AnyAgentDefinition>("order", "o-1").effects()).toEqual(fixture.effects);
     expect(seen).toEqual([{ url: "http://x.invalid/api/v1/agents/effects?kind=order&key=o-1", method: "GET", body: undefined }]);
   });
 
@@ -340,8 +341,8 @@ describe("client effects, reconcile and destroy", () => {
 
   it("destroy posts kind, key and incarnation and decodes destroyed and abandoned", async () => {
     const { client, seen } = scripted(json(readFixture("destroy_agent_response.json")));
-    const order = client.agent("order", "o-1");
-    const destroyed = await order.destroy({ incarnation: 1 });
+    const o1 = client.agent<AnyAgentDefinition>("order", "o-1");
+    const destroyed = await o1.destroy({ incarnation: 1 });
     expect(destroyed.agent_id).toBe("19cd0e6876991314c1b6dbd8bd129297");
     expect(destroyed.incarnation).toBe(1);
     expect(destroyed.destroyed).toBe(true);
@@ -350,7 +351,7 @@ describe("client effects, reconcile and destroy", () => {
     expect(destroyed.abandoned.effects_in_doubt).toBe(1);
     expect(destroyed.abandoned.effects_authorized).toBe(0);
     expect(destroyed.abandoned.timers_scheduled).toBe(1);
-    await order.destroy();
+    await o1.destroy();
     expect(seen.map((s) => [s.method, s.url])).toEqual([
       ["POST", "http://x.invalid/api/v1/agents/destroy"],
       ["POST", "http://x.invalid/api/v1/agents/destroy"],
@@ -362,7 +363,7 @@ describe("client effects, reconcile and destroy", () => {
 
   it("state decodes null for an agent that has never committed", async () => {
     const { client, seen } = scripted(json(readFixture("state_response_uncommitted.json")));
-    expect(await client.agent("order", "o-1").state()).toEqual({
+    expect(await client.agent<AnyAgentDefinition>("order", "o-1").state()).toEqual({
       agentId: "19cd0e6876991314c1b6dbd8bd129297",
       incarnation: 1,
       stateVersion: 0,
