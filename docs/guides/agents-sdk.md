@@ -229,22 +229,36 @@ server. Its tests are in `transport/http.test.ts`.
   other failure is retried at the next tick, and one inside the lease does
   not abort the turn. Once renewals have failed past the lease, the worker
   aborts the handler's signal at the expiry and abandons the turn without a
-  commit, with `LeaseExpired`, before the server's grace lets another
-  worker take it over. It measures the expiry on its own timers, `leaseMs`
-  (a `serveAgents` option, default 30000) after it received the assignment
-  or the last answered renewal, because no answer carries the lease length
-  and the two wall clocks may disagree; set it to the server's `lease_ms`.
-  The agents runtime's `RuntimeConfig::default` sets `lease_ms` to 30000
-  and `heartbeat_grace_ms` to 10000. Renewals live in the memory
-  of the coordinator that answered them, so with two coordinators a worker
-  polling the other one can still take a turn over once the lease and grace
-  run out after its takeover. Tests: `a turn longer than the lease renews
+  commit, with `LeaseExpired`. A step the handler calls after either abort,
+  or whose record is answered after it, rejects with the abort's reason and
+  sends no step record, runs no tool and reports no effect result. The
+  worker measures the expiry on its own timers, `leaseMs` (a `serveAgents`
+  option, default 30000) after it received the assignment or sent the last
+  renewal that was answered, because no answer carries the lease length and
+  the two wall clocks may disagree. The server counts a renewal's lease from
+  when it processed the request, no earlier than the sending, so the abort
+  lands before the server's grace lets another worker take the turn over
+  only when `leaseMs` is no longer than the server's agents lease, `lease_ms`
+  in its agents settings (`AgentsConfig::lease_ms`, 30000 by default, with a
+  `heartbeat_grace_ms` of 10000; the agents runtime's
+  `RuntimeConfig::default` uses the same two values). Issue #3568 tracks
+  carrying the lease length on the wire, which would remove the option.
+  `leaseMs` outside 1000 to 2147483647, or not an integer, rejects
+  `serveAgents` with `InvalidWorkerOption` before any request. Renewals
+  live in the memory of the coordinator that answered them, so with two
+  coordinators a worker polling the other one can still take a turn over
+  once the lease and grace run out after its takeover. Tests: `a turn longer than the lease renews
   it in the background and commits`, `a refused renewal aborts the turn
   and nothing is committed`, `a transient renewal failure inside the lease
   does not abort the turn`, `renewals that keep failing past the lease abort
   the turn and send no commit`, `an answered renewal restarts the lease the
-  worker measures` (`worker/renew.test.ts`), `renews once at assignment,
-  sends nothing while a tool runs, and no heartbeat before a step`.
+  worker measures from its sending`, `leaseMs left unset aborts at the 30 s
+  default`, `serveAgents refuses leaseMs %d at startup with
+  InvalidWorkerOption`, `a step called after the lease expired is refused
+  locally and never reaches the server`, `a lease that expires while the
+  step's record is in flight runs no tool` (`worker/renew.test.ts`),
+  `renews once at assignment, sends nothing while a tool runs, and no
+  heartbeat before a step`.
 - There is no `journal` option: steps and effect results are recorded on
   the server. Test: `takes no journal option: steps and effect results are
   recorded on the server`.
