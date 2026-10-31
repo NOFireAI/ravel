@@ -1374,7 +1374,7 @@ second call. One restart-protocol box per arm. The bands are copied to
 | Restart hot wall geomean B/A, min of tries 2 and 3 | 0.945 to 0.975 | above 0.985 | predicted from CPU 0.9586, `tryonly.out`, comment 6548679123 |
 | Restart q21 try 3 | 0 misses, 39,423 hits | any miss | predicted, comment 6548679123 |
 | Restart q21 try-1 wall, B minus A (`result.csv`) | 0 to +0.5 s | above +0.6 s | predicted: 0.5 to 1 CPU-s (#3326 comment 6542227753) against 4.3 CPU-s (the model's cost table) |
-| Restart q21, B: plan-time estimate / resident bytes after try 1 | 0.96 to 1.10 | outside | predicted, the test bound above |
+| Restart q21, B: plan-time estimate / resident bytes after try 1 | 0.96 to 1.08 | outside | predicted, the test bound above |
 | Restart q24, q25, q27 try 3, B: evictions, and misses against admissions | 0 evictions; misses equal admissions | any eviction, or misses not equal to admissions | measured 2026-10-31: held in 13 of 13 restart runs from 2026-10-29, `spread.out`, comment 6548679123 |
 | Answers equal between arms, q18 and q25 excepted | yes | any other difference | measured 2026-10-31 on the abgate run, comment 6548679123 |
 | Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside: the box is invalid | measured 2026-10-31: 0.9997 on the abgate run; `cpuab` stage, #3231 comment 6433600863 |
