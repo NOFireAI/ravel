@@ -427,7 +427,8 @@ fn bind_rows(
     {
         if let Some(failure) = &row.row_failure {
             // The oracle every engine is classified against must hold the
-            // stream, as for a stalled or failed-replay oracle below.
+            // stream, as for a failed read-back, a stall or a failed replay
+            // of the oracle below.
             if !diagnostic || row.system == system_name(Engine::Prometheus) {
                 return Err(BindError::RowFailed {
                     system: row.system.clone(),
@@ -462,7 +463,7 @@ fn bind_rows(
             _ => None,
         };
         if let Some(detail) = failed_readback {
-            if !diagnostic {
+            if !diagnostic || row.system == system_name(Engine::Prometheus) {
                 return Err(BindError::Readback {
                     system: row.system.clone(),
                     detail,

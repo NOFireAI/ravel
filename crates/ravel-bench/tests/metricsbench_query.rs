@@ -1721,6 +1721,43 @@ fn a_row_failure_or_failed_replay_does_not_bind() {
         "{err}"
     );
 
+    // So is a failed read-back on the oracle's row, while the same failure
+    // on a comparator binds as a diagnostic.
+    let readback_failed = |system: &str| {
+        let mut ingest = ingest_report(&urls);
+        ingest
+            .systems
+            .iter_mut()
+            .find(|r| r.system == system)
+            .expect("row")
+            .readback_error = Some("query samples.0 failed after 3 ms: 422".to_string());
+        ingest
+    };
+    let err = bind_diagnostic(
+        &readback_failed("prometheus"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .map(|_| ())
+    .expect_err("a failed read-back on the oracle refuses even as a diagnostic");
+    assert!(
+        matches!(&err, BindError::Readback { system, .. } if system == "prometheus"),
+        "{err}"
+    );
+    let (_, failed) = bind_diagnostic(
+        &readback_failed("mimir"),
+        &workload_bytes,
+        &workload,
+        &specs,
+        |_| None,
+    )
+    .expect("a failed comparator read-back binds as a diagnostic");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].check, FailedCheck::Readback);
+    assert_eq!(failed[0].system, "mimir");
+
     let replay_failed = |system: &str| {
         let mut ingest = ingest_report(&urls);
         ingest.systems.retain(|r| r.system != system);
