@@ -60,6 +60,13 @@ class Findings(unittest.TestCase):
                          [(1, "should_fix", True), (4, "nit", False)])
         self.assertEqual(rows[0]["summary"], "the thing is wrong.")
 
+    def test_a_finding_carried_forward_to_a_new_head_is_not_counted_at_that_head(self):
+        moved = [{"id": 7, "user": BOT, "commit_id": "H", "original_commit_id": "OLD",
+                  "path": "a.rs", "line": 1, "body": "should_fix: from the last round"}]
+        self.assertEqual(cli.classify_findings(moved, "H"), [])
+        self.assertEqual([r["commit"] for r in cli.classify_findings(moved, "H", all_commits=True)],
+                         ["OLD"])
+
     def test_all_commits_includes_older_findings(self):
         rows = cli.classify_findings(self.comments(), "H", all_commits=True)
         self.assertEqual([r["id"] for r in rows], [1, 2, 4])
