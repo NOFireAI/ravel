@@ -36,7 +36,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use ravel_agents_core::command::{
     Cancel, CompleteTurn, EventSpec, HandlerPin, IncarnationFence, IntentSpec, OwnerFence,
-    TimerChange, TimerSpec, TurnFence,
+    TimerChange, TimerSpec, Tombstone, TurnFence,
 };
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
 use ravel_agents_core::head::{Head, ObjectRef};
@@ -146,6 +146,21 @@ impl Default for RuntimeConfig {
             poll_wait_cap_ms: DEFAULT_POLL_WAIT_CAP_MS,
         }
     }
+}
+
+/// What [`Coordinator::destroy`] did.
+#[derive(Debug, Clone)]
+pub struct DestroyOutcome {
+    pub agent_id: AgentId,
+    /// The incarnation now tombstoned.
+    pub incarnation: u64,
+    /// False when HEAD was already tombstoned and nothing was written.
+    pub destroyed: bool,
+    /// The tombstoned root, as published or as read. It holds what the
+    /// tombstone left behind
+    /// (`ravel_agents_core::wire::AbandonedCounts::from_head`); sealed pages
+    /// are not attached.
+    pub head: Head,
 }
 
 /// One loaded agent: the newest root this coordinator has seen.
@@ -266,6 +281,80 @@ impl Coordinator {
             incarnation,
             created,
         })
+    }
+
+    /// Tombstone the agent's current incarnation (ADR-3331, destroy
+    /// amendment): one HEAD CAS that changes only the lifecycle and the root
+    /// revision. `incarnation`, when set and not current, is `AgentGone`
+    /// with nothing written. A HEAD already tombstoned at the current
+    /// incarnation answers `destroyed: false` and writes nothing. Either
+    /// way this coordinator forgets the agent
+    /// (`tests::a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll`);
+    /// another coordinator learns of the tombstone on its next HEAD read
+    /// (`tests::a_coordinator_that_did_not_serve_the_destroy_stops_offering_the_agent_after_one_refused_dispatch`).
+    pub async fn destroy(
+        &self,
+        agent: &AgentRef,
+        incarnation: Option<u64>,
+    ) -> Result<DestroyOutcome, AgentError> {
+        let (kind, key) = parse_agent(agent)?;
+        let agent = agent_id(&kind, &key);
+        let current = match self.store.read_head_shallow(&agent).await? {
+            HeadState::Present { head, .. } => head.incarnation,
+            HeadState::Absent => {
+                return Err(refused(
+                    &agent,
+                    ErrorKind::AgentGone,
+                    "agent does not exist",
+                ));
+            }
+            HeadState::Unsupported { .. } => {
+                return Err(refused(
+                    &agent,
+                    ErrorKind::UnsupportedFormat,
+                    "HEAD format version is newer than this release",
+                ));
+            }
+        };
+        if incarnation.is_some_and(|pinned| pinned != current) {
+            return Err(refused(
+                &agent,
+                ErrorKind::AgentGone,
+                "handle names another incarnation",
+            ));
+        }
+        let command = ravel_agents_core::command::Command::Tombstone(Tombstone {
+            fence: IncarnationFence {
+                incarnation: current,
+            },
+        });
+        let out = self.execute(&agent, &command).await?;
+        let destroyed = match out.reply {
+            Reply::Tombstoned => true,
+            Reply::AlreadyTombstoned => false,
+            _ => {
+                return Err(refused(
+                    &agent,
+                    ErrorKind::AgentGone,
+                    "tombstone answered without a lifecycle reply",
+                ));
+            }
+        };
+        self.forget_agent(&agent);
+        Ok(DestroyOutcome {
+            agent_id: agent,
+            incarnation: out.head.incarnation,
+            destroyed,
+            head: out.head,
+        })
+    }
+
+    /// Drop every in-memory record of `agent`: its loaded root, its lease
+    /// and its open attempts, reconcile hand-overs included.
+    pub(crate) fn forget_agent(&self, agent: &AgentId) {
+        self.agents.lock().remove(agent);
+        self.leases.forget(agent);
+        self.open_attempts.lock().retain(|(a, _), _| a != agent);
     }
 
     /// Accept one input. Loads the agent from HEAD when it is not loaded.

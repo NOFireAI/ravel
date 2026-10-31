@@ -1435,3 +1435,178 @@ async fn an_enqueue_with_a_lost_ack_is_settled_through_the_receipt_index() {
     assert_eq!(store.counters().since(&before).publish.cas, 0);
     assert_eq!(head(&store, "o-1").await.inbox.len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_destroyed_agent_is_dropped_from_the_loaded_set_and_never_offered_to_a_poll() {
+    use ravel_agents_core::head::Lifecycle;
+    use ravel_agents_core::wire::AbandonedCounts;
+
+    let (_clock, store, co) = rig();
+    let id = id_of("o-1");
+    create(&co, "o-1").await;
+    send(&co, "o-1", "r-1", json!(1)).await;
+    send(&co, "o-1", "r-2", json!(2)).await;
+    let w = worker(&co, "v1");
+    let la = poll_now(&co, &w, "v1").await.expect("leased");
+    assert!(co.leases.holds(&id));
+    struct Ignore;
+    impl EffectDispatcher for Ignore {
+        fn dispatch(&self, _: &Dispatch) {}
+    }
+    let spec = StepSpec {
+        step_key: "charge".to_string(),
+        tool_name: "charge".to_string(),
+        tool_version: "1".to_string(),
+        policy: ravel_agents_core::head::RecoveryPolicy::Manual,
+        input_hash: ravel_agents_core::identity::step_input_hash("charge", "1", b"{}"),
+    };
+    let progress = co.run_step(&la.lease, &spec, &Ignore).await.expect("step");
+    assert!(matches!(progress, StepProgress::Dispatched(_)));
+    assert!(co.open_attempts.lock().keys().any(|(a, _)| *a == id));
+
+    let before = store.counters();
+    let out = co
+        .destroy(&agent_ref("o-1"), Some(1))
+        .await
+        .expect("destroy");
+    assert_eq!(store.counters().since(&before).publish.cas, 1);
+    assert!(out.destroyed);
+    assert_eq!((out.agent_id, out.incarnation), (id, 1));
+    assert_eq!(out.head.lifecycle, Lifecycle::Tombstoned);
+    assert_eq!(
+        AbandonedCounts::from_head(&out.head, out.head.inbox_depth()),
+        AbandonedCounts {
+            inputs: 2,
+            active_turn: true,
+            effects_in_doubt: 0,
+            effects_authorized: 1,
+            timers_scheduled: 0,
+        }
+    );
+    assert!(co.cached(&id).is_none());
+    assert!(!co.leases.holds(&id));
+    assert!(!co.open_attempts.lock().keys().any(|(a, _)| *a == id));
+
+    let before = store.counters();
+    assert!(poll_now(&co, &w, "v1").await.is_none());
+    assert_eq!(store.counters().since(&before).publish.cas, 0);
+    assert!(co.cached(&id).is_none());
+
+    // The owner's renewal and commit answer what the kernel answers.
+    let before = store.counters();
+    let gone = co
+        .heartbeat(&la.lease)
+        .await
+        .expect_err("renew after destroy");
+    assert_eq!(gone.kind, ErrorKind::AgentGone);
+    assert_eq!(co.metrics().ownership_lost_refusals, 0);
+    assert!(!co.leases.holds(&id));
+    let gone = co
+        .commit(&completed(&la.lease, json!("s1")))
+        .await
+        .expect_err("commit after destroy");
+    assert_eq!(gone.kind, ErrorKind::AgentGone);
+    assert_eq!(store.counters().since(&before).publish.cas, 0);
+
+    // A repeat is not a second tombstone, and a stale or unknown handle is
+    // refused unwritten.
+    let before = store.counters();
+    let again = co.destroy(&agent_ref("o-1"), None).await.expect("repeat");
+    assert!(!again.destroyed);
+    assert_eq!(again.head.root_revision, out.head.root_revision);
+    let pinned = co
+        .destroy(&agent_ref("o-1"), Some(2))
+        .await
+        .expect_err("another incarnation");
+    assert_eq!(pinned.kind, ErrorKind::AgentGone);
+    let absent = co
+        .destroy(&agent_ref("o-9"), None)
+        .await
+        .expect_err("never created");
+    assert_eq!(absent.kind, ErrorKind::AgentGone);
+    assert_eq!(store.counters().since(&before).publish.cas, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_coordinator_that_did_not_serve_the_destroy_stops_offering_the_agent_after_one_refused_dispatch()
+ {
+    use ravel_agents_core::head::Lifecycle;
+
+    // c2 sweeps from its first poll, over an empty tenant, and never again
+    // from a poll, so it learns of the destroys only from the dispatch
+    // commands they refuse.
+    let clock = clock();
+    let store = store_over(Arc::new(MemoryStore::new()), &clock);
+    let c1 = coordinator(&store, &clock, 100);
+    let c2 = coordinator_with(
+        &store,
+        &clock,
+        200,
+        SweepConfig {
+            interval_ms: u64::MAX,
+            ..SweepConfig::default()
+        },
+    );
+    let w = worker(&c2, "v1");
+    assert!(poll_now(&c2, &w, "v1").await.is_none());
+    // "z" is owned by w with no active turn, so its next dispatch is a
+    // `BeginTurn`; "x" has no owner, so its next dispatch is a `Takeover`.
+    create(&c2, "z").await;
+    send(&c2, "z", "z-1", json!(1)).await;
+    let lz = poll_now(&c2, &w, "v1").await.expect("z leased");
+    c2.commit(&completed(&lz.lease, json!("s1")))
+        .await
+        .expect("commit z");
+    create(&c2, "x").await;
+    send(&c2, "x", "x-1", json!(1)).await;
+    clock.advance_ms(1);
+    send(&c2, "z", "z-2", json!(2)).await;
+    clock.advance_ms(1);
+    create(&c2, "y").await;
+    send(&c2, "y", "y-1", json!(1)).await;
+    for key in ["x", "z"] {
+        assert!(
+            c1.destroy(&agent_ref(key), None)
+                .await
+                .expect("destroy")
+                .destroyed
+        );
+    }
+    let (hx, hz) = (head(&store, "x").await, head(&store, "z").await);
+
+    // Both are refused once, reloaded as tombstoned, and the scan moves on.
+    let ly = poll_now(&c2, &w, "v1").await.expect("y leased");
+    assert_eq!(ly.agent, agent_ref("y"));
+    for (key, before) in [("x", &hx), ("z", &hz)] {
+        let cached = c2.cached(&id_of(key)).expect("reloaded");
+        assert_eq!(cached.lifecycle, Lifecycle::Tombstoned, "{key}");
+        assert_eq!(&head(&store, key).await, before, "{key}: refused unwritten");
+    }
+    c2.commit(&completed(&ly.lease, json!("s1")))
+        .await
+        .expect("commit y");
+
+    // The next poll issues no command and no read for either.
+    let before = store.counters();
+    assert!(poll_now(&c2, &w, "v1").await.is_none());
+    let spent = store.counters().since(&before);
+    assert_eq!((spent.resolve.get, spent.publish.cas), (0, 0));
+
+    // Idle unload drops them although their inboxes still hold input.
+    clock.advance_ms(IDLE_MS);
+    assert_eq!(c2.unload_idle(), 3);
+    assert!(c2.cached(&id_of("x")).is_none());
+    assert!(c2.cached(&id_of("z")).is_none());
+
+    // A new incarnation is found by the sweep and served at its own fence.
+    create(&c1, "x").await;
+    send(&c1, "x", "x2-1", json!(1)).await;
+    c2.sweep_once(store.tenant()).await.expect("sweep");
+    assert!(
+        c2.cached(&id_of("z")).is_none(),
+        "the sweep does not load a tombstoned root"
+    );
+    let lx = poll_now(&c2, &w, "v1").await.expect("x leased again");
+    assert_eq!(lx.agent, agent_ref("x"));
+    assert_eq!(lx.lease.incarnation, 2);
+}

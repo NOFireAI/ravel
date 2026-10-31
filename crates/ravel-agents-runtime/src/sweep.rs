@@ -144,7 +144,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use ravel_agents_core::error::{AgentError, ErrorKind, SafeIds};
-use ravel_agents_core::head::Head;
+use ravel_agents_core::head::{Head, Lifecycle};
 use ravel_agents_core::identity::AgentId;
 use ravel_agents_core::kernel::Usage;
 use ravel_agents_core::keys::DueBucket;
@@ -514,14 +514,17 @@ impl Coordinator {
     }
 
     /// Put an agent whose root has inputs or an active turn into the
-    /// dispatch set.
+    /// dispatch set. A loaded root is refreshed whatever its lifecycle, so a
+    /// tombstone read here reaches `candidates`; an unloaded root whose
+    /// lifecycle is not `Active` is not loaded, since what it holds was
+    /// abandoned by a destroy.
     fn offer(&self, pass: &mut Pass, agent: &AgentId, head: &Head) {
         let loaded = self.agents.lock().contains_key(agent);
         if loaded {
             self.observe(agent, head);
             return;
         }
-        if head.active_turn.is_some() || head.has_inbox() {
+        if head.lifecycle == Lifecycle::Active && (head.active_turn.is_some() || head.has_inbox()) {
             self.observe(agent, head);
             pass.report.agents_loaded += 1;
             self.wake.notify_waiters();

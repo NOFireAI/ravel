@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use ravel_agents_core::command::{BeginTurn, Command, HandlerPin, OwnerFence};
 use ravel_agents_core::error::{AgentError, ErrorKind};
-use ravel_agents_core::head::{ActiveTurn, Head, ObjectRef};
+use ravel_agents_core::head::{ActiveTurn, Head, Lifecycle, ObjectRef};
 use ravel_agents_core::identity::AgentId;
 use ravel_agents_core::kernel::Reply;
 use ravel_agents_core::pages::{ListKind, Need};
@@ -100,13 +100,17 @@ impl Coordinator {
 
     /// Agents with work this worker's pins can serve, oldest next input
     /// first. An active turn the pins do not exactly match is counted as a
-    /// refusal and left out.
+    /// refusal and left out. A root whose lifecycle is not `Active` is left
+    /// out without one: its inbox and turn are what a destroy abandoned.
     fn candidates(&self, worker: &str, pins: &[HandlerPin]) -> (Vec<AgentId>, Option<AgentError>) {
         let mut found = Vec::new();
         let mut refusal = None;
         let agents = self.agents.lock();
         for (agent, loaded) in agents.iter() {
             let head = &loaded.head;
+            if head.lifecycle != Lifecycle::Active {
+                continue;
+            }
             // The inbox entries read below are the ones `dispatch_needs`
             // names; without their pages the first one in memory is not the
             // first input.
@@ -159,7 +163,9 @@ impl Coordinator {
             .agents
             .lock()
             .iter()
-            .filter(|(_, l)| !l.dispatching && !dispatch_ready(&l.head))
+            .filter(|(_, l)| {
+                !l.dispatching && l.head.lifecycle == Lifecycle::Active && !dispatch_ready(&l.head)
+            })
             .map(|(a, l)| (*a, l.head.clone()))
             .collect();
         for (agent, mut head) in lacking {
@@ -195,6 +201,11 @@ impl Coordinator {
                         e.kind,
                         ErrorKind::OwnershipLost | ErrorKind::IncompatibleHandler
                     ) => {}
+                // A tombstone or a recreate this coordinator did not see,
+                // met by the `Takeover` or the `BeginTurn`: load the HEAD
+                // that refused, which `candidates` skips while it is not
+                // `Active`, and move on to the next candidate.
+                Err(e) if e.kind == ErrorKind::AgentGone => self.refresh_gone(&agent).await,
                 Err(e) => return Err(e),
             }
         }
@@ -209,6 +220,15 @@ impl Coordinator {
             }
             None => Scan::Nothing,
         })
+    }
+
+    /// Replace the loaded root of an agent a dispatch command answered
+    /// `AgentGone` with its HEAD; forget it when HEAD cannot be read.
+    async fn refresh_gone(&self, agent: &AgentId) {
+        if let Err(error) = self.reload(agent).await {
+            tracing::debug!(agent = %agent.to_hex(), %error, "agents gone root not reloaded");
+            self.forget_agent(agent);
+        }
     }
 
     fn claim(&self, agent: &AgentId) -> bool {

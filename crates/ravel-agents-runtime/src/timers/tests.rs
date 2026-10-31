@@ -355,6 +355,32 @@ async fn a_reschedule_supersedes_the_scheduled_generation() {
     assert_eq!(h.timers.len(), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_hint_of_a_destroyed_incarnation_fires_nothing_and_is_deleted() {
+    let r = rig();
+    create(&r.co, "o-1").await;
+    schedule(&r.co, "o-1", "t", T0 + 30 * SEC).await;
+    assert_eq!(hint_keys(r.backend.as_ref()).await.len(), 1);
+    r.co.destroy(&agent_ref("o-1"), None)
+        .await
+        .expect("destroy");
+
+    r.now.advance(60 * SEC);
+    let before = r.store.counters();
+    let deletes = r.store.wake_hint_deletes();
+    let pass = r.co.sweep_once(&TENANT).await.expect("sweep");
+    assert_eq!(r.store.counters().since(&before).publish.cas, 0);
+    assert_eq!(r.store.wake_hint_deletes() - deletes, 1);
+    assert_eq!(
+        (pass.hints_read, pass.hints_deleted, pass.timers_fired),
+        (1, 1, 0)
+    );
+    assert!(hint_keys(r.backend.as_ref()).await.is_empty());
+    let h = head(&r.store, "o-1").await;
+    assert_eq!(status(&h, "t"), TimerStatus::Scheduled);
+    assert_eq!(tick_inputs(&h), 0);
+}
+
 fn id_of_timer(h: &Head, timer_key: &str) -> ravel_agents_core::identity::Id128 {
     ravel_agents_core::identity::timer_id(h.incarnation, timer_key)
 }

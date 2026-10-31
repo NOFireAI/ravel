@@ -197,6 +197,125 @@ async fn create_on_a_tombstoned_agent_bumps_the_incarnation() {
     backend.head(&dir).await.expect("dir entry");
 }
 
+/// Create, enqueue two inputs, take ownership and begin the first turn:
+/// the HEAD a destroy and a commit then race on.
+async fn in_a_turn(store: &AgentStore) -> Head {
+    let mut head = create(store).await.head;
+    for step in [
+        Step::Enqueue {
+            request: 0,
+            payload: 0,
+        },
+        Step::Enqueue {
+            request: 1,
+            payload: 1,
+        },
+        Step::Takeover,
+        Step::Begin,
+    ] {
+        let (cmd, deps) = command(&step, Some(&head), T0);
+        head = store
+            .execute_with(&agent(), &cmd, &deps)
+            .await
+            .expect("setup step")
+            .head;
+    }
+    assert!(head.active_turn.is_some());
+    head
+}
+
+fn tombstone_of(head: &Head) -> Command {
+    Command::Tombstone(Tombstone {
+        fence: IncarnationFence {
+            incarnation: head.incarnation,
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_destroy_racing_a_commit_lands_in_cas_order_and_the_loser_is_agent_gone() {
+    // Commit first: the result is part of the HEAD the tombstone keeps.
+    let store = store_with(Arc::new(MemoryStore::new()), StoreLimits::default());
+    let head = in_a_turn(&store).await;
+    let (commit, deps) = command(&Step::Complete { state: 0 }, Some(&head), T0);
+    let committed = store
+        .execute_with(&agent(), &commit, &deps)
+        .await
+        .expect("commit");
+    assert!(matches!(
+        committed.reply,
+        Reply::TurnCommitted { accept_seq: 1, .. }
+    ));
+    let gone = store
+        .execute(&agent(), &tombstone_of(&head))
+        .await
+        .expect("tombstone");
+    assert_eq!(gone.reply, Reply::Tombstoned);
+    assert_eq!(gone.head.lifecycle, Lifecycle::Tombstoned);
+    assert_eq!(gone.head.state_version, committed.head.state_version);
+    assert_eq!(gone.head.results, committed.head.results);
+    assert_eq!(gone.head.inbox_depth(), 1, "the second input is abandoned");
+
+    // Tombstone first: the commit under the old fence is refused unwritten.
+    let store = store_with(Arc::new(MemoryStore::new()), StoreLimits::default());
+    let head = in_a_turn(&store).await;
+    store
+        .execute(&agent(), &tombstone_of(&head))
+        .await
+        .expect("tombstone");
+    let (commit, deps) = command(&Step::Complete { state: 0 }, Some(&head), T0);
+    let before = store.counters();
+    let refused = store
+        .execute_with(&agent(), &commit, &deps)
+        .await
+        .expect_err("a commit on a tombstoned root");
+    let delta = store.counters().since(&before);
+    assert_eq!(refused.kind, ErrorKind::AgentGone);
+    assert_eq!(delta.publish.cas, 0);
+
+    // The tombstone lands between the commit's read and its CAS: the CAS
+    // loses, the re-read finds the tombstone, and nothing is retried onto it.
+    let mem = Arc::new(MemoryStore::new());
+    let other = store_with(mem.clone(), StoreLimits::default());
+    let head = in_a_turn(&other).await;
+    let held = Arc::new(FaultStore::new(mem.clone(), FaultPlan::empty()));
+    let gate = held.hold(Op::Put, Some("/head".to_string()), Occurrence::Nth(1));
+    let committer = Arc::new(store_with(held.clone(), StoreLimits::default()));
+    let (commit, deps) = command(&Step::Complete { state: 0 }, Some(&head), T0);
+    let task = {
+        let committer = committer.clone();
+        tokio::spawn(async move { committer.execute_with(&agent(), &commit, &deps).await })
+    };
+    gate.wait_until_held(1).await;
+    other
+        .execute(&agent(), &tombstone_of(&head))
+        .await
+        .expect("tombstone wins the race");
+    for id in gate.held() {
+        assert!(gate.release(id));
+    }
+    let refused = task
+        .await
+        .expect("join")
+        .expect_err("the commit loses to the tombstone");
+    let counts = committer.counters();
+    assert_eq!(refused.kind, ErrorKind::AgentGone);
+    assert_eq!(counts.publish.cas, 1, "no second CAS onto the tombstone");
+    assert_eq!(counts.publish.conflict, 1);
+    assert_eq!(
+        counts.resolve.get, 2,
+        "read, then re-read after the conflict"
+    );
+    let HeadState::Present { head: stored, .. } =
+        other.read_head_full(&agent()).await.expect("read")
+    else {
+        panic!("HEAD is present");
+    };
+    assert_eq!(stored.lifecycle, Lifecycle::Tombstoned);
+    assert_eq!(stored.state_version, head.state_version);
+    assert!(stored.active_turn.is_some());
+}
+
 #[tokio::test]
 async fn enqueue_with_the_same_request_id_and_hash_returns_the_same_handle() {
     let store = store_with(Arc::new(MemoryStore::new()), StoreLimits::default());
