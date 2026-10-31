@@ -10688,14 +10688,14 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            42,
-            "exactly 42 label variants every build has, 24 distinct keys (sql adds DdlKind, \
-             DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
+            44,
+            "exactly 44 label variants every build has, 25 distinct keys (sql adds DdlKind, \
+             DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            24,
-            "exactly 24 distinct keys"
+            25,
+            "exactly 25 distinct keys"
         );
     }
 

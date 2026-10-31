@@ -45,7 +45,7 @@ The renderer can attach only these label keys: `tenant_hash`, `signal`,
 
 | Label | What it splits |
 |---|---|
-| `phase` | The [SQL DDL families](#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_) only. It exists only in a build with the `sql` feature. |
+| `phase` | The logs ingest histograms `ravel_ingest_flush_phase_seconds` and `ravel_ingest_strict_ack_seconds`, in every build. The [SQL DDL families](#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_), in a build with the `sql` feature. |
 | `kind` | DDL statements by leading keyword. The maintenance merge-memory gauge into its transient and total high-water marks. |
 | `outcome` | DDL statements by how they ended. The alert-tick counter by how one evaluation tick ended. The IPCrypt values counter by `encrypted` or `unparsed`. |
 | `variant` | The IPCrypt values counter only, by `deterministic` or `prefix`. |
