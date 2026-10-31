@@ -1,7 +1,7 @@
 # ADR-3541: An optional subject on the principal, recorded in audit records
 
-- Status: Accepted (owner approval 2026-11-01)
-- Date: 2026-10-31
+- Status: Accepted (2026-11-01)
+- Date: 2026-11-01
 - Refs: #3541, #3408, #3525, ADR-0042, ADR-0050, ADR-0062, ADR-0072,
   ADR-2040, ADR-2993, ADR-3331
 
@@ -118,7 +118,13 @@ and `ravel-ingest-router`'s `--tenant-token` all accept it (the router
 discards it as it discards capabilities). A label is 1 to 64 bytes drawn
 from `A-Z a-z 0-9 . _ @ + -`, a strict subset of the `Subject` bound, so an
 email address or a service name fits and a comma, semicolon, space or `=`
-cannot. The entry appears at most once per pair. Anything else refuses
+cannot. The entry appears at most once per pair. Because the pair's
+suffix starts after the tenant side's last `;`, a `subject=` entry placed
+before a capability word (`acme;subject=alice;ddl`) would otherwise land
+in the tenant id. The guard that refuses a capability word inside the
+tenant segment therefore also refuses a tenant segment that is `subject`
+or starts with `subject=`, so a misplaced label refuses startup instead of
+naming a tenant. Anything else refuses
 startup with the same error shape the capability words use: the message
 names the argv position or the file and line, never the pair text, because
 for the file source that text is the bearer token. The pair is still split
@@ -139,7 +145,11 @@ today. Set without `--oidc-issuer`, startup is refused, as for every other
 readable name, with the issuer's guarantees on that claim being the
 deployment's to judge. The claim is read from the verified claim set only,
 after signature, issuer, expiry and audience checks, the way the tenant
-claim is read.
+claim is read. Whatever claim is chosen is written into audit records
+that any holder of a token for that tenant reads through the `audit`
+table, so choosing `email` or `preferred_username` writes each end user's
+identifier where the tenant can read it. That is the decision this flag
+makes: pick a claim the operator is content for the tenant to read.
 
 A claim that is missing, not a JSON string, empty, or outside the
 `Subject` bound leaves the subject absent. The request is still
@@ -163,6 +173,10 @@ rule. It is read on the `--mtls-listener` chain only, under exactly the
 trust rule of the tenant header: the proxy verifies the certificate and
 strips any client-supplied copy. The public listeners never contain an
 `MtlsResolver`, so the header has no effect there whatever a client sends.
+The tenant reads the recorded value through the `audit` table like any
+other subject, so a certificate DN that names a person is written where
+the tenant can read it. Choosing what the proxy forwards is the moment
+that decision is made.
 
 Not a source: `DevHeaderTenantResolver` sets no subject. `DurableBearerResolver`
 sets no subject, because `sys/auth` entries hold no label; giving them one
@@ -195,15 +209,27 @@ keep `query.tenant` as it is; `query.principal.subject` is the first
 records, so a reader learns one name for "who" across both kinds.
 
 The plumbing: `agents_reconcile_audit_event` and `agents_destroy_audit_event`
-already take the `Principal` and read the field. `query_audit_event` gains
-a `subject: Option<&Subject>` parameter and `QueryControls::audit` passes
-it through; every surface that audits resolves the caller with
-`authenticate_principal` (the agents routes and the SQL handler already
-do) and hands the subject to the audit step. The Flight SQL stream resolves
-the principal from the `DoGet` metadata it already authenticates and
-records it the same way. The MCP authentication step stores the principal,
-not only the tenant, in the request extension so records written on an MCP
-tool's behalf carry it.
+already take the `Principal` and read the field. `query_audit_event` lives
+in `ravel-maintain`, which does not depend on `ravel-tenant-resolve` and
+must not: that crate pulls in axum, reqwest and jsonwebtoken. So it gains
+a parameter of plain values, an `AuditSubject { value, source }` of
+strings defined in `ravel-maintain`, and `ravel-query` converts a
+`Subject` into it. `QueryControls::audit` passes it through; every
+surface that audits resolves the caller with `authenticate_principal`
+(the agents routes and the SQL handler already do) and hands the
+converted subject to the audit step.
+
+The Flight SQL path has no principal today: `FlightAuth::tenant` returns a
+`TenantHash`, and the trait states only what Flight needs without seeing a
+credential. `FlightAuth` therefore gains a second required method,
+`audit_subject(&self, metadata) -> Option<AuditSubject>`, with no default
+implementation, so every implementation states its answer. The server's
+implementation resolves the principal from the same `DoGet` metadata it
+already authenticates. `ravel-sql` gains no dependency on
+`ravel-tenant-resolve`: it sees only the plain `AuditSubject`. The MCP
+authentication step stores the principal, not only the tenant, in the
+request extension, so records written on an MCP tool's behalf carry it.
+No new crate dependency results from this decision.
 
 ### 6. Audited, not logged, and never answered
 
