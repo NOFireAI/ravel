@@ -38,7 +38,7 @@ sample was taken per arm:
 | libc memcpy, self, flat profile | about 15.5% | not split | measured 2026-10-30 |
 | jemalloc, self, flat profile | about 10% | not split | measured 2026-10-30 |
 
-This profile predates D1 to D7; the profile of the code as built is in the
+This profile predates the decisions below; the profile of the code as built is in the
 2026-10-31 baseline amendment.
 
 At 100% of 8 vCPU, 120k lines/s allows at most 66 us of CPU per line. That is
@@ -515,8 +515,9 @@ and no `abandoned_*` counter (`a_failed_page_job_fails_the_flush_retryably`).
 
 <!-- amendment-applies: sections="Context|D2. The OTLP flush uses the columnar writer, if it measures cheaper|What strict acks can reach" pointer="2026-10-31 baseline amendment" -->
 
-D1 to D8 are built. This amendment records where the CPU and the strict ack
-go in the code as built, and the order of the next cuts. It changes no
+D1, D2, D3a and D4 to D8 are built; D3b is not, and is cut (d) below. This
+amendment records where the CPU and the strict ack go in the code as built
+at main 7726a95ea (not current `main`), and the order of the next cuts. It changes no
 decision above; each cut below is adopted on the same rule as D2 and D3b,
 only if it measures cheaper at the benchmark's shape.
 
@@ -525,6 +526,15 @@ shards, 100 ms, 8 write-gate permits) missed both rows: buffered best 30-min
 112,226 lines/s, strict 99,296, against 115k. Buffered was CPU-bound at its
 best window (7.0 to 7.95 busy cores of 8). Strict had idle CPU and no queue
 inside Ravel; its ack was the limit.
+
+Exit run 2 and every measurement below ran with `--cpu-gate-write-permits 8`,
+not the default of `max(1, cores / 2)`, 4 on 8 vCPU, that D8 and the
+prediction in "What strict acks can reach" assume, so the ack split below
+compares with that prediction at twice its gate width. The run deviated from
+D8 on this flag alone. Exit run 1, at the default 4, stored buffered 102,517
+lines/s and strict 96,971 (comment 6540809017): the extra permits bought the
+buffered row about 10k lines/s and did not move the strict row, whose gate
+was never full.
 
 **The strict ack, split.** Measured with the phase histograms #3533 added
 (`ravel_ingest_strict_ack_seconds`, `ravel_ingest_flush_phase_seconds`), at a
@@ -541,8 +551,13 @@ and 8,853 flushes (comment 6548202905):
 | `shard_skew`, first shard ack to last | 60 ms | 150 ms | comment 6548202905 |
 | `permit_wait`, `resolve`, `commit_build` | about 0 | about 0 | comment 6548202905 |
 
-Encode is 56% of the ack, for about 9.7k lines per flush, with the write
-gate's wait per job at zero: it is CPU in the flush, not contention. The two
+Encode is 56% of the ack, for about 9.7k lines per flush. The `encode` phase
+bundles the gate wait with the encode, so the wait is read from
+`ravel_cpu_gate_wait_seconds{gate="write"}`, whose mean per job over the
+window was 0 to four decimal places. That family pools every write-gate site,
+and a pooled mean of waits that cannot be negative bounds each site's mean by
+the pooled figure divided by that site's share of jobs, so the flush's own
+wait is also about zero: encode is CPU in the flush, not contention. The two
 PUTs are 132 ms together, so the ack-path figures in "What strict acks can
 reach" overstated the store share and understated the encode. About 0.11 s
 per request falls outside `request`, in decode, normalize and admission ahead
