@@ -347,8 +347,9 @@ Client (`src/client/`):
 - `agent.destroy({ incarnation })` posts the agent's kind and key, and the
   incarnation only when one is given, to `/api/v1/agents/destroy`, and
   answers whether it destroyed the agent and what the destruction
-  abandoned. The server's destroy route is added under #3478; the request
-  and answer follow the `destroy_agent_request` and
+  abandoned. It needs a server that serves the destroy route, which
+  ravel-server gains with #3529; against an older server the call ends in
+  a 404. The request and answer follow the `destroy_agent_request` and
   `destroy_agent_response` fixtures. Test: `destroy posts kind, key and
   incarnation and decodes destroyed and abandoned`.
 - `reconcile` and `destroy` are sent once, never retried: a network failure
