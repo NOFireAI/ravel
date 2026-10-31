@@ -845,6 +845,22 @@ pub fn emit<T: Serialize>(
     Ok(())
 }
 
+/// Pass `result` through; under `--json` a typed refusal's [`ErrorBody`] is
+/// first printed on `out`, and the error still makes the command exit
+/// non-zero.
+///
+/// [`ErrorBody`]: ravel_agents_core::wire::ErrorBody
+pub fn emit_refusal<T>(
+    out: &mut dyn Write,
+    json: bool,
+    result: Result<T, AgentsCliError>,
+) -> anyhow::Result<T> {
+    if json && let Err(AgentsCliError::Client(ClientError::Agent(failure))) = &result {
+        writeln!(out, "{}", serde_json::to_string_pretty(&failure.body())?)?;
+    }
+    Ok(result?)
+}
+
 /// `agents scaffold <dir>`: run the SDK generator as `node <bin> <dir>`.
 /// A `dir` that exists and is not empty is refused before anything is
 /// spawned. Returns the generator's stdout.
