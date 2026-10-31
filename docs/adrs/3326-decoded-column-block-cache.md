@@ -186,7 +186,8 @@ Exclusions, each a property the implementation tests:
   the cache.
 - **Narrowed values never populate an entry.** No narrowed, survivor-only
   or Arrow value populates an entry, and nothing after step 2 reads from
-  one.
+  one (narrowed by the zero-copy values amendment below: an entry keeps one
+  whole-block Arrow values array over its own buffers, and step 4 reads it).
 - **Blocks with an erasure pending bypass the cache.** The columnar path
   decodes nothing while an erasure is pending (`log_fetcher.rs:599-601`).
   Such blocks take the row path, where erased rows are filtered after
@@ -274,7 +275,8 @@ it after its revert, so admission stays CLOCK and the intent rule).
   callers (`crates/ravel-maintain/src/rlog.rs:2265`,
   `crates/ravel-logseg/src/ranged.rs:717`). A pinned test asserts the
   scan's charge for a block with one cached column and one fresh column.
-  Charged once means once on the process budget: the per-query and
+  Charged once means once on the process budget (narrowed for the values
+  array by the zero-copy values amendment below): the per-query and
   per-tenant ceilings do not count served columns (see the tenant-ceiling
   amendment below).
 - **The reservation travels with the bytes.** It is owned by the shared
@@ -283,7 +285,9 @@ it after its revert, so admission stays CLOCK and the intent rule).
   index but frees nothing until that scan drops it. A pressure-eviction
   pass therefore counts toward the request only the bytes of entries it
   holds the last reference to. Evicting a referenced entry does not
-  pretend to free memory the host still holds.
+  pretend to free memory the host still holds. The shared buffer includes
+  an Arrow array built over the entry's buffers, so a batch that holds one
+  keeps the reservation (see the zero-copy values amendment below).
 - **Eviction under pressure:** when a reservation from any other consumer
   would be refused, the budget first asks the decoded cache to evict until
   the request fits. Both refusal causes trigger the pass: the budget's
@@ -321,7 +325,9 @@ it after its revert, so admission stays CLOCK and the intent rule).
   for bit, for every column kind and layout.
 - A cached column's UTF-8 validation state is part of the entry, so a hit
   validates nothing again (narrowed to the columns it holds for by the
-  validation-state amendment below). `str_cells_validated` therefore counts
+  validation-state amendment below; the one build of an entry's Arrow
+  values array validates again, see the zero-copy values amendment below).
+  `str_cells_validated` therefore counts
   validation work done by this statement. A hot try served from the cache
   reports fewer cells than the cold try that filled it. The counter
   documentation says so, and the differential test asserts results and
@@ -451,7 +457,9 @@ work, and the readout names the step that missed.
 
 - **Cache Arrow arrays at step 4.** Rejected: they are survivor-only and
   built under the tenant's declared-column list, so they depend on the
-  statement and the tenant config.
+  statement and the tenant config. A whole-block values array depends on
+  neither, and an entry keeps one (see the zero-copy values amendment
+  below).
 - **Cache decompressed pages only (skip zstd, keep page decode).** The
   ceiling is zstd's 12.1% share against step 2's whole share. It is kept
   as the fallback if Stage 0 shows decoded entries cost more memory than
@@ -752,7 +760,10 @@ check (`PlainColumn::text`). `StrCursor::text_at` in
 the column's present cells in `str_cells_validated`, and a hit, which does
 not decode, adds nothing: `a_cache_hit_on_a_plain_str_column_validates_nothing`
 in `crates/ravel-sql/tests/logs_decoded_cache.rs` pins 48 on the cold run
-and 0 on each hot run. The `String` is the same allocation the raw buffer
+and 0 on each hot run. The build of an entry's Arrow values array also
+counts, once per entry, on whichever call builds it, a hit included (see
+the zero-copy values amendment below), and the pull request that adds the
+array re-pins that test. The `String` is the same allocation the raw buffer
 was, so the entry's charge does not change
 (`plain_text_is_validated_once_and_falls_back_per_cell` asserts equal
 `heap_bytes` before and after validation).
@@ -1175,6 +1186,337 @@ serving pull request, built on main.)
 - **q22 is 2.4 MB over the cap.** Proposed: band it as fitting (0.999 in
   the model), and read a miss on its hit share as a sizing finding, not as
   a defect of the gate.
+
+## Amendment (2026-10-31): each cached string column keeps a zero-copy Arrow values array
+
+<!-- amendment-applies: sections="1. The cache holds step 2's output, per (object, block, column)|4. Entries are charged to the shared memory budget and give way to queries|5. Answers do not change|Alternatives considered|Amendment (2026-10-30): which cached string columns keep their validation" pointer="zero-copy values amendment" -->
+<!-- amendment-supersedes: phrase="or Arrow value populates an entry, and nothing after step 2 reads from one" pointer="zero-copy values amendment" -->
+<!-- amendment-supersedes: phrase="Charged once means once on the process budget" pointer="zero-copy values amendment" -->
+
+This is the separate amendment that the LIKE-deferred amendment's
+out-of-scope list asks for (option (e2), Arrow-ready string values kept
+with the entry). The evidence is an investigation of step 4 on cache hits,
+#3231 comment 6548679399. It reads `main` 250106f77, the profile run
+`prof028-20261030T1244Z` (8 GB cap), and two paired `cpuab` runs:
+`abe2a-20261031T1346Z` (#3515 alone) and `abe1-20261031T1346Z` (#3524).
+Its scripts are `strsplit.py`, `reapportion.py`, `remaining.py` and
+`predict.py`, with the outputs `remaining.out` and `predict.out`.
+
+**What a hit still pays.** A hit seeds the cached column into the block and
+copies nothing. Step 4 then rebuilds the column as Arrow on every call.
+- **Plain pages.** `build_str_block`
+  (`crates/ravel-sql/src/logs_scan/batch.rs:1366`) reads each surviving row,
+  pushes a key and a null bit, and `StrValuesCache::block_values`
+  (`batch.rs:524`) copies every cell into a fresh `StringBuilder`. The
+  cached `PlainColumn` already holds the block as one validated `String`
+  plus `u32` offsets (`crates/ravel-logseg/src/block.rs:1597`). The
+  `SearchPhrase` statements push no string filter, so every row of every
+  block survives.
+- **Dictionary pages.** `dict_values_array` (`batch.rs:778`) copies the
+  whole dictionary text once per dictionary per scan. URL and SearchPhrase
+  dictionaries are per block, so that is about one copy per block:
+  13,086 to 13,132 per timed call of the statements in H that read a
+  dictionary-page string column (H is defined under Measurement; the
+  `strDictValuesBuilt` row there lists them), measured 2026-10-31, abe2a B.
+- **Size.** `build_str_block` is 3.28 s of the 38.69 s hot sum, weighted
+  by hot wall (measured 2026-10-30, prof028): 2.13 s in the plain
+  SearchPhrase statements and 1.15 s in the dictionary-page statements.
+  #3515 removed 0.47 s of it (measured 2026-10-31, abe2a), against a
+  profile ceiling of 0.85 s. What is left is 1.28 to 1.66 s on plain pages
+  and 1.15 s on dictionary pages (inference: profile share less the
+  measured cut).
+
+This amendment makes six decisions.
+
+1. **An entry's string column keeps one Arrow values array, zero-copy
+   over the entry's own validated buffers.**
+   - **Plain.** `PlainColumn` gains a memo slot,
+     `OnceLock<Arc<dyn ValuesMemo>>`. `ValuesMemo` is a trait that
+     `ravel-logseg` defines and `ravel-sql` implements, with `Send + Sync`
+     as supertraits: the cache is shared across tasks, so `PlainColumn`
+     must stay `Send + Sync`. It has two methods:
+     `held_outside(&self) -> bool`, true while any holder beyond the memo
+     itself shares one of its buffers, and `as_any(&self) -> &dyn Any`,
+     through which `ravel-sql` gets its own type back. `ravel-sql` fills the
+     slot with the block's `StringArray` the first time step 4 takes the
+     fast path below.
+     The pressure pass needs `held_outside` (this amendment's decision 5).
+     A bare `dyn Any` could not answer it: the counts live in Arrow's
+     `Buffer`, which `ravel-logseg` cannot name, and `bytes::Bytes` exposes
+     no count. `ravel-logseg` depends on no Arrow crate today
+     (`crates/ravel-logseg/Cargo.toml`), and the trait keeps it so: the
+     storage crate needs one yes or no from the memo, and an Arrow upgrade
+     then never touches the crate that reads the on-disk format. Arrow `Utf8` takes
+     `i32` offsets and the column holds `u32`; up to `i32::MAX` the bits are
+     the same.
+   - **Dictionary.** `DictValues` gains the same slot, and
+     `StrValuesCache::values` (`batch.rs:464`) takes the memo instead of
+     calling `dict_values_array`. A `Region::Text` shares its `String` and
+     offsets. A `Region::Mixed` shares its `text` and `text_offsets`, with
+     a `NullBuffer` from `valid`. A `Region::Raw` dictionary gets no memo,
+     and an array extended by fallback values stays per scan.
+   - **Which columns.** The memo is filled only on a column a cache entry
+     holds, served or just admitted, and for a dictionary only when that
+     entry charges the dictionary in full (`values_charge`, `block.rs:1363`).
+     A row group's dictionary is shared by several entries, each charging a
+     share, so no single reservation covers an array over all of it; it
+     keeps today's per-scan build. Any other column keeps today's build.
+     The dictionary rows of the bands below assume per-block dictionaries.
+     That is measured for the statements in the `strDictValuesBuilt` row,
+     about one build per block, and assumed for q37 to q40 (inference).
+   - **Why ADR decision 1's exclusion is narrowed, not dropped.** The array
+     covers the whole block, before survivors, and is a pure function of
+     (object, block, column). The declared-column list decides only whether
+     step 4 builds it, not what it holds. Narrowed and survivor-only values
+     still never populate an entry.
+   - **One `ArrayRef` per scan.** `ChargedValues::held` is
+     `Arc::strong_count > 1` (`batch.rs:424`). A scan that stored the memo's
+     own `ArrayRef` would look held for good, and a threshold of 2 fails
+     when two scans read one block. Each scan wraps the memo in a new `Arc`
+     around a `StringArray` clone that shares the buffers, so `held`,
+     `owns` and the `ptr_eq` checks work unchanged.
+
+2. **A served block that no filter narrowed skips the per-row loop.** The
+   fast path runs only when all of these hold. Each is a precondition of
+   today's loop, so the arrays are byte-identical:
+   - `single_matching`;
+   - a `Text` buffer;
+   - `surviving_count == record_count`, which means identity rows, since
+     `rows` is ascending;
+   - every row present, by a popcount of the presence bitmap;
+   - a last offset at most `i32::MAX`.
+
+   The keys are then `0..n`, built in one pass, and the values are the
+   memo. Any other block, a narrowed one or one with absent rows, takes
+   today's loop unchanged. The output type stays `Dictionary(Int32, Utf8)`.
+
+   The second pull request extends this to dictionary keys. On an
+   unnarrowed block whose column is fully present and `all_valid()`, the
+   keys are the cached `Arc<[i32]>` (`block.rs:1351`), shared zero-copy,
+   instead of one `dict_key` call per row. `all_valid()` means no entry is
+   NULL, so no valid key points at a NULL entry (#3535).
+
+3. **No cycle.** Every owner behind an Arrow buffer holds an `Arc` to an
+   inner buffer (the values, the offsets, the keys), never to the
+   `PlainColumn` or the `DictValues`. The memo lives inside the column, so
+   an owner holding the column would make the memo keep its own column
+   alive and leak the entry's bytes. The column's buffers therefore move
+   behind `Arc`s of their own.
+
+4. **`unsafe` stays denied.** Every step uses a safe constructor:
+   `arrow_buffer::ToByteSlice` for the `u32` offsets' bytes,
+   `bytes::Bytes::from_owner` (bytes 1.12.1), `Buffer::from(bytes::Bytes)`
+   (arrow-buffer 59.3.0), `ScalarBuffer<i32>`, and `StringArray::try_new`.
+   `try_new` validates the buffer: one `from_utf8` and a boundary check
+   per offset. `new_unchecked` is `unsafe` and is not used.
+   `DictionaryArray::try_new` still checks every key.
+
+5. **The reservation moves onto the shared buffers.** Today it lives in
+   `DecodedEntry` (`crates/ravel-logseg/src/decoded_cache.rs:60-64`). It
+   moves into a cell that the entry and every Arrow buffer owner over the
+   entry's buffers hold. The cell holds the reservation and nothing else,
+   so no owner reaches the column through it. `offer` fills the cell, and
+   the reservation drops with the last holder: entry, block or array.
+   - **Why not an exception.** Once batches hold buffers over an entry,
+     two kinds of holder escape both the entry and the scan's charge. A
+     scan's `held` test counts its own `ArrayRef`, not the buffers. And
+     Arrow's dictionary-to-view cast, which GROUP BY keys go through
+     (`crates/ravel-sql/src/group_keys.rs:240`), appends the values
+     `Buffer` itself to the views it builds (arrow-cast 59.3.0,
+     `cast/dictionary.rs:136`). Under an exception, `evict_for_pressure`
+     counts an entry as held only while `Arc::strong_count(&slot.entry) > 1`
+     (`decoded_cache.rs:361`). It would report those bytes as freed while
+     the host still holds them. ADR decision 4 forbids that false free,
+     because it would admit a reservation the host has no room for. The
+     only bound an exception could state is whatever downstream operators
+     keep, which no counter reports.
+     Moving the reservation keeps ADR decision 4's sentence true as written.
+   - **The pressure pass asks the memo.** The cell's own count does not
+     move when a batch takes the array: a clone of the array, a batch
+     holding it, and the view cast each clone a `Buffer`, which shares the
+     `Bytes` and not its owner. `Buffer::strong_count` (arrow-buffer
+     59.3.0, `buffer/immutable.rs:124`) does move. `ravel-sql`'s
+     `held_outside` returns true when any of the memo's buffers (values,
+     offsets, nulls) has a count above 1, the memo's own reference.
+     `evict_for_pressure` counts an entry as held while its entry `Arc` is
+     shared, as today, or while its column's memo, if filled, says
+     `held_outside`. An evicted entry whose buffers a batch still holds
+     frees nothing until that batch drops.
+   - **The test moves with it.**
+     `the_reservation_is_released_by_the_last_handle_not_by_eviction`
+     (`decoded_cache.rs:870`) moves to the cell. It gains a case where an
+     Arrow array, not a scan, is the last holder.
+   - **The scan's own charge stays.** While it holds a memo array, the scan
+     charges the array's layout bytes, as it charges its copy today
+     (`batch.rs:424`, `:568`). ADR-1170 pool accounting and the
+     tenant-ceiling amendment do not move. Those bytes are then counted
+     twice on the process budget while a scan holds the array: by the
+     entry and by the scan. This narrows ADR decision 4's "a hit is charged
+     once" for the values array only. It errs high, and the total is
+     today's: today the scan holds a copy of the same size beside the
+     entry.
+
+6. **Building the memo counts as validation.** `try_new` is UTF-8
+   validation that the statement does, and `str_cells_validated` counts
+   validation work done by this statement (ADR decision 5). A plain build
+   adds the block's rows, which are all present on the fast path. A
+   dictionary build adds the entries it validates. Each entry builds once.
+   The build normally lands on the call that admits the entry, the same
+   call whose step 4 first reads it, so later calls count 0, as a hit does
+   today. Two things change from the validation-state amendment's text,
+   which now points here:
+   - the admitting call validates each admitted plain column twice, once
+     in `PlainColumn::validate_text` and once in `try_new`;
+   - a hit can count, once, when the admitting call never built the memo:
+     a scan whose block a filter narrowed takes the loop, so the entry's
+     first unnarrowed hit builds it.
+
+   Not counting it would need ADR decision 5 narrowed, and the counter
+   would then hide CPU the statement spends.
+
+**Memory.** The memo shares the entry's buffers. Its own cost is the array
+struct and the `Buffer` and `Bytes` headers, about 200 to 500 B per entry
+(inference), or 3 to 7 MB for a column of 13,141 blocks. `offer` adds that
+constant to the column's `heap_bytes` when it takes the reservation, since
+the memo is filled after `offer` fixes the charge. `heap_bytes` and
+`decoded_heap_bytes` stay unchanged for their other callers
+(`crates/ravel-maintain/src/rlog.rs`, `crates/ravel-logseg/src/ranged.rs`).
+A copying memo is not an option: it would take URL's dictionaries, most of
+its 5.295 GB entry set, a second time, and push q28, q34 and q35 from
+6.89 GB to about 11 to 12 GB, over the 8 GB cap (inference).
+
+**What it saves.** In hot-sum seconds on the prof028 basis, with CPU
+geomeans over 43 statements from `predict.out` (predicted). The hot-wall
+estimate assumes wall tracks CPU for statements at or above 0.3 s and
+gains half as much below that (inference).
+- The whole lever, both pull requests: 2.02 to 2.41 s; CPU geomean 0.923
+  to 0.937 on ClickBench's hit pattern, 0.928 to 0.941 on the `cpuab`
+  loop's; hot-wall geomean 0.932 to 0.944 and 0.937 to 0.948 on the same
+  two bases (the whole-lever table below shows the arithmetic). The rule
+  is judged on the `cpuab` basis, since that is what the paired run
+  measures. Its upper end, 0.948, meets the rule with little margin.
+- The first pull request alone: 1.71 to 2.10 s; CPU geomean 0.934 to
+  0.948 on ClickBench's hit pattern, 0.939 to 0.952 on the `cpuab` loop's;
+  hot-wall geomean 0.943 to 0.955 and 0.948 to 0.959 on the same two
+  bases. The first pull request is at the edge of the rule. The rule is
+  met by the lever as a whole, not by the first pull request.
+- The plain memo alone: 1.03 to 1.42 s, CPU geomean 0.952 to 0.966, which
+  fails the rule.
+
+**Delivery.** Two pull requests, in order, each with its own paired A/B.
+1. **The memo**, for plain and dictionary values: the slot on
+   `PlainColumn` and `DictValues`, the reservation cell, and the plain
+   identity-key fast path. Its tests:
+   - byte-identical arrays against today's loop: a proptest over plain and
+     dictionary blocks, with absent rows, non-UTF-8 cells, narrowed blocks
+     and multi-typed keys falling back;
+   - no leak: an evicted entry's bytes are freed once the last batch
+     drops, and a pressure pass counts nothing a batch still holds, in two
+     cases: a batch holding a clone of the memo array, and a view array
+     from the dictionary-to-view cast;
+   - the entry's charge includes the memo constant;
+   - `StrValuesCache` releases a memo array's charge once no batch holds
+     it, also when two concurrent scans read one block;
+   - `str_cells_validated` counts the build once per entry, on the call
+     that builds it.
+2. **Dictionary keys without the per-row loop**, stacked on the first.
+
+**Measurement.** Paired `cpuab` (A B B A B A A B) on one c6a.4xlarge at an
+8 GB cap. For the first pull request, A is current main and B is A with
+it. The rows below use three statement sets from the loop's hit pattern
+(measured 2026-10-31, abe2a B):
+- **H, fully hit:** q11 to q19, q25 to q28, q32, q34, q35 and q37 to q40.
+  Every timed call hits every cached column it reads. q16 reads no string
+  column, so the lever cannot move it.
+- **P, partly hit:** q29 and q31.
+- **q06:** never hits SearchPhrase.
+
+The bands are copied to #3326 before launch. A miss on any row stops that
+pull request, except the q06 row, which does not gate.
+
+| First pull request figure, B/A unless stated | Band | Miss | Basis |
+|---|---|---|---|
+| Same-binary stamp, A{4,6}/A{1,7} non-target median | 0.98 to 1.02 | outside | `cpuab` stage, #3231 comment 6433600863 |
+| q13 server CPU | 0.80 to 0.88 | above 0.93 | predicted 0.816 to 0.861, #3231 comment 6548679399 |
+| q14 server CPU | 0.84 to 0.92 | above 0.95 | predicted 0.859 to 0.900 |
+| q15 server CPU | 0.79 to 0.89 | above 0.94 | predicted 0.807 to 0.875 |
+| q17, q18 server CPU | 0.89 to 0.95 | above 0.97 | predicted 0.908 to 0.938 |
+| q19 server CPU | 0.93 to 0.97 | above 0.985 | predicted 0.943 to 0.959 |
+| q26 server CPU | 0.65 to 0.75 | above 0.82 | predicted 0.677 to 0.716 |
+| q32 server CPU | 0.79 to 0.89 | above 0.94 | predicted 0.812 to 0.869 |
+| q25, q27 server CPU (each about 0.24 CPU-s) | 0.75 to 0.92 | above 0.97 | predicted 0.78 to 0.88 |
+| q31 server CPU (about 45% of its SearchPhrase accesses miss in the loop) | 0.86 to 0.96 | above 0.99 | predicted 0.903 to 0.928: the saving times 0.55 hits |
+| q06 server CPU, not gating (SearchPhrase never hits in the loop) | 0.95 to 1.05 | outside 0.90 to 1.10 | predicted 1.00; abe2a B misses all 13,141 blocks on every call, yet abe2a's B/A was an unexplained 0.915 on that path, measured 2026-10-31 |
+| q28 server CPU | 0.77 to 0.86 | above 0.92 | predicted 0.800 (dictionary values are 19.0% of its CPU) |
+| q34, q35 server CPU | 0.93 to 0.97 | above 0.99 | predicted 0.949 to 0.950 |
+| q37 to q40 server CPU geomean | 0.88 to 0.96 | above 0.99 | predicted 0.869 to 0.961 each |
+| q11, q12, q29 server CPU | 0.96 to 1.01 | above 1.03 | predicted 0.978 to 0.986 |
+| H less q16, server CPU geomean | 0.86 to 0.91 | above 0.94 | predicted 0.873 to 0.900 |
+| CPU geomean, all 43 | 0.935 to 0.960 | above 0.975 | predicted 0.939 to 0.952, `cpuab` hit pattern |
+| Hot wall geomean, all 43 | 0.94 to 0.965 | above 0.98 | predicted 0.948 to 0.959, `cpuab` hit pattern; the band reaches past 0.95 |
+| Every other statement, hot wall | 0.95 to 1.05 | above 1.10 | predicted 1.00; a statement under 0.3 s whose server CPU B/A is within 1.03 is read as noise (q20 read 1.095 in abe1, measured 2026-10-31) |
+| `strDictValuesBuilt` per timed call, the statements of H that A builds about once per block (q13 to q15, q17 to q19, q26, q32, q34, q35; q16 reads no string column) | at most 1% of A | above 10% of A | predicted about 0; A is 13,086 to 13,132, measured 2026-10-31 |
+| `strCellsValidated` per timed call, H | equal to A per statement (0 on q13 to q19, q25 to q27, q32) | any other value | predicted: each memo builds once, on the call that admits its entry (this amendment's decision 6), which in the loop is the untimed warm call |
+| `strCellsValidated` per timed call, P | at least A, and B minus A at most the cells of the entries that call admits | under A, or above that bound | predicted: a missed block is admitted and its memo built on the same call, so it counts twice there, as on try 1 under the restart protocol |
+| Decoded-cache hits and misses per call | within 1% of A per statement | outside 2% | predicted: the memo changes no admission |
+| Decoded-cache `residentBytes` at the end of the loop | 1.000 to 1.01 | above 1.02 | predicted: a constant per entry; higher means the memo copied |
+| `peakIntermediateBytes` per statement | at most 1.05 | above 1.10 | predicted: higher means a memo array stayed charged until the scan ended |
+| Cold (try 1) sum, where the run records both arms | 0.98 to 1.03 | above 1.05 | predicted: one more whole validation per admitted entry |
+| Answers | equal except q18 and q25 | any other difference | q18 and q25 differ between arms on main today, measured 2026-10-31 (abe2a, abe1) |
+| Errors | none | any | predicted |
+
+A statement whose entries an earlier, narrowed scan admitted builds each
+memo on its first unnarrowed hit (this amendment's decision 6). Its first
+such call counts B minus A equal to the cells of those memos. Its later
+calls count as A. In the loop that first call is the untimed warm call, so
+its timed rows are H's.
+
+Passing the first pull request's hot-wall row does not meet the program's
+0.95 rule, since that band reaches past it. The rule is judged on the whole lever, the product
+of the two pull requests' hot-wall B/A, on the `cpuab` basis:
+
+| Whole lever figure, product of the two B/A readouts | Band | Miss | Basis |
+|---|---|---|---|
+| Hot wall geomean, all 43, `cpuab` hit pattern (the 0.95 rule) | 0.93 to 0.95 | above 0.95 | predicted 0.937 to 0.948: the first pull request's 0.948 x 0.9889 = 0.937 and 0.959 x 0.9889 = 0.948, where 0.9889 is the second's CPU geomean on this hit pattern (`predict.out`) |
+| Hot wall geomean, all 43, ClickBench hit pattern | not judged | none: the paired run does not measure this pattern | predicted 0.932 to 0.944: 0.943 x 0.9884 = 0.932 and 0.955 x 0.9884 = 0.944, with the second's CPU geomean on this hit pattern |
+
+Both hot-wall rows take the second pull request's CPU geomean as its
+hot-wall ratio. Its statements, q11, q12 and q28, run at 0.33 s or more,
+where the estimate takes wall to track CPU (inference). If the `cpuab`
+product is above 0.95, the lever has missed the rule, and the second
+readout says so.
+
+The q06 row is wide on purpose. abe2a validated the same 64,681,096 cells
+in both arms and missed SearchPhrase on every call, so this lever has no
+mechanism to move it. A reading outside its miss line is reported with
+those counters and is not a reason to stop.
+
+For the second pull request, A is main with the first. The rows below are
+the investigation's predictions. Their miss lines, and the same-binary
+stamp, other-statement, answers and errors rows, go on #3326 before it
+launches.
+
+| Second pull request figure, B/A | Band | Basis |
+|---|---|---|
+| q11, q12 server CPU | 0.88 to 0.92 | predicted; `dict_key` is 13.2% and 10.9% of their CPU |
+| q28 server CPU | 0.95 to 0.98 | predicted |
+
+The investigation also predicts the 43-statement CPU geomean 0.012 lower
+than A (predicted, `predict.out`).
+
+**Out of scope.**
+- **A view memo for GROUP BY.** The dictionary-to-view cast costs 1.07 s
+  of hot wall and is rebuilt per batch even over a shared values array
+  (measured 2026-10-30, prof028). Once the first pull request makes those
+  arrays stable across calls, a memo keyed by the values array could keep
+  the views. Its memory is not sized.
+- **Building the array per call without a memo.** A safe constructor
+  validates the whole buffer on every call. It saves about 0.4 to 0.65 s
+  (inference) and needs no amendment. It is the fallback if this one is
+  refused.
+- **`Utf8View` output.** `StringViewArray::try_new` validates every view,
+  which brings per-cell validation back, and it changes the declared `Str`
+  schema. Rejected.
 
 ## Amendment (2026-10-31): LIKE-deferred columns are served only when the scan fits the cache
 
