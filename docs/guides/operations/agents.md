@@ -434,7 +434,9 @@ hint, for example `agents request refused: CODE (REASON), retry HINT; ids:
 agent_id=AGENT_ID, effect_id=EFF_ID`, where `EFF_ID` is the effect's id
 rather than the handle you passed. The error carries no attempt; the attempt
 in question is the `--attempt` you sent. With `--json` the error body itself
-is printed on stdout.
+is printed on stdout; a 401 or 403 is not a refusal body and prints no JSON
+on stdout under `--json`. The ids appear in wire field order
+(`a_refusal_renders_every_id_in_wire_field_order`).
 
 ## Destroying an agent
 
