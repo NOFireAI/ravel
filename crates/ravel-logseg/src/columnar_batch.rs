@@ -683,7 +683,7 @@ pub struct ColumnarLogBatch {
 
 /// The [`FieldType`] a cell's column must have: the type half of the writer's
 /// `resolve_value` (`record.rs`), where `List` and `Map` resolve to `Bytes`.
-fn attr_field_type(value: &AttrValue) -> FieldType {
+pub(crate) fn attr_field_type(value: &AttrValue) -> FieldType {
     match value {
         AttrValue::Str(_) => FieldType::Str,
         AttrValue::I64(_) => FieldType::I64,
@@ -1064,7 +1064,7 @@ impl ColumnarLogBatch {
     /// fails [`Self::validate`]; [`Self::try_from_records`] returns that
     /// refusal instead.
     pub fn from_records(records: &[LogRecord]) -> Self {
-        Self::build_from_records(records, VAR_BYTES_MAX).0
+        Self::build_from_rows(records, VAR_BYTES_MAX).0
     }
 
     /// [`Self::from_records`], returning [`LogSegError::LimitExceeded`] naming
@@ -1080,15 +1080,16 @@ impl ColumnarLogBatch {
         records: &[LogRecord],
         limit: usize,
     ) -> Result<Self, LogSegError> {
-        match Self::build_from_records(records, limit) {
-            (batch, None) => Ok(batch),
-            (_, Some(refused)) => Err(refused),
-        }
+        Self::try_from_rows_with_limit(records, limit)
     }
 
-    /// The batch [`Self::from_records`] builds, and the first push its byte
-    /// limit refused, with the column named.
-    fn build_from_records(records: &[LogRecord], limit: usize) -> (Self, Option<LogSegError>) {
+    /// The reference builder [`Self::build_from_rows`] must agree with: the
+    /// straightforward per-row form, kept for the equality tests.
+    #[cfg(test)]
+    pub(crate) fn build_from_records_reference(
+        records: &[LogRecord],
+        limit: usize,
+    ) -> (Self, Option<LogSegError>) {
         use std::collections::BTreeMap;
 
         let n = records.len();
@@ -1789,7 +1790,7 @@ mod tests {
             ),
             other => panic!("expected Err(LimitExceeded), got {other:?}"),
         }
-        let unchecked = ColumnarLogBatch::build_from_records(&records, 4).0;
+        let unchecked = ColumnarLogBatch::build_from_rows(&records, 4).0;
         assert!(
             unchecked.validate().is_err(),
             "the batch from_records would return fails validate"
