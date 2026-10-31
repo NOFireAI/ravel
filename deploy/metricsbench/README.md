@@ -589,9 +589,10 @@ verification (step 6), after which the run goes on as a diagnostic:
    so the steps after it do not run. When the failed row is the Prometheus
    oracle's (a failed read-back, a `row_failure`, a stall or a failed
    replay), `query` refuses the diagnostic and writes no `report.json`, so
-   `validate` and `memory` do not run and no `--rss-band` is checked;
-   `failed_after_ingest` is `["query"]`, and `memory-summary.json` is still
-   written on the way out (case q4). Any other failing ingest (no
+   the `validate` and `memory` steps do not run and `failed_after_ingest` is
+   `["query"]`. `memory-summary.json` is still written on the way out, with
+   every `--rss-band` checked, so a breach is recorded there, but it is not
+   listed in `stamps.json` and does not change the exit (case q4). Any other failing ingest (no
    report on stdout, or a report with no failed row, such as a band 4
    accounting failure) exits 70 naming the step at once, before capture or
    query, and the stack is still torn down (cases b, r).
@@ -719,7 +720,7 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | 0 | Every step passed (cases a, f, g). |
 | 64 | Usage error (cases h, p). |
 | 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach is recorded only when every step before `memory` passed (cases q, q2, q3, q4). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
