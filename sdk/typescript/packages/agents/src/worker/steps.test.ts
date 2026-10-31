@@ -398,8 +398,8 @@ describe("turns", () => {
     const op = await agent.send("add", { by: 3 });
     await until(() => hold.draft === 3);
     expect((await op.status()).status).toBe("running");
-    // The handler already mutated its draft; the published state has not moved.
-    expect(await agent.state()).toMatchObject({ stateVersion: 0, state: { total: 0 } });
+    // The handler already mutated its draft; nothing is published before the first commit.
+    expect(await agent.state()).toMatchObject({ stateVersion: 0, state: null });
     // So have the events it emitted: none are readable yet.
     const page = await harness.coordinator.fetch("http://fake.invalid/api/v1/agents/events", {
       method: "POST",
@@ -424,7 +424,7 @@ describe("turns", () => {
     expect(harness.coordinator.commits.map((c) => c.outcome)).toEqual(["failed", "failed", "failed"]);
     // Each attempt ran under its own turn id.
     expect(new Set(harness.coordinator.commits.map((c) => c.lease.turn_id)).size).toBe(3);
-    expect(await agent.state()).toMatchObject({ stateVersion: 0, state: { total: 0 } });
+    expect(await agent.state()).toMatchObject({ stateVersion: 0, state: null });
     const events = [];
     for await (const event of op.events()) events.push(event);
     expect(events).toEqual([]);

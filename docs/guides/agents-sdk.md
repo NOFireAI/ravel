@@ -182,6 +182,30 @@ pass without an API key` runs.
 A test that passes against the harness shows how the handler behaves under
 replay. It shows nothing about what Ravel stores.
 
+## Effects, reconcile and destroy
+
+The client reads and settles effects and destroys agents. `agent.effects()`
+lists an agent's effects and `client.effect(handle)` inspects one by its
+handle, with its attempts and the evidence of late results. Tests: `effects
+lists the agent's effects from /api/v1/agents/effects`, `effect inspects a
+handle at /api/v1/agents/effects/{effect}` (`client/client.test.ts`).
+`client.reconcile(request)` records an operator's decision on an in-doubt
+effect, and `agent.destroy({ incarnation })` destroys an agent, pinned to
+an incarnation when one is given; both need a token holding `agents_admin`.
+The server does not serve the destroy route yet; the client follows the
+wire fixtures for it. Tests: `reconcile
+posts the decision to /api/v1/agents/reconcile`, `destroy posts kind, key
+and incarnation and decodes destroyed and abandoned`. Both are sent once
+and never retried, so a lost answer is `OutcomeUnknown`: read
+`client.effect(handle)` or the agent to learn whether it landed. Tests:
+`reconcile is sent once: a network failure is OutcomeUnknown with no second
+request`, `destroy is sent once: an untyped 503 is OutcomeUnknown with no
+second request`. A destroyed agent's worker routes answer `AgentGone`, and
+the worker abandons the turn without retry. Tests: `agent_gone from a
+worker route is AgentGone with retry never` (`transport/http.test.ts`),
+`agent_gone at commit abandons the turn without retry`
+(`worker/serve.test.ts`).
+
 ## HTTP transport limits
 
 `createHttpTransport` in `@ravel/agents/worker` connects a worker to a
@@ -189,20 +213,12 @@ server. Its tests are in `transport/http.test.ts`.
 
 - The poll wait is clamped to 20 s. Test: `clamps the poll wait to 20 s and
   leaves a shorter one alone`.
-- The lease is heartbeated once before each step and never while a tool
-  runs. Test: `heartbeats once before each step and sends nothing while a
-  tool runs`. So one tool run, or handler code between two steps, that
-  outlasts the server's lease loses the turn to another worker. The lease
-  is 30 s by default: the agents runtime's `RuntimeConfig::default` sets
-  `lease_ms` to 30000.
-- The SDK does not call the server's step and effect routes in this
-  release, so steps are journaled in the worker's own memory and lost with
-  its process. Test: `authorizes a
-  new attempt at an unsettled at_least_once step and replays a settled
-  one`.
-- A manual step left without a result is in doubt until a reconcile through
-  that in-memory journal records one. Test: `puts an unsettled manual step
-  in doubt until a reconcile records its result`.
+- The transport does nothing about the lease during a long tool run: it
+  sends no heartbeat while a tool runs or before a step. Test: `sends
+  nothing while a tool runs, and no heartbeat before a step`. So one tool
+  run, or handler code between two steps, that outlasts the server's lease
+  loses the turn to another worker. The lease is 30 s by default: the
+  agents runtime's `RuntimeConfig::default` sets `lease_ms` to 30000.
 - An untyped 5xx, a request with no answer, or a body that fails mid-read
   is `OutcomeUnknown`. Tests: `maps an untyped 5xx and a request with no
   answer to OutcomeUnknown`, `maps a response body that fails mid-read to
@@ -210,15 +226,6 @@ server. Its tests are in `transport/http.test.ts`.
 
 ## What the SDK does not do yet
 
-- Steps and effects are not stored on the server, so a worker restart
-  loses the step journal and a kill across processes cannot replay a step.
-  Test: `authorizes a new attempt at an unsettled at_least_once step and
-  replays a settled one` (`transport/http.test.ts`).
-- The server's reconcile route cannot see an SDK worker's step, because the
-  SDK keeps it in memory, and while one is in doubt the server reports the
-  operation as running. Test: `worker killed inside a
-  manual step blocks as EffectInDoubt in the in-memory journal until
-  reconciled there` (`e2e/recover.test.ts`).
 - The fake coordinator has no timers. Test: `advancing the fake's clock
   past a lease's expiry neither takes the turn away nor runs anything`.
 - The package is not published; a project links it from a checkout. Test:

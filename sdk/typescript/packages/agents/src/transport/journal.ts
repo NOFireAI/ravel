@@ -1,11 +1,10 @@
 /**
- * The step and effect journal the HTTP transport consults for the calls the
- * server has no route for yet: recording a step, completing or failing an
- * effect, listing effects and reconciling one (ADR-3331 T16). Its shapes are
- * SDK-local and provisional. {@link MemoryStepJournal} keeps it in process
- * memory, so it survives a worker that is closed and replaced inside one
- * process and is lost with the process; it is not durable and replaces no
- * server state.
+ * An SDK-local step and effect journal from before the server served the
+ * step, effect and reconcile routes. No transport consults it: the HTTP
+ * transport records steps on the server and the fake coordinator keeps its
+ * own. It stays exported, deprecated, until the example scenario stops
+ * importing it (#3532). {@link MemoryStepJournal} keeps it in process
+ * memory; it is not durable and replaces no server state.
  */
 import { EffectInDoubt, NonDeterministicReplay, UnsupportedFormat } from "../errors.js";
 import { effectId, stepId } from "../identity.js";

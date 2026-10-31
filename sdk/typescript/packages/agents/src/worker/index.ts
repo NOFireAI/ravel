@@ -38,13 +38,20 @@ export {
   createHttpTransport,
   HttpTransport,
   type HttpTransportOptions,
+  MAX_POLL_WAIT_MS,
+} from "../transport/http.js";
+/**
+ * @deprecated No transport uses an in-process journal any more; the server
+ * records steps and effects. Exported until the example scenario stops
+ * importing it (#3532).
+ */
+export {
   type JournalLateResult,
   type JournalStepRequest,
-  MAX_POLL_WAIT_MS,
   MemoryStepJournal,
   type StepJournal,
   type StepScope,
-} from "../transport/http.js";
+} from "../transport/journal.js";
 
 export interface MessageOptions<P extends Schema, R extends Schema, S> {
   readonly payload: P;
