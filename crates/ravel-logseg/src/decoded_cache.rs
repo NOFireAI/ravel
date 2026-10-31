@@ -1773,4 +1773,195 @@ mod tests {
         assert_eq!(cache.resident_bytes(), 5 * b);
         assert_eq!(c.snapshot().frequency_refusals, 0);
     }
+
+    /// The production-shaped traces of the LIKE-deferred amendment, decision
+    /// 5, scaled in bytes and not in entries (decision 6): the model's 8 GB
+    /// cap over uniform 400 KB entries holds 20,000 entries, and so does this
+    /// cache, of 20,000 equal entries. The entry and lookup counts are the
+    /// model's, which keeps the aging window above its 65,536 floor.
+    const TRACE_SLOTS: u64 = 20_000;
+
+    /// A trace driver over one cache: every access is the columnar path, a
+    /// lookup and on a miss an offer under the statement's intent, and every
+    /// halving of the counts is recorded at the lookup that caused it.
+    struct Trace {
+        cache: DecodedColumnCache,
+        v: CachedColumn,
+        lookups: u64,
+        halvings: Vec<u64>,
+    }
+
+    impl Trace {
+        fn new() -> Self {
+            let v = col(8);
+            let cache = DecodedColumnCache::new(TRACE_SLOTS * v.heap_bytes() as u64, None);
+            Trace {
+                cache,
+                v,
+                lookups: 0,
+                halvings: Vec::new(),
+            }
+        }
+
+        /// Entry `i` of set `set`: keys are distinct per (object, block,
+        /// column).
+        fn key(set: u8, i: u32) -> DecodedKey {
+            DecodedKey {
+                tenant: [1; 16],
+                object: [set; 32],
+                block: i,
+                column: 1,
+                layout: LAYOUT_TAG,
+            }
+        }
+
+        /// One access; returns whether it hit.
+        fn access(&mut self, k: DecodedKey, intent: AccessIntent) -> bool {
+            let c = DecodedCacheCounters::default();
+            let hit = self.cache.lookup(&k, 8, &c).is_some();
+            self.lookups += 1;
+            if self.cache.lock().lookups_since_aging == 0 {
+                self.halvings.push(self.lookups);
+            }
+            if !hit {
+                drop(self.cache.offer(k, &self.v, intent, &c));
+            }
+            hit
+        }
+    }
+
+    /// Trace B: a 10,000-entry interactive working set W read in full every
+    /// round, through a 30,000-entry scan S read once per round, the two
+    /// interleaved one W entry to three S entries. Returns W's hit share per
+    /// round and the trace.
+    fn trace_b(scan: AccessIntent, rounds: usize) -> (Vec<f64>, Trace) {
+        const W: u32 = 10_000;
+        let mut t = Trace::new();
+        let mut shares = Vec::new();
+        for _ in 0..rounds {
+            let mut hits = 0u32;
+            for i in 0..W {
+                if t.access(Trace::key(1, i), AccessIntent::Interactive) {
+                    hits += 1;
+                }
+                for j in 0..3 {
+                    t.access(Trace::key(2, 3 * i + j), scan);
+                }
+            }
+            shares.push(f64::from(hits) / f64::from(W));
+        }
+        (shares, t)
+    }
+
+    /// Trace E: a 15,000-entry set A read `k` passes, then a disjoint
+    /// 15,000-entry set B read up to `max_passes` passes, all interactive.
+    /// Returns B's hit share per pass and the trace.
+    fn trace_e(k: usize, max_passes: usize) -> (Vec<f64>, Trace) {
+        const N: u32 = 15_000;
+        let mut t = Trace::new();
+        for _ in 0..k {
+            for i in 0..N {
+                t.access(Trace::key(1, i), AccessIntent::Interactive);
+            }
+        }
+        let mut shares = Vec::new();
+        for _ in 0..max_passes {
+            let mut hits = 0u32;
+            for i in 0..N {
+                if t.access(Trace::key(2, i), AccessIntent::Interactive) {
+                    hits += 1;
+                }
+            }
+            shares.push(f64::from(hits) / f64::from(N));
+        }
+        (shares, t)
+    }
+
+    /// The 1-based first pass whose hit share reaches 0.90.
+    fn first_pass_at_090(shares: &[f64]) -> Option<usize> {
+        shares.iter().position(|&s| s >= 0.90).map(|p| p + 1)
+    }
+
+    /// Trace B's two registered rows (decision 6): W retained at least 0.90
+    /// on every round after the cold first one under a bulk-scan scan (model
+    /// 1.000), and at least 0.40 under an interactive scan (model 0.486,
+    /// CLOCK 0.000). No test-only switch turns the gate off, so the CLOCK
+    /// figure is the model's and is not rerun here.
+    ///
+    /// The aging window is ten lookups per slot and ghost record, above the
+    /// 65,536 floor: 10,000 slots and 20,000 ghost records under a bulk-scan
+    /// scan halve every 300,000 lookups, and 20,000 of each under an
+    /// interactive scan every 400,000. Twenty rounds of 40,000 lookups put
+    /// at least one halving inside the reported rounds of both variants.
+    #[test]
+    fn trace_b_keeps_the_interactive_set_through_a_scan() {
+        const ROUNDS: usize = 20;
+        for (scan, band) in [
+            (AccessIntent::BulkScan, 0.90),
+            (AccessIntent::Interactive, 0.40),
+        ] {
+            let (shares, t) = trace_b(scan, ROUNDS);
+            let after_warmup = &shares[1..];
+            let min = after_warmup.iter().copied().fold(f64::INFINITY, f64::min);
+            let mean = after_warmup.iter().sum::<f64>() / after_warmup.len() as f64;
+            println!(
+                "trace B, {scan:?} scan: W hit share per round {shares:.3?}, \
+                 after warmup min {min:.3} mean {mean:.3}; lookups {}, halvings at {:?}, \
+                 {:?}",
+                t.lookups,
+                t.halvings,
+                t.cache.process_counters(),
+            );
+            assert_eq!(shares[0], 0.0, "the first round is cold");
+            assert!(
+                min >= band,
+                "{scan:?} scan: W retained {min:.3} on some round, band at least {band}"
+            );
+            let window = match scan {
+                AccessIntent::Interactive => 400_000,
+                _ => 300_000,
+            };
+            assert_eq!(t.halvings.first(), Some(&window), "{scan:?} scan");
+        }
+    }
+
+    /// Trace E's registered row (decision 6): after A was read 15 times, the
+    /// first pass of B at a 0.90 hit share is at most 13 (model 12). k = 4
+    /// and k = 30 (model 6 and 9) are reported, not asserted. No test-only
+    /// switch turns the gate off, so CLOCK's 3 passes are the model's.
+    ///
+    /// A's 15,000 slots set a 150,000-lookup aging window, so A's counts
+    /// halve during its reads for k = 15 and 30, and every variant halves
+    /// again while B displaces A.
+    #[test]
+    fn trace_e_a_shifted_working_set_displaces_a_stale_one() {
+        const MAX_PASSES: usize = 25;
+        let mut first = Vec::new();
+        for k in [4, 15, 30] {
+            let (shares, t) = trace_e(k, MAX_PASSES);
+            let pass = first_pass_at_090(&shares);
+            println!(
+                "trace E, A read {k} times: B hit share per pass {shares:.3?}, \
+                 first pass at 0.90 {pass:?}; lookups {}, halvings at {:?}, {:?}",
+                t.lookups,
+                t.halvings,
+                t.cache.process_counters(),
+            );
+            assert!(
+                t.halvings.first().is_some_and(|&l| l > 1 << 16),
+                "k = {k}: the window, not its floor, sets the cadence"
+            );
+            let b_starts = k as u64 * 15_000;
+            assert!(
+                t.halvings.iter().any(|&l| l > b_starts),
+                "k = {k}: counts halve while B is read"
+            );
+            first.push((k, pass));
+        }
+        let (_, at_15) = first[1];
+        assert!(
+            at_15.is_some_and(|p| p <= 13),
+            "A read 15 times: first pass of B at 0.90 is {at_15:?}, band at most 13"
+        );
+    }
 }
