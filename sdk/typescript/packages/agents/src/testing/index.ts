@@ -176,7 +176,11 @@ function errorFor(code: string, reason: string): RavelAgentsError {
 }
 
 export interface FakeCoordinatorOptions {
-  /** Agent definitions whose `initialState` an agent starts from. */
+  /**
+   * Agent definitions the fake serves. Like the server, the fake stores a
+   * null state until an agent's first commit; the runner starts a turn
+   * from the definition's `initialState`.
+   */
   readonly agents: readonly AnyAgentDefinition[];
   readonly startUnixNs?: bigint;
   /** Attempts at one input before a retryable failure dead-letters it. Default 3. */
