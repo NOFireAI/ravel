@@ -202,6 +202,7 @@ unchanged.
 
 `tokenizer::tokens` gains an ASCII fast path and yields byte slices instead
 of `Vec`s. The bloom builder deduplicates through a non-SipHash hasher.
+The bloom builder's hasher is corrected in the bloom hasher amendment.
 
 The tokens and the bloom bits are unchanged, so objects stay byte-identical
 and the golden-bytes test holds.
@@ -640,3 +641,15 @@ separately from the cuts above: keep the write gate from oversubscribing the
 cores the request path needs, or refuse load before buffers reach that
 regime. The same run is why the flush-delay A/B it carried answers nothing:
 the delay is not what fires a size-triggered flush.
+
+## Amendment (2026-11-01): the bloom hasher amendment (#3605)
+
+<!-- amendment-applies: sections="D4. The tokenizer stops allocating per token" pointer="bloom hasher amendment" -->
+
+D4's bloom dedup uses std's SipHash, not a non-SipHash hasher. Its keys are
+tenant-chosen tokens, nothing caps how many distinct keys a block stages, and
+the owner declined a hasher without HashDoS resistance for this data on #3228
+(decisions of 2026-10-25 and 2026-11-01). #3501 had moved both of the bloom
+builder's staging sets to foldhash; #3605 restores SipHash in both, at an
+expected cost of about 1% of server CPU. The tokenizer half of D4 stands, and
+the bloom bytes are unchanged.
