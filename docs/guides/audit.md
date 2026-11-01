@@ -9,7 +9,7 @@ client cannot write one.
 
 ## What is recorded
 
-Every audit record carries a `kind` attribute. There are three kinds today.
+Every audit record carries a `kind` attribute. There are five kinds today.
 A query selects one kind with `attrs['kind']`.
 
 ### `kind = query`
@@ -288,6 +288,37 @@ Attributes:
 - `reshard.activation_hour`: the hour from which the new count applies.
 
 `severity_text` is `INFO`, and `body` restates the change in one line.
+
+### `kind = agents_reconcile` and `kind = agents_destroy`
+
+Ravel Agents writes one record for each reconcile decision that changes an
+effect and for each destroy that tombstones an agent. A repeat that changes
+nothing writes no record. Both are written before the change, in the same
+audit pipeline as the other kinds, so in `required` mode a refused write
+refuses the call.
+
+Attributes on both:
+
+- `agents.tenant`: the tenant hash of the agent.
+- `agents.principal.tenant` and `agents.principal.capabilities`: the caller's
+  tenant and its capabilities, comma-separated.
+- `agents.principal.subject` and `agents.principal.subject_source`: who the
+  caller is, and where that came from (`static_token`, `oidc` or `mtls`).
+  Both are omitted when the caller's credential carries no subject. A subject
+  comes from a `subject=LABEL` entry on a static token or from the claim named
+  by `--oidc-subject-claim`, never from a request header the caller chooses.
+  The tenant reads these records through the `audit` table, so a subject is
+  written where the tenant can read it.
+
+`agents_reconcile` also carries `agents.effect`, `agents.attempt` and
+`agents.decision` (`record_result` or `retry`); its `body` names the decision.
+`agents_destroy` also carries `agents.agent_id`, `agents.incarnation`, and the
+counts of what the tombstone left behind: `agents.abandoned.inputs`,
+`agents.abandoned.active_turn`, `agents.abandoned.effects_in_doubt`,
+`agents.abandoned.effects_authorized` and `agents.abandoned.timers_scheduled`.
+These counts are the ones the route read before the write; the destroy
+response carries the counts of the state it was applied to. `severity_text` is
+`INFO` for both.
 
 ## Writers and storage
 

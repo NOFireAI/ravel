@@ -209,10 +209,10 @@ pub fn split_tenant_suffix(
 /// (ADR-3541 decision 1). It is attribution only and grants nothing: no
 /// capability field depends on it, so one OIDC token resolves to the same
 /// capabilities whether or not its subject claim is read
-/// (`a_subject_grants_nothing`), and outside
-/// this crate's tests no code reads the field; the one comparison that sees it
-/// is the whole-principal equality in `ravel-server`'s
-/// `Cli::parse_tenant_pairs` duplicate-token check. It is `None` unless a
+/// (`a_subject_grants_nothing`). Outside this crate it is read only to
+/// write audit attributes (`ravel-server`'s agents audit records) and by the
+/// whole-principal equality in `Cli::parse_tenant_pairs`' duplicate-token
+/// check; no authorization path reads it. It is `None` unless a
 /// source produced one: a static token's `subject=LABEL` entry
 /// ([`split_tenant_suffix`]) or the claim
 /// [`OidcResolver::with_subject_claim`] names.
@@ -384,8 +384,8 @@ impl SubjectDropReason {
 }
 
 /// Counts of subjects a source dropped to absent, keyed by source and reason
-/// (ADR-3541 decision 3). Nothing exports them yet: the server exports them as
-/// `ravel_auth_subject_dropped_total{source,reason}` in T2 (#3576).
+/// (ADR-3541 decision 3). `ravel-server` exports them on `/metrics` as
+/// `ravel_auth_subject_dropped_total{source,reason}`.
 #[derive(Debug, Default)]
 pub struct SubjectDropCounters {
     counts: [[AtomicU64; SubjectDropReason::ALL.len()]; SubjectSource::ALL.len()],
