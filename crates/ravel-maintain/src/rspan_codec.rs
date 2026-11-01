@@ -2374,16 +2374,24 @@ mod tests {
         .await?;
         let mut bytes = Vec::new();
         for p in &out.parts {
-            bytes.push(store.get(&p.key, GetRange::Full).await.expect("get part").data);
+            bytes.push(
+                store
+                    .get(&p.key, GetRange::Full)
+                    .await
+                    .expect("get part")
+                    .data,
+            );
         }
         Ok((out, bytes))
     }
 
+    /// One opened part: its traces in order, its per-bucket entry counts, its
+    /// records.
+    type OpenedPart = (Vec<[u8; 16]>, Vec<u32>, Vec<SpanRecord>);
+
     /// Per part: its footer opens as an L1 part at its index, its KEY_IDX
-    /// verifies, and it is returned as (its traces in order, its per-bucket
-    /// entry counts, its records).
-    #[allow(clippy::type_complexity)]
-    fn open_parts(parts: &[Bytes]) -> Vec<(Vec<[u8; 16]>, Vec<u32>, Vec<SpanRecord>)> {
+    /// verifies, and it is returned as an [`OpenedPart`].
+    fn open_parts(parts: &[Bytes]) -> Vec<OpenedPart> {
         let cfg = RspanConfig::default();
         parts
             .iter()
@@ -2409,7 +2417,7 @@ mod tests {
     }
 
     /// Every trace sits in exactly one part.
-    fn assert_no_trace_straddles(parts: &[(Vec<[u8; 16]>, Vec<u32>, Vec<SpanRecord>)]) {
+    fn assert_no_trace_straddles(parts: &[OpenedPart]) {
         let mut seen: BTreeMap<[u8; 16], usize> = BTreeMap::new();
         for (i, (traces, _, _)) in parts.iter().enumerate() {
             for t in traces {

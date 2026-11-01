@@ -283,7 +283,10 @@ mod tests {
             .expect("a bucket of exactly the cap encodes");
         let summary = verify_key_idx(&encoded.bytes, encoded.prefix_len).expect("verify");
         assert_eq!(summary.bucket_bits, TRACE_KEY_IDX_BUCKET_BITS);
-        assert_eq!(summary.fields[0].bucket_entry_counts[9], KEY_IDX_BUCKET_MAX_ENTRIES);
+        assert_eq!(
+            summary.fields[0].bucket_entry_counts[9],
+            KEY_IDX_BUCKET_MAX_ENTRIES
+        );
 
         match encode_trace_key_idx(at_cap().chain([(trace_id_in_bucket(9, max), 0)])) {
             Err(SpanSegError::KeyIdxBucketOverflow {
