@@ -7291,7 +7291,11 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(estimates.len(), actual.len(), "one estimate per decoded column");
+            assert_eq!(
+                estimates.len(),
+                actual.len(),
+                "one estimate per decoded column"
+            );
 
             let url = reader
                 .field_dir()

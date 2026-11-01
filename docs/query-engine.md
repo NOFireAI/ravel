@@ -5289,7 +5289,35 @@ the flag.
   columns the decode did produce are offered afterwards. The row path
   (`next_block`, used by `fetch_block` and `next_block_on_gate`, and by every
   scan with a pending erasure) neither reads nor fills it. A column deferred
-  for a `Contains` arm is never looked up or offered.
+  for a `Contains` arm is never looked up or offered, unless the scan fits
+  the cache (next item)
+  (`decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit`
+  in `crates/ravel-sql/tests/logs_decoded_cache.rs`).
+- Serve if it fits (ADR-3326, serve-if-fits amendment): a scan with a
+  `Contains` arm also looks up and offers its deferred columns when its plan
+  pass estimates the scan's whole decoded set at most 0.95 of the cap. The
+  verdict is made once per scan, in the plan pass every partition awaits
+  (`compute_plan_counts` in `crates/ravel-sql/src/logs_scan/plan.rs`), and
+  `BlockScan::decode_block` reads it once per block. The estimate
+  (`SegmentDirectories::decoded_set_estimate`) is summed over every
+  projected column of every block the plan publishes, from PAGE_DIR page
+  lengths before compression and SKIP_IDX row counts: exact for fixed-width
+  columns, close for plain strings and per-block dictionaries, and an upper
+  bound for a row group dictionary, which it charges whole to each block
+  (`the_decoded_set_estimate_matches_heap_bytes_per_kind` in
+  `crates/ravel-logseg/src/reader.rs`). A scan that leaves a sub-bound
+  segment unplanned does not fit
+  (`a_scan_that_skips_sub_bound_plans_is_withheld`), and neither does one
+  the whole-segment fast path takes, since it runs no plan pass
+  (`a_contains_scan_on_the_whole_segment_fast_path_is_withheld`). In a scan
+  that fits, a hit serves the deferred column, and a miss the cache will
+  admit is decoded validated and offered before the survivor narrowing, so
+  the entry holds the whole column and only the block's copy is narrowed
+  (`a_contains_deferred_column_is_served_whole_when_the_scan_fits`). `offer`
+  refuses a dictionary whose entries were not validated
+  (`offer_refuses_an_unvalidated_dictionary`), so a later scan without the
+  arm reads a served column exactly
+  (`a_column_cached_by_a_contains_scan_serves_a_later_scan_exactly`).
 - Admission: an `Interactive` statement admits on first decode. Every other
   intent (`BulkScan`, `Maintenance`) admits on the second touch, through a
   ghost list of keys spanning the cap in bytes. Eviction is CLOCK, weighted
@@ -5323,7 +5351,15 @@ the flag.
 
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
 once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
-`marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`.
+`marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`,
+`deferredServed`, and `deferredSetEstimateBytes`. `deferredSetEstimateBytes`
+is the plan-time decoded-set estimate, summed over the statement's scans with
+a `Contains` arm, and is present only when such a scan ran its plan pass.
+`deferredServed` is true when a scan of the statement serves its deferred
+columns, and false otherwise (`decoded_cache_json` in
+`crates/ravel-sql/src/stats_json.rs`;
+`decoded_cache_stats_appear_once_when_enabled_and_never_at_zero` in
+`services/ravel-server/tests/sql_decoded_cache_e2e.rs`).
 `/metrics` publishes `ravel_decoded_cache_resident_bytes`, `_max_bytes` and
 `_entries` as gauges and `_hits_total`, `_misses_total`, `_admissions_total`,
 `_evictions_total`, `_ghost_hits_total`, `_margin_skips_total`,

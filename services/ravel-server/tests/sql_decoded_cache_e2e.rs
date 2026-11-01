@@ -272,7 +272,11 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
         if field == "deferredServed" {
             assert_eq!(decoded[field], Value::Bool(true), "{}", like.1);
         } else {
-            assert!(decoded[field].is_u64(), "stats.decodedCache.{field}: {}", like.1);
+            assert!(
+                decoded[field].is_u64(),
+                "stats.decodedCache.{field}: {}",
+                like.1
+            );
         }
     }
     let estimate = decoded["deferredSetEstimateBytes"]

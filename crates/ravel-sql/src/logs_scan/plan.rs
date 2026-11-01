@@ -55,7 +55,11 @@ pub(super) struct DeferredVerdict {
 /// scan fits when every segment it opens was planned (`unplanned` is
 /// [`skips_sub_bound_plans`]) and `estimate_bytes` is at most 0.95 of
 /// `cap_bytes`, `--decoded-cache-max-bytes`.
-pub(super) fn deferred_verdict(estimate_bytes: u64, cap_bytes: u64, unplanned: bool) -> DeferredVerdict {
+pub(super) fn deferred_verdict(
+    estimate_bytes: u64,
+    cap_bytes: u64,
+    unplanned: bool,
+) -> DeferredVerdict {
     let fits = u128::from(estimate_bytes) * 20 <= u128::from(cap_bytes) * 19;
     DeferredVerdict {
         estimate_bytes,
@@ -500,14 +504,14 @@ async fn compute_plan_counts(
             // bytes nothing reuses.
             if deferred_cap.is_some() && survivors > 0 {
                 let published = keyed.key_blocks.as_deref().unwrap_or(&indices);
-                let estimate = dirs
-                    .decoded_set_estimate(&ctx.columns, published)
-                    .map_err(|source| {
-                        SqlError::LogFetch(LogFetchError::Corrupt {
-                            key: segments[idx].data_object_key.clone(),
-                            source,
-                        })
-                    })?;
+                let estimate =
+                    dirs.decoded_set_estimate(&ctx.columns, published)
+                        .map_err(|source| {
+                            SqlError::LogFetch(LogFetchError::Corrupt {
+                                key: segments[idx].data_object_key.clone(),
+                                source,
+                            })
+                        })?;
                 deferred_estimate = deferred_estimate.saturating_add(estimate);
             }
             let planned = if survivors > 0 {
@@ -3059,7 +3063,10 @@ mod carried_directory_reservation_tests {
         );
         assert!(!counts.serves_deferred());
         let s = skipping.phase_accounting.decoded_cache().snapshot();
-        assert_eq!((s.deferred_set_estimate_bytes, s.deferred_served), (Some(0), false));
+        assert_eq!(
+            (s.deferred_set_estimate_bytes, s.deferred_served),
+            (Some(0), false)
+        );
 
         let planning = ctx();
         let counts = compute_plan_counts(&planning, &segments, 3, true, false)

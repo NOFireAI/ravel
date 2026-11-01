@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -30,7 +31,6 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_memory::MemoryBudget;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_cache::{Cache, CacheLimits};
 use ravel_query::{CacheFetchError, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
@@ -484,7 +484,11 @@ async fn decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_f
         assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
         assert!(!s.deferred_served, "run {run}");
         let (hits, misses, admissions) = if run == 0 { (0, 24, 24) } else { (24, 0, 0) };
-        assert_eq!((s.hits, s.misses, s.admissions), (hits, misses, admissions), "run {run}");
+        assert_eq!(
+            (s.hits, s.misses, s.admissions),
+            (hits, misses, admissions),
+            "run {run}"
+        );
         assert_eq!((s.evictions, s.unvalidated_refusals), (0, 0), "run {run}");
     }
     assert_eq!(cache.column_hits(c_id), 0, "c is never served");
@@ -534,10 +538,18 @@ async fn a_fitting_contains_scan_serves_its_deferred_column_with_identical_rows(
             .counters;
         assert!(s.deferred_served, "run {run}");
         let (hits, misses, admissions) = if run == 0 { (0, 32, 32) } else { (32, 0, 0) };
-        assert_eq!((s.hits, s.misses, s.admissions), (hits, misses, admissions), "run {run}");
+        assert_eq!(
+            (s.hits, s.misses, s.admissions),
+            (hits, misses, admissions),
+            "run {run}"
+        );
         assert_eq!(s.unvalidated_refusals, 0, "run {run}");
     }
-    assert_eq!(cache.column_hits(c_id), BLOCKS, "c hit once per block on run 1");
+    assert_eq!(
+        cache.column_hits(c_id),
+        BLOCKS,
+        "c hit once per block on run 1"
+    );
 }
 
 /// A statement that fails while its scan is served from the cache fails with
@@ -798,4 +810,39 @@ async fn a_column_cached_by_a_contains_scan_serves_a_later_scan_exactly() {
         .counters;
     assert_eq!((s.hits, s.misses, s.unvalidated_refusals), (24, 8, 0));
     assert_eq!(cache.column_hits(d_id), BLOCKS, "d served once per block");
+}
+
+/// Without a read cache the scan runs as many partitions as segments, so the
+/// whole-segment fast path takes [`CONTAINS_SQL`] and no plan pass runs: no
+/// estimate, `deferredServed` false, and `c` is neither looked up nor offered
+/// however large the cap (24 lookups a run, as in the over-cap test).
+#[tokio::test]
+async fn a_contains_scan_on_the_whole_segment_fast_path_is_withheld() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = executor(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let s = cached
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("cached statement executes")
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        assert_eq!(s.deferred_set_estimate_bytes, None, "run {run}");
+        assert!(!s.deferred_served, "run {run}");
+        assert_eq!(s.hits + s.misses, 24, "run {run}");
+    }
+    assert_eq!(cache.column_hits(c_id), 0);
 }

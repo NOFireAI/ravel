@@ -2624,9 +2624,7 @@ pub(crate) fn estimate_cached_heap_bytes(
         ColKind::Fixed(width) => {
             let width = width as u64;
             let present = match presence {
-                Some(_) if value.enc == Enc::FixedWidth && width > 0 => {
-                    value.uncomp_len / width
-                }
+                Some(_) if value.enc == Enc::FixedWidth && width > 0 => value.uncomp_len / width,
                 _ => r,
             };
             (
