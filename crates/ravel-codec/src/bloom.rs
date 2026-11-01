@@ -13,8 +13,6 @@
 
 use std::collections::HashSet;
 
-use foldhash::fast::RandomState;
-
 use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
@@ -136,7 +134,7 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// 0.4375 just after a resize and 0.875 just before the next one, so a
 /// slot's real cost is `(value_width + 1) / load_factor`, not the bare
 /// value width):
-/// - `staged: HashSet<Box<[u8]>, _>` -- each slot holds a `Box<[u8]>` fat
+/// - `staged: HashSet<Box<[u8]>>` -- each slot holds a `Box<[u8]>` fat
 ///   pointer (16 bytes: data pointer + length), so the slot itself costs
 ///   `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to 39 bytes. That
 ///   pointer addresses a separate heap allocation for the raw
@@ -144,7 +142,7 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 ///   64-byte token bound `insert` documents below) plus a typical ~16-byte
 ///   allocator header, roughly 84 bytes. Staged cost: roughly 103 to 123
 ///   bytes per distinct key.
-/// - `triples: HashSet<(u64, u64, u64), _>` -- the 24-byte tuple lives inline
+/// - `triples: HashSet<(u64, u64, u64)>` -- the 24-byte tuple lives inline
 ///   in the slot, no separate heap allocation, so the slot costs
 ///   `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57 bytes per
 ///   distinct key.
@@ -155,13 +153,20 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// bytes per distinct key on the same basis), roughly 3x -- negligible in
 /// absolute terms at a per-block builder's typical scale (a few MB at
 /// ~16k distinct keys).
+///
+/// Both sets hash with std's SipHash `RandomState`: `staged` holds
+/// tenant-chosen tokens, and `triples` follows the same rule so the crate has
+/// one hasher policy (owner decision on issue #3228). The hasher does not
+/// change which keys are distinct, so it does not change the emitted bytes.
 pub struct BloomBuilder {
     seed: u64,
     /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
     /// `Box<[u8]>: Borrow<[u8]>`, so a duplicate insert probes without
-    /// allocating. Hashed with foldhash rather than SipHash: dedup runs once
-    /// per inserted token, and the set of keys does not depend on the hasher.
-    staged: HashSet<Box<[u8]>, RandomState>,
+    /// allocating. Hashed with std's SipHash `RandomState`, not a faster
+    /// non-SipHash hasher: the keys are tenant-chosen tokens, nothing caps
+    /// how many distinct keys a block stages, and the owner declined a
+    /// hasher without HashDoS resistance for this data (issue #3228).
+    staged: HashSet<Box<[u8]>>,
     /// Reused `column_id_le || token` buffer for the membership probe, so a
     /// duplicate insert copies bytes but allocates nothing.
     scratch: Vec<u8>,
@@ -231,8 +236,7 @@ impl BloomBuilder {
         // capacity reserved below covers the full table up front, so `staged`
         // and `triples` are both fully live once the loop starts -- see the
         // struct doc for the measured peak and per-key arithmetic.
-        let mut triples: HashSet<(u64, u64, u64), RandomState> =
-            HashSet::with_capacity_and_hasher(self.staged.len(), RandomState::default());
+        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
         for key in self.staged.drain() {
             let mut col = [0u8; 4];
             col.copy_from_slice(&key[..4]);
@@ -342,6 +346,16 @@ impl<'a> BloomView<'a> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Owner decision on issue #3228: `staged` holds tenant tokens and keeps
+    /// std's SipHash `RandomState`. Swapping the hasher fails to compile here.
+    fn staged_uses_siphash(_: &HashSet<Box<[u8]>, std::collections::hash_map::RandomState>) {}
+
+    #[test]
+    fn staged_set_hasher_is_pinned_to_siphash() {
+        let builder = BloomBuilder::new(0);
+        staged_uses_siphash(&builder.staged);
+    }
 
     #[test]
     fn field_scoping_separates_columns() {
