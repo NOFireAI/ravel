@@ -3575,6 +3575,7 @@ impl SqlExecutor {
         // (`resolve_snapshot`) paths pass through, so any tenant running a query
         // is kept out of the idle sweep.
         self.touch_tenant(tenant_hash, req.now_ns);
+        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
         let tables = statement.tables()?;
         // ADR-2040: the Parquet tables a statement names resolve their
         // manifests first, so a statement that also names signal tables
@@ -3607,9 +3608,7 @@ impl SqlExecutor {
                 fold_lag,
             }) = request_budget_exceeded(
                 estimate.estimated_requests,
-                self.effective_config(req.budgets.as_ref())
-                    .engine
-                    .max_s3_requests,
+                engine_config.max_s3_requests,
             ) {
                 return Err(SqlError::RequestBudgetExceeded {
                     requests,
@@ -3669,7 +3668,6 @@ impl SqlExecutor {
             }
             _ => None,
         };
-        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
         // Every lane is admitted against the statement's one `max_segments`,
         // so each is checked here unbounded and the running sum against the
         // ceiling below.
@@ -6970,7 +6968,7 @@ pub(crate) mod tests {
     use ravel_object_store::instrument::InstrumentedStore;
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
-    use ravel_query::FetchError;
+    use ravel_query::{ByteLimit, FetchError, RequestLimit};
     use ravel_rspan::{
         ObjectIdentity as SpanObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode,
     };
@@ -10295,7 +10293,7 @@ pub(crate) mod tests {
                 row_count: records.len() as u64,
                 min_event_ts_ns: min,
                 max_event_ts_ns: max,
-                segment_format_version: 1,
+                segment_format_version: u32::from(ravel_rspan::footer::VERSION),
                 ingest_hour_bucket: 0,
             },
         )
@@ -11058,5 +11056,99 @@ pub(crate) mod tests {
             7,
             "the seven audit records outside the window are excluded"
         );
+    }
+
+    /// Every signal table reports the budgets its scan checked: the request's
+    /// lowered budgets when it carries some, the executor's configuration when
+    /// it does not, and one check per data object fetched.
+    ///
+    /// FLIP: a constant `budgets` field (or one read from the server config
+    /// instead of the effective one) reports the same limits for both runs
+    /// below; a table whose scan carries no budget reports `None`.
+    #[tokio::test]
+    async fn stats_report_which_budgets_each_table_enforces() {
+        let tenant = TenantId::new("stats-budgets-1409".to_string());
+        let tenant_hash = tenant.hash();
+        let memory = MemoryStore::new();
+        let samples: Vec<Sample> = (0..4)
+            .map(|i| Sample {
+                ts_ns: i * 100,
+                value: i as f64,
+            })
+            .collect();
+        publish_metric_samples(&memory, &tenant, 1, "m", samples).await;
+        let logs: Vec<LogRecord> = (0..4).map(|i| log_record("logs", i * 100)).collect();
+        publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &logs).await;
+        publish_log_records(&memory, tenant_hash, Signal::Audit, 3, &logs).await;
+        publish_log_records(&memory, tenant_hash, Signal::Alerts, 4, &logs).await;
+        let spans: Vec<SpanRecord> = (0..4)
+            .map(|i| SpanRecord {
+                trace_id: [1u8; 16],
+                span_id: [u8::try_from(i).unwrap_or(u8::MAX); 8],
+                parent_span_id: None,
+                name: "op".to_string(),
+                start_ts_ns: i * 100,
+                end_ts_ns: i * 100 + 10,
+                status_code: StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            })
+            .collect();
+        publish_spans(&memory, tenant_hash, 5, &spans).await;
+        let store = wrap_fixture_store(memory);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        let server = EngineConfig::default();
+        let lowered = RequestBudgets {
+            max_bytes_scanned: Some(ByteLimit::Bounded(1 << 30)),
+            max_store_requests: Some(RequestLimit::Bounded(64)),
+            ..Default::default()
+        };
+
+        for (sql, tables) in [
+            ("SELECT * FROM samples", &["samples"][..]),
+            ("SELECT * FROM logs", &["logs"][..]),
+            ("SELECT * FROM spans", &["spans"][..]),
+            ("SELECT * FROM alerts", &["alerts"][..]),
+            ("SELECT * FROM audit", &["audit"][..]),
+            (
+                "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
+                &["samples", "logs"][..],
+            ),
+        ] {
+            for budgets in [None, Some(lowered)] {
+                let mut request = sql_request(sql, window);
+                request.budgets = budgets;
+                let outcome = executor_over(store.clone())
+                    .execute(tenant_hash, &request)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let (bytes, requests) = match &budgets {
+                    None => (server.max_bytes_scanned, server.max_s3_requests),
+                    Some(_) => (ByteLimit::Bounded(1 << 30), RequestLimit::Bounded(64)),
+                };
+                let reported: Vec<(&str, Option<EnforcedBudgets>)> = outcome
+                    .signals
+                    .iter()
+                    .map(|signal| (signal.table, signal.budgets))
+                    .collect();
+                let expected: Vec<(&str, Option<EnforcedBudgets>)> = tables
+                    .iter()
+                    .map(|&table| {
+                        (
+                            table,
+                            Some(EnforcedBudgets {
+                                max_bytes_scanned: bytes,
+                                max_store_requests: requests,
+                                checks: 1,
+                            }),
+                        )
+                    })
+                    .collect();
+                assert_eq!(reported, expected, "{sql} under {budgets:?}");
+            }
+        }
     }
 }
