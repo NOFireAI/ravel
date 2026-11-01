@@ -17,7 +17,9 @@ use ravel_sql::{DeclaredColumnSource, KeyIndexDeclaration};
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Signal, TenantHash, TimeRange};
 
-use super::{LiveCost, QueryService, ServiceError, core, finish_usage, query_span};
+use super::{
+    LiveCost, QueryService, ServiceError, core, finish_usage, query_span, record_span_cost,
+};
 
 /// The most metric families one page carries, and the page size of a request
 /// that names none.
@@ -25,9 +27,6 @@ pub const MAX_FAMILIES_PER_PAGE: usize = 100;
 
 /// Why a non-metrics signal's family page is empty.
 pub const FAMILIES_METRICS_ONLY: &str = "metric families are recorded for the metrics signal only";
-
-/// The `logs` column a tenant's `index_trace_id` declaration indexes.
-const LOGS_TRACE_ID: &str = "trace_id";
 
 /// The `audit` language of a describe call.
 const AUDIT_LANGUAGE: &str = "describe_data";
@@ -98,13 +97,24 @@ impl DescribeSignal {
 pub struct DescribeDataRequest {
     /// `metrics`, `logs` or `traces`.
     pub signal: String,
-    /// The first family of the page, in [`DescribeData::families`] order.
-    pub offset: usize,
+    /// The keyset position: the page holds the families whose names sort
+    /// strictly after this one, in [`DescribeData::families`] order. `None`
+    /// starts at the first family. A later page passes the last name of the
+    /// page before it.
+    ///
+    /// The metadata record is not pinned between pages: each call reads the
+    /// shared cache's current record, which a refresh can change between two
+    /// calls. A keyset position never skips or repeats a family present in
+    /// the record throughout the sequence, and a family added that sorts
+    /// before the position is not returned by any later page.
+    pub after_name: Option<String>,
     /// The page size; `None` and anything above [`MAX_FAMILIES_PER_PAGE`] are
-    /// [`MAX_FAMILIES_PER_PAGE`].
+    /// [`MAX_FAMILIES_PER_PAGE`], and `Some(0)` is refused as
+    /// [`super::ServiceErrorKind::InvalidArgument`].
     pub limit: Option<usize>,
     /// The resolve instant. A later page passes the instant its cursor was
-    /// minted at (ADR-1374, 2026-09-13 amendment, item 5).
+    /// minted at (ADR-1374, 2026-09-13 amendment, item 5). It pins the
+    /// resolve, not the family record.
     pub now_ns: i64,
     pub deadline: Duration,
 }
@@ -174,7 +184,9 @@ pub struct DescribeData {
     /// One page of families, ordered by name in byte order. Empty for a
     /// non-metrics signal.
     pub families: Vec<DescribeFamily>,
-    /// Every family the record holds, not only this page's.
+    /// Every family the record held when this call read it, not only this
+    /// page's. The record is not pinned between pages, so two pages of one
+    /// sequence can report different totals.
     pub families_total: usize,
     /// Why the family page is empty by construction; `None` for metrics.
     pub families_absent_reason: Option<&'static str>,
@@ -214,8 +226,9 @@ impl QueryService {
     /// ingest by the seal margin, costs a HEAD read of its own, and is not a
     /// freshness signal (ADR-1374, 2026-09-13 amendment, items 4 and 8).
     ///
-    /// An unknown signal is refused before the permit is taken, and a process
-    /// built without [`DescribeState`] refuses every call as unsupported.
+    /// An unknown signal and a zero limit are refused before the permit is
+    /// taken, and a process built without [`DescribeState`] refuses every call
+    /// as unsupported.
     pub async fn describe_data(
         &self,
         tenant_hash: TenantHash,
@@ -226,9 +239,15 @@ impl QueryService {
             .as_ref()
             .ok_or_else(|| ServiceError::unsupported_surface("describe_data"))?;
         let signal = DescribeSignal::parse(&request.signal)?;
-        let limit = request.limit.map_or(MAX_FAMILIES_PER_PAGE, |limit| {
-            limit.min(MAX_FAMILIES_PER_PAGE)
-        });
+        let limit = match request.limit {
+            None => MAX_FAMILIES_PER_PAGE,
+            Some(0) => {
+                return Err(ServiceError::invalid_argument(
+                    "limit must be at least 1".to_string(),
+                ));
+            }
+            Some(limit) => limit.min(MAX_FAMILIES_PER_PAGE),
+        };
 
         let _permit = self.controls.admit()?;
         let deadline = self
@@ -246,23 +265,24 @@ impl QueryService {
             state,
             tenant_hash,
             signal,
-            request.offset,
+            request.after_name.as_deref(),
             limit,
             request.now_ns,
             &accounting,
         );
-        let result = tokio::time::timeout(deadline, tracing::Instrument::instrument(run, span))
-            .await
-            .unwrap_or(Err(ServiceError::from_query(
-                QueryError::DeadlineExceeded { deadline },
-            )));
+        let result =
+            tokio::time::timeout(deadline, tracing::Instrument::instrument(run, span.clone()))
+                .await
+                .unwrap_or(Err(ServiceError::from_query(
+                    QueryError::DeadlineExceeded { deadline },
+                )));
 
         let status = finish_usage(guard, &result, |_| (live.snapshot(), core::zero_estimate()));
 
         let text = format!(
-            "describe_data signal={} offset={} limit={limit}",
+            "describe_data signal={} after_name={:?} limit={limit}",
             signal.name(),
-            request.offset
+            request.after_name
         );
         self.controls
             .audit(
@@ -277,6 +297,7 @@ impl QueryService {
             .await?;
         let data = result?;
 
+        record_span_cost(&span, &data.accounting);
         self.controls
             .record_cost(tenant_hash, &data.accounting, &core::zero_estimate());
         Ok(data)
@@ -287,7 +308,7 @@ async fn describe(
     state: &DescribeState,
     tenant_hash: TenantHash,
     signal: DescribeSignal,
-    offset: usize,
+    after_name: Option<&str>,
     limit: usize,
     now_ns: i64,
     accounting: &QueryAccounting,
@@ -327,10 +348,12 @@ async fn describe(
         DescribeSignal::Metrics => {
             let record = state.metadata_cache.get(tenant_hash).await;
             let mut entries: Vec<_> = record.iter().collect();
-            entries.sort_by(|a, b| a.family_name.cmp(&b.family_name));
+            entries.sort_by(|a, b| a.family_name.as_bytes().cmp(b.family_name.as_bytes()));
             let page = entries
                 .iter()
-                .skip(offset)
+                .filter(|entry| {
+                    after_name.is_none_or(|after| entry.family_name.as_bytes() > after.as_bytes())
+                })
                 .take(limit)
                 .map(|entry| DescribeFamily {
                     name: entry.family_name.clone(),
@@ -419,7 +442,7 @@ fn column(name: &str, data_type: &impl std::fmt::Display, nullable: bool) -> Des
 fn tenant_key_index(declaration: KeyIndexDeclaration) -> IndexedKeys {
     let mut keys = declaration.columns;
     if declaration.trace_id {
-        keys.push(LOGS_TRACE_ID.to_string());
+        keys.push(ravel_logseg::key_index::TRACE_ID_FIELD.to_string());
     }
     IndexedKeys {
         keys,
