@@ -2341,8 +2341,8 @@ breach, never a silently dropped or served key. Both this and the HEAD/
 postings tenant_hash checks above increment
 `ravel_catalog_isolation_breach_total`, and so do the fold's tenant_hash
 checks on a tenant's previous postings object and previous snapshot parts.
-Every other snapshot-part reader runs the same check after the GET and
-before the decode, and counts a foreign part on the `Catalog` it was given:
+These other snapshot-part readers run the same check after the GET and
+before the decode, and count a foreign part on the `Catalog` they were given:
 the key-index rebuild (through the fold's part loader), the scrub's
 covering-postings load (`LoadPostingsError::PartTenantHashMismatch`, a hard
 error rather than a degrade to `None`) and its seal-divergence tier, and
@@ -2353,7 +2353,12 @@ verify` and `ravel-cli load` call. The server hands the scrub its own
 renders it; the command-line readers count on a `Catalog` of their own and
 report the error as a failed command. A tenant_hash mismatch on the postings
 object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
-is not counted.
+is not counted. Four readers still decode a part with no tenant_hash check,
+so a foreign part they read is neither refused nor counted: the on-demand
+fold's `read_entry_ids` (`services/ravel-server/src/fold_on_demand.rs`), the
+format-window audit (`services/ravel-server/src/format_window.rs`), the GC
+reachability sweep (`crates/ravel-maintain/src/reachability.rs`) and
+`ravel-cli catalog inspect` (`services/ravel-cli/src/catalog.rs`).
 The counter is rendered at `/metrics` beside the
 existing `ravel_catalog_interlock_violations_total` and
 `ravel_catalog_compaction_input_set_conflicts_total` anomaly counters

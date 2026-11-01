@@ -2220,8 +2220,6 @@ mod tests {
     #[tokio::test]
     async fn spawn_refuses_a_zero_scrub_period() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        // Built before the count: the catalog's own background tasks are not
-        // the scrub's.
         let catalog = Arc::new(test_catalog());
         let metrics = tokio::runtime::Handle::current().metrics();
         let alive_before = metrics.num_alive_tasks();
