@@ -47,9 +47,16 @@ review. After 3 review rounds on one PR, stop and hand it to a person.
 Merge by hand once the review is clean and CI is green:
 
 ```sh
-scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
-                                           # the exact merge command to run
+bin/agent-cli pr <pr-number>          # one line: CI counts, review at head,
+                                      # findings by severity, unreplied count
+bin/agent-cli pr-findings <pr-number> # each finding: severity, path, replied
+bin/agent-cli merge-line <pr-number>  # the exact merge command, pinned to the
+                                      # head it checked, or why there is none
 ```
+
+`merge-line` runs `scripts/pr-review-status.sh` and prints only its
+merge line or the notes that withheld it; exit 1 means no line, exit 2
+means the script reached no verdict.
 
 `FLEET_MERGE_AUTO=1` restores the old `gh pr merge --auto --rebase`
 behavior for the rare case that genuinely does not need to wait for a
@@ -159,13 +166,14 @@ scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local 
 
 ## After the PR is open
 
-**Under `FLEET_MERGE_AUTO=1`** (auto-merge already enabled): just poll
-`gh pr view <number> --json state,mergedAt` until it reports merged, then
+**Under `FLEET_MERGE_AUTO=1`** (auto-merge already enabled): run
+`bin/agent-cli pr-landed <number> --wait 540` until it reports merged, then
 go straight to cleanup below. Do not run a second, manual `gh pr merge`
 against a PR GitHub is already landing for you.
 
-**Otherwise** (the default): poll `scripts/pr-review-status.sh <number>`
-until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
+**Otherwise** (the default): run `bin/agent-cli pr-wait <number>` (a
+bounded poll, exit 75 means run it again), then read `bin/agent-cli pr
+<number>` until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
 `DRAFT`/`BEHIND` mean it isn't mergeable regardless of CI or review state
 -- resolve those first), and it reports a review against the PR's current
 head commit in state `COMMENTED` or `APPROVED` (`PENDING`, `DISMISSED`, and
@@ -188,7 +196,7 @@ count reaches zero. A review with zero comments from the start is the one
 case that is actually clean by count. Findings the bot could not place
 inline sit in the review BODY under "Findings outside the diff:" and are
 counted separately on the status line; read those too. Once every finding is
-accounted for, `pr-review-status.sh` prints the exact merge command, pinned
+accounted for, `bin/agent-cli merge-line <number>` prints the exact merge command, pinned
 to the head SHA it just checked via `--match-head-commit` so the merge
 refuses if the branch moved since. Run it as printed:
 
@@ -214,11 +222,13 @@ that is green. Consequences here:
 - `mergeStateStatus` and the merge-base guard stay worth reading, but a
   behind-ness count is no longer a reason to act. The guard covers a merge that
   bypasses the queue.
-- The PR does not merge the instant the command returns. Poll
-  `gh pr view <number> --json state,mergedAt` as under `FLEET_MERGE_AUTO=1`.
+- The PR does not merge the instant the command returns. Run
+  `bin/agent-cli pr-landed <number> --wait 540` as under `FLEET_MERGE_AUTO=1`.
   A queue entry can also be ejected (its batch went red, or it conflicted after
-  the rebase); an ejected PR sits open with the queue gone, so "still open ten
-  minutes later" is something to look at rather than something to wait out.
+  the rebase); an ejected PR sits open with the queue gone, which `pr-landed`
+  reports as `reason=ejected` with exit 1 once the entry it saw is gone for
+  two reads, so "still open ten minutes later" is something to look at rather
+  than something to wait out.
 - The queue is `ALLGREEN` and batches up to 5, so one bad PR fails its whole
   batch and the rest requeue. When a batch fails, read which check went red on
   the `merge_group` run, not on the PR.
@@ -236,7 +246,7 @@ before the checks (and the review wait) finish would mean a failed
 check or an unresolved finding leaves the PR open with no way to recover
 the original result branch.
 
-Watch the PR (`gh pr view <number> --json state,mergedAt`) until it reports
+Watch the PR (`bin/agent-cli pr-landed <number> --wait 540`) until it reports
 merged. Once merged, delete the task refs yourself:
 
 ```sh

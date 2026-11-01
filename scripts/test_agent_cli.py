@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -225,6 +226,42 @@ class FleetConfig(unittest.TestCase):
 
     def test_expired_is_terminal(self):
         self.assertIn("expired", cli.TERMINAL_TASK)
+
+
+class Usage(unittest.TestCase):
+    TABLE = [{"pattern": "\\bgh\\s+pr\\s+(view|checks|status)\\b", "subcommand": "pr N", "answers": ""},
+             {"pattern": "(^|[;&|]\\s*)df\\s+-h\\b", "subcommand": "box", "answers": ""}]
+
+    def record(self, ts, cmd):
+        return json.dumps({"timestamp": ts, "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]}})
+
+    def test_every_shared_pattern_compiles_in_python(self):
+        table = json.loads((pathlib.Path(__file__).resolve().parents[1] / ".claude" / "guards"
+                            / "agent-cli-nudges.json").read_text())["nudges"]
+        for n in table:
+            re.compile(n["pattern"])
+        self.assertGreaterEqual(len(table), 10)
+
+    def test_counts_agent_cli_and_raw_calls_after_since_per_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "s1.jsonl"
+            p.write_text("\n".join([
+                self.record("2026-10-30T00:00:00Z", "gh pr view 1"),        # before since
+                self.record("2026-11-02T00:00:00Z", "gh pr view 2 --json state"),
+                self.record("2026-11-02T00:00:01Z", "cd /x && df -h ."),
+                self.record("2026-11-02T00:00:02Z", "bin/agent-cli --json pr 2"),
+                self.record("2026-11-02T00:00:03Z", "grep -rn 'df -h' docs/"),  # neither
+                self.record("2026-11-02T00:00:04Z", "git commit -m 'use agent-cli first'"),  # a mention
+                "not json",
+            ]))
+            (pathlib.Path(d) / "s2.jsonl").write_text(self.record("2026-11-03T00:00:00Z", "ls"))
+            t = cli.count_usage(sorted(pathlib.Path(d).glob("*.jsonl")), "2026-11-01", self.TABLE,
+                                cli.subcommand_names())
+        self.assertIn("usage", cli.subcommand_names())
+        self.assertEqual((t["sessions"], t["agent_cli"], t["raw"]), (2, 1, 2))
+        self.assertEqual(t["raw_by_subcommand"], {"pr": 1, "box": 1})
+        self.assertEqual(t["agent_cli_by_subcommand"], {"pr": 1})
 
 
 class Parser(unittest.TestCase):

@@ -976,6 +976,96 @@ def cmd_dispatch(a):
     return 0 if not (rec_rc or orch_rc) else 1
 
 
+# ---------------------------------------------------------------- usage
+
+
+def nudge_table():
+    """The raw commands agent-cli replaces, shared with the PreToolUse hook."""
+    root = Path(run(["git", "rev-parse", "--show-toplevel"], check=True)[1].strip())
+    return json.loads((root / ".claude" / "guards" / "agent-cli-nudges.json").read_text())["nudges"]
+
+
+def transcript_dir():
+    """This repository's Claude Code transcript directory on this machine."""
+    common = Path(run(["git", "rev-parse", "--git-common-dir"], check=True)[1].strip()).resolve()
+    primary = common.parent
+    return Path.home() / ".claude" / "projects" / str(primary).replace("/", "-")
+
+
+AGENT_CLI_CALL = re.compile(r"(?:^|[;&|(]\s*|\s)(?:\S*/)?agent-cli\s+(?:--json\s+)?([a-z-]+)")
+
+
+def subcommand_names():
+    return {n for a in build_parser()._actions if isinstance(a, argparse._SubParsersAction)
+            for n in a.choices}
+
+
+def count_usage(paths, since, table, known):
+    """Per session file: agent-cli calls and raw calls per subcommand, after `since`.
+
+    An agent-cli call is the command word followed by a subcommand in `known`,
+    so a commit message or comment that mentions the tool does not count."""
+    compiled = [(re.compile(n["pattern"]), n["subcommand"].split()[0]) for n in table]
+    totals = {"sessions": 0, "agent_cli": 0, "raw": 0, "raw_by_subcommand": {}, "agent_cli_by_subcommand": {}}
+    for path in paths:
+        counted = False
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if (rec.get("timestamp") or "") < since:
+                continue
+            content = (rec.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "tool_use" or part.get("name") != "Bash":
+                    continue
+                cmd = (part.get("input") or {}).get("command") or ""
+                counted = True
+                m = AGENT_CLI_CALL.search(cmd)
+                if m and m.group(1) in known:
+                    totals["agent_cli"] += 1
+                    sub = totals["agent_cli_by_subcommand"]
+                    sub[m.group(1)] = sub.get(m.group(1), 0) + 1
+                    continue
+                for rx, sub_name in compiled:
+                    if rx.search(cmd):
+                        totals["raw"] += 1
+                        sub = totals["raw_by_subcommand"]
+                        sub[sub_name] = sub.get(sub_name, 0) + 1
+                        break
+        if counted:
+            totals["sessions"] += 1
+    return totals
+
+
+def cmd_usage(a):
+    o = Out(a.json)
+    d = Path(a.dir) if a.dir else transcript_dir()
+    if not d.is_dir():
+        raise CliError(f"no transcript directory {d}")
+    t = count_usage(sorted(d.glob("*.jsonl")), a.since, nudge_table(), subcommand_names())
+    total = t["agent_cli"] + t["raw"]
+    t["since"] = a.since
+    t["dir"] = str(d)
+    t["agent_cli_share"] = round(t["agent_cli"] / total, 3) if total else None
+    o.data = t
+    o.text(f"since={a.since} sessions={t['sessions']} agent-cli={t['agent_cli']} raw={t['raw']} "
+           f"share={t['agent_cli_share'] if total else '-'}")
+    for k, v in sorted(t["raw_by_subcommand"].items(), key=lambda kv: -kv[1]):
+        o.text(f"  raw instead of {k}: {v}")
+    for k, v in sorted(t["agent_cli_by_subcommand"].items(), key=lambda kv: -kv[1]):
+        o.text(f"  agent-cli {k}: {v}")
+    o.emit()
+    return 0
+
+
 # ---------------------------------------------------------------- local checks
 
 
@@ -1365,6 +1455,14 @@ def build_parser():
 
     sp = add("box", cmd_box, "free disk, load, build processes, running executor tasks; --du sizes the caches")
     sp.add_argument("--du", action="store_true")
+
+    sp = add("usage", cmd_usage, "agent-cli calls against the raw commands it replaces, from this machine's transcripts",
+             "Reads this repository's Claude Code transcripts (~/.claude/projects/<primary path>) and counts "
+             "Bash tool calls after --since: those that ran agent-cli, and those matching a pattern in "
+             ".claude/guards/agent-cli-nudges.json, the table the PreToolUse hook reads. The share is the "
+             "adoption figure; the per-subcommand rows say which lookups still go raw.")
+    sp.add_argument("--since", default="2026-11-01", help="ISO date or timestamp; records before it are skipped")
+    sp.add_argument("--dir", help="transcript directory (default: derived from the primary checkout path)")
 
     sp = add("wt", cmd_wt, "worktrees: ls [--dirty] | new NAME [--ref R] [--branch B] | rm PATH [--force]",
              "new creates <primary>-wt-NAME from a fresh origin/main (detached unless --branch). "
