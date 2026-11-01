@@ -689,12 +689,20 @@ mod with_mcp {
     use rmcp::{ClientServiceExt, service::ClientLifecycleMode};
 
     async fn call_get_trace(running: &ravel_server::Running, arguments: Value) -> Value {
+        call_get_trace_as(running, TOKEN, arguments).await
+    }
+
+    async fn call_get_trace_as(
+        running: &ravel_server::Running,
+        token: &str,
+        arguments: Value,
+    ) -> Value {
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(format!(
                 "http://{}/mcp",
                 running.http_addr
             ))
-            .auth_header(TOKEN),
+            .auth_header(token),
         );
         let client = ()
             .serve_with_lifecycle(
@@ -800,6 +808,89 @@ mod with_mcp {
             want(&EVERY_SPAN[..2]),
             "{capped}"
         );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// A `ravel_get_trace` call writes a query-audit record naming the
+    /// subject the caller's configured token carries, with its source; a
+    /// token with no subject leaves both attributes off.
+    #[tokio::test]
+    async fn get_trace_over_mcp_audits_the_callers_configured_subject() {
+        const LABELLED: &str = "acme-labelled-token";
+        const PLAIN: &str = "acme-plain-token";
+        let (store, _) = seeded().await;
+        let tenant = TenantId::new(TENANT);
+        let mut labelled = ravel_tenant_resolve::Principal::tenant_only(tenant.clone());
+        labelled.subject = Some(
+            ravel_tenant_resolve::Subject::new(
+                ravel_tenant_resolve::SubjectSource::StaticToken,
+                "alice",
+            )
+            .expect("a valid subject"),
+        );
+        let principals = HashMap::from([
+            (LABELLED.to_string(), labelled),
+            (
+                PLAIN.to_string(),
+                ravel_tenant_resolve::Principal::tenant_only(tenant.clone()),
+            ),
+        ]);
+        let mut config = server_config(true);
+        config.tenant_resolver = Arc::new(
+            ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(principals),
+        );
+        let running = ravel_server::start(
+            config,
+            store.clone(),
+            store.clone(),
+            Arc::new(ravel_object_store::StoreMetrics::default()),
+            None,
+        )
+        .await
+        .expect("server starts");
+
+        for (token, subject, source) in [
+            (LABELLED, Some("alice"), Some("static_token")),
+            (PLAIN, None, None),
+        ] {
+            let before = query_audit_records(store.as_ref(), &tenant).await.len();
+            let envelope = call_get_trace_as(
+                &running,
+                token,
+                serde_json::json!({ "trace_id": TRACE_HEX }),
+            )
+            .await;
+            assert_eq!(envelope["status"], "ok", "{token}: {envelope}");
+            assert!(
+                !envelope.to_string().contains("alice"),
+                "{token}: the tool result names the subject: {envelope}"
+            );
+            let records = query_audit_records(store.as_ref(), &tenant).await;
+            assert_eq!(
+                records.len(),
+                before + 1,
+                "{token}: one ravel_get_trace call writes one query-audit record"
+            );
+            let row = records
+                .iter()
+                .find(|row| {
+                    attr(row, "query.text")
+                        == Some(ravel_server::traces::trace_statement(&TRACE).as_str())
+                        && attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT) == subject
+                })
+                .unwrap_or_else(|| panic!("{token}: no record with subject {subject:?}"));
+            assert_eq!(
+                attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE),
+                source,
+                "{token}"
+            );
+            assert_eq!(
+                attr(row, "query.tenant"),
+                Some(tenant.hash().to_hex().as_str()),
+                "{token}"
+            );
+        }
 
         running.shutdown().await.expect("graceful shutdown");
     }
