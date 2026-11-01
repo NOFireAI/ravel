@@ -7,7 +7,7 @@
 //! the impls below (or their own), so an unauthenticated deployment is a
 //! conscious choice, not an oversight (docs/query-engine.md "default deny").
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -214,8 +214,9 @@ pub fn split_tenant_suffix(
 /// whole-principal equality in `Cli::parse_tenant_pairs`' duplicate-token
 /// check; no authorization path reads it. It is `None` unless a
 /// source produced one: a static token's `subject=LABEL` entry
-/// ([`split_tenant_suffix`]) or the claim
-/// [`OidcResolver::with_subject_claim`] names.
+/// ([`split_tenant_suffix`]), the claim
+/// [`OidcResolver::with_subject_claim`] names, or the header
+/// [`MtlsResolver::with_subject_header`] names.
 /// [`DevHeaderTenantResolver`] never sets one
 /// (`the_dev_header_resolver_never_sets_a_subject`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,8 +239,7 @@ pub enum SubjectSource {
     StaticToken,
     /// The claim [`OidcResolver::with_subject_claim`] names.
     Oidc,
-    /// A proxy-forwarded mTLS subject header. Declared for ADR-3541's mTLS
-    /// source; no resolver produces it yet.
+    /// The header [`MtlsResolver::with_subject_header`] names.
     Mtls,
 }
 
@@ -340,7 +340,8 @@ impl Subject {
 /// Why a source left a subject absent (ADR-3541 decision 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubjectDropReason {
-    /// The configured claim is not in the verified claim set.
+    /// The configured claim is not in the verified claim set, or the
+    /// configured mTLS subject header is not on the request.
     Missing,
     /// The claim is present but not a JSON string.
     NotString,
@@ -1060,8 +1061,15 @@ fn oidc_subject(value: Option<&serde_json::Value>) -> Result<Subject, SubjectDro
 /// The header value maps straight to a [`TenantId`] with no further parsing:
 /// certificate SAN/CN extraction already happened at the proxy, and duplicating
 /// it here would be a second, weaker parser of a format Ravel never sees.
+///
+/// The subject header [`with_subject_header`](Self::with_subject_header) names
+/// (ADR-3541 decision 3) is in the same trust class as the tenant header: the
+/// proxy sets it from the verified certificate and strips any client-supplied
+/// copy. It is read only here, so it is read only on the `--mtls-listener`
+/// chain, and no other resolver reads a request header for a subject.
 pub struct MtlsResolver {
     header_name: String,
+    subject_header: Option<(String, Arc<SubjectDropCounters>)>,
 }
 
 impl MtlsResolver {
@@ -1072,7 +1080,25 @@ impl MtlsResolver {
     pub fn new(header_name: impl Into<String>) -> Self {
         MtlsResolver {
             header_name: header_name.into(),
+            subject_header: None,
         }
+    }
+
+    /// Configure the header whose value becomes the principal's subject, with
+    /// [`SubjectSource::Mtls`] (ADR-3541 decision 3). The value is taken
+    /// verbatim, never parsed. A header that is missing, not valid UTF-8, or
+    /// outside the [`Subject`] bound leaves the subject `None`, records the
+    /// reason in `drops` (a value that is not UTF-8 counts as `charset`), and
+    /// still resolves the tenant
+    /// (`the_mtls_subject_header_sets_the_subject_only_when_configured_and_is_bounded`).
+    /// With no header configured (the default) no subject is read.
+    pub fn with_subject_header(
+        mut self,
+        header: impl Into<String>,
+        drops: Arc<SubjectDropCounters>,
+    ) -> Self {
+        self.subject_header = Some((header.into(), drops));
+        self
     }
 }
 
@@ -1091,6 +1117,23 @@ impl TenantResolver for MtlsResolver {
         }
         Ok(TenantId::new(value.to_string()))
     }
+
+    fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        let mut principal = Principal::tenant_only(self.resolve(headers)?);
+        principal.subject = self.subject_header.as_ref().and_then(|(header, drops)| {
+            mtls_subject(headers.get(header.as_str()))
+                .inspect_err(|&reason| drops.record(SubjectSource::Mtls, reason))
+                .ok()
+        });
+        Ok(principal)
+    }
+}
+
+/// The subject a proxy-forwarded header value names, or why it names none.
+fn mtls_subject(value: Option<&HeaderValue>) -> Result<Subject, SubjectDropReason> {
+    let value = value.ok_or(SubjectDropReason::Missing)?;
+    let value = std::str::from_utf8(value.as_bytes()).map_err(|_| SubjectDropReason::Charset)?;
+    Subject::new(SubjectSource::Mtls, value).map_err(SubjectError::drop_reason)
 }
 
 #[cfg(test)]
@@ -1716,6 +1759,139 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
             resolver.resolve(&headers).expect("resolves"),
             TenantId::new("beta")
         );
+    }
+
+    /// The subject header is read only when `with_subject_header` configured
+    /// it, and only a value inside the `Subject` bound becomes the subject;
+    /// every other value leaves it absent and counts exactly one drop under
+    /// `mtls`. Flip to watch it fail: read the subject header in
+    /// `MtlsResolver::new`'s resolver whenever it is present (the first case),
+    /// or build the subject without `Subject::new` (the space and 256-byte
+    /// cases).
+    #[test]
+    fn the_mtls_subject_header_sets_the_subject_only_when_configured_and_is_bounded() {
+        const SUBJECT_HEADER: &str = "x-ravel-client-cert-subject";
+        let only = |reason: SubjectDropReason| -> Vec<(SubjectSource, SubjectDropReason, u64)> {
+            SubjectSource::ALL
+                .iter()
+                .flat_map(|&source| {
+                    SubjectDropReason::ALL.iter().map(move |&r| {
+                        let count = u64::from(source == SubjectSource::Mtls && r == reason);
+                        (source, r, count)
+                    })
+                })
+                .collect()
+        };
+        let no_drops = || SubjectDropCounters::default().snapshot();
+        let request = |subject: Option<HeaderValue>| {
+            let mut headers = HeaderMap::new();
+            headers.insert(MtlsResolver::DEFAULT_HEADER, "acme".parse().unwrap());
+            if let Some(subject) = subject {
+                headers.insert(SUBJECT_HEADER, subject);
+            }
+            headers
+        };
+        let alice = || Some(HeaderValue::from_static("CN=alice,O=Acme"));
+
+        // Unconfigured: the header is on the request and nothing reads it.
+        let plain = MtlsResolver::default();
+        let principal = plain
+            .resolve_principal(&request(alice()))
+            .expect("resolves");
+        assert_eq!(principal, Principal::tenant_only(TenantId::new("acme")));
+        assert_eq!(principal.subject, None);
+        assert_eq!(
+            plain.resolve(&request(alice())).expect("resolves"),
+            TenantId::new("acme")
+        );
+
+        // Configured: a value inside the bound is the subject, verbatim.
+        let drops = Arc::new(SubjectDropCounters::default());
+        let mtls = MtlsResolver::default().with_subject_header(SUBJECT_HEADER, Arc::clone(&drops));
+        let principal = mtls.resolve_principal(&request(alice())).expect("resolves");
+        assert_eq!(principal.tenant, TenantId::new("acme"));
+        let subject = principal.subject.expect("the header sets the subject");
+        assert_eq!(subject.value(), "CN=alice,O=Acme");
+        assert_eq!(subject.source(), SubjectSource::Mtls);
+        assert_eq!(drops.snapshot(), no_drops());
+        assert_eq!(
+            mtls.resolve(&request(alice())).expect("resolves"),
+            TenantId::new("acme")
+        );
+
+        // No tenant header: no principal, and the subject header is not read.
+        let mut subject_only = HeaderMap::new();
+        subject_only.insert(SUBJECT_HEADER, HeaderValue::from_static("CN=alice"));
+        assert!(mtls.resolve_principal(&subject_only).is_err());
+        assert!(mtls.resolve(&subject_only).is_err());
+        assert_eq!(drops.snapshot(), no_drops());
+
+        let cases: [(&str, Option<HeaderValue>, SubjectDropReason); 6] = [
+            ("missing", None, SubjectDropReason::Missing),
+            (
+                "empty",
+                Some(HeaderValue::from_static("")),
+                SubjectDropReason::Empty,
+            ),
+            (
+                "space",
+                Some(HeaderValue::from_static("CN=alice smith")),
+                SubjectDropReason::Charset,
+            ),
+            (
+                "RFC 4514 DN with a space",
+                Some(HeaderValue::from_static("CN=Alice Smith,O=Example Corp")),
+                SubjectDropReason::Charset,
+            ),
+            (
+                "not UTF-8",
+                Some(HeaderValue::from_bytes(b"CN=\xffalice").expect("opaque bytes are a value")),
+                SubjectDropReason::Charset,
+            ),
+            (
+                "256 bytes",
+                Some(
+                    HeaderValue::from_str(&"a".repeat(SUBJECT_MAX_BYTES + 1))
+                        .expect("ASCII is a value"),
+                ),
+                SubjectDropReason::TooLong,
+            ),
+        ];
+        for (name, value, reason) in cases {
+            let drops = Arc::new(SubjectDropCounters::default());
+            let mtls =
+                MtlsResolver::default().with_subject_header(SUBJECT_HEADER, Arc::clone(&drops));
+            let headers = request(value);
+            let principal = mtls
+                .resolve_principal(&headers)
+                .unwrap_or_else(|_| panic!("{name}: a dropped subject still resolves"));
+            assert_eq!(
+                principal,
+                Principal::tenant_only(TenantId::new("acme")),
+                "{name}: the tenant, no subject"
+            );
+            assert_eq!(drops.snapshot(), only(reason), "{name}");
+            assert_eq!(
+                mtls.resolve(&headers).expect("resolves"),
+                TenantId::new("acme"),
+                "{name}: resolve is unchanged"
+            );
+            assert_eq!(
+                drops.snapshot(),
+                only(reason),
+                "{name}: resolve counts nothing"
+            );
+        }
+
+        // 255 bytes is inside the bound.
+        let drops = Arc::new(SubjectDropCounters::default());
+        let mtls = MtlsResolver::default().with_subject_header(SUBJECT_HEADER, Arc::clone(&drops));
+        let longest = "a".repeat(SUBJECT_MAX_BYTES);
+        let principal = mtls
+            .resolve_principal(&request(Some(HeaderValue::from_str(&longest).unwrap())))
+            .expect("resolves");
+        assert_eq!(principal.subject.expect("255 bytes fits").value(), longest);
+        assert_eq!(drops.snapshot(), no_drops());
     }
 
     // A real 2048-bit RSA keypair (openssl genrsa 2048), used to sign and

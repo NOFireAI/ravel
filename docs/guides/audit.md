@@ -204,8 +204,10 @@ under a lost key stay readable, but they do not correlate with later records.
   Both are absent when no subject is configured for the caller's credential,
   and never written empty. A subject comes from a `subject=LABEL` entry on a
   static token or from the claim named by `--oidc-subject-claim`, never from a
-  request header the caller chooses. It goes to audit records only, never to
-  a query response.
+  request header the caller chooses. On the mTLS listener it is the value the
+  proxy forwards in the header named by `--mtls-subject-header`, recorded
+  verbatim with source `mtls`; no other listener reads that header. It goes to
+  audit records only, never to a query response.
 
 `ts_ns` is the request timestamp. `body` is a one-line summary
 (`sql query ok`). `severity_text` is `INFO` for `ok` and `ERROR` for `error`,

@@ -1437,12 +1437,39 @@ because a trusted hop set it, and anyone can forge it if that hop is absent.
   deployment starting. Nothing else about the deployment changes.
 - A loopback-bound mTLS listener is unaffected.
 
+`--mtls-subject-header <HEADER>` names a second header the proxy forwards:
+who, within the tenant, the verified certificate belongs to. It has no
+default; unset, the mTLS resolver sets no subject.
+
+- The header is under the same trust rule as the tenant header. The proxy
+  sets it from the certificate it verified and strips any client-supplied
+  copy before it forwards.
+- It is read on the mTLS listener only. The public HTTP and gRPC listeners
+  never contain the mTLS resolver, so the header has no effect there,
+  whatever a client sends.
+- The value is recorded verbatim, never parsed, into the query audit record
+  as `query.principal.subject`, with `query.principal.subject_source` set to
+  `mtls`. It grants no capability.
+- The value must be 1 to 255 bytes of printable ASCII with no space. A
+  missing, empty, longer or otherwise out-of-bound value leaves the subject
+  absent, still authenticates the request, and adds one to
+  `ravel_auth_subject_dropped_total{source="mtls"}` with the reason.
+- A space is outside that bound, so an RFC 4514 subject DN such as
+  `CN=Alice Smith,O=Example Corp` is dropped with reason `charset`. Have the
+  proxy forward a value without a space: a SAN such as an email address or a
+  URI, or a single CN component that has none.
+- The tenant reads the recorded value through the `audit` table, so choose
+  a value you are content for the tenant to read.
+
 Dependent flags fail fast. Each of these combinations refuses to start:
 
 - `--oidc-tenant-claim`, `--oidc-ddl-claim`, `--oidc-ipcrypt-claim`,
   `--oidc-agents-claim`, `--oidc-agents-worker-claim`,
   `--oidc-agents-admin-claim`, or `--oidc-audience` without OIDC enabled
-- `--mtls-header` or `--mtls-listener` without `--mtls-enabled`
+- `--mtls-header`, `--mtls-subject-header` or `--mtls-listener` without
+  `--mtls-enabled`
+- `--mtls-subject-header` empty, or naming the tenant header
+  (`--mtls-header`, or its default)
 - `--mtls-enabled` without `--mtls-listener`
 - `--mtls-trust-forwarded-header` without `--mtls-listener`
 
