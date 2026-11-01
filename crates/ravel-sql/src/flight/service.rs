@@ -53,9 +53,7 @@ use tonic::transport::ClientTlsConfig;
 use crate::distributed::{
     DistributedFlightConfig, FlightWorkerSliceClient, SliceTlsDialCounter, WorkerSliceClient,
 };
-use crate::executor::{
-    ParquetPlan, PinnedLanes, PinnedPlanInputs, SqlExecutor, unqualified_tokens,
-};
+use crate::executor::{ParquetPlan, PinnedLanes, PinnedPlanInputs, SqlExecutor};
 use crate::flight::request::{sql_request, status_from_sql};
 use crate::flight::slice::{
     FlightListenerRole, SliceReject, SliceRejectCounters, check_slice_claims, verify_slice,
@@ -583,9 +581,13 @@ impl FlightSqlService for RavelFlightSqlService {
             tenant,
             statement: query.query.clone(),
             segments,
-            // A ticket carries plain tokens: a qualified one cannot ride it.
-            min_commit_tokens: unqualified_tokens(&req.min_tokens)
-                .map_err(|err| status_from_sql(&err, tenant))?,
+            // An untagged list (ADR-2904 decision 10): the qualifiers did
+            // their work in the resolve above, and `DoGet` resolves nothing.
+            min_commit_tokens: req
+                .min_tokens
+                .iter()
+                .map(|min_token| min_token.token.clone())
+                .collect(),
             now_ns,
             deadline_ns,
             slice_index: 0,

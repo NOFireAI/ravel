@@ -125,7 +125,7 @@ use ravel_types::accounting::{
     CostEstimate, NoopQueryCostRecorder, QueryAccounting, QueryAccountingSnapshot,
     QueryCostRecorder, QueryWorkloadClass,
 };
-use ravel_types::{CommitToken, Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use tokio::sync::Notify;
 use tonic::metadata::{KeyRef, MetadataMap};
 use tonic::{Request, Status};
@@ -404,7 +404,10 @@ impl FlightAuth for FixedAuth {
         Ok(TENANT)
     }
 
-    fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
+    fn min_commit_tokens(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Vec<ravel_sql::MinCommitToken>, Status> {
         Ok(Vec::new())
     }
 }
@@ -3778,7 +3781,10 @@ impl FlightAuth for CountingAuth {
             .ok_or_else(|| Status::unauthenticated("invalid or missing tenant credentials"))
     }
 
-    fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
+    fn min_commit_tokens(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Vec<ravel_sql::MinCommitToken>, Status> {
         Ok(Vec::new())
     }
 }
