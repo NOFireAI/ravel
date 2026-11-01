@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, HeaderValue};
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_logseg::{AttrValue, LogRecord, Predicate, RlogConfig, RlogReader};
@@ -193,38 +192,25 @@ async fn a_query_on_the_mtls_listener_records_the_proxy_set_subject_and_the_publ
     let running = start_server(store.clone()).await;
     let tenant = TenantId::new(TENANT);
 
-    let mut proxy_headers = HeaderMap::new();
-    proxy_headers.insert(
-        MtlsResolver::DEFAULT_HEADER,
-        HeaderValue::from_static(TENANT),
-    );
-    proxy_headers.insert(SUBJECT_HEADER, HeaderValue::from_static(SUBJECT));
+    let client = reqwest::Client::new();
 
-    // The mTLS query service, driven as its in-process transport drives it:
-    // authenticate the headers, then run the query under that principal.
-    let mtls_service = running
-        .mtls_query_service
-        .as_ref()
-        .expect("an mTLS listener was configured on a query-serving mode");
-    let principal = mtls_service
-        .authenticate_principal(&proxy_headers)
-        .expect("the mTLS headers authenticate");
-    assert_eq!(principal.tenant, tenant);
-    let instant = ravel_query::http::service::InstantRequest {
-        query: "m".to_string(),
-        time_ms: 0,
-        min_tokens: Vec::new(),
-        deadline: std::time::Duration::from_secs(30),
-        allow_partial: false,
-        now_ns: 4 * 3_600_000_000_000,
-        budgets: None,
-    };
-    mtls_service
-        .clone()
-        .with_audit_subject(ravel_query::http::audit_subject(&principal))
-        .promql_instant(principal.tenant.hash(), &instant)
+    // The mTLS listener's own socket, carrying the two headers the
+    // TLS-terminating proxy forwards.
+    let mtls_addr = running.mtls_addr.expect("an mTLS listener was configured");
+    let response = client
+        .get(format!("http://{mtls_addr}/api/v1/query"))
+        .header(MtlsResolver::DEFAULT_HEADER, TENANT)
+        .header(SUBJECT_HEADER, SUBJECT)
+        .query(&[("query", "m"), ("time", "0")])
+        .send()
         .await
-        .unwrap_or_else(|err| panic!("the mTLS service serves the query: {err:?}"));
+        .expect("request sent");
+    let status = response.status();
+    let body = response.text().await.expect("body readable");
+    assert_eq!(
+        status, 200,
+        "the proxy headers authenticate on the mTLS listener: {body}"
+    );
 
     let records = query_audit_records(store.as_ref(), &tenant).await;
     assert_eq!(records.len(), 1, "the mTLS query writes one record");
@@ -234,7 +220,6 @@ async fn a_query_on_the_mtls_listener_records_the_proxy_set_subject_and_the_publ
 
     // The public listener, as PUB, with both proxy headers attached.
     let base = format!("http://{}", running.http_addr);
-    let client = reqwest::Client::new();
     let query = || {
         client
             .get(format!("{base}/api/v1/query"))
