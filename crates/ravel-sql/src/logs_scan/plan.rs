@@ -33,6 +33,43 @@ pub(super) struct PlanCounts {
     /// What the tier-1 KEY_IDX probe pruned over every planned segment
     /// (ADR-2707 decision 5), published once by partition 0.
     pub(super) key_index: KeyIndexPruning,
+    /// The decoded-set verdict for a scan with a `Contains` arm and a decoded
+    /// cache ([`deferred_verdict`]); `None` otherwise.
+    deferred: Option<DeferredVerdict>,
+}
+
+/// Whether a scan's Contains-deferred columns are served from the decoded
+/// cache, made once per scan by the plan pass (ADR-3326, serve-if-fits
+/// amendment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DeferredVerdict {
+    /// What the cache would charge to hold every projected column over every
+    /// block the plan publishes, summed over the planned segments
+    /// ([`SegmentDirectories::decoded_set_estimate`]).
+    pub(super) estimate_bytes: u64,
+    /// The estimate is at most 0.95 of the cap and every segment is planned.
+    pub(super) serve: bool,
+}
+
+/// The serve-if-fits rule (ADR-3326, serve-if-fits amendment, decision 2): a
+/// scan fits when every segment it opens was planned (`unplanned` is
+/// [`skips_sub_bound_plans`]) and `estimate_bytes` is at most 0.95 of
+/// `cap_bytes`, `--decoded-cache-max-bytes`.
+pub(super) fn deferred_verdict(estimate_bytes: u64, cap_bytes: u64, unplanned: bool) -> DeferredVerdict {
+    let fits = u128::from(estimate_bytes) * 20 <= u128::from(cap_bytes) * 19;
+    DeferredVerdict {
+        estimate_bytes,
+        serve: fits && !unplanned,
+    }
+}
+
+/// Whether `content` holds a `Contains` arm, at any depth of `And`.
+fn has_contains_arm(content: &[Predicate]) -> bool {
+    content.iter().any(|p| match p {
+        Predicate::Contains { .. } => true,
+        Predicate::And(inner) => has_contains_arm(inner),
+        _ => false,
+    })
 }
 
 /// What the plan phase learned about a segment with at least one surviving
@@ -409,6 +446,14 @@ async fn compute_plan_counts(
     let mut carried_bytes = 0u64;
     let mut carried_seen = 0usize;
     let mut key_index = KeyIndexPruning::default();
+    // ADR-3326, serve-if-fits amendment: only a scan with a `Contains` arm and
+    // a decoded cache needs the decoded-set estimate.
+    let deferred_cap = ctx
+        .fetcher
+        .decoded_cache()
+        .filter(|_| has_contains_arm(&ctx.query.content))
+        .map(|cache| cache.max_bytes());
+    let mut deferred_estimate = 0u64;
     while let Some((idx, entry)) = stream.next().await {
         let keyed = match entry.map_err(SqlError::from)? {
             PlanPassRead::Planned(keyed) => *keyed,
@@ -453,6 +498,18 @@ async fn compute_plan_counts(
             // and only then are they reserved: `PlanCounts::publish` skips a
             // zero-survivor segment, so carrying them would hold decoded
             // bytes nothing reuses.
+            if deferred_cap.is_some() && survivors > 0 {
+                let published = keyed.key_blocks.as_deref().unwrap_or(&indices);
+                let estimate = dirs
+                    .decoded_set_estimate(&ctx.columns, published)
+                    .map_err(|source| {
+                        SqlError::LogFetch(LogFetchError::Corrupt {
+                            key: segments[idx].data_object_key.clone(),
+                            source,
+                        })
+                    })?;
+                deferred_estimate = deferred_estimate.saturating_add(estimate);
+            }
             let planned = if survivors > 0 {
                 let reservation = ctx
                     .fetcher
@@ -485,7 +542,14 @@ async fn compute_plan_counts(
     ctx.phase_accounting
         .plan()
         .observe_intermediate_bytes(carried_bytes);
-    Ok(Arc::new(PlanCounts::assemble(
+    let deferred = deferred_cap.map(|cap| {
+        let verdict = deferred_verdict(deferred_estimate, cap, skip_sub_bound);
+        ctx.phase_accounting
+            .decoded_cache()
+            .record_deferred_verdict(verdict.estimate_bytes, verdict.serve);
+        verdict
+    });
+    let mut counts = PlanCounts::assemble(
         segs,
         unplanned,
         full_reads,
@@ -493,7 +557,9 @@ async fn compute_plan_counts(
         segments,
         stripe_blocks,
         by_min_ts,
-    )))
+    );
+    counts.deferred = deferred;
+    Ok(Arc::new(counts))
 }
 
 /// Which of a segment's blocks one published unit carries.
@@ -538,7 +604,20 @@ impl PlanCounts {
             full_reads,
             global,
             key_index,
+            deferred: None,
         }
+    }
+
+    /// Whether the scan serves its Contains-deferred columns from the decoded
+    /// cache: the plan pass's [`DeferredVerdict`], false when it made none.
+    pub(super) fn serves_deferred(&self) -> bool {
+        self.deferred.is_some_and(|v| v.serve)
+    }
+
+    /// The plan pass's decoded-set verdict, when it made one.
+    #[cfg(test)]
+    pub(super) fn deferred_verdict(&self) -> Option<DeferredVerdict> {
+        self.deferred
     }
 
     fn planned(&self, seg_idx: usize) -> Option<&PlannedBlocks> {
@@ -2910,6 +2989,116 @@ mod carried_directory_reservation_tests {
         }
     }
 
+    /// ADR-3326, serve-if-fits amendment, decision 2: the verdict is "fits"
+    /// exactly when the estimate is at most 0.95 of the cap and every segment
+    /// is planned.
+    #[test]
+    fn the_deferred_verdict_fits_at_most_0_95_of_the_cap() {
+        assert!(deferred_verdict(95, 100, false).serve);
+        assert!(deferred_verdict(0, 0, false).serve);
+        assert!(!deferred_verdict(96, 100, false).serve);
+        assert!(!deferred_verdict(100, 100, false).serve);
+        assert!(!deferred_verdict(0, 100, true).serve);
+        assert!(deferred_verdict(u64::MAX / 20 * 19, u64::MAX / 20 * 20, false).serve);
+        assert_eq!(deferred_verdict(96, 100, false).estimate_bytes, 96);
+    }
+
+    /// ADR-3326, serve-if-fits amendment: two sub-bound segments under a scan
+    /// with a `Contains` arm. At a plan concurrency of 2 the scan holds as many
+    /// sub-bound segments as partitions, so [`skips_sub_bound_plans`] leaves
+    /// both unplanned and the scan is withheld, with an estimate of 0 since no
+    /// segment's directories were read. At 3 both are planned, the estimate is
+    /// the sum of each segment's [`SegmentDirectories::decoded_set_estimate`]
+    /// over the blocks the plan publishes, and the scan is served. Both
+    /// verdicts reach the statement's decoded-cache counters.
+    #[tokio::test]
+    async fn a_scan_that_skips_sub_bound_plans_is_withheld() {
+        use ravel_logseg::decoded_cache::DecodedColumnCache;
+
+        let store = Arc::new(MemoryStore::new());
+        let objects = [object(1, 1), object(2, 1)];
+        let mut segments = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            let key = format!("t/small{i}.rlog");
+            store
+                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(seg_ref(&key, obj, 1, i as u64 + 1));
+        }
+        let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
+        let ctx = || PartitionCtx {
+            fetcher: LogSegmentFetcher::new(store.clone()).with_decoded_cache(Arc::clone(&cache)),
+            tenant_hash: TENANT,
+            query: LogQuery::new(0, 100).with_content(Predicate::Contains {
+                key: "k".into(),
+                needle: "row".into(),
+                negated: false,
+            }),
+            columns: ColumnSelection::all(),
+            projected_fraction: 1.0,
+            phase_accounting: PhaseAccounting::new(),
+            serve_deferred: Default::default(),
+        };
+        assert!(
+            segments.iter().all(|seg| !ctx().fetcher.plans_segment(seg)),
+            "both segments are sub-bound"
+        );
+
+        let skipping = ctx();
+        let counts = compute_plan_counts(&skipping, &segments, 2, true, false)
+            .await
+            .expect("plan counts");
+        assert!(counts.is_unplanned(0) && counts.is_unplanned(1));
+        assert_eq!(
+            counts.deferred_verdict(),
+            Some(DeferredVerdict {
+                estimate_bytes: 0,
+                serve: false
+            })
+        );
+        assert!(!counts.serves_deferred());
+        let s = skipping.phase_accounting.decoded_cache().snapshot();
+        assert_eq!((s.deferred_set_estimate_bytes, s.deferred_served), (Some(0), false));
+
+        let planning = ctx();
+        let counts = compute_plan_counts(&planning, &segments, 3, true, false)
+            .await
+            .expect("plan counts");
+        let mut expected = 0u64;
+        for (i, obj) in objects.iter().enumerate() {
+            assert!(!counts.is_unplanned(i));
+            let published: Vec<usize> = counts
+                .planned(i)
+                .expect("planned with survivors")
+                .groups
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(published.len(), BLOCKS);
+            let dirs = RlogReader::new(obj, &RlogConfig::default())
+                .expect("reader")
+                .directories();
+            expected += dirs
+                .decoded_set_estimate(&ColumnSelection::all(), &published)
+                .expect("estimate");
+        }
+        assert!(expected > 0);
+        assert_eq!(
+            counts.deferred_verdict(),
+            Some(DeferredVerdict {
+                estimate_bytes: expected,
+                serve: true
+            })
+        );
+        let s = planning.phase_accounting.decoded_cache().snapshot();
+        assert_eq!(
+            (s.deferred_set_estimate_bytes, s.deferred_served),
+            (Some(expected), true)
+        );
+    }
+
     /// Two segments with a surviving block and one that overlaps the query
     /// window but has none: the budget holds exactly the first two segments'
     /// decoded directory bytes while the plan counts live, and nothing once
@@ -2973,6 +3162,7 @@ mod carried_directory_reservation_tests {
             columns: ColumnSelection::all(),
             projected_fraction: 1.0,
             phase_accounting: PhaseAccounting::new(),
+            serve_deferred: Default::default(),
         };
         assert_eq!(budget.reserved(), 0);
         let counts = compute_plan_counts(&ctx, &segments, 4, true, false)
@@ -3034,6 +3224,7 @@ mod carried_directory_reservation_tests {
             columns: ColumnSelection::all(),
             projected_fraction: 1.0,
             phase_accounting: PhaseAccounting::new(),
+            serve_deferred: Default::default(),
         };
         let exact = compute_plan_counts(&with_limit(total), &segments, 1, true, false).await;
         assert!(
@@ -3101,6 +3292,7 @@ mod carried_directory_reservation_tests {
             columns: ColumnSelection::all(),
             projected_fraction: 1.0,
             phase_accounting: PhaseAccounting::new(),
+            serve_deferred: Default::default(),
         };
         let counts = compute_plan_counts(&ctx, &segments, 2, true, false)
             .await
@@ -3211,6 +3403,7 @@ mod carried_directory_reservation_tests {
             full_reads: 1,
             global: None,
             key_index: KeyIndexPruning::default(),
+            deferred: None,
         };
         assert!(exec.counts.set(Arc::new(counts)).is_ok());
         let mut stream = exec
