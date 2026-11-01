@@ -260,8 +260,8 @@ pub enum SqlError {
     /// rules (ADR-2904, LIKE-scope amendment, #3026). A qualifier then names a
     /// relation that is not that table. `FROM logs AS logs` is not refused: it
     /// still names the logs relation. Refused from the statement text before
-    /// any catalog resolve. `name` is the caller's own text, cut to 64 bytes;
-    /// HTTP 400.
+    /// any catalog resolve. `name` is the caller's own text and `table` the
+    /// table name it equals, each cut to 64 bytes; HTTP 400.
     #[error(
         "{kind} {name:?} shadows the table {table}; in a statement that reads more \
          than one table, an alias or CTE name may not equal a table name: rename it"
@@ -273,7 +273,8 @@ pub enum SqlError {
         /// The declared name as written, truncated to 64 bytes on a char
         /// boundary.
         name: String,
-        /// The table name it shadows.
+        /// The table name it shadows, truncated to 64 bytes on a char
+        /// boundary.
         table: String,
     },
 

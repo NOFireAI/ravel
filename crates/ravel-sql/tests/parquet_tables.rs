@@ -1468,6 +1468,54 @@ async fn a_logs_key_equality_beside_a_parquet_table_returns_exact_rows() {
     }
 }
 
+/// The plan treats a logs table beside a Parquet table as a statement over
+/// several tables, as the resolve's budget check does, so the logs
+/// column-stats gate reads only the `logs` scan's own conjuncts. The tenant
+/// declares a logs column `id`, the name of a `hits` column: beside a `SUM`
+/// over `logs` that the statistics can answer, `h.id = 1` is a `hits`
+/// predicate and leaves the load, whose first read is a GET of the logs
+/// catalog HEAD, while the same equality on the logs scan declines it.
+///
+/// FLIP: a plan that counts signal lanes alone reads the whole statement's
+/// filters, takes `h.id = 1` for a logs prune on `id`, and skips the load.
+#[tokio::test]
+async fn a_parquet_predicate_beside_logs_leaves_the_logs_column_stats_load() {
+    let (mut declared, key_index) = keyed_declared();
+    declared.push(DeclaredColumn::new("id", DeclaredType::I64));
+    let (lake, gets) = Lake::keyed(declared, key_index);
+    let acme = util::tenant_id("acme");
+    lake.hits_for(&acme.hash()).await;
+    for (index, records) in KEYED_LOGS.iter().enumerate() {
+        publish_keyed_logs(lake.ravel.as_ref(), &acme, index, records).await;
+    }
+    let logs_head = format!("t/{}/catalog/l/HEAD", acme.hash().to_hex());
+    let declines = "SELECT h.name, (SELECT SUM(latency_ms) FROM logs WHERE id = 1) \
+                    FROM hits h WHERE h.id = 1";
+    // The resolve's own HEAD read is cached after the first statement, so a
+    // HEAD GET below is the column-stats load's.
+    lake.execute(&acme.hash(), declines).await.expect(declines);
+    let cases = [
+        (
+            "SELECT h.name, (SELECT SUM(latency_ms) FROM logs) FROM hits h WHERE h.id = 1",
+            vec!["a|60"],
+            1,
+        ),
+        (declines, vec!["a|"], 0),
+    ];
+    for (sql, want_rows, want_head_gets) in cases {
+        gets.lock().expect("range log").clear();
+        let outcome = lake.execute(&acme.hash(), sql).await.expect(sql);
+        assert_eq!(rows(&outcome), want_rows, "{sql}");
+        let head_gets = gets
+            .lock()
+            .expect("range log")
+            .iter()
+            .filter(|(key, _)| *key == logs_head)
+            .count();
+        assert_eq!(head_gets, want_head_gets, "{sql}: logs catalog HEAD GETs");
+    }
+}
+
 /// A Parquet table has no commit tokens, so a `min_commit_token` on a
 /// statement that reads only Parquet tables is
 /// [`SqlError::CommitTokenOnParquetStatement`], unqualified or qualified with
@@ -2918,11 +2966,14 @@ async fn a_mixed_statement_is_held_to_one_byte_budget() {
 /// least the logs lane's own resolve reads and the Parquet estimate (its
 /// resolve reads plus one GET per file), so neither check alone refuses, and
 /// below their sum: the logs lane's check refuses with exactly that sum,
-/// before any scan GET.
+/// before any scan GET. The statement names two tables, so the refusal names
+/// the table whose check refused, as a two-signal statement's does.
 ///
 /// FLIP: resolving the Parquet tables after the lanes lets the logs lane's
 /// check see its own reads alone, and the Parquet check then refuses with
-/// its estimate on top of the logs reads, a different count.
+/// its estimate on top of the logs reads, a different count. A resolve path
+/// that counts signal lanes alone, and not the Parquet table beside them,
+/// names no table.
 #[tokio::test]
 async fn a_lanes_resolve_budget_check_counts_the_parquet_resolve_reads() {
     let acme = tenant("acme");
@@ -2957,7 +3008,7 @@ async fn a_lanes_resolve_budget_check_counts_the_parquet_resolve_reads() {
     assert!(
         matches!(
             err,
-            SqlError::RequestBudgetExceeded { requests, max: limit, table: None, .. }
+            SqlError::RequestBudgetExceeded { requests, max: limit, table: Some("logs"), .. }
                 if requests == resolve && limit == max
         ),
         "{err:?}"
