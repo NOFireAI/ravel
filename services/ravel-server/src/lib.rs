@@ -3551,6 +3551,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         // configured.
         #[cfg(feature = "sql")]
         let mtls_sql_query_state: Option<sql::SqlState>;
+        // The declared-column source the SQL executor plans with, kept for the
+        // `describe_data` state of both listeners' `QueryService`.
+        #[cfg(feature = "sql")]
+        let describe_declared_columns: Arc<dyn ravel_sql::DeclaredColumnSource>;
         #[cfg(feature = "sql")]
         {
             // Mounted alongside the Prometheus-shaped routes on the same
@@ -3577,6 +3581,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 );
             }
             sweep_declared_columns = Some(declared_columns.clone());
+            describe_declared_columns = declared_columns.clone();
             // ADR-2040: the deployment's minimum DDL sweep grace, from the
             // already-bootstrapped `sys/gc` (`config.gc`, read once at
             // startup in `main`) rather than a second read of the durable
@@ -3939,6 +3944,25 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         .with_exemplars(exemplars_state);
         #[cfg(feature = "sql")]
         let query_service = query_service.with_sql(sql_query_state);
+        // `describe_data` reads the catalog and the metadata cache the routes
+        // above serve from, never instances of its own. Both exist in every
+        // mode this block runs in; the `None` arm only keeps the two facts
+        // from having to agree here.
+        #[cfg(feature = "sql")]
+        let describe_state =
+            metadata_cache
+                .as_ref()
+                .map(|metadata_cache| service::describe::DescribeState {
+                    catalog: catalog.clone(),
+                    metadata_cache: metadata_cache.clone(),
+                    declared_columns: describe_declared_columns.clone(),
+                    max_deadline: app_state.engine.config().deadline,
+                });
+        #[cfg(feature = "sql")]
+        let query_service = match describe_state.clone() {
+            Some(state) => query_service.with_describe(state),
+            None => query_service,
+        };
         // `POST /mcp` (ADR-1374 decision 7), on the same listener and behind
         // the same tenant resolver as the HTTP query routes above. Mounted
         // from the query service just built rather than from a facade of its
@@ -4001,6 +4025,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             #[cfg(feature = "sql")]
             let mtls_query_service = match mtls_sql_query_state {
                 Some(state) => mtls_query_service.with_sql(state),
+                None => mtls_query_service,
+            };
+            #[cfg(feature = "sql")]
+            let mtls_query_service = match describe_state.clone() {
+                Some(state) => mtls_query_service.with_describe(state),
                 None => mtls_query_service,
             };
             // The mTLS listener's own MCP route, from the instance built just
