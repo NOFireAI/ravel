@@ -148,7 +148,7 @@ the first ledger entry.
    # --paths: predicted files for this task, from the Stage 2 table.
    # Optional, but it is what turns an overlapping open pull request
    # into a refusal instead of two divergent rewrites of one file.
-   bin/agent-cli dispatch <epic> <sub-issue> <spec-file> \
+   bin/agent-cli dispatch --epic <epic> --ticket <sub-issue> --spec <spec-file> \
      --paths crates/x/src/a.rs,crates/x/src/b.rs [--effort high]
    ```
 

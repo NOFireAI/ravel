@@ -6,7 +6,7 @@
     {"pattern": "\\bgh\\s+issue\\s+view\\b", "subcommand": "issue N", "answers": "state, checklist counts, body; epic N adds the ledger with live task states"},
     {"pattern": "\\bscripts/pr-review-status\\.sh\\b", "subcommand": "merge-line N", "answers": "the pinned merge command or the notes that withheld it"},
     {"pattern": "\\bscripts/epic-status\\.sh\\b", "subcommand": "epic N", "answers": "ledger rows with task state and PR"},
-    {"pattern": "\\bscripts/fleet-dispatch-intent\\.sh\\s+intent\\b", "subcommand": "dispatch EPIC TICKET SPEC", "answers": "lint, intent, fleet_dispatch, record and the ledger line in one command"},
+    {"pattern": "\\bscripts/fleet-dispatch-intent\\.sh\\s+intent\\b", "subcommand": "dispatch --epic E --ticket T --spec FILE", "answers": "lint, intent, fleet_dispatch, record and the ledger line in one command"},
     {"pattern": "\\bscripts/guards/assert-fresh-merge-base\\.sh\\b", "subcommand": "fresh N", "answers": "the guard's verdict and first lines"},
     {"pattern": "\\bscripts/guards/assert-clean-authorship\\.sh\\b", "subcommand": "authorship [REF]", "answers": "the guard with the configured email"},
     {"pattern": "\\bpython3?\\s+scripts/check_docs\\.py\\b", "subcommand": "docs-check", "answers": "check_docs plus the five doc guards"},
