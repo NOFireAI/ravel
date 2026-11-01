@@ -8,6 +8,7 @@
 
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const WAKEUP_FLOOR_SECONDS = 900;
 
@@ -23,6 +24,20 @@ function deny(reason) {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
         permissionDecisionReason: reason,
+      },
+    }),
+  );
+  process.exit(0);
+}
+
+// Allow, and add a note the model reads beside the tool result. No
+// permissionDecision is set, so the user's permission flow is unchanged.
+function allowWithContext(context) {
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext: context,
       },
     }),
   );
@@ -608,6 +623,33 @@ function checkBash(rawCommand, cwd) {
   }
 }
 
+// --- agent-cli nudge ----------------------------------------------------
+// bin/agent-cli answers the lookups sessions kept re-deriving by hand
+// (AGENTS.md says to use it first). The raw command is allowed; the note
+// names the subcommand that answers it in one call. It fires only when the
+// checkout has the file, so a stale tree or an old fleet ref gets nothing.
+// The table is shared with `bin/agent-cli usage`, which counts the same
+// commands in session transcripts.
+function agentCliNudge(rawCommand, cwd) {
+  if (typeof rawCommand !== "string" || rawCommand.includes("agent-cli")) return null;
+  const base = typeof cwd === "string" && cwd !== "" ? cwd : process.cwd();
+  const found = gitDirFor(resolve(base));
+  if (!found || !existsSync(resolve(found.repoRoot, "bin", "agent-cli"))) return null;
+  const table = JSON.parse(
+    readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "agent-cli-nudges.json"), "utf8"),
+  );
+  const hits = [];
+  for (const n of table.nudges) {
+    if (new RegExp(n.pattern).test(rawCommand)) hits.push(`\`bin/agent-cli ${n.subcommand}\` (${n.answers})`);
+  }
+  if (hits.length === 0) return null;
+  return (
+    "bin/agent-cli answers this in one call, and AGENTS.md says to use it first: " +
+    hits.join("; ") +
+    ". Run `bin/agent-cli <subcommand> --help` for options; --json gives the same data as one object."
+  );
+}
+
 // --- Edit/Write rules ---------------------------------------------------
 
 function gitDirFor(startPath) {
@@ -700,8 +742,11 @@ try {
   const tool = payload.tool_name;
   const input = payload.tool_input ?? {};
 
-  if (tool === "Bash") checkBash(input.command, payload.cwd);
-  else if (tool === "Write" || tool === "Edit" || tool === "MultiEdit") {
+  if (tool === "Bash") {
+    checkBash(input.command, payload.cwd);
+    const nudge = agentCliNudge(input.command, payload.cwd);
+    if (nudge) allowWithContext(nudge);
+  } else if (tool === "Write" || tool === "Edit" || tool === "MultiEdit") {
     checkFileWrite(input.file_path);
   } else if (tool === "ScheduleWakeup") checkWakeup(input);
 } catch {

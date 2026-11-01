@@ -527,6 +527,58 @@ check allow "workspace check, fleet"                    "$(bash_in 'cargo check 
 check allow "scoped gates.sh, fleet"                    "$(bash_in 'scripts/gates.sh -p ravel-types' "$fleet")"
 rm -rf "$cliproot"
 
+# --- agent-cli nudge ------------------------------------------------------
+# The raw command is allowed and the output carries a note naming the
+# subcommand. It fires only in a checkout that has bin/agent-cli.
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+# want: nudge | quiet (both are allow)
+check_nudge() {
+  local want="$1" label="$2" payload="$3" out got
+  out=$(printf '%s' "$payload" | node "$GUARD" 2>&1) || {
+    printf 'FAIL  %-52s guard exited non-zero: %s\n' "$label" "$out"
+    fail=$((fail + 1))
+    return
+  }
+  if printf '%s' "$out" | grep -q '"permissionDecision":"deny"'; then
+    printf 'FAIL  %-52s nudge must never deny\n' "$label"
+    fail=$((fail + 1))
+    return
+  fi
+  if printf '%s' "$out" | grep -q 'additionalContext.*bin/agent-cli'; then
+    got=nudge
+  else
+    got=quiet
+  fi
+  if [ "$got" = "$want" ]; then
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  %-52s want %s, got %s\n' "$label" "$want" "$got"
+    fail=$((fail + 1))
+  fi
+}
+if [ -x "$repo_root/bin/agent-cli" ]; then
+  check_nudge nudge "gh pr view"                    "$(bash_in 'gh pr view 3583 --json state,mergedAt' "$repo_root")"
+  check_nudge nudge "gh api pulls comments"         "$(bash_in 'gh api --paginate repos/NOFireAI/ravel/pulls/3583/comments' "$repo_root")"
+  check_nudge nudge "gh issue view"                 "$(bash_in 'gh issue view 3541 --json body' "$repo_root")"
+  check_nudge nudge "pr-review-status.sh"           "$(bash_in 'scripts/pr-review-status.sh 3583' "$repo_root")"
+  check_nudge nudge "epic-status.sh"                "$(bash_in 'scripts/epic-status.sh 3541' "$repo_root")"
+  check_nudge nudge "intent script"                 "$(bash_in 'nonce=$(scripts/fleet-dispatch-intent.sh intent 1 2 abc)' "$repo_root")"
+  check_nudge nudge "check_docs.py"                 "$(bash_in 'python3 scripts/check_docs.py' "$repo_root")"
+  check_nudge nudge "df -h"                         "$(bash_in 'df -h /' "$repo_root")"
+  check_nudge nudge "df -h after cd"                "$(bash_in 'cd /tmp && df -h .' "$repo_root")"
+  check_nudge nudge "git worktree list"             "$(bash_in 'git worktree list' "$repo_root")"
+  check_nudge nudge "curl control plane task"       "$(bash_in 'curl -s https://cp.example/v1/tasks/abc' "$repo_root")"
+  check_nudge quiet "agent-cli itself"              "$(bash_in 'bin/agent-cli pr 3583' "$repo_root")"
+  check_nudge quiet "gh pr merge is not a lookup"   "$(bash_in 'gh pr merge 3583 --rebase' "$repo_root")"
+  check_nudge quiet "git worktree add"              "$(bash_in 'git worktree add ../x origin/main' "$repo_root")"
+  check_nudge quiet "grep for the words df -h"      "$(bash_in 'grep -rn "df -h" docs/' "$repo_root")"
+  check_nudge quiet "no cwd and not in a checkout"  "$(bash_in 'gh pr view 1' "$(mktemp -d)")"
+  # A nudge rides on an allow only: a denied command stays denied.
+  check deny  "nudge candidate piped from a guard"  "$(bash_in 'scripts/guards/assert-fresh-merge-base.sh 1 | head -3' "$repo_root")"
+else
+  printf 'SKIP  agent-cli nudge cases: %s/bin/agent-cli is not in this checkout\n' "$repo_root"
+fi
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"

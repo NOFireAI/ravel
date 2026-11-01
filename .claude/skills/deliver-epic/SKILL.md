@@ -136,45 +136,51 @@ the first ledger entry.
    working all refuse there. Calling the MCP tool directly skips all
    three, and "remember to check first" is not a check.
 
+   `bin/agent-cli dispatch` is that chokepoint as one command: it lints
+   the spec for the characters the dispatch service refuses, fetches
+   `origin/main` and uses that tip as the ref, runs
+   `scripts/fleet-dispatch-intent.sh intent`, calls `fleet_dispatch`
+   over the MCP server, then runs `fleet-dispatch-intent.sh record` and
+   `epic-orchestrator.sh record task-dispatched`, and writes the watch
+   URL to a file it names.
+
    ```sh
-   sha=$(git fetch origin main -q && git rev-parse origin/main)
-   # Predicted files for this task, from the Stage 2 table. Optional, but
-   # it is what turns an overlapping open pull request into a refusal
-   # instead of two divergent rewrites of one file.
-   export DISPATCH_PATHS="crates/x/src/a.rs,crates/x/src/b.rs"
-   nonce=$(scripts/fleet-dispatch-intent.sh intent <epic> <sub-issue> "$sha")
+   # --paths: predicted files for this task, from the Stage 2 table.
+   # Optional, but it is what turns an overlapping open pull request
+   # into a refusal instead of two divergent rewrites of one file.
+   bin/agent-cli dispatch <epic> <sub-issue> <spec-file> \
+     --paths crates/x/src/a.rs,crates/x/src/b.rs [--effort high]
    ```
 
-   Refusals here are terminal for that task this tick: 65 means a pull
-   request already addresses the ticket, 66 that one is already touching
-   those files, 69 that GitHub could not be asked, which is not the same
-   as a clean answer. Resolve the named pull request rather than reaching
-   for `DISPATCH_SKIP_DUPLICATE_CHECK=1`; that flag is for a deliberate
+   Read its exit code: 0 dispatched and recorded; 1 dispatched but a
+   ledger record failed, so fix the ledger and never redispatch; 2 not
+   dispatched, or the outcome is unknown and the intent is left open,
+   and the message says which. The intent script's own refusals pass
+   through: 65 means a pull request already addresses the ticket, 66
+   that one is already touching those files, 69 that GitHub could not be
+   asked, which is not the same as a clean answer. Resolve the named pull
+   request rather than reaching for `--fix` (which sets
+   `DISPATCH_SKIP_DUPLICATE_CHECK=1`); that flag is for a deliberate
    second task on one ticket (a fix round, a continuation after a ceiling
    kill), and a habit of using it to get past a refusal retires the guard.
+   `--ref <branch>` dispatches a deliberately older ref (a result branch
+   for a fix round) and records that ref.
 
-   Then `fleet_dispatch` with `ref=$sha`, and close out the intent with
-   the task id (or `failed` and the reason, if the dispatch errored):
-
-   ```sh
-   scripts/fleet-dispatch-intent.sh record <epic> "$nonce" <task_id>
-   scripts/epic-orchestrator.sh record <epic> task-dispatched \
-     ticket=<sub-issue> task=<task_id> ref="$sha"
-   ```
-
-   Both, not either. The intent script writes COMMENTS, which close out
-   the dangling-intent check; `epic-orchestrator.sh record` writes the
-   `- #<ticket> task=<uuid> dispatched` line into the issue BODY and reads
-   it back to prove it arrived (exit 70 if not: `gh` exits 0 on an edit
-   another session overwrote), and indexes it locally. `epic-status.sh`
-   reads the body and nothing else, so a task recorded only in comments is
+   Both records matter, which is why the command runs both. The intent
+   script writes COMMENTS, which close out the dangling-intent check;
+   `epic-orchestrator.sh record` writes the `- #<ticket> task=<uuid>
+   dispatched` line into the issue BODY and reads it back to prove it
+   arrived (exit 70 if not: `gh` exits 0 on an edit another session
+   overwrote), and indexes it locally. `bin/agent-cli epic <epic>` reads
+   the body and nothing else, so a task recorded only in comments is
    invisible to the reconciliation that exists to catch a silently dead
-   one. Record every task id IMMEDIATELY, before watching anything: a
-   dropped session with unrecorded task ids orphans running work, and
-   hand-editing the body instead leaves the index empty, so the resume
-   procedure's first command fails with exit 66.
+   one. A dropped session with unrecorded task ids orphans running work,
+   which is why the records run in the same command as the dispatch.
 4. Watch with `scripts/fleet-watch.sh <watch-url> <interval>` in
-   background, one per task. Pass the bare command straight to the
+   background, one per task; the watch URL is in the file
+   `bin/agent-cli dispatch` printed as `watch=`, and `bin/agent-cli task
+   <task-id>` reads the task's state and report from the control plane
+   when the file is gone. Pass the bare command straight to the
    background-execution tool with its own backgrounding flag (e.g. the
    Bash tool's `run_in_background: true`) - do not wrap it in `nohup
    ... &` yourself first. Backgrounding it manually returns control to

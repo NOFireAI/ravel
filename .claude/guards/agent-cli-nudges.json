@@ -1,0 +1,17 @@
+{
+  "comment": "Raw commands bin/agent-cli replaces. pretooluse.mjs allows each and adds a note naming the subcommand; bin/agent-cli usage counts them against agent-cli calls in session transcripts. Patterns must parse as both a JavaScript and a Python regular expression.",
+  "nudges": [
+    {"pattern": "\\bgh\\s+pr\\s+(view|checks|status)\\b", "subcommand": "pr N", "answers": "state, CI counts, review at head, findings by severity; pr-landed N for the merge queue"},
+    {"pattern": "\\bgh\\s+api\\b[^;|&]*/pulls/\\d+/(comments|reviews)\\b", "subcommand": "pr-findings N", "answers": "each bot finding with severity, path, line and whether it was replied to"},
+    {"pattern": "\\bgh\\s+issue\\s+view\\b", "subcommand": "issue N", "answers": "state, checklist counts, body; epic N adds the ledger with live task states"},
+    {"pattern": "\\bscripts/pr-review-status\\.sh\\b", "subcommand": "merge-line N", "answers": "the pinned merge command or the notes that withheld it"},
+    {"pattern": "\\bscripts/epic-status\\.sh\\b", "subcommand": "epic N", "answers": "ledger rows with task state and PR"},
+    {"pattern": "\\bscripts/fleet-dispatch-intent\\.sh\\s+intent\\b", "subcommand": "dispatch EPIC TICKET SPEC", "answers": "lint, intent, fleet_dispatch, record and the ledger line in one command"},
+    {"pattern": "\\bscripts/guards/assert-fresh-merge-base\\.sh\\b", "subcommand": "fresh N", "answers": "the guard's verdict and first lines"},
+    {"pattern": "\\bscripts/guards/assert-clean-authorship\\.sh\\b", "subcommand": "authorship [REF]", "answers": "the guard with the configured email"},
+    {"pattern": "\\bpython3?\\s+scripts/check_docs\\.py\\b", "subcommand": "docs-check", "answers": "check_docs plus the five doc guards"},
+    {"pattern": "(^|[;&|]\\s*)df\\s+-h\\b", "subcommand": "box", "answers": "free disk, load, build processes, running executor tasks"},
+    {"pattern": "\\bgit\\s+worktree\\s+list\\b", "subcommand": "wt ls", "answers": "worktrees with branch and dirty state"},
+    {"pattern": "\\bcurl\\b[^;|&]*/v1/tasks/", "subcommand": "task ID", "answers": "state, result ref, diff against main, report"}
+  ]
+}

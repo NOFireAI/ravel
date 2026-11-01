@@ -491,6 +491,16 @@ and must be kept: a `--match-head-commit` value re-resolved at merge time
 matches whatever the head is by then, so a push landing after review merges
 unreviewed. That is why `scripts/pr-review-status.sh` prints its merge line
 with the prefix already on it.
+The same hook also allows and annotates: a raw `gh pr view`, `gh api
+.../pulls/N/comments`, `gh issue view`, `pr-review-status.sh`,
+`epic-status.sh`, `fleet-dispatch-intent.sh intent`, `check_docs.py`,
+`df -h`, `git worktree list` or a control-plane `curl` gets a note naming
+the `bin/agent-cli` subcommand that answers it in one call, only when the
+checkout has that file. The table is
+`.claude/guards/agent-cli-nudges.json`, shared with `bin/agent-cli usage`,
+which counts those raw commands against agent-cli calls in this machine's
+session transcripts; that count, not the note, says whether the tool is
+being used.
 Its cases live in `.claude/guards/pretooluse.test.sh` and run in CI's
 doc-scripts job; add one there before changing a rule.
 
