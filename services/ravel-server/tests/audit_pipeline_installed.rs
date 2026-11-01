@@ -747,6 +747,7 @@ async fn every_query_surface_names_the_callers_configured_subject() {
             }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
     for body in &bodies {
         assert!(
             !body.contains("alice"),
@@ -768,7 +769,6 @@ async fn every_query_surface_names_the_callers_configured_subject() {
             );
         }
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 
     running.shutdown().await.expect("graceful shutdown");
 }
