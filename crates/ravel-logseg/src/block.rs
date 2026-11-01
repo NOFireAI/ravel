@@ -90,6 +90,12 @@ impl Hasher for ColumnIdHasher {
 /// own internal, per-crate use.
 pub type ColumnIdSet = std::collections::HashSet<u32, BuildHasherDefault<ColumnIdHasher>>;
 
+/// Only for keys a tenant cannot choose (column ids, dictionary codes, stream
+/// refs, indices); tenant-keyed maps keep SipHash (#3228).
+pub(crate) type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+/// Only for keys a tenant cannot choose; see [`FastMap`] and #3228.
+pub(crate) type FastSet<K> = std::collections::HashSet<K, foldhash::fast::RandomState>;
+
 /// The type of a dynamic attribute column, as resolved from FIELD_DIR. Fixed
 /// columns (ids 0..=9) carry no plan; their types are implicit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -458,7 +464,7 @@ enum OwnedInput {
 /// dictionary. Both string paths derive the page and the [`StrShape`] from the
 /// per-row value sequence alone, which this preserves.
 fn compact_dict(dict: &[&[u8]], ids: &[u32]) -> OwnedInput {
-    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut remap: FastMap<u32, u32> = FastMap::default();
     let mut kept: Vec<&[u8]> = Vec::new();
     let ids = ids
         .iter()
