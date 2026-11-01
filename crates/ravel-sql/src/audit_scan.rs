@@ -221,6 +221,7 @@ impl ExecutionPlan for AuditScanExec {
 /// Fetch every segment in this partition and return its records sorted by
 /// `ts_ns` ascending. Only the ts range prunes the fetch; the residual
 /// re-applies everything above.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
     tenant_hash: TenantHash,
