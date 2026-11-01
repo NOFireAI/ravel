@@ -624,7 +624,8 @@ capabilities. The record names `agents.principal.subject` and
 `agents.principal.subject_source` when the caller's token or claim carries a
 subject (a `subject=LABEL` entry on its `--tenant-token` pair, or the claim
 `--oidc-subject-claim` names); two admins whose tokens carry none are not
-told apart. No response names the subject, and no request header sets it
+told apart. No response names the subject, and no request header other than
+the credential sets it
 (`agents_effects_e2e::reconcile_and_destroy_records_name_each_admins_configured_subject_and_a_token_without_one_writes_no_subject_attr`).
 Without `--audit-mode` no record is written. Only
 `--audit-mode required` refuses on a failed audit write: the reconcile is
