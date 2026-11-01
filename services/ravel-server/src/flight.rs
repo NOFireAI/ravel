@@ -67,6 +67,9 @@ impl FlightAuth for ResolverFlightAuth {
             .tenant_resolver
             .resolve_principal(&headers)
             .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
+        if principal.tenant.hash() != self.tenant(metadata)? {
+            return Ok(None);
+        }
         Ok(ravel_query::http::audit_subject(&principal))
     }
 }
@@ -212,4 +215,63 @@ pub fn service_on_listener(
         service,
         state.max_deadline,
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    use axum::http::HeaderMap;
+    use ravel_tenant_resolve::{AuthError, Principal, Subject, SubjectSource};
+    use ravel_types::TenantId;
+
+    /// Admits `admitted` and resolves a principal of `principal` carrying the
+    /// subject `alice`, so the two resolutions `ResolverFlightAuth` makes can
+    /// disagree.
+    struct SplitResolver {
+        admitted: TenantId,
+        principal: TenantId,
+    }
+
+    impl TenantResolver for SplitResolver {
+        fn resolve(&self, _headers: &HeaderMap) -> Result<TenantId, AuthError> {
+            Ok(self.admitted.clone())
+        }
+
+        fn resolve_principal(&self, _headers: &HeaderMap) -> Result<Principal, AuthError> {
+            let mut principal = Principal::tenant_only(self.principal.clone());
+            principal.subject = Some(
+                Subject::new(SubjectSource::StaticToken, "alice").expect("a valid subject"),
+            );
+            Ok(principal)
+        }
+    }
+
+    fn audit_subject_for(admitted: &str, principal: &str) -> Option<AuditSubject> {
+        let auth = ResolverFlightAuth {
+            tenant_resolver: Arc::new(SplitResolver {
+                admitted: TenantId::new(admitted),
+                principal: TenantId::new(principal),
+            }),
+        };
+        auth.audit_subject(&MetadataMap::new())
+            .expect("both resolutions succeed")
+    }
+
+    #[test]
+    fn audit_subject_names_the_principal_of_the_admitted_tenant() {
+        assert_eq!(
+            audit_subject_for("acme", "acme"),
+            Some(AuditSubject {
+                value: "alice".to_string(),
+                source: "static_token".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn audit_subject_is_none_when_the_principal_is_another_tenants() {
+        assert_eq!(audit_subject_for("acme", "globex"), None);
+    }
 }

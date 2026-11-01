@@ -230,8 +230,9 @@ The Flight SQL path has no principal today: `FlightAuth::tenant` returns a
 `TenantHash`, and the trait states only what Flight needs without seeing a
 credential. `FlightAuth` (today `tenant` and `min_commit_tokens`, with
 seven implementations) therefore gains a third required method,
-`audit_subject(&self, metadata) -> Option<AuditSubject>`, with no default
-implementation, so every implementation states its answer. The server's
+`audit_subject(&self, metadata) -> Result<Option<AuditSubject>, Status>`,
+with no default implementation, so every implementation states its answer,
+and an `Err` refuses the statement as one from `tenant` does. The server's
 implementation resolves the principal from the same `DoGet` metadata it
 already authenticates. `ravel-sql` gains no dependency on
 `ravel-tenant-resolve`: it sees only the plain `AuditSubject`. The MCP
