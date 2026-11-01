@@ -2372,53 +2372,113 @@ mod tests {
         Ok(like_calls(ctx, sql).await)
     }
 
+    /// The session alone cannot tell `FROM samples AS logs` from the `logs`
+    /// table: it rewrites the alias's `LIKE` to the UDF. What keeps the
+    /// qualifier test exact is the statement-level refusal, which this
+    /// statement meets before any session is built.
+    ///
+    /// FLIP: dropping the type and escape conditions without the refusal makes
+    /// `statement_tables` admit the statement, and the `LIKE` over a samples
+    /// column runs through the logs UDF.
     #[tokio::test]
-    async fn an_alias_named_logs_over_samples_is_not_rewritten() {
-        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let samples_only = session_with(vec![metrics_table(&store)]);
-        let builtin = like_outcome(
-            &samples_only,
-            "SELECT value FROM samples WHERE value LIKE '1%'",
-        )
-        .await;
-        let aliased = like_outcome(
-            &samples_and_logs(),
-            "SELECT logs.value FROM samples AS logs JOIN logs AS l ON logs.ts = l.ts \
-             WHERE logs.value LIKE '1%'",
-        )
-        .await;
+    async fn an_alias_named_logs_over_samples_is_refused_before_the_session() {
+        let sql = "SELECT logs.value FROM samples AS logs JOIN logs AS l ON logs.ts = l.ts \
+                   WHERE logs.value LIKE '1%'";
+        let refused = crate::executor::SqlExecutor::statement_tables(sql).err();
         assert!(
-            builtin.is_err(),
-            "the built-in LIKE refuses a Float64 operand: {builtin:?}"
+            matches!(
+                &refused,
+                Some(crate::SqlError::ShadowedTableName { kind: "relation alias", name, table })
+                    if name == "logs" && table == LOGS_TABLE
+            ),
+            "{refused:?}"
         );
+        assert_eq!(like_calls(&samples_and_logs(), sql).await, (true, false));
+    }
+
+    /// A custom escape on a `logs` column beside samples now plans to the UDF
+    /// and builds a physical plan, as it does in a logs-only session; over an
+    /// aliased logs scan (`logs l`) it stays on the built-in, which refuses it.
+    ///
+    /// FLIP: keeping the escape condition in `LikeScope::LogsColumnsOnly`
+    /// leaves the `logs.body` statement on the built-in, which refuses it.
+    #[tokio::test]
+    async fn a_custom_escape_on_a_logs_column_beside_samples_runs_on_the_udf() {
+        let ctx = samples_and_logs();
+        let qualified = "SELECT logs.body FROM logs JOIN samples s ON logs.ts = s.ts \
+                         WHERE logs.body LIKE 'a#%' ESCAPE '#'";
+        let outcome = like_outcome(&ctx, qualified).await;
         assert!(
-            aliased.is_err(),
-            "a LIKE over samples aliased logs is refused as the built-in refuses it: {aliased:?}"
+            matches!(outcome, Ok((true, false))),
+            "a custom ESCAPE on logs.body plans to the UDF: {outcome:?}"
+        );
+
+        let aliased = "SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts \
+                       WHERE l.body LIKE 'a#%' ESCAPE '#'";
+        assert_eq!(like_calls(&ctx, aliased).await, (false, true));
+        let refused = like_outcome(&ctx, aliased).await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e
+                .to_string()
+                .contains("escape_char other than the backslash")),
+            "the built-in refuses a custom ESCAPE at physical planning: {refused:?}"
         );
     }
 
+    /// A non-string `logs` operand beside samples plans to the UDF, which casts
+    /// it to `Utf8` as it does in a logs-only session.
+    ///
+    /// FLIP: keeping the string-type condition leaves `logs.severity_num LIKE '1%'` on
+    /// the built-in, which refuses an integer operand.
     #[tokio::test]
-    async fn a_custom_escape_beside_samples_stays_on_the_builtin() {
-        let ctx = samples_and_logs();
-        for sql in [
-            "SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts \
-             WHERE l.body LIKE 'a#%' ESCAPE '#'",
+    async fn a_non_string_logs_operand_beside_samples_plans_as_in_a_logs_only_session() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let logs_only = session_with(vec![logs_table(&store)]);
+        let alone = like_outcome(
+            &logs_only,
+            "SELECT body FROM logs WHERE logs.severity_num LIKE '1%'",
+        )
+        .await;
+        let beside = like_outcome(
+            &samples_and_logs(),
             "SELECT logs.body FROM logs JOIN samples s ON logs.ts = s.ts \
-             WHERE logs.body LIKE 'a#%' ESCAPE '#'",
-        ] {
-            assert_eq!(
-                like_calls(&ctx, sql).await,
-                (false, true),
-                "a custom ESCAPE stays on the built-in operator: {sql}"
-            );
-            let refused = like_outcome(&ctx, sql).await;
-            assert!(
-                refused.as_ref().is_err_and(|e| e
-                    .to_string()
-                    .contains("escape_char other than the backslash")),
-                "the built-in refuses a custom ESCAPE at physical planning: {refused:?}"
-            );
-        }
+             WHERE logs.severity_num LIKE '1%'",
+        )
+        .await;
+        assert!(matches!(alone, Ok((true, false))), "{alone:?}");
+        assert!(matches!(beside, Ok((true, false))), "{beside:?}");
+    }
+
+    /// A scalar subquery operand is a value: the test reads the operands' own
+    /// columns, so a `logs.body` LIKE whose pattern a samples subquery computes
+    /// is rewritten, and a samples-column LIKE whose pattern a logs subquery
+    /// computes is not, while the subquery's own `LIKE` on a logs column is
+    /// rewritten against the subquery's schema.
+    ///
+    /// FLIP: a walk that entered the subquery's plan and required its columns
+    /// to be `logs` columns leaves the first statement on the built-in.
+    #[tokio::test]
+    async fn a_scalar_subquery_operand_is_tested_by_the_operands_own_columns() {
+        let ctx = samples_and_logs();
+        assert_eq!(
+            like_calls(
+                &ctx,
+                "SELECT logs.body FROM logs JOIN samples s ON logs.ts = s.ts \
+                 WHERE logs.body LIKE (SELECT max(label(labels, 'job')) FROM samples)"
+            )
+            .await,
+            (true, false)
+        );
+        assert_eq!(
+            like_calls(
+                &ctx,
+                "SELECT s.value FROM samples s JOIN logs ON s.ts = logs.ts \
+                 WHERE label(s.labels, 'job') LIKE \
+                 (SELECT max(body) FROM logs WHERE logs.body LIKE 'a%')"
+            )
+            .await,
+            (true, true)
+        );
     }
 
     #[tokio::test]

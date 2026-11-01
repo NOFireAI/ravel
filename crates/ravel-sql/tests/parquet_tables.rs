@@ -1601,6 +1601,66 @@ async fn a_mixed_statement_takes_a_token_for_its_signal_table_only() {
     assert_eq!(reads(&lake), before, "refused before either store is read");
 }
 
+/// A custom-escape LIKE on a `logs` column beside a Parquet table returns
+/// exactly the rows the same LIKE returns with the Parquet table replaced by
+/// inline values, a statement whose only table is `logs` (issue #3026).
+///
+/// FLIP: before #3026 a custom escape kept the LIKE on the built-in beside
+/// another table, which refuses an escape other than the backslash, and the
+/// mixed statement failed where the logs-only one ran.
+#[tokio::test]
+async fn a_custom_escape_logs_like_beside_a_parquet_table_returns_the_logs_only_rows() {
+    let lake = Lake::configured();
+    hits_and_logs(&lake).await;
+    let sql = "SELECT h.id, logs.body FROM hits h JOIN logs \
+               ON logs.body = concat('line ', CAST(h.id AS VARCHAR)) \
+               WHERE logs.body LIKE 'li_e 2' ESCAPE '!' ORDER BY h.id";
+    let values = sql.replace("hits h", HITS_AS_VALUES);
+    assert_ne!(values, sql);
+
+    let alone = lake
+        .execute(&tenant("acme"), &values)
+        .await
+        .unwrap_or_else(|err| panic!("{values}: {err}"));
+    assert_eq!(rows(&alone), vec!["2|line 2"], "{values}");
+    let mixed = lake
+        .execute(&tenant("acme"), sql)
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
+    assert_eq!(rows(&mixed), rows(&alone), "{sql}");
+}
+
+/// An alias equal to a Parquet table's name, in a statement beside a signal
+/// table, is [`SqlError::ShadowedTableName`] from the statement text, before
+/// either store is read (issue #3026).
+///
+/// FLIP: a refusal that reserves only the signal table names lets `logs AS
+/// hits` through to the resolve.
+#[tokio::test]
+async fn an_alias_shadowing_a_parquet_table_is_refused_before_either_store_is_read() {
+    let lake = Lake::configured();
+    hits_and_logs(&lake).await;
+    let before = reads(&lake);
+    let err = lake
+        .execute(
+            &tenant("acme"),
+            "SELECT count(*) FROM hits h JOIN logs AS hits \
+             ON hits.body = concat('line ', CAST(h.id AS VARCHAR))",
+        )
+        .await
+        .expect_err("an alias shadowing hits");
+    match &err {
+        SqlError::ShadowedTableName { kind, name, table } => {
+            assert_eq!(
+                (*kind, name.as_str(), table.as_str()),
+                ("relation alias", "hits", "hits")
+            );
+        }
+        other => panic!("expected ShadowedTableName, got {other}"),
+    }
+    assert_eq!(reads(&lake), before, "refused before either store is read");
+}
+
 /// Grants are checked when a query resolves the table: after the grant a
 /// table was created under is removed, the table's files lie outside every
 /// grant and the query fails typed, reading none of them.

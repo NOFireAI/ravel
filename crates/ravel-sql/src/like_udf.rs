@@ -69,8 +69,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ExprSchemable, Like, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility,
+    ColumnarValue, Expr, Like, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
 
@@ -173,27 +172,24 @@ pub(crate) enum LikeScope {
     /// single-signal statements keep today's behaviour (ADR-2904, LIKE-scope
     /// amendment).
     Every,
-    /// Only a `LIKE` that meets all of: its operands reference at least one
-    /// column and every column resolves, through the schema the rewrite is
-    /// given, with the qualifier `logs`; neither operand contains an outer
-    /// reference; both operands type as `Utf8`, `LargeUtf8`, `Utf8View`, or a
-    /// dictionary over one of those; and its escape is absent or backslash.
-    /// Any other `LIKE`, including one over an aliased `logs` scan or a column
-    /// the schema cannot resolve, is left to the built-in operator.
+    /// Only a `LIKE` that meets both of: its operands' own columns number at
+    /// least one and each resolves, through the schema the rewrite is given,
+    /// with the qualifier `logs`; and neither operand contains an outer
+    /// reference. Any other `LIKE`, including one over an aliased `logs` scan
+    /// (`FROM logs AS l`) or a column the schema cannot resolve, is left to
+    /// the built-in operator. A rewritten `LIKE` runs exactly as it would in a
+    /// logs-only session, whatever its operand types and escape.
     ///
-    /// ADR-2904 decision 4 scopes the rewrite to the relation `logs`, but the
-    /// schema carries only the qualifier's name, so the first condition
-    /// cannot tell the `logs` table from another relation aliased `logs`
-    /// (`FROM samples AS logs`, a derived table or CTE named `logs`). The
-    /// type and escape conditions keep that harmless: a `LIKE` meeting them
-    /// is one the built-in operator also plans, so a misclassified `LIKE` is
-    /// evaluated by the UDF where the built-in would have accepted it too.
+    /// The qualifier test is exact because the executor refuses, before the
+    /// session is built, a statement reading two or more tables that declares
+    /// a relation alias, derived-table alias or CTE name equal to a table name
+    /// (ADR-2904, LIKE-scope amendment, #3026): the qualifier `logs` then
+    /// names the `logs` table's relation and nothing else. `FROM logs AS logs`
+    /// is admitted, since it still names that relation.
     ///
-    /// The cost falls on genuine `logs` predicates: a `LIKE` on a `logs`
-    /// column with a custom escape, or with a non-string operand, goes to the
-    /// built-in operator, which refuses it, while the same predicate runs in a
-    /// logs-only session ([`LikeScope::Every`]). Issue #2910 tracks closing
-    /// that gap.
+    /// A scalar subquery operand is a value: its columns belong to its own
+    /// plan, which this rewrite visits separately with the subquery's own
+    /// schema, so only the operands' own columns are tested here.
     LogsColumnsOnly,
 }
 
@@ -206,6 +202,8 @@ impl LikeToUdf {
 /// Whether every column `operands` reference resolves through `schema` to the
 /// `logs` relation, with at least one column referenced. A column the schema
 /// cannot resolve (unknown, or an ambiguous unqualified name) answers false.
+/// The columns inside a scalar subquery operand are not the operand's own and
+/// are not tested.
 fn references_only_logs_columns(operands: [&Expr; 2], schema: &DFSchema) -> bool {
     let mut columns = operands.into_iter().flat_map(Expr::column_refs).peekable();
     if columns.peek().is_none() {
@@ -219,32 +217,15 @@ fn references_only_logs_columns(operands: [&Expr; 2], schema: &DFSchema) -> bool
     })
 }
 
-/// Whether either operand contains an outer reference anywhere. A walk error
-/// answers true, which leaves the `LIKE` unrewritten.
+/// Whether either operand's own expression tree contains an outer reference.
+/// A scalar subquery operand's plan is not entered. A walk error answers
+/// true, which leaves the `LIKE` unrewritten.
 fn references_outer_columns(operands: [&Expr; 2]) -> bool {
     operands.into_iter().any(|operand| {
         operand
             .exists(|e| Ok(matches!(e, Expr::OuterReferenceColumn(..))))
             .unwrap_or(true)
     })
-}
-
-/// Whether both operands type, through `schema`, as `Utf8`, `LargeUtf8`,
-/// `Utf8View`, or a dictionary over one of those. A type error answers false.
-fn both_string_typed(operands: [&Expr; 2], schema: &DFSchema) -> bool {
-    fn is_string(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
-            DataType::Dictionary(_, value) => matches!(
-                **value,
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-            ),
-            _ => false,
-        }
-    }
-    operands
-        .into_iter()
-        .all(|operand| matches!(operand.get_type(schema), Ok(t) if is_string(&t)))
 }
 
 impl FunctionRewrite for LikeToUdf {
@@ -268,9 +249,7 @@ impl FunctionRewrite for LikeToUdf {
         {
             if self.scope == LikeScope::LogsColumnsOnly
                 && !(references_only_logs_columns([inner, pattern], schema)
-                    && !references_outer_columns([inner, pattern])
-                    && both_string_typed([inner, pattern], schema)
-                    && matches!(escape_char, None | Some('\\')))
+                    && !references_outer_columns([inner, pattern]))
             {
                 return Ok(Transformed::no(expr));
             }

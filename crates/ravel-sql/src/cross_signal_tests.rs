@@ -2,8 +2,9 @@
 //! resolve and plan of the HTTP statement path (issue #2910), the
 //! table-qualified `min_commit_token` on that path (issue #2911), the
 //! multi-lane pinned entry points Flight SQL plans such a statement through
-//! (issue #2913), and the one-table refusal the single-snapshot pinned entry
-//! points keep.
+//! (issue #2913), the one-table refusal the single-snapshot pinned entry
+//! points keep, and the shadowing refusal and `LIKE` scope of a statement
+//! over two or more tables (issue #3026).
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -1699,4 +1700,244 @@ async fn a_failed_explain_still_merges_its_cost_into_the_caller() {
     let caller = accounting.snapshot();
     assert!(caller.total_s3_requests() > 0);
     assert_eq!(caller.total_s3_requests(), requests.len() as u64);
+}
+
+/// One logs record of scope `checkout` at `ts` carrying `body`.
+fn log_with_body(ts: i64, body: &str) -> ravel_logseg::LogRecord {
+    let mut record = log_record("checkout", ts);
+    record.body = body.to_string();
+    record
+}
+
+/// A tenant with samples at 100, 200 and 300 and one logs record at each of
+/// those times built by `record`, and an executor over it carrying
+/// `declared`.
+async fn samples_and_logs_executor(
+    name: &str,
+    record: impl Fn(i64) -> ravel_logseg::LogRecord,
+    declared: Vec<crate::declared::DeclaredColumn>,
+) -> (SqlExecutor, TenantHash) {
+    let tenant = TenantId::new(name.to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(
+        &memory,
+        &tenant,
+        1,
+        "m",
+        samples(&[(100, 1.0), (200, 2.0), (300, 3.0)]),
+    )
+    .await;
+    let records: Vec<_> = [100, 200, 300].into_iter().map(record).collect();
+    publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &records).await;
+    let executor = executor_over(wrap_fixture_store(memory)).with_declared_column_source(Arc::new(
+        crate::declared::StaticDeclaredColumns::new(declared),
+    ));
+    (executor, tenant_hash)
+}
+
+/// The `ts` column of `sql`'s result, run over `executor` in [`WINDOW`].
+async fn logs_times(executor: &SqlExecutor, tenant_hash: TenantHash, sql: &str) -> Vec<i64> {
+    let outcome = executor
+        .execute(tenant_hash, &sql_request(sql, WINDOW))
+        .await
+        .unwrap_or_else(|err| panic!("{sql} must run, got {err:?}"));
+    i64_column(&outcome.output, "ts")
+}
+
+/// A custom-escape LIKE on a `logs` column beside `samples` returns exactly
+/// the rows the same LIKE returns in a logs-only statement: the escaped `_`
+/// matches only the literal `a_b` at 100, where an escape read as the
+/// backslash would match `a!_b` at 300 instead (issue #3026).
+///
+/// FLIP: before #3026 the two-table forms kept the LIKE on the built-in,
+/// which refuses an escape other than the backslash, and this failed on that
+/// error.
+#[tokio::test]
+async fn a_custom_escape_logs_like_beside_samples_returns_the_logs_only_rows() {
+    let bodies = |ts: i64| {
+        log_with_body(
+            ts,
+            match ts {
+                100 => "a_b",
+                200 => "axb",
+                _ => "a!_b",
+            },
+        )
+    };
+    let (executor, tenant_hash) =
+        samples_and_logs_executor("cross-signal-escape-like", bodies, Vec::new()).await;
+
+    let logs_only = logs_times(
+        &executor,
+        tenant_hash,
+        "SELECT logs.ts FROM logs WHERE logs.body LIKE 'a!_b' ESCAPE '!' ORDER BY logs.ts",
+    )
+    .await;
+    assert_eq!(logs_only, vec![100], "the logs-only reading of the escape");
+
+    for sql in [
+        "SELECT logs.ts FROM logs JOIN samples s ON s.ts = logs.ts \
+         WHERE logs.body LIKE 'a!_b' ESCAPE '!' ORDER BY logs.ts",
+        "SELECT logs.ts FROM logs AS logs JOIN samples s ON s.ts = logs.ts \
+         WHERE logs.body LIKE 'a!_b' ESCAPE '!' ORDER BY logs.ts",
+    ] {
+        assert_eq!(
+            logs_times(&executor, tenant_hash, sql).await,
+            logs_only,
+            "{sql}"
+        );
+    }
+}
+
+/// A declared Int64 logs column under LIKE beside `samples` returns exactly
+/// the rows the same LIKE returns in a logs-only statement: `'4%'` matches
+/// the 404 at 100 and the 410 at 300, not the 500 at 200 (issue #3026).
+///
+/// FLIP: before #3026 a non-string operand kept the LIKE on the built-in,
+/// which refuses an Int64 operand, and the two-table statement failed where
+/// the logs-only one ran.
+#[tokio::test]
+async fn a_declared_int64_like_beside_samples_returns_the_logs_only_rows() {
+    let status = |ts: i64| {
+        let mut record = log_record("checkout", ts);
+        let code = match ts {
+            100 => 404,
+            200 => 500,
+            _ => 410,
+        };
+        record.attrs = vec![(
+            "status_code".to_string(),
+            ravel_logseg::AttrValue::I64(code),
+        )];
+        record
+    };
+    let declared = vec![crate::declared::DeclaredColumn::new(
+        "status_code",
+        crate::declared::DeclaredType::I64,
+    )];
+    let (executor, tenant_hash) =
+        samples_and_logs_executor("cross-signal-int64-like", status, declared).await;
+
+    let logs_only = logs_times(
+        &executor,
+        tenant_hash,
+        "SELECT logs.ts FROM logs WHERE logs.status_code LIKE '4%' ORDER BY logs.ts",
+    )
+    .await;
+    assert_eq!(logs_only, vec![100, 300], "the logs-only reading");
+
+    let beside_samples = logs_times(
+        &executor,
+        tenant_hash,
+        "SELECT logs.ts FROM logs JOIN samples s ON s.ts = logs.ts \
+         WHERE logs.status_code LIKE '4%' ORDER BY logs.ts",
+    )
+    .await;
+    assert_eq!(beside_samples, logs_only);
+}
+
+/// In a statement over two or more tables, a relation alias, derived-table
+/// alias or CTE name equal to a table name is
+/// [`SqlError::ShadowedTableName`] at every HTTP entry point, naming both
+/// names, before any store request (issue #3026).
+///
+/// FLIP: before #3026 none of these was refused: each reached the catalog,
+/// and `samples AS logs` let a `logs.` qualifier name the samples relation.
+#[tokio::test]
+async fn a_name_shadowing_a_table_in_a_two_table_statement_is_refused_before_any_listing() {
+    let tenant_hash = TenantHash([5u8; 16]);
+    let cases = [
+        (
+            "SELECT logs.ts FROM samples AS logs JOIN logs AS l ON l.ts = logs.ts",
+            "relation alias",
+            "logs",
+            "logs",
+        ),
+        (
+            "SELECT count(*) FROM samples AS LOGS, spans",
+            "relation alias",
+            "LOGS",
+            "logs",
+        ),
+        (
+            "WITH logs AS (SELECT ts FROM samples) SELECT count(*) FROM logs, spans",
+            "CTE name",
+            "logs",
+            "logs",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT ts FROM samples) logs, spans",
+            "derived table alias",
+            "logs",
+            "logs",
+        ),
+        (
+            "SELECT count(*) FROM hits h, logs AS hits",
+            "relation alias",
+            "hits",
+            "hits",
+        ),
+    ];
+    for (sql, kind, name, table) in cases {
+        let recording = Arc::new(RecordingStore::new(empty_store()));
+        let executor = executor_with(recording.clone(), SqlConfig::default());
+        let refused = http_entry_errors(&executor, tenant_hash, &sql_request(sql, WINDOW)).await;
+        assert_eq!(refused.len(), 4);
+        for (entry, err) in refused {
+            let Some(err) = err else {
+                panic!("{entry} must refuse {sql}");
+            };
+            let SqlError::ShadowedTableName {
+                kind: got_kind,
+                name: got_name,
+                table: got_table,
+            } = &err
+            else {
+                panic!("{entry} must refuse {sql} with ShadowedTableName, got {err:?}");
+            };
+            assert_eq!(
+                (*got_kind, got_name.as_str(), got_table.as_str()),
+                (kind, name, table),
+                "{entry}: {sql}"
+            );
+            assert_eq!(err.class(), ErrorClass::BadRequest, "{entry}: {sql}");
+            assert_eq!(
+                err.client_message(),
+                format!(
+                    "{kind} {name:?} shadows the table {table}; in a statement that reads more \
+                     than one table, an alias or CTE name may not equal a table name: rename it"
+                ),
+                "{entry}: {sql}"
+            );
+        }
+        assert_eq!(recording.requests(), Vec::<String>::new(), "{sql}");
+    }
+}
+
+/// The shadowing refusal reads only statements over two or more tables, and
+/// an alias equal to its own table's name is not shadowing: a one-table
+/// `samples AS logs` and a two-table `logs AS logs` both reach the catalog
+/// (issue #3026).
+///
+/// FLIP: a refusal applied to every statement, or one that does not exempt
+/// a table aliased by its own name, refuses one of these.
+#[tokio::test]
+async fn a_one_table_alias_and_a_tables_own_name_are_not_refused() {
+    let tenant_hash = TenantHash([6u8; 16]);
+    for sql in [
+        "SELECT logs.value FROM samples AS logs",
+        "SELECT logs.ts FROM logs AS logs JOIN samples s ON s.ts = logs.ts",
+    ] {
+        let recording = Arc::new(RecordingStore::new(empty_store()));
+        let executor = executor_with(recording.clone(), SqlConfig::default());
+        let outcome = executor
+            .execute(tenant_hash, &sql_request(sql, WINDOW))
+            .await;
+        assert!(outcome.is_ok(), "{sql} must run, got {:?}", outcome.err());
+        assert!(
+            !recording.requests().is_empty(),
+            "{sql} reached the catalog"
+        );
+    }
 }

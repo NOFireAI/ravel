@@ -162,7 +162,7 @@ its name: `attrs`, `ts`, `trace_id` and `span_id` are column names `logs`
 shares with other tables. Any other `LIKE` is evaluated by the engine's
 built-in operator, as it is in a session without `logs` today. The LIKE-scope
 amendment below says how this rule applies to a logs-only session and what
-it costs beside another table.
+makes it exact beside another table.
 
 ### 5. Plan-derived work is attributed per table
 
@@ -404,22 +404,35 @@ Decision 4's `LIKE` rule is applied per session shape:
   which this ADR promises; the rule as written would have moved some of
   them to the built-in operator.
 - **A session that registers `logs` beside another table** rewrites a `LIKE`
-  only when all of these hold:
-  - every column its operands reference is qualified `logs`;
-  - neither operand contains an outer reference;
-  - both operands are string typed;
-  - its escape is absent or backslash.
+  only when both of these hold:
+  - its operands reference at least one column, and every column they
+    reference is qualified `logs`;
+  - neither operand contains an outer reference.
 
-  The schema the rewrite sees carries only a qualifier's name, so the first
-  condition cannot tell the `logs` table from another relation aliased
-  `logs`. The type and escape conditions make such a misclassified `LIKE`
-  one the built-in operator also plans, so the alias cannot change what is
-  accepted.
-- **The cost.** In a session beside another table, a `LIKE` on a genuine
-  `logs` column with a custom escape, or with a non-string operand, goes to
-  the built-in operator, which refuses it. The same predicate runs in a
-  logs-only session. Until the qualifier test is exact, whether such a
-  predicate is accepted depends on whether the statement names another
-  table. Issue #2910 tracks closing this. One way is to refuse, in a
-  multi-table statement, a relation alias that shadows a registered table
-  name; the type and escape conditions could then go.
+  The columns inside a scalar subquery operand are not tested: the subquery
+  is a value, and its own plan is rewritten separately against its own
+  schema. A rewritten `LIKE` runs as it does in a logs-only session,
+  whatever its operand types or escape. A `LIKE` on a column of `logs`
+  aliased under another name (`FROM logs AS l`) is not qualified `logs` and
+  goes to the built-in operator, which refuses a custom escape.
+- **The qualifier test is exact because a shadowing name is refused
+  (#3026).** The schema the rewrite sees carries only a qualifier's name, so
+  on its own the first condition cannot tell the `logs` table from another
+  relation aliased `logs`. A statement that reads two or more tables is
+  refused, from its text and before any catalog or store request, when it
+  declares a relation alias, derived-table alias or CTE name equal to a
+  table name: one of the statement's other tables, or any of the five
+  signal table names. The error is `ShadowedTableName` (HTTP 400, Flight
+  `INVALID_ARGUMENT`), and its message names both the declared name and the
+  table. Names compare as the planner compares them: an unquoted name is
+  lowercased and a quoted one is kept, so `AS LOGS` shadows `logs` and
+  `AS "LOGS"` does not. A table aliased by its own name, `FROM logs AS
+  logs`, is not refused, because its qualifier still names the table it
+  reads. A one-table statement is not checked.
+
+  The rule this amendment first stated also required both operands to be
+  string typed and the escape to be absent or backslash. Those conditions
+  kept a misclassified `LIKE` on the built-in operator, at the cost that a
+  `LIKE` on a genuine `logs` column with a custom escape or a non-string
+  operand was refused beside another table and accepted in a logs-only
+  session (#2910). With the refusal in place they are removed.
