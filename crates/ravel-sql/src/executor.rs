@@ -1261,12 +1261,17 @@ fn lanes_covering_window(lanes: &[(TargetSignal, Snapshot)]) -> (TimeRange, i64)
 /// optimizer then pushes projections and filters down over the rewritten plan
 /// exactly as it would over a predicate the statement itself carried. Pruning
 /// therefore tightens: the injected filter is offered to the provider like any
-/// other, and the result stays sound because every provider reports `Inexact`,
-/// so DataFusion re-applies the filter above the scan and a segment straddling
-/// the window is read whole and filtered by row.
+/// other, and the result stays sound either way the provider answers. Every
+/// provider but a local `logs` scan reports `Inexact`, so DataFusion re-applies
+/// the filter above the scan and a segment straddling the window is read whole
+/// and filtered by row. A local `logs` scan reports the pure `ts` bound
+/// `Exact` ([`crate::logs_pushdown::filter_is_exact`]) and drops the residual,
+/// because the RLOG reader re-checks every decoded row against
+/// `Predicate::TsRange` with the half-open end taken as `end_ns - 1`.
 ///
 /// The traversal descends into subqueries embedded in expressions
-/// (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as well as into
+/// (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`,
+/// `Expr::SetComparison`) as well as into
 /// plan children, so a statement whose `WHERE` clause carries its own `SELECT`
 /// gets the window on that scan too. A plain `transform_up` walks only the plan
 /// tree, which would leave the inner scan reading the whole overlapping segment
@@ -2550,6 +2555,10 @@ impl SqlExecutor {
     /// [`ParquetPlan::Resolved`]) reads each table's manifests and the grants
     /// record once for the whole `GetFlightInfo`, not once here and again at
     /// plan time.
+    ///
+    /// The pinned plan entries take no row window, so a request with
+    /// `row_window` set is [`SqlError::RowWindowNotPinned`] here, before any
+    /// store request, on this and every other pinned resolve.
     pub async fn resolve_pinned(
         &self,
         tenant_hash: TenantHash,
@@ -2608,6 +2617,11 @@ impl SqlExecutor {
         tables: &StatementTables,
         accounting: &QueryAccounting,
     ) -> Result<PinnedLanes, SqlError> {
+        // `PinnedPlanInputs` carries no row window, so the plan that follows
+        // this resolve could not apply one.
+        if req.row_window {
+            return Err(SqlError::RowWindowNotPinned);
+        }
         let tokens = admit_http_tokens(tables, &req.min_tokens)?;
         // Kept on the pooled `&QueryAccounting` signature (the public Flight
         // SQL `GetFlightInfo`-side resolve, whose caller has no phase-split
@@ -10664,18 +10678,32 @@ pub(crate) mod tests {
         kept.sort_unstable();
         assert_eq!(kept.first().copied(), Some(350));
         assert_eq!(kept.last().copied(), Some(499));
+    }
 
-        // An IN subquery is the other expression-embedded shape: the inner
-        // scan's own predicate keeps ts 400..1000, and the window cuts it to
-        // 400..500.
-        let in_list = executor
+    /// The IN-subquery shape of [`row_window_reaches_scans_inside_expression_subqueries`].
+    /// The inner select shifts every value down by 100, so its windowed rows
+    /// (values 200..500) yield 100..400 and the outer windowed scan keeps
+    /// ts 200..400: 200 rows. An unwindowed inner scan yields -100..900, which
+    /// covers the whole outer window and keeps 300 rows.
+    ///
+    /// FLIP: `plan.transform_up(` in place of
+    /// `plan.transform_up_with_subqueries(` in `apply_row_window` returns 300
+    /// rows, failing the `num_rows() == 200` assertion.
+    #[tokio::test]
+    async fn row_window_reaches_scans_inside_in_subqueries() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-in-subquery-1376", 1_000, FaultPlan::empty()).await;
+        let in_list = executor_over(store)
             .execute(
                 tenant_hash,
                 &SqlRequest {
                     row_window: true,
                     ..sql_request(
-                        "SELECT ts FROM samples WHERE ts IN (SELECT ts FROM samples WHERE value >= 400)",
-                        window,
+                        "SELECT ts FROM samples WHERE value IN (SELECT value - 100 FROM samples)",
+                        TimeRange {
+                            start_ns: 200,
+                            end_ns: 500,
+                        },
                     )
                 },
             )
@@ -10683,13 +10711,13 @@ pub(crate) mod tests {
             .expect("execute the IN-subquery statement under the row window");
         assert_eq!(
             in_list.output.num_rows(),
-            100,
-            "the window bounds the inner scan too, so ts 400..500 survives"
+            200,
+            "the window bounds the inner scan too, so ts 200..400 survives"
         );
         let mut kept = ts_values(&in_list.output);
         kept.sort_unstable();
-        assert_eq!(kept.first().copied(), Some(400));
-        assert_eq!(kept.last().copied(), Some(499));
+        assert_eq!(kept.first().copied(), Some(200));
+        assert_eq!(kept.last().copied(), Some(399));
     }
 
     /// Prerequisite 3. `explain` resolves, admits, and plans; it must never
@@ -11055,6 +11083,131 @@ pub(crate) mod tests {
             7,
             "the seven audit records outside the window are excluded"
         );
+    }
+
+    /// The row window on the two RLOG tables that answer the injected filter
+    /// differently. A local `logs` scan reports the pure `ts` bound `Exact`,
+    /// so no residual runs and the reader's `Predicate::TsRange` re-check is
+    /// the only row filter; `alerts` reports it `Inexact` and DataFusion
+    /// re-applies it. One segment straddles the window, with records at
+    /// `0, 100, ..., 900` plus `199` and `499` either side of the edges: 12
+    /// rows, of which exactly `200, 300, 400, 499` are inside `[200, 500)`.
+    ///
+    /// FLIP (logs): `Operator::Lt => tighten_hi(out, ns)` in
+    /// `logs_pushdown::apply_ts_bound`, taking `ts < 500` as `ts <= 500`,
+    /// also returns the record at 500.
+    /// FLIP (alerts): `TableProviderFilterPushDown::Exact` from
+    /// `AlertsTableProvider::supports_filters_pushdown` returns all 12.
+    #[tokio::test]
+    async fn row_window_applies_to_logs_ts_and_alerts_ts_ns() {
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+        let mut stamps: Vec<i64> = (0..10).map(|i| i * 100).collect();
+        stamps.extend([199, 499]);
+        stamps.sort_unstable();
+
+        for (signal, table, ts_col) in [
+            (Signal::Logs, "logs", "ts"),
+            (Signal::Alerts, "alerts", "ts_ns"),
+        ] {
+            let tenant_hash = TenantId::new(format!("row-window-{table}-1409")).hash();
+            let records: Vec<LogRecord> = stamps.iter().map(|&ts| log_record(table, ts)).collect();
+            let memory = MemoryStore::new();
+            publish_log_records(&memory, tenant_hash, signal, 1, &records).await;
+            let store = wrap_fixture_store(memory);
+            let base = sql_request(&format!("SELECT {ts_col} FROM {table}"), window);
+
+            let unfiltered = executor_over(store.clone())
+                .execute(tenant_hash, &base)
+                .await
+                .unwrap_or_else(|e| panic!("execute {table} without the row window: {e}"));
+            assert_eq!(unfiltered.output.num_rows(), 12, "{table}");
+
+            let filtered = executor_over(store)
+                .execute(
+                    tenant_hash,
+                    &SqlRequest {
+                        row_window: true,
+                        ..base
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("execute {table} with the row window: {e}"));
+            assert_eq!(
+                filtered.stats.window_predicate.as_deref(),
+                Some(
+                    window_filter_expr(&TableReference::bare(table), ts_col, window)
+                        .to_string()
+                        .as_str()
+                ),
+                "{table}"
+            );
+            let mut kept = ts_column_values(&filtered.output, ts_col);
+            kept.sort_unstable();
+            assert_eq!(kept, vec![200, 300, 400, 499], "{table}");
+            assert_eq!(filtered.output.num_rows(), 4, "{table}");
+        }
+    }
+
+    /// The pinned plan entries take no row window, so a pinned resolve of a
+    /// request that sets one is refused typed, before any store request,
+    /// instead of planning rows outside the window.
+    ///
+    /// FLIP: removing the `req.row_window` refusal from
+    /// `resolve_pinned_tables` resolves the snapshot and returns `Ok`.
+    #[tokio::test]
+    async fn a_pinned_resolve_refuses_a_row_window() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-pinned-1409", 10, FaultPlan::empty()).await;
+        let executor = executor_over(store.clone());
+        let req = SqlRequest {
+            row_window: true,
+            ..sql_request(
+                "SELECT ts FROM samples",
+                TimeRange {
+                    start_ns: 2,
+                    end_ns: 5,
+                },
+            )
+        };
+        let before = store.metrics().snapshot();
+        let single = executor
+            .resolve_pinned(tenant_hash, &req, &QueryAccounting::new())
+            .await;
+        assert!(
+            matches!(single, Err(SqlError::RowWindowNotPinned)),
+            "{:?}",
+            single.err()
+        );
+        let lanes = executor
+            .resolve_pinned_lanes(tenant_hash, &req, &QueryAccounting::new())
+            .await;
+        assert!(
+            matches!(lanes, Err(SqlError::RowWindowNotPinned)),
+            "{:?}",
+            lanes.err()
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.get.calls, before.get.calls);
+        assert_eq!(after.list.calls, before.list.calls);
+        assert_eq!(
+            SqlError::RowWindowNotPinned.class(),
+            crate::error::ErrorClass::BadRequest
+        );
+
+        let unwindowed = executor
+            .resolve_pinned(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: false,
+                    ..req
+                },
+                &QueryAccounting::new(),
+            )
+            .await;
+        assert!(unwindowed.is_ok(), "{:?}", unwindowed.err());
     }
 
     /// Every signal table reports the budgets its scan checked: the request's
