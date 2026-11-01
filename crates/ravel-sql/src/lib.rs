@@ -102,6 +102,7 @@ pub mod redact;
 mod regexp_replace_udf;
 mod rlog_attrs;
 mod scan;
+mod scan_budget;
 #[cfg(test)]
 mod scan_alternation_tests;
 mod schema;
@@ -174,6 +175,7 @@ pub use executor::{
     PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest,
     SqlStats, TargetSignal,
 };
+pub use scan_budget::EnforcedBudgets;
 #[cfg(feature = "flight-sql")]
 pub use flight::{
     DEFAULT_GC_PROTECTION_HORIZON, FlightAuth, FlightClock, FlightListenerRole, FlightSqlConfig,

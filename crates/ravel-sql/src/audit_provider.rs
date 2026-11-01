@@ -32,6 +32,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -45,8 +46,7 @@ use crate::distributed::{WorkerSlice, WorkerSliceClient};
 use crate::distributed_rlog::{
     AUDIT_ORDER_COLS, DistributedRlogContext, distributed_audit_plan, sort_slice_fragment,
 };
-#[cfg(feature = "flight-sql")]
-use ravel_query::ByteLimit;
+use crate::scan_budget::ScanBudget;
 
 /// The `audit` table provider for one tenant over one pinned `Signal::Audit`
 /// snapshot.
@@ -66,6 +66,11 @@ pub struct AuditTableProvider {
     /// default, and every non-Flight build -- is the local scan path unchanged.
     #[cfg(feature = "flight-sql")]
     distributed: Option<DistributedRlogContext>,
+    /// The statement's byte and store-request budgets (issue #1409), checked
+    /// by every `AuditScanExec` this provider builds after each store read and
+    /// passed to the distributed fan-out. Unlimited by default, installed with
+    /// [`Self::with_scan_budget`].
+    scan_budget: ScanBudget,
 }
 
 impl AuditTableProvider {
@@ -80,6 +85,7 @@ impl AuditTableProvider {
         accounting: QueryAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
+        let scan_budget = ScanBudget::unlimited(&PhaseAccounting::pooled_over(&accounting));
         AuditTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
@@ -89,7 +95,17 @@ impl AuditTableProvider {
             erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
+            scan_budget,
         }
+    }
+
+    /// Install the statement's scan budget (issue #1409): every
+    /// `AuditScanExec` this provider builds refuses once the statement total
+    /// passes the effective `max_bytes_scanned` or `max_s3_requests`, and the
+    /// distributed fan-out carries the same byte ceiling.
+    pub(crate) fn with_scan_budget(mut self, scan_budget: ScanBudget) -> Self {
+        self.scan_budget = scan_budget;
+        self
     }
 
     /// Install a coordinator-side distributed scan context (ADR-0071; #326). The
@@ -182,7 +198,8 @@ impl AuditTableProvider {
             pushdown.ts_max(),
             Arc::clone(&self.erasure),
             self.accounting.clone(),
-        )?;
+        )?
+        .with_scan_budget(self.scan_budget.clone());
         Ok(Arc::new(scan))
     }
 
@@ -236,8 +253,8 @@ impl TableProvider for AuditTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Distributed coordinator path (ADR-0071; #326): fan out to worker slices
         // instead of scanning locally, folding worker bytes into the query
-        // accounting under an `Unlimited` ceiling. See the `logs` provider for the
-        // full rationale.
+        // accounting under the statement's effective `max_bytes_scanned` (issue
+        // #1409). See the `logs` provider for the full rationale.
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
             let plan = distributed_audit_plan(
@@ -246,7 +263,7 @@ impl TableProvider for AuditTableProvider {
                 Arc::clone(&self.schema),
                 _limit,
                 self.accounting.clone(),
-                ByteLimit::Unlimited,
+                self.scan_budget.max_bytes_scanned(),
             )?;
             return self.apply_projection(plan, projection);
         }

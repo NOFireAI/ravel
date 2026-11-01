@@ -410,7 +410,9 @@ async fn compute_plan_counts(
     let mut carried_seen = 0usize;
     let mut key_index = KeyIndexPruning::default();
     while let Some((idx, entry)) = stream.next().await {
-        let keyed = match entry.map_err(SqlError::from)? {
+        let entry = entry.map_err(SqlError::from)?;
+        ctx.budget.check()?;
+        let keyed = match entry {
             PlanPassRead::Planned(keyed) => *keyed,
             PlanPassRead::Probed(probe) => {
                 key_index.segments_pruned += probe.segments_pruned;
@@ -2973,6 +2975,7 @@ mod carried_directory_reservation_tests {
             columns: ColumnSelection::all(),
             projected_fraction: 1.0,
             phase_accounting: PhaseAccounting::new(),
+            budget: ScanBudget::unlimited(&PhaseAccounting::new()),
         };
         assert_eq!(budget.reserved(), 0);
         let counts = compute_plan_counts(&ctx, &segments, 4, true, false)
@@ -3034,6 +3037,7 @@ mod carried_directory_reservation_tests {
             columns: ColumnSelection::all(),
             projected_fraction: 1.0,
             phase_accounting: PhaseAccounting::new(),
+            budget: ScanBudget::unlimited(&PhaseAccounting::new()),
         };
         let exact = compute_plan_counts(&with_limit(total), &segments, 1, true, false).await;
         assert!(
@@ -3101,6 +3105,7 @@ mod carried_directory_reservation_tests {
             columns: ColumnSelection::all(),
             projected_fraction: 1.0,
             phase_accounting: PhaseAccounting::new(),
+            budget: ScanBudget::unlimited(&PhaseAccounting::new()),
         };
         let counts = compute_plan_counts(&ctx, &segments, 2, true, false)
             .await

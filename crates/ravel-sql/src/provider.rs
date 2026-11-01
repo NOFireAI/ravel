@@ -47,6 +47,7 @@ use crate::config::SqlConfig;
 use crate::dedup::RsegDedupExec;
 use crate::pushdown::{Pushdown, extract};
 use crate::scan::RsegScanExec;
+use crate::scan_budget::ScanBudget;
 use crate::schema::public_schema;
 use crate::statement_accounting::StatementAccounting;
 
@@ -73,11 +74,11 @@ pub struct RavelTableProvider {
     /// fetch the scan issues on this query's behalf is recorded against the
     /// right phase.
     phase_accounting: PhaseAccounting,
-    /// What the scan's byte and request budgets are checked against: the
-    /// statement total across every table it reads. A provider built with
-    /// [`Self::new`] alone checks its own handle, the whole statement when it
+    /// The scan's byte and request budgets and the statement total they are
+    /// checked against. A provider built with [`Self::new`] alone checks
+    /// `config`'s budgets against its own handle, the whole statement when it
     /// is the only table.
-    budget_accounting: StatementAccounting,
+    scan_budget: ScanBudget,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `RsegScanExec` the provider builds. On the distributed
@@ -110,13 +111,18 @@ impl RavelTableProvider {
         phase_accounting: PhaseAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
+        let config: SqlConfig = config.into();
         RavelTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
             fetcher,
-            config: config.into(),
+            scan_budget: ScanBudget::new(
+                &config.engine,
+                StatementAccounting::One(phase_accounting.clone()),
+                None,
+            ),
+            config,
             schema: public_schema(),
-            budget_accounting: StatementAccounting::One(phase_accounting.clone()),
             phase_accounting,
             erasure,
             #[cfg(feature = "flight-sql")]
@@ -124,10 +130,10 @@ impl RavelTableProvider {
         }
     }
 
-    /// Check the scan's byte and request budgets against `statement`, the
-    /// statement total, rather than this table's own handle.
-    pub(crate) fn with_statement_accounting(mut self, statement: StatementAccounting) -> Self {
-        self.budget_accounting = statement;
+    /// Check `budget` in the scan, the statement's budgets against its
+    /// total, rather than `config`'s against this table's own handle.
+    pub(crate) fn with_scan_budget(mut self, budget: ScanBudget) -> Self {
+        self.scan_budget = budget;
         self
     }
 
@@ -204,11 +210,9 @@ impl RavelTableProvider {
             matchers,
             series_ids,
             self.config.engine.max_series,
-            self.config.engine.max_bytes_scanned,
-            self.config.engine.max_s3_requests,
+            self.scan_budget.clone(),
             Arc::clone(&self.erasure),
             self.phase_accounting.clone(),
-            self.budget_accounting.clone(),
         )?);
         let scan_schema = scan.schema();
 

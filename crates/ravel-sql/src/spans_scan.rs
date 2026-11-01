@@ -93,6 +93,7 @@ use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::error::SqlError;
+use crate::scan_budget::ScanBudget;
 use crate::spans_fetcher::{SpanRow, SpanSegmentFetcher};
 use crate::spans_schema::{
     SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_EVENTS, SPAN_COL_LINKS,
@@ -248,6 +249,9 @@ pub struct SpansScanExec {
     /// funnel, mirroring `LogsScanExec`. A trace lookup's footer and section
     /// reads land on the probe phase and its block runs on the scan phase.
     accounting: PhaseAccounting,
+    /// The statement's byte and request budgets (issue #1409), checked after
+    /// each segment fetch and before its blocks are decoded.
+    budget: ScanBudget,
     /// Partition metrics (ADR-0110 decision 5): `columnar_batches`/
     /// `rowpath_batches` show which path a partition ran, and
     /// `pages_decoded`/`pages_skipped` show projection reaching decode, so
@@ -300,6 +304,8 @@ impl SpansScanExec {
         };
         let columnar_eligible = columnar_static_eligible(projection.as_deref(), &erasure);
         let properties = Arc::new(Self::compute_properties(&schema, n, projection.as_deref())?);
+        let accounting = PhaseAccounting::pooled_over(&accounting);
+        let budget = ScanBudget::unlimited(&accounting);
         Ok(SpansScanExec {
             tenant_hash,
             fetcher,
@@ -314,7 +320,8 @@ impl SpansScanExec {
             columnar_eligible,
             schema,
             properties,
-            accounting: PhaseAccounting::pooled_over(&accounting),
+            accounting,
+            budget,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -324,6 +331,13 @@ impl SpansScanExec {
     #[must_use]
     pub fn with_phase_accounting(mut self, phases: PhaseAccounting) -> Self {
         self.accounting = phases;
+        self
+    }
+
+    /// Check the statement's byte and request budgets after every segment
+    /// fetch (issue #1409). Unlimited by default.
+    pub(crate) fn with_scan_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -458,6 +472,7 @@ impl ExecutionPlan for SpansScanExec {
             self.columnar_eligible,
             self.projection.clone(),
             self.accounting.clone(),
+            self.budget.clone(),
             metrics.blocks_decoded.clone(),
             metrics.key_index.clone(),
         ));
@@ -626,6 +641,7 @@ async fn prepare_partition(
     attempt_columnar: bool,
     projection: Option<Arc<Vec<usize>>>,
     accounting: PhaseAccounting,
+    budget: ScanBudget,
     blocks_decoded: Count,
     key_index: KeyIndexCounters,
 ) -> DFResult<Prepared> {
@@ -666,6 +682,7 @@ async fn prepare_partition(
             &predicates,
             &proj,
             &accounting,
+            &budget,
             &blocks_decoded,
             &key_index,
         )
@@ -687,7 +704,7 @@ async fn prepare_partition(
 
     let mut out: Vec<SpanRow> = Vec::new();
     for seg in &segs {
-        let Some(output) = fetcher
+        let fetched = fetcher
             .fetch_accounted_in_blocks(
                 seg,
                 tenant_hash,
@@ -699,8 +716,11 @@ async fn prepare_partition(
                 &accounting,
             )
             .await
-            .map_err(SqlError::from)?
-        else {
+            .map_err(SqlError::from)?;
+        // This exit decodes inside the fetch, so the check lands before the
+        // next segment's fetch rather than before this one's decode.
+        budget.check()?;
+        let Some(output) = fetched else {
             continue;
         };
         // The same decode-side counts the columnar arm reads off each block; the
@@ -750,6 +770,7 @@ async fn prepare_columnar(
     predicates: &[BloomPredicate<'_>],
     projection: &Arc<Vec<usize>>,
     accounting: &PhaseAccounting,
+    budget: &ScanBudget,
     blocks_decoded: &Count,
     key_index: &KeyIndexCounters,
 ) -> DFResult<ColumnarAttempt> {
@@ -761,7 +782,7 @@ async fn prepare_columnar(
     let mut pages_decoded = 0usize;
     let mut pages_skipped = 0usize;
     for seg in segs {
-        let Some(mut scan) = fetcher
+        let fetched = fetcher
             .fetch_accounted_columnar_in_blocks(
                 seg,
                 tenant_hash,
@@ -774,8 +795,10 @@ async fn prepare_columnar(
                 accounting,
             )
             .await
-            .map_err(SqlError::from)?
-        else {
+            .map_err(SqlError::from)?;
+        // Every store read for this segment is done; its blocks decode below.
+        budget.check()?;
+        let Some(mut scan) = fetched else {
             continue;
         };
         pruned.segments_pruned += scan.key_index().segments_pruned;

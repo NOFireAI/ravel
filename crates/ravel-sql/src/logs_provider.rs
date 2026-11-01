@@ -37,8 +37,6 @@ use datafusion::physical_plan::ExecutionPlan;
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{LoadedColumnStats, SegmentRef, Snapshot};
-#[cfg(feature = "flight-sql")]
-use ravel_query::ByteLimit;
 use ravel_query::LogSegmentFetcher;
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
@@ -59,6 +57,7 @@ use crate::logs_pushdown::{LogsPushdown, extract_logs_keyed, filter_is_exact};
 use crate::logs_scan::{LogsScanExec, ScanExecutions};
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 use crate::logs_stats_prune::prune_segments_by_stats;
+use crate::scan_budget::ScanBudget;
 
 /// The `logs` table provider for one tenant over one pinned `Signal::Logs`
 /// snapshot.
@@ -115,6 +114,11 @@ pub struct LogsTableProvider {
     /// every `LogsScanExec` this provider builds. `None` by default, installed
     /// with [`Self::with_scan_executions`].
     scan_executions: Option<Arc<ScanExecutions>>,
+    /// The statement's byte and store-request budgets (issue #1409), checked
+    /// by every `LogsScanExec` this provider builds after each store read and
+    /// passed to the distributed fan-out. Unlimited over this provider's own
+    /// accounting by default, installed with [`Self::with_scan_budget`].
+    scan_budget: ScanBudget,
 }
 
 impl LogsTableProvider {
@@ -129,6 +133,7 @@ impl LogsTableProvider {
         phase_accounting: PhaseAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
+        let scan_budget = ScanBudget::unlimited(&phase_accounting);
         LogsTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
@@ -145,6 +150,7 @@ impl LogsTableProvider {
             stats_pruning: true,
             contains_pushdown: true,
             scan_executions: None,
+            scan_budget,
         }
     }
 
@@ -279,6 +285,15 @@ impl LogsTableProvider {
         self
     }
 
+    /// Install the statement's scan budget (issue #1409): every
+    /// `LogsScanExec` this provider builds refuses once the statement total
+    /// passes the effective `max_bytes_scanned` or `max_s3_requests`, and the
+    /// distributed fan-out carries the same byte ceiling.
+    pub(crate) fn with_scan_budget(mut self, scan_budget: ScanBudget) -> Self {
+        self.scan_budget = scan_budget;
+        self
+    }
+
     /// Turn plan-time statistics pruning off, so a test can compare the rows
     /// and fetches of the same query with and without it.
     #[cfg(test)]
@@ -361,7 +376,8 @@ impl LogsTableProvider {
         .with_segment_timing(self.segment_timing)
         .with_segments_pruned_by_stats(pruned_by_stats)
         .with_key_equals(Arc::new(pushdown.key_equals.clone()))
-        .with_scan_executions(self.scan_executions.clone());
+        .with_scan_executions(self.scan_executions.clone())
+        .with_scan_budget(self.scan_budget.clone());
         Ok(Arc::new(scan))
     }
 
@@ -467,10 +483,9 @@ impl TableProvider for LogsTableProvider {
         // and prune comparisons ride to each worker with its slice ticket
         // (#2755) and only narrow which blocks it decodes; the content channel
         // is not carried, which widens a worker's read and never changes a
-        // row. The `logs` provider carries no
-        // per-query byte budget (admission is decided at resolve time), so the
-        // fan-out folds bytes into the query accounting under an `Unlimited`
-        // ceiling, matching the local path.
+        // row. The fan-out folds worker bytes into the query accounting under
+        // the statement's effective `max_bytes_scanned` (issue #1409), the
+        // ceiling the local path checks after each store read.
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
             let pushdown = extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index);
@@ -480,7 +495,7 @@ impl TableProvider for LogsTableProvider {
                 Arc::clone(&self.schema),
                 _limit,
                 self.phase_accounting.scan().clone(),
-                ByteLimit::Unlimited,
+                self.scan_budget.max_bytes_scanned(),
                 Some(SlicePushdown::logs(&pushdown)),
             )?;
             return self.apply_projection(plan, projection);

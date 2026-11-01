@@ -3120,7 +3120,7 @@ impl SqlExecutor {
                             config.clone(),
                             phase_accounting.lane(signal).clone(),
                         )
-                        .with_statement_accounting(phase_accounting.clone());
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine));
                         // Install the distributed samples scan for this query only,
                         // when the coordinator decided to fan out. `None`/feature-off
                         // leaves the provider byte-identical to the local path.
@@ -3193,7 +3193,8 @@ impl SqlExecutor {
                             .with_key_index(key_index)
                             .with_column_stats(column_stats)
                             .with_segment_timing(config.segment_timing)
-                            .with_scan_executions(Arc::clone(&self.scan_executions)),
+                            .with_scan_executions(Arc::clone(&self.scan_executions))
+                            .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
                         ))
                     }
                     // The alerts and audit providers are not yet threaded onto the
@@ -3216,27 +3217,32 @@ impl SqlExecutor {
                             self.span_fetcher.clone(),
                             phase_accounting.lane(signal).scan().clone(),
                         )
-                        .with_phase_accounting(phase_accounting.lane(signal).clone()),
+                        .with_phase_accounting(phase_accounting.lane(signal).clone())
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
                     )),
                     // The two RLOG-backed tables (ADR-1101 decision 1) read through the
                     // executor's existing `log_fetcher`: an alert and an audit record
                     // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
                     // tenant-checked fetch funnel and its caches. No declared columns
                     // and no column statistics apply to either.
-                    TargetSignal::Alerts => {
-                        SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+                    TargetSignal::Alerts => SessionTable::Alerts(Arc::new(
+                        AlertsTableProvider::new(
                             snapshot,
                             tenant_hash,
                             self.log_fetcher.clone(),
                             phase_accounting.lane(signal).scan().clone(),
-                        )))
-                    }
-                    TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
-                        snapshot,
-                        tenant_hash,
-                        self.log_fetcher.clone(),
-                        phase_accounting.lane(signal).scan().clone(),
-                    ))),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
+                    )),
+                    TargetSignal::Audit => SessionTable::Audit(Arc::new(
+                        AuditTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.log_fetcher.clone(),
+                            phase_accounting.lane(signal).scan().clone(),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
+                    )),
                     // A lane read beside Parquet tables is a signal table.
                     TargetSignal::Parquet => {
                         return Err(SqlError::Internal(
