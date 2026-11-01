@@ -1298,6 +1298,9 @@ struct QueryAccountingJson {
     bytes_reused: u64,
     #[serde(rename = "peakIntermediateBytes")]
     peak_intermediate_bytes: u64,
+    /// Always 0: this path has no SQL memory pool to report a pre-factor peak.
+    #[serde(rename = "peakAskedIntermediateBytes")]
+    peak_asked_intermediate_bytes: u64,
 }
 
 impl QueryAccountingJson {
@@ -1317,6 +1320,7 @@ impl QueryAccountingJson {
             series_matched: snapshot.series_matched,
             bytes_reused: snapshot.bytes_reused,
             peak_intermediate_bytes: snapshot.peak_intermediate_bytes,
+            peak_asked_intermediate_bytes: 0,
         }
     }
 }
@@ -3167,6 +3171,7 @@ mod tests {
             serde_json::to_value(QueryAccountingJson::from_snapshot(&snapshot)).expect("serialize");
         let theirs = crate::query::accounting_stats_json(
             &snapshot,
+            0,
             &ravel_types::accounting::CostEstimate::new(0, 0, 0, 0, 0),
         );
         let keys = |v: &Value| {

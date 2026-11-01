@@ -3404,6 +3404,14 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
   `peakIntermediateBytes` (SQL executor only).
 
+`/api/v1/sql` and the ES|QL catalog path also render
+`stats.accounting.peakAskedIntermediateBytes`, the high-water mark of the
+bytes the query's memory consumers asked the pool for; the charged
+`peakIntermediateBytes` includes the reserve-ahead factor (1.25 by default)
+for the hash aggregate consumers and the asked figure does not, so the two
+differ by up to that factor on an aggregate-heavy statement and agree on a scan.
+The PromQL, analytics and ES|QL row paths render it as 0.
+
 **`/api/v1/sql`'s JSON response** carries `stats.phases` and
 `stats.io` alongside its own pre-existing `stats.accounting`/`stats.estimate`,
 with the identical field names, `QueryPhase::ALL` ordering, and
