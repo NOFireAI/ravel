@@ -44,6 +44,8 @@
 //! transports are the first, and the unchanged end-to-end suites over them are
 //! the reachability proof that every existing query route runs through here.
 
+#[cfg(feature = "sql")]
+pub mod describe;
 pub mod error;
 #[cfg(test)]
 mod tests;
@@ -239,6 +241,8 @@ pub struct QueryService {
     exemplars: Option<crate::exemplars::ExemplarsState>,
     #[cfg(feature = "sql")]
     sql: Option<crate::sql::SqlState>,
+    #[cfg(feature = "sql")]
+    describe: Option<describe::DescribeState>,
     /// The authenticated caller's subject, written to every audit record this
     /// service submits (ADR-3541). Set per request by
     /// [`Self::with_audit_subject`]; `None` writes no subject attributes.
@@ -271,6 +275,8 @@ impl QueryService {
             exemplars: None,
             #[cfg(feature = "sql")]
             sql: None,
+            #[cfg(feature = "sql")]
+            describe: None,
             audit_subject: None,
         }
     }
