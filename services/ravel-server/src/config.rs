@@ -7345,7 +7345,16 @@ impl Cli {
                      one header cannot name both the tenant and the subject"
                 )
             }
-            (Some(subject), Some(_)) => Some(subject.clone()),
+            (Some(subject), Some(_)) => {
+                // A value no request header can carry would match nothing
+                // and leave every subject absent.
+                if http::HeaderName::try_from(subject.as_str()).is_err() {
+                    anyhow::bail!(
+                        "--mtls-subject-header '{subject}' is not a valid HTTP header name"
+                    );
+                }
+                Some(subject.clone())
+            }
         };
 
         Ok(AuthResolverSettings {
@@ -21100,6 +21109,33 @@ mod tests {
             .parse_auth_resolvers()
             .expect("--mtls-enabled alone parses");
         assert_eq!(settings.mtls_subject_header, None, "no default");
+    }
+
+    /// An mtls subject header that is not a valid header name refuses
+    /// startup, naming the flag and the value. Flip to watch it fail: in
+    /// `parse_auth_resolvers`, drop the `HeaderName::try_from` check from the
+    /// `(Some(subject), Some(_))` arm.
+    #[test]
+    fn an_mtls_subject_header_that_is_not_a_valid_header_name_refuses_startup() {
+        for subject in ["x-subject ", "x sub", "x-subject:cn"] {
+            let err = cli(&["--mtls-enabled", "--mtls-subject-header", subject])
+                .parse_auth_resolvers()
+                .expect_err("an invalid header name refuses startup");
+            assert_eq!(
+                err.to_string(),
+                format!("--mtls-subject-header '{subject}' is not a valid HTTP header name"),
+                "{subject:?}"
+            );
+        }
+
+        // Header names are case-insensitive, so mixed case is still valid.
+        let settings = cli(&["--mtls-enabled", "--mtls-subject-header", "X-Cert-Subject"])
+            .parse_auth_resolvers()
+            .expect("a mixed-case header name parses");
+        assert_eq!(
+            settings.mtls_subject_header.as_deref(),
+            Some("X-Cert-Subject")
+        );
     }
 
     #[test]
