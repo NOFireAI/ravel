@@ -272,7 +272,6 @@ impl StatementTables {
     }
 
     /// Whether the statement names more than one base table of any kind.
-    #[cfg(feature = "flight-sql")]
     pub(crate) fn names_several_tables(&self) -> bool {
         self.signals.len() + self.others.len() > 1
     }
@@ -296,6 +295,25 @@ fn reads_several_tables(signal_lanes: usize, beside_parquet: bool) -> bool {
 pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlError> {
     if tables.signals.len() > 1 {
         return Err(SqlError::CrossSignalQuery);
+    }
+    Ok(())
+}
+
+/// The one-table rule of the MCP SQL tools (ADR-1374, ADR-2904 decision 9):
+/// refuse `sql` when it names more than one base table of any kind, reading
+/// the statement text alone, with no store or catalog request.
+///
+/// Two or more signal tables are [`SqlError::CrossSignalQuery`]. Any other
+/// second table (a Parquet table beside a signal table, or two names that are
+/// not signal tables) is [`SqlError::OneTablePerStatement`]. A table named in
+/// a subquery or a CTE body counts; a CTE name does not, and one table read
+/// twice is one table. Text that does not parse, and the shadowed-name and
+/// table-count refusals, are [`SqlExecutor::statement_tables`]'s errors.
+pub fn refuse_several_tables(sql: &str) -> Result<(), SqlError> {
+    let tables = SqlExecutor::statement_tables(sql)?;
+    refuse_cross_signal(&tables)?;
+    if tables.names_several_tables() {
+        return Err(SqlError::OneTablePerStatement);
     }
     Ok(())
 }
@@ -7547,6 +7565,30 @@ pub(crate) mod tests {
             SqlExecutor::target_signal("SELECT * FROM samples JOIN logs ON samples.ts = logs.ts")
                 .expect_err("both tables rejected");
         assert!(matches!(err, SqlError::CrossSignalQuery));
+    }
+
+    /// Text that does not parse, or that the complexity guard refuses, is
+    /// refused by `refuse_several_tables` with exactly the error
+    /// `statement_tables` returns for it.
+    ///
+    /// FLIP: a `refuse_several_tables` that answers Ok when `statement_tables`
+    /// fails (`let Ok(tables) = .. else { return Ok(()) }`) panics at the
+    /// second `let .. else`.
+    #[test]
+    fn refuse_several_tables_returns_the_statement_tables_error_for_bad_text() {
+        let too_complex = format!(
+            "SELECT 1{}",
+            "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY)
+        );
+        for sql in ["SELEC ts FROM logs", "SELECT * FROM", too_complex.as_str()] {
+            let Err(SqlError::Validation(expected)) = SqlExecutor::statement_tables(sql) else {
+                panic!("statement_tables must refuse {sql:?} with a validation error");
+            };
+            let Err(SqlError::Validation(got)) = refuse_several_tables(sql) else {
+                panic!("refuse_several_tables must refuse {sql:?} with a validation error");
+            };
+            assert_eq!(got, expected, "{sql:?}");
+        }
     }
 
     /// ADR-0045 decision 5: the one-signal-per-query rule, which ADR-2904
