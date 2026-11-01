@@ -856,6 +856,8 @@ impl QueryService {
         let accounting = QueryAccounting::new();
         let live = LiveCost::new();
         live.install(&accounting);
+        // A cancelled explain is charged only because `explain_accounted`'s
+        // `MergeOnDrop` merges into `accounting` as its future drops, before this guard does.
         let guard = self
             .controls
             .usage_guard(tenant_hash, Arc::new(live.clone()));

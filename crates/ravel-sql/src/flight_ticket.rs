@@ -394,8 +394,11 @@ use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
+#[cfg(any(feature = "flight-sql", test))]
 use crate::error::SqlError;
-use crate::executor::{SIGNAL_LANE_ORDER, SqlExecutor, TargetSignal, pinned_signals_mismatch};
+use crate::executor::{SIGNAL_LANE_ORDER, TargetSignal};
+#[cfg(any(feature = "flight-sql", test))]
+use crate::executor::{SqlExecutor, pinned_signals_mismatch};
 use crate::logs_pushdown::LogsPushdown;
 use crate::parquet::{MAX_STATEMENT_TABLE_NAMES, ParquetPin};
 use crate::spans_pushdown::SpansPushdown;
@@ -1342,6 +1345,7 @@ impl FlightTicket {
     /// tables the statement reads ([`SqlError::PinnedSignalsMismatch`]
     /// otherwise). The statement's tables come from the same parse every plan
     /// takes ([`SqlExecutor::statement_tables`]).
+    #[cfg(any(feature = "flight-sql", test))]
     pub(crate) fn redemption_lanes(
         &self,
     ) -> Result<Vec<(TargetSignal, ravel_catalog::Snapshot)>, SqlError> {

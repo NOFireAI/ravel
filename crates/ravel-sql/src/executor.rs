@@ -2703,9 +2703,9 @@ impl SqlExecutor {
     /// table's provider reads only its own lane's snapshot and applies that
     /// snapshot's pending erasure.
     ///
-    /// For a statement naming two or more signal tables, the lanes' signals
+    /// For a statement naming one or more signal tables, the lanes' signals
     /// must be exactly the statement's signal tables in [`SIGNAL_LANE_ORDER`];
-    /// otherwise, exactly one lane. Anything else is
+    /// a statement naming none takes exactly one lane. Anything else is
     /// [`SqlError::PinnedSignalsMismatch`], refused before any store request.
     pub async fn plan_pinned_lanes(
         &self,
@@ -2785,15 +2785,16 @@ impl SqlExecutor {
 
     /// `lanes` checked against the signal tables `sql` names, before anything
     /// is read: every signal table's lane, in [`SIGNAL_LANE_ORDER`], for a
-    /// statement naming two or more; otherwise exactly one lane, which plans
-    /// as the statement's one table the way [`Self::pinned_lane`] plans it.
+    /// statement naming one or more, so a one-table statement's lane must be
+    /// that table's signal; a statement naming no signal table takes exactly
+    /// one lane, which plans the way [`Self::pinned_lane`] plans it.
     fn checked_lanes(
         sql: &str,
         lanes: Vec<(TargetSignal, Snapshot)>,
     ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
         let tables = Statement::Sql(sql).tables()?;
         let pinned: Vec<TargetSignal> = lanes.iter().map(|(signal, _)| *signal).collect();
-        if tables.signals.len() > 1 {
+        if !tables.signals.is_empty() {
             if pinned != tables.signals {
                 return Err(pinned_signals_mismatch(&pinned, &tables.signals));
             }
