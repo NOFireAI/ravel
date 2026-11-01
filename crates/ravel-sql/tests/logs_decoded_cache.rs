@@ -438,9 +438,10 @@ async fn contains_estimate(store: &Arc<dyn ObjectStoreBackend>, t: &TenantId) ->
 /// 24 admissions cold, 24 hits and no miss hot, and the cache ends holding
 /// those 24 entries and no `c`. The rows equal the uncached scan's.
 ///
-/// Seen failing against serving every deferred column (cold: 32 misses where
-/// 24 are expected) and against comparing the estimate with the cap instead
-/// of 0.95 of it (the same 32, since the estimate equals the cap).
+/// Seen failing against serving every deferred column (the counts assertion:
+/// cold `(0, 32, 32)` where `(0, 24, 24)` is expected) and against comparing
+/// the estimate with the cap instead of 0.95 of it (the `deferred_served`
+/// assertion on run 0, since the estimate equals the cap).
 #[tokio::test]
 async fn decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit() {
     let t = tenant();
