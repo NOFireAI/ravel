@@ -1489,10 +1489,10 @@ the Parquet tables. In such a statement the request row window applies to
 the signal scans and not to the Parquet scan, and commit tokens apply to
 signal tables only. A statement over Parquet tables alone that carries a row
 window stays a 400. The session settings D6 chose for Parquet plans are
-unchanged. Until ticket T7 of epic #2904 (#2914) lands (it has; see the
-interim refusal amendment below), the executor refuses such a statement
-with `SqlError::SignalBesideParquet`, a 400 that says it is not supported
-yet, before any signal catalog listing.
+unchanged. Until ticket T7 of epic #2904 (#2914) landed, the executor
+refused such a statement with `SqlError::SignalBesideParquet`, a 400 that
+said it was not supported yet, before any signal catalog listing; that
+variant is gone (see the interim refusal amendment below).
 
 ## Amendment (2026-10-19, issue #2914): the interim refusal beside a signal table is lifted
 

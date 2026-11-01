@@ -165,6 +165,14 @@ The SQL surface registers five tables, one per signal: `samples` (metrics),
 `logs`, `spans` (traces), `alerts` (alert state transitions), and `audit`
 (audit records, including the query-audit trail).
 
+A statement may name several of those five and the tenant's Parquet tables,
+for example a join of `samples` and `logs`. Each signal table is read from
+its own snapshot, with no order between them, and the join runs on the
+receiving server under a memory ceiling that is best-effort for join
+operators. An alias or CTE name that equals a table name in a statement
+reading two or more tables is 400 before any catalog listing. See
+[the query guide](../guides/query.md#sql-queries) for the terms.
+
 Request limits:
 
 - The request body is capped at 64 KiB. A larger body is 400.

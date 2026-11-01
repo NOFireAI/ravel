@@ -596,8 +596,9 @@ Every transition that an evaluator writes is a row in the `alerts` table.
 `POST /api/v1/sql` and Flight SQL serve the table. It is one of the five
 tables that the SQL surface exposes (`samples`, `logs`, `spans`, `alerts`,
 `audit`). `POST /api/v1/sql` and Flight SQL can join it with the other four,
-each table read from its own snapshot. Over Flight SQL such a join takes no
-`min_commit_token`.
+each table read from its own snapshot. On both, a `min_commit_token` on such
+a join is qualified with the table it bounds (`alerts:<token>`), and the
+join's memory ceiling is best-effort; see the [query guide](query.md).
 
 The table has these columns:
 

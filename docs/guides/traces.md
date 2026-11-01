@@ -135,9 +135,10 @@ and `end`.
 (metrics), `logs`, `spans`, `alerts` (alert state transitions), and `audit`
 (the audit trail). Ravel decides which tables a query reads from its `FROM`
 clause before planning. `POST /api/v1/sql` and Flight SQL can join `spans`
-with the other four tables, reading one snapshot per signal. Over Flight SQL
-such a query takes no `min_commit_token`. The [query guide](query.md) gives
-the terms of a join.
+with the other four tables, reading one snapshot per signal. On both, a
+`min_commit_token` on such a query is qualified with the table it bounds
+(`spans:<token>`). The [query guide](query.md) gives the terms of a join,
+including its best-effort memory ceiling.
 
 The `spans` table has these columns:
 
