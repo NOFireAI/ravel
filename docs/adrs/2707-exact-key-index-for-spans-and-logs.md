@@ -568,7 +568,9 @@ flowchart LR
   RLOG object all of whose fields were left out under the T8 compaction
   amendment below, which carries none and is read as unindexed. For RSPAN
   that follows from the shared flush pipeline (`RspanWriter::finish_compacted`
-  builds `trace_id` from rows). For RLOG the indexed set is a builder input
+  builds `trace_id` from rows), and the compactor cuts an L1 part before
+  one of its KEY_IDX buckets could pass the codec's cap (see the RSPAN
+  bucket cap amendment below). For RLOG the indexed set is a builder input
   (`RlogWriter::with_key_index_fields`), so the compactor recovers it the
   way it recovers the POSTINGS names today: the union of its inputs' KEY_IDX
   headers (`crates/ravel-maintain/src/rlog.rs`, the `input_indexed_fields`
@@ -950,8 +952,8 @@ object's index a field one of whose buckets would exceed
 dropped field is logged. All three are exact under decision 1: a field an
 object's header does not name is uncovered there, the probe declines, and
 the object is read as unindexed for that field. RSPAN cannot drop its one
-mandatory field, so the same bucket overflow there is tracked separately
-as issue #2985.
+mandatory field, so the compactor bounds the same bucket overflow there
+instead (see the RSPAN bucket cap amendment below).
 
 Refs: #2707, #849, #2680, #1848, #1869, #1987, #1382
 
@@ -1349,3 +1351,63 @@ loader's serial decode and its per-batch wait for the shards to merge,
 which this amendment does not change.
 
 Refs: #2961, #3072, #3119
+
+## Amendment (issue #2985): RSPAN L1 parts are cut before a KEY_IDX bucket passes its cap
+
+<!-- amendment-applies: sections="6. Erasure, compaction and resharding|Amendment (issue #2759): T8 leaves an unmergeable field uncovered instead of refusing the merge" pointer="RSPAN bucket cap amendment" -->
+<!-- amendment-supersedes: phrase="tracked separately as issue #2985" pointer="RSPAN bucket cap amendment" -->
+
+The KEY_IDX codec refuses an object one of whose buckets holds more than
+`KEY_IDX_BUCKET_MAX_ENTRIES` (2^20) entries, an entry being a distinct
+`(key8, block)` pair. RSPAN indexes `trace_id`, a key the sender chooses,
+and its one field cannot be dropped the way the T8 compaction amendment
+drops an RLOG field. Before this amendment the RSPAN writer did not check
+the cap, the codec refused the encode, and a compaction whose inputs held
+more than 2^20 entries in one bucket failed on every retry over the same
+immutable inputs, so a sender could wedge that compaction bucket for good.
+
+Raising the writer's bucket bits does not close this. The bucket mix
+(multiply by `0x9E3779B97F4A7C15`, keep the top bits) is a bijection on
+`u64`, so a sender can invert it and choose `key8` values whose mixed form
+shares its top 16 bits, which puts them in one bucket at every bucket width
+up to 16 bits, the codec's maximum.
+
+What this amendment decides, with no format change:
+
+- **The compactor cuts at a trace boundary.** `rspan_codec::merge` in
+  `ravel-maintain` keeps, per L1 part, a running load for each of the 256
+  writer buckets (`TRACE_KEY_IDX_BUCKET_BITS`, computed with the writer's
+  own bucket function through `ravel_rspan::trace_key_idx_bucket`), reset
+  when the part closes. A trace is admitted whole once its last surviving
+  span is read. Its charge is its surviving span count, billed to its
+  `trace_id`'s bucket: every entry has at least one row behind it, so the
+  summed charges bound the bucket's entries from above whatever blocks the
+  writer later cuts. When the part is non-empty and the charge would take
+  the bucket past `PART_KEY_IDX_BUCKET_CAP` (equal to
+  `KEY_IDX_BUCKET_MAX_ENTRIES`), the part closes first and the trace opens
+  the next one. The existing estimate cut still applies after admission.
+  Both cuts depend only on the merged record order, so the part layout is
+  the same on every run and for any split of the same records into inputs.
+- **A trace over the cap on its own is not an error.** It opens a fresh
+  part. Its own entries are one per block it occupies, about its span count
+  over `block_target_records` (8192 by default), so it reaches the cap only
+  past 2^20 x 8192 (about 8.6 x 10^9) spans in one trace, a trace the merge
+  could not hold in memory, since it buffers the pending trace whole.
+- **The writer refuses with a typed error.** `RspanWriter::finish` and
+  `finish_compacted` count distinct entries per bucket before encoding and
+  return `SpanSegError::KeyIdxBucketOverflow { bucket, entries, cap }`
+  naming the lowest overflowing bucket. With the compactor's cut this is a
+  backstop the merge never reaches.
+- **The ingest flush keeps its byte trigger.** It closes an object on an
+  estimate of encoded bytes, not on a span count, and
+  `IngestConfig::target_bytes` has no upper bound (`ravel-cli` accepts up
+  to 360,000,000,000), so an L0 object can hold more than 2^20 spans and a
+  sender can fill one bucket in it. Bounding the shared `target_bytes`
+  would change the metrics and logs loaders and still leave the batch
+  overshoot and the hand-back paths, so the flush is not bounded here. An
+  L0 overflow fails that one flush: the waiters receive
+  `SpanWriteError::SegmentBuild` carrying the typed message, the
+  `abandoned_input_rejected` counter moves, and nothing is written, so no
+  object exists for a later compaction to wedge on.
+
+Refs: #2707, #2759, #2985

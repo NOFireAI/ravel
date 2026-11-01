@@ -79,13 +79,16 @@
 //! sort key puts `trace_id` first, a trace's records from every input are
 //! contiguous in the merged stream, so the boundary check the old per-trace
 //! loop made once per trace group becomes an inline check on each
-//! `trace_id` transition in the flat loop. Merged records feed straight into
-//! the in-progress part's [`RspanWriter`]; there is no intermediate
-//! `Vec<SpanRecord>` batch or `by_trace` map.
+//! `trace_id` transition in the flat loop. Merged records of the trace being
+//! read are held until that transition, when the whole trace moves into the
+//! in-progress part's [`RspanWriter`]: holding it is what lets the part be cut
+//! before a trace whose KEY_IDX charge would overflow a bucket (issue #2985).
+//! There is no larger intermediate batch and no `by_trace` map.
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input),
 //! plus at most one decoded block per input (`O(input_count * block_size)`,
-//! independent of trace size), plus the in-progress part's writer buffer.
+//! independent of trace size), plus the in-progress part's writer buffer and
+//! the trace being read.
 //!
 //! That last term is where RSPAN differs from RLOG, and it is not a bound. The
 //! split target `l1_part_memory_target_bytes` is compared against the part's
@@ -382,6 +385,13 @@ impl RecordCounts {
 /// [`PartBuilder::push`]) counts distinct traces correctly without a set. A
 /// record `keep` rejects is released here, so the erasure rewrite's peak memory
 /// is bounded by its survivors' part, not by everything it read.
+///
+/// A second cut runs at the same trace boundary (issue #2985): a part closes
+/// before the next trace would take any of its KEY_IDX buckets past
+/// [`PART_KEY_IDX_BUCKET_CAP`] entries (see [`admit_trace`]). Trace ids are
+/// caller-chosen and the bucket mix is invertible, so a sender can aim every
+/// trace at one bucket; without the cut such a bucket fails the writer and
+/// the bucket's inputs could never be compacted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn merge(
     store: &dyn ObjectStoreBackend,
@@ -391,6 +401,32 @@ pub(crate) async fn merge(
     input_set_hash: &[u8; 32],
     dry_run: bool,
     keep: &mut (dyn FnMut(&SpanRecord) -> Result<bool> + Send),
+) -> Result<SpanMergeOutput> {
+    merge_with_key_idx_cap(
+        store,
+        config,
+        bucket,
+        catalogs,
+        input_set_hash,
+        dry_run,
+        keep,
+        PART_KEY_IDX_BUCKET_CAP,
+    )
+    .await
+}
+
+/// [`merge`] with the per-bucket KEY_IDX cap as a parameter, so a test can
+/// reach the cut with a few traces instead of 2^20 spans in one bucket.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_with_key_idx_cap(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    catalogs: &[SpanInputCatalog],
+    input_set_hash: &[u8; 32],
+    dry_run: bool,
+    keep: &mut (dyn FnMut(&SpanRecord) -> Result<bool> + Send),
+    key_idx_cap: u64,
 ) -> Result<SpanMergeOutput> {
     let ledger = config.request_ledger.as_ref();
     // No whole-object fetch: the per-input ranged readers are already in the
@@ -427,9 +463,19 @@ pub(crate) async fn merge(
         .try_collect()
         .await?;
 
-    let mut parts = Vec::new();
-    let mut part_index: u32 = 0;
+    let mut out = PartSink {
+        store,
+        bucket,
+        config,
+        input_set_hash,
+        dry_run,
+        ledger,
+        tracker,
+        parts: Vec::new(),
+        part_index: 0,
+    };
     let mut current: Option<PartBuilder> = None;
+    let mut pending = PendingTrace::default();
     let mut current_trace: Option<[u8; 16]> = None;
     let mut counts = RecordCounts::default();
 
@@ -455,10 +501,10 @@ pub(crate) async fn merge(
 
         counts.add_input()?;
 
-        // The trace-boundary flush runs on every `trace_id` transition in the
-        // merged stream, independent of `keep`: a part is closed before the
-        // first record of a new trace so a trace never straddles two parts.
-        // Only surviving records open or push into a part.
+        // The trace-boundary work runs on every `trace_id` transition in the
+        // merged stream, independent of `keep`: the trace just completed is
+        // admitted whole into a part, so a trace never straddles two parts.
+        // Only surviving records join the pending trace.
         //
         // This transition is the only place the split target is consulted, so
         // the part's heap is whatever the traces it already holds weigh: past
@@ -475,34 +521,12 @@ pub(crate) async fn merge(
                 crate::claim_guard::Checkpoint::MergeLoop,
             )
             .await?;
+            admit_trace(&mut out, &mut current, &mut pending, &identity, key_idx_cap).await?;
             if let Some(part) = &current {
-                let over_cap =
+                let over_target =
                     part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
-                if over_cap && let Some(builder) = current.take() {
-                    let built = builder
-                        .finish(
-                            store,
-                            bucket,
-                            config,
-                            input_set_hash,
-                            part_index,
-                            dry_run,
-                            ledger,
-                        )
-                        .await?;
-                    // Cancellation checkpoint 4: a part boundary, after the
-                    // part PUT returned.
-                    crate::claim_guard::checkpoint(
-                        config,
-                        store,
-                        crate::claim_guard::Checkpoint::PartBoundary,
-                    )
-                    .await?;
-                    parts.push(built);
-                    part_index += 1;
-                    if let Some(t) = tracker {
-                        t.set_writer_bytes(0);
-                    }
+                if over_target && let Some(builder) = current.take() {
+                    out.close(builder).await?;
                 }
             }
             current_trace = Some(trace_id);
@@ -510,40 +534,142 @@ pub(crate) async fn merge(
 
         if keep(&rec)? {
             counts.add_output()?;
-            let part = current.get_or_insert_with(|| PartBuilder::new(&identity));
-            part.push(rec, tracker);
+            pending.push(rec)?;
+            if let Some(t) = tracker {
+                let part_estimate = current.as_ref().map_or(0, |p| p.estimate);
+                t.set_writer_bytes(part_estimate.saturating_add(pending.estimate));
+            }
         }
         cursors[bi].refill(store, tracker, ledger).await?;
     }
 
+    admit_trace(&mut out, &mut current, &mut pending, &identity, key_idx_cap).await?;
     if let Some(part) = current
         && !part.is_empty()
     {
-        let built = part
-            .finish(
-                store,
-                bucket,
-                config,
-                input_set_hash,
-                part_index,
-                dry_run,
-                ledger,
-            )
-            .await?;
-        // Cancellation checkpoint 4 for the tail part.
-        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
-            .await?;
-        parts.push(built);
-        if let Some(t) = tracker {
-            t.set_writer_bytes(0);
-        }
+        out.close(part).await?;
     }
 
     Ok(SpanMergeOutput {
-        parts,
+        parts: out.parts,
         input_record_count: counts.input,
         output_record_count: counts.output,
     })
+}
+
+/// The most KEY_IDX entries the merge lets one bucket of an L1 part reach: the
+/// cap the RSPAN writer refuses past. A test lowers it through
+/// [`merge_with_key_idx_cap`] to reach the cut without 2^20 spans.
+pub(crate) const PART_KEY_IDX_BUCKET_CAP: u64 = ravel_rspan::KEY_IDX_BUCKET_MAX_ENTRIES as u64;
+
+/// Admits the completed pending trace whole into a part (issue #2985).
+///
+/// The trace's charge is its surviving span count, billed to the KEY_IDX
+/// bucket its `trace_id` lands in. A bucket entry is a distinct
+/// `(key8, block)` pair and every pair has at least one row behind it, so the
+/// summed charges bound the bucket's entries from above whatever blocks the
+/// writer later cuts. When the part is non-empty and the charge would take
+/// that bucket past `cap`, the part is closed first and the trace opens the
+/// next one, so the writer's overflow refusal is never reached. A trace whose
+/// charge alone passes `cap` gets a fresh part rather than an error: its own
+/// entries are one per block it occupies, about its span count over
+/// `block_target_records`, far below the cap.
+async fn admit_trace(
+    out: &mut PartSink<'_>,
+    current: &mut Option<PartBuilder>,
+    pending: &mut PendingTrace,
+    identity: &ObjectIdentity,
+    cap: u64,
+) -> Result<()> {
+    let Some(bucket) = pending.bucket else {
+        return Ok(());
+    };
+    let charge = pending.records.len() as u64;
+    if let Some(part) = current.as_ref() {
+        let over_cap = part.bucket_load(bucket)?.saturating_add(charge) > cap;
+        if over_cap
+            && !part.is_empty()
+            && let Some(builder) = current.take()
+        {
+            out.close(builder).await?;
+        }
+    }
+    let part = current.get_or_insert_with(|| PartBuilder::new(identity));
+    part.charge_bucket(bucket, charge)?;
+    for rec in std::mem::take(&mut pending.records) {
+        part.push(rec);
+    }
+    *pending = PendingTrace::default();
+    if let Some(t) = out.tracker {
+        t.set_writer_bytes(part.estimate);
+    }
+    Ok(())
+}
+
+/// Where [`merge`] closes its parts: everything a part's encode and PUT need,
+/// the parts built so far, and the next part's index.
+struct PartSink<'a> {
+    store: &'a dyn ObjectStoreBackend,
+    bucket: &'a Bucket,
+    config: &'a CompactorConfig,
+    input_set_hash: &'a [u8; 32],
+    dry_run: bool,
+    ledger: Option<&'a RequestLedger>,
+    tracker: Option<&'a MergeMemoryTracker>,
+    parts: Vec<BuiltPart>,
+    part_index: u32,
+}
+
+impl PartSink<'_> {
+    /// Encodes and PUTs `builder` as the next part, then passes cancellation
+    /// checkpoint 4 (a part boundary, after the part PUT returned).
+    async fn close(&mut self, builder: PartBuilder) -> Result<()> {
+        let built = builder
+            .finish(
+                self.store,
+                self.bucket,
+                self.config,
+                self.input_set_hash,
+                self.part_index,
+                self.dry_run,
+                self.ledger,
+            )
+            .await?;
+        crate::claim_guard::checkpoint(
+            self.config,
+            self.store,
+            crate::claim_guard::Checkpoint::PartBoundary,
+        )
+        .await?;
+        self.parts.push(built);
+        self.part_index += 1;
+        if let Some(t) = self.tracker {
+            t.set_writer_bytes(0);
+        }
+        Ok(())
+    }
+}
+
+/// The surviving records of the trace the merge is reading, held until the
+/// next `trace_id` transition shows the trace is complete and its KEY_IDX
+/// charge is known. `bucket` is the trace's KEY_IDX bucket once a record has
+/// survived, `None` while the trace is empty.
+#[derive(Default)]
+struct PendingTrace {
+    records: Vec<SpanRecord>,
+    estimate: u64,
+    bucket: Option<u32>,
+}
+
+impl PendingTrace {
+    fn push(&mut self, rec: SpanRecord) -> Result<()> {
+        if self.bucket.is_none() {
+            self.bucket = Some(ravel_rspan::trace_key_idx_bucket(&rec.trace_id)?);
+        }
+        self.estimate = self.estimate.saturating_add(estimate_record(&rec));
+        self.records.push(rec);
+        Ok(())
+    }
 }
 
 /// Open one input's cursor over its whole block sequence and load its first
@@ -571,12 +697,17 @@ async fn open_cursor<'a>(
 /// [`MergeMemoryTracker`]'s writer term. Between two such boundaries the
 /// estimate grows unchecked, which is why the target is a split point rather
 /// than a bound on this part's heap.
+///
+/// `bucket_loads` is the part's per-KEY_IDX-bucket charge ([`admit_trace`]),
+/// indexed by [`ravel_rspan::trace_key_idx_bucket`], the writer's own bucket
+/// function. It lives on the part, so every new part starts at zero.
 struct PartBuilder {
     writer: RspanWriter,
     estimate: u64,
     count: usize,
     trace_count: u64,
     last_trace: Option<[u8; 16]>,
+    bucket_loads: Vec<u64>,
 }
 
 impl PartBuilder {
@@ -587,6 +718,7 @@ impl PartBuilder {
             count: 0,
             trace_count: 0,
             last_trace: None,
+            bucket_loads: vec![0; ravel_rspan::TRACE_KEY_IDX_BUCKETS],
         }
     }
 
@@ -594,12 +726,28 @@ impl PartBuilder {
         self.count == 0
     }
 
+    fn bucket_load(&self, bucket: u32) -> Result<u64> {
+        self.bucket_loads
+            .get(bucket as usize)
+            .copied()
+            .ok_or_else(|| bucket_out_of_range(bucket))
+    }
+
+    fn charge_bucket(&mut self, bucket: u32, charge: u64) -> Result<()> {
+        let load = self
+            .bucket_loads
+            .get_mut(bucket as usize)
+            .ok_or_else(|| bucket_out_of_range(bucket))?;
+        *load = load.saturating_add(charge);
+        Ok(())
+    }
+
     /// Push one merged record into the part's writer, updating the running
     /// estimate and the distinct-trace count. Since the merge feeds records in
     /// `(trace_id, start_ts_ns)` order, all of one trace's records arrive
     /// contiguously, so a transition on `last_trace` counts distinct traces
     /// exactly.
-    fn push(&mut self, r: SpanRecord, tracker: Option<&MergeMemoryTracker>) {
+    fn push(&mut self, r: SpanRecord) {
         if self.last_trace != Some(r.trace_id) {
             self.trace_count += 1;
             self.last_trace = Some(r.trace_id);
@@ -607,9 +755,6 @@ impl PartBuilder {
         self.estimate = self.estimate.saturating_add(estimate_record(&r));
         self.count += 1;
         self.writer.push(r);
-        if let Some(t) = tracker {
-            t.set_writer_bytes(self.estimate);
-        }
     }
 
     /// Encode and PUT the part through the shared writer pipeline. See
@@ -639,6 +784,13 @@ impl PartBuilder {
         )
         .await
     }
+}
+
+fn bucket_out_of_range(bucket: u32) -> MaintainError {
+    MaintainError::Invariant(format!(
+        "KEY_IDX bucket {bucket} outside {} buckets",
+        ravel_rspan::TRACE_KEY_IDX_BUCKETS
+    ))
 }
 
 /// One input's cursor over its whole block sequence, yielding records in
@@ -2103,6 +2255,289 @@ mod tests {
         );
         let parts = differential_check(corpus, BOUNDARY_MEMORY_CAP).await;
         assert_eq!(parts, expected, "observed part count must match the rule");
+    }
+
+    // --- KEY_IDX bucket cut (issue #2985) ------------------------------
+
+    /// The cap the bucket-cut tests merge under, so a handful of traces reach
+    /// it instead of 2^20 spans.
+    const TEST_KEY_IDX_CAP: u64 = 4;
+    /// The KEY_IDX bucket the adversarial traces aim at.
+    const HOT_BUCKET: u32 = 17;
+    /// Span counts of the hot traces, in ascending trace-id order. Under
+    /// [`TEST_KEY_IDX_CAP`] the cut groups them `[0, 1] [2] [3, 4] [5, 6]`.
+    const HOT_SIZES: [u32; 7] = [3, 1, 2, 3, 1, 1, 2];
+
+    /// A trace id whose `key8` lands in KEY_IDX `bucket` at the writer's
+    /// bucket_bits. The mix multiplies by an odd constant, so it inverts mod
+    /// 2^64 and a sender can aim every trace at one bucket.
+    fn trace_in_bucket(bucket: u32, j: u64) -> [u8; 16] {
+        const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut inv = MIX;
+        for _ in 0..5 {
+            inv = inv.wrapping_mul(2u64.wrapping_sub(MIX.wrapping_mul(inv)));
+        }
+        let key8 = ((u64::from(bucket) << 56) | j).wrapping_mul(inv);
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&key8.to_be_bytes());
+        assert_eq!(ravel_rspan::trace_key_idx_bucket(&id).unwrap(), bucket);
+        id
+    }
+
+    /// `n` spans of trace `id`, numbered from `base` so every span of a corpus
+    /// is distinct and orders the same way in every input layout.
+    fn trace_spans(id: [u8; 16], n: u32, base: u32) -> Vec<SpanRecord> {
+        (base..base + n)
+            .map(|s| SpanRecord {
+                trace_id: id,
+                span_id: u64::from(s).to_be_bytes(),
+                parent_span_id: None,
+                name: format!("op-{s}"),
+                start_ts_ns: i64::from(s),
+                end_ts_ns: i64::from(s) + 1,
+                status_code: StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("k".into(), format!("v{s}"))],
+            })
+            .collect()
+    }
+
+    /// Hot trace ids in ascending order, each with its span count from
+    /// `sizes`, plus every record of the corpus. The hot ids differ in bit 55
+    /// of `j`, so at 9 or more bucket bits they fall into two buckets, and
+    /// `fillers` one-span traces sit in bucket 16, which shares a bucket with
+    /// [`HOT_BUCKET`] at 7 bits: a cut that buckets with any bits but the
+    /// writer's 8 draws different boundaries.
+    fn hot_corpus(sizes: &[u32], fillers: u64) -> (Vec<[u8; 16]>, Vec<SpanRecord>) {
+        let mut hot: Vec<[u8; 16]> = (0..sizes.len() as u64)
+            .map(|i| trace_in_bucket(HOT_BUCKET, ((i & 1) << 55) | (i + 1)))
+            .collect();
+        hot.sort();
+        let mut records = Vec::new();
+        let mut base = 0;
+        for (id, &n) in hot.iter().zip(sizes) {
+            records.extend(trace_spans(*id, n, base));
+            base += n;
+        }
+        for i in 0..fillers {
+            records.extend(trace_spans(trace_in_bucket(16, i + 1), 1, base));
+            base += 1;
+        }
+        (hot, records)
+    }
+
+    /// Deal `records` round-robin into `n` L0 inputs, so a trace's spans come
+    /// from several inputs and the merge has to bring them together.
+    fn deal(records: &[SpanRecord], n: usize) -> Vec<Vec<SpanRecord>> {
+        let mut inputs = vec![Vec::new(); n];
+        for (i, r) in records.iter().enumerate() {
+            inputs[i % n].push(r.clone());
+        }
+        inputs
+    }
+
+    /// Seed `inputs` as L0 objects and run the merge over them under `cap`,
+    /// returning the merge output and every part's bytes.
+    async fn merge_under_cap(
+        inputs: &[Vec<SpanRecord>],
+        cap: u64,
+    ) -> Result<(SpanMergeOutput, Vec<Bytes>)> {
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let mut catalogs = Vec::new();
+        for (i, records) in inputs.iter().enumerate() {
+            let writer_id = Uuid::from_u128(i as u128 + 1);
+            let seq = i as u64 + 1;
+            let bytes = seed(&store, writer_id, seq, records).await;
+            let key = keys::data_key(
+                &tenant_hash(),
+                Signal::Spans,
+                SHARD,
+                writer_id,
+                EPOCH,
+                seq,
+                blake3::hash(&bytes).as_bytes(),
+            )
+            .expect("data key");
+            catalogs.push(load_catalog_from_object(&store, &config, key).await?);
+        }
+        let out = merge_with_key_idx_cap(
+            &store,
+            &config,
+            &bucket(),
+            &catalogs,
+            &[7u8; 32],
+            false,
+            &mut |_| Ok(true),
+            cap,
+        )
+        .await?;
+        let mut bytes = Vec::new();
+        for p in &out.parts {
+            bytes.push(
+                store
+                    .get(&p.key, GetRange::Full)
+                    .await
+                    .expect("get part")
+                    .data,
+            );
+        }
+        Ok((out, bytes))
+    }
+
+    /// One opened part: its traces in order, its per-bucket entry counts, its
+    /// records.
+    type OpenedPart = (Vec<[u8; 16]>, Vec<u32>, Vec<SpanRecord>);
+
+    /// Per part: its footer opens as an L1 part at its index, its KEY_IDX
+    /// verifies, and it is returned as an [`OpenedPart`].
+    fn open_parts(parts: &[Bytes]) -> Vec<OpenedPart> {
+        let cfg = RspanConfig::default();
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let ftr = footer::open(bytes).expect("part footer opens");
+                assert_eq!(ftr.level, 1);
+                assert_eq!(ftr.part_index, i as u32);
+                let summary = RspanReader::new(bytes, &cfg)
+                    .expect("open part")
+                    .key_idx_summary()
+                    .expect("KEY_IDX verifies");
+                let records = decode_all(bytes);
+                let mut traces: Vec<[u8; 16]> = records.iter().map(|r| r.trace_id).collect();
+                traces.dedup();
+                (
+                    traces,
+                    summary.fields[0].bucket_entry_counts.clone(),
+                    records,
+                )
+            })
+            .collect()
+    }
+
+    /// Every trace sits in exactly one part.
+    fn assert_no_trace_straddles(parts: &[OpenedPart]) {
+        let mut seen: BTreeMap<[u8; 16], usize> = BTreeMap::new();
+        for (i, (traces, _, _)) in parts.iter().enumerate() {
+            for t in traces {
+                if let Some(prev) = seen.insert(*t, i) {
+                    panic!("trace {t:?} straddles parts {prev} and {i}");
+                }
+            }
+        }
+    }
+
+    /// Adversarial input: every hot trace lands in one KEY_IDX bucket. The
+    /// merge cuts at trace boundaries so no part's bucket passes the cap,
+    /// every part opens and verifies, and every row comes out exactly once.
+    ///
+    /// FLIP: before #2985 the merge had no bucket cut, so the whole corpus is
+    /// one part whose bucket 17 holds 7 entries, over the cap of 4, and the
+    /// part count and the bucket assertion fail. The exact grouping rules out
+    /// a per-record count with no per-trace headroom (cutting once the load
+    /// has reached the cap groups `[0, 1] [2, 3] [4, 5, 6]`), a load not reset
+    /// at the part boundary (every trace after the first cut gets its own
+    /// part), and bucket bits re-typed away from the writer's 8 (bucket 16's
+    /// fillers join the hot bucket at 7 bits; the hot traces split in two at
+    /// 9). A cut checked mid-trace puts traces 3 and 6 in two parts each.
+    #[tokio::test]
+    async fn the_merge_cuts_parts_before_an_adversarial_key_idx_bucket_overflows() {
+        assert_eq!(
+            PART_KEY_IDX_BUCKET_CAP,
+            u64::from(ravel_rspan::KEY_IDX_BUCKET_MAX_ENTRIES)
+        );
+        assert_eq!(PART_KEY_IDX_BUCKET_CAP, 1 << 20);
+
+        let (hot, records) = hot_corpus(&HOT_SIZES, 3);
+        let (out, bytes) = merge_under_cap(&deal(&records, 2), TEST_KEY_IDX_CAP)
+            .await
+            .expect("merge");
+        assert_eq!(out.parts.len(), 4);
+        let parts = open_parts(&bytes);
+
+        let groups: Vec<Vec<usize>> = parts
+            .iter()
+            .map(|(traces, _, _)| {
+                traces
+                    .iter()
+                    .filter_map(|t| hot.iter().position(|h| h == t))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(groups, vec![vec![0, 1], vec![2], vec![3, 4], vec![5, 6]]);
+        for (_, counts, _) in &parts {
+            assert!(counts.iter().all(|&n| u64::from(n) <= TEST_KEY_IDX_CAP));
+        }
+        assert_no_trace_straddles(&parts);
+
+        let n = records.len() as u64;
+        assert_eq!(n, 16);
+        assert_eq!((out.input_record_count, out.output_record_count), (n, n));
+        let sample_counts: u64 = out.parts.iter().map(|p| p.part.sample_count).sum();
+        assert_eq!(sample_counts, n);
+        let all: Vec<SpanRecord> = parts.iter().flat_map(|(_, _, r)| r.clone()).collect();
+        assert_eq!(canon_multiset(&all), canon_multiset(&records));
+    }
+
+    /// The cut is a function of the merged trace stream alone: the same corpus
+    /// dealt into two inputs and into three, merged twice each, gives the same
+    /// part keys and trace boundaries every time.
+    ///
+    /// FLIP: before #2985 every run was one part, so the part-count assertion
+    /// fails. Rules out a cut whose threshold or charge draws on a randomly
+    /// seeded hasher, such as a bucket-load map iterated in `RandomState`
+    /// order (repeat runs disagree), and one that reads wall-clock time
+    /// (likewise), as well as a charge taken per input object rather than per
+    /// merged trace (the two- and three-input runs disagree).
+    #[tokio::test]
+    async fn the_bucket_cut_is_deterministic_across_runs_and_input_layouts() {
+        let (_, records) = hot_corpus(&HOT_SIZES, 3);
+        let mut runs = Vec::new();
+        for n in [2, 3, 2, 3] {
+            let (out, _) = merge_under_cap(&deal(&records, n), TEST_KEY_IDX_CAP)
+                .await
+                .expect("merge");
+            let shape: Vec<(String, Vec<u8>, Vec<u8>)> = out
+                .parts
+                .iter()
+                .map(|p| {
+                    (
+                        p.key.clone(),
+                        p.part.first_series_id.clone(),
+                        p.part.last_series_id.clone(),
+                    )
+                })
+                .collect();
+            runs.push(shape);
+        }
+        for run in &runs[1..] {
+            assert_eq!(run, &runs[0]);
+        }
+        assert_eq!(runs[0].len(), 4);
+    }
+
+    /// One trace whose charge alone passes the cap does not fail the merge: it
+    /// gets a part of its own, whose KEY_IDX holds one entry for it, and the
+    /// traces on either side of it in the same bucket go to their own parts.
+    ///
+    /// FLIP: an implementation that errors on a trace over the cap fails the
+    /// merge; one that admits such a trace into the non-empty part before it
+    /// yields two parts, not three; one that splits the trace mid-way to stay
+    /// under the cap fails the straddle check.
+    #[tokio::test]
+    async fn a_single_trace_over_the_bucket_cap_gets_its_own_part() {
+        let (hot, records) = hot_corpus(&[1, 10, 1], 0);
+        let (out, bytes) = merge_under_cap(&deal(&records, 2), TEST_KEY_IDX_CAP)
+            .await
+            .expect("an oversized trace must not fail the merge");
+        let parts = open_parts(&bytes);
+        let traces: Vec<Vec<[u8; 16]>> = parts.iter().map(|(t, _, _)| t.clone()).collect();
+        assert_eq!(traces, vec![vec![hot[0]], vec![hot[1]], vec![hot[2]]]);
+        assert_eq!(parts[1].1[HOT_BUCKET as usize], 1);
+        assert_eq!(parts[1].2.len(), 10);
+        assert_no_trace_straddles(&parts);
+        assert_eq!(out.output_record_count, 12);
     }
 
     proptest! {
