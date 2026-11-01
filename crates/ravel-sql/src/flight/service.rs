@@ -643,7 +643,6 @@ impl FlightSqlService for RavelFlightSqlService {
         }
 
         let tenant = self.tenant(request.metadata())?;
-        let subject = self.auth.audit_subject(request.metadata())?;
 
         let decoded = self
             .ticket_keys
@@ -714,6 +713,7 @@ impl FlightSqlService for RavelFlightSqlService {
         // or first-batch error surfaced by `statement_stream` as a redacted
         // `Status`) is that query's final outcome, so it is audited Error and
         // awaited here, synchronously, before the error is returned.
+        let subject = self.auth.audit_subject(request.metadata())?;
         let now_ns = self.clock.now_ns();
         let query_text = decoded.statement.clone();
 

@@ -27,6 +27,7 @@ use axum::routing::post;
 use rand::TryRng;
 use rand::rngs::SysRng;
 use ravel_ingest::Clock;
+use ravel_maintain::AuditSubject;
 use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
 use ravel_mcp::catalog::{agents_tool_catalog, tool_catalog};
 use ravel_mcp::compact;
@@ -38,7 +39,6 @@ use ravel_mcp::tools::agents::{
 };
 use ravel_mcp::tools::{ToolContext, ToolError, dispatch};
 use ravel_query::{ByteLimit, EngineConfig, RequestBudgets, RequestLimit};
-use ravel_maintain::AuditSubject;
 use ravel_types::TenantHash;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
@@ -258,8 +258,9 @@ impl ServerHandler for RavelMcp {
             .meta
             .get_progress_token()
             .map(|token| ProgressReporter::new(context.peer.clone(), token));
-        let backend = ServiceBackend::new(self.service.clone().with_audit_subject(subject), budgets)
-            .with_progress(progress);
+        let backend =
+            ServiceBackend::new(self.service.clone().with_audit_subject(subject), budgets)
+                .with_progress(progress);
 
         let agents = match &self.agents {
             Some(router) if AGENTS_TOOLS.contains(&request.name.as_ref()) => {

@@ -489,8 +489,8 @@ mod tests {
         let mut keys = Vec::new();
         for line in list {
             for (i, token) in line.split('`').enumerate() {
-                let is_key = token == ATTR_KIND
-                    || (token.starts_with("query.") && !token.contains(' '));
+                let is_key =
+                    token == ATTR_KIND || (token.starts_with("query.") && !token.contains(' '));
                 if i % 2 == 1 && is_key && !keys.iter().any(|k| k == token) {
                     keys.push(token.to_string());
                 }
@@ -589,7 +589,11 @@ mod tests {
         }
         let documented = documented_attr_keys();
         let documented: Vec<&str> = documented.iter().map(String::as_str).collect();
-        assert_eq!(documented.len(), 9, "the doc list names nine keys: {documented:?}");
+        assert_eq!(
+            documented.len(),
+            9,
+            "the doc list names nine keys: {documented:?}"
+        );
         let labelled_keys: Vec<&str> = labelled.attrs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             sorted(labelled_keys),

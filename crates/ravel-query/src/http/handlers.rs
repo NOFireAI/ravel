@@ -119,8 +119,7 @@ async fn handle_query(state: &AppState, req: Request<Body>) -> Result<Response, 
         now_ns: now,
         budgets: None,
     };
-    let outcome =
-        service::promql_instant(
+    let outcome = service::promql_instant(
         &state.controls(),
         &state.engine,
         tenant_hash,
@@ -164,8 +163,7 @@ async fn handle_query_range(state: &AppState, req: Request<Body>) -> Result<Resp
         now_ns: now_ns(),
         budgets: None,
     };
-    let outcome =
-        service::promql_range(
+    let outcome = service::promql_range(
         &state.controls(),
         &state.engine,
         tenant_hash,

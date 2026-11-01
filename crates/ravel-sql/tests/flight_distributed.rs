@@ -3799,6 +3799,7 @@ impl FlightAuth for CountingAuth {
         &self,
         _metadata: &MetadataMap,
     ) -> Result<Option<ravel_sql::flight::AuditSubject>, Status> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
         Ok(None)
     }
 }
@@ -4048,7 +4049,7 @@ async fn worker_do_get_carries_no_authorization_and_resolves_ticket_tenant() {
         assert_eq!(
             auth.calls(),
             0,
-            "{role:?}: FlightAuth::tenant is never called"
+            "{role:?}: neither FlightAuth::tenant nor FlightAuth::audit_subject is called"
         );
 
         // The slice executed under the ticket's tenant: its cost is folded
