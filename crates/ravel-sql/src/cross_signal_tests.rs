@@ -9,6 +9,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -920,7 +921,11 @@ async fn http_and_multi_lane_pinned_entries_run_two_signal_tables_and_single_sna
 
 /// `plan_pinned_lanes` refuses lanes that are not the statement's signal
 /// tables, before any store request: a missing lane, an extra lane, lanes out
-/// of lane order, and two lanes for a one-table statement.
+/// of lane order, two lanes for a one-table statement, and one lane of the
+/// wrong signal for a one-table statement.
+///
+/// FLIP: a one-table check that counts lanes and not their signal plans the
+/// `spans` lane as `logs` and returns no error.
 #[tokio::test]
 async fn plan_pinned_lanes_refuses_lanes_that_are_not_the_statements_tables() {
     let (recording, executor) =
@@ -958,6 +963,7 @@ async fn plan_pinned_lanes_refuses_lanes_that_are_not_the_statements_tables() {
             "logs, spans",
             "logs",
         ),
+        (one, vec![lane(TargetSignal::Spans)], "spans", "logs"),
         (one, Vec::new(), "none", "logs"),
     ];
     for (sql, lanes, want_pinned, want_tables) in cases {
@@ -1702,6 +1708,118 @@ async fn a_failed_explain_still_merges_its_cost_into_the_caller() {
     assert_eq!(caller.total_s3_requests(), requests.len() as u64);
 }
 
+/// The two-table explain fixture with the logs lane's deletion listing held:
+/// the samples lane resolves, then the explain parks on the logs listing
+/// until something outside it gives up.
+async fn explain_held_on_the_logs_listing(
+    name: &str,
+) -> (
+    Arc<RecordingStore<FixtureStore>>,
+    SqlExecutor,
+    TenantHash,
+    ravel_object_store::fault::GateHandle,
+) {
+    let tenant = TenantId::new(name.to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(&memory, &tenant, 1, "m", samples(&[(0, 1.0), (100, 2.0)])).await;
+    publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &logs_at(&[100])).await;
+    let logs_deletions = format!("t/{}/l/del/", tenant_hash.to_hex());
+    let store: FixtureStore = Arc::new(InstrumentedStore::new(FaultStore::new(
+        memory,
+        FaultPlan::empty(),
+    )));
+    let held = store
+        .inner()
+        .hold(Op::List, Some(logs_deletions), Occurrence::Nth(1));
+    let (recording, executor) = recorded(store, SqlConfig::default());
+    (recording, executor, tenant_hash, held)
+}
+
+/// The caller's accounting after an explain that stopped on the held logs
+/// listing: the samples lane's requests reached it, and the gate held exactly
+/// the logs deletion listing, so the explain stopped where the test says.
+fn assert_stopped_explain_cost_reached_the_caller(
+    recording: &RecordingStore<FixtureStore>,
+    tenant_hash: TenantHash,
+    held: &ravel_object_store::fault::GateHandle,
+    accounting: &QueryAccounting,
+) {
+    let details = held.held_details();
+    assert_eq!(details.len(), 1, "the gate held exactly one call");
+    assert_eq!(details[0].1, Op::List);
+    let requests = recording.requests();
+    let samples_deletions = format!("LIST t/{}/m/del/", tenant_hash.to_hex());
+    assert!(
+        requests.contains(&samples_deletions),
+        "the samples lane resolved before the stop: {requests:?}"
+    );
+    let caller = accounting.snapshot();
+    assert!(
+        caller.total_s3_requests() > 0,
+        "the stopped explain's cost reached the caller: {requests:?}"
+    );
+    // The held listing never completed, so it is the one request the store saw
+    // that no accounting counted.
+    assert_eq!(
+        requests.last().map(String::as_str),
+        Some(format!("LIST t/{}/l/del/", tenant_hash.to_hex()).as_str()),
+        "the held listing is the last request"
+    );
+    assert_eq!(caller.total_s3_requests(), requests.len() as u64 - 1);
+}
+
+/// An `explain` stopped by its own request deadline still hands the caller
+/// the requests it made: the logs lane's deletion listing is held, the 50 ms
+/// deadline trips, and the caller's accounting holds the samples lane's cost.
+///
+/// FLIP: a `MergeOnDrop` whose drop merges nothing leaves the caller at zero.
+#[tokio::test(start_paused = true)]
+async fn an_explain_past_its_deadline_still_merges_its_cost_into_the_caller() {
+    let (recording, executor, tenant_hash, held) =
+        explain_held_on_the_logs_listing("cross-signal-explain-deadline").await;
+    let request = SqlRequest {
+        deadline: Duration::from_millis(50),
+        ..sql_request(PER_TABLE_JOIN, WINDOW)
+    };
+    let accounting = QueryAccounting::new();
+    let err = tokio::time::timeout(
+        Duration::from_secs(60),
+        executor.explain_accounted(tenant_hash, &request, &accounting),
+    )
+    .await
+    .expect("explain returns under its own deadline")
+    .expect_err("the held logs listing trips the deadline");
+    assert!(
+        matches!(err, SqlError::DeadlineExceeded { millis: 50 }),
+        "{err:?}"
+    );
+    assert_stopped_explain_cost_reached_the_caller(&recording, tenant_hash, &held, &accounting);
+}
+
+/// An `explain` whose caller drops it (a client that went away) still hands
+/// the caller the requests it made before the drop. The request deadline is
+/// far away, so only the caller's own timeout stops it.
+///
+/// FLIP: a `MergeOnDrop` whose drop merges nothing leaves the caller at zero.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_explain_still_merges_its_cost_into_the_caller() {
+    let (recording, executor, tenant_hash, held) =
+        explain_held_on_the_logs_listing("cross-signal-explain-cancelled").await;
+    let request = SqlRequest {
+        deadline: Duration::from_secs(60),
+        ..sql_request(PER_TABLE_JOIN, WINDOW)
+    };
+    let accounting = QueryAccounting::new();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        executor.explain_accounted(tenant_hash, &request, &accounting),
+    )
+    .await
+    .expect_err("the caller drops the explain while the logs listing is held");
+    assert_stopped_explain_cost_reached_the_caller(&recording, tenant_hash, &held, &accounting);
+}
+
 /// One logs record of scope `checkout` at `ts` carrying `body`.
 fn log_with_body(ts: i64, body: &str) -> ravel_logseg::LogRecord {
     let mut record = log_record("checkout", ts);
@@ -1913,6 +2031,40 @@ async fn a_name_shadowing_a_table_in_a_two_table_statement_is_refused_before_any
         }
         assert_eq!(recording.requests(), Vec::<String>::new(), "{sql}");
     }
+}
+
+/// A shadowed table name is the caller's own text too, so the refusal cuts
+/// `table` to 64 bytes exactly as it cuts `name`: an alias equal to a
+/// 100-byte Parquet table name echoes neither in full.
+///
+/// FLIP: a cut applied to `name` only returns the whole 100-byte `table`.
+#[tokio::test]
+async fn a_shadowed_table_name_is_cut_like_the_alias() {
+    let long = format!("hits_{}", "x".repeat(95));
+    assert_eq!(long.len(), 100);
+    let cut = format!("{}...", &long[..64]);
+    let sql = format!("SELECT count(*) FROM {long} h, logs AS {long}");
+    let recording = Arc::new(RecordingStore::new(empty_store()));
+    let executor = executor_with(recording.clone(), SqlConfig::default());
+    let refused =
+        http_entry_errors(&executor, TenantHash([7u8; 16]), &sql_request(&sql, WINDOW)).await;
+    assert_eq!(refused.len(), 4);
+    for (entry, err) in refused {
+        let Some(SqlError::ShadowedTableName { kind, name, table }) = &err else {
+            panic!("{entry} must refuse with ShadowedTableName, got {err:?}");
+        };
+        assert_eq!(
+            (*kind, name.as_str(), table.as_str()),
+            ("relation alias", cut.as_str(), cut.as_str()),
+            "{entry}"
+        );
+        let message = err
+            .as_ref()
+            .map(SqlError::client_message)
+            .unwrap_or_default();
+        assert!(!message.contains(&long), "{entry}: {message}");
+    }
+    assert_eq!(recording.requests(), Vec::<String>::new());
 }
 
 /// The shadowing refusal reads only statements over two or more tables, and

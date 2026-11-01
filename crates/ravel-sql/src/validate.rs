@@ -1000,7 +1000,21 @@ impl Visitor for ShadowingFinder<'_> {
             | TableFactor::SemanticView {
                 alias: Some(alias), ..
             } => ("relation alias", alias),
-            _ => return ControlFlow::Continue(()),
+            // Listed rather than matched with `_`, so a variant a sqlparser
+            // upgrade adds fails to compile here instead of passing unchecked.
+            TableFactor::Table { alias: None, .. }
+            | TableFactor::Derived { alias: None, .. }
+            | TableFactor::TableFunction { alias: None, .. }
+            | TableFactor::Function { alias: None, .. }
+            | TableFactor::UNNEST { alias: None, .. }
+            | TableFactor::JsonTable { alias: None, .. }
+            | TableFactor::OpenJsonTable { alias: None, .. }
+            | TableFactor::NestedJoin { alias: None, .. }
+            | TableFactor::Pivot { alias: None, .. }
+            | TableFactor::Unpivot { alias: None, .. }
+            | TableFactor::MatchRecognize { alias: None, .. }
+            | TableFactor::XmlTable { alias: None, .. }
+            | TableFactor::SemanticView { alias: None, .. } => return ControlFlow::Continue(()),
         };
         self.check(kind, &alias.name)
     }

@@ -277,6 +277,14 @@ impl StatementTables {
     }
 }
 
+/// Whether a statement reading `signal_lanes` signal tables, and a Parquet
+/// table beside them when `beside_parquet`, names more than one table. The
+/// resolve's budget check and the plan both ask this, so a refusal names its
+/// table exactly when the plan treats the statement as several tables.
+fn reads_several_tables(signal_lanes: usize, beside_parquet: bool) -> bool {
+    signal_lanes > 1 || beside_parquet
+}
+
 /// The one-table rule of the entry points that read one snapshot: refuse a
 /// statement naming two or more signal tables, before any catalog request.
 /// ES|QL keeps it as its own rule (ADR-2887), which ADR-2904 leaves unchanged;
@@ -457,7 +465,7 @@ fn refuse_shadowed_table_name(sql: &str, others: &BTreeSet<String>) -> Result<()
         Some(found) => Err(SqlError::ShadowedTableName {
             kind: found.kind,
             name: quoted_qualifier(&found.name),
-            table: found.table,
+            table: quoted_qualifier(&found.table),
         }),
         None => Ok(()),
     }
@@ -2703,9 +2711,9 @@ impl SqlExecutor {
     /// table's provider reads only its own lane's snapshot and applies that
     /// snapshot's pending erasure.
     ///
-    /// For a statement naming two or more signal tables, the lanes' signals
+    /// For a statement naming one or more signal tables, the lanes' signals
     /// must be exactly the statement's signal tables in [`SIGNAL_LANE_ORDER`];
-    /// otherwise, exactly one lane. Anything else is
+    /// a statement naming none takes exactly one lane. Anything else is
     /// [`SqlError::PinnedSignalsMismatch`], refused before any store request.
     pub async fn plan_pinned_lanes(
         &self,
@@ -2785,15 +2793,16 @@ impl SqlExecutor {
 
     /// `lanes` checked against the signal tables `sql` names, before anything
     /// is read: every signal table's lane, in [`SIGNAL_LANE_ORDER`], for a
-    /// statement naming two or more; otherwise exactly one lane, which plans
-    /// as the statement's one table the way [`Self::pinned_lane`] plans it.
+    /// statement naming one or more, so a one-table statement's lane must be
+    /// that table's signal; a statement naming no signal table takes exactly
+    /// one lane, which plans the way [`Self::pinned_lane`] plans it.
     fn checked_lanes(
         sql: &str,
         lanes: Vec<(TargetSignal, Snapshot)>,
     ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
         let tables = Statement::Sql(sql).tables()?;
         let pinned: Vec<TargetSignal> = lanes.iter().map(|(signal, _)| *signal).collect();
-        if tables.signals.len() > 1 {
+        if !tables.signals.is_empty() {
             if pinned != tables.signals {
                 return Err(pinned_signals_mismatch(&pinned, &tables.signals));
             }
@@ -2935,7 +2944,7 @@ impl SqlExecutor {
         } else {
             TargetSignal::Parquet
         };
-        let several_tables = lanes.len() > 1 || (parquet.is_some() && reads_lanes);
+        let several_tables = reads_several_tables(lanes.len(), parquet.is_some() && reads_lanes);
         let parquet_tables = match (parquet, &self.parquet) {
             (Some(resolution), Some(sources)) => {
                 // One ledger per query, shared by every reader it opens, over
@@ -3620,7 +3629,9 @@ impl SqlExecutor {
             }
         }
         let lanes = tables.lanes();
-        let several = lanes.len() > 1;
+        // Past the early return above, a statement with Parquet tables also
+        // names a signal table, so it reads both.
+        let several = reads_several_tables(lanes.len(), parquet.is_some());
         let target = tables.first_lane();
         // Postings pruning by the equality `__name__` predicate pushed down
         // from the query's WHERE clause. Without this the SQL
