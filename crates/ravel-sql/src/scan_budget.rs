@@ -100,6 +100,7 @@ impl ScanBudget {
 
     /// The byte ceiling, for a distributed fan-out that folds its workers'
     /// bytes against it.
+    #[cfg(feature = "flight-sql")]
     pub(crate) fn max_bytes_scanned(&self) -> ByteLimit {
         self.max_bytes_scanned
     }

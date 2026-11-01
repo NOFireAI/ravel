@@ -165,6 +165,7 @@ use crate::parquet::{
 };
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
+use crate::scan_budget::EnforcedBudgets;
 use crate::session::{
     LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SessionTable, SpillDecision,
     build_session_with_tables,
@@ -1376,6 +1377,10 @@ pub struct SignalStats {
     pub segments_pruned: u64,
     /// This table's cost, split by phase like [`SqlOutcome::phase_accounting`].
     pub phases: PhaseAccountingSnapshot,
+    /// The byte and store-request budgets this table's scan checked the
+    /// statement total against, and how many checks it ran (issue #1409).
+    /// `None` when no scan of this table was built with a budget.
+    pub budgets: Option<EnforcedBudgets>,
 }
 
 /// Merges `view`'s statement total into `into` when dropped, so a caller
@@ -1411,6 +1416,7 @@ fn signal_stats(lanes: &[LaneCounts], view: &StatementAccounting) -> Vec<SignalS
             segments: lane.segments,
             segments_pruned: lane.segments_pruned,
             phases: view.lane(lane.signal).snapshot(),
+            budgets: view.enforced_budgets(lane.signal),
         })
         .collect()
 }
