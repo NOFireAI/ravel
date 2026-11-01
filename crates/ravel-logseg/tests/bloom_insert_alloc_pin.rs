@@ -7,6 +7,12 @@
 //! allocator counts every allocation in the process, so a second test running
 //! concurrently in the same binary would pollute the count, as in
 //! `stamp_alloc_pin.rs`.
+//!
+//! The test harness's own thread can still allocate while the counter runs,
+//! and `unsafe_code` is forbidden, so the count cannot be limited to the
+//! measuring thread. The loop is measured in [`WINDOWS`] separate windows and
+//! the quietest one is asserted: a per-token allocation shows in every window,
+//! a stray harness allocation in at most a few.
 
 #![allow(clippy::expect_used)]
 
@@ -15,7 +21,7 @@ use std::alloc::System;
 use ravel_logseg::bloom::BloomBuilder;
 use ravel_logseg::tokenizer::tokens;
 use ravel_logseg::writer::bloom_probe::insert_text;
-use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -30,8 +36,30 @@ const TEXTS: [&str; 5] = [
     "short",
 ];
 const COLUMN: u32 = 4;
-/// Passes over [`TEXTS`] under the counter.
+/// Passes over [`TEXTS`] under the counter, per window.
 const MEASURED: usize = 1_000;
+/// Separately counted windows of [`MEASURED`] passes each.
+const WINDOWS: usize = 5;
+
+/// Each window's counts, in order, from running `measured` once per window.
+fn windows(mut measured: impl FnMut()) -> Vec<Stats> {
+    let mut counts = Vec::with_capacity(WINDOWS);
+    for _ in 0..WINDOWS {
+        let region = Region::new(GLOBAL);
+        measured();
+        counts.push(region.change());
+    }
+    counts
+}
+
+/// The window with the fewest allocations and reallocations.
+fn quietest(counts: &[Stats]) -> Stats {
+    counts
+        .iter()
+        .copied()
+        .min_by_key(|stats| stats.allocations + stats.reallocations)
+        .expect("at least one window")
+}
 
 #[test]
 fn bloom_text_insert_allocates_nothing_per_token() {
@@ -45,21 +73,24 @@ fn bloom_text_insert_allocates_nothing_per_token() {
         insert_text(&mut builder, COLUMN, text.as_bytes());
     }
 
-    let region = Region::new(GLOBAL);
-    for _ in 0..MEASURED {
-        for text in TEXTS {
-            insert_text(&mut builder, COLUMN, text.as_bytes());
+    let counts = windows(|| {
+        for _ in 0..MEASURED {
+            for text in TEXTS {
+                insert_text(&mut builder, COLUMN, text.as_bytes());
+            }
         }
-    }
-    let stats = region.change();
+    });
+    let stats = quietest(&counts);
 
     assert_eq!(
         stats.allocations,
         0,
-        "inserting {} tokens allocated {} times ({} bytes)",
+        "inserting {} tokens allocated {} times ({} bytes) in the quietest window; \
+         allocations per window: {:?}",
         MEASURED * token_count,
         stats.allocations,
-        stats.bytes_allocated
+        stats.bytes_allocated,
+        counts.iter().map(|s| s.allocations).collect::<Vec<_>>()
     );
     assert_eq!(stats.reallocations, 0);
 
