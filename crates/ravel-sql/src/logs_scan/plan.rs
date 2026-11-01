@@ -67,6 +67,16 @@ pub(super) fn deferred_verdict(
     }
 }
 
+/// `--decoded-cache-max-bytes` when the scan needs a decoded-set estimate:
+/// it has a `Contains` arm and a decoded cache (ADR-3326, serve-if-fits
+/// amendment). `None` otherwise, and then no estimate is computed.
+fn deferred_cap(ctx: &PartitionCtx) -> Option<u64> {
+    ctx.fetcher
+        .decoded_cache()
+        .filter(|_| has_contains_arm(&ctx.query.content))
+        .map(|cache| cache.max_bytes())
+}
+
 /// Whether `content` holds a `Contains` arm, at any depth of `And`.
 fn has_contains_arm(content: &[Predicate]) -> bool {
     content.iter().any(|p| match p {
@@ -276,6 +286,105 @@ pub(super) fn plan_counts_future(
     })
 }
 
+/// The whole-segment fast path's serve-if-fits verdict, resolved through
+/// `cell` as [`plan_counts_future`] resolves the plan: the first partition to
+/// poll computes it ([`compute_fast_path_verdict`]) and every partition awaits
+/// that one result before its first open. `None`, and no I/O, unless the scan
+/// has a `Contains` arm and a decoded cache ([`deferred_cap`]).
+pub(super) fn fast_path_verdict_future(
+    cell: Arc<OnceCell<Arc<PlanCounts>>>,
+    ctx: Arc<PartitionCtx>,
+    segments: Arc<Vec<SegmentRef>>,
+    concurrency: usize,
+    plan_init_elapsed: Time,
+) -> Option<CountsFuture> {
+    let cap = deferred_cap(&ctx)?;
+    Some(Box::pin(async move {
+        let counts = cell
+            .get_or_try_init(|| async {
+                let started = Instant::now();
+                let counts = compute_fast_path_verdict(&ctx, &segments, concurrency, cap).await;
+                plan_init_elapsed.add_elapsed(started);
+                counts
+            })
+            .await?;
+        Ok(Arc::clone(counts))
+    }))
+}
+
+/// The decoded-set estimate and [`deferred_verdict`] of a scan on the
+/// whole-segment fast path, which runs no plan pass (ADR-3326, serve-if-fits
+/// amendment, implementation note). Every relevant segment's directories are
+/// read once through
+/// [`fetch_plan_directories`](ravel_query::BlockRangeFetcher::fetch_plan_directories), the
+/// plan pass's own directory read: its extents go through the fetcher's read
+/// cache, and its requests are charged to the plan phase. The fast path keeps
+/// every block of a relevant segment, so the estimate covers all of them.
+///
+/// The result is a [`PlanCounts`] carrying only the verdict: no segment is
+/// planned and nothing is published, so the fast path's routing and opens are
+/// unchanged.
+async fn compute_fast_path_verdict(
+    ctx: &PartitionCtx,
+    segments: &[SegmentRef],
+    concurrency: usize,
+    cap: u64,
+) -> DFResult<Arc<PlanCounts>> {
+    let mut reads = Vec::new();
+    for seg in segments {
+        if !LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns) {
+            continue;
+        }
+        refuse_unreadable_version(seg)?;
+        reads.push(async move {
+            let plan = ctx.phase_accounting.plan();
+            let (footer, dirs, _) = ctx
+                .fetcher
+                .block_range_fetcher()
+                .fetch_plan_directories(seg, ctx.tenant_hash, plan)
+                .await
+                .map_err(SqlError::from)?;
+            plan.add_decompressed_bytes(dirs.open_decompressed_bytes());
+            let corrupt = |source| {
+                SqlError::LogFetch(LogFetchError::Corrupt {
+                    key: seg.data_object_key.clone(),
+                    source,
+                })
+            };
+            let blocks = usize::try_from(footer.block_count).map_err(|_| {
+                corrupt(LogSegError::Corrupted(
+                    "footer block_count out of range".into(),
+                ))
+            })?;
+            let all: Vec<usize> = (0..blocks).collect();
+            dirs.decoded_set_estimate(&ctx.columns, &all)
+                .map_err(corrupt)
+        });
+    }
+    let mut stream = futures::stream::iter(reads).buffer_unordered(concurrency.max(1));
+    let mut estimate = 0u64;
+    while let Some(read) = stream.next().await {
+        estimate = estimate.saturating_add(read?);
+    }
+    let verdict = deferred_verdict(estimate, cap, false);
+    ctx.phase_accounting
+        .decoded_cache()
+        .record_deferred_verdict(verdict.estimate_bytes, verdict.serve);
+    let mut counts = PlanCounts::assemble(
+        std::iter::repeat_with(|| None)
+            .take(segments.len())
+            .collect(),
+        vec![false; segments.len()],
+        0,
+        KeyIndexPruning::default(),
+        segments,
+        false,
+        false,
+    );
+    counts.deferred = Some(verdict);
+    Ok(Arc::new(counts))
+}
+
 /// One segment's [`LogSegmentFetcher::plan_segment`] result: the surviving
 /// whole-object block indices and this segment's decoded directories
 /// (ADR-2414 decision A1), stats, a carried footer (skip-decidable
@@ -450,13 +559,7 @@ async fn compute_plan_counts(
     let mut carried_bytes = 0u64;
     let mut carried_seen = 0usize;
     let mut key_index = KeyIndexPruning::default();
-    // ADR-3326, serve-if-fits amendment: only a scan with a `Contains` arm and
-    // a decoded cache needs the decoded-set estimate.
-    let deferred_cap = ctx
-        .fetcher
-        .decoded_cache()
-        .filter(|_| has_contains_arm(&ctx.query.content))
-        .map(|cache| cache.max_bytes());
+    let deferred_cap = deferred_cap(ctx);
     let mut deferred_estimate = 0u64;
     while let Some((idx, entry)) = stream.next().await {
         let keyed = match entry.map_err(SqlError::from)? {
