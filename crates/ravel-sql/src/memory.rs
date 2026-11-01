@@ -1263,9 +1263,15 @@ impl TenantDelegatingPool {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The high-water mark, over this query, of the bytes its consumers asked
-    /// for before any reserve-ahead factor. It equals the charged peak for a
-    /// plan with no reserve-ahead consumer.
+    /// The high-water mark, over this query, of the sum of the bytes its
+    /// consumers' reservations hold live, before any reserve-ahead factor.
+    /// This is a live-demand gauge, not a cumulative charge: a held shrink
+    /// ([`Self::holds_shrink`]) takes bytes off it while the bytes it frees
+    /// stay charged, held rather than released ([`Self::hold`]); a grow
+    /// served from a hold ([`Self::grow_charged`]) adds to it while charging
+    /// nothing new. So the asked peak is at most the charged peak
+    /// (`peak_intermediate_bytes`), and equals it only for a plan with no
+    /// reserve-ahead consumer and no held release.
     pub fn peak_asked_bytes(&self) -> u64 {
         self.peak_asked_bytes.load(Ordering::Acquire)
     }
