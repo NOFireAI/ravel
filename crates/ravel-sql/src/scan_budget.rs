@@ -441,6 +441,9 @@ mod tests {
 
     /// The ledger reports the installed limits and every check, a refused one
     /// included.
+    ///
+    /// FLIP: a `report` that returns `Unlimited` for both limits instead of
+    /// the installed ones fails the first `assert_eq!`.
     #[test]
     fn the_ledger_counts_every_check() {
         let ledger = Arc::new(BudgetLedger::default());

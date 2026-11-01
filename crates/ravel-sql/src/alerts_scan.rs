@@ -60,8 +60,8 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_schema::{ALERT_ID_KEY, GENERATION_KEY, RULE_ID_KEY, STATE_KEY, alerts_schema};
 use crate::error::SqlError;
-use crate::scan_budget::ScanBudget;
 use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased_by};
+use crate::scan_budget::ScanBudget;
 
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;

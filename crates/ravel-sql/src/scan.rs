@@ -134,15 +134,13 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
 use ravel_query::erasure::{ErasurePredicate, retain_series_soa};
-use ravel_query::{
-    FetchedSeriesSoa, PhaseAccounting, SamplePriority, SegmentFetcher,
-};
+use ravel_query::{FetchedSeriesSoa, PhaseAccounting, SamplePriority, SegmentFetcher};
 use ravel_types::{LabelSet, TenantHash};
 
 use crate::error::SqlError;
 use crate::labels::build_labels_dict;
-use crate::schema::{COL_SERIES_ID, COL_TS, COL_VALUE, internal_schema};
 use crate::scan_budget::ScanBudget;
+use crate::schema::{COL_SERIES_ID, COL_TS, COL_VALUE, internal_schema};
 
 /// Rows accumulated into one output batch before it is emitted. Bounds the
 /// per-batch working set and gives the memory reservation a per-batch

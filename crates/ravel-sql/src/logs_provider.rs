@@ -4788,7 +4788,10 @@ mod tests {
             max: 1000,
         }) = run.error
         else {
-            panic!("expected TooManyBytesScanned at 1772 of 1000, got {:?}", run.error);
+            panic!(
+                "expected TooManyBytesScanned at 1772 of 1000, got {:?}",
+                run.error
+            );
         };
         assert_eq!(run.rows, 4, "only seg-0 is decoded");
         assert_eq!(run.gets(), [1, 1, 0], "seg-2 is never fetched");
@@ -4800,7 +4803,10 @@ mod tests {
             max: 1772,
         }) = edge.error
         else {
-            panic!("expected TooManyBytesScanned at 2670 of 1772, got {:?}", edge.error);
+            panic!(
+                "expected TooManyBytesScanned at 2670 of 1772, got {:?}",
+                edge.error
+            );
         };
         assert_eq!(edge.rows, 8);
         assert_eq!(edge.gets(), [1, 1, 1]);
@@ -4821,7 +4827,10 @@ mod tests {
             ..
         }) = run.error
         else {
-            panic!("expected RequestBudgetExceeded at 2 of 1, got {:?}", run.error);
+            panic!(
+                "expected RequestBudgetExceeded at 2 of 1, got {:?}",
+                run.error
+            );
         };
         assert_eq!(run.rows, 4);
         assert_eq!(run.gets(), [1, 1, 0]);
@@ -4852,7 +4861,10 @@ mod tests {
             max: 3000,
         }) = run.error
         else {
-            panic!("expected TooManyBytesScanned at 3272 of 3000, got {:?}", run.error);
+            panic!(
+                "expected TooManyBytesScanned at 3272 of 3000, got {:?}",
+                run.error
+            );
         };
         assert_eq!(run.rows, 4);
         assert_eq!(run.gets(), [1, 1, 0]);
@@ -4988,7 +5000,10 @@ mod tests {
             Err(SqlError::TooManyBytesScanned { scanned, max }) => {
                 assert_eq!((scanned, max), (total, total - 1));
             }
-            other => panic!("expected TooManyBytesScanned at {total} of {}, got {other:?}", total - 1),
+            other => panic!(
+                "expected TooManyBytesScanned at {total} of {}, got {other:?}",
+                total - 1
+            ),
         }
         assert_eq!(folded, total);
 

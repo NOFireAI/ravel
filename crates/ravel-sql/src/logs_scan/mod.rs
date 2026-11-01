@@ -415,7 +415,6 @@ use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::error::SqlError;
 use crate::late_materialization::{RowRef, row_ref_field};
 use crate::logs_pushdown::{content_is_route_neutral, prune_is_rewrite_neutral};
-use crate::scan_budget::ScanBudget;
 use crate::logs_schema::{
     FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
@@ -424,6 +423,7 @@ use crate::logs_schema::{
 use crate::rlog_attrs::{
     attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
 };
+use crate::scan_budget::ScanBudget;
 use ravel_logseg::record::canonical_value_bytes;
 
 mod batch;

@@ -3619,10 +3619,9 @@ impl SqlExecutor {
                 requests,
                 max,
                 fold_lag,
-            }) = request_budget_exceeded(
-                estimate.estimated_requests,
-                engine_config.max_s3_requests,
-            ) {
+            }) =
+                request_budget_exceeded(estimate.estimated_requests, engine_config.max_s3_requests)
+            {
                 return Err(SqlError::RequestBudgetExceeded {
                     requests,
                     max,
